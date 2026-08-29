@@ -34,6 +34,24 @@ def _load_tokenizer(model: str, trust_remote_code: bool = False):
     return tokenizer
 
 
+
+def _install_compass_clock(config) -> None:
+    """Put this process on the same virtual clock as the engine core.
+
+    Arrival is stamped here while first-token is stamped in the engine core, and
+    TTFT subtracts one from the other. They must therefore read the same clock
+    and share an origin. This clock does not advance — in a simulated run the
+    engine core owns progress — so an offline batch submitted together arrives
+    together, at the start of virtual time.
+    """
+    compass = getattr(config, "compass_config", None)
+    if compass is None or not compass.enabled or not compass.virtual_clock:
+        return
+    from atom.utils.clock import VirtualClock, set_clock
+
+    set_clock(VirtualClock(epoch=compass.epoch))
+
+
 class LLMEngine:
 
     def __init__(self, model, tokenizer=None, **kwargs):
@@ -43,6 +61,7 @@ class LLMEngine:
         data_parallel_master_port = kwargs.get("data_parallel_master_port", None)
         config = Config(model, **config_kwargs)
         self.config = config
+        _install_compass_clock(self.config)
         self.tokenizer = tokenizer or _load_tokenizer(
             config.model, config.trust_remote_code
         )
@@ -775,7 +794,9 @@ class InputOutputProcessor:
             if external_request_id is not None:
                 self._external_to_internal.pop(external_request_id, None)
             output_str = self.tokenizer.decode(req.completion_token_ids)
-            req.leave_time = get_clock().time()
+            # Prefer the engine core's own stamp: it owns time, and under a
+            # simulated run this process's clock is deliberately frozen.
+            req.leave_time = getattr(req, "finish_time", 0.0) or get_clock().time()
 
             # Calculate TTFT (Time To First Token) and TPOT (Time Per Output Token)
             ttft = 0.0

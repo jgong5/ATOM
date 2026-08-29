@@ -75,7 +75,7 @@ def _install_compass_clock(config) -> None:
         return
     from atom.utils.clock import VirtualClock, set_clock
 
-    set_clock(VirtualClock())
+    set_clock(VirtualClock(epoch=compass.epoch))
     logger.info("ATOMCompass: engine core running on a virtual clock")
 
 
@@ -421,6 +421,7 @@ class EngineCore:
             fwd_out = self.runner_mgr.call_func(
                 "forward", scheduled_batch, wait_out=True
             )
+            _advance_clock_for(fwd_out)
             if (
                 self.scheduler.prefill_delayer is not None
                 and scheduled_batch.total_seqs_num_prefill > 0

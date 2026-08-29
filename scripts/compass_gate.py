@@ -55,15 +55,37 @@ def main() -> int:
     from atom.utils.clock import VirtualClock, get_clock
 
     clock = get_clock()
-    on_virtual = isinstance(clock, VirtualClock)
-    print(f"  clock: {type(clock).__name__}")
-    if on_virtual:
-        print(f"  virtual time modelled : {clock.elapsed:.3f}s")
-        print(f"  wall time spent       : {wall:.3f}s")
-        if clock.elapsed <= 0.0:
-            failures.append("virtual clock never advanced")
-    else:
-        failures.append("engine did not run on a virtual clock")
+    print(f"  clock in this process: {type(clock).__name__}")
+    if not isinstance(clock, VirtualClock):
+        failures.append("client process did not get a virtual clock")
+
+    # This process stamps arrival; the engine core stamps first-token and owns
+    # progress. So the evidence that virtual time advanced is the reported TTFT,
+    # not this process's own clock, which never moves by design.
+    ttfts = [o.get("ttft") for o in outputs if isinstance(o, dict)]
+    modelled = max([t for t in ttfts if t is not None], default=None)
+    if modelled is None:
+        modelled = max((o.get("latency") for o in outputs
+                        if isinstance(o, dict) and o.get("latency") is not None),
+                       default=None)
+    print(f"  modelled request time : {modelled if modelled is not None else 'n/a'}")
+    print(f"  wall time spent       : {wall:.3f}s")
+    if modelled is not None and modelled <= 0.0:
+        failures.append(f"engine reported non-positive modelled time ({modelled})")
+
+    # A weaker gate would pass even if decode never iterated, so check the
+    # per-token timing too: TPOT must be positive, which it cannot be unless
+    # every decode step advanced the clock.
+    tpots = [o.get("tpot") for o in outputs if isinstance(o, dict)]
+    tpots = [t for t in tpots if t is not None]
+    if tpots:
+        print(f"  modelled TPOT         : {min(tpots):.6f}s")
+        if min(tpots) <= 0.0:
+            failures.append(
+                f"non-positive TPOT ({min(tpots)}): decode steps did not advance time"
+            )
+    if args.max_tokens > 1 and not tpots:
+        failures.append("engine reported no TPOT, so decode timing is unverified")
 
     print("=" * 66)
     if failures:

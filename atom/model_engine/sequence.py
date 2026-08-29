@@ -253,6 +253,11 @@ class Sequence:
         self.arrive_time = 0.0
         self.first_token_time = 0.0
         self.leave_time = 0.0
+        # Stamped by the engine core when the sequence finishes, on whichever
+        # clock the engine is running. The client stamps leave_time on its own
+        # clock, which under a simulated run does not advance — so latency and
+        # TPOT must be derived from this instead.
+        self.finish_time = 0.0
         self.leave_reason = ""
 
         # kv_transfer params

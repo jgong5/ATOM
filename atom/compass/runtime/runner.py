@@ -70,6 +70,12 @@ class CompassModelRunner(ModelRunner):
         """Predict the step, synthesise its output, and report the duration."""
         shape = self._describe(batch)
         cost = self._oracle.estimate(shape)
+        self._step_count = getattr(self, "_step_count", 0) + 1
+        logger.debug(
+            "COMPASS step %d: reqs=%d tokens=%d prefill_tokens=%d cost=%.6fs",
+            self._step_count, shape.batch_size, shape.total_tokens,
+            shape.num_prefill_tokens, cost.seconds,
+        )
 
         req_ids = list(batch.req_ids)
         filler = self._compass_config.filler_token_id
@@ -91,11 +97,13 @@ class CompassModelRunner(ModelRunner):
         unreduced; the oracle decides what to do with them.
         """
         num_scheduled = tuple(int(n) for n in batch.num_scheduled_tokens)
-        context_lens = tuple(
-            int(n) for n in getattr(batch, "context_lens", ()) or ()
-        )
-        if not context_lens:
+        # These arrive as numpy arrays, so test for None rather than truthiness:
+        # `arr or default` raises on anything with more than one element.
+        raw_context_lens = getattr(batch, "context_lens", None)
+        if raw_context_lens is None:
             context_lens = tuple(0 for _ in num_scheduled)
+        else:
+            context_lens = tuple(int(n) for n in raw_context_lens)
         return StepShape(
             num_scheduled_tokens=num_scheduled,
             context_lens=context_lens,

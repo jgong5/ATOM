@@ -1513,6 +1513,7 @@ class Scheduler:
             unschedulable = self._unschedulable_reason(seq)
             if unschedulable is not None:
                 seq.status = SequenceStatus.FINISHED
+                seq.finish_time = get_clock().time()
                 seq.leave_reason = f"unschedulable: {unschedulable}"
                 self._rejected.append(seq)
                 continue
@@ -1931,6 +1932,7 @@ class Scheduler:
     def _reject_aborted_waiting(self, seq: Sequence) -> None:
         has_inflight_load = bool(getattr(seq, "_counted_as_inflight_load", False))
         seq.status = SequenceStatus.FINISHED
+        seq.finish_time = get_clock().time()
         seq.leave_reason = "aborted"
         self._rejected.append(seq)
         if not has_inflight_load or not self._connector_flag("is_offload"):
@@ -2754,6 +2756,7 @@ class Scheduler:
                 seq.num_tokens = num_tokens
                 seq.leave_reason = leave_reason
                 seq.status = SequenceStatus.FINISHED
+                seq.finish_time = get_clock().time()
                 self.total_finished_requests += 1
                 self.total_prompt_tokens += int(seq.num_prompt_tokens)
                 self.total_generation_tokens += max(

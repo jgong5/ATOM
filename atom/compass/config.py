@@ -29,12 +29,21 @@ class CompassConfig:
     """
 
     enabled: bool = False
+    epoch: Optional[float] = None
     oracle_qualname: str = "atom.compass.core.cost.constant.ConstantCostOracle"
     oracle_options: Optional[dict] = None
     virtual_clock: bool = True
     filler_token_id: int = 100
 
     def __post_init__(self) -> None:
+        if self.enabled and self.epoch is None:
+            # Pinned once, then carried to every process that stamps request
+            # timestamps. Without a shared origin, a time recorded in one
+            # process is not comparable to one recorded in another — which
+            # shows up immediately as a negative TTFT.
+            import time as _time
+
+            self.epoch = _time.time()
         if self.oracle_options is None:
             self.oracle_options = {}
         if self.filler_token_id < 0:
