@@ -16,6 +16,7 @@ from atom.model_engine.multimodal import get_mrope_input_positions
 from atom.model_engine.sequence import Sequence
 from atom.sampling_params import SamplingParams
 from atom.utils import envs
+from atom.utils.clock import get_clock
 
 logger = logging.getLogger("atom")
 
@@ -742,7 +743,7 @@ class InputOutputProcessor:
                 dp_session_id=dp_session_id,
                 dp_parent_session_id=dp_parent_session_id,
             )
-            seq.arrive_time = time.time()
+            seq.arrive_time = get_clock().time()
             self.requests[seq.id] = seq
             if seq.external_request_id is not None:
                 self._external_to_internal[seq.external_request_id] = seq.id
@@ -774,7 +775,7 @@ class InputOutputProcessor:
             if external_request_id is not None:
                 self._external_to_internal.pop(external_request_id, None)
             output_str = self.tokenizer.decode(req.completion_token_ids)
-            req.leave_time = time.time()
+            req.leave_time = get_clock().time()
 
             # Calculate TTFT (Time To First Token) and TPOT (Time Per Output Token)
             ttft = 0.0

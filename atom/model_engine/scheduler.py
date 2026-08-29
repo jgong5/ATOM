@@ -42,6 +42,7 @@ from atom.model_engine.state_runtime import (
     StateRuntime,
 )
 from atom.utils import envs
+from atom.utils.clock import get_clock
 
 logger = logging.getLogger("atom")
 
@@ -866,9 +867,15 @@ class ScheduledBatchOutput:
         is_prev_prefill=False,
         logprobs=None,
         dspark_ell: np.ndarray | None = None,
+        compass_step_seconds: float | None = None,
     ):
         self.req_ids = req_ids
         self.token_ids = token_ids
+        # Set only by a simulated runner: how long this step was predicted to
+        # take. The scheduling process advances its clock by this rather than
+        # waiting, because the runner executes in a different process and has
+        # no clock of its own. None during a normal run.
+        self.compass_step_seconds = compass_step_seconds
         self.draft_token_ids = draft_token_ids
         self.num_rejected = num_rejected
         self.num_bonus = num_bonus
@@ -1197,7 +1204,7 @@ class Scheduler:
                 oldest_arrive = seq.arrive_time
         if oldest_arrive is None:
             return 0.0
-        return max(0.0, (time.time() - oldest_arrive) * 1000.0)
+        return max(0.0, (get_clock().time() - oldest_arrive) * 1000.0)
 
     def publish_kv_events(self) -> None:
         """Drain BlockManager's event log and publish as one EventBatch. Called
@@ -1477,7 +1484,7 @@ class Scheduler:
         # ---- Phase 2: new requests from waiting ----
         while (
             delayer_allows
-            and (self.delay_factor <= 0 or self._passed_delay(time.time()))
+            and (self.delay_factor <= 0 or self._passed_delay(get_clock().time()))
             and self.waiting
             and num_seqs_prefill < self.max_num_seqs
             and num_batched_tokens < self.max_num_batched_tokens
@@ -2596,6 +2603,9 @@ class Scheduler:
                     seq.num_tokens,
                     len(seq.block_table),
                 )
+            if seq.num_completion_tokens >= 1 and seq.first_token_time == 0.0:
+                seq.first_token_time = get_clock().time()
+
             num_tokens = seq.num_tokens - num_placeholder_width - num_rejected
             leave_reason = None
             # Client disconnected -> finish now via the normal stop path (frees
@@ -3367,7 +3377,7 @@ class DecodeScheduler(Scheduler):
         if seq is not None:
             seq.num_cached_tokens = num_tokens_computed
             seq.append_token(sampled_token_id)
-            seq.first_token_time = time.time()
+            seq.first_token_time = get_clock().time()
             self.prefill_done.append(seq)
 
     def schedule(self):
