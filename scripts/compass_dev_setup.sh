@@ -8,6 +8,11 @@
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# The checkout is owned by the host user while the container runs as root, so
+# git refuses to touch it until told the directory is trusted. Lost on recreate
+# along with the rest of /root.
+git config --global --add safe.directory "${REPO}" 2>/dev/null || true
+
 echo "repointing editable install -> ${REPO}"
 pip install -q -e "${REPO}"
 python - <<PY

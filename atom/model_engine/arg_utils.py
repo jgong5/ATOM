@@ -17,6 +17,7 @@ from atom.config import (
     SpeculativeConfig,
 )
 from atom.model_engine.engine_core_mgr import DP_LB_DEFAULT, DP_LB_STRATEGIES
+from atom.compass.config import CompassConfig
 
 logger = logging.getLogger("atom")
 
@@ -48,6 +49,8 @@ class EngineArgs:
     data_parallel_master_port: int = 29500
     data_parallel_base_port: int | None = None
     enforce_eager: bool = False
+    compass: bool = False
+    compass_oracle: str = ""
     enable_prefix_caching: bool = True
     port: int = 8006
     kv_cache_dtype: str = "bf16"
@@ -111,6 +114,21 @@ class EngineArgs:
             "--trust-remote-code",
             action="store_true",
             help="Trust remote code when loading model.",
+        )
+        parser.add_argument(
+            "--compass",
+            action="store_true",
+            help="Run under ATOMCompass: predict the forward pass instead of "
+            "performing it. Selects the Compass model runner and puts the "
+            "engine on a virtual clock.",
+        )
+        parser.add_argument(
+            "--compass-oracle",
+            type=str,
+            default="",
+            help="Fully-qualified cost-oracle class for --compass. Defaults to "
+            "a constant-cost oracle, which is only useful for checking that "
+            "the plumbing works.",
         )
         parser.add_argument(
             "--tensor-parallel-size",
@@ -642,6 +660,12 @@ class EngineArgs:
 
         # Handle special transformations
         kwargs["kv_cache_block_size"] = kwargs.pop("block_size")
+        compass_enabled = kwargs.pop("compass", False)
+        compass_oracle = kwargs.pop("compass_oracle", "")
+        compass_kwargs = {"enabled": compass_enabled}
+        if compass_oracle:
+            compass_kwargs["oracle_qualname"] = compass_oracle
+        kwargs["compass_config"] = CompassConfig(**compass_kwargs)
         kwargs["compilation_config"] = CompilationConfig(
             level=kwargs.pop("level"),
             cudagraph_mode=CUDAGraphMode[kwargs.pop("cudagraph_mode")],
