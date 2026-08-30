@@ -74,3 +74,31 @@ The symmetric half looks close to solved. The asymmetric half remains the real
 open risk, and nothing in the field has shipped a solution: Revati claims a
 multi-process timekeeper and released no code, and LLM-Emu avoids the problem
 entirely by hooking a single-process executor.
+
+## Settled by failure: tracing must go through the runner, not the model
+
+Driving `model(input_ids, positions)` directly traces *a* forward, but not the
+forward ATOM would run. On real hardware it fails at
+`fwd_ctx.context.is_dummy_run`: attention reads a forward context that only the
+runner establishes, carrying attention metadata, KV-cache state and the
+dummy-run flag. Building those by hand means reimplementing `prepare_inputs`,
+which is exactly the re-implementation this design exists to avoid.
+
+So both sides of the comparison have to enter through `ModelRunner.forward`.
+`dummy_execution()` already does this: it assembles a `ScheduledBatch` with
+`is_dummy_run=True` and calls `self.forward(...)`, letting ATOM set up
+everything. Capture is then a real runner on hardware; derivation is the same
+runner with `_build_and_load_model` overridden to construct on meta and skip
+weight loading — an override the base method's own docstring invites.
+
+**The 2999-operator meta graph recorded so far is therefore provisional.** It is
+reproducible and it proved the tracing machinery works end to end — dispatcher
+and Triton interception, persistence, comparison — but it came from a bare model
+call, so it is not yet the graph a served batch produces. It should not be
+treated as a reference artifact until it is re-derived through the runner.
+
+A related trap, worth keeping: built at the default fp32 rather than the model's
+`torch_dtype`, meta traces happily while hardware refuses — AITER's fused
+qk-rmsnorm takes fp16/bf16 only. Meta accepts kernels real devices reject, so
+dtype has to be pinned deliberately on both sides. The diff caught this, which
+is some evidence it is worth having.

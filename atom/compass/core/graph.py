@@ -99,3 +99,71 @@ class OpGraph:
         for op in self.ops:
             out[op.name] = out.get(op.name, 0) + 1
         return out
+
+    # -- persistence ---------------------------------------------------------
+    #
+    # A graph outlives the process that produced it: derivation and capture run
+    # separately (ATOM registers attention layers globally, so one process can
+    # only build a model once), and a derived graph is reused across a sweep
+    # rather than recomputed.
+
+    def to_dict(self) -> dict:
+        return {
+            "version": 1,
+            "key": None if self.key is None else {
+                "model_id": self.key.model_id,
+                "topology": [list(t) for t in self.key.topology],
+                "rank_coords": [list(t) for t in self.key.rank_coords],
+                "batch_signature": list(self.key.batch_signature),
+            },
+            "ops": [
+                {
+                    "name": op.name,
+                    "input_shapes": [list(s) for s in op.input_shapes],
+                    "output_shapes": [list(s) for s in op.output_shapes],
+                    "dtypes": list(op.dtypes),
+                    "group": op.group,
+                }
+                for op in self.ops
+            ],
+        }
+
+    @classmethod
+    def from_dict(cls, data: dict) -> "OpGraph":
+        version = data.get("version")
+        if version != 1:
+            raise ValueError(f"unsupported op-graph version: {version!r}")
+        key = None
+        raw_key = data.get("key")
+        if raw_key:
+            key = GraphKey(
+                model_id=raw_key["model_id"],
+                topology=tuple(tuple(t) for t in raw_key["topology"]),
+                rank_coords=tuple(tuple(t) for t in raw_key["rank_coords"]),
+                batch_signature=tuple(raw_key["batch_signature"]),
+            )
+        graph = cls(key=key)
+        for op in data["ops"]:
+            graph.add(
+                OpSpec(
+                    name=op["name"],
+                    input_shapes=tuple(tuple(s) for s in op["input_shapes"]),
+                    output_shapes=tuple(tuple(s) for s in op["output_shapes"]),
+                    dtypes=tuple(op["dtypes"]),
+                    group=op["group"],
+                )
+            )
+        return graph
+
+    def save(self, path) -> None:
+        import json
+
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(self.to_dict(), fh)
+
+    @classmethod
+    def load(cls, path) -> "OpGraph":
+        import json
+
+        with open(path, encoding="utf-8") as fh:
+            return cls.from_dict(json.load(fh))

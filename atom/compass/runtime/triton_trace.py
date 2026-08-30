@@ -79,8 +79,10 @@ def _resolve_grid(grid, meta) -> tuple:
 class TritonLaunchTracer:
     """Context manager that records Triton launches, skipping them on meta.
 
-    Launches whose tensors live on a real device are passed through untouched,
-    so this is safe to leave enabled outside a meta run.
+    Every launch is recorded, whether or not it runs, so that a graph captured
+    on real hardware can be compared against one derived on meta. Only the
+    launch itself is conditional, which makes this safe to leave enabled outside
+    a meta run.
     """
 
     def __init__(self, graph: Optional[OpGraph] = None) -> None:
@@ -101,10 +103,12 @@ class TritonLaunchTracer:
 
         def run(self, *args, **kwargs):  # noqa: ANN001 - mirrors triton's signature
             tensors = _tensors(args, kwargs)
-            if not any(_is_meta(t) for t in tensors):
-                return original(self, *args, **kwargs)
+            # Record either way, so a graph captured on real hardware is
+            # comparable to one derived on meta. Only the launch is conditional.
             tracer._record(self, args, kwargs, tensors)
-            return None
+            if any(_is_meta(t) for t in tensors):
+                return None
+            return original(self, *args, **kwargs)
 
         JITFunction.run = run
         self._original, self._patched_cls = original, JITFunction
