@@ -18,6 +18,7 @@ import time
 import torch
 
 from atom.compass.runtime.meta import MetaOpTracer, MetaTrace
+from atom.compass.runtime.triton_trace import TritonLaunchTracer
 
 
 def main() -> int:
@@ -82,10 +83,13 @@ def main() -> int:
     positions = torch.arange(args.tokens, dtype=torch.long, device="meta")
 
     tracer = MetaOpTracer()
+    # Triton kernels never reach the dispatcher, so they need their own
+    # interception. Both write into one graph, preserving execution order.
+    triton_tracer = TritonLaunchTracer(graph=tracer.graph)
     failure = None
     completed = False
     try:
-        with tracer, torch.inference_mode():
+        with triton_tracer, tracer, torch.inference_mode():
             model(input_ids, positions)
         completed = True
     except Exception as exc:  # noqa: BLE001
@@ -96,6 +100,7 @@ def main() -> int:
         seconds=tracer.seconds, completed=completed, failure=failure,
     )
     print(trace.report())
+    print(triton_tracer.summary())
 
     if args.show_ops:
         print("\noperators executed (count):")
