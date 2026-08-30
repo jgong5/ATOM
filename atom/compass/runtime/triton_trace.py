@@ -101,14 +101,19 @@ class TritonLaunchTracer:
         tracer = self
         original = JITFunction.run
 
-        def run(self, *args, **kwargs):  # noqa: ANN001 - mirrors triton's signature
+        # The signature mirrors triton's exactly: `grid` and `warmup` are
+        # keyword-only after *args, and triton calls this as
+        # `self.run(grid=..., warmup=False, *args, **kwargs)`. Forwarding through
+        # a generic (*args, **kwargs) re-binds them into the kernel's own
+        # parameters and the launch fails with a duplicate-argument error.
+        def run(self, *args, grid=None, warmup=False, **kwargs):  # noqa: ANN001
             tensors = _tensors(args, kwargs)
             # Record either way, so a graph captured on real hardware is
             # comparable to one derived on meta. Only the launch is conditional.
-            tracer._record(self, args, kwargs, tensors)
+            tracer._record(self, args, dict(kwargs, grid=grid), tensors)
             if any(_is_meta(t) for t in tensors):
                 return None
-            return original(self, *args, **kwargs)
+            return original(self, *args, grid=grid, warmup=warmup, **kwargs)
 
         JITFunction.run = run
         self._original, self._patched_cls = original, JITFunction

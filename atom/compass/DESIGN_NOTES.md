@@ -102,3 +102,37 @@ A related trap, worth keeping: built at the default fp32 rather than the model's
 qk-rmsnorm takes fp16/bf16 only. Meta accepts kernels real devices reject, so
 dtype has to be pinned deliberately on both sides. The diff caught this, which
 is some evidence it is worth having.
+
+## Settled: never trace the first forward — Triton autotunes on it
+
+Tracing step one of a real run recorded **90,838 operators**. Tracing step two
+recorded **101**. The difference is Triton autotuning: on a kernel's first
+launch it benchmarks every candidate configuration, so the first step contains
+tens of thousands of launches that steady-state serving never performs —
+`chunk_fwd_kernel_o` alone appeared 34,269 times, `chunk_scaled_dot_kkt_fwd_kernel`
+26,528. It is also slow, taking minutes of wall time.
+
+`CompassConfig.trace_step` therefore defaults to 2 rather than 1. Anything that
+captures a graph, times a step, or calibrates a cost model has to step past
+warmup first, and a tool that quietly recorded step one would produce numbers
+that look precise and describe nothing that happens in production.
+
+Meta never revealed this, because skipped launches never autotune. It is a case
+where hardware capture told us something derivation could not — which is an
+argument for keeping the comparison even after meta is trusted.
+
+## Open: the captured graph looks too small for the model
+
+The steady-state capture holds 101 operators with 3
+`linear_attention_with_output_base` and 13 `gemm_a16w16`, which is on the order
+of three layers, not the 64 this model has. Either the trace is being cut short,
+or most layers execute inside a region that does not dispatch operator by
+operator — `torch.compile(..., backend="eager")` is applied to the model in
+`ModelRunner`, and a compiled region would explain both the low count and why
+meta, which is not compiled the same way, saw 2999.
+
+Unresolved. It matters, because a graph that silently omits most of the model
+would cost out at a fraction of the truth while looking well-formed. Worth
+checking before any cost model is fitted against these graphs: compare the
+per-layer operator counts against the model's layer count, and fail loudly when
+they disagree rather than trusting the artifact.

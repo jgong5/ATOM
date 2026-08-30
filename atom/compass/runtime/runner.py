@@ -27,6 +27,7 @@ from typing import Optional
 
 from atom.compass.config import CompassConfig
 from atom.compass.core.cost.base import CostOracle, StepShape
+from atom.compass.core.graph import GraphKey, OpGraph
 from atom.model_engine.model_runner import ModelRunner
 from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput
 from atom.utils import resolve_obj_by_qualname
@@ -43,10 +44,13 @@ class CompassModelRunner(ModelRunner):
         super().__init__(*args, **kwargs)
         self._compass_config = self._resolve_compass_config()
         self._oracle: CostOracle = self._build_oracle(self._compass_config)
+        self._graph = OpGraph()
+        self._traced_steps = 0
+        self._step_index = 0
         logger.info(
-            "ATOMCompass active: oracle=%s filler_token_id=%d",
+            "ATOMCompass active: mode=%s oracle=%s",
+            self._compass_config.mode,
             self._oracle.describe(),
-            self._compass_config.filler_token_id,
         )
 
     # -- setup ----------------------------------------------------------------
@@ -67,7 +71,10 @@ class CompassModelRunner(ModelRunner):
     # -- the seam -------------------------------------------------------------
 
     def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
-        """Predict the step, synthesise its output, and report the duration."""
+        """Predict the step, or trace it, depending on the configured mode."""
+        if self._compass_config.mode == "trace":
+            return self._forward_traced(batch)
+
         shape = self._describe(batch)
         cost = self._oracle.estimate(shape)
         self._step_count = getattr(self, "_step_count", 0) + 1
@@ -88,6 +95,58 @@ class CompassModelRunner(ModelRunner):
             num_bonus=None,
             draft_token_ids=None,
             compass_step_seconds=cost.seconds,
+        )
+
+    def _forward_traced(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
+        """Run the real forward and record the operations it performed.
+
+        The forward is ATOM's own, so the recorded graph is what a served batch
+        actually produces — attention metadata, KV state and forward context all
+        established by the runner rather than reconstructed. That is the whole
+        point: a graph assembled by calling the model directly is a different
+        forward, and would validate nothing.
+
+        One step is recorded, and deliberately not the first. Triton autotunes
+        on a kernel's first launch, benchmarking every candidate configuration:
+        recording that yields tens of thousands of launches that steady-state
+        serving never performs. Which step to take is ``trace_step``.
+        """
+        from atom.compass.runtime.meta import MetaOpTracer
+        from atom.compass.runtime.triton_trace import TritonLaunchTracer
+
+        self._step_index += 1
+        if self._step_index != self._compass_config.trace_step:
+            return super().forward(batch)
+
+        ops = MetaOpTracer(graph=self._graph)
+        triton = TritonLaunchTracer(graph=self._graph)
+        try:
+            with triton, ops:
+                output = super().forward(batch)
+        finally:
+            self._traced_steps += 1
+            self._write_graph(batch)
+        return output
+
+    def _write_graph(self, batch: ScheduledBatch) -> None:
+        path = self._compass_config.graph_out
+        if not path:
+            return
+        shape = self._describe(batch)
+        self._graph.key = GraphKey.of(
+            model_id=str(getattr(self.config, "model", "unknown")),
+            topology=self._topology(),
+            rank_coords=self._rank_coords(),
+            batch_signature=shape.num_scheduled_tokens,
+        )
+        try:
+            self._graph.save(path)
+        except OSError as exc:
+            logger.warning("ATOMCompass: could not write graph to %s: %s", path, exc)
+            return
+        logger.info(
+            "ATOMCompass: traced %d operators (%d distinct) -> %s",
+            len(self._graph), len(self._graph.op_names()), path,
         )
 
     def _describe(self, batch: ScheduledBatch) -> StepShape:

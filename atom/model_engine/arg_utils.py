@@ -51,6 +51,8 @@ class EngineArgs:
     enforce_eager: bool = False
     compass: bool = False
     compass_oracle: str = ""
+    compass_mode: str = "predict"
+    compass_graph_out: str = ""
     enable_prefix_caching: bool = True
     port: int = 8006
     kv_cache_dtype: str = "bf16"
@@ -121,6 +123,21 @@ class EngineArgs:
             help="Run under ATOMCompass: predict the forward pass instead of "
             "performing it. Selects the Compass model runner and puts the "
             "engine on a virtual clock.",
+        )
+        parser.add_argument(
+            "--compass-mode",
+            type=str,
+            default="predict",
+            choices=["predict", "trace"],
+            help="predict: replace the forward pass with a cost estimate. "
+            "trace: run the real forward and record the operators it performed, "
+            "writing the graph to --compass-graph-out.",
+        )
+        parser.add_argument(
+            "--compass-graph-out",
+            type=str,
+            default="",
+            help="Where --compass-mode=trace writes the recorded op graph.",
         )
         parser.add_argument(
             "--compass-oracle",
@@ -662,9 +679,13 @@ class EngineArgs:
         kwargs["kv_cache_block_size"] = kwargs.pop("block_size")
         compass_enabled = kwargs.pop("compass", False)
         compass_oracle = kwargs.pop("compass_oracle", "")
-        compass_kwargs = {"enabled": compass_enabled}
+        compass_mode = kwargs.pop("compass_mode", "predict")
+        compass_graph_out = kwargs.pop("compass_graph_out", "")
+        compass_kwargs = {"enabled": compass_enabled, "mode": compass_mode}
         if compass_oracle:
             compass_kwargs["oracle_qualname"] = compass_oracle
+        if compass_graph_out:
+            compass_kwargs["graph_out"] = compass_graph_out
         kwargs["compass_config"] = CompassConfig(**compass_kwargs)
         kwargs["compilation_config"] = CompilationConfig(
             level=kwargs.pop("level"),
