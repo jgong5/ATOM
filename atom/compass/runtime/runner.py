@@ -123,9 +123,20 @@ class CompassModelRunner(ModelRunner):
         try:
             with triton, ops:
                 output = super().forward(batch)
-        finally:
+        except BaseException:
+            # Deliberately do not write a graph here. A forward that died
+            # part-way leaves a well-formed but truncated recording, and a
+            # truncated graph is worse than none: it costs out at a fraction of
+            # the model while looking like a complete artifact.
             self._traced_steps += 1
-            self._write_graph(batch)
+            logger.error(
+                "ATOMCompass: forward failed after %d operators; no graph "
+                "written. A partial trace is not a usable artifact.",
+                len(self._graph),
+            )
+            raise
+        self._traced_steps += 1
+        self._write_graph(batch)
         return output
 
     def _write_graph(self, batch: ScheduledBatch) -> None:
@@ -139,6 +150,7 @@ class CompassModelRunner(ModelRunner):
             rank_coords=self._rank_coords(),
             batch_signature=shape.num_scheduled_tokens,
         )
+        self._warn_if_incomplete()
         try:
             self._graph.save(path)
         except OSError as exc:
@@ -148,6 +160,30 @@ class CompassModelRunner(ModelRunner):
             "ATOMCompass: traced %d operators (%d distinct) -> %s",
             len(self._graph), len(self._graph.op_names()), path,
         )
+
+    def _warn_if_incomplete(self) -> None:
+        """Sanity-check the recording against the model's depth.
+
+        Attention runs once per layer, so the number of attention operators
+        should match the layer count. A graph holding a handful of layers for a
+        deep model is truncated, and nothing downstream would notice: it is
+        structurally valid and merely wrong.
+        """
+        hf = getattr(self.config, "hf_config", None)
+        layers = getattr(hf, "num_hidden_layers", None)
+        if layers is None:
+            text_config = getattr(hf, "text_config", None)
+            layers = getattr(text_config, "num_hidden_layers", None)
+        if not layers:
+            return
+        counts = self._graph.counts()
+        seen = sum(n for name, n in counts.items() if "attention" in name.lower())
+        if seen and seen < layers:
+            logger.warning(
+                "ATOMCompass: graph holds %d attention operators for a %d-layer "
+                "model. It looks truncated; do not calibrate against it.",
+                seen, layers,
+            )
 
     def _describe(self, batch: ScheduledBatch) -> StepShape:
         """Translate an ATOM batch into the oracle's engine-agnostic input.

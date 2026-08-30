@@ -121,7 +121,43 @@ Meta never revealed this, because skipped launches never autotune. It is a case
 where hardware capture told us something derivation could not — which is an
 argument for keeping the comparison even after meta is trusted.
 
-## Open: the captured graph looks too small for the model
+## Resolved: the small captured graph was an artifact of a crash
+
+The 101-operator capture recorded about three layers of a 64-layer model. It was
+not truncation by `torch.compile` — compilation is off at level 0 under
+`--enforce-eager`. The traced forward **crashed**, and the recording was written
+anyway from a `finally` block, producing a well-formed artifact from a failed
+run. Nothing downstream would have noticed: it is structurally valid and merely
+wrong, and would have costed out at a fraction of the model.
+
+Two fixes. A failed forward now writes no graph at all and says so loudly. And
+what does get written is checked against the model's depth first — attention
+runs once per layer, so a graph holding fewer attention operators than the model
+has layers is reported as truncated rather than trusted.
+
+The general lesson is worth keeping: for a tool whose output is an artifact, a
+plausible artifact from a broken run is a worse failure than a crash, because it
+propagates silently into everything fitted against it.
+
+## Blocked: capture needs an AITER JIT build that fails here
+
+The crash itself is environmental. Running the real forward reaches AITER's
+paged-attention path, which JIT-builds a kernel module on first use, and the
+build fails:
+
+    subprocess.CalledProcessError: Command '['make', 'build', '-j1']'
+    returned non-zero exit status 2
+
+Predict mode never hit this because it never runs the forward. Capture cannot
+complete on this model in this image until the build works, which makes the
+meta-versus-capture comparison blocked on the environment rather than on the
+design.
+
+Worth noting what capture costs even when it works: Triton autotunes the prefill
+path for several minutes before the first traced step. That is an argument for
+meta derivation rather than against it — capture is the expensive side.
+
+## Superseded: the captured graph looked too small for the model
 
 The steady-state capture holds 101 operators with 3
 `linear_attention_with_output_base` and 13 `gemm_a16w16`, which is on the order
