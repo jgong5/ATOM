@@ -79,6 +79,12 @@ class OpGraph:
 
     key: Optional[GraphKey] = None
     ops: list[OpSpec] = field(default_factory=list)
+    #: How this graph came to exist — device, compilation level, tracer mode.
+    #: A graph is compared long after it is written, often against one produced
+    #: another way, and the conditions of its recording decide whether that
+    #: comparison means anything. Carrying them in the artifact is the only way
+    #: they survive the trip.
+    provenance: dict = field(default_factory=dict)
 
     def add(self, op: OpSpec) -> None:
         self.ops.append(op)
@@ -109,13 +115,14 @@ class OpGraph:
 
     def to_dict(self) -> dict:
         return {
-            "version": 1,
+            "version": 2,
             "key": None if self.key is None else {
                 "model_id": self.key.model_id,
                 "topology": [list(t) for t in self.key.topology],
                 "rank_coords": [list(t) for t in self.key.rank_coords],
                 "batch_signature": list(self.key.batch_signature),
             },
+            "provenance": dict(self.provenance),
             "ops": [
                 {
                     "name": op.name,
@@ -131,7 +138,7 @@ class OpGraph:
     @classmethod
     def from_dict(cls, data: dict) -> "OpGraph":
         version = data.get("version")
-        if version != 1:
+        if version not in (1, 2):
             raise ValueError(f"unsupported op-graph version: {version!r}")
         key = None
         raw_key = data.get("key")
@@ -142,7 +149,7 @@ class OpGraph:
                 rank_coords=tuple(tuple(t) for t in raw_key["rank_coords"]),
                 batch_signature=tuple(raw_key["batch_signature"]),
             )
-        graph = cls(key=key)
+        graph = cls(key=key, provenance=dict(data.get("provenance") or {}))
         for op in data["ops"]:
             graph.add(
                 OpSpec(

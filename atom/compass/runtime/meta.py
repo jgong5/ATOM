@@ -24,7 +24,10 @@ from torch.utils._python_dispatch import TorchDispatchMode
 
 from atom.compass.core.graph import OpGraph, OpSpec
 
-__all__ = ["MissingMetaKernel", "MetaTrace", "MetaOpTracer"]
+__all__ = [
+    "MissingMetaKernel", "MetaTrace", "MetaOpTracer",
+    "derived_inputs", "AMBIGUOUS_GROUP",
+]
 
 # Collectives name the group they ran on; everything else is local compute.
 _COLLECTIVE_HINTS = (
@@ -33,9 +36,39 @@ _COLLECTIVE_HINTS = (
 )
 
 
-def _looks_collective(name: str) -> Optional[str]:
+#: Recorded when an operator is a collective but the group it ran on cannot be
+#: determined. Distinct from ``None``, which asserts local computation.
+AMBIGUOUS_GROUP = "?"
+
+
+def _is_collective(name: str) -> bool:
     lowered = name.lower()
-    return "unknown" if any(h in lowered for h in _COLLECTIVE_HINTS) else None
+    return any(h in lowered for h in _COLLECTIVE_HINTS)
+
+
+def _resolve_group(name: str, topology: Optional[dict]) -> Optional[str]:
+    """Name the communication group a collective ran on.
+
+    The op graph's one concession to parallelism is that a collective names its
+    group; the shapes around it carry everything else. So a collective recorded
+    without a name is a graph that cannot distinguish an all-reduce over tensor
+    ranks from one over expert ranks — which is the whole distinction the
+    representation exists to preserve.
+
+    The dispatcher does not hand us the group. What it does hand us is enough
+    when the rank belongs to only one group of size greater than one: there is
+    nothing else the collective could have run on. With several such groups the
+    ambiguity is real, and is recorded as such rather than guessed at.
+
+    Resolving the remaining case means intercepting at the group object rather
+    than the dispatcher — ATOM routes collectives through ``get_tp_group()`` and
+    friends, which know their own identity. That is the replacement for this
+    function, not an addition to it.
+    """
+    if not _is_collective(name):
+        return None
+    candidates = [g for g, size in (topology or {}).items() if size > 1]
+    return candidates[0] if len(candidates) == 1 else AMBIGUOUS_GROUP
 
 
 def _shape_of(x: Any):
@@ -127,9 +160,13 @@ class MetaOpTracer(TorchDispatchMode):
     reported operator, run again, learn the next.
     """
 
-    def __init__(self, graph: Optional[OpGraph] = None) -> None:
+    def __init__(self, graph: Optional[OpGraph] = None,
+                 topology: Optional[dict] = None) -> None:
         super().__init__()
         self.graph = graph if graph is not None else OpGraph()
+        #: Group sizes this rank participates in, e.g. ``{"tp": 2}``. Used only
+        #: to name the group a collective ran on; see :func:`_resolve_group`.
+        self.topology = dict(topology or {})
         self.missing: list[MissingMetaKernel] = []
         self._t0 = 0.0
         self.seconds = 0.0
@@ -176,7 +213,7 @@ class MetaOpTracer(TorchDispatchMode):
                 input_shapes=in_shapes,
                 output_shapes=out_shapes,
                 dtypes=dtypes,
-                group=_looks_collective(name),
+                group=_resolve_group(name, self.topology),
             )
         )
         return out
@@ -185,3 +222,24 @@ class MetaOpTracer(TorchDispatchMode):
 def _short(exc: BaseException, limit: int = 120) -> str:
     text = " ".join(str(exc).split())
     return text[:limit] + ("…" if len(text) > limit else "")
+
+
+def derived_inputs(tokens: int, device="meta"):
+    """The token and position tensors ATOM's runner would hand the model.
+
+    The dtypes are part of the contract, not a detail, and the two differ:
+    ATOM stages ``input_ids`` as ``int32`` and ``positions`` as ``int64``
+    (``model_runner.py`` lines 189 and 1277). They are easy to get wrong in the
+    same way and the consequence is disproportionate — a derivation using
+    PyTorch's ``int64`` default produces a graph whose embedding differs from
+    the captured one in dtype alone, and one using ``int32`` for both diverges
+    at the first attention operator instead. Either way the comparison rejects
+    every operator from that point on, and the rejection reads as a real
+    structural disagreement rather than a wrong probe.
+    """
+    import torch
+
+    return (
+        torch.zeros(tokens, dtype=torch.int32, device=device),
+        torch.arange(tokens, dtype=torch.int64, device=device),
+    )

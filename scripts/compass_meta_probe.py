@@ -39,7 +39,12 @@ def main() -> int:
     import os
 
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-    os.environ.setdefault("MASTER_PORT", "29591")
+    # A fixed port collides on a host-networked container; let the OS choose.
+    import socket
+
+    with socket.socket() as _sock:
+        _sock.bind(("127.0.0.1", 0))
+        os.environ.setdefault("MASTER_PORT", str(_sock.getsockname()[1]))
     os.environ.setdefault("RANK", "0")
     os.environ.setdefault("WORLD_SIZE", "1")
     from aiter import init_dist_env
@@ -79,10 +84,11 @@ def main() -> int:
     build_s = time.perf_counter() - build_t0
     print(f"built on meta in {build_s:.2f}s\n")
 
-    input_ids = torch.zeros(args.tokens, dtype=torch.long, device="meta")
-    positions = torch.arange(args.tokens, dtype=torch.long, device="meta")
+    from atom.compass.runtime.meta import derived_inputs
 
-    tracer = MetaOpTracer()
+    input_ids, positions = derived_inputs(args.tokens, "meta")
+
+    tracer = MetaOpTracer(topology={"tp": args.tp})
     # Triton kernels never reach the dispatcher, so they need their own
     # interception. Both write into one graph, preserving execution order.
     triton_tracer = TritonLaunchTracer(graph=tracer.graph)

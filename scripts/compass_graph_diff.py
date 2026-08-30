@@ -16,6 +16,17 @@ Weights are random: the comparison is structural, and values never enter it.
     python scripts/compass_graph_diff.py trace --device meta --model M -o meta.json
     python scripts/compass_graph_diff.py trace --device cuda --model M -o real.json
     python scripts/compass_graph_diff.py diff meta.json real.json
+
+To validate derivation against what the engine really ran, capture through the
+runner and compare with ``compare`` rather than ``diff`` — a capture holds the
+runner's work as well as the model's, so containment is the question, not
+equality::
+
+    python scripts/compass_smoke.py --model M --level 0 --compass \
+        --compass-mode trace --compass-graph-out capture.json
+    python scripts/compass_graph_diff.py trace --device meta --model M \
+        --tokens 1 -o derived.json
+    python scripts/compass_graph_diff.py compare derived.json capture.json
 """
 
 import argparse
@@ -26,19 +37,34 @@ import time
 import torch
 
 
+def _free_port() -> str:
+    """Ask the OS for a port nobody is using.
+
+    A fixed port is wrong here. The container runs with host networking on a
+    shared machine, so a hardcoded number collides with whatever else happens to
+    hold it — including a previous run of this same script — and the failure
+    (``EADDRINUSE`` from the rendezvous store) says nothing about tracing.
+    """
+    import socket
+
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return str(sock.getsockname()[1])
+
+
 def _init_env(tp: int) -> None:
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
-    os.environ.setdefault("MASTER_PORT", "29593")
+    os.environ.setdefault("MASTER_PORT", os.environ.get("MASTER_PORT") or _free_port())
     os.environ.setdefault("RANK", "0")
     os.environ.setdefault("WORLD_SIZE", "1")
 
 
-def _trace(model, input_ids, positions):
+def _trace(model, input_ids, positions, topology=None):
     """Run one forward under both tracers, returning the combined graph."""
     from atom.compass.runtime.meta import MetaOpTracer
     from atom.compass.runtime.triton_trace import TritonLaunchTracer
 
-    ops = MetaOpTracer()
+    ops = MetaOpTracer(topology=topology)
     triton = TritonLaunchTracer(graph=ops.graph)
     t0 = time.perf_counter()
     with triton, ops, torch.inference_mode():
@@ -80,10 +106,10 @@ def _trace_cmd(args) -> int:
         model = model.to(device)
     build_s = time.perf_counter() - build_t0
 
+    from atom.compass.runtime.meta import derived_inputs
+
     graph, trace_s = _trace(
-        model,
-        torch.zeros(args.tokens, dtype=torch.long, device=device),
-        torch.arange(args.tokens, dtype=torch.long, device=device),
+        model, *derived_inputs(args.tokens, device), topology={"tp": args.tp}
     )
     graph.key = GraphKey.of(
         model_id=f"{arch}@{os.path.basename(args.model.rstrip('/'))}",
@@ -91,6 +117,12 @@ def _trace_cmd(args) -> int:
         rank_coords={"tp": 0},
         batch_signature=(args.tokens,),
     )
+    graph.provenance = {
+        "source": "derivation" if device.type == "meta" else "capture",
+        "device": device.type,
+        "compilation_level": 0,  # a bare model call is never compiled
+        "tokens": args.tokens,
+    }
     graph.save(args.out)
 
     resident = ""
@@ -125,6 +157,56 @@ def _diff_cmd(args) -> int:
     return 1
 
 
+def _compare_cmd(args) -> int:
+    """Check that a derived graph is contained in a capture, in order.
+
+    This is the validation that matters, and it is not equality. A capture also
+    holds the runner's own work — batch metadata, the LM head, sampling — which
+    the model body has no reason to contain. What must hold is that every
+    operator the model performs appears in the capture, in order, at the same
+    shapes.
+    """
+    from atom.compass.core.diff import align_graphs
+    from atom.compass.core.graph import OpGraph
+
+    derived = OpGraph.load(args.derived)
+    captured = OpGraph.load(args.captured)
+
+    print("ATOMCompass derivation-vs-capture check")
+    print("=" * 66)
+    for label, graph in (("derived", derived), ("captured", captured)):
+        prov = graph.provenance or {}
+        if prov:
+            print(f"  {label:<9}: " + ", ".join(
+                f"{k}={v}" for k, v in sorted(prov.items())))
+
+    level = (captured.provenance or {}).get("compilation_level")
+    if level:
+        print(f"\n  WARNING: the capture was recorded at compilation level {level}.")
+        print("  Inductor-fused operators reach neither tracer, so the capture is")
+        print("  missing an unknown number of them. Recapture with --level 0.")
+
+    dl = derived.key.batch_signature if derived.key else None
+    cl = captured.key.batch_signature if captured.key else None
+    if dl and cl and sum(dl) != sum(cl):
+        print(f"\n  WARNING: different batches ({sum(dl)} tokens vs {sum(cl)}).")
+        print("  Shapes will differ for reasons that carry no information;")
+        print("  derive at the token count the capture used.")
+
+    result = align_graphs(derived, captured, compare_dtypes=not args.ignore_dtypes)
+    print()
+    print(result.report())
+    print("=" * 66)
+    if result.contained:
+        print("  Derivation reproduces hardware for this configuration.")
+        print("  A graph derived for a configuration nobody has run can be trusted")
+        print("  to the same extent.")
+        return 0
+    print("  Derivation does NOT reproduce hardware here.")
+    print("  The unmatched operators above are the gap.")
+    return 1
+
+
 def main() -> int:
     ap = argparse.ArgumentParser(description="ATOMCompass graph trace and diff")
     sub = ap.add_subparsers(dest="cmd", required=True)
@@ -136,6 +218,15 @@ def main() -> int:
     tr.add_argument("--tp", type=int, default=1)
     tr.add_argument("-o", "--out", required=True)
     tr.set_defaults(func=_trace_cmd)
+
+    cp = sub.add_parser(
+        "compare",
+        help="check a derived graph is contained in a runner capture",
+    )
+    cp.add_argument("derived")
+    cp.add_argument("captured")
+    cp.add_argument("--ignore-dtypes", action="store_true")
+    cp.set_defaults(func=_compare_cmd)
 
     df = sub.add_parser("diff", help="compare two written graphs")
     df.add_argument("left")

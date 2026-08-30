@@ -52,6 +52,8 @@ class CompassModelRunner(ModelRunner):
             self._compass_config.mode,
             self._oracle.describe(),
         )
+        if self._compass_config.mode == "trace":
+            self._warn_if_compiled()
 
     # -- setup ----------------------------------------------------------------
 
@@ -118,7 +120,7 @@ class CompassModelRunner(ModelRunner):
         if self._step_index != self._compass_config.trace_step:
             return super().forward(batch)
 
-        ops = MetaOpTracer(graph=self._graph)
+        ops = MetaOpTracer(graph=self._graph, topology=self._topology())
         triton = TritonLaunchTracer(graph=self._graph)
         try:
             with triton, ops:
@@ -139,17 +141,43 @@ class CompassModelRunner(ModelRunner):
         self._write_graph(batch)
         return output
 
+    @staticmethod
+    def _rank_path(path: str, coords: dict[str, int]) -> str:
+        """Give each rank its own file.
+
+        Every rank traces, and under any parallelism their graphs differ — that
+        difference is the thing worth recording. Writing them all to one path
+        makes them race for it and leaves a single file that names no rank, so
+        the one artifact that survives cannot be attributed and the rest are
+        lost without a trace.
+        """
+        import os
+
+        suffix = "-".join(f"{name}{index}" for name, index in sorted(coords.items()))
+        stem, ext = os.path.splitext(path)
+        return f"{stem}.{suffix}{ext}" if suffix else path
+
     def _write_graph(self, batch: ScheduledBatch) -> None:
         path = self._compass_config.graph_out
         if not path:
             return
         shape = self._describe(batch)
+        topology = self._topology()
+        coords = self._rank_coords()
         self._graph.key = GraphKey.of(
             model_id=str(getattr(self.config, "model", "unknown")),
-            topology=self._topology(),
-            rank_coords=self._rank_coords(),
+            topology=topology,
+            rank_coords=coords,
             batch_signature=shape.num_scheduled_tokens,
         )
+        if any(size > 1 for size in topology.values()):
+            path = self._rank_path(path, coords)
+        self._graph.provenance = {
+            "source": "capture",
+            "device": "cuda",
+            "compilation_level": self._compilation_level(),
+            "trace_step": self._compass_config.trace_step,
+        }
         self._warn_if_incomplete()
         try:
             self._graph.save(path)
@@ -160,6 +188,38 @@ class CompassModelRunner(ModelRunner):
             "ATOMCompass: traced %d operators (%d distinct) -> %s",
             len(self._graph), len(self._graph.op_names()), path,
         )
+
+    def _compilation_level(self) -> Optional[int]:
+        compilation = getattr(self.config, "compilation_config", None)
+        return getattr(compilation, "level", None)
+
+    def _warn_if_compiled(self) -> None:
+        """Refuse to pretend a compiled forward can be traced completely.
+
+        Both tracers work by interception: the dispatcher sees ATen and custom
+        operators, and ``JITFunction.run`` sees hand-written Triton kernels.
+        Inductor defeats both. It fuses operators into generated kernels that
+        never reach the dispatcher, and launches them through a compiled
+        launcher rather than ``JITFunction.run``, so they are invisible to each
+        tracer for a different reason.
+
+        The result is not a trace that fails — it is one that quietly omits
+        whatever was fused. On Qwen3-0.6B at the default level that is the
+        embedding, every qkv split and every intermediate allocation: 57 of 386
+        operators, gone, in a graph that still looks entirely reasonable.
+
+        ``--enforce-eager`` does not prevent this. It disables CUDA graphs;
+        compilation is ``--level``, and its default is on.
+        """
+        level = self._compilation_level()
+        if level:
+            logger.warning(
+                "ATOMCompass: tracing with compilation level %d. Operators "
+                "fused by inductor reach neither tracer, so the graph will be "
+                "missing whatever was fused, with nothing to mark the gap. "
+                "Capture with --level 0 for a graph worth comparing.",
+                level,
+            )
 
     def _warn_if_incomplete(self) -> None:
         """Sanity-check the recording against the model's depth.
