@@ -1,6 +1,18 @@
 # ATOMCompass — open problems
 
-**Ranked #1: A1, the CUDA-graph gap — an 8.9x error on decode, measured.**
+**Where the error stands**, Qwen3-0.6B TP=1, calibrated on a sweep and evaluated
+on a workload it did not see:
+
+| iteration | TTFT | TPOT | latency |
+| --- | --- | --- | --- |
+| first end-to-end run | +107% | +800% | +560% |
+| A1 fixed (CUDA graphs) | +39.6% | +13.1% | +22.9% |
+| prefill coverage widened | −23.9% | +22.5% | +4.7% |
+| batch coverage widened | **−11.9%** | **+17.5%** | **+7.1%** |
+
+**Ranked next: D4, the decode model's form.** TPOT is now the largest error and
+it grew when the sweep widened, which is the signature of a model that cannot
+fit its whole range rather than one short of data.
 
 The target is to simulate ATOM **as it is deployed**: compilation on
 (`--level 3`), CUDA graphs on, prefix caching on, chunked prefill on. Anything
@@ -17,35 +29,24 @@ See `DESIGN_NOTES.md` for what is settled and why.
 
 ## A. The graph does not yet match a production launch
 
-### A1. CUDA-graph replay is never observed — **M** — *measured at 8.9x*
+### A1. CUDA-graph replay — **fixed**, was an 8.9x error
 
-**The top-priority problem, and now with a number attached.**
+Trace and measure both stubbed `capture_cudagraph`, so a Compass run executed
+eagerly while the deployment replayed a captured graph. Measured on Qwen3-0.6B
+decode, TP=1: **3.24 ms** replayed against **28.78 ms** eager — 8.9x, which
+reached the end-to-end comparison as +800% TPOT.
 
-Trace and measure mode both stub `capture_cudagraph`, so a Compass run executes
-eagerly even when CUDA graphs are enabled. The default configuration replays a
-captured graph, and the whole reason it exists is to remove per-launch overhead.
+`measure` now captures for real; `predict` skips because no kernels run; `trace`
+skips because a replay is one opaque submission and would record no operators
+at all. Operator sequence from eager execution, cost from a measure run.
 
-Measured on Qwen3-0.6B, decode, TP=1:
+    TTFT   +107%  ->  +39.6%
+    TPOT   +800%  ->  +13.1%
 
-| configuration | TPOT |
-| --- | --- |
-| default (CUDA graphs on) | **3.24 ms** |
-| `--enforce-eager` | **28.78 ms** |
-
-**8.9x.** So a cost model calibrated through measure mode is fitted to a machine
-running nine times slower than the deployment it is meant to predict. End to end
-that showed up as a TPOT error of +800% — while the oracle itself reproduced the
-steps it was calibrated on to within about 1%. The model was right; the
-configuration it was calibrated against was wrong.
-
-This is also why a replay cannot simply be traced: it is one opaque submission,
-so there are no per-operator events to record even in principle. The operators
-have to come from the capture phase, and the replay's cost has to be carried as
-a separate term the oracle applies.
-
-Settles it: let measure mode capture CUDA graphs like a normal run, so timings
-come from the replayed path; and for trace mode, record during
-`capture_cudagraph` rather than during a steady-state step.
+Still open in this area: trace mode's graph is the eager operator sequence, so
+it does not describe the replayed launch. That is inherent — a replay has no
+per-operator events — and the answer is to carry replay overhead as a term the
+oracle applies rather than as operators in the graph.
 
 ### A2. Derivation is uncompiled; production is not — **L**
 
@@ -153,11 +154,32 @@ worth knowing before anyone tries to capture a sweep.
 Everything above is about the graph being right. None of it is the cost model,
 and the cost model is what Compass is for.
 
-### D1. No real cost oracle — **L**
+### D1. A calibrated oracle exists; analytical and empirical do not — **L**
 
-`ConstantCostOracle` returns a fixed number per prefill and per decode. The whole
-F1 axis — analytical, calibrated, empirical — is unimplemented. Nothing has been
-fitted to any captured graph.
+`CalibratedCostOracle` fits prefill and decode separately against measured steps
+and reproduces a serving run's latency to within about 10-20%. That is the F1
+"calibrated" point. Analytical (cost from first principles) and empirical (cost
+attributed per operator from a captured graph) are both unimplemented, and
+nothing has yet been fitted to an **op graph** — the calibrated oracle uses only
+the step's shape, so all the structural work on graphs is not yet feeding the
+cost model at all.
+
+### D4. Decode cost is not linear in batch size — **M**, ranked next
+
+TPOT sits at +17.5% and it *rose* when the sweep widened, from +13.1%. A model
+short of data improves when given more; a model whose form cannot fit its range
+gets worse, because the extra range pulls the fit away from wherever it is being
+asked about.
+
+The physical reason is visible in the table: with CUDA graphs the replay is for a
+**padded batch-size bucket**, not the actual batch, so cost steps at the capture
+sizes (1, 2, 4, 8, 16, 32, ...) rather than rising smoothly. Measured means at
+batch 1/2/3/4 were 4.0/4.6/5.0/4.1 ms — not monotonic, which a linear term
+cannot represent.
+
+Settles it: feature the padded capture bucket rather than the raw batch size,
+and keep context linear within a bucket. `Config.capture_sizes` already declares
+the ladder.
 
 ### D2. No collective cost model — **M**
 
@@ -190,6 +212,54 @@ drops a real sample when the workload has few, and keeps warmup steps when it
 has many. What is missing is a measurement window the engine can open and close
 across the process boundary — the same gap that makes it hard to calibrate one
 phase of a deployment without the others polluting the table.
+
+### F6. Calibration must bracket what it will be asked about — **S**, mitigated
+
+ATOM batches several requests' prefill into one step, so what lands in the table
+is the *batched* token count. A sweep of large prompts therefore produced only
+large samples: seven of them, spanning 1753 to 16370 tokens. Asked about an
+evaluation workload batching to ~520, the model extrapolated below everything it
+had seen, where the intercept dominates and the slope does no work — it
+predicted 66.8 ms for a 64-token prefill.
+
+The sweep now runs twenty sizes from 8 to 1024, twice through. Twice because
+**Triton autotunes per shape, not once per process**: the first visit to a shape
+pays a benchmarking cost steady-state serving never pays again, and having both
+visits lets outlier rejection see the difference rather than guess at it.
+
+### F8. Calibration coverage has to bracket every dimension, not one — **S**, done
+
+The same error twice, in two dimensions, an hour apart.
+
+First prefill: ATOM batches several requests' prefill into one step, so a sweep
+of large prompts produced seven samples spanning 1753-16370 tokens, and the
+evaluation batched to ~520. The model extrapolated below everything it had seen
+and predicted 66.8 ms for a 64-token prefill.
+
+Widening the prompt lengths fixed that and left the sweep varying *only* length,
+so it produced decode steps at batch sizes 1-4 — and the evaluation ran 8
+concurrent requests. TTFT improved and TPOT got worse, from +13.1% to +22.5%,
+because the decode model was now extrapolating in a dimension nobody had
+thought to check.
+
+Both are the same mistake: coverage was designed against the dimension that had
+just caused a problem rather than against the model's feature set. The sweep now
+varies length and concurrency together.
+
+The general fix is not a better sweep, it is that **the oracle now says when it
+is extrapolating**. A fitted model answers anything, confidently, including
+questions its evidence does not cover, and a linear extrapolation is worst
+exactly where the intercept starts to dominate. Warned once per kind and
+direction, since a serving run asks thousands of times.
+
+### F7. The fit is now resistant to one-off contamination — **S**, done
+
+Least squares, then discard points whose residual is far outside the spread of
+the rest, then refit. Spread measured by median absolute deviation, since the
+contaminating points would otherwise inflate the very quantity used to detect
+them. The number dropped is reported in `describe()` rather than logged and
+forgotten: a fit that discarded half its evidence should not describe itself the
+same way as one that kept it.
 
 ### F2. Prefill samples are scarce by nature — **S**, mitigated
 
@@ -239,3 +309,6 @@ rather than a misconfigured clock. Real modes now keep the real clock.
 * Structural validation cannot rank its own findings. Nothing in this file had a
   defensible priority until something predicted time and was wrong by a
   measurable amount.
+* A fitted model is confident everywhere, including outside its evidence. Twice
+  now the error was not the fit but the range it was fitted over, and neither
+  time did anything complain.

@@ -48,24 +48,58 @@ def _decode_features(shape: StepShape) -> list[float]:
     return [1.0, batch, context]
 
 
-def _least_squares(rows: list[list[float]], targets: list[float]) -> Optional[list[float]]:
-    """Non-negative-intercept least squares, or None if the fit is not supported.
+def _least_squares(
+    rows: list[list[float]], targets: list[float], outlier_sigmas: float = 4.0,
+) -> tuple[Optional[list[float]], int]:
+    """Least squares, resistant to one-off contamination.
 
     Refuses rather than extrapolates when there are fewer samples than
     coefficients. An underdetermined fit returns numbers that look like a model
-    and predict nothing, which is the failure mode this whole project keeps
-    running into.
+    and predict nothing, which is the failure mode this project keeps meeting.
+
+    Fits, then discards points whose residual is far outside the spread of the
+    rest, then refits. This is not statistical hygiene for its own sake — the
+    contamination is specific and expected. **Triton autotunes per shape, not
+    once per process**, so a calibration sweep deliberately made of varied
+    shapes pays a one-off benchmarking cost on many of its own samples. One such
+    row sat at 0.13 s where its neighbour at a larger size took 0.036 s.
+
+    Spread is measured by median absolute deviation rather than standard
+    deviation, since the contaminating points would otherwise inflate the very
+    quantity used to detect them.
+
+    Returns the coefficients and how many points were dropped. The count is
+    returned rather than logged and forgotten: a fit that quietly discarded half
+    its evidence should not describe itself the same way as one that kept it.
     """
     try:
         import numpy as np
     except ImportError:  # pragma: no cover - numpy is a hard dep of torch
-        return None
-    if len(rows) < len(rows[0]):
-        return None
+        return None, 0
+    width = len(rows[0])
+    if len(rows) < width:
+        return None, 0
+
     a = np.asarray(rows, dtype=float)
     b = np.asarray(targets, dtype=float)
     coeffs, *_ = np.linalg.lstsq(a, b, rcond=None)
-    return [float(c) for c in coeffs]
+
+    # Enough points left to still determine the fit after dropping some.
+    if len(rows) < width + 2:
+        return [float(c) for c in coeffs], 0
+
+    residuals = np.abs(b - a @ coeffs)
+    mad = float(np.median(np.abs(residuals - np.median(residuals))))
+    if mad <= 0.0:
+        return [float(c) for c in coeffs], 0
+
+    keep = residuals <= np.median(residuals) + outlier_sigmas * mad
+    dropped = int((~keep).sum())
+    if not dropped or int(keep.sum()) < width + 1:
+        return [float(c) for c in coeffs], 0
+
+    refit, *_ = np.linalg.lstsq(a[keep], b[keep], rcond=None)
+    return [float(c) for c in refit], dropped
 
 
 class CalibratedCostOracle:
@@ -87,6 +121,12 @@ class CalibratedCostOracle:
         self._n_decode = 0
         self._fallback_prefill = 0.0
         self._fallback_decode = 0.0
+        self._dropped_prefill = 0
+        self._dropped_decode = 0
+        # The range each feature was calibrated over, so a prediction can say
+        # whether it is interpolating or extrapolating.
+        self._hull: dict = {}
+        self._warned: set = set()
         self._fit()
 
     def _fit(self) -> None:
@@ -111,15 +151,24 @@ class CalibratedCostOracle:
                     decode_targets.append(row["seconds"])
 
         self._n_prefill, self._n_decode = len(prefill_targets), len(decode_targets)
+        for name, rows in (("prefill", prefill_rows), ("decode", decode_rows)):
+            if rows:
+                # Column 0 is the intercept and carries no range.
+                self._hull[name] = [
+                    (min(r[i] for r in rows), max(r[i] for r in rows))
+                    for i in range(1, len(rows[0]))
+                ]
         # The mean is the fallback when a fit is refused: a poor predictor, but
         # one whose error is bounded by the spread of what was measured, rather
         # than an extrapolation that can be arbitrarily wrong.
         if prefill_targets:
             self._fallback_prefill = sum(prefill_targets) / len(prefill_targets)
-            self._prefill = _least_squares(prefill_rows, prefill_targets)
+            self._prefill, self._dropped_prefill = _least_squares(
+                prefill_rows, prefill_targets)
         if decode_targets:
             self._fallback_decode = sum(decode_targets) / len(decode_targets)
-            self._decode = _least_squares(decode_rows, decode_targets)
+            self._decode, self._dropped_decode = _least_squares(
+                decode_rows, decode_targets)
 
         if self._prefill is None and self._n_prefill:
             logger.warning(
@@ -156,14 +205,55 @@ class CalibratedCostOracle:
             )
         if coeffs is None:
             return StepCost(seconds=max(fallback, self.floor_seconds))
+        self._warn_if_extrapolating(shape, features)
         predicted = sum(c * f for c, f in zip(coeffs, features))
         return StepCost(seconds=max(predicted, self.floor_seconds))
 
+    def _warn_if_extrapolating(self, shape: StepShape, features: list[float]) -> None:
+        """Say so when asked about a shape outside what was calibrated.
+
+        A fitted model answers anything, confidently, including questions its
+        evidence does not cover — and a linear extrapolation is at its worst
+        exactly where the intercept starts to dominate. This has now caused the
+        same error twice, in two different dimensions: a prefill model fitted to
+        1753-16370 tokens asked about 520, and a decode model fitted to batch
+        sizes 1-4 asked about 8. Neither said anything; both were simply wrong.
+
+        Warned once per kind and direction, because a serving run asks this
+        thousands of times and a warning repeated per step is a warning nobody
+        reads.
+        """
+        kind = "prefill" if shape.is_prefill else "decode"
+        bounds = self._hull.get(kind)
+        if not bounds:
+            return
+        for index, (low, high) in enumerate(bounds):
+            value = features[index + 1]
+            if low <= value <= high:
+                continue
+            key = (kind, index, value < low)
+            if key in self._warned:
+                continue
+            self._warned.add(key)
+            logger.warning(
+                "ATOMCompass: costing a %s step whose feature %d is %.0f, "
+                "outside the calibrated range [%.0f, %.0f]. The prediction is "
+                "an extrapolation; calibrate over a workload that brackets "
+                "this one.",
+                kind, index, value, low, high,
+            )
+
     def describe(self) -> str:
-        kind = lambda c, n: "fitted" if c is not None else f"mean of {n}"  # noqa: E731
+        def part(name, coeffs, n, dropped):
+            if coeffs is None:
+                return f"{name}=mean of {n}"
+            outliers = f", {dropped} dropped" if dropped else ""
+            return f"{name}=fitted on {n} steps{outliers}"
+
         return (
-            f"CalibratedCostOracle(prefill={kind(self._prefill, self._n_prefill)}"
-            f" on {self._n_prefill} steps, "
-            f"decode={kind(self._decode, self._n_decode)}"
-            f" on {self._n_decode} steps)"
+            "CalibratedCostOracle("
+            + part("prefill", self._prefill, self._n_prefill, self._dropped_prefill)
+            + ", "
+            + part("decode", self._decode, self._n_decode, self._dropped_decode)
+            + ")"
         )
