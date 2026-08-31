@@ -28,8 +28,10 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from typing import Optional
 
+from atom.compass.core.artifacts import resolve_rank_path
 from atom.compass.core.cost.base import StepCost, StepShape
 
 logger = logging.getLogger(__name__)
@@ -105,15 +107,42 @@ def _least_squares(
 class CalibratedCostOracle:
     """Predicts step duration from coefficients fitted to measured steps."""
 
-    def __init__(self, table: str, floor_seconds: float = 1e-6) -> None:
+    def __init__(self, table: str, floor_seconds: float = 1e-6,
+                 rank_coords: Optional[dict] = None) -> None:
         """
         Args:
             table: Path to a JSONL file written by ``--compass-mode=measure``.
+                Under parallelism each rank wrote its own, and ``rank_coords``
+                selects between them.
             floor_seconds: Smallest duration ever returned. A fitted model can
                 produce a negative prediction outside the range it saw, and a
                 negative step duration would run the virtual clock backwards.
+            rank_coords: This rank's coordinates, supplied by the runner when
+                the run is parallel. Absent for a single-rank run, where no
+                per-rank table was written in the first place.
         """
-        self.table = table
+        self.table, own = resolve_rank_path(table, rank_coords)
+        if rank_coords and not own:
+            logger.warning(
+                "ATOMCompass WARNING: rank %s has no calibration table of its "
+                "own; fitting to the shared %s. Ranks of a symmetric group time "
+                "within a fraction of a percent of each other, so this is "
+                "usually fine — but it is an assumption, not a measurement.",
+                rank_coords, self.table,
+            )
+
+        if not os.path.exists(self.table):
+            # Named here rather than left to `open`, because this raises inside
+            # a worker process: what reaches the terminal is the engine
+            # manager's summary of a worker that vanished, which names neither
+            # Compass nor the file. The message has to carry its own context.
+            tried = f" (also tried {resolve_rank_path(table, rank_coords)[0]})" \
+                if rank_coords else ""
+            raise FileNotFoundError(
+                f"ATOMCompass: no calibration table at {table}{tried}. "
+                f"Record one with --compass-mode=measure --compass-measure-out "
+                f"before predicting from it."
+            )
         self.floor_seconds = floor_seconds
         self._prefill: Optional[list[float]] = None
         self._decode: Optional[list[float]] = None

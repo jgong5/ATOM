@@ -72,6 +72,27 @@ def _run(cmd: list[str]) -> None:
             print(f"  ! {message}")
 
 
+def _steps_fitted(table: Path) -> str:
+    """Rows the oracle was fitted to, *per rank*.
+
+    Each rank writes its own table under parallelism, so the single path this
+    script asked for may not be the file that exists — counting it
+    unconditionally is how a TP=2 run first failed here. Summing across ranks
+    instead would be worse than failing: every rank fits to its own table, so a
+    total overstates the evidence behind any one prediction by the world size.
+    """
+    own = sorted(table.parent.glob(f"{table.stem}.*{table.suffix}"))
+    files = own or ([table] if table.exists() else [])
+    if not files:
+        return "none"
+    counts = [sum(1 for _ in f.open()) for f in files]
+    if len(counts) == 1:
+        return str(counts[0])
+    lo, hi = min(counts), max(counts)
+    span = str(lo) if lo == hi else f"{lo}-{hi}"
+    return f"{span} per rank, {len(counts)} ranks"
+
+
 def _percent_error(real: float, modelled: float) -> float:
     return 100.0 * (modelled - real) / real if real else float("nan")
 
@@ -118,7 +139,7 @@ def main() -> int:
         "--prompt-tokens", str(args.prompt_tokens),
     ]
 
-    print("phase 1/4  calibrating on a sweep of shapes ...")
+    print("phase 1/4  calibrating on a sweep of shapes ...", flush=True)
     _run(common + ["--out", str(work / "sweep.json"), "--sweep",
                    "--compass", "--compass-mode", "measure",
                    "--compass-measure-out", str(table),
@@ -126,16 +147,16 @@ def main() -> int:
                    # every other prefill sample the sweep produced.
                    "--compass-measure-warmup-steps", "1"])
 
-    print("phase 2/4  running the evaluation workload for real ...")
+    print("phase 2/4  running the evaluation workload for real ...", flush=True)
     _run(common + ["--out", str(real_out)])
 
-    print("phase 3/4  running it again, modelled ...")
+    print("phase 3/4  running it again, modelled ...", flush=True)
     _run(common + ["--out", str(modelled_out), "--compass",
                    "--compass-oracle",
                    "atom.compass.core.cost.calibrated.CalibratedCostOracle",
                    "--compass-oracle-option", f"table={table}"])
 
-    print("phase 4/4  comparing\n")
+    print("phase 4/4  comparing\n", flush=True)
     real = json.loads(real_out.read_text())
     modelled = json.loads(modelled_out.read_text())
 
@@ -156,7 +177,7 @@ def main() -> int:
     print(f"  model      : {args.model.rstrip('/').split('/')[-1]}")
     print(f"  requests   : {len(real['requests'])}, "
           f"{args.prompt_tokens} prompt tokens, {args.max_tokens} output tokens")
-    print(f"  steps fitted: {sum(1 for _ in table.open())}")
+    print(f"  steps fitted: {_steps_fitted(table)}")
     print()
     print(f"  {'metric':<9} {'real':>10} {'modelled':>10} {'mean err':>10} "
           f"{'median req':>11} {'worst req':>10}")

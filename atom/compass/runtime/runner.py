@@ -26,6 +26,7 @@ import logging
 from typing import Optional
 
 from atom.compass.config import CompassConfig
+from atom.compass.core.artifacts import rank_path
 from atom.compass.core.cost.base import CostOracle, StepShape
 from atom.compass.core.graph import GraphKey, OpGraph
 from atom.model_engine.model_runner import ModelRunner
@@ -91,10 +92,34 @@ class CompassModelRunner(ModelRunner):
             config = CompassConfig(enabled=True)
         return config
 
-    @staticmethod
-    def _build_oracle(config: CompassConfig) -> CostOracle:
+    def _build_oracle(self, config: CompassConfig) -> CostOracle:
+        """Construct the configured oracle, telling it which rank it serves.
+
+        ``oracle_options`` is deliberately opaque — it is whatever the oracle's
+        constructor takes — so the rank is offered rather than imposed: passed
+        only to an oracle that names ``rank_coords`` in its signature. An oracle
+        that reads a per-rank artifact needs it; one that computes a cost from
+        shape alone does not, and should not have to accept an argument it would
+        ignore.
+        """
+        import inspect
+
         oracle_cls = resolve_obj_by_qualname(config.oracle_qualname)
-        return oracle_cls(**(config.oracle_options or {}))
+        options = dict(config.oracle_options or {})
+        try:
+            takes_rank = "rank_coords" in inspect.signature(oracle_cls).parameters
+        except (TypeError, ValueError):  # builtins, C types, odd callables
+            takes_rank = False
+        # Guarded by the same condition the write side uses, so a single-rank
+        # run behaves exactly as it did before this existed: no suffix was
+        # written, so none should be looked for.
+        if (
+            takes_rank
+            and "rank_coords" not in options
+            and any(size > 1 for size in self._topology().values())
+        ):
+            options["rank_coords"] = self._rank_coords()
+        return oracle_cls(**options)
 
     # -- the seam -------------------------------------------------------------
 
@@ -296,12 +321,12 @@ class CompassModelRunner(ModelRunner):
         makes them race for it and leaves a single file that names no rank, so
         the one artifact that survives cannot be attributed and the rest are
         lost without a trace.
-        """
-        import os
 
-        suffix = "-".join(f"{name}{index}" for name, index in sorted(coords.items()))
-        stem, ext = os.path.splitext(path)
-        return f"{stem}.{suffix}{ext}" if suffix else path
+        The convention itself lives in :mod:`atom.compass.core.artifacts`, so
+        whatever reads these files back resolves them the same way this wrote
+        them.
+        """
+        return rank_path(path, coords)
 
     def _write_graph(self, batch: ScheduledBatch) -> None:
         path = self._compass_config.graph_out

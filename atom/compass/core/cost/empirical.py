@@ -25,8 +25,10 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from typing import Optional
 
+from atom.compass.core.artifacts import resolve_rank_path
 from atom.compass.core.cost.base import StepCost, StepShape
 
 logger = logging.getLogger(__name__)
@@ -87,8 +89,30 @@ class EmpiricalCostOracle:
     """Predicts a step's duration from the measured steps most like it."""
 
     def __init__(self, table: str, neighbours: int = 5,
-                 floor_seconds: float = 1e-6) -> None:
-        self.table = table
+                 floor_seconds: float = 1e-6,
+                 rank_coords: Optional[dict] = None) -> None:
+        self.table, own = resolve_rank_path(table, rank_coords)
+        if rank_coords and not own:
+            logger.warning(
+                "ATOMCompass WARNING: rank %s has no calibration table of its "
+                "own; fitting to the shared %s. Ranks of a symmetric group time "
+                "within a fraction of a percent of each other, so this is "
+                "usually fine — but it is an assumption, not a measurement.",
+                rank_coords, self.table,
+            )
+
+        if not os.path.exists(self.table):
+            # Named here rather than left to `open`, because this raises inside
+            # a worker process: what reaches the terminal is the engine
+            # manager's summary of a worker that vanished, which names neither
+            # Compass nor the file. The message has to carry its own context.
+            tried = f" (also tried {resolve_rank_path(table, rank_coords)[0]})" \
+                if rank_coords else ""
+            raise FileNotFoundError(
+                f"ATOMCompass: no calibration table at {table}{tried}. "
+                f"Record one with --compass-mode=measure --compass-measure-out "
+                f"before predicting from it."
+            )
         self.neighbours = neighbours
         self.floor_seconds = floor_seconds
         self._kinds: dict[str, _Neighbourhood] = {}

@@ -58,6 +58,7 @@ online_quant_info_*.json
 # CI: Docker / BuildKit state under workspace (self-hosted CI)
 .atom-docker-client/
 .buildkit-tmp/
-compass_artifacts/
-compass_artifacts/
+# Compass run artifacts: graphs, timing tables, validation output.
+compass_artifacts*/
+compass_overhead/
 .commitmsg

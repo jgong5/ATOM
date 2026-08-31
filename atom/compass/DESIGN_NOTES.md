@@ -16,9 +16,12 @@ Effort estimates are rough: **S** hours, **M** days, **L** weeks or unknown.
 
 # Status
 
-A simulated serving run reproduces a real one, on Qwen3-0.6B at TP=1 on MI308X,
-calibrated on a sweep of shapes and evaluated on a workload it did not see —
-so the error is a generalisation error, not a fit residual:
+A simulated serving run predicts a real one to within a few percent at TP=1 and
+around twenty at TP=2. Both on Qwen3-0.6B on MI308X, calibrated on a sweep of
+shapes and evaluated on a workload neither saw, so the error is a generalisation
+error rather than a fit residual.
+
+TP=1:
 
 | metric | real | modelled | error |
 | --- | --- | --- | --- |
@@ -27,6 +30,21 @@ so the error is a generalisation error, not a fit residual:
 | latency | 155.83 ms | 150.65 ms | **−3.3%** |
 
 at 6.2× wall clock. Reproduce with `scripts/compass/validate.py`.
+
+The same comparison at **TP=2**, on the same model and the same hardware:
+
+| metric | real | modelled | error |
+| --- | --- | --- | --- |
+| TTFT | 69.10 ms | 46.80 ms | **−32.3%** |
+| TPOT | 3.54 ms | 3.06 ms | **−13.6%** |
+| latency | 178.90 ms | 141.71 ms | **−20.8%** |
+
+**The TP=1 result above is partly luck.** Two errors of similar size sit under
+both numbers: the linear fit under-predicts the region the evaluation lands in,
+at both widths, and a run repeated at a fixed shape varies by ±3–4% in either
+direction. At TP=1 they cancelled. At TP=2 they compounded. A single good
+end-to-end number is not evidence that a cost model is right — it is one draw
+from a distribution whose spread nobody had measured.
 
 How it got there, because the shape of the sequence matters more than the
 endpoint:
@@ -38,11 +56,15 @@ endpoint:
 | prefill calibration widened | −23.9% | +22.5% | +4.7% |
 | batch calibration widened | −11.9% | +17.5% | +7.1% |
 | timing switched to CUDA events | **−6.1%** | **−1.8%** | **−3.3%** |
+| the same, at TP=2 | −32.3% | −13.6% | −20.8% |
 
-**Every one of those steps was a defect in how Compass measured or calibrated,
-never in the cost model's form.** The model has been a six-coefficient linear
-fit throughout. Three of the four were configurations or methods that looked
-entirely reasonable and were quietly wrong.
+Every step up to the last was a defect in how Compass measured or calibrated,
+never in the cost model's form; three of the four were configurations or methods
+that looked entirely reasonable and were quietly wrong. **The last row is the
+first exception.** Widening to a second rank did not introduce an error so much
+as stop concealing one: the linear fit cannot reproduce its own training data in
+the region both evaluations land in, by −3.8% at TP=1 and −8.3% at TP=2, and at
+TP=1 that was cancelled by run-to-run variation pointing the other way.
 
 ---
 
@@ -71,12 +93,39 @@ Precondition, from the event-timing finding below: per-operator attribution must
 be checked for the same observer effect — run the workload with and without it
 and compare the engine's own numbers.
 
-### 2. No collective cost model — **M**
+### 2. A single run cannot tell an improvement from noise — **S**
+
+Repeating a run at a **fixed shape** — batch 8, per-sequence context ~330, same
+model, same hardware, same configuration — moves the measured decode step by
+±3–4%, and the direction is not stable: the evaluation came out 4.0% *faster*
+than the calibration sweep at TP=1 and 3.4% *slower* at TP=2.
+
+That band is wider than the TP=1 headline error (−1.8% TPOT). So the best result
+this project has produced is inside its own noise, and every comparison made so
+far — including each row of the trajectory table — is a difference of two single
+draws. Nothing here reports an interval, so nothing here can distinguish a real
+improvement from a lucky one.
+
+Cheap to fix and worth fixing before the next change is evaluated: repeat each
+phase n times and report a spread. Until then, treat sub-5% differences as
+unmeasured.
+
+### 3. No collective cost model — **S/M**, and narrower than it looked
 
 Collectives are recorded with their group and their bytes, which is what a cost
-model needs, and nothing consumes it. Blocks any credible multi-GPU prediction.
+model needs, and nothing consumes it.
 
-### 3. Never validated against `benchmark_serving` — **M**
+It does **not** block multi-GPU prediction the way this once claimed. The
+collective runs inside the forward, and the forward is timed with CUDA events, so
+a calibrated oracle at a width it was measured at has already absorbed the
+collective's cost without naming it. The TP=2 error above is not a missing
+collective — it is item 10.
+
+What the gap actually costs is prediction at a width **nobody measured**:
+calibrate at TP=2 and ask about TP=4, and there is nothing to scale. That is a
+narrower and later problem than "blocks any credible multi-GPU prediction".
+
+### 4. Never validated against `benchmark_serving` — **M**
 
 `validate.py` compares against ATOM's own offline path, which is a
 tighter comparison than an HTTP benchmark: same engine, same scheduler, same
@@ -87,7 +136,7 @@ not been attempted.
 
 ## Graph fidelity against a production launch
 
-### 4. Derivation is uncompiled; production is not — **L**
+### 5. Derivation is uncompiled; production is not — **L**
 
 Derivation runs the model eagerly on meta. At `--level 3` inductor fuses
 operators and eliminates views and allocations, so a derived graph and a captured
@@ -103,7 +152,7 @@ which is a research problem, not an implementation one.
 Interim: derive and capture at matched levels, and be explicit that a level-0
 validation does not transfer to level 3.
 
-### 5. Trace mode does not observe the CUDA-graph path — **M**
+### 6. Trace mode does not observe the CUDA-graph path — **M**
 
 Trace mode skips `capture_cudagraph` deliberately, so its graph is the eager
 operator sequence. A replay is a single opaque submission: there are no
@@ -114,14 +163,14 @@ applies, not as operators in the graph.
 Measure mode does capture, so timings already come from the replayed path. What
 is missing is the bridge between the two artifacts.
 
-### 6. Only decode steps are traced, and only one — **M**
+### 7. Only decode steps are traced, and only one — **M**
 
 `trace_step` records exactly one step, in practice a small decode. A deployment's
 cost is dominated by shapes never captured: prefill, chunked prefill, mixed
 prefill/decode batches, and long-context decode where attention stops being
 cheap. Speculative decoding and MTP are entirely untraced.
 
-### 7. A custom op's inner Triton kernel is recorded only on hardware — **S**
+### 8. A custom op's inner Triton kernel is recorded only on hardware — **S**
 
 On a real device `aiter::masked_embedding` both dispatches and launches
 `triton::_masked_embedding_kernel`, so the capture holds both. On meta the kernel
@@ -129,29 +178,55 @@ never launches, so derivation holds only the outer operator. Harmless for cost �
 the outer operator carries the shapes — but a systematic difference between the
 two graphs that will confuse anyone diffing them.
 
-### 8. Simulated TP's `all_gather` is not the real one — **S**
+### 9. Simulated TP's `all_gather` is not the real one — **S**
 
 At a physical width of one it builds a zero-padded buffer (`movedim`, `reshape`,
 `view`, `zeros`) where the real path uses `view.dtype`. Seven operators out of
 451. Possibly worth simply accepting — but as a decision, not a residue nobody
 looked at.
 
-### 9. Decode cost is not linear in batch size — **M**
+### 10. Decode cost falls as batch grows; the model says it rises — **M**
 
-With CUDA graphs the replay runs a **padded batch-size bucket**, so cost steps at
-the capture sizes rather than rising smoothly: at matched context, batch 1/2/4
-cost 3.59/3.85/3.78 ms — nearly flat, and not monotonic, which a linear term
-cannot represent.
+Not "not linear". The **sign is wrong**. At matched total context, mean cost per
+step over a sweep of 1662 decode steps:
 
-Originally ranked higher, on the strength of TPOT rising when the sweep widened.
-That diagnosis was wrong: a nearest-neighbour oracle, assuming no functional form
-at all, predicted 3.84 ms where the linear fit predicted 3.83 ms, so the fit was
-faithful and the *data* was wrong — see the event-timing finding. Featuring the
-padded bucket should still help; `Config.capture_sizes` declares the ladder.
+| batch | 1 | 2 | 4 | 8 | 12 |
+| --- | --- | --- | --- | --- | --- |
+| TP=1 | 3.640 ms | 3.564 | 3.393 | 3.317 | 3.532 |
+| TP=2 | 3.636 ms | 3.563 | 3.403 | 3.351 | 3.310 |
+
+Twelve sequences cost *less* per step than one, because with CUDA graphs the
+replay runs a padded batch-size bucket and the step is bound by launch and replay
+rather than by the work inside it. Per-sequence cost falls more than twelvefold
+across that range, and at TP=1 the curve is not even monotonic. The decode model carries batch size as a positive linear term.
+
+The consequence is in-sample, which is what makes it a statement about the
+model's form rather than about coverage. Asked about 49 of **its own training
+rows** at batch 8 and short context:
+
+| | measured | linear fit | k-NN |
+| --- | --- | --- | --- |
+| TP=1 | 3.282 ms | −3.8% | +0.0% |
+| TP=2 | 3.303 ms | −8.3% | +0.0% |
+
+(k-NN scoring zero on training rows is memorisation and proves nothing about
+k-NN. The linear column is the finding.) Held out on an evaluation workload the
+same contrast survives: −10.3% against −3.4% at TP=2.
+
+This item was **demoted once already**, on the grounds that a nearest-neighbour
+oracle assuming no functional form agreed with the linear fit to within 0.3%.
+That agreement was over a whole workload; it did not hold in the region the
+evaluation actually occupies, and averaging concealed it. Two methods agreeing is
+evidence only where they were both asked the same question — and "the same
+question" has to mean the same *region*, not the same table.
+
+Featuring the padded bucket is the obvious repair; `Config.capture_sizes`
+declares the ladder. Whether a per-bucket constant is enough, or the KV term
+needs to stop being linear too, is not yet known.
 
 ## Configurations that cannot be modelled at all
 
-### 10. Asymmetric parallelism — **L**
+### 11. Asymmetric parallelism — **L**
 
 `simulated_tp.py`'s `_reject_unsupported` refuses pipeline parallel, prefill and
 decode context parallel, data parallel and DP-attention, TBO, EPLB, and
@@ -167,7 +242,7 @@ single-process executor. Expert parallelism matters most: it is where the
 interesting models are going, and where a rank's graph genuinely depends on which
 experts its tokens chose.
 
-### 11. Shape-changing collectives have no meta stand-in — **S/M**
+### 12. Shape-changing collectives have no meta stand-in — **S/M**
 
 `all_reduce` and `broadcast` preserve shape, so meta can hand back the input.
 `all_gather` grows and `reduce_scatter` shrinks, so they raise rather than guess
@@ -175,7 +250,7 @@ experts its tokens chose.
 while appearing to work. TP alone does not need them; sequence and expert
 parallelism do.
 
-### 12. One communication group is resolvable; several are not — **M**
+### 13. One communication group is resolvable; several are not — **M**
 
 A collective names its group by elimination: with exactly one group of size above
 one, there is nothing else it could have run on. With TP and EP together the
@@ -183,9 +258,9 @@ ambiguity is real and is recorded as `"?"`.
 
 Settling it means intercepting at the group object rather than the dispatcher —
 `get_tp_group()` and its siblings know their own identity. That is a replacement
-for the current resolver, not an addition, and item 10 needs it too.
+for the current resolver, not an addition, and item 11 needs it too.
 
-### 13. Qwen3.8-27B cannot be captured here — **?** (environmental)
+### 14. Qwen3.8-27B cannot be captured here — **?** (environmental)
 
 Its decode path JIT-builds AITER's *gluon* paged-attention kernel and the build
 fails:
@@ -201,7 +276,23 @@ stderr captured to tell a toolchain problem from an image defect.
 
 ## Measurement and performance
 
-### 14. No way to tell the runner when to start measuring — **M**
+### 15. The extrapolation warning is per-feature, so it cannot see a hole — **S**
+
+The oracle warns when a query falls outside the range of a feature it was
+calibrated over, and that safeguard has caught two real errors. It checks each
+feature *separately*, so it is blind to a gap in their joint distribution.
+
+The TP=2 evaluation asked about batch 8 with a total context of ~2650. Batch 8
+was covered (1–16 seen) and 2650 was covered (57–41052 seen), so nothing warned.
+The sweep's batch-8 steps actually run 1776–2288 and then jump to 5360: the query
+sits in a hole, and the guard reported it as interpolation.
+
+Not the cause of the TP=2 error — item 10 is, and it is in-sample — but the guard
+claims a property it does not have. A convex hull, or a nearest-neighbour
+distance with a threshold, would say what the bounding box cannot. The k-NN
+oracle already computes the distance this needs.
+
+### 16. No way to tell the runner when to start measuring — **M**
 
 Throwaway warmup requests were served to get Triton autotuning out of the way,
 and the runner measured them anyway: a runner sees steps and has no idea which
@@ -214,7 +305,7 @@ many. What is missing is a measurement window the engine can open and close
 across the process boundary. The same gap makes it hard to calibrate one phase of
 a deployment without the others polluting the table.
 
-### 15. Derivation is too slow to run per step — **M**
+### 17. Derivation is too slow to run per step — **M**
 
 A full meta forward of Qwen3.8-27B (64 layers, 2999 operators) takes **~0.16 s**
 against a modelled decode step of ~1 ms, so deriving inside the serving loop
@@ -233,7 +324,7 @@ the batch that changed, or a bucketing scheme with a **measured** error budget
 rather than an assumed one. Not on the critical path for correctness, only for
 speed.
 
-### 16. Capture pays for Triton autotuning — **S**
+### 18. Capture pays for Triton autotuning — **S**
 
 The first launch of each kernel benchmarks every candidate configuration, which is
 why `trace_step` is never 1 and why capture takes minutes. Fine as it is; worth
@@ -425,7 +516,7 @@ everything it does is recorded, while `--fake-eplb` makes one device stand in fo
 a TP-N deployment. A TP2 capture on a single GPU gives **451** operators against
 **448** for the real two-GPU capture.
 
-The residual seven are simulated TP's own zero-padded `all_gather` — item 8.
+The residual seven are simulated TP's own zero-padded `all_gather` — item 9.
 
 **The division of labour this settles.** *Capture* on one device gives the
 complete step for any symmetric TP width, and is what a cost model should be
@@ -441,6 +532,46 @@ ranks race for it and left one file naming no rank: the survivor could not be
 attributed and the rest were lost. Paths carry the rank's coordinates in every
 group it belongs to (`g.json` → `g.tp1.json`, or `g.dp3-tp1.json`).
 
+### ...and must read it back the same way
+
+Writing per-rank artifacts is only half a convention. The measure side suffixed
+the timing table whenever any group was wider than one; the predicting side asked
+for the path it was given. At TP=2 that meant a calibration wrote
+`steps.tp0.jsonl` and `steps.tp1.jsonl` and the run fitted against them looked
+for `steps.jsonl`.
+
+**A single rank cannot expose this.** At width one no suffix is applied, so the
+two sides agree by accident, and every test and every validation run to that
+point had been at width one.
+
+What reached the terminal was worse than the bug: both workers died on a bare
+`FileNotFoundError`, and the engine manager reported *"Received unexpected
+SHUTDOWN signal from DP rank 0 during initialization"* — no DP in the run, and
+nothing to do with initialization. The same shape as the `capture_cudagraph`
+unpacking hang: a worker dies of a specific, nameable cause and the parent
+announces something else entirely.
+
+The convention now lives in `atom/compass/core/artifacts.py` and both sides go
+through it. A rank prefers its own file, falls back to a shared one with a
+warning, and a missing table raises a message that names the path it wanted and
+how to produce one — because that message is the only thing that escapes a
+worker process.
+
+### Ranks of a symmetric group are interchangeable, measured
+
+The engine core owns the clock and advances it by the duration the forward
+reported; that reply comes from rank 0's output channel, so every other rank's
+prediction is discarded. Whether that is sound had never been checked.
+
+Over 1727 steps at TP=2, rank 1 against rank 0: identical shapes on every step,
+median difference **0.03%**, worst **0.82%**, and rank 1 was the slower one on
+**51%** of steps — a coin flip, so there is no systematic skew to correct for.
+Rank-0-only accounting discards 0.01% of the total.
+
+So single-sourcing the clock on rank 0 is right for symmetric TP, and the concern
+belongs entirely to the asymmetric strategies of item 11, where ranks genuinely
+diverge and no rank stands in for another.
+
 ### No fixed ports
 
 The rendezvous store was hardcoded to a port. The container runs with host
@@ -449,6 +580,32 @@ collides with whatever holds it — including an earlier run of the same script 
 and fails with an `EADDRINUSE` that says nothing about tracing. The OS picks it.
 
 ## Measurement
+
+### The step period is the forward, and TP does not change that
+
+A simulated run advances its clock by the predicted forward alone, so everything
+the engine does *between* forwards — broadcasting the batch to each worker,
+collecting output, scheduling, detokenising — is implicitly zero. With two
+workers instead of one there is more of it, which made a tidy explanation for why
+TP=2 predicted 13.6% fast.
+
+It is wrong. Measure mode reports the real TPOT and records each forward's device
+time in the same run, so the difference between them is exactly that unmodelled
+remainder:
+
+| | real TPOT | forward | remainder |
+| --- | --- | --- | --- |
+| TP=1 | 3.139 ms | 3.150 ms | −0.4% |
+| TP=2 | 3.387 ms | 3.414 ms | −0.8% |
+
+Nil at both widths, and not growing. For offline batch serving the step period
+*is* the forward, so modelling the forward is not the approximation it looked
+like. Whether that survives real request arrival over HTTP — where queueing,
+admission and detokenisation are not overlapped with a saturated engine — is
+item 4 and is untested.
+
+Worth recording as a refutation rather than deleting: the hypothesis was
+plausible, cheap to test, and wrong, and the test is two runs.
 
 ### The instrument was changing what it measured — a 33% error
 
@@ -610,4 +767,20 @@ the sum is what the hardware actually moves.
   worse than a crash.
 * Two methods agreeing is only evidence when they could have disagreed. The
   nearest-neighbour oracle earned its place by matching the linear fit, not by
-  beating it.
+  beating it. But they have to be asked the same *question*, and a whole-workload
+  average is not one question: the two agreed to within 0.3% over a table while
+  disagreeing by 7 points in the region that decided the answer. An agreement
+  computed over an average can only rule out disagreements that survive
+  averaging.
+* A good end-to-end number can be two errors cancelling. The TP=1 result stood
+  for weeks as evidence the cost model was sound; widening to a second rank
+  showed the fit had been under-predicting the whole time and run-to-run
+  variation had been quietly paying the difference back.
+* Report an interval or report nothing. Repeating a fixed shape moves the answer
+  by ±3–4%, which is wider than the best headline error this project has
+  produced. Every single-run comparison here, including the trajectory table, is
+  a difference of two draws from that spread.
+* Widening a configuration is a cheaper way to find defects than deepening one.
+  One flag — `--tp 2` — produced a broken artifact convention, a misattributed
+  worker death, a refuted hypothesis, a measured non-issue, and the first
+  functional-form failure in the project.
