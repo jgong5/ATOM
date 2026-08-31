@@ -194,30 +194,35 @@ class CompassModelRunner(ModelRunner):
         return getattr(compilation, "level", None)
 
     def _warn_if_compiled(self) -> None:
-        """Refuse to pretend a compiled forward can be traced completely.
+        """Note that a compiled graph is not comparable to an uncompiled one.
 
-        Both tracers work by interception: the dispatcher sees ATen and custom
-        operators, and ``JITFunction.run`` sees hand-written Triton kernels.
-        Inductor defeats both. It fuses operators into generated kernels that
-        never reach the dispatcher, and launches them through a compiled
-        launcher rather than ``JITFunction.run``, so they are invisible to each
-        tracer for a different reason.
+        Compilation is on by default, so it is the configuration that gets
+        deployed and therefore the one worth modelling. Inductor's kernels are
+        traced (``CachingAutotuner`` is intercepted alongside ``JITFunction``),
+        so a compiled capture is complete — but it is a different graph, and
+        legitimately so:
 
-        The result is not a trace that fails — it is one that quietly omits
-        whatever was fused. On Qwen3-0.6B at the default level that is the
-        embedding, every qkv split and every intermediate allocation: 57 of 386
-        operators, gone, in a graph that still looks entirely reasonable.
+        * fused compute appears as one ``inductor::`` kernel where the
+          uncompiled graph has the operators it replaced
+        * views and allocations — ``split_with_sizes``, ``empty`` — do not
+          appear at all, because inductor resolves them into offsets and a
+          buffer plan rather than executing them
 
-        ``--enforce-eager`` does not prevent this. It disables CUDA graphs;
-        compilation is ``--level``, and its default is on.
+        On Qwen3-0.6B that is 330 operators compiled against 386 uncompiled,
+        with identical compute in both: 283 operators either way. Neither is
+        wrong; they describe different configurations, and a derivation can only
+        be compared against a capture taken at its own level.
+
+        ``--enforce-eager`` does not turn compilation off. It disables CUDA
+        graphs; compilation is ``--level``.
         """
         level = self._compilation_level()
         if level:
-            logger.warning(
-                "ATOMCompass: tracing with compilation level %d. Operators "
-                "fused by inductor reach neither tracer, so the graph will be "
-                "missing whatever was fused, with nothing to mark the gap. "
-                "Capture with --level 0 for a graph worth comparing.",
+            logger.info(
+                "ATOMCompass: tracing at compilation level %d. Inductor kernels "
+                "are traced, but fused compute appears as one operator and "
+                "views and allocations do not appear at all. Compare only "
+                "against a graph derived at the same level.",
                 level,
             )
 

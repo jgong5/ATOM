@@ -60,14 +60,16 @@ def _init_env(tp: int) -> None:
 
 
 def _trace(model, input_ids, positions, topology=None):
-    """Run one forward under both tracers, returning the combined graph."""
+    """Run one forward under the tracers, returning the combined graph."""
+    from atom.compass.runtime.derive import record_collectives
     from atom.compass.runtime.meta import MetaOpTracer
     from atom.compass.runtime.triton_trace import TritonLaunchTracer
 
     ops = MetaOpTracer(topology=topology)
     triton = TritonLaunchTracer(graph=ops.graph)
+    collectives = record_collectives(ops.graph)
     t0 = time.perf_counter()
-    with triton, ops, torch.inference_mode():
+    with collectives, triton, ops, torch.inference_mode():
         model(input_ids, positions)
     return ops.graph, time.perf_counter() - t0
 
@@ -76,7 +78,22 @@ def _trace_cmd(args) -> int:
     _init_env(args.tp)
     from aiter import init_dist_env
 
-    init_dist_env(args.tp, rankID=0, backend="gloo",
+    # Derivation builds the group at world size ONE, whatever TP width is being
+    # derived, and then tells the group to report the wider width.
+    #
+    # A real group of size N needs N processes to arrive. That defeats the whole
+    # purpose here: the point of derivation is to produce a sharded rank's graph
+    # from one process, on no GPUs, for a configuration nobody has run. Asking
+    # gloo for a world of 2 from a single process simply waits forever.
+    #
+    # ATOM already solves this for benchmarking -- `apply_simulated_tp` reports
+    # a logical width while the real group stays physical, all the way down to
+    # one rank -- and the reason it works there is the reason it works here:
+    # every shard-size computation bottoms out at `get_tp_group().world_size`.
+    # Its caveat, that collectives over absent ranks make the *output*
+    # meaningless, costs derivation nothing, because derivation never looks at
+    # the output. Only shapes are recorded, and shapes stay right.
+    init_dist_env(1, rankID=0, backend="gloo",
                   distributed_init_method="env://", local_rank=0)
 
     from atom.compass.core.graph import GraphKey
@@ -86,6 +103,10 @@ def _trace_cmd(args) -> int:
 
     config = Config(model=args.model, tensor_parallel_size=args.tp, load_dummy=True)
     set_current_atom_config(config)
+    if args.tp > 1:
+        from atom.compass.runtime.derive import simulate_group_width
+
+        simulate_group_width(args.tp)
     arch = config.hf_config.architectures[0]
     model_class = resolve_obj_by_qualname(support_model_arch_dict[arch])
 
@@ -114,7 +135,7 @@ def _trace_cmd(args) -> int:
     graph.key = GraphKey.of(
         model_id=f"{arch}@{os.path.basename(args.model.rstrip('/'))}",
         topology={"tp": args.tp},
-        rank_coords={"tp": 0},
+        rank_coords={"tp": args.rank},
         batch_signature=(args.tokens,),
     )
     graph.provenance = {
@@ -216,6 +237,9 @@ def main() -> int:
     tr.add_argument("--device", default="meta", choices=["meta", "cuda", "cpu"])
     tr.add_argument("--tokens", type=int, default=8)
     tr.add_argument("--tp", type=int, default=1)
+    tr.add_argument("--rank", type=int, default=0,
+                    help="Which rank of the group to derive. Any rank can be "
+                         "derived from any process; nothing is communicated.")
     tr.add_argument("-o", "--out", required=True)
     tr.set_defaults(func=_trace_cmd)
 

@@ -183,23 +183,36 @@ enforced rather than remembered:
   capture used; otherwise shapes differ for reasons that carry no information.
   The tool warns when the batches disagree.
 
-## Settled: a compiled capture is silently incomplete
+## Corrected: a compiled capture is a different graph, not an incomplete one
 
-Both tracers work by interception, and inductor defeats each for a different
-reason. Fused operators never reach the dispatcher, and the kernels inductor
-generates are launched through a compiled launcher rather than
-`JITFunction.run`, so the Triton tracer does not see them either. Nothing marks
-the gap.
+An earlier version of this note claimed compilation silently dropped 57 of 386
+operators. That was wrong in substance, and the correction matters because the
+wrong version argued for capturing at `--level 0`, which is not the
+configuration anybody deploys.
 
-At the default compilation level, Qwen3-0.6B captures 329 operators. At
-`--level 0` it captures 386. The missing 57 are the embedding, all 28 qkv splits
-and 28 intermediate allocations — and the 329-operator graph looks entirely
-reasonable on its own.
+Inductor kernels **are** traced now: `CachingAutotuner.run` is intercepted
+alongside `JITFunction.run`, because inductor launches its generated kernels
+through the former and a graph built only from the dispatcher and `JITFunction`
+would miss them. That interception was the one real gap, and it accounted for
+exactly one operator: `aten::embedding` becomes
+`inductor::triton_poi_fused_embedding_0`.
 
-`--enforce-eager` does **not** prevent this; it disables CUDA graphs. Compilation
-is `--level`, and its default is on. Trace mode now warns when the level is
-non-zero, and every graph carries its compilation level in `provenance` so an
-artifact cannot be misread later by whoever compares it.
+The other 56 are `split_with_sizes` and `empty` — views and allocations, which
+inductor resolves into offsets and a buffer plan rather than executing. They do
+not run at level 3. Their absence is the compiled configuration being faithfully
+recorded, not a hole in the trace. The compute totals confirm it: 283 operators
+either way.
+
+So a compiled and an uncompiled capture are both correct and describe different
+configurations. Compilation is the default, so it is the one worth modelling,
+and a derivation may only be compared against a capture taken at its own level.
+`--enforce-eager` does not change this; it disables CUDA graphs, and compilation
+is `--level`.
+
+Open: derivation still runs uncompiled. Comparing it to a compiled capture means
+either running inductor during derivation or modelling the fusion itself —
+predicting which operators collapse into one kernel and what that kernel costs.
+Unsolved, and the largest remaining gap between derivation and production.
 
 ## Settled: the derivation must use the engine's input dtypes
 
@@ -279,3 +292,62 @@ networking on a machine shared with about twenty others, so a fixed number
 collides with whatever holds it — including an earlier run of the same script —
 and fails with an `EADDRINUSE` that says nothing about tracing. The OS picks the
 port now.
+
+
+## Settled: a sharded rank can be derived from one process
+
+TP>1 derivation used to hang, and the hang was only ever on the derivation side:
+capture at TP=2 works fine, because it really does start two processes. A single
+process asking gloo for a world of two waits forever for a peer nobody launched.
+
+The fix is ATOM's own simulated TP, which reports a logical group width over a
+smaller real group. One correction was needed to use it: `apply_simulated_tp`
+decides the physical width from `torch.cuda.device_count()`, which is the right
+question for a worker holding a device and the wrong one for derivation, whose
+real group is always exactly one rank however many GPUs exist. On an 8-GPU box
+that heuristic concluded a TP2 derivation needed no simulation, and the model
+then built unsharded — silently, and looking normal.
+`simulate_group_width()` states the widths outright instead.
+
+That surfaced a second problem. At a physical width of one there is no
+communicator, so simulated TP replaces `all_reduce` with a passthrough — right
+for benchmarking kernels, wrong here, because the derived graph then contains no
+communication at all and tensor parallelism costs out as free. Collectives are
+now recorded rather than performed, under the same name the dispatcher records
+on hardware, so the two graphs compare operator for operator.
+
+With both in place, a TP=2 rank derived on meta in one process reproduces the
+TP=2 capture: all 395 operators, including all 57 all-reduces. Deriving a
+configuration nobody has run — the point of the whole exercise — works for
+symmetric TP.
+
+## Open: the derived graph is the model, but Compass models the whole step
+
+The comparison asks containment because a capture holds the runner's work as
+well as the model's. That framing is a description of a limitation, not a
+target: ATOMCompass exists to simulate the serving flow, and batch-metadata
+preparation, the LM head, sampling and the device transfer all cost real time in
+a real deployment. Fifty-odd operators are currently outside what derivation
+produces, and calling them "not part of the model body" excuses rather than
+solves it.
+
+The fix is to derive through the runner rather than through a bare model call,
+which needs meta-aware KV allocation — `get_num_blocks` probes real VRAM, and a
+meta model with a real KV cache would mix devices. Once derivation goes through
+the same path as capture, the check becomes equality and the containment
+allowance can be removed.
+
+A smaller instance of the same gap: on hardware a custom op both dispatches and
+launches its inner Triton kernel, so the capture records `aiter::masked_embedding`
+*and* `triton::_masked_embedding_kernel`. On meta only the outer operator is
+recorded, since the kernel never launches.
+
+## Open: predict mode has only been validated without CUDA graphs
+
+The step-1 gate passes with `--enforce-eager` and hangs without it, on an AITER
+shared-memory broadcast. CUDA graphs are the default, so every Compass run to
+date has been in a configuration that is not the deployed one.
+`capture_cudagraph` is a no-op in Compass, and the likely cause is the engine
+waiting on a capture that never happens. Same class of problem as the
+compilation one: validated against a convenient configuration rather than the
+real one.

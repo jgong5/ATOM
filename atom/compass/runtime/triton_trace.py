@@ -29,6 +29,13 @@ logger = logging.getLogger(__name__)
 
 __all__ = ["TritonLaunch", "TritonLaunchTracer"]
 
+#: Prefix for kernels torch.compile generated, as opposed to hand-written ones.
+#: Worth keeping separate: a hand-written kernel is a stable identity a cost
+#: model can be fitted to, while an inductor kernel is generated per compilation
+#: and named by hash, so its cost has to come from its shapes and its fused body
+#: rather than from recognising it again.
+INDUCTOR_PREFIX = "inductor"
+
 
 @dataclass(frozen=True)
 class TritonLaunch:
@@ -48,6 +55,20 @@ class TritonLaunch:
     arg_shapes: tuple = ()
     arg_dtypes: tuple = ()
     constexprs: tuple = ()
+
+
+def _kernel_name(fn: Any) -> str:
+    """Best available identity for a kernel.
+
+    Hand-written kernels carry their function name. Inductor's autotuner wraps a
+    generated function and records the name it chose in ``inductor_meta``, which
+    is more informative than the wrapper's own ``__name__``.
+    """
+    meta = getattr(fn, "inductor_meta", None)
+    if isinstance(meta, dict) and meta.get("kernel_name"):
+        return str(meta["kernel_name"])
+    inner = getattr(fn, "fn", fn)
+    return getattr(inner, "__name__", None) or str(inner)
 
 
 def _is_meta(x: Any) -> bool:
@@ -90,6 +111,11 @@ class TritonLaunchTracer:
         self.launches: list[TritonLaunch] = []
         self._original = None
         self._patched_cls = None
+        self._inductor_original = None
+        self._inductor_cls = None
+        # An inductor launch may reach JITFunction.run underneath. Recording it
+        # at both levels would double-count the same kernel.
+        self._in_inductor = False
 
     def __enter__(self) -> "TritonLaunchTracer":
         try:
@@ -117,16 +143,59 @@ class TritonLaunchTracer:
 
         JITFunction.run = run
         self._original, self._patched_cls = original, JITFunction
+        self._patch_inductor()
         return self
+
+    def _patch_inductor(self) -> None:
+        """Also intercept the kernels ``torch.compile`` generates.
+
+        Inductor does not launch through ``JITFunction.run``. It compiles each
+        fused kernel and calls it through ``CachingAutotuner``, so a graph built
+        only from the dispatcher and ``JITFunction`` silently omits everything
+        inductor fused — and omits it without leaving a mark, which is worse
+        than failing.
+
+        This matters because compilation is on by default. A capture taken with
+        it off describes a configuration nobody deploys.
+        """
+        try:
+            from torch._inductor.runtime.triton_heuristics import CachingAutotuner
+        except ImportError:  # pragma: no cover - inductor absent or moved
+            logger.debug("inductor autotuner not importable; fused kernels "
+                         "will not be traced")
+            return
+
+        tracer = self
+        original = CachingAutotuner.run
+
+        def run(self, *args, stream=None, **kwargs):  # noqa: ANN001
+            tensors = _tensors(args, kwargs)
+            tracer._record(self, args, kwargs, tensors, prefix=INDUCTOR_PREFIX)
+            if any(_is_meta(t) for t in tensors):
+                return None
+            previously = tracer._in_inductor
+            tracer._in_inductor = True
+            try:
+                return original(self, *args, stream=stream, **kwargs)
+            finally:
+                tracer._in_inductor = previously
+
+        CachingAutotuner.run = run
+        self._inductor_original, self._inductor_cls = original, CachingAutotuner
 
     def __exit__(self, *exc) -> None:
         if self._original is not None and self._patched_cls is not None:
             self._patched_cls.run = self._original
             self._original = self._patched_cls = None
+        if self._inductor_original is not None and self._inductor_cls is not None:
+            self._inductor_cls.run = self._inductor_original
+            self._inductor_original = self._inductor_cls = None
 
-    def _record(self, fn, args, kwargs, tensors) -> None:
+    def _record(self, fn, args, kwargs, tensors, prefix: str = "triton") -> None:
+        if self._in_inductor and prefix == "triton":
+            return  # already recorded one level up, as the fused kernel
         kwargs = kwargs or {}
-        name = getattr(getattr(fn, "fn", fn), "__name__", str(fn))
+        name = _kernel_name(fn)
         constexprs = tuple(
             sorted(
                 (k, v) for k, v in kwargs.items()
@@ -143,7 +212,7 @@ class TritonLaunchTracer:
         self.launches.append(launch)
         self.graph.add(
             OpSpec(
-                name=f"triton::{name}",
+                name=f"{prefix}::{name}",
                 input_shapes=launch.arg_shapes,
                 output_shapes=(),
                 dtypes=launch.arg_dtypes,

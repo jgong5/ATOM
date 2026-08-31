@@ -71,6 +71,26 @@ def _resolve_group(name: str, topology: Optional[dict]) -> Optional[str]:
     return candidates[0] if len(candidates) == 1 else AMBIGUOUS_GROUP
 
 
+#: Collectives whose output has the same shape as their input, and which ATOM
+#: performs in place. These can be stood in for on meta by handing back the
+#: tensor that went in — the graph still records that the collective happened,
+#: on which group, over how many bytes, which is all a cost model needs.
+#:
+#: Deliberately not a catch-all. ``all_gather`` grows its output and
+#: ``reduce_scatter`` shrinks it, so guessing "same shape" for those would
+#: corrupt every downstream shape while looking like it worked. They are
+#: reported as missing until each is given its own rule.
+_SHAPE_PRESERVING = ("all_reduce", "allreduce", "broadcast")
+
+
+def _collective_stand_in(name: str, tensors: list) -> Optional[Any]:
+    """Result of a collective that cannot run, or None if we must not guess."""
+    lowered = name.lower()
+    if any(h in lowered for h in _SHAPE_PRESERVING) and tensors:
+        return tensors[0]
+    return None
+
+
 def _shape_of(x: Any):
     return tuple(int(d) for d in x.shape) if isinstance(x, torch.Tensor) else None
 
@@ -187,8 +207,30 @@ class MetaOpTracer(TorchDispatchMode):
         in_shapes = tuple(s for s in (_shape_of(t) for t in tensors) if s is not None)
         dtypes = tuple(str(t.dtype).replace("torch.", "") for t in tensors)
 
+        # A collective on meta has no group to talk to and no storage to send.
+        # Standing in for the shape-preserving ones is what lets a single
+        # process derive a sharded rank's graph: the collective is recorded --
+        # its group, its bytes -- without a peer having to exist.
+        stand_in = None
+        if _is_collective(name) and any(
+            isinstance(t, torch.Tensor) and t.device.type == "meta" for t in tensors
+        ):
+            stand_in = _collective_stand_in(name, tensors)
+            if stand_in is None:
+                self.missing.append(
+                    MissingMetaKernel(
+                        name=name,
+                        reason="collective changes shape; no stand-in rule yet",
+                        input_shapes=in_shapes,
+                    )
+                )
+                raise NotImplementedError(
+                    f"{name}: collective is not shape-preserving, so meta "
+                    "derivation cannot synthesise its result"
+                )
+            out = stand_in
         try:
-            out = func(*args, **kwargs)
+            out = out if stand_in is not None else func(*args, **kwargs)
         except NotImplementedError as exc:
             self.missing.append(
                 MissingMetaKernel(name=name, reason=_short(exc), input_shapes=in_shapes)
