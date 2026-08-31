@@ -114,18 +114,8 @@ def _summarise(name: str, real: list[float], modelled: list[float]) -> dict:
     }
 
 
-def main() -> int:
-    ap = argparse.ArgumentParser(description="ATOMCompass end-to-end validation")
-    ap.add_argument("--model", required=True)
-    ap.add_argument("--tp", type=int, default=1)
-    ap.add_argument("--num-prompts", type=int, default=8)
-    ap.add_argument("--max-tokens", type=int, default=32)
-    ap.add_argument("--prompt-tokens", type=int, default=64)
-    ap.add_argument("--workdir", default="compass_artifacts")
-    ap.add_argument("--python", default=sys.executable)
-    args = ap.parse_args()
-
-    work = Path(args.workdir)
+def _one_pass(args, work: Path) -> tuple[list[dict], dict, dict, str]:
+    """Calibrate, run for real, run modelled, compare. One draw."""
     work.mkdir(parents=True, exist_ok=True)
     table = work / "steps.jsonl"
     real_out = work / "real.json"
@@ -139,7 +129,7 @@ def main() -> int:
         "--prompt-tokens", str(args.prompt_tokens),
     ]
 
-    print("phase 1/4  calibrating on a sweep of shapes ...", flush=True)
+    print("  phase 1/4  calibrating on a sweep of shapes ...", flush=True)
     _run(common + ["--out", str(work / "sweep.json"), "--sweep",
                    "--compass", "--compass-mode", "measure",
                    "--compass-measure-out", str(table),
@@ -147,16 +137,16 @@ def main() -> int:
                    # every other prefill sample the sweep produced.
                    "--compass-measure-warmup-steps", "1"])
 
-    print("phase 2/4  running the evaluation workload for real ...", flush=True)
+    print("  phase 2/4  running the evaluation workload for real ...", flush=True)
     _run(common + ["--out", str(real_out)])
 
-    print("phase 3/4  running it again, modelled ...", flush=True)
+    print("  phase 3/4  running it again, modelled ...", flush=True)
     _run(common + ["--out", str(modelled_out), "--compass",
                    "--compass-oracle",
                    "atom.compass.core.cost.calibrated.CalibratedCostOracle",
                    "--compass-oracle-option", f"table={table}"])
 
-    print("phase 4/4  comparing\n", flush=True)
+    print("  phase 4/4  comparing", flush=True)
     real = json.loads(real_out.read_text())
     modelled = json.loads(modelled_out.read_text())
 
@@ -171,33 +161,94 @@ def main() -> int:
         _summarise("latency", [r["latency"] for r in real["requests"]],
                    [r["latency"] for r in modelled["requests"]]),
     ]
+    return rows, real, modelled, _steps_fitted(table)
 
+
+def main() -> int:
+    ap = argparse.ArgumentParser(description="ATOMCompass end-to-end validation")
+    ap.add_argument("--model", required=True)
+    ap.add_argument("--tp", type=int, default=1)
+    ap.add_argument("--num-prompts", type=int, default=8)
+    ap.add_argument("--max-tokens", type=int, default=32)
+    ap.add_argument("--prompt-tokens", type=int, default=64)
+    ap.add_argument("--workdir", default="compass_artifacts")
+    ap.add_argument("--python", default=sys.executable)
+    ap.add_argument(
+        "--repeats", type=int, default=1,
+        help="Repeat the whole pipeline this many times and report a spread. "
+             "One run cannot distinguish an improvement from a lucky draw: "
+             "five repeats of the identical command have moved TPOT error from "
+             "-5.4%% to +2.4%%. Three or more before believing a difference.",
+    )
+    args = ap.parse_args()
+
+    if args.repeats < 1:
+        raise SystemExit("--repeats must be at least 1")
+
+    work = Path(args.workdir)
+    passes = []
+    for i in range(args.repeats):
+        target = work if args.repeats == 1 else work / f"rep{i + 1}"
+        if args.repeats > 1:
+            print(f"repeat {i + 1}/{args.repeats}", flush=True)
+        passes.append(_one_pass(args, target))
+
+    rows0, real, modelled, fitted = passes[0]
+    print()
     print("ATOMCompass end-to-end validation")
     print("=" * 78)
-    print(f"  model      : {args.model.rstrip('/').split('/')[-1]}")
+    print(f"  model      : {args.model.rstrip('/').split('/')[-1]}, tp={args.tp}")
     print(f"  requests   : {len(real['requests'])}, "
           f"{args.prompt_tokens} prompt tokens, {args.max_tokens} output tokens")
-    print(f"  steps fitted: {_steps_fitted(table)}")
+    print(f"  steps fitted: {fitted}")
+    print(f"  repeats    : {args.repeats}")
     print()
-    print(f"  {'metric':<9} {'real':>10} {'modelled':>10} {'mean err':>10} "
-          f"{'median req':>11} {'worst req':>10}")
-    for row in rows:
-        print(f"  {row['metric']:<9} {row['real_mean']*1000:>9.2f}ms "
-              f"{row['modelled_mean']*1000:>9.2f}ms "
-              f"{row['mean_error_pct']:>+9.1f}% "
-              f"{row['median_abs_request_error_pct']:>10.1f}% "
-              f"{row['worst_request_error_pct']:>9.1f}%")
-    print()
-    print(f"  wall clock : real {real['wall']:.2f}s, "
-          f"modelled {modelled['wall']:.2f}s "
-          f"({real['wall'] / modelled['wall']:.1f}x faster)")
-    print("=" * 78)
-    print("  Calibrated on a sweep of shapes, evaluated on a workload it did not")
-    print("  see. The error is a generalisation error, not a fit residual.")
 
-    (work / "validation.json").write_text(json.dumps(rows, indent=2))
+    if args.repeats == 1:
+        print(f"  {'metric':<9} {'real':>10} {'modelled':>10} {'mean err':>10} "
+              f"{'median req':>11} {'worst req':>10}")
+        for row in rows0:
+            print(f"  {row['metric']:<9} {row['real_mean']*1000:>9.2f}ms "
+                  f"{row['modelled_mean']*1000:>9.2f}ms "
+                  f"{row['mean_error_pct']:>+9.1f}% "
+                  f"{row['median_abs_request_error_pct']:>10.1f}% "
+                  f"{row['worst_request_error_pct']:>9.1f}%")
+        print()
+        print(f"  wall clock : real {real['wall']:.2f}s, "
+              f"modelled {modelled['wall']:.2f}s "
+              f"({real['wall'] / modelled['wall']:.1f}x faster)")
+        print("=" * 78)
+        print("  One run. It cannot tell an improvement from a lucky draw --")
+        print("  pass --repeats 3 or more before believing a difference.")
+    else:
+        print(f"  {'metric':<9} {'mean err':>10} {'sd':>8} {'min':>9} {'max':>9}"
+              f"   per run")
+        for k, name in enumerate(("TTFT", "TPOT", "latency")):
+            errs = [p[0][k]["mean_error_pct"] for p in passes]
+            mean = statistics.fmean(errs)
+            sd = statistics.stdev(errs) if len(errs) > 1 else 0.0
+            each = " ".join(f"{e:+.1f}" for e in errs)
+            print(f"  {name:<9} {mean:>+9.1f}% {sd:>7.1f} {min(errs):>+8.1f}% "
+                  f"{max(errs):>+8.1f}%   {each}")
+        print("=" * 78)
+        flagged = [
+            n for k, n in enumerate(("TTFT", "TPOT", "latency"))
+            if (lambda e: abs(statistics.fmean(e)) < statistics.stdev(e))(
+                [p[0][k]["mean_error_pct"] for p in passes])
+        ]
+        if flagged:
+            print(f"  Inside the noise: {', '.join(flagged)} -- the spread is "
+                  f"wider than the error.")
+            print("  Do not quote these as accuracy without more repeats.")
+        if args.repeats < 3:
+            print("  Two draws do not estimate a spread. Use 3 or more.")
+        print("  Repeats run back-to-back share whatever the machine was doing")
+        print("  at the time, so this sd is a lower bound on the real one.")
+
+    (work / "validation.json").write_text(json.dumps(
+        {"repeats": args.repeats, "tp": args.tp,
+         "passes": [p[0] for p in passes]}, indent=2))
     return 0
-
 
 if __name__ == "__main__":
     sys.exit(main())

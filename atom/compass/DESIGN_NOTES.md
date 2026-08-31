@@ -16,22 +16,34 @@ Effort estimates are rough: **S** hours, **M** days, **L** weeks or unknown.
 
 # Status
 
-A simulated serving run predicts a real one to within a few percent at TP=1 and
-around twenty at TP=2. Both on Qwen3-0.6B on MI308X, calibrated on a sweep of
-shapes and evaluated on a workload neither saw, so the error is a generalisation
-error rather than a fit residual.
+A simulated serving run predicts a real one on Qwen3-0.6B on MI308X, calibrated
+on a sweep of shapes and evaluated on a workload neither saw, so the error is a
+generalisation error rather than a fit residual. Five runs of the identical
+command at TP=1, at roughly 6× wall clock:
 
-TP=1:
-
-| metric | real | modelled | error |
+| run | TTFT | TPOT | latency |
 | --- | --- | --- | --- |
-| TTFT | 55.10 ms | 51.75 ms | **−6.1%** |
-| TPOT | 3.25 ms | 3.19 ms | **−1.8%** |
-| latency | 155.83 ms | 150.65 ms | **−3.3%** |
+| 1 | −6.1% | −1.8% | −3.3% |
+| 2 | −14.0% | −5.4% | −8.7% |
+| 3 | −14.7% | −5.3% | −8.8% |
+| 4 | −14.4% | −1.9% | −6.7% |
+| 5 | −0.5% | +2.4% | +1.4% |
+| **mean ± sd** | **−9.9 ± 6.4** | **−2.4 ± 3.2** | **−5.2 ± 4.3** |
 
-at 6.2× wall clock. Reproduce with `scripts/compass/validate.py`.
+Reproduce with `scripts/compass/validate.py`.
 
-The same comparison at **TP=2**, on the same model and the same hardware:
+**Read the spread before the mean.** This document reported run 1 alone for some
+time, as −6.1/−1.8/−3.3, and treated it as the project's result. It is one draw
+from a distribution whose TPOT runs from −5.4% to +2.4% — the reported error was
+smaller than the interval it came from. Nothing was wrong with that run; what was
+wrong was quoting it. The machine is shared with about twenty other containers
+and the GPUs are not partitioned, so a run is a sample of the box as much as of
+the model.
+
+The same comparison at **TP=2**, on the same model and the same hardware.
+One run, so read it with the caveat above — and note that calling it
+significant below borrows the TP=1 spread as an estimate of this one's,
+which is an assumption and not a measurement:
 
 | metric | real | modelled | error |
 | --- | --- | --- | --- |
@@ -39,12 +51,12 @@ The same comparison at **TP=2**, on the same model and the same hardware:
 | TPOT | 3.54 ms | 3.06 ms | **−13.6%** |
 | latency | 178.90 ms | 141.71 ms | **−20.8%** |
 
-**The TP=1 result above is partly luck.** Two errors of similar size sit under
-both numbers: the linear fit under-predicts the region the evaluation lands in,
-at both widths, and a run repeated at a fixed shape varies by ±3–4% in either
-direction. At TP=1 they cancelled. At TP=2 they compounded. A single good
-end-to-end number is not evidence that a cost model is right — it is one draw
-from a distribution whose spread nobody had measured.
+TP=2 is worse than TP=1 by more than the noise: −13.6% TPOT sits 3.5 standard
+deviations below the TP=1 mean, so it is a real effect and not another draw. Two
+things are under it. The linear fit under-predicts the region both evaluations
+land in, at both widths — that is item 10, and it is in-sample. And run 1 of the
+TP=1 series happened to land at the optimistic end of the band, which made the
+gap between the two widths look larger than the −2.4% mean justifies.
 
 How it got there, because the shape of the sequence matters more than the
 endpoint:
@@ -55,7 +67,8 @@ endpoint:
 | CUDA graphs captured in measure mode | +39.6% | +13.1% | +22.9% |
 | prefill calibration widened | −23.9% | +22.5% | +4.7% |
 | batch calibration widened | −11.9% | +17.5% | +7.1% |
-| timing switched to CUDA events | **−6.1%** | **−1.8%** | **−3.3%** |
+| timing switched to CUDA events | −6.1% | −1.8% | −3.3% |
+| ...the same command, four more times | −0.5 to −14.7% | +2.4 to −5.4% | +1.4 to −8.8% |
 | the same, at TP=2 | −32.3% | −13.6% | −20.8% |
 
 Every step up to the last was a defect in how Compass measured or calibrated,
@@ -93,22 +106,36 @@ Precondition, from the event-timing finding below: per-operator attribution must
 be checked for the same observer effect — run the workload with and without it
 and compare the engine's own numbers.
 
-### 2. A single run cannot tell an improvement from noise — **S**
+### 2. Most of this project's numbers are inside their own noise — **S**, done
 
-Repeating a run at a **fixed shape** — batch 8, per-sequence context ~330, same
-model, same hardware, same configuration — moves the measured decode step by
-±3–4%, and the direction is not stable: the evaluation came out 4.0% *faster*
-than the calibration sweep at TP=1 and 3.4% *slower* at TP=2.
+Five runs of one command, no change between them, gave a TPOT error ranging from
+−5.4% to +2.4% and a TTFT error from −14.7% to −0.5% — see the spread in Status.
+Mean ± sd is −2.4 ± 3.2 (TPOT) and −9.9 ± 6.4 (TTFT): **the standard deviation is
+larger than the mean in both**. At a fixed shape, without the calibration and
+scheduling variance on top, repeats still move ±3–4% and the sign is not stable.
 
-That band is wider than the TP=1 headline error (−1.8% TPOT). So the best result
-this project has produced is inside its own noise, and every comparison made so
-far — including each row of the trajectory table — is a difference of two single
-draws. Nothing here reports an interval, so nothing here can distinguish a real
-improvement from a lucky one.
+Every row of the trajectory table is therefore a difference of two single draws.
+The early rows are large enough to survive it — +800% is not noise — but the last
+two steps, from +17.5% to −1.8% TPOT, are not distinguishable from a lucky pair
+by the evidence that was recorded for them.
 
-Cheap to fix and worth fixing before the next change is evaluated: repeat each
-phase n times and report a spread. Until then, treat sub-5% differences as
-unmeasured.
+Some of the spread is the box: about twenty containers share these GPUs and they
+are not partitioned, so a run samples the neighbours as much as the model. That
+is not a defect to fix, it is a condition to measure under.
+
+And the variance has **time structure**, so repeats are not independent draws. A
+`--repeats 2` run taken back-to-back reported −2.2% ± 0.1 on TPOT — a hundredth
+of the spread the five separated runs showed. Adjacent runs share whatever the
+machine was doing, so a tight sd from consecutive repeats is a lower bound and
+not a measurement. Spacing repeats, or interleaving the configurations being
+compared, would be the honest design; the script says so rather than pretending
+otherwise.
+
+`validate.py --repeats N` now runs the whole pipeline N times and reports mean,
+sd, range and each draw, and says so plainly when the spread exceeds the mean.
+The remaining work is judgement, not code: nothing should be quoted as an
+accuracy figure from a single run again, and a difference smaller than ~5% needs
+repeats before it means anything.
 
 ### 3. No collective cost model — **S/M**, and narrower than it looked
 
@@ -776,10 +803,14 @@ the sum is what the hardware actually moves.
   for weeks as evidence the cost model was sound; widening to a second rank
   showed the fit had been under-predicting the whole time and run-to-run
   variation had been quietly paying the difference back.
-* Report an interval or report nothing. Repeating a fixed shape moves the answer
-  by ±3–4%, which is wider than the best headline error this project has
-  produced. Every single-run comparison here, including the trajectory table, is
-  a difference of two draws from that spread.
+* Report an interval or report nothing. Five runs of one unchanged command gave
+  TPOT errors from −5.4% to +2.4%: the standard deviation is larger than the
+  mean, and the number this document led with for weeks was simply the luckiest
+  draw of the five. Every single-run comparison here, the trajectory table
+  included, is a difference of two samples from that spread.
+* The thing that finally measured the noise was running the same command five
+  times, which cost twenty minutes and nothing else. It was not done earlier
+  because each individual run had always looked reasonable.
 * Widening a configuration is a cheaper way to find defects than deepening one.
   One flag — `--tp 2` — produced a broken artifact convention, a misattributed
   worker death, a refuted hypothesis, a measured non-issue, and the first
