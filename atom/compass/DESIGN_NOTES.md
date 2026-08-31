@@ -157,23 +157,6 @@ Worth noting what capture costs even when it works: Triton autotunes the prefill
 path for several minutes before the first traced step. That is an argument for
 meta derivation rather than against it — capture is the expensive side.
 
-## Superseded: the captured graph looked too small for the model
-
-The steady-state capture holds 101 operators with 3
-`linear_attention_with_output_base` and 13 `gemm_a16w16`, which is on the order
-of three layers, not the 64 this model has. Either the trace is being cut short,
-or most layers execute inside a region that does not dispatch operator by
-operator — `torch.compile(..., backend="eager")` is applied to the model in
-`ModelRunner`, and a compiled region would explain both the low count and why
-meta, which is not compiled the same way, saw 2999.
-
-Unresolved. It matters, because a graph that silently omits most of the model
-would cost out at a fraction of the truth while looking well-formed. Worth
-checking before any cost model is fitted against these graphs: compare the
-per-layer operator counts against the model's layer count, and fail loudly when
-they disagree rather than trusting the artifact.
-
-
 ## Settled: derivation reproduces hardware, and the check is now repeatable
 
 For Qwen3-0.6B at TP=1, on a decode step of one token, all **338** derived
@@ -282,8 +265,12 @@ between "derive a graph for a configuration nobody has run" and what the tool
 does today, and it is the whole point of derivation — sweeping TP without a GPU
 per point.
 
-ATOM already has the mechanism (`apply_simulated_tp` simulates wider TP than the
-physical device count), so this is a matter of wiring rather than invention.
+ATOM already has the mechanism — see *Open risk: asymmetric parallelism* above:
+`atom/distributed/simulated_tp.py` reports a logical group width wider than the
+devices present, so layers shard that many ways without the ranks existing. That
+is exactly what a single-process derivation needs, so this is wiring rather than
+invention, and it is bounded by the same line that module already draws: TP is
+symmetric and simulable, the asymmetric strategies are not.
 
 ## Settled: no fixed ports
 
