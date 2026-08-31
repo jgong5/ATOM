@@ -42,7 +42,6 @@ class CompassModelRunner(ModelRunner):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
-        self._compass_config = self._resolve_compass_config()
         self._oracle: CostOracle = self._build_oracle(self._compass_config)
         self._graph = OpGraph()
         self._traced_steps = 0
@@ -59,6 +58,26 @@ class CompassModelRunner(ModelRunner):
             self._warn_if_compiled()
 
     # -- setup ----------------------------------------------------------------
+
+    @property
+    def _compass_config(self) -> CompassConfig:
+        """The active settings, resolved on first use rather than in ``__init__``.
+
+        ``ModelRunner.__init__`` warms the model up before it returns, and
+        warmup drives a forward — so this class's own ``__init__`` body has not
+        run yet the first time anything here asks which mode it is in. Assigning
+        the config after ``super().__init__()`` therefore left every
+        mode-dependent decision during startup reading an attribute that did not
+        exist yet.
+
+        ``self.config`` is set early in the base ``__init__`` (well before
+        warmup), so resolving lazily is safe where assigning eagerly was not.
+        """
+        cached = self.__dict__.get("_compass_config_cache")
+        if cached is None:
+            cached = self._resolve_compass_config()
+            self.__dict__["_compass_config_cache"] = cached
+        return cached
 
     def _resolve_compass_config(self) -> CompassConfig:
         config = getattr(self.config, "compass_config", None)
@@ -77,6 +96,13 @@ class CompassModelRunner(ModelRunner):
 
     def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
         """Predict the step, or trace it, depending on the configured mode."""
+        if self._runs_real_forward and getattr(batch, "is_dummy_run", False):
+            # Warmup drives synthetic batches through this same entry point.
+            # They are real forwards, so they must actually run — but they are
+            # not steps a deployment performs, and counting them would spend the
+            # trace budget on a dummy shape and put dummy timings in the table
+            # that a cost model is fitted to.
+            return super().forward(batch)
         if self._compass_config.mode == "trace":
             return self._forward_traced(batch)
         if self._compass_config.mode == "measure":
@@ -383,26 +409,65 @@ class CompassModelRunner(ModelRunner):
     def _rank_coords(self) -> dict[str, int]:
         return {"tp": int(getattr(self, "rank", 0) or 0)}
 
-    # -- work that has no meaning without real compute -------------------------
+    # -- work whose meaning depends on the mode --------------------------------
+    #
+    # Only `predict` replaces the forward pass. `trace` and `measure` both run
+    # the real thing, so anything skipped for them is skipped from a real run,
+    # and the artifact then describes a machine configured unlike the
+    # deployment it is meant to stand for.
+
+    @property
+    def _runs_real_forward(self) -> bool:
+        return self._compass_config.mode in ("trace", "measure")
 
     def capture_cudagraph(self):
-        """No graphs to capture when no kernels run — but say so in the caller's
-        own terms.
+        """Capture CUDA graphs unless there is a reason not to — per mode.
+
+        Skipping this unconditionally is what made the first end-to-end
+        validation wrong by 800%. A measure run executed eagerly while the
+        deployment it modelled replayed a captured graph, so the oracle was
+        fitted to a machine running 8.9x slower than the one it predicts
+        (Qwen3-0.6B decode: 28.78 ms eager against 3.24 ms replayed). The oracle
+        reproduced its training data to about 1%; the training data was taken
+        from the wrong configuration.
+
+        So:
+
+        * ``measure`` captures for real. Timings have to come from the path that
+          runs in production, and in production that path is the replay.
+        * ``predict`` skips: no kernels run, so there is nothing to capture.
+        * ``trace`` skips as well, but for the opposite reason to ``predict``.
+          A replay is a single opaque submission, so a traced step would record
+          nothing at all. The operator sequence has to come from eager
+          execution; what it costs has to come from a measure run.
 
         ``engine_core`` calls this across the worker boundary with
-        ``wait_out=True`` and unpacks three values from the result. Returning
-        ``None`` therefore does not skip the capture: it kills the worker on an
-        unpacking error while the parent is still waiting for a reply, and the
-        run hangs on a shared-memory broadcast that never arrives. The symptom
-        names neither CUDA graphs nor Compass.
-
-        Worth remembering as a pattern: overriding a method to do nothing still
-        has to honour its return contract, and a cross-process caller turns the
-        breach into a hang rather than a traceback.
+        ``wait_out=True`` and unpacks three values, so a skip still has to
+        return the triple. Returning ``None`` does not skip the capture — it
+        kills the worker mid-reply and hangs the parent on a broadcast that
+        never arrives, naming neither CUDA graphs nor Compass.
         """
-        logger.debug("ATOMCompass: skipping CUDA graph capture")
+        if self._compass_config.mode == "measure":
+            return super().capture_cudagraph()
+        if self._compass_config.mode == "trace":
+            logger.info(
+                "ATOMCompass: skipping CUDA graph capture so the forward stays "
+                "traceable — a replay is one opaque submission and would record "
+                "nothing. The graph is the eager operator sequence; take its "
+                "cost from a measure run."
+            )
+        else:
+            logger.debug("ATOMCompass: skipping CUDA graph capture")
         return 0.0, [], 0
 
     def warmup_model(self) -> None:
-        """Nothing to warm up."""
+        """Warm up for real whenever the forward is real.
+
+        Warmup is where Triton autotunes and the allocator settles. Skipping it
+        does not avoid that cost, it relocates it into the first measured step —
+        which is how a 7.5 s prefill came to sit in a timing table beside a
+        0.03 s one.
+        """
+        if self._runs_real_forward:
+            return super().warmup_model()
         logger.debug("ATOMCompass: skipping model warmup")

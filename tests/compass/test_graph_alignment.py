@@ -195,19 +195,103 @@ class TestGroupResolution:
             assert self.resolve(f"c10d::{name}_", {"tp": 2}) == "tp"
 
 
-def test_skipped_cudagraph_capture_still_honours_its_contract():
-    """A do-nothing override must still return what the caller unpacks.
+def _stub_runner(mode):
+    """A runner with settings but no engine behind it.
 
-    `engine_core` calls `capture_cudagraph` across the worker boundary with
-    `wait_out=True` and unpacks three values. Returning None killed the worker
-    on an unpacking error while the parent waited for a reply, so the run hung
-    on a shared-memory broadcast — a symptom naming neither CUDA graphs nor
-    Compass. It only reproduced without `--enforce-eager`, which is the default,
-    so every gate run had been in a configuration nobody deploys.
+    `_compass_config` resolves lazily from `self.config`, so seeding the cache
+    directly is what lets these run without standing up a model.
     """
+    from atom.compass.config import CompassConfig
     from atom.compass.runtime.runner import CompassModelRunner
 
-    cost, sizes, pool_bytes = CompassModelRunner.capture_cudagraph(object())
-    assert cost == 0.0
-    assert list(sizes) == []
-    assert pool_bytes == 0
+    stub = CompassModelRunner.__new__(CompassModelRunner)
+    stub.__dict__["_compass_config_cache"] = CompassConfig(
+        enabled=True, mode=mode,
+        graph_out="g.json" if mode == "trace" else None,
+        measure_out="t.jsonl" if mode == "measure" else None,
+    )
+    return stub
+
+
+class TestCudagraphCapturePerMode:
+    """Whether to capture CUDA graphs depends on what the mode is doing.
+
+    Getting this wrong is expensive in a way that does not announce itself.
+    Skipping capture in `measure` fitted the oracle to eager execution while the
+    deployment replayed a graph -- 28.78 ms against 3.24 ms on Qwen3-0.6B
+    decode, an 8.9x error that reached the end-to-end comparison as +800% TPOT.
+    """
+
+    def test_measure_captures_for_real(self, monkeypatch):
+        """Timings must come from the path production actually runs."""
+        from atom.model_engine.model_runner import ModelRunner
+
+        called = []
+        monkeypatch.setattr(
+            ModelRunner, "capture_cudagraph",
+            lambda self: (called.append(True), (1.0, [8], 42))[1],
+        )
+        assert _stub_runner("measure").capture_cudagraph() == (1.0, [8], 42)
+        assert called
+
+    def test_predict_and_trace_skip_but_return_the_triple(self):
+        """A skip still has to honour the contract.
+
+        `engine_core` calls this across the worker boundary with wait_out=True
+        and unpacks three values. Returning None killed the worker mid-reply and
+        hung the parent on a broadcast that never arrived -- a symptom naming
+        neither CUDA graphs nor Compass.
+        """
+        for mode in ("predict", "trace"):
+            cost, sizes, pool = _stub_runner(mode).capture_cudagraph()
+            assert (cost, list(sizes), pool) == (0.0, [], 0)
+
+    def test_trace_runs_a_real_forward_and_predict_does_not(self):
+        assert _stub_runner("trace")._runs_real_forward
+        assert _stub_runner("measure")._runs_real_forward
+        assert not _stub_runner("predict")._runs_real_forward
+
+
+def test_warmup_batches_are_run_but_not_counted(monkeypatch):
+    """Warmup drives dummy batches through `forward`.
+
+    They must run -- they are what autotunes Triton and settles the allocator --
+    but they are not steps a deployment performs. Counted, they would spend the
+    trace budget on a dummy shape and put dummy rows in the table a cost model
+    is fitted to.
+    """
+    from atom.model_engine.model_runner import ModelRunner
+
+    sentinel = object()
+    monkeypatch.setattr(ModelRunner, "forward", lambda self, batch: sentinel)
+
+    for mode in ("measure", "trace"):
+        stub = _stub_runner(mode)
+
+        def _fail(batch):
+            raise AssertionError(f"{mode}: a dummy batch reached the recording path")
+
+        stub._forward_measured = _fail
+        stub._forward_traced = _fail
+
+        class DummyBatch:
+            is_dummy_run = True
+
+        from atom.compass.runtime.runner import CompassModelRunner
+
+        assert CompassModelRunner.forward(stub, DummyBatch()) is sentinel
+
+
+def test_a_real_batch_still_reaches_the_recording_path():
+    """The guard must key on the dummy flag, not disable recording outright."""
+    from atom.compass.runtime.runner import CompassModelRunner
+
+    reached = []
+    stub = _stub_runner("measure")
+    stub._forward_measured = lambda batch: reached.append(batch) or "out"
+
+    class RealBatch:
+        is_dummy_run = False
+
+    assert CompassModelRunner.forward(stub, RealBatch()) == "out"
+    assert reached

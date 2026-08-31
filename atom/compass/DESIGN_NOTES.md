@@ -396,3 +396,41 @@ per-launch overhead is the entire purpose of a CUDA graph.
 A replay is one opaque submission, so tracing it operator by operator is not
 possible even in principle: the operators have to come from the capture phase
 and the replay's cost has to be carried as a separate term. See `TODO.md` A1.
+
+
+## Settled: what a mode skips has to depend on what that mode is doing
+
+`capture_cudagraph` and `warmup_model` were stubbed unconditionally, on the
+reasoning that neither means anything when no kernels run. True for `predict`,
+and false for the two modes that perform the real forward — where skipping them
+skips them from a *real* run, and the artifact then describes a machine
+configured unlike the deployment it stands for. That single assumption produced
+the +800% TPOT error: measure ran eager while production replayed a graph.
+
+Now: `measure` captures for real, since timings must come from the path that
+runs in production. `predict` skips, having nothing to capture. `trace` skips
+too, but for the opposite reason to `predict` — a replay is one opaque
+submission, so a traced step would record no operators at all. The operator
+sequence comes from eager execution; its cost comes from a measure run. That
+split is not a workaround, it is the division of labour the two artifacts
+already had.
+
+Turning the two stubs back on exposed two further bugs, both of which had been
+hidden by never running the code:
+
+**Warmup batches are steps.** `warmup_model` drives synthetic batches through
+`forward` with `is_dummy_run=True`. They must run — they are what autotunes
+Triton — but they are not steps a deployment performs, and counted they spend
+the trace budget on a dummy shape and put dummy rows in the table a cost model
+is fitted to. Skipped by flag now.
+
+**A subclass's `__init__` body runs too late.** `ModelRunner.__init__` warms the
+model up before returning, and warmup drives a forward, so anything
+mode-dependent is consulted before `CompassModelRunner.__init__` has assigned
+its config. `_compass_config` resolves lazily from `self.config` — set early in
+the base `__init__`, well before warmup — rather than being assigned after
+`super().__init__()`.
+
+Both are the same shape as the `capture_cudagraph` return-contract bug: a
+subclass that stubs out work the base class depends on will be wrong in
+proportion to how much of the base class it never lets run.
