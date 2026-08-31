@@ -188,3 +188,154 @@ class TestExtrapolationIsAnnounced:
             after = len([r for r in caplog.records if "extrapolation" in r.message])
         assert first >= 1
         assert after == first
+
+
+class TestEventDraining:
+    """Timed steps are written once the device has finished them, not before.
+
+    Draining by `query()` rather than `synchronize()` is the whole point: a
+    host-side sync on every step destroyed the host/device overlap a serving
+    loop runs on, making the measured run 33% slower than the same run
+    unmeasured (4.33 ms per output token against 3.26 ms). The table then
+    described a machine that only existed while being measured.
+    """
+
+    class FakeEvent:
+        def __init__(self, ready=True, ms=1.0):
+            self._ready, self._ms = ready, ms
+
+        def query(self):
+            return self._ready
+
+        def elapsed_time(self, other):
+            return other._ms
+
+    @staticmethod
+    def _runner():
+        import collections
+
+        from atom.compass.config import CompassConfig
+        from atom.compass.runtime.runner import CompassModelRunner
+
+        stub = CompassModelRunner.__new__(CompassModelRunner)
+        stub.__dict__["_compass_config_cache"] = CompassConfig(
+            enabled=True, mode="measure", measure_out="t.jsonl",
+        )
+        stub._pending = collections.deque()
+        stub._measured_steps = 0
+        stub._measured_by_kind = {}
+        stub._written = []
+        stub._record_measurement = lambda shape, seconds: stub._written.append(
+            (shape, seconds)
+        )
+        return stub
+
+    def test_an_unfinished_step_is_not_written_yet(self):
+        stub = self._runner()
+        stub._pending.append((decode(), self.FakeEvent(), self.FakeEvent(ready=False)))
+        stub._drain_pending()
+        assert stub._written == []
+        assert len(stub._pending) == 1
+
+    def test_finished_steps_are_written_in_order(self):
+        stub = self._runner()
+        for ms in (2.0, 4.0, 8.0):
+            stub._pending.append(
+                (decode(), self.FakeEvent(), self.FakeEvent(ms=ms))
+            )
+        stub._drain_pending()
+        assert [s for _, s in stub._written] == [0.002, 0.004, 0.008]
+        assert not stub._pending
+
+    def test_draining_stops_at_the_first_unfinished_step(self):
+        """Order matters: a later step must not be written before an earlier
+        one, or the table's rows stop corresponding to the run's sequence."""
+        stub = self._runner()
+        stub._pending.append((decode(), self.FakeEvent(), self.FakeEvent(ms=2.0)))
+        stub._pending.append((decode(), self.FakeEvent(), self.FakeEvent(ready=False)))
+        stub._pending.append((decode(), self.FakeEvent(), self.FakeEvent(ms=8.0)))
+        stub._drain_pending()
+        assert [s for _, s in stub._written] == [0.002]
+        assert len(stub._pending) == 2
+
+    def test_warmup_is_counted_per_kind(self):
+        """Prefill happens a handful of times in a whole run, so a warmup
+        counted in total steps discards every prefill sample there is."""
+        from atom.compass.config import CompassConfig
+
+        stub = self._runner()
+        stub.__dict__["_compass_config_cache"] = CompassConfig(
+            enabled=True, mode="measure", measure_out="t.jsonl",
+            measure_warmup_steps=1,
+        )
+        stub._count_and_record(prefill(128), 0.5)     # first prefill: dropped
+        stub._count_and_record(decode(), 0.001)       # first decode: dropped
+        stub._count_and_record(prefill(256), 0.05)    # kept
+        stub._count_and_record(decode(), 0.002)       # kept
+        assert [s for _, s in stub._written] == [0.05, 0.002]
+
+
+class TestEmpiricalOracle:
+    """Answering from nearby measurements instead of a fitted form.
+
+    Its diagnostic value came first: asked about the shape the calibrated oracle
+    was getting wrong, it returned 3.84 ms where the fit returned 3.83 ms. Two
+    methods with opposite failure modes agreeing meant the fit was faithful to
+    its data and the data was wrong — which is what led to F9.
+    """
+
+    @staticmethod
+    def _oracle(tmp_path, rows):
+        from atom.compass.core.cost.empirical import EmpiricalCostOracle
+
+        path = tmp_path / "t.jsonl"
+        with open(path, "w", encoding="utf-8") as fh:
+            for batch, ctx, seconds in rows:
+                fh.write(json.dumps({
+                    "seconds": seconds,
+                    "num_scheduled_tokens": [1] * batch,
+                    "context_lens": [ctx // batch] * batch,
+                    "num_prefill_tokens": 0,
+                }) + "\n")
+        return EmpiricalCostOracle(str(path), neighbours=3)
+
+    def test_an_exact_match_answers_exactly(self, tmp_path):
+        rows = [(4, ctx, 0.001 + ctx * 1e-6) for ctx in range(400, 2000, 400)]
+        oracle = self._oracle(tmp_path, rows)
+        got = oracle.estimate(decode(batch=4, context=200)).seconds  # ctx total 800
+        assert got == pytest.approx(0.001 + 800 * 1e-6, rel=1e-6)
+
+    def test_it_interpolates_between_neighbours(self, tmp_path):
+        rows = [(4, ctx, ctx * 1e-6) for ctx in range(400, 4000, 400)]
+        oracle = self._oracle(tmp_path, rows)
+        got = oracle.estimate(decode(batch=4, context=250)).seconds  # total 1000
+        assert 0.0008 < got < 0.0012
+
+    def test_a_kind_never_measured_is_refused(self, tmp_path):
+        oracle = self._oracle(tmp_path, [(4, c, 0.001) for c in range(400, 2000, 400)])
+        with pytest.raises(ValueError, match="no prefill measurements"):
+            oracle.estimate(prefill(512))
+
+    def test_far_outside_the_data_it_warns(self, tmp_path, caplog):
+        """Nearest-neighbour degrades to "the closest edge" rather than
+        diverging, which is gentler than extrapolating a line but still an
+        answer given without evidence."""
+        import logging
+
+        oracle = self._oracle(tmp_path, [(4, c, 0.001) for c in range(400, 2000, 400)])
+        with caplog.at_level(logging.WARNING):
+            oracle.estimate(decode(batch=4, context=100000))
+        assert any("outside the measured range" in r.message for r in caplog.records)
+
+    def test_features_are_standardised_before_distances_are_taken(self, tmp_path):
+        """Context runs to thousands and batch size to single digits.
+
+        Unstandardised, every neighbour would be chosen by context alone and
+        batch size would carry no weight at all.
+        """
+        rows = [(1, 1000, 0.010), (8, 1000, 0.020)]
+        rows += [(1, 1200, 0.010), (8, 1200, 0.020)]
+        oracle = self._oracle(tmp_path, rows)
+        near_one = oracle.estimate(decode(batch=1, context=1100)).seconds
+        near_eight = oracle.estimate(decode(batch=8, context=137)).seconds
+        assert near_one < near_eight

@@ -49,6 +49,10 @@ class CompassModelRunner(ModelRunner):
         self._measured_steps = 0
         self._measured_by_kind: dict = {}
         self._measure_fh = None
+        # Timed steps whose CUDA events have not been read back yet.
+        import collections as _collections
+
+        self._pending = _collections.deque()
         logger.info(
             "ATOMCompass active: mode=%s oracle=%s",
             self._compass_config.mode,
@@ -131,48 +135,72 @@ class CompassModelRunner(ModelRunner):
         )
 
     def _forward_measured(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
-        """Run the real forward and record how long it took.
+        """Run the real forward and record how long the device spent on it.
 
-        This is the training data for a calibrated oracle, so what is recorded
-        has to be the same description the oracle will later be asked to predict
-        from — hence ``StepShape``, unreduced, rather than a summary. Reducing
-        here and expecting the oracle to cope later is how a cost model ends up
-        fitted to a feature it will never see again.
+        Timed with CUDA events rather than a host-side synchronise, and the
+        distinction is not a refinement — measuring with a sync made the run
+        **33% slower than the same run without it** (4.33 ms per output token
+        against 3.26 ms), so the table described a machine that only exists
+        while being measured.
 
-        Timing brackets a device synchronise on both sides. ATOM's forward
-        returns once the work is enqueued, so timing it directly measures how
-        long it took to submit, which is not what anybody wants to predict.
+        The reason is that a serving loop overlaps host and device: while the
+        device runs one step the host is already preparing the next. A sync on
+        every step destroys that overlap, so what gets recorded is each step's
+        *isolated latency* — and a cost model fitted to isolated latencies then
+        predicts a pipelined run, over-estimating it by however much the overlap
+        was worth. That was most of the residual TPOT error.
 
-        The first steps are timed and discarded: Triton autotunes on a kernel's
-        first launch and the allocator is still growing, so an oracle fitted to
-        them describes a machine nobody runs.
+        Events are recorded on the stream and read back later, so the host never
+        waits. Completed pairs are drained on subsequent steps; a few of the
+        very last ones are simply not written, which costs a calibration run
+        nothing.
         """
-        import time
-
         import torch
 
-        sync = torch.cuda.synchronize if torch.cuda.is_available() else lambda: None
         shape = self._describe(batch)
+        if not torch.cuda.is_available():
+            # No device to time: fall back to wall clock, which is exact here
+            # because there is nothing asynchronous to miss.
+            import time
 
-        sync()
-        start = time.perf_counter()
+            began = time.perf_counter()
+            output = super().forward(batch)
+            self._count_and_record(shape, time.perf_counter() - began)
+            return output
+
+        began = torch.cuda.Event(enable_timing=True)
+        ended = torch.cuda.Event(enable_timing=True)
+        began.record()
         output = super().forward(batch)
-        sync()
-        seconds = time.perf_counter() - start
+        ended.record()
+        self._pending.append((shape, began, ended))
+        self._drain_pending()
+        return output
 
-        # Counted per kind, not overall. Prefill happens at the very start of a
-        # run, so a warmup counted in total steps discards every prefill sample
-        # there is -- the oracle then has nothing to fit, predicts zero, and
-        # TTFT comes out as 0 ms against a real 7.6 s. Both kinds autotune on
-        # their own first launch, so per-kind counting still excludes what the
-        # warmup exists to exclude.
+    def _drain_pending(self) -> None:
+        """Write out every timed step whose events have completed.
+
+        Draining by ``query()`` rather than ``synchronize()`` keeps the host off
+        the critical path: a step is written once the device has finished it
+        anyway, never by waiting for it.
+        """
+        while self._pending:
+            shape, began, ended = self._pending[0]
+            if not ended.query():
+                return
+            self._pending.popleft()
+            self._count_and_record(shape, began.elapsed_time(ended) / 1000.0)
+
+    def _count_and_record(self, shape: StepShape, seconds: float) -> None:
         kind = "prefill" if shape.is_prefill else "decode"
-        self._measured_steps += 1
         seen = self._measured_by_kind.get(kind, 0) + 1
         self._measured_by_kind[kind] = seen
+        self._measured_steps += 1
+        # Counted per kind, not overall. Prefill happens a handful of times in a
+        # whole run, so a warmup counted in total steps discards every prefill
+        # sample there is.
         if seen > self._compass_config.measure_warmup_steps:
             self._record_measurement(shape, seconds)
-        return output
 
     def _record_measurement(self, shape: StepShape, seconds: float) -> None:
         """Append one timed step to the table.

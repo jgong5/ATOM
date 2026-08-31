@@ -1,18 +1,25 @@
 # ATOMCompass — open problems
 
-**Where the error stands**, Qwen3-0.6B TP=1, calibrated on a sweep and evaluated
-on a workload it did not see:
+**Where the error stands**, Qwen3-0.6B TP=1, calibrated on a sweep of shapes and
+evaluated on a workload it did not see:
 
 | iteration | TTFT | TPOT | latency |
 | --- | --- | --- | --- |
 | first end-to-end run | +107% | +800% | +560% |
 | A1 fixed (CUDA graphs) | +39.6% | +13.1% | +22.9% |
 | prefill coverage widened | −23.9% | +22.5% | +4.7% |
-| batch coverage widened | **−11.9%** | **+17.5%** | **+7.1%** |
+| batch coverage widened | −11.9% | +17.5% | +7.1% |
+| F9 fixed (event timing) | **−6.1%** | **−1.8%** | **−3.3%** |
 
-**Ranked next: D4, the decode model's form.** TPOT is now the largest error and
-it grew when the sweep widened, which is the signature of a model that cannot
-fit its whole range rather than one short of data.
+Every one of those steps was a defect in how Compass measured or calibrated,
+not in the cost model's form. Three of the four were configurations or
+methodologies that looked reasonable and were quietly wrong: capture skipped in
+the mode that needed it, calibration outside the range it was asked about, and a
+profiler that serialised what it profiled.
+
+**Ranked next: D1 — none of the op-graph work feeds the cost model.** The oracle
+predicts from a step's *shape* alone. Everything structural — the graphs, the
+derivation, the TP validation — is not yet contributing to a single prediction.
 
 The target is to simulate ATOM **as it is deployed**: compilation on
 (`--level 3`), CUDA graphs on, prefix caching on, chunked prefill on. Anything
@@ -164,7 +171,19 @@ nothing has yet been fitted to an **op graph** — the calibrated oracle uses on
 the step's shape, so all the structural work on graphs is not yet feeding the
 cost model at all.
 
-### D4. Decode cost is not linear in batch size — **M**, ranked next
+### D4. Decode cost is not linear in batch size — **M**, partly explained
+
+Originally ranked next on the strength of TPOT rising when the sweep widened.
+That diagnosis was incomplete: a nearest-neighbour oracle, which assumes no
+functional form at all, predicted 3.84 ms where the linear fit predicted 3.83 ms
+— so the fit was reproducing its data faithfully and the data itself was wrong
+(see F9).
+
+The observation still stands and is worth acting on: at matched context, batch
+1/2/4 cost 3.59/3.85/3.78 ms — nearly flat and not monotonic, because with CUDA
+graphs the replay runs a **padded batch-size bucket** rather than the actual
+batch. Featuring the padded bucket rather than raw batch size should help, and
+`Config.capture_sizes` declares the ladder. Lower priority than it looked.
 
 TPOT sits at +17.5% and it *rose* when the sweep widened, from +13.1%. A model
 short of data improves when given more; a model whose form cannot fit its range
@@ -226,6 +245,32 @@ The sweep now runs twenty sizes from 8 to 1024, twice through. Twice because
 **Triton autotunes per shape, not once per process**: the first visit to a shape
 pays a benchmarking cost steady-state serving never pays again, and having both
 visits lets outlier rejection see the difference rather than guess at it.
+
+### F9. The instrument was changing what it measured — **fixed**, was 33%
+
+`measure` timed each forward between two `torch.cuda.synchronize()` calls. The
+same workload, same engine, measured and unmeasured:
+
+| | TPOT |
+| --- | --- |
+| plain run | **3.26 ms** |
+| under measure (host sync) | **4.33 ms** |
+
+A serving loop overlaps host and device — while the device runs one step the
+host prepares the next — and a sync on every step destroys that overlap. So what
+was recorded was each step's *isolated latency*, and a model fitted to isolated
+latencies then predicts a pipelined run and over-estimates it by whatever the
+overlap was worth. That was most of the residual TPOT error.
+
+Timed with CUDA events now, recorded on the stream and read back later, drained
+by `query()` rather than `synchronize()` so the host never waits. Perturbation
+fell from 1.33x to 0.97x and the recorded decode mean from 4.05 ms to 3.43 ms
+against a real 3.26 ms.
+
+Worth generalising: **a profiler that serialises what it profiles measures a
+machine that only exists while being profiled.** Anything added here later —
+per-operator attribution especially — has to be checked the same way, by running
+the workload with and without it and comparing the engine's own numbers.
 
 ### F8. Calibration coverage has to bracket every dimension, not one — **S**, done
 
