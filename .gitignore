@@ -61,4 +61,5 @@ online_quant_info_*.json
 # Compass run artifacts: graphs, timing tables, validation output.
 compass_artifacts*/
 compass_overhead/
+compass_serving/
 .commitmsg

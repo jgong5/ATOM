@@ -152,14 +152,80 @@ What the gap actually costs is prediction at a width **nobody measured**:
 calibrate at TP=2 and ask about TP=4, and there is nothing to scale. That is a
 narrower and later problem than "blocks any credible multi-GPU prediction".
 
-### 4. Never validated against `benchmark_serving` — **M**
+### 4. An HTTP benchmark cannot measure a simulated engine — **L**
 
-`validate.py` compares against ATOM's own offline path, which is a
-tighter comparison than an HTTP benchmark: same engine, same scheduler, same
-admission decisions, only the forward differs. But it is not the standard
-yardstick, and a serving-level comparison under real request arrival — with
-queuing, prefix caching across requests, and chunked prefill interacting — has
-not been attempted.
+Attempted, and the result is structural rather than numerical. The server takes
+the Compass flags for free (it builds `EngineArgs` like everything else), so
+predict mode serves over HTTP with no new plumbing. Qwen3-0.6B, TP=1, random
+256-in/64-out:
+
+| | real | predict | |
+| --- | --- | --- | --- |
+| **32 requests at 4/s** | | | |
+| duration | 9.54 s | 9.55 s | arrival-bound |
+| TTFT | 48.5 ms | 11.2 ms | |
+| TPOT | 3.27 ms | 0.32 ms | |
+| concurrency | 0.85 | 0.11 | |
+| **64 requests, unpaced** | | | |
+| duration | 0.71 s | 0.22 s | server-bound |
+| TTFT | 371.9 ms | 89.5 ms | |
+| TPOT | 5.13 ms | 1.78 ms | |
+| output tok/s | 5 795 | 18 943 | |
+
+**Nothing in the predict column is a prediction.** `benchmark_serving` times
+requests with `perf_counter` around an HTTP stream and divides every metric by
+its own wall-clock duration, so it measures the process that produced the
+tokens. Predict mode skips the forward, so what it reports is how fast the
+simulator ran. The oracle's estimate influences the run — it advances the
+virtual clock, which the scheduler reads — but it is never reported to anybody.
+
+Three separate defects sit under that, and only the first is about measurement.
+
+**The simulated numbers are computed nowhere in serving.** Offline, `postprocess`
+derives per-request TTFT and TPOT from `arrive_time` and `first_token_time`,
+which under a virtual clock are the simulated values — that is what `run.py`
+compares and what every number in Status rests on. `api_server.py` never calls
+`postprocess` and never touches `first_token_time`. So in serving the quantity
+this project exists to produce is not merely unexported, it is never calculated.
+
+**Arrival is stamped on a clock that does not move.** `seq.arrive_time =
+get_clock().time()` in the engine process, and that process installs a
+`VirtualClock` which by design never advances — correct for an offline batch,
+where everything is submitted at once, and wrong for a server, where it means
+every request appears to arrive at virtual t=0 no matter when it really did. The
+arrival process a `--request-rate` benchmark exists to create is erased on entry.
+
+**A paced workload cannot tell the two apart.** At 4 requests/s the duration and
+throughput matched to within 0.1% — not accuracy, but the client pacing both
+runs: 32 requests at 4/s takes 8 s regardless of the server. Only the unpaced run
+separated them. Any future serving comparison has to saturate, or it measures the
+client. Concurrency looked preserved in the unpaced run (62.9 against 59.6) for
+the same hollow reason — with no arrival process there is no queue behaviour left
+to get wrong.
+
+What *did* work: the extrapolation guard fired correctly through the server,
+catching 16-token prefill steps below the calibrated floor of 64. Chunked prefill
+produces shapes the offline sweep never generated, and the safeguard saw them.
+
+**The design conclusion.** A simulator that runs at a different speed from the
+system it models cannot be driven by a real-time client — the client's clock and
+the engine's clock are different clocks, and no amount of metric export fixes the
+scheduling consequences. Three routes:
+
+* *Export the simulated metrics* — compute virtual TTFT/TPOT in the streaming
+  path and return them alongside the response. Cheap, and fixes measurement only.
+* *Virtual arrival* — feed the arrival process in as a trace so arrivals are
+  stamped on the virtual clock, and drive the engine as a discrete-event
+  simulation. The only route where queueing is right. It means the workload
+  becomes an input file and `benchmark_serving` stops being the harness.
+* *Real-time pacing* — sleep the difference between virtual and wall time. HTTP
+  works unchanged and queueing is right, but the speedup that motivates the whole
+  project is gone, and only systems slower than real time can be simulated.
+
+Virtual arrival is the right architecture. Which reframes this item: the goal was
+"validate against `benchmark_serving`" and that goal is partly mis-specified. An
+HTTP benchmark can validate the *real* engine, and is the right yardstick for
+that. It cannot drive a simulated one.
 
 ## Graph fidelity against a production launch
 
@@ -811,6 +877,11 @@ the sum is what the hardware actually moves.
 * The thing that finally measured the noise was running the same command five
   times, which cost twenty minutes and nothing else. It was not done earlier
   because each individual run had always looked reasonable.
+* A harness can measure itself instead of the system and still return a full
+  table of plausible numbers. `benchmark_serving` reported TTFT, TPOT, ITL and
+  throughput for a simulated engine; every one of them described the simulator.
+  Nothing failed, nothing warned, and the numbers were in the range a reader
+  would expect.
 * Widening a configuration is a cheaper way to find defects than deepening one.
   One flag — `--tp 2` — produced a broken artifact convention, a misattributed
   worker death, a refuted hypothesis, a measured non-issue, and the first
