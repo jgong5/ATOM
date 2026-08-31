@@ -3,6 +3,11 @@
 Recorded as they were established, so the reasoning survives the context it was
 found in. Each item says what is known, what is not, and what would settle it.
 
+Open problems live in `TODO.md`. The target configuration is ATOM's default —
+compilation on, CUDA graphs on — and anything validated only under
+`--enforce-eager` or `--level 0` is a step towards that rather than an instance
+of it.
+
 ## Deferred: graph derivation is too slow to run per step
 
 A full meta forward of Qwen3.8-27B (64 layers, 2999 operators) takes **~0.16 s**.
@@ -379,3 +384,15 @@ Worth keeping as a pattern: overriding a method to do nothing still has to
 honour its return contract, and a cross-process caller turns the breach into a
 hang rather than a traceback. The same shape of bug is likely wherever Compass
 stubs out work the engine expects a reply from.
+
+
+## Open: trace mode does not observe the CUDA-graph path
+
+Trace mode stubs `capture_cudagraph`, so a traced run executes eagerly even with
+CUDA graphs enabled — the default. The recorded graph is faithful about which
+operators run and silently wrong about how they are launched, and removing
+per-launch overhead is the entire purpose of a CUDA graph.
+
+A replay is one opaque submission, so tracing it operator by operator is not
+possible even in principle: the operators have to come from the capture phase
+and the replay's cost has to be carried as a separate term. See `TODO.md` A1.
