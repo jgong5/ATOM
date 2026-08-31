@@ -57,6 +57,16 @@ class WallClock:
     def perf_counter(self) -> float:
         return _time.perf_counter()
 
+    @property
+    def epoch(self) -> Optional[float]:
+        """Real time has no start-of-run, so a declared offset is meaningless.
+
+        None rather than 0.0: a caller offsetting from the Unix epoch would get
+        a timestamp from 1970 and a duration in the billions, which is exactly
+        the failure this property exists to prevent.
+        """
+        return None
+
     def __repr__(self) -> str:  # pragma: no cover - trivial
         return "WallClock()"
 
@@ -91,6 +101,17 @@ class VirtualClock:
     def elapsed(self) -> float:
         """Virtual seconds since construction."""
         return self._elapsed
+
+    @property
+    def epoch(self) -> float:
+        """Where this clock started, so an offset into the run can be placed.
+
+        ``time()`` is ``epoch + elapsed`` and the epoch is a real timestamp, so
+        a caller declaring "half a second into the run" has to add it. Passing
+        0.5 straight through instead yields a first-token time in the billions
+        minus an arrival of 0.5, which is not a duration.
+        """
+        return self._epoch
 
     def __repr__(self) -> str:  # pragma: no cover - trivial
         return f"VirtualClock(elapsed={self._elapsed:.6f})"

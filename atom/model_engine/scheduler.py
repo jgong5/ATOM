@@ -1183,6 +1183,49 @@ class Scheduler:
                 break  # all partials summed; skip the rest of the decode tail
         return total
 
+    def _declared_arrival_pending(self, seq) -> bool:
+        """Has this request been declared to arrive later than it is now?
+
+        Only ever true on a virtual clock. A simulated engine advances time by
+        the steps it predicts, not with the wall clock a client sends on, so a
+        workload declares when each request should be treated as arriving. The
+        engine has to honour that or the declaration only changes what TTFT is
+        measured *from* while the work still happens immediately -- which
+        produced 62 of 64 requests finishing before they arrived.
+
+        A real clock has no start-of-run, so nothing declares against it and
+        this costs one attribute read per waiting seq per tick.
+        """
+        clock = get_clock()
+        if getattr(clock, "epoch", None) is None:
+            return False
+        return seq.arrive_time > clock.time()
+
+    def _advance_to_next_arrival(self) -> None:
+        """Jump the virtual clock forward when there is nothing else to do.
+
+        The discrete-event step. With no runnable work and every waiting request
+        declared for later, real time would spin and virtual time would never
+        move -- so the next thing that can possibly happen is the next arrival,
+        and time goes straight there. Skipping the idle gap is the whole reason
+        a simulation is faster than the thing it simulates.
+
+        Deliberately narrow: it fires only when nothing is running and nothing
+        is admittable, so it can never skip past work that was ready.
+        """
+        clock = get_clock()
+        advance = getattr(clock, "advance", None)
+        if advance is None or getattr(clock, "epoch", None) is None:
+            return
+        if self.running or not self.waiting:
+            return
+        now = clock.time()
+        pending = [seq.arrive_time for seq in self.waiting
+                   if seq.arrive_time > now]
+        if len(pending) != len(self.waiting):
+            return  # something has already arrived; let it run
+        advance(min(pending) - now)
+
     def _oldest_waiting_prefill_age_ms(self) -> float:
         """Age in ms (since arrival) of the oldest ADMITTABLE waiting prefill,
         or 0.0 if none.
@@ -1408,6 +1451,9 @@ class Scheduler:
         decoding already-running sequences.
         """
         self._schedule_tick += 1
+        # Nothing runnable and every arrival still in the future: move virtual
+        # time to the next one rather than spinning. No-op off a virtual clock.
+        self._advance_to_next_arrival()
         # Sources borrowed by the previous batch: its forward has been issued,
         # so they can go back on the free list.
         self.block_manager.complete_previous_state_batch()
@@ -1499,6 +1545,13 @@ class Scheduler:
             # lose the abort intent.
             if seq.status == SequenceStatus.ABORTED:
                 self._reject_aborted_waiting(seq)
+                continue
+
+            # Declared to arrive later: put it back and look again next tick.
+            # Not `_unschedulable_reason`, which finishes a sequence -- this one
+            # is fine, it is simply not here yet.
+            if self._declared_arrival_pending(seq):
+                skipped_waiting_requests.append(seq)
                 continue
 
             # Drop seqs the static-capacity check at submit-time flagged as

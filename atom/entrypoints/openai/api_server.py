@@ -880,6 +880,7 @@ async def generate_async(
     data_parallel_rank: int | None = None,
     dp_session_id: str | None = None,
     dp_parent_session_id: str | None = None,
+    arrival_time: float | None = None,
 ) -> AsyncGenerator[dict[str, Any], None]:
     """Generate text asynchronously for non-streaming requests."""
     token_queue: asyncio.Queue = asyncio.Queue()
@@ -930,6 +931,7 @@ async def generate_async(
             data_parallel_rank=data_parallel_rank,
             dp_session_id=dp_session_id,
             dp_parent_session_id=dp_parent_session_id,
+            arrival_time=arrival_time,
         )
 
     seq = await loop.run_in_executor(None, do_preprocess)
@@ -1259,6 +1261,7 @@ async def setup_streaming_request(
     data_parallel_rank: int | None = None,
     dp_session_id: str | None = None,
     dp_parent_session_id: str | None = None,
+    arrival_time: float | None = None,
 ) -> tuple[int, StreamOutputCollector, int]:
     """Set up a streaming request with the engine.
 
@@ -1294,6 +1297,7 @@ async def setup_streaming_request(
             data_parallel_rank=data_parallel_rank,
             dp_session_id=dp_session_id,
             dp_parent_session_id=dp_parent_session_id,
+            arrival_time=arrival_time,
         )
         _seq_id_to_request_id[seq.id] = request_id
         return seq
@@ -1954,6 +1958,7 @@ async def completions(request: CompletionRequest, raw_request: Request):
                         sampling_params,
                         request_id,
                         kv_transfer_params=request.kv_transfer_params,
+                        arrival_time=request.compass_arrival,
                         **dp_routing,
                     )
                 )
@@ -1994,6 +1999,7 @@ async def completions(request: CompletionRequest, raw_request: Request):
                     sampling_params,
                     request_id,
                     kv_transfer_params=request.kv_transfer_params,
+                    arrival_time=request.compass_arrival,
                     **dp_routing,
                 ),
                 raw_request,

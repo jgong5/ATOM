@@ -188,12 +188,28 @@ compares and what every number in Status rests on. `api_server.py` never calls
 `postprocess` and never touches `first_token_time`. So in serving the quantity
 this project exists to produce is not merely unexported, it is never calculated.
 
-**Arrival is stamped on a clock that does not move.** `seq.arrive_time =
-get_clock().time()` in the engine process, and that process installs a
-`VirtualClock` which by design never advances — correct for an offline batch,
-where everything is submitted at once, and wrong for a server, where it means
-every request appears to arrive at virtual t=0 no matter when it really did. The
-arrival process a `--request-rate` benchmark exists to create is erased on entry.
+**Arrival is stamped on a clock that does not move, and it costs everything.**
+`seq.arrive_time = get_clock().time()` in the engine process, and that process
+installs a `VirtualClock` which by design never advances — correct for an offline
+batch submitted at once, wrong for a server. Measured over 65 requests:
+
+| | real | simulated |
+| --- | --- | --- |
+| arrival spread | 310.6 ms | **0.000 ms** |
+| distinct arrival stamps | 65 | **1** |
+| mean TTFT | 349.9 ms | 643.2 ms |
+
+Every request is stamped as having arrived at the same instant, so its TTFT is
+measured from the start of the run rather than from when it turned up. The TTFT
+gap is 293 ms and the collapsed arrival spread is 311 ms: **the whole of the
+engine-side TTFT error is this artifact**, and none of it is the cost model. The
+cost model's own errors here point the other way -- decode at batch 63 predicts
+2.47 ms against a real 3.72 ms.
+
+Worth stating plainly, because it is the second time on this page that a headline
+error turned out not to be about the thing being modelled. A simulator returns a
+number for every request whether or not the question it answers is the one that
+was asked.
 
 **A paced workload cannot tell the two apart.** At 4 requests/s the duration and
 throughput matched to within 0.1% — not accuracy, but the client pacing both
@@ -207,25 +223,57 @@ What *did* work: the extrapolation guard fired correctly through the server,
 catching 16-token prefill steps below the calibrated floor of 64. Chunked prefill
 produces shapes the offline sweep never generated, and the safeguard saw them.
 
-**The design conclusion.** A simulator that runs at a different speed from the
-system it models cannot be driven by a real-time client — the client's clock and
-the engine's clock are different clocks, and no amount of metric export fixes the
-scheduling consequences. Three routes:
+**What was built, and what it settled.** Both halves of the virtual-clock route
+are now in place. The engine's arrival, first-token and finish readings ride out
+on `RequestOutput` and are served by `GET /compass/requests`, reporting which
+clock they came from. Requests carry a declared arrival (`compass_arrival`, an
+offset into the run), the scheduler defers one whose time has not come, and when
+nothing is runnable the clock jumps to the next arrival — the discrete-event
+step, and the reason a simulation can be faster than the thing it simulates.
+`scripts/compass/serve_bench.py` computes one arrival schedule and applies it two
+ways: paced in real time against a real server, declared against a simulated one.
 
-* *Export the simulated metrics* — compute virtual TTFT/TPOT in the streaming
-  path and return them alongside the response. Cheap, and fixes measurement only.
-* *Virtual arrival* — feed the arrival process in as a trace so arrivals are
-  stamped on the virtual clock, and drive the engine as a discrete-event
-  simulation. The only route where queueing is right. It means the workload
-  becomes an input file and `benchmark_serving` stops being the harness.
+64 requests, Poisson at 8/s, Qwen3-0.6B TP=1:
+
+| | real | simulated |
+| --- | --- | --- |
+| TTFT median | 35.84 ms | **35.85 ms** |
+| TTFT mean | 42.23 ms | 213.50 ms |
+| TTFT max | 82.10 ms | 1653.09 ms |
+| latency median | 262.35 ms | 306.40 ms |
+| wall clock | 9 417 ms | 495 ms |
+
+The median is exact and the mean is not, and the residual is one specific thing:
+the first 13 requests share **two** distinct first-token instants where the real
+run has 13. They were held and released in two batches.
+
+**Which turns out to be a causality constraint, not a bug.** The client submits
+concurrently, so requests reach the engine in a different order from the one they
+were declared in. If the first request *received* is declared for t=0.9 s, the
+idle engine jumps virtual time to 0.9 s — and a request declared for t=0 that
+lands on the socket a moment later is retroactively late. A discrete-event clock
+may only advance when it knows no earlier event will still turn up, and an HTTP
+client submitting concurrently cannot promise that. Serialising submission would
+fix the order and reintroduce the wall-clock pacing the whole design exists to
+escape.
+
+So the remaining step is forced, and it is the one the routes below already
+pointed at: **the engine has to be given the whole arrival schedule up front.**
+Then it can advance to the next arrival knowing what the next arrival is. The
+workload becomes an input file, submission stops being an event, and HTTP becomes
+a way to fetch results rather than the thing being timed.
+
+That also reframes the original goal. "Validate against `benchmark_serving`" is
+partly mis-specified: an HTTP benchmark is the right yardstick for the *real*
+engine and cannot drive a simulated one. The three routes, for the record:
+
+* *Export the simulated metrics* — done, and necessary, but measurement only.
+* *Virtual arrival* — half done: declared arrivals and a clock that skips idle
+  time work; the schedule must move from per-request to up-front.
 * *Real-time pacing* — sleep the difference between virtual and wall time. HTTP
-  works unchanged and queueing is right, but the speedup that motivates the whole
-  project is gone, and only systems slower than real time can be simulated.
-
-Virtual arrival is the right architecture. Which reframes this item: the goal was
-"validate against `benchmark_serving`" and that goal is partly mis-specified. An
-HTTP benchmark can validate the *real* engine, and is the right yardstick for
-that. It cannot drive a simulated one.
+  would work unchanged and queueing would be right, but the speedup that
+  motivates the project is gone, and only systems slower than real time could be
+  simulated. Rejected.
 
 ## Graph fidelity against a production launch
 

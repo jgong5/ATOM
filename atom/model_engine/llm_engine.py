@@ -35,6 +35,29 @@ def _load_tokenizer(model: str, trust_remote_code: bool = False):
 
 
 
+def _stamp_arrival(arrival_time: float | None) -> float:
+    """When a request should be treated as having arrived.
+
+    ``arrival_time`` is an offset into the run, not a timestamp, and it only
+    means anything on a clock that knows where the run began -- a virtual one.
+    Against a real server there is no start-of-run to offset from, so a declared
+    arrival is ignored and "now" is used, which is the right answer there.
+    """
+    clock = get_clock()
+    if arrival_time is None:
+        return clock.time()
+    epoch = getattr(clock, "epoch", None)
+    if epoch is None:
+        logger.warning(
+            "ATOMCompass WARNING: ignoring a declared arrival of %.3fs -- this "
+            "engine is on a real clock, which has no start-of-run to offset "
+            "from. Arrivals are only declarable against a simulated run.",
+            arrival_time,
+        )
+        return clock.time()
+    return epoch + float(arrival_time)
+
+
 def _install_compass_clock(config) -> None:
     """Put this process on the same virtual clock as the engine core.
 
@@ -648,6 +671,7 @@ class InputOutputProcessor:
         data_parallel_rank: int | None = None,
         dp_session_id: str | None = None,
         dp_parent_session_id: str | None = None,
+        arrival_time: float | None = None,
     ):
         """responsible for:
         1) Tokenize
@@ -672,6 +696,7 @@ class InputOutputProcessor:
             data_parallel_rank=data_parallel_rank,
             dp_session_id=dp_session_id,
             dp_parent_session_id=dp_parent_session_id,
+            arrival_time=arrival_time,
         )
         return seqs[0]
 
@@ -687,6 +712,7 @@ class InputOutputProcessor:
         data_parallel_rank: int | None = None,
         dp_session_id: str | None = None,
         dp_parent_session_id: str | None = None,
+        arrival_time: float | None = None,
     ) -> list[Sequence]:
         """Tokenize once and materialize ``sampling_params.n`` Sequences.
 
@@ -762,7 +788,7 @@ class InputOutputProcessor:
                 dp_session_id=dp_session_id,
                 dp_parent_session_id=dp_parent_session_id,
             )
-            seq.arrive_time = get_clock().time()
+            seq.arrive_time = _stamp_arrival(arrival_time)
             self.requests[seq.id] = seq
             if seq.external_request_id is not None:
                 self._external_to_internal[seq.external_request_id] = seq.id
