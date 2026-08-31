@@ -32,7 +32,7 @@ class CompassConfig:
             non-zero value here can consume every prefill sample there is,
             leaving an oracle with nothing to fit and a TTFT prediction of zero.
             Exclude Triton autotuning with throwaway *requests* instead — see
-            ``--warmup-prompts`` in ``scripts/compass_run.py`` — which drops the
+            ``--warmup-prompts`` in ``scripts/compass/run.py`` — which drops the
             expensive first launches without discarding a whole category.
         trace_step: Which forward to record, counting from one. Not the first:
             Triton autotunes on a kernel's first launch, benchmarking every

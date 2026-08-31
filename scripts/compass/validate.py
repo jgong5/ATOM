@@ -24,7 +24,7 @@ admission decisions, same prompts. Only the forward differs. So the error is
 attributable to the cost model rather than to two benchmarks disagreeing about
 what they ran.
 
-    python scripts/compass_validate.py --model M --num-prompts 8
+    python scripts/compass/validate.py --model M --num-prompts 8
 """
 
 import argparse
@@ -35,12 +35,41 @@ import sys
 from pathlib import Path
 
 
+#: Prefix every Compass warning carries, so a captured phase can be scanned for
+#: them without depending on the log format naming the level.
+MARKER = "ATOMCompass WARNING:"
+
+
 def _run(cmd: list[str]) -> None:
+    """Run one phase, surfacing anything Compass wanted to say about it.
+
+    Phases are captured rather than streamed, because an engine start-up is
+    thousands of lines and none of them are the point. But capturing them
+    swallowed the warnings too, and those *are* the point: the oracle warns when
+    asked to cost a step outside the range it was calibrated over, and that
+    warning exists precisely so a bad number announces itself rather than being
+    read off the table as fact. Swallowed, the safeguard was inert in the one
+    workflow anybody actually uses.
+    """
     proc = subprocess.run(cmd, capture_output=True, text=True)
     if proc.returncode != 0:
         sys.stderr.write(proc.stdout[-4000:])
         sys.stderr.write(proc.stderr[-4000:])
         raise SystemExit(f"phase failed ({proc.returncode}): {' '.join(cmd[:6])} ...")
+
+    seen = set()
+    for line in (proc.stdout + proc.stderr).splitlines():
+        # Matched on the message, not the log level: ATOM's format prints
+        # "[atom.compass.x 00:00:00] ..." and never names the level, so
+        # filtering on "WARNING" as a field matches nothing at all. Compass
+        # warnings carry the word in the message itself for exactly this reason;
+        # tests/compass enforces that they all do.
+        if MARKER not in line:
+            continue
+        message = line[line.index(MARKER):]
+        if message not in seen:
+            seen.add(message)
+            print(f"  ! {message}")
 
 
 def _percent_error(real: float, modelled: float) -> float:
@@ -82,7 +111,7 @@ def main() -> int:
     modelled_out = work / "modelled.json"
 
     common = [
-        args.python, "scripts/compass_run.py",
+        args.python, "scripts/compass/run.py",
         "--model", args.model, "-tp", str(args.tp),
         "--num-prompts", str(args.num_prompts),
         "--max-tokens", str(args.max_tokens),

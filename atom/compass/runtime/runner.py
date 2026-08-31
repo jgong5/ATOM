@@ -223,7 +223,7 @@ class CompassModelRunner(ModelRunner):
             try:
                 self._measure_fh = open(path, "w", encoding="utf-8")
             except OSError as exc:
-                logger.warning("ATOMCompass: could not open %s for timings: %s",
+                logger.warning("ATOMCompass WARNING: could not open %s for timings: %s",
                                path, exc)
                 self._compass_config.measure_out = None
                 return
@@ -328,7 +328,7 @@ class CompassModelRunner(ModelRunner):
         try:
             self._graph.save(path)
         except OSError as exc:
-            logger.warning("ATOMCompass: could not write graph to %s: %s", path, exc)
+            logger.warning("ATOMCompass WARNING: could not write graph to %s: %s", path, exc)
             return
         logger.info(
             "ATOMCompass: traced %d operators (%d distinct) -> %s",
@@ -391,7 +391,7 @@ class CompassModelRunner(ModelRunner):
         seen = sum(n for name, n in counts.items() if "attention" in name.lower())
         if seen and seen < layers:
             logger.warning(
-                "ATOMCompass: graph holds %d attention operators for a %d-layer "
+                "ATOMCompass WARNING: graph holds %d attention operators for a %d-layer "
                 "model. It looks truncated; do not calibrate against it.",
                 seen, layers,
             )

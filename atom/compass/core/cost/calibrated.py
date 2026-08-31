@@ -172,13 +172,13 @@ class CalibratedCostOracle:
 
         if self._prefill is None and self._n_prefill:
             logger.warning(
-                "ATOMCompass: %d prefill steps is too few to fit; using their "
+                "ATOMCompass WARNING: %d prefill steps is too few to fit; using their "
                 "mean. Predictions will not vary with prompt length.",
                 self._n_prefill,
             )
         if self._decode is None and self._n_decode:
             logger.warning(
-                "ATOMCompass: %d decode steps is too few to fit; using their "
+                "ATOMCompass WARNING: %d decode steps is too few to fit; using their "
                 "mean. Predictions will not vary with batch size or context.",
                 self._n_decode,
             )
@@ -236,7 +236,7 @@ class CalibratedCostOracle:
                 continue
             self._warned.add(key)
             logger.warning(
-                "ATOMCompass: costing a %s step whose feature %d is %.0f, "
+                "ATOMCompass WARNING: costing a %s step whose feature %d is %.0f, "
                 "outside the calibrated range [%.0f, %.0f]. The prediction is "
                 "an extrapolation; calibrate over a workload that brackets "
                 "this one.",

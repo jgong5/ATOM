@@ -13,20 +13,20 @@ sweep without a GPU per point. If they disagree, the disagreements are the bugs.
 
 Weights are random: the comparison is structural, and values never enter it.
 
-    python scripts/compass_graph_diff.py trace --device meta --model M -o meta.json
-    python scripts/compass_graph_diff.py trace --device cuda --model M -o real.json
-    python scripts/compass_graph_diff.py diff meta.json real.json
+    python scripts/compass/graph_diff.py trace --device meta --model M -o meta.json
+    python scripts/compass/graph_diff.py trace --device cuda --model M -o real.json
+    python scripts/compass/graph_diff.py diff meta.json real.json
 
 To validate derivation against what the engine really ran, capture through the
 runner and compare with ``compare`` rather than ``diff`` — a capture holds the
 runner's work as well as the model's, so containment is the question, not
 equality::
 
-    python scripts/compass_smoke.py --model M --level 0 --compass \
+    python scripts/compass/smoke.py --model M --level 0 --compass \
         --compass-mode trace --compass-graph-out capture.json
-    python scripts/compass_graph_diff.py trace --device meta --model M \
+    python scripts/compass/graph_diff.py trace --device meta --model M \
         --tokens 1 -o derived.json
-    python scripts/compass_graph_diff.py compare derived.json capture.json
+    python scripts/compass/graph_diff.py compare derived.json capture.json
 """
 
 import argparse

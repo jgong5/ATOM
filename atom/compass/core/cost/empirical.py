@@ -156,7 +156,7 @@ class EmpiricalCostOracle:
                 continue
             self._warned.add(key)
             logger.warning(
-                "ATOMCompass: costing a %s step whose feature %d is %.0f, "
+                "ATOMCompass WARNING: costing a %s step whose feature %d is %.0f, "
                 "outside the measured range [%.0f, %.0f]. The answer is the "
                 "nearest measured step, not an estimate for this one.",
                 kind, index, features[index],

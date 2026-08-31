@@ -8,7 +8,7 @@ The list has to be discovered rather than read off the source: AITER registers
 its operators lazily through JIT, so only a run reveals which ones a given model
 actually reaches.
 
-    python scripts/compass_meta_probe.py --model <path> [--tokens 8] [--tp 1]
+    python scripts/compass/meta_probe.py --model <path> [--tokens 8] [--tp 1]
 """
 
 import argparse

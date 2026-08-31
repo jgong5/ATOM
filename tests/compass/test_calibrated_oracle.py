@@ -339,3 +339,83 @@ class TestEmpiricalOracle:
         near_one = oracle.estimate(decode(batch=1, context=1100)).seconds
         near_eight = oracle.estimate(decode(batch=8, context=137)).seconds
         assert near_one < near_eight
+
+
+def test_every_compass_warning_is_greppable():
+    """Warnings must announce themselves in the message, not rely on the level.
+
+    ATOM logs as "[atom.compass.x 00:00:00] ..." and never names the level, so
+    anything scanning captured output for warnings has to match on the text.
+    `compass/validate.py` does exactly that; a warning added without the prefix
+    would be silently invisible in the one workflow that runs all the phases.
+    """
+    import ast
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[2] / "atom" / "compass"
+    offenders = []
+    for path in root.rglob("*.py"):
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if not (isinstance(func, ast.Attribute) and func.attr == "warning"):
+                continue
+            if not node.args or not isinstance(node.args[0], ast.Constant):
+                continue
+            message = node.args[0].value
+            if isinstance(message, str) and not message.startswith(
+                "ATOMCompass WARNING:"
+            ):
+                offenders.append(f"{path.name}:{node.lineno} {message[:50]!r}")
+
+    assert not offenders, (
+        "these logger.warning calls will not be surfaced by validate.py:\n  "
+        + "\n  ".join(offenders)
+    )
+
+
+class TestWarningsReachTheUser:
+    """`validate.py` captures each phase, so warnings must be extracted from it.
+
+    Capturing is right — an engine start-up is thousands of lines and none of
+    them are the point — but it swallowed the warnings too, and those *are* the
+    point. The extrapolation warning exists so a bad number announces itself
+    rather than being read off the table as fact; swallowed, it was inert in the
+    one workflow that runs all four phases.
+    """
+
+    @staticmethod
+    def _validate_module():
+        import importlib.util
+        import pathlib
+
+        path = (pathlib.Path(__file__).resolve().parents[2]
+                / "scripts" / "compass" / "validate.py")
+        spec = importlib.util.spec_from_file_location("compass_validate", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_a_warning_on_stderr_is_surfaced(self, capsys):
+        module = self._validate_module()
+        line = "[atom.compass.core.cost.calibrated 00:00:00] " + module.MARKER \
+            + " costing a decode step outside the calibrated range"
+        module._run(["python", "-c", f"import sys; sys.stderr.write({line!r})"])
+        assert "outside the calibrated range" in capsys.readouterr().out
+
+    def test_ordinary_output_is_not_surfaced(self, capsys):
+        """Only warnings, or the signal drowns in engine start-up noise."""
+        module = self._validate_module()
+        module._run(["python", "-c",
+                     "print('ATOMCompass active: mode=predict oracle=X')"])
+        assert capsys.readouterr().out == ""
+
+    def test_the_same_warning_is_printed_once(self, capsys):
+        """A serving run emits per-step; the phase log holds many copies."""
+        module = self._validate_module()
+        line = module.MARKER + " costing a decode step outside the range"
+        module._run(["python", "-c",
+                     f"print({line!r}); print({line!r}); print({line!r})"])
+        assert capsys.readouterr().out.count("costing a decode step") == 1

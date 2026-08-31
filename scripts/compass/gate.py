@@ -8,7 +8,7 @@ if either seam were wrong:
   * time came from the virtual clock, not the wall clock
 
 Usage (inside the container):
-    python scripts/compass_gate.py --model <path> --compass -tp 1
+    python scripts/compass/gate.py --model <path> --compass -tp 1
 """
 
 import argparse

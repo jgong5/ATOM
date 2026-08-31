@@ -1,6 +1,6 @@
 """Serve a fixed set of prompts and record each request's latency.
 
-Used by `compass_validate.py` for both halves of the comparison, so that the
+Used by `validate.py` for both halves of the comparison, so that the
 real run and the simulated one differ in exactly one thing: whether the forward
 pass happened. Anything else that differed would show up as model error.
 

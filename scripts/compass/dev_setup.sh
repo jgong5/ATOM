@@ -4,7 +4,7 @@
 # The container venv lives in the writable layer, so this is lost on
 # ./teardown.sh or ./setup.sh --recreate. Re-run it after either.
 #
-#   ../gpu_docker/shell.sh bash -lc /workspace/ATOM/scripts/compass_dev_setup.sh
+#   ../gpu_docker/shell.sh bash -lc /workspace/ATOM/scripts/compass/dev_setup.sh
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

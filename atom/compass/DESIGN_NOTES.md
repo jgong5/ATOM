@@ -26,7 +26,7 @@ so the error is a generalisation error, not a fit residual:
 | TPOT | 3.25 ms | 3.19 ms | **−1.8%** |
 | latency | 155.83 ms | 150.65 ms | **−3.3%** |
 
-at 6.2× wall clock. Reproduce with `scripts/compass_validate.py`.
+at 6.2× wall clock. Reproduce with `scripts/compass/validate.py`.
 
 How it got there, because the shape of the sequence matters more than the
 endpoint:
@@ -78,7 +78,7 @@ model needs, and nothing consumes it. Blocks any credible multi-GPU prediction.
 
 ### 3. Never validated against `benchmark_serving` — **M**
 
-`compass_validate.py` compares against ATOM's own offline path, which is a
+`validate.py` compares against ATOM's own offline path, which is a
 tighter comparison than an HTTP benchmark: same engine, same scheduler, same
 admission decisions, only the forward differs. But it is not the standard
 yardstick, and a serving-level comparison under real request arrival — with
@@ -326,7 +326,7 @@ For Qwen3-0.6B at TP=1 on a one-token decode, all **338** derived operators appe
 in the capture in order, with identical shapes *and* dtypes. At TP=2, all **395**
 do, including all 57 all-reduces.
 
-`compass_graph_diff.py compare` asks **containment, not equality**. A positional
+`graph_diff.py compare` asks **containment, not equality**. A positional
 diff is right between two graphs of the same kind and wrong here: a derivation is
 the model body, a capture is the body plus the runner around it, so compared
 position by position they disagree from the first operator while in fact agreeing
