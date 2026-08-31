@@ -361,12 +361,21 @@ launches its inner Triton kernel, so the capture records
 `aiter::masked_embedding` *and* `triton::_masked_embedding_kernel`. On meta only
 the outer operator is recorded, since the kernel never launches.
 
-## Open: predict mode has only been validated without CUDA graphs
+## Resolved: predict mode hung with CUDA graphs, which are the default
 
-The step-1 gate passes with `--enforce-eager` and hangs without it, on an AITER
-shared-memory broadcast. CUDA graphs are the default, so every Compass run to
-date has been in a configuration that is not the deployed one.
-`capture_cudagraph` is a no-op in Compass, and the likely cause is the engine
-waiting on a capture that never happens. Same class of problem as the
-compilation one: validated against a convenient configuration rather than the
-real one.
+The step-1 gate passed with `--enforce-eager` and hung without it, on an AITER
+shared-memory broadcast. Every Compass run to date had used `--enforce-eager`,
+so predict mode had only ever been exercised in a configuration nobody deploys.
+
+The cause was a return contract, not CUDA graphs. `engine_core` calls
+`capture_cudagraph` across the worker boundary with `wait_out=True` and unpacks
+three values from the reply. Compass overrode it to do nothing and returned
+`None`, which killed the worker on an unpacking error while the parent was still
+waiting — so the failure surfaced as a hang on a broadcast that never arrived,
+naming neither CUDA graphs nor Compass. The override now returns
+`(0.0, [], 0)`.
+
+Worth keeping as a pattern: overriding a method to do nothing still has to
+honour its return contract, and a cross-process caller turns the breach into a
+hang rather than a traceback. The same shape of bug is likely wherever Compass
+stubs out work the engine expects a reply from.

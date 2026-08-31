@@ -299,9 +299,23 @@ class CompassModelRunner(ModelRunner):
 
     # -- work that has no meaning without real compute -------------------------
 
-    def capture_cudagraph(self) -> None:
-        """No graphs to capture when no kernels run."""
+    def capture_cudagraph(self):
+        """No graphs to capture when no kernels run — but say so in the caller's
+        own terms.
+
+        ``engine_core`` calls this across the worker boundary with
+        ``wait_out=True`` and unpacks three values from the result. Returning
+        ``None`` therefore does not skip the capture: it kills the worker on an
+        unpacking error while the parent is still waiting for a reply, and the
+        run hangs on a shared-memory broadcast that never arrives. The symptom
+        names neither CUDA graphs nor Compass.
+
+        Worth remembering as a pattern: overriding a method to do nothing still
+        has to honour its return contract, and a cross-process caller turns the
+        breach into a hang rather than a traceback.
+        """
         logger.debug("ATOMCompass: skipping CUDA graph capture")
+        return 0.0, [], 0
 
     def warmup_model(self) -> None:
         """Nothing to warm up."""

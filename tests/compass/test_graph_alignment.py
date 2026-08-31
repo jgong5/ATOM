@@ -193,3 +193,21 @@ class TestGroupResolution:
     def test_every_collective_kind_is_recognised(self):
         for name in ("all_gather", "reduce_scatter", "broadcast", "all_to_all"):
             assert self.resolve(f"c10d::{name}_", {"tp": 2}) == "tp"
+
+
+def test_skipped_cudagraph_capture_still_honours_its_contract():
+    """A do-nothing override must still return what the caller unpacks.
+
+    `engine_core` calls `capture_cudagraph` across the worker boundary with
+    `wait_out=True` and unpacks three values. Returning None killed the worker
+    on an unpacking error while the parent waited for a reply, so the run hung
+    on a shared-memory broadcast — a symptom naming neither CUDA graphs nor
+    Compass. It only reproduced without `--enforce-eager`, which is the default,
+    so every gate run had been in a configuration nobody deploys.
+    """
+    from atom.compass.runtime.runner import CompassModelRunner
+
+    cost, sizes, pool_bytes = CompassModelRunner.capture_cudagraph(object())
+    assert cost == 0.0
+    assert list(sizes) == []
+    assert pool_bytes == 0
