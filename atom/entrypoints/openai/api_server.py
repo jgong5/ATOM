@@ -23,6 +23,7 @@ import time
 import urllib.request
 import uuid
 from asyncio import AbstractEventLoop
+from collections import OrderedDict
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any
@@ -133,6 +134,46 @@ DEFAULT_PORT = 8000
 
 engine = None
 tokenizer: AutoTokenizer | None = None
+
+# Per-request timings as the *engine* saw them, keyed by request id.
+#
+# Under Compass the engine core runs on a virtual clock and the forward is
+# predicted rather than performed, so this process -- which only watches tokens
+# arrive on a socket -- is timing the simulator, not the system being simulated.
+# An HTTP benchmark divides every metric by its own wall-clock duration and so
+# reports how fast the simulation ran. The engine's own readings are the only
+# place the simulated latency exists, and nothing in the serving path used to
+# look at them: `postprocess` computes them offline and the server never calls
+# it. These are served by GET /compass/requests.
+#
+# Bounded, and dropped oldest-first: a long-running server must not accumulate a
+# row per request forever. A benchmark drains it at the end of a run.
+_compass_records: "OrderedDict[str, dict]" = OrderedDict()
+COMPASS_MAX_RECORDS = 100_000
+
+
+def _record_engine_timings(request_id: str, out: "RequestOutput") -> None:
+    """Keep what the engine believed about one finished request.
+
+    Zero means unstamped, and a request that produced no token has no
+    time-to-first-token -- reporting 0.0 for it would pull a mean down with a
+    number that is not a measurement. Such a request is recorded with ttft None.
+    """
+    arrive = getattr(out, "arrive_time", 0.0) or 0.0
+    first = getattr(out, "first_token_time", 0.0) or 0.0
+    finish = getattr(out, "finish_time", 0.0) or 0.0
+    if not arrive or not finish:
+        return
+    if len(_compass_records) >= COMPASS_MAX_RECORDS:
+        _compass_records.popitem(last=False)
+    _compass_records[request_id] = {
+        "request_id": request_id,
+        "arrive_time": arrive,
+        "first_token_time": first or None,
+        "finish_time": finish,
+        "ttft": (first - arrive) if first else None,
+        "latency": finish - arrive,
+    }
 # The tool-call format this model emits, resolved once at startup from its
 # chat template. `None` means none was recognised and tool calls, if any, are
 # delivered as plain text -- said out loud at startup, never discovered here.
@@ -786,6 +827,8 @@ def _send_stream_chunk_direct(
     state: Any,
 ) -> None:
     """Buffer a single-request chunk for this engine step."""
+    if request_output.finished:
+        _record_engine_timings(request_id, request_output)
     assert _stream_batch_dispatcher is not None
     _stream_batch_dispatcher.enqueue(
         loop=loop,
@@ -865,6 +908,8 @@ async def generate_async(
         _ct = getattr(request_output, "num_cached_tokens", 0)
         if _ct:
             num_cached_tokens_seen = _ct
+        if request_output.finished:
+            _record_engine_timings(request_id, request_output)
         now = time.time()
         loop.call_soon_threadsafe(
             token_queue.put_nowait,
@@ -2331,6 +2376,44 @@ async def list_models():
 async def health():
     """Health check endpoint."""
     return {"status": "ok"}
+
+
+@app.get("/compass/requests")
+async def compass_requests(drain: bool = True):
+    """Per-request timings as the engine measured them, on the engine's clock.
+
+    Exists because a client cannot time a simulated run. Under Compass the
+    engine core advances a virtual clock by each predicted step and never
+    performs the forward, so a benchmark timing the socket reports how fast the
+    simulator ran -- roughly 3x faster than the system it stands for, on the
+    workload this was built against. These readings come from the engine and are
+    therefore in simulated time when the run is simulated, and in wall time when
+    it is not, which makes the two directly comparable.
+
+    ``drain`` (default true) clears what it returns, so a benchmark reads each
+    run exactly once and a long-lived server does not grow a row per request.
+    """
+    records = list(_compass_records.values())
+    if drain:
+        _compass_records.clear()
+    return {
+        "count": len(records),
+        "clock": "virtual" if _compass_clock_is_virtual() else "wall",
+        "requests": records,
+    }
+
+
+def _compass_clock_is_virtual() -> bool:
+    """Whether this process reports simulated time.
+
+    The engine core is a different process and owns the clock that stamps these
+    readings; this one only knows whether Compass was switched on. Reported so a
+    consumer is never left guessing which clock a number came from.
+    """
+    config = getattr(engine, "config", None)
+    compass = getattr(config, "compass_config", None)
+    return bool(compass and compass.enabled and compass.virtual_clock
+                and compass.mode == "predict")
 
 
 @app.api_route("/metrics", methods=["GET", "HEAD"], include_in_schema=False)

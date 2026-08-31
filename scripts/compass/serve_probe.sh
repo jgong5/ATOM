@@ -50,6 +50,12 @@ python -m atom.benchmarks.benchmark_serving \
   --num-prompts "${NPROMPTS:-64}" --request-rate "${RATE:-inf}" --ignore-eos \
   --save-result --result-filename "$OUT/bench.json" 2>&1 | tail -35
 
+# The engine's own readings, on the engine's clock. Under --compass these are
+# the simulated latencies, and they are the only place those exist: the client
+# above timed the simulator. Drains the server-side buffer.
+curl -s "http://localhost:$PORT/compass/requests" > "$OUT/engine.json" 2>/dev/null \
+  && echo "### engine-side timings: $(python -c "import json;print(json.load(open('$OUT/engine.json'))['count'])" 2>/dev/null || echo '?') requests"
+
 echo "### stopping server"
 kill $SRV 2>/dev/null
 wait $SRV 2>/dev/null

@@ -2703,7 +2703,10 @@ class Scheduler:
             # speculative tokens and cap/stop overflow have been removed. A
             # terminal response with no completion tokens must keep TTFT zero.
             if num_tokens - seq.num_prompt_tokens >= 1 and seq.first_token_time == 0.0:
-                seq.first_token_time = time.time()
+                # get_clock(), not time.time(): the other two stamp sites go
+                # through the clock, and mixing them makes TTFT a wall-clock
+                # instant minus a virtual one, which is not a duration.
+                seq.first_token_time = get_clock().time()
 
             # Hash generated blocks. Deferred output: all tokens forwarded;
             # undeferred: last token not yet forwarded, so exclude it.
@@ -2719,6 +2722,12 @@ class Scheduler:
             # A terminal event is required even when truncation leaves no
             # tokens (for example max_tokens <= 0). Async consumers wait for
             # this finished RequestOutput and would otherwise block forever.
+            if leave_reason is not None and seq.finish_time == 0.0:
+                # Stamped before the stream output is built rather than after,
+                # so the finishing output can carry it. The assignment further
+                # down is now conditional and leaves this value alone.
+                seq.finish_time = get_clock().time()
+
             if stream_output_queue is not None and (
                 new_tokens or leave_reason is not None
             ):
@@ -2738,6 +2747,9 @@ class Scheduler:
                         seq, "kv_transfer_params_output", None
                     ),
                     num_cached_tokens=getattr(seq, "prefix_cache_hit_tokens", 0),
+                    arrive_time=seq.arrive_time,
+                    first_token_time=seq.first_token_time,
+                    finish_time=seq.finish_time,
                 )
 
                 if request_output.kv_transfer_params_output is not None:
@@ -2756,7 +2768,8 @@ class Scheduler:
                 seq.num_tokens = num_tokens
                 seq.leave_reason = leave_reason
                 seq.status = SequenceStatus.FINISHED
-                seq.finish_time = get_clock().time()
+                if seq.finish_time == 0.0:
+                    seq.finish_time = get_clock().time()
                 self.total_finished_requests += 1
                 self.total_prompt_tokens += int(seq.num_prompt_tokens)
                 self.total_generation_tokens += max(
