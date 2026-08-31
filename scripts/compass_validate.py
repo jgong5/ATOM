@@ -3,23 +3,26 @@
 This is the question the whole project exists to answer, and until it is asked
 every claim about Compass is structural — graphs matching graphs, not time
 matching time. A structural claim cannot be ranked against another structural
-claim, which is why nothing in TODO.md has a priority attached yet.
+claim, which is why nothing in DESIGN_NOTES.md had a priority attached until
+this ran.
 
-Three phases, one process each, because a run's own timings are what the next
-phase is fitted to:
+Four phases, a process each, because a run's own timings are what the next phase
+is fitted to:
 
-    measure  -- real engine, real forward, record how long each step took
-    predict  -- same prompts, forward replaced by a cost fitted to those steps
-    compare  -- per-request TTFT and TPOT, real against modelled
+    calibrate -- a sweep of shapes, real forward, recording how long each took
+    real      -- the evaluation workload, unmodified
+    modelled  -- the same workload, forward replaced by a cost fitted to the sweep
+    compare   -- per-request TTFT and TPOT, real against modelled
+
+Calibrating on a sweep rather than on the evaluation workload is deliberate twice
+over: a fixed workload prefills everything in one or two steps, too few to fit
+against, and evaluating on shapes the model was not shown makes the reported
+number a generalisation error rather than a fit residual.
 
 The comparison is deliberately tight: same engine, same scheduler, same
 admission decisions, same prompts. Only the forward differs. So the error is
 attributable to the cost model rather than to two benchmarks disagreeing about
 what they ran.
-
-Reported honestly: fitting and evaluating on the same prompts measures whether
-the model can reproduce what it was shown, which is the weaker of the two
-questions. Pass --eval-prompts to hold out different ones.
 
     python scripts/compass_validate.py --model M --num-prompts 8
 """

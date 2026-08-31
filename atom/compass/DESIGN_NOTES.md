@@ -1,38 +1,251 @@
-# ATOMCompass — findings and deferred work
+# ATOMCompass — design notes and open problems
 
-Recorded as they were established, so the reasoning survives the context it was
-found in. Each item says what is known, what is not, and what would settle it.
+What is settled and why, and what is not. Recorded as each was established, so
+the reasoning survives the context it was found in, including the things that
+were wrong first.
 
-Open problems live in `TODO.md`. The target configuration is ATOM's default —
-compilation on, CUDA graphs on — and anything validated only under
-`--enforce-eager` or `--level 0` is a step towards that rather than an instance
-of it.
+The target is to simulate ATOM **as it is deployed**: compilation on
+(`--level 3`), CUDA graphs on, prefix caching on, chunked prefill on. Anything
+that only works under `--enforce-eager` or `--level 0` is a step towards that,
+not an instance of it. `--enforce-eager` does **not** disable compilation — it
+disables CUDA graphs; compilation is `--level`, and its default is on.
 
-## Deferred: graph derivation is too slow to run per step
+Effort estimates are rough: **S** hours, **M** days, **L** weeks or unknown.
 
-A full meta forward of Qwen3.8-27B (64 layers, 2999 operators) takes **~0.16 s**.
-A modelled decode step is on the order of a millisecond, so deriving the graph
-inside the serving loop would dominate the very thing being measured and put the
-5× speed goal out of reach.
+---
 
-The graph only changes when the batch shape changes, so it should be derived
-once per distinct shape and reused. Per the earlier decision, the cache key is
-the **exact** `GraphKey` — model, topology, rank coordinates, batch signature —
-not a quantised bucket. Bucketing trades accuracy for reuse, and the accuracy it
-trades is precisely the batch-skew sensitivity that this design keeps: a decode
-batch mixing short and long histories does not cost what its mean history would
-suggest.
+# Status
 
-Open: whether an exact-key cache hits often enough in practice. Decode steps at
-a stable batch size should repeat shapes constantly; prefill with varied prompt
-lengths will not. If the miss rate turns out high, the options are incremental
-re-derivation for the part of the batch that changed, or admitting a bucketing
-scheme with a **measured** error budget rather than an assumed one.
+A simulated serving run reproduces a real one, on Qwen3-0.6B at TP=1 on MI308X,
+calibrated on a sweep of shapes and evaluated on a workload it did not see —
+so the error is a generalisation error, not a fit residual:
 
-Not on the critical path for correctness — only for speed. Deferred until the
-empirical oracle exists and there is something worth timing.
+| metric | real | modelled | error |
+| --- | --- | --- | --- |
+| TTFT | 55.10 ms | 51.75 ms | **−6.1%** |
+| TPOT | 3.25 ms | 3.19 ms | **−1.8%** |
+| latency | 155.83 ms | 150.65 ms | **−3.3%** |
 
-## Settled: Triton kernels need interception, not shape inference
+at 6.2× wall clock. Reproduce with `scripts/compass_validate.py`.
+
+How it got there, because the shape of the sequence matters more than the
+endpoint:
+
+| iteration | TTFT | TPOT | latency |
+| --- | --- | --- | --- |
+| first end-to-end run | +107% | +800% | +560% |
+| CUDA graphs captured in measure mode | +39.6% | +13.1% | +22.9% |
+| prefill calibration widened | −23.9% | +22.5% | +4.7% |
+| batch calibration widened | −11.9% | +17.5% | +7.1% |
+| timing switched to CUDA events | **−6.1%** | **−1.8%** | **−3.3%** |
+
+**Every one of those steps was a defect in how Compass measured or calibrated,
+never in the cost model's form.** The model has been a six-coefficient linear
+fit throughout. Three of the four were configurations or methods that looked
+entirely reasonable and were quietly wrong.
+
+---
+
+# Open problems
+
+Ranked by what is known about their size. Anything without a measured magnitude
+is ranked by argument, which is weaker — the whole reason the end-to-end
+comparison was built first is that structural findings cannot rank each other.
+
+## The product gap
+
+### 1. No op-graph work feeds the cost model — **L**
+
+Both oracles predict from a step's **shape** alone: token counts, batch size,
+context lengths. The graphs, the meta derivation, the TP validation — none of it
+contributes to a single prediction.
+
+This is the difference between the F1 "calibrated" point, which is where the
+project is, and "empirical", which is per-operator cost attributed from a
+captured graph. It also decides whether Compass can predict a configuration
+nobody has measured, or only interpolate between ones that were. Everything
+under *Settled* about graphs is groundwork for this and is not yet paying for
+itself.
+
+Precondition, from the event-timing finding below: per-operator attribution must
+be checked for the same observer effect — run the workload with and without it
+and compare the engine's own numbers.
+
+### 2. No collective cost model — **M**
+
+Collectives are recorded with their group and their bytes, which is what a cost
+model needs, and nothing consumes it. Blocks any credible multi-GPU prediction.
+
+### 3. Never validated against `benchmark_serving` — **M**
+
+`compass_validate.py` compares against ATOM's own offline path, which is a
+tighter comparison than an HTTP benchmark: same engine, same scheduler, same
+admission decisions, only the forward differs. But it is not the standard
+yardstick, and a serving-level comparison under real request arrival — with
+queuing, prefix caching across requests, and chunked prefill interacting — has
+not been attempted.
+
+## Graph fidelity against a production launch
+
+### 4. Derivation is uncompiled; production is not — **L**
+
+Derivation runs the model eagerly on meta. At `--level 3` inductor fuses
+operators and eliminates views and allocations, so a derived graph and a captured
+one differ by construction at the default level: 386 operators against 330 on
+Qwen3-0.6B. Neither is wrong; they cannot be compared, and the sweep story
+depends on comparing them.
+
+Two routes, neither cheap. Run dynamo and inductor during derivation, which means
+compiling for a device the derivation does not have. Or model the fusion —
+predict which operators collapse into one kernel and what that kernel costs —
+which is a research problem, not an implementation one.
+
+Interim: derive and capture at matched levels, and be explicit that a level-0
+validation does not transfer to level 3.
+
+### 5. Trace mode does not observe the CUDA-graph path — **M**
+
+Trace mode skips `capture_cudagraph` deliberately, so its graph is the eager
+operator sequence. A replay is a single opaque submission: there are no
+per-operator events to record, even in principle. So the operators must come from
+eager execution and the replay's cost must be carried as a term the oracle
+applies, not as operators in the graph.
+
+Measure mode does capture, so timings already come from the replayed path. What
+is missing is the bridge between the two artifacts.
+
+### 6. Only decode steps are traced, and only one — **M**
+
+`trace_step` records exactly one step, in practice a small decode. A deployment's
+cost is dominated by shapes never captured: prefill, chunked prefill, mixed
+prefill/decode batches, and long-context decode where attention stops being
+cheap. Speculative decoding and MTP are entirely untraced.
+
+### 7. A custom op's inner Triton kernel is recorded only on hardware — **S**
+
+On a real device `aiter::masked_embedding` both dispatches and launches
+`triton::_masked_embedding_kernel`, so the capture holds both. On meta the kernel
+never launches, so derivation holds only the outer operator. Harmless for cost —
+the outer operator carries the shapes — but a systematic difference between the
+two graphs that will confuse anyone diffing them.
+
+### 8. Simulated TP's `all_gather` is not the real one — **S**
+
+At a physical width of one it builds a zero-padded buffer (`movedim`, `reshape`,
+`view`, `zeros`) where the real path uses `view.dtype`. Seven operators out of
+451. Possibly worth simply accepting — but as a decision, not a residue nobody
+looked at.
+
+### 9. Decode cost is not linear in batch size — **M**
+
+With CUDA graphs the replay runs a **padded batch-size bucket**, so cost steps at
+the capture sizes rather than rising smoothly: at matched context, batch 1/2/4
+cost 3.59/3.85/3.78 ms — nearly flat, and not monotonic, which a linear term
+cannot represent.
+
+Originally ranked higher, on the strength of TPOT rising when the sweep widened.
+That diagnosis was wrong: a nearest-neighbour oracle, assuming no functional form
+at all, predicted 3.84 ms where the linear fit predicted 3.83 ms, so the fit was
+faithful and the *data* was wrong — see the event-timing finding. Featuring the
+padded bucket should still help; `Config.capture_sizes` declares the ladder.
+
+## Configurations that cannot be modelled at all
+
+### 10. Asymmetric parallelism — **L**
+
+`simulated_tp.py`'s `_reject_unsupported` refuses pipeline parallel, prefill and
+decode context parallel, data parallel and DP-attention, TBO, EPLB, and
+disaggregated prefill, because ranks diverge and absent ranks cannot be faked.
+Compass inherits every one of those limits, and the line it draws is exactly
+where this project drew it independently: TP is symmetric and simulable on fewer
+devices, the rest are not, because virtual time would have to be coordinated
+across processes.
+
+Nothing in the field has shipped a solution — Revati claims a multi-process
+timekeeper and released no code, LLM-Emu avoids the problem by hooking a
+single-process executor. Expert parallelism matters most: it is where the
+interesting models are going, and where a rank's graph genuinely depends on which
+experts its tokens chose.
+
+### 11. Shape-changing collectives have no meta stand-in — **S/M**
+
+`all_reduce` and `broadcast` preserve shape, so meta can hand back the input.
+`all_gather` grows and `reduce_scatter` shrinks, so they raise rather than guess
+— deliberately, since assuming "same shape" would corrupt every downstream shape
+while appearing to work. TP alone does not need them; sequence and expert
+parallelism do.
+
+### 12. One communication group is resolvable; several are not — **M**
+
+A collective names its group by elimination: with exactly one group of size above
+one, there is nothing else it could have run on. With TP and EP together the
+ambiguity is real and is recorded as `"?"`.
+
+Settling it means intercepting at the group object rather than the dispatcher —
+`get_tp_group()` and its siblings know their own identity. That is a replacement
+for the current resolver, not an addition, and item 10 needs it too.
+
+### 13. Qwen3.8-27B cannot be captured here — **?** (environmental)
+
+Its decode path JIT-builds AITER's *gluon* paged-attention kernel and the build
+fails:
+
+    subprocess.CalledProcessError: Command '['make', 'build', '-j1']'
+    returned non-zero exit status 2
+
+Narrower than it first appeared: Qwen3-0.6B takes the **ASM** decode path, which
+ships as a prebuilt `.co`, so it captures without touching the failing build. One
+kernel path, not capture as a mechanism — which is why validation was possible on
+a smaller model while the stated target model stays blocked. Needs the `make`
+stderr captured to tell a toolchain problem from an image defect.
+
+## Measurement and performance
+
+### 14. No way to tell the runner when to start measuring — **M**
+
+Throwaway warmup requests were served to get Triton autotuning out of the way,
+and the runner measured them anyway: a runner sees steps and has no idea which
+request a step belongs to, or that some were meant to be ignored. The result was
+a 7.5 s prefill sample sitting in a table beside a 0.03 s one.
+
+Worked around by discarding the first step of each kind, which is blunt — it
+drops a real sample when a workload has few and keeps warmup steps when it has
+many. What is missing is a measurement window the engine can open and close
+across the process boundary. The same gap makes it hard to calibrate one phase of
+a deployment without the others polluting the table.
+
+### 15. Derivation is too slow to run per step — **M**
+
+A full meta forward of Qwen3.8-27B (64 layers, 2999 operators) takes **~0.16 s**
+against a modelled decode step of ~1 ms, so deriving inside the serving loop
+would dominate what it measures.
+
+The graph only changes when the batch shape changes, so it should be derived once
+per distinct shape and reused, keyed on the **exact** `GraphKey` rather than a
+quantised bucket. Bucketing trades away precisely the batch-skew sensitivity this
+design keeps: a decode batch mixing short and long histories does not cost what
+its mean history suggests.
+
+Open whether an exact-key cache hits often enough. Decode at a stable batch size
+should repeat shapes constantly; prefill with varied prompt lengths will not. If
+the miss rate is high, the options are incremental re-derivation for the part of
+the batch that changed, or a bucketing scheme with a **measured** error budget
+rather than an assumed one. Not on the critical path for correctness, only for
+speed.
+
+### 16. Capture pays for Triton autotuning — **S**
+
+The first launch of each kernel benchmarks every candidate configuration, which is
+why `trace_step` is never 1 and why capture takes minutes. Fine as it is; worth
+knowing before anyone tries to capture a sweep.
+
+---
+
+# Settled
+
+## Tracing
+
+### Triton kernels need interception, not shape inference
 
 Triton launches bypass the dispatcher, so no meta kernel can stand in for them,
 and on meta they fail outright: there is no storage behind the pointers.
@@ -42,395 +255,359 @@ as an argument — `run_pa_decode_gluon(output, q, k_cache, ...)` — so the cal
 has already allocated every output with the right shape before the launch.
 Tracing one is therefore: record what it was asked to do, and skip it.
 
-Assumption worth re-checking if a kernel ever traces wrongly: that every
+Worth re-checking if a kernel ever traces wrongly: the assumption that every
 intercepted kernel is out-parameter style. One that allocates internally and
 returns a tensor would need real handling.
 
-## Settled: the meta-kernel worklist is empty for this model
+### Inductor kernels launch through a different path
 
-Every AITER operator Qwen3.8-27B reaches already runs on meta —
-`gemm_a16w16`, `_fused_qk_rmsnorm_group_quant_kernel`,
-`linear_attention_with_output_base`, `silu_and_mul`,
-`unified_attention_with_output_base`. The earlier estimate of "22 meta kernels
-to write" was wrong in both directions: fewer are missing, and the real barrier
-was a different mechanism entirely.
+`torch.compile` does not use `JITFunction.run`; it calls generated kernels
+through `CachingAutotuner`, which is intercepted alongside it. Without that a
+compiled capture silently omits whatever inductor generated.
 
-This is model-specific. AITER registers operators lazily through JIT, so the
-worklist for a different architecture — a MoE model especially — has to be
-discovered by running the probe against it, not predicted.
-
-## Open risk: asymmetric parallelism
-
-ATOM already simulates a **TP** width wider than the physical device count
-(`atom/distributed/simulated_tp.py`): the group reports the logical width so
-layers shard that many ways, while collectives cover only the ranks that exist.
-Its own warning says the model output is then meaningless — which costs Compass
-nothing, since Compass never uses the output and models collective cost from
-bytes, group size and interconnect rather than performing collectives.
-
-`_reject_unsupported` in that module refuses pipeline parallel, prefill and
-decode context parallel, data parallel and DP-attention, TBO, EPLB, and
-disaggregated prefill. That line is drawn in exactly the same place this project
-drew it independently: TP is symmetric and simulable on fewer devices; expert
-parallelism, DP-attention and prefill/decode disaggregation are not, because
-ranks diverge and virtual time would have to be coordinated across processes.
-
-The symmetric half looks close to solved. The asymmetric half remains the real
-open risk, and nothing in the field has shipped a solution: Revati claims a
-multi-process timekeeper and released no code, and LLM-Emu avoids the problem
-entirely by hooking a single-process executor.
-
-## Settled by failure: tracing must go through the runner, not the model
-
-Driving `model(input_ids, positions)` directly traces *a* forward, but not the
-forward ATOM would run. On real hardware it fails at
-`fwd_ctx.context.is_dummy_run`: attention reads a forward context that only the
-runner establishes, carrying attention metadata, KV-cache state and the
-dummy-run flag. Building those by hand means reimplementing `prepare_inputs`,
-which is exactly the re-implementation this design exists to avoid.
-
-So both sides of the comparison have to enter through `ModelRunner.forward`.
-`dummy_execution()` already does this: it assembles a `ScheduledBatch` with
-`is_dummy_run=True` and calls `self.forward(...)`, letting ATOM set up
-everything. Capture is then a real runner on hardware; derivation is the same
-runner with `_build_and_load_model` overridden to construct on meta and skip
-weight loading — an override the base method's own docstring invites.
-
-**The 2999-operator meta graph recorded so far is therefore provisional.** It is
-reproducible and it proved the tracing machinery works end to end — dispatcher
-and Triton interception, persistence, comparison — but it came from a bare model
-call, so it is not yet the graph a served batch produces. It should not be
-treated as a reference artifact until it is re-derived through the runner.
-
-A related trap, worth keeping: built at the default fp32 rather than the model's
-`torch_dtype`, meta traces happily while hardware refuses — AITER's fused
-qk-rmsnorm takes fp16/bf16 only. Meta accepts kernels real devices reject, so
-dtype has to be pinned deliberately on both sides. The diff caught this, which
-is some evidence it is worth having.
-
-## Settled: never trace the first forward — Triton autotunes on it
-
-Tracing step one of a real run recorded **90,838 operators**. Tracing step two
-recorded **101**. The difference is Triton autotuning: on a kernel's first
-launch it benchmarks every candidate configuration, so the first step contains
-tens of thousands of launches that steady-state serving never performs —
-`chunk_fwd_kernel_o` alone appeared 34,269 times, `chunk_scaled_dot_kkt_fwd_kernel`
-26,528. It is also slow, taking minutes of wall time.
-
-`CompassConfig.trace_step` therefore defaults to 2 rather than 1. Anything that
-captures a graph, times a step, or calibrates a cost model has to step past
-warmup first, and a tool that quietly recorded step one would produce numbers
-that look precise and describe nothing that happens in production.
-
-Meta never revealed this, because skipped launches never autotune. It is a case
-where hardware capture told us something derivation could not — which is an
-argument for keeping the comparison even after meta is trusted.
-
-## Resolved: the small captured graph was an artifact of a crash
-
-The 101-operator capture recorded about three layers of a 64-layer model. It was
-not truncation by `torch.compile` — compilation is off at level 0 under
-`--enforce-eager`. The traced forward **crashed**, and the recording was written
-anyway from a `finally` block, producing a well-formed artifact from a failed
-run. Nothing downstream would have noticed: it is structurally valid and merely
-wrong, and would have costed out at a fraction of the model.
-
-Two fixes. A failed forward now writes no graph at all and says so loudly. And
-what does get written is checked against the model's depth first — attention
-runs once per layer, so a graph holding fewer attention operators than the model
-has layers is reported as truncated rather than trusted.
-
-The general lesson is worth keeping: for a tool whose output is an artifact, a
-plausible artifact from a broken run is a worse failure than a crash, because it
-propagates silently into everything fitted against it.
-
-## Blocked, but only for one attention path: the AITER gluon JIT build
-
-Running Qwen3.8-27B's real forward reaches AITER's *gluon* paged-attention
-decode kernel, which JIT-builds on first use, and the build fails:
-
-    subprocess.CalledProcessError: Command '['make', 'build', '-j1']'
-    returned non-zero exit status 2
-
-This is environmental and narrower than it first appeared. Qwen3-0.6B takes the
-**ASM** decode path instead, which ships as a prebuilt `.co`, so it captures
-without touching the failing build. The blocker is one kernel path, not capture
-as a mechanism — which is why validation was possible on a smaller model while
-the 27B path stays blocked.
-
-Worth noting what capture costs even when it works: Triton autotunes the prefill
-path for several minutes before the first traced step. That is an argument for
-meta derivation rather than against it — capture is the expensive side.
-
-## Settled: derivation reproduces hardware, and the check is now repeatable
-
-For Qwen3-0.6B at TP=1, on a decode step of one token, all **338** derived
-operators appear in the capture in order, with identical shapes *and* dtypes.
-The 48 operators the capture holds in addition are the runner's own work —
-batch-metadata slicing and copies, two hand-written Triton metadata kernels, the
-LM-head GEMM, sampling, and the transfer home. None of them belong to the model
-body, and the model body is what a cost model is fitted against.
-
-The check is `compass_graph_diff.py compare`, and its question is **containment,
-not equality**. A positional diff is right between two graphs of the same kind
-and wrong here: a derivation is the model body alone, a capture is the body plus
-the runner around it, so compared position by position they disagree from the
-first operator while in fact agreeing about everything that matters. Matching is
-greedy and fails closed — on divergence it reports every subsequent derived
-operator as unfound rather than hunting for a later match that might be a
-coincidence.
-
-Two conditions have to hold or the comparison is meaningless, and both are now
-enforced rather than remembered:
-
-* **The capture must be uncompiled.** See below.
-* **Both sides must describe the same batch.** Derive at the token count the
-  capture used; otherwise shapes differ for reasons that carry no information.
-  The tool warns when the batches disagree.
-
-## Corrected: a compiled capture is a different graph, not an incomplete one
-
-An earlier version of this note claimed compilation silently dropped 57 of 386
-operators. That was wrong in substance, and the correction matters because the
-wrong version argued for capturing at `--level 0`, which is not the
-configuration anybody deploys.
-
-Inductor kernels **are** traced now: `CachingAutotuner.run` is intercepted
-alongside `JITFunction.run`, because inductor launches its generated kernels
-through the former and a graph built only from the dispatcher and `JITFunction`
-would miss them. That interception was the one real gap, and it accounted for
-exactly one operator: `aten::embedding` becomes
-`inductor::triton_poi_fused_embedding_0`.
-
+An earlier version of this note claimed compilation dropped 57 of 386 operators.
+That was wrong in substance, and the correction matters because the wrong version
+argued for capturing at `--level 0`, which nobody deploys. Inductor accounted for
+exactly **one**: `aten::embedding` becomes `inductor::triton_poi_fused_embedding_0`.
 The other 56 are `split_with_sizes` and `empty` — views and allocations, which
 inductor resolves into offsets and a buffer plan rather than executing. They do
-not run at level 3. Their absence is the compiled configuration being faithfully
-recorded, not a hole in the trace. The compute totals confirm it: 283 operators
-either way.
+not run at level 3. Compute totals confirm it: 283 operators either way.
 
 So a compiled and an uncompiled capture are both correct and describe different
-configurations. Compilation is the default, so it is the one worth modelling,
-and a derivation may only be compared against a capture taken at its own level.
-`--enforce-eager` does not change this; it disables CUDA graphs, and compilation
-is `--level`.
+configurations. Compilation is the default, so it is the one worth modelling, and
+a derivation may only be compared against a capture at its own level.
 
-Open: derivation still runs uncompiled. Comparing it to a compiled capture means
-either running inductor during derivation or modelling the fusion itself —
-predicting which operators collapse into one kernel and what that kernel costs.
-Unsolved, and the largest remaining gap between derivation and production.
+### Never trace the first forward — Triton autotunes on it
 
-## Settled: the derivation must use the engine's input dtypes
+Tracing step one recorded **90,838** operators. Step two recorded **101**. On a
+kernel's first launch Triton benchmarks every candidate configuration, so step one
+contains tens of thousands of launches steady-state serving never performs —
+`chunk_fwd_kernel_o` alone appeared 34,269 times.
+
+`trace_step` therefore defaults to 2. Anything that captures a graph, times a
+step, or calibrates a cost model has to step past warmup first, and a tool that
+quietly recorded step one would produce numbers that look precise and describe
+nothing that happens in production.
+
+Meta never revealed this, because skipped launches never autotune — a case where
+hardware told us something derivation could not, which is an argument for keeping
+the comparison even after derivation is trusted.
+
+### A failed forward writes no graph
+
+A 101-operator capture of a 64-layer model looked like truncation. The forward had
+**crashed**, and the recording was written anyway from a `finally` block: a
+well-formed artifact from a failed run, structurally valid and merely wrong, which
+would have costed out at a fraction of the model.
+
+Now a failed forward writes nothing and says so, and what does get written is
+checked against the model's depth — attention runs once per layer, so a graph with
+fewer attention operators than the model has layers is reported as truncated.
+
+The lesson generalises: for a tool whose output is an artifact, a plausible
+artifact from a broken run is worse than a crash, because it propagates silently
+into everything fitted against it.
+
+### The meta-kernel worklist is empty for this model
+
+Every AITER operator Qwen3.8-27B reaches already runs on meta. An earlier estimate
+of "22 meta kernels to write" was wrong in both directions: fewer are missing, and
+the real barrier was a different mechanism entirely (Triton interception).
+
+Model-specific. AITER registers operators lazily through JIT, so the worklist for
+another architecture — a MoE model especially — has to be discovered by running
+the probe, not predicted.
+
+## Derivation and comparison
+
+### Derivation reproduces hardware, and the check is repeatable
+
+For Qwen3-0.6B at TP=1 on a one-token decode, all **338** derived operators appear
+in the capture in order, with identical shapes *and* dtypes. At TP=2, all **395**
+do, including all 57 all-reduces.
+
+`compass_graph_diff.py compare` asks **containment, not equality**. A positional
+diff is right between two graphs of the same kind and wrong here: a derivation is
+the model body, a capture is the body plus the runner around it, so compared
+position by position they disagree from the first operator while in fact agreeing
+about everything a cost model is fitted to. Matching is greedy and fails closed —
+on divergence it reports every later derived operator as unfound rather than
+hunting for a match that might be coincidence.
+
+Two conditions must hold, both enforced rather than remembered: the two sides must
+be at the same compilation level, and must describe the same batch. The tool warns
+when the batches disagree.
+
+### Derivation must use the engine's input dtypes
 
 `input_ids` is `int32` and `positions` is `int64` (`model_runner.py`, lines 189
-and 1277). They are easy to get wrong in the same way, and the consequence is
-out of all proportion to the cause: a derivation using PyTorch's `int64` default
-differs from the capture at the embedding, and one using `int32` for both
+and 1277). Easy to get wrong in the same way, and the consequence is out of all
+proportion: PyTorch's `int64` default diverges at the embedding, `int32` for both
 diverges at the first attention operator. Because matching fails closed, either
-mistake rejects every operator from that point on — a correct derivation
-reporting as a total structural disagreement.
+mistake rejects every operator from that point on — a correct derivation reporting
+as a total structural disagreement. Both live in `derived_inputs()` now.
 
-Both live in `derived_inputs()` now, so there is one definition rather than a
-literal at each call site.
+### Tracing goes through the runner, not the model
 
-## Settled: each rank writes its own graph
+Driving `model(input_ids, positions)` directly traces *a* forward, but not the one
+ATOM would run. On hardware it fails at `fwd_ctx.context.is_dummy_run`: attention
+reads a forward context only the runner establishes. Building that by hand means
+reimplementing `prepare_inputs`, which is the re-implementation this design exists
+to avoid. So capture enters through `ModelRunner.forward`.
 
-Every rank traces, and under any parallelism their graphs differ — that
-difference is precisely what records how the model is sharded. A single
-`--compass-graph-out` path made the ranks race for it and left one file naming
-no rank: the survivor could not be attributed, and the others were lost without
-a trace. The path now carries the rank's coordinates in every group it belongs
-to (`g.json` becomes `g.tp1.json`, or `g.dp3-tp1.json`).
+Derivation still uses a bare model call, which is why the comparison asks
+containment. That is a known limitation rather than a defect — see the division of
+labour below.
 
-## Settled: collectives now name their group, where the group is determinable
+A related trap: built at the default fp32 rather than the model's `torch_dtype`,
+meta traces happily while hardware refuses — AITER's fused qk-rmsnorm takes
+fp16/bf16 only. Meta accepts kernels real devices reject, so dtype is pinned
+deliberately on both sides. The diff caught this, which is some evidence it earns
+its keep.
 
-The op graph's one concession to parallelism is that a collective names the
-group it ran on. It was being recorded as the literal string `"unknown"` for
-every collective, which quietly hollowed that out: a graph in which every
-collective is indistinguishable cannot tell an all-reduce over tensor ranks from
-one over expert ranks, and that distinction is the reason the representation is
-shaped this way.
+## Parallelism
 
-The dispatcher does not hand us the group, but it does not need to when the rank
-belongs to only one group of size greater than one — there is nothing else the
-collective could have been. At TP=2 all 57 all-reduces and the one broadcast now
-resolve to `tp`. With several non-trivial groups the ambiguity is real and is
+### The op graph knows world sizes and ranks, nothing else
+
+A collective names the communication group it ran on; the shapes around it already
+reflect whatever sharding produced them. That is what lets one representation
+serve every parallel strategy, including combinations, without Compass being
+taught what any of them mean.
+
+Collectives were being recorded with the literal group `"unknown"`, which hollowed
+that out — a graph in which every collective is indistinguishable cannot tell an
+all-reduce over tensor ranks from one over expert ranks. Resolved by elimination
+now where the rank belongs to a single non-trivial group; genuine ambiguity is
 recorded as `"?"` rather than guessed.
 
-Open: resolving the ambiguous case means intercepting at the group object rather
-than the dispatcher. ATOM routes collectives through `get_tp_group()` and its
-siblings, which know their own identity. That is the replacement for the current
-resolver, not an addition to it, and it is what asymmetric parallelism (EP, DP
-attention, P/D) will require.
-
-## Settled: TP=2 shows the abstraction doing its job
+### TP=2 shows the abstraction working
 
 Captured at TP=2, with nothing in Compass that knows what tensor parallelism is:
 
-* the qkv GEMM narrows from `[4096, 1024]` to `[2048, 1024]` — the sharding is
-  visible in the shapes, exactly as the design intends
+* the qkv GEMM narrows from `[4096, 1024]` to `[2048, 1024]` — sharding visible in
+  the shapes, exactly as intended
 * 57 `all_reduce_` collectives appear where TP=1 has none
-* the embedding switches from `aten::embedding` to `aiter::masked_embedding`
-  plus its Triton kernel, which is the vocab-parallel path
-* the two ranks' graphs are identical, which is correct for symmetric TP and is
-  the reason rank attribution has to come from the filename and key rather than
-  from the contents
+* the embedding switches to `aiter::masked_embedding` plus its Triton kernel, the
+  vocab-parallel path
+* the two ranks' graphs are identical, correct for symmetric TP — which is why
+  rank attribution comes from the filename and key rather than the contents
 
-## Open: deriving a sharded graph from a single process
+### A sharded rank can be derived from one process
 
-Derivation is validated at TP=1. At TP=2 it hangs: `init_dist_env(2, ...)` from
-one process waits forever for a rank that will never arrive. This is the gap
-between "derive a graph for a configuration nobody has run" and what the tool
-does today, and it is the whole point of derivation — sweeping TP without a GPU
-per point.
+TP>1 derivation used to hang, and only on the derivation side: capture at TP=2
+works because it really starts two processes, while one process asking gloo for a
+world of two waits forever for a peer nobody launched.
 
-ATOM already has the mechanism — see *Open risk: asymmetric parallelism* above:
-`atom/distributed/simulated_tp.py` reports a logical group width wider than the
-devices present, so layers shard that many ways without the ranks existing. That
-is exactly what a single-process derivation needs, so this is wiring rather than
-invention, and it is bounded by the same line that module already draws: TP is
-symmetric and simulable, the asymmetric strategies are not.
+Fixed with ATOM's own simulated TP, which reports a logical group width over a
+smaller real group. One correction was needed: `apply_simulated_tp` takes the
+physical width from `torch.cuda.device_count()`, right for a worker holding a
+device and wrong for derivation, whose real group is one rank however many GPUs
+exist. On an 8-GPU box it concluded a TP2 derivation needed no simulation, and the
+model built **unsharded, silently**. `simulate_group_width()` states the widths
+outright.
 
-## Settled: no fixed ports
+That surfaced a second problem. At a physical width of one there is no
+communicator, so simulated TP replaces `all_reduce` with a passthrough — right for
+benchmarking kernels, wrong here, because the derived graph then holds no
+communication and tensor parallelism costs out as free. Collectives are recorded
+rather than performed, under the name the dispatcher uses on hardware.
+
+### The whole step, at any TP width, on one device
+
+Compass models the serving flow, not the model body, so the runner's own work —
+batch-metadata preparation, the LM head, sampling, the transfer home — is inside
+the scope. Calling those "not part of the model body" excused the gap rather than
+closing it.
+
+The route that closes it is not a meta runner (62 `torch.cuda.` sites in
+`model_runner.py`). It is capture under simulated TP: the runner runs for real, so
+everything it does is recorded, while `--fake-eplb` makes one device stand in for
+a TP-N deployment. A TP2 capture on a single GPU gives **451** operators against
+**448** for the real two-GPU capture.
+
+The residual seven are simulated TP's own zero-padded `all_gather` — item 8.
+
+**The division of labour this settles.** *Capture* on one device gives the
+complete step for any symmetric TP width, and is what a cost model should be
+fitted against. *Derivation* on meta gives the model body with no device at all,
+about a thousand times faster, and is what a sweep should use once the two are
+known to agree.
+
+### Each rank writes its own graph
+
+Every rank traces and under any parallelism their graphs differ — that difference
+is what records how the model is sharded. A single `--compass-graph-out` made the
+ranks race for it and left one file naming no rank: the survivor could not be
+attributed and the rest were lost. Paths carry the rank's coordinates in every
+group it belongs to (`g.json` → `g.tp1.json`, or `g.dp3-tp1.json`).
+
+### No fixed ports
 
 The rendezvous store was hardcoded to a port. The container runs with host
 networking on a machine shared with about twenty others, so a fixed number
 collides with whatever holds it — including an earlier run of the same script —
-and fails with an `EADDRINUSE` that says nothing about tracing. The OS picks the
-port now.
+and fails with an `EADDRINUSE` that says nothing about tracing. The OS picks it.
 
+## Measurement
 
-## Settled: a sharded rank can be derived from one process
+### The instrument was changing what it measured — a 33% error
 
-TP>1 derivation used to hang, and the hang was only ever on the derivation side:
-capture at TP=2 works fine, because it really does start two processes. A single
-process asking gloo for a world of two waits forever for a peer nobody launched.
+`measure` timed each forward between two `torch.cuda.synchronize()` calls. Same
+workload, same engine:
 
-The fix is ATOM's own simulated TP, which reports a logical group width over a
-smaller real group. One correction was needed to use it: `apply_simulated_tp`
-decides the physical width from `torch.cuda.device_count()`, which is the right
-question for a worker holding a device and the wrong one for derivation, whose
-real group is always exactly one rank however many GPUs exist. On an 8-GPU box
-that heuristic concluded a TP2 derivation needed no simulation, and the model
-then built unsharded — silently, and looking normal.
-`simulate_group_width()` states the widths outright instead.
+| | TPOT |
+| --- | --- |
+| plain run | **3.26 ms** |
+| under measure (host sync) | **4.33 ms** |
 
-That surfaced a second problem. At a physical width of one there is no
-communicator, so simulated TP replaces `all_reduce` with a passthrough — right
-for benchmarking kernels, wrong here, because the derived graph then contains no
-communication at all and tensor parallelism costs out as free. Collectives are
-now recorded rather than performed, under the same name the dispatcher records
-on hardware, so the two graphs compare operator for operator.
+A serving loop overlaps host and device — while the device runs one step the host
+prepares the next — and a sync on every step destroys that overlap. So what was
+recorded was each step's *isolated latency*, and a model fitted to isolated
+latencies then predicts a pipelined run and over-estimates it by whatever the
+overlap was worth. That was most of the residual TPOT error.
 
-With both in place, a TP=2 rank derived on meta in one process reproduces the
-TP=2 capture: all 395 operators, including all 57 all-reduces. Deriving a
-configuration nobody has run — the point of the whole exercise — works for
-symmetric TP.
+Timed with CUDA events now, recorded on the stream and read back later, drained by
+`query()` rather than `synchronize()` so the host never waits. Perturbation fell
+from 1.33× to 0.97×, recorded decode mean from 4.05 ms to 3.43 ms against a real
+3.26 ms.
 
-## Settled: the whole step, at any TP width, on one device
+Found by disagreement between two methods that should have disagreed: a
+nearest-neighbour oracle assuming no functional form predicted 3.84 ms where the
+linear fit predicted 3.83 ms. Two methods with opposite failure modes agreeing
+meant the fit was faithful to its data and the data was wrong.
 
-Compass models the serving flow, not the model body, so the runner's own work —
-batch-metadata preparation, the LM head, sampling, the transfer home — is inside
-the scope, not outside it. Calling those operators "not part of the model body"
-excused the gap rather than closing it.
+Generalises: **a profiler that serialises what it profiles measures a machine that
+only exists while being profiled.**
 
-The route that closes it is not a meta runner. It is capture under simulated TP:
-the runner runs for real, so every operator it performs is recorded, while
-`--fake-eplb` makes one device stand in for a TP-N deployment. A TP2 capture on
-a single GPU produces **451** operators against **448** for the real two-GPU
-capture, including all 57 all-reduces and every runner operator.
-
-One fix was needed to get there, the same one derivation needed: simulated TP
-replaces `all_reduce` with a passthrough at a physical width of one, so a graph
-captured on a single device showed no communication whatsoever. Collectives are
-now recorded in the capture path too — a no-op on a real multi-device run, where
-the collective dispatches and is recorded once already.
-
-The residual seven operators are simulated TP's own `all_gather`, which builds a
-zero-padded buffer (`movedim`, `reshape`, `view`, `zeros`) where the real path
-uses `view.dtype`. That is the module's documented behaviour for absent ranks
-rather than a tracing gap, and it is bookkeeping either way.
-
-What this leaves is a division of labour worth stating plainly. **Capture** on
-one device gives the complete step for any symmetric TP width, and is what a
-cost model should be fitted against. **Derivation** on meta gives the model body
-with no device at all, is roughly a thousand times faster, and is what a sweep
-should use once the two are known to agree.
-
-Still open: derivation does not produce the runner's operators, so the
-derivation-vs-capture check remains containment rather than equality. Since
-capture now covers the configurations a sweep would want, this is a performance
-question rather than a coverage one.
-
-A smaller instance of the same gap: on hardware a custom op both dispatches and
-launches its inner Triton kernel, so the capture records
-`aiter::masked_embedding` *and* `triton::_masked_embedding_kernel`. On meta only
-the outer operator is recorded, since the kernel never launches.
-
-## Resolved: predict mode hung with CUDA graphs, which are the default
-
-The step-1 gate passed with `--enforce-eager` and hung without it, on an AITER
-shared-memory broadcast. Every Compass run to date had used `--enforce-eager`,
-so predict mode had only ever been exercised in a configuration nobody deploys.
-
-The cause was a return contract, not CUDA graphs. `engine_core` calls
-`capture_cudagraph` across the worker boundary with `wait_out=True` and unpacks
-three values from the reply. Compass overrode it to do nothing and returned
-`None`, which killed the worker on an unpacking error while the parent was still
-waiting — so the failure surfaced as a hang on a broadcast that never arrived,
-naming neither CUDA graphs nor Compass. The override now returns
-`(0.0, [], 0)`.
-
-Worth keeping as a pattern: overriding a method to do nothing still has to
-honour its return contract, and a cross-process caller turns the breach into a
-hang rather than a traceback. The same shape of bug is likely wherever Compass
-stubs out work the engine expects a reply from.
-
-
-## Open: trace mode does not observe the CUDA-graph path
-
-Trace mode stubs `capture_cudagraph`, so a traced run executes eagerly even with
-CUDA graphs enabled — the default. The recorded graph is faithful about which
-operators run and silently wrong about how they are launched, and removing
-per-launch overhead is the entire purpose of a CUDA graph.
-
-A replay is one opaque submission, so tracing it operator by operator is not
-possible even in principle: the operators have to come from the capture phase
-and the replay's cost has to be carried as a separate term. See `TODO.md` A1.
-
-
-## Settled: what a mode skips has to depend on what that mode is doing
+### CUDA graphs must be captured when the forward is real
 
 `capture_cudagraph` and `warmup_model` were stubbed unconditionally, on the
 reasoning that neither means anything when no kernels run. True for `predict`,
-and false for the two modes that perform the real forward — where skipping them
-skips them from a *real* run, and the artifact then describes a machine
-configured unlike the deployment it stands for. That single assumption produced
-the +800% TPOT error: measure ran eager while production replayed a graph.
+false for the two modes that perform the real forward — where skipping them skips
+them from a *real* run.
 
-Now: `measure` captures for real, since timings must come from the path that
-runs in production. `predict` skips, having nothing to capture. `trace` skips
-too, but for the opposite reason to `predict` — a replay is one opaque
-submission, so a traced step would record no operators at all. The operator
-sequence comes from eager execution; its cost comes from a measure run. That
-split is not a workaround, it is the division of labour the two artifacts
-already had.
+That single assumption produced a **+800%** TPOT error: measure ran eager while
+production replayed a graph. Measured directly, Qwen3-0.6B decode: **28.78 ms**
+eager against **3.24 ms** replayed, 8.9×.
 
-Turning the two stubs back on exposed two further bugs, both of which had been
-hidden by never running the code:
+Now `measure` captures for real, `predict` skips having nothing to capture, and
+`trace` skips for the opposite reason to `predict` — a replay is one opaque
+submission, so a traced step would record no operators at all.
 
-**Warmup batches are steps.** `warmup_model` drives synthetic batches through
-`forward` with `is_dummy_run=True`. They must run — they are what autotunes
-Triton — but they are not steps a deployment performs, and counted they spend
-the trace budget on a dummy shape and put dummy rows in the table a cost model
-is fitted to. Skipped by flag now.
+### A stub must honour its caller's return contract
 
-**A subclass's `__init__` body runs too late.** `ModelRunner.__init__` warms the
-model up before returning, and warmup drives a forward, so anything
-mode-dependent is consulted before `CompassModelRunner.__init__` has assigned
-its config. `_compass_config` resolves lazily from `self.config` — set early in
-the base `__init__`, well before warmup — rather than being assigned after
-`super().__init__()`.
+`engine_core` calls `capture_cudagraph` across the worker boundary with
+`wait_out=True` and unpacks three values. The override returned `None`, which
+killed the worker on an unpacking error while the parent was still waiting — so
+the failure surfaced as a hang on a shared-memory broadcast that never arrived,
+naming neither CUDA graphs nor Compass.
 
-Both are the same shape as the `capture_cudagraph` return-contract bug: a
-subclass that stubs out work the base class depends on will be wrong in
-proportion to how much of the base class it never lets run.
+Across a process boundary a breached contract becomes a hang, not a traceback.
+
+### A subclass's `__init__` body runs too late
+
+`ModelRunner.__init__` warms the model up before returning, and warmup drives a
+forward, so anything mode-dependent is consulted before `CompassModelRunner`'s own
+`__init__` has assigned its config. `_compass_config` resolves lazily from
+`self.config`, which the base sets well before warmup.
+
+Together with the two above: **a subclass that stubs out work the base class
+depends on is wrong in proportion to how much of the base class it never lets
+run.**
+
+### Warmup batches are steps, and must not be counted
+
+`warmup_model` drives synthetic batches through `forward` with `is_dummy_run=True`.
+They must run — they are what autotunes Triton — but they are not steps a
+deployment performs, and counted they spend the trace budget on a dummy shape and
+put dummy rows in the table a cost model is fitted to.
+
+### A real run must not use the virtual clock
+
+`trace` and `measure` perform the real forward, so the wall clock is the truthful
+one. The virtual clock was installed for any Compass run, so every request came
+back with a TTFT of zero — which reads as a broken measurement rather than a
+misconfigured clock.
+
+## Calibration
+
+### Coverage must bracket every dimension the model uses
+
+The same error twice, in two dimensions, an hour apart.
+
+ATOM batches several requests' prefill into one step, so a sweep of large prompts
+produced seven samples spanning 1753–16370 tokens while the evaluation batched to
+~520. The model extrapolated below everything it had seen, where the intercept
+dominates and the slope does no work, and predicted 66.8 ms for a 64-token
+prefill.
+
+Widening the prompt lengths fixed that and left the sweep varying *only* length,
+so it produced decode steps at batch sizes 1–4 — and the evaluation ran 8
+concurrent requests. TTFT improved and TPOT got worse, from +13.1% to +22.5%.
+
+Both times coverage was designed against the dimension that had just caused a
+problem rather than against the model's feature set. The sweep now varies length
+and concurrency together.
+
+The durable fix is not a better sweep: **the oracle says when it is
+extrapolating.** A fitted model answers anything, confidently, including questions
+its evidence does not cover, and neither of these errors announced itself. Warned
+once per kind and direction, since a serving run asks thousands of times.
+
+### Warmup counted in steps destroys the data it protects
+
+`measure_warmup_steps` defaulted to 2, and prefill happens twice in a whole run,
+so it discarded every prefill sample. The oracle had nothing to fit, fell back to a
+mean of zero samples, and predicted a TTFT of 0 ms against a real 7.6 s. Counted
+per kind now, defaulting to zero.
+
+### An oracle asked outside its evidence must refuse
+
+The fallback for "no samples of this kind" was the mean of an empty list, which is
+zero: a confident, precise, entirely fictional answer. It raises now.
+
+### The fit resists one-off contamination
+
+**Triton autotunes per shape, not once per process**, so a calibration sweep built
+from deliberately varied shapes pays a benchmarking cost on many of its own
+samples — one prefill row sat at 0.13 s where its neighbour at a larger size took
+0.036 s.
+
+Least squares, then discard points whose residual is far outside the spread of the
+rest, then refit. Spread by median absolute deviation, since the contaminating
+points would otherwise inflate the very quantity used to detect them. The number
+dropped is reported in `describe()`: a fit that discarded half its evidence should
+not describe itself like one that kept it.
+
+### Prefill and decode are fitted separately
+
+They are not two regimes of one function. Prefill is compute-bound in new tokens;
+decode is bandwidth-bound in the KV history it must read. Fitting them together
+produces a model that is wrong about both.
+
+Total context is summed across the batch rather than averaged: a decode batch
+mixing short and long histories does not cost what its mean history suggests, and
+the sum is what the hardware actually moves.
+
+---
+
+# Process notes
+
+* Every defect in this project surfaced by **running** something, never by reading
+  code. The meta-kernel worklist, the autotuning blowup, the passthrough
+  all-reduce, the unpacking hang, the observer effect — all of them.
+* Validating against a convenient configuration (`--enforce-eager`, `--level 0`,
+  one GPU) reads as validation and is not. Three separate bugs hid behind that.
+* Structural validation cannot rank its own findings. Nothing here had a
+  defensible priority until something predicted time and was wrong by a measurable
+  amount.
+* A fitted model is confident everywhere, including outside its evidence. Twice the
+  error was not the fit but the range it was fitted over, and neither time did
+  anything complain.
+* A profiler that serialises what it profiles measures a machine that only exists
+  while being profiled.
+* For a tool whose output is an artifact, a plausible artifact from a broken run is
+  worse than a crash.
+* Two methods agreeing is only evidence when they could have disagreed. The
+  nearest-neighbour oracle earned its place by matching the linear fit, not by
+  beating it.
