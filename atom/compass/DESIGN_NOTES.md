@@ -321,26 +321,45 @@ TP=2 capture: all 395 operators, including all 57 all-reduces. Deriving a
 configuration nobody has run — the point of the whole exercise — works for
 symmetric TP.
 
-## Open: the derived graph is the model, but Compass models the whole step
+## Settled: the whole step, at any TP width, on one device
 
-The comparison asks containment because a capture holds the runner's work as
-well as the model's. That framing is a description of a limitation, not a
-target: ATOMCompass exists to simulate the serving flow, and batch-metadata
-preparation, the LM head, sampling and the device transfer all cost real time in
-a real deployment. Fifty-odd operators are currently outside what derivation
-produces, and calling them "not part of the model body" excuses rather than
-solves it.
+Compass models the serving flow, not the model body, so the runner's own work —
+batch-metadata preparation, the LM head, sampling, the transfer home — is inside
+the scope, not outside it. Calling those operators "not part of the model body"
+excused the gap rather than closing it.
 
-The fix is to derive through the runner rather than through a bare model call,
-which needs meta-aware KV allocation — `get_num_blocks` probes real VRAM, and a
-meta model with a real KV cache would mix devices. Once derivation goes through
-the same path as capture, the check becomes equality and the containment
-allowance can be removed.
+The route that closes it is not a meta runner. It is capture under simulated TP:
+the runner runs for real, so every operator it performs is recorded, while
+`--fake-eplb` makes one device stand in for a TP-N deployment. A TP2 capture on
+a single GPU produces **451** operators against **448** for the real two-GPU
+capture, including all 57 all-reduces and every runner operator.
+
+One fix was needed to get there, the same one derivation needed: simulated TP
+replaces `all_reduce` with a passthrough at a physical width of one, so a graph
+captured on a single device showed no communication whatsoever. Collectives are
+now recorded in the capture path too — a no-op on a real multi-device run, where
+the collective dispatches and is recorded once already.
+
+The residual seven operators are simulated TP's own `all_gather`, which builds a
+zero-padded buffer (`movedim`, `reshape`, `view`, `zeros`) where the real path
+uses `view.dtype`. That is the module's documented behaviour for absent ranks
+rather than a tracing gap, and it is bookkeeping either way.
+
+What this leaves is a division of labour worth stating plainly. **Capture** on
+one device gives the complete step for any symmetric TP width, and is what a
+cost model should be fitted against. **Derivation** on meta gives the model body
+with no device at all, is roughly a thousand times faster, and is what a sweep
+should use once the two are known to agree.
+
+Still open: derivation does not produce the runner's operators, so the
+derivation-vs-capture check remains containment rather than equality. Since
+capture now covers the configurations a sweep would want, this is a performance
+question rather than a coverage one.
 
 A smaller instance of the same gap: on hardware a custom op both dispatches and
-launches its inner Triton kernel, so the capture records `aiter::masked_embedding`
-*and* `triton::_masked_embedding_kernel`. On meta only the outer operator is
-recorded, since the kernel never launches.
+launches its inner Triton kernel, so the capture records
+`aiter::masked_embedding` *and* `triton::_masked_embedding_kernel`. On meta only
+the outer operator is recorded, since the kernel never launches.
 
 ## Open: predict mode has only been validated without CUDA graphs
 

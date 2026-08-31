@@ -113,6 +113,7 @@ class CompassModelRunner(ModelRunner):
         recording that yields tens of thousands of launches that steady-state
         serving never performs. Which step to take is ``trace_step``.
         """
+        from atom.compass.runtime.derive import record_collectives
         from atom.compass.runtime.meta import MetaOpTracer
         from atom.compass.runtime.triton_trace import TritonLaunchTracer
 
@@ -122,8 +123,13 @@ class CompassModelRunner(ModelRunner):
 
         ops = MetaOpTracer(graph=self._graph, topology=self._topology())
         triton = TritonLaunchTracer(graph=self._graph)
+        # Under simulated TP the collective is replaced by a passthrough, so it
+        # never dispatches and never gets recorded — a TP graph captured on one
+        # device would show no communication at all. A no-op on a real
+        # multi-device run, where the collective dispatches and is recorded once.
+        collectives = record_collectives(self._graph)
         try:
-            with triton, ops:
+            with collectives, triton, ops:
                 output = super().forward(batch)
         except BaseException:
             # Deliberately do not write a graph here. A forward that died
