@@ -47,6 +47,9 @@ class CompassModelRunner(ModelRunner):
         self._graph = OpGraph()
         self._traced_steps = 0
         self._step_index = 0
+        self._measured_steps = 0
+        self._measured_by_kind: dict = {}
+        self._measure_fh = None
         logger.info(
             "ATOMCompass active: mode=%s oracle=%s",
             self._compass_config.mode,
@@ -76,6 +79,8 @@ class CompassModelRunner(ModelRunner):
         """Predict the step, or trace it, depending on the configured mode."""
         if self._compass_config.mode == "trace":
             return self._forward_traced(batch)
+        if self._compass_config.mode == "measure":
+            return self._forward_measured(batch)
 
         shape = self._describe(batch)
         cost = self._oracle.estimate(shape)
@@ -98,6 +103,87 @@ class CompassModelRunner(ModelRunner):
             draft_token_ids=None,
             compass_step_seconds=cost.seconds,
         )
+
+    def _forward_measured(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
+        """Run the real forward and record how long it took.
+
+        This is the training data for a calibrated oracle, so what is recorded
+        has to be the same description the oracle will later be asked to predict
+        from — hence ``StepShape``, unreduced, rather than a summary. Reducing
+        here and expecting the oracle to cope later is how a cost model ends up
+        fitted to a feature it will never see again.
+
+        Timing brackets a device synchronise on both sides. ATOM's forward
+        returns once the work is enqueued, so timing it directly measures how
+        long it took to submit, which is not what anybody wants to predict.
+
+        The first steps are timed and discarded: Triton autotunes on a kernel's
+        first launch and the allocator is still growing, so an oracle fitted to
+        them describes a machine nobody runs.
+        """
+        import time
+
+        import torch
+
+        sync = torch.cuda.synchronize if torch.cuda.is_available() else lambda: None
+        shape = self._describe(batch)
+
+        sync()
+        start = time.perf_counter()
+        output = super().forward(batch)
+        sync()
+        seconds = time.perf_counter() - start
+
+        # Counted per kind, not overall. Prefill happens at the very start of a
+        # run, so a warmup counted in total steps discards every prefill sample
+        # there is -- the oracle then has nothing to fit, predicts zero, and
+        # TTFT comes out as 0 ms against a real 7.6 s. Both kinds autotune on
+        # their own first launch, so per-kind counting still excludes what the
+        # warmup exists to exclude.
+        kind = "prefill" if shape.is_prefill else "decode"
+        self._measured_steps += 1
+        seen = self._measured_by_kind.get(kind, 0) + 1
+        self._measured_by_kind[kind] = seen
+        if seen > self._compass_config.measure_warmup_steps:
+            self._record_measurement(shape, seconds)
+        return output
+
+    def _record_measurement(self, shape: StepShape, seconds: float) -> None:
+        """Append one timed step to the table.
+
+        Appended and flushed per step rather than collected and written at exit.
+        There is no shutdown hook on the runner to flush from, and a table that
+        only exists if the process ends cleanly is a table that goes missing
+        exactly when a run was interesting. A partial file is honest here in a
+        way a partial op graph is not: every row in it is a step that really
+        happened and was really timed.
+        """
+        path = self._compass_config.measure_out
+        if not path:
+            return
+        import json
+
+        if self._measure_fh is None:
+            if any(size > 1 for size in self._topology().values()):
+                path = self._rank_path(path, self._rank_coords())
+            try:
+                self._measure_fh = open(path, "w", encoding="utf-8")
+            except OSError as exc:
+                logger.warning("ATOMCompass: could not open %s for timings: %s",
+                               path, exc)
+                self._compass_config.measure_out = None
+                return
+            logger.info("ATOMCompass: writing step timings to %s", path)
+
+        self._measure_fh.write(json.dumps({
+            "seconds": seconds,
+            "num_scheduled_tokens": list(shape.num_scheduled_tokens),
+            "context_lens": list(shape.context_lens),
+            "num_prefill_tokens": shape.num_prefill_tokens,
+            "topology": dict(shape.topology),
+            "rank_coords": dict(shape.rank_coords),
+        }) + "\n")
+        self._measure_fh.flush()
 
     def _forward_traced(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
         """Run the real forward and record the operations it performed.

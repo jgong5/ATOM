@@ -51,8 +51,11 @@ class EngineArgs:
     enforce_eager: bool = False
     compass: bool = False
     compass_oracle: str = ""
+    compass_oracle_option: list = None
     compass_mode: str = "predict"
     compass_graph_out: str = ""
+    compass_measure_out: str = ""
+    compass_measure_warmup_steps: int = 0
     enable_prefix_caching: bool = True
     port: int = 8006
     kv_cache_dtype: str = "bf16"
@@ -128,16 +131,43 @@ class EngineArgs:
             "--compass-mode",
             type=str,
             default="predict",
-            choices=["predict", "trace"],
+            choices=["predict", "trace", "measure"],
             help="predict: replace the forward pass with a cost estimate. "
             "trace: run the real forward and record the operators it performed, "
-            "writing the graph to --compass-graph-out.",
+            "writing the graph to --compass-graph-out. "
+            "measure: run the real forward and record how long it took, "
+            "writing timings to --compass-measure-out.",
         )
         parser.add_argument(
             "--compass-graph-out",
             type=str,
             default="",
             help="Where --compass-mode=trace writes the recorded op graph.",
+        )
+        parser.add_argument(
+            "--compass-measure-out",
+            type=str,
+            default="",
+            help="Where --compass-mode=measure writes per-step timings, which "
+            "are what a calibrated oracle is fitted to.",
+        )
+        parser.add_argument(
+            "--compass-measure-warmup-steps",
+            type=int,
+            default=0,
+            help="Steps of each kind (prefill, decode) to time and discard. "
+            "One is usually right: it drops the launch that pays for Triton "
+            "autotuning. Larger values risk discarding every prefill sample a "
+            "workload produces, since prefill steps are rare.",
+        )
+        parser.add_argument(
+            "--compass-oracle-option",
+            type=str,
+            action="append",
+            default=[],
+            metavar="KEY=VALUE",
+            help="Constructor argument for the cost oracle. Repeatable, e.g. "
+            "--compass-oracle-option table=steps.jsonl.",
         )
         parser.add_argument(
             "--compass-oracle",
@@ -679,13 +709,35 @@ class EngineArgs:
         kwargs["kv_cache_block_size"] = kwargs.pop("block_size")
         compass_enabled = kwargs.pop("compass", False)
         compass_oracle = kwargs.pop("compass_oracle", "")
+        compass_oracle_option = kwargs.pop("compass_oracle_option", None) or []
         compass_mode = kwargs.pop("compass_mode", "predict")
         compass_graph_out = kwargs.pop("compass_graph_out", "")
+        compass_measure_out = kwargs.pop("compass_measure_out", "")
+        compass_measure_warmup = kwargs.pop("compass_measure_warmup_steps", 0)
         compass_kwargs = {"enabled": compass_enabled, "mode": compass_mode}
         if compass_oracle:
             compass_kwargs["oracle_qualname"] = compass_oracle
         if compass_graph_out:
             compass_kwargs["graph_out"] = compass_graph_out
+        if compass_measure_out:
+            compass_kwargs["measure_out"] = compass_measure_out
+        if compass_measure_warmup:
+            compass_kwargs["measure_warmup_steps"] = compass_measure_warmup
+        if compass_oracle_option:
+            # Values arrive as strings from the command line. Numbers are
+            # converted so an oracle can declare a float parameter and get one;
+            # anything else stays a string, which is what paths need.
+            options = {}
+            for item in compass_oracle_option:
+                key, _, value = item.partition("=")
+                try:
+                    options[key] = int(value)
+                except ValueError:
+                    try:
+                        options[key] = float(value)
+                    except ValueError:
+                        options[key] = value
+            compass_kwargs["oracle_options"] = options
         kwargs["compass_config"] = CompassConfig(**compass_kwargs)
         kwargs["compilation_config"] = CompilationConfig(
             level=kwargs.pop("level"),

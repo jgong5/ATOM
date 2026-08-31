@@ -16,11 +16,24 @@ class CompassConfig:
         enabled: Master switch. When false the runner behaves as stock ATOM.
         mode: ``"predict"`` replaces the forward pass with a cost estimate.
             ``"trace"`` performs the real forward and records what it did,
-            which is how a reference op graph is obtained. Tracing is
-            deliberately not free: it exists to produce artifacts, not to serve.
+            which is how a reference op graph is obtained. ``"measure"`` also
+            performs the real forward but records how long it took, which is
+            what a calibrated oracle is fitted to. Neither trace nor measure is
+            free: they exist to produce artifacts, not to serve.
         graph_out: Where a traced graph is written. The runner is a separate
             process from the engine, so the graph leaves via the filesystem
             rather than a return value.
+        measure_out: Where measured step timings are written, one JSON row per
+            step. Separate from ``graph_out`` because the two artifacts answer
+            different questions and are produced by different runs.
+        measure_warmup_steps: Steps of each kind to time but discard. Defaults
+            to zero, because discarding by step count is a bad way to exclude
+            warmup: prefill happens a handful of times in a whole run, so any
+            non-zero value here can consume every prefill sample there is,
+            leaving an oracle with nothing to fit and a TTFT prediction of zero.
+            Exclude Triton autotuning with throwaway *requests* instead — see
+            ``--warmup-prompts`` in ``scripts/compass_run.py`` — which drops the
+            expensive first launches without discarding a whole category.
         trace_step: Which forward to record, counting from one. Not the first:
             Triton autotunes on a kernel's first launch, benchmarking every
             candidate configuration, so an initial step records tens of
@@ -43,6 +56,8 @@ class CompassConfig:
     epoch: Optional[float] = None
     mode: str = "predict"
     graph_out: Optional[str] = None
+    measure_out: Optional[str] = None
+    measure_warmup_steps: int = 0
     trace_step: int = 2
     oracle_qualname: str = "atom.compass.core.cost.constant.ConstantCostOracle"
     oracle_options: Optional[dict] = None
@@ -62,11 +77,26 @@ class CompassConfig:
             self.oracle_options = {}
         if self.filler_token_id < 0:
             raise ValueError(f"filler_token_id must be >= 0, got {self.filler_token_id}")
-        if self.mode not in ("predict", "trace"):
+        if self.mode not in ("predict", "trace", "measure"):
             raise ValueError(
-                f"mode must be 'predict' or 'trace', got {self.mode!r}"
+                f"mode must be 'predict', 'trace' or 'measure', got {self.mode!r}"
             )
         if self.mode == "trace" and not self.graph_out:
             raise ValueError("mode='trace' needs graph_out to write the graph to")
+        if self.mode == "measure" and not self.measure_out:
+            raise ValueError(
+                "mode='measure' needs measure_out to write the timings to"
+            )
+        if self.mode != "predict" and self.virtual_clock:
+            # trace and measure perform the real forward, so the wall clock is
+            # the truthful one. Leaving the virtual clock installed makes a real
+            # run report the timings of a simulation that never ran: every
+            # request comes back with a TTFT of zero, which reads as a broken
+            # measurement rather than a misconfigured clock.
+            self.virtual_clock = False
+        if self.measure_warmup_steps < 0:
+            raise ValueError(
+                f"measure_warmup_steps must be >= 0, got {self.measure_warmup_steps}"
+            )
         if self.trace_step < 1:
             raise ValueError(f"trace_step counts from one, got {self.trace_step}")

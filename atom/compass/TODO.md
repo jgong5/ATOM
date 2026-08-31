@@ -1,5 +1,7 @@
 # ATOMCompass — open problems
 
+**Ranked #1: A1, the CUDA-graph gap — an 8.9x error on decode, measured.**
+
 The target is to simulate ATOM **as it is deployed**: compilation on
 (`--level 3`), CUDA graphs on, prefix caching on, chunked prefill on. Anything
 that only works with `--enforce-eager` or `--level 0` is a step towards that,
@@ -15,25 +17,35 @@ See `DESIGN_NOTES.md` for what is settled and why.
 
 ## A. The graph does not yet match a production launch
 
-### A1. CUDA-graph replay is never observed — **M**
+### A1. CUDA-graph replay is never observed — **M** — *measured at 8.9x*
 
-Trace mode stubs `capture_cudagraph`, so a traced run executes eagerly even when
-CUDA graphs are enabled. The default configuration replays a captured graph
-instead, and the whole reason it exists is to remove per-launch overhead.
+**The top-priority problem, and now with a number attached.**
 
-So the op graph is faithful about *what* runs and silently wrong about *how* it
-is launched. A cost model fitted to eager traces will overstate a replayed
-step's launch cost, and the error grows as the batch gets smaller — which is
-exactly the decode regime the 5x speed goal lives in.
+Trace and measure mode both stub `capture_cudagraph`, so a Compass run executes
+eagerly even when CUDA graphs are enabled. The default configuration replays a
+captured graph, and the whole reason it exists is to remove per-launch overhead.
 
-Worth noting the shape of the problem: a replay is one opaque submission, so
-tracing it operator by operator is not possible even in principle. The graph has
-to come from the capture phase, and the *cost* has to account for replay
-separately.
+Measured on Qwen3-0.6B, decode, TP=1:
 
-Settles it: trace during `capture_cudagraph` rather than during a steady-state
-step, and measure replay overhead against eager for the same batch so the oracle
-can carry the difference as a term.
+| configuration | TPOT |
+| --- | --- |
+| default (CUDA graphs on) | **3.24 ms** |
+| `--enforce-eager` | **28.78 ms** |
+
+**8.9x.** So a cost model calibrated through measure mode is fitted to a machine
+running nine times slower than the deployment it is meant to predict. End to end
+that showed up as a TPOT error of +800% — while the oracle itself reproduced the
+steps it was calibrated on to within about 1%. The model was right; the
+configuration it was calibrated against was wrong.
+
+This is also why a replay cannot simply be traced: it is one opaque submission,
+so there are no per-operator events to record even in principle. The operators
+have to come from the capture phase, and the replay's cost has to be carried as
+a separate term the oracle applies.
+
+Settles it: let measure mode capture CUDA graphs like a normal run, so timings
+come from the replayed path; and for trace mode, record during
+`capture_cudagraph` rather than during a steady-state step.
 
 ### A2. Derivation is uncompiled; production is not — **L**
 
@@ -160,6 +172,59 @@ claimed so far is structural: graphs matching graphs, not time matching time.
 
 ---
 
+## F. Found while closing the loop
+
+Building the first end-to-end comparison surfaced these. Most are fixed; the
+ones that are not are the interesting ones.
+
+### F1. No way to tell the runner when to start measuring — **M**
+
+`--warmup-prompts` served throwaway requests to get Triton autotuning out of
+the way, and the runner measured them anyway, because a runner sees steps and
+has no idea which request a step belongs to or that some of them were meant to
+be ignored. The result was a 7.5 s prefill sample sitting in a table next to a
+0.03 s one, and a cost model that split the difference.
+
+Worked around by discarding the first step of each kind, which is blunt: it
+drops a real sample when the workload has few, and keeps warmup steps when it
+has many. What is missing is a measurement window the engine can open and close
+across the process boundary — the same gap that makes it hard to calibrate one
+phase of a deployment without the others polluting the table.
+
+### F2. Prefill samples are scarce by nature — **S**, mitigated
+
+A fixed workload prefills everything in one or two steps, so a table from it
+holds two prefill rows and cannot support fitting three coefficients. Fixed by
+calibrating on a sweep of prompt lengths and batch sizes rather than on the
+evaluation workload — which also means the reported error is a generalisation
+error rather than a fit residual.
+
+Still thin for long contexts: nothing in the sweep goes beyond a few thousand
+tokens, and that is where attention stops being cheap.
+
+### F3. Warmup counted in steps destroys the data it was meant to protect —
+fixed
+
+`measure_warmup_steps` defaulted to 2 and prefill happens twice in a whole run,
+so it discarded every prefill sample. The oracle then had nothing to fit, fell
+back to a mean of zero samples, and predicted a TTFT of 0 ms against a real
+7.6 s. Now counted per kind and defaulting to zero.
+
+### F4. An oracle asked outside its evidence must refuse — fixed
+
+The fallback for "no samples of this kind" was the mean of an empty list, which
+is zero: a confident, precise, entirely fictional answer, and exactly the class
+of failure this project keeps meeting. It raises now.
+
+### F5. A real run under a virtual clock reports zeros — fixed
+
+`measure` and `trace` perform the real forward, so the wall clock is the
+truthful one, but the virtual clock was installed for any Compass run. Every
+request came back with a TTFT of zero, which reads as a broken measurement
+rather than a misconfigured clock. Real modes now keep the real clock.
+
+---
+
 ## E. Process notes worth keeping
 
 * Every defect in this project so far surfaced by running something, never by
@@ -171,3 +236,6 @@ claimed so far is structural: graphs matching graphs, not time matching time.
   one GPU) reads as validation and is not. Three separate bugs hid behind that.
 * For a tool whose output is an artifact, a plausible artifact from a broken run
   is worse than a crash.
+* Structural validation cannot rank its own findings. Nothing in this file had a
+  defensible priority until something predicted time and was wrong by a
+  measurable amount.
