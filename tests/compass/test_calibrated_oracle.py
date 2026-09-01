@@ -225,14 +225,17 @@ class TestEventDraining:
         stub._measured_steps = 0
         stub._measured_by_kind = {}
         stub._written = []
-        stub._record_measurement = lambda shape, seconds: stub._written.append(
-            (shape, seconds)
+        stub._record_measurement = (
+            lambda shape, seconds, gap=None: stub._written.append(
+                (shape, seconds, gap)
+            )
         )
         return stub
 
     def test_an_unfinished_step_is_not_written_yet(self):
         stub = self._runner()
-        stub._pending.append((decode(), self.FakeEvent(), self.FakeEvent(ready=False)))
+        stub._pending.append(
+            (decode(), self.FakeEvent(), self.FakeEvent(ready=False), None))
         stub._drain_pending()
         assert stub._written == []
         assert len(stub._pending) == 1
@@ -241,21 +244,24 @@ class TestEventDraining:
         stub = self._runner()
         for ms in (2.0, 4.0, 8.0):
             stub._pending.append(
-                (decode(), self.FakeEvent(), self.FakeEvent(ms=ms))
+                (decode(), self.FakeEvent(), self.FakeEvent(ms=ms), None)
             )
         stub._drain_pending()
-        assert [s for _, s in stub._written] == [0.002, 0.004, 0.008]
+        assert [s for _, s, _g in stub._written] == [0.002, 0.004, 0.008]
         assert not stub._pending
 
     def test_draining_stops_at_the_first_unfinished_step(self):
         """Order matters: a later step must not be written before an earlier
         one, or the table's rows stop corresponding to the run's sequence."""
         stub = self._runner()
-        stub._pending.append((decode(), self.FakeEvent(), self.FakeEvent(ms=2.0)))
-        stub._pending.append((decode(), self.FakeEvent(), self.FakeEvent(ready=False)))
-        stub._pending.append((decode(), self.FakeEvent(), self.FakeEvent(ms=8.0)))
+        stub._pending.append(
+            (decode(), self.FakeEvent(), self.FakeEvent(ms=2.0), None))
+        stub._pending.append(
+            (decode(), self.FakeEvent(), self.FakeEvent(ready=False), None))
+        stub._pending.append(
+            (decode(), self.FakeEvent(), self.FakeEvent(ms=8.0), None))
         stub._drain_pending()
-        assert [s for _, s in stub._written] == [0.002]
+        assert [s for _, s, _g in stub._written] == [0.002]
         assert len(stub._pending) == 2
 
     def test_warmup_is_counted_per_kind(self):
@@ -272,7 +278,7 @@ class TestEventDraining:
         stub._count_and_record(decode(), 0.001)       # first decode: dropped
         stub._count_and_record(prefill(256), 0.05)    # kept
         stub._count_and_record(decode(), 0.002)       # kept
-        assert [s for _, s in stub._written] == [0.05, 0.002]
+        assert [s for _, s, _g in stub._written] == [0.05, 0.002]
 
 
 class TestEmpiricalOracle:

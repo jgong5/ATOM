@@ -54,6 +54,15 @@ class CompassModelRunner(ModelRunner):
         import collections as _collections
 
         self._pending = _collections.deque()
+        # When the previous forward returned, on the wall clock. The wall time
+        # between one forward returning and the next starting is everything the
+        # engine does that is not a forward -- scheduling, block accounting,
+        # sampling, routing output, crossing the process boundary. A simulated
+        # run advances its clock by predicted forward durations alone, so that
+        # time does not exist, and a quarter of TTFT was found to live in it.
+        # Measured rather than inferred by subtraction, which cannot tell a
+        # scheduler gap from a mis-measured forward.
+        self._last_forward_ended: Optional[float] = None
         logger.info(
             "ATOMCompass active: mode=%s oracle=%s",
             self._compass_config.mode,
@@ -190,15 +199,22 @@ class CompassModelRunner(ModelRunner):
 
             began = time.perf_counter()
             output = super().forward(batch)
-            self._count_and_record(shape, time.perf_counter() - began)
+            self._count_and_record(shape, time.perf_counter() - began, None)
             return output
+
+        import time
+
+        entered = time.perf_counter()
+        gap = (entered - self._last_forward_ended
+               if self._last_forward_ended is not None else None)
 
         began = torch.cuda.Event(enable_timing=True)
         ended = torch.cuda.Event(enable_timing=True)
         began.record()
         output = super().forward(batch)
         ended.record()
-        self._pending.append((shape, began, ended))
+        self._last_forward_ended = time.perf_counter()
+        self._pending.append((shape, began, ended, gap))
         self._drain_pending()
         return output
 
@@ -210,13 +226,14 @@ class CompassModelRunner(ModelRunner):
         anyway, never by waiting for it.
         """
         while self._pending:
-            shape, began, ended = self._pending[0]
+            shape, began, ended, gap = self._pending[0]
             if not ended.query():
                 return
             self._pending.popleft()
-            self._count_and_record(shape, began.elapsed_time(ended) / 1000.0)
+            self._count_and_record(shape, began.elapsed_time(ended) / 1000.0, gap)
 
-    def _count_and_record(self, shape: StepShape, seconds: float) -> None:
+    def _count_and_record(self, shape: StepShape, seconds: float,
+                          gap: Optional[float] = None) -> None:
         kind = "prefill" if shape.is_prefill else "decode"
         seen = self._measured_by_kind.get(kind, 0) + 1
         self._measured_by_kind[kind] = seen
@@ -225,9 +242,10 @@ class CompassModelRunner(ModelRunner):
         # whole run, so a warmup counted in total steps discards every prefill
         # sample there is.
         if seen > self._compass_config.measure_warmup_steps:
-            self._record_measurement(shape, seconds)
+            self._record_measurement(shape, seconds, gap)
 
-    def _record_measurement(self, shape: StepShape, seconds: float) -> None:
+    def _record_measurement(self, shape: StepShape, seconds: float,
+                            gap: Optional[float] = None) -> None:
         """Append one timed step to the table.
 
         Appended and flushed per step rather than collected and written at exit.
@@ -262,6 +280,11 @@ class CompassModelRunner(ModelRunner):
             "topology": dict(shape.topology),
             "rank_coords": dict(shape.rank_coords),
             "capture_bucket": shape.capture_bucket,
+            # Wall seconds between the previous forward returning and this one
+            # starting: the engine's own work, which a simulated run does not
+            # advance its clock for. None on the first step of a process, where
+            # there is no previous forward to measure from.
+            "gap_seconds": gap,
         }) + "\n")
         self._measure_fh.flush()
 
