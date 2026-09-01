@@ -33,19 +33,25 @@ command at TP=1, at roughly 6× wall clock:
 | 5 | −0.5% | +2.4% | +1.4% |
 | **mean ± sd** | **−9.9 ± 6.4** | **−2.4 ± 3.2** | **−5.2 ± 4.3** |
 
-Since then, decode fitted per CUDA-graph rung and every fit moved to relative
-error (items 2 and 10), over three repeats:
+Since then: decode fitted per CUDA-graph rung, every fit moved to relative error,
+and admission time modelled (items 2, 3 and 11). Three repeats each:
 
 | | TTFT | TPOT | latency |
 | --- | --- | --- | --- |
-| mean ± sd | −20.7 ± 4.5 | **−0.4 ± 4.1** | −8.0 ± 1.7 |
+| before any of it | −9.9 ± 6.4 | −2.4 ± 3.2 | −5.2 ± 4.3 |
+| rungs + relative fit | −20.7 ± 4.5 | −0.4 ± 4.1 | −8.0 ± 1.7 |
+| **+ admission (13 ms)** | **+2.0 ± 7.0** | **−1.0 ± 3.3** | **+0.0 ± 1.8** |
 
-TPOT is the metric decode governs and it is now centred on zero, inside its own
-noise. TTFT is worse, and not because anything about prefill got worse: prefill
-prediction improved from +18.3% to +3.9% at the shape this workload actually
-uses. A quarter of TTFT is spent outside any forward and Compass does not model
-it; the old fit's over-prediction had been covering the gap. See "A quarter of
-TTFT happens outside any forward".
+All three are now **inside the noise** — the harness says so itself, because the
+spread across repeats exceeds the error. That is the point at which further
+modelling stops being measurable on this workload, and it is the honest ceiling
+for a single-GPU 0.6B model on a shared machine.
+
+The middle row is worth keeping. TTFT looked worse there, and not because prefill
+got worse — prefill improved from +18.3% to +3.9% at the shape this workload
+actually uses. Correcting the fit removed an over-prediction that had been paying
+for the admission cost, and made the missing term visible. See "A quarter of TTFT
+happens outside any forward".
 
 Reproduce with `scripts/compass/validate.py`.
 
