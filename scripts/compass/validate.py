@@ -141,10 +141,16 @@ def _one_pass(args, work: Path) -> tuple[list[dict], dict, dict, str]:
     _run(common + ["--out", str(real_out)])
 
     print("  phase 3/4  running it again, modelled ...", flush=True)
-    _run(common + ["--out", str(modelled_out), "--compass",
-                   "--compass-oracle",
-                   "atom.compass.core.cost.calibrated.CalibratedCostOracle",
-                   "--compass-oracle-option", f"table={table}"])
+    modelled_cmd = common + [
+        "--out", str(modelled_out), "--compass",
+        "--compass-oracle",
+        "atom.compass.core.cost.calibrated.CalibratedCostOracle",
+        "--compass-oracle-option", f"table={table}",
+    ]
+    if args.admission_seconds:
+        modelled_cmd += ["--compass-admission-seconds",
+                         str(args.admission_seconds)]
+    _run(modelled_cmd)
 
     print("  phase 4/4  comparing", flush=True)
     real = json.loads(real_out.read_text())
@@ -174,6 +180,18 @@ def main() -> int:
     ap.add_argument("--workdir", default="compass_artifacts")
     ap.add_argument("--python", default=sys.executable)
     ap.add_argument(
+        "--admission-seconds", type=float, default=0.0,
+        help="Seconds a request takes to become schedulable, passed to the "
+             "modelled run. A simulated engine advances its clock by predicted "
+             "forward durations, so the two process hops between preprocess and "
+             "a worker cost nothing -- which is the whole of a -20%% TTFT error "
+             "and nothing to do with the cost model. Measure it: run the "
+             "workload under --compass-mode=measure and take mean TTFT minus "
+             "the prefill step that produced the first token. It is specific to "
+             "the entry path, so the offline number (~13ms here) is not the "
+             "serving one (~9ms). Default 0 leaves it unmodelled.",
+    )
+    ap.add_argument(
         "--repeats", type=int, default=1,
         help="Repeat the whole pipeline this many times and report a spread. "
              "One run cannot distinguish an improvement from a lucky draw: "
@@ -202,6 +220,9 @@ def main() -> int:
           f"{args.prompt_tokens} prompt tokens, {args.max_tokens} output tokens")
     print(f"  steps fitted: {fitted}")
     print(f"  repeats    : {args.repeats}")
+    print(f"  admission  : {args.admission_seconds*1000:.1f}ms"
+          + ("" if args.admission_seconds else
+             "  (unmodelled -- TTFT will read short by roughly this much)"))
     print()
 
     if args.repeats == 1:

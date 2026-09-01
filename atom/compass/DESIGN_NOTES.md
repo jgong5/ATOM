@@ -558,8 +558,31 @@ fails:
 Narrower than it first appeared: Qwen3-0.6B takes the **ASM** decode path, which
 ships as a prebuilt `.co`, so it captures without touching the failing build. One
 kernel path, not capture as a mechanism — which is why validation was possible on
-a smaller model while the stated target model stays blocked. Needs the `make`
-stderr captured to tell a toolchain problem from an image defect.
+a smaller model while the stated target model stayed blocked.
+
+**Diagnosed: it is an image defect, and the fix is one package.** The `make`
+stderr had never been looked at, because `aiter` passes
+`capture_output=AITER_LOG_MORE < 2` and nobody had set that to 2. Running the
+leftover build by hand shows it:
+
+    clang++: warning: ... '/usr/lib/gcc/x86_64-linux-gnu/13' would be chosen
+                          over '/usr/lib/gcc/x86_64-linux-gnu/14'
+    error: "Could not find standard C++ header 'cmath'..."
+    fatal error: 'cstdlib' file not found
+
+`/usr/include/c++/` holds only `13`. The image has gcc-14's runtime directory
+(`crtbegin.o` and friends) but not its C++ headers, and ROCm 7.2.4's clang prefers
+the highest version it finds. So every JIT build of a C++ kernel fails, while
+everything prebuilt is unaffected — which is exactly the observed split.
+
+Verified: adding `--gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/13` compiles
+the failing translation unit cleanly, exit 0. `libstdc++-14-dev` is installable
+from the configured apt sources and would fix it at the root, since clang's own
+preference then finds headers where it looks.
+
+Not applied — it changes the shared container rather than this repository, and
+the container's writable layer does not survive a teardown, so it belongs in
+`gpu_docker`'s setup rather than in an ad-hoc `apt install`.
 
 ## Measurement and performance
 
@@ -1198,6 +1221,12 @@ the sum is what the hardware actually moves.
 * The thing that finally measured the noise was running the same command five
   times, which cost twenty minutes and nothing else. It was not done earlier
   because each individual run had always looked reasonable.
+* Every engine start calls the HuggingFace API to resolve the repo, even with
+  the weights already in the local cache. A day of runs plus one attempt at a
+  27B download exhausted the shared IP's quota, and the next validation died at
+  engine init with `429 Too Many Requests` — surfaced, of course, as the engine
+  manager reporting a DP-rank shutdown. `HF_HUB_OFFLINE=1` avoids it entirely
+  and should be the default for any repeated run.
 * Adding evidence can make a model worse somewhere else. Widening a sweep to
   cover decode rungs degraded prefill by 4 points, because an unweighted fit is
   a weighted average whose weights are the sample values. Nothing was removed

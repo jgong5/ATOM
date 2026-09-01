@@ -1,6 +1,6 @@
 # Defects in ATOM found while building Compass
 
-Bugs in the **engine**, not in Compass. Collected here because a simulator is an
+Bugs in the **engine and the image it ships in**, not in Compass. Collected here because a simulator is an
 unusually harsh reader of an engine: it runs the runner in configurations nobody
 runs by hand, on a clock that does not tick the way the code assumes, and it
 compares the engine against itself.
@@ -115,7 +115,43 @@ what Compass should be reaching into. Compass mitigates it only where it owns th
 message: its own errors now name the file, the rank and the remedy, on the
 assumption that the surrounding report will be misleading.
 
-### 5. Serving computes no per-request latency at all
+### 5. The container cannot JIT-build any C++ kernel
+
+Not ATOM's code, but ATOM's shipped environment, and it blocks the model this
+project exists to simulate. `rocm/atom-dev:vllm-latest` has gcc-14's runtime
+directory (`/usr/lib/gcc/x86_64-linux-gnu/14`, holding `crtbegin.o` and friends)
+but no gcc-14 C++ headers — `/usr/include/c++/` contains only `13`. ROCm 7.2.4's
+clang prefers the highest version directory it finds, so:
+
+    error: "Could not find standard C++ header 'cmath'..."
+    fatal error: 'cstdlib' file not found
+    2 errors generated when compiling for gfx942
+
+Everything prebuilt is unaffected, which is why Qwen3-0.6B runs: it takes the ASM
+paged-attention path, which ships as a `.co`. Qwen3.8-27B takes the *gluon* path,
+which JIT-builds, and dies at engine init.
+
+**Cost:** the target model cannot be loaded. Any AITER kernel needing a JIT C++
+build is unavailable in this image.
+
+**How it stayed unknown:** `aiter` runs the build with
+`capture_output=AITER_LOG_MORE < 2`, so the compiler's output is discarded unless
+that environment variable is set to 2. What surfaces is
+`CalledProcessError: Command '['make', 'build', '-j1']' returned non-zero exit
+status 2`, which says nothing about headers, and then defect 4 turns *that* into
+a report about a DP rank shutting down during initialization. Three layers, each
+discarding the one below.
+
+**Fix:** `libstdc++-14-dev` is installable from the configured apt sources, and
+adding it puts headers where clang already looks. Verified the mechanism by
+compiling the failing translation unit with
+`--gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/13`: exit 0.
+
+Not applied here. It changes the shared container rather than this repository,
+and the writable layer does not survive `teardown.sh`, so it belongs in the
+image or in `gpu_docker`'s setup script rather than in an ad-hoc install.
+
+### 6. Serving computes no per-request latency at all
 
 `LLMEngine.postprocess` derives per-request TTFT, TPOT and latency from
 `arrive_time` / `first_token_time` / `finish_time`, and is reached only from the
@@ -145,7 +181,7 @@ runs on the wall clock, so neither is visible without a virtual one. They are
 listed because they are wrong in ATOM's code rather than Compass's, and because
 a future reader changing that code should know why it looks the way it does.
 
-### 6. `first_token_time` stamped off the wall clock at one of three sites
+### 7. `first_token_time` stamped off the wall clock at one of three sites
 
 `atom/model_engine/scheduler.py` stamps `seq.first_token_time` in three places.
 Two went through `get_clock().time()`; the third — on the speculative-decode
@@ -156,7 +192,7 @@ Fixed in commit `0e2f880f`. A test walks the AST of `scheduler.py` and fails if
 any assignment to `first_token_time`, `finish_time` or `arrive_time` is sourced
 from the `time` module again.
 
-### 7. `finish_time` stamped after the output that should carry it
+### 8. `finish_time` stamped after the output that should carry it
 
 The finishing `RequestOutput` was constructed at `scheduler.py:2732` and
 `seq.finish_time` assigned at `:2759` — after it. The offline path re-reads the
