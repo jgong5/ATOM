@@ -57,6 +57,7 @@ class EngineArgs:
     compass_measure_out: str = ""
     compass_measure_warmup_steps: int = 0
     compass_admission_seconds: float = 0.0
+    compass_op_timings_out: str = ""
     enable_prefix_caching: bool = True
     port: int = 8006
     kv_cache_dtype: str = "bf16"
@@ -160,6 +161,15 @@ class EngineArgs:
             "One is usually right: it drops the launch that pays for Triton "
             "autotuning. Larger values risk discarding every prefill sample a "
             "workload produces, since prefill steps are rare.",
+        )
+        parser.add_argument(
+            "--compass-op-timings-out",
+            type=str,
+            default="",
+            help="Where a traced step writes how long each operator took. Only "
+            "meaningful with --compass-mode=trace, which runs eagerly: a "
+            "replayed CUDA graph is one submission with nothing to observe "
+            "inside it, so these are eager times and not production costs.",
         )
         parser.add_argument(
             "--compass-admission-seconds",
@@ -728,6 +738,7 @@ class EngineArgs:
         compass_measure_out = kwargs.pop("compass_measure_out", "")
         compass_measure_warmup = kwargs.pop("compass_measure_warmup_steps", 0)
         compass_admission = kwargs.pop("compass_admission_seconds", 0.0)
+        compass_op_timings = kwargs.pop("compass_op_timings_out", "")
         compass_kwargs = {"enabled": compass_enabled, "mode": compass_mode}
         if compass_oracle:
             compass_kwargs["oracle_qualname"] = compass_oracle
@@ -739,6 +750,8 @@ class EngineArgs:
             compass_kwargs["measure_warmup_steps"] = compass_measure_warmup
         if compass_admission:
             compass_kwargs["admission_seconds"] = compass_admission
+        if compass_op_timings:
+            compass_kwargs["op_timings_out"] = compass_op_timings
         if compass_oracle_option:
             # Values arrive as strings from the command line. Numbers are
             # converted so an oracle can declare a float parameter and get one;

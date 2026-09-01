@@ -46,6 +46,12 @@ class CompassConfig:
         virtual_clock: Advance a virtual clock by each predicted duration
             instead of sleeping. This is what makes a simulated run faster than
             the run it stands in for.
+        op_timings_out: Where a traced step writes how long each operator took.
+            Only meaningful in ``trace`` mode, which is the one that runs
+            eagerly -- a replayed CUDA graph is a single submission with nothing
+            to observe inside it. The artifact is written beside the graph and
+            joined to it by operator index, so the graph stays a purely
+            structural record that a derived run can still be compared against.
         admission_seconds: How long a request takes to reach the point of being
             schedulable, in seconds. A simulated run advances its clock by
             predicted *forward* durations, so the time a request spends getting
@@ -77,6 +83,7 @@ class CompassConfig:
     oracle_options: Optional[dict] = None
     virtual_clock: bool = True
     admission_seconds: float = 0.0
+    op_timings_out: Optional[str] = None
     filler_token_id: int = 100
 
     def __post_init__(self) -> None:

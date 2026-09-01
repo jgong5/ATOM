@@ -310,6 +310,11 @@ class CompassModelRunner(ModelRunner):
         if self._step_index != self._compass_config.trace_step:
             return super().forward(batch)
 
+        timing = None
+        if self._compass_config.op_timings_out:
+            from atom.compass.runtime.op_timing import OpTimingTracer
+
+            timing = OpTimingTracer()
         ops = MetaOpTracer(graph=self._graph, topology=self._topology())
         triton = TritonLaunchTracer(graph=self._graph)
         # Under simulated TP the collective is replaced by a passthrough, so it
@@ -319,7 +324,13 @@ class CompassModelRunner(ModelRunner):
         collectives = record_collectives(self._graph)
         try:
             with collectives, triton, ops:
-                output = super().forward(batch)
+                if timing is None:
+                    output = super().forward(batch)
+                else:
+                    # Innermost, so it sees the same dispatches the graph does
+                    # and their indices line up.
+                    with timing:
+                        output = super().forward(batch)
         except BaseException:
             # Deliberately do not write a graph here. A forward that died
             # part-way leaves a well-formed but truncated recording, and a
@@ -334,7 +345,45 @@ class CompassModelRunner(ModelRunner):
             raise
         self._traced_steps += 1
         self._write_graph(batch)
+        if timing is not None:
+            self._write_op_timings(timing)
         return output
+
+    def _write_op_timings(self, timing) -> None:
+        """Write what each operator cost, beside the graph it belongs to.
+
+        Reports whether the operators account for the region containing them,
+        because that is the question the artifact exists to answer and a reader
+        should not have to compute it to find out the answer is no.
+        """
+        import json
+
+        path = self._compass_config.op_timings_out
+        if any(size > 1 for size in self._topology().values()):
+            path = self._rank_path(path, self._rank_coords())
+        summary = timing.summary()
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump({
+                    "version": 1,
+                    "provenance": {
+                        "source": "trace",
+                        "eager": True,
+                        "note": "eager device time; production replays a graph",
+                    },
+                    "summary": summary,
+                    "operators": [t.as_dict() for t in timing.timings],
+                }, fh, indent=1)
+        except OSError as exc:
+            logger.warning("ATOMCompass WARNING: could not write op timings to "
+                           "%s: %s", path, exc)
+            return
+        logger.info(
+            "ATOMCompass: %d operators timed, summing to %.3fms against a "
+            "%.3fms region (%.1f%% covered); written to %s",
+            summary["operators"], summary["sum_of_operators"] * 1000,
+            summary["region"] * 1000, 100 * summary["covered"], path,
+        )
 
     @staticmethod
     def _rank_path(path: str, coords: dict[str, int]) -> str:

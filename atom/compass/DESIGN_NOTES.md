@@ -129,6 +129,46 @@ Precondition, from the event-timing finding below: per-operator attribution must
 be checked for the same observer effect — run the workload with and without it
 and compare the engine's own numbers.
 
+**Checked, and the obvious route is closed.** `OpTimingTracer` brackets every
+dispatched operator with its own pair of CUDA events, and the region containing
+them with one more, in the same forward — so the comparison carries no
+run-to-run variance. On a decode step at batch 4, compiled at level 3:
+
+| | |
+| --- | --- |
+| 327 operators, summed | 45.664 ms |
+| the region containing them | 68.949 ms |
+| covered | **66.2%** |
+| the same step, replayed | **3.946 ms** |
+| its 113 gemms alone, timed per-op | **15.368 ms** |
+
+Two separate problems, and the second is fatal. A third of the eager region
+belongs to no operator, so the parts do not account for the whole. And the parts
+are themselves inflated by roughly an order of magnitude: the gemms alone cost
+nearly four times the entire replayed step, and every operator together costs
+nearly twelve times it. A gemm reads 0.121 ms where its true cost must be tens of
+microseconds. **The instrumentation costs several times the kernel it measures**,
+which is the same observer effect that made the first step timer report a machine
+33% slower than the real one, at a scale where it cannot be tuned away: these
+kernels are simply too small to bracket individually.
+
+So in-line per-operator events are not a cost source. What survives is more
+encouraging than that sounds:
+
+* The concentration is extreme. Sixteen distinct operators, **half the time in
+  two of them** — `aiter::gemm_a16w16` at 33.7% and
+  `aiter::unified_attention_with_output_base` at 23.8% — and twelve kinds cover
+  99.7%. Pricing a handful of kernels would cover almost all of a step, rather
+  than needing a model per operator across hundreds.
+* That makes **offline microbenchmarking** the indicated route: run each
+  `(kernel, shapes, dtypes)` many times back to back and take the steady state.
+  No per-operator instrumentation, no observer effect, and a price list that is
+  reusable across every configuration rather than remeasured per deployment —
+  which is also the answer to the calibration-economics problem.
+
+The tracer is kept, because the question it answers is the right one and the
+answer needs to stay reproducible. `scripts/compass/op_cost.py` reports it.
+
 ### 2. Most of this project's numbers are inside their own noise — **S**, done
 
 Five runs of one command, no change between them, gave a TPOT error ranging from
