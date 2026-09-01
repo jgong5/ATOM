@@ -12,6 +12,9 @@ disables CUDA graphs; compilation is `--level`, and its default is on.
 
 Effort estimates are rough: **S** hours, **M** days, **L** weeks or unknown.
 
+Defects in ATOM itself, rather than in Compass, are collected separately in
+[ATOM_DEFECTS.md](ATOM_DEFECTS.md).
+
 ---
 
 # Status
