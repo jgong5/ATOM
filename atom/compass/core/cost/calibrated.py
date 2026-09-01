@@ -50,6 +50,18 @@ def _decode_features(shape: StepShape) -> list[float]:
     return [1.0, batch, context]
 
 
+def _decode_bucket_features(shape: StepShape) -> list[float]:
+    """Decode features within one CUDA-graph bucket: just the KV to read.
+
+    Batch size is dropped because the bucket already carries it -- the replay
+    runs the padded rung whatever the batch, so twelve sequences and sixteen
+    perform the same work. What still varies inside a rung is how much history
+    the step reads, and that is the only thing left to fit.
+    """
+    context = float(sum(shape.context_lens)) if shape.context_lens else 0.0
+    return [1.0, context]
+
+
 def _least_squares(
     rows: list[list[float]], targets: list[float], outlier_sigmas: float = 4.0,
 ) -> tuple[Optional[list[float]], int]:
@@ -70,6 +82,17 @@ def _least_squares(
     deviation, since the contaminating points would otherwise inflate the very
     quantity used to detect them.
 
+    **Fitted on relative error, not absolute.** Ordinary least squares minimises
+    seconds-squared, so a 250 ms sample counts sixty times a 32 ms one, and a
+    prefill sweep spanning 64 to 16 000 tokens is decided almost entirely by its
+    largest steps. What anyone reads off this model is a percentage, and the
+    small end is where serving actually lives: widening a sweep for decode
+    coverage dropped the share of prefill steps under 1024 tokens from 17% to 9%
+    and moved the prediction at 512 tokens from -13% to -17% against an
+    unchanged measurement, purely by adding large samples elsewhere. Dividing
+    each row and its target by that target makes every sample worth the same
+    fraction of itself, which is the quantity being reported.
+
     Returns the coefficients and how many points were dropped. The count is
     returned rather than logged and forgotten: a fit that quietly discarded half
     its evidence should not describe itself the same way as one that kept it.
@@ -84,13 +107,22 @@ def _least_squares(
 
     a = np.asarray(rows, dtype=float)
     b = np.asarray(targets, dtype=float)
-    coeffs, *_ = np.linalg.lstsq(a, b, rcond=None)
+
+    # Scale each equation by 1/target so the residual being minimised is the
+    # fractional one. A non-positive target carries no scale, so it keeps its
+    # own: durations are positive and one that is not is not evidence.
+    scale = np.where(b > 0.0, 1.0 / np.where(b > 0.0, b, 1.0), 1.0)
+    aw = a * scale[:, None]
+    bw = b * scale
+    coeffs, *_ = np.linalg.lstsq(aw, bw, rcond=None)
 
     # Enough points left to still determine the fit after dropping some.
     if len(rows) < width + 2:
         return [float(c) for c in coeffs], 0
 
-    residuals = np.abs(b - a @ coeffs)
+    # Residuals in the same relative units, so the outlier test is not itself
+    # dominated by the largest samples.
+    residuals = np.abs(bw - aw @ coeffs)
     mad = float(np.median(np.abs(residuals - np.median(residuals))))
     if mad <= 0.0:
         return [float(c) for c in coeffs], 0
@@ -100,7 +132,7 @@ def _least_squares(
     if not dropped or int(keep.sum()) < width + 1:
         return [float(c) for c in coeffs], 0
 
-    refit, *_ = np.linalg.lstsq(a[keep], b[keep], rcond=None)
+    refit, *_ = np.linalg.lstsq(aw[keep], bw[keep], rcond=None)
     return [float(c) for c in refit], dropped
 
 
@@ -146,6 +178,16 @@ class CalibratedCostOracle:
         self.floor_seconds = floor_seconds
         self._prefill: Optional[list[float]] = None
         self._decode: Optional[list[float]] = None
+        # One small fit per CUDA-graph rung, which is what a replay actually is:
+        # a fixed shape, plus the KV history it reads. Held out on 499 unseen
+        # rows, this halves-and-halves-again the error of a single fit carrying
+        # batch size as a linear term -- median 5.04% -> 0.93%, RMSE 0.42ms ->
+        # 0.13ms. A shared slope across rungs does not work (8.09%): a replay at
+        # rung 16 reads sixteen padded rows and one at rung 1 reads one, so the
+        # cost per unit of history is not the same number.
+        self._decode_by_bucket: dict[int, list[float]] = {}
+        self._decode_bucket_n: dict[int, int] = {}
+        self._decode_bucket_hull: dict[int, tuple[float, float]] = {}
         self._n_prefill = 0
         self._n_decode = 0
         self._fallback_prefill = 0.0
@@ -161,6 +203,7 @@ class CalibratedCostOracle:
     def _fit(self) -> None:
         prefill_rows, prefill_targets = [], []
         decode_rows, decode_targets = [], []
+        by_bucket: dict[int, tuple[list, list]] = {}
         with open(self.table, encoding="utf-8") as fh:
             for line in fh:
                 line = line.strip()
@@ -178,6 +221,12 @@ class CalibratedCostOracle:
                 else:
                     decode_rows.append(_decode_features(shape))
                     decode_targets.append(row["seconds"])
+                    bucket = row.get("capture_bucket")
+                    if bucket:
+                        by_bucket.setdefault(int(bucket), ([], []))
+                        rows_, targets_ = by_bucket[int(bucket)]
+                        rows_.append(_decode_bucket_features(shape))
+                        targets_.append(row["seconds"])
 
         self._n_prefill, self._n_decode = len(prefill_targets), len(decode_targets)
         for name, rows in (("prefill", prefill_rows), ("decode", decode_rows)):
@@ -199,6 +248,20 @@ class CalibratedCostOracle:
             self._decode, self._dropped_decode = _least_squares(
                 decode_rows, decode_targets)
 
+        # Per rung. Three samples is the floor for two coefficients plus a
+        # residual worth calling one; below that the rung falls back rather than
+        # fitting a line through almost nothing.
+        for bucket, (rows_, targets_) in by_bucket.items():
+            if len(targets_) < 3:
+                continue
+            coeffs, _dropped = _least_squares(rows_, targets_)
+            if coeffs is None:
+                continue
+            self._decode_by_bucket[bucket] = coeffs
+            self._decode_bucket_n[bucket] = len(targets_)
+            self._decode_bucket_hull[bucket] = (
+                min(r[1] for r in rows_), max(r[1] for r in rows_))
+
         if self._prefill is None and self._n_prefill:
             logger.warning(
                 "ATOMCompass WARNING: %d prefill steps is too few to fit; using their "
@@ -219,6 +282,9 @@ class CalibratedCostOracle:
             coeffs, features = self._prefill, _prefill_features(shape)
             fallback = self._fallback_prefill
         else:
+            bucketed = self._decode_for_bucket(shape)
+            if bucketed is not None:
+                return bucketed
             coeffs, features = self._decode, _decode_features(shape)
             fallback = self._fallback_decode
         if coeffs is None and not (self._n_prefill if shape.is_prefill else self._n_decode):
@@ -235,6 +301,58 @@ class CalibratedCostOracle:
         if coeffs is None:
             return StepCost(seconds=max(fallback, self.floor_seconds))
         self._warn_if_extrapolating(shape, features)
+        predicted = sum(c * f for c, f in zip(coeffs, features))
+        return StepCost(seconds=max(predicted, self.floor_seconds))
+
+    def _decode_for_bucket(self, shape: StepShape) -> Optional[StepCost]:
+        """Cost this decode step from the fit for its own CUDA-graph rung.
+
+        Returns None when there is no rung to use -- an eager step carries no
+        bucket, and an older table recorded none -- leaving the caller on the
+        single batch-linear fit, which is what this replaces but not what it
+        removes: a run without CUDA graphs is still a run worth costing.
+
+        A rung that was never measured is a different matter. It is not an
+        extrapolation along an axis, it is a gap in the evidence, and the nearest
+        rung is the least-bad answer available; the alternative is refusing
+        mid-run and killing a serving process over one step. Said out loud, once
+        per rung, because the number that comes back is not supported by
+        anything measured at that width.
+        """
+        if not self._decode_by_bucket:
+            return None
+        bucket = shape.capture_bucket
+        if bucket is None:
+            return None
+
+        coeffs = self._decode_by_bucket.get(bucket)
+        if coeffs is None:
+            nearest = min(self._decode_by_bucket, key=lambda b: abs(b - bucket))
+            key = ("bucket", bucket)
+            if key not in self._warned:
+                self._warned.add(key)
+                logger.warning(
+                    "ATOMCompass WARNING: costing a decode step at CUDA graph "
+                    "bucket %d, which was never measured; using bucket %d "
+                    "instead. Rungs are measured, not interpolated -- calibrate "
+                    "over a workload that reaches this concurrency.",
+                    bucket, nearest,
+                )
+            coeffs = self._decode_by_bucket[nearest]
+            bucket = nearest
+
+        features = _decode_bucket_features(shape)
+        low, high = self._decode_bucket_hull.get(bucket, (None, None))
+        if low is not None and not (low <= features[1] <= high):
+            key = ("bucket-context", bucket, features[1] < low)
+            if key not in self._warned:
+                self._warned.add(key)
+                logger.warning(
+                    "ATOMCompass WARNING: costing a decode step at bucket %d "
+                    "whose total context is %.0f, outside the calibrated range "
+                    "[%.0f, %.0f]. The prediction is an extrapolation.",
+                    bucket, features[1], low, high,
+                )
         predicted = sum(c * f for c, f in zip(coeffs, features))
         return StepCost(seconds=max(predicted, self.floor_seconds))
 
@@ -279,10 +397,21 @@ class CalibratedCostOracle:
             outliers = f", {dropped} dropped" if dropped else ""
             return f"{name}=fitted on {n} steps{outliers}"
 
+        rungs = ""
+        if self._decode_by_bucket:
+            # Which rungs exist, and how thinly each is supported: a rung fitted
+            # on four samples predicts with the same confidence as one fitted on
+            # four hundred, and only this says which is which.
+            rungs = ", decode buckets={" + ", ".join(
+                f"{b}:{self._decode_bucket_n[b]}"
+                for b in sorted(self._decode_by_bucket)
+            ) + "}"
+
         return (
             "CalibratedCostOracle("
             + part("prefill", self._prefill, self._n_prefill, self._dropped_prefill)
             + ", "
             + part("decode", self._decode, self._n_decode, self._dropped_decode)
+            + rungs
             + ")"
         )

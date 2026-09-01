@@ -380,3 +380,71 @@ class TestTheArrivalBarrier:
             assert "invalid" in message, "must say the run cannot be trusted"
         finally:
             reset_clock()
+
+
+class TestTheCaptureBucket:
+    """A decode step costs what its padded bucket costs, not what its batch does.
+
+    With CUDA graphs the replay runs the smallest capture size no smaller than
+    the batch, so cost steps at the ladder: twelve sequences cost more than
+    eight (3.532ms against 3.317ms at matched context) because twelve pads to
+    sixteen. The decode model carried batch size as a linear term and could not
+    represent that.
+    """
+
+    class _Runner:
+        """Enough of the runner for the bucket rule."""
+
+        def __init__(self, capture_sizes, enforce_eager=False):
+            self.capture_sizes = capture_sizes
+            self.enforce_eager = enforce_eager
+
+    def _bucket(self, runner, batch):
+        from atom.compass.runtime.runner import CompassModelRunner
+
+        return CompassModelRunner._capture_bucket(runner, batch)
+
+    def test_it_rounds_up_to_the_ladder(self):
+        runner = self._Runner([1, 2, 4, 8, 16])
+        assert self._bucket(runner, 1) == 1
+        assert self._bucket(runner, 3) == 4
+        assert self._bucket(runner, 8) == 8
+        assert self._bucket(runner, 12) == 16, "the case that broke the fit"
+
+    def test_the_ordering_of_the_ladder_does_not_matter(self):
+        """capture_cudagraph sorts it descending, then ascending again at the end.
+
+        A rule that assumes one of those silently returns the top rung under the
+        other -- which is how a whole sweep came to report bucket 512.
+        """
+        for sizes in ([1, 2, 4, 8, 16], [16, 8, 4, 2, 1], [4, 16, 1, 8, 2]):
+            assert self._bucket(self._Runner(sizes), 12) == 16, sizes
+            assert self._bucket(self._Runner(sizes), 5) == 8, sizes
+
+    def test_a_batch_above_the_ladder_has_no_bucket(self):
+        """ForwardMode.decide falls back to eager there, so no graph replays."""
+        assert self._bucket(self._Runner([1, 2, 4, 8, 16]), 63) is None
+
+    def test_eager_has_no_bucket(self):
+        runner = self._Runner([16, 8, 4, 2, 1], enforce_eager=True)
+        assert self._bucket(runner, 8) is None
+
+    def test_an_unresolved_ladder_has_no_bucket(self):
+        """`[0]` is the sentinel a runner starts with, before capture."""
+        assert self._bucket(self._Runner([0]), 8) is None
+        assert self._bucket(self._Runner([]), 8) is None
+
+    def test_it_matches_the_rule_that_selects_the_graph(self):
+        """Pinned to ForwardMode.decide, which is what actually picks the graph.
+
+        Not to the input-buffer padding in model_runner, which reverses an
+        ascending list and so takes the largest rung -- an engine bug, and the
+        one this mirrored at first.
+        """
+        import re
+        from pathlib import Path
+
+        source = Path(__file__).resolve().parents[2] / "atom/utils/forward_context.py"
+        pattern = r"next\(\(x for x in capture_sizes if x >= unified_bs\)"
+        assert re.search(pattern, source.read_text()), (
+            "the engine's graph-selection rule moved; the bucket must follow it")

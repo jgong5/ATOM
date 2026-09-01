@@ -30,6 +30,20 @@ command at TP=1, at roughly 6× wall clock:
 | 5 | −0.5% | +2.4% | +1.4% |
 | **mean ± sd** | **−9.9 ± 6.4** | **−2.4 ± 3.2** | **−5.2 ± 4.3** |
 
+Since then, decode fitted per CUDA-graph rung and every fit moved to relative
+error (items 2 and 10), over three repeats:
+
+| | TTFT | TPOT | latency |
+| --- | --- | --- | --- |
+| mean ± sd | −20.7 ± 4.5 | **−0.4 ± 4.1** | −8.0 ± 1.7 |
+
+TPOT is the metric decode governs and it is now centred on zero, inside its own
+noise. TTFT is worse, and not because anything about prefill got worse: prefill
+prediction improved from +18.3% to +3.9% at the shape this workload actually
+uses. A quarter of TTFT is spent outside any forward and Compass does not model
+it; the old fit's over-prediction had been covering the gap. See "A quarter of
+TTFT happens outside any forward".
+
 Reproduce with `scripts/compass/validate.py`.
 
 **Read the spread before the mean.** This document reported run 1 alone for some
@@ -345,7 +359,7 @@ At a physical width of one it builds a zero-padded buffer (`movedim`, `reshape`,
 451. Possibly worth simply accepting — but as a decision, not a residue nobody
 looked at.
 
-### 10. Decode cost falls as batch grows; the model says it rises — **M**
+### 10. Decode cost falls as batch grows; the model said it rises — **M**, done
 
 Not "not linear". The **sign is wrong**. At matched total context, mean cost per
 step over a sweep of 1662 decode steps:
@@ -380,9 +394,53 @@ evaluation actually occupies, and averaging concealed it. Two methods agreeing i
 evidence only where they were both asked the same question — and "the same
 question" has to mean the same *region*, not the same table.
 
-Featuring the padded bucket is the obvious repair; `Config.capture_sizes`
-declares the ladder. Whether a per-bucket constant is enough, or the KV term
-needs to stop being linear too, is not yet known.
+**Repaired by fitting one small model per rung.** `StepShape` now carries
+`capture_bucket` — which rung the replay padded up to — and decode is fitted
+separately within each, as `intercept + slope x total_context`. Batch size is
+dropped inside a rung because the rung already carries it.
+
+Held out on 499 rows none of the models had seen:
+
+| decode model | median \|err\| | RMSE | the bad region |
+| --- | --- | --- | --- |
+| `[1, batch, total_context]` (was) | 5.04% | 0.4216 ms | −3.7% |
+| per-rung intercept, shared slope | 8.09% | 0.3952 ms | −12.6% |
+| **per-rung intercept and slope** | **0.93%** | **0.1259 ms** | **−1.3%** |
+
+A shared slope across rungs is *worse* than what it replaced, which is the
+informative part: a replay at rung 16 reads sixteen padded rows and one at rung 1
+reads one, so cost per unit of history is not the same number at both. The rung
+has to own both coefficients.
+
+In place, over 2174 measured decode steps the fitted oracle sits at 0.73% median
+error, per rung: 0.46 / 0.45 / 0.69 / 1.67 / 2.11 / 1.57 / 0.25 / 0.37% for rungs
+1 to 64.
+
+**It does not explain everything.** The batch-8 short-context region went from
+−3.8% to −1.7%, not to zero, and error is worst at rungs 8 and 16. Something
+still varies with batch *inside* a rung: at matched total context, one long
+sequence is not the same cost as many short ones, and neither the rung nor the
+summed history can see the difference. That is the next feature to look for, and
+it is a smaller effect than the one just removed.
+
+**Getting the rung right was harder than fitting it.** The first implementation
+mirrored `ModelRunner`'s input-buffer padding, which scans `reversed(capture_
+sizes)` — correct only on a descending list. `capture_cudagraph` sorts descending
+for the capture loop and ascending again when it finishes, so at runtime that
+expression returns the *largest* rung, not the smallest: every step in a 1662-row
+sweep came back as bucket 512 and the diagnostic compared three models that had
+all collapsed to one. The rule that actually selects the graph is in
+`ForwardMode.decide`, and Compass now mirrors that instead, written as a `min` so
+it cannot care which way the list is sorted.
+
+That leaves a real defect in ATOM: the padding site takes the largest rung where
+its own comment says a 65-request batch should replay the 128 graph. It
+over-zeroes a buffer rather than mis-selecting a graph, so it costs a little
+bandwidth and nothing else — but it is wrong, and it is not Compass's to fix.
+
+The sweep now reaches rungs 32, 48 and 64, each at two prompt lengths so its
+slope is identifiable. Stopping at 16 is what left the serving run at batch 63
+asking about a rung nothing had measured.
 
 ## Configurations that cannot be modelled at all
 
@@ -741,6 +799,43 @@ and fails with an `EADDRINUSE` that says nothing about tracing. The OS picks it.
 
 ## Measurement
 
+### A quarter of TTFT happens outside any forward
+
+TTFT has been wrong by 15-25% through every version of the cost model, and no
+amount of work on prefill moved it. Measured on the evaluation workload, with
+every step timed:
+
+| | |
+| --- | --- |
+| prefill steps in the whole run | **1** |
+| that step, measured | 43.78 ms |
+| that step, predicted | 46.09 ms (+5.3%) |
+| mean TTFT reported by the engine | 57.68 ms |
+| **TTFT not spent inside any forward** | **13.91 ms — 24%** |
+
+The prefill step is predicted to within 5%. The error is the 14 ms either side of
+it: scheduling, block allocation, sampling, detokenising the first token,
+returning it. A simulated run advances its clock by predicted *forward*
+durations, so none of that time exists — TTFT is short by almost exactly the
+amount that is missing, and 46.09/57.68 is −20.1% against an observed −20.7%.
+
+**This is not the same as the decode finding above, and both are true.** In
+steady-state decode the step period *is* the forward to within 0.4%, because
+steps run back to back and the engine's own work overlaps the device. TTFT is a
+different quantity: it spans one request's arrival to its first token, and
+crosses the scheduling and sampling path once, unoverlapped.
+
+Which explains why two rounds of cost-model work could not fix it, and why the
+prefill fix appeared to make things worse: a fit over-predicting prefill by 18%
+was paying for the missing 14 ms. Correcting the fit to +3.9% removed the
+compensation and exposed the gap. **Two errors cancelling, for the third time on
+this page** — and this is the argument for checking components against their own
+measurements rather than reading a system-level number and calling it accuracy.
+
+The repair is a term for per-request non-forward time, calibrated the same way
+everything else is: measured, not assumed. It is squarely inside the stated goal
+of simulating what the inference process does rather than what the model does.
+
 ### The step period is the forward, and TP does not change that
 
 A simulated run advances its clock by the predicted forward alone, so everything
@@ -883,6 +978,50 @@ per kind now, defaulting to zero.
 The fallback for "no samples of this kind" was the mean of an empty list, which is
 zero: a confident, precise, entirely fictional answer. It raises now.
 
+### A fit minimising seconds is decided by its largest samples
+
+Widening the sweep to cover decode rungs 32-64 made TTFT worse: −9.9% before,
+−17.3% after, and the standard deviation collapsed from 6.4 to 0.6, so it was
+systematic rather than a draw. Nothing about prefill had changed.
+
+The added rounds run 24-64 concurrent requests, and ATOM batches their prefill
+into one step, so they are large prefill samples. The share of prefill steps
+under 1024 tokens fell from 17% to 9% and the median token count doubled to
+13 008. Ordinary least squares minimises squared *seconds*, so a 250 ms sample
+counts about sixty times a 32 ms one: the fit followed the new mass to the large
+end and the prediction at 512 tokens moved from −13% to −17% against a
+measurement that did not move at all (32.51 ms then, 32.53 ms after).
+
+Every number this project reports is a percentage, so the residual being
+minimised should be a percentage too. Each equation is divided by its own target
+before fitting, which makes every sample worth the same fraction of itself, and
+the outlier test runs on the same relative residuals so it is not dominated by
+the largest samples either. Decode is unaffected: 0.79% median against 0.73%.
+
+| prefill prediction | absolute fit | relative fit | measured |
+| --- | --- | --- | --- |
+| at 512 tokens | −11.8% | −5.3% | 32.53 ms |
+| **at 2512 tokens** | **+18.3%** | **+3.9%** | 43.78 ms |
+| median over 121 rows | 9.51% | 9.03% | |
+
+2512 is the number that matters, and finding that out took longer than the fix.
+The change was first judged at 512 tokens, on the reasoning that eight prompts of
+64 tokens make a 512-token prefill step. They do not: `--prompt-tokens 64` builds
+64 *words*, which tokenise to about 314 each, so the evaluation's one prefill step
+carries 2512. **A model checked at a shape the workload never visits has not been
+checked.** The fix was right anyway, and by a wider margin there than at the point
+used to argue for it.
+
+The general form of the trap: **coverage is not only about range**. The range
+here always bracketed the evaluation — 64 to 16 000 tokens. What changed was the
+*density*, and an unweighted fit is a weighted average whose weights are the
+sample values. Adding evidence in one region degraded prediction in another,
+which is not something a coverage check can catch.
+
+**And making it more accurate made the end-to-end number worse.** TTFT went from
+−17.3% to −20.7% as prefill went from +18.3% to +3.9%, because the
+over-prediction had been paying for something else that is missing — see below.
+
 ### The fit resists one-off contamination
 
 **Triton autotunes per shape, not once per process**, so a calibration sweep built
@@ -944,6 +1083,16 @@ the sum is what the hardware actually moves.
 * The thing that finally measured the noise was running the same command five
   times, which cost twenty minutes and nothing else. It was not done earlier
   because each individual run had always looked reasonable.
+* Adding evidence can make a model worse somewhere else. Widening a sweep to
+  cover decode rungs degraded prefill by 4 points, because an unweighted fit is
+  a weighted average whose weights are the sample values. Nothing was removed
+  and no range stopped being covered.
+* Mirroring an engine's rule means finding the rule that runs, not the first one
+  that looks right. The bucket rule was copied from a padding site whose
+  expression only holds on a descending list, against a list that is ascending
+  by then -- so every step in a 1662-row sweep reported the top rung and a
+  three-way model comparison silently became a one-way one. It was caught by a
+  value being impossible, not by the comparison looking wrong.
 * A harness can measure itself instead of the system and still return a full
   table of plausible numbers. `benchmark_serving` reported TTFT, TPOT, ITL and
   throughput for a simulated engine; every one of them described the simulator.

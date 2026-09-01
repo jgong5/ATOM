@@ -25,6 +25,14 @@ class StepShape:
             Compass does not interpret these names; a group is a size and a
             membership, and the operators recorded against it carry the meaning.
         rank_coords: This rank's index within each group.
+        capture_bucket: The batch size this step's CUDA graph replay was padded
+            up to, or None when nothing was replayed (eager, or a build that
+            never captured). A replay runs the padded bucket, not the batch, so
+            cost steps at the ladder rather than rising with batch size --
+            twelve sequences cost more than eight because twelve pads to
+            sixteen. An engine-agnostic number: the runner resolves the ladder,
+            since the padding rule is the engine's, and the oracle only sees
+            which rung was used.
     """
 
     num_scheduled_tokens: tuple[int, ...]
@@ -32,6 +40,7 @@ class StepShape:
     num_prefill_tokens: int = 0
     topology: Mapping[str, int] = field(default_factory=dict)
     rank_coords: Mapping[str, int] = field(default_factory=dict)
+    capture_bucket: int | None = None
 
     @property
     def batch_size(self) -> int:

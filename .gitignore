@@ -62,4 +62,5 @@ online_quant_info_*.json
 compass_artifacts*/
 compass_overhead/
 compass_serving/
+compass_bucket*/
 .commitmsg

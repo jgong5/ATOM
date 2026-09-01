@@ -261,6 +261,7 @@ class CompassModelRunner(ModelRunner):
             "num_prefill_tokens": shape.num_prefill_tokens,
             "topology": dict(shape.topology),
             "rank_coords": dict(shape.rank_coords),
+            "capture_bucket": shape.capture_bucket,
         }) + "\n")
         self._measure_fh.flush()
 
@@ -441,7 +442,42 @@ class CompassModelRunner(ModelRunner):
             num_prefill_tokens=int(getattr(batch, "total_tokens_num_prefill", 0)),
             topology=self._topology(),
             rank_coords=self._rank_coords(),
+            capture_bucket=self._capture_bucket(len(num_scheduled)),
         )
+
+    def _capture_bucket(self, batch_size: int) -> Optional[int]:
+        """Which rung of the CUDA-graph ladder this batch replays at.
+
+        Mirrors `ForwardMode.decide`, which is what actually picks the graph::
+
+            running_bs = next((x for x in capture_sizes if x >= unified_bs), ...)
+
+        -- the smallest capture size no smaller than the batch. Written here as
+        a `min` rather than copied verbatim, because that expression is only
+        correct on an ascending list and `capture_sizes` is sorted both ways
+        during a run: descending for the capture loop, ascending again once
+        capture finishes. `min` does not care, and this has to stay right if the
+        ordering changes again.
+
+        (`ModelRunner`'s input-buffer padding at the `fill_to` bound reverses the
+        list before scanning, so on the ascending list it holds at runtime it
+        takes the *largest* rung rather than the smallest -- against its own
+        comment about a 65-request batch replaying the 128 graph. That is an
+        engine bug and it over-zeroes a buffer rather than mis-selecting a graph,
+        so it is not copied here. Mirroring it is what first made every step in a
+        sweep report bucket 512.)
+
+        None when no graph is replayed: `enforce_eager`, a ladder not yet
+        resolved, or a batch larger than the top rung -- `ForwardMode.decide`
+        falls back to eager there. A bucket that did not happen must not be
+        fitted as though it did.
+        """
+        if getattr(self, "enforce_eager", False):
+            return None
+        sizes = getattr(self, "capture_sizes", None)
+        if not sizes or sizes == [0]:
+            return None
+        return min((g for g in sizes if g >= batch_size), default=None)
 
     def _topology(self) -> dict[str, int]:
         """Communication group sizes, by name.
@@ -511,7 +547,49 @@ class CompassModelRunner(ModelRunner):
             )
         else:
             logger.debug("ATOMCompass: skipping CUDA graph capture")
+            self._resolve_capture_ladder()
         return 0.0, [], 0
+
+    def _resolve_capture_ladder(self) -> None:
+        """Work out which graphs a real run would have captured, without capturing.
+
+        `capture_sizes` starts as `[0]` and is filled in by the capture this
+        method's caller just skipped, so a predicting runner would otherwise know
+        nothing about the ladder -- and the ladder is what decides a decode
+        step's cost, since the replay runs a padded bucket rather than the batch.
+        Skipping capture must not also discard the shape of the machine being
+        simulated.
+
+        Resolving it is a bound, not a side effect of capturing: the declared
+        ladder from config, narrowed to what this deployment could schedule.
+        Mirrors `ModelRunner.capture_cudagraph` and reuses its bound function, so
+        the two cannot disagree about which rungs exist.
+        """
+        from atom.model_engine.model_runner import max_schedulable_decode_bs
+
+        try:
+            sizes = sorted(self.config.capture_sizes, reverse=True)
+            full_q_len = self.drafter.mtp_k + 1 if hasattr(self, "drafter") else 1
+            max_bs = max_schedulable_decode_bs(
+                self.config.max_num_seqs,
+                self.config.max_num_batched_tokens,
+                full_q_len,
+            )
+            self.capture_sizes = [s for s in sizes if s <= max_bs]
+        except Exception as exc:  # noqa: BLE001 - never block a run over this
+            # Costs accuracy on decode, not correctness: without a ladder the
+            # oracle sees no bucket and falls back to whatever it does for an
+            # eager step. Say so rather than leaving a silent [0].
+            logger.warning(
+                "ATOMCompass WARNING: could not resolve the CUDA graph capture "
+                "ladder (%s); decode steps will carry no bucket and a "
+                "bucket-aware oracle will have nothing to key on.", exc,
+            )
+            return
+        logger.info(
+            "ATOMCompass: simulating a deployment whose capture ladder is %s",
+            sorted(self.capture_sizes),
+        )
 
     def warmup_model(self) -> None:
         """Warm up for real whenever the forward is real.

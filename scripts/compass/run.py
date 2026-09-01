@@ -65,12 +65,24 @@ def main() -> int:
         # workload running 8 concurrent requests -- extrapolating outside its
         # evidence in a dimension nobody had thought to check. Coverage has to
         # bracket the evaluation in *every* dimension the model uses.
+        # Concurrency is not a smooth dimension either. With CUDA graphs a
+        # decode step replays the smallest capture size no smaller than the
+        # batch, so cost steps at that ladder -- and the decode model is now
+        # fitted per rung, which means a rung with no samples has no model. The
+        # default ladder is [1,2,4,8,16,32,48,64,128,256], and stopping at 16
+        # concurrent requests is what left a serving run at batch 63 asking
+        # about a rung nothing had ever measured. Each rung appears at two
+        # prompt lengths, because a rung needs its own context slope and one
+        # length gives one band of history to fit it over.
         rounds = [
             (8, 1), (16, 2), (24, 4), (32, 1), (32, 8), (48, 2), (64, 1),
             (64, 4), (64, 12), (96, 8), (128, 1), (128, 4), (128, 16),
             (192, 2), (192, 8), (256, 1), (256, 6), (256, 12), (384, 2),
             (384, 8), (512, 1), (512, 4), (768, 2), (768, 6), (1024, 1),
             (1024, 3),
+            # Rungs 32, 48 and 64.
+            (64, 24), (256, 24), (64, 32), (256, 32),
+            (64, 48), (192, 48), (64, 64), (128, 64),
         ]
         # Twice through, because Triton autotunes per shape rather than once per
         # process: the first visit to a shape pays a benchmarking cost that
