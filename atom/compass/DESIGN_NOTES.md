@@ -77,7 +77,7 @@ which is an assumption and not a measurement:
 TP=2 is worse than TP=1 by more than the noise: −13.6% TPOT sits 3.5 standard
 deviations below the TP=1 mean, so it is a real effect and not another draw. Two
 things are under it. The linear fit under-predicts the region both evaluations
-land in, at both widths — that is item 11, and it is in-sample. And run 1 of the
+land in, at both widths — that is item 12, and it is in-sample. And run 1 of the
 TP=1 series happened to land at the optimistic end of the band, which made the
 gap between the two widths look larger than the −2.4% mean justifies.
 
@@ -184,7 +184,40 @@ expect TTFT accurate to about ±8% afterwards, not better -- worth having agains
 Per-*step* engine work needs no term: it measures ~0.5 ms and is overlapped with
 the device, so adding it would make decode worse.
 
-### 4. No collective cost model — **S/M**, and narrower than it looked
+### 4. TP=4 calibrates and evaluates 19% apart on prefill — **M**
+
+The cost model generalises to four ranks; the calibration does not. Three
+repeats at TP=4, against three at TP=1, both with 13 ms admission:
+
+| | TP=1 | TP=4 |
+| --- | --- | --- |
+| TPOT | −1.0 ± 3.3 | −2.1 ± 6.9 |
+| TTFT | +2.0 ± 7.0 | **−26.1 ± 11.4** |
+| latency | +0.0 ± 1.8 | −12.1 ± 9.4 |
+
+TPOT is inside its noise at both widths, so the per-rung decode model transfers
+untouched. TTFT is negative on every draw and its best is −16.3%, so it is
+systematic.
+
+**Not admission**, which was the obvious guess and is wrong: measured the same
+way at both widths it is 17.88 ms at TP=1 and 17.94 ms at TP=4. It does not scale
+with worker count, so it is not made of process hops in the way the two-hop
+description suggests.
+
+**Not the model's form either.** At TP=4 the oracle predicts 39.49 ms for the
+evaluation's 2512-token prefill, and its own sweep rows between 1500 and 4000
+tokens average 40.69 ms — faithful to about 3%. The evaluation measured 48.44 ms.
+
+So the sweep and the evaluation disagree by **19%** at a matched shape, where at
+TP=1 the same comparison agrees to 4%. Whatever differs between a calibration run
+and an evaluation run is four times larger at four ranks. Run-to-run spread is
+larger there too — sd 11.4 against 7.0 on TTFT — so some of it is simply variance
+across four contending processes, but a gap that big on a single shape is worth
+separating from noise with repeated calibration rather than repeated evaluation.
+Nothing yet distinguishes "the sweep's prefill steps are warm and the
+evaluation's is cold" from "four processes vary more".
+
+### 5. No collective cost model — **S/M**, and narrower than it looked
 
 Collectives are recorded with their group and their bytes, which is what a cost
 model needs, and nothing consumes it.
@@ -193,13 +226,13 @@ It does **not** block multi-GPU prediction the way this once claimed. The
 collective runs inside the forward, and the forward is timed with CUDA events, so
 a calibrated oracle at a width it was measured at has already absorbed the
 collective's cost without naming it. The TP=2 error above is not a missing
-collective — it is item 11.
+collective — it is item 12.
 
 What the gap actually costs is prediction at a width **nobody measured**:
 calibrate at TP=2 and ask about TP=4, and there is nothing to scale. That is a
 narrower and later problem than "blocks any credible multi-GPU prediction".
 
-### 5. An HTTP benchmark cannot measure a simulated engine — **L**
+### 6. An HTTP benchmark cannot measure a simulated engine — **L**
 
 Attempted, and the result is structural rather than numerical. The server takes
 the Compass flags for free (it builds `EngineArgs` like everything else), so
@@ -385,7 +418,7 @@ engine and cannot drive a simulated one. The three routes, for the record:
 
 ## Graph fidelity against a production launch
 
-### 6. Derivation is uncompiled; production is not — **L**
+### 7. Derivation is uncompiled; production is not — **L**
 
 Derivation runs the model eagerly on meta. At `--level 3` inductor fuses
 operators and eliminates views and allocations, so a derived graph and a captured
@@ -401,7 +434,7 @@ which is a research problem, not an implementation one.
 Interim: derive and capture at matched levels, and be explicit that a level-0
 validation does not transfer to level 3.
 
-### 7. Trace mode does not observe the CUDA-graph path — **M**
+### 8. Trace mode does not observe the CUDA-graph path — **M**
 
 Trace mode skips `capture_cudagraph` deliberately, so its graph is the eager
 operator sequence. A replay is a single opaque submission: there are no
@@ -412,14 +445,14 @@ applies, not as operators in the graph.
 Measure mode does capture, so timings already come from the replayed path. What
 is missing is the bridge between the two artifacts.
 
-### 8. Only decode steps are traced, and only one — **M**
+### 9. Only decode steps are traced, and only one — **M**
 
 `trace_step` records exactly one step, in practice a small decode. A deployment's
 cost is dominated by shapes never captured: prefill, chunked prefill, mixed
 prefill/decode batches, and long-context decode where attention stops being
 cheap. Speculative decoding and MTP are entirely untraced.
 
-### 9. A custom op's inner Triton kernel is recorded only on hardware — **S**
+### 10. A custom op's inner Triton kernel is recorded only on hardware — **S**
 
 On a real device `aiter::masked_embedding` both dispatches and launches
 `triton::_masked_embedding_kernel`, so the capture holds both. On meta the kernel
@@ -427,14 +460,14 @@ never launches, so derivation holds only the outer operator. Harmless for cost �
 the outer operator carries the shapes — but a systematic difference between the
 two graphs that will confuse anyone diffing them.
 
-### 10. Simulated TP's `all_gather` is not the real one — **S**
+### 11. Simulated TP's `all_gather` is not the real one — **S**
 
 At a physical width of one it builds a zero-padded buffer (`movedim`, `reshape`,
 `view`, `zeros`) where the real path uses `view.dtype`. Seven operators out of
 451. Possibly worth simply accepting — but as a decision, not a residue nobody
 looked at.
 
-### 11. Decode cost falls as batch grows; the model said it rises — **M**, done
+### 12. Decode cost falls as batch grows; the model said it rises — **M**, done
 
 Not "not linear". The **sign is wrong**. At matched total context, mean cost per
 step over a sweep of 1662 decode steps:
@@ -519,7 +552,7 @@ asking about a rung nothing had measured.
 
 ## Configurations that cannot be modelled at all
 
-### 12. Asymmetric parallelism — **L**
+### 13. Asymmetric parallelism — **L**
 
 `simulated_tp.py`'s `_reject_unsupported` refuses pipeline parallel, prefill and
 decode context parallel, data parallel and DP-attention, TBO, EPLB, and
@@ -535,7 +568,7 @@ single-process executor. Expert parallelism matters most: it is where the
 interesting models are going, and where a rank's graph genuinely depends on which
 experts its tokens chose.
 
-### 13. Shape-changing collectives have no meta stand-in — **S/M**
+### 14. Shape-changing collectives have no meta stand-in — **S/M**
 
 `all_reduce` and `broadcast` preserve shape, so meta can hand back the input.
 `all_gather` grows and `reduce_scatter` shrinks, so they raise rather than guess
@@ -543,7 +576,7 @@ experts its tokens chose.
 while appearing to work. TP alone does not need them; sequence and expert
 parallelism do.
 
-### 14. One communication group is resolvable; several are not — **M**
+### 15. One communication group is resolvable; several are not — **M**
 
 A collective names its group by elimination: with exactly one group of size above
 one, there is nothing else it could have run on. With TP and EP together the
@@ -551,9 +584,9 @@ ambiguity is real and is recorded as `"?"`.
 
 Settling it means intercepting at the group object rather than the dispatcher —
 `get_tp_group()` and its siblings know their own identity. That is a replacement
-for the current resolver, not an addition, and item 12 needs it too.
+for the current resolver, not an addition, and item 13 needs it too.
 
-### 15. Qwen3.8-27B cannot be captured here — **?** (environmental)
+### 16. Qwen3.8-27B cannot be captured here — **?** (environmental)
 
 Its decode path JIT-builds AITER's *gluon* paged-attention kernel and the build
 fails:
@@ -592,7 +625,7 @@ the container's writable layer does not survive a teardown, so it belongs in
 
 ## Measurement and performance
 
-### 16. The extrapolation warning is per-feature, so it cannot see a hole — **S**
+### 17. The extrapolation warning is per-feature, so it cannot see a hole — **S**
 
 The oracle warns when a query falls outside the range of a feature it was
 calibrated over, and that safeguard has caught two real errors. It checks each
@@ -603,12 +636,12 @@ was covered (1–16 seen) and 2650 was covered (57–41052 seen), so nothing war
 The sweep's batch-8 steps actually run 1776–2288 and then jump to 5360: the query
 sits in a hole, and the guard reported it as interpolation.
 
-Not the cause of the TP=2 error — item 11 is, and it is in-sample — but the guard
+Not the cause of the TP=2 error — item 12 is, and it is in-sample — but the guard
 claims a property it does not have. A convex hull, or a nearest-neighbour
 distance with a threshold, would say what the bounding box cannot. The k-NN
 oracle already computes the distance this needs.
 
-### 17. No way to tell the runner when to start measuring — **M**
+### 18. No way to tell the runner when to start measuring — **M**
 
 Throwaway warmup requests were served to get Triton autotuning out of the way,
 and the runner measured them anyway: a runner sees steps and has no idea which
@@ -621,7 +654,7 @@ many. What is missing is a measurement window the engine can open and close
 across the process boundary. The same gap makes it hard to calibrate one phase of
 a deployment without the others polluting the table.
 
-### 18. Derivation is too slow to run per step — **M**
+### 19. Derivation is too slow to run per step — **M**
 
 A full meta forward of Qwen3.8-27B (64 layers, 2999 operators) takes **~0.16 s**
 against a modelled decode step of ~1 ms, so deriving inside the serving loop
@@ -640,7 +673,7 @@ the batch that changed, or a bucketing scheme with a **measured** error budget
 rather than an assumed one. Not on the critical path for correctness, only for
 speed.
 
-### 19. Capture pays for Triton autotuning — **S**
+### 20. Capture pays for Triton autotuning — **S**
 
 The first launch of each kernel benchmarks every candidate configuration, which is
 why `trace_step` is never 1 and why capture takes minutes. Fine as it is; worth
@@ -832,7 +865,7 @@ everything it does is recorded, while `--fake-eplb` makes one device stand in fo
 a TP-N deployment. A TP2 capture on a single GPU gives **451** operators against
 **448** for the real two-GPU capture.
 
-The residual seven are simulated TP's own zero-padded `all_gather` — item 10.
+The residual seven are simulated TP's own zero-padded `all_gather` — item 11.
 
 **The division of labour this settles.** *Capture* on one device gives the
 complete step for any symmetric TP width, and is what a cost model should be
@@ -885,8 +918,27 @@ median difference **0.03%**, worst **0.82%**, and rank 1 was the slower one on
 Rank-0-only accounting discards 0.01% of the total.
 
 So single-sourcing the clock on rank 0 is right for symmetric TP, and the concern
-belongs entirely to the asymmetric strategies of item 12, where ranks genuinely
+belongs entirely to the asymmetric strategies of item 13, where ranks genuinely
 diverge and no rank stands in for another.
+
+**It holds at four ranks too**, which was not obvious — four processes contending
+could have skewed where two did not. Over 2295 steps at TP=4:
+
+| rank | total | vs rank 0 |
+| --- | --- | --- |
+| 0 | 16527.3 ms | — |
+| 1 | 16524.7 ms | −0.02% |
+| 2 | 16530.3 ms | +0.02% |
+| 3 | 16527.8 ms | +0.00% |
+
+Charging every step to its *slowest* rank rather than to rank 0 — which is what a
+barrier actually costs — adds **0.06%**. And the slowest rank was 0/1/2/3 on
+615/555/567/558 steps, near-uniform, so there is no straggler to correct for.
+Rank 0 is a fair proxy at both widths tried.
+
+Everything else structural survived the widening untouched: four per-rank tables
+written and read back, all eight rungs fitted, the arrival barrier and the
+admission delay unchanged. TP=4 needed no code.
 
 ### No fixed ports
 
@@ -1001,7 +1053,7 @@ Nil at both widths, and not growing. For offline batch serving the step period
 *is* the forward, so modelling the forward is not the approximation it looked
 like. Whether that survives real request arrival over HTTP — where queueing,
 admission and detokenisation are not overlapped with a saturated engine — is
-item 5 and is untested.
+item 6 and is untested.
 
 Worth recording as a refutation rather than deleting: the hypothesis was
 plausible, cheap to test, and wrong, and the test is two runs.

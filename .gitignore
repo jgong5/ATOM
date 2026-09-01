@@ -64,4 +64,5 @@ compass_overhead/
 compass_serving/
 compass_bucket*/
 compass_admval*/
+compass_tp4*/
 .commitmsg
