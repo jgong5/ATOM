@@ -46,6 +46,20 @@ class CompassConfig:
         virtual_clock: Advance a virtual clock by each predicted duration
             instead of sleeping. This is what makes a simulated run faster than
             the run it stands in for.
+        admission_seconds: How long a request takes to reach the point of being
+            schedulable, in seconds. A simulated run advances its clock by
+            predicted *forward* durations, so the time a request spends getting
+            from ``preprocess`` to the engine core and from there to a worker --
+            two process hops through polling loops, with an idle engine on the
+            far side and so nothing to overlap against -- does not exist. It is
+            not small: measured at 8-18 ms on this deployment, which is the
+            whole of a −20% TTFT error that four rounds of work on the cost
+            model could not touch.
+
+            Defaults to zero, which reproduces the behaviour before this
+            existed. It has to be **measured per deployment** -- it is a
+            property of the machine and the process layout, not of the model --
+            and a measure-mode run reports the value to use.
         filler_token_id: Token emitted for every generated position. Simulated
             output is not meaningful text; it exists so sequences advance and
             terminate. Must not collide with the model's EOS id, or requests
@@ -62,6 +76,7 @@ class CompassConfig:
     oracle_qualname: str = "atom.compass.core.cost.constant.ConstantCostOracle"
     oracle_options: Optional[dict] = None
     virtual_clock: bool = True
+    admission_seconds: float = 0.0
     filler_token_id: int = 100
 
     def __post_init__(self) -> None:

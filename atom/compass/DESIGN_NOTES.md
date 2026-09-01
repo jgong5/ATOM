@@ -311,10 +311,52 @@ run's latencies are then invalid rather than letting a plausible table through.
 | wall clock | 9 417 ms | 495 ms | 847 ms |
 
 64 distinct first-token instants out of 64 requests, and none finishing before it
-arrived. The tail is gone and the maximum is now *below* the real one. What is
-left — TTFT −11.5%, latency +8.8% on the mean — is ordinary cost-model error, of
-the same order as the offline numbers and pointing the same way. The simulation
-still runs 11× faster than the system.
+arrived. The tail is gone and the maximum is now *below* the real one.
+
+**Re-measured once decode was fitted per rung and every fit moved to relative
+error**, same workload, 64 requests at 8/s:
+
+| | real | simulated | error |
+| --- | --- | --- | --- |
+| **latency mean** | 280.28 ms | 269.00 ms | **−4.0%** |
+| latency median | 271.14 ms | 262.58 ms | −3.2% |
+| TTFT mean | 40.97 ms | 31.79 ms | −22.4% |
+| TTFT median | 35.37 ms | 31.05 ms | −12.2% |
+| wall clock | 9 426 ms | 639 ms | 14.8× faster |
+
+Against +83.8% TTFT and +37.5% latency the first time this ran. End-to-end
+latency at −4% is the closest this project has come to reproducing a served
+workload, and it is on the configuration the whole thing is for.
+
+The remaining TTFT shortfall was 9.18 ms, inside the 8-18 ms admission cost
+measured offline, and the same single cause: item 3. One extrapolation warning
+fired, correctly, on a context below rung 8's calibrated floor.
+
+**With admission modelled** (`--compass-admission-seconds`):
+
+| | real | none | 13 ms | 9 ms |
+| --- | --- | --- | --- | --- |
+| TTFT mean | 40.97 ms | −22.4% | +9.3% | **−0.4%** |
+| latency mean | 280.28 ms | −4.0% | +0.6% | **−0.8%** |
+| latency median | 271.14 ms | −3.2% | +1.6% | **+0.2%** |
+| TTFT median | 35.37 ms | −12.2% | +24.5% | +13.2% |
+
+**The constant is path-specific, not machine-specific.** 13 ms is what the
+offline batch path measured and it overshoots serving by 9%; 9 ms is what the
+serving path measured. Same machine, same model, same process layout — different
+entry code, so a different cost. Calibrate it against the path being simulated,
+not against whichever run was convenient.
+
+**Read the mean, not the median.** A single constant shifts the whole
+distribution, and the real one is right-skewed — mean 40.97 against median 35.37.
+So the means land near-exact while the median overshoots by 13%. Reproducing the
+shape needs a distribution rather than a constant, which is more machinery than
+this is worth until something depends on tail TTFT.
+
+**And this number is in-sample for that term.** 9 ms was derived from the
+previous run of this same workload, so −0.4% is a fit, not a generalisation. It
+is a different run — the spread between runs is real — but a held-out figure
+needs a workload the constant was not measured on.
 
 **What this does not solve.** There is no count to wait for in open-ended
 serving, and a simulator cannot know whether another request is about to arrive.
@@ -888,14 +930,22 @@ to overlap against. Across six runs it measured 8.25, 11.52, 13.71, 13.91, 17.88
 and 18.25 ms, with no relationship to request count or prompt length. It looks
 like a fixed cost of order 13 ms whose spread is a polling artifact.
 
-**Not implemented, deliberately.** Two reasons. The term would have to advance
-the clock when a request is *admitted*, not when a step runs, and the clock is
-advanced in `engine_core` from the forward's return value — so this reaches into
-ATOM's scheduling loop rather than staying behind the runner seam. And the
-quantity's own spread is ±5 ms on 13 ms, so a calibrated constant would leave
-TTFT accurate to about ±8% and no better. It is worth doing, and it is worth
-doing as its own piece of work with its own measurement, rather than bolted onto
-the cost oracle where it does not belong.
+**Implemented, and the seam was not the one first proposed.** The initial reading
+was that this needed the clock advanced when a request is admitted, in
+`engine_core`, reaching past the runner into ATOM's scheduling loop. That was
+wrong twice over. Advancing a global clock per admission double-counts — two
+requests arriving together would pay it twice, when in reality they are admitted
+concurrently. And the machinery already existed: the declared-arrival deferral
+holds a request until `arrive_time`, so holding it until `arrive_time +
+admission` is the same hook with a different threshold.
+
+So it is modelled as a delay on the *request*, not as time the engine consumes:
+`--compass-admission-seconds`, defaulting to zero, which is exactly the previous
+behaviour. It has to be measured per deployment, being a property of the machine
+and the process layout rather than of the model.
+
+The quantity's own spread is ±5 ms on 13 ms, so expect TTFT accurate to roughly
+±8% afterwards and no better.
 
 What it is *not* is a cost-model problem, which is the thing worth recording: TTFT
 was wrong by 15-25% through four separate rounds of work on prefill and decode,

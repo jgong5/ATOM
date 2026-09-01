@@ -188,9 +188,11 @@ class TestTheEngineHonoursDeclaredArrivals:
     class _Sched:
         """Enough of a Scheduler for the two methods under test."""
 
-        def __init__(self, running=(), waiting=(), barrier_open=True):
+        def __init__(self, running=(), waiting=(), barrier_open=True,
+                     admission=0.0):
             self.running = list(running)
             self.waiting = list(waiting)
+            self.admission = admission
             # Open by default: these cases are about the clock jump itself, not
             # about waiting for a workload to finish arriving.
             self._arrival_barrier_open = barrier_open
@@ -202,6 +204,15 @@ class TestTheEngineHonoursDeclaredArrivals:
             from atom.model_engine.scheduler import Scheduler
 
             return Scheduler._arrival_barrier_unmet(self)
+
+        def _schedulable_at(self, seq):
+            from atom.model_engine.scheduler import Scheduler
+
+            return Scheduler._schedulable_at(self, seq)
+
+        @property
+        def _admission_seconds(self):
+            return self.admission
 
     class _Seq:
         def __init__(self, arrive_time):
@@ -448,3 +459,115 @@ class TestTheCaptureBucket:
         pattern = r"next\(\(x for x in capture_sizes if x >= unified_bs\)"
         assert re.search(pattern, source.read_text()), (
             "the engine's graph-selection rule moved; the bucket must follow it")
+
+
+class TestAdmissionDelay:
+    """A request is not schedulable the instant it arrives.
+
+    Getting from `preprocess` to the engine core and from there to a worker is
+    two process hops through polling loops, with an idle engine on the far side
+    and so nothing to overlap against. Measured at 8-18ms, and unmodelled it was
+    the entire TTFT error -- four rounds of work on the cost model could not
+    touch it, because it is not a cost-model quantity.
+
+    Modelled as a delay on the request rather than as time the engine consumes,
+    because it is per-request and concurrent: two requests arriving together
+    each wait once, not twice.
+    """
+
+    class _Seq:
+        def __init__(self, arrive_time):
+            self.arrive_time = arrive_time
+
+    def _sched(self, admission, waiting=(), running=()):
+        from atom.model_engine.scheduler import Scheduler
+
+        class S:
+            # The real implementations, so these cases exercise the real
+            # interaction between admission, deferral and the clock jump
+            # rather than three stubs that agree with each other.
+            _admission_seconds = Scheduler._admission_seconds
+            _schedulable_at = Scheduler._schedulable_at
+            _arrival_barrier_unmet = Scheduler._arrival_barrier_unmet
+
+        s = S()
+        s.waiting = list(waiting)
+        s.running = list(running)
+        s._arrival_barrier_open = True
+        s._arrival_barrier_since = None
+        s.config = type("C", (), {
+            "compass_config": type("K", (), {"admission_seconds": admission})()
+        })()
+        return s
+
+    def _pending(self, sched, seq):
+        from atom.model_engine.scheduler import Scheduler
+
+        return Scheduler._declared_arrival_pending(sched, seq)
+
+    def _at(self, sched, seq):
+        from atom.model_engine.scheduler import Scheduler
+
+        return Scheduler._schedulable_at(sched, seq)
+
+    def test_the_delay_is_added_to_the_arrival(self):
+        sched = self._sched(admission=0.013)
+        assert self._at(sched, self._Seq(1000.0)) == pytest.approx(1000.013)
+
+    def test_zero_reproduces_the_previous_behaviour(self):
+        sched = self._sched(admission=0.0)
+        assert self._at(sched, self._Seq(1000.0)) == 1000.0
+
+    def test_a_request_waits_out_its_admission(self):
+        from atom.utils.clock import VirtualClock, reset_clock, set_clock
+
+        clock = VirtualClock(epoch=1000.0)
+        set_clock(clock)
+        try:
+            sched = self._sched(admission=0.013)
+            seq = self._Seq(1000.0)          # arrived exactly now
+            assert self._pending(sched, seq) is True, "still being admitted"
+            clock.advance(0.014)
+            assert self._pending(sched, seq) is False
+        finally:
+            reset_clock()
+
+    def test_a_real_clock_is_untouched(self):
+        """A real engine really does take this long; nothing is simulated."""
+        from atom.utils.clock import WallClock, reset_clock, set_clock
+
+        set_clock(WallClock())
+        try:
+            sched = self._sched(admission=0.013)
+            assert self._pending(sched, self._Seq(2**40)) is False
+        finally:
+            reset_clock()
+
+    def test_concurrent_arrivals_each_wait_once(self):
+        """Not a cost the engine pays per request in series."""
+        from atom.utils.clock import VirtualClock, reset_clock, set_clock
+
+        clock = VirtualClock(epoch=1000.0)
+        set_clock(clock)
+        try:
+            sched = self._sched(admission=0.013)
+            together = [self._Seq(1000.0) for _ in range(8)]
+            clock.advance(0.014)
+            assert all(self._pending(sched, s) is False for s in together)
+        finally:
+            reset_clock()
+
+    def test_idle_time_skips_to_the_admitted_instant(self):
+        """The clock jumps to when a request becomes schedulable, not to when
+        it arrived -- otherwise it wakes to find nothing runnable."""
+        from atom.model_engine.scheduler import Scheduler
+        from atom.utils.clock import VirtualClock, reset_clock, set_clock
+
+        clock = VirtualClock(epoch=1000.0)
+        set_clock(clock)
+        try:
+            sched = self._sched(admission=0.013, waiting=[self._Seq(1005.0)])
+            Scheduler._advance_to_next_arrival(sched)
+            assert clock.time() == pytest.approx(1005.013)
+        finally:
+            reset_clock()

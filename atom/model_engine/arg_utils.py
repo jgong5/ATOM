@@ -56,6 +56,7 @@ class EngineArgs:
     compass_graph_out: str = ""
     compass_measure_out: str = ""
     compass_measure_warmup_steps: int = 0
+    compass_admission_seconds: float = 0.0
     enable_prefix_caching: bool = True
     port: int = 8006
     kv_cache_dtype: str = "bf16"
@@ -159,6 +160,18 @@ class EngineArgs:
             "One is usually right: it drops the launch that pays for Triton "
             "autotuning. Larger values risk discarding every prefill sample a "
             "workload produces, since prefill steps are rare.",
+        )
+        parser.add_argument(
+            "--compass-admission-seconds",
+            type=float,
+            default=0.0,
+            help="Seconds a request takes to become schedulable, simulated. A "
+            "simulated run advances its clock by predicted forward durations, "
+            "so the two process hops between preprocess and a worker cost "
+            "nothing -- measured at 8-18ms here, and the whole of a -20%% TTFT "
+            "error. Defaults to 0, which is the behaviour before this existed. "
+            "Measure it per deployment: it is a property of the machine and the "
+            "process layout, not of the model.",
         )
         parser.add_argument(
             "--compass-oracle-option",
@@ -714,6 +727,7 @@ class EngineArgs:
         compass_graph_out = kwargs.pop("compass_graph_out", "")
         compass_measure_out = kwargs.pop("compass_measure_out", "")
         compass_measure_warmup = kwargs.pop("compass_measure_warmup_steps", 0)
+        compass_admission = kwargs.pop("compass_admission_seconds", 0.0)
         compass_kwargs = {"enabled": compass_enabled, "mode": compass_mode}
         if compass_oracle:
             compass_kwargs["oracle_qualname"] = compass_oracle
@@ -723,6 +737,8 @@ class EngineArgs:
             compass_kwargs["measure_out"] = compass_measure_out
         if compass_measure_warmup:
             compass_kwargs["measure_warmup_steps"] = compass_measure_warmup
+        if compass_admission:
+            compass_kwargs["admission_seconds"] = compass_admission
         if compass_oracle_option:
             # Values arrive as strings from the command line. Numbers are
             # converted so an oracle can declare a float parameter and get one;

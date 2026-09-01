@@ -1258,8 +1258,32 @@ class Scheduler:
             )
         return not self._arrival_barrier_open
 
+    @property
+    def _admission_seconds(self) -> float:
+        """How long a request takes to become schedulable, simulated.
+
+        Measured at 8-18 ms on this deployment and unmodelled until now, which
+        was the entire TTFT error: a simulated run advances its clock by
+        predicted forward durations, so the two process hops between
+        ``preprocess`` and a worker cost nothing. Zero unless configured, and
+        configured only from a measurement.
+        """
+        compass = getattr(self.config, "compass_config", None)
+        return float(getattr(compass, "admission_seconds", 0.0) or 0.0)
+
+    def _schedulable_at(self, seq) -> float:
+        """The earliest simulated instant this request may be scheduled.
+
+        Its declared arrival plus the time the engine really takes to get it in
+        hand. Modelled as a delay on the request rather than as time consumed by
+        the engine, because it is per-request and concurrent: two requests
+        arriving together each wait once, not twice.
+        """
+        return seq.arrive_time + self._admission_seconds
+
     def _declared_arrival_pending(self, seq) -> bool:
-        """Has this request been declared to arrive later than it is now?
+        """Is this request not yet schedulable -- either not arrived, or arrived
+        and still being admitted?
 
         Only ever true on a virtual clock. A simulated engine advances time by
         the steps it predicts, not with the wall clock a client sends on, so a
@@ -1274,7 +1298,7 @@ class Scheduler:
         clock = get_clock()
         if getattr(clock, "epoch", None) is None:
             return False
-        return seq.arrive_time > clock.time()
+        return self._schedulable_at(seq) > clock.time()
 
     def _advance_to_next_arrival(self) -> None:
         """Jump the virtual clock forward when there is nothing else to do.
@@ -1297,8 +1321,8 @@ class Scheduler:
         if self._arrival_barrier_unmet():
             return  # an earlier arrival may still be in flight
         now = clock.time()
-        pending = [seq.arrive_time for seq in self.waiting
-                   if seq.arrive_time > now]
+        pending = [self._schedulable_at(seq) for seq in self.waiting
+                   if self._schedulable_at(seq) > now]
         if len(pending) != len(self.waiting):
             return  # something has already arrived; let it run
         advance(min(pending) - now)
