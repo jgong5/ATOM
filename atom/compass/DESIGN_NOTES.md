@@ -243,25 +243,44 @@ ways: paced in real time against a real server, declared against a simulated one
 | latency median | 262.35 ms | 306.40 ms |
 | wall clock | 9 417 ms | 495 ms |
 
-The median is exact and the mean is not, and the residual is one specific thing:
-the first 13 requests share **two** distinct first-token instants where the real
-run has 13. They were held and released in two batches.
+The median was exact and the mean was not: the first 13 requests shared **two**
+distinct first-token instants where the real run had 13.
 
-**Which turns out to be a causality constraint, not a bug.** The client submits
-concurrently, so requests reach the engine in a different order from the one they
-were declared in. If the first request *received* is declared for t=0.9 s, the
-idle engine jumps virtual time to 0.9 s — and a request declared for t=0 that
-lands on the socket a moment later is retroactively late. A discrete-event clock
-may only advance when it knows no earlier event will still turn up, and an HTTP
-client submitting concurrently cannot promise that. Serialising submission would
-fix the order and reintroduce the wall-clock pacing the whole design exists to
-escape.
+**That was a causality constraint, not a bug.** The client submits concurrently,
+so requests reach the engine in a different order from the one they were declared
+in. If the first request *received* is declared for t=0.9 s, the idle engine jumps
+virtual time to 0.9 s — and a request declared for t=0 landing on the socket a
+moment later is retroactively late. A discrete-event clock may only advance when
+it knows no earlier event will still turn up.
 
-So the remaining step is forced, and it is the one the routes below already
-pointed at: **the engine has to be given the whole arrival schedule up front.**
-Then it can advance to the next arrival knowing what the next arrival is. The
-workload becomes an input file, submission stops being an event, and HTTP becomes
-a way to fetch results rather than the thing being timed.
+**Fixed, for a closed workload, without pacing.** The client says how many
+requests are coming (`compass_workload_size`) and the engine runs nothing until
+it has them all; after that every arrival time is known, so every jump is safe.
+The wait is bounded by how long submission takes — a one-off startup cost, not a
+per-step sleep, which is what makes real-time pacing unacceptable. A timeout
+releases the barrier if a client dies mid-submission, and says outright that the
+run's latencies are then invalid rather than letting a plausible table through.
+
+| | real | declared arrivals | + barrier |
+| --- | --- | --- | --- |
+| TTFT median | 35.84 ms | 35.85 ms | **35.39 ms** |
+| TTFT mean | 42.23 ms | 213.50 ms | **37.39 ms** |
+| TTFT max | 82.10 ms | 1653.09 ms | **67.63 ms** |
+| latency median | 262.35 ms | 306.40 ms | **294.05 ms** |
+| wall clock | 9 417 ms | 495 ms | 847 ms |
+
+64 distinct first-token instants out of 64 requests, and none finishing before it
+arrived. The tail is gone and the maximum is now *below* the real one. What is
+left — TTFT −11.5%, latency +8.8% on the mean — is ordinary cost-model error, of
+the same order as the offline numbers and pointing the same way. The simulation
+still runs 11× faster than the system.
+
+**What this does not solve.** There is no count to wait for in open-ended
+serving, and a simulator cannot know whether another request is about to arrive.
+That case still needs the schedule handed over up front — the workload as an
+input file, with HTTP demoted to fetching results. The barrier buys a correct
+closed-workload validation harness, which is what validation needs, and defers
+the general problem rather than answering it.
 
 That also reframes the original goal. "Validate against `benchmark_serving`" is
 partly mis-specified: an HTTP benchmark is the right yardstick for the *real*

@@ -21,6 +21,7 @@ import logging
 import struct
 import threading
 import time
+import time as _time  # real seconds, for the arrival barrier's timeout
 from collections import deque
 from collections.abc import Callable, Iterable
 
@@ -935,6 +936,10 @@ class Scheduler:
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
         self.config = config
+        # See _arrival_barrier_unmet: latched open once a declared workload has
+        # fully arrived, so a draining queue cannot re-close it.
+        self._arrival_barrier_open = False
+        self._arrival_barrier_since: float | None = None
 
         # Admit-rejected seqs (those `_unschedulable_reason` flags). Drained
         # by `take_rejected` each EngineCore step; routed through the same
@@ -1183,6 +1188,76 @@ class Scheduler:
                 break  # all partials summed; skip the rest of the decode tail
         return total
 
+    #: How long to wait, in real seconds, for a declared workload to finish
+    #: arriving before giving up on the barrier and running anyway. A client
+    #: that dies mid-submission must not hang the engine forever.
+    ARRIVAL_BARRIER_TIMEOUT_S = 120.0
+
+    def _arrival_barrier_unmet(self) -> bool:
+        """Is the engine still waiting to be told about every arrival?
+
+        Advancing virtual time is only safe when no earlier event can still turn
+        up. A client submitting over HTTP submits concurrently, so requests reach
+        the engine out of declared order: if the first one received is declared
+        for 0.9s, an idle engine jumps there, and a request declared for 0.0
+        arriving a moment later is retroactively late. That cost the first 13
+        requests of a 64-request run, which shared two first-token instants where
+        the real run had 64 distinct ones.
+
+        For a *closed* workload the fix is cheap: the client says how many
+        requests are coming, and the engine runs nothing until it has them all.
+        After that every arrival time is known, so every jump is safe. The wait
+        is bounded by how long submission takes -- a one-off startup cost, not a
+        per-step sleep, which is what makes real-time pacing unacceptable here.
+
+        Open-ended serving gets no help from this: there is no count to wait for,
+        and a simulator cannot know whether another request is about to arrive.
+        That case needs the schedule handed over up front.
+
+        Latched once open: a workload that has fully arrived cannot un-arrive,
+        and re-checking after requests start finishing would compare a shrinking
+        queue against the original total and stall the run.
+        """
+        if self._arrival_barrier_open:
+            return False
+        if getattr(get_clock(), "epoch", None) is None:
+            self._arrival_barrier_open = True  # real clock: nothing to wait for
+            return False
+
+        expected = None
+        for seq in self.waiting:
+            declared = getattr(seq, "compass_workload_size", None)
+            if declared:
+                expected = int(declared)
+                break
+        if not expected:
+            return False  # nobody declared a workload; nothing to hold for
+
+        if len(self.waiting) >= expected:
+            self._arrival_barrier_open = True
+            logger.info(
+                "ATOMCompass: all %d declared requests have arrived; "
+                "the virtual clock may now advance safely",
+                expected,
+            )
+            return False
+
+        # Real seconds deliberately: this measures the harness submitting, not
+        # the workload being simulated, and the virtual clock is frozen anyway.
+        if self._arrival_barrier_since is None:
+            self._arrival_barrier_since = _time.monotonic()
+        elif (_time.monotonic() - self._arrival_barrier_since
+              > self.ARRIVAL_BARRIER_TIMEOUT_S):
+            self._arrival_barrier_open = True
+            logger.warning(
+                "ATOMCompass WARNING: only %d of %d declared requests arrived "
+                "within %.0fs; running anyway. Virtual time may now advance "
+                "past an arrival still in flight, which makes that request "
+                "retroactively late -- treat this run's latencies as invalid.",
+                len(self.waiting), expected, self.ARRIVAL_BARRIER_TIMEOUT_S,
+            )
+        return not self._arrival_barrier_open
+
     def _declared_arrival_pending(self, seq) -> bool:
         """Has this request been declared to arrive later than it is now?
 
@@ -1219,6 +1294,8 @@ class Scheduler:
             return
         if self.running or not self.waiting:
             return
+        if self._arrival_barrier_unmet():
+            return  # an earlier arrival may still be in flight
         now = clock.time()
         pending = [seq.arrive_time for seq in self.waiting
                    if seq.arrive_time > now]
@@ -1494,6 +1571,12 @@ class Scheduler:
             delayer_allows = True
 
         if not self.running and not self.waiting:
+            return None
+
+        # Hold the whole run until a declared workload has finished arriving.
+        # Placed after should_allow_prefill above, which must execute every tick
+        # on every rank for cross-DP lockstep.
+        if self._arrival_barrier_unmet():
             return None
 
         # ---- Phase 1: resume partial prefills from running ----

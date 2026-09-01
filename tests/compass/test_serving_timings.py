@@ -188,9 +188,20 @@ class TestTheEngineHonoursDeclaredArrivals:
     class _Sched:
         """Enough of a Scheduler for the two methods under test."""
 
-        def __init__(self, running=(), waiting=()):
+        def __init__(self, running=(), waiting=(), barrier_open=True):
             self.running = list(running)
             self.waiting = list(waiting)
+            # Open by default: these cases are about the clock jump itself, not
+            # about waiting for a workload to finish arriving.
+            self._arrival_barrier_open = barrier_open
+            self._arrival_barrier_since = None
+
+        def _arrival_barrier_unmet(self):
+            # The real one, so these cases exercise the real interaction rather
+            # than a stub that always agrees.
+            from atom.model_engine.scheduler import Scheduler
+
+            return Scheduler._arrival_barrier_unmet(self)
 
     class _Seq:
         def __init__(self, arrive_time):
@@ -265,5 +276,107 @@ class TestTheEngineHonoursDeclaredArrivals:
         try:
             self._advance(self._Sched())
             assert clock.time() == 1000.0
+        finally:
+            reset_clock()
+
+
+class TestTheArrivalBarrier:
+    """Virtual time may not pass an arrival the engine has not been told about.
+
+    An HTTP client submits concurrently, so requests reach the engine out of
+    declared order. An idle engine that jumps to the earliest arrival it has
+    *seen* can be overtaken by an earlier one still in flight, which then looks
+    retroactively late -- it cost the first 13 requests of a 64-request run.
+
+    For a closed workload the client can say how many are coming, and the engine
+    waits for all of them before starting. That is a one-off wait bounded by
+    submission, not a per-step sleep: real-time pacing would throw away the
+    speedup the whole design exists for.
+    """
+
+    class _Seq:
+        def __init__(self, arrive_time=0.0, workload_size=None):
+            self.arrive_time = arrive_time
+            self.compass_workload_size = workload_size
+
+    def _sched(self, waiting=()):
+        from atom.model_engine.scheduler import Scheduler
+
+        class S:
+            pass
+
+        s = S()
+        s.waiting = list(waiting)
+        s.running = []
+        s._arrival_barrier_open = False
+        s._arrival_barrier_since = None
+        s.ARRIVAL_BARRIER_TIMEOUT_S = Scheduler.ARRIVAL_BARRIER_TIMEOUT_S
+        return s
+
+    def _unmet(self, sched):
+        from atom.model_engine.scheduler import Scheduler
+
+        return Scheduler._arrival_barrier_unmet(sched)
+
+    def test_a_real_clock_never_holds(self):
+        from atom.utils.clock import WallClock, reset_clock, set_clock
+
+        set_clock(WallClock())
+        try:
+            sched = self._sched([self._Seq(workload_size=64)])
+            assert self._unmet(sched) is False
+        finally:
+            reset_clock()
+
+    def test_it_holds_until_the_whole_workload_has_arrived(self):
+        from atom.utils.clock import VirtualClock, reset_clock, set_clock
+
+        set_clock(VirtualClock(epoch=1000.0))
+        try:
+            sched = self._sched([self._Seq(workload_size=3)])
+            assert self._unmet(sched) is True, "1 of 3 arrived"
+            sched.waiting.append(self._Seq())
+            assert self._unmet(sched) is True, "2 of 3 arrived"
+            sched.waiting.append(self._Seq())
+            assert self._unmet(sched) is False, "3 of 3 arrived"
+        finally:
+            reset_clock()
+
+    def test_an_undeclared_workload_is_not_held(self):
+        """Nobody said how many are coming, so there is nothing to wait for."""
+        from atom.utils.clock import VirtualClock, reset_clock, set_clock
+
+        set_clock(VirtualClock(epoch=1000.0))
+        try:
+            assert self._unmet(self._sched([self._Seq()])) is False
+        finally:
+            reset_clock()
+
+    def test_it_stays_open_once_the_queue_drains(self):
+        """A workload that has arrived cannot un-arrive."""
+        from atom.utils.clock import VirtualClock, reset_clock, set_clock
+
+        set_clock(VirtualClock(epoch=1000.0))
+        try:
+            sched = self._sched([self._Seq(workload_size=2), self._Seq()])
+            assert self._unmet(sched) is False
+            sched.waiting.pop()  # one starts running
+            assert self._unmet(sched) is False, "must not re-close and stall"
+        finally:
+            reset_clock()
+
+    def test_a_client_that_dies_mid_submission_does_not_hang_it(self, caplog):
+        from atom.utils.clock import VirtualClock, reset_clock, set_clock
+
+        set_clock(VirtualClock(epoch=1000.0))
+        try:
+            sched = self._sched([self._Seq(workload_size=64)])
+            assert self._unmet(sched) is True
+            sched.ARRIVAL_BARRIER_TIMEOUT_S = -1.0  # already expired
+            with caplog.at_level("WARNING"):
+                assert self._unmet(sched) is False
+            message = " ".join(r.getMessage() for r in caplog.records)
+            assert "ATOMCompass WARNING:" in message
+            assert "invalid" in message, "must say the run cannot be trusted"
         finally:
             reset_clock()

@@ -258,6 +258,12 @@ class CompletionRequest(BaseModel):
     # than from when the request turned up. Ignored by a normal server, where
     # "now" is already the right answer.
     compass_arrival: float | None = None
+    # How many requests the whole workload contains. A simulated engine may not
+    # advance virtual time past an arrival it has not been told about, and an
+    # HTTP client submits concurrently, so requests reach it out of declared
+    # order. Told the total, it holds until every one has arrived and then every
+    # jump is safe. Only useful for a closed workload; ignored without Compass.
+    compass_workload_size: int | None = None
 
     def get_max_tokens(self) -> int:
         """Return the effective generation cap for completion requests."""

@@ -24,13 +24,13 @@ this process's stopwatch.
         --model Qwen/Qwen3-0.6B --num-prompts 64 --request-rate 8
     python scripts/compass/serve_bench.py ... --declare-arrivals   # Compass server
 
-KNOWN GAP: declaring an arrival fixes what TTFT is measured *from*, not when the
-engine starts work. The engine still begins a request the moment it is received,
-so queueing is not yet simulated -- a request whose declared arrival is in the
-engine's future can even finish before it. Those are counted and reported rather
-than hidden. Holding requests until virtual time reaches their arrival, and
-advancing the clock to the next arrival when the engine idles, is the remaining
-half; see DESIGN_NOTES.md.
+CLOSED WORKLOADS ONLY. Requests are submitted concurrently and so reach the
+engine out of declared order; an idle engine that jumped to the earliest arrival
+it had *seen* could be overtaken by an earlier one still in flight, which then
+looks retroactively late. So the client tells the engine how many requests are
+coming and the engine runs nothing until all of them have arrived -- a one-off
+wait bounded by submission, not a per-step sleep. An open-ended server has no
+count to wait for and needs the schedule handed over up front instead.
 """
 
 import argparse
@@ -77,7 +77,7 @@ def _prompts(model: str, n: int, length: int, seed: int) -> list[str]:
             for _ in range(n)]
 
 
-async def _one(session, url, model, prompt, out_len, arrival, declare):
+async def _one(session, url, model, prompt, out_len, arrival, declare, total):
     body = {
         "model": model,
         "prompt": prompt,
@@ -88,6 +88,10 @@ async def _one(session, url, model, prompt, out_len, arrival, declare):
     }
     if declare:
         body["compass_arrival"] = arrival
+        # The engine may not advance virtual time past an arrival it has not
+        # been told about, and these are submitted concurrently, so they reach
+        # it out of order. Told the total, it holds until all have landed.
+        body["compass_workload_size"] = total
     started = time.perf_counter()
     async with session.post(url, json=body) as resp:
         await resp.read()
@@ -108,7 +112,7 @@ async def _run(args, prompts, schedule) -> float:
                     await asyncio.sleep(delay)
             tasks.append(asyncio.create_task(
                 _one(session, url, args.model, prompt, args.output_len,
-                     arrival, args.declare_arrivals)))
+                     arrival, args.declare_arrivals, len(prompts))))
         await asyncio.gather(*tasks)
     return time.perf_counter() - began
 

@@ -672,6 +672,7 @@ class InputOutputProcessor:
         dp_session_id: str | None = None,
         dp_parent_session_id: str | None = None,
         arrival_time: float | None = None,
+        workload_size: int | None = None,
     ):
         """responsible for:
         1) Tokenize
@@ -697,6 +698,7 @@ class InputOutputProcessor:
             dp_session_id=dp_session_id,
             dp_parent_session_id=dp_parent_session_id,
             arrival_time=arrival_time,
+            workload_size=workload_size,
         )
         return seqs[0]
 
@@ -713,6 +715,7 @@ class InputOutputProcessor:
         dp_session_id: str | None = None,
         dp_parent_session_id: str | None = None,
         arrival_time: float | None = None,
+        workload_size: int | None = None,
     ) -> list[Sequence]:
         """Tokenize once and materialize ``sampling_params.n`` Sequences.
 
@@ -789,6 +792,7 @@ class InputOutputProcessor:
                 dp_parent_session_id=dp_parent_session_id,
             )
             seq.arrive_time = _stamp_arrival(arrival_time)
+            seq.compass_workload_size = workload_size
             self.requests[seq.id] = seq
             if seq.external_request_id is not None:
                 self._external_to_internal[seq.external_request_id] = seq.id
