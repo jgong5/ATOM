@@ -166,6 +166,29 @@ encouraging than that sounds:
   reusable across every configuration rather than remeasured per deployment —
   which is also the answer to the calibration-economics problem.
 
+**Where such a harness can live is not a free choice.** `aiter` registers its
+operators lazily, through a JIT that fires on first call: importing the module
+that defines `gemm_a16w16` does not put it in `torch.ops.aiter`. So a benchmark
+cannot look a kernel up cold. Worse, running a whole model first does not help
+either — a process that created an engine and generated tokens still reports
+`torch.ops.aiter.gemm_a16w16` missing, because ATOM runs the model in a **worker
+subprocess** and the registration happens there. The traced graph is the proof
+from the other side: it holds `aiter::`, `triton::` and `inductor::` operators,
+recorded inside the runner.
+
+So the price list has to be produced **inside the model-runner process, after
+warmup** — a Compass mode rather than a standalone script. That is not a
+concession: the kernels priced are then the deployment's own, already autotuned
+for the shapes it uses, rather than a fresh JIT build tuned differently.
+
+The shape of it: after warmup, read a captured graph, take each distinct
+`(name, input_shapes, dtypes)`, allocate tensors to match, call it a few thousand
+times inside one pair of events, and divide. The graph records every tensor
+argument in dispatch order, which is what makes the call reconstructible —
+`silu_and_mul`'s schema is `(Tensor(a0!) out, Tensor(a1!) input, float limit=0.)`
+and both tensors are in the record, so allocating in order and letting scalars
+default reproduces the call.
+
 The tracer is kept, because the question it answers is the right one and the
 answer needs to stay reproducible. `scripts/compass/op_cost.py` reports it.
 
