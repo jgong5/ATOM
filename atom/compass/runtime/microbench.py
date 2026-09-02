@@ -44,7 +44,16 @@ __all__ = ["price_graph", "signature_of"]
 def signature_of(op: dict) -> str:
     """A kernel plus the shapes it ran on — what a price is a price *of*."""
     shapes = ";".join(",".join(str(d) for d in s) for s in op["input_shapes"])
-    return f"{op['name']}|{shapes}|{','.join(op['dtypes'])}"
+    sig = f"{op['name']}|{shapes}|{','.join(op['dtypes'])}"
+    # Two calls with the same shapes but different metadata are different
+    # amounts of work -- one decode step reading 40 tokens of history and
+    # another reading 4000 have identical signatures until the contents are part
+    # of the key.
+    values = op.get("int_values") or ()
+    if values:
+        sig += "|" + ";".join(
+            f"{i}:" + ",".join(str(x) for x in v) for i, v in values)
+    return sig
 
 
 def _resolve(name: str):
@@ -66,19 +75,31 @@ def _resolve(name: str):
     return getattr(op, overload, op)
 
 
-def _make_tensor(shape, dtype_name: str):
+def _make_tensor(shape, dtype_name: str, values=None):
+    """A stand-in for one tensor argument, from its shape and its contents.
+
+    ``values`` are the recorded contents of a small integer tensor, and where
+    they exist they are used, because for a data-dependent kernel the numbers
+    decide the work. Attention reads as much KV cache as ``context_lens`` says;
+    handed zeros it measured something that is not attention, and priced one
+    step of it above the cost of the whole step.
+
+    Without recorded values an integer tensor falls back to zeros -- in range
+    for anything that indexes, where a random value would not be -- and the
+    price that results should be read as describing the shape only.
+    """
     import torch
 
     dtype = getattr(torch, dtype_name, None)
     if dtype is None:
         return None
     size = tuple(int(d) for d in shape)
+    if values is not None and not dtype.is_floating_point:
+        flat = torch.tensor(list(values), dtype=dtype, device="cuda")
+        if flat.numel() == int(torch.Size(size).numel()):
+            return flat.reshape(size)
     if dtype.is_floating_point:
         return torch.randn(size, dtype=dtype, device="cuda")
-    if dtype is torch.bool:
-        return torch.zeros(size, dtype=dtype, device="cuda")
-    # Integer arguments are usually indices or lengths. Zero is in range for
-    # anything that indexes, which a random value would not be.
     return torch.zeros(size, dtype=dtype, device="cuda")
 
 
@@ -156,9 +177,12 @@ def _build_arg_sets(op: dict, cache: str, fn) -> Optional[list]:
     """
     import torch
 
+    recorded = {int(i): v for i, v in (op.get("int_values") or ())}
+
     def one():
-        tensors = [_make_tensor(s, d)
-                   for s, d in zip(op["input_shapes"], op["dtypes"])]
+        tensors = [_make_tensor(s, d, recorded.get(i))
+                   for i, (s, d) in enumerate(
+                       zip(op["input_shapes"], op["dtypes"]))]
         if any(t is None for t in tensors):
             return None
         return _rebuild_args(op, tensors)

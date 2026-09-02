@@ -60,6 +60,16 @@ class OpSpec:
         dtypes: Dtype of each tensor argument, in order.
         group: For a collective, the communication group it ran on. ``None``
             for local computation.
+        int_values: Contents of the small integer tensor arguments, as
+            ``(position, values)``. Shapes describe how much memory an operator
+            touches; for a data-dependent kernel they do not describe how much
+            work it does. Attention walks as much KV cache as ``context_lens``
+            says, so a benchmark handed a zero-filled tensor of the right shape
+            measures the wrong thing -- it priced one decode step's attention at
+            more than the whole step cost. Only integer tensors, and only small
+            ones: metadata is a handful of numbers per sequence, while the data
+            an operator computes over is large and float, and its values do not
+            decide the cost.
         scalars: The operator's non-tensor arguments, positional then keyword,
             as ``(name, value)`` pairs. Shapes alone do not describe a call:
             ``aiter::rmsnorm2d_fwd_`` takes an ``eps`` and refuses without one,
@@ -74,6 +84,7 @@ class OpSpec:
     dtypes: tuple[str, ...] = ()
     group: Optional[str] = None
     scalars: tuple[tuple[str, Any], ...] = ()
+    int_values: tuple[tuple[int, tuple[int, ...]], ...] = ()
 
     @property
     def is_collective(self) -> bool:
@@ -138,6 +149,7 @@ class OpGraph:
                     "dtypes": list(op.dtypes),
                     "group": op.group,
                     "scalars": [list(kv) for kv in op.scalars],
+                    "int_values": [[i, list(v)] for i, v in op.int_values],
                 }
                 for op in self.ops
             ],
@@ -169,6 +181,9 @@ class OpGraph:
                     # Absent from graphs written before scalars were recorded;
                     # those simply cannot be replayed to price their operators.
                     scalars=tuple(tuple(kv) for kv in op.get("scalars") or ()),
+                    int_values=tuple(
+                        (int(i), tuple(v)) for i, v in op.get("int_values") or ()
+                    ),
                 )
             )
         return graph

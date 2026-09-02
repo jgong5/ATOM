@@ -416,13 +416,39 @@ zeros, so `context_lens` is all zero, while the recorded scalars carry
 sizes its work from those and walks 16K of KV per sequence where the real step
 walks a few dozen tokens.
 
-So a signature of `(name, shapes, dtypes, scalars)` is still not enough for a
-**data-dependent** kernel: its cost turns on argument *values*. Which is a result
-worth having, because it says exactly what to record next -- `context_lens` is a
-batch-sized `int32` tensor and `cu_seqlens_q` one longer, both trivially small,
-and their values are the quantity attention's cost depends on. Note where that
-lands: the calibrated oracle's decode feature is `sum(context_lens)`, the same
-quantity, arrived at from the other direction.
+So a signature of `(name, shapes, dtypes, scalars)` is not enough for a
+**data-dependent** kernel: its cost turns on argument *values*.
+
+`OpSpec` now carries `int_values` -- the contents of small integer tensor
+arguments, recorded during trace and used to rebuild the call. The signature
+includes them, so the same kernel at two context lengths prices as two entries
+rather than one, which took the graph from 36 signatures to 44. That is correct
+and was needed regardless of what follows.
+
+**It did not move attention's price.** With `context_lens` recorded truthfully as
+`[155, 155, 155, 155]` instead of zeros, attention costs 163.7 µs against 163.6 µs
+before. So the zero-filled metadata was never the cause, and the hypothesis that
+motivated the work was wrong.
+
+What attention must cost in situ can be bounded: the step is 3.946 ms and the
+other priced kernels account for about 1.6 ms of it, leaving roughly 84 µs per
+call. The benchmark says 163.7 µs -- about twice too slow, and indifferent to the
+metadata values.
+
+**The reconstruction is incomplete in a way arguments cannot fix.**
+`AttentionMetaData` has 29 fields and the synthetic one fills 7. The backend
+reads `has_cached` and `cu_seqlens_k`, which are not among them, and it also
+reaches into runner-owned buffers -- `var["slot_mapping"].gpu[:running_bs]` --
+that are not arguments to the operator at all. So the benchmark is very likely
+executing a different branch from production, and passing more arguments does not
+close that: some of what the kernel consumes belongs to the runner, not the call.
+
+Which sharpens the earlier rule. An operator is priceable when it is a pure
+function of its arguments; attention was made *callable* by supplying its
+metadata, but it is still not *pure*, because the backend sources state from
+elsewhere. The boundary has moved down one level and needs to move further --
+or the state the backend reaches for has to become part of the operator's
+declared inputs.
 
 (A false lead worth recording so nobody follows it twice: the implementation
 returns `torch.empty_like(q)` when `is_dummy_run` is set, with a comment saying

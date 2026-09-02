@@ -172,6 +172,43 @@ class MetaTrace:
         return "\n".join(lines)
 
 
+#: Largest integer tensor whose contents are worth keeping. Metadata is a few
+#: numbers per sequence; anything much bigger is data, and an artifact should not
+#: grow with the size of a batch.
+MAX_RECORDED_INTS = 4096
+
+
+def _int_values_of(tensors) -> tuple:
+    """Contents of the small integer tensor arguments, by position.
+
+    Shapes say how much memory an operator touches, not how much work it does.
+    Attention reads as much KV cache as ``context_lens`` says it should, so a
+    benchmark given a zero-filled tensor of the right shape measures something
+    else entirely -- it priced one step's attention above the cost of the whole
+    step. Floating-point arguments are skipped: they are the data, they are
+    large, and their values do not decide what a kernel costs.
+
+    Each read is a device-to-host copy, so this is confined to trace mode, which
+    already runs eagerly and exists to produce an artifact rather than to serve.
+    """
+    import torch
+
+    out = []
+    for i, t in enumerate(tensors):
+        if not isinstance(t, torch.Tensor):
+            continue
+        if t.dtype not in (torch.int32, torch.int64, torch.int16, torch.uint8,
+                           torch.int8, torch.bool):
+            continue
+        if t.numel() == 0 or t.numel() > MAX_RECORDED_INTS:
+            continue
+        try:
+            out.append((i, tuple(int(x) for x in t.flatten().tolist())))
+        except Exception:  # noqa: BLE001 - a value that will not move is skipped
+            continue
+    return tuple(out)
+
+
 def _scalars_of(args, kwargs) -> tuple:
     """An operator's non-tensor arguments, in a form an artifact can hold.
 
@@ -286,6 +323,7 @@ class MetaOpTracer(TorchDispatchMode):
                 dtypes=dtypes,
                 group=_resolve_group(name, self.topology),
                 scalars=_scalars_of(args, kwargs),
+                int_values=_int_values_of(tensors),
             )
         )
         return out
