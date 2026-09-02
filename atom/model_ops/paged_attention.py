@@ -4,6 +4,8 @@
 # from flash_attn import flash_attn_with_kvcache
 from typing import Optional
 import torch
+
+from atom.utils.forward_context import get_forward_context
 from torch import nn
 
 from .attention_mla import MLAModules
@@ -118,7 +120,17 @@ class Attention(BaseAttention):
         qkv: torch.Tensor = None,
         **kwargs,
     ):
+        # The metadata this call depends on, passed rather than left ambient.
+        # Already in hand -- the backends are about to read the same object --
+        # so this costs a few argument slots and makes the operator describe
+        # what it consumes. An op graph records arguments, not globals: without
+        # these, attention is an opaque node whose real inputs are invisible and
+        # whose recorded form cannot be replayed to price it.
+        md = get_forward_context().attn_metadata
         output = torch.ops.aiter.unified_attention_with_output_base(
-            query, q_scale, key, value, positions, self.layer_name, self.use_mla, qkv
+            query, q_scale, key, value, positions, self.layer_name, self.use_mla,
+            qkv,
+            md.block_tables, md.context_lens, md.slot_mapping, md.cu_seqlens_q,
+            md.max_seqlen_q, md.max_seqlen_k,
         )
         return output

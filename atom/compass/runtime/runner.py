@@ -610,7 +610,15 @@ class CompassModelRunner(ModelRunner):
         never arrives, naming neither CUDA graphs nor Compass.
         """
         if self._compass_config.mode == "measure":
-            return super().capture_cudagraph()
+            result = super().capture_cudagraph()
+            # Priced here rather than after warmup, because warmup runs while
+            # the runner is still being built -- before the KV cache exists. An
+            # operator that walks paged KV cannot be called without one, and
+            # attention is exactly such an operator. By this point the kernels
+            # are registered and autotuned, the cache is allocated, and the
+            # graphs are captured.
+            self._run_microbenchmark()
+            return result
         if self._compass_config.mode == "trace":
             logger.info(
                 "ATOMCompass: skipping CUDA graph capture so the forward stays "
@@ -667,11 +675,13 @@ class CompassModelRunner(ModelRunner):
     def _run_microbenchmark(self) -> None:
         """Price the kernels this deployment just warmed up.
 
-        Placed after warmup because that is the only moment both conditions
-        hold: the operators are registered (``aiter`` does it lazily, on first
-        call, in this process) and autotuned for the shapes in use. Before
-        warmup a lookup fails; in the parent process it fails whatever happens,
-        because the model runs here.
+        Placed after CUDA graph capture, the first moment every condition
+        holds: the operators are registered (``aiter`` does it lazily, on first
+        call, in this process), they are autotuned for the shapes in use, and
+        the KV cache has been allocated. Warmup satisfies the first two but runs
+        during the runner construction, before any KV cache exists -- and an
+        operator that walks paged KV cannot be called without one. In the parent
+        process none of it holds, because the model runs here.
         """
         config = self._compass_config
         if not (config.bench_graph and config.bench_out):
@@ -715,7 +725,5 @@ class CompassModelRunner(ModelRunner):
         0.03 s one.
         """
         if self._runs_real_forward:
-            result = super().warmup_model()
-            self._run_microbenchmark()
-            return result
+            return super().warmup_model()
         logger.debug("ATOMCompass: skipping model warmup")

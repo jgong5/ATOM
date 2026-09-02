@@ -378,11 +378,51 @@ paged-KV state — how many blocks the sequences occupy and how scattered they a
 amount of extra recorded arguments would fix. A price list keyed that way has a
 hole in it exactly where a quarter of the work is.
 
-That is the strongest argument yet for pricing a **chain** rather than a kernel.
-Attention can only be measured in a context that supplies its metadata, and the
-cheapest such context is the model running a step. Capturing one transformer
-layer keeps the KV state real, keeps the dependency order real, and still costs
-far less than a shape sweep.
+**Fixed by moving the boundary, not the granularity.** Pricing a whole layer
+would have worked and was the wrong answer: a layer is a model-structure concept,
+and Compass does not have those -- its graph knows group sizes and ranks and
+nothing else. Putting layers in it to serve a benchmark would trade the property
+that makes the representation general.
+
+The op boundary moved instead. `unified_attention_with_output_base` now takes
+`block_tables`, `context_lens`, `slot_mapping`, `cu_seqlens_q`, `max_seqlen_q`
+and `max_seqlen_k` as arguments, resolved by the caller from the same context the
+backends read. Production takes the same path it always did and ignores them; off
+the serving path, with no live forward, the operator stands up a context from
+them and the backends work unchanged. Eight attention backends were left
+untouched. The KV cache needs no argument -- it lives in its own context,
+installed once at startup, and `set_forward_context` picks it up, which is also
+why the benchmark had to move from after warmup to after CUDA graph capture: at
+warmup the runner is still being built and there is no cache to walk.
+
+Coverage went from 90.3% to **98.8%** of operators, and the graph is better for
+it independently of pricing: attention used to be an opaque node whose real
+inputs were invisible.
+
+### Callable is not the same as priced
+
+The number that came back is not credible, and the way it fails is the finding:
+
+| kernel | n | each | total |
+| --- | --- | --- | --- |
+| `unified_attention_with_output_base` | 28 | 163.6 µs | **4.582 ms** |
+| `gemm_a16w16` | 113 | 11.3 µs | 1.275 ms |
+| priced total | | | 6.347 ms |
+| the replayed step | | | **3.946 ms** |
+
+Attention alone exceeds the whole step. The harness fills integer tensors with
+zeros, so `context_lens` is all zero, while the recorded scalars carry
+`max_seqlen_k = 16384` -- the padded bound, not the actual context. The kernel
+sizes its work from those and walks 16K of KV per sequence where the real step
+walks a few dozen tokens.
+
+So a signature of `(name, shapes, dtypes, scalars)` is still not enough for a
+**data-dependent** kernel: its cost turns on argument *values*. Which is a result
+worth having, because it says exactly what to record next -- `context_lens` is a
+batch-sized `int32` tensor and `cu_seqlens_q` one longer, both trivially small,
+and their values are the quantity attention's cost depends on. Note where that
+lands: the calibrated oracle's decode feature is `sum(context_lens)`, the same
+quantity, arrived at from the other direction.
 
 (A false lead worth recording so nobody follows it twice: the implementation
 returns `torch.empty_like(q)` when `is_dummy_run` is set, with a comment saying
