@@ -125,6 +125,11 @@ nobody has measured, or only interpolate between ones that were. Everything
 under *Settled* about graphs is groundwork for this and is not yet paying for
 itself.
 
+**Ceiling on this, before anything else is built on top: #21.** Priced kernels
+come out about a quarter under what a step costs, measured without a profiler,
+at 98.8% coverage. If that ratio is constant it is one calibration factor; if it
+is not, no amount of coverage fixes it.
+
 Precondition, from the event-timing finding below: per-operator attribution must
 be checked for the same observer effect — run the workload with and without it
 and compare the engine's own numbers.
@@ -1408,6 +1413,83 @@ knowing before anyone tries to capture a sweep.
 ---
 
 # Settled
+
+### 21. Priced kernels are systematically optimistic — **M**
+
+A kernel measured on its own comes out cheaper than the same kernel in a step,
+and it happens to every kernel measured so far. This bounds everything item 1
+could deliver: a price list that reaches every operator and sums correctly still
+under-predicts.
+
+The profiler-free statement, which is the strong one, because it involves no
+instrument beyond the engine's own clock:
+
+| | |
+| --- | --- |
+| priced kernels, one decode step, 98.8% of operators | 2.332 ms |
+| the replayed step | 3.115 ms |
+| **parts / whole** | **0.749** |
+
+Per kernel, comparing each priced value against the same kernel read out of a
+profile of the real run:
+
+| kernel | priced | in situ | ratio |
+| --- | --- | --- | --- |
+| gemm `4,1024;6144,1024` | 13.030 µs | 14.061 µs | 0.93 |
+| gemm `4,1024;4096,1024` | 9.150 µs | 10.699 µs | 0.86 |
+| gemm `4,3072;1024,3072` | 9.079 µs | 10.456 µs | 0.87 |
+| gemm `4,2048;1024,2048` | 7.926 µs | 9.577 µs | 0.83 |
+| attention | 8.52 µs | 10.24 µs | 0.83 |
+| rope | 7.54 µs | 9.19 µs | 0.82 |
+| KV write | 5.00 µs | 5.79 µs | 0.86 |
+
+Seven kernels across two families, memory-bound and compute-bound, clustering at
+0.83 to 0.93. **Whether that ratio is constant is the question that decides the
+fix**, and it is worth answering before anything is built on top:
+
+* If it is constant, one calibration factor corrects the whole price list, the
+  residual error is the spread rather than the ratio, and the mechanism can stay
+  unexplained. Cheap, and probably good enough.
+* If it varies by kernel class, shape or occupancy, a single factor is wrong and
+  the mechanism has to be found first.
+
+The sample is seven kernels at one batch size on one model, which is not enough
+to tell those apart. Widening it is mostly bookkeeping: every priced signature
+already has an in-situ counterpart in a profile of the same workload.
+
+What it is **not**, each ruled out by measurement rather than argument:
+
+* Not cache residency. Cooling the KV cache by rotating the region each captured
+  call addresses moves attention from 0.79 to 0.83 and then plateaus, flat from
+  128 regions out to 512.
+* Not specific to attention. The gemms show the same ratio and never touch the
+  KV cache.
+* Not overlap between the captured copies. Per-call cost asymptotes with batch
+  size and fits `c + r/B` to within 1%; concurrency would keep driving it down.
+* Not a disagreement between instruments. Ablation and profile agree on
+  attention's in-situ cost to 1%, and they share no machinery.
+
+Two candidate mechanisms, neither tested:
+
+* *Clocks.* A benchmark replaying one small kernel draws far less power than a
+  dense decode step and may boost higher. A uniform multiplicative discount
+  across kernels of different shapes is what that would look like. Sample
+  `rocm-smi` clocks during each.
+* *Kernel boundaries.* The captured copies are mutually independent where a
+  step's are a dependency chain, and the hardware may pipeline the boundary
+  between two independent kernels more tightly. This harness has already
+  measured something that looks like it: cold mode came out **0.94x** hot,
+  against the expectation that streaming a weight costs more than rereading a
+  resident one, read at the time as rotating output buffers removing a
+  write-after-write serialisation. Test by capturing a batch whose calls share
+  an output buffer.
+
+One caveat on the per-kernel column, which the 0.749 does not share: summed
+profiled kernel time for the later decode steps comes to ~3.42 ms against a
+step that is nearer 3.2 ms, so the profiler carries its own inflation of order
+5-10%. That is inside the ratios in the table and would move them *up*, toward
+1. It cannot explain the 0.749, which no profiler touched.
+
 
 ## Tracing
 
