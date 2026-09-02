@@ -314,35 +314,47 @@ device-bound above it. **The loop number is the host's cost and the in-graph
 number is the kernel's**, and `host_seconds` sits beside every price so a reader
 can tell which one they are holding.
 
-One caveat survives, and it can be quantified rather than left as a caveat: the
-in-graph figure captures 64 *independent* calls the device may overlap, so it is
-throughput under concurrency rather than the latency of one kernel.
+Hoisting the event construction out of the loop is worth doing and worth very
+little: `torch.cuda.Event` builds its CUDA event lazily on first `record()`, so
+constructing `ended` inside the loop put that construction between the two
+timestamps. Removing it saves **0.95 µs** per call at the median.
 
-Two small experiments pin it down. `torch.cuda.Event` builds its CUDA event
-lazily on first `record()`, so constructing `ended` inside the loop puts that
-construction between the two timestamps. Hoisting both events out saves
-**0.95 µs** per call at the median -- real, and kept, but a tenth of the gap it
-was meant to explain.
+**A claim retracted.** It looked for a while as though graph mode understated a
+kernel by 1.5-1.8x, on the grounds that it captures 64 independent calls the
+device could overlap, with `own pair − host` as the honest figure. That
+subtraction is invalid: part of the host's 31 µs happens *after* the kernel is
+enqueued and runs concurrently with it, so removing the whole host cost removes
+work that overlapped the kernel and inflates what is left.
 
-What is left is the concurrency gain, and subtracting the host cost from the
-own-pair measurement isolates it:
+Varying the capture size settles it, because the two stories predict opposite
+things -- overlap keeps falling with more captured calls, serialisation does not:
 
-| M | own pair − host | in graph | graph understates by |
-| --- | --- | --- | --- |
-| 4 | 16.7 µs | 9.22 µs | **1.8x** |
-| 64 | 19.3 µs | 12.65 µs | 1.5x |
-| 256 | 34.1 µs | 29.29 µs | 1.16x |
-| 1024 | 142.5 µs | 137.58 µs | 1.04x |
+| M | B=1 | B=2 | B=8 | B=32 | B=128 |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 14.78 µs | 11.56 | 9.38 | 8.87 | **9.04** |
+| 64 | 18.12 µs | 15.18 | 12.68 | 12.31 | **12.63** |
+| 1024 | 143.07 µs | 139.91 | 137.39 | 138.23 | **137.88** |
 
-Large for a small kernel and vanishing for a large one, which is how overlap must
-behave as a kernel saturates the device. So the residual was never noise.
+Falls to B=8, flat after. That is a fixed per-replay cost being amortised --
+`kernel + overhead/B`, with the overhead measuring 5.7 µs at M=1 and 5.2 µs at
+M=1024, the same constant regardless of kernel size, which is what a graph launch
+must look like. The model reproduces the intermediate points (M=1, B=2 predicts
+11.91 against 11.56 measured).
 
-**The best estimate of a kernel's cost is `own pair − host`**, not the in-graph
-figure. Which means the graph-mode priced total of 1.765 ms against a 3.946 ms
-step -- 0.45x, the "over-correction" above -- is understated by something like
-1.5-1.8x at decode shapes. Correcting for that moves the sum to roughly 3 ms and
-much of the remaining shortfall is attention, still unpriced. The three modes
-bracket a step far more tightly than they first appeared to.
+**Flat across B means the captured calls serialise**, as stream-ordered capture
+implies. So the in-graph figure is a latency, not a throughput, and it is the
+kernel's cost.
+
+### So graph pricing is the right measurement
+
+It removes the ~31 µs of host dispatch that swamps a decode-shaped kernel, and it
+measures the kernel in a replayed graph -- the context production runs it in. The
+only requirement is a capture past the knee, since a one-call capture charges the
+whole 5.5 µs replay cost to one kernel; B=8 is enough and 64 is used.
+
+Which means the gap between the priced total of 1.765 ms and the 3.946 ms step is
+**not** a measurement error waiting to be corrected. It is mostly the 28
+unpriced attention operators, and that is where the next work is.
 
 Capturing the calls into a CUDA graph removes what production removes — one
 submission, no host in the loop — and takes ~21 µs off. A ~9 µs floor survives,

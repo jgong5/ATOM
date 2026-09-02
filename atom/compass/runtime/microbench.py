@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 import logging
+import os
 from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
@@ -186,7 +187,14 @@ def _build_arg_sets(op: dict, cache: str, fn) -> Optional[list]:
 
 #: Calls captured into one graph. Large enough that replaying the graph costs
 #: far more than submitting it, small enough to capture quickly.
-GRAPH_BATCH = 64
+#: Calls captured into one graph. A replay costs about 5.5 microseconds
+#: whatever it contains, so a capture of one call charges that to one kernel and
+#: overstates it; measured per-call cost falls from B=1 to B=8 and is flat
+#: thereafter, at every shape from M=1 to M=2048. Flat is the important part --
+#: it means the captured calls run one after another, as stream-ordered capture
+#: implies, so what is measured is a latency and not a throughput. 64 is
+#: comfortably past the knee.
+GRAPH_BATCH = int(os.environ.get("COMPASS_GRAPH_BATCH", "64"))
 
 
 def _time_in_graph(fn, sets: list, iters: int, warmup: int) -> float:
