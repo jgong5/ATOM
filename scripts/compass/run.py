@@ -47,6 +47,21 @@ def main() -> int:
     ]
     params = SamplingParams(temperature=0.0, max_tokens=args.max_tokens)
 
+    if getattr(args, "compass_trace_prefill", 0) > 1:
+        # Triton autotunes a shape on its first launch, benchmarking every
+        # candidate configuration, so the first prefill of a workload records a
+        # tuning run rather than a serving one. Warm the same shapes first.
+        #
+        # Same lengths, so the same kernels are tuned; different text, because
+        # prefix caching would otherwise let the second pass skip the prefill
+        # this exists to record. One token out, so it contributes a prefill and
+        # no decode steps.
+        llm.generate(
+            [f"Warm {i}. " + " ".join(f"w{i}x{j}" for j in range(args.prompt_tokens))
+             for i in range(args.num_prompts)],
+            SamplingParams(temperature=0.0, max_tokens=1),
+        )
+
     if args.sweep:
         # Each round is its own generate, so each contributes at least one
         # prefill step at a different size. Lengths and batch sizes vary

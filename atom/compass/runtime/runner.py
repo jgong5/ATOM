@@ -47,6 +47,8 @@ class CompassModelRunner(ModelRunner):
         self._oracle: CostOracle = self._build_oracle(self._compass_config)
         self._graph = OpGraph()
         self._traced_steps = 0
+        self._prefill_index = 0
+        self._decode_index = 0
         self._step_index = 0
         self._measured_steps = 0
         self._measured_by_kind: dict = {}
@@ -308,11 +310,31 @@ class CompassModelRunner(ModelRunner):
         from atom.compass.runtime.triton_trace import TritonLaunchTracer
 
         self._step_index += 1
-        wanted = self._compass_config.traced_steps()
-        if self._step_index not in wanted:
+        config = self._compass_config
+        # Prefills are counted separately from forwards, because which forward
+        # a prefill happens to be depends on the workload -- how many decode
+        # steps ran before it -- while "the second prefill" does not.
+        prefilling = int(getattr(batch, "total_tokens_num_prefill", 0)) > 0
+        if prefilling:
+            self._prefill_index += 1
+        else:
+            self._decode_index += 1
+        # Counted per kind rather than by forward index. Which forward a decode
+        # step happens to be depends on how many prefills ran before it, so a
+        # workload that warms its shapes first -- which tracing a prefill needs,
+        # since Triton autotunes on a shape's first launch -- would shift every
+        # index and quietly record the wrong step.
+        kind = None
+        if prefilling:
+            if config.trace_prefill and self._prefill_index == config.trace_prefill:
+                kind = "prefill"
+        elif self._decode_index == config.trace_step:
+            kind = "decode"
+        if kind is None:
             return super().forward(batch)
-        # A graph per traced step, not one accumulated across them: they
-        # describe different shapes and merging them would describe none.
+        # A graph per traced step, not one accumulated across them: a decode
+        # graph and a prefill graph describe different work and merging them
+        # would describe neither.
         self._graph = OpGraph()
 
         timing = None
@@ -349,7 +371,7 @@ class CompassModelRunner(ModelRunner):
             )
             raise
         self._traced_steps += 1
-        self._write_graph(batch, len(wanted) > 1)
+        self._write_graph(batch, kind)
         if timing is not None:
             self._write_op_timings(timing)
         return output
@@ -406,14 +428,14 @@ class CompassModelRunner(ModelRunner):
         """
         return rank_path(path, coords)
 
-    def _write_graph(self, batch: ScheduledBatch, per_step: bool = False) -> None:
+    def _write_graph(self, batch: ScheduledBatch, kind: str = "decode") -> None:
         path = self._compass_config.graph_out
         if not path:
             return
-        if per_step:
-            from atom.compass.core.artifacts import step_path
+        if kind == "prefill":
+            from atom.compass.core.artifacts import kind_path
 
-            path = step_path(path, self._step_index)
+            path = kind_path(path, kind)
         shape = self._describe(batch)
         topology = self._topology()
         coords = self._rank_coords()
@@ -532,10 +554,13 @@ class CompassModelRunner(ModelRunner):
             num_prefill_tokens=int(getattr(batch, "total_tokens_num_prefill", 0)),
             topology=self._topology(),
             rank_coords=self._rank_coords(),
-            capture_bucket=self._capture_bucket(len(num_scheduled)),
+            capture_bucket=self._capture_bucket(
+                len(num_scheduled),
+                prefilling=int(getattr(batch, "total_tokens_num_prefill", 0)) > 0),
         )
 
-    def _capture_bucket(self, batch_size: int) -> Optional[int]:
+    def _capture_bucket(self, batch_size: int,
+                        prefilling: bool = False) -> Optional[int]:
         """Which rung of the CUDA-graph ladder this batch replays at.
 
         Mirrors `ForwardMode.decide`, which is what actually picks the graph::
@@ -558,11 +583,16 @@ class CompassModelRunner(ModelRunner):
         sweep report bucket 512.)
 
         None when no graph is replayed: `enforce_eager`, a ladder not yet
-        resolved, or a batch larger than the top rung -- `ForwardMode.decide`
-        falls back to eager there. A bucket that did not happen must not be
-        fitted as though it did.
+        resolved, a batch larger than the top rung -- `ForwardMode.decide` falls
+        back to eager there -- or a **prefill** step, which runs eager whatever
+        the ladder holds, because the ladder is captured at one token per
+        sequence and a prefill step has hundreds. A bucket that did not happen
+        must not be fitted as though it did, and reporting one for prefill told
+        a cost model the host was not in the loop when it was: the same graph
+        costs its kernels plus 2 microseconds a launch replayed and plus 67
+        microseconds an operator eager, so prefill priced at 0.42 of its step.
         """
-        if getattr(self, "enforce_eager", False):
+        if prefilling or getattr(self, "enforce_eager", False):
             return None
         sizes = getattr(self, "capture_sizes", None)
         if not sizes or sizes == [0]:

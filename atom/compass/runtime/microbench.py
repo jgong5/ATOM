@@ -475,13 +475,15 @@ def price_graph(graph_path: str, iters: int = 2000, warmup: int = 20,
     accounts for, because the two differ enormously: a handful of signatures
     cover most of a step.
     """
-    # A glob, because one graph describes one shape and an oracle that
-    # interpolates needs several. Their operators are pooled before pricing:
-    # signatures that repeat across shapes are priced once, and the ones that
-    # differ -- attention at each context length -- each get their own price.
+    # A glob or a comma-separated list, because a deployment has more than one
+    # kind of step and each is its own graph -- a decode one and a prefill one.
+    # Their operators are pooled before pricing: signatures common to both are
+    # priced once, and the ones that differ each get their own price.
     import glob as _glob
 
-    paths = sorted(_glob.glob(graph_path)) or [graph_path]
+    paths = []
+    for part in str(graph_path).split(","):
+        paths.extend(sorted(_glob.glob(part.strip())) or [part.strip()])
     ops = []
     for path in paths:
         with open(path, encoding="utf-8") as fh:

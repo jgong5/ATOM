@@ -35,10 +35,9 @@ extrapolating from one shape to another. Deriving a graph per shape is what
 
 from __future__ import annotations
 
-import glob
 import json
 import logging
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Optional
 
 from atom.compass.core.cost.base import StepCost, StepShape
@@ -54,14 +53,22 @@ class _Costed:
 
     path: str
     seconds: float
+    ops: int
     launches: int
     breakdown: dict
     is_prefill: bool
     batch: int
     context: float
 
-    def at(self, seconds: float) -> "_Costed":
-        return replace(self, seconds=seconds)
+
+
+#: Seconds added per *operator* on a step that was not replayed. A prefill step
+#: runs eager -- its token count is not on the capture ladder -- so the host
+#: dispatches every operator individually and that dispatch, not the kernels, is
+#: most of the step. Prefill's kernels come to 15.8ms of a 37.3ms step, and the
+#: remainder over 319 operators is 67us each. The same fit as the boundary
+#: constant and the same caveat: one step, one deployment.
+DEFAULT_EAGER_SECONDS_PER_OP = 67.4e-6
 
 #: Seconds added per kernel launch. Fitted as (step - priced) / launches on a
 #: Qwen3-0.6B decode step at batch 4: (3.115ms - 2.305ms) / 401. Independently,
@@ -73,18 +80,31 @@ DEFAULT_BOUNDARY_SECONDS = 2.02e-6
 class PricedGraphCostOracle:
     """Costs a step by summing the priced operators of its op graph."""
 
-    def __init__(self, prices: str, graph: str,
+    def __init__(self, prices: str, graph: str, prefill_graph: str = "",
                  boundary_seconds: float = DEFAULT_BOUNDARY_SECONDS,
+                 eager_seconds_per_op: float = DEFAULT_EAGER_SECONDS_PER_OP,
                  floor_seconds: float = 1e-6, fallback: str = "",
                  rank_coords: Optional[dict] = None) -> None:
         """
         Args:
             prices: A price list from ``--compass-bench-out``.
-            graph: An op graph from ``--compass-graph-out``. Its operators are
-                looked up in the price list by the same signature the benchmark
-                priced them under.
-            boundary_seconds: Added per kernel launch. See the module docstring;
-                zero reproduces the naive sum, which is 26% low.
+            graph: A decode op graph from ``--compass-graph-out``. Its
+                operators are looked up in the price list by the same signature
+                the benchmark priced them under.
+            prefill_graph: A prefill op graph, from the same run with
+                ``--compass-trace-prefill``. Without one, prefill steps fall
+                through to ``fallback`` and none of the op-graph work reaches
+                TTFT.
+            boundary_seconds: Added per kernel launch on a replayed step. See
+                the module docstring; zero reproduces the naive sum, which is
+                26% low.
+            eager_seconds_per_op: Added per operator on a step that was not
+                replayed, where the host dispatches each one. Two constants
+                rather than one because the two kinds of step differ by more
+                than a factor: the same graph costs its kernels plus 2 µs a
+                launch when replayed and its kernels plus 67 µs an operator when
+                not, and using the replayed constant for prefill priced it at
+                0.42 of the step.
             floor_seconds: Smallest duration ever returned, so a virtual clock
                 cannot be run backwards by an empty or unpriced graph.
             fallback: A calibration table, used for steps the graph does not
@@ -102,22 +122,30 @@ class PricedGraphCostOracle:
         self.prices_path, _ = resolve_rank_path(prices, rank_coords)
         self.graph_path, _ = resolve_rank_path(graph, rank_coords)
         self.boundary_seconds = float(boundary_seconds)
+        self.eager_seconds_per_op = float(eager_seconds_per_op)
         self.floor_seconds = float(floor_seconds)
 
         with open(self.prices_path, encoding="utf-8") as fh:
             price_list = json.load(fh)["prices"]
 
-        # One graph describes one shape. Given several -- `graph` is a glob --
-        # the oracle costs each and interpolates between them, which is what
-        # lets a prediction move with context length instead of answering every
-        # decode step with the number the traced step happened to cost.
-        paths = sorted(glob.glob(self.graph_path)) or [self.graph_path]
-        self.points: list[_Costed] = []
         self.unpriced = 0
-        for path in paths:
-            with open(path, encoding="utf-8") as fh:
-                self.points.append(self._cost(json.load(fh), price_list, path))
-        self.points.sort(key=lambda p: p.context)
+        with open(self.graph_path, encoding="utf-8") as fh:
+            self.decode = self._cost(json.load(fh), price_list, self.graph_path)
+
+        # A prefill step is different operators at different shapes, so a decode
+        # graph cannot answer for one. Interpolating *within* a kind was tried
+        # and dropped: four decode graphs across a run's context range moved the
+        # held-out error from 3.7% to 1.5-2.3%, and covering the range rather
+        # than extrapolating over it made no further difference -- so context is
+        # not what dominates, and the machinery was not worth its complexity.
+        # Two graphs of two kinds is a different proposition: it is the
+        # difference between predicting TTFT and not predicting it at all.
+        self.prefill = None
+        if prefill_graph:
+            self.prefill_path, _ = resolve_rank_path(prefill_graph, rank_coords)
+            with open(self.prefill_path, encoding="utf-8") as fh:
+                self.prefill = self._cost(json.load(fh), price_list,
+                                          self.prefill_path)
 
         self.fallback = None
         if fallback:
@@ -130,9 +158,8 @@ class PricedGraphCostOracle:
 
         if self.unpriced:
             logger.warning(
-                "ATOMCompass WARNING: %d operators across %d graph(s) have no "
-                "price and contribute nothing; steps will be predicted low.",
-                self.unpriced, len(self.points))
+                "ATOMCompass WARNING: %d operators have no price and contribute "
+                "nothing; steps will be predicted low.", self.unpriced)
 
     def _cost(self, graph_blob: dict, price_list: dict, path: str) -> "_Costed":
         """What one graph costs, and the shape it is a graph of."""
@@ -140,12 +167,14 @@ class PricedGraphCostOracle:
 
         seconds = 0.0
         launches = 0
+        priced_ops = 0
         breakdown: dict[str, float] = {}
         for op in graph_blob["ops"]:
             entry = price_list.get(signature_of(op))
             if entry is None:
                 self.unpriced += 1
                 continue
+            priced_ops += 1
             seconds += entry["seconds"]
             # An operator is not one kernel. Attention launches three, and the
             # boundary cost is paid at each -- so the count comes from what the
@@ -157,7 +186,8 @@ class PricedGraphCostOracle:
         contexts = recorded.get("context_lens") or []
         return _Costed(
             path=path,
-            seconds=seconds + launches * self.boundary_seconds,
+            seconds=seconds,
+            ops=priced_ops,
             launches=launches,
             breakdown=breakdown,
             is_prefill=bool(recorded.get("num_prefill_tokens", 0)),
@@ -165,51 +195,38 @@ class PricedGraphCostOracle:
             context=(sum(contexts) / len(contexts)) if contexts else 0.0,
         )
 
-    def _interpolate(self, context: float) -> "_Costed":
-        """The cost at ``context``, from the decode graphs either side of it.
-
-        Linear, and extrapolating past the ends rather than clamping: decode
-        cost rises with context because attention walks more KV, and a run that
-        generates past the last traced step is the ordinary case, not an edge
-        one. Clamping there would reintroduce exactly the flat prediction this
-        exists to remove.
-        """
-        usable = [p for p in self.points if not p.is_prefill] or self.points
-        if len(usable) == 1:
-            return usable[0]
-        lower, upper = usable[0], usable[-1]
-        for left, right in zip(usable, usable[1:]):
-            if left.context <= context <= right.context:
-                lower, upper = left, right
-                break
-        span = upper.context - lower.context
-        if span <= 0:
-            return lower
-        at = (context - lower.context) / span
-        return lower.at(lower.seconds + at * (upper.seconds - lower.seconds))
-
     def estimate(self, shape: StepShape) -> StepCost:
-        if shape.is_prefill != any(p.is_prefill for p in self.points):
+        point = self.prefill if shape.is_prefill else self.decode
+        if point is None:
             if self.fallback is not None:
                 return self.fallback.estimate(shape)
             if not self._warned:
                 self._warned = True
                 logger.warning(
-                    "ATOMCompass WARNING: no graph describes a %s step; "
-                    "answering with a %s one. Pass "
-                    "--compass-oracle-option fallback=<measure table>.",
-                    "prefill" if shape.is_prefill else "decode",
-                    "prefill" if not shape.is_prefill else "decode")
-        context = (sum(shape.context_lens) / len(shape.context_lens)
-                   if shape.context_lens else 0.0)
-        point = self._interpolate(context)
-        total = max(point.seconds, self.floor_seconds)
-        return StepCost(seconds=total, breakdown=dict(point.breakdown))
+                    "ATOMCompass WARNING: no prefill graph, so prefill steps "
+                    "are answered with the decode graph's cost. Trace one with "
+                    "--compass-trace-prefill and pass it as "
+                    "--compass-oracle-option prefill_graph=<path>.")
+            point = self.decode
+        # What a step pays on top of its kernels depends on how it ran, and the
+        # difference is thirtyfold. A replayed step is one submission and the
+        # host is not in the loop; an eager one dispatches every operator. The
+        # engine says which through `capture_bucket`, which is None exactly when
+        # nothing was replayed -- so this stays a property of the step rather
+        # than of the model or of what "prefill" happens to mean.
+        if shape.capture_bucket is None:
+            overhead = point.ops * self.eager_seconds_per_op
+        else:
+            overhead = point.launches * self.boundary_seconds
+        total = max(point.seconds + overhead, self.floor_seconds)
+        return StepCost(seconds=total,
+                        breakdown=dict(point.breakdown, **{"<overhead>": overhead}))
 
     def describe(self) -> str:
-        span = (f"{self.points[0].context:.0f}-{self.points[-1].context:.0f} "
-                f"tokens of context" if self.points else "no graphs")
-        costs = ", ".join(f"{p.seconds*1e3:.3f}ms" for p in self.points[:4])
-        return (f"PricedGraphCostOracle({len(self.points)} graph(s) over {span}: "
-                f"{costs}"
+        prefill = (f"{self.prefill.seconds*1e3:.3f}ms prefill kernels"
+                   if self.prefill else "no prefill graph")
+        return (f"PricedGraphCostOracle("
+                f"{self.decode.seconds*1e3:.3f}ms decode kernels, {prefill}; "
+                f"+{self.boundary_seconds*1e6:.2f}us/launch replayed, "
+                f"+{self.eager_seconds_per_op*1e6:.1f}us/op eager"
                 + (", calibrated fallback" if self.fallback else "") + ")")

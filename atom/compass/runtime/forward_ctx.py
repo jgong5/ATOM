@@ -69,8 +69,16 @@ def _capture_attention() -> tuple[tuple[str, Any], ...]:
         ("context_lens", _values(md.context_lens)),
         ("slot_mapping", _values(md.slot_mapping)),
         ("cu_seqlens_q", _values(md.cu_seqlens_q)),
+        # Prefill reads more of the metadata than decode does. The varlen fmha
+        # kernel wants both cumulative-length arrays and all three extents, and
+        # raises on a missing one rather than defaulting it -- recording only
+        # what decode needed left every prefill attention unpriced, which is the
+        # whole of prefill's attention cost.
+        ("cu_seqlens_k", _values(md.cu_seqlens_k)),
         ("max_seqlen_q", int(md.max_seqlen_q)),
         ("max_seqlen_k", int(md.max_seqlen_k)),
+        ("min_seqlen_q", int(md.min_seqlen_q)),
+        ("has_cached", bool(md.has_cached)),
         ("state", md.state.value),
         ("is_prefill", bool(fwd.context.is_prefill)),
         ("positions", _values(fwd.context.positions)),
@@ -175,8 +183,11 @@ def _install_attention(recorded: dict[str, Any], variants: int) -> list:
                 None if slots is None
                 else [x + v * stride * block_size for x in slots], torch.int64),
             cu_seqlens_q=tensor(recorded.get("cu_seqlens_q"), torch.int32),
+            cu_seqlens_k=tensor(recorded.get("cu_seqlens_k"), torch.int32),
             max_seqlen_q=int(recorded.get("max_seqlen_q", 0)),
             max_seqlen_k=int(recorded.get("max_seqlen_k", 0)),
+            min_seqlen_q=int(recorded.get("min_seqlen_q", 0)),
+            has_cached=bool(recorded.get("has_cached", False)),
             state=AttnState(recorded.get("state", AttnState.DECODE.value)),
         )
         context = Context(
