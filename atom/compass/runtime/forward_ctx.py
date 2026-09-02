@@ -88,7 +88,45 @@ def _capture_attention() -> tuple[tuple[str, Any], ...]:
     return tuple(recorded)
 
 
-def _install_attention(recorded: dict[str, Any]) -> None:
+def _kv_blocks() -> int:
+    """How many blocks the KV cache holds, or 0 if it is not reachable.
+
+    Read from the persistent KV context rather than the live forward one. The
+    cache is installed once at startup and kept separately, which is exactly why
+    a benchmark can reset the forward context and still find it -- and why
+    reading it from the live context returns nothing right after that reset.
+    """
+    from atom.utils import forward_context as fc
+
+    holders = [getattr(fc, "_forward_kv_cache_context", None),
+               fc.get_forward_context()]
+    for holder in holders:
+        for entry in (getattr(holder, "kv_cache_data", None) or {}).values():
+            cache = getattr(entry, "k_cache", None)
+            if cache is not None and cache.dim() >= 1 and cache.shape[0] > 0:
+                return int(cache.shape[0])
+    return 0
+
+
+def _install_attention(recorded: dict[str, Any], variants: int) -> list:
+    """One installer per distinct KV region the captured batch should touch.
+
+    A benchmark that calls attention repeatedly calls it against *one* layer's
+    KV cache, so after the first call the whole working set is resident and every
+    kernel that touches it -- the attention read, the RoPE-and-cache write, the
+    reshape-and-cache write -- runs against warm memory. A decode step does not
+    work that way: it touches each of 28 layers' regions once, separated by the
+    other ~300 kernels of a model far larger than the last level of cache. That
+    difference showed up as a uniform 15-30% discount across all three kernels.
+
+    So each captured call is given its own slice of the KV cache, offset by the
+    blocks the recorded call used. Rotating with period ``variants`` means a
+    region is revisited only after every other one has been walked, which is what
+    evicts it -- eviction reproduced rather than simulated, and at no cost, where
+    scrubbing a 256 MB cache between 18 us calls would swamp what it measures.
+
+    Variant 0 is the recorded call exactly, so a single-variant run is unchanged.
+    """
     import torch
 
     from atom.config import get_current_atom_config
@@ -99,39 +137,62 @@ def _install_attention(recorded: dict[str, Any]) -> None:
         set_forward_context,
     )
 
-    def tensor(name, dtype):
-        values = recorded.get(name)
+    def tensor(values, dtype):
         if values is None:
             return None
         return torch.tensor(values, dtype=dtype, device="cuda")
 
-    table = None
     shape = recorded.get("block_tables_shape")
-    if shape is not None:
-        table = torch.zeros(tuple(shape), dtype=torch.int32, device="cuda")
-        flat = recorded.get("block_tables") or []
-        used = len(flat) // max(shape[0], 1)
-        if used:
-            table[:, :used] = torch.tensor(
-                flat, dtype=torch.int32, device="cuda").reshape(shape[0], used)
+    flat = recorded.get("block_tables") or []
+    slots = recorded.get("slot_mapping")
+    block_size = int(get_current_atom_config().kv_cache_block_size)
 
-    metadata = AttentionMetaData(
-        block_tables=table,
-        context_lens=tensor("context_lens", torch.int32),
-        slot_mapping=tensor("slot_mapping", torch.int64),
-        cu_seqlens_q=tensor("cu_seqlens_q", torch.int32),
-        max_seqlen_q=int(recorded.get("max_seqlen_q", 0)),
-        max_seqlen_k=int(recorded.get("max_seqlen_k", 0)),
-        state=AttnState(recorded.get("state", AttnState.DECODE.value)),
-    )
-    set_forward_context(
-        attn_metadata=metadata,
-        atom_config=get_current_atom_config(),
-        context=Context(
-            positions=tensor("positions", torch.int64),
+    # One variant's footprint, in blocks: the recorded call's own, so successive
+    # variants are disjoint. Bounded by what the cache actually holds -- asking
+    # for regions past the end would index out of the allocation.
+    stride = (max(flat) + 1) if flat else 0
+    if stride and variants > 1:
+        blocks = _kv_blocks()
+        variants = max(1, min(variants, blocks // stride)) if blocks else 1
+    else:
+        variants = 1
+
+    thunks = []
+    for v in range(variants):
+        table = None
+        if shape is not None:
+            table = torch.zeros(tuple(shape), dtype=torch.int32, device="cuda")
+            used = len(flat) // max(shape[0], 1)
+            if used:
+                table[:, :used] = torch.tensor(
+                    [x + v * stride for x in flat],
+                    dtype=torch.int32, device="cuda").reshape(shape[0], used)
+
+        metadata = AttentionMetaData(
+            block_tables=table,
+            context_lens=tensor(recorded.get("context_lens"), torch.int32),
+            slot_mapping=tensor(
+                None if slots is None
+                else [x + v * stride * block_size for x in slots], torch.int64),
+            cu_seqlens_q=tensor(recorded.get("cu_seqlens_q"), torch.int32),
+            max_seqlen_q=int(recorded.get("max_seqlen_q", 0)),
+            max_seqlen_k=int(recorded.get("max_seqlen_k", 0)),
+            state=AttnState(recorded.get("state", AttnState.DECODE.value)),
+        )
+        context = Context(
+            positions=tensor(recorded.get("positions"), torch.int64),
             is_prefill=bool(recorded.get("is_prefill", False)),
-        ),
-    )
+        )
+
+        def install_this(metadata=metadata, context=context):
+            set_forward_context(
+                attn_metadata=metadata,
+                atom_config=get_current_atom_config(),
+                context=context,
+            )
+
+        thunks.append(install_this)
+    return thunks
 
 
 _CAPTURE = {_ATTENTION: _capture_attention}
@@ -160,15 +221,21 @@ def capture(name: str) -> tuple[tuple[str, Any], ...]:
         return ()
 
 
-def install(name: str, recorded) -> bool:
-    """Stand up the forward context ``name`` was recorded with.
+def install(name: str, recorded, variants: int = 1) -> list:
+    """Stand up the forward context(s) ``name`` was recorded with.
 
-    Returns whether it could, so a caller can report the operator unpriced
-    rather than price it against whatever context happened to be installed --
-    which is the failure this whole module exists to prevent.
+    Returns a list of thunks, one per distinct cache footprint the captured
+    batch should rotate over, or an empty list if the operator cannot be given
+    the context it needs. Empty means the caller must report it unpriced rather
+    than price it against whatever context happened to be installed, which is the
+    failure this module exists to prevent.
+
+    The first thunk installs the recorded call exactly, so ``variants=1`` is the
+    faithful single-shot case and anything above it trades exactness for a cache
+    state that resembles a real step's.
     """
     installer = _INSTALL.get(name)
     if installer is None or not recorded:
-        return False
-    installer({k: v for k, v in (tuple(x) for x in recorded)})
-    return True
+        return []
+    return installer({k: v for k, v in (tuple(x) for x in recorded)},
+                     max(1, int(variants)))

@@ -171,3 +171,36 @@ class TestOperatorsThatReadAmbientState:
 
         assert not result["prices"]
         assert "recorded none" in next(iter(result["unpriced"].values()))
+
+    def test_kv_regions_are_rotated_only_when_capturing(self, tmp_path,
+                                                        monkeypatch):
+        """A loop cannot rotate them: it installs one context and calls in it.
+
+        Only the captured path gives each call its own region, which is what
+        stops the whole working set staying resident across the batch.
+        """
+        import json
+
+        import atom.utils.forward_context as forward_context
+        from atom.compass.runtime import forward_ctx, microbench
+
+        path = tmp_path / "graph.json"
+        path.write_text(json.dumps({"ops": [{
+            "name": "aiter::unified_attention_with_output_base",
+            "input_shapes": [], "dtypes": [], "scalars": [],
+            "context": [["context_lens", [8]]]}]}))
+        monkeypatch.setattr(forward_context, "reset_forward_context", lambda: None)
+        monkeypatch.setattr(microbench, "_resolve", lambda n: object())
+
+        asked = []
+
+        def fake_install(name, recorded, variants=1):
+            asked.append(variants)
+            return []
+
+        monkeypatch.setattr(forward_ctx, "install", fake_install)
+
+        microbench.price_graph(str(path), cache="graph")
+        microbench.price_graph(str(path), cache="hot")
+
+        assert asked == [microbench.KV_VARIANTS, 1]

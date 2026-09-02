@@ -677,21 +677,98 @@ A constant ~6.1 µs per replay, amortised, over a flat ~18.2 µs per call. Per-c
 cost **asymptotes**; concurrency would keep driving it down as B grew. The
 captured calls run one after another, as stream-ordered capture implies.
 
-What is left is cache residency, and this is a hypothesis with evidence rather
-than a demonstration. The benchmark replays one operator against **one layer's**
-KV cache 64 times back to back; ~2.6 MB of KV stays resident and every kernel
-finds its data warm. A real step touches each of 28 layers' KV regions once,
-interleaved with the ~300 other kernels of a 1.2 GB model, which is more traffic
-than the last level of cache holds. A uniform discount across three kernels that
-share nothing but their working set is what that would look like.
+What is left is cache residency -- partly. The benchmark replays one operator
+against **one layer's** KV cache, so after the first call the whole working set
+is resident and every kernel that touches it runs warm. A real step touches each
+of 28 layers' regions once, separated by the other ~300 kernels of a model far
+larger than the last level of cache.
 
-Note where the gap is *not* closed by `cache=cold`: `_build_arg_sets` rotates the
-**argument** tensors, and the KV cache is not an argument -- it is fetched from
-the forward context, so it is the same layer's tensor on every call in every
-mode. Neither `hot` nor `cold` says anything about it. The experiment that would
-settle this is to rotate `layer_name` across the captured calls so each hits a
-different layer's cache, and see whether the three numbers walk up toward the
-in-situ column. Not yet run.
+### Making the benchmark cool the KV cache
+
+The cache is not an argument. It is reached through the forward context, so no
+argument-rotation mode can touch it: `hot` and `cold` alike price it warm, and
+`_build_arg_sets` rotating 64 sets of q/k/v changes nothing about it.
+
+Since the context is now installed by Compass, the fix goes there. `install`
+returns one thunk per distinct KV region, each offsetting the recorded call's
+block ids and slots by the span the recorded call used, so successive regions are
+disjoint. `_time_in_graph` calls the i-th before capturing the i-th call, which
+is host-only work -- it swaps which pre-built metadata the call reads, so nothing
+is allocated inside the capture. A region is then revisited only after every
+other one has been walked, which is what evicts it.
+
+Eviction reproduced rather than simulated, and at no cost. The alternative --
+scrubbing the cache between calls -- is numerically hopeless here: clearing 256 MB
+of last-level cache takes ~100 µs against an 18 µs operator, so the measurement
+would be a 350x baseline subtraction.
+
+It works, and the sweep shows the mechanism directly. Per-call cost against the
+number of regions the batch rotates over:
+
+| regions | µs/call |
+| --- | --- |
+| 1 | 18.31 |
+| 16 | 19.78 |
+| 64 | 20.19 |
+| 128 | 20.77 |
+| 256 | 20.75 |
+| 512 | 20.66 |
+
+Cost rises with footprint and plateaus by 128 regions -- 650 MB, past any cache
+on the device -- and is flat out to 512 (2.6 GB). One region per captured call is
+the default, which is where the knee is for this shape.
+
+### But most of the gap was never attention's
+
+Against the in-situ figures at matched context, per kernel:
+
+| | in situ | rotating | single region |
+| --- | --- | --- | --- |
+| attention | 10.24 µs | 8.52 µs | 7.70 µs |
+| rope | 9.19 µs | 7.54 µs | 6.87 µs |
+| KV write | 5.79 µs | 5.00 µs | 5.37 µs |
+| **operator** | **25.21 µs** | **21.06 µs** | **19.94 µs** |
+
+So the KV rotation closed 2.4 µs of a 6.9 µs gap -- a third of it -- and the
+error went from 27% to 18%. What remains is still a *uniform* discount across
+three kernels with quite different memory profiles, which is not what a cache
+effect looks like.
+
+It is not attention's at all. The gemms in the same graph are priced against
+their own in-situ kernels, and they never touch the KV cache:
+
+| priced | in situ | ratio |
+| --- | --- | --- |
+| 13.030 µs | 14.061 µs | 0.93 |
+| 9.150 µs | 10.699 µs | 0.86 |
+| 9.079 µs | 10.456 µs | 0.87 |
+| 7.926 µs | 9.577 µs | 0.83 |
+| **39.19 µs** | **44.79 µs** | **0.875** |
+
+**Every kernel is priced 13-16% under what it costs in a step**, whatever it
+touches. That is a global property of pricing kernels apart from the step, not
+a property of attention or of the KV cache, and no cache modelling will remove
+it. Two candidates, untested:
+
+* *Clocks.* A benchmark replaying one small kernel draws far less power than a
+  dense decode step, so it boosts higher. A uniform multiplicative discount
+  across kernels of different shapes is what that looks like. Sampling
+  `rocm-smi` clocks during each would separate it.
+* *Kernel boundaries.* The captured copies are mutually independent where a
+  step's are a dependency chain. They still serialise -- the batch sweep says so
+  -- but the hardware may pipeline the boundary between two independent kernels
+  more tightly than between two dependent ones. A much narrower claim than the
+  "they run concurrently" one it replaces, and this harness has already measured
+  something that looks exactly like it: cold mode came out **0.94x** hot,
+  against the expectation that streaming a weight costs more than rereading a
+  resident one, and the reading at the time was that hot reuses one output
+  buffer and serialises on a write-after-write where rotating buffers pipeline
+  (below). 6% from that, on top of what the cache rotation now recovers, is most
+  of the 13%. Testable by capturing a batch whose calls share an output buffer.
+
+Worth stating plainly, because it bounds what this whole approach can deliver:
+priced kernels are systematically optimistic by about an eighth, before any
+question of whether they sum to a step.
 
 One thing worth noticing while reading a recorded context: ATOM's decode
 metadata carries `state=prefill_native` on a step whose `is_prefill` is `False`.
@@ -758,6 +835,10 @@ activation is hot because the previous operator wrote it, while its weight is
 cold and every one of the 113 gemms uses a different one. So the harness prices
 either way — `--compass-bench-cache hot|cold`, the latter rotating over enough
 input sets to overflow the cache.
+
+(Since amended: state an operator does not take as an argument is reached
+separately now -- the KV cache is cooled by rotating the region each captured
+call addresses, above. Neither mode says anything about it.)
 
 The expectation was that cold would be dearer, since streaming a weight from
 memory costs more than rereading a resident one. **Cold came out cheaper**:

@@ -192,6 +192,13 @@ def _build_arg_sets(op: dict, cache: str, fn) -> Optional[list]:
     know which inputs a previous operator produced. The graph records shapes,
     not identity, so it cannot distinguish them today -- these two modes bracket
     the answer rather than giving it.
+
+    Neither mode reaches state an operator does not take as an argument. The KV
+    cache is the case that matters: attention fetches it from the forward
+    context, so rotating arguments leaves it resident across the whole batch
+    however many sets there are. That one is cooled separately, by rotating the
+    KV region each captured call addresses -- see ``KV_VARIANTS`` and
+    ``forward_ctx.install``.
     """
     import torch
 
@@ -239,6 +246,12 @@ def _build_arg_sets(op: dict, cache: str, fn) -> Optional[list]:
 #: is measured is a latency and not a throughput. 64 is comfortably past the knee.
 GRAPH_BATCH = int(os.environ.get("COMPASS_GRAPH_BATCH", "64"))
 
+#: Distinct KV-cache regions a captured batch rotates over. One per captured
+#: call by default, so a region is revisited only after every other has been
+#: walked -- which is what evicts it. Set to 1 to price against a single region,
+#: the warm case, which understated all three of attention's kernels by 15-30%.
+KV_VARIANTS = int(os.environ.get("COMPASS_KV_VARIANTS", str(GRAPH_BATCH)))
+
 
 #: Signatures whose key contains this substring get taken apart rather than just
 #: priced. A price is a duration and says nothing about where the duration went;
@@ -247,7 +260,7 @@ GRAPH_BATCH = int(os.environ.get("COMPASS_GRAPH_BATCH", "64"))
 PROFILE_MATCH = os.environ.get("COMPASS_BENCH_PROFILE", "")
 
 
-def _time_in_graph(fn, sets: list, iters: int, warmup: int) -> float:
+def _time_in_graph(fn, sets: list, iters: int, warmup: int, before=None) -> float:
     """Seconds per call, with the launch amortised the way production does.
 
     A per-call loop cannot price a kernel smaller than its own call overhead. On
@@ -269,6 +282,8 @@ def _time_in_graph(fn, sets: list, iters: int, warmup: int) -> float:
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
         for i in range(max(warmup, 3)):
+            if before is not None:
+                before(i)
             a, k = sets[i % n]
             fn(*a, **k)
     torch.cuda.current_stream().wait_stream(stream)
@@ -277,6 +292,11 @@ def _time_in_graph(fn, sets: list, iters: int, warmup: int) -> float:
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
         for i in range(GRAPH_BATCH):
+            # Host-only: it swaps which pre-built metadata the next call reads,
+            # so each captured call bakes in its own KV region. Nothing is
+            # allocated here, which capture would otherwise charge to the pool.
+            if before is not None:
+                before(i)
             a, k = sets[i % n]
             fn(*a, **k)
 
@@ -438,11 +458,23 @@ def price_graph(graph_path: str, iters: int = 2000, warmup: int = 20,
         # with, or is not priced. Calling it without would price it against
         # whatever capture left installed, which is how attention came to be
         # measured at 7x its cost.
+        rotate, variants = None, []
         if forward_ctx.is_context_dependent(op["name"]):
-            if not forward_ctx.install(op["name"], op.get("context")):
+            # One context per captured call, each against its own slice of the
+            # KV cache. The cache is not an argument -- it is reached through
+            # the context -- so no amount of rotating arguments cools it, and
+            # `hot` and `cold` alike price it warm.
+            variants = forward_ctx.install(
+                op["name"], op.get("context"),
+                variants=KV_VARIANTS if cache == "graph" else 1)
+            if not variants:
                 unpriced[sig] = ("reads a forward context and the graph "
                                  "recorded none")
                 continue
+            variants[0]()
+            if len(variants) > 1:
+                def rotate(i, _variants=variants):
+                    _variants[i % len(_variants)]()
         try:
             sets = _build_arg_sets(op, cache, fn)
         except Exception as exc:  # noqa: BLE001 - allocation can fail many ways
@@ -452,9 +484,12 @@ def price_graph(graph_path: str, iters: int = 2000, warmup: int = 20,
             unpriced[sig] = "unknown dtype"
             continue
         try:
-            timer = {"graph": _time_in_graph,
-                     "isolated": _time_isolated}.get(cache, _time_over)
-            seconds, host_seconds = timer(fn, sets, iters, warmup)
+            if cache == "graph":
+                seconds, host_seconds = _time_in_graph(
+                    fn, sets, iters, warmup, before=rotate)
+            else:
+                timer = _time_isolated if cache == "isolated" else _time_over
+                seconds, host_seconds = timer(fn, sets, iters, warmup)
         except Exception as exc:  # noqa: BLE001 - a call can fail many ways
             unpriced[sig] = f"{type(exc).__name__}: {str(exc)[:120]}"
             continue
@@ -464,6 +499,7 @@ def price_graph(graph_path: str, iters: int = 2000, warmup: int = 20,
             "occurrences": counts[sig],
             "cache": cache,
             "arg_sets": len(sets),
+            "kv_regions": len(variants) or 1,
             # Host enqueue cost per call. Where this matches `seconds`, the
             # device was idle waiting and the price is the host's, not the
             # kernel's.
@@ -471,7 +507,8 @@ def price_graph(graph_path: str, iters: int = 2000, warmup: int = 20,
         }
         if PROFILE_MATCH and PROFILE_MATCH in sig:
             try:
-                _profile_signature(fn, sets, sig, iters, warmup)
+                _profile_signature(fn, sets, sig, iters, warmup,
+                                   before=rotate)
             except Exception as exc:  # noqa: BLE001 - a probe must not stop a run
                 print(f"### PROBE FAILED {type(exc).__name__}: {exc}", flush=True)
 
@@ -497,7 +534,8 @@ def price_graph(graph_path: str, iters: int = 2000, warmup: int = 20,
 
 
 
-def _profile_signature(fn, sets, sig: str, iters: int, warmup: int) -> None:
+def _profile_signature(fn, sets, sig, iters: int, warmup: int,
+                       before=None) -> None:
     """Four views of one operator, printed rather than returned.
 
     Priced one way a kernel is a number with nothing to check it against. These
@@ -517,9 +555,12 @@ def _profile_signature(fn, sets, sig: str, iters: int, warmup: int) -> None:
     global GRAPH_BATCH
     keep = GRAPH_BATCH
     try:
-        for batch in (1, 4, 16, 64):
+        batches = [int(b) for b in os.environ.get(
+            "COMPASS_PROBE_BATCHES", "1,4,16,64").split(",")]
+        for batch in batches:
             GRAPH_BATCH = batch
-            secs, _ = _time_in_graph(fn, sets, max(iters, batch), warmup)
+            secs, _ = _time_in_graph(fn, sets, max(iters, batch), warmup,
+                                     before=before)
             print(f"###  graph B={batch:<3d}: {secs*1e6:8.2f}us per call",
                   flush=True)
     finally:
@@ -536,12 +577,16 @@ def _profile_signature(fn, sets, sig: str, iters: int, warmup: int) -> None:
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
         for i in range(3):
+            if before is not None:
+                before(i)
             a, k = sets[i % n]
             fn(*a, **k)
     torch.cuda.current_stream().wait_stream(stream)
     torch.cuda.synchronize()
     with torch.cuda.graph(graph):
         for i in range(GRAPH_BATCH):
+            if before is not None:
+                before(i)
             a, k = sets[i % n]
             fn(*a, **k)
     graph.replay()
