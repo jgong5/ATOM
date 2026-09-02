@@ -144,7 +144,9 @@ def _build_arg_sets(op: dict, cache: str, fn) -> Optional[list]:
     ``hot`` reuses a single set: an upper bound on speed, and the right answer
     for a value the previous operator just produced. ``cold`` rotates over
     enough distinct sets to overflow the cache, which is what reading a weight
-    or a KV block actually costs.
+    or a KV block actually costs. ``graph`` is hot inputs with the launch
+    amortised into a CUDA graph, which is the only one of the three that can
+    price a kernel smaller than the harness's own call overhead.
 
     Doing this properly would price each argument separately, which needs to
     know which inputs a previous operator produced. The graph records shapes,
@@ -180,6 +182,58 @@ def _build_arg_sets(op: dict, cache: str, fn) -> Optional[list]:
             break
         sets.append(nxt)
     return sets
+
+
+#: Calls captured into one graph. Large enough that replaying the graph costs
+#: far more than submitting it, small enough to capture quickly.
+GRAPH_BATCH = 64
+
+
+def _time_in_graph(fn, sets: list, iters: int, warmup: int) -> float:
+    """Seconds per call, with the launch amortised the way production does.
+
+    A per-call loop cannot price a kernel smaller than its own call overhead. On
+    this hardware that overhead is about 30 microseconds, and a gemm of
+    [M,1024]x[4096,1024] costs the same 30 microseconds for every M from 1 to
+    256 -- 256 times the work for the same price. Decode-shape kernels are far
+    below the floor, so a loop measures dispatch and reports it as kernel time.
+    That is why summed prices came to 2.2x a step: 298 operators times a 30
+    microsecond floor is 8.9ms, against a priced total of 9.2ms.
+
+    Capturing the calls into a CUDA graph removes exactly what production
+    removes -- the graph is submitted once and the kernels run back to back with
+    no host in the loop. What is left is the work.
+    """
+    import torch
+
+    n = len(sets)
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for i in range(max(warmup, 3)):
+            a, k = sets[i % n]
+            fn(*a, **k)
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        for i in range(GRAPH_BATCH):
+            a, k = sets[i % n]
+            fn(*a, **k)
+
+    replays = max(1, iters // GRAPH_BATCH)
+    graph.replay()
+    torch.cuda.synchronize()
+    began = torch.cuda.Event(enable_timing=True)
+    ended = torch.cuda.Event(enable_timing=True)
+    began.record()
+    for _ in range(replays):
+        graph.replay()
+    ended.record()
+    torch.cuda.synchronize()
+    total = began.elapsed_time(ended) / 1000.0
+    return total / (replays * GRAPH_BATCH)
 
 
 def _time_over(fn, sets: list, iters: int, warmup: int) -> float:
@@ -238,7 +292,8 @@ def price_graph(graph_path: str, iters: int = 2000, warmup: int = 20,
             unpriced[sig] = "unknown dtype"
             continue
         try:
-            seconds = _time_over(fn, sets, iters, warmup)
+            timer = _time_in_graph if cache == "graph" else _time_over
+            seconds = timer(fn, sets, iters, warmup)
         except Exception as exc:  # noqa: BLE001 - a call can fail many ways
             unpriced[sig] = f"{type(exc).__name__}: {str(exc)[:120]}"
             continue

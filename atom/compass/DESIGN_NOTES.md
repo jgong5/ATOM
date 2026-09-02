@@ -238,12 +238,65 @@ agreement to 7% was an artifact of pricing only 55% of the operators: adding
 rmsnorm's 113 doubled the sum. A replay overlaps its kernels heavily, and a
 back-to-back loop measures each one alone.
 
-So the mapping from summed prices to step cost is nothing like identity — around
-0.43 here — and whether *that ratio* is stable across shapes, widths and models
-is the question that decides whether a price list is worth having. A stable ratio
-is a usable model; a ratio that moves with the workload is a second thing to
-calibrate, and calibrating it needs the measured steps a price list was supposed
-to replace.
+**The root cause of the 2.3x, found.** A per-call benchmark cannot price a
+kernel smaller than its own call overhead. Pricing one gemm at twelve shapes:
+
+| M | per-call loop | in a CUDA graph |
+| --- | --- | --- |
+| 1 | 30.9 µs | 9.09 µs |
+| 8 | 30.2 µs | 9.24 µs |
+| 64 | 30.0 µs | 12.65 µs |
+| 256 | 30.4 µs | 29.29 µs |
+| 1024 | 135.3 µs | 137.58 µs |
+
+**A flat 30 µs floor from M=1 to M=256** — 256 times the work for the same price.
+The kernel only becomes visible past M=512, and the two methods converge there,
+which is what a launch-overhead explanation predicts. The arithmetic closes it:
+298 priced operators times 30 µs is 8.9 ms, against a priced total of 9.24 ms.
+**The price list was the operator count times the floor.**
+
+Capturing the calls into a CUDA graph removes what production removes — one
+submission, no host in the loop — and takes ~21 µs off. A ~9 µs floor survives,
+and that one is real: the gemm reads an 8 MB weight whatever M is.
+
+### And the fix over-corrects, which is the more interesting result
+
+| | |
+| --- | --- |
+| priced total, per-call loop | 9.239 ms — **2.34x** the step |
+| priced total, in a graph | 1.765 ms — **0.45x** the step |
+| the replayed step | 3.946 ms |
+
+Two reasons, and the second is structural.
+
+*Attention is still not priced.* `aiter::unified_attention_with_output_base` takes
+a runtime object, not a scalar — it fails with `'NoneType' object has no attribute
+'is_dummy_run'`, so it wants a forward-context argument the graph cannot record
+as a value. That is 28 operators and about a quarter of the work, missing from
+the total.
+
+*The graph benchmark lets kernels overlap that never overlap.* It captures 64
+copies of one kernel on one set of inputs, which are mutually independent, so the
+device runs them concurrently. In a real step, layer N+1 consumes layer N's
+output and the chain is serial. `aten::slice` falling **315x** to essentially zero
+is the signature: not a cheap kernel, an elided one.
+
+**So neither mode measures a kernel in the dependency context it runs in.** The
+loop adds a host launch the replay does not pay; the graph removes a
+serialisation the model cannot avoid. They bracket the answer —
+1.765 ms < 3.946 ms < 9.239 ms — and neither converges to it.
+
+That is a limit of per-operator pricing itself, not of this harness: **a step's
+cost is a property of the sequence, not of the multiset of kernels in it.**
+Pricing kernels independently discards exactly the information that decides how
+they compose.
+
+The route that survives is to benchmark a *chain* rather than a kernel — capture
+one transformer layer's operator sequence, price that, and multiply by depth.
+It keeps the dependency structure inside the measurement, stays far cheaper than
+a shape sweep, and should transfer across batch size and width. Pricing the whole
+step that way would just be measuring the step again, which is what the
+calibrated oracle already does; a layer is the largest unit that is not circular.
 
 ### Hot and cold do not isolate what they were meant to
 

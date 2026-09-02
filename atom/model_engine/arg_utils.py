@@ -193,12 +193,15 @@ class EngineArgs:
             "--compass-bench-cache",
             type=str,
             default="hot",
-            choices=["hot", "cold"],
+            choices=["hot", "cold", "graph"],
             help="Cache state to price kernels in. 'hot' reuses one set of "
             "inputs, which flatters anything memory-bound; 'cold' rotates over "
             "enough sets to overflow the cache, which is what reading a weight "
             "or a KV block really costs. The truth is per argument -- a gemm's "
-            "activation is hot and its weight is not -- so the two bracket it.",
+            "activation is hot and its weight is not -- so the two bracket it. "
+            "'graph' captures the calls into a CUDA graph, removing the ~30us "
+            "per-call launch cost that otherwise swamps a decode-shape kernel "
+            "and is what production removes too.",
         )
         parser.add_argument(
             "--compass-op-timings-out",
