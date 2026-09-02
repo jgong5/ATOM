@@ -53,6 +53,13 @@ def signature_of(op: dict) -> str:
     if values:
         sig += "|" + ";".join(
             f"{i}:" + ",".join(str(x) for x in v) for i, v in values)
+    # Scalars belong in the key for the same reason. A decode attention passing
+    # max_qlen=1 and one passing 16384 are the same shapes and the same tensors
+    # and are not the same amount of work; without this they collapse to one
+    # entry and whichever was seen first prices both.
+    scalars = op.get("scalars") or ()
+    if scalars:
+        sig += "|" + ";".join(f"{k}={v}" for k, v in scalars)
     return sig
 
 

@@ -5,6 +5,7 @@ from functools import cache
 from typing import Optional
 
 import aiter
+import os
 import torch
 from aiter import fused_qk_norm_rope_cache_quant_shuffle
 from aiter.jit.utils.chip_info import get_gfx
@@ -24,6 +25,14 @@ from atom.model_ops.base_attention import (
     run_pa_decode_gluon,
     run_pa_fwd_asm,
 )
+
+
+#: Return the right shape without doing the work, so the difference in step
+#: time is attention's cost in situ. A measurement aid rather than a feature:
+#: it is what established that attention costs 23.0us per call here while the
+#: microbenchmark reported 163.7us. Read once, because this is consulted 28
+#: times per decode step and an environment lookup is not free at that rate.
+_ABLATE_ATTN = bool(os.environ.get("ATOM_ABLATE_ATTN"))
 
 
 @cache
@@ -175,7 +184,7 @@ class PagedAttentionImpl(nn.Module):
         fwd_ctx: ForwardContext = get_forward_context()
 
         # dummy run will skip attention in cuda graph capture phase
-        if fwd_ctx.context.is_dummy_run:
+        if fwd_ctx.context.is_dummy_run or _ABLATE_ATTN:
             o = torch.empty_like(q)
             return o
 

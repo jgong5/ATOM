@@ -446,9 +446,49 @@ close that: some of what the kernel consumes belongs to the runner, not the call
 Which sharpens the earlier rule. An operator is priceable when it is a pure
 function of its arguments; attention was made *callable* by supplying its
 metadata, but it is still not *pure*, because the backend sources state from
-elsewhere. The boundary has moved down one level and needs to move further --
-or the state the backend reaches for has to become part of the operator's
-declared inputs.
+elsewhere.
+
+### What attention actually costs, measured rather than inferred
+
+Three hypotheses about the initialisation were tested and all three were wrong.
+Recording `context_lens` truthfully as `[155, 155, 155, 155]` instead of zeros
+left the price at 163.7 µs against 163.6 µs. Correcting the extents from the
+configured bound to the decode-actual values -- `max_qlen` 16384 to 1,
+`max_klen` 16384 to 155 -- gave 163.73 µs against 163.61 µs. And the
+work-partitioning fields (`kv_indices`, `work_info_set`) are not on this path at
+all: `use_pa_decode_bf16_asm()` requires `gfx1250` and this is `gfx942`, so the
+backend is `paged_attention_asm`, which reads only `block_tables`,
+`context_lens`, `max_qlen` and `qo_indptr`.
+
+The benchmark's figure is invariant to every attention parameter there is to
+vary, which is itself the finding: it is not measuring attention's work.
+
+So the cost was measured by **ablation** instead -- return the right shape
+without doing the work, and difference the step:
+
+| | |
+| --- | --- |
+| decode step with attention | 3.041 ms |
+| decode step without | 2.396 ms |
+| attention, per call | **23.0 µs** |
+| the microbenchmark | 163.7 µs |
+
+**The benchmark overstates attention by 7.1x.** And the earlier estimate of
+84 µs, arrived at by subtracting the other priced kernels from the step, was
+also wrong -- which says those prices do not sum correctly either. Substituting
+the measured 23 µs, the priced total becomes 2.41 ms against a 3.946 ms step:
+the sum now *under*-counts by 1.5 ms, where with the benchmark's attention it
+over-counted by 2.4 ms.
+
+Two lessons worth keeping. Ablation is the ground truth this line of work needed
+and was reached for only after three rounds of guessing at inputs; differencing a
+step with and without an operator answers "what does this cost here" directly,
+where a microbenchmark answers "what does this cost somewhere". And a benchmark
+figure that does not move when its inputs do is not a measurement of those
+inputs -- that invariance should have been checked first, since it is one run.
+
+`ATOM_ABLATE_ATTN` is kept for the purpose, read once at import because it is
+consulted 28 times per decode step.
 
 (A false lead worth recording so nobody follows it twice: the implementation
 returns `torch.empty_like(q)` when `is_dummy_run` is set, with a comment saying
