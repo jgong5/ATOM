@@ -137,35 +137,63 @@ additive per launch rather than multiplicative -- 2.02 µs, fitted without a
 profiler, matching a profiled per-kernel median of 2.05 µs arrived at
 separately.
 
-That held-out -3.7% was the single-graph limitation: the oracle held **one**
-graph, so it returned one number for every decode step while real TPOT climbs
-from 3.115 ms to 3.224 ms as context grows. `--compass-trace-steps 2,10,20,30`
-records a graph per step, `--compass-bench-graph` takes a glob and prices their
-union, and the oracle interpolates between them on mean context:
+Prefill is priced too, from its own graph. `--compass-trace-prefill 2` records a
+prefill step alongside the decode one, `--compass-bench-graph` takes both, and
+the oracle picks by kind. With that, the calibrated fallback is not used at all:
 
-| | one graph | four graphs |
+| | fallback for prefill | prefill priced |
 | --- | --- | --- |
-| 32 tokens, tpot | -0.4% | +0.6% |
-| 32 tokens, latency | -0.7% | **-0.1%** |
-| 96 tokens, tpot | -3.7% | **-1.5%** |
-| 96 tokens, latency | -3.4% | **-1.5%** |
+| ttft | -1.3% (the fallback's) | **-12.5%** |
+| tpot | -0.4% | **-0.1%** |
+| latency | -0.7% | **-4.7%** |
+| ttft, 96 tokens | -1.7% (the fallback's) | -12.9% |
+| tpot, 96 tokens | -3.7% | **-3.5%** |
+| latency, 96 tokens | -3.4% | **-4.9%** |
 
-The prediction now moves -- 3.105 ms to 3.146 ms across the traced range -- which
-is the point.
+The TTFT column looks like a regression and is not: -1.3% was a calibrated
+oracle fitted to the very steps it was predicting, and this is the op graph
+answering for the first time. The prefill **step** comes out at 36.6 ms against a
+measured 37.3 -- **-1.9%** -- and the rest of TTFT is admission and scheduling
+that happen outside any step, which is #3 and not this oracle's to fix.
 
-**Covering the range does not help further, which is the more useful result.**
-Tracing 2,30,60,90 instead spans 315-403 tokens of context, so a 96-token run
-interpolates rather than extrapolates, and it comes out at -2.3%: slightly
-*worse* than extrapolating from the narrow range. The relationship is not quite
-linear and the extrapolation happened to overshoot helpfully. Both land at 1.5-2.3%,
-so context is no longer what dominates the error and widening the trace further
-is not the lever. What remains is a systematic ~2% low -- the oracle's whole
-range tops out below the real mean -- which points at the 16 of 1320 operators
-still unpriced and at a boundary constant fitted at one context.
+Three things had to be right, and two were wrong first.
 
-Prefill is not priced at all: every traced step is a decode step (#9). Prefill
-falls through to a calibrated fallback, so **the TTFT figures above are that
-fallback's, not this oracle's**, and they are the next thing worth closing.
+*Prefill reads more metadata than decode.* The varlen fmha kernel wants
+`cu_seqlens_k` and `min_seqlen_q` as well, and raises on a missing one rather
+than defaulting it. Recording only what decode needed left every prefill
+attention unpriced -- 28 operators, and the whole of prefill's attention cost.
+Coverage went from 94.6% to 98.9% when they were added.
+
+*A prefill step runs eager, and that is most of it.* Prefill's kernels are
+15.1 ms of a 37.3 ms step. The priced sum was right and the model was wrong. A
+decode step is one graph replay with the host out of the loop; a prefill step's
+token count is not on the capture ladder -- the ladder is captured at one token
+per sequence -- so the host dispatches all 319 operators individually. Hence two
+overhead constants rather than one:
+
+| | replayed | eager |
+| --- | --- | --- |
+| paid per | kernel launch | operator |
+| fitted | 2.02 µs | 67.4 µs |
+
+Thirtyfold apart, which is why using the replayed constant for prefill priced it
+at 0.42 of its step. Both are one-step fits on one deployment, with the caveats
+#21 records.
+
+*And the engine has to say which.* `StepShape.capture_bucket` is documented as
+None when nothing was replayed, but `_capture_bucket` returned a rung for prefill
+steps too -- it only ever looked at batch size. A four-sequence prefill was
+reported as replaying the batch-4 graph it cannot use, so the oracle charged it
+2 µs a launch instead of 67 µs an operator, and the fix above did nothing until
+this was corrected. Once right it is engine-agnostic: the oracle asks whether the
+step was replayed, not whether it is prefill, and gets a straight answer.
+
+*Not done, deliberately: several graphs of the same kind.* Recording four decode
+graphs across a run's context range and interpolating between them moved the
+held-out error from -3.7% to -1.5%, and covering the range rather than
+extrapolating over it made no further difference -- so context is not what
+dominates, and the machinery was dropped as not worth its complexity. One graph
+per kind is enough.
 
 Precondition, from the event-timing finding below: per-operator attribution must
 be checked for the same observer effect — run the workload with and without it
