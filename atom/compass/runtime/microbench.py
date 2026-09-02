@@ -233,11 +233,26 @@ def _time_in_graph(fn, sets: list, iters: int, warmup: int) -> float:
     ended.record()
     torch.cuda.synchronize()
     total = began.elapsed_time(ended) / 1000.0
-    return total / (replays * GRAPH_BATCH)
+    return total / (replays * GRAPH_BATCH), 0.0
 
 
-def _time_over(fn, sets: list, iters: int, warmup: int) -> float:
-    """Seconds per call, cycling through ``sets`` so cold mode stays cold."""
+def _time_over(fn, sets: list, iters: int, warmup: int) -> tuple[float, float]:
+    """Seconds per call on the device, and seconds per call on the host.
+
+    Both, because one without the other cannot say what was measured. CUDA
+    events are timestamped when the *device* reaches them, so the elapsed time
+    between them is device-side wall clock across the whole loop -- not a sum of
+    kernel durations. If the host enqueues faster than the device drains, the
+    queue stays full and that elapsed time is real kernel work. If the host is
+    slower, the device runs dry and waits, and the waiting is inside the window.
+
+    The host figure is the wall time of the enqueue loop alone, taken before any
+    synchronise, so it measures Python plus the dispatcher plus the operator
+    wrapper plus the driver call, and nothing of the kernel. When the two agree,
+    the device was idle waiting for the host and the "price" is the host's.
+    """
+    import time as _time
+
     import torch
 
     n = len(sets)
@@ -248,12 +263,14 @@ def _time_over(fn, sets: list, iters: int, warmup: int) -> float:
     began = torch.cuda.Event(enable_timing=True)
     ended = torch.cuda.Event(enable_timing=True)
     began.record()
+    host0 = _time.perf_counter()
     for i in range(iters):
         a, k = sets[i % n]
         fn(*a, **k)
+    host = _time.perf_counter() - host0
     ended.record()
     torch.cuda.synchronize()
-    return began.elapsed_time(ended) / 1000.0 / iters
+    return began.elapsed_time(ended) / 1000.0 / iters, host / iters
 
 
 def price_graph(graph_path: str, iters: int = 2000, warmup: int = 20,
@@ -293,7 +310,7 @@ def price_graph(graph_path: str, iters: int = 2000, warmup: int = 20,
             continue
         try:
             timer = _time_in_graph if cache == "graph" else _time_over
-            seconds = timer(fn, sets, iters, warmup)
+            seconds, host_seconds = timer(fn, sets, iters, warmup)
         except Exception as exc:  # noqa: BLE001 - a call can fail many ways
             unpriced[sig] = f"{type(exc).__name__}: {str(exc)[:120]}"
             continue
@@ -303,6 +320,10 @@ def price_graph(graph_path: str, iters: int = 2000, warmup: int = 20,
             "occurrences": counts[sig],
             "cache": cache,
             "arg_sets": len(sets),
+            # Host enqueue cost per call. Where this matches `seconds`, the
+            # device was idle waiting and the price is the host's, not the
+            # kernel's.
+            "host_seconds": host_seconds,
         }
 
     ops_priced = sum(counts[s] for s in priced)

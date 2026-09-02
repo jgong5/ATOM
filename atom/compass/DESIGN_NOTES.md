@@ -255,6 +255,40 @@ which is what a launch-overhead explanation predicts. The arithmetic closes it:
 298 priced operators times 30 µs is 8.9 ms, against a priced total of 9.24 ms.
 **The price list was the operator count times the floor.**
 
+**And the floor is the host, measured directly.** A CUDA event is timestamped
+when the *device* reaches it, so the elapsed time between two of them is
+device-side wall clock across the loop — not a sum of kernel durations. That
+leaves two possibilities, and timing the enqueue loop's own wall clock separates
+them:
+
+| M | device (event) | host (enqueue) | host/device | in graph |
+| --- | --- | --- | --- | --- |
+| 1 | 31.9 µs | 31.9 µs | **1.00** | 9.09 µs |
+| 8 | 31.4 µs | 31.4 µs | **1.00** | 9.24 µs |
+| 64 | 31.3 µs | 31.2 µs | **1.00** | 12.65 µs |
+| 256 | 30.7 µs | 30.7 µs | **1.00** | 29.29 µs |
+| 512 | 43.3 µs | 31.7 µs | 0.73 | 48.44 µs |
+| 1024 | 136.0 µs | 30.7 µs | **0.23** | 137.58 µs |
+
+They are the same number up to M=256. The device was idle waiting for the host
+for the whole loop, so the price is not the kernel plus an overhead — it is the
+host's cost, with the kernel finishing early inside the wait. At M=4 that is 9 µs
+of work inside a 34 µs wait.
+
+The host figure is flat across every shape, which is what per-call work that
+cannot depend on tensor size looks like: the Python call, the dispatcher, aiter's
+ctypes wrapper, the operator's output allocation, the HIP launch. Not decomposed
+further here.
+
+The crossover falls where it must. At M=256 the kernel is 29.3 µs against 31 µs
+of host and the two are neck and neck; by M=1024 the kernel is 138 µs and the
+host is irrelevant. Past that point a per-call loop measures the kernel correctly,
+which is exactly where loop and graph pricing agree.
+
+**So the loop number is the host's cost and the in-graph number is the kernel's.**
+For decode-shaped work they differ by three to four times, and `host_seconds` is
+recorded beside every price so a reader can tell which one they are holding.
+
 Capturing the calls into a CUDA graph removes what production removes — one
 submission, no host in the loop — and takes ~21 µs off. A ~9 µs floor survives,
 and that one is real: the gemm reads an 8 MB weight whatever M is.
