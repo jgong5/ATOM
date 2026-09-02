@@ -66,4 +66,5 @@ compass_bucket*/
 compass_admval*/
 compass_tp4*/
 compass_ops/
+compass_purecheck/
 .commitmsg
