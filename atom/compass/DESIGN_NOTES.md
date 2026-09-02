@@ -183,11 +183,46 @@ for the shapes it uses, rather than a fresh JIT build tuned differently.
 
 The shape of it: after warmup, read a captured graph, take each distinct
 `(name, input_shapes, dtypes)`, allocate tensors to match, call it a few thousand
-times inside one pair of events, and divide. The graph records every tensor
-argument in dispatch order, which is what makes the call reconstructible —
-`silu_and_mul`'s schema is `(Tensor(a0!) out, Tensor(a1!) input, float limit=0.)`
-and both tensors are in the record, so allocating in order and letting scalars
-default reproduces the call.
+times inside one pair of events, and divide.
+
+**Built and run.** `--compass-bench-graph` / `--compass-bench-out`, priced after
+warmup inside the runner. On the batch-4 decode graph:
+
+| | |
+| --- | --- |
+| signatures priced | 24 of 36 |
+| operators covered | 181 of 330 (54.8%) |
+| `aiter::gemm_a16w16` | **31.4 µs** each |
+| the same gemm, in-line events | **121 µs** |
+
+The instrumentation overhead is confirmed quantitatively at **3.9x**, which is
+what the in-line route was rejected for.
+
+**But summed prices overshoot the step.** 113 gemms at 31.4 µs is 3.552 ms and
+the priced total is 4.235 ms, against a replayed step of **3.946 ms** — and that
+total does not include attention or rmsnorm, the second and third largest
+consumers, which are unpriced. So the parts already exceed the whole while a
+third of the whole is missing.
+
+Two candidates, neither yet separated: a standalone call allocates its output
+every iteration where the model reuses a buffer, so the price carries an
+allocation the real step does not; and a replay overlaps kernels that a
+back-to-back loop serialises. Both inflate a sum of standalone prices. This is
+the same shape of question as "does Σ ops explain a step", asked of better
+numbers, and it is what phase C has to answer.
+
+**What is not priced, and why it matters differently.** Twelve signatures failed,
+in two distinct ways:
+
+* *Missing a scalar the record does not carry* — `aiter::rmsnorm2d_fwd_` wants
+  `eps`, `profiler::_record_function_enter_new` wants `name`. The graph keeps
+  every tensor argument but no scalars, so the call cannot be rebuilt. Recording
+  non-tensor arguments alongside the shapes fixes this, and it is worth doing:
+  rmsnorm is 113 of the 330 operators.
+* *Not a dispatcher operator at all* — `triton::...` and `inductor::...` are
+  recorded by the Triton launch tracer patching `JITFunction.run`, not by the
+  dispatcher, so `torch.ops` can never resolve them. Pricing those needs the
+  launch path, which is a different mechanism rather than a missing field.
 
 The tracer is kept, because the question it answers is the right one and the
 answer needs to stay reproducible. `scripts/compass/op_cost.py` reports it.

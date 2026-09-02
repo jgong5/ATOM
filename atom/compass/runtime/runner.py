@@ -22,6 +22,7 @@ Two consequences worth stating plainly:
 
 from __future__ import annotations
 
+import json
 import logging
 from typing import Optional
 
@@ -663,6 +664,46 @@ class CompassModelRunner(ModelRunner):
             sorted(self.capture_sizes),
         )
 
+    def _run_microbenchmark(self) -> None:
+        """Price the kernels this deployment just warmed up.
+
+        Placed after warmup because that is the only moment both conditions
+        hold: the operators are registered (``aiter`` does it lazily, on first
+        call, in this process) and autotuned for the shapes in use. Before
+        warmup a lookup fails; in the parent process it fails whatever happens,
+        because the model runs here.
+        """
+        config = self._compass_config
+        if not (config.bench_graph and config.bench_out):
+            return
+        from atom.compass.runtime.microbench import price_graph
+
+        out = config.bench_out
+        if any(size > 1 for size in self._topology().values()):
+            out = self._rank_path(out, self._rank_coords())
+        logger.info("ATOMCompass: pricing kernels from %s ...", config.bench_graph)
+        try:
+            result = price_graph(config.bench_graph, iters=config.bench_iters)
+        except OSError as exc:
+            logger.warning("ATOMCompass WARNING: could not read %s: %s",
+                           config.bench_graph, exc)
+            return
+        try:
+            with open(out, "w", encoding="utf-8") as fh:
+                json.dump(result, fh, indent=1)
+        except OSError as exc:
+            logger.warning("ATOMCompass WARNING: could not write %s: %s",
+                           out, exc)
+            return
+        cov = result["coverage"]
+        logger.info(
+            "ATOMCompass: priced %d of %d signatures, covering %d of %d "
+            "operators (%.1f%%) -> %s",
+            cov["signatures_priced"], cov["signatures"],
+            cov["operators_priced"], cov["operators"],
+            100 * cov["fraction_of_operators"], out,
+        )
+
     def warmup_model(self) -> None:
         """Warm up for real whenever the forward is real.
 
@@ -672,5 +713,7 @@ class CompassModelRunner(ModelRunner):
         0.03 s one.
         """
         if self._runs_real_forward:
-            return super().warmup_model()
+            result = super().warmup_model()
+            self._run_microbenchmark()
+            return result
         logger.debug("ATOMCompass: skipping model warmup")

@@ -52,6 +52,15 @@ class CompassConfig:
             to observe inside it. The artifact is written beside the graph and
             joined to it by operator index, so the graph stays a purely
             structural record that a derived run can still be compared against.
+        bench_graph: A captured graph whose operators to price, and
+            ``bench_out`` where to write the price list. Runs once after warmup
+            and only there: ``aiter`` registers its kernels lazily on first
+            call, and the model runs in a worker, so a kernel is reachable
+            nowhere else. Pricing after warmup also means the kernels priced are
+            the ones this deployment autotuned, not a fresh build.
+        bench_iters: Calls per signature, timed as one block. Per-call timing is
+            what this exists to avoid -- it cost eleven times the step it was
+            measuring.
         admission_seconds: How long a request takes to reach the point of being
             schedulable, in seconds. A simulated run advances its clock by
             predicted *forward* durations, so the time a request spends getting
@@ -84,6 +93,9 @@ class CompassConfig:
     virtual_clock: bool = True
     admission_seconds: float = 0.0
     op_timings_out: Optional[str] = None
+    bench_graph: Optional[str] = None
+    bench_out: Optional[str] = None
+    bench_iters: int = 2000
     filler_token_id: int = 100
 
     def __post_init__(self) -> None:

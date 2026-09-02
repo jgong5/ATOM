@@ -58,6 +58,9 @@ class EngineArgs:
     compass_measure_warmup_steps: int = 0
     compass_admission_seconds: float = 0.0
     compass_op_timings_out: str = ""
+    compass_bench_graph: str = ""
+    compass_bench_out: str = ""
+    compass_bench_iters: int = 2000
     enable_prefix_caching: bool = True
     port: int = 8006
     kv_cache_dtype: str = "bf16"
@@ -161,6 +164,29 @@ class EngineArgs:
             "One is usually right: it drops the launch that pays for Triton "
             "autotuning. Larger values risk discarding every prefill sample a "
             "workload produces, since prefill steps are rare.",
+        )
+        parser.add_argument(
+            "--compass-bench-graph",
+            type=str,
+            default="",
+            help="A captured graph whose kernels to price. With "
+            "--compass-bench-out, prices each distinct operator signature once "
+            "after warmup, calling it --compass-bench-iters times inside a "
+            "single pair of events. Needs a mode that really warms up (trace or "
+            "measure): aiter registers kernels lazily on first call, so nothing "
+            "can price one before the model has run.",
+        )
+        parser.add_argument(
+            "--compass-bench-out",
+            type=str,
+            default="",
+            help="Where the kernel price list is written.",
+        )
+        parser.add_argument(
+            "--compass-bench-iters",
+            type=int,
+            default=2000,
+            help="Calls per signature, timed as one block (default 2000).",
         )
         parser.add_argument(
             "--compass-op-timings-out",
@@ -739,6 +765,9 @@ class EngineArgs:
         compass_measure_warmup = kwargs.pop("compass_measure_warmup_steps", 0)
         compass_admission = kwargs.pop("compass_admission_seconds", 0.0)
         compass_op_timings = kwargs.pop("compass_op_timings_out", "")
+        compass_bench_graph = kwargs.pop("compass_bench_graph", "")
+        compass_bench_out = kwargs.pop("compass_bench_out", "")
+        compass_bench_iters = kwargs.pop("compass_bench_iters", 2000)
         compass_kwargs = {"enabled": compass_enabled, "mode": compass_mode}
         if compass_oracle:
             compass_kwargs["oracle_qualname"] = compass_oracle
@@ -752,6 +781,12 @@ class EngineArgs:
             compass_kwargs["admission_seconds"] = compass_admission
         if compass_op_timings:
             compass_kwargs["op_timings_out"] = compass_op_timings
+        if compass_bench_graph:
+            compass_kwargs["bench_graph"] = compass_bench_graph
+        if compass_bench_out:
+            compass_kwargs["bench_out"] = compass_bench_out
+        if compass_bench_iters != 2000:
+            compass_kwargs["bench_iters"] = compass_bench_iters
         if compass_oracle_option:
             # Values arrive as strings from the command line. Numbers are
             # converted so an oracle can declare a float parameter and get one;
