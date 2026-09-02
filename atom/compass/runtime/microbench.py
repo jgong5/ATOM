@@ -49,6 +49,17 @@ def signature_of(op: dict) -> str:
     # amounts of work -- one decode step reading 40 tokens of history and
     # another reading 4000 have identical signatures until the contents are part
     # of the key.
+    # Ambient state the arguments do not carry. One decode attention reading 40
+    # tokens of history and another reading 4000 are the same operator on the
+    # same shapes and are not the same amount of work, and after the operator
+    # stopped pretending to be a function of its arguments this is the only
+    # place that difference is recorded. `block_tables` is left out: it decides
+    # which blocks are walked, not how many.
+    context = op.get("context") or ()
+    if context:
+        sig += "|" + ";".join(
+            f"{k}={v}" for k, v in (tuple(x) for x in context)
+            if k != "block_tables")
     values = op.get("int_values") or ()
     if values:
         sig += "|" + ";".join(
@@ -410,6 +421,8 @@ def price_graph(graph_path: str, iters: int = 2000, warmup: int = 20,
     # invariant to every argument, because the arguments were never read.
     from atom.utils.forward_context import reset_forward_context
 
+    from atom.compass.runtime import forward_ctx
+
     priced: dict[str, dict] = {}
     unpriced: dict[str, str] = {}
     for sig, op in example.items():
@@ -420,6 +433,15 @@ def price_graph(graph_path: str, iters: int = 2000, warmup: int = 20,
         if fn is None:
             unpriced[sig] = "operator not registered in this process"
             continue
+        # An operator that reads a forward context gets the one it was recorded
+        # with, or is not priced. Calling it without would price it against
+        # whatever capture left installed, which is how attention came to be
+        # measured at 7x its cost.
+        if forward_ctx.is_context_dependent(op["name"]):
+            if not forward_ctx.install(op["name"], op.get("context")):
+                unpriced[sig] = ("reads a forward context and the graph "
+                                 "recorded none")
+                continue
         try:
             sets = _build_arg_sets(op, cache, fn)
         except Exception as exc:  # noqa: BLE001 - allocation can fail many ways

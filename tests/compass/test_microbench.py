@@ -125,3 +125,49 @@ class TestPricingIsNotInsideAForward:
         microbench.price_graph(str(path))
 
         assert len(resets) == 2, "once per signature, before it is priced"
+
+
+class TestOperatorsThatReadAmbientState:
+    """Attention takes its metadata from a forward context, not its arguments.
+
+    Giving it those arguments was tried and does not survive `torch.compile`:
+    the tensor reads become graph inputs, but an `int` is constant-folded and an
+    argument that was `None` when the graph compiled is baked in as `None`. So
+    the context is recorded beside the operator instead, and is the only place
+    the difference between a 40-token and a 4000-token decode is written down.
+    """
+
+    def test_the_context_is_part_of_the_key(self):
+        short = _op(shapes=[(4, 2048)], dtypes=["bfloat16"])
+        short["context"] = [["context_lens", [40, 40]]]
+        long = dict(short, context=[["context_lens", [4000, 4000]]])
+        assert signature_of(short) != signature_of(long), (
+            "same shapes, different amounts of KV walked")
+
+    def test_block_table_contents_are_not(self):
+        """They decide which blocks are walked, not how many."""
+        a = _op(shapes=[(4, 2048)], dtypes=["bfloat16"])
+        a["context"] = [["context_lens", [40]], ["block_tables", [1, 2, 3]]]
+        b = dict(a, context=[["context_lens", [40]], ["block_tables", [7, 8, 9]]])
+        assert signature_of(a) == signature_of(b)
+
+    def test_one_without_a_recorded_context_is_not_priced(self, tmp_path,
+                                                          monkeypatch):
+        """Rather than priced against whatever capture left installed."""
+        import json
+
+        import atom.utils.forward_context as forward_context
+        from atom.compass.runtime import microbench
+
+        name = "aiter::unified_attention_with_output_base"
+        path = tmp_path / "graph.json"
+        path.write_text(json.dumps({"ops": [
+            {"name": name, "input_shapes": [], "dtypes": [], "scalars": []},
+        ]}))
+        monkeypatch.setattr(forward_context, "reset_forward_context", lambda: None)
+        monkeypatch.setattr(microbench, "_resolve", lambda n: object())
+
+        result = microbench.price_graph(str(path))
+
+        assert not result["prices"]
+        assert "recorded none" in next(iter(result["unpriced"].values()))

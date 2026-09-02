@@ -108,6 +108,22 @@ def test_provenance_survives_a_round_trip(tmp_path):
     assert OpGraph.load(path).provenance == g.provenance
 
 
+def test_a_recorded_forward_context_survives_a_round_trip(tmp_path):
+    """Attention cannot be replayed without it, and it lives only here.
+
+    Its arguments cannot carry it: `torch.compile` constant-folds every one that
+    is not a tensor, so an operator given its metadata as arguments records the
+    values the *warmup* forward had.
+    """
+    recorded = (("context_lens", [315, 315]), ("max_seqlen_q", 1),
+                ("block_tables_shape", [2, 2560]))
+    g = graph(OpSpec(name="aiter::unified_attention_with_output_base",
+                     context=recorded))
+    path = tmp_path / "g.json"
+    g.save(path)
+    assert OpGraph.load(path).ops[0].context == recorded
+
+
 def test_version_1_graphs_still_load(tmp_path):
     """Graphs written before provenance existed remain readable."""
     import json

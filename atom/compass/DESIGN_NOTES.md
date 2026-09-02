@@ -564,21 +564,99 @@ Production never notices, because the operator ignores its arguments and reads
 the context. Compass notices because reading the arguments is the entire point of
 having added them.
 
-**So option A -- describe an operator by giving it its metadata as arguments --
-carries tensors and nothing else.** Three ways out, none yet chosen:
+### The pure-function plan, and why it is abandoned
 
-* Record attention's metadata from the live forward context at trace time,
-  through a side channel, instead of from the operator's arguments. Keeps the
-  operator untouched; makes the tracer know something op-specific.
-* Pass the extents as 0-d tensors so they flow instead of folding. Cheap, ugly,
-  and does nothing for `block_tables`, which folds because of *when* it was
-  `None`, not because of its type.
-* Give the operator a metadata argument that is opaque to Dynamo. Largest
-  change, and the one that would generalise past attention.
+The plan this project had been building toward was to make each operator a
+**pure function of its arguments**. It is the property that makes an op graph
+worth having: if an operator's cost is decided entirely by what is passed to it,
+then a recorded `(name, shapes, dtypes, scalars)` is a complete description, any
+recorded call can be replayed anywhere to find out what it costs, and Compass can
+price a configuration nobody has run by deriving its graph and pricing the
+operators in it. Every other design decision here assumed it.
 
-Until one is picked, attention is honestly unpriced: coverage on this graph
-reads 90.3% (298/330) rather than the 98.8% it read while 28 operators carried a
-figure that was 7x wrong. The lower number is the true one.
+Attention was the operator that did not have the property, and `c337ee3a` --
+"Make attention a pure function of its arguments" -- was the attempt to give it
+one: add the metadata to the operator's signature, have production pass what it
+already holds, and let the operator stand up its own context when there is no
+live forward. It reads well and it does not work.
+
+**A compiled caller destroys the property faster than an operator signature can
+establish it.** `md = get_forward_context().attn_metadata` is traced by Dynamo.
+Tensor reads become graph inputs and flow per step. Everything else is a compile
+-time constant, read once from whichever forward triggered compilation --
+`max_seqlen_q` because it is an `int`, `block_tables` because it happened to be
+`None` in the warmup dummy. The compiled graph then passes those constants
+forever. The operator's signature says it is a function of its arguments; the
+call site guarantees it is not.
+
+This is not a fact about attention. It applies to any operator whose cost depends
+on something that is not a tensor, in any engine that compiles its model -- which
+is every engine worth simulating. So the generalisation is worth stating plainly:
+
+> An op graph records arguments. Arguments cannot carry non-tensor state through
+> `torch.compile`. Therefore an op graph cannot, on its own, describe an operator
+> whose cost depends on non-tensor ambient state, and no change to that
+> operator's signature will make it able to.
+
+Two smaller repairs were considered and rejected. Passing the extents as 0-d
+tensors makes them flow, but does nothing for `block_tables`, which folded
+because of *when* it was `None` rather than because of its type. Giving the
+operator a Dynamo-opaque metadata argument is the largest change and still
+leaves production carrying an argument only a simulator reads.
+
+### What replaced it: record the context beside the operator
+
+`c337ee3a` is reverted -- `base_attention.py` and `paged_attention.py` are back
+to what ATOM ships -- and the ambient state is recorded *alongside* the operator
+instead of *through* it. `atom/compass/runtime/forward_ctx.py` holds both halves:
+the tracer reads the live forward context, where the values are true, and the
+benchmark stands one up before calling. `OpSpec` gains a `context` field for
+them.
+
+`block_tables` is kept by full shape but only the columns the kernel reads. The
+full width is `max_model_len / block_size` -- 2560 here -- and is part of the
+call because it is the row stride the kernel indexes with, but a decode at 315
+tokens of context touches 20 columns of it. Shape plus used prefix reproduces
+both the addressing and the traffic without an artifact that grows with the
+model's maximum context; the graph grew 89 KB to 107 KB.
+
+The recorded context also has to be part of the price key, because after the
+revert it is the *only* place the difference between a 40-token and a 4000-token
+decode is written down. `block_tables` contents are excluded from the key: they
+decide which blocks are walked, not how many.
+
+Measured against the ablation ground truth, on the same workload:
+
+| | |
+| --- | --- |
+| benchmark, before | 163.7 µs/call — **7.1x over** |
+| benchmark, now | **18.3 µs/call** |
+| ablation | **26.1 µs/call** |
+
+28 layers priced independently, 18.29 to 18.49 µs, a spread of 1%. The remaining
+30% is the known graph-mode bias -- 64 captured copies of one call on one set of
+inputs are mutually independent and overlap, where a real step's are not --
+which is the next thing to attack, and is a bias in the right direction and of
+an ordinary size. Coverage is back to 98.8% (326/330), this time honestly.
+
+The cost of this design, stated so nobody is surprised by it: Compass now knows
+something about attention specifically, which the rest of the op graph is built
+to avoid. It is confined to one module and one operator. Any future operator
+whose cost turns on ambient state will need an entry there too, and the honest
+reading is that the op graph's "records only arguments" purity was never
+achievable and this is where the exception now lives.
+
+One thing worth noticing while reading a recorded context: ATOM's decode
+metadata carries `state=prefill_native` on a step whose `is_prefill` is `False`.
+`paged_attention_asm` does not read `state`, so nothing is wrong today, and it
+is recorded verbatim rather than corrected -- but a backend that does read it
+would be reading a stale default.
+
+A consequence of recording `layer_name` as a scalar: the 28 layers are 28
+signatures rather than one, so attention is benchmarked 28 times to produce 28
+numbers that agree to 1%. Harmless and slow, and it means the price list cannot
+generalise one attention price across depth. Left alone for now, since the
+agreement across layers is itself a useful check on the measurement.
 
 Capturing the calls into a CUDA graph removes what production removes — one
 submission, no host in the loop — and takes ~21 µs off. A ~9 µs floor survives,
@@ -594,11 +672,10 @@ and that one is real: the gemm reads an 8 MB weight whatever M is.
 
 Two reasons, and the second is structural.
 
-*Attention is still not priced.* `aiter::unified_attention_with_output_base` takes
-a runtime object, not a scalar — it fails with `'NoneType' object has no attribute
-'is_dummy_run'`, so it wants a forward-context argument the graph cannot record
-as a value. That is 28 operators and about a quarter of the work, missing from
-the total.
+*Attention was not priced at all when this table was measured* — 28 operators
+and about a quarter of the work, missing from the total. It is priced now, from
+a recorded forward context rather than from its arguments (above), so this
+table's totals are stale in that respect. The second reason below is not.
 
 *The graph benchmark lets kernels overlap that never overlap.* It captures 64
 copies of one kernel on one set of inputs, which are mutually independent, so the

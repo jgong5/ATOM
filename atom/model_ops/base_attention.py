@@ -318,9 +318,6 @@ def cp_mha_gather_cache(
     )
 
 
-from atom.utils.forward_context import get_forward_context
-
-
 def fake_(
     q: torch.Tensor,
     q_scale: Optional[torch.Tensor],
@@ -330,12 +327,6 @@ def fake_(
     layer_name: str,
     use_mla: bool,
     qkv: torch.Tensor,
-    block_tables: Optional[torch.Tensor] = None,
-    context_lens: Optional[torch.Tensor] = None,
-    slot_mapping: Optional[torch.Tensor] = None,
-    cu_seqlens_q: Optional[torch.Tensor] = None,
-    max_seqlen_q: int = 0,
-    max_seqlen_k: int = 0,
 ) -> torch.Tensor:
     output_shape = list(q.shape)
     # If we fusion rmsnorm and quant, the input dtype is fp8, but actually we use bf16 for output.
@@ -363,56 +354,9 @@ def unified_attention_with_output_base(
     layer_name: str,
     use_mla: bool,
     qkv: torch.Tensor,
-    # The attention metadata this call depends on, passed rather than fetched.
-    #
-    # The backends still read it from the forward context and are untouched;
-    # these arguments exist so the operator *describes* what it consumes. An op
-    # graph records arguments, not ambient globals, so without them attention is
-    # an opaque node whose real inputs -- which blocks of KV cache it walks, how
-    # long each sequence is -- are invisible to anything reading the graph, and
-    # a recorded call cannot be replayed to find out what it cost.
-    #
-    # They are also what makes the operator a pure function of its arguments:
-    # given them, the branch below can stand up the context the backends expect
-    # instead of requiring a live forward. Production passes what it already has
-    # in hand and takes the fast path, ignoring them.
-    block_tables: Optional[torch.Tensor] = None,
-    context_lens: Optional[torch.Tensor] = None,
-    slot_mapping: Optional[torch.Tensor] = None,
-    cu_seqlens_q: Optional[torch.Tensor] = None,
-    max_seqlen_q: int = 0,
-    max_seqlen_k: int = 0,
 ) -> torch.Tensor:
     atom_config = get_current_atom_config()
     self = atom_config.compilation_config.static_forward_context[layer_name]
-
-    if get_forward_context().context is None:
-        # No live forward: rebuild just enough context from the arguments. Only
-        # reached off the serving path -- by a benchmark pricing this operator
-        # from a recorded graph. The KV cache is not rebuilt because it does not
-        # need to be: it is installed once at startup, in its own context, and
-        # set_forward_context picks it up.
-        from atom.utils.forward_context import (
-            AttentionMetaData,
-            AttnState,
-            Context,
-            set_forward_context,
-        )
-
-        set_forward_context(
-            attn_metadata=AttentionMetaData(
-                block_tables=block_tables,
-                context_lens=context_lens,
-                slot_mapping=slot_mapping,
-                cu_seqlens_q=cu_seqlens_q,
-                max_seqlen_q=int(max_seqlen_q),
-                max_seqlen_k=int(max_seqlen_k),
-                state=AttnState.DECODE,
-            ),
-            atom_config=atom_config,
-            context=Context(positions=positions),
-        )
-
     if use_mla:
         return self.impl.forward(
             query=q,

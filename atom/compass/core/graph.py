@@ -70,6 +70,13 @@ class OpSpec:
             ones: metadata is a handful of numbers per sequence, while the data
             an operator computes over is large and float, and its values do not
             decide the cost.
+        context: Ambient state the operator reads that its arguments do not
+            describe, as ``(name, value)`` pairs. Empty for all but a handful of
+            operators. Attention takes its metadata from a module-global forward
+            context, so a recorded call cannot be replayed without it -- and
+            giving the operator those arguments instead does not work, because
+            ``torch.compile`` constant-folds every one that is not a tensor. See
+            ``atom.compass.runtime.forward_ctx``.
         scalars: The operator's non-tensor arguments, positional then keyword,
             as ``(name, value)`` pairs. Shapes alone do not describe a call:
             ``aiter::rmsnorm2d_fwd_`` takes an ``eps`` and refuses without one,
@@ -85,6 +92,7 @@ class OpSpec:
     group: Optional[str] = None
     scalars: tuple[tuple[str, Any], ...] = ()
     int_values: tuple[tuple[int, tuple[int, ...]], ...] = ()
+    context: tuple[tuple[str, Any], ...] = ()
 
     @property
     def is_collective(self) -> bool:
@@ -150,6 +158,7 @@ class OpGraph:
                     "group": op.group,
                     "scalars": [list(kv) for kv in op.scalars],
                     "int_values": [[i, list(v)] for i, v in op.int_values],
+                    "context": [list(kv) for kv in op.context],
                 }
                 for op in self.ops
             ],
@@ -184,6 +193,7 @@ class OpGraph:
                     int_values=tuple(
                         (int(i), tuple(v)) for i, v in op.get("int_values") or ()
                     ),
+                    context=tuple(tuple(kv) for kv in op.get("context") or ()),
                 )
             )
         return graph

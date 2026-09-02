@@ -22,6 +22,8 @@ from typing import Any, Optional
 import torch
 from torch.utils._python_dispatch import TorchDispatchMode
 
+from atom.compass.runtime import forward_ctx
+
 from atom.compass.core.graph import OpGraph, OpSpec
 
 __all__ = [
@@ -324,6 +326,10 @@ class MetaOpTracer(TorchDispatchMode):
                 group=_resolve_group(name, self.topology),
                 scalars=_scalars_of(args, kwargs),
                 int_values=_int_values_of(tensors),
+                # An operator that reads ambient state needs that state recorded
+                # with it; its arguments do not describe it, and cannot be made
+                # to. Empty for everything but attention.
+                context=forward_ctx.capture(name),
             )
         )
         return out
