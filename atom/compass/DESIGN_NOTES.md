@@ -353,8 +353,43 @@ only requirement is a capture past the knee, since a one-call capture charges th
 whole 5.5 µs replay cost to one kernel; B=8 is enough and 64 is used.
 
 Which means the gap between the priced total of 1.765 ms and the 3.946 ms step is
-**not** a measurement error waiting to be corrected. It is mostly the 28
-unpriced attention operators, and that is where the next work is.
+**not** a measurement error waiting to be corrected. It is mostly the 28 unpriced
+attention operators.
+
+### Attention cannot be priced from a shape signature at all
+
+Not a missing scalar. `unified_attention_with_output_base(q, q_scale, k, v,
+positions, layer_name, use_mla, qkv)` takes a `layer_name` and a `use_mla` that
+the tracer does record — but the body looks the layer up in
+`static_forward_context` and calls into its implementation, which begins
+(`attention_mha.py:175`):
+
+```python
+fwd_ctx: ForwardContext = get_forward_context()
+if fwd_ctx.context.is_dummy_run:      # .context is None outside a forward
+```
+
+and goes on to need `attn_metadata`: block tables, sequence lengths, a populated
+paged KV cache. Rebuilding the call means rebuilding the runner's per-step state.
+
+So **attention's cost is not a function of its tensor arguments.** It depends on
+paged-KV state — how many blocks the sequences occupy and how scattered they are
+— which a signature of `(name, input_shapes, dtypes)` cannot express and which no
+amount of extra recorded arguments would fix. A price list keyed that way has a
+hole in it exactly where a quarter of the work is.
+
+That is the strongest argument yet for pricing a **chain** rather than a kernel.
+Attention can only be measured in a context that supplies its metadata, and the
+cheapest such context is the model running a step. Capturing one transformer
+layer keeps the KV state real, keeps the dependency order real, and still costs
+far less than a shape sweep.
+
+(A false lead worth recording so nobody follows it twice: the implementation
+returns `torch.empty_like(q)` when `is_dummy_run` is set, with a comment saying
+attention is skipped during CUDA graph capture — which would mean the captured
+graph omits attention entirely. It does not. `is_dummy_run=True` is set only in
+`dummy_execution` and `warmup_model`, never in `capture_cudagraph`, so the skip
+applies to the dummy runs *around* capture and attention is captured normally.)
 
 Capturing the calls into a CUDA graph removes what production removes — one
 submission, no host in the loop — and takes ~21 µs off. A ~9 µs floor survives,
