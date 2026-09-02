@@ -61,6 +61,7 @@ class EngineArgs:
     compass_bench_graph: str = ""
     compass_bench_out: str = ""
     compass_bench_iters: int = 2000
+    compass_bench_cache: str = "hot"
     enable_prefix_caching: bool = True
     port: int = 8006
     kv_cache_dtype: str = "bf16"
@@ -187,6 +188,17 @@ class EngineArgs:
             type=int,
             default=2000,
             help="Calls per signature, timed as one block (default 2000).",
+        )
+        parser.add_argument(
+            "--compass-bench-cache",
+            type=str,
+            default="hot",
+            choices=["hot", "cold"],
+            help="Cache state to price kernels in. 'hot' reuses one set of "
+            "inputs, which flatters anything memory-bound; 'cold' rotates over "
+            "enough sets to overflow the cache, which is what reading a weight "
+            "or a KV block really costs. The truth is per argument -- a gemm's "
+            "activation is hot and its weight is not -- so the two bracket it.",
         )
         parser.add_argument(
             "--compass-op-timings-out",
@@ -768,6 +780,7 @@ class EngineArgs:
         compass_bench_graph = kwargs.pop("compass_bench_graph", "")
         compass_bench_out = kwargs.pop("compass_bench_out", "")
         compass_bench_iters = kwargs.pop("compass_bench_iters", 2000)
+        compass_bench_cache = kwargs.pop("compass_bench_cache", "hot")
         compass_kwargs = {"enabled": compass_enabled, "mode": compass_mode}
         if compass_oracle:
             compass_kwargs["oracle_qualname"] = compass_oracle
@@ -787,6 +800,8 @@ class EngineArgs:
             compass_kwargs["bench_out"] = compass_bench_out
         if compass_bench_iters != 2000:
             compass_kwargs["bench_iters"] = compass_bench_iters
+        if compass_bench_cache != "hot":
+            compass_kwargs["bench_cache"] = compass_bench_cache
         if compass_oracle_option:
             # Values arrive as strings from the command line. Numbers are
             # converted so an oracle can declare a float parameter and get one;

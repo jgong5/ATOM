@@ -11,7 +11,7 @@ combinations of them, without teaching Compass what any of them mean.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Mapping, Optional
+from typing import Any, Mapping, Optional
 
 __all__ = ["OpSpec", "OpGraph", "GraphKey"]
 
@@ -60,6 +60,12 @@ class OpSpec:
         dtypes: Dtype of each tensor argument, in order.
         group: For a collective, the communication group it ran on. ``None``
             for local computation.
+        scalars: The operator's non-tensor arguments, positional then keyword,
+            as ``(name, value)`` pairs. Shapes alone do not describe a call:
+            ``aiter::rmsnorm2d_fwd_`` takes an ``eps`` and refuses without one,
+            so a graph that records only tensors cannot be replayed to find out
+            what its operators cost. Kept only for values a JSON artifact can
+            hold; anything else is dropped rather than guessed at.
     """
 
     name: str
@@ -67,6 +73,7 @@ class OpSpec:
     output_shapes: tuple[tuple[int, ...], ...] = ()
     dtypes: tuple[str, ...] = ()
     group: Optional[str] = None
+    scalars: tuple[tuple[str, Any], ...] = ()
 
     @property
     def is_collective(self) -> bool:
@@ -130,6 +137,7 @@ class OpGraph:
                     "output_shapes": [list(s) for s in op.output_shapes],
                     "dtypes": list(op.dtypes),
                     "group": op.group,
+                    "scalars": [list(kv) for kv in op.scalars],
                 }
                 for op in self.ops
             ],
@@ -158,6 +166,9 @@ class OpGraph:
                     output_shapes=tuple(tuple(s) for s in op["output_shapes"]),
                     dtypes=tuple(op["dtypes"]),
                     group=op["group"],
+                    # Absent from graphs written before scalars were recorded;
+                    # those simply cannot be replayed to price their operators.
+                    scalars=tuple(tuple(kv) for kv in op.get("scalars") or ()),
                 )
             )
         return graph

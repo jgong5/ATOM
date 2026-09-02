@@ -81,6 +81,33 @@ def _make_tensor(shape, dtype_name: str):
     return torch.zeros(size, dtype=dtype, device="cuda")
 
 
+def _rebuild_args(op: dict, tensors: list) -> tuple[list, dict]:
+    """Put the tensors and scalars back in the order the operator wants them.
+
+    The tracer records tensor arguments as an ordered list of shapes and
+    non-tensor ones as ``(name, value)``, where a positional argument is named
+    by its index. Interleaving them again recovers the call: for
+    ``rmsnorm2d_fwd_(out, input, weight, eps)`` the first three positions come
+    from the tensor list and the fourth from the scalars.
+    """
+    scalars = {k: v for k, v in (tuple(x) for x in op.get("scalars") or ())}
+    positional = {int(k[1:]): v for k, v in scalars.items() if k.startswith("#")}
+    keywords = {k: v for k, v in scalars.items() if not k.startswith("#")}
+
+    args: list = []
+    remaining = list(tensors)
+    width = (max(positional) + 1) if positional else 0
+    for i in range(max(width, len(tensors) + len(positional))):
+        if i in positional:
+            args.append(positional[i])
+        elif remaining:
+            args.append(remaining.pop(0))
+        else:
+            break
+    args.extend(remaining)
+    return args, keywords
+
+
 def _time(callable_, iters: int, warmup: int) -> float:
     """Seconds per call, measured over ``iters`` calls and one pair of events."""
     import torch
@@ -98,8 +125,85 @@ def _time(callable_, iters: int, warmup: int) -> float:
     return began.elapsed_time(ended) / 1000.0 / iters
 
 
-def price_graph(graph_path: str, iters: int = 2000,
-                warmup: int = 20) -> dict[str, Any]:
+#: Bytes of distinct input to cycle through in ``cold`` mode. Has to exceed the
+#: last-level cache comfortably or the rotation is pointless; capped so a large
+#: weight does not exhaust the device building copies of itself.
+COLD_WORKING_SET_BYTES = 1 << 30
+
+
+def _build_arg_sets(op: dict, cache: str, fn) -> Optional[list]:
+    """One or many argument sets, depending on what cache state is wanted.
+
+    Cache state is really a property of each *argument*, not of the kernel. In a
+    real decode step a gemm's activation input is hot -- the previous operator
+    just wrote it -- while its weight is cold, streamed from memory, and every
+    one of the 113 gemms in a step uses a different weight. Calling one kernel
+    repeatedly on one buffer measures the hot case for everything, which
+    flatters any kernel that moves a lot of memory.
+
+    ``hot`` reuses a single set: an upper bound on speed, and the right answer
+    for a value the previous operator just produced. ``cold`` rotates over
+    enough distinct sets to overflow the cache, which is what reading a weight
+    or a KV block actually costs.
+
+    Doing this properly would price each argument separately, which needs to
+    know which inputs a previous operator produced. The graph records shapes,
+    not identity, so it cannot distinguish them today -- these two modes bracket
+    the answer rather than giving it.
+    """
+    import torch
+
+    def one():
+        tensors = [_make_tensor(s, d)
+                   for s, d in zip(op["input_shapes"], op["dtypes"])]
+        if any(t is None for t in tensors):
+            return None
+        return _rebuild_args(op, tensors)
+
+    first = one()
+    if first is None:
+        return None
+    if cache == "hot":
+        return [first]
+
+    per_set = sum(
+        int(torch.empty(0, dtype=getattr(torch, d)).element_size())
+        * max(1, int(torch.Size(tuple(sh)).numel()))
+        for sh, d in zip(op["input_shapes"], op["dtypes"])
+        if getattr(torch, d, None) is not None
+    ) or 1
+    n = max(2, min(64, COLD_WORKING_SET_BYTES // per_set))
+    sets = [first]
+    for _ in range(n - 1):
+        nxt = one()
+        if nxt is None:
+            break
+        sets.append(nxt)
+    return sets
+
+
+def _time_over(fn, sets: list, iters: int, warmup: int) -> float:
+    """Seconds per call, cycling through ``sets`` so cold mode stays cold."""
+    import torch
+
+    n = len(sets)
+    for i in range(warmup):
+        a, k = sets[i % n]
+        fn(*a, **k)
+    torch.cuda.synchronize()
+    began = torch.cuda.Event(enable_timing=True)
+    ended = torch.cuda.Event(enable_timing=True)
+    began.record()
+    for i in range(iters):
+        a, k = sets[i % n]
+        fn(*a, **k)
+    ended.record()
+    torch.cuda.synchronize()
+    return began.elapsed_time(ended) / 1000.0 / iters
+
+
+def price_graph(graph_path: str, iters: int = 2000, warmup: int = 20,
+                cache: str = "hot") -> dict[str, Any]:
     """Price every distinct operator signature in a captured graph.
 
     Returns the price list and what it could not reach. Coverage is reported by
@@ -126,24 +230,24 @@ def price_graph(graph_path: str, iters: int = 2000,
             unpriced[sig] = "operator not registered in this process"
             continue
         try:
-            args = [_make_tensor(s, d)
-                    for s, d in zip(op["input_shapes"], op["dtypes"])]
+            sets = _build_arg_sets(op, cache, fn)
         except Exception as exc:  # noqa: BLE001 - allocation can fail many ways
             unpriced[sig] = f"could not build inputs: {type(exc).__name__}"
             continue
-        if any(a is None for a in args):
+        if sets is None:
             unpriced[sig] = "unknown dtype"
             continue
         try:
-            seconds = _time(lambda: fn(*args), iters, warmup)
+            seconds = _time_over(fn, sets, iters, warmup)
         except Exception as exc:  # noqa: BLE001 - a call can fail many ways
-            # Almost always a non-default scalar the record does not carry.
             unpriced[sig] = f"{type(exc).__name__}: {str(exc)[:120]}"
             continue
         priced[sig] = {
             "name": op["name"],
             "seconds": seconds,
             "occurrences": counts[sig],
+            "cache": cache,
+            "arg_sets": len(sets),
         }
 
     ops_priced = sum(counts[s] for s in priced)
@@ -152,6 +256,7 @@ def price_graph(graph_path: str, iters: int = 2000,
         "provenance": {
             "graph": graph_path,
             "iters": iters,
+            "cache": cache,
             "note": "steady state, one event pair per signature",
         },
         "coverage": {

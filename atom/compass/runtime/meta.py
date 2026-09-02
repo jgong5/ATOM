@@ -172,6 +172,35 @@ class MetaTrace:
         return "\n".join(lines)
 
 
+def _scalars_of(args, kwargs) -> tuple:
+    """An operator's non-tensor arguments, in a form an artifact can hold.
+
+    Shapes do not describe a call. `aiter::rmsnorm2d_fwd_` takes an `eps` and
+    raises without one, so a graph recording only tensors cannot be replayed to
+    price it -- which is how 113 of 330 operators went unpriced.
+
+    Positional arguments are named by position, since the dispatcher does not
+    hand over the schema's parameter names. Only values a JSON artifact can hold
+    are kept: a tensor is already recorded as a shape, and anything else is
+    dropped rather than turned into a string that cannot be passed back.
+    """
+    keep = (bool, int, float, str, type(None))
+    out = []
+    for i, a in enumerate(args):
+        if isinstance(a, keep):
+            out.append((f"#{i}", a))
+        elif isinstance(a, (list, tuple)) and a and all(
+                isinstance(x, (bool, int, float)) for x in a):
+            out.append((f"#{i}", list(a)))
+    for k, v in (kwargs or {}).items():
+        if isinstance(v, keep):
+            out.append((k, v))
+        elif isinstance(v, (list, tuple)) and v and all(
+                isinstance(x, (bool, int, float)) for x in v):
+            out.append((k, list(v)))
+    return tuple(out)
+
+
 class MetaOpTracer(TorchDispatchMode):
     """Records every dispatched operator, and any that meta cannot execute.
 
@@ -256,6 +285,7 @@ class MetaOpTracer(TorchDispatchMode):
                 output_shapes=out_shapes,
                 dtypes=dtypes,
                 group=_resolve_group(name, self.topology),
+                scalars=_scalars_of(args, kwargs),
             )
         )
         return out

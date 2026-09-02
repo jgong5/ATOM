@@ -683,7 +683,9 @@ class CompassModelRunner(ModelRunner):
             out = self._rank_path(out, self._rank_coords())
         logger.info("ATOMCompass: pricing kernels from %s ...", config.bench_graph)
         try:
-            result = price_graph(config.bench_graph, iters=config.bench_iters)
+            result = price_graph(config.bench_graph,
+                                 iters=config.bench_iters,
+                                 cache=config.bench_cache)
         except OSError as exc:
             logger.warning("ATOMCompass WARNING: could not read %s: %s",
                            config.bench_graph, exc)

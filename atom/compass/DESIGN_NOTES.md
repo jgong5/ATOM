@@ -211,18 +211,59 @@ back-to-back loop serialises. Both inflate a sum of standalone prices. This is
 the same shape of question as "does Σ ops explain a step", asked of better
 numbers, and it is what phase C has to answer.
 
-**What is not priced, and why it matters differently.** Twelve signatures failed,
-in two distinct ways:
+**Scalars recorded, and coverage nearly doubled.** Twelve signatures failed at
+first, nine of them wanting a non-tensor argument the graph did not keep --
+`aiter::rmsnorm2d_fwd_` wants `eps`. `OpSpec` now carries them, positional ones
+named by index so the call can be interleaved back together, and coverage went
+from **54.8% to 90.3%** of operators. Graph comparison is untouched: `_signature`
+in `diff.py` never looked at scalars.
 
-* *Missing a scalar the record does not carry* — `aiter::rmsnorm2d_fwd_` wants
-  `eps`, `profiler::_record_function_enter_new` wants `name`. The graph keeps
-  every tensor argument but no scalars, so the call cannot be rebuilt. Recording
-  non-tensor arguments alongside the shapes fixes this, and it is worth doing:
-  rmsnorm is 113 of the 330 operators.
-* *Not a dispatcher operator at all* — `triton::...` and `inductor::...` are
-  recorded by the Triton launch tracer patching `JITFunction.run`, not by the
-  dispatcher, so `torch.ops` can never resolve them. Pricing those needs the
-  launch path, which is a different mechanism rather than a missing field.
+The three that remain are `triton::` and `inductor::` kernels, recorded by the
+Triton launch tracer patching `JITFunction.run` rather than by the dispatcher, so
+`torch.ops` can never resolve them. Those need the launch path, which is a
+different mechanism rather than a missing field.
+
+### A step is not the sum of its kernels
+
+With 90% of the operators priced:
+
+| | |
+| --- | --- |
+| priced total, hot | 9.239 ms |
+| priced total, cold | 8.640 ms |
+| the replayed step | **3.946 ms** |
+
+**Summed prices are 2.2-2.3x the step they are meant to explain.** The earlier
+agreement to 7% was an artifact of pricing only 55% of the operators: adding
+rmsnorm's 113 doubled the sum. A replay overlaps its kernels heavily, and a
+back-to-back loop measures each one alone.
+
+So the mapping from summed prices to step cost is nothing like identity — around
+0.43 here — and whether *that ratio* is stable across shapes, widths and models
+is the question that decides whether a price list is worth having. A stable ratio
+is a usable model; a ratio that moves with the workload is a second thing to
+calibrate, and calibrating it needs the measured steps a price list was supposed
+to replace.
+
+### Hot and cold do not isolate what they were meant to
+
+Cache state is per argument, not per kernel: in a real decode step a gemm's
+activation is hot because the previous operator wrote it, while its weight is
+cold and every one of the 113 gemms uses a different one. So the harness prices
+either way — `--compass-bench-cache hot|cold`, the latter rotating over enough
+input sets to overflow the cache.
+
+The expectation was that cold would be dearer, since streaming a weight from
+memory costs more than rereading a resident one. **Cold came out cheaper**:
+0.94x overall, 0.94x on gemm, 0.87x on rmsnorm. The likely reason is that hot
+mode reuses one output buffer, so consecutive calls serialise on a
+write-after-write dependency, while rotating buffers lets them pipeline. The two
+modes therefore conflate cache residency with output-buffer serialisation, and
+neither isolates cache by itself.
+
+Worth keeping — they bracket a 6% band and cost nothing to run — but the honest
+reading is that at this kernel size overlap dominates cache, and the 2.2x gap
+above is not something cache realism will close.
 
 The tracer is kept, because the question it answers is the right one and the
 answer needs to stay reproducible. `scripts/compass/op_cost.py` reports it.

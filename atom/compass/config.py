@@ -58,6 +58,11 @@ class CompassConfig:
             call, and the model runs in a worker, so a kernel is reachable
             nowhere else. Pricing after warmup also means the kernels priced are
             the ones this deployment autotuned, not a fresh build.
+        bench_cache: ``hot`` reuses one set of inputs, ``cold`` rotates over
+            enough of them to overflow the cache. Cache state is really per
+            argument -- a gemm's activation is hot because the previous operator
+            wrote it, while its weight is cold and every gemm in a step uses a
+            different one -- so these bracket the answer rather than give it.
         bench_iters: Calls per signature, timed as one block. Per-call timing is
             what this exists to avoid -- it cost eleven times the step it was
             measuring.
@@ -96,6 +101,7 @@ class CompassConfig:
     bench_graph: Optional[str] = None
     bench_out: Optional[str] = None
     bench_iters: int = 2000
+    bench_cache: str = "hot"
     filler_token_id: int = 100
 
     def __post_init__(self) -> None:
