@@ -633,11 +633,9 @@ Measured against the ablation ground truth, on the same workload:
 | benchmark, now | **18.3 µs/call** |
 | ablation | **26.1 µs/call** |
 
-28 layers priced independently, 18.29 to 18.49 µs, a spread of 1%. The remaining
-30% is the known graph-mode bias -- 64 captured copies of one call on one set of
-inputs are mutually independent and overlap, where a real step's are not --
-which is the next thing to attack, and is a bias in the right direction and of
-an ordinary size. Coverage is back to 98.8% (326/330), this time honestly.
+28 layers priced independently, 18.29 to 18.49 µs, a spread of 1%. Coverage is
+back to 98.8% (326/330), this time honestly. The remaining 30% is taken apart
+below; it is **not** overlap, which is what it was first attributed to.
 
 The cost of this design, stated so nobody is surprised by it: Compass now knows
 something about attention specifically, which the rest of the op graph is built
@@ -645,6 +643,55 @@ to avoid. It is confined to one module and one operator. Any future operator
 whose cost turns on ambient state will need an entry there too, and the honest
 reading is that the op graph's "records only arguments" purity was never
 achievable and this is where the exception now lives.
+
+### The residual 30% is not overlap
+
+Read the kernels out of a profile of the real run rather than differencing a
+step, and the operator's cost in situ resolves into three kernels. 896 launches,
+being 28 layers over 32 decode steps:
+
+| kernel | in situ | in the benchmark |
+| --- | --- | --- |
+| `pa_bf16_noquant_gqa8_1tg_4w` | 11.07 µs | 7.70 µs |
+| `kn_entry_..._cached_indirect_inplace` (rope) | 9.04 µs | 6.87 µs |
+| `reshape_and_cache_kernel` (the KV write) | 6.33 µs | 5.37 µs |
+| **the operator** | **26.44 µs** | **19.94 µs** |
+
+26.44 against the ablation's 26.1 -- two methods that share no machinery, 1%
+apart. Ablation can stay as a cheap cross-check, but a profile is the better
+instrument: it attributes, where a difference only subtracts.
+
+**Every kernel is cheaper in the benchmark, by 15% to 30%.** That rules out a
+single pathological kernel and it rules out overlap, which would show up in one
+place and not uniformly across three unrelated kernels. The batch sweep rules
+overlap out directly. Fitting `measured = c + r/B` to B=1 and B=64:
+
+| B | measured | c + r/B, for c=18.2 r=6.1 |
+| --- | --- | --- |
+| 1 | 24.33 µs | 24.33 |
+| 4 | 19.93 µs | 19.76 |
+| 16 | 18.71 µs | 18.61 |
+| 64 | 18.33 µs | 18.32 |
+
+A constant ~6.1 µs per replay, amortised, over a flat ~18.2 µs per call. Per-call
+cost **asymptotes**; concurrency would keep driving it down as B grew. The
+captured calls run one after another, as stream-ordered capture implies.
+
+What is left is cache residency, and this is a hypothesis with evidence rather
+than a demonstration. The benchmark replays one operator against **one layer's**
+KV cache 64 times back to back; ~2.6 MB of KV stays resident and every kernel
+finds its data warm. A real step touches each of 28 layers' KV regions once,
+interleaved with the ~300 other kernels of a 1.2 GB model, which is more traffic
+than the last level of cache holds. A uniform discount across three kernels that
+share nothing but their working set is what that would look like.
+
+Note where the gap is *not* closed by `cache=cold`: `_build_arg_sets` rotates the
+**argument** tensors, and the KV cache is not an argument -- it is fetched from
+the forward context, so it is the same layer's tensor on every call in every
+mode. Neither `hot` nor `cold` says anything about it. The experiment that would
+settle this is to rotate `layer_name` across the captured calls so each hits a
+different layer's cache, and see whether the three numbers walk up toward the
+in-situ column. Not yet run.
 
 One thing worth noticing while reading a recorded context: ATOM's decode
 metadata carries `state=prefill_native` on a step whose `is_prefill` is `False`.
@@ -677,11 +724,15 @@ and about a quarter of the work, missing from the total. It is priced now, from
 a recorded forward context rather than from its arguments (above), so this
 table's totals are stale in that respect. The second reason below is not.
 
-*The graph benchmark lets kernels overlap that never overlap.* It captures 64
-copies of one kernel on one set of inputs, which are mutually independent, so the
-device runs them concurrently. In a real step, layer N+1 consumes layer N's
-output and the chain is serial. `aten::slice` falling **315x** to essentially zero
-is the signature: not a cheap kernel, an elided one.
+*The graph benchmark prices some operators at nothing.* `aten::slice` falls
+**315x** to essentially zero, because it is a view: it launches no kernel, so
+what a loop measures for it is host dispatch and what a capture measures is the
+absence of any GPU work. Correct, and useless — a graph cannot price an operator
+that does not exist on the device.
+
+(This was originally written up as *overlap* — 64 mutually independent copies
+running concurrently. That is wrong, and is refuted further down: per-call cost
+asymptotes with batch size, which is what serialisation predicts.)
 
 **So neither mode measures a kernel in the dependency context it runs in.** The
 loop adds a host launch the replay does not pay; the graph removes a

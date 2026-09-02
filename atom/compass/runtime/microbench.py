@@ -227,15 +227,16 @@ def _build_arg_sets(op: dict, cache: str, fn) -> Optional[list]:
     return sets
 
 
-#: Calls captured into one graph. Large enough that replaying the graph costs
-#: far more than submitting it, small enough to capture quickly.
-#: Calls captured into one graph. A replay costs about 5.5 microseconds
-#: whatever it contains, so a capture of one call charges that to one kernel and
-#: overstates it; measured per-call cost falls from B=1 to B=8 and is flat
-#: thereafter, at every shape from M=1 to M=2048. Flat is the important part --
-#: it means the captured calls run one after another, as stream-ordered capture
-#: implies, so what is measured is a latency and not a throughput. 64 is
-#: comfortably past the knee.
+#: Calls captured into one graph. A replay costs a few microseconds whatever it
+#: contains, so a capture of one call charges all of that to one kernel and
+#: overstates it; per-call cost falls from B=1 to B=8 and is flat thereafter, at
+#: every shape from M=1 to M=2048. Attention fits `c + r/B` with r = 6.1us and
+#: c = 18.2us across B = 1, 4, 16, 64 to within 1%.
+#:
+#: Flat is the important part, and it is what says the captured calls run one
+#: after another, as stream-ordered capture implies: concurrency would keep
+#: driving per-call cost down as B grew instead of letting it asymptote. So what
+#: is measured is a latency and not a throughput. 64 is comfortably past the knee.
 GRAPH_BATCH = int(os.environ.get("COMPASS_GRAPH_BATCH", "64"))
 
 
