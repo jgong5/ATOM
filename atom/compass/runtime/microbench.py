@@ -148,6 +148,59 @@ def _rebuild_args(op: dict, tensors: list) -> tuple[list, dict]:
     return args, keywords
 
 
+def _kernels_of(fn, args, kwargs) -> dict:
+    """Which device kernels one call of an operator launches, and for how long.
+
+    The join key between a price and the same work inside a real step. A step is
+    a replayed CUDA graph -- one host call for the whole thing -- so its profile
+    has kernels and no operators to hang them on: 13232 kernel events against
+    5348 host ops, none of them per kernel. Operator names simply are not
+    present on that side. Kernel names are on both.
+
+    One eager call, because eager is where an operator still brackets its own
+    kernels. The durations are only used as *shares* of the measured price, so a
+    single cold-ish call is enough to apportion; it is not itself the price.
+    """
+    import json as _json
+    import os as _os
+    import tempfile
+
+    import torch
+    from torch.profiler import ProfilerActivity, profile
+
+    fn(*args, **kwargs)
+    torch.cuda.synchronize()
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+        fn(*args, **kwargs)
+        torch.cuda.synchronize()
+
+    # Read the exported trace rather than `key_averages()`, so that what counts
+    # as a kernel here is exactly what counts as one on the other side of the
+    # comparison -- events whose category is `kernel`. The summary view cannot
+    # make that distinction: an operator, a device-side annotation and the
+    # kernel itself all report self device time under names that no prefix
+    # separates, so apportioning across them split each kernel's price two ways.
+    handle, path = tempfile.mkstemp(suffix=".json")
+    _os.close(handle)
+    try:
+        prof.export_chrome_trace(path)
+        with open(path, encoding="utf-8") as fh:
+            events = _json.load(fh).get("traceEvents", [])
+    finally:
+        try:
+            _os.unlink(path)
+        except OSError:
+            pass
+
+    kernels: dict[str, float] = {}
+    for event in events:
+        if event.get("cat") in ("kernel", "Kernel"):
+            name = event.get("name", "")
+            kernels[name] = kernels.get(name, 0.0) + float(
+                event.get("dur", 0.0)) / 1e6
+    return kernels
+
+
 def _time(callable_, iters: int, warmup: int) -> float:
     """Seconds per call, measured over ``iters`` calls and one pair of events."""
     import torch
@@ -493,6 +546,10 @@ def price_graph(graph_path: str, iters: int = 2000, warmup: int = 20,
         except Exception as exc:  # noqa: BLE001 - a call can fail many ways
             unpriced[sig] = f"{type(exc).__name__}: {str(exc)[:120]}"
             continue
+        try:
+            kernels = _kernels_of(fn, *sets[0])
+        except Exception:  # noqa: BLE001 - a breakdown is a bonus, not the price
+            kernels = {}
         priced[sig] = {
             "name": op["name"],
             "seconds": seconds,
@@ -504,6 +561,11 @@ def price_graph(graph_path: str, iters: int = 2000, warmup: int = 20,
             # device was idle waiting and the price is the host's, not the
             # kernel's.
             "host_seconds": host_seconds,
+            # Which kernels this operator launches, so its price can be compared
+            # against the same work in a step -- where a graph replay leaves
+            # kernel names as the only thing the two sides share. See
+            # scripts/compass/price_check.py and open problem 21.
+            "kernels": kernels,
         }
         if PROFILE_MATCH and PROFILE_MATCH in sig:
             try:

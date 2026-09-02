@@ -125,10 +125,27 @@ nobody has measured, or only interpolate between ones that were. Everything
 under *Settled* about graphs is groundwork for this and is not yet paying for
 itself.
 
-**Ceiling on this, before anything else is built on top: #21.** Priced kernels
-come out about a quarter under what a step costs, measured without a profiler,
-at 98.8% coverage. If that ratio is constant it is one calibration factor; if it
-is not, no amount of coverage fixes it.
+**Done, for one decode shape.** `PricedGraphCostOracle` costs a step as the sum
+of its priced operators plus a fixed cost per kernel launch, and it is the first
+oracle here that reads an operator at all. Against the workload it was fitted on:
+TTFT -1.3%, TPOT **-0.4%**, latency -0.7%. Held out at 96 output tokens instead
+of 32: TTFT -1.7%, TPOT -3.7%, latency -3.4%.
+
+The second term is not a fudge and its shape was the open question (#21): priced
+kernels sum to 0.740 of a step at 98.8% coverage, and the missing quarter is
+additive per launch rather than multiplicative -- 2.02 µs, fitted without a
+profiler, matching a profiled per-kernel median of 2.05 µs arrived at
+separately.
+
+Read the held-out row for what is still missing rather than as a result. The
+oracle holds **one graph**, so it returns one number for every decode step; real
+TPOT rises from 3.115 ms to 3.224 ms as context grows from ~346 to ~410 tokens
+and the prediction does not move. That -3.7% *is* the single-graph limitation,
+and it is the argument for deriving a graph per shape (`runtime/derive.py`)
+rather than for anything else. Prefill is not priced at all -- one step is
+traced and it is a decode step (#9) -- so prefill steps fall through to a
+calibrated fallback, and the TTFT figures above are that fallback's, not this
+oracle's.
 
 Precondition, from the event-timing finding below: per-operator attribution must
 be checked for the same observer effect — run the workload with and without it
@@ -1444,18 +1461,49 @@ profile of the real run:
 | KV write | 5.00 µs | 5.79 µs | 0.86 |
 
 Seven kernels across two families, memory-bound and compute-bound, clustering at
-0.83 to 0.93. **Whether that ratio is constant is the question that decides the
-fix**, and it is worth answering before anything is built on top:
+0.83 to 0.93. **Answered: the ratio is not constant, and a ratio is the wrong shape to look
+for.** `scripts/compass/price_check.py` widened the sample to every kernel the
+price list reaches, and the ratio runs 0.434 to 0.989 -- far too wide for one
+factor. The same numbers as a **fixed cost per launch** are 0.80 to 3.56 µs,
+median 2.05, and the constant that closes the whole step using no instrument but
+the engine's own clock is `(3.115 - 2.305) / 401 = 2.02 µs`. Two routes, taken
+separately, to the same number.
 
-* If it is constant, one calibration factor corrects the whole price list, the
-  residual error is the spread rather than the ratio, and the mechanism can stay
-  unexplained. Cheap, and probably good enough.
-* If it varies by kernel class, shape or occupancy, a single factor is wrong and
-  the mechanism has to be found first.
+A ratio looked wrong because the cost is not proportional to the kernel: it is
+invisible on a 13 µs gemm and doubles a 2.7 µs rmsnorm, which is exactly the
+spread that made a factor look impossible.
 
-The sample is seven kernels at one batch size on one model, which is not enough
-to tell those apart. Widening it is mostly bookkeeping: every priced signature
-already has an in-situ counterpart in a profile of the same workload.
+| kernel | n | priced | in situ | gap/call |
+| --- | --- | --- | --- | --- |
+| gemm `MT64x16x128` | 28 | 12.99 µs | 14.29 µs | 1.30 µs |
+| attention | 28 | 8.74 µs | 11.11 µs | 2.37 µs |
+| rope | 28 | 7.19 µs | 9.34 µs | 2.15 µs |
+| `reshape_and_cache` | 28 | 4.44 µs | 6.04 µs | 1.61 µs |
+| `add_rmsnorm_quant` | 56 | 2.73 µs | 6.29 µs | 3.56 µs |
+| `act_and_mul` (silu) | 28 | 2.96 µs | 6.31 µs | 3.35 µs |
+
+So the correction is additive per kernel launch, which is what
+`PricedGraphCostOracle` applies. What the cost physically *is* remains open --
+the candidates below still stand -- but the model does not depend on knowing.
+
+Two measurement notes worth keeping. Profiled kernel time sums to 3.54 ms inside
+a 3.12 ms step, so the in-situ column is inflated by ~14% and the per-kernel gaps
+are upper bounds; the 2.02 µs fit avoids the profiler entirely. And a profiled
+run is ~16% slower end to end (TPOT 3.619 ms against 3.115), so a prediction must
+never be validated against a profiled baseline -- which cost one comparison here
+before it was caught.
+
+Getting the join right took two attempts, both worth recording. A decode step is
+a replayed CUDA graph -- one host call for all of it -- so its profile has 13232
+kernel events and no operator to charge them to; kernel *names* are the only key
+the two sides share, which is why the price list now records which kernels each
+operator launched. And those names are no help in telling an operator from a
+kernel: `aiter::pa_bf16_noquant_gqa8_1tg_4w` is a kernel while
+`aiter::_pa_fwd_asm` is the operator that launched it. Filtering by prefix
+dropped attention's kernel entirely and handed its price to rope and the KV
+write, which then priced *above* their in-situ cost. Reading the exported trace
+and keeping `cat == "kernel"` -- the same filter the other side uses -- is what
+makes the two comparable.
 
 What it is **not**, each ruled out by measurement rather than argument:
 

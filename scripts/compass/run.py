@@ -101,9 +101,24 @@ def main() -> int:
             json.dump({"wall": 0.0, "requests": []}, fh)
         return 0
 
+    # A profile of this same workload is what says whether a priced kernel costs
+    # what it costs in a step. The two have to be the same workload or the
+    # comparison is between different shapes -- so it is a flag here rather than
+    # a second script with its own prompts. One warm generate first, because the
+    # trace should hold steady-state work and not Triton autotuning its way
+    # through every shape.
+    profiling = bool(getattr(args, "torch_profiler_dir", None))
+    if profiling:
+        llm.generate(["warmup"], SamplingParams(temperature=0.0, max_tokens=4))
+        llm.start_profile()
+
     start = time.perf_counter()
     outputs = llm.generate(prompts, params)
     wall = time.perf_counter() - start
+
+    if profiling:
+        llm.stop_profile()
+        print(f"profile written to {args.torch_profiler_dir}")
 
     requests = [
         {
