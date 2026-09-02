@@ -461,7 +461,9 @@ backend is `paged_attention_asm`, which reads only `block_tables`,
 `context_lens`, `max_qlen` and `qo_indptr`.
 
 The benchmark's figure is invariant to every attention parameter there is to
-vary, which is itself the finding: it is not measuring attention's work.
+vary, which is itself the finding: it is not measuring attention's work. Why it
+is not is settled below, and the answer is duller and worse than a modelling
+error -- the arguments were never read.
 
 So the cost was measured by **ablation** instead -- return the right shape
 without doing the work, and difference the step:
@@ -496,6 +498,87 @@ attention is skipped during CUDA graph capture — which would mean the captured
 graph omits attention entirely. It does not. `is_dummy_run=True` is set only in
 `dummy_execution` and `warmup_model`, never in `capture_cudagraph`, so the skip
 applies to the dummy runs *around* capture and attention is captured normally.)
+
+### Why it was 7x over: the arguments were never read
+
+`unified_attention_with_output_base` rebuilds a forward context from its
+arguments only when there is not one already:
+
+    if get_forward_context().context is None:
+
+and after `capture_cudagraph()` there always is one. `set_forward_context`
+assigns a module global and nothing clears it, so what stands when capture
+returns is the **last rung of the ladder** -- capture walks it descending, so the
+last rung is batch 1, describing one sequence at the model's maximum context.
+Printing what the kernel was handed:
+
+    ambient context is None: False
+    KERNEL SEES q=(4,16,128) block_tables=(1,2560)
+                context_lens=(1,) [16384] max_qlen=1 qo_indptr=(2,) [0,1]
+
+Four sequences of 155 tokens were passed in; one sequence of 16384 was attended
+-- 26x the KV traffic. Every explicit argument was dead, which is precisely why
+varying them changed nothing. The invariance was not a property of attention.
+
+Worth recording that the 163.7 µs is real device time in a real kernel, since
+the standing suspicion had been the opposite:
+
+    one eager call:    163.7 µs  aiter::pa_bf16_noquant_gqa8_1tg_4w
+                         7.3 µs  rope_cached_positions_2c_fwd_impl
+                         1.9 µs  reshape_and_cache
+    loop over 2000:    device 183.47 µs   host 183.40 µs   ratio 1.00
+    graph B=1/4/16/64: 169.6 / 165.1 / 163.9 / 163.5 µs
+
+Flat in batch, and the profile puts the whole of it in one kernel. Nothing here
+was harness overhead; the kernel really did walk 16384 tokens of KV.
+
+The fix is one call -- `reset_forward_context()` before each signature is priced.
+Nothing a benchmark prices is inside a live forward, and an operator that reads
+ambient state must not be allowed to inherit the last one. Per signature rather
+than once, because an operator that rebuilds the context leaves it behind for
+whatever is priced next.
+
+### An op graph cannot record anything that is not a tensor
+
+With the context reset, attention stops being mispriced and starts failing
+outright -- `'NoneType' object has no attribute 'stride'` -- because the rebuild
+now honours the recorded arguments and two of them are wrong. Against the live
+values at the same eager step:
+
+| field | live | recorded |
+| --- | --- | --- |
+| `context_lens` | `[315,315,315,315]` | `[315,315,315,315]` |
+| `slot_mapping` | live | live |
+| `block_tables` | `(4, 2560)` tensor | **`None`** |
+| `max_seqlen_q` | `1` | **`16384`** |
+
+Tensors survive. An `int`, and an argument that happened to be `None` when the
+graph was compiled, do not. `md = get_forward_context().attn_metadata` is traced
+by Dynamo: the tensor reads become graph inputs and flow per step, while
+`md.max_seqlen_q` is constant-folded and a then-`None` `md.block_tables` is baked
+in as the constant `None`. Both constants come from the forward that compiled --
+the warmup dummy, a 16384-token prefill that has no block table. 16384 is
+`max_num_batched_tokens`, which is the tell.
+
+Production never notices, because the operator ignores its arguments and reads
+the context. Compass notices because reading the arguments is the entire point of
+having added them.
+
+**So option A -- describe an operator by giving it its metadata as arguments --
+carries tensors and nothing else.** Three ways out, none yet chosen:
+
+* Record attention's metadata from the live forward context at trace time,
+  through a side channel, instead of from the operator's arguments. Keeps the
+  operator untouched; makes the tracer know something op-specific.
+* Pass the extents as 0-d tensors so they flow instead of folding. Cheap, ugly,
+  and does nothing for `block_tables`, which folds because of *when* it was
+  `None`, not because of its type.
+* Give the operator a metadata argument that is opaque to Dynamo. Largest
+  change, and the one that would generalise past attention.
+
+Until one is picked, attention is honestly unpriced: coverage on this graph
+reads 90.3% (298/330) rather than the 98.8% it read while 28 operators carried a
+figure that was 7x wrong. The lower number is the true one.
 
 Capturing the calls into a CUDA graph removes what production removes — one
 submission, no host in the loop — and takes ~21 µs off. A ~9 µs floor survives,

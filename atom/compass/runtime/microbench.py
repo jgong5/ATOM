@@ -228,6 +228,13 @@ def _build_arg_sets(op: dict, cache: str, fn) -> Optional[list]:
 GRAPH_BATCH = int(os.environ.get("COMPASS_GRAPH_BATCH", "64"))
 
 
+#: Signatures whose key contains this substring get taken apart rather than just
+#: priced. A price is a duration and says nothing about where the duration went;
+#: this says whether it went into kernels or into the gaps between them, which is
+#: the difference between "this kernel is slow" and "this measurement is wrong".
+PROFILE_MATCH = os.environ.get("COMPASS_BENCH_PROFILE", "")
+
+
 def _time_in_graph(fn, sets: list, iters: int, warmup: int) -> float:
     """Seconds per call, with the launch amortised the way production does.
 
@@ -394,9 +401,21 @@ def price_graph(graph_path: str, iters: int = 2000, warmup: int = 20,
         counts[sig] = counts.get(sig, 0) + 1
         example.setdefault(sig, op)
 
+    # Nothing priced here is inside a live forward, and an operator that reads
+    # ambient state must not silently inherit the last one. Capture leaves a
+    # forward context installed -- the final rung of the ladder, one sequence at
+    # the model's maximum context -- so attention, which reads its metadata from
+    # the context rather than its arguments, walked 16384 tokens of KV whatever
+    # it was handed. It priced at 163.7us against a true 23.0us, and was
+    # invariant to every argument, because the arguments were never read.
+    from atom.utils.forward_context import reset_forward_context
+
     priced: dict[str, dict] = {}
     unpriced: dict[str, str] = {}
     for sig, op in example.items():
+        # Per signature, not once: an operator that rebuilds the context from
+        # its arguments leaves that context behind for whatever is priced next.
+        reset_forward_context()
         fn = _resolve(op["name"])
         if fn is None:
             unpriced[sig] = "operator not registered in this process"
@@ -427,6 +446,11 @@ def price_graph(graph_path: str, iters: int = 2000, warmup: int = 20,
             # kernel's.
             "host_seconds": host_seconds,
         }
+        if PROFILE_MATCH and PROFILE_MATCH in sig:
+            try:
+                _profile_signature(fn, sets, sig, iters, warmup)
+            except Exception as exc:  # noqa: BLE001 - a probe must not stop a run
+                print(f"### PROBE FAILED {type(exc).__name__}: {exc}", flush=True)
 
     ops_priced = sum(counts[s] for s in priced)
     return {
@@ -447,3 +471,71 @@ def price_graph(graph_path: str, iters: int = 2000, warmup: int = 20,
         "prices": priced,
         "unpriced": unpriced,
     }
+
+
+
+def _profile_signature(fn, sets, sig: str, iters: int, warmup: int) -> None:
+    """Four views of one operator, printed rather than returned.
+
+    Priced one way a kernel is a number with nothing to check it against. These
+    four disagree in ways that identify the fault: a loop whose device time
+    equals its host time was waiting on the host; a captured batch whose per-call
+    cost falls with batch size was paying capture overhead per call; and a
+    profile whose kernels do not add up to the measured time has gaps in it.
+    """
+    import torch
+
+    print(f"\n### PROBE {sig[:150]}", flush=True)
+
+    dev, host = _time_over(fn, sets, iters, warmup)
+    print(f"###  loop over {iters}: device {dev*1e6:8.2f}us  "
+          f"host {host*1e6:8.2f}us  ratio {dev/max(host,1e-12):5.2f}", flush=True)
+
+    global GRAPH_BATCH
+    keep = GRAPH_BATCH
+    try:
+        for batch in (1, 4, 16, 64):
+            GRAPH_BATCH = batch
+            secs, _ = _time_in_graph(fn, sets, max(iters, batch), warmup)
+            print(f"###  graph B={batch:<3d}: {secs*1e6:8.2f}us per call",
+                  flush=True)
+    finally:
+        GRAPH_BATCH = keep
+
+    # What the captured batch actually executes. If these kernels sum to far
+    # less than the measured per-call cost, the batch is not kernel-bound and
+    # the price is of something other than the kernel.
+    from torch.profiler import ProfilerActivity, profile
+
+    n = len(sets)
+    graph = torch.cuda.CUDAGraph()
+    stream = torch.cuda.Stream()
+    stream.wait_stream(torch.cuda.current_stream())
+    with torch.cuda.stream(stream):
+        for i in range(3):
+            a, k = sets[i % n]
+            fn(*a, **k)
+    torch.cuda.current_stream().wait_stream(stream)
+    torch.cuda.synchronize()
+    with torch.cuda.graph(graph):
+        for i in range(GRAPH_BATCH):
+            a, k = sets[i % n]
+            fn(*a, **k)
+    graph.replay()
+    torch.cuda.synchronize()
+
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+        graph.replay()
+        torch.cuda.synchronize()
+
+    rows = []
+    for entry in prof.key_averages():
+        micros = float(getattr(entry, "device_time_total", 0.0) or 0.0)
+        if micros > 0.0:
+            rows.append((micros, entry.count, entry.key))
+    rows.sort(reverse=True)
+    total = sum(r[0] for r in rows)
+    print(f"###  profile of one replay of {GRAPH_BATCH}: device total "
+          f"{total:9.1f}us -> {total/GRAPH_BATCH:8.2f}us per call", flush=True)
+    for micros, count, key in rows[:15]:
+        print(f"###    {micros:9.1f}us n={count:<5d} {key[:88]}", flush=True)

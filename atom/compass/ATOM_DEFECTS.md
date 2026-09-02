@@ -169,6 +169,35 @@ is not, so client-side timings describe the simulator.
 now travel on `RequestOutput` and are served by `GET /compass/requests`. ATOM's
 own serving path still computes nothing.
 
+### 7. `capture_cudagraph` leaves its last rung's forward context installed
+
+`set_forward_context` assigns the module global `_forward_context`
+(`atom/utils/forward_context.py:686`) and there is no scoping around capture. So
+when `capture_cudagraph()` returns, the context still standing is the one built
+for the **last rung captured** — the ladder is walked descending, so batch 1,
+carrying `context_lens=[16384]`, a `(1, 2560)` block table, and a `(2,)`
+`qo_indptr`. It describes a single sequence at the model's maximum context, and
+it outlives the capture that needed it.
+
+Anything running after capture that calls `get_forward_context()` gets that,
+with no indication it is stale — the object is fully populated and
+`context is not None`, so the usual "am I inside a forward?" test passes.
+
+**Cost:** nothing during normal operation, because the next real forward
+overwrites it before anything reads it. It is a hazard for anything that runs
+*between* capture and the first step. It cost this project a 7x error: a
+microbenchmark calling attention after capture had every argument it passed
+ignored in favour of the leftover metadata, so it attended one 16384-token
+sequence while measuring what it believed to be four sequences of 155 — 163.7 µs
+against a true 23.0 µs, and invariant to every argument, for a fortnight.
+
+**Fix:** not applied to ATOM; the engine is not wrong so much as unscoped, and
+narrowing the global's lifetime touches every caller. Compass calls the existing
+`reset_forward_context()` before it prices anything. Making capture restore the
+prior context — or making `set_forward_context` a context manager, which the
+`@contextmanager` import at the top of the file suggests was once intended —
+would remove the hazard for everyone.
+
 ---
 
 ## Fixed here
@@ -181,7 +210,7 @@ runs on the wall clock, so neither is visible without a virtual one. They are
 listed because they are wrong in ATOM's code rather than Compass's, and because
 a future reader changing that code should know why it looks the way it does.
 
-### 7. `first_token_time` stamped off the wall clock at one of three sites
+### 8. `first_token_time` stamped off the wall clock at one of three sites
 
 `atom/model_engine/scheduler.py` stamps `seq.first_token_time` in three places.
 Two went through `get_clock().time()`; the third — on the speculative-decode
@@ -192,7 +221,7 @@ Fixed in commit `0e2f880f`. A test walks the AST of `scheduler.py` and fails if
 any assignment to `first_token_time`, `finish_time` or `arrive_time` is sourced
 from the `time` module again.
 
-### 8. `finish_time` stamped after the output that should carry it
+### 9. `finish_time` stamped after the output that should carry it
 
 The finishing `RequestOutput` was constructed at `scheduler.py:2732` and
 `seq.finish_time` assigned at `:2759` — after it. The offline path re-reads the

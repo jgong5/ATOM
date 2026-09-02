@@ -88,3 +88,40 @@ class TestScalarCapture:
             pass
 
         assert self._scalars((Odd(),)) == ()
+
+
+class TestPricingIsNotInsideAForward:
+    """Nothing priced here is inside a live forward.
+
+    `capture_cudagraph` leaves its last rung's context installed, and an
+    operator that reads its metadata from the ambient context rather than its
+    arguments will use it. Attention did: it walked the leftover 16384-token
+    sequence whatever it was handed, priced at 163.7us against a true 23.0us,
+    and was invariant to every argument because none was read. The reset is per
+    signature, not once, because an operator that rebuilds the context from its
+    arguments leaves that context behind for whatever is priced next.
+    """
+
+    def test_the_context_is_reset_before_each_signature(self, tmp_path,
+                                                        monkeypatch):
+        import json
+
+        import atom.utils.forward_context as forward_context
+        from atom.compass.runtime import microbench
+
+        graph = {"ops": [
+            {"name": "aiter::a", "input_shapes": [], "dtypes": [], "scalars": []},
+            {"name": "aiter::b", "input_shapes": [], "dtypes": [], "scalars": []},
+        ]}
+        path = tmp_path / "graph.json"
+        path.write_text(json.dumps(graph))
+
+        resets: list[int] = []
+        monkeypatch.setattr(forward_context, "reset_forward_context",
+                            lambda: resets.append(1))
+        # Unresolvable, so each signature stops right after its reset.
+        monkeypatch.setattr(microbench, "_resolve", lambda name: None)
+
+        microbench.price_graph(str(path))
+
+        assert len(resets) == 2, "once per signature, before it is priced"
