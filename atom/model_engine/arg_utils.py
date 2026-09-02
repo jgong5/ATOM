@@ -193,7 +193,7 @@ class EngineArgs:
             "--compass-bench-cache",
             type=str,
             default="hot",
-            choices=["hot", "cold", "graph"],
+            choices=["hot", "cold", "graph", "isolated"],
             help="Cache state to price kernels in. 'hot' reuses one set of "
             "inputs, which flatters anything memory-bound; 'cold' rotates over "
             "enough sets to overflow the cache, which is what reading a weight "

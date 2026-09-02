@@ -285,9 +285,38 @@ of host and the two are neck and neck; by M=1024 the kernel is 138 µs and the
 host is irrelevant. Past that point a per-call loop measures the kernel correctly,
 which is exactly where loop and graph pricing agree.
 
-**So the loop number is the host's cost and the in-graph number is the kernel's.**
-For decode-shaped work they differ by three to four times, and `host_seconds` is
-recorded beside every price so a reader can tell which one they are holding.
+A third measurement settles it, and its surprise is the useful part. Bracketing
+each call in its own pair of events -- meant to time one kernel alone -- returns
+the *largest* number of the three:
+
+| M | loop | host | own event pair | in graph |
+| --- | --- | --- | --- | --- |
+| 4 | 33.9 µs | 33.9 µs | **52.20 µs** | 9.22 µs |
+| 64 | 31.3 µs | 31.2 µs | 52.08 µs | 12.65 µs |
+| 256 | 30.7 µs | 30.7 µs | 65.72 µs | 29.29 µs |
+| 1024 | 136.0 µs | 30.7 µs | 174.46 µs | 137.58 µs |
+
+Because `began` is recorded before the call: the stream is empty, the device
+timestamps it immediately, and then idles through the entire host dispatch before
+the kernel arrives. So it measures dispatch **plus** kernel with no overlap --
+174 ≈ 31 + 138 at M=1024, and 52 ≈ 34 + 9 plus a synchronise at M=4. There is no
+way with this API to start a clock after dispatch and before execution, so a
+single call cannot be timed in isolation at all.
+
+The loop, by contrast, pipelines: while the device runs kernel *i* the host
+dispatches *i+1*, so it returns `max(host, kernel)`. That model reproduces every
+row — 31.2 against 31.3 at M=64, 30.7 against 30.7 at M=256, 137.6 against 136.0
+at M=1024.
+
+**Three measurements, one model:** host dispatch about 31 µs per call, kernel
+from 9 µs at M=4 to 138 µs at M=1024, the loop host-bound below M≈256 and
+device-bound above it. **The loop number is the host's cost and the in-graph
+number is the kernel's**, and `host_seconds` sits beside every price so a reader
+can tell which one they are holding.
+
+One caveat that survives: the in-graph figure captures 64 *independent* calls the
+device may overlap, so it is throughput under concurrency rather than the latency
+of one kernel. It is a lower bound on kernel cost, not the cost itself.
 
 Capturing the calls into a CUDA graph removes what production removes — one
 submission, no host in the loop — and takes ~21 µs off. A ~9 µs floor survives,

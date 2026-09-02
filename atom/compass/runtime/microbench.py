@@ -236,6 +236,58 @@ def _time_in_graph(fn, sets: list, iters: int, warmup: int) -> float:
     return total / (replays * GRAPH_BATCH), 0.0
 
 
+def _time_isolated(fn, sets: list, iters: int, warmup: int) -> tuple[float, float]:
+    """Host dispatch and kernel, in series -- **not** the kernel alone.
+
+    Named for what it was meant to measure and kept for what it does measure.
+    The intent was one kernel with nothing else in flight. But ``began`` is
+    recorded before the call, the stream is empty so the device timestamps it at
+    once, and the device then sits idle through the whole host dispatch before
+    the kernel even arrives. What comes back is dispatch **plus** kernel, with
+    no overlap between them, which is why it is the largest of the three numbers
+    rather than the smallest:
+
+    | M | loop | host | this | in graph |
+    | --- | --- | --- | --- | --- |
+    | 4 | 33.9 µs | 33.9 µs | 52.2 µs | 9.2 µs |
+    | 1024 | 136.0 µs | 30.7 µs | 174.5 µs | 137.6 µs |
+
+    At M=1024 that is 31 + 138 almost exactly. There is no way with this API to
+    start the clock after dispatch and before execution, so a single call cannot
+    be timed in isolation at all -- the alternatives are to pipeline (the loop,
+    which measures ``max(host, kernel)``) or to capture (the graph, which
+    measures throughput with overlap allowed).
+
+    Its use is as the third leg of a triangle: three numbers that only fit
+    together if host dispatch is around 31 µs and the kernel runs from 9 µs at
+    M=4 to 138 µs at M=1024. Median rather than mean, so one scheduling hiccup
+    does not decide a price.
+    """
+    import statistics
+
+    import torch
+
+    n = len(sets)
+    for i in range(warmup):
+        a, k = sets[i % n]
+        fn(*a, **k)
+    torch.cuda.synchronize()
+
+    # Far fewer iterations than the loop modes: each one pays a synchronise.
+    rounds = max(20, min(200, iters // 20))
+    samples = []
+    for i in range(rounds):
+        a, k = sets[i % n]
+        began = torch.cuda.Event(enable_timing=True)
+        ended = torch.cuda.Event(enable_timing=True)
+        began.record()
+        fn(*a, **k)
+        ended.record()
+        torch.cuda.synchronize()
+        samples.append(began.elapsed_time(ended) / 1000.0)
+    return statistics.median(samples), 0.0
+
+
 def _time_over(fn, sets: list, iters: int, warmup: int) -> tuple[float, float]:
     """Seconds per call on the device, and seconds per call on the host.
 
@@ -309,7 +361,8 @@ def price_graph(graph_path: str, iters: int = 2000, warmup: int = 20,
             unpriced[sig] = "unknown dtype"
             continue
         try:
-            timer = _time_in_graph if cache == "graph" else _time_over
+            timer = {"graph": _time_in_graph,
+                     "isolated": _time_isolated}.get(cache, _time_over)
             seconds, host_seconds = timer(fn, sets, iters, warmup)
         except Exception as exc:  # noqa: BLE001 - a call can fail many ways
             unpriced[sig] = f"{type(exc).__name__}: {str(exc)[:120]}"
