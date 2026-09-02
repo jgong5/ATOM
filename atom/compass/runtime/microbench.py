@@ -275,11 +275,21 @@ def _time_isolated(fn, sets: list, iters: int, warmup: int) -> tuple[float, floa
 
     # Far fewer iterations than the loop modes: each one pays a synchronise.
     rounds = max(20, min(200, iters // 20))
+
+    # Created once, outside the window. A torch.cuda.Event builds its underlying
+    # CUDA event lazily on first record(), so constructing `ended` inside the
+    # loop puts that construction *between* the two timestamps -- after fn() has
+    # been dispatched and before the closing event is enqueued. Recording an
+    # event again simply overwrites its timestamp, so two suffice for the run.
+    began = torch.cuda.Event(enable_timing=True)
+    ended = torch.cuda.Event(enable_timing=True)
+    began.record()
+    ended.record()
+    torch.cuda.synchronize()
+
     samples = []
     for i in range(rounds):
         a, k = sets[i % n]
-        began = torch.cuda.Event(enable_timing=True)
-        ended = torch.cuda.Event(enable_timing=True)
         began.record()
         fn(*a, **k)
         ended.record()

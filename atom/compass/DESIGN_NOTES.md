@@ -314,9 +314,35 @@ device-bound above it. **The loop number is the host's cost and the in-graph
 number is the kernel's**, and `host_seconds` sits beside every price so a reader
 can tell which one they are holding.
 
-One caveat that survives: the in-graph figure captures 64 *independent* calls the
-device may overlap, so it is throughput under concurrency rather than the latency
-of one kernel. It is a lower bound on kernel cost, not the cost itself.
+One caveat survives, and it can be quantified rather than left as a caveat: the
+in-graph figure captures 64 *independent* calls the device may overlap, so it is
+throughput under concurrency rather than the latency of one kernel.
+
+Two small experiments pin it down. `torch.cuda.Event` builds its CUDA event
+lazily on first `record()`, so constructing `ended` inside the loop puts that
+construction between the two timestamps. Hoisting both events out saves
+**0.95 µs** per call at the median -- real, and kept, but a tenth of the gap it
+was meant to explain.
+
+What is left is the concurrency gain, and subtracting the host cost from the
+own-pair measurement isolates it:
+
+| M | own pair − host | in graph | graph understates by |
+| --- | --- | --- | --- |
+| 4 | 16.7 µs | 9.22 µs | **1.8x** |
+| 64 | 19.3 µs | 12.65 µs | 1.5x |
+| 256 | 34.1 µs | 29.29 µs | 1.16x |
+| 1024 | 142.5 µs | 137.58 µs | 1.04x |
+
+Large for a small kernel and vanishing for a large one, which is how overlap must
+behave as a kernel saturates the device. So the residual was never noise.
+
+**The best estimate of a kernel's cost is `own pair − host`**, not the in-graph
+figure. Which means the graph-mode priced total of 1.765 ms against a 3.946 ms
+step -- 0.45x, the "over-correction" above -- is understated by something like
+1.5-1.8x at decode shapes. Correcting for that moves the sum to roughly 3 ms and
+much of the remaining shortfall is attention, still unpriced. The three modes
+bracket a step far more tightly than they first appeared to.
 
 Capturing the calls into a CUDA graph removes what production removes — one
 submission, no host in the loop — and takes ~21 µs off. A ~9 µs floor survives,
