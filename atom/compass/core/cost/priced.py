@@ -35,8 +35,10 @@ extrapolating from one shape to another. Deriving a graph per shape is what
 
 from __future__ import annotations
 
+import glob
 import json
 import logging
+from dataclasses import dataclass, replace
 from typing import Optional
 
 from atom.compass.core.cost.base import StepCost, StepShape
@@ -44,6 +46,22 @@ from atom.compass.core.cost.base import StepCost, StepShape
 logger = logging.getLogger(__name__)
 
 __all__ = ["PricedGraphCostOracle"]
+
+
+@dataclass(frozen=True)
+class _Costed:
+    """One graph, priced, and the shape it describes."""
+
+    path: str
+    seconds: float
+    launches: int
+    breakdown: dict
+    is_prefill: bool
+    batch: int
+    context: float
+
+    def at(self, seconds: float) -> "_Costed":
+        return replace(self, seconds=seconds)
 
 #: Seconds added per kernel launch. Fitted as (step - priced) / launches on a
 #: Qwen3-0.6B decode step at batch 4: (3.115ms - 2.305ms) / 401. Independently,
@@ -88,31 +106,18 @@ class PricedGraphCostOracle:
 
         with open(self.prices_path, encoding="utf-8") as fh:
             price_list = json.load(fh)["prices"]
-        with open(self.graph_path, encoding="utf-8") as fh:
-            graph_blob = json.load(fh)
 
-        self.seconds = 0.0
-        self.launches = 0
+        # One graph describes one shape. Given several -- `graph` is a glob --
+        # the oracle costs each and interpolates between them, which is what
+        # lets a prediction move with context length instead of answering every
+        # decode step with the number the traced step happened to cost.
+        paths = sorted(glob.glob(self.graph_path)) or [self.graph_path]
+        self.points: list[_Costed] = []
         self.unpriced = 0
-        breakdown: dict[str, float] = {}
-        for op in graph_blob["ops"]:
-            entry = price_list.get(signature_of(op))
-            if entry is None:
-                self.unpriced += 1
-                continue
-            self.seconds += entry["seconds"]
-            # An operator is not one kernel. Attention launches three, and the
-            # boundary cost is paid at each -- so the count comes from what the
-            # benchmark saw the operator launch, not from the operator count.
-            self.launches += max(1, len(entry.get("kernels") or {}))
-            breakdown[op["name"]] = breakdown.get(op["name"], 0.0) + entry["seconds"]
-
-        self.overhead = self.launches * self.boundary_seconds
-        self.breakdown = dict(breakdown)
-        # The step this graph describes: one shape, and the oracle knows only it.
-        self.is_prefill = any(
-            (dict(kv for kv in (tuple(x) for x in op.get("context") or ()))
-             .get("is_prefill")) for op in graph_blob["ops"])
+        for path in paths:
+            with open(path, encoding="utf-8") as fh:
+                self.points.append(self._cost(json.load(fh), price_list, path))
+        self.points.sort(key=lambda p: p.context)
 
         self.fallback = None
         if fallback:
@@ -125,31 +130,86 @@ class PricedGraphCostOracle:
 
         if self.unpriced:
             logger.warning(
-                "ATOMCompass WARNING: %d of %d operators in %s have no price "
-                "and contribute nothing; the step will be predicted low.",
-                self.unpriced, len(graph_blob["ops"]), self.graph_path)
+                "ATOMCompass WARNING: %d operators across %d graph(s) have no "
+                "price and contribute nothing; steps will be predicted low.",
+                self.unpriced, len(self.points))
+
+    def _cost(self, graph_blob: dict, price_list: dict, path: str) -> "_Costed":
+        """What one graph costs, and the shape it is a graph of."""
+        from atom.compass.runtime.microbench import signature_of
+
+        seconds = 0.0
+        launches = 0
+        breakdown: dict[str, float] = {}
+        for op in graph_blob["ops"]:
+            entry = price_list.get(signature_of(op))
+            if entry is None:
+                self.unpriced += 1
+                continue
+            seconds += entry["seconds"]
+            # An operator is not one kernel. Attention launches three, and the
+            # boundary cost is paid at each -- so the count comes from what the
+            # benchmark saw the operator launch, not from the operator count.
+            launches += max(1, len(entry.get("kernels") or {}))
+            breakdown[op["name"]] = breakdown.get(op["name"], 0.0) + entry["seconds"]
+
+        recorded = (graph_blob.get("provenance") or {}).get("shape") or {}
+        contexts = recorded.get("context_lens") or []
+        return _Costed(
+            path=path,
+            seconds=seconds + launches * self.boundary_seconds,
+            launches=launches,
+            breakdown=breakdown,
+            is_prefill=bool(recorded.get("num_prefill_tokens", 0)),
+            batch=len(recorded.get("num_scheduled_tokens") or []),
+            context=(sum(contexts) / len(contexts)) if contexts else 0.0,
+        )
+
+    def _interpolate(self, context: float) -> "_Costed":
+        """The cost at ``context``, from the decode graphs either side of it.
+
+        Linear, and extrapolating past the ends rather than clamping: decode
+        cost rises with context because attention walks more KV, and a run that
+        generates past the last traced step is the ordinary case, not an edge
+        one. Clamping there would reintroduce exactly the flat prediction this
+        exists to remove.
+        """
+        usable = [p for p in self.points if not p.is_prefill] or self.points
+        if len(usable) == 1:
+            return usable[0]
+        lower, upper = usable[0], usable[-1]
+        for left, right in zip(usable, usable[1:]):
+            if left.context <= context <= right.context:
+                lower, upper = left, right
+                break
+        span = upper.context - lower.context
+        if span <= 0:
+            return lower
+        at = (context - lower.context) / span
+        return lower.at(lower.seconds + at * (upper.seconds - lower.seconds))
 
     def estimate(self, shape: StepShape) -> StepCost:
-        if shape.is_prefill != self.is_prefill:
+        if shape.is_prefill != any(p.is_prefill for p in self.points):
             if self.fallback is not None:
                 return self.fallback.estimate(shape)
             if not self._warned:
                 self._warned = True
                 logger.warning(
-                    "ATOMCompass WARNING: the graph describes a %s step and "
-                    "this one is %s; answering with the graph's cost anyway "
-                    "because no fallback table was given. Pass "
+                    "ATOMCompass WARNING: no graph describes a %s step; "
+                    "answering with a %s one. Pass "
                     "--compass-oracle-option fallback=<measure table>.",
-                    "prefill" if self.is_prefill else "decode",
-                    "prefill" if shape.is_prefill else "decode")
-        total = max(self.seconds + self.overhead, self.floor_seconds)
-        return StepCost(seconds=total,
-                        breakdown=dict(self.breakdown,
-                                       **{"<kernel boundaries>": self.overhead}))
+                    "prefill" if shape.is_prefill else "decode",
+                    "prefill" if not shape.is_prefill else "decode")
+        context = (sum(shape.context_lens) / len(shape.context_lens)
+                   if shape.context_lens else 0.0)
+        point = self._interpolate(context)
+        total = max(point.seconds, self.floor_seconds)
+        return StepCost(seconds=total, breakdown=dict(point.breakdown))
 
     def describe(self) -> str:
-        return (f"PricedGraphCostOracle({len(self.breakdown)} operator kinds, "
-                f"{self.launches} launches, "
-                f"{self.seconds*1e3:.3f}ms priced + "
-                f"{self.overhead*1e3:.3f}ms boundaries"
+        span = (f"{self.points[0].context:.0f}-{self.points[-1].context:.0f} "
+                f"tokens of context" if self.points else "no graphs")
+        costs = ", ".join(f"{p.seconds*1e3:.3f}ms" for p in self.points[:4])
+        return (f"PricedGraphCostOracle({len(self.points)} graph(s) over {span}: "
+                f"{costs}"
                 + (", calibrated fallback" if self.fallback else "") + ")")

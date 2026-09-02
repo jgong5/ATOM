@@ -54,6 +54,7 @@ class EngineArgs:
     compass_oracle_option: list = None
     compass_mode: str = "predict"
     compass_graph_out: str = ""
+    compass_trace_steps: str = ""
     compass_measure_out: str = ""
     compass_measure_warmup_steps: int = 0
     compass_admission_seconds: float = 0.0
@@ -149,6 +150,16 @@ class EngineArgs:
             type=str,
             default="",
             help="Where --compass-mode=trace writes the recorded op graph.",
+        )
+        parser.add_argument(
+            "--compass-trace-steps",
+            type=str,
+            default="",
+            help="Record several forwards rather than the one --compass-mode="
+            "trace records by default, as \"2,10,20\". One graph describes one "
+            "shape, so an oracle holding one answers every decode step with the "
+            "same number while the real cost climbs with context. Each step is "
+            "written to its own file, suffixed with the step number.",
         )
         parser.add_argument(
             "--compass-measure-out",
@@ -776,6 +787,7 @@ class EngineArgs:
         compass_oracle_option = kwargs.pop("compass_oracle_option", None) or []
         compass_mode = kwargs.pop("compass_mode", "predict")
         compass_graph_out = kwargs.pop("compass_graph_out", "")
+        compass_trace_steps = kwargs.pop("compass_trace_steps", "")
         compass_measure_out = kwargs.pop("compass_measure_out", "")
         compass_measure_warmup = kwargs.pop("compass_measure_warmup_steps", 0)
         compass_admission = kwargs.pop("compass_admission_seconds", 0.0)
@@ -789,6 +801,8 @@ class EngineArgs:
             compass_kwargs["oracle_qualname"] = compass_oracle
         if compass_graph_out:
             compass_kwargs["graph_out"] = compass_graph_out
+        if compass_trace_steps:
+            compass_kwargs["trace_steps"] = compass_trace_steps
         if compass_measure_out:
             compass_kwargs["measure_out"] = compass_measure_out
         if compass_measure_warmup:

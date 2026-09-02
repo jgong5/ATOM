@@ -137,15 +137,35 @@ additive per launch rather than multiplicative -- 2.02 µs, fitted without a
 profiler, matching a profiled per-kernel median of 2.05 µs arrived at
 separately.
 
-Read the held-out row for what is still missing rather than as a result. The
-oracle holds **one graph**, so it returns one number for every decode step; real
-TPOT rises from 3.115 ms to 3.224 ms as context grows from ~346 to ~410 tokens
-and the prediction does not move. That -3.7% *is* the single-graph limitation,
-and it is the argument for deriving a graph per shape (`runtime/derive.py`)
-rather than for anything else. Prefill is not priced at all -- one step is
-traced and it is a decode step (#9) -- so prefill steps fall through to a
-calibrated fallback, and the TTFT figures above are that fallback's, not this
-oracle's.
+That held-out -3.7% was the single-graph limitation: the oracle held **one**
+graph, so it returned one number for every decode step while real TPOT climbs
+from 3.115 ms to 3.224 ms as context grows. `--compass-trace-steps 2,10,20,30`
+records a graph per step, `--compass-bench-graph` takes a glob and prices their
+union, and the oracle interpolates between them on mean context:
+
+| | one graph | four graphs |
+| --- | --- | --- |
+| 32 tokens, tpot | -0.4% | +0.6% |
+| 32 tokens, latency | -0.7% | **-0.1%** |
+| 96 tokens, tpot | -3.7% | **-1.5%** |
+| 96 tokens, latency | -3.4% | **-1.5%** |
+
+The prediction now moves -- 3.105 ms to 3.146 ms across the traced range -- which
+is the point.
+
+**Covering the range does not help further, which is the more useful result.**
+Tracing 2,30,60,90 instead spans 315-403 tokens of context, so a 96-token run
+interpolates rather than extrapolates, and it comes out at -2.3%: slightly
+*worse* than extrapolating from the narrow range. The relationship is not quite
+linear and the extrapolation happened to overshoot helpfully. Both land at 1.5-2.3%,
+so context is no longer what dominates the error and widening the trace further
+is not the lever. What remains is a systematic ~2% low -- the oracle's whole
+range tops out below the real mean -- which points at the 16 of 1320 operators
+still unpriced and at a boundary constant fitted at one context.
+
+Prefill is not priced at all: every traced step is a decode step (#9). Prefill
+falls through to a calibrated fallback, so **the TTFT figures above are that
+fallback's, not this oracle's**, and they are the next thing worth closing.
 
 Precondition, from the event-timing finding below: per-operator attribution must
 be checked for the same observer effect — run the workload with and without it

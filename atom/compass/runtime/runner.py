@@ -308,8 +308,12 @@ class CompassModelRunner(ModelRunner):
         from atom.compass.runtime.triton_trace import TritonLaunchTracer
 
         self._step_index += 1
-        if self._step_index != self._compass_config.trace_step:
+        wanted = self._compass_config.traced_steps()
+        if self._step_index not in wanted:
             return super().forward(batch)
+        # A graph per traced step, not one accumulated across them: they
+        # describe different shapes and merging them would describe none.
+        self._graph = OpGraph()
 
         timing = None
         if self._compass_config.op_timings_out:
@@ -345,7 +349,7 @@ class CompassModelRunner(ModelRunner):
             )
             raise
         self._traced_steps += 1
-        self._write_graph(batch)
+        self._write_graph(batch, len(wanted) > 1)
         if timing is not None:
             self._write_op_timings(timing)
         return output
@@ -402,10 +406,14 @@ class CompassModelRunner(ModelRunner):
         """
         return rank_path(path, coords)
 
-    def _write_graph(self, batch: ScheduledBatch) -> None:
+    def _write_graph(self, batch: ScheduledBatch, per_step: bool = False) -> None:
         path = self._compass_config.graph_out
         if not path:
             return
+        if per_step:
+            from atom.compass.core.artifacts import step_path
+
+            path = step_path(path, self._step_index)
         shape = self._describe(batch)
         topology = self._topology()
         coords = self._rank_coords()
@@ -421,7 +429,16 @@ class CompassModelRunner(ModelRunner):
             "source": "capture",
             "device": "cuda",
             "compilation_level": self._compilation_level(),
-            "trace_step": self._compass_config.trace_step,
+            "trace_step": self._step_index,
+            # The shape this graph describes, so a reader can tell which step it
+            # is a graph *of* without inferring it from the operators. An oracle
+            # holding several needs to choose between them.
+            "shape": {
+                "num_scheduled_tokens": list(shape.num_scheduled_tokens),
+                "context_lens": list(shape.context_lens),
+                "num_prefill_tokens": shape.num_prefill_tokens,
+                "capture_bucket": shape.capture_bucket,
+            },
         }
         self._warn_if_incomplete()
         try:

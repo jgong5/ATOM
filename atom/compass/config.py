@@ -34,6 +34,11 @@ class CompassConfig:
             Exclude Triton autotuning with throwaway *requests* instead — see
             ``--warmup-prompts`` in ``scripts/compass/run.py`` — which drops the
             expensive first launches without discarding a whole category.
+        trace_steps: Several forwards to record, as "2,10,20", instead of the
+            one ``trace_step`` names. A single graph describes a single shape,
+            so an oracle holding one answers every decode step with the same
+            number while the real cost climbs with context. Recording a few
+            steps across a run gives it something to interpolate over.
         trace_step: Which forward to record, counting from one. Not the first:
             Triton autotunes on a kernel's first launch, benchmarking every
             candidate configuration, so an initial step records tens of
@@ -93,6 +98,7 @@ class CompassConfig:
     measure_out: Optional[str] = None
     measure_warmup_steps: int = 0
     trace_step: int = 2
+    trace_steps: Optional[str] = None
     oracle_qualname: str = "atom.compass.core.cost.constant.ConstantCostOracle"
     oracle_options: Optional[dict] = None
     virtual_clock: bool = True
@@ -103,6 +109,17 @@ class CompassConfig:
     bench_iters: int = 2000
     bench_cache: str = "hot"
     filler_token_id: int = 100
+
+    def traced_steps(self) -> tuple[int, ...]:
+        """Which forwards to record, as a sorted tuple.
+
+        ``trace_steps`` when given, otherwise the single ``trace_step``.
+        """
+        if not self.trace_steps:
+            return (self.trace_step,)
+        return tuple(sorted({int(part) for part in
+                             str(self.trace_steps).replace(" ", "").split(",")
+                             if part}))
 
     def __post_init__(self) -> None:
         if self.enabled and self.epoch is None:
@@ -140,3 +157,6 @@ class CompassConfig:
             )
         if self.trace_step < 1:
             raise ValueError(f"trace_step counts from one, got {self.trace_step}")
+        for step in self.traced_steps():
+            if step < 1:
+                raise ValueError(f"trace steps count from one, got {step}")

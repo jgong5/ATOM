@@ -475,9 +475,17 @@ def price_graph(graph_path: str, iters: int = 2000, warmup: int = 20,
     accounts for, because the two differ enormously: a handful of signatures
     cover most of a step.
     """
-    with open(graph_path, encoding="utf-8") as fh:
-        graph = json.load(fh)
-    ops = graph["ops"]
+    # A glob, because one graph describes one shape and an oracle that
+    # interpolates needs several. Their operators are pooled before pricing:
+    # signatures that repeat across shapes are priced once, and the ones that
+    # differ -- attention at each context length -- each get their own price.
+    import glob as _glob
+
+    paths = sorted(_glob.glob(graph_path)) or [graph_path]
+    ops = []
+    for path in paths:
+        with open(path, encoding="utf-8") as fh:
+            ops.extend(json.load(fh)["ops"])
 
     counts: dict[str, int] = {}
     example: dict[str, dict] = {}
@@ -579,6 +587,7 @@ def price_graph(graph_path: str, iters: int = 2000, warmup: int = 20,
         "version": 1,
         "provenance": {
             "graph": graph_path,
+            "graphs": paths,
             "iters": iters,
             "cache": cache,
             "note": "steady state, one event pair per signature",

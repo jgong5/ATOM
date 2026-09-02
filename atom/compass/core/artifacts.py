@@ -15,7 +15,7 @@ from __future__ import annotations
 import os
 from typing import Mapping, Optional
 
-__all__ = ["rank_path", "resolve_rank_path"]
+__all__ = ["rank_path", "resolve_rank_path", "step_path"]
 
 
 def rank_path(path: str, coords: Mapping[str, int]) -> str:
@@ -52,3 +52,14 @@ def resolve_rank_path(
             return path, False
         return mine, True
     return path, False
+
+
+def step_path(path: str, step: int) -> str:
+    """Where the graph for one traced step goes.
+
+    ``g.json`` at step 10 becomes ``g.s10.json``. Applied only when more than one
+    step is traced, so a single-step run keeps the plain name it always had and
+    nothing downstream has to learn about this.
+    """
+    stem, ext = os.path.splitext(path)
+    return f"{stem}.s{step}{ext}"
