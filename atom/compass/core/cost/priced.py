@@ -68,13 +68,14 @@ class _Costed:
 #: most of the step. Prefill's kernels come to 15.8ms of a 37.3ms step, and the
 #: remainder over 319 operators is 67us each. The same fit as the boundary
 #: constant and the same caveat: one step, one deployment.
-DEFAULT_EAGER_SECONDS_PER_OP = 67.4e-6
+DEFAULT_EAGER_SECONDS_PER_OP = 86.35e-6
 
 #: Seconds added per kernel launch. Fitted as (step - priced) / launches on a
-#: Qwen3-0.6B decode step at batch 4: (3.115ms - 2.305ms) / 401. Independently,
-#: the median gap between a priced kernel and the same kernel in a profile of a
-#: real step is 2.05us. Deployment-specific, and an option for that reason.
-DEFAULT_BOUNDARY_SECONDS = 2.02e-6
+#: Qwen3-0.6B decode step at batch 4, over three runs: (3.201ms - 2.341ms) / 382.
+#: Independently, the median gap between a priced kernel and the same kernel in a
+#: profile of a real step is 2.05us. Deployment-specific, and an option for that
+#: reason.
+DEFAULT_BOUNDARY_SECONDS = 2.25e-6
 
 
 class PricedGraphCostOracle:

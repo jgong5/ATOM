@@ -137,6 +137,31 @@ additive per launch rather than multiplicative -- 2.02 µs, fitted without a
 profiler, matching a profiled per-kernel median of 2.05 µs arrived at
 separately.
 
+With admission measured and both overhead constants refitted over three runs,
+every metric is inside the run-to-run noise of a shared GPU:
+
+| | predicted | real (n=3) | error | noise |
+| --- | --- | --- | --- | --- |
+| ttft | 55.580 ms | 54.731 ms | +1.6% | ±1.0% |
+| tpot | 3.200 ms | 3.189 ms | +0.3% | ±1.8% |
+| latency | 154.783 ms | 153.594 ms | +0.8% | ±0.8% |
+| **held out, 96 tokens** | | | | |
+| ttft | 55.580 ms | 53.954 ms | +3.0% | ±1.6% |
+| tpot | 3.200 ms | 3.208 ms | **-0.2%** | ±1.9% |
+| latency | 359.591 ms | 358.687 ms | **+0.3%** | ±1.4% |
+
+Both constants had to be refitted, and why is worth keeping. They were first
+fitted on one step each: a 37.27 ms prefill and a 3.115 ms decode. Over three
+runs those steps are 42.64 ± 0.22 ms and 3.201 ± 0.06 ms, so the single samples
+were 13% and 3% low, and the constants came out at 67.4 µs/op and 2.02 µs/launch
+instead of **86.35** and **2.25**. The prefill step had been reported as -1.9%
+against that one sample and was really -14%. On a shared GPU one step is a poor
+estimator, and the caveat #21 records turned out to matter within the hour.
+
+These remain fits on this deployment, so the table is not a held-out test of the
+*constants* -- two numbers for the whole model. The graph and the prices are
+independent of it, and the 96-token rows are held out in shape.
+
 Prefill is priced too, from its own graph. `--compass-trace-prefill 2` records a
 prefill step alongside the decode one, `--compass-bench-graph` takes both, and
 the oracle picks by kind. With that, the calibrated fallback is not used at all:
@@ -956,7 +981,27 @@ The remaining work is judgement, not code: nothing should be quoted as an
 accuracy figure from a single run again, and a difference smaller than ~5% needs
 repeats before it means anything.
 
-### 3. Admission time is not modelled, and it is all of the TTFT error — **M**
+### 3. Admission time is not modelled, and it is all of the TTFT error — **M**, measured
+
+**Now measured rather than passed in.** `validate.py` derives it from the real
+run as `TTFT - the prefill step that produced the first token`, which is exact
+for an offline workload: every request arrives at once and one prefill step
+serves them all, so there is no queueing between the two to mistake for
+admission. It comes out at 13.7 ms end to end, against 13.19 ± 0.5 ms measured
+independently over three runs -- and against the 13 ms that had been passed by
+hand, which turns out to have been right.
+
+Deriving it from the *modelled* run would have been easier and is circular: it
+would absorb whatever TTFT error the oracle has and report zero. This uses only
+the real run, so the comparison it feeds stays honest. It degrades where requests
+queue, which is why `--admission-seconds` still overrides it.
+
+Recording the real run costs nothing, which had to be checked rather than
+assumed: over three repeats a measured run and a plain one agree on TTFT to 2%
+and on TPOT and latency to well under 1%, all inside the spread of a shared GPU.
+A single pair of runs had suggested a 28% observer effect on TTFT; it was
+contention, and one run could not have told the difference.
+
 
 A request's first token arrives about 13 ms later than the forward that produced
 it can account for. That time is spent getting the request from `preprocess` to

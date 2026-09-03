@@ -114,10 +114,42 @@ def _summarise(name: str, real: list[float], modelled: list[float]) -> dict:
     }
 
 
-def _one_pass(args, work: Path) -> tuple[list[dict], dict, dict, str]:
+def _measure_admission(real_out: Path, real_table: Path) -> float:
+    """How long a request takes to become schedulable, from the real run.
+
+    A simulated engine advances its clock by the forward durations it predicts,
+    so the hops between a request arriving and a worker having it in hand cost
+    nothing -- and that was the whole of the TTFT error. It was a hand-passed
+    constant until now, which is a guess dressed as a measurement.
+
+    Measured instead as ``TTFT - the prefill step that produced the first
+    token``. Exact for an offline workload, where every request arrives at once
+    and one prefill step serves them all, so there is no queueing between the two
+    to confuse for admission. It degrades where requests queue, which is why it
+    stays overridable.
+
+    Deriving it from the *modelled* run would be circular -- it would absorb
+    whatever TTFT error the oracle has and report zero. This uses only the real
+    run, so the comparison stays honest.
+    """
+    try:
+        requests = json.loads(real_out.read_text())["requests"]
+        steps = [json.loads(line) for line in
+                 real_table.read_text().splitlines() if line.strip()]
+    except (OSError, ValueError):
+        return 0.0
+    prefill = [s["seconds"] for s in steps if s.get("num_prefill_tokens")]
+    ttfts = [r["ttft"] for r in requests if r.get("ttft")]
+    if not prefill or not ttfts:
+        return 0.0
+    return max(0.0, statistics.fmean(ttfts) - prefill[0])
+
+
+def _one_pass(args, work: Path) -> tuple[list[dict], dict, dict, str, float]:
     """Calibrate, run for real, run modelled, compare. One draw."""
     work.mkdir(parents=True, exist_ok=True)
     table = work / "steps.jsonl"
+    real_table = work / "real_steps.jsonl"
     real_out = work / "real.json"
     modelled_out = work / "modelled.json"
 
@@ -138,7 +170,13 @@ def _one_pass(args, work: Path) -> tuple[list[dict], dict, dict, str]:
                    "--compass-measure-warmup-steps", "1"])
 
     print("  phase 2/4  running the evaluation workload for real ...", flush=True)
-    _run(common + ["--out", str(real_out)])
+    # Recorded rather than merely run, so admission can be measured from it.
+    # Recording is free: over three repeats a measured run and a plain one agree
+    # on TTFT to 2% and on TPOT and latency to well under 1%, all inside the
+    # run-to-run spread of a shared GPU.
+    _run(common + ["--out", str(real_out), "--compass",
+                   "--compass-mode", "measure",
+                   "--compass-measure-out", str(real_table)])
 
     print("  phase 3/4  running it again, modelled ...", flush=True)
     modelled_cmd = common + [
@@ -147,9 +185,9 @@ def _one_pass(args, work: Path) -> tuple[list[dict], dict, dict, str]:
         "atom.compass.core.cost.calibrated.CalibratedCostOracle",
         "--compass-oracle-option", f"table={table}",
     ]
-    if args.admission_seconds:
-        modelled_cmd += ["--compass-admission-seconds",
-                         str(args.admission_seconds)]
+    admission = args.admission_seconds or _measure_admission(real_out, real_table)
+    if admission:
+        modelled_cmd += ["--compass-admission-seconds", str(admission)]
     _run(modelled_cmd)
 
     print("  phase 4/4  comparing", flush=True)
@@ -167,7 +205,7 @@ def _one_pass(args, work: Path) -> tuple[list[dict], dict, dict, str]:
         _summarise("latency", [r["latency"] for r in real["requests"]],
                    [r["latency"] for r in modelled["requests"]]),
     ]
-    return rows, real, modelled, _steps_fitted(table)
+    return rows, real, modelled, _steps_fitted(table), admission
 
 
 def main() -> int:
@@ -211,7 +249,7 @@ def main() -> int:
             print(f"repeat {i + 1}/{args.repeats}", flush=True)
         passes.append(_one_pass(args, target))
 
-    rows0, real, modelled, fitted = passes[0]
+    rows0, real, modelled, fitted, admission = passes[0]
     print()
     print("ATOMCompass end-to-end validation")
     print("=" * 78)
@@ -220,9 +258,9 @@ def main() -> int:
           f"{args.prompt_tokens} prompt tokens, {args.max_tokens} output tokens")
     print(f"  steps fitted: {fitted}")
     print(f"  repeats    : {args.repeats}")
-    print(f"  admission  : {args.admission_seconds*1000:.1f}ms"
-          + ("" if args.admission_seconds else
-             "  (unmodelled -- TTFT will read short by roughly this much)"))
+    print(f"  admission  : {admission*1000:.1f}ms"
+          + (" (given)" if args.admission_seconds else
+             " (measured from the real run as TTFT minus its prefill step)"))
     print()
 
     if args.repeats == 1:
