@@ -1643,23 +1643,63 @@ being served from cache. A cold prefill does the same work either way. With it:
 prefill drops from 51179 operators to **1280**, the two ranks agree, and coverage
 goes 2.7% to 62.1%.
 
-**62.1%, where the dense 0.6B reaches 98.8%** -- and the gap is structural rather
-than incidental. 28 of the 37 unpriced signatures fail with *operator not
-registered in this process*, and every one of them is `triton::` or
-`inductor::`. The benchmark prices an operator by calling
-`torch.ops.<namespace>.<op>`; a Triton `JITFunction` is not one, so it cannot be
-called at all. On the 0.6B that cost four signatures and was a rounding error.
-Here it is the 48 gated-DeltaNet layers -- 1734 operators, 38% of the graph.
+**62.1% against the dense 0.6B's 98.8% -- and it does not mean what it looks
+like.** 28 of the 37 unpriced signatures fail with *operator not registered in
+this process*, and every one is `triton::` or `inductor::`: the benchmark prices
+by calling `torch.ops.<namespace>.<op>` and a Triton `JITFunction` is not one.
 
-So the pricing method covers a dense transformer well and a hybrid poorly, for a
-reason that has nothing to do with how well it measures. This is #10 on the list,
-whose size was estimated **S** when the only Triton kernels were incidental; on
-the model this project exists to predict it is most of the linear-attention path.
+The reflex is to call that 38% of the model missing. It is not. `TritonLaunchTracer`
+records a custom op's **inner** kernels *as well as* the dispatcher-level operator
+that launched them, so the graph holds both `aiter::linear_attention_with_output_base`
+(48 per graph, priced at 4.1 µs) and the `_causal_conv1d_update_kernel` and
+`fused_gdn_gating_kernel` inside it (48 each, unpriced). Pricing both would
+double-count. The unpriced operators are mostly duplicates of priced parents.
 
-There is a route. `TritonLaunchTracer` already records each launch's kernel name,
-grid, argument shapes, dtypes and constexprs -- everything needed to launch it
-again except a handle to the `JITFunction`. Building a name-to-function registry
-while tracing, and re-launching from it while pricing, is the shape of the fix.
+Which is why coverage by *time* is nothing like coverage by count:
+
+| | priced kernels | + overhead | real step | error |
+| --- | --- | --- | --- | --- |
+| decode | 16.173 ms | 17.85 ms | 17.919 ms | **-0.4%** |
+
+The overhead constant is the 0.6B's 2.25 µs/launch, unrefitted, on a model 45x
+larger and of a different architecture. Against the warmed decode step of
+17.840 ms it gives 17.854 -- **+0.1%**. That is the strongest evidence so far
+that the shape of the model is right, and it warns that a coverage percentage is
+not a measure of missing work when the graph records two levels of the same call.
+
+### The two constants are two different things, and now we know which
+
+They behave completely differently across models:
+
+| | 0.6B dense | 27B hybrid | |
+| --- | --- | --- | --- |
+| replayed, per kernel launch | 2.25 µs | 2.25 µs (+0.1% unrefitted) | transfers |
+| eager, per operator | 86.35 µs | 34.62 µs | 2.5x |
+
+That asymmetry is the explanation. A **replayed** step has no host in the loop,
+so its per-launch cost is a hardware property -- the boundary between two
+dependent kernels -- and there is no reason for it to know what model it is in.
+It transferred across a 45x size difference and an architecture change without
+refitting.
+
+An **eager** step's per-operator cost is host dispatch, and host dispatch does not
+add to kernel time so much as *race* it: the host runs ahead while the device
+works, and only the part it cannot hide is paid. On the 0.6B the kernels are
+small, the host loses, and nearly the whole dispatch shows up -- 86 µs. On the
+27B the kernels are large enough to hide most of it -- 34.6 µs. So the eager
+constant is not a constant at all but roughly `max(0, dispatch - kernel)` summed
+over operators, and it should fall as kernels grow.
+
+This is worth testing rather than believing: it predicts the eager constant is a
+function of the graph's own kernel sizes, which are already priced, so it could be
+computed instead of fitted. That would remove the last thing in this oracle that
+needs a measured step from the configuration being predicted -- which is the
+whole difference between interpolating and predicting.
+
+**So #10 is not urgent for cost, only for attribution.** A priced parent gives
+the right total; what the graph cannot do is say how that total splits between
+conv1d, gating and the rest -- which matters for asking *why* a configuration is
+slow, not for predicting *that* it is.
 
 
 ### 17. The extrapolation warning is per-feature, so it cannot see a hole — **S**
