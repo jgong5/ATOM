@@ -1607,44 +1607,60 @@ Settling it means intercepting at the group object rather than the dispatcher �
 `get_tp_group()` and its siblings know their own identity. That is a replacement
 for the current resolver, not an addition, and item 13 needs it too.
 
-### 16. Qwen3.8-27B cannot be captured here — **?** (environmental)
+### 16. Qwen3.8-27B — **runs**, and is not the model this was scoped for
 
-Its decode path JIT-builds AITER's *gluon* paged-attention kernel and the build
-fails:
+Fixed by `gpu_docker/fix-cxx-headers.sh` (ATOM_DEFECTS #5): the container had gcc
+runtime directories for 13 and 14 but C++ headers only for 13, so every JIT C++
+build failed. The target model now loads and generates -- two requests, 99.3 s,
+TP=2, with its real 52 GB of weights.
 
-    subprocess.CalledProcessError: Command '['make', 'build', '-j1']'
-    returned non-zero exit status 2
+**And it is a hybrid, not a dense transformer.** The decode graph is 1010
+operators over 39 distinct kinds, and among them are 48
+`triton::_causal_conv1d_update_kernel` and 48 `triton::fused_gdn_gating_kernel`:
+48 layers of **gated DeltaNet** -- linear attention with a recurrent state --
+alongside the full-attention ones. The prefill graph carries the matching chunked
+kernels: `chunk_scaled_dot_kkt_fwd`, `recompute_w_u_fwd`,
+`chunk_local_cumsum_scalar`, `l2norm_fwd`.
 
-Narrower than it first appeared: Qwen3-0.6B takes the **ASM** decode path, which
-ships as a prebuilt `.co`, so it captures without touching the failing build. One
-kernel path, not capture as a mechanism — which is why validation was possible on
-a smaller model while the stated target model stayed blocked.
+That matters more than a note. Everything measured on Qwen3-0.6B assumed
+attention that grows with context and a KV cache that is walked; a DeltaNet layer
+carries fixed-size state and its decode cost does not grow with history at all.
+So the context-interpolation question settled on the 0.6B model -- where cost
+rose with context and four graphs bought little -- was settled on an
+architecture that only half applies here. It has to be re-asked.
 
-**Diagnosed: it is an image defect, and the fix is one package.** The `make`
-stderr had never been looked at, because `aiter` passes
-`capture_output=AITER_LOG_MORE < 2` and nobody had set that to 2. Running the
-leftover build by hand shows it:
+The first trace also found a hole in the warmup this project added for exactly
+this purpose. Triton autotunes per shape, and the warm pass used prompts of the
+same *word* count rather than the same *token* count, so the shapes differed and
+the linear-attention kernels tuned again during the traced step: **50451 tuning
+launches in a prefill graph of 51179 operators**, and the two ranks disagreed --
+51179 against 50549 -- because they tuned for different times. Coverage read
+2.7%. The decode graph was unaffected, which is why it looked fine.
 
-    clang++: warning: ... '/usr/lib/gcc/x86_64-linux-gnu/13' would be chosen
-                          over '/usr/lib/gcc/x86_64-linux-gnu/14'
-    error: "Could not find standard C++ header 'cmath'..."
-    fatal error: 'cstdlib' file not found
+The fix is to warm with the *same* prompts, which then needs
+`--no-enable_prefix_caching` so the second pass really re-prefills rather than
+being served from cache. A cold prefill does the same work either way. With it:
+prefill drops from 51179 operators to **1280**, the two ranks agree, and coverage
+goes 2.7% to 62.1%.
 
-`/usr/include/c++/` holds only `13`. The image has gcc-14's runtime directory
-(`crtbegin.o` and friends) but not its C++ headers, and ROCm 7.2.4's clang prefers
-the highest version it finds. So every JIT build of a C++ kernel fails, while
-everything prebuilt is unaffected — which is exactly the observed split.
+**62.1%, where the dense 0.6B reaches 98.8%** -- and the gap is structural rather
+than incidental. 28 of the 37 unpriced signatures fail with *operator not
+registered in this process*, and every one of them is `triton::` or
+`inductor::`. The benchmark prices an operator by calling
+`torch.ops.<namespace>.<op>`; a Triton `JITFunction` is not one, so it cannot be
+called at all. On the 0.6B that cost four signatures and was a rounding error.
+Here it is the 48 gated-DeltaNet layers -- 1734 operators, 38% of the graph.
 
-Verified: adding `--gcc-install-dir=/usr/lib/gcc/x86_64-linux-gnu/13` compiles
-the failing translation unit cleanly, exit 0. `libstdc++-14-dev` is installable
-from the configured apt sources and would fix it at the root, since clang's own
-preference then finds headers where it looks.
+So the pricing method covers a dense transformer well and a hybrid poorly, for a
+reason that has nothing to do with how well it measures. This is #10 on the list,
+whose size was estimated **S** when the only Triton kernels were incidental; on
+the model this project exists to predict it is most of the linear-attention path.
 
-Not applied — it changes the shared container rather than this repository, and
-the container's writable layer does not survive a teardown, so it belongs in
-`gpu_docker`'s setup rather than in an ad-hoc `apt install`.
+There is a route. `TritonLaunchTracer` already records each launch's kernel name,
+grid, argument shapes, dtypes and constexprs -- everything needed to launch it
+again except a handle to the `JITFunction`. Building a name-to-function registry
+while tracing, and re-launching from it while pricing, is the shape of the fix.
 
-## Measurement and performance
 
 ### 17. The extrapolation warning is per-feature, so it cannot see a hole — **S**
 

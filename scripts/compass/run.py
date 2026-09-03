@@ -50,17 +50,26 @@ def main() -> int:
     if getattr(args, "compass_trace_prefill", 0) > 1:
         # Triton autotunes a shape on its first launch, benchmarking every
         # candidate configuration, so the first prefill of a workload records a
-        # tuning run rather than a serving one. Warm the same shapes first.
+        # tuning run rather than a serving one. Warm the shapes first.
         #
-        # Same lengths, so the same kernels are tuned; different text, because
-        # prefix caching would otherwise let the second pass skip the prefill
-        # this exists to record. One token out, so it contributes a prefill and
-        # no decode steps.
-        llm.generate(
-            [f"Warm {i}. " + " ".join(f"w{i}x{j}" for j in range(args.prompt_tokens))
-             for i in range(args.num_prompts)],
-            SamplingParams(temperature=0.0, max_tokens=1),
-        )
+        # The *same* prompts, not merely same-length ones. Qwen3.8-27B is a
+        # hybrid: 48 of its layers are gated DeltaNet, whose Triton kernels
+        # autotune per shape, and prompts differing by a token or two are a
+        # different shape. Warming with `Warm {i}` text of the same word count
+        # left 50451 tuning launches in a prefill graph of 51179 operators, and
+        # the two ranks disagreed because they tuned for different times.
+        #
+        # Same prompts means prefix caching would let the second pass skip the
+        # prefill this exists to record, so a trace run wants
+        # `--no-enable_prefix_caching`. Said rather than forced: the flag
+        # belongs to the caller, and a cold prefill does the same work either
+        # way.
+        if getattr(args, "enable_prefix_caching", False):
+            print("warning: --compass-trace-prefill warms with the same prompts, "
+                  "which prefix caching will then serve from cache -- pass "
+                  "--no-enable_prefix_caching so the traced prefill is real",
+                  file=sys.stderr)
+        llm.generate(prompts, SamplingParams(temperature=0.0, max_tokens=1))
 
     if args.sweep:
         # Each round is its own generate, so each contributes at least one
