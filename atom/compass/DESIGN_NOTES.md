@@ -1699,9 +1699,28 @@ At a shared `D = 130 µs` both prefill steps come out within about 3%.
 
 The 27B barely constrains it -- 403 of its 708 operators hide the dispatch
 entirely, so its prediction moves only 3% across the whole range 100-132 µs --
-and the 0.6B, where only 29 of 316 hide it, is what pins the value. Two models is
-a thin basis. But it is enough to make the eager term *computed* rather than
-fitted, which is what `dispatch_seconds` now does by default.
+and the 0.6B, where only 29 of 316 hide it, is what pins the value.
+
+**A third model says it is not a machine constant.** Qwen3-30B-A3B, a MoE, fits
+D = 91.72 µs:
+
+| model | fitted D | prefill error at a shared 130 µs |
+| --- | --- | --- |
+| Qwen3-0.6B, dense | 132.70 µs | (pins the value) |
+| Qwen3.8-27B, hybrid | 101.22 µs | +2.8% |
+| Qwen3-30B-A3B, MoE | 91.72 µs | **+16.8%** |
+
+So the reframing narrows the spread -- 2.5x on the raw overhead becomes 1.45x on
+the dispatch -- without removing it, and a shared value is good on one unseen
+model and poor on another. `dispatch_seconds` stays the default because it is
+better than a flat per-operator figure and is at least *bounded*, but **an eager
+step still needs one measured step from the model being predicted** if better
+than ~15% is wanted.
+
+The replayed constant is a different story and survives the same test: on the
+MoE, priced decode plus 481 launches at the 0.6B's 2.25 µs gives 8.193 ms against
+7.900 measured, **+3.7%** -- 2.25 µs now carried unchanged across a dense 0.6B, a
+27B hybrid and a 30B MoE.
 
 ### The target model, end to end, with nothing fitted on it
 
@@ -1721,13 +1740,43 @@ is shown to make the difference visible: it is better, and it is better because
 it saw the answer.
 
 So the graph, the prices, and two machine constants predict a model the constants
-have never seen, to within 2.5% on every metric. That is the first evidence in
-this project that any of it *predicts* rather than interpolates.
+have never seen, to within 2.5% on every metric.
 
-Two things that are not evidence and should not be read as such. Admission was
-measured from the same run it is compared against; it is stable across everything
-tried (13.19 ms on the 0.6B, 12.89 at TP=2, 18.4 on the 27B) but it is not held
-out. And the workload is one shape -- four prompts, one prefill step, batch-4
+**That claim survives for decode and not for prefill.** The per-launch constant
+transfers across three architectures (+0.1% on the 27B, +3.7% on the MoE). The
+dispatch constant does not: a third model wants 91.72 µs where the first wanted
+132.70, and the shared value costs 16.8% on its prefill. Decode is predicted with
+nothing fitted on the model; prefill still needs one measured step from it. For a
+long generation that is a small caveat on a large result, and for a
+prefill-dominated one it is the whole result.
+
+One thing that is not evidence: admission was measured from the same run it is
+compared against. **Held out, it costs 4 points of TTFT.** Carrying the 18.447 ms
+measured on the 16-token workload over to a 32-token one -- same prompts, same
+prefill graph, same decode graph, only more decode steps -- gives:
+
+| | predicted | real (n=3) | error |
+| --- | --- | --- | --- |
+| ttft | 347.513 ms | 326.073 ms | **+6.58%** |
+| tpot | 17.854 ms | 17.873 ms | -0.11% |
+| latency | 900.980 ms | 880.127 ms | +2.37% |
+
+against +2.45% / 0.00% / +1.37% when admission came from the run being predicted.
+TPOT is untouched, as it must be -- admission is a one-off per request.
+
+The interesting part was in the real column rather than the predicted one: the
+32-token run's TTFT is 326.07 ms where the 16-token run's was 339.22, for
+identical prompts and an identical prefill. TTFT cannot depend on output length,
+so one of the two was wrong by 13 ms -- and it was mine. Running 16 tokens
+*plain* gives **328.04 ms** against the same workload's 339.22 in measure mode.
+
+**Measure mode costs ~11 ms of TTFT on this model, 4% of it**, against about 2%
+on the 0.6B. Admission was measured in one mode and the prediction compared
+against the other, so the instrumentation's own cost went into the constant. The
+constant is fine; the pairing was not. `validate.py` measures and compares on the
+same footing and is unaffected -- this was a defect of the ad-hoc scripts, and
+the rule is that **admission must come from a run instrumented like the one the
+prediction is judged against.** And the workload is one shape -- four prompts, one prefill step, batch-4
 decode -- which is precisely the case #6b showed a fixed-shape oracle handles and
 serving does not.
 
