@@ -162,6 +162,30 @@ These remain fits on this deployment, so the table is not a held-out test of the
 *constants* -- two numbers for the whole model. The graph and the prices are
 independent of it, and the 96-token rows are held out in shape.
 
+**It holds at TP=2.** The graph and the prices transfer unchanged -- collectives
+included -- and only the two overhead constants move:
+
+| TP=2 | TP=1 constants | refitted | real (n=3) | noise |
+| --- | --- | --- | --- | --- |
+| ttft | -5.8% | **-2.2%** | 63.822 ms | ±2.9% |
+| tpot | +6.2% | **+2.4%** | 3.290 ms | ±3.9% |
+| latency | +1.6% | **+0.6%** | 165.805 ms | ±2.2% |
+
+Reused from TP=1 the constants cost a few percent and pull in opposite
+directions -- tpot over, ttft under -- which is what said they were the problem
+rather than the prices. Refitted they are 1.97 µs/launch against 2.25, and
+92.5 µs/op against 86.35: **7% and 12% off, in different directions.** So the
+constants are a property of a deployment, not of the hardware, and #21's
+"one calibration factor" would have been wrong even had the ratio been constant.
+
+What that costs the product is worth stating: predicting a configuration nobody
+has run needs either one measured step from it to fit two numbers, or an accepted
+~5% error on metrics whose overhead term is a quarter of the step. Everything
+else -- the graph, every price, the collectives -- carries over.
+
+Admission carries over untouched: 12.89 ms at TP=2 against 13.19 at TP=1, as it
+should, being engine-side work that never reaches a device.
+
 Prefill is priced too, from its own graph. `--compass-trace-prefill 2` records a
 prefill step alongside the decode one, `--compass-bench-graph` takes both, and
 the oracle picks by kind. With that, the calibrated fallback is not used at all:
@@ -1058,10 +1082,27 @@ separating from noise with repeated calibration rather than repeated evaluation.
 Nothing yet distinguishes "the sweep's prefill steps are warm and the
 evaluation's is cold" from "four processes vary more".
 
-### 5. No collective cost model — **S/M**, and narrower than it looked
+### 5. No collective cost model — **S/M**, done
 
-Collectives are recorded with their group and their bytes, which is what a cost
-model needs, and nothing consumes it.
+**Collectives price like any other operator.** The microbenchmark calls them, in
+the worker, where the process group is live:
+
+| collective | shape | price |
+| --- | --- | --- |
+| `aiter::all_reduce_` | `[4, 1024]`, decode | 10.38 µs |
+| `aiter::all_reduce_` | `[1256, 1024]`, prefill | 71.33 µs |
+
+A TP=2 decode graph holds 58 grouped operators, 57 of them `all_reduce_`, and
+coverage came to 98.3% on both ranks. The one failure is `c10d::broadcast_`,
+which takes a `ProcessGroup` object no JSON artifact can hold; it is one operator
+per step.
+
+**The thing that makes this safe is pricing the union of every rank's graphs
+rather than each rank's own.** A collective requires all ranks to call it in
+lockstep, so signature lists that differ by a single entry deadlock rather than
+fail -- a hang with no error, in a benchmark that runs inside the worker. The
+union is identical across ranks by construction. That is a rule, not an
+accident, and it is why the first attempt worked.
 
 It does **not** block multi-GPU prediction the way this once claimed. The
 collective runs inside the forward, and the forward is timed with CUDA events, so
@@ -1576,7 +1617,15 @@ spread that made a factor look impossible.
 | `act_and_mul` (silu) | 28 | 2.96 µs | 6.31 µs | 3.35 µs |
 
 So the correction is additive per kernel launch, which is what
-`PricedGraphCostOracle` applies. What the cost physically *is* remains open --
+`PricedGraphCostOracle` applies.
+
+**And it is a property of the deployment, not of the hardware.** Between TP=1 and
+TP=2 on the same GPUs and the same model the two constants move by 12% and 7%,
+in opposite directions -- 2.25 to 1.97 µs/launch and 86.35 to 92.48 µs/op. So the
+"one calibration factor" this section originally hoped for would have been wrong
+even if the ratio had been constant: it is one *pair* of numbers per
+configuration. Reusing another configuration's costs a few percent, which is
+tolerable and is not nothing. What the cost physically *is* remains open --
 the candidates below still stand -- but the model does not depend on knowing.
 
 Two measurement notes worth keeping. Profiled kernel time sums to 3.54 ms inside
