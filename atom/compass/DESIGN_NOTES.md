@@ -1337,6 +1337,46 @@ The fix is not more graphs of the same kind -- that was tried on decode context
 and dropped. It is a graph per *shape*, which is what `runtime/derive.py` exists
 for, and which makes #7 a prerequisite rather than an improvement.
 
+### 6c. Expert parallelism traces and prices, but its communication is invisible
+
+Qwen3-30B-A3B, 128 experts and 8 per token, at TP=2 with `--enable-expert-parallel`.
+It traces (488 decode operators, 477 prefill, identical on both ranks) and prices
+at **98.7%** coverage:
+
+| operator | shape | price |
+| --- | --- | --- |
+| `aiter::moe_forward` | `[4, 2048]` decode | 71.58 µs |
+| `aiter::moe_forward` | `[1256, 2048]` prefill | 597.40 µs |
+| `aiter::fused_allreduce_rmsnorm_` | decode | 9.60 µs |
+| `aiter::fused_allreduce_rmsnorm_` | prefill | 140.96 µs |
+
+No new machinery was needed, which is the encouraging part.
+
+**The discouraging part is what the graph does not contain.** There is no
+all-to-all, no dispatch and no combine. Expert parallelism's communication
+happens *inside* `aiter::moe_forward`, a single opaque node, and the only
+collectives left standing are the tensor-parallel ones -- 96
+`fused_allreduce_rmsnorm_`, where the all-reduce has been fused into the norm
+and is not separable either.
+
+So the price is right for the EP degree it was measured at and says nothing about
+any other. A graph whose collectives are named and sized can be re-costed for a
+different group size; one whose collectives are welded inside a fused operator
+cannot. This is the same shape of problem as attention reading ambient metadata,
+and harder: there the state could be recorded beside the operator, whereas here
+the *work* is inside it. Re-costing EP would need either the operator to expose
+its communication or a model of `moe_forward` as a function of expert count and
+group size, which is the analytical path this project has otherwise avoided.
+
+Two smaller notes. Running any of this needed only the config and tokenizer --
+`--load_dummy=xavier` gives finite, real-scale weights and 60 GB never moves --
+but `--load_dummy` skips *reading* a checkpoint, not *resolving* one, so the hub
+still demands all 16 shards; pointing `--model` at a local directory with the
+shard index removed is what makes it work. And `moe_forward` carries a
+per-layer identifier, so 48 layers are 48 signatures at each shape: 96 benchmarks
+to produce two numbers that agree to under a percent. Harmless, slow, and the
+same thing `layer_name` does to attention.
+
 ### 7. Derivation is uncompiled; production is not — **L**
 
 Derivation runs the model eagerly on meta. At `--level 3` inductor fuses
