@@ -1690,11 +1690,52 @@ small, the host loses, and nearly the whole dispatch shows up -- 86 µs. On the
 constant is not a constant at all but roughly `max(0, dispatch - kernel)` summed
 over operators, and it should fall as kernels grow.
 
-This is worth testing rather than believing: it predicts the eager constant is a
-function of the graph's own kernel sizes, which are already priced, so it could be
-computed instead of fitted. That would remove the last thing in this oracle that
-needs a measured step from the configuration being predicted -- which is the
-whole difference between interpolating and predicting.
+Tested, and it holds well enough to use. Solving `sum(max(0, D - kernel)) ==
+step - priced` for the dispatch `D` gives **132.70 µs** on the 0.6B and
+**101.22 µs** on the 27B, against per-operator overheads of 86.35 and 34.62: the
+spread between two very different models narrows from 2.5x to 1.3x once the
+quantity is stated as a dispatch the kernels race rather than a cost they add.
+At a shared `D = 130 µs` both prefill steps come out within about 3%.
+
+The 27B barely constrains it -- 403 of its 708 operators hide the dispatch
+entirely, so its prediction moves only 3% across the whole range 100-132 µs --
+and the 0.6B, where only 29 of 316 hide it, is what pins the value. Two models is
+a thin basis. But it is enough to make the eager term *computed* rather than
+fitted, which is what `dispatch_seconds` now does by default.
+
+### The target model, end to end, with nothing fitted on it
+
+Qwen3.8-27B at TP=2, predicted against three warmed passes:
+
+| | fitted on the 27B | computed | real (n=3) | noise |
+| --- | --- | --- | --- | --- |
+| ttft | -0.15% | **+2.45%** | 339.216 ms | ±0.8% |
+| tpot | 0.00% | **0.00%** | 17.854 ms | ±0.1% |
+| latency | -0.08% | **+1.37%** | 607.020 ms | ±0.5% |
+
+The *computed* column is the one that means anything. Its per-launch constant
+(2.25 µs) and its dispatch constant (130 µs) both come from Qwen3-0.6B, a dense
+model 45x smaller; nothing in it was fitted on the 27B except admission, which is
+a measured property of the deployment rather than of the model. The fitted column
+is shown to make the difference visible: it is better, and it is better because
+it saw the answer.
+
+So the graph, the prices, and two machine constants predict a model the constants
+have never seen, to within 2.5% on every metric. That is the first evidence in
+this project that any of it *predicts* rather than interpolates.
+
+Two things that are not evidence and should not be read as such. Admission was
+measured from the same run it is compared against; it is stable across everything
+tried (13.19 ms on the 0.6B, 12.89 at TP=2, 18.4 on the 27B) but it is not held
+out. And the workload is one shape -- four prompts, one prefill step, batch-4
+decode -- which is precisely the case #6b showed a fixed-shape oracle handles and
+serving does not.
+
+A harness note, since it nearly cost a wrong conclusion: running several passes
+in one predict process makes TTFT climb by ~588 ms a pass, because the client
+stamps arrival on the wall clock while the engine advances a virtual one (#6).
+The first pass is the only uncorrupted one, and in predict mode it needs no
+warming because no kernels run. Averaging the passes reported TTFT +346%.
 
 **So #10 is not urgent for cost, only for attribution.** A priced parent gives
 the right total; what the graph cannot do is say how that total splits between

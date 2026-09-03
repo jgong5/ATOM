@@ -75,6 +75,33 @@ class TestTheArithmetic:
         assert oracle.estimate(EAGER_DECODE).seconds == pytest.approx(
             2 * 1e-5 + 2 * 7e-5)
 
+    def test_dispatch_is_hidden_by_the_kernels_that_outrun_it(self, tmp_path):
+        """The default: compute the eager cost rather than take a flat figure.
+
+        The host dispatches while the device works, so an operator pays only
+        `max(0, dispatch - kernel)`. That is why a flat per-operator figure came
+        out 86us on a model with small kernels and 35us on one with large ones
+        while the dispatch behind both was nearly the same number.
+        """
+        # Two operators at 10us each, dispatch 25us: each pays the 15us the
+        # kernel cannot hide.
+        prices, graph = _artifacts(tmp_path, [_op("a"), _op("b")], seconds=1e-5)
+        oracle = PricedGraphCostOracle(prices, graph, dispatch_seconds=2.5e-5)
+        assert oracle.estimate(EAGER_DECODE).seconds == pytest.approx(
+            2 * 1e-5 + 2 * 1.5e-5)
+
+    def test_a_kernel_longer_than_the_dispatch_pays_nothing(self, tmp_path):
+        prices, graph = _artifacts(tmp_path, [_op("a")], seconds=1e-4)
+        oracle = PricedGraphCostOracle(prices, graph, dispatch_seconds=2.5e-5)
+        assert oracle.estimate(EAGER_DECODE).seconds == pytest.approx(1e-4)
+
+    def test_a_flat_figure_still_overrides(self, tmp_path):
+        """Kept so a deployment that has measured its own can say so."""
+        prices, graph = _artifacts(tmp_path, [_op("a")], seconds=1e-5)
+        oracle = PricedGraphCostOracle(prices, graph, eager_seconds_per_op=7e-5,
+                                       dispatch_seconds=2.5e-5)
+        assert oracle.estimate(EAGER_DECODE).seconds == pytest.approx(1e-5 + 7e-5)
+
     def test_zero_boundary_reproduces_the_naive_sum(self, tmp_path):
         """Which is the 26%-low number, kept reachable so it can be compared."""
         prices, graph = _artifacts(tmp_path, [_op("a")], seconds=1e-5)

@@ -56,6 +56,7 @@ class _Costed:
     ops: int
     launches: int
     breakdown: dict
+    kernel_seconds: tuple
     is_prefill: bool
     batch: int
     context: float
@@ -68,7 +69,21 @@ class _Costed:
 #: most of the step. Prefill's kernels come to 15.8ms of a 37.3ms step, and the
 #: remainder over 319 operators is 67us each. The same fit as the boundary
 #: constant and the same caveat: one step, one deployment.
-DEFAULT_EAGER_SECONDS_PER_OP = 86.35e-6
+DEFAULT_EAGER_SECONDS_PER_OP = None
+
+#: Seconds the host takes to dispatch one operator, of which a step pays only
+#: what its kernels do not hide. Fitted as the D solving
+#: ``sum(max(0, D - kernel)) == step - priced`` : 132.70 us on Qwen3-0.6B and
+#: 101.22 us on Qwen3.8-27B, against per-operator overheads of 86.35 and 34.62 --
+#: so restating the quantity as a dispatch the kernels race narrows the spread
+#: between two very different models from 2.5x to 1.3x. At 130 us both prefill
+#: steps come out within about 3%.
+#:
+#: The 27B barely constrains it: 403 of its 708 operators hide the dispatch
+#: entirely, so its prediction moves only 3% across the whole range 100-132 us.
+#: The 0.6B, where only 29 of 316 hide it, is what pins the value. Two models is
+#: a thin basis and this should be refitted as more are measured.
+DEFAULT_DISPATCH_SECONDS = 130e-6
 
 #: Seconds added per kernel launch. Fitted as (step - priced) / launches on a
 #: Qwen3-0.6B decode step at batch 4, over three runs: (3.201ms - 2.341ms) / 382.
@@ -83,7 +98,8 @@ class PricedGraphCostOracle:
 
     def __init__(self, prices: str, graph: str, prefill_graph: str = "",
                  boundary_seconds: float = DEFAULT_BOUNDARY_SECONDS,
-                 eager_seconds_per_op: float = DEFAULT_EAGER_SECONDS_PER_OP,
+                 eager_seconds_per_op: Optional[float] = DEFAULT_EAGER_SECONDS_PER_OP,
+                 dispatch_seconds: float = DEFAULT_DISPATCH_SECONDS,
                  floor_seconds: float = 1e-6, fallback: str = "",
                  rank_coords: Optional[dict] = None) -> None:
         """
@@ -99,13 +115,17 @@ class PricedGraphCostOracle:
             boundary_seconds: Added per kernel launch on a replayed step. See
                 the module docstring; zero reproduces the naive sum, which is
                 26% low.
-            eager_seconds_per_op: Added per operator on a step that was not
-                replayed, where the host dispatches each one. Two constants
-                rather than one because the two kinds of step differ by more
-                than a factor: the same graph costs its kernels plus 2 µs a
-                launch when replayed and its kernels plus 67 µs an operator when
-                not, and using the replayed constant for prefill priced it at
-                0.42 of the step.
+            eager_seconds_per_op: A flat cost per operator on a step that was
+                not replayed. ``None`` -- the default -- computes it from
+                ``dispatch_seconds`` instead, which transfers between models
+                where a flat figure does not.
+            dispatch_seconds: What the host takes to dispatch one operator. An
+                eager step pays ``max(0, dispatch - kernel)`` of it per operator,
+                because the host runs ahead while the device works and only the
+                part the device cannot hide is spent. This is why a flat
+                per-operator figure is 86 µs on a model with small kernels and
+                35 µs on one with large ones, while the dispatch behind both is
+                nearly the same number.
             floor_seconds: Smallest duration ever returned, so a virtual clock
                 cannot be run backwards by an empty or unpriced graph.
             fallback: A calibration table, used for steps the graph does not
@@ -123,7 +143,9 @@ class PricedGraphCostOracle:
         self.prices_path, _ = resolve_rank_path(prices, rank_coords)
         self.graph_path, _ = resolve_rank_path(graph, rank_coords)
         self.boundary_seconds = float(boundary_seconds)
-        self.eager_seconds_per_op = float(eager_seconds_per_op)
+        self.eager_seconds_per_op = (None if eager_seconds_per_op is None
+                                     else float(eager_seconds_per_op))
+        self.dispatch_seconds = float(dispatch_seconds)
         self.floor_seconds = float(floor_seconds)
 
         with open(self.prices_path, encoding="utf-8") as fh:
@@ -169,6 +191,11 @@ class PricedGraphCostOracle:
         seconds = 0.0
         launches = 0
         priced_ops = 0
+        # Per operator, not just the total: what an eager step pays for dispatch
+        # depends on how each operator's own kernels compare to it, and a mean
+        # cannot say that -- a step of one huge kernel and one tiny one hides
+        # dispatch on the first and pays it on the second.
+        kernel_seconds: list = []
         breakdown: dict[str, float] = {}
         for op in graph_blob["ops"]:
             entry = price_list.get(signature_of(op))
@@ -176,6 +203,7 @@ class PricedGraphCostOracle:
                 self.unpriced += 1
                 continue
             priced_ops += 1
+            kernel_seconds.append(entry["seconds"])
             seconds += entry["seconds"]
             # An operator is not one kernel. Attention launches three, and the
             # boundary cost is paid at each -- so the count comes from what the
@@ -189,6 +217,7 @@ class PricedGraphCostOracle:
             path=path,
             seconds=seconds,
             ops=priced_ops,
+            kernel_seconds=tuple(kernel_seconds),
             launches=launches,
             breakdown=breakdown,
             is_prefill=bool(recorded.get("num_prefill_tokens", 0)),
@@ -216,7 +245,11 @@ class PricedGraphCostOracle:
         # nothing was replayed -- so this stays a property of the step rather
         # than of the model or of what "prefill" happens to mean.
         if shape.capture_bucket is None:
-            overhead = point.ops * self.eager_seconds_per_op
+            if self.eager_seconds_per_op is not None:
+                overhead = point.ops * self.eager_seconds_per_op
+            else:
+                overhead = sum(max(0.0, self.dispatch_seconds - k)
+                               for k in point.kernel_seconds)
         else:
             overhead = point.launches * self.boundary_seconds
         total = max(point.seconds + overhead, self.floor_seconds)
@@ -229,5 +262,8 @@ class PricedGraphCostOracle:
         return (f"PricedGraphCostOracle("
                 f"{self.decode.seconds*1e3:.3f}ms decode kernels, {prefill}; "
                 f"+{self.boundary_seconds*1e6:.2f}us/launch replayed, "
-                f"+{self.eager_seconds_per_op*1e6:.1f}us/op eager"
+                + (f"+{self.eager_seconds_per_op*1e6:.1f}us/op eager"
+                   if self.eager_seconds_per_op is not None
+                   else f"{self.dispatch_seconds*1e6:.0f}us dispatch, hidden by "
+                        f"kernels")
                 + (", calibrated fallback" if self.fallback else "") + ")")
