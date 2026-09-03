@@ -1337,6 +1337,20 @@ The fix is not more graphs of the same kind -- that was tried on decode context
 and dropped. It is a graph per *shape*, which is what `runtime/derive.py` exists
 for, and which makes #7 a prerequisite rather than an improvement.
 
+### A rank coordinate left out is not a merge, it is a race
+
+`_rank_coords` reported only `{"tp": rank}` while `_topology` reported `tp` *and*
+`dp`. Under TP=2 x DP=2 all four ranks resolved to one `graph.tp0.json` and wrote
+it in turn, so three quarters of the run's evidence was discarded and the
+surviving file looked complete -- 807 operators, no error, nothing to notice.
+
+This is the same defect the `artifacts.py` convention was written to fix, in the
+same shape, one parallelism later: the write side knew about the group and the
+naming did not. The general rule is worth stating rather than re-learning a third
+time -- **every group in `_topology()` must have a coordinate in
+`_rank_coords()`** -- and the failure it prevents is silent, because a
+single-writer path is indistinguishable from a correct one by inspection.
+
 ### 6c. Expert parallelism: what ran was not meaningful EP — **L**
 
 Qwen3-30B-A3B, 128 experts and 8 per token, at TP=2 with
@@ -1364,7 +1378,34 @@ no all-to-all in the graph because this path does not use one.
 
 `ep_size` only exceeds `tp_size` when the DP and TP dims are flattened, which
 `enable_dp_attention` turns on. At TP=2 x DP=2 that resolves correctly --
-`ep_size=4` across four ranks -- and then **fails to initialise**:
+`ep_size=4` across four ranks -- and **runs**, once the container could build
+MORI's kernels (ATOM_DEFECTS #5) and once `--level 0` avoided a second defect
+(#10, `VllmBackend can only be called once` under DP-attention; note
+`--enforce-eager` does *not* avoid it, since in ATOM that disables graph capture
+and not `torch.compile`).
+
+**And the expert communication is still not in the graph.** At `ep_size=4` two
+collectives appear that were absent at 2, and neither is expert routing:
+
+| operator | shape | dtype | what it is |
+| --- | --- | --- | --- |
+| `c10d::alltoall_base_` | `[151936]` | bf16 | vocab-sized: DP's logits exchange |
+| `c10d::allgather_` | `[2]` | int32 | token counts across DP |
+
+48 `aiter::moe_forward` and not one per-layer collective. The dispatch and
+combine are MORI kernels called inside the operator, so they never reach the
+dispatcher and cannot be recorded. So the conclusion from `ep_size=2` survives
+being tested at a degree where EP is real: **the graph cannot see expert
+communication at any EP degree**, and re-costing EP across degrees needs
+`moe_forward` to expose it or a model of it.
+
+Two caveats on this run. `--level 0` means the graph is uncompiled -- 807
+operators against 488 compiled -- so it is not production-shaped (#7), and EP=4
+stays unpriceable in a faithful way until #10 is fixed. And `moe_forward` here
+takes `[1, 2048]`: DP split four requests across four ranks, one token each,
+which is a different operating point from the TP-only runs above.
+
+The earlier write-up said this configuration **fails to initialise**:
 
     moe.py:609 _maybe_make_prepare_finalize
     hipcc --genco --offload-arch=gfx942 ... mori/_jit-sources ...

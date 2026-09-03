@@ -23,6 +23,7 @@ Two consequences worth stating plainly:
 from __future__ import annotations
 
 import json
+import os
 import logging
 from typing import Optional
 
@@ -616,7 +617,28 @@ class CompassModelRunner(ModelRunner):
         return {name: size for name, size in groups.items() if size > 1} or {"tp": 1}
 
     def _rank_coords(self) -> dict[str, int]:
-        return {"tp": int(getattr(self, "rank", 0) or 0)}
+        """This rank's index within each group it belongs to.
+
+        Must name every group `_topology()` names. A coordinate left out does not
+        make the artifacts merge -- it makes the ranks that differ only in that
+        coordinate resolve to one path and race for it, and the winner is
+        whichever wrote last. Under TP=2 x DP=2 all four ranks wrote one
+        `graph.tp0.json`, so three quarters of a run's evidence was silently
+        discarded and the file looked complete.
+        """
+        coords = {"tp": int(getattr(self, "rank", 0) or 0)}
+        parallel = getattr(self.config, "parallel_config", None)
+        if parallel is not None:
+            if int(getattr(parallel, "data_parallel_size", 1) or 1) > 1:
+                coords["dp"] = int(getattr(parallel, "data_parallel_rank", 0) or 0)
+            if int(getattr(parallel, "pipeline_parallel_size", 1) or 1) > 1:
+                coords["pp"] = int(getattr(parallel, "pipeline_parallel_rank", 0) or 0)
+        if os.environ.get("ATOM_LOG_RANK_COORDS"):
+            import torch.distributed as dist
+
+            world = dist.get_rank() if dist.is_initialized() else -1
+            print(f"### RANK COORDS {coords} global={world}", flush=True)
+        return coords
 
     # -- work whose meaning depends on the mode --------------------------------
     #
