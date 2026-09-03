@@ -115,7 +115,7 @@ what Compass should be reaching into. Compass mitigates it only where it owns th
 message: its own errors now name the file, the rank and the remedy, on the
 assumption that the surrounding report will be misleading.
 
-### 5. The container cannot JIT-build any C++ kernel
+### 5. The container cannot JIT-build any C++ kernel — *fixed*
 
 Not ATOM's code, but ATOM's shipped environment, and it blocks the model this
 project exists to simulate. `rocm/atom-dev:vllm-latest` has gcc-14's runtime
@@ -163,6 +163,26 @@ So the only EP configuration with a real all-to-all cannot be built here, and th
 one that can (`ep_size == tp_size`) is close to a no-op -- same FLOPs per rank,
 differently decomposed. Between this and Qwen3.8-27B, one missing package holds
 up two of the project's larger open items.
+
+**Fixed.** `apt-get install libstdc++-14-dev`, recorded as
+`gpu_docker/fix-cxx-headers.sh` because the writable layer survives a restart but
+not a teardown or an image upgrade. The image carried gcc runtime directories for
+13 and 14 but headers only for 13; clang selects the newest it finds and then
+cannot resolve `<cmath>`. Installing the matching headers is additive -- nothing
+that already compiled changes toolchain.
+
+Verified by compiling a trivial `--genco` translation unit that includes `<cmath>`
+and `<cstdlib>`, and then by the two things it had been blocking:
+
+* **Qwen3.8-27B loads and generates.** The project's actual target model had never
+  run on this machine. Two requests, 99.3 s wall, at TP=2.
+* **MORI's dispatch/combine kernels build**, so expert parallelism above
+  `ep_size == tp_size` gets past compilation.
+
+EP does not yet run to completion, but the reason has changed and is unrelated:
+`atom/utils/backends.py:649` asserts `VllmBackend can only be called once`, and
+under DP-attention it is called more than once. That is an engine defect of its
+own, recorded below.
 
 ### 6. Serving computes no per-request latency at all
 
@@ -212,6 +232,33 @@ prior context — or making `set_forward_context` a context manager, which the
 would remove the hazard for everyone.
 
 ---
+
+### 10. `VllmBackend` is called twice under DP-attention
+
+`atom/utils/backends.py:649`:
+
+```python
+assert not self._called, "VllmBackend can only be called once"
+```
+
+With `--enable-dp-attention`, Dynamo calls the backend more than once and every
+rank dies during initialisation:
+
+    torch._dynamo.exc.BackendCompilerFailed: backend='VllmBackend' raised:
+    AssertionError: VllmBackend can only be called once
+
+**Cost:** DP-attention cannot be used with `torch.compile`, and DP-attention is
+what flattens the DP and TP dims so `ep_size` can exceed `tp_size`. So the only
+expert-parallel configuration with a real all-to-all is unreachable at the
+default compilation level. `--enforce-eager` avoids it, at the price of a
+forward that is not the one production runs.
+
+Found after fixing #5: the compile error there was masking this one, so the two
+had to be cleared in order.
+
+**Fix:** not applied. The assertion is presumably guarding a real single-use
+assumption inside the backend, and whether the second call is legitimate or a
+symptom is an engine question rather than a Compass one.
 
 ## Fixed here
 
