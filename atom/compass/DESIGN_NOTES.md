@@ -1155,8 +1155,20 @@ coverage came to 98.3% on both ranks. The one failure is `c10d::broadcast_`,
 which takes a `ProcessGroup` object no JSON artifact can hold; it is one operator
 per step.
 
-**The thing that makes this safe is pricing the union of every rank's graphs
-rather than each rank's own.** A collective requires all ranks to call it in
+**Anything a rank does differently from its peers while pricing deadlocks the
+group.** The union of graphs makes the *signature list* identical, which is
+necessary and turned out not to be sufficient: pricing at TP=4 died in a
+distributed `recvBytes` after CUDA-graph capture -- the moment the benchmark
+runs -- with no error of its own. The per-signature kernel breakdown added for
+#21 makes two extra calls per signature, and for a collective those are two extra
+*collectives*; a breakdown that fails on one rank and not another, which the
+profiler does not guarantee, diverges the group silently. It is off by default
+under parallelism now (`COMPASS_PRICE_KERNELS`), and the general rule is that
+anything optional in the pricing loop has to be optional on every rank or on
+none.
+
+**The other thing that makes this safe is pricing the union of every rank's
+graphs rather than each rank's own.** A collective requires all ranks to call it in
 lockstep, so signature lists that differ by a single entry deadlock rather than
 fail -- a hang with no error, in a benchmark that runs inside the worker. The
 union is identical across ranks by construction. That is a rule, not an
@@ -1724,6 +1736,40 @@ larger and of a different architecture. Against the warmed decode step of
 17.840 ms it gives 17.854 -- **+0.1%**. That is the strongest evidence so far
 that the shape of the model is right, and it warns that a coverage percentage is
 not a measure of missing work when the graph records two levels of the same call.
+
+### The parallelism sweep on the target model
+
+Qwen3.8-27B, decode and prefill graphs priced per rank, both constants carried
+from Qwen3-0.6B, admission measured on a run instrumented like the baseline:
+
+| TP | ttft | tpot | latency |
+| --- | --- | --- | --- |
+| 1 | -2.58% | +0.94% | -0.90% |
+| 2 | +2.45% | 0.00% | +1.37% |
+| 4 | **+6.46%** | **-5.73%** | +1.37% |
+
+TP=1 and TP=2 are inside a few percent on everything. **TP=4 is where it starts
+to come apart, and in a way that names its own cause.** Decode is under-predicted
+by 5.73%: the priced kernels plus 655 launches at 2.25 µs give 11.690 ms against
+12.401 measured, and closing that needs **3.33 µs a launch**. The same 2.25 µs
+was right at TP=1 and TP=2 and on three different models.
+
+What changes at TP=4 is the group. A decode graph holds 129 `all_reduce_` per
+rank, and the cost at a collective's boundary is not only the hardware's -- it
+includes waiting for the slowest peer, which has more chances to be slow as the
+group grows. So the per-launch constant looks model-independent (it is) and
+group-size-independent (it is not), and a graph whose collectives are a sixth of
+its launches is where the difference shows.
+
+That is a hypothesis with an obvious test: fit the per-launch constant separately
+for collective and non-collective launches, on graphs that already record which
+is which (`OpSpec.group`). If the non-collective part stays at 2.25 µs across
+TP=1, 2 and 4 while the collective part grows, the constant is two constants.
+
+On #4, which recorded a 19% calibrate-vs-evaluate gap on TP=4 prefill that was
+never explained: the priced oracle gets TTFT to +6.46% on the same configuration.
+That does not explain the 19%, but it does locate most of it in the calibrated
+oracle rather than in the machine.
 
 ### The two constants are two different things, and now we know which
 

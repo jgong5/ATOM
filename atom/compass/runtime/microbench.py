@@ -305,6 +305,16 @@ GRAPH_BATCH = int(os.environ.get("COMPASS_GRAPH_BATCH", "64"))
 #: the warm case, which understated all three of attention's kernels by 15-30%.
 KV_VARIANTS = int(os.environ.get("COMPASS_KV_VARIANTS", str(GRAPH_BATCH)))
 
+#: Whether to record which kernels each operator launches. Off by default under
+#: parallelism, because the breakdown costs two extra calls per signature and for
+#: a *collective* those are two extra collectives. Every rank must make the same
+#: calls in the same order or the group deadlocks, and a breakdown that fails on
+#: one rank -- the profiler is not guaranteed to succeed -- diverges it silently.
+#: Pricing at TP=4 died in a distributed recv for exactly this reason.
+PRICE_KERNELS = os.environ.get(
+    "COMPASS_PRICE_KERNELS",
+    "0" if int(os.environ.get("WORLD_SIZE", "1") or 1) > 1 else "1") != "0"
+
 
 #: Signatures whose key contains this substring get taken apart rather than just
 #: priced. A price is a duration and says nothing about where the duration went;
@@ -570,10 +580,12 @@ def price_graph(graph_path: str, iters: int = 2000, warmup: int = 20,
         except Exception as exc:  # noqa: BLE001 - a call can fail many ways
             unpriced[sig] = f"{type(exc).__name__}: {str(exc)[:120]}"
             continue
-        try:
-            kernels = _kernels_of(fn, *sets[0])
-        except Exception:  # noqa: BLE001 - a breakdown is a bonus, not the price
-            kernels = {}
+        kernels = {}
+        if PRICE_KERNELS:
+            try:
+                kernels = _kernels_of(fn, *sets[0])
+            except Exception:  # noqa: BLE001 - a breakdown is a bonus, not a price
+                kernels = {}
         priced[sig] = {
             "name": op["name"],
             "seconds": seconds,
