@@ -1300,6 +1300,43 @@ engine and cannot drive a simulated one. The three routes, for the record:
 
 ## Graph fidelity against a production launch
 
+### 6b. The priced oracle is a fixed-shape predictor, and serving is not — **L**
+
+Offline it lands inside the noise. Served, on the engine's own clock:
+
+| | real | simulated | error |
+| --- | --- | --- | --- |
+| TTFT | 352.11 ms | 520.75 ms | **+47.9%** |
+| latency | 663.34 ms | 831.24 ms | **+25.3%** |
+
+The cause is not the prices. It is that an offline workload has exactly one shape
+of each kind -- four prompts of 314 tokens, then decode at batch 4, every step
+identical -- so an oracle holding one graph per kind is *exactly* right, and the
+limitation stayed invisible. A served workload does not:
+
+| | what really ran | what the oracle answers |
+| --- | --- | --- |
+| prefill, 3 steps | 16, 256 and **16128** tokens; 38.6, 151.0, 177.6 ms | ~47 ms for each |
+| decode, 127 steps | batch 1 (64 steps) and batch 64 (63); 2.68 to 10.25 ms | ~3.2 ms for each |
+
+A thousandfold range of prefill sizes and two capture rungs, answered with two
+constants. So the offline result should be read as *the machinery works*, not as
+*the model generalises* -- and "one graph per kind is enough", which was true of
+every workload tested to that point, is false of the first varying one.
+
+What is **not** established is why the net error comes out positive. Every step
+is priced *low* -- prefill 141 ms against 367, decode ~406 ms against ~626 -- yet
+simulated TTFT and latency come out high, which means the simulated scheduler is
+batching differently rather than merely mis-costing. A virtual clock staggers
+admission, which changes which requests are batched together, which changes the
+step shapes, which changes their cost: the shape distribution is an *output* of
+the simulation, not an input to it. Predict mode writes no step table, so this is
+where the evidence stops. Getting one is the next measurement.
+
+The fix is not more graphs of the same kind -- that was tried on decode context
+and dropped. It is a graph per *shape*, which is what `runtime/derive.py` exists
+for, and which makes #7 a prerequisite rather than an improvement.
+
 ### 7. Derivation is uncompiled; production is not — **L**
 
 Derivation runs the model eagerly on meta. At `--level 3` inductor fuses
