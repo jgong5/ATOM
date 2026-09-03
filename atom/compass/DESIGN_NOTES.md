@@ -974,6 +974,64 @@ above is not something cache realism will close.
 The tracer is kept, because the question it answers is the right one and the
 answer needs to stay reproducible. `scripts/compass/op_cost.py` reports it.
 
+### 22. KV sizing is real only because the GPU is still there — **M**
+
+This runner's docstring says weight loading and KV-cache sizing are "inherited and
+therefore real". They are. What that sentence does not say is what it costs: they
+are real because a predict-mode run still loads real weights onto a real device
+with a live RCCL context, and calls `ModelRunner.get_num_blocks` unmodified.
+
+That budget (`atom/model_engine/model_runner.py:1629`) is four device
+measurements and some arithmetic:
+
+| term | source |
+| --- | --- |
+| `total`, and a physical `min(budget, free)` clamp | `torch.cuda.mem_get_info()` |
+| weights + peak activations | `memory_stats()["allocated_bytes.all.peak"]` |
+| non-torch — RCCL buffers, CUDA context | `(total - free) - memory_reserved()` |
+| CUDA-graph pool | `_estimate_cudagraph_overhead()` |
+
+Take the GPU away and all four are gone. Everything downstream of the byte
+number already runs on a CPU: `plan_pools` over `SubPoolSpec`
+(`atom/model_ops/attentions/sub_pool_spec.py`) is pure arithmetic, and it is the
+part that gets a hybrid right — PAGE against STATE, the GDN recurrent state and
+the V4 compressor ring counted separately, an Eagle3 draft KV merged onto the
+target's block ids by name. Item 16's model is a hybrid, and that sizing is
+correct today for free.
+
+So the gap is one number, not a subsystem. A memory oracle on the same dial as
+the cost oracle: `measured` is what happens now, `replayed` reads a budget
+captured from a real run and keyed by ATOM commit and configuration, and
+`analytical` derives it — weights from the checkpoint index, non-torch from a
+per-rank constant, the graph pool from the geometry term ATOM already computes,
+and **activations from a def-use walk over the traced op graph**, which is the
+one term everybody else guesses at and the one this project happens to already
+have the artifact for.
+
+Two things that will be wrong if they are not designed for:
+
+* `min(available_for_kv_budget, free)` makes a captured budget a property of the
+  box, not of the configuration. On this machine `free` is set by the twenty
+  other containers. Record `free` and `total` separately and refuse a replay in
+  which `free` was the binding term, or the admission cliff moves with the
+  neighbours.
+* `gpu_memory_utilization` here is a fraction of *total*, with the non-KV
+  footprint subtracted after. That is the vLLM convention and not TRT-LLM's.
+  Inheriting it is right; comparing the resulting block count against a number
+  from the other convention is not.
+
+Not modelled and not planned: fragmentation. Nobody models it.
+
+Validation costs no GPU time, because every hardware run already made prints the
+real breakdown — compare the derived terms against the measured ones on runs
+already scheduled. The gate that matters is not the byte error: it is whether
+top-1 configuration agreement survives swapping `measured` for `analytical`. If
+the ranking moves, the memory model is what moved it.
+
+Until this exists, only configurations that fit on the box in front of you can be
+simulated at all, which is the wrong constraint for a tool whose question is
+"does this fit".
+
 ### 2. Most of this project's numbers are inside their own noise — **S**, done
 
 Five runs of one command, no change between them, gave a TPOT error ranging from

@@ -483,7 +483,21 @@ def price_graph(graph_path: str, iters: int = 2000, warmup: int = 20,
 
     paths = []
     for part in str(graph_path).split(","):
-        paths.extend(sorted(_glob.glob(part.strip())) or [part.strip()])
+        part = part.strip()
+        found = sorted(_glob.glob(part))
+        if not found and any(c in part for c in "*?["):
+            # A pattern that matches nothing is a mistake worth naming. Falling
+            # through to open the pattern as a filename reports it as a missing
+            # file, which reads like the graph was not written rather than like
+            # the pattern was wrong -- `graph.tp*.json` matches nothing at TP=1,
+            # where no rank suffix is applied.
+            logger.warning("ATOMCompass WARNING: --compass-bench-graph pattern "
+                           "%r matched no files; nothing from it is priced",
+                           part)
+            continue
+        paths.extend(found or [part])
+    if not paths:
+        raise OSError(f"no graphs matched {graph_path!r}")
     ops = []
     for path in paths:
         with open(path, encoding="utf-8") as fh:
