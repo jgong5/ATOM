@@ -1337,45 +1337,66 @@ The fix is not more graphs of the same kind -- that was tried on decode context
 and dropped. It is a graph per *shape*, which is what `runtime/derive.py` exists
 for, and which makes #7 a prerequisite rather than an improvement.
 
-### 6c. Expert parallelism traces and prices, but its communication is invisible
+### 6c. Expert parallelism: what ran was not meaningful EP — **L**
 
-Qwen3-30B-A3B, 128 experts and 8 per token, at TP=2 with `--enable-expert-parallel`.
-It traces (488 decode operators, 477 prefill, identical on both ranks) and prices
-at **98.7%** coverage:
+Qwen3-30B-A3B, 128 experts and 8 per token, at TP=2 with
+`--enable-expert-parallel`. It traces (488 decode operators, 477 prefill,
+identical on both ranks) and prices at **98.7%** coverage with no new machinery.
+That was first written up as a success. It is not one, and the check that shows
+why is the one that should have been run first: **turn the flag off and see what
+changes.**
 
-| operator | shape | price |
-| --- | --- | --- |
-| `aiter::moe_forward` | `[4, 2048]` decode | 71.58 µs |
-| `aiter::moe_forward` | `[1256, 2048]` prefill | 597.40 µs |
-| `aiter::fused_allreduce_rmsnorm_` | decode | 9.60 µs |
-| `aiter::fused_allreduce_rmsnorm_` | prefill | 140.96 µs |
+The flag is doing what it says. The engine resolves `use_ep=True, ep_size=2,
+ep_rank=0/1` for all 48 layers on both ranks, and `use_ep=False` without it. But:
 
-No new machinery was needed, which is the encouraging part.
+| | EP on | EP off | ratio |
+| --- | --- | --- | --- |
+| `moe_forward`, prefill | 597.40 µs | 651.28 µs | 0.92x |
+| `moe_forward`, decode | 71.58 µs | 73.47 µs | 0.97x |
+| `fused_allreduce_rmsnorm_` | 140.96 / 9.60 µs | 140.90 / 9.64 µs | 1.00x |
 
-**The discouraging part is what the graph does not contain.** There is no
-all-to-all, no dispatch and no combine. Expert parallelism's communication
-happens *inside* `aiter::moe_forward`, a single opaque node, and the only
-collectives left standing are the tensor-parallel ones -- 96
-`fused_allreduce_rmsnorm_`, where the all-reduce has been fused into the norm
-and is not separable either.
+and the graph is structurally identical either way, 488 operators and 23 distinct.
+The reason is arithmetic rather than a bug: at TP=2 with DP=1, *without* EP each
+rank holds all 128 experts sharded along the intermediate dimension, and *with*
+EP each rank holds 64 experts whole. Same FLOPs per rank, different
+decomposition. **EP at `ep_size == tp_size` is close to a no-op**, and there is
+no all-to-all in the graph because this path does not use one.
 
-So the price is right for the EP degree it was measured at and says nothing about
-any other. A graph whose collectives are named and sized can be re-costed for a
-different group size; one whose collectives are welded inside a fused operator
-cannot. This is the same shape of problem as attention reading ambient metadata,
-and harder: there the state could be recorded beside the operator, whereas here
-the *work* is inside it. Re-costing EP would need either the operator to expose
-its communication or a model of `moe_forward` as a function of expert count and
-group size, which is the analytical path this project has otherwise avoided.
+`ep_size` only exceeds `tp_size` when the DP and TP dims are flattened, which
+`enable_dp_attention` turns on. At TP=2 x DP=2 that resolves correctly --
+`ep_size=4` across four ranks -- and then **fails to initialise**:
 
-Two smaller notes. Running any of this needed only the config and tokenizer --
-`--load_dummy=xavier` gives finite, real-scale weights and 60 GB never moves --
-but `--load_dummy` skips *reading* a checkpoint, not *resolving* one, so the hub
+    moe.py:609 _maybe_make_prepare_finalize
+    hipcc --genco --offload-arch=gfx942 ... mori/_jit-sources ...
+    error: Could not find standard C++ header 'cmath'
+    fatal error: 'cstdlib' file not found
+
+That is defect #5 in ATOM_DEFECTS, unchanged: the container carries gcc runtime
+directories for 13 and 14 but C++ headers only for 13, so clang selects 14 and
+finds no standard library. MORI's dispatch/combine kernels are JIT-built at
+startup, so the *only* EP configuration with a real all-to-all is the one that
+cannot be built here.
+
+So the honest position: EP-as-configured prices fine and tells us nothing, and
+EP-as-intended has never run. The same container defect blocks this and the
+project's actual target model (#16). Two significant items behind one apt-get,
+which is worth weighing against not touching a shared container.
+
+What stands regardless: nothing about the graph, the pricing or the collectives
+needed changing for a MoE model, and `moe_forward` prices at 71.58 µs decode and
+597.40 µs prefill. When the all-to-all does appear it will sit inside
+`moe_forward` -- a single opaque node -- so re-costing EP across degrees will
+need the operator to expose its communication, or a model of it. That problem is
+unchanged by any of the above.
+
+Two smaller notes. Running a 30B MoE needed only the config and tokenizer:
+`--load_dummy=xavier` gives finite, real-scale weights and 60 GB never moves.
+But `--load_dummy` skips *reading* a checkpoint, not *resolving* one, so the hub
 still demands all 16 shards; pointing `--model` at a local directory with the
-shard index removed is what makes it work. And `moe_forward` carries a
-per-layer identifier, so 48 layers are 48 signatures at each shape: 96 benchmarks
-to produce two numbers that agree to under a percent. Harmless, slow, and the
-same thing `layer_name` does to attention.
+shard index removed is what makes a weightless run work. And `moe_forward`
+carries a per-layer identifier, so 48 layers are 48 signatures at each shape: 96
+benchmarks producing two numbers that agree to under a percent, the same thing
+`layer_name` does to attention.
 
 ### 7. Derivation is uncompiled; production is not — **L**
 

@@ -151,6 +151,19 @@ Not applied here. It changes the shared container rather than this repository,
 and the writable layer does not survive `teardown.sh`, so it belongs in the
 image or in `gpu_docker`'s setup script rather than in an ad-hoc install.
 
+**Second thing it blocks, found later:** expert parallelism at any degree above
+`tp_size`. `enable_dp_attention` flattens the DP and TP dims so `ep_size` can
+exceed `tp_size`, and that path builds MORI's dispatch/combine kernels at startup
+through the same `hipcc` invocation:
+
+    moe.py:609 _maybe_make_prepare_finalize
+    error: Could not find standard C++ header 'cmath'
+
+So the only EP configuration with a real all-to-all cannot be built here, and the
+one that can (`ep_size == tp_size`) is close to a no-op -- same FLOPs per rank,
+differently decomposed. Between this and Qwen3.8-27B, one missing package holds
+up two of the project's larger open items.
+
 ### 6. Serving computes no per-request latency at all
 
 `LLMEngine.postprocess` derives per-request TTFT, TPOT and latency from
