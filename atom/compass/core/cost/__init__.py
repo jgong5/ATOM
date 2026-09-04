@@ -28,8 +28,16 @@ A cost is obtained in one of two ways:
         No form is assumed; nearby measurements are looked up. `interpolated`.
 
     The species above are the ones built so far, not a closed set --
-    ``empirical/extrapolated`` and others are equally admissible, and naming the
-    genus separately is what leaves room for them.
+    ``empirical/extrapolated`` is the obvious next one, and naming the genus
+    separately is what leaves room for it.
+
+    What does *not* make a new species: where the number was read from. A
+    measurement taken now off a device and one read back from an artifact an
+    earlier run wrote are both ``empirical/measured``, because provenance is how
+    a number was obtained and not when. Every oracle here already reads
+    measurements taken earlier -- that is what a price list is. Whether the
+    artifact's key matched exactly, approximately, or not at all is what
+    separates ``measured`` from ``interpolated`` from ``extrapolated``.
 
 So:
 

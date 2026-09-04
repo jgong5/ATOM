@@ -159,9 +159,17 @@ to **bytes**. Memory consumption has the same two subjects -- **model memory**
 (weights, activations, the CUDA-graph pool) and **serving memory** (the KV cache
 and its block pools) -- and the same dial. What ATOM does today is
 `empirical/measured`: four readings off a live device. `analytical` would derive
-the same terms from the checkpoint index and the traced op graph. A captured
-budget replayed from an earlier run of the same build is a further species,
-`empirical/replayed` -- which is the reason for leaving the species list open.
+the same terms from the checkpoint index and the traced op graph.
+
+Reading a budget captured by an earlier run is **not** a further species. It is
+still `empirical/measured` -- the number is a direct measurement of the quantity,
+and *when* it was taken is not provenance. Every empirical oracle here already
+works that way: a price list, the boundary constant, the admission figure and the
+calibration table are all measurements written to an artifact and read back
+later. What changes between reading a device and reading an artifact is only
+whether the key matched, and that already has species -- exact match is
+`empirical/measured`, nearest is `empirical/interpolated`, past the range is
+`empirical/extrapolated`.
 
 So "cost" should not be read as meaning time. Say **time cost** or **memory
 cost** where it matters, and the subject and provenance words carry over.
@@ -1077,8 +1085,8 @@ is seconds or bytes:
 
 | species | what it does |
 | --- | --- |
-| `empirical/measured` | what happens now: four readings off a live device |
-| `empirical/replayed` | a budget captured from a real run, keyed by ATOM commit and configuration |
+| `empirical/measured` | the terms as measured for this configuration -- read off a live device, or off an artifact an earlier run of the same build wrote. Same species: reading a recorded measurement is what every oracle here already does |
+| `empirical/interpolated` | no artifact for this configuration, so the nearest ones are used |
 | `analytical` | derives the terms: weights from the checkpoint index, non-torch from a per-rank constant, the graph pool from the geometry term ATOM already computes, and **activations from a def-use walk over the traced op graph** |
 
 The activation term is the one everybody else guesses at, and the one this
@@ -1098,9 +1106,12 @@ cannot run is answering a different question.
    `total`, `free`, `peak_torch`, `non_torch`, `cudagraph_est` and the resulting
    block count into an artifact beside the step table. Costs nothing and is the
    validation set for everything below.
-2. `empirical/replayed` — read that artifact instead of the device. Unblocks
-   sizing a configuration on a box that could not hold it, which is the immediate
-   product need.
+2. Read that artifact instead of the device, on an exact key match. Still
+   `empirical/measured` -- a different source for the same measurement, not a
+   different kind of number. Unblocks sizing a configuration on a box that could
+   not hold it, which is the immediate product need, and makes the reuse
+   conditions explicit: refuse a key whose `free` was the binding term, since
+   that is a property of the neighbours rather than of the configuration.
 3. `analytical` — derive each term. Validate per term against the recorded ones,
    on runs already scheduled.
 4. Feed it back: `get_num_blocks` off the modelled budget, so `max_num_seqs` and
