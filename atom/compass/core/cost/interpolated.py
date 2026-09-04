@@ -1,8 +1,10 @@
-"""A cost oracle that answers from nearby measurements rather than a fitted form.
+"""**empirical/interpolated** — costs a model step by looking up nearby measurements.
 
-This is the F1 "empirical" point. Where the calibrated oracle assumes a shape
-for the cost function and fits its coefficients, this one assumes nothing and
-looks up what similar steps actually took.
+Where `calibrated` (empirical/fitted) assumes a shape for the cost function and
+fits its coefficients, this one assumes nothing and looks up what similar steps
+actually took. Both are empirical; they differ in the species, which is what the
+name now says. It was called `EmpiricalCostOracle`, which claimed the genus:
+every oracle here except `constant` is empirical.
 
 The reason to have both is not completeness. A global fit is pulled by every
 point it was given, including points nowhere near the question being asked, and
@@ -33,7 +35,7 @@ from atom.compass.core.cost.base import StepCost, StepShape
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["EmpiricalCostOracle"]
+__all__ = ["InterpolatedCostOracle"]
 
 
 def _features(shape: StepShape) -> list[float]:
@@ -85,7 +87,7 @@ class _Neighbourhood:
         ]
 
 
-class EmpiricalCostOracle:
+class InterpolatedCostOracle:
     """Predicts a step's duration from the measured steps most like it."""
 
     def __init__(self, table: str, neighbours: int = 5,
@@ -189,7 +191,7 @@ class EmpiricalCostOracle:
 
     def describe(self) -> str:
         return (
-            f"EmpiricalCostOracle(k={self.neighbours}, "
+            f"InterpolatedCostOracle(k={self.neighbours}, "
             f"prefill={self._counts['prefill']} steps, "
             f"decode={self._counts['decode']} steps)"
         )

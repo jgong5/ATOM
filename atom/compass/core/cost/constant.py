@@ -1,4 +1,4 @@
-"""A fixed-cost oracle.
+"""A declared model-step oracle: neither analytical nor empirical.
 
 Every step costs the same regardless of what it contains, which is wrong in
 every way that matters for prediction. It exists to prove the plumbing: if a

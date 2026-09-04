@@ -1,7 +1,7 @@
-"""A cost oracle fitted to steps that were actually timed.
+"""**empirical/fitted** -- a model-step oracle fitted to steps that were timed.
 
-This is the F1 "calibrated" point: the shape of the model is chosen by hand and
-its coefficients come from measurement. It is deliberately the simplest thing
+The shape of the cost function is chosen by hand and its coefficients come from
+measurement. It is deliberately the simplest thing
 that could reproduce a serving run, because the purpose of the first one is to
 produce an error number — until something predicts time, every claim about
 Compass is structural, and structural claims cannot be ranked by how much they

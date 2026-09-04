@@ -1,7 +1,9 @@
-"""A step costs what its operators cost, plus what it costs to run them.
+"""**empirical/measured** -- a model step costs what its operators cost, plus
+what it costs to run them.
 
-The first oracle that predicts from the **op graph** rather than from a step's
-shape. Everything else here -- tracing, derivation, the microbenchmark, the
+It reaches a model step by summing its operators, where `calibrated` fits the
+step directly -- a difference of method, not of subject. The first oracle that
+predicts from the **op graph** rather than from a step's shape. Everything else here -- tracing, derivation, the microbenchmark, the
 recorded forward context -- was groundwork for this and until now paid for
 nothing: both other oracles fit token counts and batch sizes and never look at
 an operator.

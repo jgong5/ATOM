@@ -110,6 +110,52 @@ Ranked by what is known about their size. Anything without a measured magnitude
 is ranked by argument, which is weaker — the whole reason the end-to-end
 comparison was built first is that structural findings cannot rank each other.
 
+## Vocabulary
+
+Two questions, and everything here is one answer to each.
+
+**What is costed.** A **model step** -- the forward, for a step of a given shape
+-- or **serving**: admission, scheduling, KV cache management. Serving
+*decisions* are not costed at all, because they are not modelled: Compass runs
+ATOM's real scheduler and replaces only the forward. What serving contributes to
+a prediction is the time it consumes, not the choices it makes.
+
+**How the cost is obtained.** **analytical**, computed without measuring the
+subject; or **empirical**, derived from measuring it. Empirical is a genus and is
+written `empirical/<species>`:
+
+| | |
+| --- | --- |
+| `empirical/measured` | the unit itself is timed -- `priced` prices operators and sums them |
+| `empirical/fitted` | a form is chosen, coefficients regressed over measured steps -- `calibrated` |
+| `empirical/interpolated` | no form assumed, nearby measurements looked up -- `interpolated` |
+
+Those are the species built so far, **not a closed set**: `empirical/extrapolated`
+and others are equally admissible, and naming the genus separately is what leaves
+room for them.
+
+| oracle | subject | how |
+| --- | --- | --- |
+| `constant` | model step | declared -- a stub, for proving the plumbing |
+| `calibrated` | model step | `empirical/fitted` |
+| `interpolated` | model step | `empirical/interpolated` |
+| `priced` | model step | `empirical/measured` |
+| admission | serving | `empirical/measured` |
+
+`priced` reaches a model step by summing operators and `calibrated` by fitting
+the step directly. A difference of method, not of subject: both answer what one
+step costs, so "step-level" and "operator-level" describe how an oracle works
+rather than what it is for.
+
+Nothing analytical exists yet for cost. The word is reserved rather than
+aspirational -- the memory-budget code already uses it in the same sense, for a
+figure derived from the checkpoint index instead of measured.
+
+This replaces an earlier three-point dial (`analytical` / `calibrated` /
+`empirical`) that described a design never built: it defined `calibrated` as the
+analytical shape scaled by a measured efficiency factor, which has no analytical
+component and never did, and gave the genus name to one species of it.
+
 ## The product gap
 
 ### 1. No op-graph work feeds the cost model — **L**
@@ -118,9 +164,9 @@ Both oracles predict from a step's **shape** alone: token counts, batch size,
 context lengths. The graphs, the meta derivation, the TP validation — none of it
 contributes to a single prediction.
 
-This is the difference between the F1 "calibrated" point, which is where the
-project is, and "empirical", which is per-operator cost attributed from a
-captured graph. It also decides whether Compass can predict a configuration
+This is the difference between **empirical/fitted**, which is where the project
+was, and **empirical/measured** -- per-operator cost attributed from a captured
+graph. It also decides whether Compass can predict a configuration
 nobody has measured, or only interpolate between ones that were. Everything
 under *Settled* about graphs is groundwork for this and is not yet paying for
 itself.

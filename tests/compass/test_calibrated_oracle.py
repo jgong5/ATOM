@@ -292,7 +292,7 @@ class TestEmpiricalOracle:
 
     @staticmethod
     def _oracle(tmp_path, rows):
-        from atom.compass.core.cost.empirical import EmpiricalCostOracle
+        from atom.compass.core.cost.interpolated import InterpolatedCostOracle
 
         path = tmp_path / "t.jsonl"
         with open(path, "w", encoding="utf-8") as fh:
@@ -303,7 +303,7 @@ class TestEmpiricalOracle:
                     "context_lens": [ctx // batch] * batch,
                     "num_prefill_tokens": 0,
                 }) + "\n")
-        return EmpiricalCostOracle(str(path), neighbours=3)
+        return InterpolatedCostOracle(str(path), neighbours=3)
 
     def test_an_exact_match_answers_exactly(self, tmp_path):
         rows = [(4, ctx, 0.001 + ctx * 1e-6) for ctx in range(400, 2000, 400)]
