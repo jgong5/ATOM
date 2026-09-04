@@ -34,6 +34,11 @@ class CompassConfig:
             Exclude Triton autotuning with throwaway *requests* instead — see
             ``--warmup-prompts`` in ``scripts/compass/run.py`` — which drops the
             expensive first launches without discarding a whole category.
+        memory_out: Where to record what the memory budget was made of. Every
+            run already computes the terms and throws them away once the block
+            count is derived; a run that does not record them is a validation
+            sample that cannot be recovered, because the numbers only exist
+            while the device is in that state.
         trace_prefill: Which prefill step to record as well, counting prefills
             from one, or 0 to record none. A decode graph says nothing about a
             prefill step -- different operators at different shapes -- so an
@@ -99,6 +104,7 @@ class CompassConfig:
     measure_warmup_steps: int = 0
     trace_step: int = 2
     trace_prefill: int = 0
+    memory_out: Optional[str] = None
     oracle_qualname: str = "atom.compass.core.cost.constant.ConstantCostOracle"
     oracle_options: Optional[dict] = None
     virtual_clock: bool = True

@@ -700,6 +700,89 @@ class CompassModelRunner(ModelRunner):
             self._resolve_capture_ladder()
         return 0.0, [], 0
 
+    def get_num_blocks(self) -> dict:
+        """Size the KV cache, and record what the budget was made of.
+
+        The engine measures four things off the device, derives a byte budget,
+        and hands the arithmetic to `plan_pools` -- which is pure CPU and already
+        correct for a hybrid. Take the device away and only the four readings are
+        missing, so those are what an artifact has to hold.
+
+        They are read here rather than parsed back out of the log line, and read
+        *before* delegating rather than after: `super()` allocates nothing, so
+        these are the same numbers it will see, while afterwards the KV cache
+        exists and `mem_get_info` says something else entirely.
+
+        Only the raw readings are recorded, never the derived budget. The
+        arithmetic from readings to block count is the engine's, it is already
+        CPU-only, and copying it here would be one more thing to drift.
+        """
+        import torch
+
+        readings = {}
+        try:
+            free, total = torch.cuda.mem_get_info()
+            stats = torch.cuda.memory_stats()
+            readings = {
+                # The four the device supplies, and nothing computed from them.
+                "total": int(total),
+                # Set by whatever else is on the box, not by this configuration.
+                # A budget in which `free` was the binding term describes the
+                # neighbours; record it so a reader can refuse such a budget.
+                "free": int(free),
+                "peak_torch": int(max(stats["allocated_bytes.all.peak"],
+                                      stats["allocated_bytes.all.current"])),
+                "non_torch": int(max((total - free)
+                                     - torch.cuda.memory_reserved(), 0)),
+                "cudagraph_overhead": int(self._estimate_cudagraph_overhead()),
+            }
+        except Exception as exc:  # noqa: BLE001 - never fail a run over a record
+            logger.warning("ATOMCompass WARNING: could not read the memory "
+                           "terms (%s); none recorded", exc)
+
+        result = super().get_num_blocks()
+        self._write_memory(readings, result)
+        return result
+
+    def _write_memory(self, readings: dict, result: dict) -> None:
+        path = self._compass_config.memory_out
+        if not path or not readings:
+            return
+        coords = self._rank_coords()
+        if any(size > 1 for size in self._topology().values()):
+            path = self._rank_path(path, coords)
+        config = self.config
+        record = {
+            "version": 1,
+            "readings": readings,
+            # What the engine made of them, so a modelled budget can be checked
+            # against the decision it actually drove rather than against bytes.
+            "blocks": {
+                "num_kvcache_blocks": result.get("num_kvcache_blocks"),
+                "pool_entries": result.get("pool_entries"),
+                "pool_entries_per_req": result.get("pool_entries_per_req"),
+            },
+            "config": {
+                "model": str(getattr(config, "model", "unknown")),
+                "gpu_memory_utilization": float(
+                    getattr(config, "gpu_memory_utilization", 0.0) or 0.0),
+                "max_num_seqs": int(getattr(config, "max_num_seqs", 0) or 0),
+                "max_model_len": getattr(config, "max_model_len", None),
+                "kv_cache_dtype": str(getattr(config, "kv_cache_dtype", "")),
+                "block_size": getattr(config, "kv_cache_block_size", None),
+                "topology": self._topology(),
+                "rank_coords": dict(coords),
+            },
+        }
+        try:
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(record, fh, indent=1)
+        except OSError as exc:
+            logger.warning("ATOMCompass WARNING: could not write memory terms "
+                           "to %s: %s", path, exc)
+            return
+        logger.info("ATOMCompass: recorded the memory budget terms -> %s", path)
+
     def _resolve_capture_ladder(self) -> None:
         """Work out which graphs a real run would have captured, without capturing.
 

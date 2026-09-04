@@ -1102,10 +1102,28 @@ cannot run is answering a different question.
 
 **Steps, in order.**
 
-1. Record the terms. Every hardware run already prints them; capture
-   `total`, `free`, `peak_torch`, `non_torch`, `cudagraph_est` and the resulting
-   block count into an artifact beside the step table. Costs nothing and is the
-   validation set for everything below.
+1. ~~Record the terms.~~ **Done** -- `--compass-memory-out`. The five readings
+   and the block counts they produced, per rank, taken in `get_num_blocks`
+   immediately *before* delegating: `super()` allocates nothing, so they are the
+   same numbers it will see, where afterwards the KV cache exists and
+   `mem_get_info` says something else. Only the readings are recorded, never the
+   derived budget -- that arithmetic is the engine's, is already CPU-only, and
+   copying it here would be one more thing to drift.
+
+   | | 0.6B TP=1 | 27B TP=2 (per rank) |
+   | --- | --- | --- |
+   | total | 192.0 GB | 192.0 GB |
+   | free | 189.5 GB | 156.7 GB |
+   | peak_torch | 2.6 GB | 28.6 GB |
+   | non_torch | 0.9 GB | 7.0 GB |
+   | cudagraph | 0.08 GB | 0.08 GB |
+   | → blocks | 95822 | 37838 |
+
+   First use of the artifact, and the reason `free` is recorded separately: both
+   records can be checked for whether `free` was the binding term, and in both it
+   was not -- the utilization budget was. So both are reusable. (The 35 GB
+   between `total` and `free` at 27B is this process's own weights and
+   activations, not neighbours; that had to be computed rather than assumed.)
 2. Read that artifact instead of the device, on an exact key match. Still
    `empirical/measured` -- a different source for the same measurement, not a
    different kind of number. Unblocks sizing a configuration on a box that could
