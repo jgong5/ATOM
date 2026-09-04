@@ -1555,9 +1555,45 @@ It also means the decode-ladder result does not show up here even though it is
 real: the ladder was validated offline against the rungs it was measured at, and
 serving spends 63 steps at a rung that only exists in the simulation.
 
-The mechanism to look at first is admission. It is modelled as a fixed 13.2 ms
-deferral per request, which quantises arrivals -- and a bucket-2 cohort appearing
-63 times is what quantised arrivals would produce.
+**The mechanism is that arrivals are on the wall clock while steps are on the
+virtual one.** Sweeping the admission constant over the same workload:
+
+| | prefill | decode | decode buckets |
+| --- | --- | --- | --- |
+| real | 3 | 127 | 1x64, 64x63 |
+| simulated, adm=0 | 20 | 159 | 1x94, **16x2**, 64x63 |
+| simulated, adm=13.2 ms | 13 | **126** | **1x63, 64x63** |
+| simulated, adm=26.4 ms | 7 | 189 | 1x63, **2x63**, 64x63 |
+
+Two things follow, and the second is the important one.
+
+*Admission changes the schedule.* At 0 a bucket-16 cohort appears, at 26.4 ms a
+bucket-2 one, and at the measured 13.2 ms the decode schedule nearly matches
+reality -- 126 steps against 127, in the same two buckets.
+
+*But 13.2 ms is also what the previous run used, and it produced 189 decode steps
+with a phantom bucket 2.* **Identical settings, different schedule.** The
+simulated schedule is not a function of the configuration at all: `serve_probe`
+drives requests over HTTP, so arrivals happen in wall-clock time while the engine
+advances a virtual clock by predicted costs, and the interleaving of the two is a
+race. (Two samples, so read this as the explanation that fits rather than as a
+measured distribution.)
+
+That is #6 in a deeper form than it was recorded. The known problem was that an
+HTTP benchmark *times* a simulated engine wrongly; this is that it *perturbs*
+one -- the schedule itself, which is the thing being validated.
+
+Prefill shows it without the noise: **7, 13 and 20 simulated prefill steps against
+3 real**, in every run and at every admission value. Chunked prefill splits when a
+step's token budget is exceeded, and a scheduler seeing requests arrive at
+scattered virtual times batches fewer of them per step and chunks more.
+
+The fix is not a cost-model fix. The offline path already does the right thing --
+a workload *declares* when each request arrives, and `_declared_arrival_pending`
+holds a step until the declared instant, so arrivals live on the same clock as
+the steps. Serving validation needs a driver that does the same rather than an
+HTTP client racing the simulation. Which is why offline agrees to within noise
+and serving does not, and it has nothing to do with shapes.
 
 The fix is not more graphs of the same kind -- that was tried on decode context
 and dropped. It is a graph per *shape*, which is what `runtime/derive.py` exists
