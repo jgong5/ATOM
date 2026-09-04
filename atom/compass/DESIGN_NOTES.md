@@ -19,6 +19,13 @@ Defects in ATOM itself, rather than in Compass, are collected separately in
 
 # Status
 
+**Scope.** Two quantities are modelled: **time** (what a step costs, and what
+serving adds around it) and, as of the survey revision, **memory** (what a
+configuration consumes, and therefore whether it fits and how many KV blocks it
+gets). Memory is #22 and is currently `empirical/measured` only -- see there for
+what it needs.
+
+
 A simulated serving run predicts a real one on Qwen3-0.6B on MI308X, calibrated
 on a sweep of shapes and evaluated on a workload neither saw, so the error is a
 generalisation error rather than a fit residual. Five runs of the identical
@@ -147,9 +154,20 @@ the step directly. A difference of method, not of subject: both answer what one
 step costs, so "step-level" and "operator-level" describe how an oracle works
 rather than what it is for.
 
-Nothing analytical exists yet for cost. The word is reserved rather than
-aspirational -- the memory-budget code already uses it in the same sense, for a
-figure derived from the checkpoint index instead of measured.
+**What quantity.** All of the above is written for *time*, and applies unchanged
+to **bytes**. Memory consumption has the same two subjects -- **model memory**
+(weights, activations, the CUDA-graph pool) and **serving memory** (the KV cache
+and its block pools) -- and the same dial. What ATOM does today is
+`empirical/measured`: four readings off a live device. `analytical` would derive
+the same terms from the checkpoint index and the traced op graph. A captured
+budget replayed from an earlier run of the same build is a further species,
+`empirical/replayed` -- which is the reason for leaving the species list open.
+
+So "cost" should not be read as meaning time. Say **time cost** or **memory
+cost** where it matters, and the subject and provenance words carry over.
+
+Nothing analytical exists yet for either quantity. The word is reserved rather
+than aspirational.
 
 This replaces an earlier three-point dial (`analytical` / `calibrated` /
 `empirical`) that described a design never built: it defined `calibrated` as the
@@ -1020,7 +1038,15 @@ above is not something cache realism will close.
 The tracer is kept, because the question it answers is the right one and the
 answer needs to stay reproducible. `scripts/compass/op_cost.py` reports it.
 
-### 22. KV sizing is real only because the GPU is still there — **M**
+### 22. Memory is `empirical/measured` only, so a configuration must exist to be sized — **M**, in PoC scope
+
+**In scope as of the survey revision**: memory consumption is now a modelled
+quantity alongside time, not an implementation detail of getting a run to start.
+
+In the vocabulary: model memory (weights, activations, the CUDA-graph pool) and
+serving memory (the KV cache and its block pools) are today `empirical/measured`
+-- four readings off a live device. The PoC needs at least one more species, so
+that a configuration can be sized without being run.
 
 This runner's docstring says weight loading and KV-cache sizing are "inherited and
 therefore real". They are. What that sentence does not say is what it costs: they
@@ -1045,14 +1071,40 @@ the V4 compressor ring counted separately, an Eagle3 draft KV merged onto the
 target's block ids by name. Item 16's model is a hybrid, and that sizing is
 correct today for free.
 
-So the gap is one number, not a subsystem. A memory oracle on the same dial as
-the cost oracle: `measured` is what happens now, `replayed` reads a budget
-captured from a real run and keyed by ATOM commit and configuration, and
-`analytical` derives it — weights from the checkpoint index, non-torch from a
-per-rank constant, the graph pool from the geometry term ATOM already computes,
-and **activations from a def-use walk over the traced op graph**, which is the
-one term everybody else guesses at and the one this project happens to already
-have the artifact for.
+So the gap is one number, not a subsystem. A memory oracle on the same dial,
+which is the same dial because the vocabulary does not care whether the quantity
+is seconds or bytes:
+
+| species | what it does |
+| --- | --- |
+| `empirical/measured` | what happens now: four readings off a live device |
+| `empirical/replayed` | a budget captured from a real run, keyed by ATOM commit and configuration |
+| `analytical` | derives the terms: weights from the checkpoint index, non-torch from a per-rank constant, the graph pool from the geometry term ATOM already computes, and **activations from a def-use walk over the traced op graph** |
+
+The activation term is the one everybody else guesses at, and the one this
+project happens to already have the artifact for.
+
+**Why it is in the PoC scope rather than a convenience.** Memory decides which
+configurations exist. Sizing the 27B at TP=1 failed before any timing could be
+taken -- *"per-request cache tensor (37.41GB for 512 slots) exceeds available KV
+budget (19.85GB)"* -- and the fix was a configuration change, not a memory
+change. A tool asked "which configuration should I deploy" answers with a set,
+and every member of that set has to fit. Predicting time for configurations that
+cannot run is answering a different question.
+
+**Steps, in order.**
+
+1. Record the terms. Every hardware run already prints them; capture
+   `total`, `free`, `peak_torch`, `non_torch`, `cudagraph_est` and the resulting
+   block count into an artifact beside the step table. Costs nothing and is the
+   validation set for everything below.
+2. `empirical/replayed` — read that artifact instead of the device. Unblocks
+   sizing a configuration on a box that could not hold it, which is the immediate
+   product need.
+3. `analytical` — derive each term. Validate per term against the recorded ones,
+   on runs already scheduled.
+4. Feed it back: `get_num_blocks` off the modelled budget, so `max_num_seqs` and
+   the capture ladder follow from the prediction rather than from the box.
 
 Two things that will be wrong if they are not designed for:
 
@@ -1070,9 +1122,11 @@ Not modelled and not planned: fragmentation. Nobody models it.
 
 Validation costs no GPU time, because every hardware run already made prints the
 real breakdown — compare the derived terms against the measured ones on runs
-already scheduled. The gate that matters is not the byte error: it is whether
-top-1 configuration agreement survives swapping `measured` for `analytical`. If
-the ranking moves, the memory model is what moved it.
+already scheduled. **The gate that matters is not the byte error**: it is whether
+top-1 configuration agreement survives swapping `empirical/measured` for
+`analytical`. If the ranking moves, the memory model is what moved it. A byte
+error of a few percent that never changes which configuration wins is a better
+outcome than a tighter one that does.
 
 Until this exists, only configurations that fit on the box in front of you can be
 simulated at all, which is the wrong constraint for a tool whose question is
