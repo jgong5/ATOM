@@ -1508,6 +1508,11 @@ Offline it lands inside the noise. Served, on the engine's own clock:
 | TTFT | 352.11 ms | 520.75 ms | **+47.9%** |
 | latency | 663.34 ms | 831.24 ms | **+25.3%** |
 
+(Later runs of the same comparison gave +24.9%/+25.2% and +80.4%/+47.6%, with the
+real side alone moving from 311 ms to 346 ms of TTFT. Serving numbers need
+repeats before any of them is treated as a difference; none of the three runs
+here had any.)
+
 The cause is not the prices. It is that an offline workload has exactly one shape
 of each kind -- four prompts of 314 tokens, then decode at batch 4, every step
 identical -- so an oracle holding one graph per kind is *exactly* right, and the
@@ -1523,14 +1528,36 @@ constants. So the offline result should be read as *the machinery works*, not as
 *the model generalises* -- and "one graph per kind is enough", which was true of
 every workload tested to that point, is false of the first varying one.
 
-What is **not** established is why the net error comes out positive. Every step
-is priced *low* -- prefill 141 ms against 367, decode ~406 ms against ~626 -- yet
-simulated TTFT and latency come out high, which means the simulated scheduler is
-batching differently rather than merely mis-costing. A virtual clock staggers
-admission, which changes which requests are batched together, which changes the
-step shapes, which changes their cost: the shape distribution is an *output* of
-the simulation, not an input to it. Predict mode writes no step table, so this is
-where the evidence stops. Getting one is the next measurement.
+**Established, now that predict mode records its steps: the simulation runs a
+different schedule.** Not the same steps at wrong prices -- a different set of
+steps.
+
+| | real | simulated |
+| --- | --- | --- |
+| prefill steps | 3 -- 16, 256, 16128 tokens | **6** -- 16, 256x2, 1536, 3072, 11264 |
+| decode steps | **127** -- buckets 1x64, 64x63 | **189** -- buckets 1x63, **2x63**, 64x63 |
+| prefill total | 371.5 ms | 251.2 ms |
+| decode total | 486.8 ms | 721.9 ms |
+
+62 extra decode steps, and 63 of them at bucket 2 -- a bucket the real run never
+visits. Prefill split six ways instead of three, and the 16128-token step became
+1536 + 3072 + 11264.
+
+This changes what #6b *is*. It is not, or not mainly, that the oracle cannot
+price the shapes serving produces. It is that **a simulated run does not perform
+the same steps as the run it stands for**, because the scheduler batches
+according to the clock the oracle drives, and a different clock coalesces
+requests differently. Aggregate latency cannot separate a wrong step cost from a
+different set of steps, which is why two attempts to attribute this error failed
+before the step tables existed.
+
+It also means the decode-ladder result does not show up here even though it is
+real: the ladder was validated offline against the rungs it was measured at, and
+serving spends 63 steps at a rung that only exists in the simulation.
+
+The mechanism to look at first is admission. It is modelled as a fixed 13.2 ms
+deferral per request, which quantises arrivals -- and a bucket-2 cohort appearing
+63 times is what quantised arrivals would produce.
 
 The fix is not more graphs of the same kind -- that was tried on decode context
 and dropped. It is a graph per *shape*, which is what `runtime/derive.py` exists

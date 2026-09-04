@@ -152,6 +152,15 @@ class CompassModelRunner(ModelRunner):
 
         shape = self._describe(batch)
         cost = self._oracle.estimate(shape)
+        # Record what was predicted, in the same format a measure run records
+        # what was timed. Without it a simulated run leaves no trace of *which
+        # steps it ran*, and the shape distribution is an output of the
+        # simulation rather than an input to it -- the scheduler batches
+        # according to the clock the oracle drives. Comparing a real run with a
+        # simulated one on aggregate latency alone cannot tell a wrong step cost
+        # from a different set of steps, which is where the serving diagnosis
+        # ran out of evidence twice.
+        self._record_measurement(shape, cost.seconds, None)
         self._step_count = getattr(self, "_step_count", 0) + 1
         logger.debug(
             "COMPASS step %d: reqs=%d tokens=%d prefill_tokens=%d cost=%.6fs",
