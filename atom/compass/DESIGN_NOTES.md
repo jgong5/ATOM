@@ -1945,10 +1945,40 @@ group grows. So the per-launch constant looks model-independent (it is) and
 group-size-independent (it is not), and a graph whose collectives are a sixth of
 its launches is where the difference shows.
 
-That is a hypothesis with an obvious test: fit the per-launch constant separately
-for collective and non-collective launches, on graphs that already record which
-is which (`OpSpec.group`). If the non-collective part stays at 2.25 µs across
-TP=1, 2 and 4 while the collective part grows, the constant is two constants.
+Tested, and it is two constants. `OpSpec.group` already says which launches are
+collective, and **TP=1 has none at all**, so it identifies the plain constant on
+its own and each higher TP then gives the collective one:
+
+| | priced | plain launches | collective | measured step |
+| --- | --- | --- | --- | --- |
+| 27B TP=1 | 26.211 ms | 617 | 0 | 27.334 ms |
+| 27B TP=2 | 16.173 ms | 618 | 129 | 17.840 ms |
+| 27B TP=4 | 10.082 ms | 586 | 129 | 12.402 ms |
+
+    plain      1.82 µs/launch   (from TP=1 alone, where there are no collectives)
+    collective 4.20 µs at TP=2, 9.72 µs at TP=4
+
+**The plain constant is stable and the collective one grows with the group**,
+which is what the hypothesis predicted. The single 2.25 µs was a blend of the
+two, which is why it fitted TP=1 and TP=2 -- where collectives are a small share
+or absent -- and broke at TP=4.
+
+Held out to *other models* at the same group size, the split is a real but modest
+improvement, and the honest reading is that it fixes TP-scaling rather than
+accuracy in general:
+
+| | split | single 2.25 µs | measured |
+| --- | --- | --- | --- |
+| Qwen3-0.6B TP=2 | **+2.11%** | +3.71% | 3.369 ms |
+| Qwen3-30B MoE TP=2 | **+9.54%** | +10.54% | 7.900 ms |
+
+The MoE is wrong by about the same amount either way, so whatever ails it is not
+the boundary constant.
+
+Two points cannot fix how the collective term scales: 4.20 to 9.72 is 2.3x for a
+doubled group, which fits linear-in-group (2.1 then 2.43 per rank), linear in
+log2 (4.2 then 4.86) and nothing cleanly. TP=8 would separate them, and until
+then the term should be read as measured per group size rather than as a law.
 
 On #4, which recorded a 19% calibrate-vs-evaluate gap on TP=4 prefill that was
 never explained: the priced oracle gets TTFT to +6.46% on the same configuration.
