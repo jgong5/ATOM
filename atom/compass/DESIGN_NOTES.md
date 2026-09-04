@@ -1550,6 +1550,61 @@ time -- **every group in `_topology()` must have a coordinate in
 `_rank_coords()`** -- and the failure it prevents is silent, because a
 single-writer path is indistinguishable from a correct one by inspection.
 
+### Interpolating prices across shapes does not work, and the reason is useful
+
+The cheap candidate for #6b was `empirical/interpolated` at operator level: price
+an operator at a few shapes and interpolate between them, instead of deriving a
+graph per shape. Probed on one gemm from the 0.6B decode graph -- `[M,1024] x
+[4096,1024]` -- priced at 20 values of M from 1 to 1024.
+
+The curve is flat at ~9.2 µs to M=12, then climbs, and then **jumps from 58.07 µs
+at M=768 to 137.45 µs at M=1024** where the trend says ~77.
+
+Interpolation looks fine until you notice that:
+
+| measured shapes | n | median | worst |
+| --- | --- | --- | --- |
+| every other shape | 10 | 5.5% | 57.8% |
+| powers of two | 11 | 2.8% | 60.1% |
+| 1, 8, 64, 512 | 4 | 3.7% | 64.7% |
+| 1, 32, 1024 | 3 | 8.6% | 80.1% |
+
+Median 3-8% from as few as four measurements, which looked like the answer.
+Restricted to the range actually bracketed it is better still: median **2.6%**,
+worst 8.4%. Every "worst" column is the same cliff.
+
+**The cliff is a kernel change, and the price list already knew.** Because each
+signature records which kernels it launched:
+
+| M | µs | tile |
+| --- | --- | --- |
+| 256, 384 | 29.38, 39.74 | `MT128x1…` |
+| 512, 768 | 48.50, 58.07 | `MT256x1…` |
+| 1024 | **137.45** | **`MT256x2…`** |
+
+So the obvious guard is to interpolate only between neighbours that ran the same
+kernel. **That guard refuses almost everything**: the library re-tunes at nearly
+every shape -- twelve distinct tile configurations across twenty values of M --
+so 8 of 10 held-out shapes have no same-kernel bracket at all, and the two that
+do come out at 0.4%.
+
+That is the finding. Interpolation is not sound-but-imprecise; it is **accurate
+most of the time with no way to tell when it is not**. It works when consecutive
+tuned kernels happen to lie on a smooth trend and fails by 2.4x when they do not,
+and the only signal that would distinguish the two cases refuses to answer for
+most shapes. For a tool whose output is a *ranking of configurations*, an
+occasional silent 60% is worse than a uniform 10%.
+
+**What the probe leaves standing.** Decode shapes are not arbitrary -- they are
+the CUDA-graph capture ladder, eleven rungs known from config before anything
+runs. Those can simply be *measured*, which is `empirical/measured` over an
+enumerable set and needs no interpolation at all. Prefill token counts are
+genuinely arbitrary, so prefill is where #6b still needs either
+`empirical/fitted` per operator against M, or derivation (#7).
+
+Which splits #6b into a bounded piece and an open one, where before it was one
+large open one.
+
 ### 6c. Expert parallelism: what ran was not meaningful EP — **L**
 
 Qwen3-30B-A3B, 128 experts and 8 per token, at TP=2 with
