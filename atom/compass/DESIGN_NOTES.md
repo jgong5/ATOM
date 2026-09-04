@@ -1588,12 +1588,51 @@ Prefill shows it without the noise: **7, 13 and 20 simulated prefill steps again
 step's token budget is exceeded, and a scheduler seeing requests arrive at
 scattered virtual times batches fewer of them per step and chunks more.
 
-The fix is not a cost-model fix. The offline path already does the right thing --
-a workload *declares* when each request arrives, and `_declared_arrival_pending`
-holds a step until the declared instant, so arrivals live on the same clock as
-the steps. Serving validation needs a driver that does the same rather than an
-HTTP client racing the simulation. Which is why offline agrees to within noise
-and serving does not, and it has nothing to do with shapes.
+The fix is not a cost-model fix, and it needed no engine change either: the
+protocol already carries `compass_arrival` (an offset into the run) and
+`compass_workload_size` (so the arrival barrier holds virtual time until every
+declared arrival has landed). `benchmark_serving` simply never sets them.
+
+`scripts/compass/replay.py` does. Requests are posted as fast as the socket
+allows and each carries the instant it should *count* as arriving, so delivery
+order and socket latency stop mattering. Against a real server the declared
+arrival is ignored and "now" is used, so one script drives both sides.
+
+**It fixes the schedule.**
+
+| | real | simulated |
+| --- | --- | --- |
+| prefill steps | 4 | 4 |
+| decode steps | 31 | 32 |
+| decode buckets | {64: 31} | {2: 1, **64: 31**} |
+
+against 3 vs 6 and 127 vs 189 under the HTTP driver. One stray bucket-2 step
+remains; everything else lines up.
+
+### And with the schedule fixed, the error is finally attributable
+
+| | real | simulated |
+| --- | --- | --- |
+| prefill | 4 steps, **691.7 ms** -- 39, 193, 251, 210 ms | 4 steps, **167.5 ms** -- **42 ms each** |
+| decode | 31 steps, 6.060 ms each | 32 steps, 5.116 ms each |
+
+Engine-side TTFT comes out -83.7% and latency -61.0%, and both are now explained
+rather than merely observed:
+
+* **Prefill is 4.1x under because one graph answers for every shape.** The
+  simulated steps cost 42 ms whether they carry 279 tokens or 16368; the real
+  ones run 39 ms to 251 ms and scale with tokens. This is the open half of #6b,
+  now isolated with nothing else mixed into it.
+* **Decode is 15.6% under because the ladder was traced at a different
+  context.** The rungs were traced on 64-word prompts and this workload uses
+  128-word ones, so the same bucket carries more KV history. The ladder fixed
+  the *batch* dimension of decode; context is a second dimension and this is the
+  first measurement that separates them.
+
+That is the serving blocker cleared. What remains is not "serving is wrong" but
+two specific shape gaps, each with an obvious next measurement.
+
+
 
 The fix is not more graphs of the same kind -- that was tried on decode context
 and dropped. It is a graph per *shape*, which is what `runtime/derive.py` exists
