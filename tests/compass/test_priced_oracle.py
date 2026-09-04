@@ -182,3 +182,67 @@ class TestPrefill:
         with caplog.at_level("WARNING"):
             oracle.estimate(PREFILL)
         assert "no prefill graph" in caplog.text
+
+
+class TestDecodeRungs:
+    """Decode shapes are enumerable, so they are measured rather than guessed.
+
+    They are the rungs of the CUDA-graph ladder, known from config before
+    anything runs. Interpolating a price across shapes was probed and rejected:
+    the library re-tunes its kernel at nearly every shape and a retune can cost
+    2.4x, with nothing in the price list able to say in advance which neighbours
+    are safe to interpolate between.
+    """
+
+    def _ladder(self, tmp_path, rungs):
+        import json as _json
+
+        prices = {"prices": {}}
+        for n in rungs:
+            op = _op(f"a{n}")
+            graph = {"version": 2, "key": None, "ops": [op],
+                     "provenance": {"shape": {
+                         "num_scheduled_tokens": [1] * n,
+                         "context_lens": [8] * n,
+                         "num_prefill_tokens": 0, "capture_bucket": n}}}
+            (tmp_path / f"g.b{n}.json").write_text(_json.dumps(graph))
+            prices["prices"][signature_of(op)] = {
+                "name": op["name"], "seconds": 1e-5 * n, "occurrences": 1,
+                "kernels": {"k": 1e-5 * n}}
+        (tmp_path / "p.json").write_text(_json.dumps(prices))
+        return str(tmp_path / "p.json"), str(tmp_path / "g.b*.json")
+
+    def _shape(self, rung):
+        return StepShape(num_scheduled_tokens=(1,) * rung,
+                         context_lens=(8,) * rung, capture_bucket=rung)
+
+    def test_each_rung_gets_its_own_graph(self, tmp_path):
+        prices, graphs = self._ladder(tmp_path, [1, 2, 4, 8])
+        oracle = PricedGraphCostOracle(prices, graphs, boundary_seconds=0.0)
+        assert sorted(oracle.by_rung) == [1, 2, 4, 8]
+        for rung in (1, 2, 4, 8):
+            assert oracle.estimate(self._shape(rung)).seconds == pytest.approx(
+                1e-5 * rung)
+
+    def test_an_unmeasured_rung_warns_rather_than_interpolating(self, tmp_path,
+                                                                caplog):
+        prices, graphs = self._ladder(tmp_path, [1, 2, 8])
+        oracle = PricedGraphCostOracle(prices, graphs, boundary_seconds=0.0)
+        with caplog.at_level("WARNING"):
+            got = oracle.estimate(self._shape(4)).seconds
+        # The largest measured rung, not something interpolated between 2 and 8.
+        assert got == pytest.approx(1e-5 * 8)
+        assert "no decode graph for rung 4" in caplog.text
+
+    def test_and_warns_only_once(self, tmp_path, caplog):
+        prices, graphs = self._ladder(tmp_path, [1, 8])
+        oracle = PricedGraphCostOracle(prices, graphs, boundary_seconds=0.0)
+        with caplog.at_level("WARNING"):
+            for _ in range(4):
+                oracle.estimate(self._shape(4))
+        assert caplog.text.count("no decode graph for rung") == 1
+
+    def test_one_graph_behaves_as_before(self, tmp_path):
+        prices, graph = _artifacts(tmp_path, [_op("a")], seconds=1e-5)
+        oracle = PricedGraphCostOracle(prices, graph, boundary_seconds=0.0)
+        assert oracle.estimate(DECODE).seconds == pytest.approx(1e-5)

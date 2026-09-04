@@ -1605,6 +1605,49 @@ genuinely arbitrary, so prefill is where #6b still needs either
 Which splits #6b into a bounded piece and an open one, where before it was one
 large open one.
 
+### The decode half of #6b, closed by measuring the ladder
+
+Decode shapes are not arbitrary: they are the rungs of the CUDA-graph capture
+ladder, known from config before anything runs. So they can be **measured**,
+which is what the interpolation probe said to do instead of interpolating.
+
+Traced at seven rungs by running seven workloads at 1, 2, 4, 8, 16, 32 and 64
+concurrent requests -- the batch *is* the rung, so no shape rewriting and nothing
+to get silently wrong. Priced as a union: 449 of 471 signatures, 2282 of 2310
+operators, 98.8%.
+
+Two facts worth having on their own:
+
+* **The structure is rung-independent.** 330 operators and 19 distinct kinds at
+  every rung, one identical operator multiset. Only shapes change, which is what
+  makes the ladder a shape family rather than seven different models.
+* **`capture_bucket` matched the rung exactly in all seven runs**, so the key the
+  oracle selects on is the one the engine actually used.
+
+Against measured decode steps, with one constant (382 launches at the 2.04 µs
+median):
+
+| rung | measured | ladder | | one graph |
+| --- | --- | --- | --- | --- |
+| 1 | 2.848 ms | +6.8% | | +10.0% |
+| 2 | 3.222 ms | -4.7% | | -2.8% |
+| 4 | 3.133 ms | 0.0% | | 0.0% |
+| 8 | 3.128 ms | +2.1% | | +0.2% |
+| 16 | 3.442 ms | -1.2% | | -9.0% |
+| 32 | 4.119 ms | -2.5% | | **-23.9%** |
+| 64 | 5.030 ms | +1.3% | | **-37.7%** |
+| | | **median 2.1%, worst 6.8%** | | median 9.0%, worst 37.7% |
+
+The right-hand column is what the oracle did before: one decode graph, traced at
+batch 4, answering for every rung. It is fine near the shape it was traced at and
+-37.7% at rung 64 -- and a served workload spends half its decode steps at
+batch 64. That is a large part of the +47.9% TTFT and it is now gone.
+
+One caveat on the left-hand column: the constant is the median of the same seven
+points, so this is one parameter fitted in-sample. What is being validated is the
+*structure* -- which graph to use for which step -- not that constant, and the
+structure is what the -37.7% was about.
+
 ### 6c. Expert parallelism: what ran was not meaningful EP — **L**
 
 Qwen3-30B-A3B, 128 experts and 8 per token, at TP=2 with
@@ -1958,8 +2001,13 @@ its own and each higher TP then gives the collective one:
     plain      1.82 µs/launch   (from TP=1 alone, where there are no collectives)
     collective 4.20 µs at TP=2, 9.72 µs at TP=4
 
-**The plain constant is stable and the collective one grows with the group**,
-which is what the hypothesis predicted. The single 2.25 µs was a blend of the
+**The plain constant is stable across the group and the collective one grows with
+it**, which is what the hypothesis predicted. Stable across the *group*, not
+across models: the 27B fits 1.82 µs where the 0.6B fits 2.25 µs, both at TP=1
+with no collectives at all. Seven independent estimates from the decode ladder
+put the 0.6B between 1.53 and 2.43 µs with a median of 2.04, so the model-to-model
+difference is within the scatter of one model and the honest statement is that
+this constant is known to about ±20% and not better. The single 2.25 µs was a blend of the
 two, which is why it fitted TP=1 and TP=2 -- where collectives are a small share
 or absent -- and broke at TP=4.
 

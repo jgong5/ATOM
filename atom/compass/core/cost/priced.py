@@ -154,8 +154,24 @@ class PricedGraphCostOracle:
             price_list = json.load(fh)["prices"]
 
         self.unpriced = 0
-        with open(self.graph_path, encoding="utf-8") as fh:
-            self.decode = self._cost(json.load(fh), price_list, self.graph_path)
+        # A glob may name one decode graph or one per capture rung. Decode shapes
+        # are not arbitrary: they are the rungs of the CUDA-graph ladder, known
+        # from config before anything runs, so they can be *measured* rather than
+        # interpolated -- which matters because interpolating a price across
+        # shapes was probed and does not work (the library re-tunes its kernel at
+        # nearly every shape, and a retune can cost 2.4x with nothing to warn
+        # you).
+        import glob as _glob
+
+        paths = sorted(_glob.glob(self.graph_path)) or [self.graph_path]
+        self.by_rung: dict[int, _Costed] = {}
+        for path in paths:
+            with open(path, encoding="utf-8") as fh:
+                blob = json.load(fh)
+            costed = self._cost(blob, price_list, path)
+            self.by_rung[costed.batch or 0] = costed
+        self.decode = (self.by_rung[max(self.by_rung)] if self.by_rung
+                       else self._cost({"ops": []}, price_list, self.graph_path))
 
         # A prefill step is different operators at different shapes, so a decode
         # graph cannot answer for one. Interpolating *within* a kind was tried
@@ -180,6 +196,7 @@ class PricedGraphCostOracle:
                                                  floor_seconds=floor_seconds,
                                                  rank_coords=rank_coords)
         self._warned = False
+        self._warned_rung = False
 
         if self.unpriced:
             logger.warning(
@@ -227,8 +244,33 @@ class PricedGraphCostOracle:
             context=(sum(contexts) / len(contexts)) if contexts else 0.0,
         )
 
+    def _for_rung(self, shape: StepShape) -> "_Costed":
+        """The decode graph for the rung this step replays.
+
+        Exact match only. The rungs are enumerable and were measured, so there is
+        nothing to interpolate and nothing that would justify it: a neighbouring
+        shape can run a different tuned kernel and cost 2.4x more, and the price
+        list cannot tell in advance which neighbours are safe. Where a rung was
+        not measured this falls back to the largest that was, and says so once --
+        an answer that is wrong by a known mechanism rather than by a silent one.
+        """
+        if len(self.by_rung) <= 1:
+            return self.decode
+        rung = shape.capture_bucket or shape.batch_size
+        point = self.by_rung.get(rung)
+        if point is not None:
+            return point
+        if not self._warned_rung:
+            self._warned_rung = True
+            logger.warning(
+                "ATOMCompass WARNING: no decode graph for rung %s (have %s); "
+                "using the largest measured one. Trace that rung to fix it -- "
+                "prices are not interpolated across shapes on purpose.",
+                rung, sorted(self.by_rung))
+        return self.decode
+
     def estimate(self, shape: StepShape) -> StepCost:
-        point = self.prefill if shape.is_prefill else self.decode
+        point = self.prefill if shape.is_prefill else self._for_rung(shape)
         if point is None:
             if self.fallback is not None:
                 return self.fallback.estimate(shape)
@@ -261,6 +303,8 @@ class PricedGraphCostOracle:
     def describe(self) -> str:
         prefill = (f"{self.prefill.seconds*1e3:.3f}ms prefill kernels"
                    if self.prefill else "no prefill graph")
+        rungs = (f", {len(self.by_rung)} decode rungs {sorted(self.by_rung)}"
+                 if len(self.by_rung) > 1 else "")
         return (f"PricedGraphCostOracle("
                 f"{self.decode.seconds*1e3:.3f}ms decode kernels, {prefill}; "
                 f"+{self.boundary_seconds*1e6:.2f}us/launch replayed, "
@@ -268,4 +312,4 @@ class PricedGraphCostOracle:
                    if self.eager_seconds_per_op is not None
                    else f"{self.dispatch_seconds*1e6:.0f}us dispatch, hidden by "
                         f"kernels")
-                + (", calibrated fallback" if self.fallback else "") + ")")
+                + rungs + (", calibrated fallback" if self.fallback else "") + ")")
