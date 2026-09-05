@@ -3285,3 +3285,88 @@ the sum is what the hardware actually moves.
   One flag — `--tp 2` — produced a broken artifact convention, a misattributed
   worker death, a refuted hypothesis, a measured non-issue, and the first
   functional-form failure in the project.
+
+### Fitting attention, and what the fit turned out to be
+
+Attention is the one prefill operator shape synthesis cannot cover, so it was
+the candidate for fitting: cost quadratic within a sequence, and -- so the
+argument went -- smooth in a way the gemms are not, no tile cliffs, the case
+where a fit is the right tool rather than a way of not measuring.
+
+`scripts/compass/fit_attention.py` fits it, comparing candidate forms on
+leave-one-out error and printing the losers. Eight configurations were traced
+across per-sequence lengths 494..10094 and priced at 100% coverage.
+
+**The first answer was wrong, and how it was wrong is the useful part.** On the
+three lengths first traced (2294, 4694, 10094, each about 2x the last), a power
+law `a*L^p` fitted with LOO median 0.75% and worst 1.08%. That looked
+conclusive. It was not: two independently traced graphs at 3194 and 6594 came
+in at **-6.2% and -6.7%**, both the same direction. Pricing them in the same
+benchmark run as the fit set did not move it (cross-run repeatability is 0.2%),
+so it was not run-to-run offset -- it was model bias, and **leave-one-out could
+not see it**. LOO perturbs the sample; it does not test the family. Dropping one
+of three geometrically spaced lengths leaves the range spanned and the refit
+barely moves, so LOO reported the variance and stayed silent about the shape.
+
+A dense ladder settles it: 13 single-sequence graphs, 2294..10094 in steps of
+600. Cost per token does not vary smoothly. It sits on flat plateaus:
+
+| L | 2294 | 2894 | 3494 | 4094 | 4694 | 5294 | 5894 | 6594 | 7294 | 7994 | 8694 | 9394 | 10094 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| us/tok | 3.67 | 6.28 | 6.10 | 5.90 | 6.01 | 8.31 | 8.45 | 8.17 | 8.22 | 10.58 | 10.41 | 10.47 | 10.50 |
+
+Four plateaus, steps of about 2.27 us/token, and the plateau index is
+`ceil(L/2530)`. The quadratic term is computed in whole chunks of keys, so
+attention is **quantised in sequence length** -- the same kind of discontinuity
+as the gemm tile cliff, in the operator that was picked precisely because it was
+supposed not to have one. Against a smooth model this appears as a periodic
+sawtooth that refitting cannot remove; on the ladder the power law's residual
+signs read `-++--++--++--`.
+
+Fitting the form the plateaus imply,
+
+    f(L) = L * (a + b * ceil(L / S)),  a = 1.461us, b = 2.272us, S = 2530
+
+gives LOO median 1.59% against 7.78% for the power law, and predicts
+independently traced single-sequence graphs to **0.13%, 0.62% and 1.21%**.
+
+**It does not survive batching.** Fitted on single-sequence graphs and applied
+to batched ones, most land within a few percent but 2x3194 is +23.9%. Tracing
+that length at one and two sequences and pricing both together:
+
+| sequences of 3194 tokens | per sequence |
+| --- | --- |
+| 1 | 19.967 ms |
+| 2 | 15.470 ms |
+
+A 22.5% drop per sequence from adding a neighbour -- while the same comparison
+moves 2.8% at 2294 and 0.9% at 4694. So the chunking is a property of **the
+batch**, not of the sequence, and per-sequence separability (which holds at
+2294 and 4694) fails where the batch changes the chunk count.
+
+Where that leaves attention. The fit is good for single-sequence prefill and is
+kept for that, with its range recorded -- `S` was resolved from data spanning
+2294..10094 and nothing outside that range is evidence. For batched prefill it
+is not a model yet. The direction it points is away from fitting: attention
+wants pricing at the shape *and context* that occurs, as the gemms now get,
+which means synthesising `cu_seqlens_q`/`cu_seqlens_k` and the rest for a
+target sequence-length multiset rather than rescaling shapes. That is
+construction of a real context, not a rescale-and-hope, so it should be exact
+where the fit is approximate.
+
+**Method note worth keeping.** Held-out error on independently produced points
+is not the same test as cross-validation on the sample, and the difference here
+was 1% versus 6%. Where a sample is small and geometrically spaced, LOO reports
+how stable the fit is, not whether the family is right.
+
+#### Chunked prefill attention cannot be priced yet
+
+A step exceeding `max_num_batched_tokens` traces the 356-operator chunked
+structure (`state=prefill_prefix`, `has_cached=True`, e.g. 3458 query tokens
+against 6594 keys). Its attention operators price at **0 of 28**, every one
+failing in tensor construction with `TypeError: empty() received an invalid
+combination of arguments`. The input shapes are structurally identical to the
+unchunked case, so the fault is in installing the recorded context -- chunked
+prefill carries `block_tables` and `has_cached` that the unchunked path does
+not. Reproduce with `--num-prompts 3 --prompt-tokens 1100`. Until this is
+fixed, only unchunked prefill can be priced or fitted.
