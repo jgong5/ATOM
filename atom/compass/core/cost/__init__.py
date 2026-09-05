@@ -20,7 +20,11 @@ A cost is obtained in one of two ways:
     and it is written ``empirical/<species>``:
 
     ``empirical/measured``
-        The unit itself is timed. `priced` prices each operator and sums them.
+        The unit itself is timed. `priced` measures each *operator* and sums
+        them; a table of timed *steps* is equally ``empirical/measured``. Where
+        both appear, say **measured (op-level)** and **measured (step-level)**
+        rather than setting "priced" against "measured" -- pricing is the act of
+        taking an op-level measurement, not a different kind of number.
     ``empirical/fitted``
         A functional form is chosen and its coefficients regressed over measured
         steps. `calibrated`.

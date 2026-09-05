@@ -137,6 +137,14 @@ written `empirical/<species>`:
 | `empirical/fitted` | a form is chosen, coefficients regressed over measured steps -- `calibrated` |
 | `empirical/interpolated` | no form assumed, nearby measurements looked up -- `interpolated` |
 
+**"Priced" is not a species.** *Pricing* is the act of measuring one operator at
+one shape, a *price* is that measurement and a *price list* the artifact -- all
+useful words, and all `empirical/measured`. So a price should never be set
+against "measured" as though the two were different kinds of number. What differs
+is the unit: write **measured (op-level)** and **measured (step-level)**, and say
+"summed" where op-level measurements are added up to stand for a step. Both are
+measurements; only one of them was taken on the thing being predicted.
+
 Those are the species built so far, **not a closed set**: `empirical/extrapolated`
 and others are equally admissible, and naming the genus separately is what leaves
 room for them.
@@ -928,7 +936,7 @@ effect looks like.
 It is not attention's at all. The gemms in the same graph are priced against
 their own in-situ kernels, and they never touch the KV cache:
 
-| priced | in situ | ratio |
+| measured (op-level) | measured (in a step) | ratio |
 | --- | --- | --- |
 | 13.030 µs | 14.061 µs | 0.93 |
 | 9.150 µs | 10.699 µs | 0.86 |
@@ -1758,7 +1766,7 @@ would be smooth in tokens even though a single gemm is not, letting a handful of
 measured sizes cover the range. Traced and priced at six sizes on the 0.6B, one
 prefill step each, and measured against real steps at the same sizes:
 
-| tokens | priced | measured | priced/measured | overhead per operator |
+| tokens | measured (op-level, summed) | measured (step-level) | ratio | overhead per operator |
 | --- | --- | --- | --- | --- |
 | 1094 | 15.766 ms | 31.746 ms | **0.50** | 50.1 µs |
 | 2188 | 28.460 ms | 31.985 ms | 0.89 | 11.0 µs |
@@ -2139,7 +2147,7 @@ Tested, and it is two constants. `OpSpec.group` already says which launches are
 collective, and **TP=1 has none at all**, so it identifies the plain constant on
 its own and each higher TP then gives the collective one:
 
-| | priced | plain launches | collective | measured step |
+| | measured (op-level, summed) | plain launches | collective | measured (step-level) |
 | --- | --- | --- | --- | --- |
 | 27B TP=1 | 26.211 ms | 617 | 0 | 27.334 ms |
 | 27B TP=2 | 16.173 ms | 618 | 129 | 17.840 ms |
@@ -2239,7 +2247,7 @@ MoE, priced decode plus 481 launches at the 0.6B's 2.25 µs gives 8.193 ms again
 
 Qwen3.8-27B at TP=2, predicted against three warmed passes:
 
-| | fitted on the 27B | computed | real (n=3) | noise |
+| | fitted on the 27B | computed | measured (step-level, n=3) | noise |
 | --- | --- | --- | --- | --- |
 | ttft | -0.15% | **+2.45%** | 339.216 ms | ±0.8% |
 | tpot | 0.00% | **0.00%** | 17.854 ms | ±0.1% |
@@ -2382,7 +2390,7 @@ instrument beyond the engine's own clock:
 Per kernel, comparing each priced value against the same kernel read out of a
 profile of the real run:
 
-| kernel | priced | in situ | ratio |
+| kernel | measured (op-level) | measured (in a step) | ratio |
 | --- | --- | --- | --- |
 | gemm `4,1024;6144,1024` | 13.030 µs | 14.061 µs | 0.93 |
 | gemm `4,1024;4096,1024` | 9.150 µs | 10.699 µs | 0.86 |
@@ -2405,7 +2413,7 @@ A ratio looked wrong because the cost is not proportional to the kernel: it is
 invisible on a 13 µs gemm and doubles a 2.7 µs rmsnorm, which is exactly the
 spread that made a factor look impossible.
 
-| kernel | n | priced | in situ | gap/call |
+| kernel | n | measured (op-level) | measured (in a step) | gap/call |
 | --- | --- | --- | --- | --- |
 | gemm `MT64x16x128` | 28 | 12.99 µs | 14.29 µs | 1.30 µs |
 | attention | 28 | 8.74 µs | 11.11 µs | 2.37 µs |
