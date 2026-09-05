@@ -1907,12 +1907,31 @@ would over-explain the 11 ms difference, so the other gemm shapes presumably
 cross at different M and partly cancel. The mechanism is established; the
 arithmetic is not.
 
-**This is the third and strongest argument for pricing at operator level.** Both
-effects are invisible in a step's shape and automatic at operator level: a gemm
-priced at its own M carries the tile cliff whether or not anyone knows it is
-there, and attention priced at its own `cu_seqlens_q` carries the quadratic. A
-step-level model in token count cannot represent either, and this is why its
-residuals were not merely large but non-monotone.
+**This is the third argument for pricing at operator level, and unlike the first
+two it was tested.** Both effects are invisible in a step's shape and automatic
+at operator level: a gemm priced at its own M carries the tile cliff whether or
+not anyone knows it is there, and attention priced at its own `cu_seqlens_q`
+carries the quadratic. So the prediction is that priced operators reproduce an
+ordering no token-count model can. Traced and priced both members of the
+non-monotone pair:
+
+| graph | tokens | seqs | measured (op-level, summed) | measured (step-level) | ratio |
+| --- | --- | --- | --- | --- | --- |
+| 2x400 | 4588 | 2 | 50.053 ms | 52.140 ms | **0.960** |
+| 4x200 | 4376 | 4 | 60.641 ms | 63.160 ms | **0.960** |
+
+The larger step prices cheaper, as it measures. **10.59 ms of the 11.02 ms gap is
+captured -- 96%** -- and both configurations land on the *same* ratio, so what is
+left is a uniform 4% rather than a shape-dependent error.
+
+The decomposition confirms which effect is which. Attention is 16.38 ms at two
+sequences against 15.09 ms at four: higher for *fewer* sequences, as the
+quadratic requires, and in the **opposite** direction to the total. So the gemms
+carry the difference, which is the tile cliff, and the two effects are separable
+in the priced graph in a way they are not in the step.
+
+That is the case for operator-level pricing closed by measurement rather than
+argument, on the hardest instance available.
 
 So the fit confirms the mechanism and refuses to be a model: right feature, wrong
 granularity. Attention's quadratic cost belongs to *attention*, where the graph

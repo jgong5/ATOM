@@ -106,15 +106,31 @@ def _make_tensor(shape, dtype_name: str, values=None):
     for anything that indexes, where a random value would not be -- and the
     price that results should be read as describing the shape only.
 
-    A latent hazard, recorded because it is easy to reach for as an explanation
-    and was once reached for wrongly: a recorded index is only in range for the
-    tensor it was recorded against, so replaying one into a rebuilt tensor of a
-    different size would fault the device rather than raise, and a GPU memory
-    fault kills the process -- losing the run rather than one signature. It has
-    not been observed. An `HSA_STATUS_ERROR_EXCEPTION` during prefill pricing
-    was blamed on it and turned out to be an oversubscribed device: a leaked
-    engine process from an earlier run was holding 169 GB. Set
-    ``COMPASS_REPLAY_INT_VALUES=0`` to fall back to zeros if it ever does bite.
+    **Which is why replaying them is off by default.** A recorded index is only
+    in range for the tensor it was recorded against, and replaying one into a
+    rebuilt tensor faults the device rather than raising:
+
+        index_elementwise_kernel ... HSA_STATUS_ERROR_EXCEPTION
+
+    A GPU memory fault kills the process, so one bad index loses the whole run
+    instead of leaving one signature unpriced -- which is why `price_graph`'s
+    per-signature `try/except` never sees it.
+
+    Attribution took two attempts and the first was wrong, so the evidence is
+    worth stating. The fault appeared while pricing prefill graphs; it was
+    blamed on replayed values, replay was disabled, and it *still* faulted --
+    because the device was also oversubscribed by a leaked engine process
+    holding 169 GB. Killing that made pricing succeed, and the success was
+    credited to the kill. It was not: replay was off in that run too. With the
+    device idle and replay back on, the fault returned. Two variables, one
+    conclusion drawn too early.
+
+    What is lost by using zeros is small and was once large. Recorded values
+    existed because attention priced wrongly without them -- one step costing
+    more than the whole step -- but attention now takes its metadata from the
+    forward context Compass installs, so the values are needed to *key* a price
+    and not to rebuild one. They are still recorded and still part of the
+    signature. ``COMPASS_REPLAY_INT_VALUES=1`` restores the old behaviour.
     """
     import torch
 
@@ -309,10 +325,10 @@ def _build_arg_sets(op: dict, cache: str, fn) -> Optional[list]:
 #: is measured is a latency and not a throughput. 64 is comfortably past the knee.
 GRAPH_BATCH = int(os.environ.get("COMPASS_GRAPH_BATCH", "64"))
 
-#: Whether to write recorded integer contents back into rebuilt tensors. On, as
-#: it has always been; the escape hatch exists because an out-of-range index
-#: would fault the device rather than raise. See `_make_tensor`.
-REPLAY_INT_VALUES = os.environ.get("COMPASS_REPLAY_INT_VALUES", "1") != "0"
+#: Whether to write recorded integer contents back into rebuilt tensors. Off:
+#: doing so faults the device while pricing prefill graphs. See `_make_tensor`
+#: for the evidence, which took two attempts to read correctly.
+REPLAY_INT_VALUES = os.environ.get("COMPASS_REPLAY_INT_VALUES", "") == "1"
 
 #: Distinct KV-cache regions a captured batch rotates over. One per captured
 #: call by default, so a region is revisited only after every other has been
