@@ -350,3 +350,42 @@ class TestWhatIsRecordedAndWhatIsOnlyExecuted:
 
         assert any("add" in op.name for op in graph.ops), [
             op.name for op in graph.ops]
+
+
+class TestKernelsLaunchedInsideOperators:
+    """A kernel inside a dispatched operator is already in that operator's price.
+
+    Chunked-prefill attention launches the KV gather itself, so recording the
+    gather as its own operator charged the step 4.4ms of gather on top of an
+    attention price that already contained 5.9ms of it. Kernels launched with no
+    operator on the stack come from the runner and are worth recording.
+    """
+
+    def test_one_launched_inside_is_not_recorded(self):
+        from atom.compass.core.graph import OpGraph, OpSpec
+        from atom.compass.runtime import meta
+        from atom.compass.runtime.triton_trace import TritonLaunchTracer
+
+        graph = OpGraph()
+        tracer = TritonLaunchTracer(graph=graph)
+        meta._DISPATCHING.append("aten::some_operator")
+        try:
+            tracer._record(_FakeKernel(), (), {}, [])
+        finally:
+            meta._DISPATCHING.pop()
+        assert not graph.ops
+
+    def test_one_launched_outside_is(self):
+        from atom.compass.core.graph import OpGraph
+        from atom.compass.runtime import meta
+        from atom.compass.runtime.triton_trace import TritonLaunchTracer
+
+        assert not meta._DISPATCHING, "no operator should be on the stack here"
+        graph = OpGraph()
+        TritonLaunchTracer(graph=graph)._record(_FakeKernel(), (), {}, [])
+        assert [op.name for op in graph.ops] == ["triton::a_kernel"]
+
+
+class _FakeKernel:
+    __name__ = "a_kernel"
+    __module__ = "some.module"

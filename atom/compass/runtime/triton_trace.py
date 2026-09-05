@@ -24,7 +24,7 @@ from typing import Any, Optional
 import torch
 
 from atom.compass.core.graph import OpGraph, OpSpec
-from atom.compass.runtime.meta import _int_ranges_of
+from atom.compass.runtime.meta import _int_ranges_of, inside_an_operator
 
 logger = logging.getLogger(__name__)
 
@@ -251,6 +251,13 @@ class TritonLaunchTracer:
     def _record(self, fn, args, kwargs, tensors, prefix: str = "triton") -> None:
         if self._in_inductor and prefix == "triton":
             return  # already recorded one level up, as the fused kernel
+        # A kernel launched inside a dispatched operator is already part of that
+        # operator's price. Recording it separately adds it to the step twice:
+        # the KV gather runs inside chunked-prefill attention, and pricing both
+        # charged 4.4ms of gather on top of an attention price that already
+        # contained 5.9ms of it.
+        if inside_an_operator():
+            return
         kwargs = kwargs or {}
         name = _kernel_name(fn)
         constexprs = tuple(

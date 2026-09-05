@@ -3516,3 +3516,74 @@ executed without being recorded (`NOT_WORK` in `meta.py`).
 
 The step predicts at **-5.53%**, which is the micro-benchmark discount and no
 longer anything specific to chunked prefill.
+
+### The in-situ versus isolated gap, measured on its own
+
+Every validation carried a residual of a few percent, recorded as "the
+micro-benchmark discount" -- isolated prices summing below the measured step,
+assumed to mean kernels run slower in a real step than on their own. It was
+carried as one number for a long time. Measured directly, it is not one thing,
+and it is not that.
+
+`scripts/compass/step_accounting.py` reads a profile and splits a step into the
+time kernels were running and the time the device was running nothing. The step
+is a `gpu_user_annotation` on the device timeline and the kernels are its own
+events, so both come out without assuming any dispatch constant.
+
+**Most of the "gap" was a cold step.** The same chunked prefill, profiled twice:
+
+| | cold | warm |
+| --- | --- | --- |
+| device window | 133.962 ms | **102.982 ms** |
+| kernels running | 97.236 ms | **97.260 ms** |
+| idle between them | 36.726 ms (27.4%) | **5.722 ms (5.6%)** |
+| largest single gap | 14.97 ms | 0.14 ms |
+
+Kernel time is identical to **0.02%**. The 31 ms difference is entirely stalls,
+and they are not spread out: cold, the ten largest gaps are 85.9% of all idle
+(15.0, 8.3, 4.5, 3.0 ms, then a cliff), while the 639 gaps under 100 us total
+2.6 ms. That is compilation, not overhead, and the step being validated against
+had it in. The warm-up bug documented earlier for prefix caching is the same
+mistake in a different place: a warm-up that does not run the shape being
+measured does not warm it.
+
+**Kernels price accurately.** Against the warm step, per kernel: attention
+-0.8%, and the three largest gemms -0.4%, -0.6%, +1.8%, covering 98.7% of the
+step's kernel time. There is no systematic discount at the kernel level -- the
+premise behind "micro-benchmarks always outperform e2e" does not survive being
+measured.
+
+**Pricing a kernel twice.** Priced 104.119 ms against 97.260 in situ. The
+attention operators priced 59.958 ms where their kernels in situ are
+`fmha` 47.382 plus gather 5.883 = 53.265 -- because chunked attention *launches*
+the KV gather, so its price already contains it, and recording the gather as its
+own operator charged the step 4.4 ms of gather on top. Introduced by pricing
+Triton kernels, which is worth stating plainly: that change made the model worse
+in this respect while making its coverage better. Triton launches that happen
+inside a dispatched operator are no longer recorded (`inside_an_operator()`),
+the same way inductor's inner launches already were not. Kernels launched with
+no operator on the stack come from the runner and are still recorded.
+
+After that, priced 99.481 ms against 97.260 in situ, **+2.28%**, and most of the
+remainder is the 31 operators timed outside a graph, whose price is wall time
+per call and so carries launch overhead the in-situ kernel figure does not.
+
+**What is actually wrong is the overhead term.** The cost model charges an eager
+step `max(0, 130us - kernel)` per operator, which here is 21.5 ms. The warm
+step's real idle is **5.7 ms**, 8.5 us per kernel, and the median gap is *zero* --
+kernels run back-to-back and a few dozen small gaps make up the total. Nor does
+a long kernel hide the gap after it, which is what `max(0, dispatch - kernel)`
+assumes: bucketed by the duration of the kernel that ran before them, every
+bucket above 10 us has a median gap of zero.
+
+The constant is not retuned here, because this step runs *compiled* and that
+term was fitted on eager decode steps -- applying it to a compiled prefill is a
+category error rather than a bad constant, and the earlier finding that the
+dispatch constant does not transfer between models (132.70 / 101.22 / 91.72 us)
+says the same thing. What the measurement gives is the target: a compiled step
+pays about 8.5 us per kernel launch, not 130 us per operator.
+
+So the residual decomposes into a cold step, a double count, and an overhead
+model four times too large -- three errors, two of them upward, which partly
+cancelled into a plausible-looking 5.5%. A single number that stays plausible
+across many validations is worth taking apart.

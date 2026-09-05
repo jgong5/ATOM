@@ -183,6 +183,18 @@ MAX_RECORDED_INTS = 4096
 #: without being recorded.
 NOT_WORK = ("profiler::",)
 
+#: Operators currently executing, innermost last. A Triton kernel launched
+#: while this is non-empty runs *inside* an operator that is itself recorded and
+#: priced, so recording it separately counts the same kernel twice -- which is
+#: what pricing the KV gather did, on top of the attention whose price already
+#: contained it. Kernels launched with this empty come from the runner rather
+#: than from an operator, and are the ones worth recording on their own.
+_DISPATCHING: list[str] = []
+
+
+def inside_an_operator() -> bool:
+    return bool(_DISPATCHING)
+
 
 def _int_ranges_of(tensors) -> tuple:
     """How far each integer tensor argument reached, and whether it climbed.
@@ -333,7 +345,11 @@ class MetaOpTracer(TorchDispatchMode):
                 )
             out = stand_in
         try:
-            out = out if stand_in is not None else func(*args, **kwargs)
+            _DISPATCHING.append(name)
+            try:
+                out = out if stand_in is not None else func(*args, **kwargs)
+            finally:
+                _DISPATCHING.pop()
         except NotImplementedError as exc:
             self.missing.append(
                 MissingMetaKernel(name=name, reason=_short(exc), input_shapes=in_shapes)
