@@ -1933,6 +1933,47 @@ in the priced graph in a way they are not in the step.
 That is the case for operator-level pricing closed by measurement rather than
 argument, on the hardest instance available.
 
+### Pricing a token count nobody traced
+
+Which leaves the practical problem: prefill token counts are arbitrary, so the
+shape that occurs is usually one no run traced. There is no enumerable set to
+measure the way decode has rungs, and interpolating across the tile cliff is
+wrong by 2x with nothing to warn you.
+
+But there is a rule. The operator *list* does not depend on the token count --
+319 operators and 19 kinds at every unchunked prefill size traced -- and the
+per-token operators carry the count as a leading dimension. So a graph traced at
+one size can be rewritten to any other and the result **priced exactly**.
+`scripts/compass/synth_shapes.py` does that.
+
+Checked by synthesising *both* members of the non-monotone pair from the 4376
+trace alone, and comparing against graphs actually traced at each size:
+
+| tokens | from a graph traced at that size | synthesised from 4376 | diff |
+| --- | --- | --- | --- |
+| 4376 | 45.555 ms | 45.529 ms | -0.06% |
+| 4588 | 33.669 ms | 33.591 ms | **-0.23%** |
+
+(Non-attention operators; attention is excluded from synthesis on purpose.)
+
+The second row is the one that matters: synthesised from a trace at 4376, the
+4588 shapes come out **26% cheaper**, which is the tile cliff. Rewriting the
+shape and pricing it picks that up because it prices rather than infers -- the
+same reason the priced graph reproduced the ordering at all.
+
+So one trace covers a shape family, and prefill needs a trace per *structure*
+rather than per size. Two structures are known: unchunked at 319 operators, and
+chunked at 356 -- a step that exceeds `max_num_batched_tokens` runs different
+operators, and its graph cannot be synthesised from an unchunked one.
+
+Two limits worth stating. The rewrite rule is "leading dimension equal to the
+traced token count", so a dimension that merely happens to be that number is
+rewritten too; it is validated at two sizes and the tool prints what it changed.
+And **attention is not synthesised**: its cost depends on `cu_seqlens_q`
+quadratically rather than on a token total, so rescaling its shapes would produce
+a number that means nothing. Attention is the one operator that still needs
+tracing or fitting, which is now the whole of the remaining prefill problem.
+
 So the fit confirms the mechanism and refuses to be a model: right feature, wrong
 granularity. Attention's quadratic cost belongs to *attention*, where the graph
 records `cu_seqlens_q` per call, not to a step-level regression that has to
