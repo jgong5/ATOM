@@ -71,6 +71,13 @@ def signature_of(op: dict) -> str:
     scalars = op.get("scalars") or ()
     if scalars:
         sig += "|" + ";".join(f"{k}={v}" for k, v in scalars)
+    # A Triton launch's grid is not an argument and decides how much work runs,
+    # so two launches of one kernel over different grids are different prices.
+    # `origin` says where the kernel came from, not what it costs, so it is not
+    # part of the key.
+    for key, value in (tuple(x) for x in op.get("launch") or ()):
+        if key == "grid":
+            sig += "|grid=" + ",".join(str(x) for x in value)
     return sig
 
 
@@ -91,6 +98,42 @@ def _resolve(name: str):
     if op is None or not overload:
         return op
     return getattr(op, overload, op)
+
+
+def _resolve_triton(op: dict):
+    """A callable for a Triton kernel that is not a torch operator.
+
+    `torch.ops` cannot find these -- they are `@triton.jit` functions reached as
+    attributes of the module that defined them -- so the graph records where to
+    import one from and what grid it ran on, and this puts the two back
+    together. The returned callable takes the kernel's arguments and supplies
+    the grid, so the caller times it exactly as it times everything else.
+    """
+    import importlib
+
+    launch = {k: v for k, v in (tuple(x) for x in op.get("launch") or ())}
+    origin, grid = launch.get("origin"), launch.get("grid")
+    if not origin or not grid:
+        return None
+    # An unresolved grid is recorded as text, and guessing one would price a
+    # different amount of work than ran. Numeric text is a dimension that an
+    # older graph stringified, and is read back rather than thrown away.
+    try:
+        dims = tuple(int(x) for x in grid)
+    except (TypeError, ValueError):
+        return None
+    module, _, name = origin.partition(":")
+    try:
+        kernel = getattr(importlib.import_module(module), name, None)
+    except Exception:  # noqa: BLE001 - an import can fail many ways
+        return None
+    if kernel is None:
+        return None
+
+    def call(*args, **kwargs):
+        return kernel[dims](*args, **kwargs)
+
+    return call
 
 
 def _make_tensor(shape, dtype_name: str, values=None):
@@ -577,9 +620,12 @@ def price_graph(graph_path: str, iters: int = 2000, warmup: int = 20,
         # Per signature, not once: an operator that rebuilds the context from
         # its arguments leaves that context behind for whatever is priced next.
         reset_forward_context()
-        fn = _resolve(op["name"])
+        triton_kernel = op["name"].partition("::")[0] in ("triton", "inductor")
+        fn = _resolve_triton(op) if triton_kernel else _resolve(op["name"])
         if fn is None:
-            unpriced[sig] = "operator not registered in this process"
+            unpriced[sig] = (
+                "triton kernel with no importable origin or resolved grid"
+                if triton_kernel else "operator not registered in this process")
             continue
         # An operator that reads a forward context gets the one it was recorded
         # with, or is not priced. Calling it without would price it against

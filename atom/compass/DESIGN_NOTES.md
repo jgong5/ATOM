@@ -3400,17 +3400,63 @@ of 28, and predicts the step it came from:
 | measured step | 132.975 ms |
 | | **-9.86%** |
 
-**What the residual is.** 30 operators are still unpriced, 28 of them
+**What the residual was.** 30 operators were unpriced, 28 of them
 `cp_mha_gather_cache_kernel` -- a raw `@triton.jit` kernel rather than a
-registered torch op, so `_resolve` cannot find it in `torch.ops` and no amount
-of context fixes that. This is a structural limit of pricing by operator name:
-inductor-generated and hand-written Triton kernels are recorded by the tracer
-and cannot be called back. A profile of the same configuration puts the gather
-at 5.88 ms (28 calls, 210 us each). Adding it back gives 125.75 ms against
-132.975 ms, or **-5.4%** -- which is the micro-benchmark discount already
-documented for every other graph, not something particular to chunked prefill.
-The profiled step (133.96 ms) agrees with the measured one, so the measurement
-is not in question.
+registered torch op. See below; that is now fixed, and the chunked step is
+predicted at -6.65%.
 
-So chunked prefill is priced, its shortfall is named and quantified, and what
-remains is the general problem of Triton kernels that are not torch operators.
+### Pricing kernels that are not torch operators
+
+`torch.ops` cannot find a `@triton.jit` kernel. It is an attribute of the module
+that defined it, and a launch grid is not an argument at all -- so a recorded
+Triton launch named a kernel nobody could call back, and every one went unpriced
+with "operator not registered in this process". That was 28 of 356 operators in
+chunked prefill and 3 of 330 in decode.
+
+The tracer already knew the missing pieces -- `TritonLaunch` carries the grid and
+the constexprs -- and threw them away when building the `OpSpec`. Now recorded:
+
+* **The positional non-tensor arguments**, by index, in the existing `#i`
+  convention `_rebuild_args` already interleaves. The KV gather takes six ints
+  (two strides, head count, head dim, `x`, block-table width) beside its ten
+  pointers, and recording only tensors lost both their values and everyone
+  else's positions. `None` is recorded too, because it holds a place.
+* **`launch`**, a new `OpSpec` field holding `grid` and `origin`. The grid is
+  part of the signature -- it decides how much work runs -- and the origin is
+  not, being where to import the kernel rather than what it costs.
+
+Two capture bugs surfaced doing it. Positional scalars were dropped entirely.
+And `_resolve_grid` kept a dimension only when `isinstance(x, int)`, recording a
+numpy or tensor integer as its own repr, so `kv_indices_generate_kernel` came
+back with grid `['2', 3]` and read as unresolvable -- a resolvable kernel lost
+to a type check.
+
+| | operators priced | |
+| --- | --- | --- |
+| chunked prefill | 326/356 -> **354/356** | 91.6% -> 99.4% |
+| decode | 327/330 -> **328/330** | 99.1% -> 99.4% |
+
+and the chunked step goes from -9.86% to **-6.65%**.
+
+**The gather's price is low, and by a knowable amount.** It prices at 158.09 us
+per call against 210.12 us in a profile of the real step -- 24.8% under, because
+`block_tables` is rebuilt as zeros, so every index points at block 0 and the
+kernel re-reads one resident block instead of walking 413. This is the
+data-dependence problem that priced attention at 7x once, in its other
+direction: an index tensor of zeros is always in range and always cheap.
+Replaying recorded indices is the obvious fix and is off by default because it
+faults the device (see `_make_tensor`), so the gather is understated on purpose
+and the amount is written down here.
+
+That closes the residual arithmetic: of the 8.84 ms between the priced total and
+the measured step, 1.46 ms is the gather understatement (28 x 52 us) and the
+remaining 7.38 ms is 5.5% -- the micro-benchmark discount every other graph
+shows.
+
+**What is still not priceable.** Inductor-generated kernels. They are compiled
+into a module whose name does not outlive the process that made it, so there is
+no origin to import and `_origin` returns empty for anything under
+`torch._inductor`. One operator per graph here (`triton_poi_fused_embedding_0`,
+an embedding lookup too small to appear in the profile's top kernels). Unlike
+before, it now says so specifically rather than claiming the operator is not
+registered.

@@ -83,6 +83,13 @@ class OpSpec:
             so a graph that records only tensors cannot be replayed to find out
             what its operators cost. Kept only for values a JSON artifact can
             hold; anything else is dropped rather than guessed at.
+        launch: How to launch a Triton kernel that is not a torch operator, as
+            ``(name, value)`` pairs: ``grid`` and ``origin``. A torch operator
+            can be found again from its name alone, through ``torch.ops``; a
+            raw ``@triton.jit`` kernel cannot, and a grid is not an argument but
+            decides how much work runs. Without both, a recorded Triton launch
+            describes a kernel nobody can call back -- which left the KV gather
+            of every chunked prefill unpriced. Empty for everything else.
     """
 
     name: str
@@ -93,6 +100,7 @@ class OpSpec:
     scalars: tuple[tuple[str, Any], ...] = ()
     int_values: tuple[tuple[int, tuple[int, ...]], ...] = ()
     context: tuple[tuple[str, Any], ...] = ()
+    launch: tuple[tuple[str, Any], ...] = ()
 
     @property
     def is_collective(self) -> bool:
@@ -159,6 +167,7 @@ class OpGraph:
                     "scalars": [list(kv) for kv in op.scalars],
                     "int_values": [[i, list(v)] for i, v in op.int_values],
                     "context": [list(kv) for kv in op.context],
+                    "launch": [list(kv) for kv in op.launch],
                 }
                 for op in self.ops
             ],
@@ -194,6 +203,7 @@ class OpGraph:
                         (int(i), tuple(v)) for i, v in op.get("int_values") or ()
                     ),
                     context=tuple(tuple(kv) for kv in op.get("context") or ()),
+                    launch=tuple(tuple(kv) for kv in op.get("launch") or ()),
                 )
             )
         return graph

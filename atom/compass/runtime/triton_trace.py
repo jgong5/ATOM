@@ -57,6 +57,32 @@ class TritonLaunch:
     constexprs: tuple = ()
 
 
+def _jsonable(v: Any) -> bool:
+    """Whether an argument is a value a JSON artifact can hold and hand back.
+
+    Anything else -- a dtype, a device, a callable -- is not recorded, and a
+    call carrying one cannot be rebuilt at all, so it is marked rather than
+    rebuilt wrongly.
+    """
+    return v is None or isinstance(v, (int, float, bool, str))
+
+
+def _origin(fn: Any) -> str:
+    """``module:name`` the kernel can be imported from, or empty.
+
+    The module attribute is the decorated `JITFunction`, which is what a launch
+    subscripts with a grid, so importing it back gives something callable.
+    Inductor's kernels are generated into a cache module whose name does not
+    survive the process, and report empty.
+    """
+    inner = getattr(fn, "fn", fn)
+    module = getattr(inner, "__module__", "") or ""
+    name = getattr(inner, "__name__", "") or ""
+    if not module or not name or module.startswith("torch._inductor"):
+        return ""
+    return f"{module}:{name}"
+
+
 def _kernel_name(fn: Any) -> str:
     """Best available identity for a kernel.
 
@@ -93,8 +119,24 @@ def _resolve_grid(grid, meta) -> tuple:
     except Exception:  # noqa: BLE001 - a grid we cannot resolve is still worth recording
         return ("<unresolved>",)
     if isinstance(resolved, (list, tuple)):
-        return tuple(int(x) if isinstance(x, int) else str(x) for x in resolved)
-    return (resolved,)
+        return tuple(_as_dim(x) for x in resolved)
+    return (_as_dim(resolved),)
+
+
+def _as_dim(x: Any):
+    """A grid dimension as an int where it is one, and text where it is not.
+
+    A dimension arrives as whatever computed it -- a numpy integer, a tensor
+    scalar, a plain int -- and testing `isinstance(x, int)` recorded the first
+    two as their own repr, which reads back as an unresolved grid and leaves a
+    perfectly resolvable kernel unpriced. Anything that converts cleanly to an
+    integer is one; anything that does not stays text, which is what the
+    unresolved marker is.
+    """
+    try:
+        return int(x)
+    except (TypeError, ValueError):
+        return str(x)
 
 
 class TritonLaunchTracer:
@@ -202,6 +244,17 @@ class TritonLaunchTracer:
                 if isinstance(v, (int, float, bool, str)) and k != "grid"
             )
         )
+        # Positional arguments that are not tensors, by index. A Triton kernel
+        # takes its strides and extents as plain ints alongside its pointers --
+        # the KV gather takes six -- and recording only the tensors loses both
+        # the values and the positions of everything else, so the call cannot be
+        # rebuilt. `None` is recorded too: it is an argument that holds a place.
+        scalars = tuple(
+            (f"#{i}", v) for i, v in enumerate(args)
+            if not isinstance(v, torch.Tensor) and _jsonable(v)
+        )
+        unrebuildable = any(
+            not isinstance(v, torch.Tensor) and not _jsonable(v) for v in args)
         launch = TritonLaunch(
             kernel=name,
             grid=_resolve_grid(kwargs.get("grid"), kwargs),
@@ -210,12 +263,19 @@ class TritonLaunchTracer:
             constexprs=constexprs,
         )
         self.launches.append(launch)
+        # `origin` is where the kernel can be imported from again. A torch
+        # operator is found by name through `torch.ops`; a raw @triton.jit
+        # kernel is only reachable as an attribute of the module that defined
+        # it, and an inductor-generated one is not reachable at all.
+        origin = "" if unrebuildable else _origin(fn)
         self.graph.add(
             OpSpec(
                 name=f"{prefix}::{name}",
                 input_shapes=launch.arg_shapes,
                 output_shapes=(),
                 dtypes=launch.arg_dtypes,
+                scalars=scalars + constexprs,
+                launch=(("grid", list(launch.grid)), ("origin", origin)),
             )
         )
 

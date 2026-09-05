@@ -231,3 +231,41 @@ class TestOperatorsThatCannotBeCaptured:
         assert not _uncapturable(RuntimeError("out of memory"))
         assert not _uncapturable(TypeError(
             "empty() received an invalid combination of arguments"))
+
+
+class TestKernelsThatAreNotTorchOperators:
+    """A raw `@triton.jit` kernel cannot be found through `torch.ops`.
+
+    Recording its name is not enough to call it back, and a launch grid is not
+    an argument but decides how much work runs. Both are recorded so the kernel
+    can be relaunched; without either it stays unpriced rather than being priced
+    over a guessed grid.
+    """
+
+    def test_the_grid_is_part_of_the_key(self):
+        small = _op(shapes=[(4096, 8)], dtypes=["bfloat16"])
+        small["launch"] = [["grid", [64, 8]], ["origin", "m:k"]]
+        large = dict(small, launch=[["grid", [6594, 8]], ["origin", "m:k"]])
+        assert signature_of(small) != signature_of(large), (
+            "same arguments, different amounts of work")
+
+    def test_where_it_came_from_is_not(self):
+        """Origin says how to import the kernel, not what it costs."""
+        a = _op(shapes=[(4096, 8)], dtypes=["bfloat16"])
+        a["launch"] = [["grid", [64, 8]], ["origin", "one:k"]]
+        b = dict(a, launch=[["grid", [64, 8]], ["origin", "other:k"]])
+        assert signature_of(a) == signature_of(b)
+
+    def test_a_kernel_with_no_origin_is_not_resolved(self):
+        """Inductor generates into a module that does not outlive the process."""
+        from atom.compass.runtime.microbench import _resolve_triton
+
+        assert _resolve_triton({"launch": [["grid", [64]], ["origin", ""]]}) is None
+        assert _resolve_triton({"launch": []}) is None
+
+    def test_nor_is_one_whose_grid_never_resolved(self):
+        """A guessed grid would price a different amount of work than ran."""
+        from atom.compass.runtime.microbench import _resolve_triton
+
+        assert _resolve_triton({
+            "launch": [["grid", ["<unresolved>"]], ["origin", "m:k"]]}) is None
