@@ -3625,3 +3625,48 @@ and the boundary term is untouched.
 
 One step of one model is a thin basis for a constant, and it is exposed as
 `compiled_seconds_per_launch` for that reason.
+
+#### Re-measuring the 27B with the split term
+
+The split was committed with prior end-to-end results flagged as needing
+re-measurement. Re-measured, and the 27B prefill step gets **worse**: -0.14%
+with the old eager term, **-5.59%** with the new compiled one, against a
+measured 320.707 ms.
+
+That is not the term being wrong. Profiling the step and accounting for it:
+
+| | |
+| --- | --- |
+| measured step | 320.707 ms |
+| kernels running in situ | 318.351 ms |
+| real idle | **1.497 ms (0.5%)** |
+| priced kernels | 295.946 ms (**-7.0%** against in situ) |
+| overhead the eager term charged | 24.320 ms |
+| overhead the compiled term charges | 6.849 ms |
+
+The 27B prefill step is 99.5% busy. Its real overhead is 1.5 ms, so *both* terms
+overstate it -- and the eager term's 24.3 ms was standing in for **22.4 ms of
+kernel work that was never priced**, this graph being 62% covered. The -0.14%
+was not a validation of the overhead model. It was a constant fitted on this
+model absorbing a coverage hole, and the two errors cancelling to a number that
+looked like agreement.
+
+So the split did not break the 27B. It removed one of two cancelling errors and
+left the other visible, which is the state that can be fixed. What the 27B needs
+is coverage, and the residual now points at it instead of away.
+
+**And the per-launch idle does not transfer either.** 8.51 us per kernel on the
+0.6B chunked prefill, 0.88 us on this one -- the same failure the dispatch
+constant has across models (132.70 / 101.22 / 91.72 us). Overhead, measured
+honestly, is small in both cases (5.6% and 0.5% of the step); it is only large
+when a fitted constant is quietly carrying something else. `step_accounting.py`
+measures it per deployment in one run, which is the answer to a constant that
+will not transfer: measure it rather than default it. The default stays at the
+0.6B figure and is an argument for that reason.
+
+**A tool bug worth recording.** Accounting for that step first reported *negative*
+idle: under tensor parallelism every rank writes its own kernels into the trace
+under its own pid, and summing across ranks counts two GPUs' work against one
+GPU's window. It now accounts for one device and refuses to report at all when
+the kernels exceed the window, because that is arithmetically impossible and
+every number derived from it would be wrong rather than imprecise.

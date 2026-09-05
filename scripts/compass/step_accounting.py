@@ -62,7 +62,15 @@ def main() -> int:
     step = max(steps, key=lambda e: float(e.get("dur", 0)))
     begin = float(step["ts"])
     end = begin + float(step["dur"])
+    # One device. Under tensor parallelism every rank writes its own kernels
+    # into the trace against its own pid, and summing across them counts two
+    # GPUs' work against one GPU's window -- which came out as *negative* idle,
+    # the arithmetic saying plainly that the input was wrong.
+    device = step.get("pid")
+    ranks = {e.get("pid") for e in steps}
     print(f"step: {step['name']}")
+    if len(ranks) > 1:
+        print(f"  {len(ranks)} ranks in this trace; accounting for pid {device}")
     print(f"  device window {float(step['dur']) / 1e3:.3f} ms")
 
     # Kernels of this step, by their own device timestamps. A kernel that
@@ -70,9 +78,16 @@ def main() -> int:
     # most one at each end.
     inside = [e for e in events
               if e.get("cat") in ("kernel", "gpu_memcpy")
+              and e.get("pid") == device
               and begin <= float(e.get("ts", -1)) < end]
     busy = sum(float(e.get("dur", 0)) for e in inside)
     window = float(step["dur"])
+    if busy > window:
+        raise SystemExit(
+            f"kernels sum to {busy / 1e3:.3f} ms inside a {window / 1e3:.3f} ms "
+            "window, which is impossible on one device -- the trace is mixing "
+            "devices or streams that run concurrently, and every number below "
+            "would be wrong rather than merely imprecise")
     print(f"  {len(inside)} kernels running {busy / 1e3:.3f} ms")
     print(f"  idle between them {(window - busy) / 1e3:.3f} ms "
           f"({(window - busy) / window * 100:.1f}% of the step)")
