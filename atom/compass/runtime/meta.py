@@ -179,6 +179,10 @@ class MetaTrace:
 #: grow with the size of a batch.
 MAX_RECORDED_INTS = 4096
 
+#: Dispatch namespaces that are bookkeeping rather than work, and are executed
+#: without being recorded.
+NOT_WORK = ("profiler::",)
+
 
 def _int_ranges_of(tensors) -> tuple:
     """How far each integer tensor argument reached, and whether it climbed.
@@ -348,22 +352,29 @@ class MetaOpTracer(TorchDispatchMode):
         out_shapes = tuple(
             s for s in (_shape_of(o) for o in outs) if s is not None
         )
-        self.graph.add(
-            OpSpec(
-                name=name,
-                input_shapes=in_shapes,
-                output_shapes=out_shapes,
-                dtypes=dtypes,
-                group=_resolve_group(name, self.topology),
-                scalars=_scalars_of(args, kwargs),
-                int_values=_int_values_of(tensors),
-                int_ranges=_int_ranges_of(tensors),
-                # An operator that reads ambient state needs that state recorded
-                # with it; its arguments do not describe it, and cannot be made
-                # to. Empty for everything but attention.
-                context=forward_ctx.capture(name),
+        # Recorded and executed are not the same thing. A profiler operator
+        # closes a `record_function` region and runs no kernel, so it belongs in
+        # the dispatch stream but not in a graph of what a step costs -- and it
+        # cannot be priced, because it takes an argument that is not a value the
+        # graph can hold, so it sat in every coverage figure as a permanently
+        # unpriced operator suggesting something was missing.
+        if not name.startswith(NOT_WORK):
+            self.graph.add(
+                OpSpec(
+                    name=name,
+                    input_shapes=in_shapes,
+                    output_shapes=out_shapes,
+                    dtypes=dtypes,
+                    group=_resolve_group(name, self.topology),
+                    scalars=_scalars_of(args, kwargs),
+                    int_values=_int_values_of(tensors),
+                    int_ranges=_int_ranges_of(tensors),
+                    # An operator that reads ambient state needs that state
+                    # recorded with it; its arguments do not describe it, and
+                    # cannot be made to. Empty for everything but attention.
+                    context=forward_ctx.capture(name),
+                )
             )
-        )
         return out
 
 

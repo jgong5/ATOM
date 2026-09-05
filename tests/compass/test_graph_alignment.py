@@ -311,3 +311,42 @@ def test_a_real_batch_still_reaches_the_recording_path():
 
     assert CompassModelRunner.forward(stub, RealBatch()) == "out"
     assert reached
+
+
+class TestWhatIsRecordedAndWhatIsOnlyExecuted:
+    """A traced graph is what a step costs, not everything it dispatched.
+
+    `profiler::_record_function_exit` closes a `record_function` region and runs
+    no kernel. Recording it put an operator in every graph that could never be
+    priced -- it takes an argument no artifact can hold -- so every coverage
+    figure carried a permanent shortfall suggesting something was missing.
+    """
+
+    def test_a_profiler_operator_is_executed_but_not_recorded(self):
+        import torch
+
+        from atom.compass.core.graph import OpGraph
+        from atom.compass.runtime.meta import MetaOpTracer
+
+        graph = OpGraph()
+        with MetaOpTracer(graph=graph):
+            with torch.profiler.record_function("a region"):
+                torch.ones(4) + torch.ones(4)
+
+        names = [op.name for op in graph.ops]
+        assert names, "the real operators are still recorded"
+        assert not any(n.startswith("profiler::") for n in names), names
+
+    def test_the_work_inside_the_region_still_is(self):
+        import torch
+
+        from atom.compass.core.graph import OpGraph
+        from atom.compass.runtime.meta import MetaOpTracer
+
+        graph = OpGraph()
+        with MetaOpTracer(graph=graph):
+            with torch.profiler.record_function("a region"):
+                torch.ones(4) + torch.ones(4)
+
+        assert any("add" in op.name for op in graph.ops), [
+            op.name for op in graph.ops]

@@ -3505,6 +3505,14 @@ something else.
 | torch operators only | 354/356 | 99.4% |
 | with generated kernels | **365/366** | **99.7%** |
 
-The one operator left is `profiler::_record_function_exit`, which is an artifact
-of tracing rather than work. The step predicts at **-5.58%**, which is the
-micro-benchmark discount and no longer anything specific to chunked prefill.
+| profiler operators dropped | **364/364** | **100%** |
+
+Recorded and executed are not the same thing. `record_function` dispatches
+`profiler::_record_function_enter_new` and `_record_function_exit`, which run no
+kernel; recording them put operators in every graph that could never be priced
+-- the exit takes an argument no artifact can hold -- so every coverage figure
+carried a permanent shortfall suggesting something was missing. They are now
+executed without being recorded (`NOT_WORK` in `meta.py`).
+
+The step predicts at **-5.53%**, which is the micro-benchmark discount and no
+longer anything specific to chunked prefill.
