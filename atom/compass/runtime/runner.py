@@ -876,6 +876,16 @@ class CompassModelRunner(ModelRunner):
             cov["operators_priced"], cov["operators"],
             100 * cov["fraction_of_operators"], out,
         )
+        # A price taken outside a graph carries per-launch overhead the graph
+        # would have amortised, so it is not the same kind of number as the
+        # rest and should not be read as one silently.
+        fell_back = sum(1 for e in result["prices"].values()
+                        if e.get("cache") == "over"
+                        and config.bench_cache == "graph")
+        if fell_back:
+            logger.info(
+                "ATOMCompass: %d of those could not be graph-captured and were "
+                "timed back-to-back instead", fell_back)
 
     def warmup_model(self) -> None:
         """Warm up for real whenever the forward is real.

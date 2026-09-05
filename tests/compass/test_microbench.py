@@ -204,3 +204,30 @@ class TestOperatorsThatReadAmbientState:
         microbench.price_graph(str(path), cache="hot")
 
         assert asked == [microbench.KV_VARIANTS, 1]
+
+
+class TestOperatorsThatCannotBeCaptured:
+    """Some operators cannot go into a CUDA graph at all.
+
+    Chunked-prefill attention gathers cached and new KV with a
+    `repeat_interleave` whose output size is only known on the device, so it
+    synchronises, and a synchronise inside a capture is an error. Refusing to
+    price those left the whole of chunked prefill unpriced; they are timed
+    back-to-back instead, which is a different kind of number and so is
+    recorded as one.
+    """
+
+    def test_a_capture_failure_is_told_from_a_broken_operator(self):
+        from atom.compass.runtime.microbench import _uncapturable
+
+        assert _uncapturable(RuntimeError(
+            "HIP error: operation not permitted when stream is capturing"))
+        assert _uncapturable(RuntimeError("cudaErrorStreamCaptureUnsupported"))
+
+    def test_an_ordinary_failure_still_leaves_the_operator_unpriced(self):
+        """A fallback that swallowed real errors would price nonsense."""
+        from atom.compass.runtime.microbench import _uncapturable
+
+        assert not _uncapturable(RuntimeError("out of memory"))
+        assert not _uncapturable(TypeError(
+            "empty() received an invalid combination of arguments"))

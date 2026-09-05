@@ -470,6 +470,15 @@ def _time_isolated(fn, sets: list, iters: int, warmup: int) -> tuple[float, floa
     return statistics.median(samples), 0.0
 
 
+def _uncapturable(exc: Exception) -> bool:
+    """Whether a failure means "this cannot be graph-captured" rather than
+    "this operator is broken"."""
+    text = str(exc)
+    return ("stream is capturing" in text
+            or "StreamCaptureUnsupported" in text
+            or "capture_begin" in text)
+
+
 def _time_over(fn, sets: list, iters: int, warmup: int) -> tuple[float, float]:
     """Seconds per call on the device, and seconds per call on the host.
 
@@ -601,10 +610,32 @@ def price_graph(graph_path: str, iters: int = 2000, warmup: int = 20,
         if sets is None:
             unpriced[sig] = "unknown dtype"
             continue
+        used = cache
         try:
             if cache == "graph":
-                seconds, host_seconds = _time_in_graph(
-                    fn, sets, iters, warmup, before=rotate)
+                try:
+                    seconds, host_seconds = _time_in_graph(
+                        fn, sets, iters, warmup, before=rotate)
+                except Exception as exc:  # noqa: BLE001
+                    if not _uncapturable(exc):
+                        raise
+                    # Some operators cannot be captured at all. Chunked-prefill
+                    # attention gathers cached and new KV with a
+                    # `repeat_interleave` whose output size is only known on the
+                    # device, so it synchronises, and a synchronise inside a
+                    # capture is an error. Refusing to price those leaves the
+                    # whole of chunked prefill's attention unpriced; timing them
+                    # back-to-back instead prices them, at the cost of carrying
+                    # per-launch overhead the graph would have amortised.
+                    #
+                    # `used` records which, so a reader can tell one price from
+                    # the other rather than finding them silently mixed.
+                    used = "over"
+                    import torch
+                    torch.cuda.synchronize()
+                    if variants:
+                        variants[0]()
+                    seconds, host_seconds = _time_over(fn, sets, iters, warmup)
             else:
                 timer = _time_isolated if cache == "isolated" else _time_over
                 seconds, host_seconds = timer(fn, sets, iters, warmup)
@@ -621,7 +652,7 @@ def price_graph(graph_path: str, iters: int = 2000, warmup: int = 20,
             "name": op["name"],
             "seconds": seconds,
             "occurrences": counts[sig],
-            "cache": cache,
+            "cache": used,
             "arg_sets": len(sets),
             "kv_regions": len(variants) or 1,
             # Host enqueue cost per call. Where this matches `seconds`, the

@@ -3359,14 +3359,58 @@ is not the same test as cross-validation on the sample, and the difference here
 was 1% versus 6%. Where a sample is small and geometrically spaced, LOO reports
 how stable the fit is, not whether the family is right.
 
-#### Chunked prefill attention cannot be priced yet
+#### Pricing chunked prefill
 
-A step exceeding `max_num_batched_tokens` traces the 356-operator chunked
+A step exceeding `max_num_batched_tokens` runs the 356-operator chunked
 structure (`state=prefill_prefix`, `has_cached=True`, e.g. 3458 query tokens
-against 6594 keys). Its attention operators price at **0 of 28**, every one
-failing in tensor construction with `TypeError: empty() received an invalid
-combination of arguments`. The input shapes are structurally identical to the
-unchunked case, so the fault is in installing the recorded context -- chunked
-prefill carries `block_tables` and `has_cached` that the unchunked path does
-not. Reproduce with `--num-prompts 3 --prompt-tokens 1100`. Until this is
-fixed, only unchunked prefill can be priced or fitted.
+against 6594 keys). Every one of its attention operators was unpriced. Two
+separate causes, and the first hid the second.
+
+**The metadata the prefix path reads was never recorded.** The gather that
+packs cached and new KV into one dense tensor takes its size from
+`total_kv` and its per-sequence offsets from `seq_starts`
+(`attentions/backends.py` sets both, plus `num_cached_tokens`, only under
+`has_cached`). Neither is recoverable from the shapes -- the query length is the
+*new* tokens while the gather spans cached+new -- so the rebuilt metadata had
+`total_kv=None` and the gather allocated `torch.empty((None, ...))`. All 28
+failed identically, which is what a missing field looks like and not what a
+broken operator looks like. They are now captured and installed, recorded only
+under `has_cached`: `total_kv` is set on the unchunked path too, but nothing
+there reads it, and recording it unconditionally would rewrite the signature of
+every attention call already priced for a value that changes no cost.
+
+**Chunked attention cannot be graph-captured at all.** With the metadata fixed
+the failure became `HIP error: operation not permitted when stream is
+capturing`. The gather calls `repeat_interleave` with a device tensor of
+repeats, whose output size is only known on the device, so it synchronises --
+and a synchronise inside a capture is an error. Refusing to price uncapturable
+operators leaves the whole of chunked prefill unpriced, so `price_graph` now
+falls back to timing them back-to-back, and records which mode each price came
+from (`cache: "over"` against `"graph"`) rather than mixing two kinds of number
+silently. The run reports the count.
+
+Chunked prefill now prices at **326 of 356 operators (91.6%)**, attention at 28
+of 28, and predicts the step it came from:
+
+| | |
+| --- | --- |
+| priced kernel time | 99.565 ms |
+| eager dispatch overhead | 20.303 ms |
+| priced total | 119.868 ms |
+| measured step | 132.975 ms |
+| | **-9.86%** |
+
+**What the residual is.** 30 operators are still unpriced, 28 of them
+`cp_mha_gather_cache_kernel` -- a raw `@triton.jit` kernel rather than a
+registered torch op, so `_resolve` cannot find it in `torch.ops` and no amount
+of context fixes that. This is a structural limit of pricing by operator name:
+inductor-generated and hand-written Triton kernels are recorded by the tracer
+and cannot be called back. A profile of the same configuration puts the gather
+at 5.88 ms (28 calls, 210 us each). Adding it back gives 125.75 ms against
+132.975 ms, or **-5.4%** -- which is the micro-benchmark discount already
+documented for every other graph, not something particular to chunked prefill.
+The profiled step (133.96 ms) agrees with the measured one, so the measurement
+is not in question.
+
+So chunked prefill is priced, its shortfall is named and quantified, and what
+remains is the general problem of Triton kernels that are not torch operators.

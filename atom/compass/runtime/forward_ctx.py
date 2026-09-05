@@ -84,6 +84,24 @@ def _capture_attention() -> tuple[tuple[str, Any], ...]:
         ("positions", _values(fwd.context.positions)),
     ]
 
+    # Chunked prefill reads three more fields than any other path. The prefix
+    # gather packs cached and new KV into one dense tensor, taking its size
+    # from `total_kv` and its per-sequence offsets from `seq_starts` -- neither
+    # recoverable from the shapes, since the query length is the *new* tokens
+    # and the gather is over cached+new. Without them the gather allocates
+    # `torch.empty((None, ...))` and every chunked attention goes unpriced.
+    #
+    # Recorded only under `has_cached`, which is where they are populated and
+    # read. `total_kv` is set on the unchunked path too, but nothing there
+    # reads it, and recording it unconditionally would rewrite the signature of
+    # every attention call already priced for a value that changes no cost.
+    if md.has_cached:
+        recorded += [
+            ("total_kv", int(md.total_kv or 0)),
+            ("seq_starts", _values(md.seq_starts)),
+            ("num_cached_tokens", _values(md.num_cached_tokens)),
+        ]
+
     table = md.block_tables
     if table is not None and table.dim() == 2:
         block_size = int(get_current_atom_config().kv_cache_block_size)
@@ -189,6 +207,13 @@ def _install_attention(recorded: dict[str, Any], variants: int) -> list:
             min_seqlen_q=int(recorded.get("min_seqlen_q", 0)),
             has_cached=bool(recorded.get("has_cached", False)),
             state=AttnState(recorded.get("state", AttnState.DECODE.value)),
+            # Absent for every path but chunked prefill, where they decide the
+            # size of the gathered KV rather than merely describing it.
+            total_kv=(None if recorded.get("total_kv") is None
+                      else int(recorded["total_kv"])),
+            seq_starts=tensor(recorded.get("seq_starts"), torch.int32),
+            num_cached_tokens=tensor(
+                recorded.get("num_cached_tokens"), torch.int32),
         )
         context = Context(
             positions=tensor(recorded.get("positions"), torch.int64),
