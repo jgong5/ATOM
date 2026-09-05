@@ -1868,13 +1868,51 @@ so over-predict `pm_n2` by ~20%. Prefill below roughly 2k tokens is not
 token-bound at all, which is the same shape of finding as decode being flat from
 batch 1 to 8.
 
-**And one measurement is not explained by anything.** `sq_2x400` carries 4588
-tokens in two sequences and measures 52.3 ms, where `sq_4x200` carries *fewer*
-tokens (4376) in more sequences and measures 63.2 ms. More tokens and more
-attention work for less time. Both are single measurements with no repeats, and
-the serving work already established that a single draw here is not a
-measurement. It should be repeated before anyone theorises about it -- including
-me, which is why there is no theory here.
+**And one measurement looked unexplainable.** `sq_2x400` carries 4588 tokens in
+two sequences and measures 52.3 ms, where `sq_4x200` carries *fewer* tokens
+(4376) in more sequences and measures 63.2 ms. More tokens and more attention
+work for less time.
+
+Repeated five times each, it is not noise. The measurements are tight to a tenth
+of a percent:
+
+| config | seqs | tokens | mean ± sd |
+| --- | --- | --- | --- |
+| 8x100 | 8 | 3952 | 55.32 ± 0.07 ms |
+| 4x200 | 4 | 4376 | 63.16 ± 0.02 ms |
+| 2x400 | 2 | 4588 | **52.14 ± 0.03 ms** |
+| 1x800 | 1 | 4694 | 65.13 ± 0.05 ms |
+
+So prefill is **non-monotone in token count**, reproducibly. Pricing one gemm --
+`[M,1024] x [4096,1024]`, whose M *is* the step's token count -- across the same
+range says why:
+
+| M | gemm | tile |
+| --- | --- | --- |
+| 3952 | 539.22 µs | `MT256x224x64` |
+| 4376 | 536.80 µs | `MT256x224x64` |
+| **4500** | **259.68 µs** | **`MT256x192x64`** |
+| 4588 | 267.80 µs | `MT256x256x32` |
+| 4694 | 260.33 µs | `MT256x192x64` |
+
+The gemm **halves** between 4376 and 4500 when the library switches tile. The two
+expensive steps sit on the slow side of that cliff and the cheap one on the fast
+side, and `1x800` is on the fast side yet costs more than `2x400` because it is
+one sequence rather than two -- the quadratic term again.
+
+So the four points need *both* effects, and they are independent: a gemm cliff in
+total tokens, and attention's quadratic in the length distribution. What is not
+reconciled is magnitude -- one gemm's 269 µs saving times the gemms in a step
+would over-explain the 11 ms difference, so the other gemm shapes presumably
+cross at different M and partly cancel. The mechanism is established; the
+arithmetic is not.
+
+**This is the third and strongest argument for pricing at operator level.** Both
+effects are invisible in a step's shape and automatic at operator level: a gemm
+priced at its own M carries the tile cliff whether or not anyone knows it is
+there, and attention priced at its own `cu_seqlens_q` carries the quadratic. A
+step-level model in token count cannot represent either, and this is why its
+residuals were not merely large but non-monotone.
 
 So the fit confirms the mechanism and refuses to be a model: right feature, wrong
 granularity. Attention's quadratic cost belongs to *attention*, where the graph
