@@ -105,6 +105,16 @@ def _make_tensor(shape, dtype_name: str, values=None):
     Without recorded values an integer tensor falls back to zeros -- in range
     for anything that indexes, where a random value would not be -- and the
     price that results should be read as describing the shape only.
+
+    A latent hazard, recorded because it is easy to reach for as an explanation
+    and was once reached for wrongly: a recorded index is only in range for the
+    tensor it was recorded against, so replaying one into a rebuilt tensor of a
+    different size would fault the device rather than raise, and a GPU memory
+    fault kills the process -- losing the run rather than one signature. It has
+    not been observed. An `HSA_STATUS_ERROR_EXCEPTION` during prefill pricing
+    was blamed on it and turned out to be an oversubscribed device: a leaked
+    engine process from an earlier run was holding 169 GB. Set
+    ``COMPASS_REPLAY_INT_VALUES=0`` to fall back to zeros if it ever does bite.
     """
     import torch
 
@@ -112,7 +122,7 @@ def _make_tensor(shape, dtype_name: str, values=None):
     if dtype is None:
         return None
     size = tuple(int(d) for d in shape)
-    if values is not None and not dtype.is_floating_point:
+    if values is not None and REPLAY_INT_VALUES and not dtype.is_floating_point:
         flat = torch.tensor(list(values), dtype=dtype, device="cuda")
         if flat.numel() == int(torch.Size(size).numel()):
             return flat.reshape(size)
@@ -298,6 +308,11 @@ def _build_arg_sets(op: dict, cache: str, fn) -> Optional[list]:
 #: driving per-call cost down as B grew instead of letting it asymptote. So what
 #: is measured is a latency and not a throughput. 64 is comfortably past the knee.
 GRAPH_BATCH = int(os.environ.get("COMPASS_GRAPH_BATCH", "64"))
+
+#: Whether to write recorded integer contents back into rebuilt tensors. On, as
+#: it has always been; the escape hatch exists because an out-of-range index
+#: would fault the device rather than raise. See `_make_tensor`.
+REPLAY_INT_VALUES = os.environ.get("COMPASS_REPLAY_INT_VALUES", "1") != "0"
 
 #: Distinct KV-cache regions a captured batch rotates over. One per captured
 #: call by default, so a region is revisited only after every other has been

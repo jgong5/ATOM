@@ -1750,6 +1750,51 @@ points, so this is one parameter fitted in-sample. What is being validated is th
 *structure* -- which graph to use for which step -- not that constant, and the
 structure is what the -37.7% was about.
 
+### Prefill does not interpolate either, and the dispatch term is wrong for it
+
+The decode half of #6b was closed by measuring an enumerable set. Prefill token
+counts are not enumerable, so the hope was that a *step* -- hundreds of kernels --
+would be smooth in tokens even though a single gemm is not, letting a handful of
+measured sizes cover the range. Traced and priced at six sizes on the 0.6B, one
+prefill step each, and measured against real steps at the same sizes:
+
+| tokens | priced | measured | priced/measured | overhead per operator |
+| --- | --- | --- | --- | --- |
+| 1094 | 15.766 ms | 31.746 ms | **0.50** | 50.1 µs |
+| 2188 | 28.460 ms | 31.985 ms | 0.89 | 11.0 µs |
+| 4376 | 60.685 ms | 63.291 ms | 0.96 | 8.2 µs |
+| 6564 | 76.218 ms | 79.135 ms | 0.96 | 9.1 µs |
+| 8752 | 100.459 ms | 104.421 ms | 0.96 | 12.4 µs |
+| 13530 | 127.520 ms | 132.948 ms | 0.96 | 17.0 µs |
+
+**The hypothesis fails.** Interpolating a measured step between its measured
+neighbours gives a median of 12.2% and a worst of 32.1%, against 2.1% for the
+decode ladder, which measures exactly instead. Averaging over hundreds of kernels
+does not smooth the shape dependence enough to interpolate across.
+
+Two further things fall out, both worth more than the failed hypothesis.
+
+*The dispatch term is wrong for prefill on this model.* Measured overhead per
+operator is 8 to 50 µs where `dispatch_seconds` charges up to 130, and applying
+it gives +35% at 1094 tokens and +59% at 2188 against +4.2% at 13530. Worse, the
+measured overhead **rises** with token count above 4k -- 8.2, 9.1, 12.4, 17.0 µs
+-- where "dispatch the kernels hide" predicts it should fall. The model has the
+sign wrong in the range that matters.
+
+*Priced kernels alone are 0.96 of a prefill step above ~4k tokens.* No overhead
+term at all beats the one we have, for every size except the smallest. That is
+worth knowing before more effort goes into modelling the term.
+
+*And prefill depends on sequence count, not only token count.* 1256 tokens in
+four sequences measured 42.6 ms; 1094 tokens in one sequence measured 31.7 ms.
+Nearly the same work, half again the time, because attention pays per sequence.
+So prefill's shape is at least two-dimensional and every measurement above varies
+only one of them.
+
+Which leaves prefill needing a fitted form -- `empirical/fitted` at operator
+level, the cell of the grid still empty -- or derivation (#7). It is the one part
+of the cost model where measuring the shapes that occur is not a viable strategy.
+
 ### 6c. Expert parallelism: what ran was not meaningful EP — **L**
 
 Qwen3-30B-A3B, 128 experts and 8 per token, at TP=2 with
