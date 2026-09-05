@@ -1,0 +1,35 @@
+Measure admission instead of passing it in, and refit on repeats
+
+validate.py derives admission from the real run as TTFT minus the
+prefill step that produced the first token -- exact for an offline
+workload, where every request arrives at once and one prefill step
+serves them all, so there is no queueing between the two to mistake
+for admission. 13.7ms end to end, against 13.19 +- 0.5ms measured
+independently over three runs, and against the 13ms that had been
+passed by hand and turns out to have been right.
+
+Deriving it from the modelled run would have been easier and is
+circular: it would absorb whatever TTFT error the oracle has and
+report zero. This uses only the real run.
+
+Recording the real run costs nothing, which had to be checked rather
+than assumed. Over three repeats a measured run and a plain one agree
+on TTFT to 2% and on TPOT and latency to well under 1%. A single pair
+of runs had suggested a 28% observer effect on TTFT; it was
+contention, and one run could not have told the difference.
+
+Both overhead constants are refitted over three runs. They were first
+fitted on one step each -- a 37.27ms prefill and a 3.115ms decode --
+and over repeats those steps are 42.64 +- 0.22 and 3.201 +- 0.06, so
+the samples were 13% and 3% low. 67.4 -> 86.35us/op and 2.02 ->
+2.25us/launch. The prefill step had been reported at -1.9% against
+that one sample and was really -14%.
+
+Every metric is now inside the run-to-run noise:
+
+                 predicted   real(n=3)    err   noise
+  ttft            55.580ms    54.731ms   +1.6%  +-1.0%
+  tpot             3.200ms     3.189ms   +0.3%  +-1.8%
+  latency        154.783ms   153.594ms   +0.8%  +-0.8%
+  96 tokens tpot   3.200ms     3.208ms   -0.2%  +-1.9%
+  96 tokens lat  359.591ms   358.687ms   +0.3%  +-1.4%

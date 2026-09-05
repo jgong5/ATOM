@@ -1,0 +1,6 @@
+Write up the prefill work
+
+Records what the previous commit did and what it cost to get there:
+the three things that had to be right, the two that were wrong first,
+and the multi-graph interpolation that was dropped as not worth its
+complexity.

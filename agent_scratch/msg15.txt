@@ -1,0 +1,24 @@
+Fix the container C++ headers, and run the target model for the first time
+
+apt-get install libstdc++-14-dev, recorded as
+gpu_docker/fix-cxx-headers.sh because the writable layer survives a
+restart but not a teardown or an image upgrade. The image carried gcc
+runtime directories for 13 and 14 but headers only for 13, so clang
+selected the newest and could not resolve <cmath>. Installing the
+matching headers is additive; nothing that already compiled changes
+toolchain.
+
+Verified by compiling a trivial --genco unit including <cmath> and
+<cstdlib>, then by the two things it had blocked:
+
+  Qwen3.8-27B loads and generates. The project's actual target model
+  had never run on this machine. Two requests, 99.3s wall, at TP=2.
+
+  MORI's dispatch/combine kernels build, so expert parallelism above
+  ep_size == tp_size gets past compilation.
+
+EP still does not run to completion, but the reason has changed and is
+unrelated: atom/utils/backends.py:649 asserts VllmBackend can only be
+called once, and under DP-attention it is called more than once.
+Recorded as defect 10. The compile error had been masking it, so the
+two had to be cleared in order.

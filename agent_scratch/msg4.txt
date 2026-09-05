@@ -1,0 +1,34 @@
+Cool the KV cache the benchmark was pricing warm
+
+The cache is not an argument -- attention fetches it from the forward
+context -- so no argument-rotation mode reaches it, and hot and cold
+alike priced it resident across the whole captured batch. Since
+Compass now installs that context, the fix goes there: install
+returns one thunk per KV region, offsetting the recorded call's block
+ids and slots by the span it used, and _time_in_graph installs the
+i-th before capturing the i-th call. Host-only work, so nothing is
+allocated inside the capture, and a region is revisited only after
+every other has been walked -- eviction reproduced rather than
+simulated. Scrubbing instead would mean a 100us baseline subtraction
+against an 18us operator.
+
+The sweep shows the mechanism: 18.31us at one region, rising to
+20.77 at 128 and flat to 512 (2.6 GB). One region per captured call
+is the default, which is where the knee is.
+
+It closes a third of the gap -- 25.21us in situ against 21.06 now,
+19.94 before -- and the error goes 27% to 18%.
+
+The rest was never attention's. The gemms in the same graph are
+priced against their own in-situ kernels at 39.19us versus 44.79us,
+0.875, and they never touch the KV cache. Every kernel is priced
+13-16% under what it costs in a step, whatever it touches. That is a
+property of pricing kernels apart from the step and no cache
+modelling will remove it. Two candidates recorded, one of which this
+harness has already half-measured: cold came out 0.94x hot, read at
+the time as independent output buffers pipelining where a shared one
+serialises.
+
+Worth knowing because it bounds the approach: priced kernels are
+systematically optimistic by about an eighth, before any question of
+whether they sum to a step.

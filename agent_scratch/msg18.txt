@@ -1,0 +1,40 @@
+Predict the target model's decode step to +0.1%, unrefitted
+
+Qwen3.8-27B, warmed: decode step 17.840ms, priced kernels 16.173ms,
+plus 747 launches at the 0.6B's 2.25us gives 17.854ms. +0.1%, with a
+constant fitted on a dense 0.6B and carried unchanged to a 27B hybrid.
+
+Also corrects the coverage reading from the previous commit. 62.1% by
+operator count is not 38% of the model missing: TritonLaunchTracer
+records a custom op's inner kernels as well as the dispatcher-level
+operator that launched them, so the graph holds both
+linear_attention_with_output_base (priced) and the conv1d and gating
+kernels inside it (unpriced). Pricing both would double-count. By time
+the decode graph is ~90% priced, and with the overhead term it is
+within a tenth of a percent. Problem 10 is therefore about
+attribution, not cost.
+
+And the two overhead constants turn out to be different things:
+
+                          0.6B     27B
+  replayed, per launch    2.25us   2.25us (unrefitted, +0.1%)
+  eager, per operator    86.35us  34.62us
+
+A replayed step has no host in the loop, so its per-launch cost is a
+hardware property -- the boundary between two dependent kernels -- and
+transferred across a 45x size difference without refitting. An eager
+step's per-operator cost is host dispatch, which does not add to
+kernel time so much as race it: only the part the device cannot hide
+is paid. Small kernels on the 0.6B hide little and it reads 86us;
+large kernels on the 27B hide most and it reads 34.6us.
+
+So the eager term is roughly max(0, dispatch - kernel) summed over
+operators, and being a function of kernel sizes already in the price
+list it could be computed rather than fitted. That would remove the
+last thing needing a measured step from the configuration being
+predicted.
+
+Also records that the 27B's first prefill costs 7130.9ms against a
+warmed 320.3ms -- 96% of it Triton autotuning the DeltaNet kernels --
+so any single-shot benchmark of this model measures compilation, and
+the admission estimator is only valid on a warmed process.

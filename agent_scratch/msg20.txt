@@ -1,0 +1,32 @@
+Hold admission out, test the dispatch constant on a third model
+
+Both checks found something, and one of them narrows yesterday's claim.
+
+Admission held out: carrying the 18.447ms measured on a 16-token
+workload to a 32-token one gave ttft +6.58% against +2.45%. But the
+real column was the tell -- the 32-token run's TTFT is 326.07ms where
+the 16-token run's was 339.22, for identical prompts and an identical
+prefill, and TTFT cannot depend on output length. Running 16 tokens
+plain gives 328.04ms. Measure mode costs ~11ms of TTFT on this model,
+4% of it, against about 2% on the 0.6B, so admission was measured in
+one mode and the prediction judged against the other. The constant is
+fine; the pairing was not. validate.py measures and compares on the
+same footing and is unaffected.
+
+The dispatch constant on a third model: Qwen3-30B-A3B fits D = 91.72us
+where the 0.6B fits 132.70 and the 27B 101.22. At the shared 130us its
+prefill is +16.8%. So restating the eager overhead as a dispatch the
+kernels race narrows the spread from 2.5x to 1.45x without removing
+it, and a shared value is good on one unseen model and poor on
+another. dispatch_seconds stays the default as the better and bounded
+choice, but an eager step still needs one measured step from the model
+being predicted for better than ~15%.
+
+The replayed constant survives the same test: on the MoE, priced
+decode plus 481 launches at the 0.6B's 2.25us gives 8.193ms against
+7.900 measured, +3.7%. That constant has now carried unchanged across
+a dense 0.6B, a 27B hybrid and a 30B MoE.
+
+So "predicts rather than interpolates" holds for decode and not for
+prefill. For a long generation that is a small caveat on a large
+result; for a prefill-dominated one it is the whole result.

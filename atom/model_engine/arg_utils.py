@@ -17,6 +17,7 @@ from atom.config import (
     SpeculativeConfig,
 )
 from atom.model_engine.engine_core_mgr import DP_LB_DEFAULT, DP_LB_STRATEGIES
+from atom.compass.config import CompassConfig
 
 logger = logging.getLogger("atom")
 
@@ -48,6 +49,21 @@ class EngineArgs:
     data_parallel_master_port: int = 29500
     data_parallel_base_port: int | None = None
     enforce_eager: bool = False
+    compass: bool = False
+    compass_oracle: str = ""
+    compass_oracle_option: list = None
+    compass_mode: str = "predict"
+    compass_graph_out: str = ""
+    compass_trace_prefill: int = 0
+    compass_memory_out: str = ""
+    compass_measure_out: str = ""
+    compass_measure_warmup_steps: int = 0
+    compass_admission_seconds: float = 0.0
+    compass_op_timings_out: str = ""
+    compass_bench_graph: str = ""
+    compass_bench_out: str = ""
+    compass_bench_iters: int = 2000
+    compass_bench_cache: str = "hot"
     enable_prefix_caching: bool = True
     port: int = 8006
     kv_cache_dtype: str = "bf16"
@@ -111,6 +127,141 @@ class EngineArgs:
             "--trust-remote-code",
             action="store_true",
             help="Trust remote code when loading model.",
+        )
+        parser.add_argument(
+            "--compass",
+            action="store_true",
+            help="Run under ATOMCompass: predict the forward pass instead of "
+            "performing it. Selects the Compass model runner and puts the "
+            "engine on a virtual clock.",
+        )
+        parser.add_argument(
+            "--compass-mode",
+            type=str,
+            default="predict",
+            choices=["predict", "trace", "measure"],
+            help="predict: replace the forward pass with a cost estimate. "
+            "trace: run the real forward and record the operators it performed, "
+            "writing the graph to --compass-graph-out. "
+            "measure: run the real forward and record how long it took, "
+            "writing timings to --compass-measure-out.",
+        )
+        parser.add_argument(
+            "--compass-graph-out",
+            type=str,
+            default="",
+            help="Where --compass-mode=trace writes the recorded op graph.",
+        )
+        parser.add_argument(
+            "--compass-trace-prefill",
+            type=int,
+            default=0,
+            help="Also record a prefill step, counting prefills from one. A "
+            "decode graph says nothing about a prefill step, so without this an "
+            "oracle has to fall through to a calibrated fallback for TTFT. Use 2 "
+            "rather than 1: Triton autotunes a shape on its first launch, so the "
+            "first prefill of a workload records a benchmarking run rather than "
+            "a serving one.",
+        )
+        parser.add_argument(
+            "--compass-memory-out",
+            type=str,
+            default="",
+            help="Where to record what the memory budget was made of: the four "
+            "device readings the KV sizing is derived from, and the block counts "
+            "they produced. Every run computes these and discards them, so a run "
+            "without this flag is a validation sample that cannot be recovered.",
+        )
+        parser.add_argument(
+            "--compass-measure-out",
+            type=str,
+            default="",
+            help="Where --compass-mode=measure writes per-step timings, which "
+            "are what a calibrated oracle is fitted to.",
+        )
+        parser.add_argument(
+            "--compass-measure-warmup-steps",
+            type=int,
+            default=0,
+            help="Steps of each kind (prefill, decode) to time and discard. "
+            "One is usually right: it drops the launch that pays for Triton "
+            "autotuning. Larger values risk discarding every prefill sample a "
+            "workload produces, since prefill steps are rare.",
+        )
+        parser.add_argument(
+            "--compass-bench-graph",
+            type=str,
+            default="",
+            help="A captured graph whose kernels to price. With "
+            "--compass-bench-out, prices each distinct operator signature once "
+            "after warmup, calling it --compass-bench-iters times inside a "
+            "single pair of events. Needs a mode that really warms up (trace or "
+            "measure): aiter registers kernels lazily on first call, so nothing "
+            "can price one before the model has run.",
+        )
+        parser.add_argument(
+            "--compass-bench-out",
+            type=str,
+            default="",
+            help="Where the kernel price list is written.",
+        )
+        parser.add_argument(
+            "--compass-bench-iters",
+            type=int,
+            default=2000,
+            help="Calls per signature, timed as one block (default 2000).",
+        )
+        parser.add_argument(
+            "--compass-bench-cache",
+            type=str,
+            default="hot",
+            choices=["hot", "cold", "graph", "isolated"],
+            help="Cache state to price kernels in. 'hot' reuses one set of "
+            "inputs, which flatters anything memory-bound; 'cold' rotates over "
+            "enough sets to overflow the cache, which is what reading a weight "
+            "or a KV block really costs. The truth is per argument -- a gemm's "
+            "activation is hot and its weight is not -- so the two bracket it. "
+            "'graph' captures the calls into a CUDA graph, removing the ~30us "
+            "per-call launch cost that otherwise swamps a decode-shape kernel "
+            "and is what production removes too.",
+        )
+        parser.add_argument(
+            "--compass-op-timings-out",
+            type=str,
+            default="",
+            help="Where a traced step writes how long each operator took. Only "
+            "meaningful with --compass-mode=trace, which runs eagerly: a "
+            "replayed CUDA graph is one submission with nothing to observe "
+            "inside it, so these are eager times and not production costs.",
+        )
+        parser.add_argument(
+            "--compass-admission-seconds",
+            type=float,
+            default=0.0,
+            help="Seconds a request takes to become schedulable, simulated. A "
+            "simulated run advances its clock by predicted forward durations, "
+            "so the two process hops between preprocess and a worker cost "
+            "nothing -- measured at 8-18ms here, and the whole of a -20%% TTFT "
+            "error. Defaults to 0, which is the behaviour before this existed. "
+            "Measure it per deployment: it is a property of the machine and the "
+            "process layout, not of the model.",
+        )
+        parser.add_argument(
+            "--compass-oracle-option",
+            type=str,
+            action="append",
+            default=[],
+            metavar="KEY=VALUE",
+            help="Constructor argument for the cost oracle. Repeatable, e.g. "
+            "--compass-oracle-option table=steps.jsonl.",
+        )
+        parser.add_argument(
+            "--compass-oracle",
+            type=str,
+            default="",
+            help="Fully-qualified cost-oracle class for --compass. Defaults to "
+            "a constant-cost oracle, which is only useful for checking that "
+            "the plumbing works.",
         )
         parser.add_argument(
             "--tensor-parallel-size",
@@ -435,8 +586,8 @@ class EngineArgs:
                 "Let a hit that was refused for want of a checkpoint place a "
                 "rung of its own. --no-state-checkpoint-demand leaves the "
                 "prompt-end anchor as the only placement. On measured traces a "
-                "demand is 47% of all checkpoint writes but reads back 2.8% of "
-                "the time, against 85.2% for an anchor, so the rung's write "
+                "demand is 47%% of all checkpoint writes but reads back 2.8%% "
+                "of the time, against 85.2%% for an anchor, so the rung's write "
                 "traffic may cost more in evictions than its reuse is worth."
             ),
         )
@@ -642,6 +793,62 @@ class EngineArgs:
 
         # Handle special transformations
         kwargs["kv_cache_block_size"] = kwargs.pop("block_size")
+        compass_enabled = kwargs.pop("compass", False)
+        compass_oracle = kwargs.pop("compass_oracle", "")
+        compass_oracle_option = kwargs.pop("compass_oracle_option", None) or []
+        compass_mode = kwargs.pop("compass_mode", "predict")
+        compass_graph_out = kwargs.pop("compass_graph_out", "")
+        compass_trace_prefill = kwargs.pop("compass_trace_prefill", 0)
+        compass_memory_out = kwargs.pop("compass_memory_out", "")
+        compass_measure_out = kwargs.pop("compass_measure_out", "")
+        compass_measure_warmup = kwargs.pop("compass_measure_warmup_steps", 0)
+        compass_admission = kwargs.pop("compass_admission_seconds", 0.0)
+        compass_op_timings = kwargs.pop("compass_op_timings_out", "")
+        compass_bench_graph = kwargs.pop("compass_bench_graph", "")
+        compass_bench_out = kwargs.pop("compass_bench_out", "")
+        compass_bench_iters = kwargs.pop("compass_bench_iters", 2000)
+        compass_bench_cache = kwargs.pop("compass_bench_cache", "hot")
+        compass_kwargs = {"enabled": compass_enabled, "mode": compass_mode}
+        if compass_oracle:
+            compass_kwargs["oracle_qualname"] = compass_oracle
+        if compass_graph_out:
+            compass_kwargs["graph_out"] = compass_graph_out
+        if compass_trace_prefill:
+            compass_kwargs["trace_prefill"] = compass_trace_prefill
+        if compass_memory_out:
+            compass_kwargs["memory_out"] = compass_memory_out
+        if compass_measure_out:
+            compass_kwargs["measure_out"] = compass_measure_out
+        if compass_measure_warmup:
+            compass_kwargs["measure_warmup_steps"] = compass_measure_warmup
+        if compass_admission:
+            compass_kwargs["admission_seconds"] = compass_admission
+        if compass_op_timings:
+            compass_kwargs["op_timings_out"] = compass_op_timings
+        if compass_bench_graph:
+            compass_kwargs["bench_graph"] = compass_bench_graph
+        if compass_bench_out:
+            compass_kwargs["bench_out"] = compass_bench_out
+        if compass_bench_iters != 2000:
+            compass_kwargs["bench_iters"] = compass_bench_iters
+        if compass_bench_cache != "hot":
+            compass_kwargs["bench_cache"] = compass_bench_cache
+        if compass_oracle_option:
+            # Values arrive as strings from the command line. Numbers are
+            # converted so an oracle can declare a float parameter and get one;
+            # anything else stays a string, which is what paths need.
+            options = {}
+            for item in compass_oracle_option:
+                key, _, value = item.partition("=")
+                try:
+                    options[key] = int(value)
+                except ValueError:
+                    try:
+                        options[key] = float(value)
+                    except ValueError:
+                        options[key] = value
+            compass_kwargs["oracle_options"] = options
+        kwargs["compass_config"] = CompassConfig(**compass_kwargs)
         kwargs["compilation_config"] = CompilationConfig(
             level=kwargs.pop("level"),
             cudagraph_mode=CUDAGraphMode[kwargs.pop("cudagraph_mode")],

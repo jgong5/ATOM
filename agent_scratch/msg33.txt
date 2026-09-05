@@ -1,0 +1,39 @@
+Probe prefill shapes: it does not interpolate, and the dispatch term
+has the wrong sign
+
+Decode was closed by measuring an enumerable set. Prefill token counts
+are not enumerable, so the hope was that a step -- hundreds of kernels
+-- would be smooth in tokens even where a single gemm is not, letting
+a handful of measured sizes cover the range. Six sizes traced, priced
+at 99.2%, and measured:
+
+  tokens   priced  measured  ratio  overhead/op
+    1094  15.766ms  31.746ms   0.50     50.1us
+    2188  28.460ms  31.985ms   0.89     11.0us
+    4376  60.685ms  63.291ms   0.96      8.2us
+    6564  76.218ms  79.135ms   0.96      9.1us
+    8752 100.459ms 104.421ms   0.96     12.4us
+   13530 127.520ms 132.948ms   0.96     17.0us
+
+The hypothesis fails: interpolating a measured step between measured
+neighbours gives median 12.2% and worst 32.1%, against 2.1% for the
+decode ladder which measures exactly.
+
+Two things fall out that are worth more. The dispatch term is wrong
+for prefill on this model -- measured overhead per operator is 8 to
+50us where dispatch_seconds charges up to 130, giving +35% at 1094
+tokens and +59% at 2188 against +4.2% at 13530 -- and the measured
+overhead rises with token count above 4k where "dispatch the kernels
+hide" predicts it should fall. The model has the sign wrong in the
+range that matters. Meanwhile priced kernels alone are 0.96 of a
+prefill step above 4k, so no overhead term at all beats the one we
+have for every size but the smallest.
+
+And prefill depends on sequence count as well as tokens: 1256 tokens
+in four sequences measured 42.6ms where 1094 in one measured 31.7ms,
+because attention pays per sequence. Its shape is at least
+two-dimensional and every measurement here varies one dimension.
+
+So prefill needs a fitted form -- empirical/fitted at operator level,
+the empty cell of the grid -- or derivation. It is the one part of the
+cost model where measuring the shapes that occur is not viable.

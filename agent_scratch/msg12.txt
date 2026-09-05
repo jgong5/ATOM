@@ -1,0 +1,29 @@
+Serve the priced oracle, and find where fixed-shape pricing breaks
+
+On the engine's own clock: TTFT +47.9%, latency +25.3%. Offline the
+same oracle is inside the noise, and the difference is not the prices.
+
+An offline workload has one shape of each kind -- four prompts of 314
+tokens, then decode at batch 4, every step identical -- so an oracle
+holding one graph per kind is exactly right and the limitation stays
+invisible. A served workload has three prefill steps of 16, 256 and
+16128 tokens taking 38.6, 151.0 and 177.6ms, and 127 decode steps
+split between batch 1 and batch 64 taking 2.68 to 10.25ms. The oracle
+answers ~47ms and ~3.2ms.
+
+So the offline result reads as the machinery working, not as the model
+generalising, and "one graph per kind is enough" was true of every
+workload tested to that point and false of the first varying one.
+
+Not established: why the net error is positive. Every step is priced
+low -- prefill 141ms against 367, decode ~406 against ~626 -- yet
+simulated TTFT and latency come out high, so the simulated scheduler
+is batching differently rather than merely mis-costing. A virtual
+clock staggers admission, which changes which requests batch together,
+which changes the step shapes and their cost: the shape distribution
+is an output of the simulation rather than an input. Predict mode
+writes no step table, so that is where the evidence stops.
+
+The fix is not more graphs of the same kind, which was tried on decode
+context and dropped. It is a graph per shape, which is what derive.py
+is for, making problem 7 a prerequisite rather than an improvement.

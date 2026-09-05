@@ -1,0 +1,34 @@
+Bring memory consumption into scope, on the same dial as time
+
+The survey and PoC scope now cover memory, so the notes say so: two
+quantities are modelled, time and bytes, and the vocabulary needed no
+new axis to carry the second. Memory has the same two subjects -- model
+memory for weights, activations and the CUDA graph pool, serving memory
+for the KV cache and its block pools -- and the same provenance dial.
+"Cost" should not be read as meaning time; say time cost or memory cost
+where it matters.
+
+Item 22 is promoted from a nice-to-have and restated in those terms.
+What ATOM does today is empirical/measured: four readings off a live
+device. A budget captured from an earlier run of the same build is
+empirical/replayed, which is a species nobody had named and is a fair
+demonstration of why the species list is open.
+
+Why it belongs in scope rather than in convenience: memory decides
+which configurations exist. Sizing the 27B at TP=1 failed before any
+timing could be taken -- per-request cache tensor 37.41GB for 512 slots
+against a 19.85GB budget -- and the fix was a configuration change. A
+tool asked which configuration to deploy answers with a set, and every
+member of that set has to fit, so predicting time for configurations
+that cannot run answers a different question.
+
+Four ordered steps: record the terms every run already prints;
+empirical/replayed to unblock sizing a configuration on a box that
+cannot hold it; analytical to derive each term, validated per term
+against the recorded ones; then feed it back so get_num_blocks and the
+capture ladder follow the prediction rather than the box.
+
+The acceptance gate is sharpened: not byte error but whether top-1
+configuration agreement survives swapping empirical/measured for
+analytical. A few percent that never changes which configuration wins
+beats a tighter number that does.

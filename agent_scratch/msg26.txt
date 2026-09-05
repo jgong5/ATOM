@@ -1,0 +1,31 @@
+Record what the memory budget was made of (item 22, step 1)
+
+--compass-memory-out writes the five device readings the KV sizing is
+derived from, and the block counts they produced, per rank. Every run
+computes these and discards them once the block count exists, so a run
+without the flag is a validation sample that cannot be recovered --
+the numbers only exist while the device is in that state.
+
+Taken in get_num_blocks immediately before delegating rather than
+after: super() allocates nothing, so these are the same numbers it
+will see, while afterwards the KV cache exists and mem_get_info says
+something else. Only the raw readings are recorded, never the derived
+budget -- that arithmetic is the engine's, is already CPU-only, and
+copying it would be one more thing to drift.
+
+Recorded on two configurations:
+
+                  0.6B TP=1   27B TP=2 (per rank)
+  total             192.0 GB   192.0 GB
+  free              189.5 GB   156.7 GB
+  peak_torch          2.6 GB    28.6 GB
+  non_torch           0.9 GB     7.0 GB
+  cudagraph          0.08 GB    0.08 GB
+  -> blocks            95822      37838
+
+First use, and the reason free is recorded separately: both records
+can be checked for whether free was the binding term, and in neither
+was it -- the utilization budget was, so both are reusable. The 35 GB
+between total and free at 27B is this process's own weights and
+activations rather than neighbours holding memory, which had to be
+computed rather than assumed.

@@ -1,0 +1,40 @@
+Price prefill from its own graph, and stop pretending it is replayed
+
+--compass-trace-prefill records a prefill step alongside the decode
+one, --compass-bench-graph takes both, and the oracle picks by kind.
+The calibrated fallback is now unused: ttft -12.5%, tpot -0.1%,
+latency -4.7%, and at 96 output tokens -12.9% / -3.5% / -4.9%.
+
+TTFT looks like a regression against the fallback's -1.3% and is not.
+That was a calibrated oracle fitted to the steps it was predicting;
+this is the op graph answering for the first time. The prefill step
+itself is 36.6ms against a measured 37.3 -- -1.9% -- and the rest of
+TTFT is admission and scheduling outside any step, which is problem 3.
+
+Three things had to be right and two were wrong first.
+
+Prefill reads more metadata than decode: the varlen fmha kernel wants
+cu_seqlens_k and min_seqlen_q too and raises rather than defaulting
+them, so recording only what decode needed left all 28 prefill
+attentions unpriced -- the whole of prefill's attention cost.
+Coverage 94.6% to 98.9%.
+
+A prefill step runs eager and that is most of it. Prefill's kernels
+are 15.1ms of a 37.3ms step; the priced sum was right and the model
+was wrong. A replayed step is one submission with the host out of the
+loop, an eager one dispatches every operator. Two constants: 2.02us
+per kernel launch replayed, 67.4us per operator eager. Thirtyfold
+apart, which is why the replayed constant priced prefill at 0.42 of
+its step.
+
+And the engine has to say which. capture_bucket is documented as None
+when nothing was replayed, but _capture_bucket only looked at batch
+size, so a four-sequence prefill was reported as replaying the batch-4
+decode graph it cannot use. The fix above did nothing until that was
+corrected. The oracle asks whether the step was replayed, not whether
+it is prefill, so it stays engine-agnostic.
+
+Also drops the multi-graph interpolation added earlier. Four decode
+graphs across a context range moved the held-out error from -3.7% to
+-1.5% and covering the range made no further difference, so it was
+not worth its complexity. One graph per kind.

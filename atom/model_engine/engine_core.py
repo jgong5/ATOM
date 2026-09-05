@@ -41,6 +41,7 @@ from atom.utils.gc_utils import (
     tune_gc,
     unfreeze_gc_heap,
 )
+from atom.utils.clock import get_clock
 
 logger = logging.getLogger("atom")
 
@@ -60,6 +61,39 @@ KV_IDLE_DRAIN_INTERVAL_S = 0.001
 KV_SHUTDOWN_DRAIN_TIMEOUT_S = 2.0
 
 
+
+
+def _install_compass_clock(config) -> None:
+    """Put this process on a virtual clock when running a simulated workload.
+
+    Only the scheduling process does this. Workers predict step durations and
+    report them back; they never hold a clock, which keeps time single-sourced
+    even when the model is sharded across processes.
+    """
+    compass = getattr(config, "compass_config", None)
+    if compass is None or not compass.enabled or not compass.virtual_clock:
+        return
+    from atom.utils.clock import VirtualClock, set_clock
+
+    set_clock(VirtualClock(epoch=compass.epoch))
+    logger.info("ATOMCompass: engine core running on a virtual clock")
+
+
+def _advance_clock_for(fwd_out) -> None:
+    """Advance a virtual clock by a simulated step's predicted duration.
+
+    A no-op during a normal run: the output carries no duration, and the wall
+    clock cannot be advanced anyway. Under Compass the runner has predicted the
+    step rather than performed it, so time only moves if we move it here — this
+    process owns scheduling, and therefore owns the clock.
+    """
+    seconds = getattr(fwd_out, "compass_step_seconds", None)
+    if seconds is None:
+        return
+    advance = getattr(get_clock(), "advance", None)
+    if advance is not None:
+        advance(seconds)
+
 class EngineCore:
     # This process's name, for the title and every GC log line. A class
     # attribute because it is per-process state and each engine is spawned into
@@ -67,6 +101,7 @@ class EngineCore:
     _process_name = "EngineCore"
 
     def __init__(self, config: Config, input_address: str, output_address: str):
+        _install_compass_clock(config)
         self.label = "Engine Core"
         self.input_queue = queue.Queue[Sequence]()
         self.output_queue = queue.Queue[list[Sequence]]()
@@ -386,6 +421,7 @@ class EngineCore:
             fwd_out = self.runner_mgr.call_func(
                 "forward", scheduled_batch, wait_out=True
             )
+            _advance_clock_for(fwd_out)
             if (
                 self.scheduler.prefill_delayer is not None
                 and scheduled_batch.total_seqs_num_prefill > 0
@@ -988,11 +1024,11 @@ class PrefillEngineCore(EngineCore):
             return False
 
         # Run on the dedicated prefill stream; returns sampled token IDs (one per seq).
-        t0 = time.perf_counter()
+        t0 = get_clock().perf_counter()
         sampled_token_ids = self.runner_mgr.call_func(
             "prefill_forward", scheduled_batch, wait_out=True
         )
-        iter_ms = (time.perf_counter() - t0) * 1000
+        iter_ms = (get_clock().perf_counter() - t0) * 1000
         logger.info(
             f"prefill iter {iter_ms:.2f}ms | "
             f"reqs={scheduled_batch.total_seqs_num} | "
@@ -1260,9 +1296,10 @@ class DecodeEngineCore(EngineCore):
         scheduled_batch, seqs = result
         if scheduled_batch is None:
             return False
-        t0 = time.perf_counter()
+        t0 = get_clock().perf_counter()
         fwd_out = self.runner_mgr.call_func("forward", scheduled_batch, wait_out=True)
-        iter_ms = (time.perf_counter() - t0) * 1000
+        _advance_clock_for(fwd_out)
+        iter_ms = (get_clock().perf_counter() - t0) * 1000
         logger.info(
             f"iter {iter_ms:.2f}ms | "
             f"reqs={scheduled_batch.total_seqs_num} "

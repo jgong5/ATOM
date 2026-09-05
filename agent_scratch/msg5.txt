@@ -1,0 +1,27 @@
+Record the systematic optimism of priced kernels as its own problem
+
+A kernel measured alone comes out cheaper than the same kernel in a
+step, and it happens to every kernel measured so far. Documented as
+open problem 21 with the ceiling it puts on item 1, since it bounds
+what per-operator pricing can deliver however good the coverage
+gets.
+
+The profiler-free statement is the strong one: priced kernels sum to
+2.332 ms against a 3.115 ms replayed step at 98.8% coverage, a ratio
+of 0.749, with no instrument beyond the engine's own clock. Per
+kernel, seven across two families, memory-bound and compute-bound,
+the ratio clusters at 0.83 to 0.93.
+
+Whether it is constant is the question that decides the fix. Constant
+means one calibration factor and the mechanism can stay unexplained;
+varying by kernel class means a factor is wrong. Seven kernels at one
+batch size cannot tell those apart, and widening the sample is mostly
+bookkeeping -- every priced signature already has an in-situ
+counterpart in a profile of the same workload.
+
+Also records what it is not, each ruled out by measurement: not cache
+residency (rotation plateaus), not attention-specific (the gemms do
+it too and never touch the KV cache), not overlap (per-call cost
+asymptotes), not instrument disagreement (ablation and profile agree
+to 1%). And the caveat that the per-kernel column carries 5-10% of
+profiler inflation which the 0.749 does not.

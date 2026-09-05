@@ -1,0 +1,42 @@
+Measure the decode ladder, and close the decode half of 6b
+
+Decode shapes are the rungs of the capture ladder, known from config
+before anything runs, so they are measured rather than interpolated --
+which is what the interpolation probe concluded. Traced at seven rungs
+by running seven workloads at 1, 2, 4, 8, 16, 32 and 64 concurrent
+requests: the batch is the rung, so no shape rewriting and nothing to
+get silently wrong. Priced as a union at 98.8%.
+
+Two facts worth having on their own. The structure is rung-independent
+-- 330 operators and 19 distinct kinds at every rung, one identical
+multiset -- which is what makes this a shape family rather than seven
+models. And capture_bucket matched the rung exactly in all seven runs,
+so the key the oracle selects on is the one the engine used.
+
+Against measured decode steps, with one constant:
+
+  rung  measured    ladder   one graph
+     1   2.848ms     +6.8%      +10.0%
+     2   3.222ms     -4.7%       -2.8%
+     4   3.133ms      0.0%        0.0%
+     8   3.128ms     +2.1%       +0.2%
+    16   3.442ms     -1.2%       -9.0%
+    32   4.119ms     -2.5%      -23.9%
+    64   5.030ms     +1.3%      -37.7%
+              median  2.1%        9.0%
+
+The right column is what the oracle did before: one decode graph
+traced at batch 4 answering for every rung. Fine near its own shape and
+-37.7% at rung 64, and a served workload spends half its decode steps
+at batch 64.
+
+The oracle now selects by rung and refuses to interpolate: an
+unmeasured rung falls back to the largest measured one and says so
+once, which is wrong by a known mechanism rather than a silent one.
+
+Also corrects an overstatement in the previous commit. The plain
+per-launch constant is stable across the group, not across models: the
+27B fits 1.82us where the 0.6B fits 2.25, both at TP=1 with no
+collectives. The ladder gives seven estimates for the 0.6B spanning
+1.53 to 2.43 with median 2.04, so the model-to-model difference sits
+inside one model's scatter and the constant is known to about +-20%.

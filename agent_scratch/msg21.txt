@@ -1,0 +1,15 @@
+Name a bench-graph pattern that matches nothing
+
+A --compass-bench-graph glob that matched no files fell through to
+opening the pattern as a filename, so the run reported a missing file
+and carried on with an empty price list. That reads like the graph was
+never written rather than like the pattern was wrong.
+
+It matters because the pattern that fails this way is the obvious one:
+graph.tp*.json matches nothing at TP=1, where no rank suffix is
+applied. Pricing then produced no output at all and the failure only
+surfaced two runs later, as the oracle refusing to open a price list
+that had never been written.
+
+Now warned by name, and an invocation whose patterns all match nothing
+raises rather than pricing an empty graph.

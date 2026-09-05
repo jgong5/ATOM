@@ -1,0 +1,31 @@
+Probe interpolating prices across shapes, and rule it out
+
+The cheap candidate for 6b was empirical/interpolated at operator
+level: price an operator at a few shapes and interpolate, rather than
+derive a graph per shape. One gemm from the 0.6B decode graph, priced
+at 20 values of M from 1 to 1024.
+
+It looks like it works. Median error 3-8% from as few as four
+measured shapes, and 2.6% within the bracketed range. Every worst-case
+column is one point: the price jumps from 58.07us at M=768 to 137.45
+at M=1024 where the trend says 77.
+
+The cliff is a kernel change and the price list already recorded it --
+MT128x1 at 256-384, MT256x1 at 512-768, MT256x2 at 1024. So the
+obvious guard is to interpolate only between neighbours that ran the
+same kernel, and that guard refuses almost everything: the library
+re-tunes at nearly every shape, twelve tile configurations across
+twenty values of M, so 8 of 10 held-out shapes have no same-kernel
+bracket. The two that do come out at 0.4%.
+
+So interpolation is not sound-but-imprecise. It is accurate most of
+the time with no way to tell when it is not, and for a tool whose
+output is a ranking of configurations an occasional silent 60% is
+worse than a uniform 10%.
+
+What survives: decode shapes are the capture ladder, eleven rungs known
+from config before anything runs, so they can be measured rather than
+interpolated -- empirical/measured over an enumerable set. Prefill
+token counts are arbitrary, so prefill still needs empirical/fitted
+per operator against M, or derivation. That splits 6b into a bounded
+piece and an open one.

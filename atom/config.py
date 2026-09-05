@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     # Annotation only. Importing AITER here would put a GPU kernel build behind
     # `import atom.config`, which is what `atom.quant_spec` defers on purpose.
     from aiter import QuantType
+from atom.compass.config import CompassConfig
 
 logger = logging.getLogger("atom")
 
@@ -1593,6 +1594,10 @@ class Config:
     # from all2all backend/mode: Mega owns dispatch, both GEMMs, and combine.
     moe_backend: str = "standard"
     runner_qualname: str = "atom.model_engine.model_runner.ModelRunner"
+    # ATOMCompass: when enabled, the runner predicts the forward pass instead of
+    # performing it. Inert unless a Compass runner is also selected via
+    # runner_qualname.
+    compass_config: CompassConfig = field(default_factory=CompassConfig)
     # EPLB master switch + sub-config
     eplb_enable: bool = False
     eplb_config: EPLBConfig = field(default_factory=EPLBConfig)
@@ -1734,6 +1739,15 @@ class Config:
             self.runner_qualname = (
                 "atom.model_engine.model_runner.RapidServeModelRunner"
             )
+
+        # ATOMCompass simulates the forward pass, which needs its own runner in
+        # every worker. Select it unless the user explicitly overrode
+        # runner_qualname, matching the RapidServe handling above.
+        if (
+            self.compass_config.enabled
+            and self.runner_qualname == "atom.model_engine.model_runner.ModelRunner"
+        ):
+            self.runner_qualname = "atom.compass.runtime.runner.CompassModelRunner"
 
         assert 1 <= self.tensor_parallel_size <= 8
         if self.decode_context_parallel_size > 1:

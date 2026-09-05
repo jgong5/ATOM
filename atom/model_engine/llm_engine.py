@@ -16,6 +16,7 @@ from atom.model_engine.multimodal import get_mrope_input_positions
 from atom.model_engine.sequence import Sequence
 from atom.sampling_params import SamplingParams
 from atom.utils import envs
+from atom.utils.clock import get_clock
 
 logger = logging.getLogger("atom")
 
@@ -33,6 +34,47 @@ def _load_tokenizer(model: str, trust_remote_code: bool = False):
     return tokenizer
 
 
+
+def _stamp_arrival(arrival_time: float | None) -> float:
+    """When a request should be treated as having arrived.
+
+    ``arrival_time`` is an offset into the run, not a timestamp, and it only
+    means anything on a clock that knows where the run began -- a virtual one.
+    Against a real server there is no start-of-run to offset from, so a declared
+    arrival is ignored and "now" is used, which is the right answer there.
+    """
+    clock = get_clock()
+    if arrival_time is None:
+        return clock.time()
+    epoch = getattr(clock, "epoch", None)
+    if epoch is None:
+        logger.warning(
+            "ATOMCompass WARNING: ignoring a declared arrival of %.3fs -- this "
+            "engine is on a real clock, which has no start-of-run to offset "
+            "from. Arrivals are only declarable against a simulated run.",
+            arrival_time,
+        )
+        return clock.time()
+    return epoch + float(arrival_time)
+
+
+def _install_compass_clock(config) -> None:
+    """Put this process on the same virtual clock as the engine core.
+
+    Arrival is stamped here while first-token is stamped in the engine core, and
+    TTFT subtracts one from the other. They must therefore read the same clock
+    and share an origin. This clock does not advance — in a simulated run the
+    engine core owns progress — so an offline batch submitted together arrives
+    together, at the start of virtual time.
+    """
+    compass = getattr(config, "compass_config", None)
+    if compass is None or not compass.enabled or not compass.virtual_clock:
+        return
+    from atom.utils.clock import VirtualClock, set_clock
+
+    set_clock(VirtualClock(epoch=compass.epoch))
+
+
 class LLMEngine:
 
     def __init__(self, model, tokenizer=None, **kwargs):
@@ -42,6 +84,7 @@ class LLMEngine:
         data_parallel_master_port = kwargs.get("data_parallel_master_port", None)
         config = Config(model, **config_kwargs)
         self.config = config
+        _install_compass_clock(self.config)
         self.tokenizer = tokenizer or _load_tokenizer(
             config.model, config.trust_remote_code
         )
@@ -628,6 +671,8 @@ class InputOutputProcessor:
         data_parallel_rank: int | None = None,
         dp_session_id: str | None = None,
         dp_parent_session_id: str | None = None,
+        arrival_time: float | None = None,
+        workload_size: int | None = None,
     ):
         """responsible for:
         1) Tokenize
@@ -652,6 +697,8 @@ class InputOutputProcessor:
             data_parallel_rank=data_parallel_rank,
             dp_session_id=dp_session_id,
             dp_parent_session_id=dp_parent_session_id,
+            arrival_time=arrival_time,
+            workload_size=workload_size,
         )
         return seqs[0]
 
@@ -667,6 +714,8 @@ class InputOutputProcessor:
         data_parallel_rank: int | None = None,
         dp_session_id: str | None = None,
         dp_parent_session_id: str | None = None,
+        arrival_time: float | None = None,
+        workload_size: int | None = None,
     ) -> list[Sequence]:
         """Tokenize once and materialize ``sampling_params.n`` Sequences.
 
@@ -742,7 +791,8 @@ class InputOutputProcessor:
                 dp_session_id=dp_session_id,
                 dp_parent_session_id=dp_parent_session_id,
             )
-            seq.arrive_time = time.time()
+            seq.arrive_time = _stamp_arrival(arrival_time)
+            seq.compass_workload_size = workload_size
             self.requests[seq.id] = seq
             if seq.external_request_id is not None:
                 self._external_to_internal[seq.external_request_id] = seq.id
@@ -774,7 +824,9 @@ class InputOutputProcessor:
             if external_request_id is not None:
                 self._external_to_internal.pop(external_request_id, None)
             output_str = self.tokenizer.decode(req.completion_token_ids)
-            req.leave_time = time.time()
+            # Prefer the engine core's own stamp: it owns time, and under a
+            # simulated run this process's clock is deliberately frozen.
+            req.leave_time = getattr(req, "finish_time", 0.0) or get_clock().time()
 
             # Calculate TTFT (Time To First Token) and TPOT (Time Per Output Token)
             ttft = 0.0

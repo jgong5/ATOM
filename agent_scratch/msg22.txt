@@ -1,0 +1,37 @@
+Complete the parallelism sweep, and find the per-launch constant is
+not group-size independent
+
+Qwen3.8-27B at TP=1, 2 and 4, both constants carried from the 0.6B:
+
+  TP    ttft     tpot   latency
+   1  -2.58%   +0.94%   -0.90%
+   2  +2.45%   +0.00%   +1.37%
+   4  +6.46%   -5.73%   +1.37%
+
+TP=1 and TP=2 sit inside a few percent. TP=4 comes apart in a way that
+names its cause: decode is 5.73% low, priced kernels plus 655 launches
+at 2.25us giving 11.690ms against 12.401 measured, and closing it needs
+3.33us a launch. The same 2.25us was right at TP=1, TP=2, and on a
+dense 0.6B, a 27B hybrid and a 30B MoE.
+
+What changes is the group. A decode graph holds 129 all_reduce_ per
+rank, and a collective's boundary cost includes waiting for the
+slowest peer, which has more chances to be slow as the group grows. So
+the constant is model-independent and not group-size independent, and
+a graph whose collectives are a sixth of its launches is where that
+shows. Testable: fit it separately for collective and non-collective
+launches, which OpSpec.group already distinguishes.
+
+Also fixes a deadlock that stopped TP=4 pricing entirely. The run died
+in a distributed recvBytes after CUDA graph capture -- when the
+benchmark runs -- with no error of its own. The per-signature kernel
+breakdown makes two extra calls per signature and for a collective
+those are two extra collectives, so a breakdown that fails on one rank
+and not another diverges the group silently. Off by default under
+parallelism now. Anything optional in the pricing loop has to be
+optional on every rank or on none.
+
+On problem 4, which recorded an unexplained 19% calibrate-vs-evaluate
+gap on TP=4 prefill: the priced oracle gets TTFT to +6.46% on the same
+configuration, which locates most of that 19% in the calibrated oracle
+rather than in the machine.

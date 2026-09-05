@@ -1,0 +1,35 @@
+Correct the EP write-up: what ran was not meaningful EP
+
+The check that should have been run first is turning the flag off and
+seeing what changes. Doing it now:
+
+                          EP on     EP off   ratio
+  moe_forward prefill   597.40us   651.28us  0.92x
+  moe_forward decode     71.58us    73.47us  0.97x
+  fused_allreduce_rmsnorm  identical          1.00x
+
+and the graph is structurally identical either way, 488 operators and
+23 distinct. The flag is doing what it says -- the engine resolves
+use_ep=True, ep_size=2 for all 48 layers on both ranks, and
+use_ep=False without it -- but at TP=2 with DP=1 the two arrangements
+are the same FLOPs per rank differently decomposed: all 128 experts
+sharded along the intermediate dimension, or 64 experts held whole. EP
+at ep_size == tp_size is close to a no-op, and there is no all-to-all
+in the graph because this path does not use one.
+
+ep_size only exceeds tp_size when enable_dp_attention flattens the DP
+and TP dims. At TP=2 x DP=2 that resolves correctly to ep_size=4 on
+four ranks and then fails to initialise: MORI's dispatch/combine
+kernels are JIT-built at startup and hipcc cannot find cmath. That is
+defect 5 unchanged -- the container has gcc runtime dirs for 13 and 14
+but C++ headers only for 13.
+
+So EP-as-configured prices fine and tells us nothing, and EP-as-
+intended has never run. The same container defect blocks this and the
+project's target model.
+
+What stands: nothing needed changing for a MoE model, and moe_forward
+prices at 71.58us decode and 597.40us prefill. When the all-to-all
+does appear it will be inside moe_forward, a single opaque node, so
+re-costing EP across degrees will still need that operator to expose
+its communication.

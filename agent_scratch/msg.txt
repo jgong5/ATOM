@@ -1,0 +1,29 @@
+Find why attention priced 7x over: its arguments were never read
+
+The microbenchmark called attention after CUDA graph capture, and
+capture leaves a forward context installed -- the last rung of the
+ladder, describing one sequence at the model maximum context. The
+operator rebuilds a context from its arguments only when there is not
+one already, so the branch never fired and every argument was dead.
+It attended one 16384-token sequence while being handed four of 155.
+
+    ambient context is None: False
+    KERNEL SEES q=(4,16,128) block_tables=(1,2560)
+                context_lens=(1,) [16384] max_qlen=1
+
+That is the whole of the invariance: the price did not move when
+context_lens or max_seqlen moved because nothing read them. The
+163.7us is real device time in a real kernel, flat from B=1 to B=64,
+with the profile putting all of it in pa_bf16_noquant_gqa8_1tg_4w.
+
+Fixed by calling reset_forward_context before each signature is
+priced. That exposes a second defect underneath: the recorded graph
+carries block_tables=None and max_seqlen_q=16384 where the live step
+has a (4,2560) tensor and 1. Tensor arguments flow; an int and an
+argument that was None at compile time are constant-folded by Dynamo
+out of the warmup forward. So describing an operator by adding its
+metadata as arguments carries tensors and nothing else -- attention
+is now honestly unpriced rather than wrong, and coverage reads 90.3%
+instead of an inflated 98.8%.
+
+Options for the second defect are written up but none chosen.

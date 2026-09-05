@@ -1,0 +1,26 @@
+Drop empirical/replayed: it was reuse conditions wearing a species name
+
+Reading a budget captured by an earlier run is not a species. The
+number is a direct measurement of the quantity, and when it was taken
+is not provenance. Every empirical oracle here already works that way:
+a price list, the boundary constant, the admission figure and the
+calibration table are all measurements written to an artifact and read
+back later. If reading from an artifact made a new species they would
+all be it.
+
+What I was reaching for was what has to match for the artifact to
+remain valid -- ATOM commit, configuration, and free, which on this box
+is set by the neighbours. That is an artifact reuse condition, which
+was already ruled out as an axis, and I reintroduced it under another
+name.
+
+The distinction that is real is whether the lookup matched: exact is
+empirical/measured, nearest is empirical/interpolated, past the range
+is empirical/extrapolated. That mirrors the time side exactly -- the
+price list is exact-match by signature and the interpolated oracle is
+nearest-match over step tables -- which is some evidence the scheme is
+right.
+
+Step 2 of the memory plan keeps its content and loses the label: read
+the artifact instead of the device on an exact key match, and refuse a
+key whose free was the binding term.

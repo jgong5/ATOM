@@ -1,0 +1,38 @@
+Correct the overlap claim: the captured calls serialise
+
+I attributed the benchmark's remaining 30% to graph-mode overlap.
+That was wrong, and this session had already established the
+opposite once. Two measurements refute it.
+
+Profiling the real run instead of differencing it resolves the
+operator into three kernels, over 896 launches (28 layers x 32
+decode steps):
+
+                      in situ   benchmark
+    attention        11.07 us     7.70 us
+    rope              9.04 us     6.87 us
+    KV write          6.33 us     5.37 us
+    operator         26.44 us    19.94 us
+
+26.44 against the ablation's 26.1 -- two methods sharing no
+machinery, 1% apart. Every kernel is cheaper in the benchmark by
+15-30%, which is not what one pathological kernel looks like and not
+what overlap looks like either.
+
+The batch sweep settles it directly. Fitting measured = c + r/B to
+B=1 and B=64 gives r=6.1us, c=18.2us, which then predicts B=4 as
+19.76 (measured 19.93) and B=16 as 18.61 (18.71). A constant
+per-replay overhead amortised over a flat per-call cost. Per-call
+cost asymptotes; concurrency would keep driving it down.
+
+What is left is cache residency: the benchmark replays against one
+layer's KV cache 64 times back to back, where a real step touches 28
+layers' regions once each amid the other ~300 kernels. Recorded as a
+hypothesis with evidence, not a demonstration, together with the
+experiment that would settle it -- rotate layer_name across the
+captured calls. Neither hot nor cold mode says anything about this,
+because _build_arg_sets rotates arguments and the KV cache is not an
+argument.
+
+Also corrects the aten::slice claim: falling 315x is a view being
+elided, not a kernel overlapping.

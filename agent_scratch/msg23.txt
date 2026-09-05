@@ -1,0 +1,41 @@
+Align the cost-modelling vocabulary on two questions
+
+The taxonomy in core/cost/__init__.py described a design that was
+never built. It defined calibrated as "the analytical shape scaled by
+a measured efficiency factor" -- calibrated has no analytical
+component and never did -- and gave the genus name empirical to one
+species of it, while priced did not appear at all.
+
+Two questions replace it.
+
+What is costed: a model step, the forward for a step of a given shape;
+or serving -- admission, scheduling, KV cache management. Serving
+decisions are not costed because they are not modelled: Compass runs
+ATOM's real scheduler and replaces only the forward, so what serving
+contributes is the time it consumes, not the choices it makes.
+
+How the cost is obtained: analytical, computed without measuring the
+subject; or empirical, derived from measuring it. Empirical is a genus
+written empirical/<species>:
+
+  empirical/measured      the unit itself is timed -- priced
+  empirical/fitted        a form chosen, coefficients regressed -- calibrated
+  empirical/interpolated  no form assumed, neighbours looked up
+
+Those are the species built so far and not a closed set;
+empirical/extrapolated and others are equally admissible, which is the
+point of naming the genus separately.
+
+EmpiricalCostOracle is renamed InterpolatedCostOracle, since it claimed
+the genus while being one species: every oracle here except constant
+is empirical. Each oracle's docstring now opens with its own
+genus/species.
+
+Step-level and operator-level are dropped as a taxonomy. priced reaches
+a model step by summing operators and calibrated by fitting the step
+directly, which is a difference of method rather than of subject --
+both answer what one step costs.
+
+Nothing analytical exists yet for cost. The word is reserved rather
+than aspirational; the memory-budget code already uses it in the same
+sense.
