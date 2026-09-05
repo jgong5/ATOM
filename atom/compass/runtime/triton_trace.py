@@ -24,6 +24,7 @@ from typing import Any, Optional
 import torch
 
 from atom.compass.core.graph import OpGraph, OpSpec
+from atom.compass.runtime.meta import _int_ranges_of
 
 logger = logging.getLogger(__name__)
 
@@ -67,14 +68,28 @@ def _jsonable(v: Any) -> bool:
     return v is None or isinstance(v, (int, float, bool, str))
 
 
-def _origin(fn: Any) -> str:
-    """``module:name`` the kernel can be imported from, or empty.
+#: Marks an origin that is a file to load rather than a module to import.
+GENERATED = "path:"
 
-    The module attribute is the decorated `JITFunction`, which is what a launch
-    subscripts with a grid, so importing it back gives something callable.
-    Inductor's kernels are generated into a cache module whose name does not
-    survive the process, and report empty.
+
+def _origin(fn: Any) -> str:
+    """Where the kernel can be got back from, or empty.
+
+    A hand-written kernel is an attribute of the module that defined it, and
+    that module attribute is the decorated `JITFunction` -- what a launch
+    subscripts with a grid -- so `module:name` is enough to import it back.
+
+    Inductor's kernels have no importable name: they are generated into a file
+    under the codecache and loaded by inductor's own machinery. But the
+    autotuner keeps the path, the file is named by a hash of the code it holds,
+    and it defines the kernel at module level under the same name inductor calls
+    it. So the file is the origin, and it is stable for as long as the codecache
+    is -- which is the assumption this rests on, and the reason it is recorded
+    as a path rather than pretended to be an import.
     """
+    filename = getattr(fn, "filename", None)
+    if filename:
+        return f"{GENERATED}{filename}::{_kernel_name(fn)}"
     inner = getattr(fn, "fn", fn)
     module = getattr(inner, "__module__", "") or ""
     name = getattr(inner, "__name__", "") or ""
@@ -276,6 +291,7 @@ class TritonLaunchTracer:
                 dtypes=launch.arg_dtypes,
                 scalars=scalars + constexprs,
                 launch=(("grid", list(launch.grid)), ("origin", origin)),
+                int_ranges=_int_ranges_of(tensors),
             )
         )
 

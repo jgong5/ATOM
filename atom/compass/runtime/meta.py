@@ -180,6 +180,37 @@ class MetaTrace:
 MAX_RECORDED_INTS = 4096
 
 
+def _int_ranges_of(tensors) -> tuple:
+    """How far each integer tensor argument reached, and whether it climbed.
+
+    ``_int_values_of`` keeps contents, and cannot keep large ones -- an artifact
+    must not grow with a batch -- so the block tables and per-token maps, which
+    are exactly the tensors that decide how much memory a kernel walks, are the
+    ones it drops. Three numbers describe them well enough: the span they
+    covered and whether they were sorted. Rebuilt from that, an index tensor
+    walks as many distinct blocks as the real one did instead of re-reading
+    block zero.
+
+    A device-to-host copy per tensor, so trace mode only, like its neighbour.
+    """
+    import torch
+
+    out = []
+    for i, t in enumerate(tensors):
+        if not isinstance(t, torch.Tensor) or t.numel() == 0:
+            continue
+        if t.dtype not in (torch.int32, torch.int64, torch.int16, torch.uint8,
+                           torch.int8):
+            continue
+        flat = t.reshape(-1)
+        low = int(flat.min())
+        high = int(flat.max())
+        climbing = (flat.numel() < 2
+                    or bool(torch.all(flat[1:] >= flat[:-1])))
+        out.append((i, (low, high, climbing)))
+    return tuple(out)
+
+
 def _int_values_of(tensors) -> tuple:
     """Contents of the small integer tensor arguments, by position.
 
@@ -326,6 +357,7 @@ class MetaOpTracer(TorchDispatchMode):
                 group=_resolve_group(name, self.topology),
                 scalars=_scalars_of(args, kwargs),
                 int_values=_int_values_of(tensors),
+                int_ranges=_int_ranges_of(tensors),
                 # An operator that reads ambient state needs that state recorded
                 # with it; its arguments do not describe it, and cannot be made
                 # to. Empty for everything but attention.

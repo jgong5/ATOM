@@ -269,3 +269,37 @@ class TestKernelsThatAreNotTorchOperators:
 
         assert _resolve_triton({
             "launch": [["grid", ["<unresolved>"]], ["origin", "m:k"]]}) is None
+
+
+class TestGeneratedKernels:
+    """Inductor's kernels have no importable name, only a file.
+
+    The autotuner keeps the path it generated into, the file is named by a hash
+    of the code it holds, and it defines the kernel at module level under the
+    name inductor calls it. So the file is the origin -- for as long as the
+    codecache survives, which is why a missing one leaves the operator unpriced
+    rather than priced against something else.
+    """
+
+    def test_a_missing_codecache_leaves_it_unpriced(self, tmp_path):
+        from atom.compass.runtime.microbench import _resolve_triton
+
+        gone = str(tmp_path / "never-generated.py")
+        assert _resolve_triton({
+            "launch": [["grid", []], ["origin", f"path:{gone}::k"]]}) is None
+
+    def test_a_generated_origin_is_not_refused_for_having_no_grid(self, tmp_path):
+        """It computes its own grid from its arguments, unlike a hand-written
+        kernel, so an empty grid is expected rather than unresolved."""
+        from atom.compass.runtime import microbench
+
+        seen = []
+        original = microbench._resolve_generated
+        microbench._resolve_generated = seen.append
+        try:
+            microbench._resolve_triton({
+                "launch": [["grid", []], ["origin", "path:/x/y.py::k"]]})
+        finally:
+            microbench._resolve_generated = original
+        assert seen == ["path:/x/y.py::k"]
+        assert microbench._resolve_generated is original

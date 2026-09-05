@@ -3438,25 +3438,73 @@ to a type check.
 
 and the chunked step goes from -9.86% to **-6.65%**.
 
-**The gather's price is low, and by a knowable amount.** It prices at 158.09 us
-per call against 210.12 us in a profile of the real step -- 24.8% under, because
-`block_tables` is rebuilt as zeros, so every index points at block 0 and the
-kernel re-reads one resident block instead of walking 413. This is the
-data-dependence problem that priced attention at 7x once, in its other
-direction: an index tensor of zeros is always in range and always cheap.
-Replaying recorded indices is the obvious fix and is off by default because it
-faults the device (see `_make_tensor`), so the gather is understated on purpose
-and the amount is written down here.
+#### Index tensors that reach as far as the real ones
 
-That closes the residual arithmetic: of the 8.84 ms between the priced total and
-the measured step, 1.46 ms is the gather understatement (28 x 52 us) and the
-remaining 7.38 ms is 5.5% -- the micro-benchmark discount every other graph
-shows.
+A rebuilt integer tensor was zeros, which is in range for anything and points
+every access at one place. `int_values` exists to replay the recorded contents
+and is off by default because it faults the device -- and it caps at 4096
+entries anyway, so it drops the block tables and per-token maps that are exactly
+the tensors deciding how much memory a kernel walks.
 
-**What is still not priceable.** Inductor-generated kernels. They are compiled
-into a module whose name does not outlive the process that made it, so there is
-no origin to import and `_origin` returns empty for anything under
-`torch._inductor`. One operator per graph here (`triton_poi_fused_embedding_0`,
-an embedding lookup too small to appear in the profile's top kernels). Unlike
-before, it now says so specifically rather than claiming the operator is not
-registered.
+So `int_ranges` records three numbers per integer tensor instead of its
+contents: the span it covered and whether it climbed. Rebuilt from that, a
+climbing tensor becomes a ramp between the recorded bounds -- which reproduces
+`cu_seqlens` exactly at the two-element sizes it usually has -- and anything else
+is spread across the span, so a block table addresses 1239 distinct blocks
+rather than block zero 2560 times.
+
+This is safe where replaying values is not, and the reason is worth stating:
+every tensor argument is rebuilt **at its recorded shape**, so an index that was
+in range for the real tensor is in range for the rebuilt one. Replay faulted
+because a recorded index met a tensor rebuilt at some other shape. On by
+default; `COMPASS_SYNTH_INT_RANGES=0` restores zeros.
+
+**It did not change the gather's price, and the earlier explanation of that
+price was wrong.** The 158 us against the profile's 210 us was attributed above
+to zero-filled block tables re-reading one resident block. Measured directly,
+launching the kernel over three block tables:
+
+| block table | us/call |
+| --- | --- |
+| zeros | 163.35 |
+| spread over the recorded span | 158.02 |
+| spread over the whole 29456-block cache (1.93 GB) | 158.27 |
+
+Scattering every read across a cache far larger than any level of the memory
+hierarchy is worth nothing, so the gather is not bandwidth-bound: its grid is
+6594x8 blocks each moving 128 elements, and it is bound by launching them. What
+a kernel reads decides its price only when reading is what it spends its time
+on, and the diagnosis should have been checked before it was written down.
+
+The 25% remains the in-situ-versus-isolated gap that every graph shows, larger
+here than the 5.5% graph-wide figure. Index realism is kept because it is
+correctness insurance -- a kernel whose control flow reads `cu_seqlens` given
+zeros does no work and prices near nothing -- not because it moved this number.
+
+#### Inductor's kernels
+
+These have no importable name: inductor generates them into a file under the
+codecache and loads them through its own machinery. But `CachingAutotuner` keeps
+`filename`, the file is named by a hash of the code it holds, and it defines the
+kernel at module level under the name inductor calls it. So the origin is
+recorded as a path rather than an import, loaded with
+`spec_from_file_location`, and called through `.run(...)` -- an inductor kernel
+computes its own grid from its arguments, so unlike a hand-written one it needs
+no grid recorded and must not be refused for lacking one.
+
+The assumption is that the codecache outlives the trace. It is a real
+dependency, which is why the origin is a path and says so; a cleared cache
+leaves the operator unpriced, as it was before, rather than priced against
+something else.
+
+#### Where chunked prefill stands
+
+| | operators priced | |
+| --- | --- | --- |
+| at the start | 0 attention, 326/356 | 91.6% |
+| torch operators only | 354/356 | 99.4% |
+| with generated kernels | **365/366** | **99.7%** |
+
+The one operator left is `profiler::_record_function_exit`, which is an artifact
+of tracing rather than work. The step predicts at **-5.58%**, which is the
+micro-benchmark discount and no longer anything specific to chunked prefill.

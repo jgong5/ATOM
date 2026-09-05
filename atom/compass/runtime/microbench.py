@@ -36,6 +36,8 @@ import logging
 import os
 from typing import Any, Optional
 
+from atom.compass.runtime.triton_trace import GENERATED
+
 logger = logging.getLogger(__name__)
 
 __all__ = ["price_graph", "signature_of"]
@@ -113,7 +115,14 @@ def _resolve_triton(op: dict):
 
     launch = {k: v for k, v in (tuple(x) for x in op.get("launch") or ())}
     origin, grid = launch.get("origin"), launch.get("grid")
-    if not origin or not grid:
+    if not origin:
+        return None
+    # An inductor kernel computes its own grid from its arguments, so unlike a
+    # hand-written one it needs no grid recorded and must not be refused for
+    # lacking it.
+    if origin.startswith(GENERATED):
+        return _resolve_generated(origin)
+    if not grid:
         return None
     # An unresolved grid is recorded as text, and guessing one would price a
     # different amount of work than ran. Numeric text is a dimension that an
@@ -136,7 +145,47 @@ def _resolve_triton(op: dict):
     return call
 
 
-def _make_tensor(shape, dtype_name: str, values=None):
+def _resolve_generated(origin: str):
+    """Load an inductor-generated kernel from the file it was generated into.
+
+    The file defines the kernel at module level, so loading it and taking the
+    attribute gives the autotuner inductor would have called. Loading executes
+    the module, which compiles the kernel -- once, and only for a graph that
+    contains one.
+
+    Returns None if the codecache has been cleared since the trace, or if the
+    module will not execute standalone. Both leave the operator unpriced, which
+    is what it was before, rather than priced against something else.
+    """
+    import importlib.util
+    import os
+
+    import torch
+
+    path, _, name = origin[len(GENERATED):].rpartition("::")
+    if not path or not name or not os.path.exists(path):
+        return None
+    spec = importlib.util.spec_from_file_location(
+        "compass_generated_" + os.path.basename(path).partition(".")[0], path)
+    if spec is None or spec.loader is None:
+        return None
+    try:
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    except Exception:  # noqa: BLE001 - generated code can fail many ways
+        return None
+    kernel = getattr(module, name, None)
+    if kernel is None:
+        return None
+
+    def call(*args, **kwargs):
+        return kernel.run(
+            *args, stream=torch.cuda.current_stream().cuda_stream, **kwargs)
+
+    return call
+
+
+def _make_tensor(shape, dtype_name: str, values=None, span=None):
     """A stand-in for one tensor argument, from its shape and its contents.
 
     ``values`` are the recorded contents of a small integer tensor, and where
@@ -187,7 +236,38 @@ def _make_tensor(shape, dtype_name: str, values=None):
             return flat.reshape(size)
     if dtype.is_floating_point:
         return torch.randn(size, dtype=dtype, device="cuda")
+    if span is not None and SYNTH_INT_RANGES:
+        return _spread(size, dtype, span)
     return torch.zeros(size, dtype=dtype, device="cuda")
+
+
+def _spread(size, dtype, span):
+    """An index tensor that reaches as far as the recorded one did.
+
+    Not the recorded values -- those are unsafe to replay -- but the same span
+    and the same direction, which is what decides how much memory the kernel
+    walks. A climbing tensor is a cumulative offset (`cu_seqlens`, whose ends
+    are the only entries that matter, and which this reproduces exactly at the
+    two-element sizes it usually has); anything else is a scattered index like a
+    block table, and is spread across the span so successive entries address
+    different blocks.
+
+    In range by construction: every tensor argument is rebuilt at its recorded
+    shape, so an index that was valid against the real tensor is valid against
+    the rebuilt one. That is the difference between this and replaying recorded
+    values into whatever shape a signature happened to carry, which faulted.
+    """
+    import torch
+
+    low, high, climbing = int(span[0]), int(span[1]), bool(span[2])
+    n = int(torch.Size(size).numel())
+    if high <= low:
+        return torch.full(size, low, dtype=dtype, device="cuda")
+    if climbing:
+        steps = torch.linspace(low, high, n, device="cuda")
+    else:
+        steps = low + torch.arange(n, device="cuda") % (high - low + 1)
+    return steps.to(dtype).reshape(size)
 
 
 def _rebuild_args(op: dict, tensors: list) -> tuple[list, dict]:
@@ -325,9 +405,10 @@ def _build_arg_sets(op: dict, cache: str, fn) -> Optional[list]:
     import torch
 
     recorded = {int(i): v for i, v in (op.get("int_values") or ())}
+    spans = {int(i): v for i, v in (op.get("int_ranges") or ())}
 
     def one():
-        tensors = [_make_tensor(s, d, recorded.get(i))
+        tensors = [_make_tensor(s, d, recorded.get(i), spans.get(i))
                    for i, (s, d) in enumerate(
                        zip(op["input_shapes"], op["dtypes"]))]
         if any(t is None for t in tensors):
@@ -372,6 +453,13 @@ GRAPH_BATCH = int(os.environ.get("COMPASS_GRAPH_BATCH", "64"))
 #: doing so faults the device while pricing prefill graphs. See `_make_tensor`
 #: for the evidence, which took two attempts to read correctly.
 REPLAY_INT_VALUES = os.environ.get("COMPASS_REPLAY_INT_VALUES", "") == "1"
+
+#: Rebuild integer tensors across the span the traced ones covered, rather than
+#: as zeros. On by default: unlike replaying the recorded values, which is not
+#: safe and is off above, a value inside the recorded span indexes the rebuilt
+#: tensor in range because the rebuilt tensor has the recorded shape. Set
+#: ``COMPASS_SYNTH_INT_RANGES=0`` to go back to zeros.
+SYNTH_INT_RANGES = os.environ.get("COMPASS_SYNTH_INT_RANGES", "1") != "0"
 
 #: Distinct KV-cache regions a captured batch rotates over. One per captured
 #: call by default, so a region is revisited only after every other has been

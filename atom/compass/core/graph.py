@@ -83,6 +83,18 @@ class OpSpec:
             so a graph that records only tensors cannot be replayed to find out
             what its operators cost. Kept only for values a JSON artifact can
             hold; anything else is dropped rather than guessed at.
+        int_ranges: The span each integer tensor argument covered, as
+            ``(position, (low, high, monotone))``. Where ``int_values`` records
+            what an index tensor held, this records only its shape in the other
+            sense -- how far it reached and whether it climbed -- which is three
+            numbers however large the tensor, so it covers the block tables and
+            per-token maps that ``int_values`` is too small to hold. A rebuilt
+            index of zeros points every access at one block and prices a walk
+            over the whole cache as a walk over one resident page; a rebuilt
+            index spread across the recorded span does not. Safe where replaying
+            the values themselves is not, because every tensor argument is
+            rebuilt at its recorded shape: a value that indexed the real tensor
+            in range indexes the rebuilt one in range too.
         launch: How to launch a Triton kernel that is not a torch operator, as
             ``(name, value)`` pairs: ``grid`` and ``origin``. A torch operator
             can be found again from its name alone, through ``torch.ops``; a
@@ -101,6 +113,7 @@ class OpSpec:
     int_values: tuple[tuple[int, tuple[int, ...]], ...] = ()
     context: tuple[tuple[str, Any], ...] = ()
     launch: tuple[tuple[str, Any], ...] = ()
+    int_ranges: tuple[tuple[int, tuple[int, int, bool]], ...] = ()
 
     @property
     def is_collective(self) -> bool:
@@ -168,6 +181,7 @@ class OpGraph:
                     "int_values": [[i, list(v)] for i, v in op.int_values],
                     "context": [list(kv) for kv in op.context],
                     "launch": [list(kv) for kv in op.launch],
+                    "int_ranges": [[i, list(v)] for i, v in op.int_ranges],
                 }
                 for op in self.ops
             ],
@@ -204,6 +218,10 @@ class OpGraph:
                     ),
                     context=tuple(tuple(kv) for kv in op.get("context") or ()),
                     launch=tuple(tuple(kv) for kv in op.get("launch") or ()),
+                    int_ranges=tuple(
+                        (int(i), (int(v[0]), int(v[1]), bool(v[2])))
+                        for i, v in op.get("int_ranges") or ()
+                    ),
                 )
             )
         return graph
