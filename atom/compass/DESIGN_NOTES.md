@@ -1784,24 +1784,56 @@ Two further things fall out, both worth more than the failed hypothesis.
 
 *The dispatch term is wrong for prefill on this model.* Measured overhead per
 operator is 8 to 50 µs where `dispatch_seconds` charges up to 130, and applying
-it gives +35% at 1094 tokens and +59% at 2188 against +4.2% at 13530. Worse, the
-measured overhead **rises** with token count above 4k -- 8.2, 9.1, 12.4, 17.0 µs
--- where "dispatch the kernels hide" predicts it should fall. The model has the
-sign wrong in the range that matters.
+it gives +35% at 1094 tokens and +59% at 2188 against +4.2% at 13530. The
+overhead also appears to **rise** above 4k -- 8.2, 9.1, 12.4, 17.0 µs -- where
+"dispatch the kernels hide" predicts it should fall; but see below, because that
+sweep confounds token count with sequence count and the rise is as likely to be
+attention's quadratic term as anything about dispatch. What is not in doubt is
+the magnitude: 130 µs is far too large.
 
 *Priced kernels alone are 0.96 of a prefill step above ~4k tokens.* No overhead
 term at all beats the one we have, for every size except the smallest. That is
 worth knowing before more effort goes into modelling the term.
 
-*And prefill depends on sequence count, not only token count.* 1256 tokens in
-four sequences measured 42.6 ms; 1094 tokens in one sequence measured 31.7 ms.
-Nearly the same work, half again the time, because attention pays per sequence.
-So prefill's shape is at least two-dimensional and every measurement above varies
-only one of them.
+*And the sweep above cannot say what its own trend means.* It varied
+`--num-prompts` at a fixed prompt length, so token count and sequence count moved
+together -- 1094 tokens was one sequence and 13530 was twelve. "Overhead rises
+with tokens" was reported from it and is not supported by it.
 
-Which leaves prefill needing a fitted form -- `empirical/fitted` at operator
-level, the cell of the grid still empty -- or derivation (#7). It is the one part
-of the cost model where measuring the shapes that occur is not a viable strategy.
+Decoupled, by holding total tokens roughly fixed and redistributing them:
+
+| tokens | sequences | step | ms per 1k tokens |
+| --- | --- | --- | --- |
+| 3952 | 8 | 55.255 ms | 13.98 |
+| 4376 | 4 | 63.232 ms | 14.45 |
+| 4588 | 2 | 52.288 ms | 11.40 |
+| 4694 | 1 | 65.027 ms | 13.85 |
+| 8752 | 8 | 104.479 ms | 11.94 |
+| 9176 | 4 | 100.278 ms | 10.93 |
+| 9388 | 2 | 121.868 ms | 12.98 |
+| **10094** | **1** | **174.534 ms** | **17.29** |
+
+**A prefill step's cost is not a function of its token count.** At ~9-10k
+tokens one long sequence costs 174.5 ms where four shorter ones totalling 9176
+cost 100.3 -- 74% more time for 10% more tokens. At ~4.5k the same comparison is
+18% and the group has no clean ordering at all.
+
+That is attention being quadratic *within* a sequence: 10094² against 4 x 2294²
+is 4.8x the attention work, and attention's share of a prefill grows with size,
+which is why the effect is large at 10k and lost in the noise at 4.5k.
+
+So a "prefill shape" is not a scalar. It is the multiset of sequence lengths, and
+two steps carrying identical token counts can differ by 74%. **Measuring the
+shapes that occur is therefore not merely expensive but ill-defined** -- there is
+no enumerable set to measure, the way the decode ladder has rungs.
+
+What this does *not* undermine is the op graph, which already records
+`cu_seqlens_q` per attention call. The quantity that behaves quadratically is
+visible at operator level and invisible at step level, which is an argument for
+`empirical/fitted` per operator -- fitting attention against its own sequence
+lengths and the gemms against total tokens -- rather than for any amount of
+step-level measurement. This is the case the op-graph approach was built for and
+the first place it is clearly necessary rather than merely tidier.
 
 ### 6c. Expert parallelism: what ran was not meaningful EP — **L**
 
