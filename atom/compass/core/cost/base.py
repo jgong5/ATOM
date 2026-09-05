@@ -33,6 +33,15 @@ class StepShape:
             sixteen. An engine-agnostic number: the runner resolves the ladder,
             since the padding rule is the engine's, and the oracle only sees
             which rung was used.
+        compiled: Whether the step ran through a compiled graph without being
+            replayed. ``None`` means the runner did not say, and is treated as
+            eager. Between "replayed" and "eager" there is a third way a step
+            runs, and it pays neither cost: a compiled step submits its kernels
+            from generated code rather than through the dispatcher, so it does
+            not pay eager dispatch, and it is not one submission, so it does not
+            pay a replay's per-launch boundary. Measured, its idle is 5.7ms
+            against the 21.5ms the eager term charges -- see the step-accounting
+            section of DESIGN_NOTES.
     """
 
     num_scheduled_tokens: tuple[int, ...]
@@ -41,6 +50,7 @@ class StepShape:
     topology: Mapping[str, int] = field(default_factory=dict)
     rank_coords: Mapping[str, int] = field(default_factory=dict)
     capture_bucket: int | None = None
+    compiled: bool | None = None
 
     @property
     def batch_size(self) -> int:

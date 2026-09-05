@@ -567,6 +567,12 @@ class CompassModelRunner(ModelRunner):
             capture_bucket=self._capture_bucket(
                 len(num_scheduled),
                 prefilling=int(getattr(batch, "total_tokens_num_prefill", 0)) > 0),
+            # A step that is neither replayed nor dispatched operator by
+            # operator pays neither of those overheads, and the oracle cannot
+            # tell which from the graph -- a compiled step and an eager one
+            # dispatch the same operators when traced, because tracing forces
+            # eager. Only the engine knows, so it says.
+            compiled=(self._compilation_level() or 0) > 0,
         )
 
     def _capture_bucket(self, batch_size: int,

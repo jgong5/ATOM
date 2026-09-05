@@ -3587,3 +3587,41 @@ So the residual decomposes into a cold step, a double count, and an overhead
 model four times too large -- three errors, two of them upward, which partly
 cancelled into a plausible-looking 5.5%. A single number that stays plausible
 across many validations is worth taking apart.
+
+#### Splitting the overhead term
+
+A step runs one of three ways, and the cost model knew two. Replayed: one
+submission, priced per launch at the boundary constant. Eager: dispatched one
+operator at a time, priced `max(0, dispatch - kernel)` per operator. Compiled
+but not replayed is neither -- it submits its kernels from generated code, so
+it pays no eager dispatch, and it is not a single submission, so it pays no
+replay boundary -- and it was being charged the eager term.
+
+`StepShape.compiled` now says which, because nothing in the graph can: tracing
+forces eager, so a compiled step and an eager one record the same operators.
+Only the engine knows, so the runner reports it from `_compilation_level()`.
+A shape that does not say is treated as eager, which is what every graph traced
+before this does.
+
+The constant is 9.71 us per launch, measured rather than fitted: the warm step's
+idle, 5.722 ms, over the 589 launches this model counts for that graph. On the
+chunked prefill:
+
+| overhead model | predicted step | against the warm 102.982 ms |
+| --- | --- | --- |
+| eager (what it was) | 120.997 ms | +17.49% |
+| compiled | **105.200 ms** | **+2.15%** |
+
+**This changes predictions for every compiled non-replayed step, and prior
+end-to-end results were taken with the eager term.** They should be re-measured
+rather than assumed to survive. What can be said without re-running them is why
+the error did not show up before: `max(0, dispatch - kernel)` contributes
+*nothing* for an operator whose kernel exceeds 130 us, so its size depends
+entirely on the kernel-size distribution. On this 0.6B chunked prefill, where
+most kernels are small, it is 21.5 ms. On a 27B prefill, where most are large,
+it is close to zero -- so the term was near-harmless exactly where it was
+validated, and wrong where it was not. Decode steps are unaffected: they replay,
+and the boundary term is untouched.
+
+One step of one model is a thin basis for a constant, and it is exposed as
+`compiled_seconds_per_launch` for that reason.

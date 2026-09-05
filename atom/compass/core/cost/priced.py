@@ -94,6 +94,17 @@ DEFAULT_DISPATCH_SECONDS = 130e-6
 #: reason.
 DEFAULT_BOUNDARY_SECONDS = 2.25e-6
 
+#: Seconds added per kernel launch on a compiled step that was not replayed.
+#: A compiled step submits its kernels from generated code, so it pays neither
+#: eager dispatch nor a replay's boundary, and charging it the eager term
+#: overstated a chunked prefill's overhead four times over -- 21.5ms against a
+#: real 5.7ms. Measured by profiling the step and subtracting the time kernels
+#: were running from the step's own device window: 5.722ms over the 589 launches
+#: this model counts for that graph. Taken warm; the same step cold spends 31ms
+#: more in compilation stalls, which is not overhead and must not be fitted as
+#: any. One step of one model, so it is an argument.
+DEFAULT_COMPILED_SECONDS_PER_LAUNCH = 9.71e-6
+
 
 class PricedGraphCostOracle:
     """Costs a step by summing the priced operators of its op graph."""
@@ -102,6 +113,8 @@ class PricedGraphCostOracle:
                  boundary_seconds: float = DEFAULT_BOUNDARY_SECONDS,
                  eager_seconds_per_op: Optional[float] = DEFAULT_EAGER_SECONDS_PER_OP,
                  dispatch_seconds: float = DEFAULT_DISPATCH_SECONDS,
+                 compiled_seconds_per_launch: float =
+                 DEFAULT_COMPILED_SECONDS_PER_LAUNCH,
                  floor_seconds: float = 1e-6, fallback: str = "",
                  rank_coords: Optional[dict] = None) -> None:
         """
@@ -128,6 +141,11 @@ class PricedGraphCostOracle:
                 per-operator figure is 86 µs on a model with small kernels and
                 35 µs on one with large ones, while the dispatch behind both is
                 nearly the same number.
+            compiled_seconds_per_launch: Added per kernel launch on a compiled
+                step that was not replayed. Used only when the runner says the
+                step was compiled; a shape that does not say falls through to
+                the eager terms, which is what every graph traced before this
+                existed does.
             floor_seconds: Smallest duration ever returned, so a virtual clock
                 cannot be run backwards by an empty or unpriced graph.
             fallback: A calibration table, used for steps the graph does not
@@ -148,6 +166,7 @@ class PricedGraphCostOracle:
         self.eager_seconds_per_op = (None if eager_seconds_per_op is None
                                      else float(eager_seconds_per_op))
         self.dispatch_seconds = float(dispatch_seconds)
+        self.compiled_seconds_per_launch = float(compiled_seconds_per_launch)
         self.floor_seconds = float(floor_seconds)
 
         with open(self.prices_path, encoding="utf-8") as fh:
@@ -288,7 +307,11 @@ class PricedGraphCostOracle:
         # engine says which through `capture_bucket`, which is None exactly when
         # nothing was replayed -- so this stays a property of the step rather
         # than of the model or of what "prefill" happens to mean.
-        if shape.capture_bucket is None:
+        if shape.capture_bucket is None and shape.compiled:
+            # Neither dispatched one operator at a time nor submitted as one
+            # graph, so neither of the terms below describes it.
+            overhead = point.launches * self.compiled_seconds_per_launch
+        elif shape.capture_bucket is None:
             if self.eager_seconds_per_op is not None:
                 overhead = point.ops * self.eager_seconds_per_op
             else:

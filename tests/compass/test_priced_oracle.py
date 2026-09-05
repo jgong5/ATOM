@@ -246,3 +246,51 @@ class TestDecodeRungs:
         prices, graph = _artifacts(tmp_path, [_op("a")], seconds=1e-5)
         oracle = PricedGraphCostOracle(prices, graph, boundary_seconds=0.0)
         assert oracle.estimate(DECODE).seconds == pytest.approx(1e-5)
+
+
+class TestHowTheStepWasRun:
+    """Replayed, compiled, and eager are three ways to run a step, not two.
+
+    A compiled step submits its kernels from generated code: it pays neither
+    eager dispatch nor a replay's per-launch boundary. Charging it the eager
+    term overstated one chunked prefill's overhead four times over, 21.5ms
+    against a measured 5.7ms.
+    """
+
+    def _oracle(self, tmp_path, monkeypatch):
+        import json
+
+        from atom.compass.core.cost.priced import PricedGraphCostOracle
+
+        op = {"name": "aten::mm", "input_shapes": [[4, 8]],
+              "output_shapes": [], "dtypes": ["bfloat16"]}
+        graph = tmp_path / "g.json"
+        graph.write_text(json.dumps({"version": 1, "ops": [op] * 10}))
+        from atom.compass.runtime.microbench import signature_of
+        prices = tmp_path / "p.json"
+        prices.write_text(json.dumps({"prices": {
+            signature_of(op): {"seconds": 1e-6, "occurrences": 1,
+                               "kernels": {"k": 1e-6}}}}))
+        return PricedGraphCostOracle(prices=str(prices), graph=str(graph))
+
+    def test_a_compiled_step_pays_neither_other_term(self, tmp_path, monkeypatch):
+        from atom.compass.core.cost.base import StepShape
+
+        oracle = self._oracle(tmp_path, monkeypatch)
+        shape = dict(num_scheduled_tokens=(1,) * 4, context_lens=(8,) * 4)
+        compiled = oracle.estimate(StepShape(**shape, compiled=True)).seconds
+        eager = oracle.estimate(StepShape(**shape, compiled=False)).seconds
+        assert compiled < eager, (compiled, eager)
+        # ten operators, one kernel each, at the compiled per-launch figure
+        assert compiled == pytest.approx(
+            10 * 1e-6 + 10 * oracle.compiled_seconds_per_launch, rel=1e-6)
+
+    def test_a_shape_that_does_not_say_is_treated_as_eager(self, tmp_path,
+                                                           monkeypatch):
+        """Every graph traced before this existed says nothing."""
+        from atom.compass.core.cost.base import StepShape
+
+        oracle = self._oracle(tmp_path, monkeypatch)
+        shape = dict(num_scheduled_tokens=(1,) * 4, context_lens=(8,) * 4)
+        assert (oracle.estimate(StepShape(**shape)).seconds
+                == oracle.estimate(StepShape(**shape, compiled=False)).seconds)
