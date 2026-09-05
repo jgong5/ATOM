@@ -3670,3 +3670,52 @@ under its own pid, and summing across ranks counts two GPUs' work against one
 GPU's window. It now accounts for one device and refuses to report at all when
 the kernels exceed the window, because that is arithmetically impossible and
 every number derived from it would be wrong rather than imprecise.
+
+#### Re-tracing the 27B, and a hypothesis that did not survive
+
+The 27B artifacts predated the Triton, chunked-prefill and profiler work, and
+its prefill graph was 44% `triton::`/`inductor::` operators against 62% coverage.
+The obvious reading was that the 7% shortfall was those unpriced operators. It
+was not.
+
+Re-traced with current code the graph is a different shape:
+
+| | before | after |
+| --- | --- | --- |
+| prefill operators | 1280 | **1005** |
+| of which `triton::` | 433 | **0** |
+| of which `profiler::` | 2 | 0 |
+| coverage | 62.1% | **87.4%** |
+
+Every one of those 433 Triton launches happened *inside* a dispatched operator,
+so they were duplicates of work already in that operator's price, and dropping
+them is the double-count fix arriving on a second model. Coverage rose 25 points.
+
+**And the priced kernel time did not move**: 295.946ms before, 296.999ms after,
+against 318.351ms in situ -- from -7.0% to -6.7%. Twenty-five points of coverage
+bought one millisecond, because what was uncovered was duplicates.
+
+The second guess, that the remaining gap was the 128 still-unpriced
+`inductor::` operators, is also wrong. Profiled, the inductor-generated kernels
+in that step are **2.016 ms, 0.6% of its kernel time** -- against a 21.4 ms gap.
+
+So the 27B's shortfall is not coverage at all. It is in the operators that *are*
+priced: they cost less in isolation than the same work costs in the step, by
+6.7%. That is the opposite direction from the 0.6B, where isolated pricing came
+out 2.28% *high*. Two models, two signs, and the instrument that would settle it
+-- the per-kernel comparison in `step_accounting.py` -- needs the per-signature
+kernel breakdown, which is off under parallelism because it deadlocks. That is
+the next thing to fix, and it is now the only thing between here and an answer.
+
+Predicting the step with the new artifacts: **-4.70%** with the compiled term,
+**+2.03%** with the eager one, against a measured 320.707ms.
+
+**Loading generated kernels faults under tensor parallelism.** Enabled at TP=2
+it kills pricing with "Memory access fault by GPU node-2" partway through, and
+this took two attempts to bound: another rank's module must not be loaded at all
+(the cache path names the rank, and loading one leaves the process on a device
+it cannot use -- "invalid device ordinal" much later, far from the cause), but a
+rank loading only its own still faults. So it is now off under parallelism like
+`PRICE_KERNELS`, for a worse reason: a fault takes the whole run, where an
+unpriced operator takes one signature. The cost of that default is the 2.0 ms
+measured above.

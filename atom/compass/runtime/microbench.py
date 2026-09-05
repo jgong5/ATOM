@@ -145,6 +145,24 @@ def _resolve_triton(op: dict):
     return call
 
 
+def _is_this_rank(path: str) -> bool:
+    """Whether a generated module belongs to the rank running this process."""
+    import re
+
+    import torch
+
+    found = re.search(r"[/_]rank_(\d+)[/_]", path)
+    if not found:
+        return True
+    try:
+        mine = (torch.distributed.get_rank()
+                if torch.distributed.is_available()
+                and torch.distributed.is_initialized() else 0)
+    except Exception:  # noqa: BLE001 - no process group is rank 0
+        mine = 0
+    return int(found.group(1)) == mine
+
+
 def _resolve_generated(origin: str):
     """Load an inductor-generated kernel from the file it was generated into.
 
@@ -163,17 +181,31 @@ def _resolve_generated(origin: str):
     import torch
 
     path, _, name = origin[len(GENERATED):].rpartition("::")
-    if not path or not name or not os.path.exists(path):
+    if not path or not name or not os.path.exists(path) or not LOAD_GENERATED:
         return None
     spec = importlib.util.spec_from_file_location(
         "compass_generated_" + os.path.basename(path).partition(".")[0], path)
     if spec is None or spec.loader is None:
         return None
+    # Another rank's generated module is not this process's to execute. Under
+    # tensor parallelism the bench graph is the union of every rank's, and
+    # inductor caches per rank (`.../rank_0/...`); loading one belonging to
+    # another rank binds this process to a device it cannot use, and every
+    # later allocation dies with "invalid device ordinal" far from the cause.
+    # Restoring the current device afterwards is not enough -- what the module
+    # does on import reaches further than that -- so the module is not loaded
+    # at all. Each rank prices its own, which is what the union was for.
+    if not _is_this_rank(path):
+        return None
+    previous = torch.cuda.current_device()
     try:
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
     except Exception:  # noqa: BLE001 - generated code can fail many ways
         return None
+    finally:
+        if torch.cuda.current_device() != previous:
+            torch.cuda.set_device(previous)
     kernel = getattr(module, name, None)
     if kernel is None:
         return None
@@ -460,6 +492,24 @@ REPLAY_INT_VALUES = os.environ.get("COMPASS_REPLAY_INT_VALUES", "") == "1"
 #: tensor in range because the rebuilt tensor has the recorded shape. Set
 #: ``COMPASS_SYNTH_INT_RANGES=0`` to go back to zeros.
 SYNTH_INT_RANGES = os.environ.get("COMPASS_SYNTH_INT_RANGES", "1") != "0"
+
+#: Load inductor-generated kernels from the codecache to price them.
+#:
+#: Off under parallelism, like `PRICE_KERNELS` and for a worse reason: at TP=2
+#: it faults the device mid-pricing ("Memory access fault by GPU node-2"),
+#: taking the whole run with it. Skipping other ranks' modules is necessary --
+#: loading one leaves the process on a device it cannot use -- and is not
+#: sufficient; a rank loading only its own still faults. Since a fault kills the
+#: run rather than leaving one signature unpriced, the default is off where it
+#: is known to happen, and what is lost is small: those kernels are 2.0ms of a
+#: 316ms step on the one model measured.
+#:
+#: Executing generated code is the one part of pricing that runs code this
+#: process did not write, so it has a way off at TP=1 too:
+#: ``COMPASS_LOAD_GENERATED=0``.
+LOAD_GENERATED = os.environ.get(
+    "COMPASS_LOAD_GENERATED",
+    "0" if int(os.environ.get("WORLD_SIZE", "1") or 1) > 1 else "1") != "0"
 
 #: Distinct KV-cache regions a captured batch rotates over. One per captured
 #: call by default, so a region is revisited only after every other has been

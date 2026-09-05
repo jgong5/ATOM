@@ -303,3 +303,35 @@ class TestGeneratedKernels:
             microbench._resolve_generated = original
         assert seen == ["path:/x/y.py::k"]
         assert microbench._resolve_generated is original
+
+
+class TestGeneratedKernelsUnderParallelism:
+    """Inductor caches per rank, and the bench graph is the union of all ranks.
+
+    Loading another rank's generated module bound the process to a device it
+    could not use, and every later allocation died with "invalid device
+    ordinal" far from the cause. Each rank prices its own.
+    """
+
+    def test_another_ranks_module_is_not_this_process_to_load(self):
+        from atom.compass.runtime.microbench import _is_this_rank
+
+        assert _is_this_rank("/cache/abc/rank_0/backbone/x.py")
+        assert not _is_this_rank("/cache/abc/rank_1/backbone/x.py")
+
+    def test_a_path_naming_no_rank_is_left_alone(self):
+        from atom.compass.runtime.microbench import _is_this_rank
+
+        assert _is_this_rank("/tmp/torchinductor_root/qk/cqkf626.py")
+
+    def test_generated_loading_is_off_under_parallelism(self, monkeypatch):
+        """A fault kills the run; an unpriced operator does not."""
+        import importlib
+
+        from atom.compass.runtime import microbench
+
+        monkeypatch.setenv("WORLD_SIZE", "2")
+        monkeypatch.delenv("COMPASS_LOAD_GENERATED", raising=False)
+        assert not importlib.reload(microbench).LOAD_GENERATED
+        monkeypatch.setenv("WORLD_SIZE", "1")
+        assert importlib.reload(microbench).LOAD_GENERATED
