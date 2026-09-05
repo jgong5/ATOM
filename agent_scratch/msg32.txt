@@ -1,0 +1,33 @@
+Drive serving from declared arrivals, and get an attributable error
+
+The serving divergence needed no engine change: the protocol already
+carries compass_arrival, an offset into the run, and
+compass_workload_size so the arrival barrier holds virtual time until
+every declared arrival has landed. benchmark_serving never sets them.
+
+scripts/compass/replay.py does. Requests are posted as fast as the
+socket allows and each carries the instant it should count as
+arriving, so delivery order and socket latency stop mattering. A real
+server ignores the declared arrival and uses now, so one script drives
+both sides. It takes a JSONL trace of {arrival_s, input_tokens,
+output_tokens} as well as synthetic Poisson arrivals, because a real
+arrival process is bursty in ways no rate parameter reproduces and
+burstiness is what decides whether requests batch together.
+
+It fixes the schedule: 4 prefill steps against 4, 31 decode against 32,
+and the same bucket 64 with the same count of 31 -- against 3 vs 6 and
+127 vs 189 under the HTTP driver.
+
+With the schedule fixed the error is attributable for the first time.
+Prefill is 4.1x under because one graph answers for every shape: the
+simulated steps cost 42ms whether they carry 279 tokens or 16368,
+where the real ones run 39ms to 251ms and scale with tokens. Decode is
+15.6% under because the ladder was traced on 64-word prompts and this
+workload uses 128-word ones, so the same bucket carries more KV
+history -- the ladder fixed the batch dimension and context is a
+second one.
+
+Two client fixes worth keeping: it reports the server's error body
+rather than a bare status, and it discovers the served model from
+/v1/models. A wrong model name failed all 64 requests identically and
+looked like a transport fault.

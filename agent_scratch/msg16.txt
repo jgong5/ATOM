@@ -1,0 +1,26 @@
+Reach a real EP degree, and confirm the comms are still invisible
+
+With the container able to build MORI's kernels and --level 0 avoiding
+defect 10, TP=2 x DP=2 with dp-attention runs at ep_size=4. Note
+--enforce-eager does not avoid that defect: in ATOM it disables graph
+capture, not torch.compile.
+
+Two collectives appear that were absent at ep_size=2, and neither is
+expert routing:
+
+  c10d::alltoall_base_  [151936] bf16   vocab-sized, DP's logits exchange
+  c10d::allgather_      [2]      int32  token counts across DP
+
+48 moe_forward and not one per-layer collective. Dispatch and combine
+are MORI kernels called inside the operator, so they never reach the
+dispatcher. The conclusion from ep_size=2 therefore survives being
+tested where EP is real: the graph cannot see expert communication at
+any EP degree.
+
+Also fixes a silent artifact race found on the way. _rank_coords
+reported only tp while _topology reported tp and dp, so under
+TP=2 x DP=2 all four ranks resolved to one graph.tp0.json and wrote it
+in turn -- three quarters of the evidence discarded, and the surviving
+file looked complete. Same defect the artifacts convention was written
+to fix, one parallelism later. Every group in _topology now has a
+coordinate in _rank_coords.

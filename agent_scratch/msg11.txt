@@ -1,0 +1,37 @@
+Price collectives, and validate the op-graph oracle at TP=2
+
+The open question was whether a microbenchmark can price a
+collective. It can: called in the worker, where the process group is
+live, all_reduce_ prices at 10.38us for a [4,1024] decode and 71.33us
+for a [1256,1024] prefill, and coverage comes to 98.3% on both ranks.
+Only c10d::broadcast_ fails, taking a ProcessGroup object no JSON
+artifact can hold, and it is one operator per step.
+
+What makes it safe is pricing the union of every rank's graphs rather
+than each rank's own. A collective needs all ranks calling it in
+lockstep, so signature lists differing by one entry deadlock rather
+than fail -- a hang with no error, inside the worker. The union is
+identical across ranks by construction.
+
+The graph and the prices then transfer to TP=2 unchanged. Only the two
+overhead constants move:
+
+              tp1 consts   refitted   real(n=3)   noise
+  ttft            -5.8%      -2.2%    63.822ms   +-2.9%
+  tpot            +6.2%      +2.4%     3.290ms   +-3.9%
+  latency         +1.6%      +0.6%   165.805ms   +-2.2%
+
+Reused from TP=1 they cost a few percent and pull in opposite
+directions -- tpot over, ttft under -- which is what identified them
+rather than the prices as the problem. Refitted: 1.97us/launch against
+2.25, and 92.5us/op against 86.35. Seven and twelve percent off, in
+different directions, on the same hardware and model.
+
+So the constants are a property of a deployment, and problem 21's hope
+of one calibration factor would have been wrong even had the ratio
+been constant. Predicting a configuration nobody has run needs either
+one measured step from it to fit two numbers, or an accepted ~5% error
+on metrics whose overhead term is a quarter of the step.
+
+Admission carries over untouched: 12.89ms at TP=2 against 13.19 at
+TP=1, being engine-side work that never reaches a device.

@@ -1,0 +1,42 @@
+Record attention's forward context beside it, not through it
+
+Reverts c337ee3a. Making an operator a pure function of its
+arguments cannot work when the caller is compiled: Dynamo traces
+md = get_forward_context().attn_metadata, tensor reads become graph
+inputs and flow, and everything else is a compile-time constant read
+from whichever forward triggered compilation. max_seqlen_q folds
+because it is an int; block_tables folds to None because it was None
+in the warmup dummy. The signature claimed a pure function and the
+call site guaranteed otherwise.
+
+That is not a fact about attention. An op graph records arguments,
+arguments cannot carry non-tensor state through torch.compile, so an
+op graph cannot on its own describe an operator whose cost depends on
+non-tensor ambient state -- and no change to that operator's
+signature will make it able to.
+
+So the context is recorded alongside the operator instead.
+forward_ctx.py holds both halves: the tracer reads the live forward
+context where the values are true, the benchmark stands one up before
+calling, and OpSpec gains a context field. block_tables is kept by
+full shape but only the columns the kernel reads -- shape plus used
+prefix reproduces the addressing and the traffic without an artifact
+that grows with max_model_len. The graph went 89 KB to 107 KB.
+
+The context is part of the price key, since after the revert it is
+the only record of the difference between a 40-token and a 4000-token
+decode. block_tables contents are excluded: they decide which blocks
+are walked, not how many.
+
+Against the ablation ground truth, same workload:
+
+    before      163.7 us/call    7.1x over
+    now          18.3 us/call
+    ablation     26.1 us/call
+
+28 layers priced independently agree to 1%. The residual 30% is the
+known graph-mode overlap bias. Coverage is back to 98.8%, honestly.
+
+Cost of the design, stated rather than hidden: Compass now knows
+something about attention specifically, in one module, for one
+operator.

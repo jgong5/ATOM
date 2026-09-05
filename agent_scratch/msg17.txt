@@ -1,0 +1,35 @@
+Trace and price the target model, and find it is a hybrid
+
+Qwen3.8-27B runs now, and it is not the dense transformer this was
+scoped around. Its decode graph carries 48
+triton::_causal_conv1d_update_kernel and 48
+triton::fused_gdn_gating_kernel: 48 layers of gated DeltaNet, linear
+attention with a recurrent state, alongside the full-attention ones.
+
+That matters beyond a note. Everything measured on Qwen3-0.6B assumed
+attention that grows with context and a KV cache that is walked. A
+DeltaNet layer carries fixed-size state and its decode cost does not
+grow with history, so the context-interpolation question settled on
+the 0.6B -- where four graphs bought little -- was settled on an
+architecture that only half applies here.
+
+The first trace also found a hole in the warmup added for exactly
+this purpose. Triton autotunes per shape, and the warm pass used
+prompts of the same word count rather than the same token count, so
+shapes differed and the linear-attention kernels tuned again during
+the traced step: 50451 tuning launches in a prefill graph of 51179
+operators, ranks disagreeing at 51179 against 50549, coverage 2.7%.
+The decode graph was unaffected, which is why it looked fine.
+
+Warming with the same prompts fixes it -- prefill 51179 to 1280, ranks
+agreeing, coverage 62.1% -- and needs --no-enable_prefix_caching so
+the second pass really re-prefills.
+
+62.1% where the dense 0.6B reaches 98.8%, and the gap is structural.
+28 of 37 unpriced signatures fail with "operator not registered in
+this process" and every one is triton:: or inductor::. The benchmark
+prices by calling torch.ops.<ns>.<op> and a Triton JITFunction is not
+one. On the 0.6B that was four signatures; here it is the 48 DeltaNet
+layers, 1734 operators, 38% of the graph. Problem 10 was sized S when
+Triton kernels were incidental; on the target model it is most of the
+linear-attention path.

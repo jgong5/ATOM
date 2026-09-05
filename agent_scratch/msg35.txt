@@ -1,0 +1,34 @@
+Fit prefill: the quadratic term is right, the granularity is not
+
+Fitted over all fourteen measured prefill steps, with features the
+step table already carries:
+
+  a*tokens + c                 median 6.5%, worst 30.1%
+  a*tokens + b*sum(len^2) + c  median 8.0%, worst 21.1%
+
+As summary statistics that looks like a wash. Per configuration it is
+not. The single-long-sequence case goes from -30.1% to -2.3% and the
+twelve-sequence case from +19.2% to +4.1%. Those are the two ends of
+the distribution axis and a token-count model is blind to both; the
+median worsens only because the term does not address the cases below
+and cannot.
+
+Two things it exposes. There is a floor no model here has: 1094 tokens
+cost 31.7ms and 2188 cost 32.0, twice the tokens for the same time, so
+both fits over-predict the second by ~20%. Prefill below roughly 2k
+tokens is not token-bound, which is the same shape of finding as
+decode being flat from batch 1 to 8.
+
+And one measurement is explained by nothing: sq_2x400 carries 4588
+tokens in two sequences for 52.3ms where sq_4x200 carries fewer tokens
+in more sequences for 63.2ms -- more tokens and more attention work
+for less time. Both are single draws with no repeats, and the serving
+work already established that a single draw is not a measurement. It
+should be repeated before anyone theorises, including me, which is why
+there is no theory recorded.
+
+So the fit confirms the mechanism and refuses to be a model: right
+feature, wrong granularity. Attention's quadratic cost belongs to
+attention, where the graph records cu_seqlens_q per call, rather than
+to a step-level regression recovering it from a sum. Second
+independent argument for the operator-level fit.

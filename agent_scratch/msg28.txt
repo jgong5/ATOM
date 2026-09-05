@@ -1,0 +1,22 @@
+Split the per-launch constant: plain is stable, collective grows
+
+OpSpec.group already says which launches are collective and TP=1 has
+none, so TP=1 identifies the plain constant alone and each higher TP
+gives the collective one:
+
+  plain       1.82us/launch
+  collective  4.20us at TP=2, 9.72us at TP=4
+
+That is what the hypothesis predicted. The single 2.25us was a blend,
+which is why it fitted TP=1 and TP=2 -- where collectives are absent
+or a small share -- and broke at TP=4 needing 3.33.
+
+Held out to other models at the same group size the split is a real
+but modest improvement: Qwen3-0.6B TP=2 goes +3.71% to +2.11%, and the
+30B MoE +10.54% to +9.54%. The MoE is wrong by about the same either
+way, so whatever ails it is not the boundary constant.
+
+Two points cannot fix how the collective term scales. 4.20 to 9.72 is
+2.3x for a doubled group, which fits linear-in-group, linear in log2,
+and nothing cleanly. TP=8 would separate them; until then it is a
+measured value per group size rather than a law.

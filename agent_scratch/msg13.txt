@@ -1,0 +1,30 @@
+Trace and price an expert-parallel MoE, and find its comms invisible
+
+Qwen3-30B-A3B, 128 experts and 8 per token, TP=2 with
+--enable-expert-parallel. It traces -- 488 decode operators, 477
+prefill, identical on both ranks -- and prices at 98.7% coverage with
+no new machinery:
+
+  moe_forward               [4,2048] decode      71.58us
+  moe_forward               [1256,2048] prefill 597.40us
+  fused_allreduce_rmsnorm_  decode                9.60us
+  fused_allreduce_rmsnorm_  prefill             140.96us
+
+The discouraging part is what the graph does not contain. There is no
+all-to-all, no dispatch, no combine: expert parallelism's
+communication happens inside aiter::moe_forward, a single opaque node,
+and the only collectives left are the tensor-parallel ones, where the
+all-reduce is fused into the norm and is not separable either.
+
+So the price is right for the EP degree it was measured at and says
+nothing about any other. A graph whose collectives are named and sized
+can be re-costed for a different group size; one whose collectives are
+welded inside a fused operator cannot. Same shape of problem as
+attention reading ambient metadata, and harder -- there the state
+could be recorded beside the operator, here the work is inside it.
+
+Also records that --load_dummy skips reading a checkpoint but not
+resolving one, so the hub still demands all 16 shards; pointing
+--model at a local directory with the shard index removed is what
+makes a weightless run work. Only the config and tokenizer were
+fetched; 60 GB never moved.

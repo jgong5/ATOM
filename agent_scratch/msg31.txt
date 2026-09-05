@@ -1,0 +1,40 @@
+Find the serving divergence: arrivals are wall-clock, steps are virtual
+
+Sweeping admission over the same workload, with step tables on both
+sides:
+
+                    prefill  decode  decode buckets
+  real                    3     127  1x64, 64x63
+  simulated adm=0        20     159  1x94, 16x2, 64x63
+  simulated adm=13.2ms   13     126  1x63, 64x63
+  simulated adm=26.4ms    7     189  1x63, 2x63, 64x63
+
+Admission changes the schedule: 0 produces a bucket-16 cohort, 26.4ms
+a bucket-2 one, and the measured 13.2ms nearly reproduces reality at
+126 decode steps against 127 in the same two buckets.
+
+But the previous run also used 13.2ms and produced 189 decode steps
+with a phantom bucket 2. Identical settings, different schedule. The
+simulated schedule is not a function of the configuration:
+serve_probe drives requests over HTTP, so arrivals happen in
+wall-clock time while the engine advances a virtual clock by predicted
+costs, and the interleaving is a race. Two samples, so that is the
+explanation that fits rather than a measured distribution.
+
+This is problem 6 in a deeper form than recorded. The known problem
+was that an HTTP benchmark times a simulated engine wrongly; this is
+that it perturbs one -- the schedule, which is the thing being
+validated.
+
+Prefill shows it without the noise: 7, 13 and 20 simulated prefill
+steps against 3 real, in every run at every admission value. Chunked
+prefill splits when a token budget is exceeded, and a scheduler seeing
+arrivals scattered across virtual time batches fewer per step and
+chunks more.
+
+The fix is not in the cost model. The offline path already declares
+when each request arrives and holds a step until that instant, so
+arrivals share the clock with steps. Serving validation needs a driver
+that does the same rather than an HTTP client racing the simulation --
+which is why offline agrees to within noise and serving does not, and
+it has nothing to do with shapes.

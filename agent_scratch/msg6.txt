@@ -1,0 +1,45 @@
+Cost a step from its op graph: the first oracle that reads an operator
+
+Item 1. Tracing, derivation, the microbenchmark and the recorded
+forward context were all groundwork for this and paid for nothing
+until now -- both other oracles fit token counts and never look at an
+operator.
+
+    step = sum(price x occurrences) + launches x boundary
+
+Against the workload it was fitted on: TTFT -1.3%, TPOT -0.4%,
+latency -0.7%. Held out at 96 output tokens instead of 32: -1.7%,
+-3.7%, -3.4%.
+
+The second term settles open problem 21, which asked whether the
+missing quarter of a step is a constant ratio. It is not -- across
+every kernel the price list reaches the ratio runs 0.434 to 0.989,
+too wide for one factor. As a fixed cost per launch it is 0.80 to
+3.56us, median 2.05, and the constant that closes the whole step
+without a profiler is (3.115 - 2.305) / 401 = 2.02us. A ratio was the
+wrong shape: the cost is invisible on a 13us gemm and doubles a 2.7us
+rmsnorm.
+
+price_check.py is the tool that answered it. Two things had to be got
+right. A decode step is a replayed CUDA graph, so its profile has
+kernels and no operators to charge them to -- kernel names are the
+only key both sides share, and the price list now records which
+kernels each operator launches. And those names cannot distinguish an
+operator from a kernel, since both live in the aiter namespace;
+filtering by prefix dropped attention's kernel and handed its price to
+rope and the KV write, which then priced above their in-situ cost.
+Reading cat == "kernel" from the exported trace, the same filter the
+other side uses, is what makes them comparable.
+
+Read the held-out row as what is missing rather than as a result. The
+oracle holds one graph, so it returns one number for every decode
+step, while real TPOT rises with context. That -3.7% is the
+single-graph limitation and it is the argument for deriving a graph
+per shape. Prefill is not priced at all -- one step is traced and it
+is a decode step -- so prefill falls through to a calibrated fallback
+and the TTFT figures are that fallback's.
+
+Also: run.py can profile its own workload, so the price list and the
+profile it is checked against are the same shapes. And a profiled run
+is 16% slower end to end, so a prediction must never be validated
+against a profiled baseline.

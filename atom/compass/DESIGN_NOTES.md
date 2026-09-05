@@ -1835,6 +1835,53 @@ lengths and the gemms against total tokens -- rather than for any amount of
 step-level measurement. This is the case the op-graph approach was built for and
 the first place it is clearly necessary rather than merely tidier.
 
+### Fitting prefill: the quadratic term is right, and two other things are wrong
+
+Fitted over all fourteen measured prefill steps, using features the step table
+already carries (`num_scheduled_tokens` gives the sequence lengths):
+
+| model | median | worst |
+| --- | --- | --- |
+| `a·tokens + c` -- what keying on token count assumes | **6.5%** | 30.1% |
+| `a·tokens + b·Σlen² + c` | 8.0% | **21.1%** |
+
+Read as summary statistics that looks like a wash. Per configuration it is not:
+
+| config | seqs | measured | tokens only | + quadratic |
+| --- | --- | --- | --- | --- |
+| **sq_1x1600** | 1 | 174.5 ms | **-30.1%** | **-2.3%** |
+| pm_n12 | 12 | 132.9 ms | +19.2% | +4.1% |
+| sq_2x800 | 2 | 121.9 ms | -6.0% | +2.5% |
+| pm_n1 | 1 | 31.7 ms | -16.1% | -9.3% |
+| pm_n2 | 2 | 32.0 ms | +19.5% | +20.1% |
+| sq_2x400 | 2 | 52.3 ms | +21.7% | +21.1% |
+
+**The quadratic term does exactly what it was introduced for.** The
+single-long-sequence case goes from -30.1% to -2.3%, and the twelve-sequence case
+from +19.2% to +4.1%. Nothing else could have fixed those: they are the two ends
+of the distribution axis, and a token-count model is blind to it. The median got
+worse only because the term does not address the cases below, and cannot.
+
+**There is a floor no model here has.** 1094 tokens cost 31.7 ms and 2188 cost
+32.0 -- twice the tokens for the same time. Both fits assume proportionality and
+so over-predict `pm_n2` by ~20%. Prefill below roughly 2k tokens is not
+token-bound at all, which is the same shape of finding as decode being flat from
+batch 1 to 8.
+
+**And one measurement is not explained by anything.** `sq_2x400` carries 4588
+tokens in two sequences and measures 52.3 ms, where `sq_4x200` carries *fewer*
+tokens (4376) in more sequences and measures 63.2 ms. More tokens and more
+attention work for less time. Both are single measurements with no repeats, and
+the serving work already established that a single draw here is not a
+measurement. It should be repeated before anyone theorises about it -- including
+me, which is why there is no theory here.
+
+So the fit confirms the mechanism and refuses to be a model: right feature, wrong
+granularity. Attention's quadratic cost belongs to *attention*, where the graph
+records `cu_seqlens_q` per call, not to a step-level regression that has to
+recover it from a sum. That is the operator-level fit, still unbuilt, and this is
+now the second independent argument for it.
+
 ### 6c. Expert parallelism: what ran was not meaningful EP — **L**
 
 Qwen3-30B-A3B, 128 experts and 8 per token, at TP=2 with

@@ -1,0 +1,38 @@
+Compute the eager term, and predict the target model with nothing fitted on it
+
+The eager overhead was fitted per model -- 86.35us/op on a 0.6B and
+34.62 on a 27B -- which is not a constant. Restating it as a dispatch
+the kernels race rather than a cost they add: solving
+sum(max(0, D - kernel)) == step - priced gives D = 132.70us and
+101.22us, narrowing the spread between two very different models from
+2.5x to 1.3x. At a shared 130us both prefill steps land within ~3%, so
+the eager term is now computed from the price list rather than fitted.
+
+The 27B barely constrains D -- 403 of its 708 operators hide the
+dispatch entirely and its prediction moves 3% across 100-132us -- so
+the 0.6B, where only 29 of 316 hide it, is what pins the value. Two
+models is a thin basis and this should be refitted as more arrive.
+
+Qwen3.8-27B at TP=2, against three warmed passes:
+
+                fitted    computed   real(n=3)   noise
+  ttft          -0.15%      +2.45%   339.216ms  +-0.8%
+  tpot          +0.00%      +0.00%    17.854ms  +-0.1%
+  latency       -0.08%      +1.37%   607.020ms  +-0.5%
+
+The computed column is the one that means anything: its per-launch
+constant and its dispatch constant both come from a dense model 45x
+smaller, and nothing in it was fitted on the 27B except admission,
+which is a property of the deployment. The fitted column is shown to
+make the difference visible -- it is better because it saw the answer.
+
+Not evidence, and not to be read as such: admission was measured from
+the same run it is compared against, and the workload is one shape,
+which is the case a fixed-shape oracle handles and serving does not.
+
+Harness note that nearly cost a wrong conclusion: several passes in
+one predict process make TTFT climb ~588ms a pass, because the client
+stamps arrival on the wall clock while the engine advances a virtual
+one. Averaging them reported TTFT +346%. The first pass is the only
+uncorrupted one, and predict mode needs no warming since no kernels
+run.

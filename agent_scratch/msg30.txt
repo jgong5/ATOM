@@ -1,0 +1,37 @@
+Record predicted steps, and find serving runs a different schedule
+
+Predict mode now writes the same step table measure mode does, so a
+simulated run leaves a trace of which steps it ran rather than only
+what they totalled. Two attempts to attribute the serving error failed
+for want of exactly this.
+
+With it, the answer is not a pricing error:
+
+                   real                    simulated
+  prefill steps    3: 16, 256, 16128       6: 16, 256x2, 1536, 3072, 11264
+  decode steps     127: bucket 1x64, 64x63 189: bucket 1x63, 2x63, 64x63
+  prefill total    371.5ms                 251.2ms
+  decode total     486.8ms                 721.9ms
+
+62 extra decode steps, 63 of them at bucket 2, a bucket the real run
+never visits, and the 16128-token prefill split into 1536 + 3072 +
+11264.
+
+So 6b is not mainly that the oracle cannot price the shapes serving
+produces. It is that a simulated run does not perform the same steps
+as the run it stands for: the scheduler batches according to the clock
+the oracle drives, and a different clock coalesces requests
+differently. Aggregate latency cannot separate a wrong step cost from
+a different set of steps.
+
+It also explains why the decode ladder does not show up here despite
+being real: it was validated against the rungs it was measured at, and
+serving spends 63 steps at a rung that exists only in the simulation.
+
+First mechanism to look at is admission, modelled as a fixed 13.2ms
+deferral per request. That quantises arrivals, and a bucket-2 cohort
+appearing 63 times is what quantised arrivals would produce.
+
+Also records that serving numbers need repeats: three runs of this
+comparison gave TTFT +47.9%, +24.9% and +80.4%, with the real side
+alone moving 311ms to 346ms.

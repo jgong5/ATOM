@@ -1,0 +1,33 @@
+Trace several steps so the oracle can move with context
+
+The held-out -3.7% was the single-graph limitation: one graph
+describes one shape, so the oracle answered every decode step with
+the number the traced step happened to cost while real TPOT climbs
+from 3.115ms to 3.224ms as context grows.
+
+--compass-trace-steps 2,10,20,30 records a graph per step, each to
+its own file; --compass-bench-graph takes a glob and prices their
+union, so signatures that repeat across shapes are priced once and
+the ones that differ -- attention at each context -- each get their
+own price; and the oracle interpolates between the graphs on mean
+context, extrapolating past the ends rather than clamping.
+
+                    one graph   four graphs
+  32 tokens tpot        -0.4%         +0.6%
+  32 tokens latency     -0.7%         -0.1%
+  96 tokens tpot        -3.7%         -1.5%
+  96 tokens latency     -3.4%         -1.5%
+
+Covering the range does not help further, which is worth more than
+the improvement. Tracing 2,30,60,90 spans 315-403 tokens so a
+96-token run interpolates rather than extrapolates, and it comes out
+at -2.3% -- slightly worse. The relationship is not quite linear and
+the extrapolation overshot helpfully. Both land at 1.5-2.3%, so
+context no longer dominates the error and widening the trace is not
+the lever. What is left is a systematic ~2% low, pointing at the 16
+of 1320 operators still unpriced and at a boundary constant fitted at
+one context.
+
+Prefill is still not priced -- every traced step is a decode step --
+so it falls through to the calibrated fallback and the TTFT figures
+are that fallback's.
