@@ -3779,3 +3779,51 @@ priced kernels, which was the remaining hypothesis. It is concentrated in the
 9.5% of kernel time -- about 30 ms -- that no priced signature accounts for.
 That is a much smaller thing to go and find than "the operators are underpriced",
 and it is where the next look should go.
+
+#### The 27B's missing 30ms: the DeltaNet layers were never running
+
+With breakdowns working, the kernels in the step that no priced signature
+accounts for come to **27.214 ms, 8.5%** — and they are one family:
+
+| ms | kernel |
+| --- | --- |
+| 5.745 | `chunk_gated_delta_rule_fwd_kernel_h_blockdim64` |
+| 4.644 | `_fused_merge_recompute_kernel` |
+| 3.120 | `chunk_fwd_kernel_o` |
+| 3.037 | `_causal_conv1d_fwd_kernel` |
+| 1.257 | `solve_tril_16x16_kernel` |
+| 1.186 | `_fused_cumsum_kkt_kernel` |
+| 0.623 | `l2norm_fwd_kernel2` |
+
+The gated-DeltaNet path. Qwen3.8-27B is a hybrid and 48 of its layers are
+DeltaNet rather than attention, and all of them run inside one operator that
+*is* in the graph and *is* priced:
+
+    aiter::linear_attention_with_output_base   x48
+      context recorded : NONE
+      priced           : 5.793 us each, 0.277 ms over all 48
+      breakdown        : one FillFunctor kernel
+      in situ          : 0.567 ms each, 27.214 ms over all 48
+
+Priced at **1% of its cost**, and the breakdown says why in one kernel name.
+`attention_gdn.py` opens with
+
+    gdn_metadata = getattr(fwd_ctx.attn_metadata, "gdn_metadata", None)
+    if gdn_metadata is None:
+        core_attn_out.zero_()
+        return core_attn_out
+
+so with no GDN metadata installed the operator zeroes its output and returns.
+The benchmark was timing 48 `zero_()` calls and pricing the linear-attention
+half of a hybrid model at nothing.
+
+This is the failure that priced attention at 7x, in the other direction and in
+the operator nobody extended `forward_ctx` to. It is worth stating what the
+earlier fix did *not* do: it made attention take its recorded context, and left
+every other context-dependent operator silently taking whatever was installed --
+which for this one is nothing at all, and reads as a very cheap operator rather
+than as an error.
+
+It also explains the sign puzzle. The 0.6B, which has no DeltaNet layers, priced
+2.28% *high*; the 27B priced 6.7% low. Not two models disagreeing about pricing
+-- one model with an entire layer type missing from its cost.
