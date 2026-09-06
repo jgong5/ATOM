@@ -95,6 +95,15 @@ class OpSpec:
             the values themselves is not, because every tensor argument is
             rebuilt at its recorded shape: a value that indexed the real tensor
             in range indexes the rebuilt one in range too.
+        inputs_from: For each tensor input, the index of the operator that
+            produced it, or -1 for one this step did not produce -- a weight, an
+            embedding table, a buffer allocated before the forward. Shapes say
+            how much memory an operator *touches*; only knowing which tensor is
+            which says how much is live at once, and that is the activation
+            term of a memory budget. Recorded by matching storage addresses as
+            the trace runs, because a graph of shapes alone cannot be walked for
+            liveness -- two tensors of the same shape are indistinguishable in
+            it.
         launch: How to launch a Triton kernel that is not a torch operator, as
             ``(name, value)`` pairs: ``grid`` and ``origin``. A torch operator
             can be found again from its name alone, through ``torch.ops``; a
@@ -114,6 +123,7 @@ class OpSpec:
     context: tuple[tuple[str, Any], ...] = ()
     launch: tuple[tuple[str, Any], ...] = ()
     int_ranges: tuple[tuple[int, tuple[int, int, bool]], ...] = ()
+    inputs_from: tuple[int, ...] = ()
 
     @property
     def is_collective(self) -> bool:
@@ -182,6 +192,7 @@ class OpGraph:
                     "context": [list(kv) for kv in op.context],
                     "launch": [list(kv) for kv in op.launch],
                     "int_ranges": [[i, list(v)] for i, v in op.int_ranges],
+                    "inputs_from": list(op.inputs_from),
                 }
                 for op in self.ops
             ],
@@ -222,6 +233,8 @@ class OpGraph:
                         (int(i), (int(v[0]), int(v[1]), bool(v[2])))
                         for i, v in op.get("int_ranges") or ()
                     ),
+                    inputs_from=tuple(
+                        int(i) for i in op.get("inputs_from") or ()),
                 )
             )
         return graph

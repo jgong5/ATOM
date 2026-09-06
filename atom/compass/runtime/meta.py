@@ -196,6 +196,18 @@ def inside_an_operator() -> bool:
     return bool(_DISPATCHING)
 
 
+def _storage_of(tensor) -> int:
+    """A tensor's storage address, or 0 where it has none.
+
+    Two views of one buffer are one entry: a reshape does not allocate, and
+    counting it twice would invent activation memory that never existed.
+    """
+    try:
+        return int(tensor.untyped_storage().data_ptr())
+    except Exception:  # noqa: BLE001 - meta and fake tensors have no storage
+        return 0
+
+
 def _int_ranges_of(tensors) -> tuple:
     """How far each integer tensor argument reached, and whether it climbed.
 
@@ -303,6 +315,9 @@ class MetaOpTracer(TorchDispatchMode):
         #: to name the group a collective ran on; see :func:`_resolve_group`.
         self.topology = dict(topology or {})
         self.missing: list[MissingMetaKernel] = []
+        #: Storage address -> the operator that last wrote it. What makes the
+        #: graph walkable for liveness rather than only summable for shapes.
+        self._producers: dict[int, int] = {}
         self._t0 = 0.0
         self.seconds = 0.0
 
@@ -368,6 +383,14 @@ class MetaOpTracer(TorchDispatchMode):
         out_shapes = tuple(
             s for s in (_shape_of(o) for o in outs) if s is not None
         )
+        # Which operator produced each input, by storage address. A graph of
+        # shapes cannot be walked for liveness -- two tensors of the same shape
+        # are the same entry in it -- and liveness is the whole of the
+        # activation term. -1 means this step did not produce it: a weight, an
+        # embedding table, a buffer from before the forward.
+        produced_by = tuple(
+            self._producers.get(_storage_of(t), -1) for t in tensors
+            if isinstance(t, torch.Tensor))
         # Recorded and executed are not the same thing. A profiler operator
         # closes a `record_function` region and runs no kernel, so it belongs in
         # the dispatch stream but not in a graph of what a step costs -- and it
@@ -389,8 +412,13 @@ class MetaOpTracer(TorchDispatchMode):
                     # recorded with it; its arguments do not describe it, and
                     # cannot be made to. Empty for everything but attention.
                     context=forward_ctx.capture(name),
+                    inputs_from=produced_by,
                 )
             )
+            index = len(self.graph.ops) - 1
+            for produced in outs:
+                if isinstance(produced, torch.Tensor):
+                    self._producers[_storage_of(produced)] = index
         return out
 
 

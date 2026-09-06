@@ -1154,8 +1154,38 @@ cannot run is answering a different question.
 
    What this does *not* do is size a configuration nobody has run. That is
    step 3.
-3. `analytical` — derive each term. Validate per term against the recorded ones,
-   on runs already scheduled.
+3. `analytical` — derive each term. **Started**:
+   `atom/compass/core/memory_model.py`.
+
+   **The activation term needed the graph to change.** It is a liveness
+   question -- not how much memory the operators touch but how much is live at
+   once -- and that cannot be answered from shapes, because two tensors of the
+   same shape are the same entry in a graph of shapes. The trace now records
+   `inputs_from`: for each tensor input, the operator that produced it, matched
+   by storage address as the trace runs, with -1 for anything the step did not
+   produce. A prefill of the 0.6B gives 327 operators and 482 def-use edges, and
+   walking them -- add an operator's outputs, drop every tensor whose last
+   reader has just run -- gives the high-water mark.
+
+   First derivation against its own recording, same run:
+
+   | term | derived | recorded |
+   | --- | --- | --- |
+   | weights | 1.400 GB | |
+   | peak activations | 0.087 GB | |
+   | weights + activations | **1.487 GB** | 1.306 GB (**+13.8%**) |
+
+   The error is in the weight term, not the walk: it is the checkpoint's size on
+   disk, and takes every tensor in the file to be resident, where tied
+   embeddings are loaded once. Overestimating weights under-allocates KV, which
+   is the safe direction for a budget, but it is an approximation to remove --
+   reading the safetensors header gives per-tensor sizes and would let a tied
+   tensor be counted once. Two approximations in the walk are stated in its
+   docstring: output dtype is taken from the first input, and a tensor with no
+   reader in the graph dies immediately.
+
+   Still to do: `non_torch` as a per-rank constant, the graph pool from ATOM's
+   geometry, and validation of each term separately rather than of their sum.
 4. Feed it back: `get_num_blocks` off the modelled budget, so `max_num_seqs` and
    the capture ladder follow from the prediction rather than from the box.
 
