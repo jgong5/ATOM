@@ -22,6 +22,8 @@ Two consequences worth stating plainly:
 
 from __future__ import annotations
 
+import contextlib
+import glob
 import json
 import os
 import logging
@@ -755,9 +757,97 @@ class CompassModelRunner(ModelRunner):
             logger.warning("ATOMCompass WARNING: could not read the memory "
                            "terms (%s); none recorded", exc)
 
-        result = super().get_num_blocks()
+        with self._recorded_readings(readings):
+            result = super().get_num_blocks()
         self._write_memory(readings, result)
         return result
+
+    @contextlib.contextmanager
+    def _recorded_readings(self, live: dict):
+        """Run the engine's budget arithmetic on recorded readings.
+
+        The readings are substituted, not the arithmetic. `super()` computes the
+        budget from four device calls; each is made to return what an earlier
+        run recorded, and everything downstream -- the utilization budget, the
+        safety margin, the `min(budget, free)` clamp, `plan_pools` over the
+        sub-pool specs -- is the engine's own and unchanged. Copying that
+        arithmetic here to feed it numbers directly would be one more thing to
+        drift out of step with the engine.
+
+        A no-op unless `--compass-memory-in` names a record matching this
+        configuration exactly.
+        """
+        import torch
+
+        source = self._recorded_memory()
+        config = self._memory_config()
+        readings = source.readings_for(config) if source else None
+        if readings is None:
+            if source is not None:
+                logger.warning("ATOMCompass WARNING: sizing from this device: "
+                               "%s", source.refusal(config))
+            yield
+            return
+        refusal = source.refusal(config)
+        if refusal:
+            logger.warning("ATOMCompass WARNING: sizing from this device: %s",
+                           refusal)
+            yield
+            return
+
+        # `non_torch` is `(total - free) - reserved`, so the reserved figure
+        # that reproduces the recorded `non_torch` is what to report.
+        reserved = max(0, (readings.total - readings.free) - readings.non_torch)
+        stats = {"allocated_bytes.all.peak": readings.peak_torch,
+                 "allocated_bytes.all.current": readings.peak_torch}
+        was = (torch.cuda.mem_get_info, torch.cuda.memory_stats,
+               torch.cuda.memory_reserved, self._estimate_cudagraph_overhead)
+        logger.info("ATOMCompass: sizing from a recorded budget, not this "
+                    "device (peak_torch %.2f GB, non_torch %.2f GB)",
+                    readings.peak_torch / 2**30, readings.non_torch / 2**30)
+        torch.cuda.mem_get_info = lambda *a, **k: (readings.free, readings.total)
+        torch.cuda.memory_stats = lambda *a, **k: stats
+        torch.cuda.memory_reserved = lambda *a, **k: reserved
+        self._estimate_cudagraph_overhead = (
+            lambda *a, **k: readings.cudagraph_overhead)
+        try:
+            yield
+        finally:
+            (torch.cuda.mem_get_info, torch.cuda.memory_stats,
+             torch.cuda.memory_reserved,
+             self._estimate_cudagraph_overhead) = was
+
+    def _recorded_memory(self):
+        """The memory records this run was given, loaded once."""
+        paths = (self._compass_config.memory_in or "").strip()
+        if not paths:
+            return None
+        if getattr(self, "_memory_source", None) is None:
+            from atom.compass.core.memory import RecordedMemory
+
+            found = [q for p in paths.split(",") for q in
+                     sorted(glob.glob(p.strip())) if q]
+            try:
+                self._memory_source = RecordedMemory(found)
+            except Exception as exc:  # noqa: BLE001 - never fail a run over it
+                logger.warning("ATOMCompass WARNING: could not read %s: %s",
+                               paths, exc)
+                self._memory_source = None
+        return self._memory_source
+
+    def _memory_config(self) -> dict:
+        """This configuration, keyed the way a record is."""
+        config = self.config
+        return {
+            "model": config.model,
+            "gpu_memory_utilization": config.gpu_memory_utilization,
+            "max_num_seqs": config.max_num_seqs,
+            "max_model_len": config.max_model_len,
+            "kv_cache_dtype": config.kv_cache_dtype,
+            "block_size": config.kv_cache_block_size,
+            "topology": self._topology(),
+            "rank_coords": self._rank_coords(),
+        }
 
     def _write_memory(self, readings: dict, result: dict) -> None:
         path = self._compass_config.memory_out

@@ -1132,12 +1132,28 @@ cannot run is answering a different question.
    was not -- the utilization budget was. So both are reusable. (The 35 GB
    between `total` and `free` at 27B is this process's own weights and
    activations, not neighbours; that had to be computed rather than assumed.)
-2. Read that artifact instead of the device, on an exact key match. Still
-   `empirical/measured` -- a different source for the same measurement, not a
-   different kind of number. Unblocks sizing a configuration on a box that could
-   not hold it, which is the immediate product need, and makes the reuse
-   conditions explicit: refuse a key whose `free` was the binding term, since
-   that is a property of the neighbours rather than of the configuration.
+2. ~~Read that artifact instead of the device, on an exact key match.~~
+   **Done** -- `--compass-memory-in`. Still `empirical/measured`: a different
+   source for the same measurement, not a different kind of number.
+
+   **The readings are substituted, not the arithmetic.** `get_num_blocks` runs
+   the engine's own budget computation with `mem_get_info`, `memory_stats`,
+   `memory_reserved` and `_estimate_cudagraph_overhead` returning what an
+   earlier run recorded. Everything downstream -- the utilization budget, the
+   2% margin, the `min(budget, free)` clamp, `plan_pools` over the sub-pool
+   specs -- is untouched, because copying that arithmetic here to feed it
+   numbers directly is exactly the drift the recording step avoided. Checked by
+   sizing the 0.6B from its own record: **95822 blocks, the recorded count**.
+
+   A record whose `free` was the binding term is refused, since that describes
+   what the neighbours left rather than what the configuration needs
+   (`atom.compass.core.memory`). The check is computed without the engine's
+   extra reserve, which is not recorded and only shrinks the budget -- so it
+   overstates how often `free` binds, and errs towards refusing a record that
+   might have been reusable rather than reusing one that was not.
+
+   What this does *not* do is size a configuration nobody has run. That is
+   step 3.
 3. `analytical` — derive each term. Validate per term against the recorded ones,
    on runs already scheduled.
 4. Feed it back: `get_num_blocks` off the modelled budget, so `max_num_seqs` and

@@ -56,6 +56,7 @@ class EngineArgs:
     compass_graph_out: str = ""
     compass_trace_prefill: int = 0
     compass_memory_out: str = ""
+    compass_memory_in: str = ""
     compass_measure_out: str = ""
     compass_measure_warmup_steps: int = 0
     compass_admission_seconds: float = 0.0
@@ -171,6 +172,14 @@ class EngineArgs:
             "device readings the KV sizing is derived from, and the block counts "
             "they produced. Every run computes these and discards them, so a run "
             "without this flag is a validation sample that cannot be recovered.",
+        )
+        parser.add_argument(
+            "--compass-memory-in",
+            type=str,
+            default="",
+            help="Memory records to size from instead of this device, "
+                 "comma-separated globs. A configuration can then be sized "
+                 "on a box that could not hold it.",
         )
         parser.add_argument(
             "--compass-measure-out",
@@ -800,6 +809,7 @@ class EngineArgs:
         compass_graph_out = kwargs.pop("compass_graph_out", "")
         compass_trace_prefill = kwargs.pop("compass_trace_prefill", 0)
         compass_memory_out = kwargs.pop("compass_memory_out", "")
+        compass_memory_in = kwargs.pop("compass_memory_in", "")
         compass_measure_out = kwargs.pop("compass_measure_out", "")
         compass_measure_warmup = kwargs.pop("compass_measure_warmup_steps", 0)
         compass_admission = kwargs.pop("compass_admission_seconds", 0.0)
@@ -817,6 +827,8 @@ class EngineArgs:
             compass_kwargs["trace_prefill"] = compass_trace_prefill
         if compass_memory_out:
             compass_kwargs["memory_out"] = compass_memory_out
+        if compass_memory_in:
+            compass_kwargs["memory_in"] = compass_memory_in
         if compass_measure_out:
             compass_kwargs["measure_out"] = compass_measure_out
         if compass_measure_warmup:

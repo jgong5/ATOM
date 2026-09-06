@@ -34,6 +34,14 @@ class CompassConfig:
             Exclude Triton autotuning with throwaway *requests* instead — see
             ``--warmup-prompts`` in ``scripts/compass/run.py`` — which drops the
             expensive first launches without discarding a whole category.
+        memory_in: Artifacts written by ``memory_out``, comma-separated. Given
+            one that matches this configuration exactly, the budget is computed
+            from *those* readings rather than from this device -- which is how a
+            configuration gets sized on a box that could not hold it. The
+            engine's own arithmetic runs either way: only the readings are
+            substituted, because copying the arithmetic here would be one more
+            thing to drift. A record whose ``free`` was the binding term is
+            refused; see ``atom.compass.core.memory``.
         memory_out: Where to record what the memory budget was made of. Every
             run already computes the terms and throws them away once the block
             count is derived; a run that does not record them is a validation
@@ -105,6 +113,7 @@ class CompassConfig:
     trace_step: int = 2
     trace_prefill: int = 0
     memory_out: Optional[str] = None
+    memory_in: Optional[str] = None
     oracle_qualname: str = "atom.compass.core.cost.constant.ConstantCostOracle"
     oracle_options: Optional[dict] = None
     virtual_clock: bool = True
