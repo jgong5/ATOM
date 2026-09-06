@@ -181,7 +181,7 @@ def _resolve_generated(origin: str):
     import torch
 
     path, _, name = origin[len(GENERATED):].rpartition("::")
-    if not path or not name or not os.path.exists(path) or not LOAD_GENERATED:
+    if not path or not name or not os.path.exists(path) or not _load_generated():
         return None
     spec = importlib.util.spec_from_file_location(
         "compass_generated_" + os.path.basename(path).partition(".")[0], path)
@@ -329,57 +329,28 @@ def _rebuild_args(op: dict, tensors: list) -> tuple[list, dict]:
     return args, keywords
 
 
-def _kernels_of(fn, args, kwargs) -> dict:
-    """Which device kernels one call of an operator launches, and for how long.
+#: Print each signature before it is touched. A device memory fault kills the
+#: process outright, so a `try/except` never sees it and the artifact never gets
+#: written -- the last line printed is the only evidence of which operator did
+#: it. Off by default because it is one line per signature.
+ANNOUNCE = os.environ.get("COMPASS_ANNOUNCE", "") == "1"
 
-    The join key between a price and the same work inside a real step. A step is
-    a replayed CUDA graph -- one host call for the whole thing -- so its profile
-    has kernels and no operators to hang them on: 13232 kernel events against
-    5348 host ops, none of them per kernel. Operator names simply are not
-    present on that side. Kernel names are on both.
 
-    One eager call, because eager is where an operator still brackets its own
-    kernels. The durations are only used as *shares* of the measured price, so a
-    single cold-ish call is enough to apportion; it is not itself the price.
+def _announce(what: str, sig: str) -> None:
+    if ANNOUNCE:
+        print(f"### compass {what}: {sig[:150]}", flush=True)
+
+
+def _is_collective_op(op: dict) -> bool:
+    """Whether running this operator makes the rank talk to its peers.
+
+    The recorded group is the honest answer where there is one; the name is a
+    fallback for graphs written before groups were recorded.
     """
-    import json as _json
-    import os as _os
-    import tempfile
-
-    import torch
-    from torch.profiler import ProfilerActivity, profile
-
-    fn(*args, **kwargs)
-    torch.cuda.synchronize()
-    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
-        fn(*args, **kwargs)
-        torch.cuda.synchronize()
-
-    # Read the exported trace rather than `key_averages()`, so that what counts
-    # as a kernel here is exactly what counts as one on the other side of the
-    # comparison -- events whose category is `kernel`. The summary view cannot
-    # make that distinction: an operator, a device-side annotation and the
-    # kernel itself all report self device time under names that no prefix
-    # separates, so apportioning across them split each kernel's price two ways.
-    handle, path = tempfile.mkstemp(suffix=".json")
-    _os.close(handle)
-    try:
-        prof.export_chrome_trace(path)
-        with open(path, encoding="utf-8") as fh:
-            events = _json.load(fh).get("traceEvents", [])
-    finally:
-        try:
-            _os.unlink(path)
-        except OSError:
-            pass
-
-    kernels: dict[str, float] = {}
-    for event in events:
-        if event.get("cat") in ("kernel", "Kernel"):
-            name = event.get("name", "")
-            kernels[name] = kernels.get(name, 0.0) + float(
-                event.get("dur", 0.0)) / 1e6
-    return kernels
+    if op.get("group") is not None:
+        return True
+    name = op.get("name", "")
+    return name.startswith("c10d::") or "all_reduce" in name or "all_gather" in name
 
 
 def _time(callable_, iters: int, warmup: int) -> float:
@@ -507,9 +478,7 @@ SYNTH_INT_RANGES = os.environ.get("COMPASS_SYNTH_INT_RANGES", "1") != "0"
 #: Executing generated code is the one part of pricing that runs code this
 #: process did not write, so it has a way off at TP=1 too:
 #: ``COMPASS_LOAD_GENERATED=0``.
-LOAD_GENERATED = os.environ.get(
-    "COMPASS_LOAD_GENERATED",
-    "0" if int(os.environ.get("WORLD_SIZE", "1") or 1) > 1 else "1") != "0"
+LOAD_GENERATED = os.environ.get("COMPASS_LOAD_GENERATED")
 
 #: Distinct KV-cache regions a captured batch rotates over. One per captured
 #: call by default, so a region is revisited only after every other has been
@@ -523,9 +492,48 @@ KV_VARIANTS = int(os.environ.get("COMPASS_KV_VARIANTS", str(GRAPH_BATCH)))
 #: calls in the same order or the group deadlocks, and a breakdown that fails on
 #: one rank -- the profiler is not guaranteed to succeed -- diverges it silently.
 #: Pricing at TP=4 died in a distributed recv for exactly this reason.
-PRICE_KERNELS = os.environ.get(
-    "COMPASS_PRICE_KERNELS",
-    "0" if int(os.environ.get("WORLD_SIZE", "1") or 1) > 1 else "1") != "0"
+PRICE_KERNELS = os.environ.get("COMPASS_PRICE_KERNELS", "1") != "0"
+
+#: Least a signature must contribute to a step, in seconds, to be worth a
+#: breakdown. Each one is a profiler session and the sessions are what break
+#: under parallelism, so under it the cheap majority are skipped: 313
+#: signatures become a few dozen, and the ones dropped are the ones no
+#: comparison would have read.
+BREAKDOWN_OVER = os.environ.get("COMPASS_BREAKDOWN_OVER")
+
+
+def under_parallelism() -> bool:
+    """Whether this process has peers it must stay in step with.
+
+    Not ``WORLD_SIZE``. Three gates in this file were written to read it and
+    none of them ever fired: the engine spawns its ranks itself and never sets
+    it, so every "off under parallelism" default was on at TP=2 and had been
+    since it was written. That is how a defect known to fault the device came
+    back -- the explicit override was dropped, the default was trusted, and the
+    default was dead.
+
+    The process group is the thing that actually knows, and it is only up after
+    this module is imported, so this cannot be a constant.
+    """
+    try:
+        import torch.distributed as dist
+
+        return (dist.is_available() and dist.is_initialized()
+                and dist.get_world_size() > 1)
+    except Exception:  # noqa: BLE001 - no distributed is one rank
+        return False
+
+
+def _load_generated() -> bool:
+    if LOAD_GENERATED is not None:
+        return LOAD_GENERATED != "0"
+    return not under_parallelism()
+
+
+def _breakdown_over() -> float:
+    if BREAKDOWN_OVER is not None:
+        return float(BREAKDOWN_OVER)
+    return 1e-3 if under_parallelism() else 0.0
 
 
 #: Signatures whose key contains this substring get taken apart rather than just
@@ -535,7 +543,9 @@ PRICE_KERNELS = os.environ.get(
 PROFILE_MATCH = os.environ.get("COMPASS_BENCH_PROFILE", "")
 
 
-def _time_in_graph(fn, sets: list, iters: int, warmup: int, before=None) -> float:
+def _time_in_graph(fn, sets: list, iters: int, warmup: int, before=None,
+                   breakdown: bool = False,
+                   occurrences: int = 1) -> tuple[float, float, dict]:
     """Seconds per call, with the launch amortised the way production does.
 
     A per-call loop cannot price a kernel smaller than its own call overhead. On
@@ -586,7 +596,76 @@ def _time_in_graph(fn, sets: list, iters: int, warmup: int, before=None) -> floa
     ended.record()
     torch.cuda.synchronize()
     total = began.elapsed_time(ended) / 1000.0
-    return total / (replays * GRAPH_BATCH), 0.0
+    seconds = total / (replays * GRAPH_BATCH)
+    # Only for signatures that carry real time. Each breakdown is a profiler
+    # session, and it is *sessions* that are the problem: profiling the real run
+    # once at TP=2 is fine, while several hundred start/stop cycles in a loop
+    # faults the device partway through, with ROCTracer complaining about
+    # duplicate flow starts on the way. Taking them only where the answer
+    # matters cuts the cycles by an order of magnitude and loses nothing the
+    # comparison uses -- on the 0.6B, 19 kernels covered 98.7% of a step.
+    take = breakdown and seconds * max(1, occurrences) >= _breakdown_over()
+    return seconds, 0.0, (_kernels_of_replay(graph) if take else {})
+
+
+def _kernels_of_replay(graph) -> dict:
+    """Which kernels the priced graph runs, from replaying the graph itself.
+
+    The breakdown used to come from two *extra* eager calls of the operator,
+    which is where both of its failures came from. For a collective those are
+    two calls the peers do not make, so ranks that price different signatures
+    wait for each other forever. And an operator that only works the way the
+    price ran it may not survive being called any other way -- at TP=2
+    `aiter::masked_embedding` faults the device outright, killing the run
+    rather than losing one breakdown.
+
+    Replaying the graph that was just timed has neither problem: no extra
+    launches beyond the one replay, nothing run that was not already run, and
+    the kernels are the ones the price is a price *of* rather than the ones a
+    differently-shaped call would have launched.
+
+    So a breakdown now exists only where there is a graph to replay. An
+    operator that could not be captured -- the chunked-prefill attention, an
+    `aten::item` that has to synchronise -- is priced without one, which is the
+    price of never calling an operator any way but the way it was priced. The
+    attribution that cost bought is worth more than the fourteen breakdowns it
+    gives up: chasing the fault by hand was unreliable anyway, because an HSA
+    fault surfaces at the next synchronise rather than at the kernel that
+    caused it, so the operator it appeared to blame moved between runs.
+
+    Durations are per replay, which is `GRAPH_BATCH` calls, so they are divided
+    back down to one.
+    """
+    import json as _json
+    import os as _os
+    import tempfile
+
+    import torch
+    from torch.profiler import ProfilerActivity, profile
+
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+        graph.replay()
+        torch.cuda.synchronize()
+
+    handle, path = tempfile.mkstemp(suffix=".json")
+    _os.close(handle)
+    try:
+        prof.export_chrome_trace(path)
+        with open(path, encoding="utf-8") as fh:
+            events = _json.load(fh).get("traceEvents", [])
+    finally:
+        try:
+            _os.unlink(path)
+        except OSError:
+            pass
+
+    kernels: dict[str, float] = {}
+    for event in events:
+        if event.get("cat") in ("kernel", "Kernel"):
+            name = event.get("name", "")
+            kernels[name] = kernels.get(name, 0.0) + float(
+                event.get("dur", 0.0)) / 1e6 / GRAPH_BATCH
+    return kernels
 
 
 def _time_isolated(fn, sets: list, iters: int, warmup: int) -> tuple[float, float]:
@@ -794,12 +873,13 @@ def price_graph(graph_path: str, iters: int = 2000, warmup: int = 20,
         if sets is None:
             unpriced[sig] = "unknown dtype"
             continue
-        used = cache
+        used, kernels = cache, {}
         try:
             if cache == "graph":
                 try:
-                    seconds, host_seconds = _time_in_graph(
-                        fn, sets, iters, warmup, before=rotate)
+                    seconds, host_seconds, kernels = _time_in_graph(
+                        fn, sets, iters, warmup, before=rotate,
+                        breakdown=PRICE_KERNELS, occurrences=counts[sig])
                 except Exception as exc:  # noqa: BLE001
                     if not _uncapturable(exc):
                         raise
@@ -826,12 +906,6 @@ def price_graph(graph_path: str, iters: int = 2000, warmup: int = 20,
         except Exception as exc:  # noqa: BLE001 - a call can fail many ways
             unpriced[sig] = f"{type(exc).__name__}: {str(exc)[:120]}"
             continue
-        kernels = {}
-        if PRICE_KERNELS:
-            try:
-                kernels = _kernels_of(fn, *sets[0])
-            except Exception:  # noqa: BLE001 - a breakdown is a bonus, not a price
-                kernels = {}
         priced[sig] = {
             "name": op["name"],
             "seconds": seconds,
@@ -904,8 +978,8 @@ def _profile_signature(fn, sets, sig, iters: int, warmup: int,
             "COMPASS_PROBE_BATCHES", "1,4,16,64").split(",")]
         for batch in batches:
             GRAPH_BATCH = batch
-            secs, _ = _time_in_graph(fn, sets, max(iters, batch), warmup,
-                                     before=before)
+            secs, _host, _kernels = _time_in_graph(
+                fn, sets, max(iters, batch), warmup, before=before)
             print(f"###  graph B={batch:<3d}: {secs*1e6:8.2f}us per call",
                   flush=True)
     finally:

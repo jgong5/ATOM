@@ -325,13 +325,48 @@ class TestGeneratedKernelsUnderParallelism:
         assert _is_this_rank("/tmp/torchinductor_root/qk/cqkf626.py")
 
     def test_generated_loading_is_off_under_parallelism(self, monkeypatch):
-        """A fault kills the run; an unpriced operator does not."""
-        import importlib
+        """A fault kills the run; an unpriced operator does not.
 
+        Asked of the process group rather than of `WORLD_SIZE`, which the
+        engine never sets -- the gate that read it never once fired.
+        """
         from atom.compass.runtime import microbench
 
-        monkeypatch.setenv("WORLD_SIZE", "2")
-        monkeypatch.delenv("COMPASS_LOAD_GENERATED", raising=False)
-        assert not importlib.reload(microbench).LOAD_GENERATED
-        monkeypatch.setenv("WORLD_SIZE", "1")
-        assert importlib.reload(microbench).LOAD_GENERATED
+        monkeypatch.setattr(microbench, "LOAD_GENERATED", None)
+        monkeypatch.setattr(microbench, "under_parallelism", lambda: True)
+        assert not microbench._load_generated()
+        assert microbench._breakdown_over() > 0
+        monkeypatch.setattr(microbench, "under_parallelism", lambda: False)
+        assert microbench._load_generated()
+        assert microbench._breakdown_over() == 0
+
+    def test_an_explicit_setting_still_wins(self, monkeypatch):
+        from atom.compass.runtime import microbench
+
+        monkeypatch.setattr(microbench, "under_parallelism", lambda: True)
+        monkeypatch.setattr(microbench, "LOAD_GENERATED", "1")
+        assert microbench._load_generated()
+
+
+class TestBreakdownsUnderParallelism:
+    """Taking a breakdown runs the operator twice more.
+
+    For a collective those are two calls its peers do not make, so one rank
+    pricing a signature another skipped leaves them waiting for each other.
+    That was read as "breakdowns deadlock under parallelism" and turned off for
+    every operator, removing the per-kernel comparison from the configurations
+    that most needed it. Only collectives need excluding.
+    """
+
+    def test_a_collective_is_excluded(self):
+        from atom.compass.runtime.microbench import _is_collective_op
+
+        assert _is_collective_op({"name": "c10d::allreduce_", "group": "tp"})
+        assert _is_collective_op({"name": "c10d::allreduce_"})
+        assert _is_collective_op({"name": "aiter::fused_all_reduce"})
+
+    def test_a_local_operator_is_not(self):
+        from atom.compass.runtime.microbench import _is_collective_op
+
+        assert not _is_collective_op({"name": "aten::mm", "group": None})
+        assert not _is_collective_op({"name": "aiter::fmha_fwd"})

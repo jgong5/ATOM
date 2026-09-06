@@ -3719,3 +3719,63 @@ rank loading only its own still faults. So it is now off under parallelism like
 `PRICE_KERNELS`, for a worse reason: a fault takes the whole run, where an
 unpriced operator takes one signature. The cost of that default is the 2.0 ms
 measured above.
+
+#### The breakdown deadlock that was not one
+
+Per-signature kernel breakdowns were believed to deadlock under parallelism and
+`PRICE_KERNELS` defaulted off there. Both halves were wrong.
+
+**The gate never fired.** It read `WORLD_SIZE`, which the engine never sets --
+it spawns its ranks itself -- so `int(os.environ.get("WORLD_SIZE", "1")) > 1`
+was false in every worker and breakdowns were taken at TP=2 all along. The
+proof was in the artifact the whole time: the 27B price list written under the
+supposedly-off gate carries breakdowns for **164 of its 237** entries.
+
+Three defaults in this file were written that way. `under_parallelism()` now
+asks the process group, which is the thing that knows, and cannot be a
+module constant because the group is not up when the module is imported.
+
+**And a dead gate is worse than no gate**, because it is trusted. Loading
+inductor-generated kernels faults the device at TP=2; that was found, gated
+"off under parallelism", and the explicit override dropped from the run script
+on the strength of the gate. Five runs then faulted, and each fault was read as
+evidence about whatever had changed most recently -- the collective exclusion,
+the eager calls, the profiler -- when the cause was the same known defect,
+ungated. The signature the fault appeared to blame moved between runs
+(`aiter::masked_embedding`, then `aten::item`) because an HSA fault surfaces at
+the next synchronise, not at the kernel that caused it, so the "culprit" was
+whichever operator happened to synchronise next.
+
+Two real improvements came out of chasing it, and both stand on their own:
+
+* **A breakdown is taken from replaying the graph that was timed**, not from two
+  extra eager calls of the operator. No extra launches, nothing run that was not
+  already run, and the kernels are the ones the price is a price *of*. It also
+  removes the one way a breakdown genuinely could have hung a rank: for a
+  collective, two extra calls its peers do not make. Operators that cannot be
+  captured get no breakdown, which is the price of never calling an operator any
+  way but the way it was priced.
+* **Only signatures that carry time get one.** Each is a profiler session, and
+  sessions are the scarce thing; under parallelism the threshold is 1ms of step
+  contribution, taking 312 signatures down to 15.
+
+#### What the 27B's per-kernel comparison says
+
+With breakdowns working at TP=2, the kernels covering **90.5% of the step's
+kernel time** price like this:
+
+| in situ | isolated | diff | kernel |
+| --- | --- | --- | --- |
+| 100.243 ms | 104.285 ms | +4.0% | gemm `MT256x2..` |
+| 46.954 ms | 46.847 ms | -0.2% | gemm `MT208x2..` |
+| 41.029 ms | 40.704 ms | -0.8% | gemm `MT256x1..` |
+| 37.295 ms | 36.246 ms | -2.8% | `cross_device_reduce_1stage` |
+| 35.842 ms | 35.675 ms | -0.5% | gemm `MT256x1..` |
+| 20.422 ms | 20.401 ms | -0.1% | gemm `MT224x2..` |
+
+Everything that carries the step is priced to within a few percent, the
+collective included. So the 27B's -6.7% is **not** spread thinly across the
+priced kernels, which was the remaining hypothesis. It is concentrated in the
+9.5% of kernel time -- about 30 ms -- that no priced signature accounts for.
+That is a much smaller thing to go and find than "the operators are underpriced",
+and it is where the next look should go.
