@@ -39,6 +39,20 @@ __all__ = ["capture", "install", "is_context_dependent"]
 
 #: Operators whose cost depends on state their arguments do not carry.
 _ATTENTION = "aiter::unified_attention_with_output_base"
+_LINEAR_ATTENTION = "aiter::linear_attention_with_output_base"
+
+#: The GDN metadata fields the implementation reads, tensors first. Recorded by
+#: name so a field added upstream is absent rather than wrong.
+_GDN_TENSORS = (
+    "has_initial_state", "spec_query_start_loc", "non_spec_query_start_loc",
+    "spec_state_indices_tensor", "non_spec_state_indices_tensor",
+    "non_spec_state_indices_in_tensor", "spec_sequence_masks",
+    "spec_token_indx", "non_spec_token_indx", "num_accepted_tokens",
+)
+_GDN_COUNTS = (
+    "num_prefills", "num_prefill_tokens", "num_decodes", "num_decode_tokens",
+    "num_spec_decodes", "num_spec_decode_tokens", "num_actual_tokens",
+)
 
 
 def _values(tensor) -> list[int] | None:
@@ -231,8 +245,112 @@ def _install_attention(recorded: dict[str, Any], variants: int) -> list:
     return thunks
 
 
-_CAPTURE = {_ATTENTION: _capture_attention}
-_INSTALL = {_ATTENTION: _install_attention}
+def _capture_linear_attention() -> tuple[tuple[str, Any], ...]:
+    """The GDN metadata a linear-attention layer reads.
+
+    Without it `attention_gdn.py` zeroes its output and returns, so the
+    benchmark timed 48 `zero_()` calls and priced the DeltaNet half of a hybrid
+    model at 1% of its cost. Unlike attention's, this metadata is not on the
+    forward context's declared fields -- the backend attaches it to the
+    attention metadata as an attribute -- so it is read the same way the
+    implementation reads it.
+
+    The recurrent and convolution state it walks is *not* recorded: those live
+    in `kv_cache_data`, which the engine sets once at start-up and which is
+    therefore already real in the process doing the pricing. Recording them
+    would mean carrying a per-layer cache in a JSON artifact to rebuild
+    something that is already there.
+    """
+    import torch
+
+    from atom.utils.forward_context import get_forward_context
+
+    fwd = get_forward_context()
+    md = getattr(fwd, "attn_metadata", None)
+    gdn = getattr(md, "gdn_metadata", None) if md is not None else None
+    if gdn is None:
+        return ()
+
+    recorded: list[tuple[str, Any]] = [
+        (name, int(getattr(gdn, name, 0) or 0)) for name in _GDN_COUNTS
+    ]
+    recorded.append(("replayssm", bool(getattr(gdn, "replayssm", False))))
+    for name in _GDN_TENSORS:
+        value = getattr(gdn, name, None)
+        if not isinstance(value, torch.Tensor):
+            continue
+        # Dtype travels with the values: these are a mix of index tensors and
+        # boolean masks, and a mask rebuilt as int32 selects nothing.
+        recorded.append((name, [_values(value),
+                                str(value.dtype).replace("torch.", "")]))
+    return tuple(recorded)
+
+
+def _install_linear_attention(recorded: dict[str, Any], variants: int) -> list:
+    """Stand up the GDN metadata, on an attention metadata to hang it off."""
+    import torch
+
+    from atom.config import get_current_atom_config
+    from atom.model_ops.attentions.gdn_attn import GDNAttentionMetadata
+    from atom.utils.forward_context import (
+        AttentionMetaData,
+        Context,
+        set_forward_context,
+    )
+
+    fields = {name: int(recorded.get(name, 0) or 0) for name in _GDN_COUNTS}
+    for name in _GDN_TENSORS:
+        held = recorded.get(name)
+        if not held:
+            continue
+        values, dtype_name = held
+        dtype = getattr(torch, dtype_name, None)
+        if dtype is None or values is None:
+            continue
+        fields[name] = torch.tensor(values, dtype=dtype, device="cuda")
+
+    # The convolution's own metadata -- `nums_dict`, `batch_ptr`,
+    # `token_chunk_offset_ptr` -- is a pure function of the query start
+    # offsets, and `causal_conv1d_fn` is handed the GDN metadata as its
+    # metadata, so it reads them straight off it. Recomputing them with the
+    # engine's own helper is exact where recording them would be a copy, and it
+    # is the difference between the operator running and dying on
+    # `batch_ptr.device` with `batch_ptr` None.
+    starts = fields.get("non_spec_query_start_loc")
+    if starts is not None:
+        from atom.model_ops.attentions.gdn_attn import (
+            compute_causal_conv1d_metadata,
+        )
+
+        (fields["nums_dict"], fields["batch_ptr"],
+         fields["token_chunk_offset_ptr"]) = compute_causal_conv1d_metadata(
+            starts)
+
+    gdn = GDNAttentionMetadata(**fields)
+    if recorded.get("replayssm"):
+        gdn.replayssm = True
+    metadata = AttentionMetaData()
+    metadata.gdn_metadata = gdn
+
+    # The GDN path reads its metadata and the caches, not the positions, but a
+    # forward context is not constructible without them.
+    positions = torch.arange(max(1, fields.get("num_actual_tokens", 1)),
+                             dtype=torch.int64, device="cuda")
+
+    def install_this(metadata=metadata, positions=positions):
+        set_forward_context(
+            attn_metadata=metadata,
+            atom_config=get_current_atom_config(),
+            context=Context(positions=positions, is_prefill=True),
+        )
+
+    return [install_this]
+
+
+_CAPTURE = {_ATTENTION: _capture_attention,
+            _LINEAR_ATTENTION: _capture_linear_attention}
+_INSTALL = {_ATTENTION: _install_attention,
+            _LINEAR_ATTENTION: _install_linear_attention}
 
 
 def is_context_dependent(name: str) -> bool:

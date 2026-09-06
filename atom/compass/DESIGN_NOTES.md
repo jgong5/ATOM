@@ -3827,3 +3827,48 @@ than as an error.
 It also explains the sign puzzle. The 0.6B, which has no DeltaNet layers, priced
 2.28% *high*; the 27B priced 6.7% low. Not two models disagreeing about pricing
 -- one model with an entire layer type missing from its cost.
+
+#### Giving the DeltaNet layers their context
+
+`forward_ctx` now captures and installs the GDN metadata for
+`aiter::linear_attention_with_output_base`, the way it already did for
+attention. Two things made it more than a copy of the attention case:
+
+* **The state is not recorded.** The recurrent and convolution state lives in
+  `kv_cache_data`, which the engine sets once at start-up, so it is already real
+  in the process doing the pricing. Recording it would mean carrying a per-layer
+  cache in a JSON artifact to rebuild something already present.
+* **The convolution metadata is recomputed, not recorded.** `causal_conv1d_fn`
+  is handed the GDN metadata as its own and reads `nums_dict`, `batch_ptr` and
+  `token_chunk_offset_ptr` off it. Those are a pure function of the query start
+  offsets, which *are* recorded, so the installer calls the engine's
+  `compute_causal_conv1d_metadata` -- exact, where a recording would be a copy.
+  Without them the operator dies on `batch_ptr.device` with `batch_ptr` None.
+
+| | before | after |
+| --- | --- | --- |
+| linear attention, 48 layers | 0.277 ms | **22.588 ms** |
+| prefill kernels priced | 296.999 ms | **319.310 ms** |
+| against 318.351 ms in situ | -6.7% | **+0.30%** |
+
+The 27B's kernel pricing is now accurate to a third of a percent, and the
+sign puzzle is gone with it.
+
+**What is left is the overhead constant, and only that.** Predicting the whole
+step gives +4.62%: the priced kernels are right to +0.30% and the compiled
+overhead term adds 16.2 ms where the step's measured idle is 1.497 ms. That
+constant was measured on the 0.6B (9.71 us per launch) and this step wants about
+a sixth of it -- the non-transfer already documented, now the *only* term
+between this model and its measured step. `step_accounting.py` measures it per
+deployment in one run.
+
+Two harness fixes came with it, both from failures this exposed:
+
+* Installing a context ran outside the per-signature guard, so one installer
+  raising took the whole pricing run and every signature with it. It is guarded
+  now, and an operator whose context cannot be stood up is unpriced like any
+  other.
+* An unpriced entry records **where** it failed, as `file:line` in this
+  codebase. `AttributeError: 'NoneType' object has no attribute 'device'` names
+  neither the field that was None nor the branch that wanted it; the frame
+  named both, and two rounds of guessing had already been wrong.

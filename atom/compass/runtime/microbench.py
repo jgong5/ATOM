@@ -341,6 +341,18 @@ def _announce(what: str, sig: str) -> None:
         print(f"### compass {what}: {sig[:150]}", flush=True)
 
 
+def _where(exc: BaseException) -> str:
+    """The innermost frame of a failure, as ``file:line`` in this codebase."""
+    import traceback
+
+    frames = traceback.extract_tb(exc.__traceback__)
+    ours = [f for f in frames if "/atom/" in f.filename] or frames
+    if not ours:
+        return ""
+    last = ours[-1]
+    return f" at {last.filename.split('/atom/')[-1]}:{last.lineno}"
+
+
 def _is_collective_op(op: dict) -> bool:
     """Whether running this operator makes the rank talk to its peers.
 
@@ -854,9 +866,18 @@ def price_graph(graph_path: str, iters: int = 2000, warmup: int = 20,
             # KV cache. The cache is not an argument -- it is reached through
             # the context -- so no amount of rotating arguments cools it, and
             # `hot` and `cold` alike price it warm.
-            variants = forward_ctx.install(
-                op["name"], op.get("context"),
-                variants=KV_VARIANTS if cache == "graph" else 1)
+            try:
+                variants = forward_ctx.install(
+                    op["name"], op.get("context"),
+                    variants=KV_VARIANTS if cache == "graph" else 1)
+            except Exception as exc:  # noqa: BLE001 - an installer can fail
+                # Standing up a context is as fallible as calling the operator,
+                # and this ran outside the guard below: one installer raising
+                # took the whole pricing run and every signature with it.
+                unpriced[sig] = (
+                    f"could not install its context: {type(exc).__name__}: "
+                    f"{str(exc)[:80]}")
+                continue
             if not variants:
                 unpriced[sig] = ("reads a forward context and the graph "
                                  "recorded none")
@@ -904,7 +925,11 @@ def price_graph(graph_path: str, iters: int = 2000, warmup: int = 20,
                 timer = _time_isolated if cache == "isolated" else _time_over
                 seconds, host_seconds = timer(fn, sets, iters, warmup)
         except Exception as exc:  # noqa: BLE001 - a call can fail many ways
-            unpriced[sig] = f"{type(exc).__name__}: {str(exc)[:120]}"
+            # Where it failed, not just what it said. An operator rebuilt from
+            # a graph fails inside the engine's own code, and the message alone
+            # ("'NoneType' object has no attribute 'device'") names neither the
+            # field that was None nor the branch that wanted it.
+            unpriced[sig] = f"{type(exc).__name__}: {str(exc)[:100]}{_where(exc)}"
             continue
         priced[sig] = {
             "name": op["name"],
