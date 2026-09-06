@@ -294,3 +294,22 @@ class TestHowTheStepWasRun:
         shape = dict(num_scheduled_tokens=(1,) * 4, context_lens=(8,) * 4)
         assert (oracle.estimate(StepShape(**shape)).seconds
                 == oracle.estimate(StepShape(**shape, compiled=False)).seconds)
+
+    def test_a_calibration_replaces_the_shipped_constant(self, tmp_path,
+                                                         monkeypatch):
+        """The constant does not transfer between models -- 9.71us per launch
+        on one, 0.90us on another -- so a measurement of the deployment beats
+        any default, and `step_accounting.py --calibrate` produces one."""
+        import json
+
+        oracle = self._oracle(tmp_path, monkeypatch)
+        shipped = oracle.compiled_seconds_per_launch
+        calib = tmp_path / "calib.json"
+        calib.write_text(json.dumps({"compiled_seconds_per_launch": 9e-7}))
+
+        from atom.compass.core.cost.priced import PricedGraphCostOracle
+
+        measured = PricedGraphCostOracle(
+            prices=oracle.prices_path, graph=oracle.graph_path,
+            calibration=str(calib))
+        assert measured.compiled_seconds_per_launch == 9e-7 != shipped

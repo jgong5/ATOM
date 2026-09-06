@@ -115,6 +115,7 @@ class PricedGraphCostOracle:
                  dispatch_seconds: float = DEFAULT_DISPATCH_SECONDS,
                  compiled_seconds_per_launch: float =
                  DEFAULT_COMPILED_SECONDS_PER_LAUNCH,
+                 calibration: str = "",
                  floor_seconds: float = 1e-6, fallback: str = "",
                  rank_coords: Optional[dict] = None) -> None:
         """
@@ -146,6 +147,12 @@ class PricedGraphCostOracle:
                 step was compiled; a shape that does not say falls through to
                 the eager terms, which is what every graph traced before this
                 existed does.
+            calibration: A file from ``step_accounting.py --calibrate``, whose
+                measured overhead replaces ``compiled_seconds_per_launch``. The
+                constant does not transfer between models -- 9.71us per launch
+                on a 0.6B, 1.68us on a 27B -- so the honest default is not a
+                better constant but a measurement of the deployment being
+                modelled, which is one profiled step away.
             floor_seconds: Smallest duration ever returned, so a virtual clock
                 cannot be run backwards by an empty or unpriced graph.
             fallback: A calibration table, used for steps the graph does not
@@ -167,6 +174,10 @@ class PricedGraphCostOracle:
                                      else float(eager_seconds_per_op))
         self.dispatch_seconds = float(dispatch_seconds)
         self.compiled_seconds_per_launch = float(compiled_seconds_per_launch)
+        if calibration:
+            with open(calibration, encoding="utf-8") as fh:
+                measured = json.load(fh)["compiled_seconds_per_launch"]
+            self.compiled_seconds_per_launch = float(measured)
         self.floor_seconds = float(floor_seconds)
 
         with open(self.prices_path, encoding="utf-8") as fh:

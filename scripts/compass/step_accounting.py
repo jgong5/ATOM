@@ -49,6 +49,10 @@ def main() -> int:
                     help="substring of the step annotation to account for")
     ap.add_argument("--prices")
     ap.add_argument("--graph")
+    ap.add_argument("--calibrate", metavar="OUT.json",
+                    help="write the overhead this step actually pays, per "
+                         "launch as the cost model counts launches, for "
+                         "`PricedGraphCostOracle(calibration=...)`")
     args = ap.parse_args()
 
     events = load_events(args.trace)
@@ -184,6 +188,34 @@ def main() -> int:
               f"{diff:+7.1f}%  {name[:52]}")
     covered = sum(got[k] for k in both)
     print(f"  those cover {covered / busy * 100:.1f}% of the step's kernel time")
+
+    if args.calibrate:
+        # Counted exactly as `PricedGraphCostOracle._cost` counts them, so the
+        # number divides back out against the same denominator it will be
+        # multiplied by. Anything else would be a per-launch figure for a
+        # different meaning of launch.
+        launches = 0
+        for op in graph["ops"]:
+            entry = prices.get(signature_of(op))
+            if entry is None:
+                continue
+            launches += max(1, len(entry.get("kernels") or {}))
+        idle = (window - busy) / 1e6
+        per = idle / launches if launches else 0.0
+        json.dump({
+            "version": 1,
+            "provenance": "empirical/measured",
+            "note": "idle in one step, over the launches the cost model counts",
+            "step": str(step["name"]),
+            "idle_seconds": idle,
+            "launches": launches,
+            "compiled_seconds_per_launch": per,
+        }, open(args.calibrate, "w"), indent=1)
+        print(f"\n  this step pays {idle * 1e3:.3f} ms of overhead over "
+              f"{launches} launches")
+        print(f"  {per * 1e6:.2f} us per launch -> {args.calibrate}")
+        print("  pass it as --compass-oracle-option "
+              f"calibration={args.calibrate}")
     return 0
 
 

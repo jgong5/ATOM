@@ -3872,3 +3872,33 @@ Two harness fixes came with it, both from failures this exposed:
   codebase. `AttributeError: 'NoneType' object has no attribute 'device'` names
   neither the field that was None nor the branch that wanted it; the frame
   named both, and two rounds of guessing had already been wrong.
+
+#### Measuring the overhead instead of defaulting it
+
+The compiled per-launch constant does not transfer -- 9.71 us on the 0.6B, 0.90
+us on the 27B -- so the answer is not a better default. `step_accounting.py
+--calibrate` writes what the profiled step actually pays, over the launches
+*the cost model counts*, and `PricedGraphCostOracle(calibration=...)` reads it:
+
+    this step pays 1.497 ms of overhead over 1669 launches
+    0.90 us per launch
+
+Counting launches the same way the oracle does matters more than it looks: the
+number is divided by a denominator it will later be multiplied by, and any other
+sense of "launch" would leave a constant that is right about a quantity nobody
+uses.
+
+The 27B prefill step, end to end:
+
+| | predicted | against 320.707 ms measured |
+| --- | --- | --- |
+| eager term (where this started) | 349.499 ms | +8.98% |
+| compiled term, 0.6B constant | 335.516 ms | +4.62% |
+| compiled term, calibrated here | **320.807 ms** | **+0.03%** |
+
+Kernels priced in isolation to +0.30% and overhead measured from one profiled
+step. Worth saying what that number is and is not: it is one step of one model,
+and the calibration was taken from *that* step, so it is a demonstration that
+the two terms are separately right rather than a prediction of an unseen
+configuration. The test of the second thing is a shape the calibration was not
+taken on.
