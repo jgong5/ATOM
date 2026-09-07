@@ -112,6 +112,13 @@ DEFAULT_COMPILED_SECONDS_PER_LAUNCH = 9.71e-6
 #: to 0% as its kernels grow. 95.8 us on Qwen3-0.6B at TP=1, fitted to the two
 #: host-bound shapes of four and holding all four to within 2%.
 #:
+#: **This default is a starting point, not a constant.** It survives a change
+#: of machine (95.7 us on a second node whose GPUs are 20% faster) and a change
+#: of width (89.3 us at TP=2 and at TP=4 alike, the 7% being the collectives'
+#: cheaper launches). It does *not* survive a change of model: the 27B measures
+#: 125.0 us, 40% higher. Calibrate per model with `step_accounting --calibrate`
+#: on any host-bound shape.
+#:
 #: Set to 0 to fall back to the older `kernels + launches x
 #: compiled_seconds_per_launch`, which no shape has ever supported over a range
 #: and which is kept only so an old calibration still loads.

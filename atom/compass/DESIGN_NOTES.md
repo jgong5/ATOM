@@ -4425,9 +4425,45 @@ it is real rather than noise: the collective launches appear to be slightly
 cheaper per launch on the host side, pulling the average down.
 
 So `launches x h` picks the width dependence up through the launch count, and
-`h` is a property of the host and its driver rather than of the box or the
-topology. That is the useful shape: one constant per *software stack*, not one
-per machine and not one per topology.
+`h` is a property of the host stack rather than of the machine or the topology.
+
+**It is not a property of the model, though.** The 27B, on the same node at
+TP=2, with three shapes that walk right through the crossover:
+
+| tokens | kernels | idle | window |
+| --- | --- | --- | --- |
+| 294 | 71.2 ms | 67.5% | 219.1 ms |
+| 94 | 131.5 ms | 37.9% | 211.7 ms |
+| 794 | 205.8 ms | 1.9% | 209.8 ms |
+
+Idle collapses from 67.5% to 1.9% as the device work climbs to meet the floor,
+which is the max form doing exactly what it claims. The plateau is ~213.5 ms
+over 1708 launches:
+
+| | launches | plateau | us per launch |
+| --- | --- | --- | --- |
+| 0.6B TP=1 | 391 | 37.4 ms | 95.7 |
+| 0.6B TP=2, TP=4 | 505 | 45.1 ms | 89.3 |
+| 27B TP=2 | 1708 | ~213.5 ms | **125.0** |
+
+**40% higher on the 27B.** So `h` survives a change of machine (0.2%) and a
+change of width (exactly), and does not survive a change of model. It has to be
+calibrated per model -- which `step_accounting --calibrate` now does, and
+refuses to do on a device-bound step.
+
+That is a far better position than the additive constant it replaced, which
+differed 10x between the same two models and 2600x between shapes of one. But
+"one constant per box" was too strong, and the 40% is the correction: one
+constant per *model on a stack*, measured on any host-bound shape of it.
+
+**A measurement caveat worth carrying.** In several campaigns the *first* shape
+run showed inflated device time -- 131.5 ms at 94 tokens against 71.2 ms at 294
+on the 27B, and 32.9 ms against 22.3 ms at TP=2 on the 0.6B. More tokens, less
+device time, which is backwards. Two warm-up rounds at the same shape do not
+remove it, so something in the first engine start of a sequence is still being
+paid for. It does not touch these numbers, because the plateau is read from the
+*window* and every one of those steps is host-bound, but a reading that depends
+on `busy` from a first run should not be trusted.
 
 **Still to do here, and it is the box's fault rather than the method's.** The
 27B and TP=4 runs of the same campaign died at initialisation, repeatedly:
