@@ -1715,7 +1715,32 @@ expect TTFT accurate to about ±8% afterwards, not better -- worth having agains
 Per-*step* engine work needs no term: it measures ~0.5 ms and is overlapped with
 the device, so adding it would make decode worse.
 
-### 4. TP=4 calibrates and evaluates 19% apart on prefill — **M**
+### 4. TP=4 calibrates and evaluates 19% apart on prefill — **RESOLVED**
+
+**It was the host floor.** Re-measured at the shape this entry flagged, on an
+idle machine, both widths are *host-bound* -- the step is waiting on the host,
+not on the device:
+
+| | launches | kernels | idle | window | `max(kernels, launches x h)` | |
+| --- | --- | --- | --- | --- | --- | --- |
+| TP=1 | 391 | 23.690 ms | 40.1% | 39.567 ms | 37.42 ms | -5.4% |
+| TP=4 | 505 | 20.379 ms | 55.5% | 45.832 ms | 45.10 ms | -1.6% |
+
+Kernel work is *lower* at TP=4 -- it shards -- while the floor is *higher*,
+because there are 114 more launches for the collectives. So at four ranks the
+step is much further from being device-determined, and any model whose
+prediction tracks kernel work is proportionally worse there. That is exactly
+the direction this entry recorded, and the eliminations below were all correct:
+it was not admission, and it was not the model's form. What was missing is that
+the machine has a floor.
+
+The max form predicts both widths to within 5.4%. This does not reproduce the
+19% arithmetically -- a different oracle, box and run -- so the claim is the
+mechanism rather than the number.
+
+The original entry follows.
+
+#### 4. TP=4 calibrates and evaluates 19% apart on prefill — the original entry
 
 The cost model generalises to four ranks; the calibration does not. Three
 repeats at TP=4, against three at TP=1, both with 13 ms admission:
