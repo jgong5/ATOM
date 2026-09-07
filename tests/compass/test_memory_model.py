@@ -9,7 +9,8 @@ import json
 import struct
 
 from atom.compass.core.memory_model import (
-    activation_curve, graph_pool_bytes, peak_activation_bytes, weight_bytes)
+    DEFAULT_NON_TORCH, activation_curve, graph_pool_bytes,
+    load_residue_bytes, non_torch_bytes, peak_activation_bytes, weight_bytes)
 
 
 def _write_checkpoint(directory, tied, tensors):
@@ -276,3 +277,42 @@ class TestBuffersNoOperatorDeclared:
                        "dies_at": [-1]}
         graph = {"ops": [_op([1024]), writes_into]}
         assert peak_activation_bytes(graph) == 1024 * 4
+
+
+class TestWhatTheCollectivesTake:
+    """`non_torch` is `(total - free) - reserved`, and `total - free` is
+    device-wide -- so a neighbour is charged to this configuration. Measured
+    per width on one box; a table, not a law, and calibratable per deployment
+    for the same reason the overhead constant is."""
+
+    def test_a_single_rank_holds_no_collective_pools(self):
+        assert load_residue_bytes(1) < non_torch_bytes(1)
+        assert load_residue_bytes(1) < 8 * (1 << 20)
+
+    def test_the_pools_appear_at_the_first_width_above_one(self):
+        assert load_residue_bytes(2) > 2000 * (1 << 20)
+        assert non_torch_bytes(2) > non_torch_bytes(1)
+
+    def test_the_residue_is_flat_in_width(self):
+        """1.1 / 2069 / 2069 / 2068 MiB at widths 1, 2, 4 and 8."""
+        assert load_residue_bytes(2) == load_residue_bytes(4)
+        assert load_residue_bytes(4) == load_residue_bytes(8)
+
+    def test_a_width_between_entries_takes_the_widest_below_it(self):
+        assert non_torch_bytes(3) == non_torch_bytes(2)
+        assert non_torch_bytes(6) == non_torch_bytes(4)
+
+    def test_calibration_replaces_the_table(self):
+        """The constants do not transfer between boxes, so a deployment
+        measures its own rather than trusting these."""
+        mine = {"non_torch": {1: 7, 2: 11}, "load_residue": {1: 3, 2: 5}}
+        assert non_torch_bytes(2, mine) == 11
+        assert load_residue_bytes(2, mine) == 5
+
+    def test_the_model_headroom_is_only_on_the_defaults(self):
+        """Carried because the 27B sat 266 MiB above the 0.6B at every width
+        and two models cannot say what that is a function of. A calibration
+        measured the model in question, so it needs no headroom."""
+        assert non_torch_bytes(2) > DEFAULT_NON_TORCH[2]
+        assert non_torch_bytes(2, {"non_torch": {2: DEFAULT_NON_TORCH[2]}}) \
+            == DEFAULT_NON_TORCH[2]

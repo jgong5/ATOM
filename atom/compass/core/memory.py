@@ -49,6 +49,7 @@ class MemoryReadings:
     #: arithmetic reads them -- they exist so each term can be checked alone.
     weights_torch: Optional[int] = None
     parameter_bytes: Optional[int] = None
+    buffer_bytes: Optional[int] = None
     current_torch: Optional[int] = None
 
     def free_was_binding(self, utilization: float) -> bool:
@@ -126,6 +127,7 @@ class RecordedMemory:
                 cudagraph_overhead=int(got["cudagraph_overhead"]),
                 weights_torch=_optional_int(got.get("weights_torch")),
                 parameter_bytes=_optional_int(got.get("parameter_bytes")),
+                buffer_bytes=_optional_int(got.get("buffer_bytes")),
                 current_torch=_optional_int(got.get("current_torch")))
         except (KeyError, TypeError, ValueError):
             return None

@@ -92,6 +92,42 @@ def row(name: str, derived, recorded, note: str = "") -> None:
                                         error, note))
 
 
+def write_calibration(records, path: str) -> None:
+    """The collective constants this box actually shows, per world size.
+
+    The minimum across the ranks of one run, not the mean: `non_torch` is
+    device-wide used memory minus torch's reserve, so a neighbour inflates it
+    and never deflates it. The least contaminated rank is the closest thing to
+    the configuration's own share.
+
+    These do not transfer between boxes -- which is the whole reason for
+    writing them rather than shipping a table -- so a calibration is only worth
+    what the box it was taken on is worth.
+    """
+    per_width: dict = {}
+    for _, config, readings, tp in records:
+        parameters = readings.get("parameter_bytes")
+        allocated = readings.get("weights_torch")
+        if parameters is None or allocated is None:
+            continue
+        seen = per_width.setdefault(tp, {"non_torch": [], "load_residue": []})
+        seen["non_torch"].append(int(readings.get("non_torch") or 0))
+        seen["load_residue"].append(int(allocated - parameters))
+    blob = {
+        "non_torch": {str(w): min(v["non_torch"]) for w, v in per_width.items()
+                      if v["non_torch"]},
+        "load_residue": {str(w): min(v["load_residue"])
+                         for w, v in per_width.items() if v["load_residue"]},
+    }
+    with open(path, "w", encoding="utf-8") as fh:
+        json.dump(blob, fh, indent=1)
+    print("\ncalibration written to %s" % path)
+    for width in sorted(int(w) for w in blob["non_torch"]):
+        print("  world size %-2d  non_torch %8.1f MiB   residue %8.1f MiB"
+              % (width, blob["non_torch"][str(width)] / (1 << 20),
+                 blob["load_residue"].get(str(width), 0) / (1 << 20)))
+
+
 def show_curve(graph: dict, worst: int = 12) -> None:
     """Where the walk and the allocator part company, operator by operator.
 
@@ -148,6 +184,9 @@ def main() -> int:
                     help="not in the record; needed to know the warmup shape")
     ap.add_argument("--curve", action="store_true",
                     help="show where the walk and the allocator diverge")
+    ap.add_argument("--calibrate",
+                    help="write the collective constants measured from these "
+                         "records to this path, for memory_model to read")
     args = ap.parse_args()
 
     paths = [q for p in args.records for q in sorted(glob.glob(p))] or args.records
@@ -179,9 +218,16 @@ def main() -> int:
         derived_weights = weight_bytes(checkpoint, tp) if checkpoint else None
         # Against the model's own parameters, which is what the term claims to
         # be -- not against the allocator after loading, which is that plus
-        # whatever the loader still holds.
-        row("weights", derived_weights, parameters,
+        # whatever the loader still holds, and not against the buffers either,
+        # which the checkpoint does not contain.
+        buffers = readings.get("buffer_bytes")
+        weights_seen = (parameters - buffers
+                        if parameters is not None and buffers is not None
+                        else parameters)
+        row("weights", derived_weights, weights_seen,
             "" if parameters else "record predates the split")
+        row("model buffers", None, buffers,
+            "not modelled; built at init, absent from the checkpoint")
 
         residue = (allocated - parameters
                    if allocated is not None and parameters is not None else None)
@@ -240,6 +286,9 @@ def main() -> int:
             "vs the engine's estimate")
         if pool_seen:
             row("graph pool", derived_pool, pool_seen, "vs the measured pool")
+
+    if args.calibrate:
+        write_calibration(non_torch_seen, args.calibrate)
 
     if args.curve and graph is not None:
         show_curve(graph)

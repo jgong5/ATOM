@@ -38,6 +38,7 @@ import os
 from typing import Mapping, Optional
 
 __all__ = ["peak_activation_bytes", "activation_curve", "weight_bytes",
+           "resident_bytes", "non_torch_bytes", "load_residue_bytes",
            "graph_pool_bytes", "ELEMENT_BYTES"]
 
 ELEMENT_BYTES = {
@@ -312,6 +313,124 @@ MANUAL_POOL_FRACTION = 0.2
 #: Live tensors a captured PIECEWISE graph retains per layer per token, the
 #: engine's `_LIVE_TENSORS_PER_LAYER`.
 PIECEWISE_LIVE_TENSORS_PER_LAYER = 2.8
+
+
+def resident_bytes(model, tied_head: bool = False) -> tuple:
+    """What a built model's parameters and buffers weigh, per rank.
+
+    Returns ``(parameters, buffers)``. Counted once per storage, so a tied head
+    and its embedding are one allocation, and a meta-built model answers as
+    well as a loaded one -- meta tensors carry shape and dtype and allocate
+    nothing, which is what lets a configuration nobody has run be sized. Pass
+    ``tied_head`` for a meta build, which has not been through the loader and
+    so has not had the tie applied.
+
+    This is what the checkpoint-derived `weight_bytes` approximates. Prefer
+    this where the model can be built: it is ATOM's own sharding rather than a
+    rule about it, and the rule is where the approximation lives -- exact on
+    the dense 0.6B at TP=1, 2 and 4 and on the hybrid 27B at TP=2, and 3.3%
+    low on the same 27B at TP=4, where something does not divide the way
+    "2-D tensors shard, 1-D tensors do not" assumes.
+    """
+    import torch
+
+    seen, parameters, buffers = set(), 0, 0
+    for tensors, into in ((model.named_parameters(), "p"),
+                          (model.named_buffers(), "b")):
+        for name, tensor in tensors:
+            if not isinstance(tensor, torch.Tensor):
+                continue
+            # A model built on meta has not been through the loader, which is
+            # what ties the head to the embedding, so the two are separate
+            # tensors with separate storages and identity cannot see the tie.
+            # It is worth exactly one embedding: 0.290 GiB on the 0.6B, which
+            # is the whole of the gap between the meta build and the loaded
+            # model.
+            if tied_head and name.endswith("lm_head.weight"):
+                continue
+            # A meta tensor has no storage to ask, so its own extent is the
+            # only answer -- and on meta there is no aliasing to deduplicate.
+            if tensor.is_meta:
+                key = id(tensor)
+                size = tensor.numel() * tensor.element_size()
+            else:
+                storage = tensor.untyped_storage()
+                key = (storage.data_ptr(), storage.nbytes())
+                size = storage.nbytes()
+            if key in seen:
+                continue
+            seen.add(key)
+            if into == "p":
+                parameters += size
+            else:
+                buffers += size
+    return parameters, buffers
+
+
+#: What a rank holds outside the torch allocator, and what the collective
+#: libraries take through it, measured on this box (MiB, per rank).
+#:
+#: `non_torch` is `(total - free) - reserved`, and `total - free` is
+#: *device-wide* -- so a neighbour's allocation is charged to this
+#: configuration. That is the same defect the recorded-`free` guard already
+#: refuses a record for, and nothing guarded this one. It shows: at TP=1 and
+#: TP=2 every rank agreed to the byte, at TP=4 they spread 192 MiB and at TP=8
+#: 640 MiB. These are the *minimum* across ranks, which is the least
+#: contaminated estimate of the configuration's own share.
+#:
+#: A table rather than a law, because the evidence does not support a law. Over
+#: the TP=1 baseline the collective term is 5980, 6196 and 9138 MiB at widths
+#: 2, 4 and 8: no fixed-plus-per-peer form fits all three, and the jump at 8 is
+#: most likely RCCL opening more channels. Calibrate per deployment rather than
+#: trusting these -- `validate_memory.py --calibrate` writes a replacement from
+#: records, the way `step_accounting.py --calibrate` does for the overhead
+#: constant, and for the same reason: the constant does not transfer.
+MIB = 1 << 20
+DEFAULT_NON_TORCH = {
+    # world size -> bytes held outside the torch allocator
+    1: 926 * MIB,
+    2: 6906 * MIB,
+    4: 7266 * MIB,
+    8: 10704 * MIB,
+}
+#: What the collective libraries take *through* the torch allocator, beyond the
+#: model's own parameters -- AITER's CustomAllreduce registers a 1 GiB pool and
+#: the two-stage kernel a second, so this is ~2 GiB from world size 2 upwards
+#: and 1 MiB at world size 1. Flat in width, which the 1.1 / 2069 / 2069 /
+#: 2068 MiB measured at widths 1, 2, 4 and 8 says plainly.
+DEFAULT_LOAD_RESIDUE = {1: 1 * MIB, 2: 2069 * MIB}
+
+#: How much of `non_torch` varied with the *model* rather than the topology:
+#: the 27B sat exactly 266 MiB above the 0.6B at TP=2 and TP=4 alike. 3.8% of
+#: the term, and two models cannot say what it is a function of, so it is
+#: carried as headroom on the larger side.
+MODEL_HEADROOM = 266 * MIB
+
+
+def _at_width(table: Mapping, world_size: int) -> int:
+    """The table's entry for this width, or the widest one at or below it."""
+    if world_size in table:
+        return int(table[world_size])
+    below = [w for w in table if w <= world_size]
+    return int(table[max(below)]) if below else int(table[min(table)])
+
+
+def non_torch_bytes(world_size: int, calibration: Optional[Mapping] = None) -> int:
+    """What this rank holds outside the torch allocator.
+
+    Includes the model headroom, because under-reserving here over-allocates
+    KV and the run then dies at steady state rather than at start-up.
+    """
+    table = (calibration or {}).get("non_torch") or DEFAULT_NON_TORCH
+    return _at_width({int(k): v for k, v in table.items()}, world_size) + (
+        MODEL_HEADROOM if not calibration else 0)
+
+
+def load_residue_bytes(world_size: int,
+                       calibration: Optional[Mapping] = None) -> int:
+    """What the collectives take through the torch allocator, beyond the model."""
+    table = (calibration or {}).get("load_residue") or DEFAULT_LOAD_RESIDUE
+    return _at_width({int(k): v for k, v in table.items()}, world_size)
 
 
 def graph_pool_bytes(activation_bytes: int, *, enforce_eager: bool = False,

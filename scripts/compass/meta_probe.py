@@ -27,6 +27,9 @@ def main() -> int:
     ap.add_argument("--tokens", type=int, default=8, help="tokens in the probe batch")
     ap.add_argument("--tp", type=int, default=1, help="tensor parallel size to model")
     ap.add_argument("--show-ops", action="store_true", help="list executed operators")
+    ap.add_argument("--weights-only", action="store_true",
+                    help="report the weight and buffer terms and stop, without "
+                         "tracing a forward")
     args = ap.parse_args()
 
     from atom.config import Config
@@ -49,13 +52,24 @@ def main() -> int:
     os.environ.setdefault("WORLD_SIZE", "1")
     from aiter import init_dist_env
 
+    # One real rank, however wide the configuration being modelled. Asking
+    # gloo for a world of N from one process waits forever for peers that will
+    # never arrive -- which is what `--tp 2` used to do here, silently, until
+    # the timeout. `simulate_group_width` is the mechanism that makes the
+    # group *report* the wider size while staying one rank, so every shard
+    # computation in the tree sizes itself for the width being modelled.
     init_dist_env(
-        args.tp,
+        1,
         rankID=0,
         backend="gloo",
         distributed_init_method="env://",
         local_rank=0,
     )
+    from atom.compass.runtime.derive import simulate_group_width
+
+    # Before the model is built: layers read the width while being constructed,
+    # so patching afterwards changes nothing already sized.
+    simulate_group_width(args.tp, physical=1)
 
     config = Config(model=args.model, tensor_parallel_size=args.tp)
 
@@ -75,14 +89,34 @@ def main() -> int:
     # Structure only: meta tensors have shape and dtype but no storage, so this
     # allocates nothing and needs no GPU.
     build_t0 = time.perf_counter()
+    # The model's dtype is the config's, not torch's default. Without this the
+    # meta build comes out in float32 and every byte it reports is twice what
+    # the loaded model holds -- which is exactly how this was caught.
+    was_dtype = torch.get_default_dtype()
     try:
+        torch.set_default_dtype(config.torch_dtype)
         with torch.device("meta"):
             model = model_class(config)
     except Exception as exc:  # noqa: BLE001
         print(f"model construction on meta failed: {type(exc).__name__}: {exc}")
         return 1
+    finally:
+        torch.set_default_dtype(was_dtype)
     build_s = time.perf_counter() - build_t0
     print(f"built on meta in {build_s:.2f}s\n")
+
+    # What this rank's weights weigh, by ATOM's own sharding rather than by a
+    # rule about it -- and without a device, so it answers for a width there
+    # are no GPUs for. Meta tensors have shape and dtype and no storage.
+    from atom.compass.core.memory_model import resident_bytes
+
+    tied = bool(getattr(config.hf_config, "tie_word_embeddings", False))
+    parameters, buffers = resident_bytes(model, tied_head=tied)
+    print("parameters   : %.4f GiB per rank at tp=%d" % (parameters / 2**30, args.tp))
+    print("buffers      : %.4f GiB (built at init, absent from the checkpoint)\n"
+          % (buffers / 2**30))
+    if args.weights_only:
+        return 0
 
     from atom.compass.runtime.meta import derived_inputs
 

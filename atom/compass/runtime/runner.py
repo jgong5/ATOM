@@ -813,10 +813,52 @@ class CompassModelRunner(ModelRunner):
                            exc)
             self._weights_bytes = None
         self._parameter_bytes = self._resident_parameter_bytes()
+        self._buffer_bytes = self._resident_parameter_bytes(buffers_only=True)
+        self._buffer_breakdown = self._resident_buffer_breakdown()
         return out
 
-    def _resident_parameter_bytes(self) -> Optional[int]:
+    def _resident_buffer_breakdown(self) -> Optional[list]:
+        """What the model's buffers are, by name, largest first.
+
+        Aggregated by the last two components of the name, so the list does not
+        grow with the layer count and one entry stands for the whole model's
+        worth of a thing.
+        """
+        import torch
+
+        model = getattr(self, "model", None)
+        if model is None:
+            return None
+        try:
+            seen, totals = set(), {}
+            for name, tensor in model.named_buffers():
+                if not isinstance(tensor, torch.Tensor) or not tensor.is_cuda:
+                    continue
+                storage = tensor.untyped_storage()
+                key = (storage.data_ptr(), storage.nbytes())
+                if key in seen:
+                    continue
+                seen.add(key)
+                kind = ".".join(str(name).split(".")[-2:])
+                count, total, shape = totals.get(kind, (0, 0, None))
+                totals[kind] = (count + 1, total + storage.nbytes(),
+                                shape or list(tensor.shape))
+            ranked = sorted(totals.items(), key=lambda kv: -kv[1][1])[:8]
+            return [{"name": kind, "count": count, "bytes": total,
+                     "shape": shape, "dtype": None}
+                    for kind, (count, total, shape) in ranked]
+        except Exception as exc:  # noqa: BLE001 - never fail a run over a record
+            logger.debug("ATOMCompass: no buffer breakdown: %s", exc)
+            return None
+
+    def _resident_parameter_bytes(self, buffers_only: bool = False) -> Optional[int]:
         """What the model's own parameters and buffers weigh.
+
+        `buffers_only` takes the buffers alone. They are the part the
+        checkpoint does not contain -- rotary tables and the like, computed at
+        init -- so the weight term derived from a checkpoint can only ever be
+        the rest, and separating them says whether a shortfall is a sharding
+        mistake or simply a tensor that was never in the file.
 
         `memory_allocated()` after loading is the weights *and* anything the
         loader still holds, and the two are not the same number -- at TP=2 they
@@ -835,7 +877,9 @@ class CompassModelRunner(ModelRunner):
             return None
         try:
             seen, total = set(), 0
-            for tensor in list(model.parameters()) + list(model.buffers()):
+            resident = (list(model.buffers()) if buffers_only
+                        else list(model.parameters()) + list(model.buffers()))
+            for tensor in resident:
                 if not isinstance(tensor, torch.Tensor) or not tensor.is_cuda:
                     continue
                 storage = tensor.untyped_storage()
@@ -891,6 +935,15 @@ class CompassModelRunner(ModelRunner):
                 # this plus whatever the loader has not let go of; keeping them
                 # apart is what stops the residue being charged to the weights.
                 "parameter_bytes": getattr(self, "_parameter_bytes", None),
+                # ...of which this much is buffers, which the checkpoint does
+                # not contain. A weight term derived from a checkpoint can only
+                # ever account for the rest.
+                "buffer_bytes": getattr(self, "_buffer_bytes", None),
+                # ...and what they are. A formula for them was guessed from one
+                # model (rotary tables: positions x head_dim x 2 matched the
+                # 0.6B's 10.0 MiB exactly) and was 4x wrong on the second, so
+                # what they are is recorded rather than inferred.
+                "buffer_breakdown": getattr(self, "_buffer_breakdown", None),
                 "current_torch": int(stats["allocated_bytes.all.current"]),
                 "non_torch": int(max((total - free)
                                      - torch.cuda.memory_reserved(), 0)),

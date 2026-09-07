@@ -1254,9 +1254,91 @@ cannot run is answering a different question.
      fitted here. Three topologies of one model is interpolation, not a model,
      and the constants are stated as measurements.
 
-   Still to do: models for `non_torch` and the load residue once there is
-   evidence from more than one model, and a graph-pool term that predicts the
-   measured pool rather than the engine's estimate of it.
+   **The weight term: ask the model, do not deduce it from the checkpoint.**
+   The checkpoint rule -- 2-D tensors shard, 1-D tensors do not, drop a tied
+   head -- is exact on the dense 0.6B at every width and on the hybrid 27B at
+   TP=2, and **3.3% low** on that same 27B at TP=4, where something does not
+   divide the way the rule assumes. Guessing better was the wrong move: ATOM
+   already knows how it shards, and `derive.py` already has the mechanism to
+   ask it for a width there are no devices for. `meta_probe.py --weights-only`
+   builds the model on meta at a simulated width and sums what it holds.
+
+   | | TP=1 | TP=2 | TP=4 | TP=8 |
+   | --- | --- | --- | --- | --- |
+   | 0.6B, meta against loaded | -0.00% | +0.00% | -0.02% | +0.01% |
+   | 27B, meta against loaded | -- | **0.00%** | **0.00%** | -- |
+
+   Exact, on both models, at every width -- and with no GPU and no weights,
+   which is the point. Two things had to be right for it. The build takes its
+   dtype from the config, not from torch's default, or every byte comes out
+   twice what the model holds. And the width is *simulated*: `--tp 2` used to
+   ask gloo for a world of two from one process and wait forever for a peer
+   that would never arrive, which is exactly the failure `simulate_group_width`
+   exists to prevent and the probe was not using it.
+
+   The one correction left is the tie. A meta-built model has not been through
+   the loader, which is what points the head at the embedding, so the two are
+   separate tensors with separate storages and identity cannot see it. Worth
+   one embedding -- 0.290 GiB on the 0.6B, and the whole of the gap.
+
+   **Model buffers are the rotary tables, and now they are recorded rather
+   than guessed.** Splitting them out of the weight term took it to +0.0% on
+   its own; a formula for them (`max_position_embeddings x head_dim x 2`)
+   matched the 0.6B's 10.0 MiB exactly and was **4x wrong** on the 27B, which
+   uses partial rotary -- so it was tested on a second model, failed, and did
+   not ship. What the trace records instead is what they are:
+
+   | | bytes | shape |
+   | --- | --- | --- |
+   | 0.6B `rotary_emb.cos_cache` / `sin_cache` | 5.00 MiB each | `[40960, 1, 1, 64]` |
+   | 27B `rotary_emb.cos_cache` / `sin_cache` | 16.00 MiB each | `[262144, 1, 1, 32]` |
+
+   The meta build reports them exactly (0.0098 and 0.0312 GiB), so there is no
+   formula to get wrong.
+
+   **`non_torch` is not a property of the configuration.** It is
+   `(total - free) - reserved`, and `total - free` is *device-wide* -- so a
+   neighbour's allocation is charged to this configuration. That is precisely
+   the defect the recorded-`free` guard already refuses a record for, and
+   nothing guarded this one. It shows in the per-rank spread of one run:
+
+   | world size | `non_torch`, min across ranks | spread |
+   | --- | --- | --- |
+   | 1 | 926 MiB | -- |
+   | 2 | 6906 MiB | **0** |
+   | 4 | 7122 MiB | 192 MiB |
+   | 8 | 10064 MiB | 640 MiB |
+
+   At widths 1 and 2 every rank agreed to the byte, which is what makes the
+   rest of the table trustworthy at all. Above that, this box is too busy for
+   finer statements.
+
+   Where the ranks did agree, the structure is exact and additive -- every
+   increment a whole number of MiB, and the same increment for both models:
+
+   * 926 MiB at TP=1: the HIP context and the libraries, no collectives.
+   * +5980 MiB the moment the width exceeds one.
+   * +360 MiB from TP=2 to TP=4, *identically for the 0.6B and the 27B*.
+   * +266 MiB for the 27B over the 0.6B, *identically at TP=2 and TP=4*.
+
+   The last is the only model-dependent part: 3.8% of the term. Two models
+   cannot say what it is a function of, so it is carried as headroom on the
+   larger side. And the width term is a table, not a law: no fixed-plus-per-peer
+   form fits 5980 / 6340 / 9138 at widths 2, 4 and 8, and the jump at 8 is most
+   likely RCCL opening more channels. `validate_memory.py --calibrate` writes a
+   replacement from records, for the same reason `step_accounting.py
+   --calibrate` does for the overhead constant: the constant does not transfer.
+
+   **The load residue is AITER's registered pools, and is flat in width.**
+   1.1 MiB at TP=1 and 2069 MiB at TP=2, 4 and 8 alike -- `CustomAllreduce`
+   registers a 1 GiB pool and the two-stage kernel a second. The model-dependent
+   part is +71 MiB (27B at TP=2) and +147 MiB (at TP=4), against a 2069 MiB
+   constant.
+
+   Still to do: a graph-pool term that predicts the measured pool rather than
+   the engine's estimate of it, a third model for the model-dependent parts
+   (the 30B-A3B checkpoint is only part-downloaded and this box is offline),
+   and a guard on `non_torch` of the kind `free` already has.
 
    **Fixing the TP spread: peaks agreed for the wrong reasons, so compare
    curves.** -0.3% / +12.6% / -9.1% has no shape as an error, and the peak is
