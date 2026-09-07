@@ -4397,10 +4397,42 @@ host run ahead across operators, not just within one.
 `compiled_seconds_per_launch` is kept, reached by setting the host constant to
 zero, so an old calibration still loads and still means what it meant.
 
-**Still to do here.** The host constant is one model at one width; it should be
-measured on the 27B and at TP>1 before it is trusted, and `step_accounting
---calibrate` should learn to write it (it currently writes the additive one,
-which is the quantity that turned out not to exist).
+**At TP=2 the constant holds; the floor moves because the launches do.**
+
+| | launches | plateau window | us per launch |
+| --- | --- | --- | --- |
+| TP=1 | 391 | ~37.5 ms | **95.8** |
+| TP=2 | 505 | ~45.0 ms | **89.1** |
+
+The step floor rises from 37 to 45 ms, but the per-launch cost is within 7%.
+The extra 114 launches are the collectives, so `launches x h` picks the width
+dependence up on its own and `h` looks like a property of the host and the
+driver rather than of the parallel configuration. That is the useful shape for
+a model: one constant per box, not one per topology.
+
+(TP=2 is two shapes, at 794 and 2294 tokens, both host-bound -- enough to place
+the plateau, not enough to see its crossover. The 32.3% and 10.5% idle at those
+two sizes bracket it.)
+
+**Still to do here, and it is the box's fault rather than the method's.** The
+27B and TP=4 runs of the same campaign died at initialisation, repeatedly:
+
+    available_for_kv=-103667.58MB (budget=57.60GB, peak_torch=2.94GB,
+    non_torch=152.01GB, cudagraph_est=0.05GB, safety=3.84GB, free=37.16GB)
+
+`non_torch` at 152 GB on a card where this process had reserved 2.9 GB -- the
+neighbours, charged to this configuration, which is the device-wide reading
+documented under `non_torch` above showing up as a *failure to launch* rather
+than as a distorted measurement. No utilization setting fixes it: the budget
+only goes positive above 0.83, which on a box shared with twenty containers is
+not a setting to reach for, and the `min(budget, free)` clamp would refuse it
+anyway. The campaign needs a quiet box, not a bigger number.
+
+That leaves the host constant measured on one model at two widths. It should
+still be checked on the 27B before it is trusted across models -- the earlier
+per-launch constants differed 10x between these two models, and while this one
+has a mechanism that the additive one lacked, that is a reason to expect it to
+transfer rather than evidence that it does.
 
 **A method note worth keeping.** Two of the numbers on the way here were
 wrong in ways that only checking caught. A naive next-start-minus-previous-end
