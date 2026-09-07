@@ -361,6 +361,14 @@ class CompassModelRunner(ModelRunner):
         # device would show no communication at all. A no-op on a real
         # multi-device run, where the collective dispatches and is recorded once.
         collectives = record_collectives(self._graph)
+        # Ground truth for the activation term, for this exact step. The
+        # engine's `peak_torch` belongs to the warmup prefill, whose shape is
+        # nobody's choice and is rarely the traced one -- so checking a
+        # graph-derived activation peak against it compares two shapes. Read
+        # here instead, around the step whose graph is about to be written, and
+        # the two are the same work by construction. Resetting the peak is safe
+        # only because `get_num_blocks` has long since run and recorded its own.
+        resident = self._reset_activation_peak()
         try:
             with collectives, triton, ops:
                 if timing is None:
@@ -383,10 +391,36 @@ class CompassModelRunner(ModelRunner):
             )
             raise
         self._traced_steps += 1
+        self._activation_peak = self._read_activation_peak(resident)
         self._write_graph(batch, kind)
         if timing is not None:
             self._write_op_timings(timing)
         return output
+
+    def _reset_activation_peak(self) -> Optional[int]:
+        """Start this step's high-water mark, and say what was already held."""
+        try:
+            import torch
+
+            resident = int(torch.cuda.memory_allocated())
+            torch.cuda.reset_peak_memory_stats()
+            return resident
+        except Exception as exc:  # noqa: BLE001 - never fail a trace over a number
+            logger.debug("ATOMCompass: no activation peak for this step: %s", exc)
+            return None
+
+    def _read_activation_peak(self, resident: Optional[int]) -> Optional[int]:
+        """How far above the resident baseline this step's allocation went."""
+        if resident is None:
+            return None
+        try:
+            import torch
+
+            peak = torch.cuda.memory_stats()["allocated_bytes.all.peak"]
+            return max(int(peak) - resident, 0)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("ATOMCompass: no activation peak for this step: %s", exc)
+            return None
 
     def _write_op_timings(self, timing) -> None:
         """Write what each operator cost, beside the graph it belongs to.
@@ -473,6 +507,11 @@ class CompassModelRunner(ModelRunner):
                 "num_prefill_tokens": shape.num_prefill_tokens,
                 "capture_bucket": shape.capture_bucket,
             },
+            # What the allocator actually went above its resident baseline for
+            # this step. The graph is the input to the modelled activation
+            # term, so its own measurement belongs beside it -- a derivation
+            # and its ground truth in one artifact, at one shape.
+            "activation_peak_bytes": getattr(self, "_activation_peak", None),
         }
         self._warn_if_incomplete()
         try:
@@ -717,6 +756,62 @@ class CompassModelRunner(ModelRunner):
             self._resolve_capture_ladder()
         return 0.0, [], 0
 
+    def _build_and_load_model(self, model_class):
+        """Load the weights, and read how many bytes of them are resident.
+
+        `peak_torch` is a single number covering the weights and the peak
+        activations both, so a budget derived from it can be right in total
+        while both its terms are wrong. The allocator read here -- after the
+        weights are resident and before any forward has run -- is the only
+        moment at which the weights are separable, and it costs one call.
+        """
+        import torch
+
+        out = super()._build_and_load_model(model_class)
+        try:
+            self._weights_bytes = int(torch.cuda.memory_allocated())
+        except Exception as exc:  # noqa: BLE001 - never fail a run over a record
+            logger.warning("ATOMCompass WARNING: could not read the weight "
+                           "bytes (%s); the term stays folded into peak_torch",
+                           exc)
+            self._weights_bytes = None
+        self._parameter_bytes = self._resident_parameter_bytes()
+        return out
+
+    def _resident_parameter_bytes(self) -> Optional[int]:
+        """What the model's own parameters and buffers weigh.
+
+        `memory_allocated()` after loading is the weights *and* anything the
+        loader still holds, and the two are not the same number -- at TP=2 they
+        differ by more than the weights themselves. Asking the model rather
+        than the allocator gives the term its exact ground truth, and the
+        difference between the two is then a residue that can be named instead
+        of being charged to the weights.
+
+        Storage is counted once per tensor, because a tied head and its
+        embedding are two parameters over one allocation.
+        """
+        import torch
+
+        model = getattr(self, "model", None)
+        if model is None:
+            return None
+        try:
+            seen, total = set(), 0
+            for tensor in list(model.parameters()) + list(model.buffers()):
+                if not isinstance(tensor, torch.Tensor) or not tensor.is_cuda:
+                    continue
+                storage = tensor.untyped_storage()
+                key = (storage.data_ptr(), storage.nbytes())
+                if key in seen:
+                    continue
+                seen.add(key)
+                total += storage.nbytes()
+            return int(total)
+        except Exception as exc:  # noqa: BLE001 - never fail a run over a record
+            logger.debug("ATOMCompass: no parameter bytes: %s", exc)
+            return None
+
     def get_num_blocks(self) -> dict:
         """Size the KV cache, and record what the budget was made of.
 
@@ -749,6 +844,17 @@ class CompassModelRunner(ModelRunner):
                 "free": int(free),
                 "peak_torch": int(max(stats["allocated_bytes.all.peak"],
                                       stats["allocated_bytes.all.current"])),
+                # `peak_torch` is weights, persistent buffers and peak
+                # activations summed. These two split it: what the allocator
+                # held once the weights were in, and what it still holds now
+                # the profiling forward has finished. Recorded raw, so the
+                # split is the reader's arithmetic and not a stored derivation.
+                "weights_torch": getattr(self, "_weights_bytes", None),
+                # The model's own parameters and buffers. `weights_torch` is
+                # this plus whatever the loader has not let go of; keeping them
+                # apart is what stops the residue being charged to the weights.
+                "parameter_bytes": getattr(self, "_parameter_bytes", None),
+                "current_torch": int(stats["allocated_bytes.all.current"]),
                 "non_torch": int(max((total - free)
                                      - torch.cuda.memory_reserved(), 0)),
                 "cudagraph_overhead": int(self._estimate_cudagraph_overhead()),
@@ -873,6 +979,12 @@ class CompassModelRunner(ModelRunner):
                     getattr(config, "gpu_memory_utilization", 0.0) or 0.0),
                 "max_num_seqs": int(getattr(config, "max_num_seqs", 0) or 0),
                 "max_model_len": getattr(config, "max_model_len", None),
+                # Not part of the key -- two runs differing only in this get
+                # the same readings. Recorded because it, with max_model_len,
+                # is what sets the shape of the warmup prefill that `peak_torch`
+                # belongs to, and a reader cannot check that term without it.
+                "max_num_batched_tokens": getattr(
+                    config, "max_num_batched_tokens", None),
                 "kv_cache_dtype": str(getattr(config, "kv_cache_dtype", "")),
                 "block_size": getattr(config, "kv_cache_block_size", None),
                 "topology": self._topology(),

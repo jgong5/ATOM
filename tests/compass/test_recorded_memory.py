@@ -76,3 +76,29 @@ class TestRecordsThatDescribeTheBoxRatherThanTheConfiguration:
         assert readings.free_was_binding(0.9)
         # budget 40 - 18 = 22 < 50, so it does not
         assert not readings.free_was_binding(0.4)
+
+
+class TestTermsThatWereOnceOneNumber:
+    """`peak_torch` is weights, persistent buffers and peak activations summed.
+
+    A budget derived from it can be right in total while both its terms are
+    wrong, so the two readings that split it are recorded -- and a record
+    written before they existed still has to load.
+    """
+
+    def test_a_record_predating_the_split_still_loads(self, tmp_path):
+        path = _record(tmp_path, "old.json")
+        readings = RecordedMemory([path]).readings_for(CONFIG)
+        assert readings is not None
+        assert readings.weights_torch is None
+        assert readings.parameter_bytes is None
+        assert readings.current_torch is None
+
+    def test_a_record_that_has_them_carries_them_through(self, tmp_path):
+        path = _record(tmp_path, "new.json", peak_torch=8, weights_torch=5,
+                       parameter_bytes=4, current_torch=6)
+        readings = RecordedMemory([path]).readings_for(CONFIG)
+        assert (readings.weights_torch, readings.parameter_bytes,
+                readings.current_torch) == (5, 4, 6)
+        # The split is the reader's arithmetic, not a stored derivation.
+        assert readings.peak_torch - readings.current_torch == 2

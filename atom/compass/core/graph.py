@@ -104,6 +104,15 @@ class OpSpec:
             the trace runs, because a graph of shapes alone cannot be walked for
             liveness -- two tensors of the same shape are indistinguishable in
             it.
+        output_aliases: Per output, whether the operator allocated it. ``None``
+            means it did; an index ``k >= 0`` means it wrote into the tensor
+            operator ``k`` produced, and ``-1`` that it wrote into one from
+            before the step. An in-place operator allocates nothing, and
+            counting its output as a fresh tensor inflates the activation term
+            by one tensor per in-place call -- at TP=2 the 57 in-place
+            all-reduces made that 12.6%. Decided by whether the output's
+            storage is one of the operator's own inputs, which cannot be
+            confused with the allocator handing back a freed address.
         launch: How to launch a Triton kernel that is not a torch operator, as
             ``(name, value)`` pairs: ``grid`` and ``origin``. A torch operator
             can be found again from its name alone, through ``torch.ops``; a
@@ -124,6 +133,7 @@ class OpSpec:
     launch: tuple[tuple[str, Any], ...] = ()
     int_ranges: tuple[tuple[int, tuple[int, int, bool]], ...] = ()
     inputs_from: tuple[int, ...] = ()
+    output_aliases: tuple = ()
 
     @property
     def is_collective(self) -> bool:
@@ -193,6 +203,7 @@ class OpGraph:
                     "launch": [list(kv) for kv in op.launch],
                     "int_ranges": [[i, list(v)] for i, v in op.int_ranges],
                     "inputs_from": list(op.inputs_from),
+                    "output_aliases": list(op.output_aliases),
                 }
                 for op in self.ops
             ],
@@ -235,6 +246,9 @@ class OpGraph:
                     ),
                     inputs_from=tuple(
                         int(i) for i in op.get("inputs_from") or ()),
+                    output_aliases=tuple(
+                        None if a is None else int(a)
+                        for a in op.get("output_aliases") or ()),
                 )
             )
         return graph

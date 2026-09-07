@@ -1,0 +1,208 @@
+"""Each memory term against its own ground truth, one row per term.
+
+The derived budget was first checked as a sum: weights plus activations against
+`peak_torch`, which came out +13.8%. A sum of terms validated only in total is
+the shape of error this project has already been caught by twice -- two terms
+wrong in opposite directions read as one term slightly wrong. So each term gets
+its own recorded counterpart here, and none of them is a subtraction of the
+others.
+
+What each row compares:
+
+* **weights** -- derived from the checkpoint headers, against the allocator
+  read once the weights were resident and before any forward ran.
+* **persistent** -- not modelled. The forward buffers and anything else that
+  outlives a step; reported so it is visible rather than absorbed into a
+  neighbour. Its recorded value is `current_torch - weights_torch`.
+* **activations** -- derived by walking the traced graph for liveness, against
+  `peak_torch - current_torch`. Only comparable when the trace and the run's
+  warmup prefill are the same shape, which the script checks and says.
+* **non-torch** -- not modelled. Recorded directly; the table over several
+  topologies is what a model would have to fit.
+* **graph pool** -- derived from the engine's own formula without a device,
+  against the recorded estimate, and separately against the pool the capture
+  loop measured if a log is given. The first says the derivation reproduces the
+  engine's decision; only the second says the decision was right.
+
+    python scripts/compass/validate_memory.py compass_ops/mem_*.json \
+        [--graph compass_ops/g.prefill.json] [--checkpoint DIR] [--log run.log]
+"""
+from __future__ import annotations
+
+import argparse
+import glob
+import json
+import os
+import re
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
+
+from atom.compass.core.memory_model import (  # noqa: E402
+    graph_pool_bytes, peak_activation_bytes, weight_bytes)
+
+GB = float(1 << 30)
+
+
+def warmup_tokens(config: dict, max_num_batched_tokens: int) -> int:
+    """The token count of the prefill that sets `peak_torch`.
+
+    `ModelRunner.warmup_model` resets the peak, then runs one dummy prefill --
+    so the peak activation reading belongs to that shape and no other. Mirrored
+    here at data parallel one, which is every configuration recorded so far.
+    """
+    max_model_len = int(config.get("max_model_len") or 0)
+    max_num_seqs = int(config.get("max_num_seqs") or 1)
+    if not (max_model_len and max_num_batched_tokens):
+        return 0
+    num_seqs = max(1, min(max_num_batched_tokens // max_model_len, max_num_seqs))
+    seq_len = max(1, min(max_model_len, max_num_batched_tokens // num_seqs))
+    return num_seqs * seq_len
+
+
+def graph_tokens(graph: dict) -> int:
+    """How many tokens the traced step ran.
+
+    `batch_signature` is the per-sequence scheduled-token count kept exact, so
+    its sum is the step's token count.
+    """
+    key = graph.get("key") or {}
+    return sum(int(n) for n in (key.get("batch_signature") or ()))
+
+
+def measured_pool(log_path: str) -> int:
+    """The pool the capture loop measured, off the line it logs."""
+    try:
+        with open(log_path, encoding="utf-8", errors="replace") as fh:
+            text = fh.read()
+    except OSError:
+        return 0
+    found = re.findall(r"pool\(reserved\)=([0-9.]+)GB", text)
+    return int(float(found[-1]) * GB) if found else 0
+
+
+def row(name: str, derived, recorded, note: str = "") -> None:
+    def show(value):
+        return "       -" if value is None else "%7.3fG" % (value / GB)
+    if derived is None or not recorded:
+        error = "     -"
+    else:
+        error = "%+5.1f%%" % ((derived - recorded) / recorded * 100)
+    print("  %-14s %8s %8s  %6s  %s" % (name, show(derived), show(recorded),
+                                        error, note))
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("records", nargs="+", help="memory records, globs allowed")
+    ap.add_argument("--graph", help="traced op graph, for the activation term")
+    ap.add_argument("--checkpoint", help="model directory, for the weight term")
+    ap.add_argument("--log", help="run log, for the measured graph pool")
+    ap.add_argument("--max-num-batched-tokens", type=int, default=0,
+                    help="not in the record; needed to know the warmup shape")
+    args = ap.parse_args()
+
+    paths = [q for p in args.records for q in sorted(glob.glob(p))] or args.records
+    graph = json.load(open(args.graph)) if args.graph else None
+    pool_seen = measured_pool(args.log) if args.log else 0
+
+    non_torch_seen = []
+    for path in paths:
+        with open(path, encoding="utf-8") as fh:
+            blob = json.load(fh)
+        readings, config = blob.get("readings") or {}, blob.get("config") or {}
+        if not readings:
+            continue
+        tp = int((config.get("topology") or {}).get("tp", 1) or 1)
+        non_torch_seen.append((os.path.basename(path), config, readings, tp))
+
+    print("  %-14s %8s %8s  %6s  %s"
+          % ("term", "derived", "recorded", "error", "note"))
+    for name, config, readings, tp in non_torch_seen:
+        print("\n%s  --  %s tp=%d max_model_len=%s"
+              % (name, config.get("model"), tp, config.get("max_model_len")))
+
+        allocated = readings.get("weights_torch")
+        parameters = readings.get("parameter_bytes")
+        current = readings.get("current_torch")
+        peak = readings.get("peak_torch")
+
+        checkpoint = args.checkpoint
+        derived_weights = weight_bytes(checkpoint, tp) if checkpoint else None
+        # Against the model's own parameters, which is what the term claims to
+        # be -- not against the allocator after loading, which is that plus
+        # whatever the loader still holds.
+        row("weights", derived_weights, parameters,
+            "" if parameters else "record predates the split")
+
+        residue = (allocated - parameters
+                   if allocated is not None and parameters is not None else None)
+        row("load residue", None, residue,
+            "not modelled; held after load, beyond the parameters")
+
+        # Everything resident at sizing time that is neither the parameters nor
+        # a step's activations: forward buffers, and any residue still held.
+        persistent = (current - parameters
+                      if current is not None and parameters is not None else None)
+        row("persistent", None, persistent, "not modelled")
+
+        derived_act = peak_activation_bytes(graph) if graph is not None else None
+
+        # Preferred ground truth: what the allocator went above its baseline
+        # for the very step the graph describes. Same shape, same work, no
+        # inference. Written into the graph's provenance by the tracing run.
+        traced_peak = ((graph or {}).get("provenance") or {}).get(
+            "activation_peak_bytes")
+        if traced_peak:
+            row("activations", derived_act, int(traced_peak),
+                "vs the traced step's own peak (%d tokens)" % graph_tokens(graph))
+
+        # Fallback, and a weaker one: the warmup prefill's peak. Only a check
+        # at all when the warmup and the trace ran the same number of tokens.
+        budget = (args.max_num_batched_tokens
+                  or int(config.get("max_num_batched_tokens") or 0))
+        if current is not None and peak is not None:  # noqa: SIM108
+            warmup_act, note = max(peak - current, 0), "vs the warmup peak"
+        else:
+            # `_estimate_cudagraph_overhead` is 0.2 x peak activations under
+            # manual capture, so a record predating the split still says what
+            # its activation term was -- inverted, and flagged as inverted.
+            overhead = readings.get("cudagraph_overhead") or 0
+            warmup_act = int(overhead / 0.2) if overhead else 0
+            note = "vs the warmup peak, inverted from the pool estimate"
+        want, got = warmup_tokens(config, budget), graph_tokens(graph or {})
+        if want and got and want != got:
+            note += "; SHAPE MISMATCH: warmup ran %d tokens, the trace %d" % (
+                want, got)
+        elif not want:
+            note += "; warmup shape unknown (pass --max-num-batched-tokens)"
+        row("activations", derived_act, warmup_act, note)
+
+        row("non-torch", None, readings.get("non_torch"), "not modelled")
+
+        derived_pool = graph_pool_bytes(warmup_act) if warmup_act else None
+        row("graph pool", derived_pool, readings.get("cudagraph_overhead"),
+            "vs the engine's estimate")
+        if pool_seen:
+            row("graph pool", derived_pool, pool_seen, "vs the measured pool")
+
+    if len(non_torch_seen) > 1:
+        print("\nthe terms with no model yet, across configurations")
+        print("  %-22s %-12s %3s %9s %9s %9s"
+              % ("record", "model", "tp", "params", "residue", "non_torch"))
+        for name, config, readings, tp in non_torch_seen:
+            parameters = readings.get("parameter_bytes")
+            allocated = readings.get("weights_torch")
+            residue = (allocated - parameters
+                       if allocated is not None and parameters is not None
+                       else None)
+            print("  %-22s %-12s %3d %8s %8s %8.3fG"
+                  % (name, str(config.get("model")).split("/")[-1], tp,
+                     "-" if parameters is None else "%.3fG" % (parameters / GB),
+                     "-" if residue is None else "%.3fG" % (residue / GB),
+                     (readings.get("non_torch") or 0) / GB))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

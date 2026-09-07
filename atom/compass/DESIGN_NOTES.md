@@ -1095,7 +1095,7 @@ is seconds or bytes:
 | --- | --- |
 | `empirical/measured` | the terms as measured for this configuration -- read off a live device, or off an artifact an earlier run of the same build wrote. Same species: reading a recorded measurement is what every oracle here already does |
 | `empirical/interpolated` | no artifact for this configuration, so the nearest ones are used |
-| `analytical` | derives the terms: weights from the checkpoint index, non-torch from a per-rank constant, the graph pool from the geometry term ATOM already computes, and **activations from a def-use walk over the traced op graph** |
+| `analytical` | derives the terms: weights from the checkpoint's safetensors headers, non-torch from a per-rank constant, the graph pool from the geometry term ATOM already computes, and **activations from a def-use walk over the traced op graph** |
 
 The activation term is the one everybody else guesses at, and the one this
 project happens to already have the artifact for.
@@ -1184,8 +1184,82 @@ cannot run is answering a different question.
    docstring: output dtype is taken from the first input, and a tensor with no
    reader in the graph dies immediately.
 
-   Still to do: `non_torch` as a per-rank constant, the graph pool from ATOM's
-   geometry, and validation of each term separately rather than of their sum.
+   **Then each term was validated on its own, and the +13.8% turned out to be
+   three errors, two of them cancelling.** Against `peak_torch`, in GB:
+
+   | | | |
+   | --- | --- | --- |
+   | weights over-counted, a tied head that is never resident | **+0.280** |
+   | activations compared at the wrong shape | -0.015 |
+   | a resident term nobody had noticed was there at all | -0.084 |
+   | net, and all that a summed check reports | **+0.181** | (+13.8%) |
+
+   The largest single error is 25% of a term and the sum said 13.8%. That is
+   exactly the shape of mistake this project has already been caught by twice,
+   so `peak_torch` was split at source. Three readings now bracket it: `parameter_bytes` (the model's own
+   parameters and buffers, counted once per storage so a tied head is not
+   counted twice), `weights_torch` (the allocator once loading is done), and
+   `current_torch` (the allocator at sizing time). None of them is a
+   subtraction of the others.
+
+   The activation term got its own ground truth too. `peak_torch` belongs to
+   the *warmup* prefill, whose shape is nobody's choice and is rarely the
+   traced one -- comparing a graph-derived peak against it compares two shapes,
+   and does so at -14.7% on this configuration. So the tracing run resets
+   the allocator's high-water mark around the step it is about to write a graph
+   for, and records the result in that graph's provenance. Derivation and
+   ground truth then describe the same work by construction.
+
+   Qwen3-0.6B, three topologies, one run each (`validate_memory.py`):
+
+   | term | TP=1 | TP=2 | TP=4 | against |
+   | --- | --- | --- | --- | --- |
+   | weights | **-0.9%** | -1.7% | -3.4% | the model's own parameters |
+   | activations | **-0.3%** | +12.6% | -9.1% | the traced step's own peak |
+   | graph pool | +0.0% | +0.0% | +0.0% | the engine's estimate |
+   | graph pool | **-94.8%** | **-88.3%** | -- | the pool capture measured |
+
+   Four things this says that the sum could not.
+
+   * **The weight term is right, and its residual is a constant.** -0.9% /
+     -1.7% / -3.4% looks like an error growing with TP; in bytes it is 9.8 /
+     9.8 / 9.6 MB. A constant is a buffer the checkpoint does not contain --
+     the model computes it at init -- not a sharding mistake, and reading the
+     percentages alone would have sent the next fix to the wrong place. Two
+     approximations were removed getting here: the checkpoint's size on disk
+     counted a tied head that is never resident (1.400 GB claimed against 1.120
+     GB), and dividing every tensor by the world size under-counted the
+     replicated norms, which is the unsafe direction for a budget. Both now
+     come from the safetensors headers, at two reads of a few KB per shard.
+   * **The activation walk is exact at TP=1 and not at TP>1.** -0.3% against a
+     measurement of the same step is as good as this can be checked. The
+     TP spread is a liveness question and not a sizing one: at TP=2 the peak is
+     six live tensors dominated by two residual-stream carriers, and the
+     over-count is about 1.4 of them. The obvious explanation was tested and is
+     wrong -- excluding the 57 in-place all-reduces changes the derived peak by
+     nothing, because the peak is not held at one.
+   * **The graph-pool term reproduces the engine's estimate exactly and the
+     estimate is 8-19x under what capture actually costs** (0.020 GB against
+     0.390 GB measured at TP=1; 0.012 against 0.100 at TP=2). Agreement with a
+     formula is not agreement with a device. This term is 0.2% of the budget on
+     a 192 GB card so nothing here depends on it -- which is the point: it is
+     invisible in a sum, and only a per-term check surfaces it before a
+     configuration where it is not.
+   * **Two terms have no model, and pretending otherwise would have been the
+     easy mistake.** `non_torch` is 0.904 GB at TP=1 and 6.744 / 7.096 GB at
+     TP=2 / TP=4 -- a jump at TP>1 and near-flat after, and near-identical
+     between the 0.6B and the 27B at TP=2 (6.744 against 7.004), so it is a
+     property of the topology rather than of the model. And loading leaves
+     **2.021 GB per rank** resident beyond the parameters at both TP=2 and
+     TP=4, against 1 MB at TP=1: at TP=4 that residue is *seven times the
+     weights it accompanies*, and it is charged to the KV budget. Neither is
+     fitted here. Three topologies of one model is interpolation, not a model,
+     and the constants are stated as measurements.
+
+   Still to do: models for `non_torch` and the load residue once there is
+   evidence from more than one model; a graph-pool term that predicts the
+   measured pool rather than the engine's estimate of it; and the TP>1
+   activation spread.
 4. Feed it back: `get_num_blocks` off the modelled budget, so `max_num_seqs` and
    the capture ladder follow from the prediction rather than from the box.
 

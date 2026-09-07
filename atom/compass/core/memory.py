@@ -43,6 +43,13 @@ class MemoryReadings:
     peak_torch: int
     non_torch: int
     cudagraph_overhead: int
+    #: Optional, and absent from records written before the terms were split.
+    #: `peak_torch` is weights + persistent buffers + peak activations; these
+    #: two are where one ends and the next begins. Nothing in the budget
+    #: arithmetic reads them -- they exist so each term can be checked alone.
+    weights_torch: Optional[int] = None
+    parameter_bytes: Optional[int] = None
+    current_torch: Optional[int] = None
 
     def free_was_binding(self, utilization: float) -> bool:
         """Whether the box, rather than the configuration, set the budget.
@@ -55,6 +62,11 @@ class MemoryReadings:
         overheads = (self.peak_torch + self.non_torch
                      + self.cudagraph_overhead + int(self.total * SAFETY_FRACTION))
         return self.free < int(self.total * utilization) - overheads
+
+
+def _optional_int(value: Any) -> Optional[int]:
+    """An int, or None -- a reading a record predating the split has not got."""
+    return None if value is None else int(value)
 
 
 def _key(config: Mapping[str, Any]) -> tuple:
@@ -111,6 +123,9 @@ class RecordedMemory:
                 total=int(got["total"]), free=int(got["free"]),
                 peak_torch=int(got["peak_torch"]),
                 non_torch=int(got["non_torch"]),
-                cudagraph_overhead=int(got["cudagraph_overhead"]))
+                cudagraph_overhead=int(got["cudagraph_overhead"]),
+                weights_torch=_optional_int(got.get("weights_torch")),
+                parameter_bytes=_optional_int(got.get("parameter_bytes")),
+                current_torch=_optional_int(got.get("current_torch")))
         except (KeyError, TypeError, ValueError):
             return None

@@ -391,6 +391,19 @@ class MetaOpTracer(TorchDispatchMode):
         produced_by = tuple(
             self._producers.get(_storage_of(t), -1) for t in tensors
             if isinstance(t, torch.Tensor))
+        # Whether each output is a fresh allocation or a write into an input.
+        # An in-place operator allocates nothing, so counting its output as a
+        # new tensor adds one tensor to the live set that was never there. The
+        # test is storage identity against *this operator's own inputs*, not
+        # against every storage ever seen -- the allocator reuses freed
+        # addresses, and a reused address is a new tensor.
+        input_producers = {
+            _storage_of(t): self._producers.get(_storage_of(t), -1)
+            for t in tensors if isinstance(t, torch.Tensor)}
+        output_aliases = tuple(
+            input_producers.get(_storage_of(o))
+            if isinstance(o, torch.Tensor) else None
+            for o in outs if _shape_of(o) is not None)
         # Recorded and executed are not the same thing. A profiler operator
         # closes a `record_function` region and runs no kernel, so it belongs in
         # the dispatch stream but not in a graph of what a step costs -- and it
@@ -413,6 +426,7 @@ class MetaOpTracer(TorchDispatchMode):
                     # cannot be made to. Empty for everything but attention.
                     context=forward_ctx.capture(name),
                     inputs_from=produced_by,
+                    output_aliases=output_aliases,
                 )
             )
             index = len(self.graph.ops) - 1
