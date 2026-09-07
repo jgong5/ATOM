@@ -1383,13 +1383,37 @@ cannot run is answering a different question.
    and exactly why a term nobody can see needs an artifact. `--compass-memory-out`
    now records the measured pool beside the estimate.
 
-   Width is the weak part. TP=2 and TP=4 at the full ladder both measured
-   104.0 MiB against 416 MiB modelled at TP=1 -- a quarter, and *byte-identical
-   to each other*. A per-rank sharding law would put TP=4 at half of TP=2. It
-   does not, so this is more likely the allocator quantising than the pool
-   sharding, and a flat fraction above width one is the least-wrong thing two
-   equal numbers support. Crude, deliberately, and the first thing to
-   re-measure.
+   **Width, re-measured: above one, the ladder stops mattering entirely.** The
+   first reading was two byte-identical numbers at TP=2 and TP=4, which was
+   shipped as "a quarter of TP=1" with no mechanism behind it. Two equal
+   numbers cannot distinguish a width-independent pool from a stuck reading, so
+   the test is to vary the ladder *within* a width. The `allocated` delta --
+   what the graphs actually pin, as opposed to `reserved`, which is segment
+   bookkeeping:
+
+   | | Σ=31 | Σ=512 | Σ=1071 |
+   | --- | --- | --- | --- |
+   | TP=1 | 89113088 | 235275264 | 406492672 |
+   | TP=2 | **79692800** | **79692800** | **79692800** |
+   | TP=4 | -- | **79692800** | **79692800** |
+   | TP=8 | -- | **79692800** | **79692800** |
+
+   At width one the pinned memory tracks the ladder over 4.6x. Above it, a 35x
+   change in captured tokens moves it by *nothing* -- seven runs across three
+   widths and three ladders, identical to the byte.
+
+   Identical allocated bytes cannot come from sharded work, so the graphs are
+   not pinning sharded activations at all. With tensor parallelism the
+   per-layer intermediates flow through AITER's registered collective buffer,
+   which is outside the torch allocator and is already charged to `non_torch`
+   and the load residue. What the graphs pin in torch is a fixed set that
+   neither shards nor grows with the ladder.
+
+   So the term is a line in the ladder at width one and a constant above it --
+   104 MiB, the largest `reserved` of the seven (80, 104, 104, 104, 104, 84,
+   84), since under-reserving buys dropped buckets. The earlier quarter was
+   arithmetically close and wrong about why, which is the kind of agreement
+   that stops being right the moment the configuration changes.
 
    Still to do: a third model for the model-dependent parts of `non_torch` and
    the load residue (the 30B-A3B checkpoint is only part-downloaded and this

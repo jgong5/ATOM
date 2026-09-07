@@ -494,16 +494,29 @@ def modelled_readings(*, total_bytes: int, world_size: int, parameters: int,
 #: The floor is the larger surprise. At the shortest ladder it is 87% of the
 #: pool, and nothing in the engine's estimate corresponds to it at all.
 #:
-#: Per rank, and the width scaling is the weak part. TP=2 and TP=4 at the full
-#: ladder both measured 104.0 MiB against 416 MiB modelled at TP=1 -- a
-#: quarter, and *byte-identical* to each other. A per-rank sharding law would
-#: have TP=4 at half of TP=2; it is not, so this is more likely the allocator
-#: quantising than the pool sharding, and a flat fraction above width one is
-#: the least-wrong thing two equal numbers support. Crude, deliberately, and
-#: the first thing to re-measure.
+#: **Only at width one.** Above it the pool does not scale with the ladder at
+#: all: across three widths and three ladders -- TP=2 at 31, 512 and 1071
+#: tokens, TP=4 at 512 and 1071, TP=8 at 1071 -- the *allocated* delta was
+#: 79692800 bytes every single time, to the byte. A 35x change in captured
+#: tokens moved it by nothing.
+#:
+#: Identical allocated bytes cannot come from sharded work, so the graphs are
+#: not pinning sharded activations. With tensor parallelism the per-layer
+#: intermediates flow through AITER's registered collective buffer, which is
+#: outside the torch allocator -- and is already charged to `non_torch` and the
+#: load residue. What the graphs pin in torch is a fixed set that neither
+#: shards nor grows with the ladder.
+#:
+#: So: a line in the ladder at width one, and a constant above it. Not "a
+#: quarter of width one", which was the earlier reading of two equal numbers
+#: and had no mechanism behind it.
 DEFAULT_POOL_FLOOR = 91.1 * MIB
 DEFAULT_POOL_PER_TOKEN = 0.3033 * MIB
-DEFAULT_POOL_SHARDED_FRACTION = 0.25
+#: The reserved delta above width one: 80, 104, 104, 104 and 88 MiB over the
+#: six runs. It is segment bookkeeping around one fixed 76.0 MiB of pinned
+#: memory, so the largest is taken rather than the mean -- under-reserving buys
+#: dropped capture buckets.
+DEFAULT_POOL_SHARDED = 104 * MIB
 
 
 def measured_graph_pool_bytes(capture_sizes, world_size: int = 1,
@@ -527,6 +540,8 @@ def measured_graph_pool_bytes(capture_sizes, world_size: int = 1,
     silently dropped buckets and a decode cliff at those batch sizes. On a
     192 GB card nothing has ever been dropped, which is exactly why this went
     unnoticed.
+
+    Above width one the ladder stops mattering -- see `DEFAULT_POOL_SHARDED`.
     """
     if enforce_eager:
         return 0
@@ -534,12 +549,11 @@ def measured_graph_pool_bytes(capture_sizes, world_size: int = 1,
     if not sizes:
         return 0
     settings = (calibration or {}).get("graph_pool") or {}
+    if world_size > 1:
+        return int(settings.get("sharded", DEFAULT_POOL_SHARDED))
     floor = float(settings.get("floor", DEFAULT_POOL_FLOOR))
     per_token = float(settings.get("per_token", DEFAULT_POOL_PER_TOKEN))
-    fraction = float(settings.get("sharded_fraction",
-                                  DEFAULT_POOL_SHARDED_FRACTION))
-    pool = floor + per_token * sum(sizes)
-    return int(pool if world_size <= 1 else pool * fraction)
+    return int(floor + per_token * sum(sizes))
 
 
 def graph_pool_bytes(activation_bytes: int, *, enforce_eager: bool = False,

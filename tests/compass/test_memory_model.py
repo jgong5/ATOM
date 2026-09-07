@@ -392,16 +392,24 @@ class TestWhatCaptureActuallyCosts:
         assert measured_graph_pool_bytes(()) == 0
         assert measured_graph_pool_bytes(self.LADDER, enforce_eager=True) == 0
 
+    def test_above_width_one_the_ladder_stops_mattering(self):
+        """Measured to the byte across three widths and three ladders: the
+        allocated delta was 79692800 every time, so the graphs are not pinning
+        sharded activations -- with tensor parallelism the intermediates go
+        through the registered collective buffer, outside torch."""
+        for width in (2, 4, 8):
+            assert (measured_graph_pool_bytes((1,), world_size=width)
+                    == measured_graph_pool_bytes(self.LADDER, world_size=width))
+
     def test_a_wider_rank_holds_less_of_it(self):
         assert (measured_graph_pool_bytes(self.LADDER, world_size=2)
                 < measured_graph_pool_bytes(self.LADDER, world_size=1))
 
     def test_calibration_replaces_the_constants(self):
-        mine = {"graph_pool": {"floor": 10, "per_token": 1,
-                               "sharded_fraction": 0.5}}
+        mine = {"graph_pool": {"floor": 10, "per_token": 1, "sharded": 3}}
         assert measured_graph_pool_bytes((5,), calibration=mine) == 15
         assert measured_graph_pool_bytes((5,), world_size=4,
-                                         calibration=mine) == 7
+                                         calibration=mine) == 3
 
     def test_it_reproduces_the_ladders_it_was_fitted_on(self):
         """100.0 MiB measured at sum=31 and 402.0 at sum=1071."""
