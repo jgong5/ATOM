@@ -1402,8 +1402,47 @@ cannot run is answering a different question.
    holds the memory, because they are views onto a storage something else is
    still keeping alive. It is transient, self-correcting, and nowhere near the
    peak.
-4. Feed it back: `get_num_blocks` off the modelled budget, so `max_num_seqs` and
-   the capture ladder follow from the prediction rather than from the box.
+4. ~~Feed it back: `get_num_blocks` off the modelled budget.~~ **Done** --
+   `--compass-memory-model`, a profile from `meta_probe.py --profile-out`.
+
+   The readings are substituted, never the arithmetic -- the same seam
+   `--compass-memory-in` uses, so the budget, the safety margin, the
+   `min(budget, free)` clamp and `plan_pools` are all still the engine's. Only
+   where the five numbers came from differs, and here none of them came off a
+   device:
+
+   | reading | derived from |
+   | --- | --- |
+   | `total` | supplied. The target card's capacity is the one thing that cannot be derived |
+   | `peak_torch` | weights + buffers (meta build) + load residue + persistent + activations (graph walk, scaled to the warmup shape) |
+   | `non_torch` | the collective table for this width |
+   | `cudagraph_overhead` | the engine's own formula over the derived activations |
+   | `free` | **a clean box**: total minus what this process holds |
+
+   That last one is the point of the exercise. The recorded `free` is what the
+   neighbours happened to leave, which is why a record in which it was the
+   binding term is refused; deriving it removes the accident rather than
+   preserving it, and the answer becomes what the configuration needs rather
+   than what that afternoon allowed.
+
+   Checked against the decision it drives rather than against bytes -- the KV
+   block count, which is what the budget exists to produce:
+
+   | | blocks modelled | blocks measured | |
+   | --- | --- | --- | --- |
+   | 0.6B TP=1 | 96033 | 96051 | **-0.02%** |
+   | 0.6B TP=2 | 183709 | 183745 | **-0.02%** |
+   | 0.6B TP=4 | 367614 | 367364 | **+0.07%** |
+
+   TP=1 and TP=2 land under, which is the safe direction -- fewer blocks than
+   the device would have allowed, never more. TP=4 lands 250 blocks *over*, and
+   the reason is the one already documented: the calibration takes the minimum
+   `non_torch` across ranks, and the run it is compared against had 144 MiB
+   more on rank 0 than its quietest rank did. The model reserved for a clean
+   box and the box was not clean. That is the right behaviour and the wrong
+   comparison -- a modelled budget should be checked against a quiet machine --
+   but it is worth stating that 0.07% is inside the contamination band and its
+   sign carries no information.
 
 Two things that will be wrong if they are not designed for:
 

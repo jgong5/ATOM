@@ -39,6 +39,7 @@ from typing import Mapping, Optional
 
 __all__ = ["peak_activation_bytes", "activation_curve", "weight_bytes",
            "resident_bytes", "non_torch_bytes", "load_residue_bytes",
+           "modelled_readings", "activation_bytes_at",
            "graph_pool_bytes", "ELEMENT_BYTES"]
 
 ELEMENT_BYTES = {
@@ -431,6 +432,58 @@ def load_residue_bytes(world_size: int,
     """What the collectives take through the torch allocator, beyond the model."""
     table = (calibration or {}).get("load_residue") or DEFAULT_LOAD_RESIDUE
     return _at_width({int(k): v for k, v in table.items()}, world_size)
+
+
+#: The engine's own per-step buffers -- `allocate_forward_vars` and the
+#: attention metadata. Flat in tensor-parallel width (85.2 MiB on the 0.6B at
+#: widths 1, 2, 4 and 8; 117.2 MiB on the 27B at 2 and 4) and differing only by
+#: model, so it is a calibrated constant rather than a geometry term. 0.05% of
+#: a 192 GB card, which is why it is not worth a campaign of its own.
+DEFAULT_PERSISTENT = 118 * MIB
+
+
+def activation_bytes_at(graph, tokens: int) -> int:
+    """The activation peak at a token count the graph was not traced at.
+
+    Linear in tokens, which is not an assumption but a measurement: the walk
+    scaled from a 3494-token trace lands on the independently measured 4096-token
+    warmup peak to +0.0% at TP=1, 2 and 4 alike.
+    """
+    peak = peak_activation_bytes(graph)
+    traced = sum(int(n) for n in
+                 ((graph.get("key") or {}).get("batch_signature") or ()))
+    return int(peak * tokens / traced) if traced and tokens else peak
+
+
+def modelled_readings(*, total_bytes: int, world_size: int, parameters: int,
+                      buffers: int, activation_bytes: int,
+                      calibration: Optional[Mapping] = None,
+                      enforce_eager: bool = False) -> dict:
+    """The five readings `get_num_blocks` needs, derived rather than measured.
+
+    This is the point of the whole memory model: a configuration nobody has run
+    can be sized, because none of these came off a device.
+
+    `total` is the one thing that cannot be derived -- it is the target card's
+    capacity and has to be supplied. `free` is modelled as *a clean box*: total
+    minus what this process itself holds. That is deliberate. The recorded
+    `free` is what the neighbours happened to leave, which is why a record in
+    which it was the binding term is refused; deriving it removes the accident
+    instead of preserving it, and the answer is what the configuration needs
+    rather than what this afternoon allowed.
+    """
+    persistent = int((calibration or {}).get("persistent") or DEFAULT_PERSISTENT)
+    residue = load_residue_bytes(world_size, calibration)
+    peak_torch = parameters + buffers + residue + persistent + activation_bytes
+    non_torch = non_torch_bytes(world_size, calibration)
+    return {
+        "total": int(total_bytes),
+        "free": max(0, int(total_bytes) - peak_torch - non_torch),
+        "peak_torch": int(peak_torch),
+        "non_torch": int(non_torch),
+        "cudagraph_overhead": graph_pool_bytes(
+            activation_bytes, enforce_eager=enforce_eager),
+    }
 
 
 def graph_pool_bytes(activation_bytes: int, *, enforce_eager: bool = False,

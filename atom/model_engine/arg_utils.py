@@ -57,6 +57,7 @@ class EngineArgs:
     compass_trace_prefill: int = 0
     compass_memory_out: str = ""
     compass_memory_in: str = ""
+    compass_memory_model: str = ""
     compass_measure_out: str = ""
     compass_measure_warmup_steps: int = 0
     compass_admission_seconds: float = 0.0
@@ -180,6 +181,14 @@ class EngineArgs:
             help="Memory records to size from instead of this device, "
                  "comma-separated globs. A configuration can then be sized "
                  "on a box that could not hold it.",
+        )
+        parser.add_argument(
+            "--compass-memory-model",
+            type=str,
+            default="",
+            help="A memory profile from meta_probe.py --profile-out. Sizes "
+                 "the KV cache from derived terms rather than from any "
+                 "device, so a configuration nobody has run can be sized.",
         )
         parser.add_argument(
             "--compass-measure-out",
@@ -810,6 +819,7 @@ class EngineArgs:
         compass_trace_prefill = kwargs.pop("compass_trace_prefill", 0)
         compass_memory_out = kwargs.pop("compass_memory_out", "")
         compass_memory_in = kwargs.pop("compass_memory_in", "")
+        compass_memory_model = kwargs.pop("compass_memory_model", "")
         compass_measure_out = kwargs.pop("compass_measure_out", "")
         compass_measure_warmup = kwargs.pop("compass_measure_warmup_steps", 0)
         compass_admission = kwargs.pop("compass_admission_seconds", 0.0)
@@ -829,6 +839,8 @@ class EngineArgs:
             compass_kwargs["memory_out"] = compass_memory_out
         if compass_memory_in:
             compass_kwargs["memory_in"] = compass_memory_in
+        if compass_memory_model:
+            compass_kwargs["memory_model"] = compass_memory_model
         if compass_measure_out:
             compass_kwargs["measure_out"] = compass_measure_out
         if compass_measure_warmup:

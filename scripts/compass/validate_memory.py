@@ -110,14 +110,24 @@ def write_calibration(records, path: str) -> None:
         allocated = readings.get("weights_torch")
         if parameters is None or allocated is None:
             continue
-        seen = per_width.setdefault(tp, {"non_torch": [], "load_residue": []})
+        seen = per_width.setdefault(tp, {"non_torch": [], "load_residue": [],
+                                         "persistent": []})
         seen["non_torch"].append(int(readings.get("non_torch") or 0))
         seen["load_residue"].append(int(allocated - parameters))
+        current = readings.get("current_torch")
+        if current is not None:
+            seen["persistent"].append(int(current - allocated))
     blob = {
         "non_torch": {str(w): min(v["non_torch"]) for w, v in per_width.items()
                       if v["non_torch"]},
         "load_residue": {str(w): min(v["load_residue"])
                          for w, v in per_width.items() if v["load_residue"]},
+        # Flat in width -- 85.2 MiB on the 0.6B at widths 1, 2, 4 and 8, and
+        # 117.2 MiB on the 27B at 2 and 4 -- so one number per model, taken as
+        # the largest seen rather than the smallest: this one is the engine's
+        # own buffers, uncontaminated, and under-reserving it over-allocates KV.
+        "persistent": max((max(v["persistent"]) for v in per_width.values()
+                           if v["persistent"]), default=0),
     }
     with open(path, "w", encoding="utf-8") as fh:
         json.dump(blob, fh, indent=1)
@@ -126,6 +136,8 @@ def write_calibration(records, path: str) -> None:
         print("  world size %-2d  non_torch %8.1f MiB   residue %8.1f MiB"
               % (width, blob["non_torch"][str(width)] / (1 << 20),
                  blob["load_residue"].get(str(width), 0) / (1 << 20)))
+    print("  persistent      %8.1f MiB (flat in width)"
+          % (blob["persistent"] / (1 << 20)))
 
 
 def show_curve(graph: dict, worst: int = 12) -> None:

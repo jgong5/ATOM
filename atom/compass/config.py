@@ -34,6 +34,12 @@ class CompassConfig:
             Exclude Triton autotuning with throwaway *requests* instead — see
             ``--warmup-prompts`` in ``scripts/compass/run.py`` — which drops the
             expensive first launches without discarding a whole category.
+        memory_model: A profile from ``meta_probe.py --profile-out``, naming
+            the model's weights and buffers at a width, and optionally a traced
+            graph and a collective calibration. Sizes the KV cache from those
+            rather than from any device -- which is the difference between
+            "size this configuration somewhere else" (``memory_in``) and "size
+            a configuration nobody has run".
         memory_in: Artifacts written by ``memory_out``, comma-separated. Given
             one that matches this configuration exactly, the budget is computed
             from *those* readings rather than from this device -- which is how a
@@ -114,6 +120,7 @@ class CompassConfig:
     trace_prefill: int = 0
     memory_out: Optional[str] = None
     memory_in: Optional[str] = None
+    memory_model: Optional[str] = None
     oracle_qualname: str = "atom.compass.core.cost.constant.ConstantCostOracle"
     oracle_options: Optional[dict] = None
     virtual_clock: bool = True

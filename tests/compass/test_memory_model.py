@@ -9,8 +9,9 @@ import json
 import struct
 
 from atom.compass.core.memory_model import (
-    DEFAULT_NON_TORCH, activation_curve, graph_pool_bytes,
-    load_residue_bytes, non_torch_bytes, peak_activation_bytes, weight_bytes)
+    DEFAULT_NON_TORCH, DEFAULT_PERSISTENT, activation_bytes_at,
+    activation_curve, graph_pool_bytes, load_residue_bytes, modelled_readings,
+    non_torch_bytes, peak_activation_bytes, weight_bytes)
 
 
 def _write_checkpoint(directory, tied, tensors):
@@ -316,3 +317,50 @@ class TestWhatTheCollectivesTake:
         assert non_torch_bytes(2) > DEFAULT_NON_TORCH[2]
         assert non_torch_bytes(2, {"non_torch": {2: DEFAULT_NON_TORCH[2]}}) \
             == DEFAULT_NON_TORCH[2]
+
+
+class TestSizingWithoutADevice:
+    """The five readings `get_num_blocks` needs, none of them measured. This is
+    what makes a configuration nobody has run sizable."""
+
+    def _readings(self, **over):
+        fields = dict(total_bytes=200 << 30, world_size=1, parameters=1 << 30,
+                      buffers=1 << 20, activation_bytes=1 << 27)
+        fields.update(over)
+        return modelled_readings(**fields)
+
+    def test_peak_torch_is_every_term_that_goes_through_the_allocator(self):
+        got = self._readings(world_size=1)
+        assert got["peak_torch"] == (
+            (1 << 30) + (1 << 20) + load_residue_bytes(1)
+            + DEFAULT_PERSISTENT + (1 << 27))
+
+    def test_free_is_a_clean_box_not_what_the_neighbours_left(self):
+        """The recorded `free` is an accident of scheduling, which is why a
+        record in which it bound is refused. Deriving it removes the accident."""
+        got = self._readings()
+        assert got["free"] == got["total"] - got["peak_torch"] - got["non_torch"]
+
+    def test_a_wider_configuration_pays_for_the_collective_pools(self):
+        narrow, wide = self._readings(world_size=1), self._readings(world_size=2)
+        assert wide["non_torch"] > narrow["non_torch"]
+        assert wide["peak_torch"] > narrow["peak_torch"]
+
+    def test_eager_reserves_no_graph_pool(self):
+        assert self._readings(enforce_eager=True)["cudagraph_overhead"] == 0
+
+    def test_a_card_too_small_to_hold_the_model_has_no_free_memory(self):
+        """Reported as zero rather than as a negative number, which the
+        engine's `min(budget, free)` would read as a very large budget."""
+        assert self._readings(total_bytes=1 << 20)["free"] == 0
+
+
+class TestScalingToAShapeNobodyTraced:
+    def test_the_peak_is_linear_in_tokens(self):
+        graph = {"key": {"batch_signature": [100]},
+                 "ops": [_op([1000], dtype="bfloat16")]}
+        assert activation_bytes_at(graph, 200) == 2 * peak_activation_bytes(graph)
+
+    def test_a_graph_that_names_no_shape_is_taken_as_it_stands(self):
+        graph = {"ops": [_op([1000], dtype="bfloat16")]}
+        assert activation_bytes_at(graph, 200) == peak_activation_bytes(graph)

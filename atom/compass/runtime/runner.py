@@ -975,6 +975,15 @@ class CompassModelRunner(ModelRunner):
         """
         import torch
 
+        modelled = self._modelled_readings()
+        if modelled is not None:
+            was = self._substitute(modelled)
+            try:
+                yield
+            finally:
+                self._restore(was)
+            return
+
         source = self._recorded_memory()
         config = self._memory_config()
         readings = source.readings_for(config) if source else None
@@ -991,27 +1000,123 @@ class CompassModelRunner(ModelRunner):
             yield
             return
 
-        # `non_torch` is `(total - free) - reserved`, so the reserved figure
-        # that reproduces the recorded `non_torch` is what to report.
-        reserved = max(0, (readings.total - readings.free) - readings.non_torch)
-        stats = {"allocated_bytes.all.peak": readings.peak_torch,
-                 "allocated_bytes.all.current": readings.peak_torch}
-        was = (torch.cuda.mem_get_info, torch.cuda.memory_stats,
-               torch.cuda.memory_reserved, self._estimate_cudagraph_overhead)
+        was = self._substitute({
+            "total": readings.total, "free": readings.free,
+            "peak_torch": readings.peak_torch, "non_torch": readings.non_torch,
+            "cudagraph_overhead": readings.cudagraph_overhead})
         logger.info("ATOMCompass: sizing from a recorded budget, not this "
                     "device (peak_torch %.2f GB, non_torch %.2f GB)",
                     readings.peak_torch / 2**30, readings.non_torch / 2**30)
-        torch.cuda.mem_get_info = lambda *a, **k: (readings.free, readings.total)
-        torch.cuda.memory_stats = lambda *a, **k: stats
-        torch.cuda.memory_reserved = lambda *a, **k: reserved
-        self._estimate_cudagraph_overhead = (
-            lambda *a, **k: readings.cudagraph_overhead)
         try:
             yield
         finally:
-            (torch.cuda.mem_get_info, torch.cuda.memory_stats,
-             torch.cuda.memory_reserved,
-             self._estimate_cudagraph_overhead) = was
+            self._restore(was)
+
+    def _substitute(self, readings: dict) -> tuple:
+        """Make the four device calls return these readings, and say what was.
+
+        The readings are substituted, never the arithmetic -- see
+        `_recorded_readings`. Shared by the recorded and the modelled paths
+        because the substitution is the same either way; only where the numbers
+        came from differs.
+        """
+        import torch
+
+        # `non_torch` is `(total - free) - reserved`, so the reserved figure
+        # that reproduces it is what to report.
+        reserved = max(0, (readings["total"] - readings["free"])
+                       - readings["non_torch"])
+        stats = {"allocated_bytes.all.peak": readings["peak_torch"],
+                 "allocated_bytes.all.current": readings["peak_torch"]}
+        was = (torch.cuda.mem_get_info, torch.cuda.memory_stats,
+               torch.cuda.memory_reserved, self._estimate_cudagraph_overhead)
+        torch.cuda.mem_get_info = lambda *a, **k: (readings["free"],
+                                                   readings["total"])
+        torch.cuda.memory_stats = lambda *a, **k: stats
+        torch.cuda.memory_reserved = lambda *a, **k: reserved
+        self._estimate_cudagraph_overhead = (
+            lambda *a, **k: readings["cudagraph_overhead"])
+        return was
+
+    def _restore(self, was: tuple) -> None:
+        import torch
+
+        (torch.cuda.mem_get_info, torch.cuda.memory_stats,
+         torch.cuda.memory_reserved, self._estimate_cudagraph_overhead) = was
+
+    def _warmup_tokens(self) -> int:
+        """The token count of the prefill that sets `peak_torch`.
+
+        `warmup_model` resets the allocator's high-water mark and runs one
+        dummy prefill, so the peak belongs to that shape and no other. Mirrored
+        here because a predicting run skips warmup entirely -- there is nothing
+        to measure, which is the point.
+        """
+        config = self.config
+        budget = int(getattr(config, "max_num_batched_tokens", 0) or 0)
+        length = int(getattr(config, "max_model_len", 0) or 0)
+        if not (budget and length):
+            return 0
+        seqs = max(1, min(budget // length,
+                          int(getattr(config, "max_num_seqs", 1) or 1)))
+        return seqs * max(1, min(length, budget // seqs))
+
+    def _modelled_readings(self) -> Optional[dict]:
+        """The five readings derived from a profile, or None if none was given.
+
+        This is what makes a configuration nobody has run sizable: no term here
+        came off a device. `total` is the target card's capacity, which is the
+        one thing that has to be supplied, and `free` is modelled as a clean
+        box rather than as whatever the neighbours left.
+        """
+        path = (self._compass_config.memory_model or "").strip()
+        if not path:
+            return None
+        if getattr(self, "_modelled", "unset") != "unset":
+            return self._modelled
+        self._modelled = None
+        try:
+            from atom.compass.core.memory_model import (
+                activation_bytes_at, modelled_readings)
+
+            with open(path, encoding="utf-8") as fh:
+                profile = json.load(fh)
+            calibration = None
+            if profile.get("calibration"):
+                with open(profile["calibration"], encoding="utf-8") as fh:
+                    calibration = json.load(fh)
+            activation = 0
+            if profile.get("graph"):
+                with open(profile["graph"], encoding="utf-8") as fh:
+                    activation = activation_bytes_at(json.load(fh),
+                                                     self._warmup_tokens())
+            total = int(profile.get("total") or 0)
+            if not total:
+                import torch
+
+                total = int(torch.cuda.mem_get_info()[1])
+                logger.info("ATOMCompass: the profile names no card capacity, "
+                            "so this device's %.1f GB is used for `total`",
+                            total / 2**30)
+            self._modelled = modelled_readings(
+                total_bytes=total,
+                world_size=int(profile.get("world_size") or 1),
+                parameters=int(profile["parameters"]),
+                buffers=int(profile.get("buffers") or 0),
+                activation_bytes=activation, calibration=calibration,
+                enforce_eager=bool(getattr(self.config, "enforce_eager", False)))
+            logger.info(
+                "ATOMCompass: sizing from a modelled budget, not from any "
+                "device (peak_torch %.2f GB, non_torch %.2f GB, activations "
+                "%.2f GB over %d warmup tokens)",
+                self._modelled["peak_torch"] / 2**30,
+                self._modelled["non_torch"] / 2**30, activation / 2**30,
+                self._warmup_tokens())
+        except Exception as exc:  # noqa: BLE001 - never fail a run over a model
+            logger.warning("ATOMCompass WARNING: could not model the memory "
+                           "budget from %s (%s); sizing from this device",
+                           path, exc)
+        return self._modelled
 
     def _recorded_memory(self):
         """The memory records this run was given, loaded once."""

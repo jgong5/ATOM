@@ -27,6 +27,11 @@ def main() -> int:
     ap.add_argument("--tokens", type=int, default=8, help="tokens in the probe batch")
     ap.add_argument("--tp", type=int, default=1, help="tensor parallel size to model")
     ap.add_argument("--show-ops", action="store_true", help="list executed operators")
+    ap.add_argument("--profile-out",
+                    help="write a memory profile for --compass-memory-model")
+    ap.add_argument("--graph", help="traced op graph to name in the profile")
+    ap.add_argument("--calibration",
+                    help="collective constants to name in the profile")
     ap.add_argument("--weights-only", action="store_true",
                     help="report the weight and buffer terms and stop, without "
                          "tracing a forward")
@@ -115,6 +120,21 @@ def main() -> int:
     print("parameters   : %.4f GiB per rank at tp=%d" % (parameters / 2**30, args.tp))
     print("buffers      : %.4f GiB (built at init, absent from the checkpoint)\n"
           % (buffers / 2**30))
+    if args.profile_out:
+        import json
+
+        with open(args.profile_out, "w", encoding="utf-8") as fh:
+            json.dump({
+                "version": 1,
+                "model": args.model,
+                "world_size": args.tp,
+                "parameters": parameters,
+                "buffers": buffers,
+                # Filled in by whoever has them; the runner resolves both.
+                "graph": args.graph or None,
+                "calibration": args.calibration or None,
+            }, fh, indent=1)
+        print("profile written to %s" % args.profile_out)
     if args.weights_only:
         return 0
 
