@@ -1539,6 +1539,50 @@ cannot run is answering a different question.
    | 0.6B TP=1 | 96033 | 96051 | **-0.02%** |
    | 0.6B TP=2 | 183709 | 183745 | **-0.02%** |
    | 0.6B TP=4 | 367614 | 367364 | **+0.07%** |
+   | **27B TP=2** | **38202** | **37858** | **+0.91%** |
+
+   The 27B is the point of running this on a hybrid, and it found something.
+   Every term but one is exact -- weights from the meta build, buffers, load
+   residue, persistent and non-torch all from a calibration taken on that node:
+
+   | term | measured | modelled | |
+   | --- | --- | --- | --- |
+   | weights | 25.9077 GB | 25.9077 GB | exact |
+   | buffers | 0.0312 | 0.0312 | exact |
+   | load residue | 2.0901 | 2.0901 | exact |
+   | persistent | 0.1145 | 0.1145 | exact |
+   | non-torch | 6.9941 | 6.9941 | exact |
+   | **activations** | **0.4027** | **0.2617** | **-35%** |
+
+   That one term accounts for the whole +0.91%, and under-reserving it frees
+   memory for KV -- the unsafe direction.
+
+   **It is the walk, not the scaling.** The graph carries the peak its own step
+   measured, so the two come apart: at the traced shape the walk gives 0.2233
+   GB against that step's own 0.3551 GB, **-37.1%**; scaling to the warmup's
+   4096 tokens turns -37.1% into -35.0%, so the linearity that held exactly on
+   the 0.6B costs about two points here and the walk costs thirty-five.
+
+   The allocator curve says where. The walk runs a near-constant **-105.8 MB**
+   behind through the whole layer stack -- introduced and recovered around
+   `unified_attention_with_output_base` and
+   `_fused_qk_rmsnorm_group_quant_kernel` -- and *ends* correct, at -0.012 MB
+   on the last operator. A persistent in-block deficit, sitting exactly where
+   the peak is.
+
+   This is the `torch.empty`-inside-a-custom-operator hole again, and the
+   out-variant rule cannot close it: those operators *return* tensors, so what
+   is invisible is their internal scratch rather than their destination. The
+   0.6B has almost none; the hybrid's chunked-scan and DeltaNet kernels have a
+   great deal.
+
+   The fix has a shape, and the trace already records what it needs. Comparing
+   the walk's curve against `allocated_after_bytes` attributes the shortfall to
+   the operator that caused it, and per-token scratch is a structural fact
+   about an operator -- the same kind of thing `output_aliases` and `dies_at`
+   already are, recorded once at one shape and applied at any. That is the next
+   piece of work on the memory side, and until it lands the activation term
+   should be read as a lower bound on any hybrid.
 
    TP=1 and TP=2 land under, which is the safe direction -- fewer blocks than
    the device would have allowed, never more. TP=4 lands 250 blocks *over*, and
