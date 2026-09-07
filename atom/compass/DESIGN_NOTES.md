@@ -4357,12 +4357,50 @@ in-situ kernel time per operator, which is a separate measurement and stands.
 The 27B's +0.03% whole-step figure, though, should be read as what it is -- a
 fit residual on the one step the constant came from.
 
-**What to do next.** Run the within-regime test: profile two eager prefill
-steps of different token counts and ask whether one per-launch constant serves
-both. If it does, the term is fine and only its calibration scope was ever in
-question. If it does not, the stall structure above says what to replace it
-with -- the idle is a few stalls clustered at the start of a step, so a
-per-step term rather than a per-launch one.
+#### The within-regime test, and what it found
+
+Four warm prefill shapes on the 0.6B, one regime, one model, launch count
+fixed at 391 (prefill runs the same operator sequence whatever its size, which
+is what makes this a clean experiment):
+
+| tokens | kernels | idle | **device window** |
+| --- | --- | --- | --- |
+| 794 | 13.384 ms | 23.360 ms (63.6%) | **36.745 ms** |
+| 2294 | 27.037 ms | 11.195 ms (29.3%) | **38.232 ms** |
+| 6594 | 110.046 ms | 0.033 ms (0.0%) | 110.080 ms |
+| 15694 | 418.164 ms | 0.009 ms (0.0%) | 418.173 ms |
+
+Read the last column, not the idle. The window sits at ~37 ms while the
+kernels double, and then tracks the kernels exactly once they exceed it. The
+step is **host-bound** until the device catches up:
+
+    step = max(kernel time, launches x host time per launch)
+
+At 95.8 us per launch -- fitted to the two host-bound rows -- that holds all
+four to within 2%. The 6594-token row was a held-out prediction before it ran:
+device work ~110 ms against a ~37 ms floor, so device-bound with near-zero
+idle. It came back at 0.033 ms.
+
+The additive term cannot express this, and the failure is not subtle. Fitted
+to the smallest shape it over-predicts the largest by **+5.6%**; fitted to the
+largest it under-predicts the smallest by **-63.6%**. Same model, same regime,
+same launch count -- so the answer to "does the constant transfer within a
+regime" is no, and this time for a reason that names its own replacement.
+
+Two things this vindicates and one it corrects. The regime split was right
+(the cross-regime entry above). The *eager* branch was right too: it already
+computes `sum(max(0, dispatch - kernel))`, which is this same max taken per
+operator. Only the compiled branch was additive, and it now takes the max at
+step level -- which is the right scale, because an asynchronous queue lets the
+host run ahead across operators, not just within one.
+
+`compiled_seconds_per_launch` is kept, reached by setting the host constant to
+zero, so an old calibration still loads and still means what it meant.
+
+**Still to do here.** The host constant is one model at one width; it should be
+measured on the 27B and at TP>1 before it is trusted, and `step_accounting
+--calibrate` should learn to write it (it currently writes the additive one,
+which is the quantity that turned out not to exist).
 
 **A method note worth keeping.** Two of the numbers on the way here were
 wrong in ways that only checking caught. A naive next-start-minus-previous-end

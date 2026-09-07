@@ -105,6 +105,18 @@ DEFAULT_BOUNDARY_SECONDS = 2.25e-6
 #: any. One step of one model, so it is an argument.
 DEFAULT_COMPILED_SECONDS_PER_LAUNCH = 9.71e-6
 
+#: How long the host takes per kernel launch on a compiled, not-replayed step.
+#: A compiled step lasts `max(kernel time, launches x this)` -- the host runs
+#: ahead and the step waits on whichever is slower -- so this is a *floor*, not
+#: an addend, and it is the only form that fits a step whose idle runs from 64%
+#: to 0% as its kernels grow. 95.8 us on Qwen3-0.6B at TP=1, fitted to the two
+#: host-bound shapes of four and holding all four to within 2%.
+#:
+#: Set to 0 to fall back to the older `kernels + launches x
+#: compiled_seconds_per_launch`, which no shape has ever supported over a range
+#: and which is kept only so an old calibration still loads.
+DEFAULT_HOST_SECONDS_PER_LAUNCH = 95.8e-6
+
 
 class PricedGraphCostOracle:
     """Costs a step by summing the priced operators of its op graph."""
@@ -115,6 +127,8 @@ class PricedGraphCostOracle:
                  dispatch_seconds: float = DEFAULT_DISPATCH_SECONDS,
                  compiled_seconds_per_launch: float =
                  DEFAULT_COMPILED_SECONDS_PER_LAUNCH,
+                 host_seconds_per_launch: float =
+                 DEFAULT_HOST_SECONDS_PER_LAUNCH,
                  calibration: str = "",
                  floor_seconds: float = 1e-6, fallback: str = "",
                  rank_coords: Optional[dict] = None) -> None:
@@ -142,6 +156,11 @@ class PricedGraphCostOracle:
                 per-operator figure is 86 µs on a model with small kernels and
                 35 µs on one with large ones, while the dispatch behind both is
                 nearly the same number.
+            host_seconds_per_launch: How long the host takes per launch. A
+                compiled step lasts `max(kernel time, launches x this)`, so
+                this is a floor rather than an addend -- see
+                `DEFAULT_HOST_SECONDS_PER_LAUNCH`. Zero restores the older
+                additive term.
             compiled_seconds_per_launch: Added per kernel launch on a compiled
                 step that was not replayed. Used only when the runner says the
                 step was compiled; a shape that does not say falls through to
@@ -174,6 +193,7 @@ class PricedGraphCostOracle:
                                      else float(eager_seconds_per_op))
         self.dispatch_seconds = float(dispatch_seconds)
         self.compiled_seconds_per_launch = float(compiled_seconds_per_launch)
+        self.host_seconds_per_launch = float(host_seconds_per_launch or 0.0)
         if calibration:
             with open(calibration, encoding="utf-8") as fh:
                 measured = json.load(fh)["compiled_seconds_per_launch"]
@@ -320,7 +340,30 @@ class PricedGraphCostOracle:
         # than of the model or of what "prefill" happens to mean.
         if shape.capture_bucket is None and shape.compiled:
             # Neither dispatched one operator at a time nor submitted as one
-            # graph, so neither of the terms below describes it.
+            # graph, so neither of the terms below describes it. What such a
+            # step pays is not an *addition* to its kernels at all: the host
+            # runs ahead of the device, so the step lasts as long as the slower
+            # of the two. Measured on the 0.6B over four prefill shapes with
+            # the launch count fixed at 391, the device window sat at ~37 ms
+            # whatever the kernels did until the kernels exceeded it:
+            #
+            #   tokens   kernels    window
+            #      794    13.4 ms   36.7 ms   <- host-bound, 64% idle
+            #     2294    27.0 ms   38.2 ms   <- host-bound, 29% idle
+            #     6594   110.0 ms  110.1 ms   <- device-bound, 0% idle
+            #    15694   418.2 ms  418.2 ms   <- device-bound, 0% idle
+            #
+            # `kernels + launches x constant` cannot express that: fitted to
+            # the first row it over-predicts the last by 5.6%, fitted to the
+            # last it under-predicts the first by 64%. A max does, with one
+            # constant, to within 2% across all four.
+            if self.host_seconds_per_launch:
+                host = point.launches * self.host_seconds_per_launch
+                total = max(max(point.seconds, host), self.floor_seconds)
+                return StepCost(
+                    seconds=total,
+                    breakdown=dict(point.breakdown,
+                                   **{"<host-bound>": max(0.0, host - point.seconds)}))
             overhead = point.launches * self.compiled_seconds_per_launch
         elif shape.capture_bucket is None:
             if self.eager_seconds_per_op is not None:

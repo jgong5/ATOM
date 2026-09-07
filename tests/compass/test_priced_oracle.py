@@ -281,8 +281,42 @@ class TestHowTheStepWasRun:
         compiled = oracle.estimate(StepShape(**shape, compiled=True)).seconds
         eager = oracle.estimate(StepShape(**shape, compiled=False)).seconds
         assert compiled < eager, (compiled, eager)
-        # ten operators, one kernel each, at the compiled per-launch figure
+        # Ten operators, one kernel each: 10 us of kernels against a host floor
+        # of ten launches, so the host is what the step waits on.
         assert compiled == pytest.approx(
+            10 * oracle.host_seconds_per_launch, rel=1e-6)
+
+    def test_a_compiled_step_waits_on_whichever_is_slower(self, tmp_path,
+                                                          monkeypatch):
+        """The host runs ahead of the device, so the step is a max and not a
+        sum. Measured on the 0.6B: idle ran 64% -> 29% -> 0% -> 0% across four
+        prefill shapes with the launch count fixed, which no additive term
+        reproduces."""
+        from atom.compass.core.cost.base import StepShape
+
+        oracle = self._oracle(tmp_path, monkeypatch)
+        shape = dict(num_scheduled_tokens=(1,) * 4, context_lens=(8,) * 4)
+        host_bound = oracle.estimate(StepShape(**shape, compiled=True)).seconds
+        assert host_bound == pytest.approx(10 * oracle.host_seconds_per_launch,
+                                           rel=1e-6)
+
+        # Now make the kernels dwarf the host floor: the step should be the
+        # kernels, with nothing added on top.
+        oracle.host_seconds_per_launch = 1e-9
+        device_bound = oracle.estimate(StepShape(**shape, compiled=True)).seconds
+        assert device_bound == pytest.approx(10 * 1e-6, rel=1e-6)
+        assert device_bound < host_bound
+
+    def test_zero_host_time_restores_the_additive_term(self, tmp_path,
+                                                       monkeypatch):
+        """Kept so an old calibration still loads and means what it meant."""
+        from atom.compass.core.cost.base import StepShape
+
+        oracle = self._oracle(tmp_path, monkeypatch)
+        oracle.host_seconds_per_launch = 0.0
+        shape = dict(num_scheduled_tokens=(1,) * 4, context_lens=(8,) * 4)
+        got = oracle.estimate(StepShape(**shape, compiled=True)).seconds
+        assert got == pytest.approx(
             10 * 1e-6 + 10 * oracle.compiled_seconds_per_launch, rel=1e-6)
 
     def test_a_shape_that_does_not_say_is_treated_as_eager(self, tmp_path,
