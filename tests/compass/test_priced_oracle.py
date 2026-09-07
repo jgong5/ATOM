@@ -347,3 +347,46 @@ class TestHowTheStepWasRun:
             prices=oracle.prices_path, graph=oracle.graph_path,
             calibration=str(calib))
         assert measured.compiled_seconds_per_launch == 9e-7 != shipped
+
+
+class TestCalibratingTheHostConstant:
+    """A device-bound step spent its time on kernels and says nothing about how
+    fast the host could feed it, beyond an upper bound. `step_accounting` names
+    that field differently, and the oracle must not mistake it for a
+    measurement -- taking the bound would put a floor under every step the size
+    of the one it was taken on."""
+
+    def _oracle(self, tmp_path, monkeypatch, calibration):
+        import json
+
+        from atom.compass.core.cost.priced import PricedGraphCostOracle
+        from atom.compass.runtime.microbench import signature_of
+
+        op = {"name": "aten::mm", "input_shapes": [[2, 2]], "output_shapes": [],
+              "dtypes": ["bfloat16"]}
+        graph = tmp_path / "g.json"
+        graph.write_text(json.dumps({"ops": [op] * 10, "key": {}}))
+        prices = tmp_path / "p.json"
+        prices.write_text(json.dumps({"prices": {
+            signature_of(op): {"seconds": 1e-6, "occurrences": 1,
+                               "kernels": {"k": 1e-6}}}}))
+        where = tmp_path / "c.json"
+        where.write_text(json.dumps(calibration))
+        return PricedGraphCostOracle(prices=str(prices), graph=str(graph),
+                                     calibration=str(where))
+
+    def test_a_measured_host_constant_is_taken(self, tmp_path, monkeypatch):
+        oracle = self._oracle(tmp_path, monkeypatch, {
+            "compiled_seconds_per_launch": 1e-9,
+            "host_seconds_per_launch": 4.2e-5})
+        assert oracle.host_seconds_per_launch == pytest.approx(4.2e-5)
+
+    def test_an_upper_bound_is_not(self, tmp_path, monkeypatch):
+        """The field is named differently on purpose; the default stands."""
+        from atom.compass.core.cost.priced import DEFAULT_HOST_SECONDS_PER_LAUNCH
+
+        oracle = self._oracle(tmp_path, monkeypatch, {
+            "compiled_seconds_per_launch": 1e-9,
+            "host_seconds_per_launch_upper_bound": 9.9})
+        assert oracle.host_seconds_per_launch == pytest.approx(
+            DEFAULT_HOST_SECONDS_PER_LAUNCH)

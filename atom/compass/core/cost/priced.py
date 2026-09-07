@@ -196,7 +196,16 @@ class PricedGraphCostOracle:
         self.host_seconds_per_launch = float(host_seconds_per_launch or 0.0)
         if calibration:
             with open(calibration, encoding="utf-8") as fh:
-                measured = json.load(fh)["compiled_seconds_per_launch"]
+                blob = json.load(fh)
+            # A calibration taken on a device-bound step carries only an upper
+            # bound on the host constant, and `step_accounting` says so by
+            # naming the field differently rather than by writing a number that
+            # looks measured. Taking the bound would put a floor under every
+            # step the size of the one it was taken on.
+            if blob.get("host_seconds_per_launch"):
+                self.host_seconds_per_launch = float(
+                    blob["host_seconds_per_launch"])
+            measured = blob["compiled_seconds_per_launch"]
             self.compiled_seconds_per_launch = float(measured)
         self.floor_seconds = float(floor_seconds)
 

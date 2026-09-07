@@ -202,7 +202,14 @@ def main() -> int:
             launches += max(1, len(entry.get("kernels") or {}))
         idle = (window - busy) / 1e6
         per = idle / launches if launches else 0.0
-        json.dump({
+        # A compiled step lasts `max(kernel time, launches x host per launch)`,
+        # so the host constant is only *measurable* on a step the host bound --
+        # one the device bound spent its time on kernels and says nothing about
+        # how fast the host could feed it, beyond an upper bound. Idle is the
+        # tell: a host-bound step has plenty, a device-bound one has none.
+        host_bound = idle > 0.10 * (window / 1e6)
+        host_per = (window / 1e6) / launches if launches else 0.0
+        record = {
             "version": 1,
             "provenance": "empirical/measured",
             "note": "idle in one step, over the launches the cost model counts",
@@ -210,10 +217,25 @@ def main() -> int:
             "idle_seconds": idle,
             "launches": launches,
             "compiled_seconds_per_launch": per,
-        }, open(args.calibrate, "w"), indent=1)
+        }
+        if host_bound:
+            record["host_seconds_per_launch"] = host_per
+        else:
+            record["host_seconds_per_launch_upper_bound"] = host_per
+        json.dump(record, open(args.calibrate, "w"), indent=1)
         print(f"\n  this step pays {idle * 1e3:.3f} ms of overhead over "
               f"{launches} launches")
         print(f"  {per * 1e6:.2f} us per launch -> {args.calibrate}")
+        if host_bound:
+            print(f"  host-bound ({idle / (window / 1e6) * 100:.0f}% idle), so "
+                  f"the host constant is measurable here:")
+            print(f"  {host_per * 1e6:.2f} us per launch of host time")
+        else:
+            print(f"  device-bound ({idle / (window / 1e6) * 100:.1f}% idle), so "
+                  f"this step cannot measure the host constant -- it only "
+                  f"bounds it\n  above, at {host_per * 1e6:.2f} us per launch. "
+                  f"Calibrate on a shape small enough\n  that the host is what "
+                  f"the step waits on.")
         print("  pass it as --compass-oracle-option "
               f"calibration={args.calibrate}")
     return 0
