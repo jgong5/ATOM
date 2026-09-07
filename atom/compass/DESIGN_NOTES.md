@@ -4397,22 +4397,37 @@ host run ahead across operators, not just within one.
 `compiled_seconds_per_launch` is kept, reached by setting the host constant to
 zero, so an old calibration still loads and still means what it meant.
 
-**At TP=2 the constant holds; the floor moves because the launches do.**
+**The constant holds across widths, and across machines.** The local box was
+too contended to finish, so the sweep was repeated on `hjbog-srdc-16` -- a
+different machine, whose GPUs are about 20% faster.
 
-| | launches | plateau window | us per launch |
-| --- | --- | --- | --- |
-| TP=1 | 391 | ~37.5 ms | **95.8** |
-| TP=2 | 505 | ~45.0 ms | **89.1** |
+| | launches | plateau | us per launch | | node 16 plateau | us per launch |
+| --- | --- | --- | --- | --- | --- | --- |
+| TP=1 | 391 | ~37.5 ms | **95.8** | | ~37.4 ms | **95.7** |
+| TP=2 | 505 | ~45.0 ms | **89.1** | | ~45.1 ms | **89.3** |
+| TP=4 | 505 | -- | -- | | ~45.1 ms | **89.3** |
 
-The step floor rises from 37 to 45 ms, but the per-launch cost is within 7%.
-The extra 114 launches are the collectives, so `launches x h` picks the width
-dependence up on its own and `h` looks like a property of the host and the
-driver rather than of the parallel configuration. That is the useful shape for
-a model: one constant per box, not one per topology.
+Two things worth more than the agreement itself.
 
-(TP=2 is two shapes, at 794 and 2294 tokens, both host-bound -- enough to place
-the plateau, not enough to see its crossover. The 32.3% and 10.5% idle at those
-two sizes bracket it.)
+**The device changed and the floor did not.** Node 16 runs the same kernels
+about 20% faster -- 85.9 ms against 110.0 ms at 6594 tokens -- and its host
+floor is the same 37.4 ms. A floor that ignores a 20% swing in device speed is
+a floor on the host side, which is what the model claims it is. Repeating the
+measurement on one box could never have shown that.
+
+**TP=4 costs exactly what TP=2 costs.** Same 505 launches, same 45.1 ms floor.
+The collectives add a fixed 114 launches the moment the width exceeds one and
+add nothing further after that, so the floor is flat above TP=1 -- the same
+shape the graph pool turned out to have, and for a related reason.
+
+The 7% between 95.7 at TP=1 and 89.3 above it reproduces on both machines, so
+it is real rather than noise: the collective launches appear to be slightly
+cheaper per launch on the host side, pulling the average down.
+
+So `launches x h` picks the width dependence up through the launch count, and
+`h` is a property of the host and its driver rather than of the box or the
+topology. That is the useful shape: one constant per *software stack*, not one
+per machine and not one per topology.
 
 **Still to do here, and it is the box's fault rather than the method's.** The
 27B and TP=4 runs of the same campaign died at initialisation, repeatedly:
