@@ -4430,15 +4430,17 @@ So `launches x h` picks the width dependence up through the launch count, and
 **It is not a property of the model, though.** The 27B, on the same node at
 TP=2, with three shapes that walk right through the crossover:
 
-| tokens | kernels | idle | window |
-| --- | --- | --- | --- |
-| 294 | 71.2 ms | 67.5% | 219.1 ms |
-| 94 | 131.5 ms | 37.9% | 211.7 ms |
-| 794 | 205.8 ms | 1.9% | 209.8 ms |
+| tokens | kernels | idle | window | `max(kernels, 213.5 ms)` | |
+| --- | --- | --- | --- | --- | --- |
+| 294 | 71.2 ms | 67.5% | 219.1 ms | 213.5 ms | -2.6% |
+| 94 | 131.5 ms | 37.9% | 211.7 ms | 213.5 ms | +0.9% |
+| 794 | 205.8 ms | 1.9% | 209.8 ms | 213.5 ms | +1.8% |
+| 2294 | 425.3 ms | 0.8% | 428.8 ms | 425.3 ms | -0.8% |
 
-Idle collapses from 67.5% to 1.9% as the device work climbs to meet the floor,
-which is the max form doing exactly what it claims. The plateau is ~213.5 ms
-over 1708 launches:
+Idle collapses from 67.5% to under 1% as the device work climbs past the floor,
+and the last row is on the far side of it -- kernels at twice the floor, the
+step tracking the kernels. One constant holds all four within 2.6% across a
+step time that doubles. The plateau is ~213.5 ms over 1708 launches:
 
 | | launches | plateau | us per launch |
 | --- | --- | --- | --- |
