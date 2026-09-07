@@ -1215,7 +1215,9 @@ cannot run is answering a different question.
    | term | TP=1 | TP=2 | TP=4 | against |
    | --- | --- | --- | --- | --- |
    | weights | **-0.9%** | -1.7% | -3.4% | the model's own parameters |
-   | activations | **-0.3%** | +12.6% | -9.1% | the traced step's own peak |
+   | activations | -0.3% | +12.6% | -9.1% | the traced step's own peak |
+   | activations, fixed | **-0.3%** | **-0.7%** | **+0.0%** | the same |
+   | activations, fixed | **+0.0%** | **+0.0%** | **+0.0%** | the warmup peak, scaled |
    | graph pool | +0.0% | +0.0% | +0.0% | the engine's estimate |
    | graph pool | **-94.8%** | **-88.3%** | -- | the pool capture measured |
 
@@ -1231,13 +1233,9 @@ cannot run is answering a different question.
      GB), and dividing every tensor by the world size under-counted the
      replicated norms, which is the unsafe direction for a budget. Both now
      come from the safetensors headers, at two reads of a few KB per shard.
-   * **The activation walk is exact at TP=1 and not at TP>1.** -0.3% against a
-     measurement of the same step is as good as this can be checked. The
-     TP spread is a liveness question and not a sizing one: at TP=2 the peak is
-     six live tensors dominated by two residual-stream carriers, and the
-     over-count is about 1.4 of them. The obvious explanation was tested and is
-     wrong -- excluding the 57 in-place all-reduces changes the derived peak by
-     nothing, because the peak is not held at one.
+   * **The activation walk was exact at TP=1 and not at TP>1, which turned out
+     to mean it was wrong everywhere.** See below: the TP=1 agreement was a
+     coincidence, and finding that took comparing curves rather than peaks.
    * **The graph-pool term reproduces the engine's estimate exactly and the
      estimate is 8-19x under what capture actually costs** (0.020 GB against
      0.390 GB measured at TP=1; 0.012 against 0.100 at TP=2). Agreement with a
@@ -1257,9 +1255,71 @@ cannot run is answering a different question.
      and the constants are stated as measurements.
 
    Still to do: models for `non_torch` and the load residue once there is
-   evidence from more than one model; a graph-pool term that predicts the
-   measured pool rather than the engine's estimate of it; and the TP>1
-   activation spread.
+   evidence from more than one model, and a graph-pool term that predicts the
+   measured pool rather than the engine's estimate of it.
+
+   **Fixing the TP spread: peaks agreed for the wrong reasons, so compare
+   curves.** -0.3% / +12.6% / -9.1% has no shape as an error, and the peak is
+   one number -- there is nothing in it to take apart. So the trace now reads
+   the allocator after every operator and writes the whole curve beside the
+   graph. The walk produces the same curve, and the two are then comparable
+   point for point: the operator where they *first* part company is the one
+   modelled wrongly, and everything after it is downstream of that.
+
+   It said the TP=1 agreement was luck. The walk's peak was at attention and
+   the allocator's was at the gate-up gemm, eleven operators away, and the two
+   numbers happened to match to 0.3%. Between them the curves were 20-60 MB
+   apart the whole way. Three faults, each found by the curve and each with its
+   own fix:
+
+   1. **Deaths were inferred from the last read, which is a different event.**
+      A tensor lives until its last Python reference goes: a residual held
+      across a block outlives every read of it. The trace now puts a finalizer
+      on each output -- it fires when the allocator takes the memory back --
+      and records where it fired. Recorded liveness, not guessed.
+   2. **Deaths were per operator, and an operator's outputs need not share a
+      life.** The fused add-and-norm returns the normed activation and the new
+      residual; the first dies into the next gemm, the second carries to the
+      end of the block. One death for the pair held an extra tensor per layer,
+      which at TP=4 was 36% of the term.
+   3. **The address map never forgot.** The allocator hands a freed address
+      straight back, so a map keyed on storage address credits the next tensor
+      there to whoever held it before -- which resurrects the dead *and* hides
+      the living. The finalizers already know when to forget, so now they do.
+
+   And one thing the curve exposed that no amount of staring at the graph
+   would have: **`torch.empty` inside a custom operator never reaches a
+   dispatch tracer**, because re-entering `func` from `__torch_dispatch__` runs
+   below the mode. The MLP's silu destination is 13.6 MB a layer at TP=1 and is
+   exactly where the allocator's high-water mark sits, and the graph did not
+   know it existed. An operator that returns no tensor is an out-variant and
+   what it produces is the destination it was handed; recorded as its output
+   when no live tensor already owns that storage.
+
+   | | TP=1 | TP=2 | TP=4 |
+   | --- | --- | --- | --- |
+   | before | -0.3% | +12.6% | -9.1% |
+   | after | **-0.3%** | **-0.7%** | **+0.0%** |
+   | held out, warmup shape | **+0.0%** | **+0.0%** | **+0.0%** |
+
+   The third row is the one that matters. The traced-step comparison shares a
+   shape with the thing it is checked against, so it can only say the walk read
+   one step correctly. The warmup prefill is a *different* shape -- 4096 tokens
+   against the trace's 3494 -- measured independently, and the walk has to
+   reach it by scaling. It lands on it at all three widths, which is what
+   licenses calling this term analytical rather than a recording: a term that
+   only answers at the shape it was taken on answers nothing worth asking.
+
+   What stays recorded is deliberately the structural part -- which outputs are
+   fresh, and how long each lives. Those are facts about an operator, taken
+   once at one shape; the bytes come from the shapes.
+
+   One divergence is left and it is understood: at each attention operator the
+   walk is 27 MB below the allocator, recovering at the next. The finalizers
+   for q, k and v fire before attention dispatches, but the allocator still
+   holds the memory, because they are views onto a storage something else is
+   still keeping alive. It is transient, self-correcting, and nowhere near the
+   peak.
 4. Feed it back: `get_num_blocks` off the modelled budget, so `max_num_seqs` and
    the capture ladder follow from the prediction rather than from the box.
 

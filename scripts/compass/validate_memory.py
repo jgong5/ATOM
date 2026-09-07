@@ -39,7 +39,7 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from atom.compass.core.memory_model import (  # noqa: E402
-    graph_pool_bytes, peak_activation_bytes, weight_bytes)
+    activation_curve, graph_pool_bytes, peak_activation_bytes, weight_bytes)
 
 GB = float(1 << 30)
 
@@ -92,6 +92,52 @@ def row(name: str, derived, recorded, note: str = "") -> None:
                                         error, note))
 
 
+def show_curve(graph: dict, worst: int = 12) -> None:
+    """Where the walk and the allocator part company, operator by operator.
+
+    Comparing peaks says the activation model is wrong. Comparing curves says
+    where -- and the operators worth looking at are the ones that *introduce*
+    a divergence, not the ones that inherit it, so this ranks by the step
+    change rather than by the running difference.
+    """
+    provenance = graph.get("provenance") or {}
+    measured = provenance.get("allocated_after_bytes") or []
+    baseline = provenance.get("allocated_before_bytes")
+    if not measured or baseline is None:
+        print("  no allocator curve in this graph; re-trace to record one")
+        return
+    ops = graph["ops"]
+    derived = activation_curve(graph)
+    n = min(len(ops), len(derived), len(measured))
+    if not n:
+        return
+
+    # A reading per operator the dispatch tracer recorded; the Triton tracer
+    # adds operators of its own to the same graph and takes no reading, so
+    # those positions are empty and simply have nothing to compare.
+    steps = []
+    previous = 0
+    for index in range(n):
+        if measured[index] is None:
+            continue
+        divergence = derived[index] - (measured[index] - baseline)
+        steps.append((divergence - previous, index, divergence))
+        previous = divergence
+    if not steps:
+        print("  no comparable readings in this graph")
+        return
+
+    print("\n  the walk against the allocator, operator by operator")
+    print("  %5s %10s %10s  %s" % ("op", "introduced", "running", "operator"))
+    for change, index, divergence in sorted(steps, key=lambda s: -abs(s[0]))[:worst]:
+        op = ops[index]
+        print("  %5d %+9.3fM %+9.3fM  %-38s out=%s"
+              % (index, change / (1 << 20), divergence / (1 << 20),
+                 op.get("name"), op.get("output_shapes")))
+    print("  %5s %10s %+9.3fM  at the last operator"
+          % ("", "", steps[-1][2] / (1 << 20)))
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("records", nargs="+", help="memory records, globs allowed")
@@ -100,6 +146,8 @@ def main() -> int:
     ap.add_argument("--log", help="run log, for the measured graph pool")
     ap.add_argument("--max-num-batched-tokens", type=int, default=0,
                     help="not in the record; needed to know the warmup shape")
+    ap.add_argument("--curve", action="store_true",
+                    help="show where the walk and the allocator diverge")
     args = ap.parse_args()
 
     paths = [q for p in args.records for q in sorted(glob.glob(p))] or args.records
@@ -162,7 +210,7 @@ def main() -> int:
         budget = (args.max_num_batched_tokens
                   or int(config.get("max_num_batched_tokens") or 0))
         if current is not None and peak is not None:  # noqa: SIM108
-            warmup_act, note = max(peak - current, 0), "vs the warmup peak"
+            warmup_act, note = max(peak - current, 0), "vs the warmup peak"  # noqa: E501
         else:
             # `_estimate_cudagraph_overhead` is 0.2 x peak activations under
             # manual capture, so a record predating the split still says what
@@ -170,13 +218,20 @@ def main() -> int:
             overhead = readings.get("cudagraph_overhead") or 0
             warmup_act = int(overhead / 0.2) if overhead else 0
             note = "vs the warmup peak, inverted from the pool estimate"
+        # The held-out test the traced-step comparison cannot be: the warmup
+        # prefill is a different shape, measured independently, and the walk
+        # has to reach it by scaling. Linear in tokens is the claim being
+        # tested, and it is the whole reason this term is analytical rather
+        # than a recording -- a term that only answers at the shape it was
+        # taken on answers nothing worth asking.
         want, got = warmup_tokens(config, budget), graph_tokens(graph or {})
-        if want and got and want != got:
-            note += "; SHAPE MISMATCH: warmup ran %d tokens, the trace %d" % (
-                want, got)
+        scaled = None
+        if derived_act is not None and want and got:
+            scaled = int(derived_act * want / got)
+            note += " (walk scaled %d -> %d tokens)" % (got, want)
         elif not want:
             note += "; warmup shape unknown (pass --max-num-batched-tokens)"
-        row("activations", derived_act, warmup_act, note)
+        row("activations", scaled, warmup_act, note)
 
         row("non-torch", None, readings.get("non_torch"), "not modelled")
 
@@ -185,6 +240,9 @@ def main() -> int:
             "vs the engine's estimate")
         if pool_seen:
             row("graph pool", derived_pool, pool_seen, "vs the measured pool")
+
+    if args.curve and graph is not None:
+        show_curve(graph)
 
     if len(non_torch_seen) > 1:
         print("\nthe terms with no model yet, across configurations")

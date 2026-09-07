@@ -13,8 +13,22 @@ Four terms, and only one of them is interesting:
 * **CUDA-graph pool** -- geometry ATOM already computes.
 * **activations** -- everyone else guesses this. It is a liveness question:
   not how much memory the operators touch, but how much is live at once, which
-  needs to know *which tensor is which*. The traced op graph now records which
+  needs to know *which tensor is which*. The traced op graph records which
   operator produced each input, so it can be walked.
+
+**Liveness is recorded, not inferred.** The first walk guessed at deaths from
+the last read of a tensor, which is a different event: a tensor lives until its
+last Python reference goes, so a local held across a block outlives every read
+of it. The trace now watches each output die -- a finalizer fires when the
+allocator takes the memory back -- and records the death per *output*, since an
+operator's outputs need not share a life. A fused add-and-norm returns the
+normed activation and the new residual, and giving both the later of the two
+deaths held one extra tensor per layer.
+
+What stays analytical is the part that has to generalise. Which outputs are
+fresh and how long each lives are structural facts about an operator, recorded
+once at one shape; the bytes come from the shapes, so the term still answers
+for a shape nobody traced.
 """
 
 from __future__ import annotations
@@ -23,8 +37,8 @@ import json
 import os
 from typing import Mapping, Optional
 
-__all__ = ["peak_activation_bytes", "weight_bytes", "graph_pool_bytes",
-           "ELEMENT_BYTES"]
+__all__ = ["peak_activation_bytes", "activation_curve", "weight_bytes",
+           "graph_pool_bytes", "ELEMENT_BYTES"]
 
 ELEMENT_BYTES = {
     "float64": 8, "int64": 8, "double": 8,
@@ -70,6 +84,96 @@ def _canonical(ops) -> list:
     return canonical
 
 
+def _deaths(ops, canonical) -> dict:
+    """After which operator each *output* was released.
+
+    A recorded death is the allocator taking the memory back: a finalizer on
+    the tensor fires the moment its last reference goes, and the operator in
+    progress then is where it died. Last-read is a guess at the same event and
+    is wrong in both directions -- a local held across a block outlives every
+    read of it, and a producer map keyed on storage address credits a reused
+    address to the tensor that used to live there, which resurrects the dead.
+
+    Keyed per output, because an operator's outputs need not share a life. A
+    fused add-and-norm returns the normed activation and the new residual: the
+    first dies into the next gemm, the second carries to the end of the block.
+    Giving both the later death holds one extra tensor per layer, which at TP=4
+    was 36% of the term.
+
+    Index ``d`` means the tensor was still live while operator ``d`` ran. A
+    position absent from the result was never seen to die and is held to the
+    end of the step -- the opposite default to the one last-read needed, where
+    an output nobody read had to be dropped at once.
+    """
+    dies, observed = {}, False
+    for index, op in enumerate(ops):
+        owner = canonical[index] if canonical[index] >= 0 else index
+        for position, death in enumerate(op.get("dies_at") or ()):
+            if death is None or death < 0:
+                continue
+            observed = True
+            key = (owner, position)
+            dies[key] = max(dies.get(key, -1), int(death))
+    if observed:
+        return dies
+
+    # No deaths recorded. Fall back to the rule this replaced, which knows
+    # nothing about positions and so gives every output of an operator the
+    # same life.
+    per_operator = {}
+    for index, op in enumerate(ops):
+        for producer in op.get("inputs_from") or ():
+            if 0 <= producer < len(canonical) and canonical[producer] >= 0:
+                per_operator[canonical[producer]] = index
+    for index, op in enumerate(ops):
+        death = per_operator.get(index, index)  # unread, so it went at once
+        for position in range(max(1, len(op.get("output_shapes") or ()))):
+            dies[(index, position)] = death
+    return dies
+
+
+def activation_curve(graph) -> list:
+    """How much activation memory is live at each operator.
+
+    The activation term is a curve and its peak is one point on it. Comparing
+    peaks says a model is wrong; comparing curves says *where* -- the first
+    operator at which the walk and the allocator disagree is the operator whose
+    liveness is modelled wrongly, and everything after it is downstream of that
+    one mistake.
+
+    Each entry is what is live *while* that operator runs: its outputs already
+    exist, and anything released only after it finished is still there. That is
+    the same instant at which the trace reads the allocator, so the two curves
+    are comparable point for point.
+    """
+    ops = graph["ops"]
+    canonical = _canonical(ops)
+    dies = _deaths(ops, canonical)
+
+    released = {}
+    for key, death in dies.items():
+        released.setdefault(death, []).append(key)
+
+    live, held, curve = 0, {}, []
+    for index, op in enumerate(ops):
+        for key in released.get(index - 1, ()):
+            if key in held:
+                live -= held.pop(key)
+        if canonical[index] == index:
+            dtypes = op.get("dtypes") or ()
+            dtype = dtypes[0] if dtypes else "bfloat16"
+            aliases = op.get("output_aliases") or ()
+            for position, shape in enumerate(op.get("output_shapes") or ()):
+                if position < len(aliases) and aliases[position] is not None:
+                    continue  # written into, not allocated
+                size = _bytes_of(shape, dtype)
+                if size:
+                    held[(index, position)] = size
+                    live += size
+        curve.append(live)
+    return curve
+
+
 def peak_activation_bytes(graph) -> int:
     """The most activation memory live at once, by walking the graph.
 
@@ -88,38 +192,7 @@ def peak_activation_bytes(graph) -> int:
     goes -- so this is a lower bound on the high-water mark, not a bound on what
     the allocator reserves.
     """
-    ops = graph["ops"]
-    canonical = _canonical(ops)
-
-    last_read = {}
-    for index, op in enumerate(ops):
-        for producer in op.get("inputs_from") or ():
-            if 0 <= producer < len(canonical) and canonical[producer] >= 0:
-                last_read[canonical[producer]] = index
-
-    live, peak, held = 0, 0, {}
-    for index, op in enumerate(ops):
-        if canonical[index] == index:
-            dtypes = op.get("dtypes") or ()
-            dtype = dtypes[0] if dtypes else "bfloat16"
-            aliases = op.get("output_aliases") or ()
-            size = 0
-            for position, shape in enumerate(op.get("output_shapes") or ()):
-                if position < len(aliases) and aliases[position] is not None:
-                    continue  # written into, not allocated
-                size += _bytes_of(shape, dtype)
-            if size:
-                held[index] = size
-                live += size
-                peak = max(peak, live)
-        # Everything whose last reader was this operator dies here, including
-        # this operator's own outputs when nothing downstream reads them.
-        for produced, reader in list(last_read.items()):
-            if reader == index and produced in held:
-                live -= held.pop(produced)
-        if index in held and index not in last_read:
-            live -= held.pop(index)
-    return peak
+    return max(activation_curve(graph) or [0])
 
 
 def _safetensors_header(path: str) -> Optional[dict]:

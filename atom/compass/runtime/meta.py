@@ -16,6 +16,7 @@ what it *could not*, and the second list is the work to be done.
 from __future__ import annotations
 
 import time
+import weakref
 from dataclasses import dataclass, field
 from typing import Any, Optional
 
@@ -196,6 +197,14 @@ def inside_an_operator() -> bool:
     return bool(_DISPATCHING)
 
 
+def _allocated() -> int:
+    """What the caching allocator currently holds, or -1 off a device."""
+    try:
+        return int(torch.cuda.memory_allocated())
+    except Exception:  # noqa: BLE001 - a curve is a diagnostic, never a failure
+        return -1
+
+
 def _storage_of(tensor) -> int:
     """A tensor's storage address, or 0 where it has none.
 
@@ -318,6 +327,33 @@ class MetaOpTracer(TorchDispatchMode):
         #: Storage address -> the operator that last wrote it. What makes the
         #: graph walkable for liveness rather than only summable for shapes.
         self._producers: dict[int, int] = {}
+        #: What the allocator held after each recorded operator, aligned with
+        #: ``graph.ops``. The activation term is a *curve* -- the walk's live
+        #: set over the step -- and checking only its maximum against only the
+        #: allocator's maximum cannot say where the two part company. This is
+        #: the same curve measured, so the first operator at which they differ
+        #: is the operator to go and look at. One host-side counter read per
+        #: operator; no device synchronisation.
+        self.allocated: dict[int, int] = {}
+        #: ``(operator, output position)`` -> the operator after which that
+        #: output was released. Recorded by watching the tensors die rather
+        #: than inferred from the last read, which is neither the same event
+        #: nor even an approximation of it: a tensor lives until its last
+        #: Python reference goes, and a producer map keyed on storage address
+        #: credits a reused address to whoever held it before.
+        #:
+        #: Per output, not per operator. A fused add-and-norm returns the
+        #: normed activation and the new residual: the first dies into the next
+        #: gemm and the second carries to the end of the block, and giving both
+        #: the later of the two deaths holds an extra tensor per layer.
+        self.deaths: dict[tuple, int] = {}
+        #: The operator most recently recorded, so a death observed between
+        #: dispatches is attributed to the operator it followed.
+        self._current = -1
+        #: Every storage this trace has laid eyes on, as an input or an output.
+        #: An out-variant's destination that is not in here came into existence
+        #: inside an operator, where a dispatch tracer cannot see it.
+        self._seen: set = set()
         self._t0 = 0.0
         self.seconds = 0.0
 
@@ -328,6 +364,32 @@ class MetaOpTracer(TorchDispatchMode):
     def __exit__(self, *exc):
         self.seconds = time.perf_counter() - self._t0
         return super().__exit__(*exc)
+
+    def _watch(self, tensor, index: int, position: int) -> None:
+        """Note when one of this operator's outputs is released.
+
+        A finalizer on the tensor fires as soon as the last reference to it
+        goes, which under refcounting is the moment the allocator takes the
+        memory back. The operator in progress at that moment is where the
+        tensor died.
+        """
+        try:
+            weakref.finalize(tensor, self._died, index, position,
+                             _storage_of(tensor))
+        except TypeError:  # not weak-referenceable; fall back to last-read
+            pass
+
+    def _died(self, index: int, position: int, storage: int) -> None:
+        key = (index, position)
+        self.deaths[key] = max(self.deaths.get(key, -1), self._current)
+        # ...and forget the address, because the allocator hands it straight
+        # back. A map that never forgets credits the next tensor at that
+        # address to whoever held it before, which both resurrects the dead --
+        # they gain the reader that belonged to their successor -- and hides
+        # the successor, which then looks like a buffer that already existed.
+        if self._producers.get(storage) == index:
+            del self._producers[storage]
+            self._seen.discard(storage)
 
     def __torch_dispatch__(self, func, types, args=(), kwargs=None):
         kwargs = kwargs or {}
@@ -410,6 +472,29 @@ class MetaOpTracer(TorchDispatchMode):
         # cannot be priced, because it takes an argument that is not a value the
         # graph can hold, so it sat in every coverage figure as a permanently
         # unpriced operator suggesting something was missing.
+        # An operator that returns no tensor is an out-variant: what it
+        # produces is the destination it was handed. Usually that destination
+        # was allocated by an operator this trace recorded, and counting it
+        # again would double it -- but not always. `torch.empty` called inside
+        # a wrapper that is itself a custom operator never reaches a dispatch
+        # tracer, because re-entering `func` from `__torch_dispatch__` runs
+        # below the mode. The buffer is real, it is this step's memory, and
+        # nothing in the graph says so: at TP=1 the MLP's silu destination is
+        # 13.6 MB a layer and it is where the allocator's high-water mark
+        # actually sits. A destination the trace has never seen before is such
+        # a buffer; one it has seen belongs to whoever it saw it from.
+        if not out_shapes:
+            unseen = next(
+                (t for t in tensors[:1] if isinstance(t, torch.Tensor)
+                 and _shape_of(t) is not None
+                 and _storage_of(t) not in self._seen), None)
+            if unseen is not None:
+                outs = (unseen,)
+                out_shapes = (_shape_of(unseen),)
+                output_aliases = (None,)
+        self._seen.update(_storage_of(t) for t in tensors
+                          if isinstance(t, torch.Tensor))
+
         if not name.startswith(NOT_WORK):
             self.graph.add(
                 OpSpec(
@@ -430,9 +515,18 @@ class MetaOpTracer(TorchDispatchMode):
                 )
             )
             index = len(self.graph.ops) - 1
+            self.allocated[index] = _allocated()
+            self._current = index
+            position = 0
             for produced in outs:
                 if isinstance(produced, torch.Tensor):
                     self._producers[_storage_of(produced)] = index
+                if _shape_of(produced) is None:
+                    continue  # not a shaped output; no position in the record
+                if isinstance(produced, torch.Tensor):
+                    self._watch(produced, index, position)
+                    self._seen.add(_storage_of(produced))
+                position += 1
         return out
 
 

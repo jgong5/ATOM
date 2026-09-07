@@ -49,6 +49,15 @@ class GraphKey:
         )
 
 
+def _deaths_of(recorded) -> tuple:
+    """A per-output death tuple, from either shape a record may carry."""
+    if recorded is None:
+        return ()
+    if isinstance(recorded, int):  # a record written per operator, not output
+        return (int(recorded),)
+    return tuple(int(d) for d in recorded)
+
+
 @dataclass(frozen=True)
 class OpSpec:
     """One operation, as executed.
@@ -56,7 +65,15 @@ class OpSpec:
     Attributes:
         name: Operator identity, e.g. ``aten::mm`` or ``aiter::fused_moe``.
         input_shapes: Shape of each tensor argument, in order.
-        output_shapes: Shape of each tensor result, in order.
+        output_shapes: Shape of each tensor result, in order. An operator that
+            returns no tensor is an out-variant, and what it produces is the
+            destination it was handed -- recorded here when no live tensor
+            already owns that storage, because then the buffer was allocated
+            somewhere a dispatch tracer cannot see. `torch.empty` inside a
+            custom operator is such a place: re-entering the operator from
+            `__torch_dispatch__` runs below the mode. At TP=1 the MLP's silu
+            destination is 13.6 MB a layer and is exactly where the allocator's
+            high-water mark sits.
         dtypes: Dtype of each tensor argument, in order.
         group: For a collective, the communication group it ran on. ``None``
             for local computation.
@@ -103,7 +120,10 @@ class OpSpec:
             term of a memory budget. Recorded by matching storage addresses as
             the trace runs, because a graph of shapes alone cannot be walked for
             liveness -- two tensors of the same shape are indistinguishable in
-            it.
+            it. The address map forgets an address when the tensor holding it
+            dies, since the allocator hands it straight back and the next
+            tensor there is a different tensor.
+
         output_aliases: Per output, whether the operator allocated it. ``None``
             means it did; an index ``k >= 0`` means it wrote into the tensor
             operator ``k`` produced, and ``-1`` that it wrote into one from
@@ -113,6 +133,18 @@ class OpSpec:
             all-reduces made that 12.6%. Decided by whether the output's
             storage is one of the operator's own inputs, which cannot be
             confused with the allocator handing back a freed address.
+        dies_at: Per output, the operator after which it was released, or -1 if
+            it outlived the step. Per output rather than per operator because a
+            fused add-and-norm's two outputs do not have the same life: the
+            normed activation dies into the next gemm and the new residual
+            carries to the end of the block. Recorded, not inferred: a tensor is
+            freed
+            when its last *Python reference* goes, which is not the same as its
+            last read -- a local held across a block keeps a tensor alive long
+            after the operator that last looked at it. Inferring from last-read
+            also resurrects the dead, since the allocator hands a freed address
+            straight back and a producer map that never forgets then credits
+            the new tensor to whoever held that address before.
         launch: How to launch a Triton kernel that is not a torch operator, as
             ``(name, value)`` pairs: ``grid`` and ``origin``. A torch operator
             can be found again from its name alone, through ``torch.ops``; a
@@ -134,6 +166,7 @@ class OpSpec:
     int_ranges: tuple[tuple[int, tuple[int, int, bool]], ...] = ()
     inputs_from: tuple[int, ...] = ()
     output_aliases: tuple = ()
+    dies_at: tuple = ()
 
     @property
     def is_collective(self) -> bool:
@@ -204,6 +237,7 @@ class OpGraph:
                     "int_ranges": [[i, list(v)] for i, v in op.int_ranges],
                     "inputs_from": list(op.inputs_from),
                     "output_aliases": list(op.output_aliases),
+                    "dies_at": list(op.dies_at),
                 }
                 for op in self.ops
             ],
@@ -249,6 +283,7 @@ class OpGraph:
                     output_aliases=tuple(
                         None if a is None else int(a)
                         for a in op.get("output_aliases") or ()),
+                    dies_at=_deaths_of(op.get("dies_at")),
                 )
             )
         return graph

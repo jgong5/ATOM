@@ -9,7 +9,7 @@ import json
 import struct
 
 from atom.compass.core.memory_model import (
-    graph_pool_bytes, peak_activation_bytes, weight_bytes)
+    activation_curve, graph_pool_bytes, peak_activation_bytes, weight_bytes)
 
 
 def _write_checkpoint(directory, tied, tensors):
@@ -33,16 +33,17 @@ def _write_checkpoint(directory, tied, tensors):
         json.dumps({"tie_word_embeddings": bool(tied)}))
 
 
-def _op(out, dtype="float32", inputs_from=()):
+def _op(out, dtype="float32", inputs_from=(), dies_at=-1):
     return {"name": "aten::x", "input_shapes": [], "output_shapes": [out],
             "dtypes": [dtype], "inputs_from": list(inputs_from),
-            "output_aliases": [None]}
+            "output_aliases": [None], "dies_at": [dies_at]}
 
 
-def _in_place(out, of, dtype="float32"):
+def _in_place(out, of, dtype="float32", dies_at=-1):
     """An operator writing into the tensor operator `of` produced."""
     return {"name": "aten::x_", "input_shapes": [out], "output_shapes": [out],
-            "dtypes": [dtype], "inputs_from": [of], "output_aliases": [of]}
+            "dtypes": [dtype], "inputs_from": [of], "output_aliases": [of],
+            "dies_at": [dies_at]}
 
 
 class TestLiveness:
@@ -193,5 +194,85 @@ class TestInPlaceOperators:
         to the cache would drop the tensor it allocated from the live set."""
         both = {"name": "aiter::attention", "input_shapes": [], "dtypes": ["float32"],
                 "output_shapes": [[4096], [1024]], "inputs_from": [-1],
-                "output_aliases": [-1, None]}
+                "output_aliases": [-1, None], "dies_at": [-1, -1]}
         assert peak_activation_bytes({"ops": [both]}) == 1024 * 4
+
+
+class TestDeathsThatWereObservedRatherThanGuessed:
+    """Last-read is not when a tensor dies, and is wrong in both directions.
+
+    A local held across a block outlives every read of it; and a producer map
+    keyed on storage address credits a reused address to whatever held it
+    before, which keeps a dead tensor in the live set to the end of the step.
+    """
+
+    def test_a_recorded_death_beats_the_last_read(self):
+        """A residual read once early and held to the end of the block.
+
+        Last-read frees it at the one operator that looked at it; the
+        recording says it was still there three operators later, and it was.
+        """
+        chain = [_op([16], inputs_from=[0]), _op([16], inputs_from=[1]),
+                 _op([16], inputs_from=[2])]
+        recorded = {"ops": [_op([1024], dies_at=3)] + chain}
+        guessed = {"ops": [_op([1024])] + [dict(o, dies_at=[-1]) for o in chain]}
+        assert peak_activation_bytes(recorded) == 1024 * 4 + 3 * 16 * 4
+        assert peak_activation_bytes(guessed) < peak_activation_bytes(recorded)
+
+    def test_an_output_with_no_recorded_death_outlived_the_step(self):
+        """The opposite default to the last-read rule, and it must not be
+        confused with it: nothing observed it dying, so it did not."""
+        graph = {"ops": [_op([1024], dies_at=1), _op([1024]), _op([16])]}
+        # Operator 0 goes at operator 1 because that was seen; operator 1 was
+        # never seen to go, so it is still there at the end.
+        assert activation_curve(graph)[-1] == 1024 * 4 + 16 * 4
+
+    def test_a_graph_with_no_deaths_at_all_falls_back_to_last_read(self):
+        """A record written before deaths were observed still walks."""
+        graph = {"ops": [_op([1024]), _op([1024], inputs_from=[0]),
+                         _op([1024], inputs_from=[1])]}
+        assert peak_activation_bytes(graph) == 2 * 1024 * 4
+
+    def test_an_in_place_operator_dies_with_the_tensor_it_wrote_into(self):
+        graph = {"ops": [_op([1024], dies_at=2), _in_place([1024], of=0),
+                         _op([16], inputs_from=[1])]}
+        assert peak_activation_bytes(graph) == 1024 * 4 + 16 * 4
+
+    def test_two_outputs_of_one_operator_can_have_different_lives(self):
+        """A fused add-and-norm returns the normed activation and the new
+        residual. The first dies into the next gemm; the second carries to the
+        end of the block. One death for the pair holds an extra tensor per
+        layer -- at TP=4 that was 36% of the term."""
+        fused = {"name": "aiter::rmsnorm2d_fwd_with_add_", "input_shapes": [],
+                 "dtypes": ["float32"], "output_shapes": [[1024], [1024]],
+                 "inputs_from": [], "output_aliases": [None, None],
+                 "dies_at": [1, 3]}
+        graph = {"ops": [fused, _op([16]), _op([16]), _op([16])]}
+        # At operator 2 only the residual survives, plus what has run since.
+        assert activation_curve(graph)[2] == 1024 * 4 + 2 * 16 * 4
+        assert peak_activation_bytes(graph) == 2 * 1024 * 4 + 16 * 4
+
+
+class TestBuffersNoOperatorDeclared:
+    """`torch.empty` inside a custom operator never reaches a dispatch tracer:
+    re-entering `func` from `__torch_dispatch__` runs below the mode. The
+    buffer is real and is where the high-water mark sits, so the trace records
+    the destination of an out-variant as that operator's output."""
+
+    def test_a_destination_recorded_as_an_output_is_counted(self):
+        out_variant = {"name": "aiter::silu_and_mul", "dtypes": ["float32"],
+                       "input_shapes": [[1024], [2048]],
+                       "output_shapes": [[1024]], "inputs_from": [-1, 0],
+                       "output_aliases": [None], "dies_at": [-1]}
+        graph = {"ops": [_op([2048]), out_variant]}
+        assert peak_activation_bytes(graph) == 2048 * 4 + 1024 * 4
+
+    def test_a_destination_that_was_already_someones_output_is_not_doubled(self):
+        """When the trace did see the destination allocated, the destination
+        belongs to whoever allocated it and the out-variant adds nothing."""
+        writes_into = {"name": "aiter::silu_and_mul", "dtypes": ["float32"],
+                       "input_shapes": [[1024]], "output_shapes": [[1024]],
+                       "inputs_from": [0], "output_aliases": [0],
+                       "dies_at": [-1]}
+        graph = {"ops": [_op([1024]), writes_into]}
+        assert peak_activation_bytes(graph) == 1024 * 4
