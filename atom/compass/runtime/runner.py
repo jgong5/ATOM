@@ -772,7 +772,8 @@ class CompassModelRunner(ModelRunner):
         never arrives, naming neither CUDA graphs nor Compass.
         """
         if self._compass_config.mode == "measure":
-            result = super().capture_cudagraph()
+            with self._measured_graph_pool():
+                result = super().capture_cudagraph()
             # Priced here rather than after warmup, because warmup runs while
             # the runner is still being built -- before the KV cache exists. An
             # operator that walks paged KV cannot be called without one, and
@@ -892,6 +893,76 @@ class CompassModelRunner(ModelRunner):
         except Exception as exc:  # noqa: BLE001 - never fail a run over a record
             logger.debug("ATOMCompass: no parameter bytes: %s", exc)
             return None
+
+    @contextlib.contextmanager
+    def _measured_graph_pool(self):
+        """What capture actually costs, recorded beside what it was estimated at.
+
+        The engine reserves for the pool from an estimate (`0.2 x` the peak
+        activations under manual capture) and that estimate is 8-19x under what
+        capture then takes -- 0.020 GB against 0.390 GB measured at TP=1. It is
+        0.2% of a 192 GB card, so nothing here has depended on it, which is
+        precisely why it needs an artifact: a term nobody can see is a term
+        nobody notices being wrong until a configuration is tight.
+
+        The pool is the *reserved* delta, not the allocated one. A captured
+        graph pins its intermediates for replay, so the segments the allocator
+        had to create are what the configuration must budget for.
+
+        Recorded after `get_num_blocks` has already written its record, so the
+        record is rewritten rather than extended -- capture cannot happen before
+        the KV cache exists, and the budget cannot be computed after it does.
+        """
+        import torch
+
+        try:
+            before = (torch.cuda.memory_reserved(), torch.cuda.memory_allocated())
+        except Exception:  # noqa: BLE001 - never fail a run over a measurement
+            yield
+            return
+        try:
+            yield
+        finally:
+            try:
+                self._graph_pool = {
+                    "reserved": max(0, int(torch.cuda.memory_reserved()
+                                           - before[0])),
+                    "allocated": max(0, int(torch.cuda.memory_allocated()
+                                            - before[1])),
+                    "capture_sizes": [int(b) for b in
+                                      sorted(getattr(self, "capture_sizes", []))
+                                      if b],
+                    "graphs": len(getattr(self, "graphs", []) or ()),
+                }
+                self._rewrite_memory_with_pool()
+            except Exception as exc:  # noqa: BLE001
+                logger.debug("ATOMCompass: no graph pool measurement: %s", exc)
+
+    def _rewrite_memory_with_pool(self) -> None:
+        """Add the measured pool to the record `get_num_blocks` already wrote."""
+        path = self._compass_config.memory_out
+        if not path or not getattr(self, "_graph_pool", None):
+            return
+        coords = self._rank_coords()
+        if any(size > 1 for size in self._topology().values()):
+            path = self._rank_path(path, coords)
+        try:
+            with open(path, encoding="utf-8") as fh:
+                record = json.load(fh)
+            record["graph_pool"] = self._graph_pool
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(record, fh, indent=1)
+        except (OSError, ValueError) as exc:
+            logger.warning("ATOMCompass WARNING: could not record the measured "
+                           "graph pool in %s: %s", path, exc)
+            return
+        logger.info(
+            "ATOMCompass: CUDA graph capture reserved %.3f GB over %d buckets "
+            "(the engine budgeted %.3f GB) -> %s",
+            self._graph_pool["reserved"] / 2**30,
+            len(self._graph_pool["capture_sizes"]),
+            (record.get("readings") or {}).get("cudagraph_overhead", 0) / 2**30,
+            path)
 
     def get_num_blocks(self) -> dict:
         """Size the KV cache, and record what the budget was made of.

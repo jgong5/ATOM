@@ -40,7 +40,7 @@ from typing import Mapping, Optional
 __all__ = ["peak_activation_bytes", "activation_curve", "weight_bytes",
            "resident_bytes", "non_torch_bytes", "load_residue_bytes",
            "modelled_readings", "activation_bytes_at",
-           "graph_pool_bytes", "ELEMENT_BYTES"]
+           "graph_pool_bytes", "measured_graph_pool_bytes", "ELEMENT_BYTES"]
 
 ELEMENT_BYTES = {
     "float64": 8, "int64": 8, "double": 8,
@@ -484,6 +484,62 @@ def modelled_readings(*, total_bytes: int, world_size: int, parameters: int,
         "cudagraph_overhead": graph_pool_bytes(
             activation_bytes, enforce_eager=enforce_eager),
     }
+
+
+#: What CUDA-graph capture actually reserves, as `floor + slope x sum(captured
+#: tokens)`. Fitted on six ladders on the 0.6B at TP=1 whose pools spanned 100
+#: to 402 MiB, to within +/-6%; fitted on the five up to 896 tokens it predicts
+#: the sixth, at 1071, to **+6.4%**.
+#:
+#: The floor is the larger surprise. At the shortest ladder it is 87% of the
+#: pool, and nothing in the engine's estimate corresponds to it at all.
+#:
+#: Per rank, and the width scaling is the weak part. TP=2 and TP=4 at the full
+#: ladder both measured 104.0 MiB against 416 MiB modelled at TP=1 -- a
+#: quarter, and *byte-identical* to each other. A per-rank sharding law would
+#: have TP=4 at half of TP=2; it is not, so this is more likely the allocator
+#: quantising than the pool sharding, and a flat fraction above width one is
+#: the least-wrong thing two equal numbers support. Crude, deliberately, and
+#: the first thing to re-measure.
+DEFAULT_POOL_FLOOR = 91.1 * MIB
+DEFAULT_POOL_PER_TOKEN = 0.3033 * MIB
+DEFAULT_POOL_SHARDED_FRACTION = 0.25
+
+
+def measured_graph_pool_bytes(capture_sizes, world_size: int = 1,
+                              calibration: Optional[Mapping] = None,
+                              enforce_eager: bool = False) -> int:
+    """What capture will actually reserve -- not what the engine budgets for it.
+
+    Two different questions, and both are needed. `graph_pool_bytes` mirrors
+    the engine's estimator, which is the number that reserves the memory and so
+    is what a modelled budget has to reproduce. This one predicts the cost, and
+    the two disagree by 4-19x.
+
+    The engine's estimator is `0.2 x` the peak activations, which depends on
+    the *warmup* shape and not on the capture ladder at all: across five
+    ladders whose pools ran 100 to 370 MiB it returned a flat 20.8 MiB. It is
+    not merely low, it is blind to the variable that drives the thing it
+    estimates.
+
+    What that costs is not an out-of-memory: the capture loop re-checks free
+    memory per bucket and skips what will not fit, so under-reserving buys
+    silently dropped buckets and a decode cliff at those batch sizes. On a
+    192 GB card nothing has ever been dropped, which is exactly why this went
+    unnoticed.
+    """
+    if enforce_eager:
+        return 0
+    sizes = [int(s) for s in (capture_sizes or ()) if int(s) > 0]
+    if not sizes:
+        return 0
+    settings = (calibration or {}).get("graph_pool") or {}
+    floor = float(settings.get("floor", DEFAULT_POOL_FLOOR))
+    per_token = float(settings.get("per_token", DEFAULT_POOL_PER_TOKEN))
+    fraction = float(settings.get("sharded_fraction",
+                                  DEFAULT_POOL_SHARDED_FRACTION))
+    pool = floor + per_token * sum(sizes)
+    return int(pool if world_size <= 1 else pool * fraction)
 
 
 def graph_pool_bytes(activation_bytes: int, *, enforce_eager: bool = False,

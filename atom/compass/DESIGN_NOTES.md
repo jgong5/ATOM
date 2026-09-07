@@ -1335,10 +1335,66 @@ cannot run is answering a different question.
    part is +71 MiB (27B at TP=2) and +147 MiB (at TP=4), against a 2069 MiB
    constant.
 
-   Still to do: a graph-pool term that predicts the measured pool rather than
-   the engine's estimate of it, a third model for the model-dependent parts
-   (the 30B-A3B checkpoint is only part-downloaded and this box is offline),
-   and a guard on `non_torch` of the kind `free` already has.
+   **The graph pool: the estimate is not low, it is blind.** The derivation
+   reproduced the engine's estimator exactly and the estimator was 8-19x under
+   the pool capture measures -- which said nothing about *why*, because a
+   single number has nothing in it to take apart. The capture ladder is
+   truncated at `max_num_seqs` and also settable outright
+   (`--cudagraph-capture-sizes`), so it is a lever: hold the largest bucket at
+   512 and vary how many buckets there are, and "cost of the biggest graph",
+   "cost per token summed over graphs" and "cost per graph" come apart.
+
+   | ladder | buckets | Σ tokens | measured | engine's estimate |
+   | --- | --- | --- | --- | --- |
+   | `[1,2,4,8,16]` | 5 | 31 | 100.0 MiB | 20.8 MiB |
+   | `[1..64]` | 8 | 175 | 136.0 MiB | 20.8 MiB |
+   | `[512]` | 1 | 512 | 254.0 MiB | 20.8 MiB |
+   | `[256,512]` | 2 | 768 | 332.0 MiB | 20.8 MiB |
+   | `[128,256,512]` | 3 | 896 | 370.0 MiB | 20.8 MiB |
+   | full | 11 | 1071 | 402.0 MiB | 20.8 MiB |
+
+   The right-hand column is the finding. The pool moves over 4x and the
+   estimate does not move at all, because it is `0.2 x` the peak activations
+   and those belong to the *warmup* shape -- the capture ladder does not enter
+   it. The estimator is not a low estimate of the pool; it is an estimate of
+   something else.
+
+   What the pool actually is:
+
+       pool = 91.1 MiB + 0.3033 MiB per captured token, summed over buckets
+
+   Fitted on the five ladders up to Σ=896 it predicts the sixth, at Σ=1071, to
+   **+6.4%**; refitted on all six it holds every point to within 6%. Note that
+   one graph at 512 tokens costs 254 MiB while five graphs totalling 31 tokens
+   cost 100 MiB -- so the *floor* is 87% of a short ladder's pool, and nothing
+   in the engine's estimate corresponds to it.
+
+   Two functions now, deliberately. `graph_pool_bytes` mirrors the engine's
+   estimator, because that is the number that reserves the memory and a
+   modelled budget has to reproduce the engine's decision.
+   `measured_graph_pool_bytes` predicts the cost. Keeping them apart is the
+   same distinction the per-term validation drew: agreement with a formula is
+   not agreement with a device.
+
+   **What under-reserving costs is not an OOM.** The capture loop re-checks
+   free memory per bucket and skips what will not fit, so the price is silently
+   dropped buckets and a decode cliff at those batch sizes. On a 192 GB card
+   nothing has ever been dropped, which is exactly why this went unnoticed --
+   and exactly why a term nobody can see needs an artifact. `--compass-memory-out`
+   now records the measured pool beside the estimate.
+
+   Width is the weak part. TP=2 and TP=4 at the full ladder both measured
+   104.0 MiB against 416 MiB modelled at TP=1 -- a quarter, and *byte-identical
+   to each other*. A per-rank sharding law would put TP=4 at half of TP=2. It
+   does not, so this is more likely the allocator quantising than the pool
+   sharding, and a flat fraction above width one is the least-wrong thing two
+   equal numbers support. Crude, deliberately, and the first thing to
+   re-measure.
+
+   Still to do: a third model for the model-dependent parts of `non_torch` and
+   the load residue (the 30B-A3B checkpoint is only part-downloaded and this
+   box is offline), the graph pool's width scaling on more than one point, and
+   a guard on `non_torch` of the kind `free` already has.
 
    **Fixing the TP spread: peaks agreed for the wrong reasons, so compare
    curves.** -0.3% / +12.6% / -9.1% has no shape as an error, and the peak is

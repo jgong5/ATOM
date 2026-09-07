@@ -9,8 +9,9 @@ import json
 import struct
 
 from atom.compass.core.memory_model import (
-    DEFAULT_NON_TORCH, DEFAULT_PERSISTENT, activation_bytes_at,
-    activation_curve, graph_pool_bytes, load_residue_bytes, modelled_readings,
+    DEFAULT_NON_TORCH, DEFAULT_PERSISTENT, DEFAULT_POOL_FLOOR,
+    activation_bytes_at, activation_curve, graph_pool_bytes,
+    load_residue_bytes, measured_graph_pool_bytes, modelled_readings,
     non_torch_bytes, peak_activation_bytes, weight_bytes)
 
 
@@ -364,3 +365,46 @@ class TestScalingToAShapeNobodyTraced:
     def test_a_graph_that_names_no_shape_is_taken_as_it_stands(self):
         graph = {"ops": [_op([1000], dtype="bfloat16")]}
         assert activation_bytes_at(graph, 200) == peak_activation_bytes(graph)
+
+
+class TestWhatCaptureActuallyCosts:
+    """Two different questions. `graph_pool_bytes` mirrors the engine's
+    estimator, which is the number that reserves the memory and so is what a
+    modelled budget must reproduce. `measured_graph_pool_bytes` predicts the
+    cost. They disagree by 4-19x, and the engine's is blind to the ladder."""
+
+    LADDER = (1, 2, 4, 8, 16, 32, 48, 64, 128, 256, 512)
+
+    def test_the_pool_grows_with_the_ladder_where_the_estimate_does_not(self):
+        short = measured_graph_pool_bytes((1, 2, 4, 8, 16))
+        long = measured_graph_pool_bytes(self.LADDER)
+        assert long > 3 * short
+        # The engine's estimator takes the peak activations, which belong to
+        # the warmup shape; the ladder does not enter it.
+        assert graph_pool_bytes(1 << 27) == graph_pool_bytes(1 << 27)
+
+    def test_the_floor_dominates_a_short_ladder(self):
+        """At the shortest ladder measured, 87% of the pool was the floor."""
+        tiny = measured_graph_pool_bytes((1,))
+        assert tiny > 0.9 * DEFAULT_POOL_FLOOR
+
+    def test_capturing_nothing_costs_nothing(self):
+        assert measured_graph_pool_bytes(()) == 0
+        assert measured_graph_pool_bytes(self.LADDER, enforce_eager=True) == 0
+
+    def test_a_wider_rank_holds_less_of_it(self):
+        assert (measured_graph_pool_bytes(self.LADDER, world_size=2)
+                < measured_graph_pool_bytes(self.LADDER, world_size=1))
+
+    def test_calibration_replaces_the_constants(self):
+        mine = {"graph_pool": {"floor": 10, "per_token": 1,
+                               "sharded_fraction": 0.5}}
+        assert measured_graph_pool_bytes((5,), calibration=mine) == 15
+        assert measured_graph_pool_bytes((5,), world_size=4,
+                                         calibration=mine) == 7
+
+    def test_it_reproduces_the_ladders_it_was_fitted_on(self):
+        """100.0 MiB measured at sum=31 and 402.0 at sum=1071."""
+        M = 1 << 20
+        assert abs(measured_graph_pool_bytes((1, 2, 4, 8, 16)) / M - 100.0) < 8
+        assert abs(measured_graph_pool_bytes(self.LADDER) / M - 402.0) < 24
