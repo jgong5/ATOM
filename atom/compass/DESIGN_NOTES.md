@@ -4283,3 +4283,60 @@ and the calibration was taken from *that* step, so it is a demonstration that
 the two terms are separately right rather than a prediction of an unseen
 configuration. The test of the second thing is a shape the calibration was not
 taken on.
+
+#### That test, run: the constant is not a constant
+
+Cross-applying the constant between the two shapes of one 27B run -- same
+model, same profile, same price list, so nothing varies but the shape:
+
+| step | idle | launches | us/launch |
+| --- | --- | --- | --- |
+| `prefill[bs=4 tok=1256]` | 1.497 ms | 971 | **1.5418** |
+| `decode[bs=4 tok=4 d=4]` | 0.012 ms | 1073 | **0.0114** |
+
+**135x apart.** Calibrated on prefill, the model predicts 1.654 ms of overhead
+for the decode step against 0.012 ms actual -- 8.9% of an 18.5 ms step, invented.
+The other direction is harmless (0.011 ms predicted against 1.497 ms actual,
+-0.46% of a 320 ms step), and the harmless direction is not the one that
+matters: decode is what TPOT is made of.
+
+Validated against the *idle*, not the step, and deliberately. The overhead is
+under half a percent of a prefill step, so a step-level comparison would have
+had any error in the kernel term swamp it -- the two terms have to be checked
+apart or neither is checked at all. `holdout.py` does the cross-application.
+
+**Why it does not transfer is visible in one number: the median gap is zero.**
+In both shapes. So is p90.
+
+| | prefill | decode |
+| --- | --- | --- |
+| median gap | 0.00 us | 0.00 us |
+| p90 gap | 0.00 us | 0.00 us |
+| largest 10 gaps, as a share of all idle | 83.7% | 92.7% |
+
+Nearly every launch is followed by no gap whatever, and essentially all the
+idle is a handful of stalls. `overhead = launches x constant` fits a per-launch
+rate to a quantity that is not per-launch: the numerator is a few stalls, the
+denominator is a launch count, and the two have nothing to do with each other.
+That is why the constant transfers neither between models (9.71 us against
+0.90) nor between shapes of one model (1.54 against 0.011) -- it was never a
+rate, and calibrating it more carefully cannot make it one.
+
+It also depends on the *price list*, since launches are counted as
+`max(1, len(kernels))` per priced operator: the same prefill step reads 0.90 us
+per launch against one price list and 1.54 against another, from the same
+profile. A constant with three dependencies and no mechanism is a fitted
+residual wearing a mechanism's clothes.
+
+What this does **not** overturn: the kernel term. Prices are validated against
+in-situ kernel time per operator, which is a separate measurement and stands.
+The 27B's +0.03% whole-step figure, though, should be read as what it is -- a
+fit residual on the one step the constant came from.
+
+**What replaces it.** The overhead is stalls, so the model should be of stalls:
+how many, and how big, as a function of what the step does. The gap
+distributions already say the count is small and stable (10 gaps carrying
+~90% of idle in both shapes) -- so a per-step constant, or a per-step term that
+scales with something other than launches, is the shape to fit next. That is a
+model change, not a recalibration, and it is the next piece of work on the
+timing side.
