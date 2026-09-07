@@ -4484,14 +4484,52 @@ differed 10x between the same two models and 2600x between shapes of one. But
 "one constant per box" was too strong, and the 40% is the correction: one
 constant per *model on a stack*, measured on any host-bound shape of it.
 
-**A measurement caveat worth carrying.** In several campaigns the *first* shape
-run showed inflated device time -- 131.5 ms at 94 tokens against 71.2 ms at 294
-on the 27B, and 32.9 ms against 22.3 ms at TP=2 on the 0.6B. More tokens, less
-device time, which is backwards. Two warm-up rounds at the same shape do not
-remove it, so something in the first engine start of a sequence is still being
-paid for. It does not touch these numbers, because the plateau is read from the
-*window* and every one of those steps is host-bound, but a reading that depends
-on `busy` from a first run should not be trusted.
+#### `busy` at TP>1 is not device work: the collective absorbs the skew
+
+Several campaigns showed a step's device time running *backwards* in its token
+count -- 131.5 ms at 94 tokens against 71.2 ms at 294 on the 27B, 32.9 against
+22.3 at TP=2 on the 0.6B. The obvious explanation was cold caches, and it is
+wrong. Running one shape twice in a freshly cold container:
+
+| | busy | window | idle |
+| --- | --- | --- | --- |
+| original campaign | 131.5 ms | 211.7 ms | 37.9% |
+| pass A, cold container | 43.3 ms | 213.3 ms | 79.7% |
+| pass B, same container | 32.2 ms | 216.6 ms | 85.1% |
+
+`busy` moves 4x and the window does not move at all. Autotuning fires the same
+six times in both passes, so it is not that either. Per kernel, with identical
+counts:
+
+| kernel | n | A | B | B/A |
+| --- | --- | --- | --- | --- |
+| `Cijk_...` gemm | 257 | 19632.9 us | 19662.2 us | 1.00x |
+| **`cross_device_reduce_1stage`** | 129 | **14554.5 us** | **3400.9 us** | **0.23x** |
+| `_fused_merge_recompute_kernel` | 48 | 1497.2 us | 1488.6 us | 0.99x |
+
+Every compute kernel matches within 4%. All of the variance is the all-reduce,
+and the reason is not mysterious: **a collective kernel's duration includes
+waiting for its peer.** A rank that arrives early sits inside the reduce until
+the other catches up, so the measured "kernel time" of a tensor-parallel step
+absorbs inter-rank skew, which is not device work.
+
+Three consequences.
+
+* `step_accounting`'s idle -- `window - busy` -- **understates** true idle at
+  TP>1, because the waiting is counted as busy.
+* Its host-bound test for `--calibrate` (idle above 10% of the window) can
+  therefore call a genuinely host-bound step device-bound and refuse to
+  measure the host constant. It warns about this now rather than silently
+  adjusting: which part of a collective's duration is transfer and which is
+  waiting is not visible in the trace, and inventing a split would be worse
+  than naming the limit.
+* Any in-situ-versus-isolated comparison at TP>1 has the same contamination on
+  its in-situ side.
+
+None of it touches the host constant, which is read from the *window*, or the
+device-bound points, where the device is saturated and there is no skew to
+absorb. It does touch anything that reads `busy` from a host-bound step at
+TP>1, which should now be read as an upper bound on device work.
 
 **Still to do here, and it is the box's fault rather than the method's.** The
 27B and TP=4 runs of the same campaign died at initialisation, repeatedly:

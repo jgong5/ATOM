@@ -207,6 +207,21 @@ def main() -> int:
         # one the device bound spent its time on kernels and says nothing about
         # how fast the host could feed it, beyond an upper bound. Idle is the
         # tell: a host-bound step has plenty, a device-bound one has none.
+        # At TP>1 a collective kernel's duration includes waiting for its
+        # peer, so `busy` absorbs inter-rank skew and this idle figure is an
+        # *under*-estimate -- a genuinely host-bound step can look device-bound
+        # here. Measured: one all-reduce set moved 14.55 ms to 3.40 ms between
+        # two runs of one shape while every compute kernel held to within 4%.
+        # Which part of a collective is transfer and which is waiting is not in
+        # the trace, so this names the limit rather than inventing a split.
+        collective = sum(float(e.get("dur", 0)) for e in inside
+                         if "reduce" in str(e.get("name", "")).lower()
+                         or "nccl" in str(e.get("name", "")).lower())
+        if collective:
+            print(f"\n  NOTE: {collective / 1e3:.3f} ms of the kernel time is "
+                  f"collectives, whose duration includes waiting for a peer.\n"
+                  f"  The idle above is an under-estimate and this step may be "
+                  f"more host-bound than it looks.")
         host_bound = idle > 0.10 * (window / 1e6)
         host_per = (window / 1e6) / launches if launches else 0.0
         record = {
