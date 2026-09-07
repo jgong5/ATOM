@@ -4294,11 +4294,31 @@ model, same profile, same price list, so nothing varies but the shape:
 | `prefill[bs=4 tok=1256]` | 1.497 ms | 971 | **1.5418** |
 | `decode[bs=4 tok=4 d=4]` | 0.012 ms | 1073 | **0.0114** |
 
-**135x apart.** Calibrated on prefill, the model predicts 1.654 ms of overhead
-for the decode step against 0.012 ms actual -- 8.9% of an 18.5 ms step, invented.
-The other direction is harmless (0.011 ms predicted against 1.497 ms actual,
--0.46% of a 320 ms step), and the harmless direction is not the one that
-matters: decode is what TPOT is made of.
+**135x apart** -- and then the interesting part, which is that this does *not*
+show what it first appeared to.
+
+**Correction, and it matters.** These two steps are on opposite sides of a
+regime boundary the oracle already respects. `estimate()` branches on
+`capture_bucket`: a replayed step is charged `launches x boundary_seconds`, a
+compiled-but-not-replayed one `launches x compiled_seconds_per_launch`, an
+eager one a dispatch term -- and the comment beside it already says the
+difference is thirtyfold. The prefill here ran eagerly; the decode has
+essentially no gaps at all, which is the signature of a replay: one submission,
+the host out of the loop, 950 kernels and 0.012 ms between them. So the model
+would never apply the prefill constant to that decode step, and the "8.9% of an
+18.5 ms step, invented" that this entry first claimed does not follow. What the
+135x actually demonstrates is that the regime split is *justified*, which is
+evidence for the model's structure rather than against it.
+
+(The decode graph's own `capture_bucket` is null, but that artifact came from a
+trace-mode run, where capture is skipped by design -- so it cannot testify to
+how the profiled step ran. The near-zero gaps are the evidence, and they are
+strong but indirect.)
+
+So the held-out question is still open, and the test that answers it is a
+**within-regime** one: two eager prefill steps of different shapes, or two
+replayed decode steps at different rungs. Crossing regimes was the wrong
+experiment, and it took building a stall model on top of it to notice.
 
 Validated against the *idle*, not the step, and deliberately. The overhead is
 under half a percent of a prefill step, so a step-level comparison would have
@@ -4314,13 +4334,17 @@ In both shapes. So is p90.
 | p90 gap | 0.00 us | 0.00 us |
 | largest 10 gaps, as a share of all idle | 83.7% | 92.7% |
 
-Nearly every launch is followed by no gap whatever, and essentially all the
-idle is a handful of stalls. `overhead = launches x constant` fits a per-launch
-rate to a quantity that is not per-launch: the numerator is a few stalls, the
-denominator is a launch count, and the two have nothing to do with each other.
-That is why the constant transfers neither between models (9.71 us against
-0.90) nor between shapes of one model (1.54 against 0.011) -- it was never a
-rate, and calibrating it more carefully cannot make it one.
+Nearly every launch is followed by no gap whatever, and the idle is
+concentrated in a few stalls -- the largest ten are 36% of the prefill step's
+idle, and the largest gaps all sit at kernel indices 1 to 34, at the very
+*start* of the step. Whatever they are, they are not a per-launch rate spread
+evenly over the step.
+
+That much survives the correction above, and it is a reason to doubt
+`launches x constant` as the *within-regime* form -- but it is now a
+hypothesis to test rather than a demonstrated failure. The one thing the
+cross-regime comparison did establish is that the constant does not transfer
+between models (9.71 us against 0.90), which was already known.
 
 It also depends on the *price list*, since launches are counted as
 `max(1, len(kernels))` per priced operator: the same prefill step reads 0.90 us
@@ -4333,10 +4357,17 @@ in-situ kernel time per operator, which is a separate measurement and stands.
 The 27B's +0.03% whole-step figure, though, should be read as what it is -- a
 fit residual on the one step the constant came from.
 
-**What replaces it.** The overhead is stalls, so the model should be of stalls:
-how many, and how big, as a function of what the step does. The gap
-distributions already say the count is small and stable (10 gaps carrying
-~90% of idle in both shapes) -- so a per-step constant, or a per-step term that
-scales with something other than launches, is the shape to fit next. That is a
-model change, not a recalibration, and it is the next piece of work on the
-timing side.
+**What to do next.** Run the within-regime test: profile two eager prefill
+steps of different token counts and ask whether one per-launch constant serves
+both. If it does, the term is fine and only its calibration scope was ever in
+question. If it does not, the stall structure above says what to replace it
+with -- the idle is a few stalls clustered at the start of a step, so a
+per-step term rather than a per-launch one.
+
+**A method note worth keeping.** Two of the numbers on the way here were
+wrong in ways that only checking caught. A naive next-start-minus-previous-end
+gap walk gave 3.885 ms of prefill idle against `step_accounting`'s 1.497 ms;
+the union of kernel intervals showed no overlap at all, so the difference was
+entirely kernels straddling the step boundary that the naive filter dropped --
+`step_accounting`'s figure is the right one. And the cross-regime comparison
+above looked like a model failure until the oracle's own branching was read.

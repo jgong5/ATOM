@@ -12,6 +12,13 @@ deliberately. A step-level comparison cannot answer this: the overhead is under
 half a percent of a prefill step, so any error in the kernel term swamps it.
 What is cross-applied is the constant against the idle it claims to predict.
 
+**Compare shapes within one regime.** `PricedGraphCostOracle.estimate` charges
+a replayed step, a compiled-not-replayed step and an eager step by three
+different terms, so cross-applying a constant between, say, an eager prefill
+and a replayed decode compares numbers the model never mixes -- it will show a
+large ratio and prove nothing. Pick two steps the oracle would charge the same
+way.
+
     python scripts/compass/holdout.py <trace-dir> \\
         --shape prefill:g.prefill.json:prices.json \\
         --shape decode:g.json:prices.json
