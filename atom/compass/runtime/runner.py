@@ -1058,13 +1058,21 @@ class CompassModelRunner(ModelRunner):
         source = self._recorded_memory()
         config = self._memory_config()
         readings = source.readings_for(config) if source else None
+        expected = self._expected_non_torch()
         if readings is None:
             if source is not None:
                 logger.warning("ATOMCompass WARNING: sizing from this device: "
-                               "%s", source.refusal(config))
+                               "%s", source.refusal(config, expected))
             yield
             return
-        refusal = source.refusal(config)
+        spread = source.rank_disagreement(config)
+        if spread:
+            logger.warning(
+                "ATOMCompass WARNING: the ranks of this record disagree about "
+                "`non_torch` by %.0f MiB. They do the same work, so a spread is "
+                "the neighbours arriving on some cards and not others -- this "
+                "budget is partly the box's.", spread / 2**20)
+        refusal = source.refusal(config, expected)
         if refusal:
             logger.warning("ATOMCompass WARNING: sizing from this device: %s",
                            refusal)
@@ -1188,6 +1196,23 @@ class CompassModelRunner(ModelRunner):
                            "budget from %s (%s); sizing from this device",
                            path, exc)
         return self._modelled
+
+    def _expected_non_torch(self) -> Optional[int]:
+        """What the collective terms say this width should hold outside torch.
+
+        Only a yardstick for the guard, never a term in a recorded budget --
+        the point of reading a record is to use what was measured.
+        """
+        try:
+            from atom.compass.core.memory_model import non_torch_bytes
+
+            world = 1
+            for size in self._topology().values():
+                world *= max(1, int(size))
+            return non_torch_bytes(world)
+        except Exception as exc:  # noqa: BLE001 - a guard must not fail a run
+            logger.debug("ATOMCompass: no expected non_torch: %s", exc)
+            return None
 
     def _recorded_memory(self):
         """The memory records this run was given, loaded once."""

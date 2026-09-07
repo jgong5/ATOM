@@ -1415,10 +1415,36 @@ cannot run is answering a different question.
    arithmetically close and wrong about why, which is the kind of agreement
    that stops being right the moment the configuration changes.
 
+   **`non_torch` now has the guard `free` always had.** The case for it got a
+   great deal sharper than "a distorted measurement": six runs on the shared
+   box died at *start-up* with
+
+       available_for_kv=-103667.58MB (budget=57.60GB, peak_torch=2.94GB,
+       non_torch=152.01GB, cudagraph_est=0.05GB, safety=3.84GB, free=37.16GB)
+
+   152 GB of `non_torch` on a card where the process had reserved 2.9 GB. No
+   utilization setting fixes that -- the budget only goes positive above 0.83,
+   which on a box shared with twenty containers is not a number to reach for,
+   and the `min(budget, free)` clamp refuses it anyway.
+
+   Two checks, because they fail in different situations:
+
+   * **Against the model.** A recorded `non_torch` far above what the
+     collective terms say the width should hold is measuring the box. The
+     expectation is passed in rather than imported, so the recorded side of
+     the project does not acquire a dependency on the derived side. The
+     tolerance is deliberately loose -- the case worth catching is 50x, not
+     50%.
+   * **Against the other ranks.** Ranks of a symmetric group do the same work
+     and should agree to the byte. At widths 1 and 2 they did; at 4 they spread
+     192 MiB and at 8 by 640 MiB. A spread is a direct, single-run measurement
+     of contamination that needs no model at all, and it is reported as a
+     warning rather than a refusal because a few hundred MiB on a 192 GB card
+     is not a reason to throw a record away.
+
    Still to do: a third model for the model-dependent parts of `non_torch` and
    the load residue (the 30B-A3B checkpoint is only part-downloaded and this
-   box is offline), the graph pool's width scaling on more than one point, and
-   a guard on `non_torch` of the kind `free` already has.
+   box is offline), and the graph pool's width scaling on more than one point.
 
    **Fixing the TP spread: peaks agreed for the wrong reasons, so compare
    curves.** -0.3% / +12.6% / -9.1% has no shape as an error, and the peak is

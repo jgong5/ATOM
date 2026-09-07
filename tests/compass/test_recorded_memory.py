@@ -102,3 +102,65 @@ class TestTermsThatWereOnceOneNumber:
                 readings.current_torch) == (5, 4, 6)
         # The split is the reader's arithmetic, not a stored derivation.
         assert readings.peak_torch - readings.current_torch == 2
+
+
+class TestNonTorchIsAlsoAPropertyOfTheBox:
+    """`non_torch` is `(total - free) - reserved`, and `total - free` is
+    device-wide, so a neighbour's memory is charged to this configuration --
+    the same defect `free` has, unguarded because the number looks like a
+    property of the process. On a shared box it stopped being a distorted
+    measurement and became a failure to launch."""
+
+    def test_a_plausible_reading_passes(self, tmp_path):
+        path = _record(tmp_path, non_torch=6 * 2**30)
+        assert RecordedMemory([path]).refusal(
+            CONFIG, expected_non_torch=7 * 2**30) is None
+
+    def test_a_reading_that_is_measuring_the_box_is_refused(self, tmp_path):
+        """152 GB recorded where this rank had reserved 2.9 GB."""
+        path = _record(tmp_path, non_torch=152 * 2**30)
+        why = RecordedMemory([path]).refusal(CONFIG,
+                                             expected_non_torch=7 * 2**30)
+        assert why is not None and "device-wide" in why
+
+    def test_no_expectation_means_no_opinion(self, tmp_path):
+        """The guard needs a yardstick; without one it must not invent a
+        refusal."""
+        path = _record(tmp_path, non_torch=152 * 2**30)
+        assert RecordedMemory([path]).refusal(CONFIG) is None
+
+    def test_ranks_that_agree_report_no_spread(self, tmp_path):
+        import json
+
+        paths = []
+        for rank in (0, 1):
+            where = tmp_path / ("r%d.json" % rank)
+            config = dict(CONFIG, topology={"tp": 2}, rank_coords={"tp": rank})
+            where.write_text(json.dumps({
+                "version": 1, "config": config,
+                "readings": {"total": 100, "free": 90, "peak_torch": 8,
+                             "non_torch": 6 * 2**30, "cudagraph_overhead": 0}}))
+            paths.append(str(where))
+        source = RecordedMemory(paths)
+        want = dict(CONFIG, topology={"tp": 2}, rank_coords={"tp": 0})
+        assert source.rank_disagreement(want) == 0
+
+    def test_ranks_that_disagree_measure_the_contamination(self, tmp_path):
+        """Ranks do the same work, so a spread is the neighbours arriving on
+        some cards and not others -- 192 MiB at TP=4, 640 MiB at TP=8."""
+        import json
+
+        paths = []
+        for rank, non_torch in ((0, 6 * 2**30), (1, 6 * 2**30 + 192 * 2**20)):
+            where = tmp_path / ("r%d.json" % rank)
+            config = dict(CONFIG, topology={"tp": 2}, rank_coords={"tp": rank})
+            where.write_text(json.dumps({
+                "version": 1, "config": config,
+                "readings": {"total": 100, "free": 90, "peak_torch": 8,
+                             "non_torch": non_torch, "cudagraph_overhead": 0}}))
+            paths.append(str(where))
+        want = dict(CONFIG, topology={"tp": 2}, rank_coords={"tp": 0})
+        assert RecordedMemory(paths).rank_disagreement(want) == 192 * 2**20
+
+    def test_one_rank_alone_cannot_say(self, tmp_path):
+        assert RecordedMemory([_record(tmp_path)]).rank_disagreement(CONFIG) is None
