@@ -1539,7 +1539,8 @@ cannot run is answering a different question.
    | 0.6B TP=1 | 96033 | 96051 | **-0.02%** |
    | 0.6B TP=2 | 183709 | 183745 | **-0.02%** |
    | 0.6B TP=4 | 367614 | 367364 | **+0.07%** |
-   | **27B TP=2** | **38202** | **37858** | **+0.91%** |
+   | 27B TP=2, walk alone | 38202 | 37858 | +0.91% |
+   | **27B TP=2, walk + scratch** | **37825** | **37858** | **-0.09%** |
 
    The 27B is the point of running this on a hybrid, and it found something.
    Every term but one is exact -- weights from the meta build, buffers, load
@@ -1576,13 +1577,32 @@ cannot run is answering a different question.
    0.6B has almost none; the hybrid's chunked-scan and DeltaNet kernels have a
    great deal.
 
-   The fix has a shape, and the trace already records what it needs. Comparing
-   the walk's curve against `allocated_after_bytes` attributes the shortfall to
-   the operator that caused it, and per-token scratch is a structural fact
-   about an operator -- the same kind of thing `output_aliases` and `dies_at`
-   already are, recorded once at one shape and applied at any. That is the next
-   piece of work on the memory side, and until it lands the activation term
-   should be read as a lower bound on any hybrid.
+   **The fix, and the one it is not.** Per-operator attribution was the obvious
+   move and is the wrong one: correcting the walk operator by operator from the
+   recorded curve reproduces the recorded curve. Exact at the traced shape by
+   construction, worth nothing at any other, and dressed up as a model.
+
+   What generalises is a single number -- the shortfall per token -- on the
+   same linear-in-tokens footing as the rest of the term. Fitted at the traced
+   3494 tokens and asked for the 4096-token warmup peak, which was measured
+   independently:
+
+   | | 0.6B | 27B |
+   | --- | --- | --- |
+   | scratch fitted | 0.1 KB/token | 39.6 KB/token |
+   | walk alone, held out | +0.0% | **-35.0%** |
+   | walk + scratch, held out | +0.3% | **+3.4%** |
+
+   End to end, the 27B's block count goes from +0.91% to **-0.09%**, and back
+   to the safe side of the measurement. The 0.6B is untouched, because a model
+   with no invisible scratch records none.
+
+   Two limits, both in the docstring rather than implied. It generalises to a
+   *shape* the trace was not taken at; it does **not** generalise to a model
+   that was never traced, so this does not restore "size a configuration nobody
+   has run" for hybrids -- the graph now has to come from a real run rather
+   than from meta. And it is clamped at zero: a walk that over-counts is a
+   different fault, and subtracting here would hide it.
 
    TP=1 and TP=2 land under, which is the safe direction -- fewer blocks than
    the device would have allowed, never more. TP=4 lands 250 blocks *over*, and

@@ -8,11 +8,14 @@ records which operator produced each input.
 import json
 import struct
 
+import pytest
+
 from atom.compass.core.memory_model import (
     DEFAULT_NON_TORCH, DEFAULT_PERSISTENT, DEFAULT_POOL_FLOOR,
     activation_bytes_at, activation_curve, graph_pool_bytes,
     load_residue_bytes, measured_graph_pool_bytes, modelled_readings,
-    non_torch_bytes, peak_activation_bytes, weight_bytes)
+    non_torch_bytes, peak_activation_bytes, scratch_bytes_per_token,
+    weight_bytes)
 
 
 def _write_checkpoint(directory, tied, tensors):
@@ -416,3 +419,51 @@ class TestWhatCaptureActuallyCosts:
         M = 1 << 20
         assert abs(measured_graph_pool_bytes((1, 2, 4, 8, 16)) / M - 100.0) < 8
         assert abs(measured_graph_pool_bytes(self.LADDER) / M - 402.0) < 24
+
+
+class TestWhatTheTracerCannotSee:
+    """`torch.empty` inside a custom operator never crosses the dispatcher. For
+    an out-variant the destination is recoverable and is recovered; for an
+    operator that *returns* a tensor and also allocates internal scratch,
+    nothing in the graph says the scratch exists. The 0.6B has almost none
+    (0.1 KB/token); the hybrid 27B has 39.6, enough to put the walk 37% under
+    its own step's measured peak."""
+
+    def _graph(self, measured=None, tokens=100):
+        graph = {"key": {"batch_signature": [tokens]},
+                 "ops": [_op([1000], dtype="bfloat16")]}
+        if measured is not None:
+            graph["provenance"] = {"activation_peak_bytes": measured}
+        return graph
+
+    def test_no_measured_peak_leaves_the_walk_alone(self):
+        graph = self._graph()
+        assert scratch_bytes_per_token(graph) == 0.0
+        assert activation_bytes_at(graph, 200) == 2 * peak_activation_bytes(graph)
+
+    def test_the_shortfall_is_recorded_per_token(self):
+        graph = self._graph(measured=peak_activation_bytes(self._graph()) + 5000,
+                            tokens=100)
+        assert scratch_bytes_per_token(graph) == 50.0
+
+    def test_a_walk_that_already_matches_records_nothing(self):
+        walk = peak_activation_bytes(self._graph())
+        assert scratch_bytes_per_token(self._graph(measured=walk)) == 0.0
+
+    def test_a_walk_that_over_counts_is_not_corrected_downwards(self):
+        """Clamped at zero. The walk over-counting is a different fault and
+        subtracting here would hide it."""
+        walk = peak_activation_bytes(self._graph())
+        assert scratch_bytes_per_token(self._graph(measured=walk // 2)) == 0.0
+
+    def test_the_correction_scales_with_the_shape(self):
+        """Both halves are activation memory and both are linear in tokens --
+        which is what makes this worth recording at all. Fitted at 3494 tokens
+        on the 27B it predicts the 4096-token warmup peak to +3.4%, against
+        -35.0% for the walk alone."""
+        base = self._graph()
+        graph = self._graph(measured=peak_activation_bytes(base) + 5000,
+                            tokens=100)
+        at100 = activation_bytes_at(graph, 100)
+        at200 = activation_bytes_at(graph, 200)
+        assert at200 == pytest.approx(2 * at100, rel=1e-6)

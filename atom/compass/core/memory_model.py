@@ -40,6 +40,7 @@ from typing import Mapping, Optional
 __all__ = ["peak_activation_bytes", "activation_curve", "weight_bytes",
            "resident_bytes", "non_torch_bytes", "load_residue_bytes",
            "modelled_readings", "activation_bytes_at",
+           "scratch_bytes_per_token",
            "graph_pool_bytes", "measured_graph_pool_bytes", "ELEMENT_BYTES"]
 
 ELEMENT_BYTES = {
@@ -442,6 +443,37 @@ def load_residue_bytes(world_size: int,
 DEFAULT_PERSISTENT = 118 * MIB
 
 
+def scratch_bytes_per_token(graph) -> float:
+    """Activation memory per token that no recorded operator output explains.
+
+    A dispatch tracer sees what crosses the dispatcher. `torch.empty` called
+    inside a custom operator does not: re-entering the operator from
+    `__torch_dispatch__` runs below the mode. For an out-variant the
+    destination can be recovered, and is; for an operator that *returns* a
+    tensor and also allocates internal scratch, nothing in the graph says the
+    scratch exists. The 0.6B has almost none. The hybrid 27B's chunked-scan and
+    DeltaNet kernels have enough to put the walk 37% under its own step's
+    measured peak.
+
+    **This is measured, not derived, and deliberately so.** Correcting the walk
+    per operator from the recorded curve would just reproduce the recorded
+    curve -- exact at the traced shape and worth nothing. What is recorded here
+    is one number, the shortfall per token, on the same linear-in-tokens
+    footing as the rest of the activation term. It generalises to a shape the
+    trace was not taken at, which is the only thing attribution can honestly
+    buy. It does not generalise to a model that was never traced.
+
+    Zero when the graph carries no measured peak to compare against, which
+    leaves the walk exactly as it was.
+    """
+    measured = (graph.get("provenance") or {}).get("activation_peak_bytes")
+    tokens = sum(int(n) for n in
+                 ((graph.get("key") or {}).get("batch_signature") or ()))
+    if not measured or not tokens:
+        return 0.0
+    return max(0.0, (int(measured) - peak_activation_bytes(graph)) / tokens)
+
+
 def activation_bytes_at(graph, tokens: int) -> int:
     """The activation peak at a token count the graph was not traced at.
 
@@ -452,7 +484,11 @@ def activation_bytes_at(graph, tokens: int) -> int:
     peak = peak_activation_bytes(graph)
     traced = sum(int(n) for n in
                  ((graph.get("key") or {}).get("batch_signature") or ()))
-    return int(peak * tokens / traced) if traced and tokens else peak
+    if not (traced and tokens):
+        return peak
+    # The walk scales, and so does what the walk cannot see -- both are
+    # activation memory and both are linear in tokens.
+    return int(peak * tokens / traced + scratch_bytes_per_token(graph) * tokens)
 
 
 def modelled_readings(*, total_bytes: int, world_size: int, parameters: int,
