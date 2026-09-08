@@ -15,6 +15,11 @@ Effort estimates are rough: **S** hours, **M** days, **L** weeks or unknown.
 Defects in ATOM itself, rather than in Compass, are collected separately in
 [ATOM_DEFECTS.md](ATOM_DEFECTS.md).
 
+**Start with [POC_SUMMARY.md](POC_SUMMARY.md)** if you want the conclusions
+rather than the reasoning. This file is the working log -- written as each thing
+was found, kept because the reasoning survives the context it was found in, and
+long. Parts of it are stale; where the two disagree, the summary is newer.
+
 ---
 
 # Status
