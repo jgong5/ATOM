@@ -34,6 +34,13 @@ def main() -> int:
              "to the shapes their steps recorded and are unaffected.")
     parser.add_argument("--out", required=True)
     parser.add_argument(
+        "--sweep-long-decode", type=int, default=64,
+        help="tokens to generate per long round. Decode is fitted per "
+             "CUDA-graph rung against total context, so a rung asked about "
+             "millions of tokens of history needs samples there; four tokens "
+             "a round leaves it fitted on short context and under-predicting "
+             "time per output token by 71%%.")
+    parser.add_argument(
         "--sweep-long", action="store_true",
         help="add long-context rounds to --sweep, out to a 262144-token "
              "prompt. Needed before predicting a workload with long prompts: "
@@ -123,6 +130,9 @@ def main() -> int:
             (64, 24), (256, 24), (64, 32), (256, 32),
             (64, 48), (192, 48), (64, 64), (128, 64),
         ]
+        # (prompt tokens, concurrent requests) so far; the long rounds below
+        # need a third field, because sampling decode is the point of them.
+        rounds = [(length, count, args.max_tokens) for length, count in rounds]
         if args.sweep_long:
             # Long context. Everything above is a prompt of at most 1024
             # tokens, so the table it produces has no evidence past a context
@@ -137,19 +147,38 @@ def main() -> int:
             # 0, 16k, 32k and so on. That is exactly the coverage wanted, and
             # it is why this costs about 684k tokens in total rather than
             # anything alarming -- roughly a minute of forward.
+            # Decode is fitted per CUDA-graph rung against *total* context --
+            # the sum across the batch, not the average -- so a rung needs
+            # samples spanning the total contexts it will be asked about. The
+            # first version of these rounds varied only prompt length at one
+            # request each, which covers prefill and leaves decode where it
+            # was: the cc-traces pilot ran twenty concurrent requests at 164k
+            # each, rung 32 at a total context of 3.3M, against rung-32 samples
+            # taken at 2k and 8k. Four hundred times outside its evidence, and
+            # it under-predicted time per output token by 71%.
+            #
+            # So each rung is sampled at two or three total contexts reaching
+            # into the millions. Long prompts are the cheap way to get there:
+            # 32 requests of 49152 tokens is a total context of 1.57M against a
+            # pool of about 8M.
+            long_decode = args.sweep_long_decode
             rounds += [
-                (2048, 1), (4096, 1), (8192, 1), (16384, 1), (32768, 1),
-                (65536, 1), (131072, 1), (196608, 1), (258048, 1),
-                # Two at once, so the batched-token dimension is covered at
-                # long context as well as at short.
-                (16384, 2), (65536, 2), (110592, 2),
+                # Rung 1, out to the model's context limit -- prefill coverage.
+                (2048, 1, long_decode), (4096, 1, long_decode),
+                (8192, 1, long_decode), (16384, 1, long_decode),
+                (65536, 1, long_decode), (131072, 1, long_decode),
+                (196608, 1, long_decode), (258048, 1, long_decode),
+                # Rungs 8, 16 and 32 at long total context -- decode coverage.
+                (16384, 8, long_decode), (65536, 8, long_decode),
+                (16384, 16, long_decode), (65536, 16, long_decode),
+                (16384, 32, long_decode), (49152, 32, long_decode),
             ]
         # Twice through, because Triton autotunes per shape rather than once per
         # process: the first visit to a shape pays a benchmarking cost that
         # steady-state serving never pays again. The second visit is the one
         # worth fitting, and having both lets the outlier rejection see the
         # difference rather than guess at it.
-        for round_index, (length, count) in enumerate(rounds + rounds):
+        for round_index, (length, count, decode) in enumerate(rounds + rounds):
             llm.generate(
                 # Exactly `length` tokens each, and a distinct opening per
                 # prompt so no two share prefix-cache blocks. This built its
@@ -159,7 +188,7 @@ def main() -> int:
                 # long one did not, being silently truncated at max_model_len.
                 [prompt_of_tokens(length, round_index * 10007 + i)
                  for i in range(count)],
-                SamplingParams(temperature=0.0, max_tokens=args.max_tokens),
+                SamplingParams(temperature=0.0, max_tokens=decode),
             )
         print("sweep complete")
         with open(args.out, "w", encoding="utf-8") as fh:
