@@ -2856,6 +2856,35 @@ doubled group, which fits linear-in-group (2.1 then 2.43 per rank), linear in
 log2 (4.2 then 4.86) and nothing cleanly. TP=8 would separate them, and until
 then the term should be read as measured per group size rather than as a law.
 
+**TP=8 was run, and the measurement is blocked upstream.** The 27B was traced
+and priced at TP=4 and TP=8 on an idle machine, TP=4 included as an anchor
+because these constants had only ever been measured on one box. The decode
+steps are as clean as they come -- fifteen replayed steps, all bs=4 bucket=4,
+9.761 to 9.829 ms -- and the graph matches them exactly. But:
+
+| | priced plain | priced collective | priced total | measured step |
+| --- | --- | --- | --- | --- |
+| 27B TP=4 | 10.172 ms | 1.243 ms | 11.415 ms | 9.774 ms |
+| 27B TP=8 | 8.454 ms | 1.378 ms | 9.833 ms | 7.864 ms |
+
+The priced sum **exceeds** the step it is inside, so `overhead = step - priced`
+is negative and there is nothing to attribute. The method cannot be applied to
+these runs at all.
+
+It is not the collectives. The plain launches alone overshoot by **+4.1%** at
+TP=4 and **+7.5%** at TP=8, and the collectives then add more on top. Nor is it
+the inner-kernel double count the section above warns about: excluding every op
+that carries a `launch` moves the total by 4 microseconds.
+
+This inverts the sign of a relationship the project has relied on throughout --
+"every kernel measured so far comes out cheaper on its own than the same kernel
+inside a forward" -- so it is not a small discrepancy to route around. Whether
+the prices have drifted, or a replayed whole-step graph runs its kernels better
+than a per-operator capture does, is the question to answer before any
+boundary constant is re-fitted. Until then the TP=2 and TP=4 figures above
+stand as what they were when measured, and the collective term stays "measured
+per group size", unsettled.
+
 On #4, which recorded a 19% calibrate-vs-evaluate gap on TP=4 prefill that was
 never explained: the priced oracle gets TTFT to +6.46% on the same configuration.
 That does not explain the 19%, but it does locate most of it in the calibrated
