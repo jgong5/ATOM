@@ -2871,19 +2871,41 @@ The priced sum **exceeds** the step it is inside, so `overhead = step - priced`
 is negative and there is nothing to attribute. The method cannot be applied to
 these runs at all.
 
-It is not the collectives. The plain launches alone overshoot by **+4.1%** at
-TP=4 and **+7.5%** at TP=8, and the collectives then add more on top. Nor is it
-the inner-kernel double count the section above warns about: excluding every op
-that carries a `launch` moves the total by 4 microseconds.
+It is not the collectives -- the plain launches alone overshoot by +4.1% at
+TP=4 and +7.5% at TP=8 -- and not the inner-kernel double count either:
+excluding every op that carries a `launch` moves the total by 4 microseconds.
 
-This inverts the sign of a relationship the project has relied on throughout --
-"every kernel measured so far comes out cheaper on its own than the same kernel
-inside a forward" -- so it is not a small discrepancy to route around. Whether
-the prices have drifted, or a replayed whole-step graph runs its kernels better
-than a per-operator capture does, is the question to answer before any
-boundary constant is re-fitted. Until then the TP=2 and TP=4 figures above
-stand as what they were when measured, and the collective term stays "measured
-per group size", unsettled.
+**It is that the price list is a mixture, and the caveat was printing all
+along.** Profiling the same configuration and attributing in situ per kernel:
+
+    priced in isolation 11.415 ms
+    same work in situ   10.529 ms
+    (203 operators were timed outside a graph, so their price carries launch
+     overhead; graph-captured alone is 9.975 ms)
+
+203 operators could not be graph-captured and fell back to back-to-back
+timing, so their prices *already contain* the per-launch overhead a graph
+amortises. Summing that mixture against a replayed step charges overhead twice
+for those 203.
+
+Restricted to the graph-captured prices, **9.975 ms isolated against 10.529 ms
+in situ, -5.3%** -- isolated cheaper than in situ, exactly the relationship this
+project has always found. Nothing is inverted. An earlier version of this entry
+said it was; that was wrong, and the mistake was reading a total whose own
+caveat line explains it.
+
+Two kernels are worth naming from the per-kernel table:
+`__amd_rocclr_copyBuffer` prices at **+200.5%** of its in-situ cost, and
+`cross_device_reduce_1stage` at **+19.5%** -- the collective, whose isolated
+price absorbs inter-rank skew for the same reason its in-situ duration does.
+
+**The boundary constant stays blocked, but now for a stated reason.** The
+method needs `step - priced`, and with 12.6% of the priced total coming from
+fallback prices neither including those operators nor excluding them gives a
+clean residual: include them and their overhead is counted twice, exclude them
+and their kernel time goes missing. It needs either those 203 to become
+graph-captured, or their overhead component separated from their kernel time.
+Until then the TP=2 and TP=4 figures stand as what they were when measured.
 
 On #4, which recorded a 19% calibrate-vs-evaluate gap on TP=4 prefill that was
 never explained: the priced oracle gets TTFT to +6.46% on the same configuration.
