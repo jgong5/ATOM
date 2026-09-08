@@ -5124,3 +5124,47 @@ they tested that a paced clock holds a future arrival, which it does. What they
 could not test is which arrival establishes the origin under concurrent posting,
 because that is a property of the client and the engine together. The smoke run
 cost four requests and two minutes.
+
+## cc-traces, first result: latency is right by cancellation
+
+A real agentic trace, replayed against the real engine and against the
+simulator, 20 requests of a Claude Code session at a median of 163,584 input
+tokens. Both sides read from `/compass/requests`, so both are the engine's own
+measurement -- wall time on one, simulated time on the other.
+
+| | real | modelled | |
+| --- | --- | --- | --- |
+| TTFT, median | 28.35 s | 50.58 s | **+51.6%** on totals |
+| decode time, median | 56.16 s | 25.44 s | **-30.3%** on totals |
+| per output token, median | 120.7 ms | 53.5 ms | **-71.1%** on totals |
+| **latency, median** | **76.28 s** | **75.91 s** | **-5.0%** |
+
+**Latency agrees to 1.3% per request and it means nothing on its own.** The
+model puts half again too much time before the first token and a third too
+little after it, and the two nearly cancel. This is the third time in this
+project that an aggregate has looked good by cancellation -- the priced sum
+matching the step while over-pricing what it covers by 5.6% and omitting 4.8%,
+and the boundary constant absorbing pricing error -- and it is the reason the
+per-request split is printed rather than the total.
+
+**The decode miss has a cause visible in the calibration.** The sweep was run
+with `--max-tokens 4`, so a long round contributes about four decode samples
+against sixteen prefill chunks, and its decode contexts come out at a median of
+258 with a p90 of 65k. The decode model is therefore fitted almost entirely on
+short context and then asked about 164k, where attention over the history is
+most of the step. Real per-token time at that context has a median of 120.7 ms
+against 53.5 ms modelled, and a real mean of 303 ms with a maximum of 3376 ms --
+a spread the fitted model does not reproduce at all.
+
+The fix is in the sweep rather than the model: generate enough tokens after a
+long prompt to sample decode where the workload decodes.
+
+**What did work.** Prompt lengths were verified against the server for every
+request. Arrivals were honoured -- the paced real replay took 309 s for a
+workload spanning that long, where an unpaced one would have finished in the
+time the forwards took. And the simulator ran the same workload in **3 seconds
+against 309**, which is the discrete-event jump doing its job: it skips idle
+that the real engine has to sit through.
+
+**Scale, stated.** One session, 20 requests, 3.3M input tokens -- 0.08% of the
+corpus. It is a pipeline result and a decode finding, not a validation.
