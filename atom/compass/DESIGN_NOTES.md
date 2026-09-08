@@ -5173,3 +5173,57 @@ that the real engine has to sit through.
 
 **Scale, stated.** One session, 20 requests, 3.3M input tokens -- 0.08% of the
 corpus. It is a pipeline result and a decode finding, not a validation.
+
+## The decode error is not a decode error: it is the schedule
+
+Covering decode properly (previous section) changed the pilot in a way worth
+recording, because it went the opposite way to the prediction.
+
+| on totals | before | after |
+| --- | --- | --- |
+| TTFT | +51.6% | **-16.9%** |
+| decode | -30.3% | **-63.1%** |
+| per output token | -71.1% | **-81.4%** |
+| latency | -5.0% | **-48.4%** |
+
+TTFT was fixed. Decode got worse, and latency with it. The -5.0% latency really
+had been two errors cancelling: removing one exposed the other at full size.
+
+**Then the diagnosis inverted.** The premise for extending decode coverage was
+that the pilot asked rung 32 about a total context of 3.3M against samples at
+2k and 8k. Both halves were wrong:
+
+* The real run's decode steps never exceed **1M** total context, which the sweep
+  now covers to 2M. It is not extrapolating.
+* At matched total context the sweep and the real run agree on what a decode
+  step costs -- 17.75 ms against 17.14 ms in the 100k-500k band, 16.16 against
+  18.56 in 500k-1M. The step cost model is not the problem.
+
+**Where the time actually goes**, from the real run's own step table, rank 0:
+
+    prefill:   106 steps,  239.4 s   (mean 2258.8 ms a chunk)
+    decode :  4116 steps,   69.1 s   (mean    16.8 ms)
+    host gaps between forwards:   2.6 s
+    total                        311.1 s   -- against a 309 s replay
+
+Prefill is **77% of the run**. And the twenty requests report about 1300 s of
+per-request decode time between them, against 69.1 s of decode steps actually
+executed -- a factor of nineteen. A request in its decode phase is overwhelmingly
+*waiting*, and what it waits behind is other requests' prefill chunks, each
+2.26 seconds long.
+
+So "time per output token" on this workload is not a property of a decode step.
+It is a property of how decode interleaves with chunked prefill, and at a
+2.26-second granularity the interleaving dominates. A cost model that prices
+every step correctly can still be 63% low on decode if it schedules the steps in
+a different order.
+
+**This redirects the work.** The remaining error is in the simulated *schedule*,
+not the simulated step. The next comparison is between the two runs' step
+sequences -- how many prefill and decode steps, in what order, at what
+concurrency -- rather than between their step costs, which now agree.
+
+A caution for whoever picks this up: latency alone would have called the first
+pilot a success at -5.0% and the second a regression at -48.4%, when the second
+is the more truthful model. Aggregate latency is the one number this benchmark
+should never be judged on.
