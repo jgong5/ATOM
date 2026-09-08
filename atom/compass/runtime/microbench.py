@@ -484,8 +484,14 @@ SYNTH_INT_RANGES = os.environ.get("COMPASS_SYNTH_INT_RANGES", "1") != "0"
 #: loading one leaves the process on a device it cannot use -- and is not
 #: sufficient; a rank loading only its own still faults. Since a fault kills the
 #: run rather than leaving one signature unpriced, the default is off where it
-#: is known to happen, and what is lost is small: those kernels are 2.0ms of a
-#: 316ms step on the one model measured.
+#: is known to happen.
+#:
+#: **What is lost is not small on a decode step.** The 2.0 ms this note used to
+#: cite was 0.6% of a 316 ms *prefill*. A decode step is thirty times shorter
+#: and runs the same per-layer generated kernels: on the 27B at TP=4 they are
+#: 112 kernels and 0.465 ms, **4.8% of the step's kernel time**, with 128 of the
+#: graph's 130 generated-kernel operators unpriced. The default trades a fault
+#: for a systematic 5% hole, not for a rounding error.
 #:
 #: Executing generated code is the one part of pricing that runs code this
 #: process did not write, so it has a way off at TP=1 too:

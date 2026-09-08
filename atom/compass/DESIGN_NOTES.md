@@ -5033,3 +5033,40 @@ one -- all within a couple of percent, which is what a repeat run moves the
 total by. That machine's pricing error is not distinguishable from zero. The
 other box's +10.0% and +14.3% are several times the repeat spread and stand.
 Any residual quoted below about 2% is quoting the instrument.
+
+## The generated-kernel hole is 4.8% of a decode step, not 0.6%
+
+Loading inductor-generated kernels faults the device under tensor parallelism,
+so pricing skips them, and that default was justified above at "2.016 ms, 0.6%
+of its kernel time". That measurement is sound and it is a *prefill*: 2.0 ms of
+a 316 ms step. A decode step is thirty times shorter and runs the same per-layer
+generated kernels, so the share is not the same number. On the 27B at TP=4:
+
+| | |
+| --- | --- |
+| generated-kernel operators in the graph | 130, of which **2 priced** |
+| their kernels in a decode step | 112, 0.465 ms corrected |
+| share of the step's kernel time | **4.8%** |
+
+The largest are `triton_per_fused_add_mean_mul_pow_rsqrt_silu` at 48 a step --
+one per DeltaNet layer -- and `triton_poi_fused_add_cat_mul_slice_split_squeeze`
+at 16. These are compiled graph regions rather than Triton launches nested
+inside a dispatched operator, so unlike the 433 `triton::` duplicates dropped
+earlier they are not covered by some other operator's price. The work is simply
+absent.
+
+**And it explains a coincidence that was about to be read as accuracy.** On that
+box the priced sum came to 9.776 ms against a 9.776 ms step, which looked like
+the price list had become exact. It has not:
+
+    priced sum                       9.776 ms
+    in-situ kernel time, corrected   9.725 ms
+      generated, unpriced            0.465 ms   (4.8%)
+      what the priced sum covers     9.259 ms
+    priced is +5.6% of the work it covers, +0.5% of the whole step
+
+Two errors of about five percent, in opposite directions, cancelling. Pricing
+the generated kernels without fixing the over-pricing would take that box's
+residual from +0.5% to about +5%, which is worth knowing before anyone treats
+the fault as the only thing standing between here and a correct price list. It
+is one of two things, and the smaller one.
