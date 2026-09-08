@@ -4889,3 +4889,76 @@ profile, all from one machine at one width, would separate pricing error from
 everything else for the first time -- every comparison so far has had at least
 one of the three from somewhere else. The runs here have the step and the
 profile; only the price list is missing.
+
+## The residual is pricing error, measured: `scripts/compass/residual.py`
+
+Every comparison in this project had been assembled from at least two runs, and
+sometimes two machines. Node 16 in fact had all three quantities -- a priced
+sum, a step and a profile -- but the constant needed to correct the profile came
+from a different run there. Gathering the set properly on one box, at two
+widths, with the profiler's cost measured *inside one process*, splits the
+residual for the first time:
+
+    step  =  device busy  +  idle between kernels  +  work outside the annotation
+    residual  =  (busy - priced)  +  idle
+                  pricing error      boundary
+
+| | priced | step | residual | boundary (idle) | pricing error |
+| --- | --- | --- | --- | --- | --- |
+| 27B TP=4, box A | 9.971 ms | 9.774 ms | -0.197 ms | +0.010 ms (10.5 ns/launch) | -0.207 ms (-2.1%) |
+| 27B TP=4, box B | 11.249 ms | 12.385 ms | +1.135 ms | +0.012 ms (12.6 ns/launch) | +1.123 ms (+10.0%) |
+| 27B TP=8, box B | 8.806 ms | 10.073 ms | +1.267 ms | +0.012 ms (12.8 ns/launch) | +1.255 ms (+14.3%) |
+
+The boundary is 10.5 to 12.8 nanoseconds per launch on three configurations
+across two machines, against the 2250 ns the model charges. On box A the
+modelled boundary is **twelve times the entire residual**, and of the wrong
+sign. The residual is pricing error almost in full.
+
+**The measurement is trustworthy in a way the earlier ones were not**, because
+the step appears twice. The priced run and the profiled run are separate
+processes with slightly different flags, and they agree on the decode step to
++0.11% at TP=4 and +0.21% at TP=8. That agreement is what licenses reading idle
+off one and the priced sum off the other.
+
+**Where the pricing error lives.** Correcting each kernel's in-situ time by the
+profiler's cost per dispatch -- 0.665 to 0.676 us, measured within the process
+that recorded it -- and comparing against the price list's own per-kernel
+breakdown:
+
+| kernel | box A TP=4 | box B TP=4 | box B TP=8 |
+| --- | --- | --- | --- |
+| `__amd_rocclr_copyBuffer` | +262.7% | +186.6% | +171.3% |
+| `cross_device_reduce_1stage` | +33.3% | +12.4% | +7.4% |
+| the GEMMs (`Cijk_...`) | +1.1 to +31.7% | -1.6 to -9.6% | -0.6 to -13.8% |
+| all checkable names together | +19.2% | +3.9% | +1.9% |
+
+Two errors are structural and survive both the machine and the width: the buffer
+copy is priced at roughly three times what it costs, and the collective at up to
+a third over. The GEMMs are the machine-dependent part, priced above their
+in-situ time on one box and below it on the other, which is what one would
+expect of a tight benchmark loop leaving the device in a different clock state
+than a step does.
+
+**And about a quarter of kernel time cannot be checked at all.** The price
+list's per-kernel breakdowns are sparse under parallelism, so 2.28-2.40 ms a
+step -- 23-24% of it, on both machines and both widths -- has no priced
+counterpart to compare against. It is not unpriced; its operators have prices.
+It simply cannot be audited by name, and the arithmetic says it is where the
+underpricing sits: at TP=4 on box B the checkable kernels are priced 3.9% *over*
+their corrected in-situ time while the total is 10% under.
+
+What is in it is the hybrid's own machinery, and the launch counts identify it
+exactly -- 48 per step for `fused_recurrent_gated_delta_rule_fwd_kernel`,
+`_causal_conv1d_update_kernel` and `fused_gdn_gating_kernel`, which is the
+27B's 48 gated-DeltaNet layers; 16 for `paged_attention_decode_sliding_window`,
+its 16 attention layers; 64 for `act_and_mul_kernel`, every layer's MLP. These
+are Triton kernels launched from inside custom operators, which is the same
+structure `TritonLaunchTracer` records at two levels and `residual.py` skips one
+of. Making them checkable is the next piece of work, and it is a change to what
+the price list records rather than a new measurement campaign.
+
+**A caution that is now quantified.** The pricing error differs between two
+machines running the same model at the same width by 12 percentage points --
+more than it differs between TP=4 and TP=8 on one box (4 points). Any residual
+assembled across machines is measuring the machines. `residual.py` says so in
+its docstring; the campaigns behind the tables above were each run on one box.

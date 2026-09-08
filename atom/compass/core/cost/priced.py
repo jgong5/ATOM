@@ -102,15 +102,20 @@ DEFAULT_DISPATCH_SECONDS = 130e-6
 #: prefill profiled the same way came out 63.6% idle. The instrument is not
 #: blind at this scale; there is nothing there.
 #:
-#: What the residual really measures is pricing error, and its sign is not even
-#: fixed: on the 0.6B the priced sum falls ~28% below the step's in-situ kernel
-#: time, on the 27B it lands ~2% above. Multiplying by launch count spreads that
-#: error over the step in a shape that happens to fit, which is why the constant
-#: works and why it does not transfer. Refitting it as what it is -- a
-#: correction to prices, per kernel and per model -- needs a priced sum, a step
-#: and a profile from one machine, which is the next thing to gather. Until
-#: then the value stands, because removing it would make predictions worse
-#: without making them righter.
+#: Measured as idle, per launch, with a priced sum and a step from the same
+#: machine (`scripts/compass/residual.py`): 10.5ns, 12.6ns and 12.8ns on three
+#: configurations across two boxes, against the 2250ns modelled here. The
+#: residual it is fitted from is pricing error almost in full.
+#:
+#: That error varies more between machines than between tensor-parallel widths:
+#: -2.1% of the priced sum for the 27B at TP=4 on one box, +10.0% for the same
+#: model and width on another, +14.3% at TP=8 there. It has structure that does
+#: survive the machine change -- `__amd_rocclr_copyBuffer` priced 171-263% over
+#: its in-situ time, `cross_device_reduce_1stage` 7-33% over, and about 24% of
+#: kernel time carrying no priced breakdown at all and underpriced as a body --
+#: so it is a fixable error rather than noise, and fixing it is what would let
+#: this constant go to zero. Until then the value stands: removing it would make
+#: predictions worse without making them righter.
 DEFAULT_BOUNDARY_SECONDS = 2.25e-6
 
 #: Seconds added per kernel launch on a compiled step that was not replayed.
