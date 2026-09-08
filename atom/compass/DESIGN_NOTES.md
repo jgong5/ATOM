@@ -4723,3 +4723,88 @@ the union of kernel intervals showed no overlap at all, so the difference was
 entirely kernels straddling the step boundary that the naive filter dropped --
 `step_accounting`'s figure is the right one. And the cross-regime comparison
 above looked like a model failure until the oracle's own branching was read.
+
+## Being profiled costs about a microsecond a kernel, and that was the baseline
+
+Two quantities had been standing in for "the step", quoted side by side without
+saying which process produced each:
+
+* the **kernel sum** inside a profiled step -- the kernels of one device's step
+  annotation, added up -- at 10.529 ms on a 27B TP=4 decode, and
+* the **event elapsed** from the measure table, a `torch.cuda.Event` pair around
+  the whole forward, at 9.774 ms for the same shape.
+
+Each is reproducible to about 0.2% inside its own run. They are 7.5% apart, and
+the kernel sum -- which measures a *subset* of what the events bracket, and must
+therefore be the smaller -- was on top. That is not a residual to model. One of
+the two was wrong about something.
+
+Three explanations fit. The kernel sum could be double-counting concurrent
+streams; ATOM has an `async_copy_stream`, and a sum over overlapping intervals
+is not busy time. The events could be missing device work, if the forward
+launched onto a stream they do not bracket -- that would be a real defect in the
+measure table, which every fitted constant depends on. Or being profiled could
+cost something.
+
+The first is refutable from a trace already on disk, and was refuted: the 951
+events inside that step are all on one stream, and their sum equals the union of
+their intervals to the microsecond. `busy` is genuine device-busy time.
+
+The other two are separated by a run that is its own control. `profile_shape.py`
+warms for several rounds with the profiler shut and profiles the last one, so a
+measure table written across the whole process holds both regimes in order, in
+one process, at one shape:
+
+       40:  12.293 12.383 12.346 12.353 12.336 12.411 12.366 12.351  <- opens
+       48:  13.370 13.389 13.373 13.302 13.273 13.289 13.366 13.369
+
+The step time steps up by 8.1% exactly where the profiler opens, and stays up.
+So the events do see the extra work: they are not blind to a stream, and the
+measure table has no defect. Within the profiled round the ordering that has to
+hold, holds -- event 13.367 >= window 13.088 >= kernels 13.082 ms.
+
+Repeated on a second model, and the cost is per kernel rather than per step:
+
+| | kernels in a step | profiling costs | per kernel | kernel sum over unprofiled step |
+| --- | --- | --- | --- | --- |
+| 27B TP=4 decode | 951 | +1.002 ms (+8.1%) | +1.05 us | +5.8% |
+| 0.6B TP=1 decode | 396 | +0.276 ms (+8.5%) | +0.70 us | +3.0% |
+
+**So neither number was wrong; the comparison was.** A profiled kernel reports
+about a microsecond more than it takes, a decode step launches hundreds of them,
+and a price list gathered without a profiler cannot be held against an in-situ
+figure gathered with one. `step_accounting` printed exactly that comparison as
+`isolated is X% of in situ`, which is biased by however much the profiler cost,
+in the direction of flattering the prices. It now says the in-situ figure is
+profiled, and takes `--steps` to compare against a step nobody was watching.
+
+**The baseline, stated once.** The cost model is validated against the measure
+table: CUDA events, no profiler, the thing a serving run actually experiences.
+A profile is for attribution *within* a step -- which kernel, what share, how
+much idle -- and never for an absolute. The two must not be mixed, and the
+percentages that mixed them are void.
+
+Two consequences that are not cosmetic.
+
+* The host constant from `--calibrate` is a **floor**. Idle is `window - busy`,
+  a difference, so the profiler's cost lands on it whole and shrinks it. On the
+  shapes it was fitted from -- prefills 30-64% idle -- that is a 1-2%
+  under-estimate, inside the agreement already claimed, so it is stated rather
+  than corrected for. On a step with little idle it would not be, and such a
+  step should not be calibrated from at all.
+* The residuals from the previous section survive, because both of their columns
+  came from one unprofiled process: `run.py --compass-mode measure` writes the
+  price list and the step table together. Re-derived with provenance attached:
+
+| | priced sum, work only | measured decode step | |
+| --- | --- | --- | --- |
+| 27B TP=4 | 9.975 ms | 9.774 ms | +2.1% |
+| 27B TP=8 | 7.543 ms | 7.864 ms | -4.1% |
+
+  The number that never belonged in that table is the profiled 10.529 ms, and
+  removing it is the whole correction.
+
+**A caution about machines, met on the way.** The same 27B TP=4 decode is
+9.774 ms on one box and 12.365 ms on another, both unprofiled, a 26% difference.
+Comparisons must be within one machine as well as within one profiling regime.
+Everything in the table above is from a single box.

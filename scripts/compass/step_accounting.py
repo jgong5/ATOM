@@ -14,6 +14,13 @@ spanning it on the device timeline, and the kernels inside are its own events.
 Summing them and subtracting says how much of the step was idle, without
 assuming a dispatch constant.
 
+What a profile cannot say is what the step costs when nobody is profiling it.
+Kernel durations reported under the profiler are inflated -- measurably, and by
+enough to matter: see `--steps` below. Every absolute number this prints is a
+profiled number, and comparing one against a figure gathered without a profiler
+is an error the tool used to make silently. Ratios *within* the profiled step --
+which kernel, what share, how much idle -- are what it is for.
+
     python scripts/compass/step_accounting.py <trace-dir-or-file> [--match prefill]
     ... [--prices p.json --graph g.json]   # also compare against what was priced
 """
@@ -49,6 +56,13 @@ def main() -> int:
                     help="substring of the step annotation to account for")
     ap.add_argument("--prices")
     ap.add_argument("--graph")
+    ap.add_argument("--steps", metavar="MEASURE.jsonl",
+                    help="a measure table from a run with no profiler, to "
+                         "compare the priced sum against a step that was not "
+                         "slowed down by being watched. A table written by the "
+                         "profiled run itself holds both regimes and its median "
+                         "is a blend of the two; use it only if the profiler "
+                         "covered a small part of the run")
     ap.add_argument("--calibrate", metavar="OUT.json",
                     help="write the overhead this step actually pays, per "
                          "launch as the cost model counts launches, for "
@@ -137,6 +151,32 @@ def main() -> int:
               f"{sum(small) / 1e3:.3f} ms "
               f"({sum(small) / max(sum(sizes), 1e-9) * 100:.1f}% of idle)")
 
+    # What the same step costs unwatched, if a measure table from a run with no
+    # profiler was passed. This is the only absolute in the output that is not a
+    # profiled number, and the difference between it and the two above is what
+    # profiling cost -- not a correction to apply, but the reason the profiled
+    # figures must not be compared against anything gathered without one.
+    measured = None
+    if args.steps:
+        rows = [json.loads(line) for line in open(args.steps) if line.strip()]
+        # Matched by kind, which is all the table records that the annotation
+        # also states. A table holding several shapes of one kind would need the
+        # shape as well; the fixed workloads this is run on do not.
+        prefilling = args.match.startswith("prefill")
+        want = sorted(r["seconds"] * 1e6 for r in rows
+                      if ((r.get("num_prefill_tokens") or 0) > 0) == prefilling)
+        if not want:
+            print(f"\n  no {args.match} rows in {args.steps}")
+        else:
+            measured = want[len(want) // 2]
+            print(f"\n  same step unprofiled {measured / 1e3:.3f} ms "
+                  f"(median of {len(want)}, CUDA events)")
+            print(f"  profiling cost it    "
+                  f"{(window - measured) / 1e3:+.3f} ms "
+                  f"({(window - measured) / measured * 100:+.1f}%, "
+                  f"{(window - measured) / max(len(inside), 1):+.2f} us "
+                  f"per kernel)")
+
     if not (args.prices and args.graph):
         return 0
 
@@ -162,13 +202,34 @@ def main() -> int:
                    ) * 1e6
     outside = sum(1 for op in graph["ops"]
                   if prices.get(signature_of(op), {}).get("cache") != "graph")
-    print(f"\n  priced in isolation {priced / 1e3:.3f} ms")
-    print(f"  same work in situ   {busy / 1e3:.3f} ms")
+    print(f"\n  priced in isolation {priced / 1e3:.3f} ms   "
+          f"(microbench, no profiler)")
+    print(f"  same work in situ   {busy / 1e3:.3f} ms   "
+          f"(profiled, so inflated -- see below)")
     print(f"  isolated is {(priced - busy) / busy * 100:+.2f}% of in situ")
+    # Being profiled is not free, and it is not a rounding error either: the
+    # same 27B decode step costs 12.365 ms with the profiler shut and 13.369 ms
+    # with it open, in one process, +1.05 us for each of its 951 kernels. So a
+    # price list gathered without a profiler cannot be compared against an
+    # in-situ figure gathered with one -- the percentage above is biased by
+    # however much the profiler cost, in the direction of flattering the prices.
+    #
+    # Pass `--steps` to compare against a step the same run really took. The
+    # in-situ figure keeps its job, which is attribution *within* one profiled
+    # step: which kernel, in what proportion. It was never an absolute.
+    if measured is None:
+        print(f"  measured while profiling, so it is not what the step costs "
+              f"unwatched;\n   pass --steps <measure.jsonl> for a comparison "
+              f"against an unprofiled step")
     if outside:
         print(f"  ({outside} operators were timed outside a graph, so their "
               f"price carries launch\n   overhead; graph-captured alone is "
               f"{captured / 1e3:.3f} ms)")
+
+    if measured is not None:
+        print(f"\n  measured step       {measured / 1e3:.3f} ms   "
+              f"(CUDA events, no profiler)")
+        print(f"  priced is {(priced - measured) / measured * 100:+.2f}% of it")
 
     # Per kernel, where the price list recorded a breakdown. A kernel that is
     # slower in situ everywhere is a different finding from a few that are.
@@ -208,6 +269,17 @@ def main() -> int:
             launches += max(1, len(entry.get("kernels") or {}))
         idle = (window - busy) / 1e6
         per = idle / launches if launches else 0.0
+        # Idle is a *difference*, so the profiler's cost lands on it whole. A
+        # profiled kernel reports about 0.7-1.05 us more than it takes (0.70 on
+        # a 396-kernel 0.6B decode, 1.05 on a 951-kernel 27B one), which comes
+        # straight out of `window - busy`. So the constant below is a floor:
+        # the true idle is larger by roughly a microsecond per kernel, and the
+        # host is therefore at least this slow rather than exactly this slow.
+        # On the shapes it has been fitted from -- prefills 30-64% idle -- that
+        # is a 1-2% under-estimate, which is inside the agreement already
+        # claimed for it, so it is stated rather than corrected for. On a step
+        # with little idle it would not be, and such a step should not be
+        # calibrated from at all.
         # A compiled step lasts `max(kernel time, launches x host per launch)`,
         # so the host constant is only *measurable* on a step the host bound --
         # one the device bound spent its time on kernels and says nothing about
