@@ -71,15 +71,7 @@ def _install_compass_clock(config) -> None:
     even when the model is sharded across processes.
     """
     compass = getattr(config, "compass_config", None)
-    if compass is None or not compass.enabled:
-        return
-    if not compass.virtual_clock:
-        if compass.paced_arrivals:
-            # Real time, with an origin, so a declared arrival can be placed on
-            # it and the scheduler can hold a request until it comes round.
-            from atom.utils.clock import PacedWallClock, set_clock
-
-            set_clock(PacedWallClock())
+    if compass is None or not compass.enabled or not compass.virtual_clock:
         return
     from atom.utils.clock import VirtualClock, set_clock
 

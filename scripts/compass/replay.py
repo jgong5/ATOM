@@ -35,6 +35,7 @@ import argparse
 import json
 import random
 import sys
+import time as _time
 import urllib.error
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -166,6 +167,17 @@ def main() -> int:
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--timeout", type=float, default=600.0)
     p.add_argument("--out", required=True)
+    p.add_argument("--pace", action="store_true",
+                   help="deliver each request when its arrival really comes "
+                        "round, instead of declaring it. Use against a real "
+                        "engine: a real clock discards a declared arrival, so "
+                        "without this the real side answers a burst while the "
+                        "simulated side answers the trace")
+    p.add_argument("--time-scale", type=float, default=1.0,
+                   help="divide every arrival offset by this, to replay a "
+                        "long trace in less time. 1.0 keeps the trace's own "
+                        "timing; it changes how much requests batch, so it is "
+                        "a property of the workload and not a free knob")
     p.add_argument("--check-lengths", action="store_true",
                    help="compare the server's reported prompt_tokens against "
                         "what was asked for, and warn if they differ")
@@ -182,18 +194,34 @@ def main() -> int:
               file=sys.stderr)
         return 2
 
+    began = _time.monotonic()
+
     def one(i_row):
         i, row = i_row
+        at = row["arrival_s"] / args.time_scale
+        if args.pace:
+            # Hold the request until its moment really comes round. Against a
+            # real engine this is what makes the arrival process real: the
+            # queue is genuinely empty between arrivals, which declaring an
+            # arrival cannot achieve -- a declared workload is posted up front
+            # and sits in `waiting`, so the scheduler always sees a full queue
+            # however the arrivals are stamped.
+            delay = at - (_time.monotonic() - began)
+            if delay > 0:
+                _time.sleep(delay)
         body = {
             "model": model,
             "prompt": _prompt(row["input_tokens"], i),
             "max_tokens": row["output_tokens"],
             "temperature": 0.0,
-            # The two fields that make this a declared workload rather than a
-            # raced one. Both are ignored by a server on a wall clock.
-            "compass_arrival": row["arrival_s"],
             "compass_workload_size": len(workload),
         }
+        if not args.pace:
+            # Declared rather than delivered: against a simulated engine the
+            # wall clock and the virtual clock race, so the arrival is stated
+            # and the engine honours it. Ignored by a server on a real clock,
+            # which is why --pace exists for that side.
+            body["compass_arrival"] = at
         try:
             return {"index": i, "ok": True, "response": _send(base + "/v1/completions",
                                                               body, args.timeout)}
@@ -202,7 +230,11 @@ def main() -> int:
 
     # Posted concurrently and as fast as the socket allows: *when* each lands is
     # deliberately not the arrival the engine uses.
-    with ThreadPoolExecutor(max_workers=min(64, len(workload))) as pool:
+    # Every paced request needs its own thread, because each spends its wait
+    # sleeping: a pool of 64 would serialise the 65th arrival behind an earlier
+    # request's *generation* rather than behind its arrival.
+    workers = len(workload) if args.pace else min(64, len(workload))
+    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
         results = list(pool.map(one, enumerate(workload)))
 
     failed = [r for r in results if not r["ok"]]

@@ -46,14 +46,6 @@ def _stamp_arrival(arrival_time: float | None) -> float:
     clock = get_clock()
     if arrival_time is None:
         return clock.time()
-    # A paced real clock takes its origin from the first declared arrival: the
-    # engine was built minutes before the workload started, so an origin from
-    # construction would leave every arrival already past. Offsetting by this
-    # request's own arrival makes the origin the same whichever request the
-    # client happens to get in first.
-    start = getattr(clock, "start", None)
-    if start is not None and getattr(clock, "epoch", None) is None:
-        start(arrival_time)
     epoch = getattr(clock, "epoch", None)
     if epoch is None:
         logger.warning(
@@ -76,15 +68,7 @@ def _install_compass_clock(config) -> None:
     together, at the start of virtual time.
     """
     compass = getattr(config, "compass_config", None)
-    if compass is None or not compass.enabled:
-        return
-    if not compass.virtual_clock:
-        if compass.paced_arrivals:
-            # Real time, with an origin, so a declared arrival can be placed on
-            # it and the scheduler can hold a request until it comes round.
-            from atom.utils.clock import PacedWallClock, set_clock
-
-            set_clock(PacedWallClock())
+    if compass is None or not compass.enabled or not compass.virtual_clock:
         return
     from atom.utils.clock import VirtualClock, set_clock
 

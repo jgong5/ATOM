@@ -5070,3 +5070,57 @@ the generated kernels without fixing the over-pricing would take that box's
 residual from +0.5% to about +5%, which is worth knowing before anyone treats
 the fault as the only thing standing between here and a correct price list. It
 is one of two things, and the smaller one.
+
+## Arrivals against a real engine: the client waits, the server cannot be told
+
+Replaying a recorded trace needs both sides to see the same arrival process.
+The simulated side honours declared arrivals through its virtual clock; the
+real side discarded them, because `WallClock.epoch` is None and `_stamp_arrival`
+falls back to "now". Left alone, real-versus-simulated on a trace compares a
+burst against the trace. On cc-traces that is not a detail: 148 requests over
+1099 seconds is one every seven seconds against a service time of seconds.
+
+**The first attempt was server-side and it does not work.** A `PacedWallClock`
+-- real time with a declared origin -- lights up machinery that already exists
+and is switched off by `epoch is None`: `_stamp_arrival` places the arrival,
+`_declared_arrival_pending` holds the request, and `_advance_to_next_arrival`
+correctly refuses to skip idle because it needs a clock with `advance`. The
+unit tests passed. The smoke test did not: four requests declaring arrivals
+twenty seconds apart completed in **0 seconds** instead of sixty.
+
+The origin was the problem. It cannot be taken at construction -- the engine is
+built minutes before a workload starts -- so it was inferred from the first
+declared arrival, as `now - offset`. Requests are posted by sixty-four threads,
+so the first one *stamped* is not the one with the smallest offset. When the
+request declaring t=60 wins the race the origin is set sixty seconds in the
+past, every earlier arrival is already overdue, and the whole workload is
+released at once. Taking the maximum candidate instead does not help either:
+`arrive_time` is fixed when the request is stamped, so a later correction
+cannot reach the requests already stamped against the wrong origin.
+
+A server can only be *told* the origin, not infer it, and telling it means
+threading a `compass_epoch` through five layers to reach `_stamp_arrival`.
+
+**The client-side answer is smaller and more faithful.** `replay.py --pace`
+holds each request until its arrival really comes round. No origin is needed,
+because the request genuinely arrives then -- and the engine's queue is
+genuinely empty between arrivals, which server-side pacing cannot reproduce: a
+declared workload is posted up front and sits in `waiting`, so the scheduler
+always sees a full queue however the arrivals are stamped. A real deployment is
+idle between requests, and this is the version that is.
+
+Measured on the smoke: 60 seconds for four requests twenty seconds apart, where
+the declared version took 0. The socket-latency objection that made arrivals
+declared in the first place was about racing a *virtual* clock; against a real
+one, milliseconds of socket latency against seconds of arrival gap do not
+signify.
+
+`PacedWallClock` and `--compass-paced-arrivals` are reverted. A flag that
+silently does nothing is worse than no flag, and there is no consumer for the
+protocol change that would make it work.
+
+**A note on the method.** Twelve unit tests passed on the reverted design --
+they tested that a paced clock holds a future arrival, which it does. What they
+could not test is which arrival establishes the origin under concurrent posting,
+because that is a property of the client and the engine together. The smoke run
+cost four requests and two minutes.
