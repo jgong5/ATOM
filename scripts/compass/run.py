@@ -34,6 +34,14 @@ def main() -> int:
              "to the shapes their steps recorded and are unaffected.")
     parser.add_argument("--out", required=True)
     parser.add_argument(
+        "--sweep-long", action="store_true",
+        help="add long-context rounds to --sweep, out to a 262144-token "
+             "prompt. Needed before predicting a workload with long prompts: "
+             "the default ladder stops at 1024 tokens, so a model fitted to it "
+             "has no evidence about attention over a long history. Chunked "
+             "prefill keeps the steps themselves small, so this costs about "
+             "684k tokens of forward.")
+    parser.add_argument(
         "--sweep", action="store_true",
         help="Calibration workload: several rounds of varied prompt length and "
              "batch size, so the table holds prefill steps across a range of "
@@ -115,6 +123,27 @@ def main() -> int:
             (64, 24), (256, 24), (64, 32), (256, 32),
             (64, 48), (192, 48), (64, 64), (128, 64),
         ]
+        if args.sweep_long:
+            # Long context. Everything above is a prompt of at most 1024
+            # tokens, so the table it produces has no evidence past a context
+            # of a few thousand -- and an agentic trace runs to 256k, where
+            # attention over the history is most of the step. Asking the fitted
+            # model about that is extrapolating two orders of magnitude outside
+            # its evidence, in the one dimension where the cost is not linear.
+            #
+            # Prefill is chunked at `attn_prefill_chunk_size` (16384 by
+            # default), so these do not produce enormous *steps*: a 262144
+            # token prompt produces sixteen steps of 16384 tokens at contexts
+            # 0, 16k, 32k and so on. That is exactly the coverage wanted, and
+            # it is why this costs about 684k tokens in total rather than
+            # anything alarming -- roughly a minute of forward.
+            rounds += [
+                (2048, 1), (4096, 1), (8192, 1), (16384, 1), (32768, 1),
+                (65536, 1), (131072, 1), (262144, 1),
+                # Two at once, so the batched-token dimension is covered at
+                # long context as well as at short.
+                (16384, 2), (65536, 2),
+            ]
         # Twice through, because Triton autotunes per shape rather than once per
         # process: the first visit to a shape pays a benchmarking cost that
         # steady-state serving never pays again. The second visit is the one
