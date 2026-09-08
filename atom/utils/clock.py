@@ -71,6 +71,68 @@ class WallClock:
         return "WallClock()"
 
 
+class PacedWallClock:
+    """Real time that knows when the run began.
+
+    A :class:`WallClock` returns ``None`` for :attr:`epoch` because real time
+    has no start-of-run, and that is right for serving. It is wrong for a
+    *replay*: a recorded trace declares each request as an offset into the run,
+    and the run does have a beginning -- the moment the workload starts.
+
+    With no epoch a declared arrival is discarded and every request is stamped
+    "now", so a trace spread over an hour is delivered to the engine as one
+    burst. That does not matter when only a simulated engine honours arrivals,
+    but it makes real and simulated runs of the same trace incomparable: one
+    sees the arrival process and the other sees a burst, and they schedule
+    nothing alike.
+
+    So this is a real clock with a declared origin. ``time()`` and
+    ``perf_counter()`` are the wall clock's, unchanged -- a real forward takes
+    real time and must be reported as such. Only :attr:`epoch` differs, and
+    that is enough for `_stamp_arrival` to place a declared arrival and for the
+    scheduler to hold a request until it comes round.
+
+    Deliberately without ``advance``. The scheduler's `_advance_to_next_arrival`
+    skips idle gaps instantly, which is how a simulation of an hour-long trace
+    finishes in minutes; a real run cannot skip idle, and the absence of the
+    method is what stops it trying.
+
+    The epoch is set once, on the first declared arrival, rather than at
+    construction: the engine is built minutes before a workload starts, and an
+    epoch from then would leave every declared arrival already in the past.
+    """
+
+    __slots__ = ("_epoch",)
+
+    def __init__(self, epoch: Optional[float] = None) -> None:
+        self._epoch = None if epoch is None else float(epoch)
+
+    def time(self) -> float:
+        return _time.time()
+
+    def perf_counter(self) -> float:
+        return _time.perf_counter()
+
+    @property
+    def epoch(self) -> Optional[float]:
+        return self._epoch
+
+    def start(self, offset: float = 0.0) -> float:
+        """Declare the run as having begun ``offset`` seconds ago.
+
+        Idempotent: the first call wins. Requests are posted concurrently, so
+        which one is stamped first is not the one with the smallest offset;
+        passing the request's own offset makes the origin the same whichever
+        arrives first, to within how long the client takes to post them.
+        """
+        if self._epoch is None:
+            self._epoch = _time.time() - float(offset)
+        return self._epoch
+
+    def __repr__(self) -> str:  # pragma: no cover - trivial
+        return f"PacedWallClock(epoch={self._epoch!r})"
+
+
 class VirtualClock:
     """Time that only moves when :meth:`advance` is called.
 

@@ -124,6 +124,13 @@ class CompassConfig:
     oracle_qualname: str = "atom.compass.core.cost.constant.ConstantCostOracle"
     oracle_options: Optional[dict] = None
     virtual_clock: bool = True
+    #: Honour a workload's declared arrivals on a *real* run, by holding each
+    #: request until its offset comes round on the wall clock. Off by default:
+    #: serving has no start-of-run and a declared arrival means nothing there.
+    #: Needed to compare a real run against a simulated one on the same
+    #: recorded trace, since the simulated side honours arrivals either way and
+    #: a real side that does not would be answering a burst.
+    paced_arrivals: bool = False
     admission_seconds: float = 0.0
     op_timings_out: Optional[str] = None
     bench_graph: Optional[str] = None
@@ -155,6 +162,12 @@ class CompassConfig:
             raise ValueError(
                 "mode='measure' needs measure_out to write the timings to"
             )
+        if self.paced_arrivals and self.virtual_clock and self.mode == "predict":
+            # A simulated run already honours declared arrivals through the
+            # virtual clock, and advances straight to the next one when idle.
+            # Pacing it against the wall clock would make it wait out the trace
+            # in real time for no gain.
+            self.paced_arrivals = False
         if self.mode != "predict" and self.virtual_clock:
             # trace and measure perform the real forward, so the wall clock is
             # the truthful one. Leaving the virtual clock installed makes a real

@@ -61,6 +61,7 @@ class EngineArgs:
     compass_measure_out: str = ""
     compass_measure_warmup_steps: int = 0
     compass_admission_seconds: float = 0.0
+    compass_paced_arrivals: bool = False
     compass_op_timings_out: str = ""
     compass_bench_graph: str = ""
     compass_bench_out: str = ""
@@ -251,6 +252,19 @@ class EngineArgs:
             "meaningful with --compass-mode=trace, which runs eagerly: a "
             "replayed CUDA graph is one submission with nothing to observe "
             "inside it, so these are eager times and not production costs.",
+        )
+        parser.add_argument(
+            "--compass-paced-arrivals",
+            action="store_true",
+            help="Hold each request until the arrival it declared, measured "
+            "on the wall clock from the start of the workload. Off by "
+            "default, because serving has no start-of-run and a declared "
+            "arrival means nothing there. Turn it on to replay a recorded "
+            "trace against a real engine: the simulated side honours arrivals "
+            "through its virtual clock either way, so without this the two "
+            "runs answer different workloads -- one the trace, one a burst -- "
+            "and schedule nothing alike. The real side then takes as long as "
+            "the trace did, since real idle cannot be skipped.",
         )
         parser.add_argument(
             "--compass-admission-seconds",
@@ -823,6 +837,7 @@ class EngineArgs:
         compass_measure_out = kwargs.pop("compass_measure_out", "")
         compass_measure_warmup = kwargs.pop("compass_measure_warmup_steps", 0)
         compass_admission = kwargs.pop("compass_admission_seconds", 0.0)
+        compass_paced = kwargs.pop("compass_paced_arrivals", False)
         compass_op_timings = kwargs.pop("compass_op_timings_out", "")
         compass_bench_graph = kwargs.pop("compass_bench_graph", "")
         compass_bench_out = kwargs.pop("compass_bench_out", "")
@@ -847,6 +862,8 @@ class EngineArgs:
             compass_kwargs["measure_warmup_steps"] = compass_measure_warmup
         if compass_admission:
             compass_kwargs["admission_seconds"] = compass_admission
+        if compass_paced:
+            compass_kwargs["paced_arrivals"] = True
         if compass_op_timings:
             compass_kwargs["op_timings_out"] = compass_op_timings
         if compass_bench_graph:
