@@ -24,7 +24,16 @@ def main() -> int:
     EngineArgs.add_cli_args(parser)
     parser.add_argument("--num-prompts", type=int, default=8)
     parser.add_argument("--max-tokens", type=int, default=32)
-    parser.add_argument("--prompt-tokens", type=int, default=64)
+    parser.add_argument(
+        "--prompt-tokens", type=int, default=64,
+        help="WORDS, not tokens. The prompt below is one `w<i>x<j>` word per "
+             "unit and each is several tokens, so a step comes out five to "
+             "seven times this -- 64 gives 314, 2400 gives 15694, the ratio "
+             "rising with length. Harmless for the campaigns here, which are "
+             "read by the shape each step actually recorded, but it is not a "
+             "token count. `replay.py:_prompt` builds an exact one; this "
+             "should adopt it, which will change the shape every existing "
+             "invocation produces.")
     parser.add_argument("--out", required=True)
     parser.add_argument(
         "--sweep", action="store_true",

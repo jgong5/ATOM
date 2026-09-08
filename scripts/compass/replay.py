@@ -70,14 +70,53 @@ def _workload(args) -> list[dict]:
     return out
 
 
-def _prompt(tokens: int, index: int) -> str:
-    """Distinct text of roughly the requested token count.
+#: Words that are exactly one token each under the Qwen tokenizers, checked
+#: with a leading space, which is how a tokenizer sees a word mid-sentence. Any
+#: single-token vocabulary would do; these are common English words, so a prompt
+#: built from them is ordinary text rather than something a tokenizer or a cache
+#: might treat specially.
+_WORDS = (
+    "the of and to in a is that it for on with as was at by an be this from "
+    "or has had not but they we you all can her his its our out over new one "
+    "two three four five six seven eight nine ten time year day work part"
+).split()
 
-    Distinct because identical prompts share prefix-cache blocks and every
-    request after the first would skip prefill -- a real behaviour, but not the
-    one being measured.
+
+def _prompt(tokens: int, index: int) -> str:
+    """Distinct text of *exactly* the requested token count.
+
+    The previous construction, ``" ".join(f"w{index}x{j}" ...)``, was one word
+    per requested token and produced five to seven times as many tokens as
+    asked -- and the ratio grew with length, because ``w3x1`` is one token and
+    ``w3x262143`` is several. Against the Qwen3.8-27B tokenizer: 64 asked gave
+    314, 1024 gave 6062, 262144 gave 2248190, a ratio going 4.91, 5.92, 8.58.
+    Every ``--input-tokens`` figure was nominal, and worse than nominal, it was
+    *superlinear*: asking for twice the tokens gave more than twice as many.
+
+    Survivable when a run is read by the shapes it actually recorded, which is
+    how the synthetic campaigns were read. Not survivable when the point of the
+    workload is to reproduce a measured length distribution, since a
+    length-dependent distortion reshapes a distribution rather than shifting it.
+
+    So: one single-token word per token. The first four encode ``index`` in
+    base 52, which is what keeps requests from sharing prefix-cache blocks --
+    blocks are hashed over the sequence from position zero, so differing in the
+    first token makes every later block differ too.
+
+    Exact by construction rather than by measurement, and the construction
+    depends on the tokenizer. ``--check-lengths`` verifies it against what the
+    server reports it actually received.
     """
-    return f"Request {index}. " + " ".join(f"w{index}x{j}" for j in range(tokens))
+    if tokens <= 0:
+        return ""
+    base = len(_WORDS)
+    head, n = [], max(0, int(index))
+    for _ in range(4):
+        head.append(_WORDS[n % base])
+        n //= base
+    words = (head + [_WORDS[0]] * tokens)[:tokens]
+    # A leading space so the first word tokenises the same way as the rest.
+    return " " + " ".join(words)
 
 
 def _send(url: str, body: dict, timeout: float) -> dict:
@@ -127,6 +166,9 @@ def main() -> int:
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--timeout", type=float, default=600.0)
     p.add_argument("--out", required=True)
+    p.add_argument("--check-lengths", action="store_true",
+                   help="compare the server's reported prompt_tokens against "
+                        "what was asked for, and warn if they differ")
     args = p.parse_args()
 
     workload = _workload(args)
@@ -164,6 +206,28 @@ def main() -> int:
         results = list(pool.map(one, enumerate(workload)))
 
     failed = [r for r in results if not r["ok"]]
+
+    # What the server says it received, against what was asked for. The builder
+    # is exact by construction under a tokenizer giving one token per word in
+    # `_WORDS`; this checks the assumption held, and costs nothing because the
+    # count is already in every response.
+    if args.check_lengths:
+        off = []
+        for r in results:
+            if not r["ok"]:
+                continue
+            got = (r["response"].get("usage") or {}).get("prompt_tokens")
+            want = workload[r["index"]]["input_tokens"]
+            if got is not None and got != want:
+                off.append((want, got))
+        if off:
+            worst = max(off, key=lambda pair: abs(pair[1] - pair[0]))
+            print(f"  WARNING: {len(off)} of {len(results)} prompts were not the "
+                  f"requested length; worst asked {worst[0]} got {worst[1]}",
+                  file=sys.stderr)
+        else:
+            print(f"  prompt lengths verified against the server for "
+                  f"{len(results) - len(failed)} requests")
     engine = {}
     try:
         engine = _send(base + "/compass/requests", {}, args.timeout)
