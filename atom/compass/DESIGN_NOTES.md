@@ -4808,3 +4808,84 @@ Two consequences that are not cosmetic.
 9.774 ms on one box and 12.365 ms on another, both unprofiled, a 26% difference.
 Comparisons must be within one machine as well as within one profiling regime.
 Everything in the table above is from a single box.
+
+## The collective boundary constant at TP=8: there is no boundary to measure
+
+The notes said TP=8 would separate linear-in-group from linear-in-log2 for the
+collective boundary term, with TP=2 at 4.20us and TP=4 at 9.72us as the two
+points and ~20us against ~14.5us as the predictions. Both laws are refuted, and
+so is the quantity they were laws about.
+
+**The residual method had already stopped working.** With `HOST_SYNC` excluded
+the blocked table reads:
+
+| | priced plain | priced coll | total | step | residual |
+| --- | --- | --- | --- | --- | --- |
+| 27B TP=4 | 8.732 ms | 1.243 ms | 9.975 ms | 9.774 ms | -0.201 ms |
+| 27B TP=8 | 6.164 ms | 1.378 ms | 7.543 ms | 7.864 ms | +0.321 ms |
+
+A per-launch constant cannot change sign between two widths of one graph on one
+machine, and the plain term alone -- 883 launches x 1.82us = 1.607 ms -- already
+exceeds the residual at both. Nothing can be fitted from this, and the
+inner-kernel double count the notes warn about is not the reason: of the 130
+operators carrying `launch`, two are priced at all, worth 4 microseconds.
+
+**A profile measures the boundary directly, and needs no price list.** The
+boundary *is* the gap between one kernel ending and the next starting. Three
+widths of the 27B on one machine, each run its own control, gaps in nanoseconds:
+
+| width | step (unprofiled) | idle in a step | gap after plain | gap after collective |
+| --- | --- | --- | --- | --- |
+| TP=2 | 17.830 ms | 0.012 ms (0.06%) | med 1.0 p90 2.0 ns | med 1.0 **max 2.0** ns |
+| TP=4 | 12.398 ms | 0.012 ms (0.09%) | med 1.0 p90 2.0 ns | med 1.0 **max 2.0** ns |
+| TP=8 | 10.094 ms | 0.012 ms (0.11%) | med 1.0 p90 2.0 ns | med 1.0 **max 2.0** ns |
+
+Over roughly 2065 gaps following a collective launch at each width, not one
+exceeds two nanoseconds. The collective boundary is 13ns *below* the plain one
+at all three widths -- which is to say both are nil. A replayed step is its
+kernels, back to back; the 12us of idle is a single gap per step where the graph
+is segmented, identical at every width.
+
+**Why this is not the profiler closing the gaps.** It is the obvious objection,
+since profiling inflates kernel durations, and a profile alone cannot separate
+"no gap" from "gap absorbed into the kernel before it". Three things settle it.
+Trace timestamps carry about a nanosecond of resolution (`...17661.284` us,
+durations like `4.919`). Gaps across a whole trace spread smoothly over the
+sub-microsecond range rather than piling up at exactly zero -- 14888 in (0, 1)us
+against 2343 at exactly zero. And the decisive one: if each launch paid 2.25us,
+every step would show about 950 gaps in the 1-5us band. Across 15200 gaps per
+configuration that band holds **zero**, while the same traces record 16 gaps
+above 5us, and an eager prefill profiled identically came out 63.6% idle. The
+instrument records gaps of the size in question. There are none.
+
+**What does carry group width is the collective kernel itself**, which the price
+list already charges for, and it is nearly flat:
+
+| | TP=2 | TP=4 | TP=8 | TP=2 -> TP=8 |
+| --- | --- | --- | --- | --- |
+| `cross_device_reduce_1stage`, in situ | 9.08 us | 10.40 us | 10.95 us | **+20.6%** |
+| `allgather_lastdim`, in situ | 29.00 us | 23.73 us | 16.39 us | **-43.5%** |
+| collectives as a share of kernel time | 6.6% | 10.4% | 13.4% | |
+
+Linear-in-group predicts +300% across that range and linear-in-log2 +200%. The
+measurement is +20.6%, and the all-gather runs *faster* at eight ranks than at
+two because each rank contributes a smaller slice. The price lists, gathered on
+a different machine by a different instrument, say the same thing: 9.64us per
+collective at TP=4 against 10.68us at TP=8, +10.8% for a doubling. A one-stage
+reduce on a fully-connected fabric is latency-bound at these sizes, so adding
+ranks costs almost nothing -- which is a claim about this interconnect, not
+about collectives, and should be re-measured on a multi-node deployment before
+being relied on there.
+
+**So the term is retired rather than fitted.** The 4.20us and 9.72us figures do
+not reproduce; they were a residual being divided by a launch count, and the
+residual is pricing error. `DEFAULT_BOUNDARY_SECONDS` keeps its value and loses
+its explanation: its docstring now says what it actually is. Removing it would
+make predictions worse without making them righter, because the pricing error it
+absorbs is real and unmodelled -- ~28% low on the 0.6B, ~2% high on the 27B.
+
+**The next measurement is named and small.** A priced sum, a measured step and a
+profile, all from one machine at one width, would separate pricing error from
+everything else for the first time -- every comparison so far has had at least
+one of the three from somewhere else. The runs here have the step and the
+profile; only the price list is missing.

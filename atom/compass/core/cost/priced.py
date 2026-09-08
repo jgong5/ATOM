@@ -89,9 +89,28 @@ DEFAULT_DISPATCH_SECONDS = 130e-6
 
 #: Seconds added per kernel launch. Fitted as (step - priced) / launches on a
 #: Qwen3-0.6B decode step at batch 4, over three runs: (3.201ms - 2.341ms) / 382.
-#: Independently, the median gap between a priced kernel and the same kernel in a
-#: profile of a real step is 2.05us. Deployment-specific, and an option for that
-#: reason.
+#: Deployment-specific, and an option for that reason.
+#:
+#: **It is not a boundary, whatever the residual it was fitted from.** A
+#: replayed step's device timeline has no room for one. Measured on four
+#: configurations -- 0.6B at TP=1 and the 27B at TP=2, 4 and 8 -- the gap
+#: between consecutive kernels has a median of 1ns and a p90 of 2ns, and the
+#: idle in a whole step is 12us, essentially all of it a single gap where the
+#: graph is segmented. If every launch paid 2.25us, each step would show ~950
+#: gaps in the 1-5us band; across 15200 gaps per configuration that band holds
+#: **zero**, while the same traces record 16 gaps above 5us and an eager
+#: prefill profiled the same way came out 63.6% idle. The instrument is not
+#: blind at this scale; there is nothing there.
+#:
+#: What the residual really measures is pricing error, and its sign is not even
+#: fixed: on the 0.6B the priced sum falls ~28% below the step's in-situ kernel
+#: time, on the 27B it lands ~2% above. Multiplying by launch count spreads that
+#: error over the step in a shape that happens to fit, which is why the constant
+#: works and why it does not transfer. Refitting it as what it is -- a
+#: correction to prices, per kernel and per model -- needs a priced sum, a step
+#: and a profile from one machine, which is the next thing to gather. Until
+#: then the value stands, because removing it would make predictions worse
+#: without making them righter.
 DEFAULT_BOUNDARY_SECONDS = 2.25e-6
 
 #: Seconds added per kernel launch on a compiled step that was not replayed.
