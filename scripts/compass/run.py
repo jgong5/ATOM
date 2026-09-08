@@ -139,10 +139,10 @@ def main() -> int:
             # anything alarming -- roughly a minute of forward.
             rounds += [
                 (2048, 1), (4096, 1), (8192, 1), (16384, 1), (32768, 1),
-                (65536, 1), (131072, 1), (262144, 1),
+                (65536, 1), (131072, 1), (196608, 1), (258048, 1),
                 # Two at once, so the batched-token dimension is covered at
                 # long context as well as at short.
-                (16384, 2), (65536, 2),
+                (16384, 2), (65536, 2), (110592, 2),
             ]
         # Twice through, because Triton autotunes per shape rather than once per
         # process: the first visit to a shape pays a benchmarking cost that
@@ -151,8 +151,13 @@ def main() -> int:
         # difference rather than guess at it.
         for round_index, (length, count) in enumerate(rounds + rounds):
             llm.generate(
-                [f"Sweep {round_index}.{i}. "
-                 + " ".join(f"s{round_index}t{i}u{j}" for j in range(length))
+                # Exactly `length` tokens each, and a distinct opening per
+                # prompt so no two share prefix-cache blocks. This built its
+                # own prompts by hand until the long rounds arrived, and a
+                # hand-built word-per-token prompt is five to eight times the
+                # length it claims -- which the short ladder survived and the
+                # long one did not, being silently truncated at max_model_len.
+                [prompt_of_tokens(length, round_index * 10007 + i)
                  for i in range(count)],
                 SamplingParams(temperature=0.0, max_tokens=args.max_tokens),
             )
