@@ -145,8 +145,14 @@ def main() -> int:
 
     prices = json.load(open(args.prices))["prices"]
     graph = json.load(open(args.graph))
+    # A synchronising operator makes the host wait and runs no kernel worth the
+    # name, so its price is the wait -- see `HOST_SYNC`. Summing it into kernel
+    # time put this total 8.4% above the step it was inside.
+    from atom.compass.core.cost.priced import HOST_SYNC
+
     priced = sum(prices[signature_of(op)]["seconds"]
-                 for op in graph["ops"] if signature_of(op) in prices) * 1e6
+                 for op in graph["ops"] if signature_of(op) in prices
+                 and op.get("name", "") not in HOST_SYNC) * 1e6
     # A price taken outside a graph is wall time per call, not kernel time, so
     # it carries launch overhead the in-situ kernel figure does not have.
     # Counting it here would attribute overhead to the kernels.

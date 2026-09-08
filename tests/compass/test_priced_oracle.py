@@ -390,3 +390,52 @@ class TestCalibratingTheHostConstant:
             "host_seconds_per_launch_upper_bound": 9.9})
         assert oracle.host_seconds_per_launch == pytest.approx(
             DEFAULT_HOST_SECONDS_PER_LAUNCH)
+
+
+class TestOperatorsThatOnlyMakeTheHostWait:
+    """`aten::item` and friends copy a scalar back and synchronise. They cannot
+    be graph-captured -- a synchronise inside a capture is an error -- so the
+    benchmark times them back to back and measures the synchronisation itself.
+
+    Summing that into a step's kernel time put a 27B decode's priced total
+    8.4% *above* the step it was inside, which read as the isolated kernels
+    having somehow become dearer than the in-situ ones. Their cost is real and
+    belongs to the overhead term, which already describes host-side waiting."""
+
+    def _oracle(self, tmp_path, ops):
+        import json
+
+        from atom.compass.core.cost.priced import PricedGraphCostOracle
+        from atom.compass.runtime.microbench import signature_of
+
+        graph = tmp_path / "g.json"
+        graph.write_text(json.dumps({"ops": ops, "key": {}}))
+        prices = tmp_path / "p.json"
+        prices.write_text(json.dumps({"prices": {
+            signature_of(op): {"seconds": 1e-5, "occurrences": 1,
+                               "kernels": {"k": 1e-5}} for op in ops}}))
+        return PricedGraphCostOracle(prices=str(prices), graph=str(graph))
+
+    def _op(self, name):
+        return {"name": name, "input_shapes": [[2, 2]], "output_shapes": [],
+                "dtypes": ["bfloat16"]}
+
+    def test_a_synchronising_operator_is_not_kernel_time(self, tmp_path):
+        from atom.compass.core.cost.base import StepShape
+
+        work = [self._op("aten::mm")] * 4
+        shape = dict(num_scheduled_tokens=(1,) * 4, context_lens=(8,) * 4)
+        plain = self._oracle(tmp_path, work)
+        mixed = self._oracle(tmp_path, work + [self._op("aten::item")] * 10)
+        # Ten synchronisations at the same price as the work must not make the
+        # step nearly four times dearer.
+        a = plain.estimate(StepShape(**shape, compiled=True)).seconds
+        b = mixed.estimate(StepShape(**shape, compiled=True)).seconds
+        assert b == pytest.approx(a, rel=1e-6)
+
+    def test_the_list_names_the_ones_that_synchronise(self):
+        from atom.compass.core.cost.priced import HOST_SYNC
+
+        assert "aten::item" in HOST_SYNC
+        assert "aten::is_nonzero" in HOST_SYNC
+        assert "aten::mm" not in HOST_SYNC

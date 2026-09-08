@@ -103,6 +103,25 @@ DEFAULT_BOUNDARY_SECONDS = 2.25e-6
 #: this model counts for that graph. Taken warm; the same step cold spends 31ms
 #: more in compilation stalls, which is not overhead and must not be fitted as
 #: any. One step of one model, so it is an argument.
+#: Operators that make the host wait for the device and run no kernel worth the
+#: name. They cannot be graph-captured -- a synchronise inside a capture is an
+#: error -- so the benchmark times them back to back, and what it measures is
+#: the synchronisation itself.
+#:
+#: They must not be summed into a step's *kernel* time. Priced at 17.15 and
+#: 16.02 microseconds and appearing 48 and 24 times in one 27B decode graph,
+#: they added 1.208 ms to a 10.5 ms step and put the priced total 8.4% *above*
+#: the step it was inside -- which looked, for a while, like the isolated
+#: kernels had somehow become more expensive than the in-situ ones.
+#:
+#: Their cost is real, and it belongs to the overhead term: a synchronise
+#: stalls the pipeline, which is exactly the host-side waiting `max(kernels,
+#: launches x host)` already describes. Counting it twice was the error.
+HOST_SYNC = frozenset({
+    "aten::item", "aten::is_nonzero", "aten::_local_scalar_dense",
+    "aten::equal", "aten::allclose",
+})
+
 DEFAULT_COMPILED_SECONDS_PER_LAUNCH = 9.71e-6
 
 #: How long the host takes per kernel launch on a compiled, not-replayed step.
@@ -283,6 +302,8 @@ class PricedGraphCostOracle:
         kernel_seconds: list = []
         breakdown: dict[str, float] = {}
         for op in graph_blob["ops"]:
+            if op.get("name", "") in HOST_SYNC:
+                continue
             entry = price_list.get(signature_of(op))
             if entry is None:
                 self.unpriced += 1

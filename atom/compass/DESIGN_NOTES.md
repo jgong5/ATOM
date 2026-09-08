@@ -2899,13 +2899,38 @@ Two kernels are worth naming from the per-kernel table:
 `cross_device_reduce_1stage` at **+19.5%** -- the collective, whose isolated
 price absorbs inter-rank skew for the same reason its in-situ duration does.
 
-**The boundary constant stays blocked, but now for a stated reason.** The
-method needs `step - priced`, and with 12.6% of the priced total coming from
-fallback prices neither including those operators nor excluding them gives a
-clean residual: include them and their overhead is counted twice, exclude them
-and their kernel time goes missing. It needs either those 203 to become
-graph-captured, or their overhead component separated from their kernel time.
-Until then the TP=2 and TP=4 figures stand as what they were when measured.
+**What the fallback-priced operators actually are.** Not 203 signatures --
+203 graph *instances* of two:
+
+| operator | in one 27B decode graph | price | total |
+| --- | --- | --- | --- |
+| `aten::item` | 48 | 17.15 us | 0.823 ms |
+| `aten::is_nonzero` | 24 | 16.02 us | 0.384 ms |
+
+They copy a scalar back and **synchronise**, which is why they cannot be
+captured, and what the back-to-back benchmark measures is the synchronisation.
+Summing that into a step's *kernel* time is the error: their cost is real and
+belongs to the overhead term, which is where host-side waiting already lives.
+`HOST_SYNC` names them and both the priced oracle and `step_accounting` now
+leave them out of kernel sums.
+
+That takes the 27B TP=4 overshoot from +8.4% to **+2.1%**, and turns TP=8's
+residual positive. It does not finish the job:
+
+| | sync excluded | kernels | step, measure table | |
+| --- | --- | --- | --- | --- |
+| 27B TP=4 | 1.440 ms | 9.975 ms | 9.774 ms | +2.1% |
+| 27B TP=8 | 2.290 ms | 7.543 ms | 7.864 ms | -4.1% |
+
+**And there is a baseline problem underneath, which is mine.** Two different
+quantities have been standing in for "the step": the in-situ *kernel sum* from
+a profile (10.529 ms) and the *step wall time* from the measure table (9.774
+ms), from two different runs. They disagree by 7.7%, and for a serial step the
+wall time should not be *below* the kernel sum. Until that is resolved -- one
+run, one baseline, and an explanation for any overlap -- a 2% residual cannot
+be told from a baseline mismatch, and no boundary constant should be fitted to
+it. That is the next thing to settle, and it is smaller and better defined than
+what it replaced.
 
 On #4, which recorded a 19% calibrate-vs-evaluate gap on TP=4 prefill that was
 never explained: the priced oracle gets TTFT to +6.46% on the same configuration.
