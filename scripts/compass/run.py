@@ -15,6 +15,7 @@ import sys
 import time
 
 from atom import SamplingParams
+from atom.compass.workload import prompt_of_tokens
 from atom.model_engine.arg_utils import EngineArgs
 from atom.utils.arg_parser import FlexibleArgumentParser
 
@@ -26,14 +27,11 @@ def main() -> int:
     parser.add_argument("--max-tokens", type=int, default=32)
     parser.add_argument(
         "--prompt-tokens", type=int, default=64,
-        help="WORDS, not tokens. The prompt below is one `w<i>x<j>` word per "
-             "unit and each is several tokens, so a step comes out five to "
-             "seven times this -- 64 gives 314, 2400 gives 15694, the ratio "
-             "rising with length. Harmless for the campaigns here, which are "
-             "read by the shape each step actually recorded, but it is not a "
-             "token count. `replay.py:_prompt` builds an exact one; this "
-             "should adopt it, which will change the shape every existing "
-             "invocation produces.")
+        help="tokens per prompt, exactly. Was words until now, and a word is "
+             "five to eight tokens, so an invocation pinned to a value here "
+             "produces a different (smaller) shape than it used to -- 64 gave "
+             "314 tokens, 2400 gave 15694. Artifacts already on disk are keyed "
+             "to the shapes their steps recorded and are unaffected.")
     parser.add_argument("--out", required=True)
     parser.add_argument(
         "--sweep", action="store_true",
@@ -51,7 +49,7 @@ def main() -> int:
     # the second request onward would skip prefill entirely, which is a real
     # ATOM behaviour but not the one being measured here.
     prompts = [
-        f"Request {i}. " + " ".join(f"w{i}x{j}" for j in range(args.prompt_tokens))
+        prompt_of_tokens(args.prompt_tokens, i)
         for i in range(args.num_prompts)
     ]
     params = SamplingParams(temperature=0.0, max_tokens=args.max_tokens)
