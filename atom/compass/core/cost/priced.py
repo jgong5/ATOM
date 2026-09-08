@@ -108,14 +108,27 @@ DEFAULT_DISPATCH_SECONDS = 130e-6
 #: residual it is fitted from is pricing error almost in full.
 #:
 #: That error varies more between machines than between tensor-parallel widths:
-#: -2.1% of the priced sum for the 27B at TP=4 on one box, +10.0% for the same
-#: model and width on another, +14.3% at TP=8 there. It has structure that does
-#: survive the machine change -- `__amd_rocclr_copyBuffer` priced 171-263% over
-#: its in-situ time, `cross_device_reduce_1stage` 7-33% over, and about 24% of
-#: kernel time carrying no priced breakdown at all and underpriced as a body --
-#: so it is a fixable error rather than noise, and fixing it is what would let
-#: this constant go to zero. Until then the value stands: removing it would make
-#: predictions worse without making them righter.
+#: +10.0% of the priced sum for the 27B at TP=4 on one box and +14.3% at TP=8
+#: there, against -2.0% to +1.1% for the same model and width on another -- which
+#: is that machine's whole residual sitting inside the +-1% a repeat pricing run
+#: moves the total by, so it is not distinguishable from zero.
+#:
+#: Per kernel, with every operator's kernels named (see `_wants_breakdown`) and
+#: each entry's own price distributed across them, the errors reproduce across
+#: two pricing runs to about a point:
+#:
+#:     __amd_rocclr_copyBuffer          +260%
+#:     fused_qk_rmsnorm_group_quant     -37%
+#:     fused_recurrent_gated_delta_rule -26%
+#:     paged_attention_decode           -25%
+#:     cross_device_reduce_1stage       -21%
+#:     the gemms                        -10% to +12%
+#:
+#: with one exception: `silu_and_mul` moved +14% to -23% between the same two
+#: runs, and +47% then -32% in its per-call price, so it is not measured, it is
+#: unstable. That aside, the error is a fixable one rather than noise, and
+#: fixing it is what would let this constant go to zero. Until then the value
+#: stands: removing it would make predictions worse without making them righter.
 DEFAULT_BOUNDARY_SECONDS = 2.25e-6
 
 #: Seconds added per kernel launch on a compiled step that was not replayed.

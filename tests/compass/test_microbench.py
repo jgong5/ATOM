@@ -370,3 +370,69 @@ class TestBreakdownsUnderParallelism:
 
         assert not _is_collective_op({"name": "aten::mm", "group": None})
         assert not _is_collective_op({"name": "aiter::fmha_fwd"})
+
+
+class TestOneBreakdownPerOperator:
+    """A threshold on the signature is blind to an operator that fragments.
+
+    `aiter::linear_attention_with_output_base` arrives as 48 signatures of
+    0.093ms, one per layer, because its signature carries per-layer state. Each
+    falls under the 1ms bar that decides whether a breakdown is worth a profiler
+    session, so the family got none -- while being the third largest thing in
+    the step at 4.47ms. That is most of the quarter of kernel time that could
+    not be audited against a price.
+
+    The rule added for it: a signature also earns a breakdown by being the first
+    of an operator nobody has taken apart yet. One per family is enough to name
+    an operator's kernels, and it bounds the sessions at the number of distinct
+    operator names.
+    """
+
+    def test_a_fragment_of_an_uncovered_operator_is_taken(self):
+        from atom.compass.runtime.microbench import _wants_breakdown
+
+        assert _wants_breakdown(23.2e-6, 4, "aiter::linear_attention", set())
+
+    def test_later_fragments_of_the_same_operator_are_not(self, monkeypatch):
+        """Under parallelism, where sessions are scarce and the bar is 1ms.
+
+        Without the parallel context the bar is zero and every signature earns a
+        breakdown anyway, so this says nothing unless the context is set.
+        """
+        from atom.compass.runtime import microbench
+
+        monkeypatch.setattr(microbench, "under_parallelism", lambda: True)
+        assert not microbench._wants_breakdown(
+            23.2e-6, 4, "aiter::linear_attention", {"aiter::linear_attention"})
+
+    def test_at_tp1_every_signature_is_taken_apart(self, monkeypatch):
+        """The bar is zero off parallelism, and the family rule changes nothing.
+
+        Sessions are only scarce where they fault, so nothing is skipped here
+        and the fragmenting operator was never invisible at TP=1.
+        """
+        from atom.compass.runtime import microbench
+
+        monkeypatch.setattr(microbench, "under_parallelism", lambda: False)
+        assert microbench._wants_breakdown(
+            23.2e-6, 4, "aiter::linear_attention", {"aiter::linear_attention"})
+
+    def test_a_big_signature_is_taken_however_covered_its_family(self, monkeypatch):
+        """Two shapes of one gemm launch different kernels.
+
+        So the family rule must not stop the second being taken apart on its
+        own merit.
+        """
+        from atom.compass.runtime import microbench
+
+        monkeypatch.setattr(microbench, "under_parallelism", lambda: True)
+        assert microbench._wants_breakdown(42e-6, 256, "aiter::gemm_a16w16",
+                                           {"aiter::gemm_a16w16"})
+
+    def test_without_a_family_it_is_the_threshold_alone(self, monkeypatch):
+        """The old behaviour, for callers that pass no family."""
+        from atom.compass.runtime import microbench
+
+        monkeypatch.setattr(microbench, "under_parallelism", lambda: True)
+        assert not microbench._wants_breakdown(23.2e-6, 4, None, None)
+        assert microbench._wants_breakdown(42e-6, 256, None, None)

@@ -4962,3 +4962,74 @@ machines running the same model at the same width by 12 percentage points --
 more than it differs between TP=4 and TP=8 on one box (4 points). Any residual
 assembled across machines is measuring the machines. `residual.py` says so in
 its docstring; the campaigns behind the tables above were each run on one box.
+
+## A threshold on the signature cannot see an operator that fragments
+
+A quarter of a replayed step's kernel time had no priced breakdown to be checked
+against. The cause was not a budget and not parallelism. `_time_in_graph` took a
+breakdown for any signature carrying a millisecond of the step, and
+`aiter::linear_attention_with_output_base` never carries one: it arrives as **48
+signatures of 0.093 ms**, one per layer, because its signature holds per-layer
+state. Every fragment falls under the bar while the family is the third largest
+thing in the step at 4.47 ms. Same for `unified_attention_with_output_base` at
+16 signatures, and `silu_and_mul` missed the bar outright at 0.950 ms.
+
+So a signature now earns a breakdown two ways: by carrying a millisecond, or by
+being the first of an operator nobody has taken apart yet. One per family is
+enough to *name* an operator's kernels, which is what an audit needs, and it
+bounds the cost -- 30 distinct operator names against the several hundred
+profiler sessions that fault the device under parallelism. Re-priced at TP=4:
+
+| | before | after |
+| --- | --- | --- |
+| breakdowns taken | 8 | 24 |
+| operators with one | 3 of 28 | 18 of 28 |
+| work-term contribution auditable | 80.2% | **100.0%** |
+| kernel time with nothing to check it | 24% | **6%** |
+
+No fault, which was the real risk. The 6% left is the inductor-generated Triton
+kernels, unpriced by design because loading them faults at TP>1.
+
+**The audit had to change with it.** One breakdown for 48 signatures means a
+tool that sums `kernels` across price entries puts one signature's kernel time
+against 48 launches and reads a 48-fold underpricing. `residual.py` now
+attributes each signature by its own breakdown where it has one -- the six
+shapes of `gemm_a16w16` each launch a different `Cijk` kernel and must not be
+pooled -- and falls back to the family's shares otherwise.
+
+**And that exposed a mistake in the previous section's per-kernel table.** It
+summed the breakdown's *absolute* kernel durations, which do not add up to the
+entry's price. So it was asking whether the breakdown replay matched the step,
+not whether the price the model uses does. Distributing each entry's own price
+across its kernels asks the right question and reconciles with the headline
+residual. On that basis `cross_device_reduce_1stage` is **under**-priced by 21%,
+not over-priced by 7-33% as recorded there. `__amd_rocclr_copyBuffer` survives
+the correction at +260%.
+
+**What reproduces.** Two pricing runs of one graph on one box, back to back
+under identical code, move the summed contribution by 0.96%, with a median
+per-signature change of 1.18% and a p90 of 32%. That p90 is alarming until it is
+broken down: it is a few volatile signatures, and everything carrying the step
+repeats to about a point.
+
+| kernel | run 1 | run 2 |
+| --- | --- | --- |
+| `__amd_rocclr_copyBuffer` | +260% | +259% |
+| `fused_qk_rmsnorm_group_quant` | -37.3% | -36.5% |
+| `fused_recurrent_gated_delta_rule_fwd` | -25.5% | -26.3% |
+| `paged_attention_decode_sliding_window` | -25.1% | -24.5% |
+| `cross_device_reduce_1stage` | -21.2% | -21.8% |
+| the gemms | +11.1 +2.0 +9.2 +0.9 -8.6% | +9.4 +2.4 +12.7 +0.9 -9.9% |
+| `act_and_mul` (`silu_and_mul`) | **+14.0%** | **-22.7%** |
+
+The last row is not a measurement. Its per-call price went 3.08 to 4.51 to
+3.06 us across three runs, so it is the one operator here whose price is
+unstable rather than merely wrong, and it should be investigated as instability
+rather than corrected as an error.
+
+**A limit this puts on the previous section.** The residual on that box is
+-0.0% with one price list and +1.1% with the next, against -2.0% with the older
+one -- all within a couple of percent, which is what a repeat run moves the
+total by. That machine's pricing error is not distinguishable from zero. The
+other box's +10.0% and +14.3% are several times the repeat spread and stand.
+Any residual quoted below about 2% is quoting the instrument.

@@ -77,6 +77,11 @@ def main() -> int:
                          "per dispatch within one process, which is what makes "
                          "the per-kernel comparison honest")
     ap.add_argument("--match", default="decode")
+    ap.add_argument("--delta-us", type=float,
+                    help="profiling cost per dispatch, when the profiled run "
+                         "wrote no measure table of its own. Measure it with a "
+                         "split run on the same machine rather than guessing: "
+                         "it has come out between 0.24 and 1.05 us")
     ap.add_argument("--by-kernel", action="store_true",
                     help="also show which kernels carry the pricing error")
     args = ap.parse_args()
@@ -160,7 +165,11 @@ def main() -> int:
         return 0
 
     delta = 0.0
-    if args.profile_steps:
+    if args.delta_us is not None:
+        delta = args.delta_us
+        print(f"\n  profiling cost taken as {delta:.3f} us per dispatch, "
+              f"from a separate run on this machine")
+    elif args.profile_steps:
         seconds = decode_steps(args.profile_steps,
                                prefill=args.match.startswith("prefill"))
         shut = seconds[:max(0, len(seconds) - len(mine))]
@@ -173,11 +182,52 @@ def main() -> int:
         print("\n  no --profile-steps with unprofiled rows: in-situ times below "
               "are\n  profiled, and so overstated, which flatters the prices")
 
-    want = collections.defaultdict(float)
+    # Aggregated by operator, not by price entry. An operator whose signature
+    # fragments per layer gets one breakdown for the whole family (see
+    # `_wants_breakdown`), so summing `kernels` over entries would put one
+    # signature's kernel time against every launch in the profile and read as a
+    # 48-fold underpricing. What the breakdown establishes is *which* kernels an
+    # operator runs; the family's own priced total says how much. Splitting that
+    # total in the proportions the one breakdown measured is the assumption
+    # here, and it is a mild one where the fragments differ by under 3% -- but
+    # it is an assumption, so it lives in the tool and not in the price list.
+    def shares_of(entry):
+        total = sum(float(v) for v in (entry.get("kernels") or {}).values())
+        return ({k: float(v) / total for k, v in entry["kernels"].items()}
+                if total > 0 else None)
+
+    # A signature with its own breakdown is attributed by it -- the six shapes
+    # of `gemm_a16w16` each launch a different `Cijk` kernel, and pooling them
+    # would credit one kernel with all six shapes' time. The family stands in
+    # only for signatures that have no breakdown of their own.
+    fallback: dict = {}
     for op in graph["ops"]:
         entry = prices.get(signature_of(op))
-        for name, seconds in (entry or {}).get("kernels", {}).items():
-            want[name] += float(seconds) * 1e6
+        if entry and entry.get("kernels") and op["name"] not in fallback:
+            got_shares = shares_of(entry)
+            if got_shares:
+                fallback[op["name"]] = got_shares
+    want = collections.defaultdict(float)
+    unnamed_by: dict = collections.defaultdict(float)
+    for op in graph["ops"]:
+        if op.get("launch") or op.get("name", "") in HOST_SYNC:
+            continue
+        entry = prices.get(signature_of(op))
+        if entry is None:
+            continue
+        seconds = float(entry.get("seconds", 0.0)) * 1e6
+        use = shares_of(entry) if entry.get("kernels") else fallback.get(op["name"])
+        if use is None:
+            unnamed_by[op["name"]] += seconds
+            continue
+        for name, share in use.items():
+            want[name] += seconds * share
+    unnamed = sorted(((s, f) for f, s in unnamed_by.items()), reverse=True)
+    if unnamed:
+        print(f"\n  {len(unnamed)} operators have no breakdown anywhere in "
+              f"their family, so\n  the kernels they run cannot be named: "
+              + ", ".join(f"{f.split('::')[-1]} ({s / 1e3:.2f}ms)"
+                          for s, f in unnamed[:5]))
     n = len(mine)
     both = sorted(set(got) & set(want), key=lambda k: -got[k])
     if both:

@@ -556,8 +556,9 @@ PROFILE_MATCH = os.environ.get("COMPASS_BENCH_PROFILE", "")
 
 
 def _time_in_graph(fn, sets: list, iters: int, warmup: int, before=None,
-                   breakdown: bool = False,
-                   occurrences: int = 1) -> tuple[float, float, dict]:
+                   breakdown: bool = False, occurrences: int = 1,
+                   family: str | None = None,
+                   covered: set | None = None) -> tuple[float, float, dict]:
     """Seconds per call, with the launch amortised the way production does.
 
     A per-call loop cannot price a kernel smaller than its own call overhead. On
@@ -616,8 +617,43 @@ def _time_in_graph(fn, sets: list, iters: int, warmup: int, before=None,
     # duplicate flow starts on the way. Taking them only where the answer
     # matters cuts the cycles by an order of magnitude and loses nothing the
     # comparison uses -- on the 0.6B, 19 kernels covered 98.7% of a step.
-    take = breakdown and seconds * max(1, occurrences) >= _breakdown_over()
-    return seconds, 0.0, (_kernels_of_replay(graph) if take else {})
+    take = breakdown and _wants_breakdown(seconds, occurrences, family, covered)
+    kernels = _kernels_of_replay(graph) if take else {}
+    if kernels and covered is not None and family is not None:
+        # Only on success. A family whose first signature yields nothing stays
+        # uncovered, so the next one is tried rather than the whole family being
+        # written off on one failure.
+        covered.add(family)
+    return seconds, 0.0, kernels
+
+
+def _wants_breakdown(seconds: float, occurrences: int,
+                     family: str | None = None,
+                     covered: set | None = None) -> bool:
+    """Whether this signature is worth a profiler session.
+
+    Two ways to earn one. Carrying a millisecond of the step is the first, and
+    was the only one; each breakdown is a profiler session and it is *sessions*
+    that fault the device under parallelism, so they go where the answer
+    matters.
+
+    Being the first signature of an operator nobody has taken apart yet is the
+    second, and it exists because a threshold on the *signature* is blind to an
+    operator whose signature fragments. `linear_attention_with_output_base`
+    arrives as 48 signatures of 0.093 ms -- one per layer, since its signature
+    carries per-layer state -- so every one falls under a 1 ms bar while the
+    family is the third largest thing in the step at 4.47 ms. It got no
+    breakdown at all, and most of the quarter of a step's kernel time that
+    could not be audited against a price was it.
+
+    One per family is enough to *name* an operator's kernels, which is what an
+    audit needs, and the fragments launch the same kernels as one another. It
+    also bounds the cost: a 27B decode graph has 30 distinct operator names,
+    against the several hundred sessions that fault.
+    """
+    if family is not None and covered is not None and family not in covered:
+        return True
+    return seconds * max(1, occurrences) >= _breakdown_over()
 
 
 def _kernels_of_replay(graph) -> dict:
@@ -845,6 +881,10 @@ def price_graph(graph_path: str, iters: int = 2000, warmup: int = 20,
 
     priced: dict[str, dict] = {}
     unpriced: dict[str, str] = {}
+    # Operator names that already have a breakdown somewhere. See the family
+    # rule in `_time_in_graph`: without it, an operator whose signature
+    # fragments per layer is never taken apart, however much of the step it is.
+    covered: set = set()
     for sig, op in example.items():
         # Per signature, not once: an operator that rebuilds the context from
         # its arguments leaves that context behind for whatever is priced next.
@@ -900,7 +940,8 @@ def price_graph(graph_path: str, iters: int = 2000, warmup: int = 20,
                 try:
                     seconds, host_seconds, kernels = _time_in_graph(
                         fn, sets, iters, warmup, before=rotate,
-                        breakdown=PRICE_KERNELS, occurrences=counts[sig])
+                        breakdown=PRICE_KERNELS, occurrences=counts[sig],
+                        family=op["name"], covered=covered)
                 except Exception as exc:  # noqa: BLE001
                     if not _uncapturable(exc):
                         raise
