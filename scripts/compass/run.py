@@ -162,6 +162,15 @@ def main() -> int:
             # 32 requests of 49152 tokens is a total context of 1.57M against a
             # pool of about 8M.
             long_decode = args.sweep_long_decode
+            # A round longer than the model's window is rejected or truncated,
+            # silently: the first version of these rounds asked for 262144
+            # against a 262144 window and the tokens it generates, and the
+            # coverage stopped 90k short with nothing in the log to say so.
+            # Clamped here so the ladder is the same shape on any model, which
+            # is what lets a small model stand in for a large one when the
+            # question is about scheduling rather than about kernels.
+            ceiling = max(1024, int(getattr(args, "max_model_len", 0) or 262144)
+                          - long_decode - 64)
             rounds += [
                 # Rung 1, out to the model's context limit -- prefill coverage.
                 (2048, 1, long_decode), (4096, 1, long_decode),
@@ -173,6 +182,17 @@ def main() -> int:
                 (16384, 16, long_decode), (65536, 16, long_decode),
                 (16384, 32, long_decode), (49152, 32, long_decode),
             ]
+            rounds = [(min(length, ceiling), count, decode)
+                      for length, count, decode in rounds]
+            # Clamping collapses distinct rounds into duplicates on a small
+            # model; one of each is enough and the sweep runs every round twice
+            # anyway.
+            seen, unique = set(), []
+            for entry in rounds:
+                if entry not in seen:
+                    seen.add(entry)
+                    unique.append(entry)
+            rounds = unique
         # Twice through, because Triton autotunes per shape rather than once per
         # process: the first visit to a shape pays a benchmarking cost that
         # steady-state serving never pays again. The second visit is the one
