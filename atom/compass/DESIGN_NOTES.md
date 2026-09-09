@@ -5302,3 +5302,48 @@ external completion ids (`cmpl-...`). The engine holds the mapping in
 request -- arrival to first step -- cannot be computed directly, only inferred
 from medians as above. Exposing that mapping is a small change and is what the
 next measurement needs.
+
+## Correction: the queue-wait inference was arithmetic, not measurement
+
+The previous section concluded that the simulator admits requests *late*: TTFT
+about 30s real and 53s modelled against a 13s prefill phase, so "roughly 17
+seconds of queueing in the real run against 39 in the simulated one".
+
+That subtraction is not valid. It takes the median of one distribution (TTFT)
+and the median of another (the prefill phase) and treats the difference as the
+median of a third. With the sequence id now on both tables the wait can be
+measured per request instead, and it comes out the other way round:
+
+| arrival to first step | real | modelled |
+| --- | --- | --- |
+| median | 56.7s | 7.0s |
+| mean | 66.7s | 8.0s |
+
+The simulator admits requests **earlier** than the real engine, not later.
+
+**That run is confounded and the number should not be quoted yet.** A 141 GB
+neighbour arrived on the box between pilots, and the real replay took 507s
+against 309s for the same workload on a quiet machine, so the real queue waits
+include contention the simulated side has no way to know about. Its calibration
+was taken on a quiet box.
+
+An attempt to recover a clean number from the earlier uncontended pilot, by
+joining sequence ids to the workload in arrival order, does not survive
+checking: sequence ids do follow arrival order on the real side, but on the
+simulated side the ordinal join gives -7.2s where the true join gives +7.0s,
+because the virtual clock's origin is not the workload's first arrival. The
+ordinal shortcut is only sound on the real side, which is the half that does not
+need it.
+
+So what is established is narrower than the previous section claimed: the
+prefill phase executes correctly and contiguously in both runs, TTFT is wrong,
+and the wait before a request's first step is now measurable per request. Which
+way that wait errs on a quiet machine is not yet measured. It needs one clean
+run of both sides on an uncontended box, which is a rerun and not a change.
+
+**A note on the shared box.** Three of the last five pilot attempts were lost or
+degraded by other tenants -- two refused to start with a negative KV budget at
+141 GB of neighbour, one ran 64% slow. Reducing `--max-num-seqs` from 512 to 32
+cut the per-request cache tensor from 9.35 GB to 0.58 GB and was not enough on
+its own; utilization had to go to 0.92 as well. Any timing campaign here needs
+the machine checked before and after, not only before.
