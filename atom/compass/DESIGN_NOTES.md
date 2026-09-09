@@ -5347,3 +5347,32 @@ degraded by other tenants -- two refused to start with a negative KV budget at
 cut the per-request cache tensor from 9.35 GB to 0.58 GB and was not enough on
 its own; utilization had to go to 0.92 as well. Any timing campaign here needs
 the machine checked before and after, not only before.
+
+## A quiet box, a small model, a light load: the model is accurate
+
+Both machines the 27B work ran on became contended, so the admission question
+was put to Qwen3-0.6B on an idle node instead. Scheduling is not a property of
+the model, and the harness is the same: same corpus, same converter, same
+replay, same analysis. Sixty requests of cc-traces filtered to what a 40960
+window can serve -- median 2368 input tokens -- calibrated by the same sweep.
+
+| on totals | error |
+| --- | --- |
+| TTFT | **+5.8%** |
+| latency | +10.5% |
+| decode time | +14.2% |
+| time per output token | +17.4% |
+
+Every figure the same sign and none of them large: no cancellation, and TTFT
+and TPOT -- the two a deployment is actually sized against -- within 6% and 17%.
+Queue wait matches as well, 0.2s median real against 0.3s modelled.
+
+**This does not answer the admission question.** The run lasts 7.5 seconds and
+the median request waits 0.2s to start, so the engine is never loaded and
+admission is never tested. The 27B case is the opposite regime: 77% of its
+device time is prefill and requests wait tens of seconds. What this establishes
+is that the cost model, the harness and the arrival replay are sound where
+nothing is queueing, which is worth having and is not what was being asked.
+
+The loaded case is the same workload with arrivals compressed, which is the next
+run rather than a different experiment.
