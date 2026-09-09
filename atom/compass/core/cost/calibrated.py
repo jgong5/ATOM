@@ -40,8 +40,32 @@ __all__ = ["CalibratedCostOracle"]
 
 
 def _prefill_features(shape: StepShape) -> list[float]:
+    """What a prefill step costs: its own tokens, and the history it reads.
+
+    `tokens` and `tokens**2` alone describe a prefill that starts from nothing --
+    linear GEMM work plus self-attention within the chunk. Chunked prefill does
+    not start from nothing. A 262144-token prompt arrives as sixteen chunks of
+    16384, and every one of them has the same `tokens`, so a model without a
+    context term predicts the same cost for the first chunk and the sixteenth.
+
+    Measured, they are not the same: a full 16384-token chunk costs 1922 ms at a
+    context under 50k, 2387 ms between 50k and 100k, and 2992 ms between 100k
+    and 200k. The model was fitted on samples spanning all of that and predicted
+    one number for them, 23% under the mean, because the feature it needed was
+    not there to fit.
+
+    `tokens * context` is the attention this chunk performs over what came
+    before -- each of its queries reads the whole history. Keeping it separate
+    from `tokens**2`, which is attention within the chunk, because the two grow
+    differently: the second is fixed once the chunk size is, and the first
+    climbs with every chunk.
+    """
     tokens = float(shape.num_prefill_tokens)
-    return [1.0, tokens, tokens * tokens]
+    context = float(sum(shape.context_lens)) if shape.context_lens else 0.0
+    # The history is what the context holds *before* this chunk's own tokens,
+    # which the reading already counts.
+    history = max(0.0, context - tokens)
+    return [1.0, tokens, tokens * tokens, tokens * history]
 
 
 def _decode_features(shape: StepShape) -> list[float]:
