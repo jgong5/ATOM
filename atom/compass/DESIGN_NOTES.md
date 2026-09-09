@@ -5376,3 +5376,43 @@ nothing is queueing, which is worth having and is not what was being asked.
 
 The loaded case is the same workload with arrivals compressed, which is the next
 run rather than a different experiment.
+
+## Under load the simulator admits late, and that is the whole signature
+
+Same model, same box, same calibration as the section above; the workload's
+arrivals compressed forty times and three hundred requests instead of sixty, so
+the engine is saturated. 239 of 300 requests wait more than a second to start,
+against 3 of 60 before.
+
+| | real | modelled |
+| --- | --- | --- |
+| arrival to first step, median | 4.0s | 4.8s |
+| requests waiting over a second | 239/300 | 246/300 |
+
+**The simulator admits about 20% late**, and everything else follows from it:
+
+| on totals | 0.6B loaded | 27B long context |
+| --- | --- | --- |
+| TTFT | +17.8% | +114% |
+| decode time | -12.4% | -62% |
+| latency | +6.6% | -6.2% |
+
+The same signature at both scales, six times milder on the small model: a
+request admitted late shows a longer TTFT, still finishes near the right time,
+and so reports a compressed decode phase. Latency, being the sum, hides it.
+
+This also settles a contradiction. The direct queue-wait measurement on the 27B
+said the simulator admits *earlier* -- 56.7s real against 7.0s modelled -- but
+that run had a 141 GB neighbour and its real side was 64% slow. On a quiet box
+the sign is the other way, and it agrees with the TTFT error, which the
+contended reading did not.
+
+**Why the 27B case is six times worse** is not measured, but the difference in
+granularity is the obvious candidate: a 0.6B step is milliseconds and a 27B
+prefill chunk is 2.26 seconds, so the same error in *which* step a request is
+admitted after costs three orders of magnitude more.
+
+**And a caution about what a simulator is for.** Under saturation the modelled
+run took 122 seconds against the real run's 36. The discrete-event jump only
+pays when there is idle to skip; with a full queue the simulator is slower than
+the system it stands for, while still being wrong about TTFT by 18%.
