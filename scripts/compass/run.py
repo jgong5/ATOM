@@ -177,12 +177,40 @@ def main() -> int:
                 (8192, 1, long_decode), (16384, 1, long_decode),
                 (65536, 1, long_decode), (131072, 1, long_decode),
                 (196608, 1, long_decode), (258048, 1, long_decode),
-                # Rungs 8, 16 and 32 at long total context -- decode coverage.
+                # Rungs 8, 16 and 32 across the context range, not only at
+                # its ends. Sampling a rung at a tiny context and an enormous
+                # one bounds it without covering it: the fit is then a line
+                # through two distant clusters, and a workload living between
+                # them is being interpolated across a region nothing measured.
+                # Measured, that is where every real decode step fell -- 117 of
+                # 117 at rung 8, 512 of 512 at rung 16, 1642 of 1642 at rung 32
+                # -- and the predictions came out 31 to 33% low. Rung 1 was the
+                # only rung whose samples surrounded its workload and the only
+                # one within a percent.
+                (1024, 8, long_decode), (4096, 8, long_decode),
                 (16384, 8, long_decode), (65536, 8, long_decode),
+                (1024, 16, long_decode), (4096, 16, long_decode),
                 (16384, 16, long_decode), (65536, 16, long_decode),
+                (1024, 32, long_decode), (4096, 32, long_decode),
                 (16384, 32, long_decode), (49152, 32, long_decode),
             ]
-            rounds = [(min(length, ceiling), count, decode)
+            # Ragged batches, so raggedness varies and can be fitted. Lengths
+            # spread geometrically within one batch, which is what a real
+            # workload looks like: requests arrive at different times and are
+            # at different points in their generation, so a decode batch mixes
+            # short histories with long ones.
+            def _spread(rung, low, high):
+                step = (high / low) ** (1.0 / max(rung - 1, 1))
+                return tuple(int(low * step ** i) for i in range(rung))
+
+            for rung in (8, 16, 32):
+                rounds += [
+                    (_spread(rung, 512, 8192), rung, long_decode),
+                    (_spread(rung, 1024, 32768), rung, long_decode),
+                ]
+            rounds = [((tuple(min(v, ceiling) for v in length)
+                        if isinstance(length, (list, tuple))
+                        else min(length, ceiling)), count, decode)
                       for length, count, decode in rounds]
             # Clamping collapses distinct rounds into duplicates on a small
             # model; one of each is enough and the sweep runs every round twice
@@ -199,6 +227,17 @@ def main() -> int:
         # worth fitting, and having both lets the outlier rejection see the
         # difference rather than guess at it.
         for round_index, (length, count, decode) in enumerate(rounds + rounds):
+            # A round is either `count` prompts of one length, or an explicit
+            # list of lengths. The second exists because every uniform round
+            # leaves the batch's *raggedness* at exactly one, and a fit cannot
+            # find a coefficient for a quantity that never varies. Measured:
+            # real decode batches run 2.8 to 3.9 times ragged (longest sequence
+            # over mean) while every sweep batch was 1.0, and the cost model,
+            # which sums context across the batch, came out 29 to 32% low at
+            # rungs 8 and 16 as a result. Widening the context range did not
+            # help, because context was not the missing dimension.
+            lengths = (list(length) if isinstance(length, (list, tuple))
+                       else [length] * count)
             llm.generate(
                 # Exactly `length` tokens each, and a distinct opening per
                 # prompt so no two share prefix-cache blocks. This built its
@@ -206,8 +245,8 @@ def main() -> int:
                 # hand-built word-per-token prompt is five to eight times the
                 # length it claims -- which the short ladder survived and the
                 # long one did not, being silently truncated at max_model_len.
-                [prompt_of_tokens(length, round_index * 10007 + i)
-                 for i in range(count)],
+                [prompt_of_tokens(n, round_index * 10007 + i)
+                 for i, n in enumerate(lengths)],
                 SamplingParams(temperature=0.0, max_tokens=decode),
             )
         print("sweep complete")

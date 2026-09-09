@@ -5554,3 +5554,63 @@ loaded experiment run here has been at essentially 100% utilisation, where the
 queue term swamps everything and no scheduling property is observable. A
 scheduler comparison needs a workload with slack, or controlled step durations
 that remove the cost error by construction.
+
+
+## The decode error was a rank deficiency, not a coverage gap
+
+Decode predictions ran 29 to 33% low at CUDA-graph rungs 8 and 16 on the real
+step sequence -- holding scheduling fixed, so nothing about simulation is
+involved. Three hypotheses, and only the third was right.
+
+**Not a missing region, though there was one.** Every rung samples its context
+at two widely separated clusters: the short ladder puts eight sequences of 96
+tokens at a total of 768, the long rounds put eight of 16384 at 131k, and
+nothing sits between. Measured, *every* real step fell in that hole -- 117 of
+117 at rung 8, 512 of 512 at rung 16, 1642 of 1642 at rung 32 -- while rung 1,
+the only rung whose samples surrounded its workload, was the only one accurate
+at -0.9%. This is what "inside recorded bounds" conceals: bucket 8's bounds are
+[264, 327168] and a step at 33045 is inside them and inside a gap.
+
+Filling the gap changed almost nothing. Rung 8 went from -32.6% to -32.1%.
+
+**It was a dimension with no variance at all.** Every calibration round runs
+sequences of one length, so within a batch the longest history equals the mean:
+raggedness exactly 1.00 in all 2997 samples. Real decode batches are 2.8 to 3.9
+times ragged, because requests arrive at different times and sit at different
+points in their generation. The model sums context across the batch, which makes
+`[10k, 10k, 10k]` and `[1k, 1k, 28k]` the same step -- and they are not, if
+attention reads a rectangle sized by the longest sequence.
+
+No feature for that could be fitted, because the quantity never varied. Not a
+coverage gap in a feature the model had; a column of zeros where a feature
+should be.
+
+Two changes, and the effect of each, measured on the real steps:
+
+| rung | before | ragged sweep rounds | + padding feature |
+| --- | --- | --- | --- |
+| 8 | -32.6% | -19.8% | **-7.4%** |
+| 16 | -29.1% | -23.1% | **-13.5%** |
+| 32 | -9.2% | -7.8% | **-4.9%** |
+
+The sweep now runs some batches with lengths spread geometrically, so
+raggedness varies from 1.0 to about 3.5. `_decode_bucket_features` gains the
+padding -- `nseq * max(context) - sum(context)` -- which is zero for a uniform
+batch, and `_least_squares` drops any feature with no variance in its samples
+and returns its coefficient as zero. A rung calibrated without ragged batches
+therefore fits the model its evidence supports, rather than failing on a
+singular system or reporting a coefficient nothing constrained.
+
+**Two things still open.** Rungs 2 and 4 have no ragged rounds at all -- rung 4
+is 100% ragged in the workload and got worse, +10.5% to +22.5%, when the other
+rungs improved. And the sweep's raggedness reaches 3.5 while rung 32's real
+steps reach 11.8, so the top of that range is still extrapolation.
+
+**And a caution repeated.** The per-request figures moved the other way while
+this was fixed: TTFT was +11.3% with the badly-fitted model and -9.2% with the
+better one. Those are queueing-amplified on a saturated workload, where a
+service-time bias is multiplied by the queue, and the aggregate that looked
+best came from the model whose step costs were worst. The per-bucket error on a
+fixed real step sequence is the measure of a cost model. The per-request one is
+a measure of cost and scheduling together, and on a saturated run it is mostly
+the queue.

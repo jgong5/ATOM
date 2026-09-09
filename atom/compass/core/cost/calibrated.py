@@ -75,15 +75,60 @@ def _decode_features(shape: StepShape) -> list[float]:
 
 
 def _decode_bucket_features(shape: StepShape) -> list[float]:
-    """Decode features within one CUDA-graph bucket: just the KV to read.
+    """Decode features within one CUDA-graph bucket: the KV read, and the
+    padding read with it.
 
     Batch size is dropped because the bucket already carries it -- the replay
     runs the padded rung whatever the batch, so twelve sequences and sixteen
-    perform the same work. What still varies inside a rung is how much history
-    the step reads, and that is the only thing left to fit.
+    perform the same work.
+
+    Total context alone treats a batch as the sum of its histories, which makes
+    ``[10k, 10k, 10k]`` and ``[1k, 1k, 28k]`` the same step. They are not, if
+    attention reads a rectangle sized by the longest sequence: the second reads
+    three times 28k where the first reads three times 10k. The difference is
+    the padding, and it is the second feature here.
+
+    Measured on a 0.6B serving run, this is most of a large error. Real decode
+    batches run 2.8 to 3.9 times ragged -- longest history over mean -- and
+    predictions from total context alone came out 21 to 23% low at rungs 8 and
+    16. With the padding term they come out 7.5% and 13.3% low.
+
+    It could not be fitted until the sweep had ragged batches to fit it from.
+    Every calibration round ran sequences of one length, so the padding was zero
+    in every sample and the coefficient had no variance to be identified by --
+    a rank deficiency rather than a coverage gap, which is why widening the
+    context range did nothing for it.
     """
-    context = float(sum(shape.context_lens)) if shape.context_lens else 0.0
-    return [1.0, context]
+    lengths = [float(v) for v in (shape.context_lens or ())]
+    if not lengths:
+        return [1.0, 0.0, 0.0]
+    context = sum(lengths)
+    # What a padded read would touch beyond the real histories. Zero for a
+    # uniform batch, which is what makes it droppable where nothing varies.
+    padding = len(lengths) * max(lengths) - context
+    return [1.0, context, padding]
+
+
+def _drop_constant_columns(rows: list[list[float]]) -> tuple[list[list[float]], list[int]]:
+    """Remove features that never vary, and say which were kept.
+
+    A column of identical values carries no information about its coefficient
+    and makes the normal equations singular. That is not hypothetical here: the
+    padding term is exactly zero for every uniform batch, so a rung calibrated
+    without ragged samples has a dead column. Dropping it fits the model that
+    the data can identify rather than refusing, or worse, returning a
+    coefficient the samples never constrained.
+
+    The intercept is kept whatever it looks like; it is meant to be constant.
+    """
+    keep = [0]
+    for i in range(1, len(rows[0]) if rows else 0):
+        values = {round(r[i], 12) for r in rows}
+        if len(values) > 1:
+            keep.append(i)
+    if len(keep) == len(rows[0] if rows else []):
+        return rows, keep
+    return [[r[i] for i in keep] for r in rows], keep
 
 
 def _least_squares(
@@ -125,9 +170,22 @@ def _least_squares(
         import numpy as np
     except ImportError:  # pragma: no cover - numpy is a hard dep of torch
         return None, 0
+    full_width = len(rows[0])
+    # A feature with no variance in these samples cannot have a coefficient
+    # identified for it, and leaves the normal equations singular. Dropped
+    # here and returned as zero, so a rung calibrated without ragged batches
+    # fits the model its evidence supports instead of failing or inventing one.
+    rows, kept = _drop_constant_columns(rows)
     width = len(rows[0])
     if len(rows) < width:
         return None, 0
+
+    def _expand(values):
+        """Back to the caller's feature width, zero where nothing varied."""
+        out = [0.0] * full_width
+        for slot, column in enumerate(kept):
+            out[column] = float(values[slot])
+        return out
 
     a = np.asarray(rows, dtype=float)
     b = np.asarray(targets, dtype=float)
@@ -142,22 +200,22 @@ def _least_squares(
 
     # Enough points left to still determine the fit after dropping some.
     if len(rows) < width + 2:
-        return [float(c) for c in coeffs], 0
+        return _expand(coeffs), 0
 
     # Residuals in the same relative units, so the outlier test is not itself
     # dominated by the largest samples.
     residuals = np.abs(bw - aw @ coeffs)
     mad = float(np.median(np.abs(residuals - np.median(residuals))))
     if mad <= 0.0:
-        return [float(c) for c in coeffs], 0
+        return _expand(coeffs), 0
 
     keep = residuals <= np.median(residuals) + outlier_sigmas * mad
     dropped = int((~keep).sum())
     if not dropped or int(keep.sum()) < width + 1:
-        return [float(c) for c in coeffs], 0
+        return _expand(coeffs), 0
 
     refit, *_ = np.linalg.lstsq(aw[keep], bw[keep], rcond=None)
-    return [float(c) for c in refit], dropped
+    return _expand(refit), dropped
 
 
 class CalibratedCostOracle:

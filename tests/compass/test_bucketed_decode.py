@@ -184,3 +184,85 @@ class TestAWorkloadFitsThroughTheClient:
         assert "MAX_IN_FLIGHT" in source
         assert "min(64, len(workload))" not in source
         assert "raise SystemExit" in source
+
+
+class TestPaddingIsAFeature:
+    """Total context makes [10k,10k,10k] and [1k,1k,28k] the same step.
+
+    They are not, if attention reads a rectangle sized by the longest sequence.
+    Real decode batches run 2.8 to 3.9 times ragged while every calibration
+    batch ran sequences of one length, so the padding term was zero in every
+    sample: a rank deficiency, not a coverage gap, which is why widening the
+    context range did nothing for a 21-23% under-prediction.
+    """
+
+    def _shape(self, lengths, bucket):
+        return StepShape(
+            num_scheduled_tokens=tuple([1] * len(lengths)),
+            context_lens=tuple(lengths),
+            num_prefill_tokens=0,
+            capture_bucket=bucket,
+        )
+
+    def test_a_ragged_batch_is_told_from_a_uniform_one(self):
+        from atom.compass.core.cost.calibrated import _decode_bucket_features
+
+        flat = _decode_bucket_features(self._shape([10000] * 3, 4))
+        tall = _decode_bucket_features(self._shape([1000, 1000, 28000], 4))
+        assert flat[1] == tall[1], "same total history"
+        assert tall[2] > flat[2], "different padded read"
+
+    def test_a_uniform_batch_has_no_padding(self):
+        from atom.compass.core.cost.calibrated import _decode_bucket_features
+
+        assert _decode_bucket_features(self._shape([500] * 8, 8))[2] == 0.0
+
+    def test_padding_is_the_rectangle_beyond_the_histories(self):
+        from atom.compass.core.cost.calibrated import _decode_bucket_features
+
+        got = _decode_bucket_features(self._shape([1000, 3000], 2))
+        assert got[1] == 4000.0          # 1000 + 3000
+        assert got[2] == 2000.0          # 2 * 3000 - 4000
+
+
+class TestAFitDropsWhatItCannotIdentify:
+    """A rung calibrated on uniform batches has a dead padding column.
+
+    Fitting it anyway is a singular system; refusing loses the rung entirely.
+    Dropping the column fits what the samples can identify and reports the
+    coefficient as zero, which is what "this evidence says nothing about it"
+    should look like.
+    """
+
+    def test_a_constant_column_is_dropped(self):
+        from atom.compass.core.cost.calibrated import _drop_constant_columns
+
+        rows = [[1.0, 10.0, 0.0], [1.0, 20.0, 0.0], [1.0, 30.0, 0.0]]
+        kept_rows, kept = _drop_constant_columns(rows)
+        assert kept == [0, 1]
+        assert kept_rows == [[1.0, 10.0], [1.0, 20.0], [1.0, 30.0]]
+
+    def test_a_varying_column_is_kept(self):
+        from atom.compass.core.cost.calibrated import _drop_constant_columns
+
+        rows = [[1.0, 10.0, 0.0], [1.0, 20.0, 5.0], [1.0, 30.0, 9.0]]
+        _, kept = _drop_constant_columns(rows)
+        assert kept == [0, 1, 2]
+
+    def test_the_intercept_survives_being_constant(self):
+        from atom.compass.core.cost.calibrated import _drop_constant_columns
+
+        rows = [[1.0, 10.0], [1.0, 20.0], [1.0, 30.0]]
+        _, kept = _drop_constant_columns(rows)
+        assert 0 in kept
+
+    def test_a_dropped_column_comes_back_as_zero(self):
+        """So a caller's feature vector still lines up with the coefficients."""
+        from atom.compass.core.cost.calibrated import _least_squares
+
+        rows = [[1.0, float(x), 0.0] for x in (1, 2, 3, 4, 5, 6)]
+        targets = [1.0 + 2.0 * x for x in (1, 2, 3, 4, 5, 6)]
+        coeffs, _ = _least_squares(rows, targets)
+        assert len(coeffs) == 3
+        assert coeffs[2] == 0.0
+        assert coeffs[1] == pytest.approx(2.0, rel=1e-6)
