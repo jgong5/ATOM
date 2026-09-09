@@ -54,7 +54,13 @@ def _workload(args) -> list[dict]:
         if args.num_requests:
             rows = rows[: args.num_requests]
         base = float(rows[0].get("arrival_s", 0.0)) if rows else 0.0
-        return [{"arrival_s": float(r.get("arrival_s", 0.0)) - base,
+        # Scaled here rather than at send time, so the workload written to the
+        # output file is the workload that ran. It was scaled at send time and
+        # saved unscaled, which meant a 40x compression that turned a 20-second
+        # arrival process into a half-second burst left no trace in the
+        # artifact -- the run looked paced and was not.
+        scale = max(1e-9, float(args.time_scale))
+        return [{"arrival_s": (float(r.get("arrival_s", 0.0)) - base) / scale,
                  "input_tokens": int(r.get("input_tokens", args.input_tokens)),
                  "output_tokens": int(r.get("output_tokens", args.output_tokens))}
                 for r in rows]
@@ -76,6 +82,31 @@ def _workload(args) -> list[dict]:
 #: the declared-arrival protocol needs a bulk submission the server does not
 #: have, and quietly posting fewer would reintroduce the deadlock this bounds.
 MAX_IN_FLIGHT = 1024
+
+
+def _digest(path):
+    """SHA-256 of a file, or None when there is no file to name."""
+    if not path:
+        return None
+    import hashlib
+
+    try:
+        with open(path, "rb") as fh:
+            return hashlib.sha256(fh.read()).hexdigest()
+    except OSError:
+        return None
+
+
+def _revision():
+    """The code this ran as, if the tree is a checkout."""
+    import subprocess
+
+    try:
+        out = subprocess.run(["git", "rev-parse", "HEAD"], capture_output=True,
+                             text=True, timeout=10)
+        return out.stdout.strip() or None
+    except Exception:  # noqa: BLE001 - provenance is best effort
+        return None
 
 
 def _prompt(tokens: int, index: int) -> str:
@@ -167,7 +198,7 @@ def main() -> int:
 
     def one(i_row):
         i, row = i_row
-        at = row["arrival_s"] / args.time_scale
+        at = row["arrival_s"]  # already scaled when the workload was built
         if args.pace:
             # Hold the request until its moment really comes round. Against a
             # real engine this is what makes the arrival process real: the
@@ -232,6 +263,7 @@ def main() -> int:
     # is exact by construction under a tokenizer giving one token per word in
     # `_WORDS`; this checks the assumption held, and costs nothing because the
     # count is already in every response.
+    length_check = "not requested"
     if args.check_lengths:
         off = []
         for r in results:
@@ -243,10 +275,12 @@ def main() -> int:
                 off.append((want, got))
         if off:
             worst = max(off, key=lambda pair: abs(pair[1] - pair[0]))
+            length_check = f"{len(off)} of {len(results)} wrong"
             print(f"  WARNING: {len(off)} of {len(results)} prompts were not the "
                   f"requested length; worst asked {worst[0]} got {worst[1]}",
                   file=sys.stderr)
         else:
+            length_check = "passed"
             print(f"  prompt lengths verified against the server for "
                   f"{len(results) - len(failed)} requests")
     engine = {}
@@ -260,9 +294,27 @@ def main() -> int:
         except Exception:  # noqa: BLE001
             engine = {}
 
+    # Everything needed to say what this run was, next to what it produced. A
+    # result whose arrival process, calibration or code revision cannot be
+    # recovered from its own artifact is not reproducible, and one of these
+    # runs was read as a measurement for a day after its arrival protocol had
+    # silently failed.
+    manifest = {
+        "revision": _revision(),
+        "paced": bool(args.pace),
+        "time_scale": float(args.time_scale),
+        "requests": len(workload),
+        "arrival_span_s": (round(workload[-1]["arrival_s"], 6)
+                           if workload else 0.0),
+        "trace": args.trace,
+        "trace_sha256": _digest(args.trace),
+        "model": model,
+        "failed": len(failed),
+        "prompt_lengths": length_check,
+    }
     with open(args.out, "w", encoding="utf-8") as fh:
-        json.dump({"workload": workload, "results": results, "engine": engine},
-                  fh, indent=1)
+        json.dump({"run": manifest, "workload": workload, "results": results,
+                   "engine": engine}, fh, indent=1)
     print(f"sent {len(workload)} requests, {len(failed)} failed -> {args.out}")
     if failed:
         print("  first failure:", failed[0]["error"], file=sys.stderr)
