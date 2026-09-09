@@ -5269,3 +5269,36 @@ of the numbers anyone would use to about a factor of two.
 and after the prefill fix. It does not move with pricing, which is the evidence
 that it is not a pricing problem. Comparing per-request step sequences needs the
 step table to record which request each step served, which it does not yet.
+
+## The TTFT error is queueing, not execution
+
+With `req_ids` on each step the prefill phase can be measured per request:
+from a request's first step to its last prefill step, and how much of that
+window went to its own steps rather than to other requests'.
+
+| | real | modelled |
+| --- | --- | --- |
+| first step to last prefill step, median | 12.8s | 13.6s |
+| of that, spent on other requests | 0.2% | 0.0% |
+
+**A request's prefill runs contiguously in both**, and takes about the same time.
+The hypothesis that the simulator interleaves more of other requests' work into
+a prefill is wrong.
+
+So the TTFT gap is elsewhere. TTFT is about 30s real and 53s modelled while the
+prefill phase is 13s, which puts most of it **before the request's first step**:
+roughly 17 seconds of queueing in the real run against 39 in the simulated one.
+The simulator executes a request's prefill correctly and admits it late.
+
+That narrows the remaining error to admission -- when a waiting request is
+allowed to start -- rather than to anything about steps or their costs. It also
+fits the decode side: a request admitted late finishes at about the right time
+(latency is -6.2%), so its decode phase is compressed, which is the -62%.
+
+**What blocks the next step.** The two id spaces do not join. The step table
+records internal sequence ids (`0`, `1`, `10`); `/compass/requests` records
+external completion ids (`cmpl-...`). The engine holds the mapping in
+`_internal_to_external` and exposes neither side of it, so queue wait per
+request -- arrival to first step -- cannot be computed directly, only inferred
+from medians as above. Exposing that mapping is a small change and is what the
+next measurement needs.
