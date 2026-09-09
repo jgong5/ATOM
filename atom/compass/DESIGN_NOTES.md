@@ -5509,3 +5509,48 @@ to be this), or a request becoming schedulable only at the next step boundary.
 Two runs is two runs. But the two agree to 40 milliseconds across a fiftyfold
 difference in queueing, which is a stronger constraint on the mechanism than
 either run alone.
+
+
+## Correction: there is no admission delay. The queue is amplifying cost error
+
+The previous section reported a constant quarter-second admission delay, from
+the median wait on two runs. The median was hiding the shape. Per request,
+by position in the run:
+
+| quartile | real wait | modelled wait |
+| --- | --- | --- |
+| requests 0-15 | 0.046s | **0.000s** |
+| 15-30 | 0.044s | 0.348s |
+| 30-45 | 0.483s | 0.670s |
+| 45-60 | 0.651s | 0.994s |
+
+The simulator admits the first requests *faster* than the real engine, not
+slower, and then falls progressively behind. A constant per-request cost cannot
+do that. The minimum wait is 0.000s simulated against 0.007s real, so nothing is
+being added at admission at all.
+
+**What is happening is queueing.** Both runs execute the same 1028 steps. The
+simulated ones cost 7.245s against 6.979s measured -- 3.8% more. And the engine
+is saturated: 99.6% utilised on the real run, 100.0% on the simulated one. At
+that utilisation a service time is not a small perturbation of the wait; the
+queue grows until arrivals stop. Adding 3.8% to every step is enough to take
+99.6% to 100%, and the wait follows.
+
+So the TTFT error on these workloads is the step-cost error, amplified. There is
+no separate scheduling defect to find, and #56 as posed -- "find why the
+simulator admits requests late" -- has no answer because it does not.
+
+**Two things follow.**
+
+The cost error is the whole remaining story on this path, which makes the
+bucket-8 and bucket-16 residuals the priority rather than a parallel concern.
+The retrospective said exactly this and it is worth quoting: "Under saturation,
+even a small service-time bias can change queueing considerably. Use the real
+sequence to assess cost predictions first; use controlled durations to assess
+the scheduler separately."
+
+And scheduling fidelity cannot be measured on a saturated workload at all. Every
+loaded experiment run here has been at essentially 100% utilisation, where the
+queue term swamps everything and no scheduling property is observable. A
+scheduler comparison needs a workload with slack, or controlled step durations
+that remove the cost error by construction.
