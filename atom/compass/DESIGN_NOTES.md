@@ -5614,3 +5614,51 @@ best came from the model whose step costs were worst. The per-bucket error on a
 fixed real step sequence is the measure of a cost model. The per-request one is
 a measure of cost and scheduling together, and on a saturated run it is mostly
 the queue.
+
+
+## Ragged rounds at every rung: decode within 8% everywhere
+
+The padding feature was fitted only where the sweep had ragged batches, which
+was rungs 8, 16 and 32. Rung 4 is fully ragged in the workload, had no ragged
+samples of its own, and was the one rung that got worse while the others
+improved. And a geometric spread of lengths cannot get very ragged -- its mean
+rises with its maximum, so the ratio tops out near 3.5 -- while rung 32's real
+steps reach 11.8.
+
+Both fixed by adding ragged rounds at every rung, and a skewed pattern: one long
+sequence among short ones, which is a real shape rather than a contrived one --
+a long-running request among freshly arrived ones. Its raggedness approaches the
+rung size instead of a constant, so the sweep now reaches 7.2, 13.0 and 21.5 at
+rungs 8, 16 and 32 against a workload reaching 3.0, 3.6 and 11.8.
+
+Per-bucket error on the real step sequence, with the model in use:
+
+| rung | total context only | with padding |
+| --- | --- | --- |
+| 1 | -0.2% | -- (uniform, correctly dropped) |
+| 2 | +30.7% | **-4.7%** |
+| 4 | +50.9% | **-0.8%** |
+| 8 | -9.4% | **-6.4%** |
+| 16 | -14.0% | **-7.8%** |
+| 32 | -0.0% | +6.5% |
+
+Every rung within 8%, from -32.6% at rung 8 where this started. The middle
+column is worth reading too: total context alone is now *worse* at rungs 2 and 4
+than before the ragged rounds were added, because the sweep contains shapes it
+cannot explain and the fit splits the difference. That is the correct behaviour
+of a model missing a term, and it is what the padding feature is for.
+
+**The outlier rejection was checked for the obvious way this could undo itself.**
+A ragged batch costs more than a uniform one at the same total context, so
+against a model that cannot see raggedness those rows have the largest
+residuals -- exactly what a four-sigma filter removes. It would discard the
+evidence the feature needs, and the fix would decay as the sweep grew. Measured,
+it does not: ragged rows are 91% of samples at rung 2 and 35% of drops, 41% at
+rung 8 and 0% of drops. The filter is removing uniform outliers, which is what
+it was written for.
+
+**Still not closed.** Rung 32 is the one rung the padding term makes worse,
++6.5% against -0.0% without it, and it is also the rung whose real raggedness
+spread is widest. That is worth understanding rather than tuning away. And all
+of this is one model on short prompts: the 27B long-context case has not been
+rerun with any of the repairs.

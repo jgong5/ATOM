@@ -203,10 +203,27 @@ def main() -> int:
                 step = (high / low) ** (1.0 / max(rung - 1, 1))
                 return tuple(int(low * step ** i) for i in range(rung))
 
-            for rung in (8, 16, 32):
+            def _skewed(rung, short, long_):
+                """One long sequence among short ones.
+
+                A geometric spread cannot get very ragged: its mean rises with
+                its maximum, so the ratio tops out near 3.5 whatever the range.
+                A batch is at its most ragged when one sequence dominates, and
+                then the ratio approaches the rung size. That is not a contrived
+                case -- it is one long-running request among freshly arrived
+                ones, and real steps reach 11.8 at rung 32, which nothing built
+                from a spread can reach.
+                """
+                return tuple([short] * (rung - 1) + [long_])
+
+            # Every rung, not just the large ones. Rung 4 is fully ragged in the
+            # workload and was the one rung that got *worse* when the others
+            # improved, because it had no ragged samples of its own.
+            for rung in (2, 4, 8, 16, 32):
                 rounds += [
                     (_spread(rung, 512, 8192), rung, long_decode),
                     (_spread(rung, 1024, 32768), rung, long_decode),
+                    (_skewed(rung, 512, 32768), rung, long_decode),
                 ]
             rounds = [((tuple(min(v, ceiling) for v in length)
                         if isinstance(length, (list, tuple))
