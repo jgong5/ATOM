@@ -226,7 +226,7 @@ class TestEventDraining:
         stub._measured_by_kind = {}
         stub._written = []
         stub._record_measurement = (
-            lambda shape, seconds, gap=None, req_ids=None: stub._written.append(
+            lambda shape, seconds, gap=None, req_ids=None, started_at=None: stub._written.append(
                 (shape, seconds, gap)
             )
         )
@@ -235,7 +235,7 @@ class TestEventDraining:
     def test_an_unfinished_step_is_not_written_yet(self):
         stub = self._runner()
         stub._pending.append(
-            (decode(), self.FakeEvent(), self.FakeEvent(ready=False), None, None))
+            (decode(), self.FakeEvent(), self.FakeEvent(ready=False), None, None, None))
         stub._drain_pending()
         assert stub._written == []
         assert len(stub._pending) == 1
@@ -244,7 +244,7 @@ class TestEventDraining:
         stub = self._runner()
         for ms in (2.0, 4.0, 8.0):
             stub._pending.append(
-                (decode(), self.FakeEvent(), self.FakeEvent(ms=ms), None, None)
+                (decode(), self.FakeEvent(), self.FakeEvent(ms=ms), None, None, None)
             )
         stub._drain_pending()
         assert [s for _, s, _g in stub._written] == [0.002, 0.004, 0.008]
@@ -255,11 +255,11 @@ class TestEventDraining:
         one, or the table's rows stop corresponding to the run's sequence."""
         stub = self._runner()
         stub._pending.append(
-            (decode(), self.FakeEvent(), self.FakeEvent(ms=2.0), None, None))
+            (decode(), self.FakeEvent(), self.FakeEvent(ms=2.0), None, None, None))
         stub._pending.append(
-            (decode(), self.FakeEvent(), self.FakeEvent(ready=False), None, None))
+            (decode(), self.FakeEvent(), self.FakeEvent(ready=False), None, None, None))
         stub._pending.append(
-            (decode(), self.FakeEvent(), self.FakeEvent(ms=8.0), None, None))
+            (decode(), self.FakeEvent(), self.FakeEvent(ms=8.0), None, None, None))
         stub._drain_pending()
         assert [s for _, s, _g in stub._written] == [0.002]
         assert len(stub._pending) == 2

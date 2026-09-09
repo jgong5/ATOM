@@ -152,6 +152,9 @@ class CompassModelRunner(ModelRunner):
         if self._compass_config.mode == "measure":
             return self._forward_measured(batch)
 
+        from atom.utils.clock import get_clock
+
+        started_at = get_clock().time()
         shape = self._describe(batch)
         cost = self._oracle.estimate(shape)
         # Record what was predicted, in the same format a measure run records
@@ -163,7 +166,8 @@ class CompassModelRunner(ModelRunner):
         # from a different set of steps, which is where the serving diagnosis
         # ran out of evidence twice.
         self._record_measurement(shape, cost.seconds, None,
-                                 req_ids=list(batch.req_ids))
+                                 req_ids=list(batch.req_ids),
+                                 started_at=started_at)
         self._step_count = getattr(self, "_step_count", 0) + 1
         logger.debug(
             "COMPASS step %d: reqs=%d tokens=%d prefill_tokens=%d cost=%.6fs",
@@ -216,12 +220,22 @@ class CompassModelRunner(ModelRunner):
             began = time.perf_counter()
             output = super().forward(batch)
             self._count_and_record(shape, time.perf_counter() - began, None,
-                                   req_ids=list(batch.req_ids))
+                                   req_ids=list(batch.req_ids),
+                                   started_at=began)
             return output
 
         import time
 
+        from atom.utils.clock import get_clock
+
         entered = time.perf_counter()
+        # Read the same clock that stamps arrivals, so a step and a request can
+        # be placed on one timeline. Reconstructing the timeline instead, by
+        # accumulating step durations and host gaps, does not work: it put 207
+        # of 300 requests' first step *after* their first token, because a gap
+        # recorded before a forward was being added after it and because device
+        # time and host time are not additive when they overlap.
+        started_at = get_clock().time()
         gap = (entered - self._last_forward_ended
                if self._last_forward_ended is not None else None)
 
@@ -233,7 +247,8 @@ class CompassModelRunner(ModelRunner):
         self._last_forward_ended = time.perf_counter()
         # The ids are read now rather than when the pair is drained: the batch
         # is the scheduler's and does not survive the step.
-        self._pending.append((shape, began, ended, gap, list(batch.req_ids)))
+        self._pending.append((shape, began, ended, gap, list(batch.req_ids),
+                              started_at))
         self._drain_pending()
         return output
 
@@ -245,16 +260,17 @@ class CompassModelRunner(ModelRunner):
         anyway, never by waiting for it.
         """
         while self._pending:
-            shape, began, ended, gap, req_ids = self._pending[0]
+            shape, began, ended, gap, req_ids, started_at = self._pending[0]
             if not ended.query():
                 return
             self._pending.popleft()
             self._count_and_record(shape, began.elapsed_time(ended) / 1000.0,
-                                   gap, req_ids=req_ids)
+                                   gap, req_ids=req_ids, started_at=started_at)
 
     def _count_and_record(self, shape: StepShape, seconds: float,
                           gap: Optional[float] = None,
-                          req_ids: Optional[list] = None) -> None:
+                          req_ids: Optional[list] = None,
+                          started_at: Optional[float] = None) -> None:
         kind = "prefill" if shape.is_prefill else "decode"
         seen = self._measured_by_kind.get(kind, 0) + 1
         self._measured_by_kind[kind] = seen
@@ -263,11 +279,13 @@ class CompassModelRunner(ModelRunner):
         # whole run, so a warmup counted in total steps discards every prefill
         # sample there is.
         if seen > self._compass_config.measure_warmup_steps:
-            self._record_measurement(shape, seconds, gap, req_ids=req_ids)
+            self._record_measurement(shape, seconds, gap, req_ids=req_ids,
+                                     started_at=started_at)
 
     def _record_measurement(self, shape: StepShape, seconds: float,
                             gap: Optional[float] = None,
-                            req_ids: Optional[list] = None) -> None:
+                            req_ids: Optional[list] = None,
+                            started_at: Optional[float] = None) -> None:
         """Append one timed step to the table.
 
         Appended and flushed per step rather than collected and written at exit.
@@ -314,6 +332,11 @@ class CompassModelRunner(ModelRunner):
             # has no evidence left to examine. That is exactly where the
             # cc-traces comparison stopped.
             "req_ids": [str(r) for r in req_ids] if req_ids else None,
+            # When this step began, on the clock that stamps request arrivals --
+            # wall time on a real run, virtual time on a simulated one. Recorded
+            # rather than reconstructed, so queueing can be measured instead of
+            # inferred.
+            "started_at": started_at,
         }) + "\n")
         self._measure_fh.flush()
 
