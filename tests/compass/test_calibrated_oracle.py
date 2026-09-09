@@ -226,7 +226,7 @@ class TestEventDraining:
         stub._measured_by_kind = {}
         stub._written = []
         stub._record_measurement = (
-            lambda shape, seconds, gap=None: stub._written.append(
+            lambda shape, seconds, gap=None, req_ids=None: stub._written.append(
                 (shape, seconds, gap)
             )
         )
@@ -235,7 +235,7 @@ class TestEventDraining:
     def test_an_unfinished_step_is_not_written_yet(self):
         stub = self._runner()
         stub._pending.append(
-            (decode(), self.FakeEvent(), self.FakeEvent(ready=False), None))
+            (decode(), self.FakeEvent(), self.FakeEvent(ready=False), None, None))
         stub._drain_pending()
         assert stub._written == []
         assert len(stub._pending) == 1
@@ -244,7 +244,7 @@ class TestEventDraining:
         stub = self._runner()
         for ms in (2.0, 4.0, 8.0):
             stub._pending.append(
-                (decode(), self.FakeEvent(), self.FakeEvent(ms=ms), None)
+                (decode(), self.FakeEvent(), self.FakeEvent(ms=ms), None, None)
             )
         stub._drain_pending()
         assert [s for _, s, _g in stub._written] == [0.002, 0.004, 0.008]
@@ -255,11 +255,11 @@ class TestEventDraining:
         one, or the table's rows stop corresponding to the run's sequence."""
         stub = self._runner()
         stub._pending.append(
-            (decode(), self.FakeEvent(), self.FakeEvent(ms=2.0), None))
+            (decode(), self.FakeEvent(), self.FakeEvent(ms=2.0), None, None))
         stub._pending.append(
-            (decode(), self.FakeEvent(), self.FakeEvent(ready=False), None))
+            (decode(), self.FakeEvent(), self.FakeEvent(ready=False), None, None))
         stub._pending.append(
-            (decode(), self.FakeEvent(), self.FakeEvent(ms=8.0), None))
+            (decode(), self.FakeEvent(), self.FakeEvent(ms=8.0), None, None))
         stub._drain_pending()
         assert [s for _, s, _g in stub._written] == [0.002]
         assert len(stub._pending) == 2
@@ -425,3 +425,52 @@ class TestWarningsReachTheUser:
         module._run(["python", "-c",
                      f"print({line!r}); print({line!r}); print({line!r})"])
         assert capsys.readouterr().out.count("costing a decode step") == 1
+
+
+class TestTheTableSaysWhoseStepItWas:
+    """A step table that cannot name the requests it served runs out of evidence.
+
+    On cc-traces the simulated run matched the real one on step counts, device
+    seconds, occupancy and when requests finished, and still reported TTFT at
+    twice the truth. Every aggregate agreed, so the next question -- which
+    request was being served when -- had nothing to answer it with.
+    """
+
+    def _runner(self, path):
+        from atom.compass.config import CompassConfig
+        from atom.compass.runtime.runner import CompassModelRunner
+
+        stub = CompassModelRunner.__new__(CompassModelRunner)
+        stub.__dict__["_compass_config_cache"] = CompassConfig(
+            enabled=True, mode="measure", measure_out=str(path),
+        )
+        stub._measure_fh = None
+        # Single rank: the writer asks the topology whether to add a rank
+        # suffix to the path, and that is the only thing it needs the engine
+        # config for.
+        stub._topology = lambda: {}
+        return stub
+
+    def _row(self, tmp_path, **kwargs):
+        import json
+
+        path = tmp_path / "steps.jsonl"
+        stub = self._runner(path)
+        stub._record_measurement(decode(), 0.002, None, **kwargs)
+        stub._measure_fh.flush()
+        return json.loads(path.read_text().splitlines()[0])
+
+    def test_the_ids_are_written(self, tmp_path):
+        row = self._row(tmp_path, req_ids=["a", "b"])
+        assert row["req_ids"] == ["a", "b"]
+
+    def test_they_are_strings_whatever_the_engine_uses(self, tmp_path):
+        """Request ids are ints in some paths and strings in others, and a
+        table read by a different process should not have to know which."""
+        row = self._row(tmp_path, req_ids=[7, 8])
+        assert row["req_ids"] == ["7", "8"]
+
+    def test_a_step_with_no_ids_records_none(self, tmp_path):
+        """Not an empty list: absent and empty mean different things, and only
+        one of them is a step that served nothing."""
+        assert self._row(tmp_path)["req_ids"] is None

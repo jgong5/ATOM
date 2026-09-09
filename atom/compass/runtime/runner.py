@@ -162,7 +162,8 @@ class CompassModelRunner(ModelRunner):
         # simulated one on aggregate latency alone cannot tell a wrong step cost
         # from a different set of steps, which is where the serving diagnosis
         # ran out of evidence twice.
-        self._record_measurement(shape, cost.seconds, None)
+        self._record_measurement(shape, cost.seconds, None,
+                                 req_ids=list(batch.req_ids))
         self._step_count = getattr(self, "_step_count", 0) + 1
         logger.debug(
             "COMPASS step %d: reqs=%d tokens=%d prefill_tokens=%d cost=%.6fs",
@@ -214,7 +215,8 @@ class CompassModelRunner(ModelRunner):
 
             began = time.perf_counter()
             output = super().forward(batch)
-            self._count_and_record(shape, time.perf_counter() - began, None)
+            self._count_and_record(shape, time.perf_counter() - began, None,
+                                   req_ids=list(batch.req_ids))
             return output
 
         import time
@@ -229,7 +231,9 @@ class CompassModelRunner(ModelRunner):
         output = super().forward(batch)
         ended.record()
         self._last_forward_ended = time.perf_counter()
-        self._pending.append((shape, began, ended, gap))
+        # The ids are read now rather than when the pair is drained: the batch
+        # is the scheduler's and does not survive the step.
+        self._pending.append((shape, began, ended, gap, list(batch.req_ids)))
         self._drain_pending()
         return output
 
@@ -241,14 +245,16 @@ class CompassModelRunner(ModelRunner):
         anyway, never by waiting for it.
         """
         while self._pending:
-            shape, began, ended, gap = self._pending[0]
+            shape, began, ended, gap, req_ids = self._pending[0]
             if not ended.query():
                 return
             self._pending.popleft()
-            self._count_and_record(shape, began.elapsed_time(ended) / 1000.0, gap)
+            self._count_and_record(shape, began.elapsed_time(ended) / 1000.0,
+                                   gap, req_ids=req_ids)
 
     def _count_and_record(self, shape: StepShape, seconds: float,
-                          gap: Optional[float] = None) -> None:
+                          gap: Optional[float] = None,
+                          req_ids: Optional[list] = None) -> None:
         kind = "prefill" if shape.is_prefill else "decode"
         seen = self._measured_by_kind.get(kind, 0) + 1
         self._measured_by_kind[kind] = seen
@@ -257,10 +263,11 @@ class CompassModelRunner(ModelRunner):
         # whole run, so a warmup counted in total steps discards every prefill
         # sample there is.
         if seen > self._compass_config.measure_warmup_steps:
-            self._record_measurement(shape, seconds, gap)
+            self._record_measurement(shape, seconds, gap, req_ids=req_ids)
 
     def _record_measurement(self, shape: StepShape, seconds: float,
-                            gap: Optional[float] = None) -> None:
+                            gap: Optional[float] = None,
+                            req_ids: Optional[list] = None) -> None:
         """Append one timed step to the table.
 
         Appended and flushed per step rather than collected and written at exit.
@@ -300,6 +307,13 @@ class CompassModelRunner(ModelRunner):
             # advance its clock for. None on the first step of a process, where
             # there is no previous forward to measure from.
             "gap_seconds": gap,
+            # Which requests this step served. Without it a table says how many
+            # steps ran and of what shape, and cannot say whose they were -- so
+            # a simulated run matching the real one on step counts, device
+            # seconds and occupancy, while reporting TTFT at twice the truth,
+            # has no evidence left to examine. That is exactly where the
+            # cc-traces comparison stopped.
+            "req_ids": [str(r) for r in req_ids] if req_ids else None,
         }) + "\n")
         self._measure_fh.flush()
 
