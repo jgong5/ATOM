@@ -219,8 +219,19 @@ def main() -> int:
             # Every rung, not just the large ones. Rung 4 is fully ragged in the
             # workload and was the one rung that got *worse* when the others
             # improved, because it had no ragged samples of its own.
+            # Three degrees of raggedness, because how ragged a real batch is
+            # depends on the workload and not on the engine. A 0.6B serving
+            # short prompts runs 2.8 to 3.9 times ragged, since generation adds
+            # a lot relative to a 2k context; a 27B serving 163k prompts runs
+            # 1.1 to 1.4, since it adds very little relative to those. Sampling
+            # only at 1.0 and at 7 to 21 -- which the first two patterns do --
+            # leaves a hole exactly where the second workload lives, and the
+            # padding coefficient is then fitted far from where it is used. On
+            # the 27B that made rung 2 worse with the feature than without it.
             for rung in (2, 4, 8, 16, 32):
                 rounds += [
+                    # Barely ragged: a batch of similar long histories.
+                    (_spread(rung, 12288, 16384), rung, long_decode),
                     (_spread(rung, 512, 8192), rung, long_decode),
                     (_spread(rung, 1024, 32768), rung, long_decode),
                     (_skewed(rung, 512, 32768), rung, long_decode),

@@ -5662,3 +5662,53 @@ it was written for.
 spread is widest. That is worth understanding rather than tuning away. And all
 of this is one model on short prompts: the 27B long-context case has not been
 rerun with any of the repairs.
+
+
+## The 27B, rerun with the repaired harness
+
+Everything previously known about this configuration came through a client that
+could not post a declared workload, a reconstructed timeline with 207 impossible
+orderings, and a calibration with no ragged batches. Rerun with all of those
+repaired, same workload, 20 requests at a median of 163,584 input tokens:
+
+| on totals | through the broken harness | repaired |
+| --- | --- | --- |
+| TTFT | +114% | **+20.9%** |
+| latency | -6.2% | -50.7% |
+| decode time | -62% | -79.2% |
+| time per output token | -88.4% | -93.7% |
+
+TTFT improved fivefold. Everything after the first token got worse, and the
+-6.2% latency that the broken harness reported is gone -- it was the usual
+cancellation.
+
+**The cost model is much worse here than on the small model.** On the real 27B
+step sequence, with the padding feature: rung 8 -7.1%, rung 16 -15.3%, rung 32
+-29.8%, and rung 2 at -54.2%, which is worse than the -25.6% without the
+feature. On the 0.6B every rung was inside 8%.
+
+**Why, and it is the same mistake one level down.** How ragged a batch is
+depends on the workload, not the engine:
+
+| | raggedness of real batches |
+| --- | --- |
+| 0.6B, 2.4k prompts | 2.82 to 3.85 |
+| 27B, 163k prompts | **1.11 to 1.42** |
+
+A 0.6B generating 400 tokens onto a 2k context spreads its batch widely; a 27B
+generating the same onto 163k barely moves it. The ragged rounds were designed
+against the first and sample at 1.0 and at 7 to 21, so the second workload sits
+in a hole between them -- and the padding coefficient is fitted from batches
+twenty times more ragged than the ones it is applied to. That is why the feature
+hurts at rung 2 here and helps everywhere on the 0.6B.
+
+Fixed by adding a barely-ragged round, sequences spread from 12288 to 16384, at
+raggedness 1.15. The sweep now covers 1.0, 1.15, 2.7, 3.5 and 7 to 21, which
+brackets both workloads rather than one.
+
+**The general point, which has now cost three iterations.** Coverage has to be
+checked against the workload in every dimension the model uses, and a bounding
+box is not coverage: the context bounds hid a gap, the raggedness bounds hid a
+gap, and each time the samples were technically inside the box and nowhere near
+the data. The dimensions themselves are also workload-dependent, so "the sweep
+covers this" is a statement about a pair, never about a sweep alone.
