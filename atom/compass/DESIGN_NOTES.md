@@ -5473,3 +5473,39 @@ bucket 16 at -28.9% -- which is independent of scheduling and which this
 workload's bucket mix does not exercise. That remains the next thing, and it
 comes before any further scheduling conclusion, because a service-time bias of
 that size changes queueing on its own.
+
+
+## The admission delay is a constant, not a rate
+
+Two runs that pass their validity checks, same model, same box, same
+calibration table (reused, and the log says so), differing only in size and
+therefore in load:
+
+| | light, 60 requests | loaded, 300 requests |
+| --- | --- | --- |
+| arrival to first step, real | 0.073s | 3.689s |
+| arrival to first step, modelled | 0.348s | 3.923s |
+| **difference** | **+0.275s** | **+0.234s** |
+| requests waiting over a second | 1 of 60 | 239 of 300 |
+| TTFT error on totals | +29.6% | +11.3% |
+
+The simulator admits each request about a quarter of a second late, and that
+figure barely moves between an idle engine and a saturated one. It is a fixed
+cost per request, not a proportional error.
+
+**That explains the load dependence of TTFT error without any load-dependent
+mechanism.** A constant 0.25s is most of a 0.4s TTFT and very little of a 3.8s
+one, so the same defect reads as +29.6% on one workload and +11.3% on the
+other. The earlier attempt to interpret those percentages as different
+behaviours was reading dilution.
+
+It also sharpens what to look for. A rate error would scale with queue length
+or step count; a constant does not. Candidates are things that happen once per
+request rather than once per step: the arrival barrier's real-time wait for the
+client to finish posting, `admission_seconds` (zero by default, and the real
+engine's own admission was measured at 8-18ms, an order of magnitude too small
+to be this), or a request becoming schedulable only at the next step boundary.
+
+Two runs is two runs. But the two agree to 40 milliseconds across a fiftyfold
+difference in queueing, which is a stronger constraint on the mechanism than
+either run alone.
