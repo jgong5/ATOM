@@ -71,6 +71,13 @@ def _workload(args) -> list[dict]:
     return out
 
 
+#: Most requests this client will hold open at once. One thread each, so this
+#: is a thread count as much as a connection count. Not a tuning knob: past it
+#: the declared-arrival protocol needs a bulk submission the server does not
+#: have, and quietly posting fewer would reintroduce the deadlock this bounds.
+MAX_IN_FLIGHT = 1024
+
+
 def _prompt(tokens: int, index: int) -> str:
     """Distinct text of exactly the requested token count.
 
@@ -192,10 +199,30 @@ def main() -> int:
 
     # Posted concurrently and as fast as the socket allows: *when* each lands is
     # deliberately not the arrival the engine uses.
-    # Every paced request needs its own thread, because each spends its wait
-    # sleeping: a pool of 64 would serialise the 65th arrival behind an earlier
-    # request's *generation* rather than behind its arrival.
-    workers = len(workload) if args.pace else min(64, len(workload))
+    # One thread per request, in both modes, for two different reasons.
+    #
+    # Paced: each thread spends its wait sleeping, so a pool of 64 would
+    # serialise the 65th arrival behind an earlier request's *generation*
+    # rather than behind its arrival.
+    #
+    # Declared: the server holds every declared request until all of them have
+    # arrived, so all of them must be in flight at once. A pool of 64 against a
+    # 300-request workload is a deadlock -- 64 threads each blocked on a
+    # response the server will not produce until 300 have been posted. It
+    # resolves only when the arrival barrier times out, and then the run is not
+    # the workload that was asked for: requests enter as earlier ones complete,
+    # which is not the declared arrival process. This happened, went unnoticed
+    # because the client still reported "0 failed", and a day's conclusions
+    # were drawn from the result.
+    workers = len(workload)
+    if workers > MAX_IN_FLIGHT:
+        raise SystemExit(
+            f"{workers} requests needs {workers} concurrent connections, over "
+            f"the {MAX_IN_FLIGHT} this client will open. A declared workload "
+            f"cannot be posted in batches -- the server waits for all of it "
+            f"before it starts -- so this needs a bulk submission endpoint "
+            f"rather than a larger pool. Use --num-requests to bound the "
+            f"workload meanwhile.")
     with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
         results = list(pool.map(one, enumerate(workload)))
 

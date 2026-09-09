@@ -1220,6 +1220,8 @@ class Scheduler:
         """
         if self._arrival_barrier_open:
             return False
+        if not hasattr(self, "arrival_barrier_timed_out"):
+            self.arrival_barrier_timed_out = None
         if getattr(get_clock(), "epoch", None) is None:
             self._arrival_barrier_open = True  # real clock: nothing to wait for
             return False
@@ -1249,6 +1251,16 @@ class Scheduler:
         elif (_time.monotonic() - self._arrival_barrier_since
               > self.ARRIVAL_BARRIER_TIMEOUT_S):
             self._arrival_barrier_open = True
+            # Recorded, not only logged. A warning in a server log is not a
+            # result: the run that this fired on was read as an accuracy
+            # measurement for a day, because the client reported "0 failed"
+            # and nothing downstream could see that the arrival protocol had
+            # not completed.
+            self.arrival_barrier_timed_out = {
+                "arrived": len(self.waiting),
+                "expected": int(expected),
+                "timeout_s": float(self.ARRIVAL_BARRIER_TIMEOUT_S),
+            }
             logger.warning(
                 "ATOMCompass WARNING: only %d of %d declared requests arrived "
                 "within %.0fs; running anyway. Virtual time may now advance "

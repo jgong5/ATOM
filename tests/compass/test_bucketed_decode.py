@@ -66,13 +66,26 @@ class TestPerRungFits:
         assert dear == pytest.approx(0.003 + 8e-7 * 250 * 16, rel=1e-3)
         assert dear > cheap
 
-    def test_the_same_batch_costs_its_rung_not_its_size(self, tmp_path):
-        """Batch 12 pads to 16, so it costs what 16 costs."""
+    def test_within_a_rung_only_the_history_matters(self, tmp_path):
+        """Eight sequences of 500 and sixteen of 250 read the same history.
+
+        This test used to say "batch 12 pads to 16, so it costs what 16 costs"
+        and assert `at_12 == approx(at_16) or at_12 > 0`, which any positive
+        number satisfies -- it could not fail. Removing the escape clause showed
+        the premise was also wrong: twelve sequences of 250 carry 3000 tokens of
+        history and sixteen carry 4000, so the model separates them, and should.
+        What the rung fixes is the row count; what varies inside it is the KV
+        the step reads, which is the feature.
+        """
         oracle = CalibratedCostOracle(table=_two_rungs(tmp_path / "t.jsonl"))
-        at_12 = oracle.estimate(_shape(12, 250, 16)).seconds
-        at_16 = oracle.estimate(_shape(16, 250, 16)).seconds
-        # Same rung and the same total history -> the same prediction.
-        assert at_12 == pytest.approx(at_16, rel=1e-6) or at_12 > 0
+        wide = oracle.estimate(_shape(16, 250, 16)).seconds
+        deep = oracle.estimate(_shape(8, 500, 16)).seconds
+        assert wide == pytest.approx(deep, rel=1e-6)
+
+    def test_less_history_in_the_same_rung_costs_less(self, tmp_path):
+        oracle = CalibratedCostOracle(table=_two_rungs(tmp_path / "t.jsonl"))
+        assert (oracle.estimate(_shape(12, 250, 16)).seconds
+                < oracle.estimate(_shape(16, 250, 16)).seconds)
 
     def test_describe_says_how_thin_each_rung_is(self, tmp_path):
         """A rung fitted on four samples predicts as confidently as one on four
@@ -114,3 +127,60 @@ class TestWhenTheRungIsMissing:
         oracle = CalibratedCostOracle(table=_write(tmp_path / "old.jsonl", rows))
         assert "decode buckets=" not in oracle.describe()
         assert oracle.estimate(_shape(4, 200, None)).seconds > 0
+
+
+class TestAWorkloadFitsThroughTheClient:
+    """A declared workload is posted all at once or it deadlocks.
+
+    The server holds every declared request until all of them have arrived, so
+    every one must be in flight at the same time. A client with fewer
+    connections than requests waits for responses the server will not produce
+    until the requests it is still holding back have been posted. It resolves
+    only when the arrival barrier times out, and the run that follows is not
+    the declared arrival process -- requests enter as earlier ones finish.
+
+    That happened on a 300-request workload against a 64-connection pool. The
+    client reported "0 failed", the server logged the timeout and called its own
+    latencies invalid, and the result was read as a measurement for a day. These
+    tests are the boundary that was missing.
+    """
+
+    def _workers(self, count, pace=False):
+        """What the client would open for a workload of `count`."""
+        import importlib.util
+        from pathlib import Path
+
+        spec = importlib.util.spec_from_file_location(
+            "replay_mod",
+            Path(__file__).resolve().parents[2] / "scripts/compass/replay.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return len(range(count)), module.MAX_IN_FLIGHT
+
+    def test_every_request_gets_a_connection(self):
+        workers, _ = self._workers(300)
+        assert workers == 300
+
+    def test_the_bound_is_above_the_workloads_in_use(self):
+        """300 was the one that failed; the bound has to clear it and the
+        831-request corpus slice as well."""
+        _, cap = self._workers(1)
+        assert cap >= 831
+
+    def test_past_the_bound_it_refuses_rather_than_deadlocks(self):
+        """Posting fewer than were declared is the deadlock. Refusing is the
+        only other honest option until a bulk submission exists."""
+        import importlib.util
+        from pathlib import Path
+
+        spec = importlib.util.spec_from_file_location(
+            "replay_mod2",
+            Path(__file__).resolve().parents[2] / "scripts/compass/replay.py")
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        source = (Path(__file__).resolve().parents[2]
+                  / "scripts/compass/replay.py").read_text()
+        # The refusal is a SystemExit on the size check, not a silent clamp.
+        assert "MAX_IN_FLIGHT" in source
+        assert "min(64, len(workload))" not in source
+        assert "raise SystemExit" in source
