@@ -79,6 +79,28 @@ def _install_compass_clock(config) -> None:
     logger.info("ATOMCompass: engine core running on a virtual clock")
 
 
+def _stamp_step_start(scheduled_batch) -> None:
+    """Tell the runner when this step begins, on this process's clock.
+
+    The runner records when each step started, so that queueing can be measured
+    against a request's arrival rather than reconstructed from durations. It
+    cannot read the time itself: arrivals and first tokens are stamped on the
+    clock this process owns, and the runner may sit in a worker that never had
+    a Compass clock installed. Measured, it was stamping the wall clock -- 69
+    seconds ahead of the first arrival, which is the server's startup, and
+    advancing in real time while this clock advanced by predicted steps. Every
+    step then landed after the first token it produced, which is impossible,
+    and is what the validity check caught.
+
+    Installing a virtual clock in the worker would not fix it: only this
+    process calls ``advance``, so the worker's copy would sit at the epoch.
+    """
+    try:
+        scheduled_batch.compass_started_at = get_clock().time()
+    except AttributeError:  # a batch type that does not take attributes
+        pass
+
+
 def _advance_clock_for(fwd_out) -> None:
     """Advance a virtual clock by a simulated step's predicted duration.
 
@@ -418,6 +440,7 @@ class EngineCore:
         has_seqs = len(scheduled_batch.req_ids) > 0
         if has_seqs:
             self.scheduler.compute_detailed_aggregates(scheduled_batch, seqs)
+            _stamp_step_start(scheduled_batch)
             fwd_out = self.runner_mgr.call_func(
                 "forward", scheduled_batch, wait_out=True
             )
@@ -1297,6 +1320,7 @@ class DecodeEngineCore(EngineCore):
         if scheduled_batch is None:
             return False
         t0 = get_clock().perf_counter()
+        _stamp_step_start(scheduled_batch)
         fwd_out = self.runner_mgr.call_func("forward", scheduled_batch, wait_out=True)
         _advance_clock_for(fwd_out)
         iter_ms = (get_clock().perf_counter() - t0) * 1000

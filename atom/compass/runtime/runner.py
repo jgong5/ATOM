@@ -152,9 +152,12 @@ class CompassModelRunner(ModelRunner):
         if self._compass_config.mode == "measure":
             return self._forward_measured(batch)
 
-        from atom.utils.clock import get_clock
-
-        started_at = get_clock().time()
+        # Stamped by the engine core, which owns the clock that arrivals and
+        # first tokens are stamped on; see `_stamp_step_start`. Falling back to
+        # this process's clock would put the step in a different time domain,
+        # which is the defect the validity check exists to catch, so the field
+        # is left absent instead.
+        started_at = getattr(batch, "compass_started_at", None)
         shape = self._describe(batch)
         cost = self._oracle.estimate(shape)
         # Record what was predicted, in the same format a measure run records
@@ -226,16 +229,14 @@ class CompassModelRunner(ModelRunner):
 
         import time
 
-        from atom.utils.clock import get_clock
-
         entered = time.perf_counter()
-        # Read the same clock that stamps arrivals, so a step and a request can
-        # be placed on one timeline. Reconstructing the timeline instead, by
-        # accumulating step durations and host gaps, does not work: it put 207
-        # of 300 requests' first step *after* their first token, because a gap
-        # recorded before a forward was being added after it and because device
-        # time and host time are not additive when they overlap.
-        started_at = get_clock().time()
+        # Stamped by the engine core on the clock that arrivals are stamped on,
+        # so a step and a request sit on one timeline. Reconstructing it
+        # instead, by accumulating step durations and host gaps, does not work:
+        # it put 207 of 300 requests' first step *after* their first token,
+        # because a gap recorded before a forward was being added after it and
+        # because device time and host time are not additive when they overlap.
+        started_at = getattr(batch, "compass_started_at", None)
         gap = (entered - self._last_forward_ended
                if self._last_forward_ended is not None else None)
 

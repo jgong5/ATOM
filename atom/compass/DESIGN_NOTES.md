@@ -15,10 +15,12 @@ Effort estimates are rough: **S** hours, **M** days, **L** weeks or unknown.
 Defects in ATOM itself, rather than in Compass, are collected separately in
 [ATOM_DEFECTS.md](ATOM_DEFECTS.md).
 
-**Start with [POC_SUMMARY.md](POC_SUMMARY.md)** if you want the conclusions
-rather than the reasoning. This file is the working log -- written as each thing
-was found, kept because the reasoning survives the context it was found in, and
-long. Parts of it are stale; where the two disagree, the summary is newer.
+**Start with [RETROSPECTIVE.md](RETROSPECTIVE.md)** for the evidence audit and
+priorities as of 9 September 2026. It invalidates the latest loaded-run admission
+and simulator-speed conclusions because of a workload barrier timeout and an
+incorrect queue-time reconstruction. [POC_SUMMARY.md](POC_SUMMARY.md) provides
+the earlier handover. This file is the chronological working log; later
+corrections can supersede earlier conclusions.
 
 ---
 
@@ -5416,3 +5418,58 @@ admitted after costs three orders of magnitude more.
 run took 122 seconds against the real run's 36. The discrete-event jump only
 pays when there is idle to skip; with a full queue the simulator is slower than
 the system it stands for, while still being wrong about TTFT by 18%.
+
+
+## P0 repaired, and the first loaded comparison that passes its own checks
+
+The retrospective at `atom/compass/RETROSPECTIVE.md` withdrew the loaded
+experiment this project had drawn three conclusions from. Its findings were
+checked against the artifacts and the code and they hold. Two repairs followed.
+
+**The client could not post a declared workload.** The server holds every
+declared request until all have arrived; the client opened at most 64
+connections and each blocked on its own response. Against 300 requests that is
+a deadlock, resolved only by the arrival barrier timing out after 120 seconds,
+after which requests enter as earlier ones finish -- not the declared arrival
+process. The client still printed "0 failed". One connection per request now,
+and past a bound it refuses rather than posting fewer than it declared.
+
+**Queue wait was reconstructed, and the reconstruction was wrong.** Each step
+now records `started_at`. That immediately exposed a second defect: the runner
+was stamping a *wall* clock while arrivals and first tokens are stamped on the
+engine core's *virtual* clock -- 69 seconds apart, that being the server's
+startup, and advancing at different rates. Every simulated step landed after
+the first token it produced. Installing a virtual clock in the worker would not
+have helped, since only the engine core calls `advance` and the worker's copy
+would sit at the epoch; the engine core stamps the batch instead. The validity
+check caught this rather than letting it become a number, which is what it is
+for.
+
+**With both repaired**, 300 requests, Qwen3-0.6B on an idle node, arrivals as
+recorded, 239 of 300 waiting over a second:
+
+| | real | modelled |
+| --- | --- | --- |
+| arrival to first step, median | 3.689s | 3.923s |
+| TTFT, median | 3.788s | 3.953s |
+| first step to first token | 0.068s | 0.033s |
+
+| on totals | error |
+| --- | --- |
+| TTFT | +11.3% |
+| latency | +5.1% |
+| decode time | -3.3% |
+| time per output token | -1.2% |
+
+The simulator admits about 6% late. The direction survives from the withdrawn
+run; the magnitude does not -- that run reported 20%, and its per-request
+errors were roughly three times these.
+
+**What this does not settle.** It is one run of a small model on short prompts,
+median 2368 input tokens. The 27B long-context case has not been rerun with the
+repaired harness. And it does not address the cost error the retrospective found
+by applying the fit to the *real* step sequence -- decode bucket 8 at -40.6% and
+bucket 16 at -28.9% -- which is independent of scheduling and which this
+workload's bucket mix does not exercise. That remains the next thing, and it
+comes before any further scheduling conclusion, because a service-time bias of
+that size changes queueing on its own.
