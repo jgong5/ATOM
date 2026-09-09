@@ -5227,3 +5227,45 @@ A caution for whoever picks this up: latency alone would have called the first
 pilot a success at -5.0% and the second a regression at -48.4%, when the second
 is the more truthful model. Aggregate latency is the one number this benchmark
 should never be judged on.
+
+## What is left on cc-traces: the first token comes out too late
+
+With prefill priced against its history, the simulated run matches the real one
+almost everywhere:
+
+| | real | modelled |
+| --- | --- | --- |
+| prefill steps / seconds | 106 / 239.4s | 105 / 237.3s |
+| decode steps / seconds | 4116 / 69.1s | 4970 / 65.8s |
+| prefill share of device time | 77.6% | 78.3% |
+| run span | 308.5s | 303.2s |
+| mean requests in flight | 6.20 | 5.92 |
+| arrive to finish, median | 76.2s | 71.2s |
+
+Same steps, same occupancy, same wall time, requests finishing within 7% of when
+they really did. And the split inside each request is wrong in both directions:
+**TTFT +114%** on totals, **decode time -62%**, cancelling into a latency figure
+of -6.2% that flatters both.
+
+**Where the first token goes.** A median request here is 163,584 tokens, ten
+chunks of 16384 at 2.26s each, so 22.6s of prefill that is its own. The real
+engine gets its first token out at 29.9s -- its own prefill plus about seven
+seconds of everyone else's work. The simulator takes about 52.7s, which is its
+own prefill plus roughly thirty. The simulator is interleaving far more of other
+requests' work into a request's prefill phase than the real scheduler does.
+
+That is a scheduling-order difference and not a cost one. Every ingredient is
+now right -- the steps, their costs, how many run, how many requests are in
+flight -- and they are put in a different order, which moves the first-token
+boundary without moving the finish.
+
+**Why this matters more than the latency number.** A serving simulator is asked
+for TTFT and TPOT, not for end-to-end latency; those are the numbers a
+deployment is sized against. This configuration reports latency to 6% and both
+of the numbers anyone would use to about a factor of two.
+
+**Note for whoever takes this on.** Decode time per request has come out near
+-62% in every configuration tried: before decode coverage was added, after it,
+and after the prefill fix. It does not move with pricing, which is the evidence
+that it is not a pricing problem. Comparing per-request step sequences needs the
+step table to record which request each step served, which it does not yet.
