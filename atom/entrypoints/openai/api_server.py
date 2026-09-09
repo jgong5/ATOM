@@ -168,6 +168,14 @@ def _record_engine_timings(request_id: str, out: "RequestOutput") -> None:
         _compass_records.popitem(last=False)
     _compass_records[request_id] = {
         "request_id": request_id,
+        # The engine's own id for the sequence, next to the client's id for the
+        # request. Two id spaces meet here and nowhere else a reader can see:
+        # the step table records sequence ids, these records are keyed by
+        # completion ids, and without both on one row a per-step table cannot be
+        # joined to a per-request one. Queue wait -- arrival to first step, which
+        # is where the cc-traces TTFT error turned out to live -- needs exactly
+        # that join.
+        "seq_id": str(getattr(out, "request_id", "")) or None,
         "arrive_time": arrive,
         "first_token_time": first or None,
         "finish_time": finish,
