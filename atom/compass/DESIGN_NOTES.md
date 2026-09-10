@@ -5812,3 +5812,52 @@ whole machine so a neighbour elsewhere stays on the record.
 
 It also caught a real one: a tenant compute-bound in 0.7 GB, which no
 free-memory check would have seen.
+
+
+## The 27B's TTFT error is one interval, and it is not prefill
+
+TTFT is over-predicted 90.5% on the 27B, reproducibly across four real runs.
+It is not the cost of prefill, not the number of chunks, and not admission.
+
+**Prefill is right.** Fitting on the sweep and applying to the real run's own
+106 prefill steps -- step sequence held fixed -- predicts 235.7s against a
+measured 235.4s, **+0.1%**, median per step -0.3%. Both sides run the same
+chunks over the same tokens:
+
+| | real | modelled |
+| --- | --- | --- |
+| prefill steps | 106 | 105 |
+| prefill seconds | 235.4 | 237.8 |
+| tokens processed | 1,681,024 | 1,681,024 |
+
+**Admission is right.** Arrival to first step is 6.2s real against 4.8s
+modelled -- the simulator starts requests slightly sooner, not later.
+
+**The whole error is after the last prefill chunk**, measured per request rather
+than by subtracting medians:
+
+| median | real | modelled |
+| --- | --- | --- |
+| first step to last prefill chunk | 12.67s | 13.41s |
+| **last prefill chunk to first token** | **9.19s** | **32.21s** |
+| that interval, p90 | 16.23s | **127.32s** |
+| that interval, max | 16.55s | **139.03s** |
+
+A simulated request finishes its prefill and then waits half a minute for its
+first token, where the real one waits nine seconds. At 2.26s a chunk, thirty-two
+seconds is about fourteen other requests' prefill chunks running first.
+
+**So this is prefill-versus-decode scheduling, not cost.** The real engine gets
+a finished request its first token sooner than the simulator does, using the
+same scheduler code, so the difference is in the state or the timing that code
+sees rather than in the code. Two things make that plausible and are worth
+checking before anything else: decode is under-priced at rung 16 by 22.7%, which
+changes what the scheduler thinks a decode step costs relative to a prefill
+chunk; and the virtual clock advances only on steps, so anything the real engine
+does between steps is free in simulation and cannot delay a prefill chunk the
+way it really does.
+
+It also explains why the 0.6B is fine at -1.1%: its prefill chunks are
+milliseconds, so the same ordering difference costs almost nothing. The error
+needs long prefill chunks to be visible, which is why every short-prompt
+experiment missed it.
