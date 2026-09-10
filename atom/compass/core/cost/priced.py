@@ -38,6 +38,7 @@ extrapolating from one shape to another. Deriving a graph per shape is what
 from __future__ import annotations
 
 import json
+import os
 import logging
 from dataclasses import dataclass
 from typing import Optional
@@ -159,6 +160,76 @@ HOST_SYNC = frozenset({
     "aten::equal", "aten::allclose",
 })
 
+
+
+def _declared_topology(price_blob: dict, prices_path: str):
+    """The parallel width a price list was measured at, or None if it cannot say.
+
+    Lists written before the width was recorded still name the graphs they were
+    priced from, and a graph has always carried its topology. Reading it back
+    from there is a statement the artifact already makes, not an assumption
+    about it -- so an existing list keeps paying for its own collectives while
+    still refusing to pay for another width's. When the graphs are gone, or
+    disagree, the list cannot certify anything and says so.
+    """
+    provenance = price_blob.get("provenance") or {}
+    if provenance.get("topology") is not None:
+        return provenance["topology"]
+    widths = set()
+    for name in provenance.get("graphs") or ():
+        for candidate in (name, os.path.join(
+                os.path.dirname(os.path.dirname(prices_path) or "."), name)):
+            if os.path.exists(candidate):
+                try:
+                    with open(candidate, encoding="utf-8") as fh:
+                        key = json.load(fh).get("key") or {}
+                except (OSError, ValueError):
+                    return None
+                widths.add(tuple(sorted(
+                    tuple(x) for x in (key.get("topology") or []))))
+                break
+        else:
+            return None
+    return dict(next(iter(widths))) if len(widths) == 1 else None
+
+_WARNED_TOPOLOGY: set = set()
+
+
+def _collectives_transferable(graph_topology, price_topology) -> bool:
+    """Whether a collective in this graph may be paid for from this price list.
+
+    Only when both sides declare the same group widths. A price list that does
+    not declare its own width -- everything written before this check existed --
+    cannot certify anything, so its collectives are refused rather than assumed
+    to fit, and the refusal is warned about once per pair.
+
+    A graph with no group wider than one rank contains no collective to price,
+    so nothing is refused and nothing is said.
+    """
+    graph_widths = {g: w for g, w in (graph_topology or {}).items() if w > 1}
+    if not graph_widths:
+        return True
+    price_widths = ({g: w for g, w in (price_topology or {}).items() if w > 1}
+                    if price_topology is not None else None)
+    if price_widths == graph_widths:
+        return True
+    token = (tuple(sorted(graph_widths.items())),
+             None if price_widths is None else tuple(sorted(
+                 price_widths.items())))
+    if token not in _WARNED_TOPOLOGY:
+        _WARNED_TOPOLOGY.add(token)
+        logger.warning(
+            "ATOMCompass WARNING: the price list was measured at %s and this "
+            "graph is %s, so its collectives are left unpriced. A collective's "
+            "signature carries its message and not its group width, so a price "
+            "from another width would have matched exactly and been spent "
+            "silently. Price the collectives at this width to close the gap.",
+            "no declared width" if price_widths is None
+            else price_widths or "no group wider than one rank",
+            graph_widths)
+    return False
+
+
 DEFAULT_COMPILED_SECONDS_PER_LAUNCH = 9.71e-6
 
 #: How long the host takes per kernel launch on a compiled, not-replayed step.
@@ -273,9 +344,18 @@ class PricedGraphCostOracle:
         self.floor_seconds = float(floor_seconds)
 
         with open(self.prices_path, encoding="utf-8") as fh:
-            price_list = json.load(fh)["prices"]
+            price_blob = json.load(fh)
+        price_list = price_blob["prices"]
+        # The width these prices were measured at. None means the list cannot
+        # certify one, which is read as "refuse" rather than "any width" -- see
+        # the collective guard in `_cost`.
+        self.price_topology = _declared_topology(price_blob, self.prices_path)
 
         self.unpriced = 0
+        #: Collectives refused a price because the list was measured at another
+        #: parallel width. Counted separately from `unpriced` so a transfer
+        #: result can say the communication term is missing, not merely thin.
+        self.untransferable_collectives = 0
         # A glob may name one decode graph or one per capture rung. Decode shapes
         # are not arbitrary: they are the rungs of the CUDA-graph ladder, known
         # from config before anything runs, so they can be *measured* rather than
@@ -327,7 +407,21 @@ class PricedGraphCostOracle:
 
     def _cost(self, graph_blob: dict, price_list: dict, path: str) -> "_Costed":
         """What one graph costs, and the shape it is a graph of."""
-        from atom.compass.runtime.microbench import signature_of
+        from atom.compass.runtime.microbench import (
+            _is_collective_op, signature_of)
+
+        # A collective price is a price for a message over a group of a given
+        # width, and the signature does not carry the width: `all_reduce_` over
+        # 2 ranks and over 4 sign identically -- same message, same dtype, and
+        # `unique_name` is `tp:0` either way. So a 4-way price matches a 2-way
+        # call exactly, at full coverage, with no warning, and tensor-parallel
+        # communication silently costs what it costs at the other width. The
+        # width lives in the graph and in the price list, not in the operator,
+        # so the check belongs here.
+        graph_topology = dict(((graph_blob.get("key") or {}).get("topology")
+                               or []))
+        transferable = _collectives_transferable(
+            graph_topology, self.price_topology)
 
         seconds = 0.0
         launches = 0
@@ -340,6 +434,10 @@ class PricedGraphCostOracle:
         breakdown: dict[str, float] = {}
         for op in graph_blob["ops"]:
             if op.get("name", "") in HOST_SYNC:
+                continue
+            if not transferable and _is_collective_op(op):
+                self.unpriced += 1
+                self.untransferable_collectives += 1
                 continue
             entry = price_list.get(signature_of(op))
             if entry is None:

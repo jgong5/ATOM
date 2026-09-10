@@ -1,0 +1,13 @@
+{
+  "kind": "decode",
+  "query_lens": [1, 1, 1, 1],
+  "context_lens": [66, 66, 66, 66],
+  "block_size": 16,
+  "max_model_len": 4096,
+  "prompt_lens": [64, 64, 64, 64],
+  "position_rows": 3,
+  "notes": {
+    "why": "The batch the level-3 27B capture ran: four requests admitted with 64-token prompts, each two tokens into generation. Reproduced field for field by tests/compass/test_batch_spec.py against compass_ops/silu27_graph.tp0.json.",
+    "source_capture": "compass_ops/silu27_graph.tp0.json"
+  }
+}

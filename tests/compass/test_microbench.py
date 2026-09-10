@@ -436,3 +436,80 @@ class TestOneBreakdownPerOperator:
         monkeypatch.setattr(microbench, "under_parallelism", lambda: True)
         assert not microbench._wants_breakdown(23.2e-6, 4, None, None)
         assert microbench._wants_breakdown(42e-6, 256, None, None)
+
+
+class TestAStrideIntoMemoryTheGraphNeverSaw:
+    """A Triton kernel's tensor arguments may be views, and a view is not a shape.
+
+    `_fused_qk_norm_single_kernel` takes q as a view into the fused qkv buffer.
+    The graph records q's shape -- [4, 24, 256] at TP=1 -- and, separately, the
+    plain integer 14336 that is the *buffer's* row stride. Rebuilt dense at the
+    recorded shape and launched with the recorded stride, row 3 addresses
+    element 49151 of 24576. On the device that is not an exception that leaves
+    one signature unpriced; it is a memory access fault that kills the process
+    with 36 signatures priced and no record of which one was in hand.
+    """
+
+    def _kernel(self, scalars):
+        op = _op(shapes=[(4, 24, 256), (4, 4, 256)],
+                 dtypes=["bfloat16", "bfloat16"], scalars=scalars)
+        op["name"] = "triton::k"
+        return op
+
+    def test_a_stride_larger_than_every_row_is_refused(self):
+        from atom.compass.runtime.microbench import _stride_past_its_tensors
+
+        found = _stride_past_its_tensors(self._kernel([("#9", 14336)]))
+        assert found == ("#9", 14336, 6144)
+
+    def test_a_contiguous_stride_is_not(self):
+        """`q_out_stride0` is 6144 -- q's own row -- and the output is dense."""
+        from atom.compass.runtime.microbench import _stride_past_its_tensors
+
+        assert _stride_past_its_tensors(self._kernel([("#11", 6144)])) is None
+
+    def test_nor_are_the_extents_beside_it(self):
+        """num_tokens=4, head_dim=256, num_q_heads=24: all inside a row."""
+        from atom.compass.runtime.microbench import _stride_past_its_tensors
+
+        op = self._kernel([("#7", 4), ("#8", 256), ("#13", 24)])
+        assert _stride_past_its_tensors(op) is None
+
+    def test_a_constexpr_is_not_applied_to_a_pointer(self):
+        """It is compiled into the kernel. `BLOCKS_PER_TILE=4096` is a tile size.
+
+        That kernel prices correctly today, and reading its constexpr as a
+        stride would refuse a price that works.
+        """
+        from atom.compass.runtime.microbench import _stride_past_its_tensors
+
+        op = self._kernel([("BLOCKS_PER_TILE", 4096), ("XBLOCK", 99999)])
+        assert _stride_past_its_tensors(op) is None
+
+    def test_a_single_row_cannot_be_walked_off(self):
+        """With one row there is no second row for a stride to reach."""
+        from atom.compass.runtime.microbench import _stride_past_its_tensors
+
+        op = _op(shapes=[(1, 8)], dtypes=["bfloat16"], scalars=[("#2", 4096)])
+        op["name"] = "triton::k"
+        assert _stride_past_its_tensors(op) is None
+
+    def test_so_is_a_kernel_of_flat_tensors(self):
+        """A 1-D argument has no row extent, so no integer contradicts it."""
+        from atom.compass.runtime.microbench import _stride_past_its_tensors
+
+        op = _op(shapes=[(4097,), (5,)], dtypes=["int32", "int32"],
+                 scalars=[("#5", 0)])
+        op["name"] = "triton::k"
+        assert _stride_past_its_tensors(op) is None
+
+    def test_it_measures_against_the_widest_argument(self):
+        """A stride belongs to one tensor, and the others are narrower.
+
+        Against the narrowest, q's own dense stride would read as a fault: k's
+        row is 1024 and q's is 6144.
+        """
+        from atom.compass.runtime.microbench import _stride_past_its_tensors
+
+        assert _stride_past_its_tensors(self._kernel([("#11", 6144)])) is None
+        assert _stride_past_its_tensors(self._kernel([("#9", 6145)]))

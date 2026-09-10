@@ -439,3 +439,103 @@ class TestOperatorsThatOnlyMakeTheHostWait:
         assert "aten::item" in HOST_SYNC
         assert "aten::is_nonzero" in HOST_SYNC
         assert "aten::mm" not in HOST_SYNC
+
+
+def _tp_artifacts(tmp_path, graph_tp, price_tp, seconds=1e-5):
+    """A graph at one width and a price list measured at another.
+
+    The all-reduce is deliberately identical on both sides -- same message, same
+    dtype, same `unique_name` -- because that is the whole problem: the width is
+    not in the signature, so the wrong price matches perfectly.
+    """
+    collective = {"name": "aiter::all_reduce_",
+                  "input_shapes": [[4, 5120]], "output_shapes": [[4, 5120]],
+                  "dtypes": ["bfloat16"], "group": "tp", "scalars": [],
+                  "int_values": [], "context": []}
+    ops = [_op("aten::mm"), collective]
+    graph = {"version": 2, "key": {"topology": [["tp", graph_tp]]},
+             "provenance": {}, "ops": ops}
+    prices = {"prices": {}, "provenance": {}}
+    if price_tp is not None:
+        prices["provenance"]["topology"] = {"tp": price_tp}
+    for op in ops:
+        prices["prices"][signature_of(op)] = {
+            "name": op["name"], "seconds": seconds, "occurrences": 1,
+            "kernels": {"k": seconds},
+        }
+    graph_path, prices_path = tmp_path / "g.json", tmp_path / "p.json"
+    graph_path.write_text(json.dumps(graph))
+    prices_path.write_text(json.dumps(prices))
+    return str(prices_path), str(graph_path)
+
+
+class TestACollectivePriceIsAPriceAtOneWidth:
+    """`all_reduce_` over two ranks and over four sign identically.
+
+    Same message, same dtype, and `unique_name` is `tp:0` however wide the group
+    is -- so a four-way price matches a two-way call exactly, at full coverage,
+    with no warning, and tensor-parallel communication is charged at the other
+    width. The width is in the graph and in the price list, never in the
+    operator, so refusing the transfer is the only place the mistake can be
+    caught.
+    """
+
+    def test_same_width_pays_for_its_collectives(self, tmp_path):
+        prices, graph = _tp_artifacts(tmp_path, graph_tp=4, price_tp=4)
+        oracle = PricedGraphCostOracle(prices, graph)
+        assert oracle.untransferable_collectives == 0
+        assert oracle.decode.ops == 2
+
+    def test_another_width_is_refused_not_spent(self, tmp_path):
+        prices, graph = _tp_artifacts(tmp_path, graph_tp=2, price_tp=4)
+        oracle = PricedGraphCostOracle(prices, graph)
+        assert oracle.untransferable_collectives == 1
+        # The local operator still prices; only the collective is withheld.
+        assert oracle.decode.ops == 1
+        assert "aiter::all_reduce_" not in oracle.decode.breakdown
+
+    def test_a_list_that_does_not_declare_its_width_certifies_nothing(
+            self, tmp_path):
+        prices, graph = _tp_artifacts(tmp_path, graph_tp=4, price_tp=None)
+        oracle = PricedGraphCostOracle(prices, graph)
+        assert oracle.untransferable_collectives == 1
+
+    def test_a_graph_with_no_group_wider_than_one_rank_refuses_nothing(
+            self, tmp_path):
+        prices, graph = _tp_artifacts(tmp_path, graph_tp=1, price_tp=None)
+        oracle = PricedGraphCostOracle(prices, graph)
+        assert oracle.untransferable_collectives == 0
+
+    def test_the_refusal_is_warned_about(self, tmp_path, caplog):
+        from atom.compass.core.cost import priced
+
+        priced._WARNED_TOPOLOGY.clear()
+        prices, graph = _tp_artifacts(tmp_path, graph_tp=2, price_tp=4)
+        with caplog.at_level("WARNING"):
+            PricedGraphCostOracle(prices, graph)
+        assert any("ATOMCompass WARNING" in r.getMessage()
+                   and "collectives are left unpriced" in r.getMessage()
+                   for r in caplog.records)
+
+    def test_an_older_list_reads_its_width_off_the_graphs_it_names(
+            self, tmp_path):
+        """It was priced from graphs, and a graph has always carried topology.
+
+        So a list written before the width was recorded is not thereby unusable
+        at its own width -- reading it back is a statement the artifact already
+        makes.
+        """
+        prices, graph = _tp_artifacts(tmp_path, graph_tp=4, price_tp=None)
+        blob = json.loads(open(prices).read())
+        blob["provenance"]["graphs"] = [graph]
+        open(prices, "w").write(json.dumps(blob))
+        oracle = PricedGraphCostOracle(prices, graph)
+        assert oracle.untransferable_collectives == 0
+
+    def test_a_named_graph_that_is_gone_certifies_nothing(self, tmp_path):
+        prices, graph = _tp_artifacts(tmp_path, graph_tp=4, price_tp=None)
+        blob = json.loads(open(prices).read())
+        blob["provenance"]["graphs"] = [str(tmp_path / "vanished.json")]
+        open(prices, "w").write(json.dumps(blob))
+        oracle = PricedGraphCostOracle(prices, graph)
+        assert oracle.untransferable_collectives == 1

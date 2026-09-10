@@ -81,7 +81,16 @@ class PagedAttentionImpl(nn.Module):
         self.kv_cache_dtype = kv_cache_dtype
         self.max_model_len = 0
         self.k_scale = self.v_scale = None
-        self.device = "cuda:" + str(torch.cuda.current_device())
+        # Follow the device this module is actually being built on. Under
+        # `with torch.device("meta")` -- how a graph is derived for a
+        # configuration that no GPU is running -- asking CUDA for a current
+        # device fails outright on a device-free machine, and on one with
+        # cards it would put the scale tensor below on a real card the rest
+        # of the module is not on. Off the meta path this is the same
+        # string it always was.
+        _build_device = torch.empty(0).device
+        self.device = (str(_build_device) if _build_device.type == "meta"
+                       else "cuda:" + str(torch.cuda.current_device()))
         self.layer_num = layer_num
         self.kv_scale_float = (
             torch.finfo(torch.float8_e4m3fn).max / torch.finfo(aiter.dtypes.fp8).max

@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 import os
 from typing import Any, Optional
 
@@ -365,6 +366,47 @@ def _is_collective_op(op: dict) -> bool:
     return name.startswith("c10d::") or "all_reduce" in name or "all_gather" in name
 
 
+def _stride_past_its_tensors(op: dict):
+    """A recorded integer that can only be a stride into memory not recorded.
+
+    A Triton kernel takes pointers, not tensors. Its strides arrive as plain
+    ints alongside them, and when the tensor it was handed was a *view*, that
+    stride belongs to the allocation the view looked into -- which the graph
+    never saw. Rebuilt here as a dense tensor of exactly its recorded shape and
+    launched with the original stride, the kernel walks off the end.
+
+    That is not an exception. It is a GPU memory access fault, and it kills the
+    pricing run and every signature after it. `_fused_qk_norm_single_kernel`
+    does it: q is a view into the fused qkv buffer, its recorded shape is
+    [4, 24, 256] and its `q_in_stride0` is 14336, so row 3 addresses element
+    49151 of 24576.
+
+    The test needs no knowledge of any particular kernel. For a tensor argument
+    [d0, *rest] with d0 > 1, its dense row extent is prod(rest), and a stride s
+    used over d0 rows fits exactly when s <= that extent -- s*(d0-1)+R > d0*R is
+    just s > R. So a positional integer larger than *every* argument's row
+    extent cannot be a dense stride for any of them, and the graph cannot show
+    it is not a stride at all. Constexprs are excluded: they are compiled into
+    the kernel, not applied to a pointer, and `BLOCKS_PER_TILE=4096` is a tile
+    size that prices correctly today.
+
+    Returns the first such (name, value, largest extent), or None. It over-
+    refuses -- a kernel taking a genuinely large extent loses its price -- and
+    that is the direction to err, because the other failure takes the run.
+    """
+    extents = [math.prod(shape[1:])
+               for shape in op.get("input_shapes") or ()
+               if len(shape) >= 2 and shape[0] > 1]
+    if not extents:
+        return None
+    limit = max(extents)
+    for key, value in (tuple(x) for x in op.get("scalars") or ()):
+        if (key.startswith("#") and isinstance(value, int)
+                and not isinstance(value, bool) and value > limit):
+            return (key, value, limit)
+    return None
+
+
 def _time(callable_, iters: int, warmup: int) -> float:
     """Seconds per call, measured over ``iters`` calls and one pair of events."""
     import torch
@@ -559,6 +601,14 @@ def _breakdown_over() -> float:
 #: this says whether it went into kernels or into the gaps between them, which is
 #: the difference between "this kernel is slow" and "this measurement is wrong".
 PROFILE_MATCH = os.environ.get("COMPASS_BENCH_PROFILE", "")
+
+#: A file to name each signature in before it is priced, so a fault that kills
+#: the process leaves behind which operator it died on. Empty means no trace.
+#: Each rank writes its own -- `{rank}` in the path is substituted.
+BENCH_TRACE = os.environ.get("COMPASS_BENCH_TRACE", "")
+if BENCH_TRACE and "{rank}" in BENCH_TRACE:
+    BENCH_TRACE = BENCH_TRACE.replace(
+        "{rank}", os.environ.get("RANK", os.environ.get("LOCAL_RANK", "0")))
 
 
 def _time_in_graph(fn, sets: list, iters: int, warmup: int, before=None,
@@ -863,9 +913,23 @@ def price_graph(graph_path: str, iters: int = 2000, warmup: int = 20,
     if not paths:
         raise OSError(f"no graphs matched {graph_path!r}")
     ops = []
+    # A price list that does not say which parallel width it was measured at
+    # cannot be stopped from being read at another one. `aiter::all_reduce_`
+    # signs identically over 2 ranks and over 4 -- same message, same dtype,
+    # and `unique_name` is `tp:0` however wide the group is -- so a 4-way price
+    # matches a 2-way call exactly, at full coverage, with no warning. The width
+    # is not in the operator; it is in the graph the operator came from.
+    topologies = set()
     for path in paths:
         with open(path, encoding="utf-8") as fh:
-            ops.extend(json.load(fh)["ops"])
+            blob = json.load(fh)
+        ops.extend(blob["ops"])
+        topology = ((blob.get("key") or {}).get("topology")) or []
+        topologies.add(tuple(sorted(tuple(x) for x in topology)))
+    # Ranks of one deployment agree; a caller who pooled graphs from two
+    # different widths gets None, which the consumer treats as uncertifiable.
+    measured_topology = (dict(next(iter(topologies)))
+                         if len(topologies) == 1 else None)
 
     counts: dict[str, int] = {}
     example: dict[str, dict] = {}
@@ -892,6 +956,17 @@ def price_graph(graph_path: str, iters: int = 2000, warmup: int = 20,
     # fragments per layer is never taken apart, however much of the step it is.
     covered: set = set()
     for sig, op in example.items():
+        # A GPU memory fault is not an exception. It kills the process, so the
+        # `unpriced` bookkeeping below never runs and the log says only that
+        # the run died -- with nothing to say which of two hundred signatures
+        # was in hand. Written and flushed before the attempt, this file names
+        # it. Off unless asked for, and appended to rather than held, because
+        # anything buffered dies with the process.
+        if BENCH_TRACE:
+            with open(BENCH_TRACE, "a", encoding="utf-8") as fh:
+                fh.write(sig + "\n")
+                fh.flush()
+                os.fsync(fh.fileno())
         # Per signature, not once: an operator that rebuilds the context from
         # its arguments leaves that context behind for whatever is priced next.
         reset_forward_context()
@@ -901,6 +976,16 @@ def price_graph(graph_path: str, iters: int = 2000, warmup: int = 20,
             unpriced[sig] = (
                 "triton kernel with no importable origin or resolved grid"
                 if triton_kernel else "operator not registered in this process")
+            continue
+        # Only for Triton: a registered aten/aiter operator is handed real
+        # tensors and reads their strides off them, so a dense rebuild is
+        # self-consistent however the original was laid out.
+        stride = _stride_past_its_tensors(op) if triton_kernel else None
+        if stride is not None:
+            unpriced[sig] = (
+                f"{stride[0]}={stride[1]} exceeds every argument's row extent "
+                f"({stride[2]}), so it can only be a stride into an allocation "
+                "the graph does not record")
             continue
         # An operator that reads a forward context gets the one it was recorded
         # with, or is not priced. Calling it without would price it against
@@ -1008,6 +1093,10 @@ def price_graph(graph_path: str, iters: int = 2000, warmup: int = 20,
         "provenance": {
             "graph": graph_path,
             "graphs": paths,
+            # Which width these prices are of. A consumer at another width
+            # must not spend a collective price from this list; see
+            # `PricedOracle._cost`.
+            "topology": measured_topology,
             "iters": iters,
             "cache": cache,
             "note": "steady state, one event pair per signature",

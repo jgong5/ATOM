@@ -240,10 +240,18 @@ def _int_ranges_of(tensors) -> tuple:
                            torch.int8):
             continue
         flat = t.reshape(-1)
-        low = int(flat.min())
-        high = int(flat.max())
-        climbing = (flat.numel() < 2
-                    or bool(torch.all(flat[1:] >= flat[:-1])))
+        try:
+            low = int(flat.min())
+            high = int(flat.max())
+            climbing = (flat.numel() < 2
+                        or bool(torch.all(flat[1:] >= flat[:-1])))
+        except Exception:  # noqa: BLE001 - same guard as _int_values_of
+            # A meta tensor has a shape and no contents, and derivation
+            # traces entirely on meta: there is no value to read, on any
+            # device, ever. Its neighbour above already skips such a
+            # tensor rather than failing, and a derived graph that
+            # carries no ranges is correct -- it is a graph about shapes.
+            continue
         out.append((i, (low, high, climbing)))
     return tuple(out)
 

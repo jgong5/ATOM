@@ -29,12 +29,17 @@ equality::
     python scripts/compass/graph_diff.py compare derived.json capture.json
 """
 
+import contextlib
 import argparse
 import os
 import sys
 import time
 
 import torch
+
+#: What `--tokens` means when nobody said otherwise. Named so a batch spec can
+#: tell "the default was left alone" from "the caller asked for this many".
+TRACE_TOKENS_DEFAULT = 8
 
 
 def _free_port() -> str:
@@ -59,23 +64,64 @@ def _init_env(tp: int) -> None:
     os.environ.setdefault("WORLD_SIZE", "1")
 
 
-def _trace(model, input_ids, positions, topology=None):
+def _trace(model, input_ids, positions, topology=None, on_meta=False,
+           spec=None):
     """Run one forward under the tracers, returning the combined graph."""
-    from atom.compass.runtime.derive import record_collectives
+    from atom.compass.runtime.derive import (record_collectives,
+                                             redirect_device_factories)
     from atom.compass.runtime.meta import MetaOpTracer
     from atom.compass.runtime.triton_trace import TritonLaunchTracer
 
     ops = MetaOpTracer(topology=topology)
     triton = TritonLaunchTracer(graph=ops.graph)
     collectives = record_collectives(ops.graph)
+    # Only on meta, and reported: see redirect_device_factories.
+    factories = (redirect_device_factories() if on_meta
+                 else contextlib.nullcontext())
+    # The batch's metadata, on the forward context, where attention reads it.
+    # Without this the model still traces -- attention runs, its shapes are
+    # right -- and every attention operator is recorded with no context, which
+    # makes it unpriceable. See atom/compass/runtime/batch_spec.py.
+    if spec is not None:
+        from atom.compass.runtime import batch_spec as bs
+
+        installed = bs.install(spec)
+    else:
+        installed = contextlib.nullcontext()
     t0 = time.perf_counter()
-    with collectives, triton, ops, torch.inference_mode():
+    with factories, installed, collectives, triton, ops, torch.inference_mode():
         model(input_ids, positions)
-    return ops.graph, time.perf_counter() - t0
+    return (ops.graph, time.perf_counter() - t0,
+            getattr(factories, "redirected", 0))
 
 
 def _trace_cmd(args) -> int:
+    # Read before anything else. A misspelled field or an impossible batch
+    # should say so now, not after a 27B model has been built on meta.
+    spec = None
+    if args.batch_spec:
+        from atom.compass.runtime.batch_spec import BatchSpec
+
+        spec = BatchSpec.load(args.batch_spec)
+        if args.tokens != spec.num_tokens:
+            if args.tokens != TRACE_TOKENS_DEFAULT:
+                print(f"--tokens {args.tokens} contradicts the batch spec, "
+                      f"which computes {spec.num_tokens}", file=sys.stderr)
+                return 2
+            args.tokens = spec.num_tokens
     _init_env(args.tp)
+    if getattr(args, "replay_target", None):
+        # Deriving on a device-free machine. AITER resolves the chip at import
+        # time by shelling out to `rocminfo`, which fails where there is no GPU,
+        # and derivation's whole point is to run there. The replay path already
+        # answers that question from a captured record; derivation asks it for
+        # the same reason, so it uses the same seam rather than a second one.
+        # Before the `aiter` import below, which is what triggers the query.
+        from atom.compass.replay.bootstrap import install_from_target
+
+        state = install_from_target(args.replay_target)
+        print(f"### derive bootstrap: arch={state['arch']} "
+              f"installed={state['installed']} ({state['reason']})", flush=True)
     from aiter import init_dist_env
 
     # Derivation builds the group at world size ONE, whatever TP width is being
@@ -127,31 +173,77 @@ def _trace_cmd(args) -> int:
         model = model.to(device)
     build_s = time.perf_counter() - build_t0
 
-    from atom.compass.runtime.meta import derived_inputs
+    if spec is None:
+        from atom.compass.runtime.meta import derived_inputs
 
-    graph, trace_s = _trace(
-        model, *derived_inputs(args.tokens, device), topology={"tp": args.tp}
-    )
+        inputs = derived_inputs(args.tokens, device)
+    else:
+        from atom.compass.runtime import batch_spec as bs
+
+        inputs = bs.model_inputs(spec, device)
+
+    # The trace runs in the model's dtype too, not only the build. A
+    # library that creates a tensor without naming one gets the ambient
+    # default, and AITER's dispatch dummy is exactly that: restored to
+    # fp32 it is recorded as `...|1;4,5120;5120;4,5120|float32,bfloat16,
+    # bfloat16,bfloat16`, against the capture's all-bfloat16, and every
+    # fused qk-rmsnorm in the graph then misses its price by dtype alone.
+    prev_dtype = torch.get_default_dtype()
+    torch.set_default_dtype(config.torch_dtype)
+    try:
+        graph, trace_s, redirected = _trace(
+            model, *inputs, topology={"tp": args.tp},
+            on_meta=device.type == "meta", spec=spec,
+        )
+    finally:
+        torch.set_default_dtype(prev_dtype)
     graph.key = GraphKey.of(
         model_id=f"{arch}@{os.path.basename(args.model.rstrip('/'))}",
         topology={"tp": args.tp},
         rank_coords={"tp": args.rank},
-        batch_signature=(args.tokens,),
+        # Per-request scheduled tokens, which is what the runner records
+        # (`runner.py`: `shape.num_scheduled_tokens`). A bare body pass is one
+        # sequence of that many. The key still does not carry context length,
+        # so a decode and a chunked prefill of the same query lengths key
+        # alike -- the spec below is what tells them apart.
+        batch_signature=spec.query_lens if spec else (args.tokens,),
     )
     graph.provenance = {
         "source": "derivation" if device.type == "meta" else "capture",
         "device": device.type,
         "compilation_level": 0,  # a bare model call is never compiled
         "tokens": args.tokens,
+        # How many device-typed factory calls were sent to meta so the
+        # operator after them could dispatch. Recorded, not hidden.
+        "device_factories_redirected": redirected,
     }
+    if spec is not None:
+        # The batch this graph is a graph of, written down in full, block
+        # table included. Without it "4 tokens" is all a reader gets, and four
+        # decodes at context 66 and a four-token prefill produce the same
+        # number with two orders of magnitude between their KV traffic.
+        graph.provenance["batch_spec"] = spec.to_dict()
+    else:
+        graph.provenance["forward_context"] = "none installed"
     graph.save(args.out)
 
     resident = ""
     if device.type == "cuda":
         resident = f", {torch.cuda.memory_allocated() / 2**30:.1f} GiB resident"
     print(f"device    : {device.type}")
+    if spec is not None:
+        print(f"batch     : {spec.kind} bs={spec.batch_size} "
+              f"tokens={spec.num_tokens} "
+              f"context={min(spec.context_lens)}..{max(spec.context_lens)} "
+              f"block={spec.block_size} bucket={spec.capture_bucket}")
+    else:
+        print("batch     : bare body pass, no forward context installed "
+              "(attention will be unpriceable)")
     print(f"operators : {len(graph)} ({len(graph.op_names())} distinct)")
     print(f"built in  : {build_s:.2f}s | traced in {trace_s:.3f}s{resident}")
+    if redirected:
+        print(f"redirected: {redirected} cuda factory calls to meta "
+              f"(dispatch keys only; no device was used)")
     print(f"written   : {args.out}")
     return 0
 
@@ -235,11 +327,24 @@ def main() -> int:
     tr = sub.add_parser("trace", help="trace one forward and write the graph")
     tr.add_argument("--model", required=True)
     tr.add_argument("--device", default="meta", choices=["meta", "cuda", "cpu"])
-    tr.add_argument("--tokens", type=int, default=8)
+    tr.add_argument("--tokens", type=int, default=TRACE_TOKENS_DEFAULT,
+                    help="Body tokens for a bare trace. Ignored when "
+                         "--batch-spec is given, which says how many.")
     tr.add_argument("--tp", type=int, default=1)
     tr.add_argument("--rank", type=int, default=0,
                     help="Which rank of the group to derive. Any rank can be "
                          "derived from any process; nothing is communicated.")
+    tr.add_argument("--replay-target", default=None,
+                    help="A captured target.json to take the architecture "
+                         "from, so a graph can be derived on a machine with "
+                         "no GPU for AITER to interrogate.")
+    tr.add_argument("--batch-spec", default=None,
+                    help="A JSON BatchSpec saying which forward to derive: "
+                         "prefill or decode, per-request query and context "
+                         "lengths, block size, capture bucket. Without it the "
+                         "trace is a bare --tokens body pass with no forward "
+                         "context, and every attention operator comes out "
+                         "unpriceable.")
     tr.add_argument("-o", "--out", required=True)
     tr.set_defaults(func=_trace_cmd)
 
