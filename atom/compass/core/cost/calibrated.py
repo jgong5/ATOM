@@ -132,14 +132,42 @@ def _decode_bucket_features(shape: StepShape) -> list[float]:
     in every sample and the coefficient had no variance to be identified by --
     a rank deficiency rather than a coverage gap, which is why widening the
     context range did nothing for it.
+
+    **The rectangle is the rung's, not the batch's.** That is the same sentence
+    as the first paragraph -- a replay runs the padded rung whatever the batch --
+    but the padding was computed as ``len(context_lens) * max``, over the
+    sequences present, while the replay reads ``rung * max``. A batch that fills
+    its rung makes those equal, so a sweep whose rounds request exactly 2, 4, 8,
+    16 sequences never sees the difference. A serving run does: as requests
+    finish, batches drift below their rung and sit there.
+
+    Measured on a 27B serving run, per rung, padding as coded against padding a
+    replay reads:
+
+        rung  2   batches of 2       1.00x    error  -0.34%
+        rung  8   batches of 5-8     1.40x    error  -2.41%
+        rung  4   batches of 3-4     2.26x    error  -3.91%
+        rung 16   batches of 9-10    5.59x    error -22.64%
+
+    The error tracks the ratio. The sweep's own rung-16 batches are 12-16, ratio
+    1.00, so the coefficient was fitted where the mistake is invisible and
+    applied where it is not. Correcting it takes decode from -2.73% to -0.09%
+    overall: rung 4 to +0.07%, rung 8 to -0.28%, rung 16 from -22.64% to +1.97%.
+
+    Two rounds of sweep changes were spent first on widening context and then on
+    making long-context batches ragged, on the theory that the coefficient was
+    unconstrained. Neither moved rung 16 by more than 0.07 points. It was not
+    unconstrained; it was fitted to the wrong number.
     """
     lengths = [float(v) for v in (shape.context_lens or ())]
     if not lengths:
         return [1.0, 0.0, 0.0]
     context = sum(lengths)
-    # What a padded read would touch beyond the real histories. Zero for a
-    # uniform batch, which is what makes it droppable where nothing varies.
-    padding = len(lengths) * max(lengths) - context
+    # What a padded read touches beyond the real histories. The rung, not the
+    # batch: a replay runs the captured shape. Falls back to the batch when no
+    # bucket was recorded, which is an eager step -- there the batch is what ran.
+    rung = float(shape.capture_bucket or len(lengths))
+    padding = rung * max(lengths) - context
     return [1.0, context, padding]
 
 

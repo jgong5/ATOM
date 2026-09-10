@@ -17,7 +17,8 @@ import json
 import pytest
 
 from atom.compass.core.cost.base import StepShape
-from atom.compass.core.cost.calibrated import CalibratedCostOracle
+from atom.compass.core.cost.calibrated import (
+    CalibratedCostOracle, _decode_bucket_features)
 
 
 def _write(path, rows):
@@ -266,3 +267,44 @@ class TestAFitDropsWhatItCannotIdentify:
         assert len(coeffs) == 3
         assert coeffs[2] == 0.0
         assert coeffs[1] == pytest.approx(2.0, rel=1e-6)
+
+class TestPaddingIsMeasuredAgainstTheRung:
+    """A replay runs the padded rung, so the rectangle it reads is the rung's.
+
+    The padding term was computed over the sequences present, which equals the
+    rung exactly when a batch fills it -- and a sweep requesting 2, 4, 8, 16
+    sequences always fills it. A serving run does not: as requests finish,
+    batches drift below their rung and stay there. On a 27B run the rung-16
+    batches were 9-10 and the padding as coded was 5.59 times too small, which
+    is the -22.64% that two rounds of sweep widening could not shift.
+    """
+
+    @staticmethod
+    def _shape(contexts, bucket):
+        return StepShape(
+            num_scheduled_tokens=tuple(1 for _ in contexts),
+            context_lens=tuple(contexts),
+            num_prefill_tokens=0,
+            capture_bucket=bucket,
+        )
+
+    def test_a_batch_below_its_rung_pays_the_rung_s_rectangle(self):
+        f = _decode_bucket_features(self._shape([100, 100, 200], bucket=8))
+        # 8 rows of 200 read, 400 of which is real history.
+        assert f[2] == pytest.approx(8 * 200 - 400)
+
+    def test_a_batch_that_fills_its_rung_is_unchanged(self):
+        """Which is why a sweep never saw this."""
+        ctx = [100, 100, 100, 200]
+        f = _decode_bucket_features(self._shape(ctx, bucket=4))
+        assert f[2] == pytest.approx(4 * 200 - sum(ctx))
+
+    def test_a_uniform_batch_filling_its_rung_still_has_no_padding(self):
+        """The zero that makes the column droppable where nothing varies."""
+        f = _decode_bucket_features(self._shape([256] * 4, bucket=4))
+        assert f[2] == pytest.approx(0.0)
+
+    def test_an_eager_step_falls_back_to_its_batch(self):
+        """No bucket means nothing was replayed, so the batch is what ran."""
+        f = _decode_bucket_features(self._shape([100, 300], bucket=None))
+        assert f[2] == pytest.approx(2 * 300 - 400)

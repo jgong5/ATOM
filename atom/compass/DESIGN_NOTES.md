@@ -6568,3 +6568,71 @@ at the run's contexts and still none in its raggedness band. Measured, not
 assumed. Mildly ragged long-context rounds are added for that, two per rung, and
 verified to bracket the run: rung 2 spans 1.00-1.24 against a run at 1.03-1.18,
 rung 16 spans 1.00-1.38 against 1.18-1.32.
+
+
+## The padding was the rung's rectangle, measured against the batch
+
+The ragged long-context rounds were run and rung 16 did not move: -22.57% to
+-22.64%. The prediction recorded beforehand was that anything short of a large
+move means the padding term is wrong rather than unconstrained, so: it is wrong.
+
+`_decode_bucket_features` computed padding as ``len(context_lens) * max - sum``
+-- the rectangle over the sequences present. A replay reads ``rung * max``. The
+first paragraph of its own docstring says so: "the replay runs the padded rung
+whatever the batch, so twelve sequences and sixteen perform the same work." The
+feature did not.
+
+Those two are equal exactly when a batch fills its rung, and a sweep that
+requests 2, 4, 8, 16 sequences always fills it. A serving run does not: as
+requests finish, batches drift below their rung and sit there. Per rung on the
+27B run, padding as coded against padding a replay reads:
+
+| rung | batches | ratio | error |
+| --- | --- | --- | --- |
+| 2 | 2 | 1.00x | -0.34% |
+| 8 | 5-8 | 1.40x | -2.41% |
+| 4 | 3-4 | 2.26x | -3.91% |
+| 16 | **9-10** | **5.59x** | **-22.64%** |
+
+The error tracks the ratio. The sweep's own rung-16 batches are 12 to 16, ratio
+1.00, so the coefficient was fitted where the mistake is invisible and applied
+where it is not.
+
+### What each change was actually worth
+
+Holding the corrected feature fixed and varying only the table:
+
+| decode error | overall | rung 2 | rung 4 | rung 8 | rung 16 |
+| --- | --- | --- | --- | --- | --- |
+| original table, original feature | -3.23% | -2.78% | -4.77% | -2.12% | -22.58% |
+| original table, fixed feature | **-0.59%** | -2.78% | -0.77% | +0.02% | **+1.98%** |
+| + long-context rounds | **-0.06%** | **-0.34%** | +0.07% | -0.28% | +1.97% |
+| + mildly ragged rounds | -0.09% | -0.34% | +0.07% | -0.28% | +1.97% |
+
+Three separable things, and they should be credited separately. The feature fix
+carries rungs 4, 8 and 16. The long-context rounds carry rung 2, which was
+genuinely coverage-limited. The mildly ragged rounds -- the hypothesis this
+section started from -- add nothing measurable, on this workload, even after the
+feature they were meant to constrain was corrected. They are kept because the
+evidence gap they close is real, but a reader trading sweep time should know
+they bought nothing here.
+
+Two rounds of sweep changes were spent on the theory that a coefficient was
+unconstrained. It was constrained; it was fitted to the wrong number. The
+symptom of that is worth remembering: widening the evidence twice moved rung 16
+by 0.07 points, which is what "not a coverage problem" looks like from the
+outside.
+
+### Where the cost model now stands on the 27B
+
+    prefill  106 steps   measured 235.56s  priced 228.20s
+      on totals               -3.13%
+      holding out step 0      -0.27%     (the unmodelled cold start)
+      median per step         -0.09%
+
+    decode  4346 steps   measured  73.17s  priced  73.10s
+      on totals               -0.09%
+      holding out step 148    -0.07%
+      median per step         +0.09%
+
+Within 0.3% on both halves, with no single step carrying the total on either.
