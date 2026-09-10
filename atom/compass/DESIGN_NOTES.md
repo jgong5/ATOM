@@ -16,11 +16,12 @@ Defects in ATOM itself, rather than in Compass, are collected separately in
 [ATOM_DEFECTS.md](ATOM_DEFECTS.md).
 
 **Start with [RETROSPECTIVE.md](RETROSPECTIVE.md)** for the evidence audit and
-priorities as of 9 September 2026. It invalidates the latest loaded-run admission
-and simulator-speed conclusions because of a workload barrier timeout and an
-incorrect queue-time reconstruction. [POC_SUMMARY.md](POC_SUMMARY.md) provides
-the earlier handover. This file is the chronological working log; later
-corrections can supersede earlier conclusions.
+priorities updated on 10 September 2026 through `87838198`. It reviews the
+replay/timing repairs, repeated 27B results, new decision records, and remaining
+validity gaps. The [9 September review](RETROSPECTIVE_2026-09-09.md) preserves
+the original audit. [POC_SUMMARY.md](POC_SUMMARY.md) provides the earlier handover.
+This file is the chronological working log; later corrections can supersede
+earlier conclusions.
 
 ---
 
@@ -5930,3 +5931,115 @@ client already needs for workloads past MAX_IN_FLIGHT.
 **What it does not yet explain** is the 27B's remaining wait after prefill.
 That needs the same record from a 27B run and a diff of the decision sequence,
 which is the next step and needs no new capacity.
+
+
+## The 27B TTFT error is a scheduling discontinuity, not a cost error
+
+The decision record from the previous section could not be used on the 27B --
+the runs were taken on node 18, which is no longer reachable, and they predate
+the record. So the two inputs the record would have supplied were rebuilt from
+the step tables instead, taking only what the artifacts determine exactly: when
+a request arrived, from the client's own trace, and how much prefill it still
+owed, from the sum of its scheduled chunks. Scheduler-internal state was not
+reconstructed and nothing below depends on it.
+
+**The scheduler behaved identically on both sides.** Neither run ever took a
+decode step while an arrived request still owed prefill -- 0 out of 4378 real
+decode steps and 0 out of 4621 simulated ones. Prefill-first was obeyed the same
+way by both. There is no scheduling disagreement to find.
+
+What differs is when the streaks *broke*. Prefill-first means a decode window
+opens only in the gap between one request's last prefill chunk and the next
+request's arrival, and the margins on that gap are small:
+
+| | ends at | next arrival | margin |
+| --- | --- | --- | --- |
+| real, 42-chunk streak | 213.0 | 214.5 | **+1.5 s** |
+| real, 7-chunk streak | 231.2 | 232.4 | **+1.2 s** |
+| simulated | never breaks; the three merge into one 63-chunk streak | | |
+
+The simulated run reaches the same point 3.9 s later, so both margins go
+negative, both windows close, and ten requests that got a first token at 213.1
+and 231.2 in the real run get one at 271.6 instead. That is the whole of the
++240 s: real post-prefill wait totals 703.6 s, simulated 944.1 s.
+
+**Where the 3.9 s comes from is a cancellation.** Priced against the real run's
+own step shapes, prefill is +0.10% -- the number previously reported as the
+headline. Excluding the first step it is **+3.06%**, and the first step is the
+cold start: 640 tokens, measured 6.87 s, priced 0.13 s. A single -6.75 s error
+almost exactly offsets +6.99 s spread over the other 105 chunks.
+
+The scheduler never sees the total. It sees the running sum, which is 3% high
+from the second step onward and never gets the 6.75 s back. By t = 213 s that is
+3.9 s, and the margin it has to beat is 1.5 s.
+
+**The lesson is about the metric, not the model.** Aggregate cost accuracy does
+not bound schedule accuracy when the scheduler has a discontinuity in it. A
+simulator can be within 1% on total step seconds -- within 1.0% on this run's
+prefill, 1.1% on decode, 1.0% on run length -- and be 90% wrong on TTFT, because
+TTFT here is decided by two comparisons with 1.5 s and 1.2 s of slack. It also
+means a TTFT improvement on this workload is not by itself evidence of a better
+cost model: it may be evidence that a window happened to reopen.
+
+Two consequences worth acting on: the cold-start step should be priced or
+excluded rather than left to cancel a real bias, and an accuracy claim should
+report the error with outliers held out, not only the total.
+
+### The real machine is not on the knife edge; only the simulator is
+
+All four real repeats produce the identical streak structure -- 36, 6, 42, 7, 15
+chunks -- and break at the same two places, 213.0 s and 231.2 s, with margins of
++1.5 s and +1.2 s that vary by at most 0.1 s between repeats. Median TTFT ranges
+over 27.54-27.62 s. So the hardware lands reproducibly on the safe side of the
+discontinuity, and a 3% cost bias is enough to put the simulator on the other.
+The metric is unstable with respect to the *model*, not with respect to the
+machine, which is what makes it a fair thing to be graded on and a bad thing to
+be graded on alone.
+
+The 3.9 s can be accounted for exactly. Splitting each side's time up to the
+deciding request:
+
+| | real | simulated |
+| --- | --- | --- |
+| cold-start step | 6.87 | 0.13 |
+| decode windows before it | 29.2 | 33.7 |
+| comparable prefill | 175.7 | 181.9 (+3.5%) |
+| reaches the deciding request at | **211.8** | **215.7** |
+
+The simulated run starts 6.74 s *ahead* on the unpriced cold start, then spends
+it twice over: 4.5 s on three extra early decode windows -- which the cheap cold
+start itself opened -- and 6.2 s on accumulated prefill bias.
+
+### The prefill bias is shape-dependent, so scaling would not fix it
+
+Priced against the real run's own chunks and split by the history each chunk
+attends over:
+
+| chunk context | chunks | measured | priced | error |
+| --- | --- | --- | --- | --- |
+| 16k-50k | 44 | 83.74 s | 82.77 s | -1.16% |
+| 50k-100k | 50 | 118.29 s | 122.71 s | +3.74% |
+| 100k-150k | 11 | 26.51 s | 30.05 s | **+13.36%** |
+
+The `tokens * history` term was added because long-context chunks were 23%
+under-priced without it. It now overshoots by 13%, and it overshoots exactly
+where the schedule is decided: the late chunks of the long requests. This is not
+an extrapolation -- the sweep has 16 samples in that band and reaches 258k. It is
+a balance problem: 77% of the sweep sits in 16k-50k, the workload never goes past
+131k, and one linear coefficient is fitted across the whole range.
+
+### The confirming experiment could not be run
+
+The test that would close this is to re-run the simulated side with prefill
+priced a few percent cheaper and watch the two windows reopen. It needs no real
+forwards -- predict mode consumes the table and executes nothing -- so it is
+hardware-independent, and the scaled tables are prepared. It did not run:
+node 18, where these runs were taken, is no longer reachable, and on this host
+ROCm device enumeration is wedged. A `rocminfo` from a day-old test run sits in
+uninterruptible sleep with zero CPU time, a fresh one hangs the same way, and a
+27B server started against it sat at engine init for eight minutes on 22 seconds
+of CPU with no device memory allocated. Nothing GPU-side can start here until
+the driver is reset.
+
+Everything above is measured, not inferred from that experiment. What the
+experiment would add is the counterfactual.
