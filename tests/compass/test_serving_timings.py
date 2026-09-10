@@ -610,7 +610,7 @@ class TestPredictedOutputIsDeferred:
         return stub
 
     @staticmethod
-    def _batch(req_ids, scheduled, contexts):
+    def _batch(req_ids, scheduled, contexts, produces=True):
         class _Batch:
             pass
 
@@ -620,6 +620,14 @@ class TestPredictedOutputIsDeferred:
         b.context_lens = list(contexts)
         b.total_tokens_num_prefill = sum(n for n in scheduled if n > 1)
         b.is_dummy_run = False
+        # A batch produces output unless every prefill in it is a middle chunk.
+        b.produces_output = lambda: produces
+        return b
+
+    @staticmethod
+    def _middle(req_ids, scheduled, contexts):
+        b = TestPredictedOutputIsDeferred._batch(req_ids, scheduled, contexts)
+        b.produces_output = lambda: False
         return b
 
     def test_the_first_step_emits_nothing(self):
@@ -647,6 +655,21 @@ class TestPredictedOutputIsDeferred:
         out = runner.forward(self._batch(["b"], [32], [32]))
         assert out.req_ids == ["a"]
         assert out.compass_step_seconds == 2.0
+
+    def test_a_middle_chunk_never_takes_a_turn_in_the_buffer(self):
+        """`ModelRunner.forward` returns early for a batch that produces no
+        output, with nothing deferred. A middle chunk of a chunked prefill
+        samples nothing, so deferring it would make the lag one step where the
+        engine's is one *meaningful* step -- on the 27B, three middle chunks and
+        eight seconds apart."""
+        runner = self._runner()
+        runner.forward(self._batch(["a"], [16384], [16384]))
+        mid = runner.forward(self._middle(["b"], [16384], [32768]))
+        assert mid.req_ids == ["b"] and mid.token_ids == []
+        assert mid.is_deferred_out is False
+        # The buffer still holds "a", untouched by the middle chunk.
+        after = runner.forward(self._batch(["b"], [16384], [49152]))
+        assert after.req_ids == ["a"]
 
     def test_speculation_counters_are_indexable_not_none(self):
         """postprocess subscripts them per request once deferral is declared."""

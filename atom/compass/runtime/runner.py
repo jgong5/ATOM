@@ -204,7 +204,26 @@ class CompassModelRunner(ModelRunner):
         # seconds late and TTFT 95% over, while the schedule and the step costs
         # agreed with the real run to a fraction of a percent. The clock was
         # right; the bookkeeping was not.
+        # ...but only on the steps the real runner defers, which is not all of
+        # them. `ModelRunner.forward` returns early for a pure middle chunk --
+        # `batch.produces_output()` is false, nothing was sampled -- with
+        # `is_deferred_out` unset and no tokens, so a middle chunk never takes a
+        # turn in the buffer. Deferring on every step instead makes the lag one
+        # step where the engine's is one *meaningful* step, and on a chunked
+        # prefill those differ by the whole prompt: the 27B's first request
+        # completed at step 0 and its token surfaced at step 4, three middle
+        # chunks later, about eight seconds. Deferring uniformly gave 1.7 s.
         filler = self._compass_config.filler_token_id
+        if self._is_pure_middle_chunk(batch):
+            return ScheduledBatchOutput(
+                req_ids=list(batch.req_ids),
+                token_ids=[],
+                num_rejected=None,
+                num_bonus=None,
+                draft_token_ids=None,
+                compass_step_seconds=cost.seconds,
+            )
+
         previous = self._deferred_output
         self._deferred_output = list(batch.req_ids)
 

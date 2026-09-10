@@ -6409,3 +6409,64 @@ is not a property of the operator.
 
 The practical consequence is the same either way: the priced total should not be
 compared against a measured step without saying how much of it is this.
+
+
+## The deferral is one *meaningful* step, not one step
+
+Deferring the predicted output by one step moved the 27B's TTFT from +95.5% to
+-25.7% -- late to early. Logging what `fwd_output` actually carries at every
+postprocess call says why the sign flipped.
+
+The real engine does not defer uniformly. `ModelRunner.forward` returns early
+for a pure middle chunk of a chunked prefill -- `batch.produces_output()` is
+false, nothing was sampled -- with `is_deferred_out` unset and no tokens. Every
+other step defers. On the 27B that is 4354 of 4440 postprocess calls: 20 of the
+106 prefill steps, the ones that complete a prompt, plus all 4333 decode steps.
+The other 86 prefill steps are middle chunks and pass straight through.
+
+So the buffer only advances on steps that sampled something real:
+
+    step 0  batch=['0']      fwd=[]     deferred=True    seq 0 held
+    step 1  batch=['1']      fwd=['1']  deferred=False   middle chunk
+    step 2  batch=['1']      fwd=['1']  deferred=False   middle chunk
+    step 3  batch=['1']      fwd=['1']  deferred=False   middle chunk
+    step 4  batch=['1','2']  fwd=['0']  deferred=True    seq 0 released
+
+Four steps and about eight seconds, which is the lag that was measured and could
+not be explained. It is one *request's* prefill only because a request happens
+to take about five chunks here; the rule is one meaningful step, and the middle
+chunks in between are free.
+
+The simulated runner deferred on all 106 prefill steps rather than 20, so its
+buffer advanced every step and the lag came out at 1.7 s -- one chunk. Mirroring
+the engine's own predicate, `_is_pure_middle_chunk`, which the runner already
+inherits:
+
+    if self._is_pure_middle_chunk(batch):
+        return ScheduledBatchOutput(req_ids=list(batch.req_ids), token_ids=[],
+                                    ..., compass_step_seconds=cost.seconds)
+
+`postprocess` is safe to call with those empty token ids because it skips a
+sequence still mid-prefill before it indexes them -- `elif
+seq.is_partial_prefill: continue` -- which is exactly why the real engine can
+return them too.
+
+### What it does
+
+| | TTFT median | mean | p90 | latency median |
+| --- | --- | --- | --- | --- |
+| real | 27.63 s | **28.68** | 48.83 | 74.63 |
+| before deferring at all | 54.03 s (+95.5%) | 49.50 | 88.87 | 73.65 |
+| deferring every step | 20.52 s (-25.7%) | 21.54 | 41.67 | 73.65 |
+| **deferring meaningful steps** | **25.09 s (-9.2%)** | **28.78 (+0.3%)** | **51.78** | 73.65 |
+
+Mean TTFT is within 0.3%, p90 within 6%, median within 9.2%, and the schedule is
+untouched throughout -- five streaks, longest 42, prefill 235.11 s over 106
+chunks. Per request the lag now matches step for step:
+
+    prompt done at step   0     4     8    12    35
+    real                +7.97 +8.08 +8.19 +9.93 +0.09
+    simulated           +8.00 +8.09 +8.18 +9.88 +0.02
+
+mean 8.99 s against 9.00 s. The quantity that could not be explained two
+sections ago is now reproduced by mirroring one predicate.
