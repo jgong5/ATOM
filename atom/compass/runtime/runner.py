@@ -170,7 +170,8 @@ class CompassModelRunner(ModelRunner):
         # ran out of evidence twice.
         self._record_measurement(shape, cost.seconds, None,
                                  req_ids=list(batch.req_ids),
-                                 started_at=started_at)
+                                 started_at=started_at,
+                                 decision=getattr(batch, "compass_decision", None))
         self._step_count = getattr(self, "_step_count", 0) + 1
         logger.debug(
             "COMPASS step %d: reqs=%d tokens=%d prefill_tokens=%d cost=%.6fs",
@@ -224,7 +225,8 @@ class CompassModelRunner(ModelRunner):
             output = super().forward(batch)
             self._count_and_record(shape, time.perf_counter() - began, None,
                                    req_ids=list(batch.req_ids),
-                                   started_at=began)
+                                   started_at=began,
+                                   decision=getattr(batch, "compass_decision", None))
             return output
 
         import time
@@ -249,7 +251,8 @@ class CompassModelRunner(ModelRunner):
         # The ids are read now rather than when the pair is drained: the batch
         # is the scheduler's and does not survive the step.
         self._pending.append((shape, began, ended, gap, list(batch.req_ids),
-                              started_at))
+                              started_at,
+                              getattr(batch, "compass_decision", None)))
         self._drain_pending()
         return output
 
@@ -261,17 +264,20 @@ class CompassModelRunner(ModelRunner):
         anyway, never by waiting for it.
         """
         while self._pending:
-            shape, began, ended, gap, req_ids, started_at = self._pending[0]
+            shape, began, ended, gap, req_ids, started_at, decision = \
+                self._pending[0]
             if not ended.query():
                 return
             self._pending.popleft()
             self._count_and_record(shape, began.elapsed_time(ended) / 1000.0,
-                                   gap, req_ids=req_ids, started_at=started_at)
+                                   gap, req_ids=req_ids, started_at=started_at,
+                                   decision=decision)
 
     def _count_and_record(self, shape: StepShape, seconds: float,
                           gap: Optional[float] = None,
                           req_ids: Optional[list] = None,
-                          started_at: Optional[float] = None) -> None:
+                          started_at: Optional[float] = None,
+                          decision: Optional[dict] = None) -> None:
         kind = "prefill" if shape.is_prefill else "decode"
         seen = self._measured_by_kind.get(kind, 0) + 1
         self._measured_by_kind[kind] = seen
@@ -281,12 +287,13 @@ class CompassModelRunner(ModelRunner):
         # sample there is.
         if seen > self._compass_config.measure_warmup_steps:
             self._record_measurement(shape, seconds, gap, req_ids=req_ids,
-                                     started_at=started_at)
+                                     started_at=started_at, decision=decision)
 
     def _record_measurement(self, shape: StepShape, seconds: float,
                             gap: Optional[float] = None,
                             req_ids: Optional[list] = None,
-                            started_at: Optional[float] = None) -> None:
+                            started_at: Optional[float] = None,
+                            decision: Optional[dict] = None) -> None:
         """Append one timed step to the table.
 
         Appended and flushed per step rather than collected and written at exit.
@@ -333,6 +340,13 @@ class CompassModelRunner(ModelRunner):
             # has no evidence left to examine. That is exactly where the
             # cc-traces comparison stopped.
             "req_ids": [str(r) for r in req_ids] if req_ids else None,
+            # Why the scheduler chose this step: what was waiting, how much of
+            # it still had prefill to do, what was held for a declared arrival,
+            # and how much of the token budget went. The step sequence alone
+            # cannot distinguish a scheduler that decided differently from one
+            # that saw different state, and that is where every real-versus-
+            # simulated comparison here has run out of evidence.
+            "decision": decision,
             # When this step began, on the clock that stamps request arrivals --
             # wall time on a real run, virtual time on a simulated one. Recorded
             # rather than reconstructed, so queueing can be measured instead of

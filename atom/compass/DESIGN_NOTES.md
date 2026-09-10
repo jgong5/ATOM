@@ -5895,3 +5895,38 @@ plainly, because the earlier account of it was wrong in every particular:
   token: 9.19s real against 32.21s modelled.
 * Longer prefill streaks in the simulator account for part of that wait.
 * None of it shows on a small model, where chunks are milliseconds.
+
+
+## The step table now records why, not only what
+
+Three times a comparison between a real run and a simulated one has stopped for
+the same reason: the artifact recorded the outcome and not the input to the
+decision. Queue wait needed timestamps the table did not carry. Per-request
+attribution needed the request ids it did not carry. The prefill-versus-decode
+ordering needs the scheduler's own view, and now has it -- per step: what was
+waiting, how much of that still had prefill outstanding, what was held for a
+declared arrival, how many requests were running, tokens batched against the
+budget, and which branch was taken.
+
+A handful of integers on ~4500 steps, so it stays on rather than being a mode
+somebody has to remember to enable, which is how the earlier gaps survived. It
+fails safe: a batch that will not take an attribute records null instead of
+breaking the run.
+
+**It found something on its first outing.** The real run's first step is
+scheduling tick 1; the simulated run's is tick **89,337**. Once running, both
+produce a step on essentially every call -- median one tick between steps -- so
+the whole difference is 89,336 calls that returned no batch before the first
+step. That is the arrival barrier spinning while the client posts the declared
+workload.
+
+Virtual time is frozen through all of it, so it costs no fidelity, and the
+earlier claim that a simulated run is "slower under saturation" was withdrawn
+for a different reason. But it is real CPU, it scales with the workload, and it
+is why a simulated run's wall-clock duration does not follow from its virtual
+one. Worth fixing when the barrier is replaced by a bulk submission, which the
+client already needs for workloads past MAX_IN_FLIGHT.
+
+**What it does not yet explain** is the 27B's remaining wait after prefill.
+That needs the same record from a 27B run and a diff of the decision sequence,
+which is the next step and needs no new capacity.

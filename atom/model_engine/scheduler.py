@@ -1557,6 +1557,47 @@ class Scheduler:
         self._rejected = []
         return out
 
+    def _decision_record(self, kind: str, batched_tokens: int) -> dict:
+        """What the scheduler could see when it chose this step.
+
+        A step table records what ran. It cannot say why, and every comparison
+        between a real run and a simulated one has eventually needed that:
+        the two run the same steps at the same prices, in a different order,
+        and the order is a consequence of decisions whose inputs nothing keeps.
+
+        Cheap on purpose -- a handful of integers per step, and a 27B run has
+        about 4500 steps -- so it can stay on rather than being a debugging
+        mode somebody has to think to enable.
+        """
+        waiting = list(self.waiting)
+        outstanding = 0
+        for seq in waiting:
+            try:
+                if seq.num_prompt_tokens > seq.num_cached_tokens:
+                    outstanding += 1
+            except AttributeError:
+                outstanding += 1
+        held = 0
+        for seq in waiting:
+            try:
+                if self._declared_arrival_pending(seq):
+                    held += 1
+            except Exception:  # noqa: BLE001 - diagnostics never break a run
+                pass
+        return {
+            "kind": kind,
+            "tick": self._schedule_tick,
+            # Everything the prefill-first rule weighs: it decodes only when no
+            # prefill is ready, so what was waiting with prefill left to do is
+            # the reason a decode step did or did not happen.
+            "waiting": len(waiting),
+            "waiting_prefill_outstanding": outstanding,
+            "waiting_held_for_arrival": held,
+            "running": len(self.running),
+            "batched_tokens": int(batched_tokens),
+            "token_budget": int(getattr(self.config, "max_num_batched_tokens", 0) or 0),
+        }
+
     def schedule(self) -> tuple[ScheduledBatch, dict[int, Sequence]]:
         """Select the next batch of sequences for a forward pass.
 
@@ -1898,6 +1939,8 @@ class Scheduler:
                     seq, start, start + int(num_scheduled_tokens[i])
                 )
 
+            _decision = self._decision_record(
+                "prefill", total_tokens_num_prefill)
             prefill_batch = ScheduledBatch(
                 seqs=scheduled_seqs,
                 num_scheduled_tokens=num_scheduled_tokens,
@@ -1920,6 +1963,12 @@ class Scheduler:
                     scheduled_seqs, num_scheduled_tokens, is_final_chunk
                 )
 
+            # Carried on the batch, the way the step's start time is, because
+            # the runner writes the table and the scheduler owns the reason.
+            try:
+                prefill_batch.compass_decision = _decision
+            except AttributeError:
+                pass
             return (prefill_batch, scheduled_seqs)
 
         # --- Decode scheduling ---
@@ -2025,6 +2074,8 @@ class Scheduler:
         if self.kv_connector is not None:
             connector_meta_output = self.kv_connector.build_connector_meta()
 
+        _decision = self._decision_record(
+            "decode", total_tokens_num_decode)
         decode_batch = ScheduledBatch(
             seqs=scheduled_seqs,
             num_scheduled_tokens=num_scheduled_tokens,
@@ -2045,6 +2096,10 @@ class Scheduler:
                 else None
             ),
         )
+        try:
+            decode_batch.compass_decision = _decision
+        except AttributeError:
+            pass
         self._consume_state_forks(scheduled_seqs)
         return (decode_batch, scheduled_seqs)
 
