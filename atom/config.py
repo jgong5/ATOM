@@ -1594,6 +1594,11 @@ class Config:
     # from all2all backend/mode: Mega owns dispatch, both GEMMs, and combine.
     moe_backend: str = "standard"
     runner_qualname: str = "atom.model_engine.model_runner.ModelRunner"
+    # Which pool the EngineCore drives its runners through. A dial for the
+    # same reason `runner_qualname` is one: the transport is not the policy, and
+    # a run that replaces the forward pass may also want to replace the process
+    # boundary around it.
+    runner_manager_qualname: str = "atom.model_engine.async_proc.AsyncIOProcManager"
     # ATOMCompass: when enabled, the runner predicts the forward pass instead of
     # performing it. Inert unless a Compass runner is also selected via
     # runner_qualname.
@@ -1748,6 +1753,21 @@ class Config:
             and self.runner_qualname == "atom.model_engine.model_runner.ModelRunner"
         ):
             self.runner_qualname = "atom.compass.runtime.runner.CompassModelRunner"
+
+        # ...and a GPU-free replay swaps the *pool* as well as the runner. The
+        # runner alone is not enough: AsyncIOProcManager spawns a worker process
+        # per rank and that process is where the device is acquired, so a replay
+        # that only changed the runner would still fork a worker to hold a
+        # device it never uses.
+        if (
+            self.compass_config.enabled
+            and self.compass_config.replay_target
+            and self.runner_qualname == "atom.compass.runtime.runner.CompassModelRunner"
+        ):
+            self.runner_qualname = "atom.compass.replay.runner.ReplayModelRunner"
+            self.runner_manager_qualname = (
+                "atom.compass.replay.local_proc.LocalProcManager"
+            )
 
         assert 1 <= self.tensor_parallel_size <= 8
         if self.decode_context_parallel_size > 1:

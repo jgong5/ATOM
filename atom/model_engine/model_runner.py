@@ -43,7 +43,11 @@ from atom.kv_transfer.disaggregation import KVConnectorOutput
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
 from atom.model_engine.run_labels import build_run_label
-from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput
+from atom.model_engine.scheduler import (
+    ScheduledBatch,
+    ScheduledBatchOutput,
+    is_pure_middle_chunk,
+)
 from atom.model_engine.sequence import (
     Sequence,
     SequenceStatus,
@@ -3494,7 +3498,7 @@ class ModelRunner:
 
     @staticmethod
     def _is_pure_middle_chunk(batch) -> bool:
-        return batch is not None and not batch.produces_output()
+        return is_pure_middle_chunk(batch)
 
     def _dp_draft_lockstep_active(self) -> bool:
         """Are this rank's draft passes bound to what the DP peers run?

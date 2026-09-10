@@ -2436,6 +2436,211 @@ def _compass_clock_is_virtual() -> bool:
                 and compass.mode == "predict")
 
 
+def _sha256_of(path) -> "str | None":
+    """Digest of a file this *server* read, or None if it read no such file."""
+    import hashlib
+    if not path:
+        return None
+    try:
+        with open(path, "rb") as fh:
+            digest = hashlib.sha256()
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return None
+
+
+def _server_revision() -> "str | None":
+    """The code this server is running, if its tree is a checkout."""
+    import subprocess
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        out = subprocess.run(["git", "-C", here, "rev-parse", "HEAD"],
+                             capture_output=True, text=True, timeout=10)
+        return out.stdout.strip() or None
+    except Exception:  # noqa: BLE001 - provenance is best effort
+        return None
+
+
+def _artifact_digests(path: str) -> dict:
+    """Every file this option actually stands for, by name, with its digest."""
+    import glob as _glob
+
+    stem, ext = os.path.splitext(path)
+    found = {}
+    for candidate in [path] + sorted(_glob.glob(f"{stem}.*{ext}")):
+        if candidate in found or not os.path.isfile(candidate):
+            continue
+        digest = _sha256_of(candidate)
+        if digest:
+            found[os.path.basename(candidate)] = digest
+    return found
+
+
+def _digest_of_set(found: dict) -> str:
+    """One digest over several files, so ranks cannot differ unnoticed."""
+    import hashlib
+
+    rolled = hashlib.sha256()
+    for name in sorted(found):
+        rolled.update(f"{name}:{found[name]}\n".encode())
+    return rolled.hexdigest()
+
+
+_CODE_DIGEST = None
+
+
+def _server_code_digest() -> "str | None":
+    """A digest of the Python this server imported.
+
+    A git revision is not available everywhere the engine runs: the GPU nodes
+    hold an rsync copy of the tree, not a checkout, so `rev-parse` fails there
+    and every run served from one was unattributable. A revision would not have
+    been the whole answer anyway -- it names a commit, and a working tree with
+    uncommitted edits reports the commit it was edited from.
+
+    So this hashes the source itself. Two runs agreeing here ran the same code,
+    checkout or not, committed or not.
+    """
+    global _CODE_DIGEST
+    if _CODE_DIGEST is not None:
+        return _CODE_DIGEST or None
+    import hashlib
+    try:
+        root = os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))))  # .../atom
+        digest = hashlib.sha256()
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = sorted(d for d in dirnames if d != "__pycache__")
+            for name in sorted(filenames):
+                if not name.endswith(".py"):
+                    continue
+                path = os.path.join(dirpath, name)
+                digest.update(os.path.relpath(path, root).encode())
+                with open(path, "rb") as fh:
+                    digest.update(fh.read())
+        _CODE_DIGEST = digest.hexdigest()
+    except Exception:  # noqa: BLE001 - provenance is best effort
+        _CODE_DIGEST = ""
+    return _CODE_DIGEST or None
+
+
+def _model_identity(path) -> "str | None":
+    """What checkpoint this is, by content rather than by name.
+
+    A served model name is whatever was typed on the command line. Under the
+    HuggingFace cache the resolved snapshot directory is named for the commit,
+    which is the identity when it is there; otherwise the config plus the sizes
+    of the weight shards distinguishes one checkpoint from another.
+    """
+    import hashlib
+    try:
+        name = str(path or "")
+        if not os.path.isdir(name):
+            # A repo id, not a directory. It was already downloaded to serve
+            # this request, so the cache can resolve it without the network.
+            from huggingface_hub import snapshot_download
+
+            name = snapshot_download(name, local_files_only=True)
+        path = os.path.abspath(name)
+        parts = path.split(os.sep)
+        if "snapshots" in parts:
+            return "hf:" + parts[parts.index("snapshots") + 1]
+        if not os.path.isdir(path):
+            return None
+        digest = hashlib.sha256()
+        for name in sorted(os.listdir(path)):
+            full = os.path.join(path, name)
+            if name == "config.json":
+                with open(full, "rb") as fh:
+                    digest.update(fh.read())
+            elif name.endswith((".safetensors", ".bin")):
+                digest.update(f"{name}:{os.path.getsize(full)}".encode())
+        return "tree:" + digest.hexdigest()[:32]
+    except Exception:  # noqa: BLE001 - provenance is best effort
+        return None
+
+
+@app.get("/compass/provenance")
+async def compass_provenance():
+    """What this server is, so a result can be attributed to something.
+
+    A replay client used to stamp results with *its own* git revision, which
+    identifies the machine that sent the requests and not the one that served
+    them -- and against a remote server those are different trees. Nothing in a
+    saved run said which build, which model or which calibration table produced
+    it, so two runs that disagreed could not be told apart from two runs of
+    different things.
+
+    Everything here is read on the server side. The calibration digest in
+    particular is the hash of the file *this process opened*: a client naming
+    the same path is naming a path on another filesystem.
+    """
+    config = getattr(engine, "config", None)
+    compass = getattr(config, "compass_config", None)
+    options = dict(getattr(compass, "oracle_options", None) or {}) if compass else {}
+
+    # Oracle options name files. Digest each one the server can actually read,
+    # so "the same calibration" is a claim about bytes rather than about a path.
+    #
+    # The path an option names is often not a file. Every rank writes its own
+    # calibration -- `steps.tp0.jsonl`, `steps.tp1.jsonl` -- and the option
+    # carries the shared stem that `resolve_rank_path` expands per rank. Asking
+    # whether the stem exists says no at every width above one, which left the
+    # runs that had a calibration looking like the runs that had none.
+    option_digests = {}
+    option_files = {}
+    for key, value in options.items():
+        if not isinstance(value, str) or not value:
+            continue
+        found = _artifact_digests(value)
+        if not found:
+            continue
+        option_files[key] = found
+        option_digests[key] = (list(found.values())[0] if len(found) == 1
+                               else _digest_of_set(found))
+
+    def pick(*names):
+        for holder in (config, getattr(config, "model_config", None),
+                       getattr(config, "parallel_config", None)):
+            for name in names:
+                if holder is not None and hasattr(holder, name):
+                    value = getattr(holder, name)
+                    if value is not None:
+                        return value
+        return None
+
+    return {
+        "server_revision": _server_revision(),
+        "server_code_sha256": _server_code_digest(),
+        "model": model_name,
+        "model_path": pick("model", "model_path", "served_model_name"),
+        "model_revision": (pick("revision", "model_revision")
+                           or _model_identity(pick("model", "model_path"))),
+        "tensor_parallel_size": pick("tensor_parallel_size", "tp_size"),
+        "pipeline_parallel_size": pick("pipeline_parallel_size", "pp_size"),
+        "max_model_len": pick("max_model_len"),
+        "enable_prefix_caching": pick("enable_prefix_caching"),
+        "gpu_memory_utilization": pick("gpu_memory_utilization"),
+        "max_num_seqs": pick("max_num_seqs"),
+        "compass": None if not compass else {
+            "enabled": compass.enabled,
+            "mode": compass.mode,
+            "oracle": compass.oracle_qualname,
+            "oracle_options": options,
+            "oracle_option_sha256": option_digests,
+            "oracle_option_files": option_files,
+            "virtual_clock": compass.virtual_clock,
+            "admission_seconds": compass.admission_seconds,
+        },
+        "calibration_sha256": option_digests.get("table"),
+        "visible_devices": os.environ.get("HIP_VISIBLE_DEVICES")
+        or os.environ.get("CUDA_VISIBLE_DEVICES"),
+        "torch_version": getattr(__import__("torch"), "__version__", None),
+    }
+
+
 @app.api_route("/metrics", methods=["GET", "HEAD"], include_in_schema=False)
 async def metrics():
     """Expose cached standalone-engine metrics in Prometheus text format."""

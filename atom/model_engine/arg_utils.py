@@ -58,6 +58,8 @@ class EngineArgs:
     compass_memory_out: str = ""
     compass_memory_in: str = ""
     compass_memory_model: str = ""
+    compass_replay_target: str = ""
+    compass_replay_target_out: str = ""
     compass_measure_out: str = ""
     compass_measure_warmup_steps: int = 0
     compass_admission_seconds: float = 0.0
@@ -189,6 +191,25 @@ class EngineArgs:
             help="A memory profile from meta_probe.py --profile-out. Sizes "
                  "the KV cache from derived terms rather than from any "
                  "device, so a configuration nobody has run can be sized.",
+        )
+        parser.add_argument(
+            "--compass-replay-target",
+            type=str,
+            default="",
+            help="Serve with no device at all, using the startup answers "
+                 "recorded in this file: the KV block count, pool layout, "
+                 "state-runtime and graph ladder a real run of this "
+                 "configuration produced. The scheduler, block manager and "
+                 "sequence lifecycle are ATOM's own and run for real; only the "
+                 "device is absent. Implies predict mode.",
+        )
+        parser.add_argument(
+            "--compass-replay-target-out",
+            type=str,
+            default="",
+            help="Record this run's startup answers for --compass-replay-target "
+                 "to replay later. Costs nothing: every run already computes "
+                 "them and throws them away.",
         )
         parser.add_argument(
             "--compass-measure-out",
@@ -820,6 +841,9 @@ class EngineArgs:
         compass_memory_out = kwargs.pop("compass_memory_out", "")
         compass_memory_in = kwargs.pop("compass_memory_in", "")
         compass_memory_model = kwargs.pop("compass_memory_model", "")
+        compass_replay_target = kwargs.pop("compass_replay_target", "")
+        compass_replay_target_out = kwargs.pop(
+            "compass_replay_target_out", "")
         compass_measure_out = kwargs.pop("compass_measure_out", "")
         compass_measure_warmup = kwargs.pop("compass_measure_warmup_steps", 0)
         compass_admission = kwargs.pop("compass_admission_seconds", 0.0)
@@ -841,6 +865,13 @@ class EngineArgs:
             compass_kwargs["memory_in"] = compass_memory_in
         if compass_memory_model:
             compass_kwargs["memory_model"] = compass_memory_model
+        if compass_replay_target:
+            compass_kwargs["replay_target"] = compass_replay_target
+            # A replay has no forward to trace or time, and asking for one is a
+            # configuration error rather than something to silently reconcile.
+            compass_kwargs["mode"] = "predict"
+        if compass_replay_target_out:
+            compass_kwargs["replay_target_out"] = compass_replay_target_out
         if compass_measure_out:
             compass_kwargs["measure_out"] = compass_measure_out
         if compass_measure_warmup:

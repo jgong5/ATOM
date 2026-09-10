@@ -42,6 +42,16 @@ def _stamp_arrival(arrival_time: float | None) -> float:
     means anything on a clock that knows where the run began -- a virtual one.
     Against a real server there is no start-of-run to offset from, so a declared
     arrival is ignored and "now" is used, which is the right answer there.
+
+    The offset is from the epoch, and it is the *client's* job to place a
+    workload that does not start there. This process's virtual clock is frozen
+    at the epoch by design (see `_install_compass_clock`): only the engine core
+    advances time, so "now" here cannot be the run's progress. That is why a
+    predictor is never warmed by executing a warmup: there is no compilation to
+    warm physically, and an executed preparation would simply sit inside every
+    later request's window without moving the origin those arrivals are declared
+    against. A prediction run starts empty, at the epoch, standing for the
+    already-warm target -- see the refusal in `scripts/compass/replay.py`.
     """
     clock = get_clock()
     if arrival_time is None:

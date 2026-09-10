@@ -151,7 +151,118 @@ def _served_model(base: str, timeout: float) -> str | None:
         return None
 
 
-def main() -> int:
+def _drain_records(base: str, timeout: float) -> dict:
+    """Read and clear the engine's record store.
+
+    `GET /compass/requests` drains by default, which is what makes the
+    boundary in the protocol real: after this returns, the store holds nothing
+    a later read could pick up.
+    """
+    try:
+        with urllib.request.urlopen(base + "/compass/requests",
+                                    timeout=timeout) as resp:
+            return json.loads(resp.read())
+    except Exception as exc:  # noqa: BLE001 - reported, not raised
+        return {"count": 0, "requests": [], "error": f"{type(exc).__name__}: {exc}"}
+
+
+#: Where preparation's prompt indices start, far enough above any workload
+#: index that the two cannot collide.
+_PREPARE_PROMPT_BASE = 1_000_000
+
+
+#: Where preparation's prompt indices start, far enough above any workload
+#: index that the two cannot collide.
+_PREPARE_PROMPT_BASE = 1_000_000
+
+
+def _clock_of(base: str, timeout: float) -> str | None:
+    """Which clock this server reports on, before anything is sent to it.
+
+    Read from `/compass/provenance` rather than by draining records, so asking
+    the question does not consume the very store the drain boundary depends on.
+    """
+    try:
+        with urllib.request.urlopen(base + "/compass/provenance",
+                                    timeout=timeout) as resp:
+            compass = json.loads(resp.read()).get("compass") or {}
+    except Exception:  # noqa: BLE001 - absence is not a virtual clock
+        return None
+    if not compass.get("enabled") or not compass.get("virtual_clock"):
+        return "wall"
+    return "virtual" if compass.get("mode") == "predict" else "wall"
+
+
+def _prepare(base: str, model: str, workload: list[dict], args) -> dict:
+    """Warm the server, wait for it, and prove the engine forgot about it.
+
+    The measured workload's own shapes, so what warms is what will be
+    measured: a server warmed on one shape and measured on another has warmed
+    the wrong kernels. Unpaced and concurrent -- preparation is not a workload
+    and its arrival process means nothing.
+
+    The drain is the point. `_drain_records` clears the engine's store, so the
+    measured read that follows contains only measured requests, and the rows
+    taken out are kept as the evidence that they were taken out.
+    """
+    shapes = [workload[i % len(workload)] for i in range(args.prepare)]
+    began = _time.monotonic()
+
+    def send(i_row):
+        i, row = i_row
+        # No `compass_workload_size`, deliberately. The scheduler's arrival
+        # barrier latches open once a declared workload has fully arrived and
+        # never re-arms -- so a preparation batch that declared itself would
+        # open it, and the *measured* workload would then run unheld. That is
+        # the failure the barrier exists to prevent: requests reach the engine
+        # out of declared order, an idle virtual clock jumps to the first one
+        # it sees, and everything declared earlier is retroactively late.
+        # Undeclared, `_arrival_barrier_unmet` finds no expected count, holds
+        # nothing, and leaves the latch armed for the phase that needs it.
+        # `_PREPARE_PROMPT_BASE + i`, not `i`: `prompt_of_tokens` is a function
+        # of the index, so preparation reusing the measured indices would send
+        # byte-identical prompts, and with prefix caching on the measured run
+        # would be scored against blocks preparation had already filled. Warm
+        # the kernels, not the workload's own prefixes.
+        body = {"model": model,
+                "prompt": _prompt(row["input_tokens"], _PREPARE_PROMPT_BASE + i),
+                "max_tokens": row["output_tokens"], "temperature": 0.0}
+        try:
+            return {"index": i, "ok": True,
+                    "response": _send(base + "/v1/completions", body,
+                                      args.timeout)}
+        except (urllib.error.URLError, OSError, ValueError, RuntimeError) as exc:
+            return {"index": i, "ok": False,
+                    "error": f"{type(exc).__name__}: {exc}"}
+
+    with ThreadPoolExecutor(max_workers=max(1, len(shapes))) as pool:
+        results = list(pool.map(send, enumerate(shapes)))
+    seconds = _time.monotonic() - began
+    returned = sum(1 for r in results if r["ok"])
+
+    drained = _drain_records(base, args.timeout)
+    after = _drain_records(base, args.timeout)
+    rows = drained.get("requests") or []
+    boundary = max((r.get("finish_time") or 0.0) for r in rows) if rows else None
+    ok = (returned == len(shapes) and not (after.get("requests") or []))
+    print(f"  prepared {returned}/{len(shapes)} in {seconds:.1f}s, drained "
+          f"{len(rows)} engine records, store empty after: "
+          f"{not (after.get('requests') or [])}")
+    return {"requested": len(shapes), "returned": returned,
+            "wall_seconds": round(seconds, 3),
+            "drained_records": len(rows),
+            "store_empty_after_drain": not (after.get("requests") or []),
+            "drained": bool(ok),
+            "boundary_engine_time": boundary,
+            "clock": drained.get("clock"),
+            "declared_workload_size": False,
+            "shapes": [{"input_tokens": r["input_tokens"],
+                        "output_tokens": r["output_tokens"]} for r in shapes],
+            "records": rows,
+            "failures": [r for r in results if not r["ok"]]}
+
+
+def main(argv=None) -> int:
     p = argparse.ArgumentParser(description=__doc__,
                                 formatter_class=argparse.RawDescriptionHelpFormatter)
     p.add_argument("--host", default="127.0.0.1")
@@ -178,10 +289,18 @@ def main() -> int:
                         "long trace in less time. 1.0 keeps the trace's own "
                         "timing; it changes how much requests batch, so it is "
                         "a property of the workload and not a free knob")
+    p.add_argument("--prepare", type=int, default=0, metavar="N",
+                   help="send N preparation requests of the measured shape and "
+                        "wait for all of them before measuring anything, then "
+                        "drain the engine's record store so no preparation row "
+                        "can reach the result. See atom/compass/PROTOCOL.md.")
+    p.add_argument("--prepare-out", default=None,
+                   help="where to keep the drained preparation records; they "
+                        "are evidence of the drain, not waste")
     p.add_argument("--check-lengths", action="store_true",
                    help="compare the server's reported prompt_tokens against "
                         "what was asked for, and warn if they differ")
-    args = p.parse_args()
+    args = p.parse_args(argv)
 
     workload = _workload(args)
     if not workload:
@@ -193,6 +312,30 @@ def main() -> int:
         print("could not determine the served model; pass --model",
               file=sys.stderr)
         return 2
+
+    if args.prepare and _clock_of(base, args.timeout) == "virtual":
+        print("ATOMCompass WARNING: refusing to warm a predictor. A declared "
+              "arrival is an offset from the engine's epoch, and the process "
+              "that stamps arrivals holds a virtual clock frozen there, so a "
+              "preparation batch does not move the origin it is measured "
+              "against: every measured request would be stamped as having "
+              "arrived before the preparation that preceded it, and its whole "
+              "duration would land inside their TTFT and latency. Measured on "
+              "the first warmed 27B cell that was +71% TTFT from a 14.4s "
+              "preparation. A predictor has no kernels to compile and no "
+              "allocator to settle; it represents the warm target state by "
+              "being given warmup_seconds=0, not by executing a warmup it "
+              "would only have to model. Warm the real server; predict from a "
+              "fresh empty run.", file=sys.stderr)
+        return 3
+
+    prepare = _prepare(base, model, workload, args) if args.prepare else None
+    if prepare is not None and not prepare["drained"]:
+        print("ATOMCompass WARNING: preparation did not drain -- the engine's "
+              "record store was not empty at the boundary, so a preparation "
+              "row could enter the measured result; refusing to measure",
+              file=sys.stderr)
+        return 3
 
     began = _time.monotonic()
 
@@ -299,8 +442,28 @@ def main() -> int:
     # recovered from its own artifact is not reproducible, and one of these
     # runs was read as a measurement for a day after its arrival protocol had
     # silently failed.
+    # Who served this. The client's own git revision names the tree that *sent*
+    # the requests, which against a remote server is a different machine from
+    # the one that answered them -- so a manifest carrying only `revision` says
+    # nothing about the build, model or calibration that produced the numbers.
+    # `GET /compass/provenance` is read on the server side, including the digest
+    # of the calibration file the server itself opened.
+    server = {}
+    try:
+        with urllib.request.urlopen(base + "/compass/provenance",
+                                    timeout=args.timeout) as resp:
+            server = json.loads(resp.read())
+    except Exception:  # noqa: BLE001 - an older or non-Compass server has none
+        server = {}
+
     manifest = {
         "revision": _revision(),
+        "client_revision": _revision(),
+        "server_revision": server.get("server_revision"),
+        "server_code_sha256": server.get("server_code_sha256"),
+        "model_revision": server.get("model_revision"),
+        "calibration_sha256": server.get("calibration_sha256"),
+        "server": server or None,
         "paced": bool(args.pace),
         "time_scale": float(args.time_scale),
         "requests": len(workload),
@@ -311,7 +474,12 @@ def main() -> int:
         "model": model,
         "failed": len(failed),
         "prompt_lengths": length_check,
+        "prepare": ({k: v for k, v in prepare.items() if k != "records"}
+                    if prepare else None),
     }
+    if prepare and args.prepare_out:
+        with open(args.prepare_out, "w", encoding="utf-8") as fh:
+            json.dump(prepare, fh, indent=1)
     with open(args.out, "w", encoding="utf-8") as fh:
         json.dump({"run": manifest, "workload": workload, "results": results,
                    "engine": engine}, fh, indent=1)

@@ -43,6 +43,7 @@ from atom.model_engine.state_runtime import (
     StateRuntime,
 )
 from atom.utils import envs
+from atom.compass.runtime.lifecycle import trace as _compass_lifecycle
 from atom.utils.clock import get_clock
 
 logger = logging.getLogger("atom")
@@ -844,6 +845,17 @@ class ScheduledBatch:
         if self.is_final_chunk is None:
             return True
         return any(self.is_final_chunk)
+
+
+def is_pure_middle_chunk(batch) -> bool:
+    """Did this batch sample nothing at all?
+
+    Such a step returns early from the runner with no tokens and no deferral,
+    so it never takes a turn in the deferred-output buffer. Anything that
+    reproduces the output contract has to agree with the runner about this, so
+    both ask here.
+    """
+    return batch is not None and not batch.produces_output()
 
 
 class ScheduledBatchOutput:
@@ -2678,6 +2690,29 @@ class Scheduler:
         draft_token_ids = fwd_output.draft_token_ids
         is_deferred_out = fwd_output.is_deferred_out
         token_logprobs = fwd_output.logprobs  # Optional[dict[int, float]]
+        # Off unless ATOM_COMPASS_LIFECYCLE names a file; see
+        # atom/compass/runtime/lifecycle.py for why a step table cannot answer
+        # the question this answers.
+        _lc = _compass_lifecycle()
+        if _lc.enabled:
+            _lc.emit(
+                "step_output",
+                # What the runner said this step produced, before postprocess
+                # decides which of it to act on.
+                returned=[str(r) for r in (fwd_output.req_ids or [])],
+                deferred=bool(is_deferred_out),
+                token_rows=len(prev_token_ids) if prev_token_ids is not None else 0,
+                # What was actually scheduled, and whether it was a step that
+                # samples anything at all.
+                scheduled=([str(r) for r in batch.req_ids]
+                           if batch is not None else None),
+                produces_output=(bool(batch.produces_output())
+                                 if batch is not None else None),
+                final_chunk=(list(batch.is_final_chunk)
+                             if batch is not None
+                             and batch.is_final_chunk is not None else None),
+                running=[str(seq.id) for seq in self.running],
+            )
         # update token_ids with the actual sampled token ids
 
         finished_seqs = []
@@ -2832,8 +2867,20 @@ class Scheduler:
                     seq.num_tokens,
                     len(seq.block_table),
                 )
-            if seq.num_completion_tokens >= 1 and seq.first_token_time == 0.0:
+            _first_now = (seq.num_completion_tokens >= 1
+                          and seq.first_token_time == 0.0)
+            if _first_now:
                 seq.first_token_time = get_clock().time()
+            if _lc.enabled:
+                # One row per sequence postprocess actually walked. A sequence
+                # missing from these rows was skipped -- `idx is None` -- and
+                # that absence is half the answer.
+                _lc.emit("seq_update", seq=str(seq.id), idx=int(idx),
+                         appended=int(num_new_token),
+                         completion_tokens=int(seq.num_completion_tokens),
+                         partial_prefill=bool(seq.is_partial_prefill),
+                         first_token_published=bool(_first_now),
+                         first_token_time=float(seq.first_token_time))
 
             num_tokens = seq.num_tokens - num_placeholder_width - num_rejected
             leave_reason = None
@@ -2934,6 +2981,16 @@ class Scheduler:
                 # through the clock, and mixing them makes TTFT a wall-clock
                 # instant minus a virtual one, which is not a duration.
                 seq.first_token_time = get_clock().time()
+                if _lc.enabled:
+                    # Reached only when the stamp above in this same loop did
+                    # not fire, so a sequence appearing here published its
+                    # first token from the *cropped* retained length rather
+                    # than from `num_completion_tokens`. Which of the two sites
+                    # stamps a request is exactly what a duration cannot show.
+                    _lc.emit("first_token_from_retained", seq=str(seq.id),
+                             retained=int(num_tokens - seq.num_prompt_tokens),
+                             completion_tokens=int(seq.num_completion_tokens),
+                             first_token_time=float(seq.first_token_time))
 
             # Hash generated blocks. Deferred output: all tokens forwarded;
             # undeferred: last token not yet forwarded, so exclude it.
@@ -2954,6 +3011,15 @@ class Scheduler:
                 # so the finishing output can carry it. The assignment further
                 # down is now conditional and leaves this value alone.
                 seq.finish_time = get_clock().time()
+                if _lc.enabled:
+                    # The other end of the interval TPOT divides. Recorded with
+                    # the first-token stamp beside it so the two can be checked
+                    # for being on the same clock rather than assumed to be.
+                    _lc.emit("finish", seq=str(seq.id), reason=str(leave_reason),
+                             first_token_time=float(seq.first_token_time),
+                             finish_time=float(seq.finish_time),
+                             completion_tokens=int(seq.num_completion_tokens),
+                             retained=int(num_tokens - seq.num_prompt_tokens))
 
             if stream_output_queue is not None and (
                 new_tokens or leave_reason is not None

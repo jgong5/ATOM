@@ -119,6 +119,15 @@ class CompassConfig:
     trace_step: int = 2
     trace_prefill: int = 0
     memory_out: Optional[str] = None
+    # A GPU-free replay needs the answers a device gives at startup: the KV
+    # block count, the pool layout, the state-runtime wire form, the graph
+    # ladder. `replay_target_out` records them from a run that had a device;
+    # `replay_target` supplies them to a run that has none. Kept apart from
+    # `memory_out`, which holds the *readings* a budget was made of so the
+    # arithmetic can be checked -- this holds the budget's result, so it can be
+    # stood in for.
+    replay_target: str = ""
+    replay_target_out: str = ""
     memory_in: Optional[str] = None
     memory_model: Optional[str] = None
     oracle_qualname: str = "atom.compass.core.cost.constant.ConstantCostOracle"

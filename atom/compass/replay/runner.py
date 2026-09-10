@@ -1,0 +1,236 @@
+"""A model runner with no model and no device.
+
+``CompassModelRunner`` in ``predict`` mode already computes its forward from a
+cost oracle rather than from weights -- but it is a ``ModelRunner``, and
+``ModelRunner.__init__`` sets up a device, initialises the distributed group,
+picks an attention backend and loads real weights before it returns. Under
+``predict`` none of that is read by the forward pass. It is paid for anyway.
+
+This runner keeps the predict path exactly as it is -- inherited, not copied,
+so a change to how a step is priced or how its output is deferred lands here
+too -- and replaces only the startup. The RPCs the engine makes during startup
+(``get_num_blocks``, ``allocate_kv_cache``, ``capture_cudagraph``) are answered
+from a **target record**: what those calls returned when the configuration was
+last measured on real hardware, or what a memory model says they would return.
+
+That record is the honest boundary of a GPU-free replay. Everything downstream
+of it -- how many blocks the scheduler may hand out, what the block manager
+does when it runs out, which requests are admitted, when a sequence finishes --
+is ATOM's own code operating on those numbers.
+"""
+
+from __future__ import annotations
+
+import logging
+
+import json
+import os
+from typing import Optional
+
+from atom.compass.runtime.predict import CompassPredictMixin
+
+logger = logging.getLogger(__name__)
+
+__all__ = ["ReplayModelRunner", "TargetRecord"]
+
+TARGET_VERSION = 1
+
+
+class TargetRecord:
+    """What a device said about a configuration, kept so it need not say it again.
+
+    Deliberately thin: it holds the reply to each startup RPC and the
+    configuration those replies belong to. It does not hold a model, weights, or
+    anything that would let this become a second implementation of sizing.
+    """
+
+    def __init__(self, blob: dict, source: str) -> None:
+        self.source = source
+        self.version = int(blob.get("version") or 0)
+        self.blocks: dict = dict(blob.get("blocks") or {})
+        self.config: dict = dict(blob.get("config") or {})
+        self.graph: dict = dict(blob.get("graph") or {})
+        # Optional on purpose, and not guarded by the version above. The
+        # version guard is for fields a replay would silently *misread*; a
+        # missing block that raises by name when something wants it is not
+        # silent, and bumping the version would force a re-capture on runs
+        # that never look at this. `atom.compass.replay.bootstrap` is what
+        # wants it, and it says so when it is absent.
+        self.hardware: dict = dict(blob.get("hardware") or {})
+
+    @classmethod
+    def load(cls, path: str) -> "TargetRecord":
+        if not path or not os.path.exists(path):
+            raise FileNotFoundError(
+                f"ATOMCompass: no replay target at {path!r}. A GPU-free replay "
+                f"needs the startup answers a device would have given -- "
+                f"capture them with --compass-replay-target-out on a run of "
+                f"this configuration, or model them."
+            )
+        with open(path, encoding="utf-8") as fh:
+            blob = json.load(fh)
+        record = cls(blob, path)
+        if record.version != TARGET_VERSION:
+            raise ValueError(
+                f"ATOMCompass: {path} is a version {record.version} replay "
+                f"target and this build writes version {TARGET_VERSION}. "
+                f"Re-capture rather than reinterpret: the fields a replay "
+                f"depends on are exactly the ones that move."
+            )
+        if not record.blocks.get("num_kvcache_blocks"):
+            raise ValueError(
+                f"ATOMCompass: {path} records no KV block count, so there is "
+                f"nothing for the block manager to allocate from. A target "
+                f"captured from a run that failed to size is not a target."
+            )
+        return record
+
+    def disagreements(self, config) -> list[str]:
+        """Where this record's configuration differs from the one being replayed.
+
+        Reported rather than enforced. A replay of a *different* configuration
+        is exactly what the PoC eventually wants -- predicting TP=4 from a TP=1
+        capture is the point -- so the differences are surfaced for the run to
+        declare, not treated as corruption. What must not happen is a difference
+        going unnoticed and the result being read as a like-for-like replay.
+        """
+        checks = {
+            "model": str(getattr(config, "model", "")),
+            "tensor_parallel_size": int(
+                getattr(config, "tensor_parallel_size", 1) or 1),
+            "max_model_len": int(getattr(config, "max_model_len", 0) or 0),
+            "max_num_seqs": int(getattr(config, "max_num_seqs", 0) or 0),
+            "gpu_memory_utilization": float(
+                getattr(config, "gpu_memory_utilization", 0.0) or 0.0),
+        }
+        out = []
+        for key, now in checks.items():
+            was = self.config.get(key)
+            if was is not None and was != now:
+                out.append(f"{key}: captured {was!r}, replaying {now!r}")
+        return out
+
+
+class ReplayModelRunner(CompassPredictMixin):
+    """Predict mode, with the device startup replaced by a captured record."""
+
+    def __init__(self, rank: int, config, *args, **kwargs) -> None:
+        # No `super().__init__` on purpose. `ModelRunner.__init__` selects a
+        # device, joins a distributed group, builds an attention backend and
+        # loads weights; under predict none of it is read, and requiring it is
+        # what ties a simulated run to the hardware it is simulating.
+        self.rank = int(rank)
+        self.config = config
+        self.device = None
+        self.model = None
+
+        compass = getattr(config, "compass_config", None)
+        mode = getattr(compass, "mode", None)
+        if mode != "predict":
+            raise ValueError(
+                f"ATOMCompass: GPU-free replay only makes sense in predict "
+                f"mode, and this run is in {mode!r}. Trace and measure exist to "
+                f"observe a real forward; there is none here to observe."
+            )
+        self.target = TargetRecord.load(getattr(compass, "replay_target", ""))
+        differences = self.target.disagreements(config)
+        if differences:
+            logger.warning(
+                "ATOMCompass WARNING: replaying a configuration the target "
+                "was not captured from (%s). The block count and pool layout "
+                "below are the captured ones; if the difference affects them, "
+                "this replay is sizing the wrong deployment.",
+                "; ".join(differences))
+
+        # `_capture_bucket` asks these two directly. A replay pays no graph
+        # launch, but it must still report the rung a real run would replay at,
+        # because that is what the cost table is keyed on.
+        self.enforce_eager = bool(getattr(config, "enforce_eager", False))
+        self.capture_sizes = list(self.target.graph.get("capture_sizes") or [])
+
+        self._init_compass_state()
+        logger.info(
+            "ATOMCompass: GPU-free replay, target %s (%d KV blocks, %d capture "
+            "sizes), no device acquired",
+            self.target.source, self.target.blocks.get("num_kvcache_blocks", 0),
+            len(self.capture_sizes))
+
+    # -- the startup RPCs, answered from the record ---------------------------
+
+    def get_num_blocks(self) -> dict:
+        """What the device said, not what a device says.
+
+        Returned verbatim, including the state-runtime wire form: the engine
+        rebuilds its own `StateRuntime` from it and the block manager plans from
+        `pool_entries`, so passing the recorded reply through is what keeps the
+        replay running ATOM's arithmetic rather than a copy of it.
+        """
+        return dict(self.target.blocks)
+
+    def allocate_kv_cache(self, num_kvcache_blocks) -> bool:
+        """There is no cache to allocate; the accounting for it is real.
+
+        The scheduler and block manager still hand out, split and free these
+        blocks. What does not happen is the tensor being made -- which is the
+        whole memory footprint of the deployment and the reason a replay fits on
+        a machine the deployment does not.
+        """
+        logger.info("ATOMCompass: %d KV blocks accounted for, none allocated",
+                    int(num_kvcache_blocks))
+        return True
+
+    def capture_cudagraph(self):
+        """Nothing to capture. Reports the captured run's cost, not zero.
+
+        The engine logs this and moves on, but the number is not cosmetic: graph
+        capture is part of what a deployment pays before it serves, and a replay
+        that reports zero has quietly dropped a real startup cost from any
+        amortisation claim.
+        """
+        graph = self.target.graph
+        return (float(graph.get("capture_seconds") or 0.0),
+                list(self.capture_sizes),
+                int(graph.get("pool_bytes") or 0))
+
+    def warmup_model(self):
+        """No forward to warm. The cost of the one a deployment runs is data.
+
+        Whatever the first real forward costs above steady state belongs in the
+        oracle as a first-use term, not here -- this runner has no way to
+        discover it and must not invent one.
+        """
+
+    def process_kvconnector_output(self, connector_meta_output):
+        raise NotImplementedError(
+            "ATOMCompass: KV transfer is not replayed. PD disaggregation is "
+            "out of the PoC's scope and a replay that silently ignored the "
+            "connector would report a schedule that cannot happen.")
+
+    def dummy_execution(self):
+        """Data-parallel lockstep filler. No collective here, so nothing to do."""
+        return None
+
+    def freeze_gc_heap(self, *args, **kwargs):
+        """The engine freezes its workers after startup; there is no worker."""
+
+    def exit(self):
+        fh = getattr(self, "_measure_fh", None)
+        if fh is not None:
+            try:
+                fh.close()
+            finally:
+                self._measure_fh = None
+
+    # -- anything else the engine reaches for ---------------------------------
+
+    def __getattr__(self, name: str):
+        # Only consulted for attributes that do not exist, so this cannot mask
+        # a real one. It exists to fail *loudly and by name*: the alternative is
+        # an AttributeError raised deep inside an engine RPC, reported as a
+        # worker that vanished, naming neither Compass nor the missing method.
+        raise AttributeError(
+            f"ATOMCompass: the GPU-free replay runner has no {name!r}. The "
+            f"engine reached for something a device-backed runner supplies and "
+            f"this one does not model. Add it deliberately, with what it should "
+            f"answer off a device -- do not inherit it by accident."
+        )
