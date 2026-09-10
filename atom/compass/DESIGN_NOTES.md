@@ -6636,3 +6636,54 @@ outside.
       median per step         +0.09%
 
 Within 0.3% on both halves, with no single step carrying the total on either.
+
+
+## Where the 27B ends up
+
+Same workload, same machine, same twenty requests, throughout. The simulated
+side changed five times; the real side is one measurement repeated.
+
+| | TTFT median | mean | p90 | latency median | prefill | streaks |
+| --- | --- | --- | --- | --- | --- | --- |
+| **real** | **27.63** | **28.68** | **48.83** | **74.63** | 235.56s / 106 | 5, max 42 |
+| at the start | 52.40 | 65.22 | 147.85 | 78.66 | 237.67s / 105 | 6, max 63 |
+| + per-request attention | 36.59 | 41.53 | 88.87 | 70.01 | 228.44s / 106 | 8, max 42 |
+| + measured warmup | 54.03 | 49.50 | 88.87 | 73.65 | 235.11s / 106 | 5, max 42 |
+| + deferred output | 20.52 | 21.54 | 41.67 | 73.65 | 235.11s / 106 | 5, max 42 |
+| + deferred on meaningful steps | 25.09 | 28.78 | 51.78 | 73.65 | 235.11s / 106 | 5, max 42 |
+| **+ rung padding** | **25.85** | **28.64** | **48.70** | **74.25** | 234.88s / 106 | 5, max 42 |
+
+Mean TTFT -0.14%, p90 -0.27%, median latency -0.51%, prefill total -0.29%, and
+the schedule identical -- five streaks, longest 42, over a 267-second run.
+Median TTFT is -6.4%, the one aggregate still outside half a percent.
+
+Note the middle of that table. Three of the five changes made a headline number
+*worse* on their way through: the warmup term moved TTFT from -32% to +96%, and
+deferring every step moved it from +96% to -26%. Each was right and each was
+incomplete, and reading any one of them as a regression would have stopped the
+sequence. What kept it honest was that the schedule and the step costs were
+checked separately from the latency: prefill total and streak structure locked
+in at the second row and never moved again, which is how it was possible to know
+that a worse TTFT meant an incomplete fix rather than a wrong one.
+
+The five, in order, and what each actually was:
+
+1. **Per-request prefill attention.** The batch was reduced to two scalars and
+   multiplied, charging one request's tokens against another's history. 8.8x too
+   much on a real step.
+2. **Measured first-step warmup.** Not learnable from the sweep -- the sweep's
+   own warmth is 72.8s and a serving run's is 6.87s -- so it is a per-deployment
+   constant like `--compass-admission-seconds`, defaulting to zero.
+3. **Deferred output.** `postprocess` skips a running sequence absent from
+   `fwd_output`, so a completed prefill's first token is only ever picked up
+   because the output arrives late. The simulator did not defer and the token
+   was dropped.
+4. **Deferred on meaningful steps only.** A middle chunk of a chunked prefill
+   samples nothing and does not take a turn in the buffer. Deferring every step
+   made the lag one chunk where the engine's is one prompt.
+5. **Rung padding.** The padded rectangle is the rung's, not the batch's.
+
+None of them is a cost model being wrong about hardware. All five are the
+simulator disagreeing with the engine about bookkeeping, and each was hidden
+behind an aggregate that looked acceptable -- which is the single most repeated
+lesson in this file.
