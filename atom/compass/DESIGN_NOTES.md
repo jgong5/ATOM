@@ -6470,3 +6470,39 @@ chunks. Per request the lag now matches step for step:
 
 mean 8.99 s against 9.00 s. The quantity that could not be explained two
 sections ago is now reproduced by mirroring one predicate.
+
+
+## silu_and_mul is not unstable; one measurement was
+
+It was recorded as pricing 3.08, 4.51 and 3.06 us per call across three runs of
+one graph, a 47% swing where every other operator repeated to about a point, and
+filed as instability to be explained rather than an error to be corrected. It
+does not reproduce. Fifteen runs on a quiet machine, three at each iteration
+count:
+
+| | 100 iters | 300 iters | 1000 iters |
+| --- | --- | --- | --- |
+| 0.6B tp=1 | 2.332 2.336 2.338 | 2.274 2.286 2.286 | 2.251 2.252 2.252 |
+| spread | 0.3% | 0.5% | 0.0% |
+| 27B tp=4 | | 2.991 2.995 2.997 | |
+| spread | | **0.2%** | |
+
+By spread it ranks 118th, 99th and 122nd of 131 operators on the 0.6B -- among
+the steadiest things measured here. And the 27B at tp=4 is the configuration the
+original numbers came from, so this is not a case of the small model being
+better behaved.
+
+Two of the three original values, 3.08 and 3.06, sit right on the 2.994 us
+measured here. Only 4.51 does not. So the finding is one anomalous measurement,
+not an unstable kernel -- and the machine those were taken on runs about twenty
+other containers, which is the obvious candidate and the reason the repeats here
+were run on an idle node.
+
+Worth keeping from the attempt regardless: iteration count is a real knob but a
+small one. The worst spread across all operators falls from 149.5% at 100
+iterations to 74.1% at 1000, and at 1000 everything above 10% is a sub-0.03us
+operator sitting at the timer's resolution. silu_and_mul itself drifts 2.335 ->
+2.282 -> 2.252 us as iterations rise, about 3.7%, which is warm-up amortising.
+
+The attempt was worth more than its result: chasing it is what turned up the
+quarter of the priced step spent waiting on the host.
