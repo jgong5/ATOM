@@ -52,9 +52,14 @@ def main() -> int:
     # swing in the priced total. It forces a device-to-host transfer to read a
     # boolean, so what is timed is a wait for whatever the GPU had queued.
     #
-    # It also could not be captured (`cache="over"`), and a production step
-    # replays a captured graph -- so this is time spent on work the deployment
-    # does not do, sitting inside a number meant to describe what it does.
+    # These operators launch nothing: in the traced graph all 27 of them carry
+    # an empty `launch` list. So the price is not device work at all. The engine
+    # does still run them every step -- they are stop-condition reads and
+    # sampling -- so they are not absent from a deployment. What does not carry
+    # over is the *number*: a synchronisation's duration is however long the
+    # queue in front of it happened to be, which at benchmark time is the
+    # benchmark's queue and not the deployment's. A quarter of the priced total
+    # is therefore a quantity measured in one context and quoted in another.
     host_rows = []
     for entry in prices["prices"].values():
         host = float(entry.get("host_seconds") or 0.0)
@@ -73,8 +78,11 @@ def main() -> int:
         for contrib, name, frac, cache, n, secs in host_rows[:8]:
             print(f"    {name[:38]:<38} {n:>4} {secs*1e6:>9.1f}us "
                   f"{100*frac:>5.0f}%  {cache}")
-        print("    A replayed step contains none of these. Treat the priced "
-              "total as an upper bound until they are dealt with.")
+        print("    These launch no kernels. The engine does run them, but a "
+              "synchronisation's")
+        print("    duration is whatever queue was in front of it, so the number "
+              "does not carry")
+        print("    from the benchmark to a deployment.")
 
     if prices["unpriced"]:
         reasons = collections.Counter(

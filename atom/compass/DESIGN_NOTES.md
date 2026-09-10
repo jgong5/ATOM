@@ -6388,3 +6388,24 @@ device work -- chunked-prefill attention is priced this way too, for a genuine
 reason -- and telling those apart needs the 27B's list, where collectives are in
 play. The number is on screen in the meantime, which is the part that was
 missing: it was recorded per entry from the beginning and never summed.
+
+
+### Correction: they are not absent from a deployment
+
+The section above said a replayed step "performs no host synchronisations at
+all", so the 26% was time spent on work the deployment does not do. That is
+wrong, and the graph says so plainly: all 27 of the `aten::item` and
+`aten::is_nonzero` entries carry an empty `launch` list -- they launch no
+kernels -- but they *are* in the traced step, and the engine runs them every
+step. They are stop-condition reads and sampling. A deployment pays them.
+
+What is actually wrong with the number is narrower and does not shrink: a
+synchronisation's duration is however long the queue in front of it happened to
+be. At benchmark time that is the benchmark's queue. So a quarter of the priced
+total is a quantity measured in one context and quoted in another, which is why
+it swings 53.4 to 17.6 us between runs of the same graph and why it cannot be
+expected to transfer -- not because the work is imaginary, but because the wait
+is not a property of the operator.
+
+The practical consequence is the same either way: the priced total should not be
+compared against a measured step without saying how much of it is this.
