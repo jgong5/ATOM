@@ -28,6 +28,7 @@ import json
 import os
 import logging
 from typing import Optional
+import numpy as np
 
 from atom.compass.config import CompassConfig
 from atom.compass.core.artifacts import rank_path
@@ -69,6 +70,10 @@ class CompassModelRunner(ModelRunner):
         # Measured rather than inferred by subtraction, which cannot tell a
         # scheduler gap from a mis-measured forward.
         self._last_forward_ended: Optional[float] = None
+        # The previous predicted step's request ids, held back one step because
+        # the engine defers real output and `postprocess` depends on it. None
+        # until the first forward has run; see the predict branch of `forward`.
+        self._deferred_output: Optional[list] = None
         logger.info(
             "ATOMCompass active: mode=%s oracle=%s",
             self._compass_config.mode,
@@ -179,16 +184,47 @@ class CompassModelRunner(ModelRunner):
             shape.num_prefill_tokens, cost.seconds,
         )
 
-        req_ids = list(batch.req_ids)
+        # Deferred by one step, because the engine is built expecting it.
+        #
+        # ModelRunner defers output whenever pipeline_parallel_size == 1, which
+        # is the default, and `Scheduler.postprocess` is written around that: it
+        # walks `self.running` and skips any sequence absent from `fwd_output`.
+        # Its own comment spells out why that matters -- "the prefill step's
+        # postprocess sees idx=None and skips this seq. By the time the prefill
+        # output surfaces, the next step's schedule has already flipped seq.type
+        # to DECODE". A request finishing its last prompt chunk is not yet in
+        # `running` when that step is postprocessed, so the *only* reason its
+        # first token is ever picked up is that the output arrives a step late.
+        #
+        # Returning the current batch's tokens offers them one step too early,
+        # when the sequence is still invisible to that loop, and never offers
+        # them again until a decode batch happens to include it. Measured on the
+        # 27B: every request whose prefill completed inside a 36-step prefill
+        # streak was stamped at step 37, the first decode step. First tokens 64
+        # seconds late and TTFT 95% over, while the schedule and the step costs
+        # agreed with the real run to a fraction of a percent. The clock was
+        # right; the bookkeeping was not.
         filler = self._compass_config.filler_token_id
+        previous = self._deferred_output
+        self._deferred_output = list(batch.req_ids)
+
+        req_ids = previous if previous is not None else []
         token_ids = [(filler,) for _ in req_ids]
+        width = len(req_ids)
 
         return ScheduledBatchOutput(
             req_ids=req_ids,
             token_ids=token_ids,
-            num_rejected=None,
-            num_bonus=None,
+            # Subscripted per request by postprocess once deferral is declared,
+            # so these are arrays of zeros rather than None: nothing is
+            # speculated here, but "nothing" still has to be indexable.
+            num_rejected=np.zeros(width, dtype=np.int32),
+            num_bonus=np.zeros(width, dtype=np.int32),
             draft_token_ids=None,
+            is_deferred_out=True,
+            # The *current* step's cost, not the deferred batch's: this is what
+            # the virtual clock advances by, and it belongs to the step that
+            # just ran.
             compass_step_seconds=cost.seconds,
         )
 

@@ -6278,3 +6278,67 @@ TTFT is out by 95%. Anyone grading Compass on TTFT today is grading one
 accounting rule about token delivery. That is worth knowing before the next
 number gets quoted -- and it is the third time in this project that a headline
 figure turned out to be about something other than what it appeared to measure.
+
+
+## The simulated forward was not deferring its output, and the engine needs it to
+
+`Scheduler.postprocess` walks `self.running` and skips any sequence absent from
+`fwd_output` -- `idx = fwd_output.get_idx(seq.id); if idx is None: continue`. Its
+own comment says why that is load-bearing:
+
+> ModelRunner runs in deferred-output mode by default
+> (tokenIDProcessor.is_deferred_out), so the prefill step's postprocess sees
+> idx=None and skips this seq. By the time the prefill output surfaces, the next
+> step's schedule has already flipped seq.type to DECODE.
+
+A request finishing its last prompt chunk is not yet in `running` when that step
+is postprocessed. The *only* reason its first token is ever picked up is that
+the output arrives late. `CompassModelRunner` returned the current batch's
+tokens with `is_deferred_out` left at its default of False, so it offered them
+one step early, to a loop that could not see the sequence yet, and never offered
+them again until a decode batch happened to include the request.
+
+Instrumenting the three sites that stamp `first_token_time` shows it exactly.
+All twenty requests are stamped at one site, `postprocess`'s walk over
+`self.running`, and:
+
+| | real | simulated |
+| --- | --- | --- |
+| seq 0, prefill done step 0 | stamped step 4 | stamped step 0 |
+| seq 1, prefill done step 4 | stamped step 8 | stamped **step 37** |
+| seq 2, prefill done step 8 | stamped step 12 | stamped **step 37** |
+| seq 7, prefill done step 30 | stamped step 36 | stamped **step 37** |
+
+Step 37 is the first decode step. Every request whose prefill completed inside
+the 36-step prefill streak waited for it.
+
+Deferring the predicted output by one step, with the zero-filled speculation
+counters `postprocess` subscripts once deferral is declared:
+
+| | TTFT median | mean | p90 |
+| --- | --- | --- | --- |
+| real | 27.63 s | 28.68 | 48.83 |
+| before | 54.03 s (+95.5%) | 49.50 | 88.87 |
+| **after** | **20.52 s (-25.7%)** | 21.54 | 41.67 |
+
+and the schedule is untouched -- five streaks, longest 42, prefill 235.11 s over
+106 chunks, median latency 73.65 s against 74.63 s -- because only the
+bookkeeping moved.
+
+**It now runs early rather than late, and the residual is measured.** Per
+request, from prompt completion to first token:
+
+    real       +7.97 +8.08 +8.19 +9.93 +8.37 +8.46 +10.51 +10.44   (mean 9.0 s)
+    simulated  +1.66 +1.69 +1.69 +1.67 +1.88 +1.80  +1.71  +1.75   (mean 1.7 s)
+
+One step is 1.7 s, so the simulation now defers by exactly the one step it was
+told to. The real engine defers by about nine seconds, which on this workload is
+one *request's* prefill rather than one step -- each request takes about five
+chunks, and each first token lands at the step where the next request's prompt
+completes. At the end of a streak both collapse to nothing: +0.09 s real,
++0.02 s simulated.
+
+So a step is the wrong unit for this deferral and the right one is not yet
+known. What is known is that it is not the cost model: the schedule, the step
+costs and the completion times all agree with the real run to a fraction of a
+percent, and this is the last thing standing between them.

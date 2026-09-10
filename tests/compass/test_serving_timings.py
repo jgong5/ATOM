@@ -571,3 +571,101 @@ class TestAdmissionDelay:
             assert clock.time() == pytest.approx(1005.013)
         finally:
             reset_clock()
+
+
+class TestPredictedOutputIsDeferred:
+    """The engine only ever picks up a finished prefill's token a step late.
+
+    `Scheduler.postprocess` walks `self.running` and skips any sequence absent
+    from `fwd_output`. A request finishing its last prompt chunk is not yet in
+    `running` when that step is postprocessed, so the only reason its first
+    token is ever seen is that ModelRunner defers output by one step -- which it
+    does whenever pipeline_parallel_size is 1, the default.
+
+    A predicted forward returning the current batch's tokens therefore offers
+    them one step too early, to a loop that cannot see the sequence yet, and
+    never offers them again until a decode batch happens to include it. On the
+    27B every request whose prefill completed inside a 36-step prefill streak
+    was stamped at step 37: first tokens 64 s late and TTFT 95% over, while the
+    schedule and the step costs matched the real run to a fraction of a percent.
+    """
+
+    @staticmethod
+    def _runner():
+        from atom.compass.config import CompassConfig
+        from atom.compass.runtime.runner import CompassModelRunner
+
+        stub = CompassModelRunner.__new__(CompassModelRunner)
+        stub.__dict__["_compass_config_cache"] = CompassConfig(
+            enabled=True, mode="predict")
+        import types
+        stub.config = types.SimpleNamespace()
+        stub._deferred_output = None
+        stub._step_count = 0
+        stub._oracle = _ConstantOracle()
+        stub._record_measurement = lambda *a, **k: None
+        stub._topology = lambda: {}
+        stub._rank_coords = lambda: {}
+        stub._capture_bucket = lambda n, prefilling=False: None
+        return stub
+
+    @staticmethod
+    def _batch(req_ids, scheduled, contexts):
+        class _Batch:
+            pass
+
+        b = _Batch()
+        b.req_ids = list(req_ids)
+        b.num_scheduled_tokens = list(scheduled)
+        b.context_lens = list(contexts)
+        b.total_tokens_num_prefill = sum(n for n in scheduled if n > 1)
+        b.is_dummy_run = False
+        return b
+
+    def test_the_first_step_emits_nothing(self):
+        """There is no previous step for its output to come from."""
+        runner = self._runner()
+        out = runner.forward(self._batch(["a"], [16], [16]))
+        assert out.req_ids == []
+        assert out.is_deferred_out is True
+
+    def test_each_step_emits_the_previous_step_s_requests(self):
+        runner = self._runner()
+        runner.forward(self._batch(["a"], [16], [16]))
+        second = runner.forward(self._batch(["b"], [32], [32]))
+        assert second.req_ids == ["a"]
+        third = runner.forward(self._batch(["c"], [1], [64]))
+        assert third.req_ids == ["b"]
+
+    def test_the_cost_is_this_step_s_not_the_deferred_one_s(self):
+        """The clock advances by the step that just ran. Deferring the tokens
+        must not defer the time."""
+        runner = self._runner()
+        runner._oracle.seconds = 1.0
+        runner.forward(self._batch(["a"], [16], [16]))
+        runner._oracle.seconds = 2.0
+        out = runner.forward(self._batch(["b"], [32], [32]))
+        assert out.req_ids == ["a"]
+        assert out.compass_step_seconds == 2.0
+
+    def test_speculation_counters_are_indexable_not_none(self):
+        """postprocess subscripts them per request once deferral is declared."""
+        runner = self._runner()
+        runner.forward(self._batch(["a", "b"], [16, 16], [16, 16]))
+        out = runner.forward(self._batch(["c"], [1], [64]))
+        assert len(out.req_ids) == 2
+        assert int(out.num_rejected[1]) == 0
+        assert int(out.num_bonus[0]) == 0
+        assert len(out.token_ids) == 2
+
+
+class _ConstantOracle:
+    seconds = 1.0
+
+    def estimate(self, shape):
+        from atom.compass.core.cost.base import StepCost
+
+        return StepCost(seconds=self.seconds)
+
+    def describe(self):
+        return "constant"
