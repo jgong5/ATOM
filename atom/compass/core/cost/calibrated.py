@@ -14,8 +14,9 @@ model that is wrong about both.
 
 Features, per step:
 
-* prefill — new tokens, and new tokens squared (attention is quadratic in the
-  chunk, and chunked prefill makes the chunk a real variable)
+* prefill — new tokens, plus attention within each chunk and over each chunk's
+  own history. Both attention terms are summed per request: a step prefilling
+  two requests at once must not charge one's tokens against the other's history
 * decode — batch size (one row of GEMM work each) and total context across the
   batch (the KV bytes that must be read)
 
@@ -54,18 +55,51 @@ def _prefill_features(shape: StepShape) -> list[float]:
     one number for them, 23% under the mean, because the feature it needed was
     not there to fit.
 
-    `tokens * context` is the attention this chunk performs over what came
-    before -- each of its queries reads the whole history. Keeping it separate
-    from `tokens**2`, which is attention within the chunk, because the two grow
-    differently: the second is fixed once the chunk size is, and the first
-    climbs with every chunk.
+    Attention is the chunk reading over what came before -- each of its queries
+    reads its own request's history. Keeping that separate from attention
+    *within* the chunk, because the two grow differently: the second is fixed
+    once the chunk size is, and the first climbs with every chunk.
+
+    **Both are summed per request, not taken on the batch totals.** A step can
+    prefill two requests at once, and collapsing it into `tokens * history` with
+    both sides summed cross-multiplies them -- request A's new tokens get
+    charged against request B's history, which A never reads. The error is not
+    small. On one real step, ``[1856 new on 67968 ctx] + [14528 new on 14528]``:
+
+        charged   16384 * 66112 = 1.08e9
+        attends    1856 * 66112 = 1.23e8      8.8x too much
+
+    Across a 27B serving run the fourteen steps that prefilled two requests came
+    out +27.28% while the ninety-two single-request ones came out -4.01%, and
+    the two nearly cancelled into a +0.04% headline. Per request they are -0.81%
+    and -3.35%. The step's error, with the unmodelled cold start held out, goes
+    from +2.96% to -0.20% -- and that 3% was what closed two decode windows and
+    put TTFT 90% high.
+
+    This is the shortcut ``StepShape`` was written to prevent, taken anyway:
+    "sequence lengths are kept per request rather than reduced to a scalar.
+    Collapsing them is the standard shortcut in this field and it is the
+    standard source of error." The lengths were there; this function summed them.
+
+    Reduces to the previous features exactly for a single-request step, which is
+    all a calibration sweep mostly contains and is why a sweep-fitted model
+    looked healthy while serving runs did not.
     """
     tokens = float(shape.num_prefill_tokens)
-    context = float(sum(shape.context_lens)) if shape.context_lens else 0.0
-    # The history is what the context holds *before* this chunk's own tokens,
-    # which the reading already counts.
-    history = max(0.0, context - tokens)
-    return [1.0, tokens, tokens * tokens, tokens * history]
+    within = 0.0    # attention inside each chunk, quadratic in that chunk
+    across = 0.0    # attention over each chunk's own history
+    for scheduled, context in zip(shape.num_scheduled_tokens,
+                                  shape.context_lens or ()):
+        if scheduled <= 1:
+            # A decode row riding along in a prefill step. Its attention is what
+            # the decode model is for; charging it here would double-count.
+            continue
+        new = float(scheduled)
+        within += new * new
+        # The history is what this request's context holds *before* its own new
+        # tokens, which the reading already counts.
+        across += new * max(0.0, float(context) - new)
+    return [1.0, tokens, within, across]
 
 
 def _decode_features(shape: StepShape) -> list[float]:

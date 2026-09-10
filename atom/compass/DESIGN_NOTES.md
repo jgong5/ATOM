@@ -6141,3 +6141,83 @@ It also gets the negative case right, which is what makes it worth having:
 decode on the same run reads -2.83% on totals and -2.82% held out, so nothing is
 hiding there, and the gap between that and its -0.42% median says decode's error
 sits in its expensive steps rather than in one of them.
+
+
+## Prefill attention was charged on the batch totals, not per request
+
+The long-context overshoot -- -1.16% at 16-50k chunk context, +3.74% at 50-100k,
++13.36% at 100-150k -- turned out to be a proxy for something sharper. Split the
+same run's prefill steps by how many requests were in the batch:
+
+| | n | error |
+| --- | --- | --- |
+| pure prefill | 92 | **-4.01%** |
+| mixed prefill | 14 | **+27.28%** |
+
+and the two nearly cancel into the +0.04% headline. Again.
+
+`_prefill_features` reduced the batch to two scalars and multiplied them:
+`tokens * history`, both sums over the batch. For one request that is right; for
+two it cross-multiplies, charging request A's new tokens against request B's
+history, which A never reads. On one real step -- 1856 new tokens on a 67968
+context, batched with 14528 new tokens on a 14528 context:
+
+    charged   16384 * 66112 = 1.08e9
+    attends    1856 * 66112 = 1.23e8      8.8x
+
+The mixed-step error is monotonic in how much foreign context is in the batch:
++0.3% at 576 tokens of it, +79.7% at 14464.
+
+This is the shortcut `StepShape`'s own docstring exists to prevent -- "collapsing
+them is the standard shortcut in this field and it is the standard source of
+error" -- taken in the function that reads it. It survived because a calibration
+sweep is almost all single-request steps, so a sweep-fitted model looked healthy
+while serving runs did not.
+
+The shape of the feature was never wrong. A full 16384-token chunk's marginal
+cost per 16k of extra context is 0.2444 s +/- 2% from 32k all the way to 246k,
+so the cost really is linear in the history attended. It was being fed the wrong
+numbers.
+
+Summing both attention terms per request instead:
+
+| | mixed | pure | all, cold start held out |
+| --- | --- | --- | --- |
+| collapsed | +27.28% | -4.01% | +2.96% |
+| per request | -0.81% | -3.35% | **-0.20%** |
+
+Existing calibration tables stay valid; the change is in how features are
+computed, and it is applied identically when fitting and when predicting.
+
+### What it does to the run
+
+No price scaling, same table, same workload:
+
+| | TTFT median | p90 | streaks | longest |
+| --- | --- | --- | --- | --- |
+| real | 27.63 s | 48.83 | 5 | 42 |
+| before | 52.40 s | 147.85 | 6 | 63 |
+| x0.97 hack | 37.31 s | 89.99 | 8 | 42 |
+| **per request** | **36.59 s** | **88.87** | 8 | **42** |
+
+TTFT error goes from +89.6% to +32.4%, and the deliberate 3% scaling is no
+longer needed to get there -- the principled fix reaches the same place the hack
+did. The two decisive windows now land where the real run's do:
+
+| streak ends at | real | fixed |
+| --- | --- | --- |
+| 42-chunk | 213.1 (+1.4 s) | **212.6 (+1.9 s)** |
+| 7-chunk | 231.2 (+1.2 s) | **231.1 (+1.3 s)** |
+| final streak | 15 chunks | **15 chunks** |
+
+### And what is left is the cold start, alone
+
+The whole remaining error is now at the start of the run. The fixed simulation
+opens three windows the real run does not, at 0.1 s, 8.1 s and 18.7 s, because
+its first step costs 0.13 s where the real one costs 6.80 s -- so it finishes
+before request 1 arrives at 0.2 s, and a window opens that should not exist.
+Both runs execute the same 36 chunks before the first real gap; the simulation
+just breaks them into four streaks instead of one.
+
+That is the term this project decided not to invent, and it is now the only
+thing between the simulated schedule and the real one on this workload.

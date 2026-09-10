@@ -11,7 +11,7 @@ import pytest
 
 from atom.compass.core.cost.base import StepShape
 from atom.compass.core.cost.calibrated import (
-    CalibratedCostOracle, _least_squares, _truthy)
+    CalibratedCostOracle, _least_squares, _prefill_features, _truthy)
 
 
 def write_table(path, rows):
@@ -130,6 +130,55 @@ class TestOracle:
         rows[5] = (rows[5][0], 0, 5.0, True)
         oracle = CalibratedCostOracle(write_table(tmp_path / "t.jsonl", rows))
         assert "dropped" in oracle.describe()
+
+
+class TestPrefillAttentionIsPerRequest:
+    """A step prefilling two requests must not charge one against the other.
+
+    `tokens * history` on the batch totals cross-multiplies them. On a real 27B
+    step -- 1856 new tokens on a 67968 context, batched with 14528 new tokens on
+    a 14528 context -- that charges 16384 * 66112 where only 1856 * 66112 is
+    attended, 8.8 times too much. Fourteen such steps in one serving run came out
+    +27.28% against -4.01% for the single-request ones, and the two nearly
+    cancelled in the total.
+    """
+
+    @staticmethod
+    def _shape(pairs, decodes=()):
+        """pairs: (new_tokens, context) per prefilling request."""
+        sched = [n for n, _ in pairs] + [1] * len(decodes)
+        ctxs = [c for _, c in pairs] + list(decodes)
+        return StepShape(
+            num_scheduled_tokens=tuple(sched), context_lens=tuple(ctxs),
+            num_prefill_tokens=sum(n for n, _ in pairs),
+        )
+
+    def test_one_request_is_unchanged(self):
+        """The old features were right for a batch of one, and a sweep is mostly
+        batches of one -- which is why this survived so long."""
+        f = _prefill_features(self._shape([(16384, 65536)]))
+        assert f == [1.0, 16384.0, 16384.0 ** 2, 16384.0 * (65536.0 - 16384.0)]
+
+    def test_two_requests_are_not_cross_multiplied(self):
+        f = _prefill_features(self._shape([(1856, 67968), (14528, 14528)]))
+        # 14528 is a first chunk: its context is its own tokens, so no history.
+        assert f[3] == pytest.approx(1856.0 * (67968.0 - 1856.0))
+        collapsed = 16384.0 * ((67968.0 + 14528.0) - 16384.0)
+        assert f[3] < collapsed / 8
+
+    def test_a_decode_riding_along_is_not_charged_here(self):
+        """Its attention is what the decode model is for."""
+        alone = _prefill_features(self._shape([(16384, 65536)]))
+        with_decode = _prefill_features(
+            self._shape([(16384, 65536)], decodes=(120000,)))
+        assert alone == with_decode
+
+    def test_within_chunk_attention_is_also_per_request(self):
+        """Two 1000-token chunks are not one 2000-token chunk: attention within
+        a chunk is quadratic, so the sum of squares is not the square of sums."""
+        f = _prefill_features(self._shape([(1000, 1000), (1000, 1000)]))
+        assert f[2] == pytest.approx(2 * 1000.0 ** 2)
+        assert f[2] < (2000.0 ** 2)
 
 
 class TestLeadingWarmupIsReportedNotCharged:
