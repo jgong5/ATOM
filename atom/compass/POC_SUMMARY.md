@@ -1,5 +1,12 @@
 # ATOMCompass — PoC summary and handover
 
+**Status update, 10 September 2026:** read [RETROSPECTIVE.md](RETROSPECTIVE.md)
+for the current evidence audit through `87838198` and revised priorities.
+The known replay deadlock and clock mismatch are fixed; repeated 27B runs still
+show median TTFT over-predicted by 90.5%. The current investigation concerns
+post-prefill completion/output and scheduling, with validity checks still to
+finish. Treat the status and priorities below as a historical snapshot.
+
 A wrap-up of the proof of concept. It states what works, what does not, what was
 tried, and what is left. It is written to be read by someone who has not seen
 the work.
@@ -8,12 +15,14 @@ the work.
 
 | file | what it is |
 | --- | --- |
-| `POC_SUMMARY.md` (this) | conclusions. The single source of truth for status. |
+| `POC_SUMMARY.md` (this) | the earlier PoC handover; current status is in `RETROSPECTIVE.md` |
+| `RETROSPECTIVE.md` | current evidence assessment and priorities, dated and tied to a revision |
 | `DESIGN_NOTES.md` | the working log, ~5000 lines, written as each thing was found. Every claim here is traceable to it. Detailed, and parts of it are stale. |
 | `ATOM_DEFECTS.md` | bugs found in ATOM itself, not in Compass. |
 
-Where the two disagree, this file is newer. Where you need the evidence for a
-claim, go to `DESIGN_NOTES.md`.
+For the original experiments summarised here, use `DESIGN_NOTES.md` for their
+evidence. Later entries there postdate this summary; `RETROSPECTIVE.md` reviews
+the latest conclusions and their validity.
 
 ---
 
