@@ -309,7 +309,8 @@ class CalibratedCostOracle:
 
     def __init__(self, table: str, floor_seconds: float = 1e-6,
                  rank_coords: Optional[dict] = None, warmup=True,
-                 warmup_ratio: float = 3.0) -> None:
+                 warmup_ratio: float = 3.0,
+                 warmup_seconds: float = 0.0) -> None:
         """
         Args:
             table: Path to a JSONL file written by ``--compass-mode=measure``.
@@ -326,6 +327,21 @@ class CalibratedCostOracle:
                 prediction -- see ``_leading_warmup`` for why the sweep's
                 warmth does not transfer to a serving run's. Pass
                 ``warmup=off`` to skip the detection.
+            warmup_seconds: Seconds to add to this run's first prefill step,
+                for the autotuning a server pays after its startup profile and
+                graph capture are done. Defaults to 0, which is the behaviour
+                before this existed.
+
+                This is a *measurement*, not a prediction, and it is the same
+                bargain as ``--compass-admission-seconds``: a property of the
+                machine and the deployment rather than of the model, taken once
+                from a real run and reused. On the 27B at tp=4 it is 6.68 s and
+                steady to 1.3% over four repeats; on the 0.6B it is 0.01 s. It
+                cannot come from the calibration table -- see
+                ``_leading_warmup`` -- and inventing it from the model's own
+                coefficients is what this project spent a week learning not to
+                do. Charged once, to the first prefill step of the process,
+                because that is where a real run pays it.
             warmup_ratio: How much more than its shape predicts a leading step
                 must cost to be called warmth rather than noise. Three is well
                 clear of both sides on the evidence here: the steps this is
@@ -383,6 +399,11 @@ class CalibratedCostOracle:
         self._warmup_enabled = _truthy(warmup)
         self._warmup_ratio = float(warmup_ratio)
         self._warmup: list[float] = []
+        # Charged once, to the first prefill step this process costs. Stateful
+        # on purpose: warmth is paid once, and an oracle that charged it on
+        # every step would be describing a different machine.
+        self._warmup_seconds = float(warmup_seconds)
+        self._warmup_charged = False
         self._fit()
 
     def _fit(self) -> None:
@@ -494,6 +515,10 @@ class CalibratedCostOracle:
             return StepCost(seconds=max(fallback, self.floor_seconds))
         self._warn_if_extrapolating(shape, features)
         predicted = sum(c * f for c, f in zip(coeffs, features))
+        if (shape.is_prefill and self._warmup_seconds > 0.0
+                and not self._warmup_charged):
+            predicted += self._warmup_seconds
+            self._warmup_charged = True
         return StepCost(seconds=max(predicted, self.floor_seconds))
 
     def _decode_for_bucket(self, shape: StepShape) -> Optional[StepCost]:
@@ -610,6 +635,11 @@ class CalibratedCostOracle:
                       f"totalling {sum(self._warmup):.2f}s, not charged")
         elif not self._warmup_enabled:
             warmup = ", warmup detection off"
+        if self._warmup_seconds > 0.0:
+            # A measured constant, so it is named as one rather than folded in
+            # with the fitted coefficients above.
+            warmup += (f", measured first-step warmup="
+                       f"{self._warmup_seconds:.2f}s charged once")
 
         return (
             "CalibratedCostOracle("

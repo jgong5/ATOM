@@ -6221,3 +6221,60 @@ just breaks them into four streaks instead of one.
 
 That is the term this project decided not to invent, and it is now the only
 thing between the simulated schedule and the real one on this workload.
+
+
+## The measured first-step warmup, and what it uncovered
+
+The cold start cannot come from the calibration table, but it can be measured
+once from a real run of the same deployment and reused -- which is the bargain
+`--compass-admission-seconds` already makes, and it is documented there as "a
+property of the machine and the process layout, not of the model". So
+`warmup_seconds` is an oracle option, defaulting to 0, charged once to the first
+prefill step of a process. On the 27B at tp=4 it is 6.68 s, steady to 1.3% over
+four repeats; on the 0.6B it is 0.01 s. The number used below came from
+yesterday's repeats and was applied to a run taken today.
+
+With it and the per-request attention fix, the simulated schedule stops being
+approximately right and starts being exactly right:
+
+| streak | real ends at | simulated |
+| --- | --- | --- |
+| 36 chunks | 78.6 | **78.8** |
+| 6 chunks | 100.4 | **100.3** |
+| 42 chunks | 213.1 | **212.6** |
+| 7 chunks | 231.2 | **231.1** |
+| 15 chunks | 267.3 | **267.3** |
+
+Five streaks, the same chunk counts, every break within half a second of the
+real one across a 267-second run. Prefill totals 235.11 s against 235.56 s,
+-0.2%. Median latency 73.65 s against 74.63 s. Per request, the step that
+completes each prompt is the same step, at the same time to a tenth of a second.
+
+**And TTFT got worse: 54.03 s against a real 27.63 s.**
+
+That is not a contradiction, it is a discovery. Lining first tokens up against
+the steps that produced them:
+
+| seq | real prefill done | sim prefill done | real 1st token | sim 1st token |
+| --- | --- | --- | --- | --- |
+| 0 | 6.80 | 6.81 | 14.77 | 6.81 |
+| 1 | 14.78 | 14.80 | 22.86 | **78.80** |
+| 2 | 22.87 | 22.90 | 31.05 | **78.80** |
+| 7 | 68.24 | 68.30 | 78.68 | **78.80** |
+
+The real run delivers a first token about one prefill-completion interval after
+each prompt finishes -- +7.97, +8.08, +8.19, +9.93, +8.37, +8.46, +10.51,
++10.44 s, one per request -- and it does this *inside* a 36-step prefill streak
+that contains no decode step at all. The simulation gives all of them their
+first token at 78.80, when the streak ends and the first decode step runs.
+
+So the remaining TTFT error is not a timing error. The work is scheduled at the
+right moment and takes the right time; what differs is when a finished prompt
+becomes a delivered token.
+
+**Which means TTFT is currently not measuring the cost model.** The cost model
+and the schedule now agree with reality to within a fraction of a percent, and
+TTFT is out by 95%. Anyone grading Compass on TTFT today is grading one
+accounting rule about token delivery. That is worth knowing before the next
+number gets quoted -- and it is the third time in this project that a headline
+figure turned out to be about something other than what it appeared to measure.

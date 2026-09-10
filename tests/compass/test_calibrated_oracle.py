@@ -242,6 +242,47 @@ class TestLeadingWarmupIsReportedNotCharged:
             tmp_path / "t.jsonl", [(128, 0, 4.0, True)] + rows))
         assert len(oracle._warmup) == 1
 
+    def test_a_measured_constant_is_charged_once_and_only_to_prefill(
+            self, tmp_path):
+        """The other half of the bargain, and the same one
+        --compass-admission-seconds makes: a number the table cannot hold, taken
+        from a real run of the same deployment and reused. 6.68 s on the 27B at
+        tp=4, steady to 1.3% over four repeats.
+
+        Charged to the first prefill step because that is where a real run pays
+        it, and never again, because warmth is paid once.
+        """
+        rows = [(n, 0, 0.005 + n * 1e-5, True) for n in range(128, 4096, 128)]
+        rows += [(1, ctx, 0.001 + ctx * 1e-6, False) for ctx in range(64, 2048, 64)]
+        table = write_table(tmp_path / "t.jsonl", rows)
+        plain = CalibratedCostOracle(table)
+        warm = CalibratedCostOracle(table, warmup_seconds=6.68)
+
+        base = plain.estimate(prefill(1024)).seconds
+        assert warm.estimate(prefill(1024)).seconds == pytest.approx(base + 6.68)
+        # Once. The second prefill step is a cold machine no longer.
+        assert warm.estimate(prefill(1024)).seconds == pytest.approx(base)
+        assert "measured first-step warmup=6.68s" in warm.describe()
+
+    def test_a_decode_first_does_not_consume_it(self, tmp_path):
+        """A run whose first step is a decode has not paid the prefill warmth
+        yet, and must not be told it has."""
+        rows = [(n, 0, 0.005 + n * 1e-5, True) for n in range(128, 4096, 128)]
+        rows += [(1, ctx, 0.001 + ctx * 1e-6, False) for ctx in range(64, 2048, 64)]
+        table = write_table(tmp_path / "t.jsonl", rows)
+        plain = CalibratedCostOracle(table)
+        warm = CalibratedCostOracle(table, warmup_seconds=6.68)
+        assert warm.estimate(decode(context=512)).seconds == pytest.approx(
+            plain.estimate(decode(context=512)).seconds)
+        assert warm.estimate(prefill(1024)).seconds == pytest.approx(
+            plain.estimate(prefill(1024)).seconds + 6.68)
+
+    def test_it_defaults_to_the_behaviour_before_it_existed(self, tmp_path):
+        rows = [(n, 0, 0.005 + n * 1e-5, True) for n in range(128, 4096, 128)]
+        oracle = CalibratedCostOracle(write_table(tmp_path / "t.jsonl", rows))
+        assert oracle._warmup_seconds == 0.0
+        assert "measured first-step warmup" not in oracle.describe()
+
     @pytest.mark.parametrize("value,expected", [
         ("off", False), ("0", False), ("false", False), ("no", False),
         ("on", True), ("1", True), (True, True), (False, False),
