@@ -5766,3 +5766,49 @@ quoting single-run per-request figures. For a per-request claim, repeat the real
 run several times and compare the simulator against the distribution rather than
 against one draw. A workload with slack would also help, since saturation is
 what makes the concurrency path so sensitive.
+
+
+## Correction: the real runs are reproducible. Repeats say so
+
+The previous section concluded from two runs that the real side was not
+reproducible -- a twofold swing in TTFT on the 27B -- and made that the blocking
+issue for every per-request claim. Four repeats say otherwise.
+
+| 27B, median over four real runs | |
+| --- | --- |
+| TTFT | 27.54, 27.57, 27.61, 27.62s -- spread **0%** |
+| latency | 74.50, 74.53, 74.70, 74.89s -- spread **1%** |
+
+| 0.6B, median over five real runs | |
+| --- | --- |
+| TTFT | 3.55, 3.58, 3.66, 3.80, 3.89s -- spread 9% |
+| latency | 4.45, 4.46, 4.52, 4.69, 4.72s -- spread 6% |
+
+The 27B's earlier 56.4s was a single anomalous first run -- first use of those
+shapes, where Triton autotunes -- and every run since has landed within 0.1s of
+27.6. Diagnosing irreproducibility from two samples, one of them a first run, is
+the error the retrospective warned about, committed while acting on it.
+
+**With repeats, the errors are these**, and they are stable rather than draws:
+
+| | 27B | 0.6B |
+| --- | --- | --- |
+| TTFT against the real median | **+90.5%**, outside the range | -1.1%, inside |
+| latency | +5.4%, outside | +7.8%, outside |
+
+The 27B over-predicts time to first token by ninety percent, reproducibly. On
+the 0.6B the same model is within a percent. Whatever that is, it is specific to
+long prompts and it is not noise.
+
+**And the machine check earned its place by being wrong three times.** It
+reported the machine busy when it was reading our own memory mid-release; it
+mislabelled which run each sample belonged to, because the health-check loop
+shared a variable name with the repeat counter and clobbered it; and it flagged
+a neighbour at 98% on cards this run was not using. All three are false alarms,
+and a validity check that cries wolf is worse than none -- it teaches the reader
+to skip it. It now waits for the server to exit, keeps its own counter, and
+judges only the devices in `HIP_VISIBLE_DEVICES`, while still recording the
+whole machine so a neighbour elsewhere stays on the record.
+
+It also caught a real one: a tenant compute-bound in 0.7 GB, which no
+free-memory check would have seen.
