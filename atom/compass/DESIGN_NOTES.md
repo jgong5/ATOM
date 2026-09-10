@@ -5861,3 +5861,37 @@ It also explains why the 0.6B is fine at -1.1%: its prefill chunks are
 milliseconds, so the same ordering difference costs almost nothing. The error
 needs long prefill chunks to be visible, which is why every short-prompt
 experiment missed it.
+
+
+## Prefill streaks: part of the answer, and the limit of what the tables show
+
+The simulator runs longer unbroken stretches of prefill than the real engine:
+
+| | real | modelled |
+| --- | --- | --- |
+| unbroken prefill streaks in the run | 5 | 6 |
+| longest | 42 chunks, **93.95s** | 63 chunks, **152.57s** |
+| median | 15 chunks, 34.78s | 6 chunks, 11.16s |
+
+A request that finishes prefill inside a streak waits for it to end, so the
+simulator's 152s worst case matches the shape of its 139s worst-case wait for a
+first token, against 16.6s real.
+
+**But this does not close it.** The worst streak is 1.6 times longer while the
+median wait after prefill is 3.5 times longer, so streak length is a part of the
+mechanism rather than the whole of it. Saying more needs the scheduler to record
+*why* it chose each step -- what was admissible, what the token budget was, what
+it passed over -- and the step table only records what it did.
+
+That is a code change rather than another pass over saved artifacts, and it is
+where this line of work stops for now. What is established is worth stating
+plainly, because the earlier account of it was wrong in every particular:
+
+* The 27B's TTFT error is 90.5%, reproducible across four runs to within 0.1s.
+* It is not prefill cost, which is +0.1% against the real run's own steps.
+* It is not the number of chunks: 106 against 105, same 1,681,024 tokens.
+* It is not admission: 6.2s real against 4.8s modelled, the simulator earlier.
+* It is entirely the wait between a request's last prefill chunk and its first
+  token: 9.19s real against 32.21s modelled.
+* Longer prefill streaks in the simulator account for part of that wait.
+* None of it shows on a small model, where chunks are milliseconds.
