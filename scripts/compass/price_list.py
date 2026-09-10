@@ -41,6 +41,41 @@ def main() -> int:
               f"{secs*1000:>9.3f}ms")
     print(f"    {'-- priced total':<44} {'':>4} {'':>10} {total*1000:>9.3f}ms")
 
+    # How much of that total is the host waiting rather than the device working.
+    #
+    # `microbench` already records this per entry and says what it means --
+    # "where this matches `seconds`, the device was idle waiting and the price is
+    # the host's, not the kernel's" -- but nothing has ever added it up. On a
+    # 0.6B graph one operator, `aten::is_nonzero`, came to 11.8% of the priced
+    # step with 98% of its own price being host time, and it swung 53.4us to
+    # 17.6us between runs of the same graph, which was the whole of an 8.3%
+    # swing in the priced total. It forces a device-to-host transfer to read a
+    # boolean, so what is timed is a wait for whatever the GPU had queued.
+    #
+    # It also could not be captured (`cache="over"`), and a production step
+    # replays a captured graph -- so this is time spent on work the deployment
+    # does not do, sitting inside a number meant to describe what it does.
+    host_rows = []
+    for entry in prices["prices"].values():
+        host = float(entry.get("host_seconds") or 0.0)
+        secs = float(entry.get("seconds") or 0.0)
+        if secs > 0 and host / secs >= 0.5:
+            host_rows.append((secs * entry["occurrences"], entry["name"],
+                              host / secs, entry.get("cache"),
+                              entry["occurrences"], secs))
+    if host_rows:
+        host_rows.sort(reverse=True)
+        charged = sum(r[0] for r in host_rows)
+        print(f"\n  of which the host was waiting, not the device "
+              f"({charged*1000:.3f}ms, {100*charged/max(total, 1e-12):.1f}% "
+              f"of the priced step):")
+        print(f"    {'kernel':<38} {'n':>4} {'each':>10} {'host':>6}  cache")
+        for contrib, name, frac, cache, n, secs in host_rows[:8]:
+            print(f"    {name[:38]:<38} {n:>4} {secs*1e6:>9.1f}us "
+                  f"{100*frac:>5.0f}%  {cache}")
+        print("    A replayed step contains none of these. Treat the priced "
+              "total as an upper bound until they are dealt with.")
+
     if prices["unpriced"]:
         reasons = collections.Counter(
             v.split(":")[0] for v in prices["unpriced"].values())

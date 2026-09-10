@@ -6342,3 +6342,49 @@ So a step is the wrong unit for this deferral and the right one is not yet
 known. What is known is that it is not the cost model: the schedule, the step
 costs and the completion times all agree with the real run to a fraction of a
 percent, and this is the last thing standing between them.
+
+
+## A quarter of the priced step is the host waiting
+
+Chasing `silu_and_mul`'s reported instability turned up something larger. Three
+benchmark runs of one 0.6B graph at 300 iterations priced the step at 2.722,
+2.527 and 2.514 ms, and almost the whole 8.3% swing was one operator:
+
+    aten::is_nonzero   53.44us x 6   |  17.82us x 6  |  17.61us x 6
+
+`silu_and_mul` in the same runs came out 2.274, 2.286, 2.286 us -- a spread of
+0.5%, and 99th of 131 operators by instability. It is one of the steadiest
+things measured here, not one of the least, so whatever was seen on the 27B at
+tp=4 belongs to that configuration and not to the kernel.
+
+Two fields already in each price entry settle what `is_nonzero` is:
+
+    aten::is_nonzero   cache="over"    host_seconds = 52.32 of 53.44us   98%
+    every other op     cache="graph"   host_seconds = 0.0
+
+`microbench` records those and says what they mean -- "where this matches
+`seconds`, the device was idle waiting and the price is the host's, not the
+kernel's" -- but nothing ever added them up. Adding them up:
+
+      of which the host was waiting, not the device (0.709ms, 26.0% of step):
+        aten::is_nonzero    6   53.4us   98%  over
+        aten::item          6   18.9us  100%  over
+        aten::item          3   18.3us  100%  over
+        ...
+
+**Twenty-six percent.** Sixteen `aten::item` calls and nine `is_nonzero` -- the
+classic device-to-host reads -- each timing a wait for whatever the GPU had
+queued rather than any work. That is why they swing: they measure the queue.
+
+And they are all `cache="over"`, the fallback for operators that cannot be
+captured into a CUDA graph. `price_list.py` already says its total is to be
+"compared against the replayed step, not the eager one", and a replayed step
+performs no host synchronisations at all. So a quarter of a number describing
+what a deployment does is spent on something the deployment does not do.
+
+Reported rather than removed for now. Subtracting host time from a `cache="over"`
+operator is right for a pure synchronisation and wrong for one that overlaps real
+device work -- chunked-prefill attention is priced this way too, for a genuine
+reason -- and telling those apart needs the 27B's list, where collectives are in
+play. The number is on screen in the meantime, which is the part that was
+missing: it was recorded per entry from the beginning and never summed.
