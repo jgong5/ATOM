@@ -49,6 +49,24 @@ def main() -> int:
              "prefill keeps the steps themselves small, so this costs about "
              "684k tokens of forward.")
     parser.add_argument(
+        "--sweep-shard", default=None, metavar="I/N",
+        help="run only shard I of N of the sweep's rounds, so a long "
+             "calibration can be collected as several separately identified "
+             "fresh processes instead of one four-hour one. The rounds are "
+             "split contiguously after de-duplication; every shard still runs "
+             "its own rounds twice, because the warm/steady distinction is a "
+             "per-process property (Triton autotunes per shape per process) "
+             "and would be destroyed by splitting the two passes apart. "
+             "Sharding does not make the collection equivalent to a monolithic "
+             "sweep: each shard pays its own process warmup, and any effect "
+             "that depends on a long single process's history is not sampled.")
+    parser.add_argument(
+        "--sweep-rounds-out", default=None,
+        help="write one record per round -- shard, pass (warmup|steady), "
+             "shape and the wall-clock interval it occupied -- so each step "
+             "row in the measure file can be attributed to its round and pass "
+             "afterwards by its own `started_at`.")
+    parser.add_argument(
         "--sweep", action="store_true",
         help="Calibration workload: several rounds of varied prompt length and "
              "batch size, so the table holds prefill steps across a range of "
@@ -298,12 +316,42 @@ def main() -> int:
                     seen.add(entry)
                     unique.append(entry)
             rounds = unique
+        # A shard of the rounds, when asked for. Contiguous rather than
+        # strided, so a shard is a describable region of the ladder ("the long
+        # uniform rounds") and not an arbitrary sample of it; and taken here,
+        # after de-duplication, so the shards partition exactly the rounds a
+        # whole sweep would have run.
+        shard_label = None
+        if args.sweep_shard:
+            index, _, total = args.sweep_shard.partition("/")
+            index, total = int(index), int(total)
+            if not 0 <= index < total:
+                print(f"--sweep-shard {args.sweep_shard}: shard index out of "
+                      f"range")
+                return 2
+            size = -(-len(rounds) // total)
+            lo, hi = index * size, min((index + 1) * size, len(rounds))
+            shard_label = f"{index}/{total}"
+            print(f"sweep shard {shard_label}: rounds [{lo}, {hi}) of "
+                  f"{len(rounds)}")
+            rounds = rounds[lo:hi]
+            if not rounds:
+                print("sweep shard is empty")
+                return 2
+
         # Twice through, because Triton autotunes per shape rather than once per
         # process: the first visit to a shape pays a benchmarking cost that
         # steady-state serving never pays again. The second visit is the one
         # worth fitting, and having both lets the outlier rejection see the
         # difference rather than guess at it.
-        for round_index, (length, count, decode) in enumerate(rounds + rounds):
+        #
+        # Both passes stay in one process for that reason. Splitting them into
+        # two fresh processes would give two warmup passes and no steady one.
+        passes = [("warmup", r) for r in rounds] + [("steady", r)
+                                                    for r in rounds]
+        round_log = []
+        for round_index, (which_pass, (length, count, decode)) in enumerate(
+                passes):
             # A round is either `count` prompts of one length, or an explicit
             # list of lengths. The second exists because every uniform round
             # leaves the batch's *raggedness* at exactly one, and a fit cannot
@@ -315,6 +363,7 @@ def main() -> int:
             # help, because context was not the missing dimension.
             lengths = (list(length) if isinstance(length, (list, tuple))
                        else [length] * count)
+            began_at = time.time()
             llm.generate(
                 # Exactly `length` tokens each, and a distinct opening per
                 # prompt so no two share prefix-cache blocks. This built its
@@ -326,6 +375,18 @@ def main() -> int:
                  for i, n in enumerate(lengths)],
                 SamplingParams(temperature=0.0, max_tokens=decode),
             )
+            # Wall clock, not `perf_counter`: step rows carry `started_at` on
+            # the same epoch, so a row can be attributed to the round and pass
+            # it belongs to without the engine having to know about either.
+            round_log.append({
+                "round": round_index, "pass": which_pass,
+                "shard": shard_label, "lengths": lengths, "decode": decode,
+                "t0": began_at, "t1": time.time(),
+            })
+        if args.sweep_rounds_out:
+            with open(args.sweep_rounds_out, "w", encoding="utf-8") as fh:
+                json.dump({"shard": shard_label, "rounds": round_log}, fh,
+                          indent=1)
         print("sweep complete")
         with open(args.out, "w", encoding="utf-8") as fh:
             json.dump({"wall": 0.0, "requests": []}, fh)

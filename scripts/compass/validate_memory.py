@@ -39,7 +39,8 @@ import sys
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from atom.compass.core.memory_model import (  # noqa: E402
-    activation_curve, graph_pool_bytes, peak_activation_bytes, weight_bytes)
+    DEFAULT_PERSISTENT, activation_curve, graph_pool_bytes,
+    load_residue_bytes, non_torch_bytes, peak_activation_bytes, weight_bytes)
 
 GB = float(1 << 30)
 
@@ -81,15 +82,23 @@ def measured_pool(log_path: str) -> int:
     return int(float(found[-1]) * GB) if found else 0
 
 
-def row(name: str, derived, recorded, note: str = "") -> None:
+def row(name: str, derived, recorded, note: str = "", budget: int = 0) -> None:
+    """One term, its own error, and what that error is worth.
+
+    The relative column alone ranks a 14 MiB term missed by 93% alongside a
+    54 GB term missed by 2%. Only one of those can move the block count, so
+    the miss is also shown against the sizing budget it competes for.
+    """
     def show(value):
         return "       -" if value is None else "%7.3fG" % (value / GB)
-    if derived is None or not recorded:
-        error = "     -"
+    if derived is None or recorded is None or not recorded:
+        error, share = "     -", "      -"
     else:
         error = "%+5.1f%%" % ((derived - recorded) / recorded * 100)
-    print("  %-14s %8s %8s  %6s  %s" % (name, show(derived), show(recorded),
-                                        error, note))
+        share = ("%+6.2f%%" % ((derived - recorded) / budget * 100)
+                 if budget else "      -")
+    print("  %-14s %8s %8s  %6s %7s  %s" % (name, show(derived), show(recorded),
+                                            error, share, note))
 
 
 def write_calibration(records, path: str) -> None:
@@ -215,8 +224,8 @@ def main() -> int:
         tp = int((config.get("topology") or {}).get("tp", 1) or 1)
         non_torch_seen.append((os.path.basename(path), config, readings, tp))
 
-    print("  %-14s %8s %8s  %6s  %s"
-          % ("term", "derived", "recorded", "error", "note"))
+    print("  %-14s %8s %8s  %6s %7s  %s"
+          % ("term", "derived", "recorded", "error", "of bgt", "note"))
     for name, config, readings, tp in non_torch_seen:
         print("\n%s  --  %s tp=%d max_model_len=%s"
               % (name, config.get("model"), tp, config.get("max_model_len")))
@@ -225,6 +234,14 @@ def main() -> int:
         parameters = readings.get("parameter_bytes")
         current = readings.get("current_torch")
         peak = readings.get("peak_torch")
+
+        # What the terms are competing for: the fraction of the card the
+        # engine may spend. An error only matters as a share of this.
+        world = 1
+        for size in (config.get("topology") or {"tp": tp}).values():
+            world *= max(1, int(size or 1))
+        sizing_budget = int((readings.get("total") or 0)
+                            * float(config.get("gpu_memory_utilization") or 0))
 
         checkpoint = args.checkpoint
         derived_weights = weight_bytes(checkpoint, tp) if checkpoint else None
@@ -237,20 +254,22 @@ def main() -> int:
                         if parameters is not None and buffers is not None
                         else parameters)
         row("weights", derived_weights, weights_seen,
-            "" if parameters else "record predates the split")
+            "" if parameters else "record predates the split", sizing_budget)
         row("model buffers", None, buffers,
-            "not modelled; built at init, absent from the checkpoint")
+            "not modelled; built at init, absent from the checkpoint", sizing_budget)
 
         residue = (allocated - parameters
                    if allocated is not None and parameters is not None else None)
-        row("load residue", None, residue,
-            "not modelled; held after load, beyond the parameters")
+        row("load residue", load_residue_bytes(world), residue,
+            "collective pools held through the allocator", sizing_budget)
 
-        # Everything resident at sizing time that is neither the parameters nor
-        # a step's activations: forward buffers, and any residue still held.
-        persistent = (current - parameters
-                      if current is not None and parameters is not None else None)
-        row("persistent", None, persistent, "not modelled")
+        # The engine's own forward buffers, and nothing else: the residue above
+        # is already resident and counting it twice would make this row a sum
+        # of two terms rather than a term.
+        persistent = (current - allocated
+                      if current is not None and allocated is not None else None)
+        row("persistent", DEFAULT_PERSISTENT, persistent,
+            "engine forward buffers; flat in width", sizing_budget)
 
         derived_act = peak_activation_bytes(graph) if graph is not None else None
 
@@ -291,7 +310,13 @@ def main() -> int:
             note += "; warmup shape unknown (pass --max-num-batched-tokens)"
         row("activations", scaled, warmup_act, note)
 
-        row("non-torch", None, readings.get("non_torch"), "not modelled")
+        # `non_torch` is device-wide used memory minus this process's reserve,
+        # so a neighbour on the same card is charged here. A disagreement is
+        # therefore ambiguous between a wrong model and a busy box, and the
+        # ranks' spread is the tell: they hold the same thing, so where they
+        # differ, something outside the run does not.
+        row("non-torch", non_torch_bytes(world), readings.get("non_torch"),
+            "device-wide reading; a neighbour is charged here", sizing_budget)
 
         derived_pool = graph_pool_bytes(warmup_act) if warmup_act else None
         row("graph pool", derived_pool, readings.get("cudagraph_overhead"),
