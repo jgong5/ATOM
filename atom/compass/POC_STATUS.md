@@ -570,7 +570,14 @@ here so a future suite run in that container is not read as a full pass.
 **Run 2026-09-11, current source (99 files hash-verified host-to-node):** GPU
 container on node 18, one device visible — **502 passed, rc=0**, nothing
 excluded and nothing skipped, including `test_graph_alignment.py`. Re-run after
-the formatting fixes below: 502 passed, rc=0 again.
+the formatting fixes below: 502 passed, rc=0 again. Logs and exit codes on node 18 at
+`/tmp/xiaobizh-compass/ATOM/agent_scratch/g4/`: `pytest_gpu.log` / `.rc` and
+`pytest_gpu2.log` / `.rc` (GPU container `xiaobizh_n18`), `pytest_20260911.log`
+/ `.rc` and `pytest2.log` / `.rc` (device-free `xiaobizh_n18_cpu`). Each `.rc`
+holds pytest's own exit status, written by the runner rather than inferred
+from a pipeline. The source manifest checked host-to-node is
+`agent_scratch/edits/manifest.txt` plus `mf2.txt`, 99 files, sha256 equal on
+both sides.
 
 The same source in the **device-free CPU container** does not pass and is not
 reported as one: collection of `test_graph_alignment.py` fails with
@@ -581,14 +588,23 @@ logic, which is what the GPU run passing all 502 on identical source
 establishes. The device-free container is a valid environment for the replay
 gate (G5b) and is not a valid environment for the suite.
 
-Formatting, checked on the 45 changed/new Python files only: `atom/config.py`
-and `tests/compass/test_clock_advance.py` were black-clean at HEAD and were made
-clean again; the other 43 fail black both before and after, as do 19 of the 22
-modified files at HEAD, so the tree is not black-clean and was not swept. Ruff
-is advisory in CI (`--exit-zero`, reviewdog on diff context); 13 F541 findings
-introduced by this work were fixed, and the remaining per-file counts are
-recorded in the checkpoint rather than mass-fixed.
+Formatting, checked on the 45 changed/new Python files only, counts kept
+separate because new files have no HEAD version to compare against:
 
+* **22 modified tracked files.** At HEAD, 19 would be reformatted by black and
+  3 were clean (`atom/config.py`, `atom/model_engine/model_runner.py`,
+  `tests/compass/test_clock_advance.py`). This work left `model_runner.py`
+  clean and broke the other two, which were reformatted back to clean. The 19
+  fail both before and after and were not touched.
+* **23 new files.** 22 would be reformatted, 1 is clean. No before-state exists
+  for them; they follow the compass subtree's existing hand-formatted style,
+  which is not black-clean either (`atom/compass/core/graph.py` at HEAD fails
+  the same check).
+* Current totals across the 45: 41 would be reformatted, 4 clean.
+
+Ruff is advisory in CI (`--exit-zero`, reviewdog on diff context). 13 F541
+findings introduced by this work were fixed; the remaining per-file counts were
+recorded rather than mass-fixed, so no unrelated edit was swept in.
 
 ---
 
