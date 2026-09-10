@@ -5712,3 +5712,57 @@ box is not coverage: the context bounds hid a gap, the raggedness bounds hid a
 gap, and each time the samples were technically inside the box and nowhere near
 the data. The dimensions themselves are also workload-dependent, so "the sweep
 covers this" is a statement about a pair, never about a sweep alone.
+
+
+## Mild-raggedness rounds fix the 27B cost model, and expose a bigger problem
+
+Re-swept with a barely-ragged round at 1.15, which is where the 27B workload
+actually sits. Per-bucket error on the real step sequence, with the padding
+feature:
+
+| rung | before | after |
+| --- | --- | --- |
+| 1 | +1.6% | -0.1% |
+| 2 | **-54.2%** | **-5.4%** |
+| 4 | -10.1% | -7.5% |
+| 8 | -7.1% | **-2.0%** |
+| 16 | -15.3% | -22.7% |
+
+Rung 2 was the one the padding feature had been making worse, and sampling
+raggedness where the workload uses it fixes that. Rung 16 went the other way and
+is now the worst rung.
+
+**But the real run is not reproducible, and that matters more.** The same
+workload on the same idle box, twice:
+
+| | run 1 | run 2 |
+| --- | --- | --- |
+| real arrival to first step, median | 25.647s | 6.174s |
+| real TTFT, median | 56.437s | 27.578s |
+| modelled TTFT, median | 53.385s | 52.557s |
+| rung 32 steps in the real run | 164 | **none** |
+
+The real measurement moved by a factor of two and the simulator moved by 1.5%.
+One real run reached 32 concurrent sequences and the other never did.
+
+The *work* is reproducible -- 239.4s and 235.4s of prefill, 69.1s and 73.3s of
+decode, across three runs including the first pilot. What varies is the
+schedule: timing jitter in the paced arrivals, interacting with an engine at
+full utilisation, puts the run on a different concurrency path.
+
+**So the per-request numbers from a single pair of runs mean much less than they
+appear to.** TTFT came out +20.9% on one pair and +128.8% on the next, with a
+better cost model on the second -- almost all of that difference is the real
+side, not the model. Any per-request claim on this workload needs repeats and an
+interval, which is what the retrospective asked for and what none of these runs
+have.
+
+The per-bucket cost error does not have this problem: it is computed by applying
+the fit to the real run's own steps, so it is a within-run comparison and both
+runs agree about it to a couple of points except at rung 16.
+
+**What to do about it.** Report cost error per bucket, which is stable, and stop
+quoting single-run per-request figures. For a per-request claim, repeat the real
+run several times and compare the simulator against the distribution rather than
+against one draw. A workload with slack would also help, since saturation is
+what makes the concurrency path so sensitive.
