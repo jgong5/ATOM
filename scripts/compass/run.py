@@ -189,10 +189,33 @@ def main() -> int:
                 # one within a percent.
                 (1024, 8, long_decode), (4096, 8, long_decode),
                 (16384, 8, long_decode), (65536, 8, long_decode),
+                (131072, 8, long_decode),
                 (1024, 16, long_decode), (4096, 16, long_decode),
                 (16384, 16, long_decode), (65536, 16, long_decode),
                 (1024, 32, long_decode), (4096, 32, long_decode),
                 (16384, 32, long_decode), (49152, 32, long_decode),
+                # Rungs 2 and 4 at long context. They had ragged rounds and no
+                # uniform ones, so their only long samples came from `_skewed`,
+                # whose single long sequence tops out at 32768. That left rung 2
+                # calibrated to a total context of 33856 and rung 4 to 57209 --
+                # and a real 27B run asked them for 163676 and 299712, five
+                # times outside the evidence, with the extrapolation warning
+                # firing on every such step. Rung 8 reached 569320 against a
+                # calibrated 524544, so it gets one more sample too.
+                #
+                # A small batch only reaches a large total context when each of
+                # its few members is individually long, which is what a nearly
+                # drained queue of long requests looks like -- exactly how a
+                # long-prompt workload ends. It is a different gap from the
+                # raggedness one closed earlier: that was the spread within a
+                # batch, this is the product of a small batch and a long
+                # history, and no amount of raggedness reaches it.
+                (1024, 2, long_decode), (4096, 2, long_decode),
+                (16384, 2, long_decode), (65536, 2, long_decode),
+                (131072, 2, long_decode),
+                (1024, 4, long_decode), (4096, 4, long_decode),
+                (16384, 4, long_decode), (65536, 4, long_decode),
+                (131072, 4, long_decode),
             ]
             # Ragged batches, so raggedness varies and can be fitted. Lengths
             # spread geometrically within one batch, which is what a real
@@ -228,6 +251,32 @@ def main() -> int:
             # leaves a hole exactly where the second workload lives, and the
             # padding coefficient is then fitted far from where it is used. On
             # the 27B that made rung 2 worse with the feature than without it.
+            # Mildly ragged *at long context*. The rounds below are ragged
+            # but short, and the uniform long-context rounds above are long but
+            # perfectly uniform, so where a long-prompt workload actually lives
+            # -- long histories, mildly ragged -- there was nothing. Measured on
+            # the 27B: at the contexts its run uses, every one of the sweep's 64
+            # rung-16 samples sat at raggedness exactly 1.00 while the run ran
+            # at 1.18-1.32, and none of its rung-8 samples were in the run's
+            # band either.
+            #
+            # Padding is identically zero at raggedness 1.00, so the padding
+            # coefficient had no variance to be identified from in that region.
+            # That is the same rank deficiency the term was introduced to fix,
+            # surviving locally after being fixed globally -- a bounding box
+            # containing the workload is not evidence near it. Rung 16 was
+            # covered on context and on raggedness separately and still came out
+            # 22.58% low, five times any other rung's error.
+            # Two per rung, so the padding coefficient has a spread to be
+            # fitted from there and not a single point. The first sits at about
+            # 1.15 and the second above the run's band; the uniform rounds above
+            # supply raggedness 1.00, so together they bracket it.
+            for rung, low, high in ((2, 98304, 131072), (4, 98304, 131072),
+                                    (8, 65536, 98304), (16, 49152, 65536),
+                                    (2, 54026, 88064), (4, 53857, 77824),
+                                    (8, 40206, 65536), (16, 26757, 53248)):
+                rounds += [(_spread(rung, low, high), rung, long_decode)]
+
             for rung in (2, 4, 8, 16, 32):
                 rounds += [
                     # Barely ragged: a batch of similar long histories.

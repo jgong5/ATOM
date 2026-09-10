@@ -6506,3 +6506,65 @@ operator sitting at the timer's resolution. silu_and_mul itself drifts 2.335 ->
 
 The attempt was worth more than its result: chasing it is what turned up the
 quarter of the priced step spent waiting on the host.
+
+
+## Coverage is checked against the table, not against the rounds
+
+`scripts/compass/coverage.py` reads a calibration table and a run's steps and
+says, per CUDA-graph rung, whether the run goes outside what was measured. It
+exists because the rounds a sweep asks for and the samples it produces are not
+the same thing -- rounds are clamped to the model's context window silently, and
+a commit here once claimed coverage from the rounds and was wrong by 90k.
+
+On the 27B it found more than expected:
+
+  rung  sweep max ctx   run max ctx   verdict
+     2         33856        200722    EXTRAPOLATES 5.9x on 635 of 635 steps
+     4         57209        427645    EXTRAPOLATES 7.5x on 775 of 775 steps
+     8        524544        816120    EXTRAPOLATES 1.6x on 878 of 987 steps
+
+2288 of 4346 decode steps -- over half -- priced outside the table. The cause was
+in the rounds: rungs 2 and 4 had ragged rounds but no uniform long-context ones,
+so their only long samples came from `_skewed`, whose single long sequence tops
+out at 32768.
+
+### What closing it was worth
+
+Adding uniform long-context rounds at rungs 2, 4 and 8 closes it -- 0 rungs
+extrapolating -- and the error moves, unevenly:
+
+| rung | before | after |
+| --- | --- | --- |
+| 1 | -0.44% | -0.28% |
+| 2 | -2.78% | **-0.38%** |
+| 4 | -4.77% | -3.92% |
+| 8 | -2.12% | -2.27% |
+| 16 | -22.58% | **-22.57%** |
+| overall | -3.23% | -2.70% |
+
+A caution was recorded before this ran -- that extrapolation and inaccuracy are
+not the same thing, since the two rungs extrapolating five to sevenfold were
+within 5% while the worst rung was a covered one. Half right. Rung 2 improved
+sevenfold, so "do not expect much" was too pessimistic. Rung 16 did not move at
+all, which was exactly right and is the more interesting half.
+
+### Rung 16 is covered on both axes and still 22.6% low
+
+Because a bounding box is not coverage. Its context range is covered and its
+raggedness range is covered -- but not together. Among the sweep's rung-16
+samples that reach the contexts the run uses:
+
+    64 samples, raggedness 1.00 to 1.00.   The run runs at 1.18 to 1.32.
+    In the run's band: none.
+
+Rung 8 is the same, 64 samples all at 1.00 against a run at 1.12-1.20. Padding is
+identically zero at raggedness 1.00, so the padding coefficient has no variance
+to be identified from where the workload lives. That is the same rank deficiency
+the term was introduced to fix, surviving locally after being fixed globally.
+
+The uniform rounds above do not touch this -- they add long-context samples at
+raggedness exactly 1.00, so afterwards rungs 2, 4 and 8 have 64 to 128 samples
+at the run's contexts and still none in its raggedness band. Measured, not
+assumed. Mildly ragged long-context rounds are added for that, two per rung, and
+verified to bracket the run: rung 2 spans 1.00-1.24 against a run at 1.03-1.18,
+rung 16 spans 1.00-1.38 against 1.18-1.32.
