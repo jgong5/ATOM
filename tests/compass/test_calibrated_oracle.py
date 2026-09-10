@@ -10,7 +10,8 @@ import json
 import pytest
 
 from atom.compass.core.cost.base import StepShape
-from atom.compass.core.cost.calibrated import CalibratedCostOracle, _least_squares
+from atom.compass.core.cost.calibrated import (
+    CalibratedCostOracle, _least_squares, _truthy)
 
 
 def write_table(path, rows):
@@ -129,6 +130,77 @@ class TestOracle:
         rows[5] = (rows[5][0], 0, 5.0, True)
         oracle = CalibratedCostOracle(write_table(tmp_path / "t.jsonl", rows))
         assert "dropped" in oracle.describe()
+
+
+class TestLeadingWarmupIsReportedNotCharged:
+    """The sweep's own first steps are autotuning, and they do not transfer.
+
+    A calibration sweep pays for Triton's per-shape autotuning on its first
+    forwards: 47.5 s, 19.5 s and 6.1 s at 8, 32 and 96 tokens on the 27B, where
+    the same shapes later cost 0.11 s. The fit rejects all three, correctly.
+
+    A serving run pays a first-step cost too -- 6.87 s, steady to 1.3% over four
+    repeats -- and it is tempting to predict the second from the first. It was
+    tried: charging the sweep's 72.8 s to the run's leading steps priced its
+    first step at 47.56 s against 6.87 s measured and moved prefill from +0.10%
+    to +31.03%. They are different programs; a server spends most of the
+    process-level warmth in startup, before its first measured step.
+
+    So the number is measured and said out loud, and never charged. These pin
+    that down, because "report it" is one edit away from "use it".
+    """
+
+    @staticmethod
+    def _with_warmup(tmp_path):
+        rows = [(n, 0, 0.005 + n * 1e-5, True) for n in range(128, 4096, 128)]
+        # Three leading steps costing far more than their shape says, then the
+        # ordinary sweep. The same shapes appear later, so nothing but position
+        # distinguishes them.
+        warm = [(128, 0, 4.0, True), (256, 0, 1.5, True), (384, 0, 0.4, True)]
+        return write_table(tmp_path / "t.jsonl", warm + rows)
+
+    def test_it_is_found_and_reported(self, tmp_path):
+        oracle = CalibratedCostOracle(self._with_warmup(tmp_path))
+        assert len(oracle._warmup) == 3
+        assert "leading warmup in table=3 steps" in oracle.describe()
+        assert "not charged" in oracle.describe()
+
+    def test_it_is_not_charged_to_any_prediction(self, tmp_path):
+        """The whole point. Detection must not become pricing."""
+        table = self._with_warmup(tmp_path)
+        on = CalibratedCostOracle(table)
+        off = CalibratedCostOracle(table, warmup="off")
+        # Including the first estimate the oracle ever makes, which is where a
+        # replayed warmup would land.
+        for shape in (prefill(128), prefill(128), prefill(2048)):
+            assert on.estimate(shape).seconds == pytest.approx(
+                off.estimate(shape).seconds)
+
+    def test_an_ordinary_sweep_reports_none(self, tmp_path):
+        """Absence has to be distinguishable from presence, or the report is
+        decoration."""
+        rows = [(n, 0, 0.005 + n * 1e-5, True) for n in range(128, 4096, 128)]
+        oracle = CalibratedCostOracle(write_table(tmp_path / "t.jsonl", rows))
+        assert oracle._warmup == []
+        assert "leading warmup" not in oracle.describe()
+
+    def test_it_stops_at_the_first_ordinary_step(self, tmp_path):
+        """A later autotuning stall is contamination, not warmth: it happens at
+        whatever shape the sweep had reached, and a run will not meet it there."""
+        rows = [(n, 0, 0.005 + n * 1e-5, True) for n in range(128, 4096, 128)]
+        rows[10] = (rows[10][0], 0, 9.0, True)
+        oracle = CalibratedCostOracle(write_table(
+            tmp_path / "t.jsonl", [(128, 0, 4.0, True)] + rows))
+        assert len(oracle._warmup) == 1
+
+    @pytest.mark.parametrize("value,expected", [
+        ("off", False), ("0", False), ("false", False), ("no", False),
+        ("on", True), ("1", True), (True, True), (False, False),
+    ])
+    def test_the_option_survives_being_a_string(self, value, expected):
+        """Oracle options arrive from a command line, so "off" must mean off and
+        not merely be a non-empty string."""
+        assert _truthy(value) is expected
 
 
 class TestExtrapolationIsAnnounced:

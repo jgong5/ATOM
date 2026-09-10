@@ -109,6 +109,58 @@ def _decode_bucket_features(shape: StepShape) -> list[float]:
     return [1.0, context, padding]
 
 
+def _truthy(value) -> bool:
+    """Options arrive from the command line as strings, so "off" must mean off."""
+    if isinstance(value, bool):
+        return value
+    return str(value).strip().lower() not in {"0", "off", "false", "no", ""}
+
+
+def _leading_warmup(rows: list[list[float]], targets: list[float],
+                    coeffs: list[float], ratio: float) -> list[float]:
+    """Seconds the sweep's own first steps cost above what their shape says.
+
+    Triton autotunes per shape and the first forwards of a process pay for it.
+    On the 27B sweep the first three prefill steps took 47.5 s, 19.5 s and 6.1 s
+    at 8, 32 and 96 tokens; the same shapes later took about 0.11 s. That is not
+    a function of the step, so ``_least_squares`` is right to reject all three --
+    their relative residuals are 0.99.
+
+    **This is measured and reported, not charged.** A real serving run pays a
+    first-step cost too -- 6.87 s on the 27B, and a remarkably steady one, 6.75,
+    6.66, 6.69 and 6.68 s across four repeats -- and it is tempting to treat the
+    sweep's leading warmth as a prediction of it. It is not. The two are
+    different quantities:
+
+        sweep, first three prefill steps      72.80 s, at 8/32/96 tokens
+        serving run, first prefill step        6.87 s, at 640 tokens
+
+    Charging the first to the second was tried and it moves the run's prefill
+    total from +0.10% to +31.03%, with the first step priced at 47.56 s against
+    6.87 s measured. The reason is that they are different programs: a server
+    does a profile run and captures graphs before its first *measured* step, so
+    most of the process-level warmth is already spent by then, while the sweep
+    meets it head-on. How much is left over depends on what the server did at
+    startup, which is not in this table.
+
+    So what is returned here exists to be said out loud in ``describe`` -- the
+    model has no term for the first step of a run, and a reader comparing a
+    simulated run against a real one should know that the simulated one starts
+    ahead. Learning the residual warmth properly needs the first use of each
+    shape class to survive the fit, which is a different piece of work.
+
+    Only a *leading* run of steps is taken, and only while each costs at least
+    ``ratio`` times what its shape predicts.
+    """
+    out: list[float] = []
+    for features, measured in zip(rows, targets):
+        predicted = sum(c * f for c, f in zip(coeffs, features))
+        if predicted <= 0.0 or measured < ratio * predicted:
+            break
+        out.append(measured - predicted)
+    return out
+
+
 def _drop_constant_columns(rows: list[list[float]]) -> tuple[list[list[float]], list[int]]:
     """Remove features that never vary, and say which were kept.
 
@@ -222,7 +274,8 @@ class CalibratedCostOracle:
     """Predicts step duration from coefficients fitted to measured steps."""
 
     def __init__(self, table: str, floor_seconds: float = 1e-6,
-                 rank_coords: Optional[dict] = None) -> None:
+                 rank_coords: Optional[dict] = None, warmup=True,
+                 warmup_ratio: float = 3.0) -> None:
         """
         Args:
             table: Path to a JSONL file written by ``--compass-mode=measure``.
@@ -234,6 +287,16 @@ class CalibratedCostOracle:
             rank_coords: This rank's coordinates, supplied by the runner when
                 the run is parallel. Absent for a single-rank run, where no
                 per-rank table was written in the first place.
+            warmup: Measure the autotuning the sweep paid on its own first
+                steps and report it in ``describe``. It is not charged to any
+                prediction -- see ``_leading_warmup`` for why the sweep's
+                warmth does not transfer to a serving run's. Pass
+                ``warmup=off`` to skip the detection.
+            warmup_ratio: How much more than its shape predicts a leading step
+                must cost to be called warmth rather than noise. Three is well
+                clear of both sides on the evidence here: the steps this is
+                meant to catch run 50 to 400 times their prediction, and the
+                first ordinary step after them runs about 1.3 times.
         """
         self.table, own = resolve_rank_path(table, rank_coords)
         if rank_coords and not own:
@@ -280,6 +343,12 @@ class CalibratedCostOracle:
         # whether it is interpolating or extrapolating.
         self._hull: dict = {}
         self._warned: set = set()
+        # Reported, never charged. The model has no term for the first step of
+        # a run, and this is how it admits that rather than letting a reader
+        # infer from a total that it does.
+        self._warmup_enabled = _truthy(warmup)
+        self._warmup_ratio = float(warmup_ratio)
+        self._warmup: list[float] = []
         self._fit()
 
     def _fit(self) -> None:
@@ -325,6 +394,13 @@ class CalibratedCostOracle:
             self._fallback_prefill = sum(prefill_targets) / len(prefill_targets)
             self._prefill, self._dropped_prefill = _least_squares(
                 prefill_rows, prefill_targets)
+            if self._prefill is not None and self._warmup_enabled:
+                # After the fit, so "what its shape predicts" means the model
+                # this table produced, not one contaminated by the very steps
+                # being measured against it.
+                self._warmup = _leading_warmup(
+                    prefill_rows, prefill_targets, self._prefill,
+                    self._warmup_ratio)
         if decode_targets:
             self._fallback_decode = sum(decode_targets) / len(decode_targets)
             self._decode, self._dropped_decode = _least_squares(
@@ -489,11 +565,24 @@ class CalibratedCostOracle:
                 for b in sorted(self._decode_by_bucket)
             ) + "}"
 
+        warmup = ""
+        if self._warmup:
+            # Said out loud because nothing else will say it: the table's first
+            # steps were autotuning, the fit dropped them, and no coefficient
+            # replaces them. A simulated run therefore starts ahead of a real
+            # one by however much that run's own first step costs, which is a
+            # different number from this one and is not in this table.
+            warmup = (f", leading warmup in table={len(self._warmup)} steps "
+                      f"totalling {sum(self._warmup):.2f}s, not charged")
+        elif not self._warmup_enabled:
+            warmup = ", warmup detection off"
+
         return (
             "CalibratedCostOracle("
             + part("prefill", self._prefill, self._n_prefill, self._dropped_prefill)
             + ", "
             + part("decode", self._decode, self._n_decode, self._dropped_decode)
             + rungs
+            + warmup
             + ")"
         )

@@ -6043,3 +6043,101 @@ the driver is reset.
 
 Everything above is measured, not inferred from that experiment. What the
 experiment would add is the counterfactual.
+
+
+## The counterfactual: a 3% price change moves TTFT by 29%
+
+The previous section reconstructed the mechanism from saved step tables and said
+the test that would close it is to re-price prefill a few percent cheaper and
+watch the two decode windows reopen. Node 18 came back, so it ran -- on an idle
+machine, four runs: the real workload, and the simulated one at three prefill
+prices.
+
+| prefill price | TTFT median | prefill streaks | longest |
+| --- | --- | --- | --- |
+| **real** | **27.63 s** | 5 | **42** |
+| x1.00 | 52.40 s | 6 | 63 |
+| **x0.97** | **37.31 s** | 8 | **42** |
+| x1.03 | 54.33 s | 6 | 63 |
+
+At x0.97 the 63-chunk streak splits back into 42 + 7 + 15, which is the real
+run's structure exactly, and it breaks where the real run breaks:
+
+| streak ends at | real | x1.00 | x0.97 |
+| --- | --- | --- | --- |
+| 42-chunk | 213.1 (+1.4 s) | merged | **213.7 (+0.8 s)** |
+| 7-chunk | 231.2 (+1.2 s) | merged | **230.6 (+1.9 s)** |
+
+So the mechanism is confirmed end to end: the error is not 90% of cost, it is 3%
+of cost landing on the wrong side of two comparisons with a second or two of
+slack. TTFT does not close all the way -- 37.31 s against 27.63 s -- which is
+consistent with the bias being shape-dependent rather than a uniform scale, and
+that is what the long-context overshoot is about.
+
+Two things worth recording about the runs themselves. They reproduce node 18's
+earlier ones 25 hours apart to three digits: real TTFT 27.63 s against 27.54,
+27.57, 27.61, 27.62; simulated 52.40 s against 52.40. And these carry the
+decision record, so the reconstruction could be checked rather than believed --
+across all four runs, **zero** decode steps were taken while an *eligible*
+prefill was waiting. The reconstruction was right.
+
+The check needed one correction, which is worth keeping. `waiting_prefill_-
+outstanding` counts every waiting request that still owes prefill, arrived or
+not, and by that counter the simulated run has 2340 apparent violations. All of
+them also show `waiting_held_for_arrival`, so the requests owed prefill but were
+not yet eligible. The two sides simply book a future request in different
+places: the paced client has not posted it, the declaring client has, and the
+barrier holds it. Eligibility is the difference of the two counters, and on that
+both sides are clean.
+
+## The sweep's warmth does not transfer to a run's, and it was tried
+
+Its own first three prefill steps cost the 27B sweep 47.5 s, 19.5 s and 6.1 s at
+8, 32 and 96 tokens, where the same shapes later cost 0.11 s. A first thought
+was that this is contaminating the fit. It is not: `_least_squares` already
+rejects all three, at relative residuals of 0.99, and the docstring saying it
+exists for Triton's per-shape autotuning is accurate.
+
+The second thought was that the rejected rows are exactly the information the
+model lacks -- a real run's first step costs 6.87 s and is priced at 0.13 s -- so
+they should be replayed onto the first steps of a simulated run. That was
+implemented and it is wrong:
+
+| | first step | prefill total |
+| --- | --- | --- |
+| measured | 6.87 s | 235.41 s |
+| not charged | 0.13 s | 235.65 s (+0.10%) |
+| sweep's warmth charged | **47.56 s** | 308.45 s (**+31.03%**) |
+
+The two quantities are 72.80 s and 6.87 s and they are not the same thing. A
+server does a profile run and captures graphs before its first *measured* step,
+so most of the process-level warmth is spent by then; a sweep meets it head-on.
+How much is left over is a property of what the server did at startup, which is
+not in the calibration table.
+
+So the oracle now measures the leading warmth and says so in `describe`, and
+charges nothing:
+
+    CalibratedCostOracle(prefill=fitted on 944 steps, 138 dropped, ...,
+                         leading warmup in table=3 steps totalling 72.80s,
+                         not charged)
+
+with a test that the estimate is identical whether detection is on or off,
+because "report it" is one edit away from "use it".
+
+## An accuracy number that cannot cancel
+
+`scripts/compass/price_steps.py` prices a recorded step table against a
+calibration table and refuses to report only the total:
+
+    prefill: 106 steps  measured 235.41s  priced 235.65s
+      on totals              +0.10%
+      holding out step 0       +3.06%   (measured 6.87s, priced 0.13s, -6.75s)
+      median per step        -0.27%
+      ^ one step moves the total by 3.0 points. The total is describing that
+        step, not the model.
+
+It also gets the negative case right, which is what makes it worth having:
+decode on the same run reads -2.83% on totals and -2.82% held out, so nothing is
+hiding there, and the gap between that and its -0.42% median says decode's error
+sits in its expensive steps rather than in one of them.
