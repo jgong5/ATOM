@@ -202,6 +202,20 @@ def audit(samples: list[dict]) -> dict:
     if not samples:
         return _unwatched()
 
+    # Samples carrying no card reading at all: rocm-smi failed and the sampler
+    # wrote the failure down rather than dropping it. Every finding below is
+    # made from card readings, so a file of these has nothing in it to find --
+    # and a run nobody managed to watch must not read as a quiet one.
+    blind = [s for s in samples if not _cards(s)]
+    if len(blind) == len(samples):
+        out = _unwatched()
+        out["samples"] = len(samples)
+        out["span"] = [samples[0].get("t"), samples[-1].get("t")]
+        out["problems"] = [
+            "%d sample(s) were taken and none carried a card reading: "
+            "this run went unwatched" % len(samples)]
+        return out
+
     owned = set()
     own_pids = set()
     for sample in samples:
@@ -281,6 +295,10 @@ def audit(samples: list[dict]) -> dict:
         unknowns.append(
             "cards %s showed a single unexplained activity sample"
             % _describe(unclear_neighbours, len(samples)))
+    if blind:
+        unknowns.append(
+            "%d of %d samples carried no card reading, so that much of the "
+            "window went unobserved" % (len(blind), len(samples)))
 
     own_clean = not own_problems
     node_quiet = not node_problems

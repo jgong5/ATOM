@@ -912,9 +912,12 @@ def cell(args) -> int:
 
     failures += check_gpu_free(cell_dir, modelled_paths)
 
+    # Every step table this cell wrote, whichever repeat wrote it and whichever
+    # rank suffix the engine appended: a predictor calibrated on any of them is
+    # calibrated on the run it is being compared against.
     forbidden = {
-        "real step table": _digest(cell_dir / "real_steps.jsonl"),
-        "real step table (rank 0)": _digest(cell_dir / "real_steps.tp0.jsonl"),
+        f"step table {p.name}": _digest(p)
+        for p in sorted(cell_dir.glob("*_steps*.jsonl"))
     }
 
     reports = []

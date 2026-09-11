@@ -3,8 +3,8 @@
 The plan runs nothing, so there is no result to check. What there is to check is
 that the sequence it prints is the protocol's: the real side paced and prepared
 on the leased node, the modelled side declared and unprepared in a container
-with no device, the device-free probe taken where the prediction happened, and
-the validator last.
+with no device, a fresh server for every repeat on both sides, the device-free
+probe taken where the prediction happened, and the validator last.
 """
 
 from __future__ import annotations
@@ -46,12 +46,16 @@ def _run(argv, capsys=None):
     return buffer.getvalue()
 
 
-def _steps(plan, cell_index=0):
-    return plan["cells"][cell_index]["steps"]
-
-
 def _by_id(cell):
     return {s["id"]: s for s in cell["steps"]}
+
+
+def _role(cell, role, side=None):
+    return [
+        s
+        for s in cell["steps"]
+        if s["role"] == role and (side is None or s.get("side") == side)
+    ]
 
 
 class TestTheMatrixItCovers:
@@ -72,40 +76,116 @@ class TestTheMatrixItCovers:
             assert cell["cell"] in plan["matrix"]
 
 
+class TestARepeatIsAProcess:
+    """Section 3 registers three repeats a side, each from a fresh process.
+
+    On the modelled side this is not bookkeeping: a predicting server's virtual
+    epoch is fixed when it starts, so a second replay against the same process
+    is stamped from an origin the first one already moved.
+    """
+
+    def test_each_repeat_starts_and_stops_its_own_server(self, plan):
+        for cell in plan["cells"]:
+            for side in ("real", "modelled"):
+                serves = _role(cell, "serve", side)
+                stops = [s for s in _role(cell, "stop", side) if "serve" in s["stops"]]
+                replays = _role(cell, "replay", side)
+                assert len(serves) == len(replays) == len(stops) == plan["repeats"]
+                assert [s["repeat"] for s in serves] == [1, 2, 3]
+
+    def test_a_repeat_s_replay_sits_between_its_own_serve_and_stop(self, plan):
+        for cell in plan["cells"]:
+            ids = [s["id"] for s in cell["steps"]]
+            for side in ("real", "modelled"):
+                for n in range(1, plan["repeats"] + 1):
+                    serve = ids.index(f"serve-{side}-{n}")
+                    replay = ids.index(f"replay-{side}-{n}")
+                    stop = ids.index(f"stop-{side}-{n}")
+                    assert serve < replay < stop
+
+    def test_no_server_outlives_the_repeat_that_started_it(self, plan):
+        """The previous repeat's process is stopped before the next starts."""
+        for cell in plan["cells"]:
+            ids = [s["id"] for s in cell["steps"]]
+            for side in ("real", "modelled"):
+                for n in range(1, plan["repeats"]):
+                    assert ids.index(f"stop-{side}-{n}") < ids.index(
+                        f"serve-{side}-{n + 1}"
+                    )
+
+    def test_every_stop_names_the_step_that_started_the_process(self, plan):
+        for cell in plan["cells"]:
+            ids = {s["id"] for s in cell["steps"]}
+            for step in _role(cell, "stop"):
+                assert step["stops"] in ids
+                assert step["command"] is None
+                assert (
+                    "signalling the process it started" in step["provided_by"]
+                    or "signalling the sampler it started" in step["provided_by"]
+                )
+
+    def test_each_repeat_writes_its_own_step_table(self, plan):
+        """The engine opens measure_out with "w": one shared name would leave
+        one table and two runs that overwrote each other."""
+        for cell in plan["cells"]:
+            tables = [
+                s["command"][s["command"].index("--compass-measure-out") + 1]
+                for s in _role(cell, "serve", "real")
+            ]
+            assert len(set(tables)) == len(tables) == plan["repeats"]
+
+
 class TestTheTwoSidesAreNotRunTheSameWay:
     def test_the_real_side_is_paced_and_prepared(self, plan):
         for cell in plan["cells"]:
-            for step in cell["steps"]:
-                if step["id"].startswith("replay-real"):
-                    assert "--pace" in step["command"]
-                    assert "--prepare" in step["command"]
-                    assert step["where"] == "gpu"
+            for step in _role(cell, "replay", "real"):
+                assert "--pace" in step["command"]
+                assert "--prepare" in step["command"]
+                assert step["where"] == "gpu"
 
     def test_the_modelled_side_is_neither(self, plan):
         """A paced modelled side answers a different arrival process, and a
         prepared one has been warmed -- both are refusals in the validator."""
         for cell in plan["cells"]:
-            for step in cell["steps"]:
-                if step["id"].startswith("replay-modelled"):
-                    assert "--pace" not in step["command"]
-                    assert "--prepare" not in step["command"]
-                    assert step["where"] == "device_free"
+            for step in _role(cell, "replay", "modelled"):
+                assert "--pace" not in step["command"]
+                assert "--prepare" not in step["command"]
+                assert step["where"] == "device_free"
 
     def test_the_modelled_side_predicts_and_the_real_side_measures(self, plan):
         steps = _by_id(plan["cells"][0])
-        real = steps["serve-real"]["command"]
-        modelled = steps["serve-modelled"]["command"]
+        real = steps["serve-real-1"]["command"]
+        modelled = steps["serve-modelled-1"]["command"]
         assert real[real.index("--compass-mode") + 1] == "measure"
         assert modelled[modelled.index("--compass-mode") + 1] == "predict"
         assert "--compass-measure-out" in real
-        assert steps["serve-real"]["where"] == "gpu"
-        assert steps["serve-modelled"]["where"] == "device_free"
+        assert steps["serve-real-1"]["where"] == "gpu"
+        assert steps["serve-modelled-1"]["where"] == "device_free"
+
+    def test_the_modelled_side_serves_through_the_device_free_entry_point(self, plan):
+        """The module entry point asks the driver for the chip at import, which
+        on a machine with no device fails before a flag could be parsed."""
+        for cell in plan["cells"]:
+            for step in _role(cell, "serve", "modelled"):
+                assert "scripts/compass/replay_server.py" in step["command"]
+                assert "--compass-replay-target" in step["command"]
+            for step in _role(cell, "serve", "real"):
+                assert "atom.entrypoints.openai.api_server" in step["command"]
+                assert "--compass-replay-target" not in step["command"]
+
+    def test_a_replay_target_reaches_every_modelled_repeat(self):
+        got = json.loads(_run(["--root", "/r", "--replay-target", "/w/t.json"]))
+        for cell in got["cells"]:
+            for step in _role(cell, "serve", "modelled"):
+                command = step["command"]
+                assert command[command.index("--compass-replay-target") + 1] == (
+                    "/w/t.json"
+                )
 
     def test_both_sides_carry_the_registered_engine_configuration(self, plan):
         for cell in plan["cells"]:
-            steps = _by_id(cell)
-            for name in ("serve-real", "serve-modelled"):
-                command = steps[name]["command"]
+            for step in _role(cell, "serve"):
+                command = step["command"]
                 for arg in plan_mod.ENGINE_ARGS:
                     assert arg in command
                 assert "--no-enable_prefix_caching" in command
@@ -114,7 +194,7 @@ class TestTheTwoSidesAreNotRunTheSameWay:
     def test_each_side_replays_the_registered_workload_for_its_class(self, plan):
         for cell in plan["cells"]:
             expected = f"atom/compass/cc_traces_{cell['class']}.jsonl"
-            replays = [s for s in cell["steps"] if s["id"].startswith("replay-")]
+            replays = _role(cell, "replay")
             assert replays
             for step in replays:
                 assert expected in step["command"]
@@ -123,17 +203,44 @@ class TestTheTwoSidesAreNotRunTheSameWay:
     def test_the_repeat_count_is_the_protocol_s_on_both_sides(self, plan):
         for cell in plan["cells"]:
             for side in ("real", "modelled"):
-                got = [s for s in cell["steps"] if s["id"].startswith(f"replay-{side}")]
-                assert len(got) == plan["repeats"] == plan_mod.REPEATS
+                assert len(_role(cell, "replay", side)) == plan["repeats"]
+                assert plan["repeats"] == plan_mod.REPEATS
 
     def test_an_oracle_option_reaches_only_the_modelled_side(self):
         got = json.loads(
             _run(["--root", "/r", "--oracle", "O", "--oracle-option", "library=/w/l"])
         )
         steps = _by_id(got["cells"][0])
-        assert "--compass-oracle-option" in steps["serve-modelled"]["command"]
-        assert "library=/w/l" in steps["serve-modelled"]["command"]
-        assert "--compass-oracle-option" not in steps["serve-real"]["command"]
+        assert "--compass-oracle-option" in steps["serve-modelled-1"]["command"]
+        assert "library=/w/l" in steps["serve-modelled-1"]["command"]
+        assert "--compass-oracle-option" not in steps["serve-real-1"]["command"]
+
+
+class TestTheNodeIsWatchedForTheWholeWindow:
+    def test_a_baseline_sample_is_taken_before_any_server(self, plan):
+        """The only sample that can show a card was already somebody else's."""
+        for cell in plan["cells"]:
+            ids = [s["id"] for s in cell["steps"]]
+            assert ids.index("sample-baseline") < ids.index("serve-real-1")
+            baseline = _by_id(cell)["sample-baseline"]["command"]
+            assert baseline[baseline.index("--phase") + 1] == "baseline"
+            assert "--once" in baseline
+
+    def test_the_sampler_runs_across_every_real_repeat(self, plan):
+        for cell in plan["cells"]:
+            ids = [s["id"] for s in cell["steps"]]
+            assert ids.index("sample") < ids.index("serve-real-1")
+            assert ids.index(f"stop-real-{plan['repeats']}") < ids.index("stop-sample")
+            assert _by_id(cell)["sample"]["background"] is True
+
+    def test_the_sampler_writes_what_the_audit_reads(self, plan):
+        for cell in plan["cells"]:
+            for name in ("sample", "sample-baseline"):
+                command = _by_id(cell)[name]["command"]
+                assert "scripts/compass/gpu_sampler.py" in command
+                assert f"{cell['cell']}/gpu.jsonl" in command
+            audit = _by_id(cell)["isolation"]["command"]
+            assert f"{cell['cell']}/gpu.jsonl" in audit
 
 
 class TestTheOrderIsTheProtocolS:
@@ -148,12 +255,18 @@ class TestTheOrderIsTheProtocolS:
         for cell in plan["cells"]:
             steps = _by_id(cell)
             assert steps["gpu-free"]["where"] == "device_free"
-            assert steps["gpu-free"]["where"] == steps["serve-modelled"]["where"]
+            assert steps["gpu-free"]["where"] == steps["serve-modelled-1"]["where"]
 
     def test_the_isolation_audit_follows_the_measured_window(self, plan):
         ids = [s["id"] for s in plan["cells"][0]["steps"]]
-        assert ids.index("sample-devices") < ids.index("replay-real-1")
+        assert ids.index("sample") < ids.index("replay-real-1")
         assert ids.index("replay-real-1") < ids.index("isolation")
+
+    def test_costs_are_merged_before_the_verdict_reads_them(self, plan):
+        for cell in plan["cells"]:
+            ids = [s["id"] for s in cell["steps"]]
+            assert ids.index("costs") < ids.index("validate")
+            assert ids.index(f"replay-modelled-{plan['repeats']}") < ids.index("costs")
 
     def test_the_verdict_is_the_last_thing_in_a_cell(self, plan):
         for cell in plan["cells"]:
@@ -176,8 +289,9 @@ class TestItSaysWhatItDoesNotProvide:
 
     def test_the_gaps_are_carried_in_the_plan_itself(self, plan):
         assert plan["gaps"]
-        assert any("gpu.jsonl" in gap for gap in plan["gaps"])
-        assert any("costs.json" in gap for gap in plan["gaps"])
+        assert any("replay target" in gap for gap in plan["gaps"])
+        assert any("oracle" in gap for gap in plan["gaps"])
+        assert any("capture, calibration, derivation" in gap for gap in plan["gaps"])
 
     def test_the_evidence_list_matches_what_the_validator_requires(self, plan):
         """A plan that forgets an artifact is a cell refused after the lease."""
@@ -186,9 +300,10 @@ class TestItSaysWhatItDoesNotProvide:
         assert "isolation.json" in plan["evidence"]
         assert "cc_traces_protocol.json" in plan["evidence"]
         assert "registry.json" in plan["evidence"]
+        assert "gpu.jsonl" in plan["evidence"]
 
     def test_it_does_not_claim_to_have_run_anything(self, plan):
-        assert "running them is not what this does" in plan["means"]
+        assert "no result is claimed here" in plan["means"]
 
 
 class TestWhatItPrints:
