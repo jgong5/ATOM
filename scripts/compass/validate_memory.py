@@ -40,10 +40,12 @@ from __future__ import annotations
 
 import argparse
 import glob
+import hashlib
 import json
 import os
 import re
 import sys
+from functools import partial
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
@@ -190,6 +192,26 @@ def kv_rows(config: dict, readings: dict, tp: int, world: int, blob: dict,
                  "derived; no recorded count in this record"))
 
 
+def record_sha(path: str) -> str:
+    """The record's own hash, so a rerun is not mistaken for the source run."""
+    with open(path, "rb") as fh:
+        return hashlib.sha256(fh.read()).hexdigest()
+
+
+def _cal_note(calib, cal_map: dict, config: dict, sha: str, term: str,
+              default: str) -> str:
+    """The row note, saying what the comparison is worth.
+
+    Bound per record with `partial`, because the answer depends on which run is
+    being read: one constant is a residual against the record it was fitted on
+    and a validation against any other.
+    """
+    if calib is None or term not in (cal_map or {}):
+        return default
+    kind = calib.classify(term, config, record_sha256=sha)
+    return "%s; source-calibrated, this record is its %s" % (default, kind)
+
+
 def row(name: str, derived, recorded, note: str = "", budget: int = 0) -> None:
     """One term, its own error, and what that error is worth.
 
@@ -222,7 +244,7 @@ def write_calibration(records, path: str) -> None:
     what the box it was taken on is worth.
     """
     per_width: dict = {}
-    for _, config, readings, tp, _blob in records:
+    for _, config, readings, tp, _blob, _sha in records:
         parameters = readings.get("parameter_bytes")
         allocated = readings.get("weights_torch")
         if parameters is None or allocated is None:
@@ -341,11 +363,12 @@ def main() -> int:
         if not readings:
             continue
         tp = int((config.get("topology") or {}).get("tp", 1) or 1)
-        non_torch_seen.append((os.path.basename(path), config, readings, tp, blob))
+        non_torch_seen.append(
+            (os.path.basename(path), config, readings, tp, blob, record_sha(path)))
 
     print("  %-14s %8s %8s  %6s %7s  %s"
           % ("term", "derived", "recorded", "error", "of bgt", "note"))
-    for name, config, readings, tp, blob in non_torch_seen:
+    for name, config, readings, tp, blob, sha in non_torch_seen:
         print("\n%s  --  %s tp=%d max_model_len=%s"
               % (name, config.get("model"), tp, config.get("max_model_len")))
 
@@ -365,12 +388,7 @@ def main() -> int:
         calib = for_model(config.get("model")) if args.source_calibration else None
         cal_map = calib.mapping(world) if calib else None
 
-        def cal_note(term: str, default: str) -> str:
-            """The row note, saying what the comparison is worth."""
-            if calib is None or term not in (cal_map or {}):
-                return default
-            kind = calib.classify(term, config)
-            return "%s; source-calibrated, this record is its %s" % (default, kind)
+        cal_note = partial(_cal_note, calib, cal_map, config, sha)
 
         checkpoint = args.checkpoint
         derived_weights = weight_bytes(checkpoint, tp) if checkpoint else None
@@ -447,8 +465,17 @@ def main() -> int:
         # therefore ambiguous between a wrong model and a busy box, and the
         # ranks' spread is the tell: they hold the same thing, so where they
         # differ, something outside the run does not.
-        row("non-torch", non_torch_bytes(world), readings.get("non_torch"),
-            "device-wide reading; a neighbour is charged here", sizing_budget)
+        #
+        # The calibration is handed over only at a width it was measured at.
+        # `non_torch_bytes` drops `MODEL_HEADROOM` whenever it is given one,
+        # which is right where the calibrated run already contains the headroom
+        # and wrong everywhere else: an uncalibrated width would lose the term.
+        nt_cal = (cal_map if cal_map and world in (cal_map.get("non_torch") or {})
+                  else None)
+        row("non-torch", non_torch_bytes(world, nt_cal), readings.get("non_torch"),
+            cal_note("non_torch",
+                     "device-wide reading; a neighbour is charged here"),
+            sizing_budget)
 
         # Two questions that were being asked as one. `graph_pool_bytes`
         # mirrors `_estimate_cudagraph_overhead`, and `cudagraph_overhead` *is*
@@ -507,7 +534,7 @@ def main() -> int:
         print("\nthe terms with no model yet, across configurations")
         print("  %-22s %-12s %3s %9s %9s %9s"
               % ("record", "model", "tp", "params", "residue", "non_torch"))
-        for name, config, readings, tp, _blob in non_torch_seen:
+        for name, config, readings, tp, _blob, _sha in non_torch_seen:
             parameters = readings.get("parameter_bytes")
             allocated = readings.get("weights_torch")
             residue = (allocated - parameters

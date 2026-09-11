@@ -31,21 +31,22 @@ configurations that die part-way through the decode of the longest request.
 from __future__ import annotations
 
 import json
+from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any, Mapping, Optional
+from typing import Any
 
 from atom.compass.core.kv_geometry import InsufficientPoolBudget, blocks_from_readings
 
 __all__ = [
     "Request",
     "Verdict",
-    "longest_request",
-    "trace_requests",
-    "within_window",
-    "window_upper_bound",
-    "blocks_for",
     "admission_refusal",
     "assess",
+    "blocks_for",
+    "longest_request",
+    "trace_requests",
+    "window_upper_bound",
+    "within_window",
 ]
 
 
@@ -67,8 +68,8 @@ class Verdict:
 
     feasible: bool
     #: ``"pool"``, ``"admission"`` or ``None`` when feasible.
-    gate: Optional[str] = None
-    reason: Optional[str] = None
+    gate: str | None = None
+    reason: str | None = None
     blocks: int = 0
     state_entries: int = 0
     blocks_needed: int = 0
@@ -116,7 +117,7 @@ def within_window(requests, *, max_input_tokens: int) -> list:
     return [r for r in requests if r.input_tokens <= int(max_input_tokens)]
 
 
-def window_upper_bound(requests, *, max_input_tokens: int) -> Optional[Request]:
+def window_upper_bound(requests, *, max_input_tokens: int) -> Request | None:
     """The longest request a window *could* contain, not the longest it did.
 
     The input cap paired with the longest output the admitted requests show.
@@ -136,7 +137,7 @@ def window_upper_bound(requests, *, max_input_tokens: int) -> Optional[Request]:
     return Request(int(max_input_tokens), max(r.output_tokens for r in inside))
 
 
-def longest_request(requests) -> Optional[Request]:
+def longest_request(requests) -> Request | None:
     """The request that has to fit, which is the longest *in total*.
 
     Not the longest prompt. A 240k-token prompt with a 20-token answer is
@@ -170,7 +171,7 @@ def admission_refusal(
     max_model_len: int,
     max_num_batched_tokens: int,
     enable_chunked_prefill: bool = True,
-) -> Optional[str]:
+) -> str | None:
     """Why this request can never be scheduled here, or None.
 
     The three static rules of `Scheduler._unschedulable_reason`, in its order,
@@ -179,9 +180,8 @@ def admission_refusal(
     total = request.total_tokens
     if max_model_len and total > max_model_len:
         return (
-            "tokens=%d > max_model_len=%d at its longest (input %d + "
-            "output %d)"
-            % (total, max_model_len, request.input_tokens, request.output_tokens)
+            f"tokens={total} > max_model_len={max_model_len} at its longest "
+            f"(input {request.input_tokens} + output {request.output_tokens})"
         )
     if (
         not enable_chunked_prefill
@@ -189,15 +189,15 @@ def admission_refusal(
         and request.input_tokens > max_num_batched_tokens
     ):
         return (
-            "input tokens=%d > max_num_batched_tokens=%d with chunked "
-            "prefill off" % (request.input_tokens, max_num_batched_tokens)
+            f"input tokens={request.input_tokens} > "
+            f"max_num_batched_tokens={max_num_batched_tokens} with chunked "
+            "prefill off"
         )
     needed = blocks_for(total, block_size)
     if needed > blocks:
-        return "needs %d KV blocks for %d tokens > total pool blocks=%d" % (
-            needed,
-            total,
-            blocks,
+        return (
+            f"needs {needed} KV blocks for {total} tokens > "
+            f"total pool blocks={blocks}"
         )
     return None
 
@@ -216,7 +216,7 @@ def assess(
     state_dtype_bytes: int = 2,
     num_spec: int = 0,
     enable_chunked_prefill: bool = True,
-    request: Optional[Request] = None,
+    request: Request | None = None,
 ) -> Verdict:
     """Both gates, in the order the engine would hit them.
 
@@ -241,8 +241,8 @@ def assess(
         return Verdict(
             False,
             "pool",
-            "state pool needs %.2fGB of %.2fGB available for %d entries"
-            % (exc.reserved_bytes / 2**30, exc.available_bytes / 2**30, exc.entries),
+            f"state pool needs {exc.reserved_bytes / 2**30:.2f}GB of "
+            f"{exc.available_bytes / 2**30:.2f}GB available for {exc.entries} entries",
             state_entries=exc.entries,
         )
 

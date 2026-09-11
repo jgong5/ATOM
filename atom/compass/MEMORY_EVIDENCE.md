@@ -266,29 +266,50 @@ Under the corrected calibration boundary, three of the four are addressable at
 the declared TP=1, util 0.90 source configuration: see "Source calibration at
 TP=1" below.
 
-## Source calibration at TP=1: two terms fixed, one refused
+## Source calibration at TP=1: three terms fixed, and what each is worth
 
 `atom/compass/core/memory_calibration.py` carries the constants measured at the
 27B's declared source configuration -- TP=1, utilization 0.90, `max_num_seqs`
-32, the cc-traces capture ladder, prefix caching off, from
-`27b.tp1.memory.json` (sha256 `62332900...`). Each one records model, width,
-the full config, the record, and which term it supplies, which is the recording
-rule the `MODEL_HEADROOM` case exists to justify.
+32, the cc-traces capture ladder, prefix caching off. Each one records model,
+width, the full config, the record it came from and that record's hash, and
+which term it supplies, which is the recording rule the `MODEL_HEADROOM` case
+exists to justify.
 
-| term | C06 default | error | calibrated | fitted at | validated at | error there |
+| term | C06 default | error | calibrated | fitted on | validated at | error there |
 |---|---|---|---|---|---|---|
-| `persistent` | 118 MiB | **-51.0%** | 252 339 712 B | TP=1, util 0.90 | TP=1 util 0.33 / 0.40 / 0.41 | **0 B** |
+| `persistent` | 118 MiB | **-51.0%** | 252 339 712 B | `27b.tp1.memory.json` | TP=1 util 0.33 / 0.40 / 0.41 | **0 B** |
 | | | | | | TP=2 rank 0 | -0.003% |
 | | | | | | TP=4 ranks 0, 1 | -0.004% |
-| `load_residue` | 1 MiB at TP=1 | **-93.0%** | 14 924 832 B | TP=1, util 0.90 | TP=1 util 0.33 / 0.40 / 0.41 | **0 B** |
+| `load_residue` | 1 MiB at TP=1 | **-93.0%** | 14 924 832 B | `27b.tp1.memory.json` | TP=1 util 0.33 / 0.40 / 0.41 | **0 B** |
+| `non_torch` | 1 104 MiB + headroom | -2.8% vs the busy record | 1 157 627 904 B | `27b.tp1.exclusive.memory.json` | TP=1 util 0.33 settled / 0.40 / 0.41 | **0 B**, and one miss of **+45.1%** |
 
-The TP=1 comparison is a **residual**, not a validation, and
-`validate_memory.py --source-calibration` says so in the row: the number came
-from that record, so reproducing it demonstrates arithmetic. The validations
-are the widths and utilizations the fit never saw. `persistent` transfers
-across both -- flat to within 11 KiB on a 240 MiB term, over TP=1, 2 and 4 and
-four utilizations -- which is the claim the 0.6B constant was making and
-getting wrong by half.
+Source records: `27b.tp1.memory.json` sha256 `62332900...`,
+`27b.tp1.exclusive.memory.json` sha256 `4ff60279...`.
+
+### Three answers, not two
+
+`classify` used to answer `residual` or `validation`. It now answers three
+ways, because two runs of one configuration are neither:
+
+* **residual** -- the record the term was fitted on. Reproducing it
+  demonstrates arithmetic and nothing else.
+* **repeat** -- a *different* run of the same configuration. Real
+  reproducibility evidence; no evidence of transfer, because nothing the
+  constant was fitted against has changed.
+* **validation** -- a run at a configuration the fit never saw.
+
+Telling `repeat` from `residual` needs the record's hash, so
+`validate_memory.py --source-calibration` hashes each record it reads and the
+row says which of the three it is. Without a hash the stricter answer stands.
+The distinction is not cosmetic: on `27b.tp1.exclusive.memory.json`,
+`persistent` is a repeat and `non_torch` is a residual, and on
+`27b.tp1.memory.json` it is the other way round.
+
+### What transferred and what did not
+
+`persistent` transfers across both axes -- flat to within 11 KiB on a 240 MiB
+term, over TP=1, 2 and 4 and four utilizations -- which is the claim the 0.6B
+constant was making and getting wrong by half.
 
 `load_residue` is offered at TP=1 only. It is 14 MiB there and 2.1 GB at TP=2,
 because at width 1 there are no collective pools to register; a constant fitted
@@ -297,28 +318,40 @@ at TP=1 says nothing about TP=2, so the C06 table keeps the wider entries
 apply. This is the same width-specificity `DEFAULT_LOAD_RESIDUE` already
 encodes, honoured rather than flattened.
 
-**`non_torch` is deliberately not calibrated**, and phase A is why. It is
-`(total - free) - reserved`, a device-wide quantity: the TP=1 source record
-reads 1 191 182 336 B, and the same configuration on an exclusively-held device
-reads 1 157 627 904 B. The 33 554 432 B between them is, as far as this
-evidence goes, a neighbour. Calibrating from the source record would freeze
-that neighbour into the model, and since `non_torch` is now the *only*
-remaining source of block error at TP=1 (phase A), doing so would be freezing
-the one term everything else has been narrowed down to. It needs an
-exclusive-device source run, which is O7 and is cheap.
+`non_torch` is offered at TP=1 only for a different reason: it is
+`(total - free) - reserved`, a whole-device reading, and at TP=1 one rank *is*
+the device. At TP=4 it is four ranks' worth of a shared card and the source run
+says nothing about it, so the C06 table keeps those widths.
 
-Nothing here mutates the campaign defaults: `DEFAULT_PERSISTENT` and
-`DEFAULT_LOAD_RESIDUE` are untouched, the 0.6B path is unchanged, and the
-calibration is opt-in per model. `for_model` returns None for a model nobody
-has measured rather than handing back a neighbouring model's constants.
+### `non_torch`: which record it may come from, and the run it cannot predict
 
-One behaviour worth flagging to the lead rather than changing here:
-`non_torch_bytes` drops `MODEL_HEADROOM` whenever *any* calibration mapping is
-passed, including one that says nothing about `non_torch`. That happens to be
-the wanted behaviour -- the headroom is a target-width fit and should go -- but
-it is implicit, and a future calibration of an unrelated term would silently
-move the non-torch row by 266 MiB.
+The TP=1 source record reads 1 191 182 336 B; the same configuration on an
+exclusively-held device reads 1 157 627 904 B (phase C, three byte-identical
+runs). The 33 554 432 B between them is, as far as this evidence goes, a
+neighbour, so the calibrated value is the exclusive one and the busy record is
+not a calibration input. That is the whole reason phase C was run.
 
+Substituting the constant for the reading predicts the frozen ladder exactly:
+1583 blocks at util 0.33 settled, 15 238 at 0.40, 17 188 at 0.41, each on the
+nose. It does **not** predict phase A's first 0.33 run, which read
+1 677 721 600 B and got 1091 blocks: the constant says 1583, **+45.1%**. Three
+controls have failed to reproduce that excursion and nobody has explained it,
+so it is recorded in the term's own `validated_against` as a KNOWN RISK, with a
+test that fails if the warning is removed. A single constant cannot bound a
+486 MiB excursion, and this one does not claim to.
+
+Nothing here mutates the campaign defaults: `DEFAULT_PERSISTENT`,
+`DEFAULT_LOAD_RESIDUE` and `DEFAULT_NON_TORCH` are untouched, the 0.6B path is
+unchanged, and the calibration is opt-in per model. `for_model` returns None
+for a model nobody has measured rather than handing back a neighbouring model's
+constants.
+
+One sharp edge, now handled rather than flagged: `non_torch_bytes` drops
+`MODEL_HEADROOM` whenever *any* calibration mapping is passed, including one
+that says nothing about `non_torch`. That is wanted where the calibrated run
+already contains the headroom and wrong everywhere else, so the validator hands
+the mapping over only at a width the term was actually measured at. At TP=2 and
+TP=4 the non-torch row is unchanged from before this work.
 ## G3 phase A: the frozen ladder, run on the device
 
 Predictions were frozen in `tests/compass/memory_records/frozen_util_predictions.json`
@@ -427,8 +460,10 @@ Two consequences follow, and they point in opposite directions:
   that the same 32 MiB buys more blocks when there are fewer of them.
 * Nothing in the model bounds the excursion. A deployment sized at 0.33 on the
   settled reading would have sized 1 091 blocks on the other one, 31% fewer.
-  That is the case for O7 and for not calibrating `non_torch` from a single
-  run, however carefully that run is provenanced.
+  Phase C answered O7 with three byte-identical exclusive-device runs, so the
+  calibrated constant is no longer a single sample -- but three samples of a
+  term that was stable six times in seven still say nothing about the seventh.
+  The constant carries the excursion in its own record as a known risk.
 
 ### What the isolation evidence actually covers
 
@@ -441,10 +476,42 @@ was present holding 0 B throughout".
 
 That is not enough to attribute the 0.33 excursion to a neighbour, and it is
 not enough to rule one out either. A process that allocated 486 MiB and exited
-between two samples leaves no trace in this evidence. Phase C samples ownership
-every 30 s across its whole run (`agent_scratch/mem/evidence/g3src/ownership.log`)
-so that the source calibration, at least, carries continuous evidence rather
-than two endpoints.
+between two samples leaves no trace in this evidence. Phase C samples ownership every ~35 s across
+its whole window (`tests/compass/memory_records/27b.tp1.exclusive.ownership.txt`)
+so that the source calibration, at least, carries sampled evidence through the
+run rather than two endpoints -- at that granularity, not continuously.
+
+### Phase C: three repeats of the source configuration, with ownership sampled
+
+08:53:49Z to 09:03:38Z, shell exit 0, same exclusively-leased device, TP=1,
+utilization 0.90, `max_num_seqs` 32. All three runs produced **byte-identical
+records** -- sha256 `4ff60279...` for each -- with 112 772 blocks,
+`non_torch` 1 157 627 904 B, `free` 149 866 676 224 B, `peak_torch`
+57 971 260 416 B, graph pool reserved 127 926 272 B. Frozen in
+`g3_util_phasebc.json` together with phase B.
+
+Ownership was sampled every ~35 s from 08:55:09Z to 09:08:32Z, 22 samples,
+kept in `27b.tp1.exclusive.ownership.txt`. What the samples show, exactly:
+every KFD process attributed VRAM in any sample belongs to this agent's own
+container; one foreign KFD entry (PID 1685833, UNKNOWN) is present in every
+sample holding 0 B; the device's idle floor is 297 689 088 B in every sample.
+The coverage is 35-second granularity over the phase C window only -- it does
+not cover phases A or B, and an allocation that began and ended between two
+samples would not appear in it.
+
+The historical TP=1 source record reads 1 191 182 336 B against these runs'
+1 157 627 904 B. The difference is 33 554 432 B, exactly 32 MiB. That is the
+observation; attributing it to a specific neighbour is not something this
+evidence does.
+
+Two of the three runs started while the box still showed 21.5 GB and 170 GB of
+residual occupancy from this agent's own previous engine, and read the same
+`non_torch` as the run that started from an idle device. That is a statement
+about the readings at those three run-starts and nothing more: it does not
+establish what the device held at each run's measurement point, and it does not
+refute an intermittent teardown interaction as the cause of the phase A
+excursion. **The phase A +42.2% remains an observed error with an unknown
+cause.**
 
 ### What this is and is not
 
@@ -506,29 +573,34 @@ So the lengths divide, and the code and tests now name them apart:
 | name | lengths | blocks | what it is for |
 |---|---|---|---|
 | `STRESS_LONGEST` | 249 344 + 5 690 | 15 940 | a prompt longer than anything the window sends; shows where the admission gate bites |
-| window bound (provisional) | 107 328 + 260 | 6 725 | the input cap paired with the longest output inside the window |
+| `CC_LONG` (registered) | 107 328 + 2 413 | 6 859 | the long arm of the registered CC protocol -- the request the deployment must admit |
+| `CC_SHORT` (registered) | 2 560 + 21 | 162 | the short arm |
+| slice bound (superseded) | 107 328 + 260 | 6 725 | what `window_upper_bound` derived from `cc_pilot.jsonl` before the manifest existed |
 | longest actually inside the window | 96 960 + 260 | 6 077 | the largest request `cc_pilot.jsonl` contributes to the window |
 
-`within_window` and `window_upper_bound` in `feasibility.py` compute the second
-and third. The bound pairs two different requests' extremes on purpose: a
-feasibility bound has to hold for the worst request the window *can* produce,
-not the worst one this slice happened to contain. It is **provisional** and is
-to be replaced with manifest-derived lengths once the final CC workload is
-locked -- a bound that never gets replaced quietly becomes a claim about a
-workload nobody measured.
+The CC protocol was registered as `47917ade` with those two arms, which
+replaces the provisional bound this ledger carried. The slice-derived numbers
+stay in the table because they are what the acceptance argument rested on until
+09:20Z today, and the gap between the two -- 260 output tokens assumed against
+2 413 registered, 6 725 blocks against 6 859 -- is the measure of what a
+slice-derived bound was worth. `within_window` and `window_upper_bound` in
+`feasibility.py` still compute the slice figures; they are the fallback for a
+workload whose manifest has not been locked, and CC no longer needs them.
 
 Consequences for the phase A rungs, stated exactly:
 
 * **util 0.32 is a verdict on the deployment.** It never starts, so no request
   length rescues it and none is needed to condemn it. It stands whatever the
   manifest says.
-* **util 0.33 and 0.40 are not verdicts on the final workload.** Both refuse
-  `STRESS_LONGEST`; that is a diagnostic. Against the provisional window bound
-  the two part company -- 0.33 sizes 1 091 blocks on a settled device and still
-  refuses it, while 0.40 sizes 15 238 and admits it comfortably. A verdict that
-  flips on which workload is asked about is a property of the question, not of
-  the deployment, and must not be reported as the latter until the manifest
-  supplies the lengths.
+* **util 0.33 refuses the registered long arm.** 6 859 blocks are needed;
+  0.33 sizes 1 583 on a settled device and 1 091 on the phase A reading. Both
+  refuse, so this rung fails against the registered workload and not merely
+  against a stress diagnostic.
+* **util 0.40 admits it.** 15 238 blocks against 6 859 needed, 2.2x over, and
+  the short arm needs 162. That is now a statement about the registered
+  workload rather than a provisional one -- subject to everything else in this
+  ledger, in particular that all three rungs hold the non-KV readings fixed
+  from the TP=1 util 0.90 run and that `max_num_seqs` has never been varied.
 
 ## Open items
 
@@ -540,7 +612,8 @@ Consequences for the phase A rungs, stated exactly:
 | O4 | `persistent` -- was 51% low | -- | **closed by calibration**, exact at TP=1, -0.004% at TP=4; a mechanism would still be better than a constant |
 | O5 | `persistent` / activations / pool as functions of `max_num_seqs` | GPU, TP=1 | open, and now the main conditionality left; all three are proven flat in *utilization* (phase A) but untested in concurrency |
 | O6 | physical start-up at `--max-num-seqs 1551` and 1400 | GPU, TP=1 | open; superseded as the acceptance gate by the utilization axis, kept as a diagnostic |
-| O7 | `non_torch` from an exclusive-device source run at util 0.90 | GPU, exclusive, ~4 min | open, and now the **single remaining source of block error at TP=1** |
+| O7 | `non_torch` from an exclusive-device source run at util 0.90 | GPU, exclusive | **closed by phase C** -- three byte-identical runs, calibrated at TP=1, exact at three unseen utilizations; the +42.2% excursion it cannot bound is carried with it |
 | O8 | graph pool at TP=4, where the model reads +26.8% | GPU, 4 devices | open |
 | O9 | `MODEL_HEADROOM` provenance: which run, which config | lead / history | open; until then it stays disallowed and is not to be relabelled as source |
-| O10 | manifest-derived acceptance lengths | final CC workload | open; the window figures here are provisional |
+| O10 | manifest-derived acceptance lengths | final CC workload | **closed** -- CC protocol `47917ade`: long 107 328 + 2 413 (6 859 blocks), short 2 560 + 21 (162) |
+| O11 | what the 486 MiB `non_torch` excursion was | unknown; three controls failed to reproduce it | open, and the one thing the calibrated `non_torch` does not bound |
