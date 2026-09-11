@@ -1358,12 +1358,120 @@ cudagraph overhead and 112 772 blocks came out. It is not a proof that all
 behaviour was unperturbed, and it is a fourth byte-identical payload, which is
 one more reason not to read byte-identity as identity.
 
+## The module path aligns the widths; the ancestry never could
+
+O23 said `lineage_keys` aligned 71 of 3014 outputs across the three real
+widths. Re-measured on freshly captured graphs it is 12 of 3014, and the
+diagnosis in O23 was only half right. `VocabParallelEmbedding` emitting two
+operator names is real, but it is not the reason the alignment is this bad.
+
+The reason is that at width the graph does not know its own ancestry. Source
+edges recorded as `-1`:
+
+| width | source edges | unknown | operators with an unknown source |
+|---|---:|---:|---:|
+| 1 | 4378 | 596 (13.6%) | 563 |
+| 2 | 4378 | 725 (16.6%) | 692 |
+| 4 | 4378 | 725 (16.6%) | 692 |
+
+An ancestry key is recursive, so one unknown producer is not one lost
+operator -- every descendant inherits the break. The extra 129 unknowns at
+TP>1 come from the collective stand-in returning its own input (O15) on top of
+`_storage_of` collapsing on meta tensors (O14), both in files this worker does
+not own. No key built on `inputs_from` can align these graphs until those are
+fixed.
+
+### What replaced it, and what stops it being index alignment in disguise
+
+`capture_lifetimes.py` now stamps each operator with the module it ran inside,
+via global `nn.Module` forward hooks, and writes it as a sidecar
+(`<graph>.modules.json`) rather than a new `OpSpec` field -- the graph schema
+is shared and not this worker's to change. 772 spans, and 2999 of 2999
+operators attributed at TP=1, 3128 of 3128 at each of TP=2 and TP=4.
+
+`module_path_keys` keys an operator on its module path and its ordinal among
+the *non-collective* operators of that module. A collective consumes no
+ordinal, or every operator after the first all-reduce would be renumbered at
+exactly the widths where all-reduces exist.
+
+That is ordinal alignment inside a module, which is the thing `lineage_keys`
+was written to avoid, so it does not ship unguarded. `alignment_integrity`
+runs two structural checks and `width_classes` refuses the keys unless both
+pass:
+
+* every module path holds the same count of non-collective operators at every
+  width. Here: 2999 at all three, and **no path disagrees**;
+* where ancestry survives at every width -- no unknown source on either side,
+  collectives walked through -- it must agree with the ordinal alignment.
+  Here: **2307 agree, 0 contradict, 692 not checkable.** The unknowns are
+  counted apart from the agreements, because a check that could not run is not
+  a check that passed.
+
+| | ancestry key | module-path key |
+|---|---:|---:|
+| aligned | 12 | **3014** |
+| unaligned at base | 3002 | 0 |
+| replicated / sharded / unresolved | 11 / 1 / 0 | 1382 / 1632 / **0** |
+
+Exactly one aligned pair joins operators with different names, and it is the
+one O23 predicted: `aten::embedding` at TP=1 against `aiter::masked_embedding`
+above it, `[16384, 5120]` at every width, classified replicated. A join the
+module tree licenses but the names do not is recorded on the entry as `names`
+and counted in coverage as `renamed`, so it is visible rather than silent.
+
+### The withdrawn trailing-dimension rule got nothing wrong at the peak
+
+With the widths aligned, the rule that was withdrawn can finally be scored
+instead of argued about. Over the eight tensors live at the TP=1 walk's
+high-water mark:
+
+    the rule agreed    : 8 tensors, 2 717 908 992 B -- 100% of the peak
+    the rule was wrong : 0 tensors, 0 B
+
+and the derived width totals are identical to the rule's at TP=2 and TP=4,
+to the byte. The rule *is* wrong elsewhere -- it would shard 224 aligned
+outputs that do not shard, mostly rope and index tensors of shape
+`[16384, 1, 1, 32]` -- but none of them is live at the peak, so none of them
+is in the activation term. **The withdrawn rule is not the cause of O16.**
+Removing it was right on its own terms, and it buys no accuracy.
+
+### The walk's eight tensors and the allocator's eight blocks are not the same eight
+
+The derived TP=1 walk peaks at 2 717 908 992 B over 8 tensors. The measured
+allocator peak holds 8 blocks allocated in the forward, 3 036 676 096 B. Both
+are eight. Matched by size:
+
+| size | walk | allocator |
+|---:|---:|---:|
+| 1 140 850 688 | 1 | 1 |
+| 570 425 344 | 1 | 1 |
+| 541 065 216 | 0 | 1 |
+| 201 326 592 | 0 | 1 |
+| 167 772 160 | **6** | **3** |
+| 79 691 776 | 0 | 1 |
+
+    in both                                2 214 592 512 B
+    walk counts, allocator does not          503 316 480 B   over-count
+    allocator holds, walk cannot see          822 083 584 B   invisible
+
+This answers O2's standing question directly. Six hidden-width buffers are
+live at the walk's peak and only three are live on the device: the walk counts
+three that are not there, 503 316 480 B, and `forward_vars["outputs"]` is one
+of them by address (O19). Against that, 822 083 584 B is allocated where a
+dispatch trace cannot look -- 541 065 216 B and 79 691 776 B inside
+`tuned_gemm.py:450`, 201 326 592 B in `linear_attention_with_output_base`.
+
+The walk lands 239 075 328 B under the gate quantity, -8.1%. That number is
+two errors of opposite sign partly cancelling, 503 MB against 822 MB. Any
+correction fitted to the -8.1% would be fitting a difference of two unrelated
+mistakes, which is the specific thing O16 says not to do.
+
 ## Open items
 
 | # | item | needs | status |
 |---|---|---|---|
 | O1 | `parameters` / `buffers` for the 27B at TP=1/2/4 | meta build | **closed** -- exact at all three widths, finding 5 |
-| O2 | 27B activation trace at TP=1, prefill-shaped | GPU, TP=1, one prefill | **closed as a constant, open as a mechanism** -- the term is 2 956 984 320 B, measured at the source configuration and exact across two independent engine starts. The walk is now possible after all: the claim that a derivation cannot record liveness was false (O13), and a device-free TP=1 lifetime capture gives 2999 operators, 2790 deaths, peak 2 717 908 992 B in the MLP. What is still wanted on a device is the *allocation curve* across the warmup step -- which of the six hidden-width buffers live at the peak were preallocated, and so already inside `current_torch` |
+| O2 | 27B activation trace at TP=1, prefill-shaped | GPU, TP=1, one prefill | **closed as a constant, closed as an accounting, open as a mechanism** -- the term is 2 956 984 320 B, exact across two independent engine starts. The allocation curve asked for here has now been read: 8 blocks live at the allocator peak, of which three are the hidden-width buffers where the walk holds six, so 503 316 480 B of the walk is preallocated or never allocated and `forward_vars["outputs"]` is one by address (O19). The reverse error is larger: 822 083 584 B is live on the device and invisible to the walk, allocated inside `tuned_gemm.py:450` and `linear_attention_with_output_base`. Net -239 075 328 B, -8.1%, and it is two errors of opposite sign, so no correction is to be fitted to it (O16) |
 | O3 | source-only candidate budget, frozen, vs the recorded budget | O2 | **closed at TP=1** -- every input classed S, C06 or S27, and the budget reproduces the source run's 112 772 blocks. A residual by construction: it is not evidence of transfer, and the widths where transfer would be tested need O2's activation term at TP=2 and TP=4, which is class X27 today and therefore underived |
 | O4 | `persistent` -- was 51% low | -- | **closed by calibration**, exact at TP=1, -0.004% at TP=4; a mechanism would still be better than a constant |
 | O5 | `persistent` / activations / pool as functions of `max_num_seqs` | GPU, TP=1 | open, and now the main conditionality left; all three are proven flat in *utilization* (phase A) but untested in concurrency |
@@ -1374,15 +1482,15 @@ one more reason not to read byte-identity as identity.
 | O10 | manifest-derived acceptance lengths | final CC workload | **closed** -- CC protocol `47917ade`: long 107 328 + 2 413 (6 859 blocks), short 2 560 + 21 (162) |
 | O11 | what the 486 MiB `non_torch` excursion was | unknown; three controls failed to reproduce it | open, and the one thing the calibrated `non_torch` does not bound |
 | O12 | a `run.execution` block in the memory record, carrying CC's `compass.execution/1` `execution_id` and its `id_inputs`, written by `_write_memory` | **lead** -- `_write_memory` is shared | open; until it lands, every calibrated row reads `residual (run unidentified)` and the phase C repeats cannot be machine-checked. The identity is CC's, not a second scheme: `atom/compass/core/execution_id.py` holds the one definition, stdlib-only, and `producer_key` reads it. `_write_replay_target` already writes a `hardware` block in the same neighbourhood, so the shape is precedented |
-| O13 | tensor lifetime at the **source** width, and the sharded/replicated derivation of it for TP=2 and TP=4 | CPU only -- done | **restated and partly closed.** The original item asked for a TP=2/TP=4 warmup capture; that is a target measurement under a source label and is withdrawn. Lifetime is now captured at TP=1 on no device (2999 ops, 2790 deaths) and the width mechanism is read off the shapes. The frozen candidate reads +21.5% at TP=2 and +40.4% at TP=4 against the class-X27 peaks, so the *mechanism* is open: see O16. Three instrumentation defects found on the way (D1-D3), all in files this worker does not own |
+| O13 | tensor lifetime at the **source** width, and the sharded/replicated derivation of it for TP=2 and TP=4 | CPU only -- done | **restated and partly closed.** The original item asked for a TP=2/TP=4 warmup capture; that is a target measurement under a source label and is withdrawn. Lifetime is now captured at TP=1 on no device (2999 ops, 2790 deaths) and the width mechanism is read off the shapes. The frozen candidate reads +21.5% at TP=2 and +40.4% at TP=4 against the class-X27 peaks, so the *mechanism* is open: see O16. Three instrumentation defects found on the way (D1-D3), all in files this worker does not own  **Width alignment is no longer the blocker**: the module-path key aligns all 3014 outputs under an integrity check (O23), and the withdrawn trailing-dimension rule, now scorable, gets all 8 tensors at the walk peak right -- 100% of 2 717 908 992 B, 0 wrong, +0.0% at TP=2 and TP=4. It is wrong on 224 aligned outputs elsewhere, none of them live at the peak, so it is eliminated as a cause of O16 rather than reinstated. |
 | O14 | `_storage_of` returns 0 for every meta tensor (`runtime/meta.py`), so alias and provenance tracking collapse on any derived graph | **lead** -- shared runtime | open; fix is `untyped_storage()._cdata` when `data_ptr()` is 0, negated so it cannot collide with a device address. Patched locally in `agent_scratch/memval/lifetime/capture_lifetimes.py` |
 | O15 | the collective the derivation records has no output tensor of its own: nothing is watched, so it can never die, and the meta stand-in (`_collective_stand_in`) returns the *input object*, which is the opposite error | **lead** -- shared runtime | open. Cost: 21.9 GiB against a true 2.5 GiB at TP=2, and **it sits under every derived-graph memory walk at TP>1, O8's graph pool included**. The in-place reading is withdrawn: the live implementation allocates a fresh output on every path (packet P2) |
-| O16 | why the derived activation term over-reads at width: +21.5% at TP=2, +40.4% at TP=4 | GPU, TP=1 source only -- the allocation history across `warmup_model`'s step, requested in `agent_scratch/memval/producer_packet/tp1_probe/REQUEST.md` | open, and **narrowed**: the residue is defined at TP=1 by difference, so a replicated over-count is absorbed by it and cancels at every width. The error is in the sharded fraction -- being exact at TP=1 and TP=2 needs ~2.45 GB that divides by width against the walk's 1.71 GB. Allocations made inside opaque custom operators are where a dispatch trace cannot look, and the allocation history can. **No term is to be chosen by the size of the error it removes**. **Narrowed by the allocation history**: 1 761 607 680 B of the 3 036 676 096 B live at the peak -- 58% -- is allocated inside `aiter/tuned_gemm.py:450`, i.e. inside `aiter::gemm_a16w16`, which is exactly where the dispatch trace cannot look. The region is now located rather than suspected |
+| O16 | why the derived activation term over-reads at width: +21.5% at TP=2, +40.4% at TP=4 | GPU, TP=1 source only -- the allocation history across `warmup_model`'s step, requested in `agent_scratch/memval/producer_packet/tp1_probe/REQUEST.md` | open, and **narrowed**: the residue is defined at TP=1 by difference, so a replicated over-count is absorbed by it and cancels at every width. The error is in the sharded fraction -- being exact at TP=1 and TP=2 needs ~2.45 GB that divides by width against the walk's 1.71 GB. Allocations made inside opaque custom operators are where a dispatch trace cannot look, and the allocation history can. **No term is to be chosen by the size of the error it removes**. **Narrowed by the allocation history**: 1 761 607 680 B of the 3 036 676 096 B live at the peak -- 58% -- is allocated inside `aiter/tuned_gemm.py:450`, i.e. inside `aiter::gemm_a16w16`, which is exactly where the dispatch trace cannot look. The region is now located rather than suspected  **The region is now measured, not suspected**: at the walk peak 822 083 584 B lives on the device that the walk cannot see -- 541 065 216 B and 79 691 776 B inside `tuned_gemm.py:450`, 201 326 592 B inside `linear_attention_with_output_base` -- against a 503 316 480 B over-count of replicated hidden-width buffers. Opposite signs, so the -8.1% residual is not a coefficient. |
 | O17 | the graph pool budget *estimate* and the pool the engine actually reserves are different quantities and are not to be compared as one | -- | open, and separate from O8. O8 is the +26.8% error in the predicted pool at TP=4; this is the prior question of which two numbers that percentage is between |
 | O18 | `OpSpec` records the dtype of each *argument* and never of an output, so every consumer that needs an output's size reads `dtypes[0]` and assumes promotion changed nothing | **lead** -- shared schema (`core/graph.py`, `runtime/meta.py`) | open. `aiter::masked_embedding` takes int32 ids and returns bfloat16: `dtypes[0]` sizes one hidden-width buffer at 335 544 320 B instead of 167 772 160, which is the whole `walk_bytes` / `visible_peak_bytes` gap in the frozen candidate. Fix is an `output_dtypes` field filled from the real outputs and a schema bump (packet P4). Until then the walk on this branch sizes an output by PyTorch's own promotion rule when the graph records no dtype -- float beats int, and float16 with bfloat16 gives float32 -- labels the basis `recorded`, `unanimous` or `promoted`, and reports every non-`recorded` output through `dtype_ambiguities`. The masked_embedding case is now right by rule rather than by name, and the ad-hoc correction that was subtracting 167 772 160 B is deleted. Refusal is available but not the default: `strict_dtypes=True` raises `UnfoundedActivation` on the first output the graph does not record, which is what a consumer that must not guess should pass |
 | O19 | the tracer's "unseen destination is a fresh allocation" rule cannot tell a buffer allocated before the traced region from one allocated invisibly inside a custom operator | **lead** -- shared runtime | open. `forward_vars["outputs"]` (`model_runner.py:1290`) is 167 772 160 B allocated at engine init, so it is inside `current_torch` and cannot be part of `peak - current`; the walk counts a write into it as an allocation. Fix is to seed the seen-set with the storages that exist when the region opens. Note this is a *replicated* over-count and therefore cancels at width -- it is a TP=1 accuracy item, not the cause of O16. The seed set is no longer hypothetical: all 29 `forward_vars` are live at the peak and every one has a pre-forward address, 172 704 716 B in total. `outputs` is the sharp case -- `embed_head.py:177` allocates a second block of the identical 167 772 160 B and shape during the forward, so the two are separable by address and by nothing else |
 | O20 | mutability, alias and output-dtype contracts of the fused computation operators, not just the collectives | source + registered schema, CPU only -- done | **closed, and it found nothing wrong with the walk.** `silu_and_mul` and `_fused_qk_rmsnorm_group_quant_kernel` are destination-passing and record no output; `gemm_a16w16`, `linear_attention_with_output_base` and `unified_attention_with_output_base` return genuinely fresh tensors, by schema and by implementation (`base_attention.py:403`). No double count. Two by-products: `mutates_args="unknown"` marks weight arguments mutable, so `(a!)` in this registry is not evidence of mutation (O22), and `fused_allreduce_rmsnorm_` is absent from the 27B's graph at every width |
 | O21 | the 2999-operator TP=1 lifetime trace against the 2439-operator body graph | the two artifacts, CPU only -- done | **closed.** Same region, device, compilation level, redirections and scope; the only difference is step kind, and the operator arithmetic closes with no remainder: 2999 - 416 (GDN chunked-prefill path) - 144 (drift) + 32 (decode's mrope and `aten::min`) = 2439. The prefill graph is the one shaped like `warmup_model`; the decode graph never was a candidate. The two caveats that remain on the prefill graph are its own: `compilation_level: 0`, and a scope that excludes `compute_logits` and the sampler |
 | O22 | whether `torch_compile_guard(mutates_args="unknown")` declares mutation the implementation does not perform | one schema read, CPU only -- done | **closed, and it does.** `aiter::gemm_a16w16(Tensor(a0!) A, Tensor(a1!) B, ...)` marks the weight matrix mutable; `fused_allreduce_rmsnorm_` marks the norm weight mutable. The usable half of the schema is the return annotation: an aliasing return must be declared, and `all_reduce_ -> Tensor` is unannotated, so the schema independently confirms the collective is out-of-place |
-| O23 | `lineage_keys` aligns 71 of 3014 outputs across the three real widths, and misclassifies one that it does align | CPU only; a module path per operator | open, and it blocks any use of `width_class` at width. Cause is read from source: `VocabParallelEmbedding.forward` (`embed_head.py:168-178`) emits `aiter::masked_embedding` at TP>1 and `aten::embedding` at TP=1, and an ancestry key that interns operator names propagates that one branch through the whole graph. Fix is a module path stamped per operator -- width-invariant by construction, already named by `@mark_trace` at trace time, and absent from `OpSpec`. The candidate's bytes do not depend on this |
+| O23 | `lineage_keys` aligns 12 of 3014 outputs across the three real widths | CPU only; a module path per operator | **closed by a different key, and the diagnosis was half right.** Re-measured on fresh captures the ancestry key aligns 12, not 71. The `VocabParallelEmbedding` name split is real but is not the cause: the graph does not know its own ancestry at width -- 725 of 4378 source edges are `-1` at TP=2/4 against 596 at TP=1 (O14, O15), and an ancestry key is recursive, so every descendant inherits the break. `module_path_keys` keys on the module path plus an ordinal among the non-collective operators of that module, from a `.modules.json` sidecar rather than a shared-schema field, and aligns **3014 of 3014** -- 1382 replicated, 1632 sharded, 0 unresolved. It is ordinal alignment, so it is guarded: `alignment_integrity` requires equal per-path non-collective counts at every width (2999 / 2999 / 2999, no path disagreeing) and requires surviving ancestry to agree where it can be read (2307 agree, **0 contradict**, 692 not checkable and counted apart), and `width_classes` raises rather than key on paths when either fails. The one renamed join is the predicted `aten::embedding` / `aiter::masked_embedding` pair, replicated, and reported as `renamed` rather than joined silently. The candidate bytes still do not depend on this |
 | O24 | a TP=1 *target* cell for a device-free replay: the committed TP=1 records carry readings, blocks and config but no run identity and no hardware identity | CPU only, read-only | **closed as a question, and a correction**. No cell need be assembled: node 18 preserves two genuine TP=1 target/table pairs (`g4/cap_subspan/`, `poc/g5_27b/`) and CC has one. `27b.tp1.exclusive.memory.json` agrees with the target on all eight shared fields, but agreement is not identity -- the phase C repeats already showed byte-identical payloads from distinct runs, and the epochs here are disjoint (2026-09-11T04:37:55Z and 2026-09-10T13:12:42Z on `visible_devices 5`, vs phase C at 08:53:49Z..09:03:38Z). Compatible independent evidence, identity unproven. The 32.0 MiB `non_torch` gap between the two committed records is observed and unexplained; the earlier neighbour attribution is withdrawn |

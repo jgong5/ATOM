@@ -424,8 +424,10 @@ def test_a_width_conditional_branch_defeats_a_name_keyed_lineage():
     all-reduce at TP>1 and `F.embedding` at TP=1 (`embed_head.py:168-178`), so
     the *same module* emits two operator names. An ancestry key that interns
     the name diverges at operator 0 and stays diverged, which is why alignment
-    over the real TP=1/2/4 graphs reaches 98 of 3014 outputs. Until an operator
-    carries its module path, `width_class` is not to be read at width.
+    over the real TP=1/2/4 graphs reaches 12 of 3014 outputs. The name split
+    is real but it is not the whole cause -- 725 of 4378 source edges are
+    unknown at TP>1 -- so the replacement is `module_path_keys`, and a
+    name-keyed lineage stays unreadable at width.
     """
     from atom.compass.core.memory_model import width_coverage
 
@@ -438,3 +440,135 @@ def test_a_width_conditional_branch_defeats_a_name_keyed_lineage():
     assert coverage["unaligned_at_base"] == len(graphs[1]["ops"])
     assert coverage["by_class"] == {"replicated": 0, "sharded": 0,
                                     "unresolved": 0}
+
+
+def _three_widths_with_paths():
+    """The same three graphs, plus the module each operator ran in.
+
+    `VocabParallelEmbedding` is the case that defeated the name-keyed
+    ancestry: one module, `aten::embedding` at TP=1 and
+    `aiter::masked_embedding` above it. The module path is the same string at
+    every width, because the module tree is the same tree.
+    """
+    graphs = _three_widths()
+    for tp in (2, 4):
+        graphs[tp]["ops"][0]["name"] = "aiter::masked_embedding"
+    paths = {
+        1: ["model.embed_tokens", "model.layers.0.self_attn.o_proj",
+            "model.layers.0.post_attention_layernorm"],
+        2: ["model.embed_tokens", "model.layers.0.self_attn.o_proj",
+            "model.layers.0.self_attn.o_proj",
+            "model.layers.0.post_attention_layernorm"],
+    }
+    paths[4] = list(paths[2])
+    return graphs, paths
+
+
+def test_a_module_path_aligns_what_an_operator_name_could_not():
+    """The O23 failure, fixed by the key rather than by naming the exception.
+
+    The name-keyed ancestry aligns nothing here -- operator 0 diverges and
+    every descendant inherits it. The module path aligns all three outputs,
+    and says out loud that one of them joins two differently-named operators.
+    """
+    from atom.compass.core.memory_model import width_coverage
+
+    graphs, paths = _three_widths_with_paths()
+    assert width_coverage(graphs)["aligned"] == 0
+
+    coverage = width_coverage(graphs, paths)
+    assert coverage["aligned"] == 3
+    assert coverage["unaligned_at_base"] == 0
+    assert coverage["renamed"] == 1
+    assert coverage["by_class"] == {"replicated": 2, "sharded": 1,
+                                    "unresolved": 0}
+
+
+def test_the_renamed_join_is_recorded_on_the_entry_itself():
+    from atom.compass.core.memory_model import width_classes
+
+    graphs, paths = _three_widths_with_paths()
+    classes = width_classes(graphs, paths)
+    renamed = [entry for entry in classes.values() if "names" in entry]
+    assert len(renamed) == 1
+    assert renamed[0]["names"] == {1: "aten::embedding",
+                                   2: "aiter::masked_embedding",
+                                   4: "aiter::masked_embedding"}
+    assert renamed[0]["class"] == "replicated"
+
+
+def test_a_collective_consumes_no_ordinal():
+    """Otherwise every operator after the first all-reduce is renumbered.
+
+    The norm is ordinal 0 of its own module at TP=1 and must stay ordinal 0
+    at TP=2, where an all-reduce sits between it and the matmul.
+    """
+    from atom.compass.core.memory_model import module_path_keys
+
+    graphs, paths = _three_widths_with_paths()
+    at_1 = module_path_keys(graphs[1], paths[1])
+    at_2 = module_path_keys(graphs[2], paths[2])
+    assert at_1[-1] == at_2[-1]
+    # and the collective itself passes its input's identity through
+    assert at_2[2] == at_2[1]
+
+
+def test_a_module_that_does_different_work_at_width_is_refused():
+    """The ordinal only means something while the module is the same module."""
+    from atom.compass.core.memory_model import (alignment_integrity,
+                                                width_classes)
+
+    graphs, paths = _three_widths_with_paths()
+    # TP=4 runs an extra operator inside the attention module
+    graphs[4]["ops"].insert(2, {"name": "aten::mul",
+                                "output_shapes": [[16384, 1280]],
+                                "dtypes": ["bfloat16"], "inputs_from": [1]})
+    paths[4].insert(2, "model.layers.0.self_attn.o_proj")
+
+    integrity = alignment_integrity(graphs, paths)
+    assert integrity["safe"] is False
+    assert integrity["paths_disagreeing"] == ["model.layers.0.self_attn.o_proj"]
+
+    with pytest.raises(ValueError) as raised:
+        width_classes(graphs, paths)
+    assert "not safe to read" in str(raised.value)
+
+
+def test_surviving_ancestry_that_contradicts_the_ordinal_ends_it():
+    """Ancestry is weak evidence at width, but it is not ignorable evidence."""
+    from atom.compass.core.memory_model import (alignment_integrity,
+                                                width_classes)
+
+    graphs, paths = _three_widths_with_paths()
+    clean = alignment_integrity(graphs, paths)
+    assert clean["safe"] is True
+    assert clean["ancestry_contradicts"] == 0
+
+    # the last operator at TP=4 claims a different producer than at TP=1
+    graphs[4]["ops"][-1]["inputs_from"] = [0, 0]
+    broken = alignment_integrity(graphs, paths)
+    assert broken["ancestry_contradicts"] == 1
+    assert broken["safe"] is False
+    with pytest.raises(ValueError):
+        width_classes(graphs, paths)
+
+
+def test_an_unknown_producer_is_counted_apart_from_agreement():
+    """A check that could not run is not a check that passed."""
+    from atom.compass.core.memory_model import alignment_integrity
+
+    graphs, paths = _three_widths_with_paths()
+    integrity = alignment_integrity(graphs, paths)
+    # operator 0 has two unknown sources at every width
+    assert integrity["ancestry_unknown"] >= 1
+    assert (integrity["ancestry_agrees"] + integrity["ancestry_contradicts"]
+            + integrity["ancestry_unknown"]) == 3
+
+
+def test_a_module_path_is_needed_for_every_operator():
+    from atom.compass.core.memory_model import module_path_keys
+
+    graphs, paths = _three_widths_with_paths()
+    with pytest.raises(ValueError) as raised:
+        module_path_keys(graphs[1], paths[1][:-1])
+    assert "every operator" in str(raised.value)

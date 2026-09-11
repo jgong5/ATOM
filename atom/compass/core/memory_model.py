@@ -1047,7 +1047,156 @@ def lineage_keys(graph) -> list:
     return keys
 
 
-def width_classes(graphs: Mapping) -> dict:
+def _non_collective_positions(ops) -> list:
+    """Indices of the operators that exist at every width."""
+    return [index for index, op in enumerate(ops) if not _is_collective(op)]
+
+
+def _resolve_through_collectives(ops, index: int) -> int:
+    """Follow a source index past any collectives to the value's real producer.
+
+    A collective is a value made whole, not a value computed, so an operator
+    whose input came from an all-reduce was really fed by whatever fed the
+    all-reduce. Walking through keeps the comparison with TP=1 -- where no
+    collective stands in the way -- an honest one.
+    """
+    seen = 0
+    while 0 <= index < len(ops) and _is_collective(ops[index]):
+        sources = ops[index].get("inputs_from") or ()
+        index = next((s for s in sources if s >= 0), -1)
+        seen += 1
+        if seen > len(ops):          # a cycle cannot happen, but do not hang
+            return -1
+    return index
+
+
+def module_path_keys(graph, module_paths) -> list:
+    """A width-invariant identity taken from the module tree, not the graph.
+
+    `lineage_keys` asks the graph who produced each input, and at TP>1 the
+    graph frequently does not know. In the derived 27B graphs 725 of 4378
+    source edges are -1 at TP=2 and TP=4 against 596 at TP=1, because
+    `_storage_of` collapses on meta tensors (O14) and the collective stand-in
+    returns its own input (O15). An unknown source breaks the ancestry chain
+    and every descendant inherits the break, which is why ancestry alone
+    aligns 12 of 3014 outputs across the three real widths.
+
+    A module path needs the graph to know nothing. It is recorded at trace
+    time by the module hooks, the module tree is the same tree at every width
+    -- only the shard sizes inside it change -- and an operator's ordinal
+    among the *non-collective* operators of its own module separates siblings
+    without a global index that an inserted collective would shift.
+
+    This is ordinal alignment inside a module, and ordinal alignment is the
+    thing `lineage_keys` was written to avoid. So it is not to be used
+    unchecked: `alignment_integrity` is the check, and `width_classes` refuses
+    these keys when that check fails.
+    """
+    ops = graph.get("ops") or ()
+    if len(module_paths) != len(ops):
+        raise ValueError("a module path is needed for every operator: got %d "
+                         "paths for %d operators"
+                         % (len(module_paths), len(ops)))
+    keys: list = []
+    seen: dict = {}
+    for index, op in enumerate(ops):
+        if _is_collective(op):
+            # A collective consumes no ordinal, or the operator after it would
+            # be renumbered at exactly the widths where it appears.
+            sources = tuple(op.get("inputs_from") or ())
+            keys.append(next((keys[s] for s in sources
+                              if 0 <= s < len(keys)), "external"))
+            continue
+        path = module_paths[index] or ""
+        ordinal = seen.get(path, 0)
+        seen[path] = ordinal + 1
+        keys.append(hashlib.blake2b(repr((path, ordinal)).encode("utf-8"),
+                                    digest_size=8).hexdigest())
+    return keys
+
+
+def alignment_integrity(graphs: Mapping, module_paths: Mapping) -> dict:
+    """Whether a module-path alignment may be read at these widths.
+
+    Two checks, both structural, neither fitted to any measured quantity:
+
+    * every module path holds the same number of non-collective operators at
+      every width. A path whose count differs is a module that did different
+      work at width, and its ordinals then mean different things;
+    * where the ancestry survives at *every* width -- no unknown source on
+      either side, collectives walked through -- it must agree with the
+      alignment the ordinals give. Ancestry that is present is evidence, and
+      evidence that contradicts the alignment ends it.
+
+    `ancestry_unknown` is the count the second check could not examine. It is
+    reported rather than counted as agreement: a check that cannot run is not
+    a check that passed.
+    """
+    widths = sorted(int(w) for w in graphs)
+    if len(widths) < 2:
+        raise ValueError("alignment integrity needs graphs at two or more "
+                         "tensor-parallel widths; got %r" % (widths,))
+
+    def pick(mapping, width):
+        return mapping[width] if width in mapping else mapping[str(width)]
+
+    ops = {w: (pick(graphs, w).get("ops") or ()) for w in widths}
+    paths = {w: pick(module_paths, w) for w in widths}
+    for width in widths:
+        if len(paths[width]) != len(ops[width]):
+            raise ValueError("width %d has %d operators and %d module paths"
+                             % (width, len(ops[width]), len(paths[width])))
+    positions = {w: _non_collective_positions(ops[w]) for w in widths}
+
+    counts = {}
+    for width in widths:
+        table: dict = {}
+        for index in positions[width]:
+            path = paths[width][index] or ""
+            table[path] = table.get(path, 0) + 1
+        counts[width] = table
+    every_path = set()
+    for table in counts.values():
+        every_path |= set(table)
+    disagreeing = sorted(path for path in every_path
+                         if len({counts[w].get(path, 0) for w in widths}) > 1)
+
+    base = widths[0]
+    agrees = contradicts = unknown = 0
+    lengths = {w: len(positions[w]) for w in widths}
+    if len(set(lengths.values())) == 1 and not disagreeing:
+        rank = {w: {index: n for n, index in enumerate(positions[w])}
+                for w in widths}
+        for n in range(lengths[base]):
+            chains = {}
+            checkable = True
+            for width in widths:
+                index = positions[width][n]
+                sources = list(ops[width][index].get("inputs_from") or ())
+                resolved = [_resolve_through_collectives(ops[width], s)
+                            for s in sources]
+                if any(s < 0 for s in resolved):
+                    checkable = False
+                    break
+                chains[width] = [rank[width].get(s) for s in resolved]
+            if not checkable:
+                unknown += 1
+            elif len({tuple(c) for c in chains.values()}) == 1:
+                agrees += 1
+            else:
+                contradicts += 1
+
+    safe = (not disagreeing and len(set(lengths.values())) == 1
+            and contradicts == 0)
+    return {"widths": widths, "operators_per_width": lengths,
+            "paths_disagreeing": disagreeing,
+            "ancestry_agrees": agrees,
+            "ancestry_contradicts": contradicts,
+            "ancestry_unknown": unknown,
+            "safe": safe}
+
+
+def width_classes(graphs: Mapping, module_paths: Mapping = None) -> dict:
     """How each tensor's shape actually behaves with width, read off the graphs.
 
     `graphs` maps a tensor-parallel width to a graph derived at that width. For
@@ -1071,16 +1220,38 @@ def width_classes(graphs: Mapping) -> dict:
     Outputs that exist at one width and not another -- a collective's own
     result, an all-gather's widened tensor -- are absent from the result rather
     than guessed at; `width_coverage` says how many those were.
+
+    `module_paths` is optional and maps each width to one module path per
+    operator, as `capture_lifetimes.py` writes beside the graph. Given it,
+    alignment comes from `module_path_keys` rather than `lineage_keys`, and is
+    refused outright unless `alignment_integrity` passes. On the real graphs
+    that is the only alignment available at all: ancestry reaches 12 of 3014
+    outputs there, because the tracer records an unknown producer for a sixth
+    of the source edges at TP>1 (O14, O15). An entry whose operator *name*
+    differs across widths keeps a `names` field, so a join the module tree
+    licenses but the names do not is visible instead of silent.
     """
     widths = sorted(int(w) for w in graphs)
     if len(widths) < 2:
         raise ValueError("width classification needs graphs at two or more "
                          "tensor-parallel widths; got %r" % (widths,))
+    if module_paths is not None:
+        integrity = alignment_integrity(graphs, module_paths)
+        if not integrity["safe"]:
+            raise ValueError(
+                "module-path alignment is not safe to read at these widths: "
+                "%r" % (integrity,))
+
     base = widths[0]
     per_width = {}
     for width in widths:
         graph = graphs[width] if width in graphs else graphs[str(width)]
-        keys = lineage_keys(graph)
+        if module_paths is None:
+            keys = lineage_keys(graph)
+        else:
+            paths = (module_paths[width] if width in module_paths
+                     else module_paths[str(width)])
+            keys = module_path_keys(graph, paths)
         table = {}
         for index, op in enumerate(graph.get("ops") or ()):
             if _is_collective(op):
@@ -1103,8 +1274,16 @@ def width_classes(graphs: Mapping) -> dict:
         if missing:
             continue
         classification, axis = _classify_shapes(shapes, base)
-        out[ident] = {"name": name, "position": ident[1], "shapes": shapes,
-                      "class": classification, "axis": axis}
+        entry = {"name": name, "position": ident[1], "shapes": shapes,
+                 "class": classification, "axis": axis}
+        # Two widths can run the same module through different operators --
+        # `VocabParallelEmbedding` emits `aten::embedding` at TP=1 and
+        # `aiter::masked_embedding` above it. A module-path alignment is
+        # right to join those, and wrong to do it silently.
+        names = {w: per_width[w][ident][0] for w in widths}
+        if len(set(names.values())) > 1:
+            entry["names"] = names
+        out[ident] = entry
     return out
 
 
@@ -1132,7 +1311,7 @@ def _classify_shapes(shapes: Mapping, base: int) -> tuple:
     return "unresolved", None
 
 
-def width_coverage(graphs: Mapping) -> dict:
+def width_coverage(graphs: Mapping, module_paths: Mapping = None) -> dict:
     """How much of each graph the width classification could align at all.
 
     A classification that quietly drops half the graph is worse than no
@@ -1141,16 +1320,20 @@ def width_coverage(graphs: Mapping) -> dict:
     outputs at the base width with no counterpart.
     """
     widths = sorted(int(w) for w in graphs)
-    classes = width_classes(graphs)
+    classes = width_classes(graphs, module_paths)
     counts = {}
     for width in widths:
         graph = graphs[width] if width in graphs else graphs[str(width)]
         counts[width] = sum(
             len(op.get("output_shapes") or ())
             for op in (graph.get("ops") or ()) if not _is_collective(op))
-    return {"aligned": len(classes),
+    out = {"aligned": len(classes),
             "outputs_per_width": counts,
+            "renamed": sum(1 for v in classes.values() if "names" in v),
             "unaligned_at_base": counts[widths[0]] - len(classes),
             "by_class": {name: sum(1 for v in classes.values()
                                    if v["class"] == name)
                          for name in ("replicated", "sharded", "unresolved")}}
+    if module_paths is not None:
+        out["integrity"] = alignment_integrity(graphs, module_paths)
+    return out
