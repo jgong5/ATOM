@@ -606,3 +606,111 @@ So: the operator that could not be priced at all now prices, at two widths, with
 99.3-99.4% operator coverage. The G4 ≤10% gate is still open, and closing it
 needs the step-level terms above plus a held-out comparison against measured
 TP=2 and TP=4 production steps.
+
+## 11. Pricing without standing the deployment up, 2026-09-11
+
+Everything above was priced by `scripts/compass/run.py`, which starts a real
+ATOM server at the target width -- weights loaded, KV pool allocated, scheduler
+running, a throwaway workload served -- and only then prices the graph. That is
+a fair diagnostic and it is what §9 and §10 used, but it is not the workflow
+this PoC promises: if pricing a candidate requires standing that candidate up,
+nothing has been avoided.
+
+`scripts/compass/primitives.py --layers attention` prices the same graph with a
+much narrower thing behind it: the attention modules materialised with random
+parameters, a KV region sized from the graph's own block tables, a real process
+group of the target width for the collectives, and no model. What the two lists
+agree on is what the server was not contributing.
+
+### What received storage and what did not
+
+Per rank, read from the process rather than asserted:
+
+| width | attention tensors on device | target tensors left on meta | stand-up peak | process peak |
+| --- | --- | --- | --- | --- |
+| TP1 | 352, 1.25 GiB | 898, 51.0 GiB not materialised | 1.62 GiB | 6513 MiB |
+| TP2 | 352, 0.63 GiB | 898, 25.9 GiB not materialised | 2.86 GiB | 5352 MiB |
+| TP4 | 352, 0.31 GiB | 898, 13.4 GiB not materialised | 2.47 GiB | 4029 MiB |
+
+`model_runner_initialized`, `weights_loaded` and `served_workload` are recorded
+`false` in every artifact. Times separate: distributed init 0.07-3.01 s, model
+build 0.62-0.81 s, pricing 9.2-17.1 s. Source and graph sha256 digests are in
+`provenance.collector.hashes`.
+
+The on-device attention storage is the primitive operands and the attention
+state -- `conv1d.weight`, `A_log`, `dt_bias`, the decode scale table, `kv_scale`
+and the bound `k_cache`/`v_cache` views. Those are expected; the requirement was
+never that attention runs on nothing, it was that the other 27 billion
+parameters are not loaded.
+
+### A placement bug that inflated the first TP2/TP4 answer
+
+`init_dist_env(..., local_rank=r)` builds the process group but does not move
+the process's current CUDA device. Under one shared `HIP_VISIBLE_DEVICES` mask
+every rank therefore allocated and ran on logical device 0 -- one physical card
+running four ranks' worth of work. It does not fail. It contends, and the first
+TP2/TP4 prices came out 1.43-1.47x and 2.18-2.81x high against the reference,
+with nothing in the artifact to say why.
+
+The fix is `torch.cuda.set_device(args.rank)` before anything allocates, and
+then a refusal: `_require_distinct_devices` gathers every rank's UUID and PCI
+address and raises before benchmarking if two ranks report the same card, or if
+any card cannot be identified. A logical index alone is not accepted as the
+answer -- `dev 0` on every rank is correct when each rank has its own mask -- so
+the mask, the logical index and the physical identity are all recorded:
+
+    TP2  rank0 dev0 vis 0,1      rank1 dev1 vis 0,1     pci 10, 128
+    TP4  rank0..3 dev0..3 vis 0,1,2,3                   pci 10, 128, 164, 200
+
+The superseded runs are kept as diagnostics, marked INVALID, and excluded from
+calibration. No correction factor was fitted to the discrepancy.
+
+### Agreement, single-rank multiplicity on both sides
+
+The reference collector was pointed at every rank's graph at once, so its raw
+operator counts are 2x at TP2 and 4x at TP4. Both sides are weighted by the
+standalone (single-rank) counts and the multiplicity is printed, rather than
+divided out afterwards.
+
+| width | reference rank | body ratio (standalone / reference) |
+| --- | --- | --- |
+| TP1 | r0 | 0.9949 |
+| TP2 | r0 | 0.9486 |
+| TP2 | r1 | 0.9736 |
+| TP4 | r0 | 0.9943 |
+
+Coverage is 107/108 signatures and 2552/2568 operators (99.4%) on both sides at
+every width; the refused signature is §8's `_fused_qk_norm_single_kernel`.
+
+Both TP2 reference ranks are retained, because they disagree with each other at
+component level and neither is the one to keep:
+
+| signature | std r0 | std r1 | ref r0 | ref r1 |
+| --- | --- | --- | --- | --- |
+| `aiter::silu_and_mul\|4,8704;4,17408` | 3.561 us | 3.598 us | 10.009 us | 3.556 us |
+| `aiter::gemm_a16w16\|4,3072;5120,3072` | 17.619 us | 17.673 us | 22.760 us | 17.739 us |
+| `aten::mul.Tensor\|4,24,128;4,24,128` | 1.988 us | 2.153 us | 2.604 us | 9.613 us |
+
+Rank-to-rank spread of |ratio - 1| over the 107 shared signatures: standalone
+p50 0.65% / p90 8.60% / max 57.19% (a 0.026 us allocation), reference p50 0.82%
+/ p90 28.31% / max 181.46% (the silu above). The TP2 residual is concentrated in
+signatures where the reference disagrees with its own sibling rank by 3-5x.
+**That is an observed asymmetry in the reference, not an explanation of it.**
+The reference run is not reproducible from these artifacts, so its cause --
+contention, clock state, allocator layout, something else -- is unknown, and is
+recorded as unknown rather than called noise.
+
+The only same-collector repeat available is at TP1 (p50 0.5%, p90 16.2%, max
+87.7%). **That band is TP1's**, and is labelled as such wherever it is printed;
+the comparison tool scores a signature against it only when the signature
+appears verbatim in both runs, so a TP2-only shape is never scored against a
+TP1 number.
+
+### What this section does not claim
+
+It is collector validation: the standalone numbers and the deployment numbers
+are the same numbers. It is not full-step accuracy, not a G4 result, and not an
+acceptance test. Every limit in §10 still stands -- the 16 refused operators,
+the LM head and runner work outside the traced body, level 0 against level 3,
+and a domain of one decode point. The long-context and chunked-prefill graphs
+are derived but not yet priced.

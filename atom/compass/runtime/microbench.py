@@ -880,14 +880,12 @@ def _time_over(fn, sets: list, iters: int, warmup: int) -> tuple[float, float]:
     return began.elapsed_time(ended) / 1000.0 / iters, host / iters
 
 
-def price_graph(graph_path: str, iters: int = 2000, warmup: int = 20,
-                cache: str = "hot") -> dict[str, Any]:
-    """Price every distinct operator signature in a captured graph.
+def load_ops(graph_path: str) -> tuple[list, list, dict | None]:
+    """Read the graph(s) at ``graph_path``: their operators, paths, topology.
 
-    Returns the price list and what it could not reach. Coverage is reported by
-    operator count *and* by how many of the graph's operators a priced signature
-    accounts for, because the two differ enormously: a handful of signatures
-    cover most of a step.
+    Shared so that whatever stands the operators up sees exactly the graphs that
+    will be priced. A stand-up sized from one glob and a pricing run reading
+    another is a cache too small by a factor nobody would notice in the numbers.
     """
     # A glob or a comma-separated list, because a deployment has more than one
     # kind of step and each is its own graph -- a decode one and a prefill one.
@@ -930,6 +928,19 @@ def price_graph(graph_path: str, iters: int = 2000, warmup: int = 20,
     # different widths gets None, which the consumer treats as uncertifiable.
     measured_topology = (dict(next(iter(topologies)))
                          if len(topologies) == 1 else None)
+    return ops, paths, measured_topology
+
+
+def price_graph(graph_path: str, iters: int = 2000, warmup: int = 20,
+                cache: str = "hot") -> dict[str, Any]:
+    """Price every distinct operator signature in a captured graph.
+
+    Returns the price list and what it could not reach. Coverage is reported by
+    operator count *and* by how many of the graph's operators a priced signature
+    accounts for, because the two differ enormously: a handful of signatures
+    cover most of a step.
+    """
+    ops, paths, measured_topology = load_ops(graph_path)
 
     counts: dict[str, int] = {}
     example: dict[str, dict] = {}
