@@ -51,6 +51,7 @@ from atom.compass.core.kv_geometry import (  # noqa: E402
     InsufficientPoolBudget, blocks_from_readings, gdn_state_bytes,
     layer_types_disagree, paged_block_bytes)
 from atom.compass.core.memory import MemoryReadings  # noqa: E402
+from atom.compass.core.memory_calibration import for_model  # noqa: E402
 from atom.compass.core.memory_model import (  # noqa: E402
     DEFAULT_PERSISTENT, activation_curve, graph_pool_bytes,
     load_residue_bytes, measured_graph_pool_bytes, non_torch_bytes,
@@ -318,6 +319,11 @@ def main() -> int:
                     help="not in the record; needed to know the warmup shape")
     ap.add_argument("--curve", action="store_true",
                     help="show where the walk and the allocator diverge")
+    ap.add_argument("--source-calibration", action="store_true",
+                    help="use the model's constants calibrated at its declared "
+                         "source configuration, where it has any. Rows say "
+                         "whether each comparison is a validation or the "
+                         "calibration's own residual.")
     ap.add_argument("--calibrate",
                     help="write the collective constants measured from these "
                          "records to this path, for memory_model to read")
@@ -356,6 +362,16 @@ def main() -> int:
         sizing_budget = int((readings.get("total") or 0)
                             * float(config.get("gpu_memory_utilization") or 0))
 
+        calib = for_model(config.get("model")) if args.source_calibration else None
+        cal_map = calib.mapping(world) if calib else None
+
+        def cal_note(term: str, default: str) -> str:
+            """The row note, saying what the comparison is worth."""
+            if calib is None or term not in (cal_map or {}):
+                return default
+            kind = calib.classify(term, config)
+            return "%s; source-calibrated, this record is its %s" % (default, kind)
+
         checkpoint = args.checkpoint
         derived_weights = weight_bytes(checkpoint, tp) if checkpoint else None
         # Against the model's own parameters, which is what the term claims to
@@ -373,16 +389,19 @@ def main() -> int:
 
         residue = (allocated - parameters
                    if allocated is not None and parameters is not None else None)
-        row("load residue", load_residue_bytes(world), residue,
-            "collective pools held through the allocator", sizing_budget)
+        row("load residue", load_residue_bytes(world, cal_map), residue,
+            cal_note("load_residue", "collective pools held through the "
+                     "allocator"), sizing_budget)
 
         # The engine's own forward buffers, and nothing else: the residue above
         # is already resident and counting it twice would make this row a sum
         # of two terms rather than a term.
         persistent = (current - allocated
                       if current is not None and allocated is not None else None)
-        row("persistent", DEFAULT_PERSISTENT, persistent,
-            "engine forward buffers; flat in width", sizing_budget)
+        row("persistent", int((cal_map or {}).get("persistent") or DEFAULT_PERSISTENT),
+            persistent,
+            cal_note("persistent", "engine forward buffers; flat in width"),
+            sizing_budget)
 
         derived_act = peak_activation_bytes(graph) if graph is not None else None
 
