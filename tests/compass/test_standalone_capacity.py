@@ -81,3 +81,48 @@ def test_pool_bytes_is_blocks_times_a_block():
     assert paged_kv_bytes(1 << 20, 524_288) == 512 * GIB
     assert paged_kv_bytes(0, 100) == 0
     assert paged_kv_bytes(1 << 20, 0) == 0
+
+
+class TestPerLayerMaterialisationCarriesItsScope:
+    """The narrowed pool is opt-in, and says so in the record it produces.
+
+    A price taken under a one-slot pool and one taken under the deployment's own
+    pool are prices of arrangements that were shown equivalent *at one working
+    set*. If the record does not say which arrangement produced it, that
+    distinction is gone the moment the number is read somewhere else.
+    """
+
+    def test_the_default_is_the_deployment_s_own_pool(self):
+        from atom.compass.runtime.standalone import KV_LAYERS
+
+        assert KV_LAYERS == "all"
+
+    def test_the_evidence_names_its_own_scope(self):
+        from atom.compass.runtime.standalone import KV_LAYERS_EVIDENCE
+
+        # The numbers AB4 actually produced, and the graph it produced them on.
+        assert KV_LAYERS_EVIDENCE["graph"].endswith("ctx_b32_c1151.json")
+        assert KV_LAYERS_EVIDENCE["bucket"] == 32
+        assert KV_LAYERS_EVIDENCE["context"] == 1151
+        assert KV_LAYERS_EVIDENCE["kv_variants"] == 64
+        assert abs(KV_LAYERS_EVIDENCE["attention_family_delta"]) < \
+            KV_LAYERS_EVIDENCE["declared_band"]
+        # And it refuses to be read as a general claim.
+        assert "not a claim of invariance" in KV_LAYERS_EVIDENCE["scope"]
+
+    def test_an_unknown_setting_is_refused_rather_than_defaulted(self):
+        import pytest
+
+        from atom.compass.runtime.standalone import _bind_caches
+
+        with pytest.raises(ValueError, match="kv_layers must be"):
+            _bind_caches(None, None, None, 0, kv_layers="sixteen")
+
+    def test_both_entry_points_take_the_setting(self):
+        import inspect
+
+        from atom.compass.runtime.standalone import (_bind_caches,
+                                                     stand_up_layers)
+
+        assert "kv_layers" in inspect.signature(stand_up_layers).parameters
+        assert "kv_layers" in inspect.signature(_bind_caches).parameters

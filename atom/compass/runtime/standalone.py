@@ -34,7 +34,8 @@ replaces. Nothing here produces an output anyone reads; only times.
 """
 
 import logging
-from typing import Any
+import os
+from typing import Any, Optional
 
 logger = logging.getLogger(__name__)
 
@@ -345,14 +346,65 @@ def _attention_modules(model) -> list:
             if hasattr(m, "base_attention") or hasattr(m, "base_linear_attention")]
 
 
-def _bind_caches(shim, model, builder, slots: int) -> dict[str, int]:
+#: How many full-attention layer slots the paged KV pool holds.
+#:
+#: ``"all"`` allocates one slot per full-attention layer, which is what a
+#: deployment does. ``"one"`` allocates a single slot and binds every
+#: full-attention layer onto it.
+#:
+#: The reduction is sound because pricing times **one operator at a time**, and
+#: during that operator only its own layer's slot is read -- the other fifteen
+#: are allocated and never touched. `tests/compass/test_kv_slice_geometry.py`
+#: establishes that a one-layer slice and a sixteen-layer slice give the module
+#: a view of identical shape, stride and contiguity, at the same offsets within
+#: the slot.
+#:
+#: **The scope of the evidence, which is narrower than the mechanism.** Job AB4
+#: compared the two configurations on `card/b27_tp1_r0_ctx_b32_c1151`, bucket
+#: 32, context 1151, at the full V=64 rotation. Attention outputs were bitwise
+#: identical across all 64 signatures, and the unified-attention family total
+#: moved -0.54% against a declared 2% band, with both cells stable. That is a
+#: result **at that working set on that graph**. It is not a claim of
+#: invariance at other contexts, and the provenance below records the scope so
+#: a reader is never left inferring it.
+KV_LAYERS = os.environ.get("COMPASS_KV_LAYERS", "all")
+
+#: Where the evidence for ``KV_LAYERS="one"`` comes from, carried into the
+#: provenance of anything priced under it so the claim travels with the number.
+KV_LAYERS_EVIDENCE = {
+    "job": "AB4",
+    "graph": "card/b27_tp1_r0_ctx_b32_c1151.json",
+    "bucket": 32,
+    "context": 1151,
+    "kv_variants": 64,
+    "correctness": "64/64 attention outputs bitwise identical",
+    "attention_family_delta": -0.0054,
+    "declared_band": 0.02,
+    "scope": ("validated at this working set on this graph only; not a claim "
+              "of invariance at other contexts or widths"),
+}
+
+
+def _bind_caches(shim, model, builder, slots: int,
+                 kv_layers: Optional[str] = None) -> dict[str, int]:
     """Allocate and bind the caches, through the builder that owns their layout.
 
     A transcription of `ModelRunner.allocate_kv_cache`'s binding loop with the
     deployment removed: same builder, same `build_kv_cache_tensor` per module,
     same `layer_{layer_num}` keys the attention reads back. The pool sizes are
     this graph's; the layouts are ATOM's.
+
+    ``kv_layers="one"`` narrows the paged pool to a single full-attention slot
+    and binds every full-attention layer onto it -- see :data:`KV_LAYERS`. The
+    DeltaNet state pool is left alone: it is per-sequence, already small, and
+    collapsing it too would move two things at once.
     """
+    # Validated before anything is touched: an argument fault should not
+    # surface as an AttributeError from halfway through the binding.
+    choice = (kv_layers or KV_LAYERS or "all").strip().lower()
+    if choice not in ("all", "one"):
+        raise ValueError(f"kv_layers must be 'all' or 'one', not {choice!r}")
+
     from atom.utils.forward_context import set_kv_cache_data
 
     import torch
@@ -372,6 +424,25 @@ def _bind_caches(shim, model, builder, slots: int) -> dict[str, int]:
     shape_by_pool: dict[str, list] = {}
     num_kv_heads = shim._get_num_kv_heads()
     shim.num_kv_heads = num_kv_heads
+
+    full_attention_layers = int(getattr(shim, "num_full_attn", 0) or 0)
+    if choice == "one":
+        # One slot, and every full-attention layer bound onto it. Only the
+        # full-attention path is redirected: `build_kv_cache_tensor` dispatches
+        # the DeltaNet modules on `base_linear_attention` and they keep their
+        # real per-sequence indices.
+        shim.num_full_attn = 1
+        original_build = builder.build_kv_cache_tensor
+
+        def build_on_one_slot(layer_id, module):
+            if hasattr(module, "base_linear_attention"):
+                return original_build(layer_id, module)
+            # layer_id 0 maps to attn_idx 0 under every branch of the index
+            # arithmetic in `aiter_attention.build_kv_cache_tensor`.
+            return original_build(0, module)
+
+        builder.build_kv_cache_tensor = build_on_one_slot
+
     try:
         _install(builder.allocate_kv_cache_tensors(num_kv_heads, 0),
                  bytes_by_pool, shape_by_pool)
@@ -406,12 +477,27 @@ def _bind_caches(shim, model, builder, slots: int) -> dict[str, int]:
             keys.append(getattr(module, "layer_num", layer_id))
             layer_id += 1
     set_kv_cache_data({f"layer_{k}": t for k, t in zip(keys, tensors)})
+    materialisation = {
+        "kv_layers": choice,
+        "full_attention_layers_in_model": full_attention_layers,
+        "full_attention_slots_allocated": (
+            1 if choice == "one" else full_attention_layers),
+    }
+    if choice == "one":
+        # The evidence travels with the number. A price taken under a narrowed
+        # pool that did not say so would be indistinguishable from one taken
+        # under the deployment's own pool.
+        materialisation["evidence"] = dict(KV_LAYERS_EVIDENCE)
+        if full_attention_layers:
+            materialisation["pool_reduction"] = full_attention_layers
     return {"bound_layers": len(tensors), "kv_heads": num_kv_heads,
             "pool_bytes": bytes_by_pool, "pool_shapes": shape_by_pool,
-            "pool_bytes_total": sum(bytes_by_pool.values())}
+            "pool_bytes_total": sum(bytes_by_pool.values()),
+            "materialisation": materialisation}
 
 
-def stand_up_layers(config, graph_path: str, mode: str) -> dict[str, Any]:
+def stand_up_layers(config, graph_path: str, mode: str,
+                    kv_layers: Optional[str] = None) -> dict[str, Any]:
     """Make the graph's attention operators callable. Returns what was done.
 
     ``mode='meta'`` registers the layers and stops: enough for the custom op to
@@ -481,7 +567,7 @@ def stand_up_layers(config, graph_path: str, mode: str) -> dict[str, Any]:
     # those blocks are the rotation rather than the graph.
     shim.kv_variants = foot["variants"]
     config.num_kvcache_blocks = foot["blocks"]
-    bound = _bind_caches(shim, model, builder, foot["slots"])
+    bound = _bind_caches(shim, model, builder, foot["slots"], kv_layers)
 
     # Kept alive for the process's lifetime: the caches are reached through the
     # module attributes and the KV context, and a shim that fell out of scope
@@ -494,6 +580,13 @@ def stand_up_layers(config, graph_path: str, mode: str) -> dict[str, Any]:
                f"to {shim.num_physical_kvcache_blocks} blocks "
                f"({foot['blocks_per_variant']} per variant x {foot['variants']})"
                f" and {foot['slots']} state slots, from {len(paths)} graph(s)")
+    material = bound.get("materialisation") or {}
+    if material.get("kv_layers") == "one":
+        # Said in the one-line summary too, not only in the structured record,
+        # because the summary is what a reader sees first.
+        in_model = material.get("full_attention_layers_in_model")
+        summary += (f"; paged KV materialised at 1 of {in_model} "
+                    "full-attention slots (AB4 scope: b32 ctx1151 V64)")
     return {
         "summary": summary,
         "registered_layers": registered,
