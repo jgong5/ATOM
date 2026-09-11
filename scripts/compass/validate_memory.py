@@ -57,7 +57,8 @@ from atom.compass.core.memory_calibration import for_model  # noqa: E402
 from atom.compass.core.memory_model import (  # noqa: E402
     DEFAULT_PERSISTENT, activation_curve, graph_pool_bytes,
     load_residue_bytes, measured_graph_pool_bytes, non_torch_bytes,
-    peak_activation_bytes, liveness_is_recorded, traced_shape, weight_bytes)
+    peak_activation_bytes, liveness_is_recorded, liveness_instrumentation,
+    traced_shape, weight_bytes, LIVENESS_INSTRUMENTATION)
 
 GB = float(1 << 30)
 
@@ -511,6 +512,21 @@ def main() -> int:
         walked = graph is not None and liveness_is_recorded(graph)
         if graph is not None and not walked:
             derived_act = None
+
+        # And which producer wrote the fields the walk read. A graph derived
+        # before 2026-09-11 is version 1, where every meta storage keyed to the
+        # same address: weights read as activations, every output as an alias,
+        # no out-variant destination as unseen. Those graphs carried no
+        # `dies_at` either, so `walked` is already False for them -- this says
+        # so out loud, because "no liveness recorded" and "liveness recorded by
+        # a producer that could not tell two tensors apart" are different
+        # findings and only one of them is fixed by re-deriving.
+        if graph is not None:
+            version = liveness_instrumentation(graph)
+            print("  liveness instrumentation : v%d%s" % (
+                version,
+                "" if version >= LIVENESS_INSTRUMENTATION else
+                "  (pre-fix producer; re-derive before trusting a walk)"))
 
         # Preferred ground truth: what the allocator went above its baseline
         # for the very step the graph describes. Same shape, same work, no

@@ -15,7 +15,8 @@ from atom.compass.core.memory_model import (
     activation_bytes_at, activation_curve, graph_pool_bytes,
     load_residue_bytes, measured_graph_pool_bytes, modelled_readings,
     non_torch_bytes, peak_activation_bytes, scratch_bytes_per_token,
-    liveness_is_recorded, traced_shape, UnfoundedActivation,
+    liveness_is_recorded, liveness_instrumentation, traced_shape,
+    LIVENESS_INSTRUMENTATION, UNVERSIONED_LIVENESS, UnfoundedActivation,
     UnfoundedPrediction, derived_readings, weight_bytes)
 
 
@@ -476,10 +477,12 @@ class TestWhatTheGraphDoesNotSay:
     def test_a_derivation_records_no_deaths_and_says_so(self):
         """The 27B's meta-derived prefill graphs, in miniature.
 
-        Nothing runs on meta, so no finalizer fires and no `dies_at` is
-        written. `_deaths` still returns a map -- it falls back to last-read --
-        and the walk still returns a number. On `s27prefhead.tp1` that number
-        is 570 425 344 B against a measured 2 956 984 320 B: 19.3% of the term,
+        Every graph derived before 2026-09-11 reached the walk with no
+        `dies_at` -- not because meta cannot observe a death, which it can, but
+        because only the capture path stamped what the tracer had watched.
+        `_deaths` still returns a map, falling back to last-read, and the walk
+        still returns a number. On `s27prefhead.tp1` that number is
+        570 425 344 B against a measured 2 956 984 320 B: 19.3% of the term,
         all of it from 64 `aten::empty.memory_format` allocations with no
         recorded death. The figure is not wrong so much as unfounded, and the
         caller has to be able to tell.
@@ -498,6 +501,26 @@ class TestWhatTheGraphDoesNotSay:
                           "dtypes": ["float32"], "output_aliases": [None],
                           "inputs_from": []}]}
         assert liveness_is_recorded(graph) is False
+
+    def test_a_graph_that_does_not_name_its_producer_is_the_old_one(self):
+        """Absent is not unknown.
+
+        Every artifact on disk predates the field and every one of them came
+        off the same producer, so an unstamped graph is version 1 and reading
+        it as "cannot say" would let an old template pass a check it never
+        met. The fields it carries look tidy either way -- that is exactly why
+        the question has to be asked of the provenance and not of the fields.
+        """
+        assert liveness_instrumentation({"ops": []}) == UNVERSIONED_LIVENESS
+        assert liveness_instrumentation(
+            {"provenance": {"source": "derivation"}}) == UNVERSIONED_LIVENESS
+        assert liveness_instrumentation(
+            {"provenance": {"liveness_instrumentation": 2}}) == 2
+        # A graph written by a producer newer than this reader still reports
+        # its own number; the reader's job is to say what it was given.
+        assert liveness_instrumentation(
+            {"provenance": {"liveness_instrumentation": 7}}) == 7
+        assert LIVENESS_INSTRUMENTATION > UNVERSIONED_LIVENESS
 
     def test_the_shape_is_queries_and_history_not_a_token_total(self):
         """`s27prefhead` and `s27prefdeep` have identical keys.

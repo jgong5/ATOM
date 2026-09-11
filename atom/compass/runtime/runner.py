@@ -252,7 +252,7 @@ class CompassModelRunner(CompassPredictMixin, ModelRunner):
         # never dispatches and never gets recorded — a TP graph captured on one
         # device would show no communication at all. A no-op on a real
         # multi-device run, where the collective dispatches and is recorded once.
-        collectives = record_collectives(self._graph)
+        collectives = record_collectives(self._graph, tracer=ops)
         # Ground truth for the activation term, for this exact step. The
         # engine's `peak_torch` belongs to the warmup prefill, whose shape is
         # nobody's choice and is rarely the traced one -- so checking a
@@ -287,39 +287,13 @@ class CompassModelRunner(CompassPredictMixin, ModelRunner):
         self._resident_before = resident
         self._allocated_curve = [ops.allocated.get(i)
                                  for i in range(len(self._graph.ops))]
-        self._stamp_deaths(ops)
+        # Stamped by the tracer, which is where the deaths were observed and
+        # is the one place the derivation path shares with this one.
+        ops.stamp_deaths()
         self._write_graph(batch, kind)
         if timing is not None:
             self._write_op_timings(timing)
         return output
-
-    def _stamp_deaths(self, ops) -> None:
-        """Write each operator's observed death onto the operator itself.
-
-        One entry per output, because a fused add-and-norm's two outputs have
-        very different lives -- the normed activation dies into the next gemm,
-        the new residual carries to the end of the block -- and one death for
-        the pair holds an extra tensor per layer.
-
-        A death is observed long after the operator that caused it is recorded,
-        so it cannot be filled in as the trace runs. Stamped as late as
-        possible -- immediately before the graph is written -- because by then
-        the forward has returned and the locals holding its intermediates are
-        gone, which is when most of the finalizers fire. An output still alive
-        at that point keeps `dies_at` at -1 and is treated as living to the end
-        of the step, which is what it did.
-        """
-        import dataclasses
-
-        by_operator: dict = {}
-        for (producer, position), death in ops.deaths.items():
-            if 0 <= producer < len(self._graph.ops):
-                by_operator.setdefault(producer, {})[position] = int(death)
-        for producer, positions in by_operator.items():
-            op = self._graph.ops[producer]
-            width = max(len(op.output_shapes), max(positions) + 1)
-            self._graph.ops[producer] = dataclasses.replace(
-                op, dies_at=tuple(positions.get(p, -1) for p in range(width)))
 
     def _reset_activation_peak(self) -> Optional[int]:
         """Start this step's high-water mark, and say what was already held."""

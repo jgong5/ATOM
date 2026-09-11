@@ -41,6 +41,7 @@ __all__ = ["peak_activation_bytes", "activation_curve", "weight_bytes",
            "resident_bytes", "non_torch_bytes", "load_residue_bytes",
            "modelled_readings", "activation_bytes_at",
            "scratch_bytes_per_token", "liveness_is_recorded", "traced_shape",
+           "liveness_instrumentation", "UNVERSIONED_LIVENESS",
            "UnfoundedActivation", "UnfoundedPrediction",
            "derived_readings", "CALIBRATED_TERMS", "traced_width",
            "graph_pool_bytes", "measured_graph_pool_bytes", "ELEMENT_BYTES"]
@@ -148,15 +149,79 @@ def liveness_is_recorded(graph) -> bool:
     reporting an activation figure has to be able to tell that apart from a
     walk over recorded liveness, so this is the question asked separately.
 
-    A graph derived on meta never has it: nothing runs, so no finalizer fires.
-    Liveness at a shape is a *device* observation, and the only honest answer
-    from a derivation is that it was not observed.
+    This used to say that a graph derived on meta never has it, because
+    nothing runs and no finalizer fires. That is wrong, and believing it is
+    why the derivation path never stamped what it had already observed. A
+    death is a Python reference going, not a device event: a meta tensor is
+    refcounted like any other and its finalizer fires at the same moment in
+    the same forward. Derived graphs carried no `dies_at` because nothing
+    wrote `MetaOpTracer.deaths` onto the operators, not because it was empty.
+
+    What a derivation genuinely cannot observe is the *allocator*: reuse,
+    fragmentation, and any buffer a kernel takes internally, none of which
+    reach a dispatch tracer. So a recorded liveness from meta is the graph's
+    own reference structure, which is what the walk needs, and is still not
+    the allocator's high-water mark -- see `activation_curve`, which is the
+    comparison that separates the two.
     """
     return any(
         death is not None and death >= 0
         for op in (graph.get("ops") or ())
         for death in (op.get("dies_at") or ())
     )
+
+
+#: What a graph that does not name its instrumentation revision is. Every
+#: artifact written before 2026-09-11 predates the field, and all of them came
+#: off the same broken producer, so the absent key is not "unknown" -- it is
+#: version 1, and reading it as anything else would let an old template pass a
+#: check it never met.
+UNVERSIONED_LIVENESS = 1
+
+#: Which revision of the tracer produced a graph's liveness fields --
+#: `inputs_from`, `output_aliases` and `dies_at`, the three this walk reads.
+#: Stamped into every graph's provenance by
+#: `atom.compass.runtime.tracer.ModelTracer.provenance`, so an artifact on disk
+#: can be told apart from a re-derived one without re-deriving it. Defined here
+#: rather than beside the producer because it is a property of what the walk is
+#: entitled to assume, and because this module reaches a reader with no torch.
+#:
+#: 1. Everything derived before 2026-09-11. `MetaOpTracer._storage_of` keyed on
+#:    `data_ptr()`, which is 0 for every meta storage ever made, so on the
+#:    device derivation runs on all three fields are wrong in the same
+#:    direction: every input reads as produced by the operator before it, every
+#:    output as an alias, and no out-variant destination as unseen. Deaths were
+#:    observed and never stamped, so the walk fell back to a last-read rule
+#:    over that same corrupted `inputs_from`. Captures are not affected: a
+#:    device tensor has an address, so the key worked where there was one.
+#: 2. Storage identity where there is no address, and the tracer stamps what it
+#:    watched die. Prices are unaffected at either version: a signature is
+#:    built from input shapes, dtypes, context, integer values and scalars, and
+#:    no storage key reaches any of them.
+LIVENESS_INSTRUMENTATION = 2
+
+
+def liveness_instrumentation(graph) -> int:
+    """Which revision of the tracer produced this graph's liveness fields.
+
+    The three fields the memory walk reads -- `inputs_from`, `output_aliases`,
+    `dies_at` -- were all wrong on anything derived on meta before
+    2026-09-11: `_storage_of` keyed on `data_ptr()`, which is 0 for every meta
+    storage, so one key stood for every tensor in the trace. The graph that
+    came out reads as tidy rather than broken, so a caller cannot tell the two
+    apart by looking at the fields; it has to ask which producer wrote them.
+
+    Prices are unaffected at either revision and old artifacts are deliberately
+    left as they are, so this is a fact about a graph, not a verdict on it. See
+    `atom.compass.runtime.meta.LIVENESS_INSTRUMENTATION` for what each revision
+    did, and `liveness_is_recorded` for the separate question of whether the
+    deaths are there at all.
+    """
+    version = (graph.get("provenance") or {}).get("liveness_instrumentation")
+    try:
+        return int(version)
+    except (TypeError, ValueError):
+        return UNVERSIONED_LIVENESS
 
 
 def traced_width(graph) -> Optional[int]:

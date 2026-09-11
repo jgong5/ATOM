@@ -103,6 +103,15 @@ def head_gather_opspec(group, input_, dim: int = -1, group_name: str = "tp"):
                  ("group_world_size", width)),
         scalars=(("#0", str(group.unique_name)),
                  ("#5", int(axis))),
+        # A fresh allocation. The output is the caller's `out` argument, sized
+        # for the whole group, and it cannot be the input's storage at any
+        # width above one -- but it is stamped rather than left to a default,
+        # because an absent `output_aliases` and a recorded "allocates" read
+        # the same in the memory walk and are not the same claim. `reg_buffer`
+        # is the persistent IPC pool the transfer passes through; it belongs to
+        # the process, is the same buffer for every step, and is not this
+        # operator's activation.
+        output_aliases=(None,),
         abi="live-state",
     )
 
@@ -176,12 +185,24 @@ class record_collectives:
     for it has to come from performing the real collective in a real group.
     """
 
-    def __init__(self, graph, group_name: str = "tp") -> None:
+    def __init__(self, graph, group_name: str = "tp", tracer=None) -> None:
         self.graph = graph
         self.group_name = group_name
+        #: The dispatch tracer recording into the same graph, where there is
+        #: one. A synthesized operator needs its bookkeeping as much as a
+        #: dispatched one does -- see `MetaOpTracer.note_operator` -- and only
+        #: the tracer holds the producer map that supplies it. Optional so a
+        #: test can record into a bare graph and read the spec back.
+        self.tracer = tracer
         self._group = None
         self._original = None
         self._original_gather = None
+
+    def _record(self, spec, inputs=(), outputs=()) -> None:
+        if self.tracer is not None:
+            self.tracer.note_operator(spec, inputs=inputs, outputs=outputs)
+        else:
+            self.graph.add(spec)
 
     def __enter__(self) -> "record_collectives":
         try:
@@ -198,7 +219,7 @@ class record_collectives:
 
         import inspect
 
-        recorder, name = self.graph, self.group_name
+        record, name = self._record, self.group_name
         original = group.all_reduce
         # The dispatcher does not record the wrapper's arguments, it
         # records the custom op's: `all_reduce_(tensor, group_name,
@@ -220,19 +241,40 @@ class record_collectives:
             bound = sig.bind(group, input_, *args, **kwargs)
             bound.apply_defaults()
             flags = bound.arguments
-            recorder.add(
-                OpSpec(
-                    name="aiter::all_reduce_",
-                    input_shapes=(tuple(int(d) for d in input_.shape),),
-                    output_shapes=(tuple(int(d) for d in input_.shape),),
-                    dtypes=(str(input_.dtype).replace("torch.", ""),),
-                    group=name,
-                    scalars=(("#1", str(group.unique_name)),
-                             ("#2", bool(flags["ca_use_new"])),
-                             ("#3", bool(flags["ca_fp8_quant"]))),
-                )
+            spec = OpSpec(
+                name="aiter::all_reduce_",
+                input_shapes=(tuple(int(d) for d in input_.shape),),
+                output_shapes=(tuple(int(d) for d in input_.shape),),
+                dtypes=(str(input_.dtype).replace("torch.", ""),),
+                group=name,
+                scalars=(("#1", str(group.unique_name)),
+                         ("#2", bool(flags["ca_use_new"])),
+                         ("#3", bool(flags["ca_fp8_quant"]))),
+                # A fresh allocation, read off the native implementation rather
+                # than off the name: the trailing underscore is a naming
+                # artifact and every path this call can take is out of place.
+                # `all_reduce_` defers to `_all_reduce_out_place`, whose fake
+                # is `torch.empty_like`; `CustomAllreduce.all_reduce` and
+                # `quick_all_reduce` each open with `out = torch.empty_like`;
+                # pynccl allocates `out_tensor` likewise; the torch.distributed
+                # fallback is `input_.clone()`; and the capture warm-up branch
+                # returns `torch.zeros_like`. `registered_input` decides
+                # whether the *input* is copied into the persistent IPC pool,
+                # not where the output lives, so there is no path on which this
+                # writes into input 0.
+                output_aliases=(None,),
             )
-            return original(input_, *args, **kwargs)
+            out = original(input_, *args, **kwargs)
+            # Under the passthrough `out` *is* `input_`, one storage where
+            # production has two. So the graph records the collective as the
+            # producer of that storage -- which is what a reader downstream
+            # sees in production -- but the input's death cannot be told from
+            # the output's, and the derived curve holds the input for the
+            # collective's life as well as its own. One collective-sized
+            # tensor per layer, in the conservative direction, and it is not
+            # observable from this side of the passthrough.
+            record(spec, inputs=(input_,), outputs=(out,))
+            return out
 
         group.all_reduce = all_reduce
         self._group, self._original = group, original
@@ -243,9 +285,10 @@ class record_collectives:
             import torch
 
             spec = head_gather_opspec(group, input_, dim, group_name=name)
-            recorder.add(spec)
-            return torch.empty(spec.output_shapes[0], dtype=input_.dtype,
-                               device=input_.device)
+            out = torch.empty(spec.output_shapes[0], dtype=input_.dtype,
+                              device=input_.device)
+            record(spec, inputs=(input_,), outputs=(out,))
+            return out
 
         group.all_gather = all_gather
         self._original_gather = original_gather

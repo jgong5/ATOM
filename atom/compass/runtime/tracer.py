@@ -261,6 +261,11 @@ def execution_record(args, spec, notes) -> dict:
         "head_rows_traced": notes.get("hidden_rows"),
         "regions_traced": REGION_INCLUDES[getattr(args, "region", "body")],
         "regions_not_traced": REGION_EXCLUDES[getattr(args, "region", "body")],
+        # How many operators the trace watched an output die from. Recorded
+        # because its absence is what a reader needs to see: a graph with no
+        # deaths is walked for memory by a last-read rule that returns a number
+        # either way, so nothing downstream ever says the liveness was guessed.
+        "operators_with_observed_deaths": notes.get("deaths_stamped"),
     }
 
 
@@ -305,7 +310,7 @@ def trace_regions(model, input_ids, positions, topology=None, on_meta=False,
 
     ops = MetaOpTracer(topology=topology)
     triton = TritonLaunchTracer(graph=ops.graph)
-    collectives = record_collectives(ops.graph)
+    collectives = record_collectives(ops.graph, tracer=ops)
     # Only on meta, and reported: see redirect_device_factories.
     factories = (redirect_device_factories() if on_meta
                  else contextlib.nullcontext())
@@ -339,7 +344,7 @@ def trace_regions(model, input_ids, positions, topology=None, on_meta=False,
             # device-free forward possible at all. Hence a second, discarded
             # tracer rather than no tracer.
             scratch = MetaOpTracer(topology=topology)
-            with record_collectives(scratch.graph), \
+            with record_collectives(scratch.graph, tracer=scratch), \
                     TritonLaunchTracer(graph=scratch.graph), scratch:
                 hidden = model(input_ids, positions)
             notes["hidden_rows"] = int(hidden.shape[0])
@@ -355,6 +360,13 @@ def trace_regions(model, input_ids, positions, topology=None, on_meta=False,
             with collectives, triton, ops:
                 model(input_ids, positions)
         trace_s = time.perf_counter() - t0
+    # The same stamp the capture path applies, from the same tracer, and for
+    # the same reason: the tracer watched every output die and nothing wrote
+    # that down. Only the capture path stamped, and every template on disk came
+    # down this one -- so every derived graph reached the memory walk with no
+    # `dies_at` at all, and the walk fell back to a last-read rule silently.
+    # After the forward has returned, which is when the finalizers fire.
+    notes["deaths_stamped"] = ops.stamp_deaths()
     return ops.graph, trace_s, getattr(factories, "redirected", 0), notes
 
 
@@ -571,10 +583,20 @@ class ModelTracer:
         Separate from :meth:`trace` so a reader can see the whole record in one
         place, and so a test can check a field without building a 27B model.
         """
+        from atom.compass.runtime.meta import LIVENESS_INSTRUMENTATION
+
         registration = collective_registration(request, spec)
         prov = {
             "source": "derivation" if self.device.type == "meta" else "capture",
             "device": self.device.type,
+            # Which revision of the tracer produced this graph's liveness
+            # fields -- `inputs_from`, `output_aliases`, `dies_at`. A graph on
+            # disk without this key is version 1: derived before 2026-09-11,
+            # when every meta storage keyed to the same address and all three
+            # were wrong in the same direction. Prices are unaffected at either
+            # version. Old artifacts are left exactly as they are and read as 1;
+            # see `atom.compass.runtime.meta.LIVENESS_INSTRUMENTATION`.
+            "liveness_instrumentation": LIVENESS_INSTRUMENTATION,
             "compilation_level": 0,  # a bare model call is never compiled
             "tokens": request.tokens,
             # How many device-typed factory calls were sent to meta so the

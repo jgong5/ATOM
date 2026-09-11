@@ -26,9 +26,12 @@ from torch.utils._python_dispatch import TorchDispatchMode
 from atom.compass.runtime import forward_ctx
 
 from atom.compass.core.graph import OpGraph, OpSpec
+from atom.compass.core.memory_model import (
+    LIVENESS_INSTRUMENTATION as _LIVENESS_INSTRUMENTATION)
 
 __all__ = [
     "MissingMetaKernel", "MetaTrace", "MetaOpTracer",
+    "LIVENESS_INSTRUMENTATION",
     "derived_inputs", "AMBIGUOUS_GROUP",
 ]
 
@@ -42,6 +45,14 @@ _COLLECTIVE_HINTS = (
 #: Recorded when an operator is a collective but the group it ran on cannot be
 #: determined. Distinct from ``None``, which asserts local computation.
 AMBIGUOUS_GROUP = "?"
+
+#: Which revision of this module produced a graph's liveness fields. Defined
+#: next to the walk that reads them -- see
+#: :data:`atom.compass.core.memory_model.LIVENESS_INSTRUMENTATION` for what
+#: each revision did -- and re-exported here because this is the module the
+#: number is a fact about. One definition, so a producer cannot claim a
+#: revision the consumer has never heard of.
+LIVENESS_INSTRUMENTATION = _LIVENESS_INSTRUMENTATION
 
 
 def _is_collective(name: str) -> bool:
@@ -205,16 +216,44 @@ def _allocated() -> int:
         return -1
 
 
-def _storage_of(tensor) -> int:
-    """A tensor's storage address, or 0 where it has none.
+def _storage_of(tensor):
+    """A tensor's storage identity, or ``None`` where it has none.
 
     Two views of one buffer are one entry: a reshape does not allocate, and
-    counting it twice would invent activation memory that never existed.
+    counting it twice would invent activation memory that never existed. On a
+    device the address is the natural key for that, and it is the key the
+    allocator hands back and hands out again, which is what ``_died`` exists
+    to handle.
+
+    A meta tensor has no address. ``data_ptr()`` returns 0 for every storage
+    ever made and does not raise, so keyed on the address alone every tensor
+    of a meta trace is one tensor -- and derivation runs on meta. What that
+    costs is not an absent field but three wrong ones: ``inputs_from`` says
+    every input came from the operator immediately before, every output looks
+    like an alias of an input, and no out-variant destination is ever unseen.
+    Those three are what the liveness walk is made of.
+
+    The storage object's own identity is shared by views of it and distinct
+    between storages, which is exactly the property wanted, so it is the key
+    where there is no address. The two are kept in separate spaces rather than
+    used interchangeably: a storage built over memory somebody else owns is a
+    second object at an address that is already keyed, and those two *are*
+    aliases.
     """
     try:
-        return int(tensor.untyped_storage().data_ptr())
-    except Exception:  # noqa: BLE001 - meta and fake tensors have no storage
-        return 0
+        storage = tensor.untyped_storage()
+    except Exception:  # noqa: BLE001 - a fake tensor has no storage at all
+        return None
+    try:
+        address = int(storage.data_ptr())
+    except Exception:  # noqa: BLE001 - nor does every subclass
+        address = 0
+    if address:
+        return address
+    try:
+        return ("storage", int(storage._cdata))
+    except Exception:  # noqa: BLE001
+        return None
 
 
 def _int_ranges_of(tensors) -> tuple:
@@ -385,9 +424,11 @@ class MetaOpTracer(TorchDispatchMode):
         #: to name the group a collective ran on; see :func:`_resolve_group`.
         self.topology = dict(topology or {})
         self.missing: list[MissingMetaKernel] = []
-        #: Storage address -> the operator that last wrote it. What makes the
+        #: Storage identity -> the operator that last wrote it. What makes the
         #: graph walkable for liveness rather than only summable for shapes.
-        self._producers: dict[int, int] = {}
+        #: Keyed by :func:`_storage_of`, never by ``None``: a tensor with no
+        #: storage is not an activation this step produced.
+        self._producers: dict = {}
         #: What the allocator held after each recorded operator, aligned with
         #: ``graph.ops``. The activation term is a *curve* -- the walk's live
         #: set over the step -- and checking only its maximum against only the
@@ -440,7 +481,82 @@ class MetaOpTracer(TorchDispatchMode):
         except TypeError:  # not weak-referenceable; fall back to last-read
             pass
 
-    def _died(self, index: int, position: int, storage: int) -> None:
+    def stamp_deaths(self) -> int:
+        """Write each observed death onto the operator whose output died.
+
+        One entry per output, because a fused add-and-norm's two outputs have
+        very different lives -- the normed activation dies into the next gemm,
+        the new residual carries to the end of the block -- and one death for
+        the pair holds an extra tensor per layer.
+
+        A death is observed long after the operator that caused it is recorded,
+        so it cannot be filled in as the trace runs; and `self.deaths` is the
+        tracer's own record, which nothing outside reads. That is how a
+        derived graph came to carry no `dies_at` at all while the tracer that
+        produced it had watched every tensor go: only the capture path stamped,
+        and derivation is the path every template on disk came down. A graph
+        with no deaths is not reported as such by the memory walk -- it falls
+        back to a last-read rule and returns a number either way.
+
+        Called as late as possible, once the forward has returned and the
+        locals holding its intermediates are gone, which is when most of the
+        finalizers fire. An output still alive then keeps -1 and is treated as
+        living to the end of the step, which is what it did.
+
+        Returns how many operators were stamped, so a caller can say so.
+        """
+        import dataclasses
+
+        by_operator: dict = {}
+        for (producer, position), death in self.deaths.items():
+            if 0 <= producer < len(self.graph.ops):
+                by_operator.setdefault(producer, {})[position] = int(death)
+        for producer, positions in by_operator.items():
+            op = self.graph.ops[producer]
+            width = max(len(op.output_shapes), max(positions) + 1)
+            self.graph.ops[producer] = dataclasses.replace(
+                op, dies_at=tuple(positions.get(p, -1) for p in range(width)))
+        return len(by_operator)
+
+    def note_operator(self, spec: OpSpec, inputs=(), outputs=()) -> int:
+        """Record an operator the dispatcher never saw, with its provenance.
+
+        Under simulated tensor parallelism a collective is replaced by a
+        passthrough before it reaches the dispatcher, so it has to be
+        synthesized -- see `atom.compass.runtime.derive.record_collectives`.
+        Synthesizing the *spec* is not enough. An operator appended straight to
+        the graph has no ``inputs_from``, so nothing in the graph reads its
+        input and the tensor it consumes looks unread; and it is absent from
+        the producer map, so whoever reads its output is recorded as reading
+        the tensor the collective was handed instead. Both are liveness, and a
+        collective sits where the activation term is largest.
+
+        ``inputs_from`` is filled in from the producer map unless the caller
+        already supplied one. ``output_aliases`` is the caller's: whether a
+        collective allocates or writes in place is a fact about the native
+        implementation, not something this can see through a passthrough.
+        """
+        import dataclasses
+
+        if not spec.inputs_from:
+            spec = dataclasses.replace(spec, inputs_from=tuple(
+                self._producers.get(_storage_of(t), -1) for t in inputs
+                if isinstance(t, torch.Tensor)))
+        self.graph.add(spec)
+        index = len(self.graph.ops) - 1
+        self.allocated[index] = _allocated()
+        self._current = index
+        for position, produced in enumerate(outputs):
+            if not isinstance(produced, torch.Tensor):
+                continue
+            key = _storage_of(produced)
+            if key is not None:
+                self._producers[key] = index
+                self._seen.add(key)
+            self._watch(produced, index, position)
+        return index
+
+    def _died(self, index: int, position: int, storage) -> None:
         key = (index, position)
         self.deaths[key] = max(self.deaths.get(key, -1), self._current)
         # ...and forget the address, because the allocator hands it straight
@@ -522,10 +638,12 @@ class MetaOpTracer(TorchDispatchMode):
         # addresses, and a reused address is a new tensor.
         input_producers = {
             _storage_of(t): self._producers.get(_storage_of(t), -1)
-            for t in tensors if isinstance(t, torch.Tensor)}
+            for t in tensors
+            if isinstance(t, torch.Tensor) and _storage_of(t) is not None}
         output_aliases = tuple(
             input_producers.get(_storage_of(o))
-            if isinstance(o, torch.Tensor) else None
+            if isinstance(o, torch.Tensor) and _storage_of(o) is not None
+            else None
             for o in outs if _shape_of(o) is not None)
         # Recorded and executed are not the same thing. A profiler operator
         # closes a `record_function` region and runs no kernel, so it belongs in
@@ -548,13 +666,16 @@ class MetaOpTracer(TorchDispatchMode):
             unseen = next(
                 (t for t in tensors[:1] if isinstance(t, torch.Tensor)
                  and _shape_of(t) is not None
+                 and _storage_of(t) is not None
                  and _storage_of(t) not in self._seen), None)
             if unseen is not None:
                 outs = (unseen,)
                 out_shapes = (_shape_of(unseen),)
                 output_aliases = (None,)
-        self._seen.update(_storage_of(t) for t in tensors
-                          if isinstance(t, torch.Tensor))
+        self._seen.update(
+            key for key in (_storage_of(t) for t in tensors
+                            if isinstance(t, torch.Tensor))
+            if key is not None)
 
         if not name.startswith(NOT_WORK):
             self.graph.add(
@@ -580,13 +701,16 @@ class MetaOpTracer(TorchDispatchMode):
             self._current = index
             position = 0
             for produced in outs:
-                if isinstance(produced, torch.Tensor):
-                    self._producers[_storage_of(produced)] = index
+                key = (_storage_of(produced)
+                       if isinstance(produced, torch.Tensor) else None)
+                if key is not None:
+                    self._producers[key] = index
                 if _shape_of(produced) is None:
                     continue  # not a shaped output; no position in the record
                 if isinstance(produced, torch.Tensor):
                     self._watch(produced, index, position)
-                    self._seen.add(_storage_of(produced))
+                    if key is not None:
+                        self._seen.add(key)
                 position += 1
         return out
 
