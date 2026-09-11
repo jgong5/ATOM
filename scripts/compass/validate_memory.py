@@ -57,7 +57,7 @@ from atom.compass.core.memory_calibration import for_model  # noqa: E402
 from atom.compass.core.memory_model import (  # noqa: E402
     DEFAULT_PERSISTENT, activation_curve, graph_pool_bytes,
     load_residue_bytes, measured_graph_pool_bytes, non_torch_bytes,
-    peak_activation_bytes, weight_bytes)
+    peak_activation_bytes, liveness_is_recorded, traced_shape, weight_bytes)
 
 GB = float(1 << 30)
 
@@ -76,6 +76,62 @@ def warmup_tokens(config: dict, max_num_batched_tokens: int) -> int:
     num_seqs = max(1, min(max_num_batched_tokens // max_model_len, max_num_seqs))
     seq_len = max(1, min(max_model_len, max_num_batched_tokens // num_seqs))
     return num_seqs * seq_len
+
+
+def warmup_shape(config: dict, max_num_batched_tokens: int) -> tuple:
+    """The prefill `warmup_model` actually runs, per request and in full.
+
+    `ModelRunner.warmup_model` builds `num_seqs` sequences of `seq_len` tokens
+    each, with no history -- they are fresh `Sequence` objects, so every token
+    is scheduled and nothing is cached. The peak reading belongs to *that*
+    shape: this many requests, this many query tokens each, zero context
+    behind them.
+
+    Returned rather than summed because the sum is not the shape. See
+    `warmup_mismatch`.
+    """
+    max_model_len = int(config.get("max_model_len") or 0)
+    max_num_seqs = int(config.get("max_num_seqs") or 1)
+    if not (max_model_len and max_num_batched_tokens):
+        return ((), ())
+    num_seqs = max(1, min(max_num_batched_tokens // max_model_len, max_num_seqs))
+    seq_len = max(1, min(max_model_len, max_num_batched_tokens // num_seqs))
+    return ((seq_len,) * num_seqs, (seq_len,) * num_seqs)
+
+
+def warmup_mismatch(graph: dict, config: dict,
+                    max_num_batched_tokens: int) -> str:
+    """Why this graph cannot be scaled to the warmup peak, or "".
+
+    The check `graph_tokens` cannot make. The 27B's two 16 384-token prefill
+    graphs have *identical* keys -- `batch_signature [16384]` both -- and
+    differ only in history: the head chunk starts cold, the deep chunk carries
+    98 304 cached tokens and reads 7x the KV. A token-total match takes either
+    one, and comparing the deep chunk's walk against the warmup peak would be
+    comparing two different steps and calling the difference model error.
+
+    A *different number of tokens* is not a mismatch -- scaling across token
+    counts is the claim the row exists to test, and the 0.6B's 3494-token trace
+    reaching its 4096-token warmup peak is the one held-out result the
+    activation term has. History is the disqualifier: warmup runs fresh
+    sequences, so any graph with cached tokens behind its queries is a
+    different step, not the same step at another size.
+
+    Context is counted inclusive of the query, the way a batch spec writes it,
+    so a cold request has `context_lens == query_lens`.
+    """
+    want_q, _ = warmup_shape(config, max_num_batched_tokens)
+    if not want_q:
+        return "warmup shape unknown (pass --max-num-batched-tokens)"
+    got_q, got_c = traced_shape(graph)
+    if not got_q:
+        return "traced shape unknown"
+    if not got_c:
+        return "traced history unrecorded, so tokens are all there is to match"
+    history = [c - q for c, q in zip(got_c, got_q)]
+    if any(h for h in history):
+        return "traced %s tokens of history, warmup runs none" % history
+    return ""
 
 
 def graph_tokens(graph: dict) -> int:
@@ -447,6 +503,15 @@ def main() -> int:
 
         derived_act = peak_activation_bytes(graph) if graph is not None else None
 
+        # A walk is only liveness where liveness was recorded. Without
+        # `dies_at` the walk falls back to last-read, which on the 27B's
+        # meta-derived prefill graphs returns 19.3% of the measured term out of
+        # allocations it never saw freed. That number is not a model of
+        # anything and is not to be read as one.
+        walked = graph is not None and liveness_is_recorded(graph)
+        if graph is not None and not walked:
+            derived_act = None
+
         # Preferred ground truth: what the allocator went above its baseline
         # for the very step the graph describes. Same shape, same work, no
         # inference. Written into the graph's provenance by the tracing run.
@@ -475,13 +540,38 @@ def main() -> int:
         # tested, and it is the whole reason this term is analytical rather
         # than a recording -- a term that only answers at the shape it was
         # taken on answers nothing worth asking.
+        #
+        # Scaled only from the graph that *is* the warmup step. Same token
+        # total is not the same step: the 27B's head and deep 16 384-token
+        # chunks have identical keys and 98 304 tokens of history between them.
         want, got = warmup_tokens(config, budget), graph_tokens(graph or {})
+        mismatch = warmup_mismatch(graph, config, budget) if graph else ""
         scaled = None
-        if derived_act is not None and want and got:
+        if graph is not None and not walked:
+            note += "; no liveness recorded in this graph, nothing to walk"
+        elif mismatch:
+            note += "; not the warmup step -- %s" % mismatch
+        elif derived_act is not None and want and got:
             scaled = int(derived_act * want / got)
             note += " (walk scaled %d -> %d tokens)" % (got, want)
         elif not want:
             note += "; warmup shape unknown (pass --max-num-batched-tokens)"
+        # The term is calibrated even where it cannot be walked, and saying so
+        # is the difference between "no derived figure here" and "no evidence
+        # for this term anywhere". It is not offered as a model input --
+        # `mapping` withholds it -- because it is a peak at a shape, so the
+        # note has to name the shape it holds at rather than the width.
+        if calib is not None and "activations" in calib.terms:
+            kind = calib.classify("activations", config, producer=blob.get("run"))
+            if kind == "validation":
+                note += ("; the source calibration is a peak at another "
+                         "configuration and is not stretched to this one")
+            else:
+                note += ("; source-calibrated at this warmup shape (%d B), "
+                         "this record is its %s"
+                         % (calib.terms["activations"].value, kind))
+                if blob.get("run") is None and kind == "residual":
+                    note += " (run unidentified)"
         row("activations", scaled, warmup_act, note)
 
         # `non_torch` is device-wide used memory minus this process's reserve,

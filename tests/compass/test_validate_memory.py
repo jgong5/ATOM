@@ -126,6 +126,8 @@ def test_a_row_on_another_record_is_not_accused_of_tampering():
     """
     import dataclasses
 
+    from atom.compass.core.execution_id import (EXECUTION_SCHEMA, ID_INPUTS,
+                                                derive_execution_id)
     from atom.compass.core.memory_calibration import (SourceCalibration,
                                                       for_model, producer_key)
 
@@ -139,9 +141,20 @@ def test_a_row_on_another_record_is_not_accused_of_tampering():
     assert "residual (run unidentified)" in note
     assert "altered" not in note and "re-serialised" not in note
 
+    # A legacy block naming a host and a pid is not an execution identity, so
+    # it cannot promote the note either.
+    legacy = {"host": "hjbog-srdc-18", "pid": 695009,
+              "started_at": "2026-09-11T08:55:40Z"}
+    assert producer_key(legacy) is None
+
     # And the note that *is* worth printing, once a run claims to be the fit.
-    run = {"host": "hjbog-srdc-18", "pid": 695009,
-           "started_at": "2026-09-11T08:55:40Z"}
+    inputs = {"host": "hjbog-srdc-18", "cell": "RESULTS/tp1_source",
+              "side": "real", "repeat": 1, "server_pid": 695009,
+              "launched_at_ns": 1757580940000000000}
+    run = {"execution": {
+        "schema": EXECUTION_SCHEMA,
+        "execution_id": derive_execution_id(*[inputs[n] for n in ID_INPUTS]),
+        "id_inputs": inputs}}
     entry = calib.terms["persistent"]
     identified = SourceCalibration(
         model=calib.model,
@@ -153,3 +166,51 @@ def test_a_row_on_another_record_is_not_accused_of_tampering():
     note = script._cal_note(identified, identified.mapping(1), config,
                             foreign_sha, run, "persistent", "held")
     assert "re-serialised since it was fitted" in note
+
+
+def test_the_deep_chunk_is_not_the_warmup_step_even_at_the_same_token_count():
+    """The match the token total cannot make.
+
+    `warmup_model` runs fresh sequences: every token scheduled, nothing
+    cached. `s27prefdeep` runs the same 16 384 tokens with 98 304 behind them
+    -- 7x the KV to read, a different attention branch, and an identical
+    `batch_signature`. Scaling its walk to the warmup peak would compare two
+    different steps and book the difference as model error.
+    """
+    script = _script()
+    config = {"max_model_len": 262144, "max_num_seqs": 32}
+
+    assert script.warmup_shape(config, 16384) == ((16384,), (16384,))
+    assert script.warmup_tokens(config, 16384) == 16384
+
+    def spec(context):
+        return {"key": {"batch_signature": [16384]},
+                "provenance": {"batch_spec": {"query_lens": [16384],
+                                              "context_lens": [context]}}}
+
+    assert script.warmup_mismatch(spec(16384), config, 16384) == ""
+    assert "98304" in script.warmup_mismatch(spec(114688), config, 16384)
+
+
+def test_a_trace_at_another_size_is_still_the_warmup_step(): 
+    """Scaling across token counts is the claim, not a mismatch.
+
+    The 0.6B's 3494-token trace reaching its independently measured 4096-token
+    warmup peak is the one held-out result the activation term has. A matcher
+    strict enough to reject the deep chunk must not reject that.
+    """
+    script = _script()
+    config = {"max_model_len": 40960, "max_num_seqs": 256}
+    cold = {"key": {"batch_signature": [3494]},
+            "provenance": {"shape": {"num_scheduled_tokens": [3494],
+                                     "context_lens": [3494]}}}
+    assert script.warmup_shape(config, 4096) == ((4096,), (4096,))
+    assert script.warmup_mismatch(cold, config, 4096) == ""
+
+
+def test_an_unlabelled_graph_is_matched_on_tokens_and_admits_it():
+    script = _script()
+    config = {"max_model_len": 262144, "max_num_seqs": 32}
+    bare = {"key": {"batch_signature": [16384]}}
+    assert "tokens are all there is to match" in script.warmup_mismatch(
+        bare, config, 16384)

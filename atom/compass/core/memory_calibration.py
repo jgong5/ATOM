@@ -45,21 +45,17 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
+from atom.compass.core.execution_id import (EXECUTION_SCHEMA,
+                                            verify_execution_id)
+
 __all__ = [
     "CalibratedTerm",
     "SourceCalibration",
     "SourceRun",
     "for_model",
     "producer_key",
+    "EXECUTION_SCHEMA",
 ]
-
-#: The fields that name one execution. Taken from the vocabulary the campaign
-#: harness already writes -- `compare.py` reads a run manifest out of a record's
-#: `run` block, `merge_sweep.py` labels fresh-process shards by `started_at`,
-#: and `residual.py`/`step_accounting.py` attribute steps by `pid`. A second
-#: run-ID scheme would have to be reconciled with those; this one is them.
-PRODUCER_FIELDS = ("host", "pid", "started_at")
-
 
 def producer_key(run: Mapping | None) -> str | None:
     """Which execution wrote a record, or None when the record cannot say.
@@ -73,21 +69,32 @@ def producer_key(run: Mapping | None) -> str | None:
     second execution at all. Neither case is exotic; the first is this module's
     own evidence.
 
-    So identity comes from fields that name the execution, and all of them are
-    required: a partial identity would collide across runs exactly where it
-    matters, and a collision here silently upgrades a residual into a repeat.
-    None means unidentified, and callers are expected to treat that as "cannot
-    tell" rather than as "no match".
+    The identity is CC's `compass.execution/1`, minted in the acceptance
+    harness at the instant the server process is launched and re-derivable from
+    the launch facts recorded beside it. Reused rather than reinvented: a
+    second scheme would have to be reconciled with the first at exactly the
+    moment the two disagreed. `execution_id.py` holds the one definition both
+    ends call.
+
+    Accepts either the execution block itself or a record's `run` block
+    carrying one. None means unidentified, and callers must treat that as
+    "cannot tell" rather than "no match" -- which is the answer for every
+    record written before the schema existed, and for a block whose id does not
+    follow from its own inputs. An identity is never *inferred* here: a legacy
+    block naming a host and a pid is not an execution id, and reading one out
+    of the payload would assert something nobody observed.
     """
     if not run:
         return None
-    values = []
-    for field_name in PRODUCER_FIELDS:
-        value = run.get(field_name)
-        if value in (None, ""):
-            return None
-        values.append(str(value))
-    return "|".join(values)
+    execution = run.get("execution")
+    if not isinstance(execution, Mapping):
+        execution = run
+    schema = execution.get("schema")
+    if schema and schema != EXECUTION_SCHEMA:
+        return None
+    if not verify_execution_id(execution):
+        return None
+    return str(execution.get("execution_id"))
 
 
 @dataclass(frozen=True)
@@ -109,6 +116,10 @@ class SourceRun:
     record: str
     record_sha256: str
     role: str = "source"
+    #: The other half of the warmup shape. `max_num_seqs` and `max_model_len`
+    #: are above; this is what `warmup_model` divides between them, so a term
+    #: that is a peak *at a shape* needs all three and the others need none.
+    max_num_batched_tokens: int = 0
     #: Which *executions* the fit was made from, as `producer_key` spells them.
     #: Empty means the executions are unidentified, which is the common case and
     #: is why `classify` has to be conservative rather than clever.
@@ -118,16 +129,28 @@ class SourceRun:
     #: which it is looking at.
     producer_basis: str = ""
 
-    def matches(self, config: Mapping) -> bool:
-        """Whether `config` is this same configuration, not merely this model."""
+    def matches(self, config: Mapping, *, shape: bool = False) -> bool:
+        """Whether `config` is this same configuration, not merely this model.
+
+        `shape` adds the warmup geometry, and only a term that is a peak at a
+        shape asks for it. Demanding it of `persistent` or `non_torch` would
+        withhold constants that are flat in the batch shape -- they are
+        validated across six utilizations at three widths -- and answer
+        `validation` where the honest answer is that nothing changed.
+        """
         topology = config.get("topology") or {}
-        return (
+        same = (
             config.get("model") == self.model
             and int(topology.get("tp", 1)) == self.tensor_parallel
             and float(config.get("gpu_memory_utilization", -1))
             == self.gpu_memory_utilization
             and int(config.get("max_num_seqs", -1)) == self.max_num_seqs
         )
+        if not same or not shape:
+            return same
+        return (int(config.get("max_model_len", -1)) == self.max_model_len
+                and int(config.get("max_num_batched_tokens", -1))
+                == self.max_num_batched_tokens)
 
 
 @dataclass(frozen=True)
@@ -139,6 +162,10 @@ class CalibratedTerm:
     run: SourceRun
     basis: str
     validated_against: tuple = field(default_factory=tuple)
+    #: A peak at a shape rather than a constant of the configuration. Matching
+    #: then has to hold the shape too, or the term is stretched to a batch
+    #: geometry nobody measured it at.
+    shape_specific: bool = False
 
 
 @dataclass(frozen=True)
@@ -158,6 +185,13 @@ class SourceCalibration:
         """
         out: dict = {}
         for name, term in self.terms.items():
+            if name == "activations":
+                # Deliberately not offered. `modelled_readings` takes the
+                # activation peak as an argument derived from a graph at the
+                # target's own shape; handing it a constant measured at the
+                # source's warmup shape would substitute one shape's peak for
+                # another's and call the result derived.
+                continue
             if name == "persistent":
                 out["persistent"] = term.value
             elif term.run.tensor_parallel == world_size:
@@ -200,7 +234,7 @@ class SourceCalibration:
         entry = self.terms.get(term)
         if entry is None:
             return "underived"
-        if not entry.run.matches(config):
+        if not entry.run.matches(config, shape=entry.shape_specific):
             return "validation"
         key = producer_key(producer)
         if key and entry.run.producers:
@@ -248,6 +282,7 @@ _QWEN27B_TP1 = SourceRun(
     gpu_memory_utilization=0.9,
     max_num_seqs=32,
     max_model_len=262144,
+    max_num_batched_tokens=16384,
     capture_sizes=(1, 2, 4, 8, 16, 32),
     enable_prefix_caching=False,
     record="tests/compass/memory_records/27b.tp1.memory.json",
@@ -269,6 +304,7 @@ _QWEN27B_TP1_EXCLUSIVE = SourceRun(
     gpu_memory_utilization=0.9,
     max_num_seqs=32,
     max_model_len=262144,
+    max_num_batched_tokens=16384,
     capture_sizes=(1, 2, 4, 8, 16, 32),
     enable_prefix_caching=False,
     record="tests/compass/memory_records/27b.tp1.exclusive.memory.json",
@@ -322,6 +358,41 @@ _QWEN27B = SourceCalibration(
                     "KNOWN RISK: one run in ten read 1 677 721 600 B, +42%, "
                     "cause unknown and not reproduced by three separate "
                     "controls. This constant does not bound that excursion."
+                ),
+            ),
+        ),
+        "activations": CalibratedTerm(
+            term="activations",
+            value=2956984320,
+            run=_QWEN27B_TP1_EXCLUSIVE,
+            shape_specific=True,
+            basis=(
+                "peak_torch - current_torch across the memory profile, which "
+                "is the warmup prefill and nothing else: `warmup_model` resets "
+                "the peak, runs one dummy prefill and reads it back. At this "
+                "configuration that prefill is 1 request of 16384 query tokens "
+                "with no history -- max_num_batched_tokens 16384 over "
+                "max_model_len 262144 gives one sequence -- so the constant is "
+                "the peak at *that* shape and carries the shape with it. "
+                "Measured because it could not be derived: the only TP=1 "
+                "prefill graphs at this shape are meta derivations with no "
+                "recorded liveness, and walking one returns 570 425 344 B, "
+                "19.3% of this. See MEMORY_EVIDENCE.md, O2."
+            ),
+            validated_against=(
+                "the historical TP=1 record, 2 956 984 320 B -- exact, 0 B, "
+                "and an independent engine start",
+                (
+                    "NOT transferable to width: TP=2 reads 1 730 150 400 B and "
+                    "TP=4 1 191 969 280 B, both class X27 (target "
+                    "configuration), so neither is an input and neither is "
+                    "offered by `mapping`. Activations at TP=2 and TP=4 stay "
+                    "underived."
+                ),
+                (
+                    "NOT transferable to shape: the warmup shape is a function "
+                    "of max_num_batched_tokens, max_model_len and "
+                    "max_num_seqs, and `matches` now holds all three."
                 ),
             ),
         ),

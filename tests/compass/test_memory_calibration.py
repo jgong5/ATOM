@@ -8,6 +8,8 @@ import pytest
 
 from atom.compass.core.feasibility import blocks_from_readings
 from atom.compass.core.memory import MemoryReadings
+from atom.compass.core.execution_id import (EXECUTION_SCHEMA, ID_INPUTS,
+                                            derive_execution_id)
 from atom.compass.core.memory_calibration import (CalibratedTerm,
                                                   SourceCalibration, SourceRun,
                                                   for_model, producer_key)
@@ -228,8 +230,20 @@ def test_the_one_run_the_constant_does_not_predict():
 #: names runs: `compare.py` reads a record's `run` block, `merge_sweep.py`
 #: labels fresh-process shards by `started_at`, `residual.py` attributes steps
 #: by `pid`.
-def _run_block(pid: int, started_at: str) -> dict:
-    return {"host": "hjbog-srdc-18", "pid": pid, "started_at": started_at}
+def _run_block(pid: int, launched_at_ns: int) -> dict:
+    """A record's `run` block carrying a well-formed `compass.execution/1` id.
+
+    Built through the shared derivation rather than written out, so that a
+    change to the rule breaks these tests instead of silently making the
+    fixtures the only thing still following the old one.
+    """
+    inputs = {"host": "hjbog-srdc-18", "cell": "RESULTS/tp1_source",
+              "side": "real", "repeat": 1, "server_pid": pid,
+              "launched_at_ns": launched_at_ns}
+    return {"execution": {
+        "schema": EXECUTION_SCHEMA,
+        "execution_id": derive_execution_id(*[inputs[n] for n in ID_INPUTS]),
+        "id_inputs": inputs}}
 
 
 def _calibration_with_producers(*producers: str) -> SourceCalibration:
@@ -262,8 +276,8 @@ def test_a_rerun_of_the_source_configuration_is_a_repeat_not_a_residual():
     configuration changed -- and calling it a residual would hide that two
     independent runs agree. The separator is the producer, not the bytes.
     """
-    first = _run_block(695009, "2026-09-11T08:55:40Z")
-    second = _run_block(751439, "2026-09-11T09:00:40Z")
+    first = _run_block(695009, 1757580940000000000)
+    second = _run_block(751439, 1757581240000000000)
     calib = _calibration_with_producers(producer_key(first))
     config = _record("27b.tp1.exclusive.memory.json")["config"]
 
@@ -287,9 +301,9 @@ def test_identical_bytes_are_not_one_run_and_the_hash_cannot_say_otherwise():
     direction that overstates nothing and understates the only reproducibility
     evidence the calibration has.
     """
-    first, second, third = (_run_block(695009, "2026-09-11T08:55:40Z"),
-                            _run_block(751439, "2026-09-11T09:00:40Z"),
-                            _run_block(775417, "2026-09-11T09:02:30Z"))
+    first, second, third = (_run_block(695009, 1757580940000000000),
+                            _run_block(751439, 1757581240000000000),
+                            _run_block(775417, 1757581350000000000))
     assert len({producer_key(r) for r in (first, second, third)}) == 3
 
     calib = _calibration_with_producers(producer_key(first))
@@ -311,7 +325,7 @@ def test_a_reserialised_record_is_the_same_run_with_a_different_hash():
     manufacture a repeat out of a text edit. The producer is unchanged, so the
     classification is unchanged; the integrity answer is the one that moves.
     """
-    calib = _calibration_with_producers(producer_key(_run_block(695009, "t0")))
+    calib = _calibration_with_producers(producer_key(_run_block(695009, 1757580940000000000)))
     blob = _record("27b.tp1.exclusive.memory.json")
     reserialised = hashlib.sha256(
         json.dumps(blob, indent=4).encode("utf-8")).hexdigest()
@@ -320,7 +334,7 @@ def test_a_reserialised_record_is_the_same_run_with_a_different_hash():
     assert calib.integrity("persistent", reserialised) == "altered"
     assert (
         calib.classify("persistent", blob["config"],
-                       producer=_run_block(695009, "t0"))
+                       producer=_run_block(695009, 1757580940000000000))
         == "residual"
     )
 
@@ -328,14 +342,27 @@ def test_a_reserialised_record_is_the_same_run_with_a_different_hash():
 def test_an_unidentified_run_is_classified_as_the_weaker_claim():
     """Which is every record the campaign has written so far.
 
-    A partial identity is treated as none: `producer_key` requires all of its
-    fields, because a key that collided across two runs would upgrade a
-    residual to a repeat silently, and that is the error this classification
-    exists to prevent.
+    An id is never inferred. A legacy block naming a host and a pid is not an
+    execution identity and is not promoted into one; an id that does not follow
+    from its own recorded inputs is damaged or transplanted, which is worse
+    than unidentified rather than better; and an id under a schema this module
+    does not know is one it cannot check. All three read as "cannot tell",
+    because the alternative -- upgrading a residual to a repeat on a guess --
+    is the error this classification exists to prevent.
     """
     assert producer_key(None) is None
-    assert producer_key({"pid": 695009}) is None
-    assert producer_key({"host": "h", "pid": 1, "started_at": ""}) is None
+    assert producer_key({"host": "h", "pid": 695009,
+                         "started_at": "2026-09-11T08:55:40Z"}) is None
+
+    identified = _run_block(695009, 1757580940000000000)["execution"]
+    assert producer_key(identified) == identified["execution_id"]
+
+    transplanted = dict(identified, id_inputs=dict(
+        identified["id_inputs"], server_pid=695010))
+    assert producer_key(transplanted) is None
+
+    later = dict(identified, schema="compass.execution/2")
+    assert producer_key(later) is None
 
     calib = for_model(MODEL)
     exclusive = _record("27b.tp1.exclusive.memory.json")
@@ -382,8 +409,8 @@ def test_only_the_fitted_run_can_have_its_bytes_called_altered():
     every row of every record but one. `identifies` is the guard: the bytes
     are only worth challenging once the producer claims to be that run.
     """
-    fitted = _run_block(695009, "2026-09-11T08:55:40Z")
-    other = _run_block(751439, "2026-09-11T09:00:40Z")
+    fitted = _run_block(695009, 1757580940000000000)
+    other = _run_block(751439, 1757581240000000000)
     calib = _calibration_with_producers(producer_key(fitted))
     foreign_sha = _sha(RECORDS / "27b.tp1.memory.json")
 
@@ -404,7 +431,107 @@ def test_the_shipped_calibration_identifies_nobody():
     and the constants are refitted against an identified execution.
     """
     calib = for_model(MODEL)
-    producer = _run_block(695009, "2026-09-11T08:55:40Z")
+    producer = _run_block(695009, 1757580940000000000)
     for term in calib.terms:
         assert calib.terms[term].run.producers == ()
         assert calib.identifies(term, producer) is False
+
+
+class TestTheActivationTermIsAPeakAtAShape:
+    """The warmup peak is measured, and carries its batch geometry with it.
+
+    Unlike `persistent` and `non_torch`, which are flat across the six
+    utilizations and three widths they were checked at, this term is the peak
+    of one dummy prefill of one shape. Stretching it to another
+    `max_num_batched_tokens` would be an extrapolation nobody measured, so the
+    match holds the shape and the calibration withholds the number rather than
+    scaling it.
+    """
+
+    def test_it_is_the_records_own_warmup_peak_in_both_tp1_runs(self):
+        """`peak_torch - current_torch`, to the byte, twice.
+
+        Two independent engine starts -- the historical record and the
+        exclusive phase C capture -- agree exactly. That is the whole basis for
+        the constant: it could not be derived, because the only TP=1 prefill
+        graphs at this shape are meta derivations with no recorded liveness.
+        """
+        term = for_model(MODEL).terms["activations"]
+        for name in ("27b.tp1.memory.json", "27b.tp1.exclusive.memory.json"):
+            readings = _record(name)["readings"]
+            assert readings["peak_torch"] - readings["current_torch"] == term.value
+        assert term.value == 2956984320
+
+    def test_another_token_budget_is_another_warmup_shape(self):
+        """`warmup_model` divides the budget, so changing it changes the peak.
+
+        And only this term notices. `persistent` is the engine's own forward
+        buffers and does not move with the batch geometry; answering
+        `validation` for it here would claim a transfer where nothing changed.
+        """
+        calib = for_model(MODEL)
+        config = dict(_record("27b.tp1.exclusive.memory.json")["config"])
+        assert calib.classify("activations", config) == "residual"
+
+        config["max_num_batched_tokens"] = 8192
+        assert calib.classify("activations", config) == "validation"
+        assert calib.classify("persistent", config) == "residual"
+
+    def test_it_is_not_offered_as_a_model_input_at_any_width(self):
+        """`mapping` feeds `modelled_readings`, which takes the peak elsewhere.
+
+        The activation argument there comes from a graph at the *target's* own
+        shape. Handing it this constant would substitute the source's warmup
+        peak for the target's and let the result be called derived. And above
+        width one there is nothing to offer in any case: the TP=2 and TP=4
+        readings are class X27, measurements of the configuration under
+        prediction, so activations at those widths stay underived.
+        """
+        calib = for_model(MODEL)
+        assert "activations" not in calib.mapping(1)
+        assert "activations" not in calib.mapping(2)
+        assert "activations" not in calib.mapping(4)
+        assert calib.terms["activations"].run.tensor_parallel == 1
+        assert calib.classify(
+            "activations", _record("27b.tp4.rank0.memory.json")["config"]
+        ) == "validation"
+
+
+def test_the_source_only_ledger_closes_and_says_what_that_is_worth():
+    """Every input classed S/C06/S27, and the budget the source run recorded.
+
+    The number is not the finding. Four of the five terms in `peak_torch` were
+    read off this record, so reproducing it demonstrates the arithmetic and not
+    the model -- it is a residual, and the test is named for what it checks:
+    that the ledger is *complete*, that no class X27 reading is needed to close
+    it, and that nothing has quietly changed one of the constants.
+
+    `free` is the one term that legitimately differs: the model assumes a clean
+    box and the record has the neighbours in it. It binds nothing here, because
+    the utilization budget is well below both.
+    """
+    import json
+
+    from atom.compass.core.kv_geometry import blocks_from_readings
+    from atom.compass.core.memory_model import modelled_readings
+
+    calib = for_model(MODEL)
+    readings = modelled_readings(
+        total_bytes=206141652992, world_size=1, parameters=54713457120,
+        buffers=33554432,
+        activation_bytes=calib.terms["activations"].value,
+        calibration=calib.mapping(1), enforce_eager=False)
+
+    record = _record("27b.tp1.exclusive.memory.json")
+    recorded = record["readings"]
+    for term in ("peak_torch", "non_torch", "cudagraph_overhead"):
+        assert readings[term] == recorded[term], term
+    assert readings["free"] < recorded["free"]
+
+    with open(RECORDS / "qwen3_5_27b.config.json", encoding="utf-8") as fh:
+        config = json.load(fh)
+    plan = blocks_from_readings(
+        config, type("R", (), readings)(), utilization=0.90, max_num_seqs=32,
+        tensor_parallel=1)
+    assert plan.entries == record["blocks"]["pool_entries"]
+    assert plan.entries["kv"] == 112772
