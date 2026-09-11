@@ -968,18 +968,37 @@ def measured_graph_pool_bytes(capture_sizes, world_size: int = 1,
 
 #: The capture-time *allocated* delta that is not the LM head, in bytes.
 #:
-#: **Source calibration, not a derivation.** Read off the 27B's TP=1 record
-#: (S27) as the residue after the logits term below -- 110 981 120 -
-#: 63 x 248 320 x 2 -- and carried as a taken number, not an explained one. The
-#: same 79 692 800 B appears on the 0.6B (C06) at TP=2, 4 and 8 over ladders
-#: from 31 to 1071 tokens, so it moves with neither the model, the width nor
-#: the ladder; that invariance constrains the explanation and is not the
-#: explanation. What it *is* has not been witnessed -- 76 MiB plus 1 KiB,
-#: allocated once inside the capture window and never returned, which could be
-#: a reusable workspace, an allocator size-class rounding or a per-pool block.
-#: Until a snapshot taken against the capture pool's own id names it, this stays
-#: calibration: pass `calibration["graph_pool"]["fixed_pinned"]` to override it.
-#: The probe is one to coordinate, not a constant to widen.
+#: **Source calibration, now witnessed.** The value was read off the 27B's
+#: TP=1 record (S27) as the residue after the logits term below --
+#: 110 981 120 - 63 x 248 320 x 2 -- and carried as a taken number. A pool-id
+#: scoped capture probe on the same source config (S27, TP=1, node18 GPU0,
+#: `agent_scratch/memval/pool_probe/att2_artifact.json`) has since named what
+#: the residue is, by diffing the *global* segment list across the capture
+#: window. Nothing was released; six segments appeared, and the residue is two
+#: allocations that live **outside every capture pool**:
+#:
+#:   * one 79 691 776 B (76 MiB exactly) block, `requested_size == size`, in
+#:     its own exactly-sized oversize `large` segment -- a fixed-size
+#:     workspace request, not a tensor of any model dimension; and
+#:   * two 512 B blocks of an 8 B request each, in a `small` segment.
+#:
+#: 79 691 776 + 2 x 512 = 79 692 800, the constant, to the byte. So it is
+#: neither private-pool residency nor a size-class rounding of the logits
+#: (the logits round by 0 B; see the docstring below). A request for exactly
+#: 76 MiB that depends on neither model nor width is what makes the same value
+#: appear on the 0.6B (C06) at TP=2, 4 and 8 over ladders from 31 to 1071
+#: tokens. The TP=1 warmup allocation history already on disk
+#: (`probe_tp1/out/warmup_history.959476.pickle`) carries a 79 691 776 B
+#: `segment_alloc` whose frames run `aiter/tuned_gemm.py:450:torch_gemm` <-
+#: `gemm_a16w16` <- the inductor region of the GDN linear-attention forward,
+#: which makes an AITER tuned-GEMM workspace the named candidate for the site.
+#: That attribution is *inference by size across two windows*: the probe
+#: recorded no frames, so the capture-window block itself is unattributed.
+#:
+#: The constant therefore stays a calibrated number rather than a derived one,
+#: and stays overridable via `calibration["graph_pool"]["fixed_pinned"]`: it is
+#: a property of the AITER/ROCm build, not of the model. Its value must not
+#: move -- frozen predictions were made with it.
 CAPTURE_FIXED_PINNED = 79_692_800
 
 
@@ -1017,6 +1036,31 @@ def capture_pinned_bytes(capture_sizes, *, vocab_size: int = 0,
     evaluation**. All of it is the capture-time *allocated* delta. The reserved
     delta the engine records is a different quantity (see
     `measured_graph_pool_bytes`) and agreement here says nothing about it.
+
+    The pool-id scoped probe (S27, TP=1) checks the *mechanism* of the logits
+    term rather than just its total. Six captures, one private pool `(1, 0)`,
+    runner keys `(bs, max_q_len)` = (32,1) (16,1) (8,1) (4,1) (2,1) (1,1), so
+    `sum` = 63. Inside that pool six new live blocks appeared, one per bucket,
+    of 15 892 480 / 7 946 240 / 3 973 120 / 1 986 560 / 993 280 / 496 640 B --
+    each exactly `bs x 248 320 x 2` and each with `requested_size == size`, so
+    the term rounds by **0 B**, not approximately. They sum to 31 288 320 B =
+    `63 x 248 320 x 2`. Five separated counters for that pool: reserved
+    residency 46 137 344, active allocated 31 288 320, active requested
+    31 288 320, internal rounding 0, inactive capacity 14 849 024 B.
+
+    Two things follow. The residue above is *not* in the pool -- pool active
+    allocated is the logits term alone -- so a pool-scoped search could never
+    have found it; it took a global before/after block diff. And the reserved
+    side is a different decomposition again: the window's reserved delta was
+    127 926 272 B from six new segments with none released -- four in the
+    capture pool (46 137 344 B) and two outside (the 79 691 776 B oversize
+    segment plus a whole 2 097 152 B small segment holding only the 1 024 B of
+    8-byte scalars). The allocated-side constant is 79 692 800 B; the same
+    residue costs 81 788 928 B of *reserved*. Do not use one for the other.
+
+    All of this is source-only (S27) diagnostic evidence for how the term is
+    built. It explains the global reserved gate; it does not redefine it, and
+    it is not target validation -- that remains the frozen e2e cc-traces gates.
 
     **The switch is `logits_in_graph`, not the width.** Reading it as a width
     law -- which `measured_graph_pool_bytes` still does -- gets the right
