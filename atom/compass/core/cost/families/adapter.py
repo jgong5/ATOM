@@ -71,27 +71,22 @@ from atom.compass.core.cost.families.support import (
     Refusal,
     RowSupport,
 )
-from atom.compass.core.cost.library import PriceLibrary
+from atom.compass.core.cost.library import (
+    INTERPOLATED_FLAG,
+    INTERPOLATED_SOURCE_PREFIX,
+    ZERO_WORK_FLAG,
+    PriceLibrary,
+)
 
 logger = logging.getLogger(__name__)
 
 __all__ = ["ParametricPriceLibrary", "coverage_split", "INTERPOLATED_SCHEME"]
 
 #: The record markers and source prefix the consumer classifies on. They belong
-#: to ``library.py``, which is what reads them; this module takes them from
-#: there as soon as that file exports them, and carries its own copies until
-#: then so the two halves can land in either order. A literal restated in two
-#: files that must agree is how they stop agreeing.
-try:  # pragma: no cover - exercised by whichever half lands second
-    from atom.compass.core.cost.library import (
-        INTERPOLATED_FLAG,
-        INTERPOLATED_SOURCE_PREFIX as INTERPOLATED_SCHEME,
-        ZERO_WORK_FLAG,
-    )
-except ImportError:
-    INTERPOLATED_FLAG = "interpolated"
-    ZERO_WORK_FLAG = "zero_work"
-    INTERPOLATED_SCHEME = "interpolated://"
+#: to ``library.py``, which is the file that reads them, and are imported from
+#: there rather than restated: a literal kept in two files that must agree is
+#: how they stop agreeing.
+INTERPOLATED_SCHEME = INTERPOLATED_SOURCE_PREFIX
 
 #: The one refusal a family module is allowed to answer.
 _OPEN_QUESTION = "no entry for this signature"

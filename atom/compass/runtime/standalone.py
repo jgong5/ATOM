@@ -175,6 +175,67 @@ def _footprint(ops) -> dict[str, int]:
             "blocks_per_variant": blocks, "variants": max(1, KV_VARIANTS)}
 
 
+def paged_kv_bytes(per_block_bytes: int, blocks: int) -> int:
+    """Bytes the paged KV pool needs, given what one block costs.
+
+    Trivial on purpose. It exists so the demand can be computed and checked
+    without a device, and so the number the refusal quotes is the same number
+    the allocation will ask for rather than a second estimate of it.
+    """
+    if per_block_bytes <= 0 or blocks <= 0:
+        return 0
+    return int(per_block_bytes) * int(blocks)
+
+
+def _demand_from_oom(exc: BaseException) -> int:
+    """Bytes the failed allocation asked for, read back off the error.
+
+    The allocator states it -- "Tried to allocate 512.00 GiB" -- and reading it
+    is better than recomputing it from the shape, because a recomputation that
+    disagreed with the allocator would send a reader after the wrong number.
+    Returns 0 when the message does not say, and the caller then reports what
+    it knows without inventing the rest.
+    """
+    import re
+
+    match = re.search(r"Tried to allocate ([\d.]+) ([KMG]i?B)", str(exc))
+    if not match:
+        return 0
+    scale = {"KiB": 1 << 10, "MiB": 1 << 20, "GiB": 1 << 30,
+             "KB": 1000, "MB": 1000 ** 2, "GB": 1000 ** 3}
+    return int(float(match.group(1)) * scale.get(match.group(2), 1))
+
+
+def capacity_refusal(demand: int, free: int, blocks: int, variants: int,
+                     where: str = "") -> str | None:
+    """Why this pool will not fit, or ``None`` if it will.
+
+    Kept apart from the allocation so the arithmetic is checkable without a
+    card, and so the message names the rotation. A bare ``torch.zeros`` OOM
+    four hundred lines into a traceback says how many bytes were asked for and
+    nothing about what asked for them -- and here that is the whole answer: the
+    pool is ``blocks x variants``, and the variants are a measurement policy,
+    not a property of the graph.
+
+    It deliberately does not suggest lowering the rotation as a remedy. That
+    would trade an error for a number whose distance from a cold-call price is
+    unmeasured, which is worse than not having the number.
+    """
+    if demand <= 0 or free <= 0 or demand <= free:
+        return None
+    gib = float(1 << 30)
+    per_variant = demand / max(1, variants)
+    return (
+        f"the KV pool this graph needs does not fit{where}: "
+        f"{blocks:,} blocks x {variants} KV variants = {demand / gib:.2f} GiB, "
+        f"against {free / gib:.2f} GiB free. One rotation copy is "
+        f"{per_variant / gib:.2f} GiB. The count is COMPASS_KV_VARIANTS, which "
+        "defaults to COMPASS_GRAPH_BATCH; lowering it makes later calls in the "
+        "batch re-read a copy an earlier call warmed, and how far the price "
+        "then moves is not measured -- so lowering it to fit would produce a "
+        "number that is not a cold-call price and does not say so.")
+
+
 class _RunnerShim:
     """The attributes ATOM's attention builder reads off a ModelRunner.
 
@@ -311,8 +372,27 @@ def _bind_caches(shim, model, builder, slots: int) -> dict[str, int]:
     shape_by_pool: dict[str, list] = {}
     num_kv_heads = shim._get_num_kv_heads()
     shim.num_kv_heads = num_kv_heads
-    _install(builder.allocate_kv_cache_tensors(num_kv_heads, 0), bytes_by_pool,
-             shape_by_pool)
+    try:
+        _install(builder.allocate_kv_cache_tensors(num_kv_heads, 0),
+                 bytes_by_pool, shape_by_pool)
+    except torch.OutOfMemoryError as exc:
+        # Nothing about the allocation changes; only what is said when it
+        # fails. The pool is blocks x KV_VARIANTS, and the variant count is a
+        # measurement policy rather than a property of the graph, so a reader
+        # who only sees a byte count cannot tell which of the two to look at.
+        blocks = int(getattr(shim, "num_physical_kvcache_blocks", 0) or 0)
+        variants = int(getattr(shim, "kv_variants", 0) or 0)
+        free = 0
+        try:
+            free, _total = torch.cuda.mem_get_info(shim.device)
+        except Exception:
+            pass
+        demand = _demand_from_oom(exc)
+        why = capacity_refusal(demand, free, blocks, variants,
+                               where=" on this device")
+        raise RuntimeError(why or (
+            f"the KV pool this graph needs did not fit: {blocks:,} blocks "
+            f"x {variants} KV variants. {exc}")) from exc
     if slots:
         entries = {_STATE_SLOT_CLASS: slots}
         _install(builder.allocate_per_req_cache(entries), bytes_by_pool,
@@ -397,6 +477,9 @@ def stand_up_layers(config, graph_path: str, mode: str) -> dict[str, Any]:
     builder = backend.get_builder_cls()(model_runner=shim)
     shim.physical_block_size = builder.block_size
     shim.num_physical_kvcache_blocks = foot["blocks"] * builder.block_ratio
+    # Carried on the shim so that a failure to allocate can say how many of
+    # those blocks are the rotation rather than the graph.
+    shim.kv_variants = foot["variants"]
     config.num_kvcache_blocks = foot["blocks"]
     bound = _bind_caches(shim, model, builder, foot["slots"])
 
