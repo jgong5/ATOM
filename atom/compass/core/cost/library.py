@@ -630,6 +630,19 @@ class LibraryCostOracle:
         self.last_coverage: Optional[Coverage] = None
 
     def estimate(self, shape: StepShape) -> StepCost:
+        # Whether a shape is inside the region model's calibrated domain
+        # depends on the shape alone -- sequence count, prefill extent, width.
+        # Asking that first costs a few microseconds and refuses for exactly
+        # the same reason, with exactly the same message, as asking it last;
+        # asking it last means a shape outside the domain pays a bind, and on
+        # a miss a full trace, for an answer that is then thrown away. On the
+        # twenty-shape diagnostic that was 805 of 922 ms, two derivations of
+        # 470 and 237 ms among them. No work is dropped and no answer moves:
+        # the refusal is hoisted, not weakened.
+        if self.regions is not None:
+            why = self.regions.refusal(shape)
+            if why is not None:
+                raise ValueError(f"no measured region for this shape: {why}")
         graph = self.graphs.graph_for(shape)
         if graph is None:
             raise KeyError(

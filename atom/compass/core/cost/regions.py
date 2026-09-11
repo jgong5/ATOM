@@ -10,12 +10,19 @@ is a prediction of a strict subset of the step.
 
 This supplies the rest, and supplies it the way the rest is actually shaped:
 
-* **Postprocess** is dominated by the sampler over `[sequences, padded_vocab]`.
-  On the source capture it is flat -- 0.1019 ms at 32 sequences and 0.1045 ms
-  at one -- because at this vocabulary the region is latency-bound rather than
-  size-bound. A constant is not a simplification chosen for convenience here;
-  it is what 260 measured steps across 1, 15, 16 and 32 sequences show, and the
-  domain below is exactly where that was seen.
+* **Postprocess** is dominated by the sampler over `[sequences, padded_vocab]`,
+  and at this vocabulary the region looks latency-bound rather than size-bound:
+  the four prefill rows sit at 0.1045 ms over one sequence and 0.1496 ms over
+  sixteen while the 255 decode rows sit at 0.1019 ms over thirty-two.
+
+  That is why a constant is used, and it is also the limit of what supports it.
+  The capture holds decode steps at **one** sequence count, 32. Flatness across
+  decode sequence counts is not measured here; it is inferred from the prefill
+  rows, which are a different step kind. `decode_sequences` is therefore (32,)
+  and every other decode batch is refused -- not because the constant is
+  believed to fail there, but because nothing has looked. Extending it needs a
+  TP1 source capture driven at several concurrencies, not a wider domain
+  tuple.
 
 * **Preparation** is `prepare_model` plus whatever device idle the host leaves
   between the regions, which the outer event pair contains and the inner ones

@@ -661,3 +661,72 @@ class TestABodyIsChargedForTheRowsItActuallyRuns:
         shape = self._decode(20, bucket=32)
         oracle = self._oracle(tmp_path, _graph([self.GEMM]), shape)
         assert oracle.estimate(shape).seconds == pytest.approx(1e-3)
+
+
+class TestADomainRefusalIsAskedBeforeTheWorkItWouldDiscard:
+    """Whether a shape is inside the region model is a fact about the shape.
+
+    It needs no graph, so asking it after binding -- and, on a miss, after a
+    trace -- buys nothing and spends the most expensive thing the oracle does.
+    The refusal itself is unchanged: same predicate, same message. What this
+    pins is the order, because the order is invisible in the answer and only
+    shows up in a profile.
+    """
+
+    GEMM = _op("aiter::gemm", [[16, 4096], [4096, 4096]])
+
+    class CountingGraphs:
+        """A graph source that records being asked."""
+
+        def __init__(self, graph):
+            self.graph, self.asked = graph, 0
+
+        def graph_for(self, shape):
+            self.asked += 1
+            return self.graph
+
+        def describe(self):
+            return "CountingGraphs"
+
+    class OnlyAtThirtyTwo:
+        """The shape of a region model, narrowed to the one rule under test."""
+
+        def refusal(self, shape):
+            if len(shape.num_scheduled_tokens) != 32:
+                return (f"decode over {len(shape.num_scheduled_tokens)} "
+                        "sequences, measured only at [32]")
+            return None
+
+        def breakdown(self, shape):
+            return {"<prepare>": 1e-4}
+
+    def _oracle(self, tmp_path, graphs):
+        priced = _price_list(tmp_path, "p.json", [self.GEMM], 1e-3)
+        return LibraryCostOracle(PriceLibrary.load([(priced, None)]), graphs,
+                                 regions=self.OnlyAtThirtyTwo())
+
+    def _decode(self, requests):
+        return StepShape(num_scheduled_tokens=(1,) * requests,
+                         context_lens=(128,) * requests, capture_bucket=32)
+
+    def test_a_shape_outside_the_domain_never_reaches_the_graph_source(
+            self, tmp_path):
+        graphs = self.CountingGraphs(_graph([self.GEMM]))
+        oracle = self._oracle(tmp_path, graphs)
+        with pytest.raises(ValueError, match="measured only at"):
+            oracle.estimate(self._decode(20))
+        assert graphs.asked == 0
+
+    def test_a_shape_inside_the_domain_still_gets_its_graph(self, tmp_path):
+        graphs = self.CountingGraphs(_graph([self.GEMM]))
+        oracle = self._oracle(tmp_path, graphs)
+        assert oracle.estimate(self._decode(32)).seconds > 0
+        assert graphs.asked == 1
+
+    def test_without_a_region_model_nothing_is_hoisted(self, tmp_path):
+        """No regions means no domain, not an empty domain that refuses all."""
+        graphs = self.CountingGraphs(_graph([self.GEMM]))
+        priced = _price_list(tmp_path, "p.json", [self.GEMM], 1e-3)
+        oracle = LibraryCostOracle(PriceLibrary.load([(priced, None)]), graphs)
+        assert oracle.estimate(self._decode(20)).seconds > 0
+        assert graphs.asked == 1
