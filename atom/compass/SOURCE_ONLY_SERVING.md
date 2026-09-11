@@ -6,9 +6,25 @@ is written down here because the composition was reachable from
 `predict_step.py` and from a hand-written script, and a served run names a
 factory and a list of `KEY=VALUE` strings instead.
 
-Nothing here is measured at the target. The prices are the source deployment's
-own; the graphs are traced on `meta`; the region model is calibrated at TP1 and
-applied unchanged at TP2 and TP4.
+Nothing here is measured at the target deployment. Two different things are
+being distinguished, and the difference is the whole point of the source-only
+rule:
+
+- **Not allowed, and absent:** any timing or memory reading taken from the
+  engine whose behaviour is being predicted. No target step latency, no target
+  throughput, no target memory high-water mark enters a price, a template or
+  the region model.
+- **Allowed, and used:** standalone measurements of a *primitive* at the width
+  being predicted, taken outside the target run — a two-rank all-reduce probe,
+  a gather probe, a GEMM microbench. These are measurements of hardware, not
+  of the deployment, and the TP2 and TP4 collective prices below are exactly
+  that.
+
+So "the prices are the source deployment's own" is true of the body and head
+GEMM families, which are measured at TP1 and transferred; the collectives at
+TP2 and TP4 are standalone primitive measurements at their own width. The
+graphs are traced on `meta`; the region model is calibrated at TP1 and applied
+unchanged at TP2 and TP4.
 
 ## The options
 
@@ -25,7 +41,7 @@ Every width shares these:
     --compass-oracle-option head=1
     --compass-oracle-option regions=source-27b-tp1-conc-v2
     --compass-oracle-option require_complete=1
-    --compass-oracle-option carry_allocation=1
+    --compass-oracle-option allocation=native
     --compass-oracle-option derive=1
 
 and adds its own prices and templates. At TP1 (`$SRC1` is `g4/src1`):
@@ -46,6 +62,9 @@ Both all-reduce price lists are loaded on purpose. They hold the same signature
 under different registration regimes and the graph selects between them, so
 which one answers does not depend on load order.
 
+`allocation=native` and `carry_allocation=1` are mutually exclusive, and only
+the first is admissible for acceptance. See refusal 3.
+
 ## Staging, and why it is needed
 
 A served run passes one option set to every rank; the rank reaches its own
@@ -65,6 +84,13 @@ linked unsuffixed and resolve by the documented fallback, recorded in
 `SourceComposition.rank_artifacts` as not this rank's own.
 
 ## What it answers today
+
+**These are diagnostic step estimates, not cc-traces acceptance cells.** They
+say that the composition assembles, resolves per rank, and prices a single
+production-shaped decode step with nothing refused. They are not a registered
+cc-traces replay, they are not compared against a measured target run, and no
+acceptance gate is evaluated on them. The acceptance evidence is the e2e
+registered cc-traces TP1/2/4 short and long runs, and none of it is here.
 
 Built per rank with `derive=0`, so that what it answers is exactly what the
 artifacts cover, on the production decode step (32 requests of one token at
@@ -101,18 +127,56 @@ would hide the thing worth looking at.
    needs the model. Derivation is device-free and costs about 10.5 s per
    structure, but it produces rank 0's shard whatever rank asks, so at TP>1 the
    other ranks are served through the representative fallback.
-3. **`carry_allocation=1` is required, and it is an unmeasured assumption.**
-   The body template carries `slot_mapping`, `block_tables` and the two
-   `non_spec_state_indices` tensors; binding refuses them without an allocation
-   source, and the factory cannot name the engine's own allocator. The
-   composition therefore reuses the template's assignment and says so.
+3. **A step nobody offers an allocation for is refused.** The body template
+   carries `slot_mapping`, `block_tables` and the two `non_spec_state_indices`
+   tensors, and binding will not reuse a capture's copy of them. With
+   `allocation=native` the oracle takes the CPU scheduler's own assignment for
+   the step being priced — `ScheduledBatch.block_tables`,
+   `state_slots_committed` and the `state_rows` that say which batch row each
+   of those slots belongs to — and re-encodes it through `BatchSpec`, the same
+   code that encodes a capture. A step reached with nothing offered is refused
+   by name rather than priced against another step's blocks. Three further
+   things it will not guess, each a refusal:
+   - **the batch kind**, which comes from `total_seqs_num_prefill` and not from
+     the batch's prefill *token* count. A batch holding both prefill and decode
+     rows is refused: `BatchSpec` carries one kind for the batch, and the
+     attention backend sends the whole batch down `prepare_prefill` while
+     preparing metadata for the leading prefill rows only. Closing this — and
+     cc-traces will need it closed — means a per-request kind in `BatchSpec`
+     and a deriver that can trace such a batch.
+   - **which row a state slot belongs to.** A row with no slot is refused, not
+     filled with its batch index, which is only what a fresh pool happens to
+     hand out.
+   - **the padded tail.** When the active request count is below the capture
+     bucket, the scheduler's entries are written over the template's head, the
+     capture's tail is kept, and the count is recorded per field in
+     `provenance.binding.allocation_padding`. Overwriting the tail would invent
+     an assignment for rows that are not running.
+
+   `carry_allocation=1` — reuse the template's assignment and declare it
+   unmeasured — remains available for diagnostics and is **inadmissible for
+   acceptance**.
 4. **The capture bucket has to be declared at derivation.** `g4/dec32`'s TP2
    and TP4 graphs record `capture_bucket: null`, so their shape is the
    uncaptured structure and the region model refuses the step as eager. They
-   were re-derived with `--capture-bucket 32`; the body graphs are
-   operator-identical to the originals, and the head graphs differ by one
-   `aten::empty.memory_format` (0.09 µs) that the bucketed derivation does not
-   record.
+   were re-derived with `--capture-bucket 32`. The body graphs are
+   operator-identical to the originals. The head graphs differ by one
+   `aten::empty.memory_format`, and the reason is the producer's
+   fresh-collective recording contract rather than the operator's 0.09 µs:
+   simulated TP has no communicator, so it reimplements `all_gather` locally as
+   *allocate the full buffer, copy this rank's shard in, movedim, reshape*, and
+   `record_collectives` replaces that reimplementation with a synthesized
+   `aiter::all_gather_unreg` instead of recording it. Since `6b4bfe8b` the
+   synthesized wrapper allocates its declared output through `fresh_shape`,
+   under `_disable_current_modes()`, precisely "so the stand-in does not appear
+   in the graph as an [allocation] a captured graph has no counterpart for".
+   The extra `aten::empty.memory_format` in the older head graphs is that
+   stand-in's own buffer, which no rank executes; the real allocation
+   production performs is inside the gathered call, and it is already inside
+   the two-rank probe measurement that prices `all_gather_unreg`. Recording it
+   separately would count it twice. Note that the difference is attributable to
+   the code change, not to `--capture-bucket`: the two derivations ran under
+   different `graph_diff.py`/producer hashes (see Provenance).
 5. **The region model is held out at TP2 and TP4.** `source-27b-tp1-conc-v2`
    is calibrated at TP1 and applied unchanged. Its prepare term was defined as
    the capture's own remainder, so at TP1 it closes by construction and proves
@@ -121,17 +185,59 @@ would hide the thing worth looking at.
 
 ## Which artifacts a served run should name
 
-For TP2 and TP4 the re-derived bucketed graphs supersede `g4/dec32`: the
-originals record no capture bucket and the region model refuses them, so they
-cannot serve at all. The body is operator-identical between the two, so the
-substitution changes no body price; the head loses one `aten::empty` and with
-it 0.09 µs, which is recorded rather than absorbed. TP1's `g4/src1` artifacts
-already declare the bucket and are used unchanged.
+The bucket-declared TP2/TP4 graphs are **new source-derived candidate
+artifacts**, not replacements of the old ones. `g4/dec32` and every frozen
+result computed from it stay exactly as they are and keep their labels; nothing
+is retroactively relabelled. What follows is the candidate set, its
+configuration, and its hashes.
+
+Produced by `agent_scratch/serving/derive_b32.sh`, which is
+`derive_dec32_tp24.sh` plus `--capture-bucket 32`, run device-free under
+`--device meta` in `xiaobizh_n18_cpu`, ~10 s per graph:
+
+    dec32b32/  (sha256, first 16)
+      ca60fac1fc1c1670  b27dec32.tp2.r0.json
+      54230ed28c664311  b27dec32.tp2.r1.json
+      f83dce526f979e5b  b27dec32.tp4.r0.json
+      fff63aceb6d21a3e  b27dec32.tp4.r1.json
+      c80b3c700928a01a  b27dec32.tp4.r2.json
+      c1bb1e76a3120f3d  b27dec32.tp4.r3.json
+      548078cbe7396bda  h27dec32.tp2.r0.json
+      f2418f548800133b  h27dec32.tp2.r1.json
+      19458c6f7da0e2a9  h27dec32.tp4.r0.json
+      9d2ed08c7e132e95  h27dec32.tp4.r1.json
+      a1e4b934f4b91cbd  h27dec32.tp4.r2.json
+      f985c61ef4b1ad20  h27dec32.tp4.r3.json
+
+The case for naming them: the originals record no capture bucket, so the region
+model refuses them and they cannot serve at all. The body is operator-identical
+between the two, so the substitution changes no body price; the head loses the
+stand-in's `aten::empty` and with it 0.09 µs, recorded above rather than
+absorbed. TP1's `g4/src1` artifacts already declare the bucket and are used
+unchanged.
 
 ## Provenance
 
-Numbers above are from `agent_scratch/serving/check_serving_config.py` run in
-`xiaobizh_n18_cpu` — device-free — against the committed snapshot of
-`e946c6ce`, verified file-by-file against `git show` before the run. The graph
-re-derivations hash `graph_diff.py`, `tracer.py` and `graph.py` into
-`agent_scratch/serving/derive_b32.sha256`.
+Step numbers above are from `agent_scratch/serving/check_serving_config.py` run
+in `xiaobizh_n18_cpu` — device-free — against the committed snapshot of
+`e946c6ce`, verified file-by-file against `git show` before the run.
+
+The native-allocation behaviour in refusal 3 is from
+`agent_scratch/check_native_allocation.py`, run the same way against `b6280165`
+over all seven rank compositions: each refuses with nothing offered, reproduces
+the capture's `slot_mapping`, `block_tables` and state indices when the
+capture's own assignment is offered, and follows the blocks when they are
+rotated by one request.
+
+The graph re-derivations hash `graph_diff.py`, `tracer.py` and `graph.py` into
+`agent_scratch/serving/dec32b32/derive_b32.sha256`:
+
+    84d077369e21aee5…  scripts/compass/graph_diff.py
+    c5dc0b71879aea9f…  atom/compass/runtime/tracer.py
+    c806740b786e5bd7…  atom/compass/core/graph.py
+
+The original `g4/dec32` derivation hashed a different file set
+(`agent_scratch/g4/dec32/derive_dec32.sha256`: `graph_diff.py`,
+`batch_spec.py`, `graph.py`, `library.py`) and a different `graph_diff.py`
+(`62a89c02…`), which is what makes the head-graph difference in refusal 4 a
+producer change rather than a bucket effect.
