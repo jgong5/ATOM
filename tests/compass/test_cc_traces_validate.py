@@ -34,6 +34,18 @@ def _load(name: str):
 
 validate = _load("cc_traces_validate")
 
+
+def _supplied(seconds: float, *, source: str = "test-fixture", within=None) -> dict:
+    """A `compass.costs/3` supplied term.
+
+    Supplied durations are read from somewhere else, so the record carries the
+    artifact they came from and the measured window they happen inside. The
+    fixtures default to a term that overlaps nothing, because most of these
+    tests are about the ratio rather than the containment.
+    """
+    return {"seconds": float(seconds), "source": source, "within": within}
+
+
 ROWS = [
     {"arrival_s": 0.0, "input_tokens": 512, "output_tokens": 8},
     {"arrival_s": 1.0, "input_tokens": 1024, "output_tokens": 16},
@@ -351,8 +363,9 @@ def cell(tmp_path, monkeypatch):
     (cell_dir / "costs.json").write_text(
         json.dumps(
             {
-                **{t: 10.0 for t in validate.COST_TERMS},
-                "cost_schema": "compass.costs/2",
+                **{t: 10.0 for t in validate.MEASURED_COST_TERMS},
+                **{t: _supplied(10.0) for t in validate.SUPPLIED_COST_TERMS},
+                "cost_schema": validate.COSTS_SCHEMA,
                 "execution_clocks": {"real": "wall", "modelled": "wall"},
             }
         )
@@ -747,14 +760,14 @@ class TestCostAndSpeedup:
         criterion is the replay ratio.
         """
         costs = {
-            "capture": 600.0,
-            "calibration": 600.0,
-            "derivation": 0.0,
+            "capture": _supplied(600.0),
+            "calibration": _supplied(600.0),
+            "derivation": _supplied(0.0),
             "startup_real": 0.0,
             "startup_modelled": 0.0,
             "execution_real": 300.0,
             "execution_modelled": 10.0,
-            "load": 0.0,
+            "load": _supplied(0.0),
             "execution_clocks": {"real": "wall", "modelled": "wall"},
         }
         one = validate._speedup(costs, reuse_cells=1)
@@ -772,48 +785,119 @@ class TestCostAndSpeedup:
         """Per-candidate derivation is part of asking the question, so it is
         inside the gate's denominator rather than beside it."""
         costs = {
-            "capture": 0.0,
-            "calibration": 0.0,
-            "derivation": 50.0,
+            "capture": _supplied(0.0),
+            "calibration": _supplied(0.0),
+            "derivation": _supplied(50.0),
             "startup_real": 0.0,
             "startup_modelled": 0.0,
             "execution_real": 300.0,
             "execution_modelled": 10.0,
-            "load": 0.0,
+            "load": _supplied(0.0),
             "execution_clocks": {"real": "wall", "modelled": "wall"},
         }
         got = validate._speedup(costs, reuse_cells=1)
         assert got["replay_ratio"] == pytest.approx(300.0 / 60.0)
         assert got["derivation_included_s"] == pytest.approx(50.0)
         assert got["meets_gate"] is True
-        costs["derivation"] = 500.0
+        costs["derivation"] = _supplied(500.0)
         assert validate._speedup(costs, reuse_cells=1)["meets_gate"] is False
 
     def test_the_break_even_count_is_reported(self):
         costs = {
-            "capture": 600.0,
-            "calibration": 0.0,
-            "derivation": 0.0,
+            "capture": _supplied(600.0),
+            "calibration": _supplied(0.0),
+            "derivation": _supplied(0.0),
             "startup_real": 0.0,
             "startup_modelled": 0.0,
             "execution_real": 310.0,
             "execution_modelled": 10.0,
-            "load": 0.0,
+            "load": _supplied(0.0),
             "execution_clocks": {"real": "wall", "modelled": "wall"},
         }
         got = validate._speedup(costs, reuse_cells=2)
         assert got["break_even_cells"] == 2  # 600 acquisition, 300 saved a cell
 
+    def test_a_load_inside_the_startup_is_not_charged_beside_it(self):
+        """`CC_TRACES_PROTOCOL.md` §5 defines `load` as the weight load and
+        graph capture *inside that startup*, so `startup_real` already contains
+        it. The startup-inclusive total used to add it again, which made the
+        real side look 200 s more expensive than the clock that measured it."""
+        contained = self._wall_costs(
+            startup_real=300.0,
+            startup_modelled=10.0,
+            load=_supplied(200.0, source="server.log", within="startup_real"),
+        )
+        got = validate._speedup(contained, reuse_cells=1)
+        # (300 execution + 300 startup) / (10 execution + 10 startup), not 800/20
+        assert got["startup_inclusive_ratio"] == pytest.approx(600.0 / 20.0)
+
+        beside = self._wall_costs(
+            startup_real=300.0,
+            startup_modelled=10.0,
+            load=_supplied(200.0, source="server.log", within=None),
+        )
+        # A load that declares it overlaps nothing is still a real cost.
+        assert validate._speedup(beside, reuse_cells=1)[
+            "startup_inclusive_ratio"
+        ] == pytest.approx(800.0 / 20.0)
+
+    def test_a_derivation_inside_the_modelled_startup_is_not_doubled(self):
+        """The oracle is built in `_init_compass_state`, before `/health`
+        answers, so a derivation declared inside `startup_modelled` is already
+        in that startup. It stays in the gate denominator either way -- that is
+        the per-candidate question -- but the end-to-end total counts it once."""
+        costs = self._wall_costs(
+            startup_real=0.0,
+            startup_modelled=40.0,
+            derivation=_supplied(
+                30.0, source="startup.json", within="startup_modelled"
+            ),
+        )
+        got = validate._speedup(costs, reuse_cells=1)
+        assert got["derivation_included_s"] == pytest.approx(30.0)
+        assert got["replay_ratio"] == pytest.approx(300.0 / 40.0)
+        assert got["startup_inclusive_ratio"] == pytest.approx(300.0 / 50.0)
+
+    def test_a_bare_supplied_number_is_refused_not_reinterpreted(self, cell):
+        """A version 2 record never said what contained its supplied terms.
+        Reading one now means guessing the containment that was the bug."""
+        costs = json.loads((cell / "costs.json").read_text())
+        costs["load"] = 200.0
+        costs["cost_schema"] = validate.COSTS_SCHEMA_V2
+        (cell / "costs.json").write_text(json.dumps(costs))
+        assert run(cell) == 1
+
+    def test_a_supplied_second_without_its_artifact_is_refused(self, cell):
+        costs = json.loads((cell / "costs.json").read_text())
+        costs["calibration"] = {"seconds": 600.0, "source": "", "within": None}
+        (cell / "costs.json").write_text(json.dumps(costs))
+        assert run(cell) == 1
+
+    def test_an_unstated_container_is_not_read_as_no_container(self, cell):
+        """Silence is the defect, not a claim of independence."""
+        costs = json.loads((cell / "costs.json").read_text())
+        costs["load"] = {"seconds": 200.0, "source": "server.log"}
+        (cell / "costs.json").write_text(json.dumps(costs))
+        assert run(cell) == 1
+
+    def test_a_duration_nobody_recorded_is_missing_not_zero(self, cell):
+        """Dropping the term is how a never-measured duration used to become a
+        free one. The cell is refused so the next run instruments it."""
+        costs = json.loads((cell / "costs.json").read_text())
+        del costs["derivation"]
+        (cell / "costs.json").write_text(json.dumps(costs))
+        assert run(cell) == 1
+
     def _wall_costs(self, **over):
         costs = {
-            "capture": 0.0,
-            "calibration": 0.0,
-            "derivation": 0.0,
+            "capture": _supplied(0.0),
+            "calibration": _supplied(0.0),
+            "derivation": _supplied(0.0),
             "startup_real": 0.0,
             "startup_modelled": 0.0,
             "execution_real": 300.0,
             "execution_modelled": 10.0,
-            "load": 0.0,
+            "load": _supplied(0.0),
             "execution_clocks": {"real": "wall", "modelled": "wall"},
         }
         costs.update(over)

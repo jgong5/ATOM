@@ -196,13 +196,39 @@ MEASURED_TERMS = (
 )
 SUPPLIED_TERMS = ("capture", "calibration", "derivation", "load")
 
+#: Which measured window each supplied term happens *inside*, when it does.
+#: `CC_TRACES_PROTOCOL.md` §5 defines `load` as "weight load and graph capture
+#: inside that startup", so it is a component of `startup_real`, and adding it
+#: beside that startup charges it twice. `capture` and `calibration` are paid
+#: before any server of this cell starts, so nothing contains them.
+#: `derivation` is the one the protocol does not settle: the oracle is built in
+#: `predict.py`'s `_init_compass_state`, which runs before the server answers
+#: `/health`, so it is probably inside `startup_modelled` -- but nobody has
+#: measured that, and a term whose containment is unknown must not be silently
+#: summed either way. It has no default; the operator has to say.
+CONTAINED_BY_DEFAULT = {
+    "capture": "none",
+    "calibration": "none",
+    "derivation": None,
+    "load": "startup_real",
+}
+
+#: What `--<term>-within` accepts. "none" is how a term says it overlaps no
+#: measured window, which is a claim; leaving it unstated is not.
+CONTAINERS = ("none", "startup_real", "startup_modelled")
+
 #: The cost record's schema. Version 2 names the clock every duration was
 #: taken on, because version 1 wrote the modelled side's *virtual* served
 #: window into `execution_modelled` -- a number that says how long the
 #: prediction thinks the workload takes, not what producing it cost. A reader
 #: that cannot tell the two apart cannot compute a speedup, so a record
 #: without this schema is refused rather than reinterpreted.
-COSTS_SCHEMA = "compass.costs/2"
+#: Version 3 makes each supplied term an object carrying the artifact it was
+#: read from and the measured window that contains it, because version 2's
+#: bare floats let `load` be added beside the `startup_real` that already
+#: included it. A version 2 record cannot be reinterpreted as a version 3 one
+#: -- its containment was never stated -- so it is refused, not upgraded.
+COSTS_SCHEMA = "compass.costs/3"
 
 #: The clock a duration a human would time with a stopwatch is taken on. The
 #: only one a runtime cost may be measured on.
@@ -1408,12 +1434,34 @@ def costs(args) -> int:
                 merged[term] = float(value)
     for term in SUPPLIED_TERMS:
         value = getattr(args, term)
+        source = getattr(args, f"{term}_source")
+        within = getattr(args, f"{term}_within") or CONTAINED_BY_DEFAULT[term]
         if value is None or not math.isfinite(value):
             missing.append(
-                f"--{term} (nothing in this cell measures it; it is an input)"
+                f"--{term} (nothing in this cell measures it; it is an input. "
+                f"If it was never recorded, say so -- it is not zero)"
             )
-        else:
-            merged[term] = float(value)
+            continue
+        if not source:
+            # A number with no origin reads exactly like a measured one.
+            missing.append(
+                f"--{term}-source (which artifact this duration was read "
+                f"from; a supplied second without one cannot be told from a "
+                f"measured one)"
+            )
+            continue
+        if within is None:
+            missing.append(
+                f"--{term}-within (whether this duration happens inside a "
+                f"measured window. Unstated is not the same as 'none', and a "
+                f"term whose containment is unknown cannot be summed)"
+            )
+            continue
+        merged[term] = {
+            "seconds": float(value),
+            "source": str(source),
+            "within": None if within == "none" else within,
+        }
     if missing:
         print(
             "costs.json not written, because it would be missing: "
@@ -1427,12 +1475,23 @@ def costs(args) -> int:
         "this cell's own repeats, on the wall clock, the rest supplied at "
         "merge time. served_window_* is what the engine reports having "
         "served -- virtual on a predicting server -- and is carried for "
-        "comparison, never as a cost"
+        "comparison, never as a cost. Each supplied term names the artifact "
+        "it was read from and the measured window it happens inside; a term "
+        "with a container is already counted in that window and a total must "
+        "not add it again"
     )
     merged["supplied"] = list(SUPPLIED_TERMS)
     merged["measured"] = list(MEASURED_TERMS)
     (cell / "costs.json").write_text(json.dumps(merged, indent=1) + "\n")
     print("costs.json: " + ", ".join(f"{t}={merged[t]:.3f}" for t in MEASURED_TERMS))
+    print(
+        "  supplied: "
+        + ", ".join(
+            f"{t}={merged[t]['seconds']:.3f}"
+            + (f" (inside {merged[t]['within']})" if merged[t]["within"] else "")
+            for t in SUPPLIED_TERMS
+        )
+    )
     return 0
 
 
@@ -1477,7 +1536,22 @@ def main(argv=None) -> int:
     c = sub.add_parser("costs", help="merge the cell's cost terms")
     c.add_argument("cell")
     for term in SUPPLIED_TERMS:
-        c.add_argument(f"--{term}", type=float, default=None)
+        c.add_argument(f"--{term}", type=float, default=None, help="seconds")
+        c.add_argument(
+            f"--{term}-source",
+            default=None,
+            help="the artifact this duration was read from",
+        )
+        c.add_argument(
+            f"--{term}-within",
+            choices=CONTAINERS,
+            default=None,
+            help=(
+                "the measured window this duration happens inside, so a "
+                "total does not charge it twice; default "
+                f"{CONTAINED_BY_DEFAULT[term] or 'none -- must be stated'}"
+            ),
+        )
     c.set_defaults(func=costs)
 
     args = ap.parse_args(argv)

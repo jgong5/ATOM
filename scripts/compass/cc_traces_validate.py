@@ -95,6 +95,24 @@ COST_TERMS = (
     "execution_modelled",
 )
 
+#: The terms `cc_traces_run.py` measures from the cell's own repeats: plain
+#: seconds. The rest are supplied at merge time and carry their origin and
+#: their container, because `load` happens inside `startup_real` and adding it
+#: beside that startup charges the same work twice.
+MEASURED_COST_TERMS = (
+    "startup_real",
+    "startup_modelled",
+    "execution_real",
+    "execution_modelled",
+)
+SUPPLIED_COST_TERMS = ("capture", "calibration", "derivation", "load")
+
+#: The record shape whose supplied terms were bare numbers. Refused rather
+#: than upgraded: it never stated containment, so there is nothing to read.
+COSTS_SCHEMA_V2 = "compass.costs/2"
+#: What `cc_traces_run.py costs` writes now.
+COSTS_SCHEMA = "compass.costs/3"
+
 TOLERANCE_PCT = {"throughput_tok_s": 10.0, "tpot": 10.0, "ttft": 15.0}
 RHO_MIN = 0.90
 SPEEDUP_MIN = 5.0
@@ -1337,7 +1355,33 @@ def cell(args) -> int:
 
     costs_path = cell_dir / "costs.json"
     costs = json.loads(costs_path.read_text()) if costs_path.exists() else {}
-    missing = [t for t in COST_TERMS if not isinstance(costs.get(t), (int, float))]
+    missing = [t for t in MEASURED_COST_TERMS if not _finite(costs.get(t))]
+    for term in SUPPLIED_COST_TERMS:
+        value = costs.get(term)
+        if isinstance(value, (int, float)):
+            # A version 2 bare float. It never said whether it happens inside
+            # a measured window, so it cannot be placed in a total now.
+            failures.append(
+                f"costs.json records {term} as a bare number: that is a "
+                f"{COSTS_SCHEMA_V2} record, whose supplied terms never stated "
+                f"what contains them. `load` sits inside `startup_real` and "
+                f"was charged twice by every total that read one. Re-merge "
+                f"the cell rather than reinterpreting the old number"
+            )
+        elif not (isinstance(value, dict) and _finite(value.get("seconds"))):
+            missing.append(term)
+        elif not value.get("source"):
+            failures.append(
+                f"costs.json does not say where {term} came from: a supplied "
+                f"second without its artifact cannot be told from a measured "
+                f"one"
+            )
+        elif "within" not in value:
+            failures.append(
+                f"costs.json does not say what contains {term}: unstated is "
+                f"not the same as contained by nothing, and a term whose "
+                f"containment is unknown cannot be summed either way"
+            )
     if missing:
         failures.append(
             f"costs.json does not record {', '.join(missing)}: the "
@@ -1552,6 +1596,35 @@ def _off_wall_clocks(costs: dict) -> list:
     ]
 
 
+def _supplied_seconds(costs: dict, term: str) -> float:
+    """The term's own duration, however deep it sits inside a window.
+
+    A `compass.costs/3` supplied term is an object; a bare number is a version
+    2 record, which `_costs` refuses before reaching here. Returning 0.0 for a
+    shape this does not recognise keeps the arithmetic from inventing seconds.
+    """
+    value = costs.get(term)
+    if isinstance(value, dict):
+        seconds = value.get("seconds")
+        return float(seconds) if _finite(seconds) else 0.0
+    return 0.0
+
+
+def _uncontained(costs: dict, term: str) -> float:
+    """The part of the term a total may add: nothing, if a window has it.
+
+    `load` is inside `startup_real` and `derivation` is (pending measurement)
+    inside `startup_modelled`. Those seconds are already in the measured
+    window, so adding the term beside it counts the same work twice -- which
+    is what version 2 of this record did, asymmetrically, inflating the real
+    side by `load` and the modelled side by `derivation`.
+    """
+    value = costs.get(term)
+    if isinstance(value, dict) and value.get("within"):
+        return 0.0
+    return _supplied_seconds(costs, term)
+
+
 def _speedup(costs: dict, reuse_cells: int) -> dict:
     """The gate ratio, and every cost the gate does not include.
 
@@ -1600,16 +1673,22 @@ def _speedup(costs: dict, reuse_cells: int) -> dict:
                 "two is not a speedup"
             ),
         }
-    derivation = float(costs.get("derivation") or 0.0)
-    acquisition = sum(float(costs.get(t) or 0.0) for t in ("capture", "calibration"))
+    derivation = _supplied_seconds(costs, "derivation")
+    acquisition = sum(_supplied_seconds(costs, t) for t in ("capture", "calibration"))
     predict_once = execution_modelled + derivation
     replay_ratio = execution_real / predict_once if predict_once > 0 else None
 
     startup_real = float(costs.get("startup_real") or 0.0)
     startup_modelled = float(costs.get("startup_modelled") or 0.0)
-    load = float(costs.get("load") or 0.0)
-    real_total = execution_real + startup_real + load
-    modelled_total = predict_once + startup_modelled
+    # A supplied term that happens inside a measured window is already in that
+    # window's seconds. `load` is inside `startup_real` by the protocol's own
+    # definition (§5, "weight load and graph capture inside that startup"), so
+    # adding it here charged the real side twice; the same holds for any term
+    # that declares a container.
+    real_total = execution_real + startup_real + _uncontained(costs, "load")
+    modelled_total = (
+        execution_modelled + _uncontained(costs, "derivation") + startup_modelled
+    )
     per_cell = acquisition / max(1, reuse_cells)
     amortised_total = modelled_total + per_cell
     saved_per_cell = real_total - modelled_total
@@ -1621,8 +1700,8 @@ def _speedup(costs: dict, reuse_cells: int) -> dict:
         "derivation_included_s": derivation,
         "acquisition_s": acquisition,
         "acquisition_terms": {
-            "capture": float(costs.get("capture") or 0.0),
-            "calibration": float(costs.get("calibration") or 0.0),
+            "capture": _supplied_seconds(costs, "capture"),
+            "calibration": _supplied_seconds(costs, "calibration"),
         },
         "startup_inclusive_ratio": (
             real_total / modelled_total if modelled_total > 0 else None

@@ -672,23 +672,18 @@ class TestTheCostsItCanMeasure:
     def test_a_complete_merge_carries_every_term_the_validator_reads(self, tmp_path):
         cell = tmp_path / "tp2_long"
         self._partials(cell)
-        argv = [
-            "costs",
-            str(cell),
-            "--capture",
-            "412",
-            "--calibration",
-            "1980",
-            "--derivation",
-            "31.5",
-            "--load",
-            "96",
-        ]
-        assert run_mod.main(argv) == 0
+        assert run_mod.main(self._argv(cell)) == 0
         costs = json.loads((cell / "costs.json").read_text())
         validate = _load("cc_traces_validate")
-        for term in validate.COST_TERMS:
+        for term in validate.MEASURED_COST_TERMS:
             assert isinstance(costs[term], float)
+        # A supplied second carries where it was read from and what contains
+        # it, so a total can tell it from a measured one and not double it.
+        for term in validate.SUPPLIED_COST_TERMS:
+            assert set(costs[term]) == {"seconds", "source", "within"}
+            assert costs[term]["source"]
+        assert costs["load"]["within"] == "startup_real"
+        assert costs["capture"]["within"] is None
         assert costs["supplied"] == list(run_mod.SUPPLIED_TERMS)
         # The gate reads this to check it is dividing wall seconds by wall
         # seconds, and the served windows travel beside it, not inside it.
@@ -699,6 +694,27 @@ class TestTheCostsItCanMeasure:
         assert costs["cost_schema"] == run_mod.COSTS_SCHEMA
         assert costs["served_window_modelled"] == 300.0
         assert costs["execution_modelled"] == 30.0
+
+    def test_a_derivation_with_no_stated_container_is_not_merged(
+        self, tmp_path, capsys
+    ):
+        """`load` has a container the protocol states, so it defaults. Nobody
+        has measured whether the oracle build is inside `startup_modelled`, so
+        `derivation` has no default and the operator has to say which it is."""
+        cell = tmp_path / "tp2_long"
+        self._partials(cell)
+        argv = [a for a in self._argv(cell) if a not in ("--derivation-within", "none")]
+        assert run_mod.main(argv) == 2
+        assert "--derivation-within" in capsys.readouterr().err
+        assert not (cell / "costs.json").exists()
+
+    def test_a_supplied_second_with_no_artifact_is_not_merged(self, tmp_path, capsys):
+        cell = tmp_path / "tp2_long"
+        self._partials(cell)
+        argv = [a for a in self._argv(cell) if a not in ("--load-source", "server.log")]
+        assert run_mod.main(argv) == 2
+        assert "--load-source" in capsys.readouterr().err
+        assert not (cell / "costs.json").exists()
 
     def test_a_partial_from_the_old_schema_is_not_merged(self, tmp_path, capsys):
         """The old record called a virtual window `execution_modelled`, and
@@ -727,12 +743,25 @@ class TestTheCostsItCanMeasure:
             str(cell),
             "--capture",
             "412",
+            "--capture-source",
+            "capture/manifest.json",
             "--calibration",
             "1980",
+            "--calibration-source",
+            "registry/calibration.json",
             "--derivation",
             "31.5",
+            "--derivation-source",
+            "startup.json",
+            # Nobody has measured whether the oracle build is inside the
+            # modelled startup, so this run says it is not and the record
+            # carries that claim.
+            "--derivation-within",
+            "none",
             "--load",
             "96",
+            "--load-source",
+            "server.log",
         ]
 
 
