@@ -602,6 +602,51 @@ Consequences for the phase A rungs, stated exactly:
   ledger, in particular that all three rungs hold the non-KV readings fixed
   from the TP=1 util 0.90 run and that `max_num_seqs` has never been varied.
 
+## Identity is not integrity: what tells a repeat from a residual
+
+Phase C settled a question the classifier had been answering with a hash. The
+three repeats wrote records that are equal **byte for byte** -- same sha256 as
+each other and as the committed `27b.tp1.exclusive.memory.json`. So:
+
+* a hash **match** is not one execution. Here it is three.
+* a hash **mismatch** is not a second execution. Re-serialising one record --
+  re-indenting the JSON, round-tripping it through a tool -- changes the hash
+  while no run has occurred.
+
+A content hash answers *are these the bytes the constant was read off*. It
+cannot answer *was this the run the constant was read off*, and only the second
+question separates a residual (the fit reported back to itself, worth nothing
+as agreement) from a repeat (reproducibility evidence, worth something).
+
+The two questions are now two calls. `classify(term, config, producer=...)`
+takes a **producer**: the `host` / `pid` / `started_at` triple, which is the
+vocabulary the harness already uses -- `compare.py` reads `blob["run"]`,
+`merge_sweep.py` labels fresh-process shards by `started_at`, `residual.py`
+and `step_accounting.py` attribute steps by `pid`. No second run-ID scheme.
+`integrity(term, sha)` takes the hash and says `intact` / `altered` /
+`unknown`.
+
+Two conservative rules, both of which cost the calibration credit rather than
+grant it:
+
+1. **An unidentified producer is classified `residual`** -- the weaker claim.
+   Calling an unknown run a repeat would credit the constant with
+   reproducibility nobody observed; calling it a residual credits it with
+   nothing.
+2. **Integrity is only reported where the producer says this *is* the fitted
+   run** (`identifies`). The first cut printed `bytes altered` on any record
+   whose hash differed from the fitted one, which fired on every row of every
+   other record: the exclusive capture is not the historical record and never
+   claimed to be. `altered` has to mean the bytes moved under a run.
+
+What this costs today, stated plainly: **no shipped record carries a run
+block**, so `producers` is empty on both source runs, every row reads
+`residual (run unidentified)`, and no integrity note can fire. The three phase
+C executions are witnessed -- engine pids 695009, 751439, 775417 across
+08:55:09Z-09:03:34Z in the ownership log -- but that witness lives in a
+gitignored sampler log beside the records, not inside them, so it cannot be
+machine-checked and is not asserted as identity. That is O12.
+
 ## Open items
 
 | # | item | needs | status |
@@ -617,3 +662,4 @@ Consequences for the phase A rungs, stated exactly:
 | O9 | `MODEL_HEADROOM` provenance: which run, which config | lead / history | open; until then it stays disallowed and is not to be relabelled as source |
 | O10 | manifest-derived acceptance lengths | final CC workload | **closed** -- CC protocol `47917ade`: long 107 328 + 2 413 (6 859 blocks), short 2 560 + 21 (162) |
 | O11 | what the 486 MiB `non_torch` excursion was | unknown; three controls failed to reproduce it | open, and the one thing the calibrated `non_torch` does not bound |
+| O12 | a producer block in the memory record: `host` / `pid` / `started_at`, written by `_write_memory` | **lead** -- `atom/compass/runtime/runner.py` is shared, not mine to edit | open; until it lands, every calibrated row reads `residual (run unidentified)` and the phase C repeats cannot be machine-checked. `_write_replay_target` already writes a `hardware` block in the same function's neighbourhood, so the shape is precedented |

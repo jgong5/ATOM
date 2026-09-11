@@ -193,23 +193,44 @@ def kv_rows(config: dict, readings: dict, tp: int, world: int, blob: dict,
 
 
 def record_sha(path: str) -> str:
-    """The record's own hash, so a rerun is not mistaken for the source run."""
+    """The record's own hash: integrity, and only integrity.
+
+    It says whether these are the bytes a constant was read off. It does not
+    say which run wrote them -- the source calibration's three runs wrote
+    identical bytes -- so it is not what tells a repeat from a residual.
+    """
     with open(path, "rb") as fh:
         return hashlib.sha256(fh.read()).hexdigest()
 
 
-def _cal_note(calib, cal_map: dict, config: dict, sha: str, term: str,
-              default: str) -> str:
+def _cal_note(calib, cal_map: dict, config: dict, sha: str, producer,
+              term: str, default: str) -> str:
     """The row note, saying what the comparison is worth.
 
     Bound per record with `partial`, because the answer depends on which run is
     being read: one constant is a residual against the record it was fitted on
     and a validation against any other.
+
+    `residual` is also what an unidentified run gets. Records do not yet carry
+    a producer, so that is every record today -- the honest reading of the row
+    is "this record cannot show the constant reproduces", not "this record is
+    the fit".
+
+    Integrity is only reported where the producer says this *is* the fitted
+    run. The first cut printed it whenever the record's hash differed from the
+    fitted one, which fired on every row of every other record -- the exclusive
+    capture is not the historical record and never claimed to be. `altered` has
+    to mean the bytes moved under a run, not "you are reading another file".
     """
     if calib is None or term not in (cal_map or {}):
         return default
-    kind = calib.classify(term, config, record_sha256=sha)
-    return "%s; source-calibrated, this record is its %s" % (default, kind)
+    kind = calib.classify(term, config, producer=producer)
+    note = "%s; source-calibrated, this record is its %s" % (default, kind)
+    if producer is None and kind == "residual":
+        note += " (run unidentified)"
+    elif calib.identifies(term, producer) and calib.integrity(term, sha) == "altered":
+        note += ", re-serialised since it was fitted"
+    return note
 
 
 def row(name: str, derived, recorded, note: str = "", budget: int = 0) -> None:
@@ -388,7 +409,10 @@ def main() -> int:
         calib = for_model(config.get("model")) if args.source_calibration else None
         cal_map = calib.mapping(world) if calib else None
 
-        cal_note = partial(_cal_note, calib, cal_map, config, sha)
+        # The producer block if the record carries one. None today: the writer
+        # does not emit it, which is why every row reads "run unidentified".
+        cal_note = partial(_cal_note, calib, cal_map, config, sha,
+                           blob.get("run"))
 
         checkpoint = args.checkpoint
         derived_weights = weight_bytes(checkpoint, tp) if checkpoint else None
