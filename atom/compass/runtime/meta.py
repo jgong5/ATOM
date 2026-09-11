@@ -256,6 +256,59 @@ def _int_ranges_of(tensors) -> tuple:
     return tuple(out)
 
 
+def _layouts_of(tensors) -> tuple:
+    """Where each tensor argument sat inside its allocation, by position.
+
+    A shape cannot say that a tensor is a *view*. The fused QKV projection
+    writes one ``[4, 56, 256]`` buffer and hands the norm kernel ``q`` as
+    ``[4, 24, 256]`` with ``q_in_stride0 = 14336`` -- the base row, not q's own
+    6144. Rebuilt as a dense ``[4, 24, 256]`` and launched with the recorded
+    stride, the kernel walks off the end of the allocation and faults the
+    device, which is why pricing refuses such an operator today (G4 section 8).
+
+    Four numbers per argument close that gap: stride, storage offset, how many
+    elements the whole storage holds, and which argument owns it. The owner is
+    the position of the *first* argument sharing that allocation, so q and k
+    rebuild as two views of one buffer rather than as two unrelated tensors --
+    a different amount of traffic and so a different price.
+
+    Only arguments a shape cannot already describe get an entry: a contiguous
+    tensor at offset zero that owns its whole storage alone is skipped. This
+    reads metadata only -- no contents, no device-to-host copy -- so unlike its
+    two neighbours it works on meta, which is where derivation runs.
+    """
+    import torch
+
+    keys = []
+    for t in tensors:
+        if not isinstance(t, torch.Tensor):
+            keys.append(None)
+            continue
+        try:
+            keys.append(t.untyped_storage()._cdata)
+        except Exception:  # noqa: BLE001 - a tensor without real storage
+            keys.append(None)
+
+    out = []
+    for i, t in enumerate(tensors):
+        if keys[i] is None:
+            continue
+        try:
+            stride = tuple(int(s) for s in t.stride())
+            offset = int(t.storage_offset())
+            elements = t.untyped_storage().nbytes() // t.element_size()
+        except Exception:  # noqa: BLE001 - same tolerance as the neighbours
+            continue
+        owner = keys.index(keys[i])
+        plain = (t.is_contiguous() and offset == 0
+                 and elements == t.numel() and owner == i
+                 and keys.count(keys[i]) == 1)
+        if plain:
+            continue
+        out.append((i, (stride, offset, int(elements), owner)))
+    return tuple(out)
+
+
 def _int_values_of(tensors) -> tuple:
     """Contents of the small integer tensor arguments, by position.
 

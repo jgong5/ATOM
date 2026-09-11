@@ -24,7 +24,8 @@ from typing import Any, Optional
 import torch
 
 from atom.compass.core.graph import OpGraph, OpSpec
-from atom.compass.runtime.meta import _int_ranges_of, inside_an_operator
+from atom.compass.runtime.meta import (
+    _int_ranges_of, _layouts_of, inside_an_operator)
 
 logger = logging.getLogger(__name__)
 
@@ -110,6 +111,27 @@ def _kernel_name(fn: Any) -> str:
         return str(meta["kernel_name"])
     inner = getattr(fn, "fn", fn)
     return getattr(inner, "__name__", None) or str(inner)
+
+
+def _param_names(fn: Any, args) -> tuple:
+    """What the kernel calls each positional argument it was handed.
+
+    A ``@triton.jit`` kernel declares its parameters, so nothing here is
+    reconstructed: ``_fused_qk_norm_single_kernel`` says in its own signature
+    that position 7 is ``num_tokens`` and position 9 is ``q_in_stride0``.
+    Recorded because the values alone cannot be told apart -- 16384 is the token
+    count of one prefill chunk and the row stride of another kernel's buffer --
+    and pricing has to know which of them addresses memory.
+
+    Empty when the kernel does not declare names, which is the honest answer:
+    an artifact that says nothing is refused later, and one that guesses is not.
+    """
+    names = getattr(fn, "arg_names", None)
+    if names is None:
+        names = getattr(getattr(fn, "fn", None), "arg_names", None)
+    if not names:
+        return ()
+    return tuple((i, str(n)) for i, n in enumerate(names) if i < len(args))
 
 
 def _is_meta(x: Any) -> bool:
@@ -299,6 +321,8 @@ class TritonLaunchTracer:
                 scalars=scalars + constexprs,
                 launch=(("grid", list(launch.grid)), ("origin", origin)),
                 int_ranges=_int_ranges_of(tensors),
+                layouts=_layouts_of(tensors),
+                param_names=_param_names(fn, args),
             )
         )
 

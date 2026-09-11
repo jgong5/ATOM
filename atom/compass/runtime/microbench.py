@@ -330,6 +330,76 @@ def _rebuild_args(op: dict, tensors: list) -> tuple[list, dict]:
     return args, keywords
 
 
+def _operand_tensors(op: dict, recorded: dict, spans: dict):
+    """One fresh set of tensor arguments, as views into what held them.
+
+    Without recorded layout every argument is rebuilt dense and alone, which is
+    wrong for any tensor that was a view: the fused QKV projection hands the
+    norm kernel a ``[4, 24, 256]`` q whose ``stride0`` is the 14336-element row
+    of the buffer it sits in, and a dense rebuild launched with that stride
+    walks off the end and faults the device. With layout, the allocation is
+    rebuilt first -- once per storage, at its recorded element count -- and each
+    argument is an ``as_strided`` view into it, so q and k come back as two
+    windows on one buffer rather than as two unrelated tensors.
+
+    The reconstruction is checked rather than trusted: the furthest element each
+    view addresses must fall inside the storage it claims, and every argument
+    sharing a storage must agree on dtype. Either failing returns ``None`` and
+    the signature goes unpriced, which is the same refusal as before -- what
+    changes is that a layout the graph *does* record no longer triggers it.
+    """
+    import torch
+
+    layouts = {int(i): tuple(v) for i, v in (op.get("layouts") or ())}
+    shapes = [tuple(s) for s in op["input_shapes"]]
+    dtypes = list(op["dtypes"])
+    if any(i >= len(shapes) for i in layouts):
+        return None
+
+    # Check every layout before allocating any of them: a refusal should cost
+    # nothing, and half-allocating a set that is about to be thrown away is how
+    # a pricing run runs out of memory for the signatures that would have worked.
+    for i, (stride, offset, elements, owner) in layouts.items():
+        if len(stride) != len(shapes[i]) or offset < 0:
+            return None
+        reach = offset + sum(abs(int(s)) * (int(d) - 1)
+                             for s, d in zip(stride, shapes[i])) + 1
+        if reach > elements:
+            return None
+        if owner not in layouts or layouts[owner][3] != owner:
+            return None
+        if len({dtypes[j] for j, v in layouts.items() if v[3] == owner}) != 1:
+            return None
+
+    bases: dict[int, object] = {}
+    for i, (_stride, _offset, elements, owner) in layouts.items():
+        if owner in bases:
+            continue
+        base = _make_tensor((int(elements),), dtypes[owner])
+        if base is None:
+            return None
+        bases[owner] = base
+
+    tensors = []
+    for i, (shape, dtype) in enumerate(zip(shapes, dtypes)):
+        if i in layouts:
+            stride, offset, _elements, owner = layouts[i]
+            view = torch.as_strided(
+                bases[owner], shape, tuple(int(s) for s in stride), int(offset))
+            if recorded.get(i) is not None or spans.get(i) is not None:
+                dense = _make_tensor(shape, dtype, recorded.get(i), spans.get(i))
+                if dense is None:
+                    return None
+                view.copy_(dense)
+            tensors.append(view)
+            continue
+        t = _make_tensor(shape, dtype, recorded.get(i), spans.get(i))
+        if t is None:
+            return None
+        tensors.append(t)
+    return tensors
+
+
 #: Print each signature before it is touched. A device memory fault kills the
 #: process outright, so a `try/except` never sees it and the artifact never gets
 #: written -- the last line printed is the only evidence of which operator did
@@ -340,6 +410,21 @@ ANNOUNCE = os.environ.get("COMPASS_ANNOUNCE", "") == "1"
 def _announce(what: str, sig: str) -> None:
     if ANNOUNCE:
         print(f"### compass {what}: {sig[:150]}", flush=True)
+
+
+def _message(exc: BaseException, head: int = 160, tail: int = 260) -> str:
+    """The failure text, kept short but not decapitated at the wrong end.
+
+    A Triton ``CompilationError`` opens with the source line it choked on and
+    says what was actually wrong several lines later; truncated to its first 100
+    characters it reads "at 176:34: + (conv_states_output_coord * strid" and
+    names no cause at all. Keeping both ends fits the whole message for almost
+    every failure and the two informative ends of the ones it does not.
+    """
+    text = " ".join(str(exc).split())
+    if len(text) <= head + tail + 5:
+        return text
+    return f"{text[:head]} ... {text[-tail:]}"
 
 
 def _where(exc: BaseException) -> str:
@@ -390,20 +475,46 @@ def _stride_past_its_tensors(op: dict):
     the kernel, not applied to a pointer, and `BLOCKS_PER_TILE=4096` is a tile
     size that prices correctly today.
 
-    Returns the first such (name, value, largest extent), or None. It over-
-    refuses -- a kernel taking a genuinely large extent loses its price -- and
-    that is the direction to err, because the other failure takes the run.
+    That size test is a guess about meaning, and it is wrong in both directions.
+    The same kernel at a 16k prefill chunk takes `num_tokens = 16384` beside
+    arguments whose rows are 6144, and the test refuses the whole family for a
+    token count that addresses nothing. Where the graph records what the kernel
+    calls its arguments (`param_names`) the guess is unnecessary: only a
+    parameter the kernel *declares* as a stride can be applied to a pointer, and
+    only such a parameter is examined. Nothing is inferred from a value's size.
+
+    A declared stride is still refused unless the graph records the allocation
+    it belongs to, either as one of that operator's `layouts` -- in which case
+    the view is rebuilt inside a storage of the recorded element count, checked
+    to fit before it is used (`_operand_tensors`) -- or by fitting a dense row
+    of some argument, which is what the rebuild produces anyway.
+
+    An operator whose names were never recorded falls back to the size test
+    unchanged, layouts or not, because for it there is still nothing better.
+    Returns the first refusal as (name, value, largest extent), or None. Both
+    paths over-refuse, which is the direction to err: the other failure takes
+    the whole run.
     """
+    shapes = [tuple(s) for s in (op.get("input_shapes") or ())]
     extents = [math.prod(shape[1:])
-               for shape in op.get("input_shapes") or ()
+               for shape in shapes
                if len(shape) >= 2 and shape[0] > 1]
     if not extents:
         return None
     limit = max(extents)
+    known = {abs(int(s))
+             for _, v in (op.get("layouts") or ())
+             for s in tuple(v)[0]}
+    params = {int(i): str(n) for i, n in (op.get("param_names") or ())}
     for key, value in (tuple(x) for x in op.get("scalars") or ()):
-        if (key.startswith("#") and isinstance(value, int)
+        if not (key.startswith("#") and isinstance(value, int)
                 and not isinstance(value, bool) and value > limit):
-            return (key, value, limit)
+            continue
+        if value in known:
+            continue
+        if params and "stride" not in params.get(int(key[1:]), ""):
+            continue
+        return (key, value, limit)
     return None
 
 
@@ -465,10 +576,8 @@ def _build_arg_sets(op: dict, cache: str, fn) -> Optional[list]:
     spans = {int(i): v for i, v in (op.get("int_ranges") or ())}
 
     def one():
-        tensors = [_make_tensor(s, d, recorded.get(i), spans.get(i))
-                   for i, (s, d) in enumerate(
-                       zip(op["input_shapes"], op["dtypes"]))]
-        if any(t is None for t in tensors):
+        tensors = _operand_tensors(op, recorded, spans)
+        if tensors is None:
             return None
         return _rebuild_args(op, tensors)
 
@@ -478,11 +587,22 @@ def _build_arg_sets(op: dict, cache: str, fn) -> Optional[list]:
     if cache == "hot":
         return [first]
 
+    # A set costs what it allocates, not what its arguments span: an argument
+    # with a recorded layout is a window into a storage that may be far larger,
+    # and two such arguments may share one. Count each storage once, at its
+    # recorded size, and every other argument at its own.
+    layouts = {int(i): tuple(v) for i, v in (op.get("layouts") or ())}
+    elements: dict[object, tuple[int, str]] = {}
+    for i, (sh, d) in enumerate(zip(op["input_shapes"], op["dtypes"])):
+        if getattr(torch, d, None) is None:
+            continue
+        if i in layouts:
+            elements[("storage", layouts[i][3])] = (int(layouts[i][2]), d)
+        else:
+            elements[("arg", i)] = (max(1, int(torch.Size(tuple(sh)).numel())), d)
     per_set = sum(
-        int(torch.empty(0, dtype=getattr(torch, d)).element_size())
-        * max(1, int(torch.Size(tuple(sh)).numel()))
-        for sh, d in zip(op["input_shapes"], op["dtypes"])
-        if getattr(torch, d, None) is not None
+        int(torch.empty(0, dtype=getattr(torch, d)).element_size()) * n
+        for n, d in elements.values()
     ) or 1
     n = max(2, min(64, COLD_WORKING_SET_BYTES // per_set))
     sets = [first]
@@ -932,15 +1052,23 @@ def load_ops(graph_path: str) -> tuple[list, list, dict | None]:
 
 
 def price_graph(graph_path: str, iters: int = 2000, warmup: int = 20,
-                cache: str = "hot") -> dict[str, Any]:
+                cache: str = "hot", only: str | None = None) -> dict[str, Any]:
     """Price every distinct operator signature in a captured graph.
 
     Returns the price list and what it could not reach. Coverage is reported by
     operator count *and* by how many of the graph's operators a priced signature
     accounts for, because the two differ enormously: a handful of signatures
     cover most of a step.
+
+    `only` narrows the run to operator names containing that substring. A whole
+    graph takes minutes and stands up a context per signature; reproducing one
+    family's failure does not need the other two hundred. The coverage counts
+    then describe the narrowed set, so the result carries `only` -- a partial
+    run must not read back as a graph's coverage.
     """
     ops, paths, measured_topology = load_ops(graph_path)
+    if only:
+        ops = [op for op in ops if only in op["name"]]
 
     counts: dict[str, int] = {}
     example: dict[str, dict] = {}
@@ -1072,7 +1200,7 @@ def price_graph(graph_path: str, iters: int = 2000, warmup: int = 20,
             # a graph fails inside the engine's own code, and the message alone
             # ("'NoneType' object has no attribute 'device'") names neither the
             # field that was None nor the branch that wanted it.
-            unpriced[sig] = f"{type(exc).__name__}: {str(exc)[:100]}{_where(exc)}"
+            unpriced[sig] = f"{type(exc).__name__}: {_message(exc)}{_where(exc)}"
             continue
         priced[sig] = {
             "name": op["name"],
@@ -1110,6 +1238,10 @@ def price_graph(graph_path: str, iters: int = 2000, warmup: int = 20,
             "topology": measured_topology,
             "iters": iters,
             "cache": cache,
+            # Set when the run was narrowed to one family. The coverage below
+            # then counts only what was asked for, and reads as complete
+            # unless this says otherwise.
+            "only": only,
             "note": "steady state, one event pair per signature",
         },
         "coverage": {

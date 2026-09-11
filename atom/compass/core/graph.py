@@ -145,6 +145,30 @@ class OpSpec:
             also resurrects the dead, since the allocator hands a freed address
             straight back and a producer map that never forgets then credits
             the new tensor to whoever held that address before.
+        layouts: Where a tensor argument sat inside its allocation, as
+            ``(position, (stride, storage_offset, storage_elements,
+            storage_key))``. A shape says how big a tensor is; it cannot say
+            that the tensor is a *view* into something larger. A Triton kernel
+            takes pointers and strides as separate plain ints, so when the
+            argument was a view the stride it was handed belongs to the base
+            allocation -- and a dense rebuild of the recorded shape, launched
+            with that stride, walks off the end and faults the device (§8 of
+            G4_TRANSFER). Recorded only where the shape cannot already say it:
+            a contiguous tensor owning its whole storage alone gets no entry.
+            ``storage_key`` is the position of the first argument sharing that
+            storage, so two views of one buffer rebuild as two views of one
+            buffer rather than as two unrelated tensors -- a different amount
+            of traffic and a different price.
+        param_names: What the kernel calls each positional argument, as
+            ``(position, name)``. The tracer records a non-tensor positional
+            argument as ``#7 = 16384`` -- a number with no meaning attached --
+            and the only way to tell a stride from a token count then is to
+            guess from its size. That guess is wrong in both directions: at 16k
+            prefill ``num_tokens`` is 16384 and looks like a stride, while at
+            batch 4 a genuine ``q_in_stride0`` of 14336 sits beside tensors
+            whose rows are 6144. A ``@triton.jit`` kernel already declares the
+            names, so they are recorded rather than reconstructed. Empty for a
+            torch operator, whose arguments are not raw pointers and strides.
         launch: How to launch a Triton kernel that is not a torch operator, as
             ``(name, value)`` pairs: ``grid`` and ``origin``. A torch operator
             can be found again from its name alone, through ``torch.ops``; a
@@ -164,6 +188,8 @@ class OpSpec:
     context: tuple[tuple[str, Any], ...] = ()
     launch: tuple[tuple[str, Any], ...] = ()
     int_ranges: tuple[tuple[int, tuple[int, int, bool]], ...] = ()
+    layouts: tuple[tuple[int, tuple], ...] = ()
+    param_names: tuple[tuple[int, str], ...] = ()
     inputs_from: tuple[int, ...] = ()
     output_aliases: tuple = ()
     dies_at: tuple = ()
@@ -235,6 +261,9 @@ class OpGraph:
                     "context": [list(kv) for kv in op.context],
                     "launch": [list(kv) for kv in op.launch],
                     "int_ranges": [[i, list(v)] for i, v in op.int_ranges],
+                    "layouts": [[i, [list(v[0]), v[1], v[2], v[3]]]
+                                for i, v in op.layouts],
+                    "param_names": [[i, n] for i, n in op.param_names],
                     "inputs_from": list(op.inputs_from),
                     "output_aliases": list(op.output_aliases),
                     "dies_at": list(op.dies_at),
@@ -277,6 +306,15 @@ class OpGraph:
                     int_ranges=tuple(
                         (int(i), (int(v[0]), int(v[1]), bool(v[2])))
                         for i, v in op.get("int_ranges") or ()
+                    ),
+                    layouts=tuple(
+                        (int(i), (tuple(int(s) for s in v[0]), int(v[1]),
+                                  int(v[2]), int(v[3])))
+                        for i, v in op.get("layouts") or ()
+                    ),
+                    param_names=tuple(
+                        (int(i), str(n))
+                        for i, n in op.get("param_names") or ()
                     ),
                     inputs_from=tuple(
                         int(i) for i in op.get("inputs_from") or ()),

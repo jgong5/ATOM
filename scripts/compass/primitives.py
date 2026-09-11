@@ -170,6 +170,11 @@ def main() -> int:
     ap.add_argument("--replay-target", default=None,
                     help="A captured target.json, for AITER's import-time "
                          "architecture query where rocminfo cannot answer.")
+    ap.add_argument("--only", default=None,
+                    help="Price only operators whose name contains this. For "
+                         "reproducing one family's failure without rerunning "
+                         "the graph; the coverage it reports is of the "
+                         "narrowed set, not the graph.")
     args = ap.parse_args()
 
     _init_env(args.rank, args.tp)
@@ -219,7 +224,7 @@ def main() -> int:
 
     t0 = time.perf_counter()
     result = price_graph(args.graph, iters=args.iters, warmup=args.warmup,
-                         cache=args.cache)
+                         cache=args.cache, only=args.only)
     price_s = time.perf_counter() - t0
 
     import torch

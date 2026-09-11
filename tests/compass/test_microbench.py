@@ -513,3 +513,184 @@ class TestAStrideIntoMemoryTheGraphNeverSaw:
 
         assert _stride_past_its_tensors(self._kernel([("#11", 6144)])) is None
         assert _stride_past_its_tensors(self._kernel([("#9", 6145)]))
+
+
+class TestRebuildingAViewIntoItsBuffer:
+    """With layout recorded, q comes back as a window on the fused qkv buffer.
+
+    Without it, q came back dense at [4, 24, 256] and the kernel was still
+    launched with stride0 = 14336, which is why pricing refuses such an operator
+    rather than faulting the device. What is tested here is the arithmetic of
+    the reconstruction and its refusals, not the launch: `_make_tensor`
+    allocates on the device, so it is replaced with a host allocator.
+    """
+
+    def _op_with(self, layouts, shapes=((4, 24, 256), (4, 4, 256))):
+        op = _op(shapes=list(shapes), dtypes=["bfloat16"] * len(shapes))
+        op["layouts"] = layouts
+        return op
+
+    def _build(self, monkeypatch, op):
+        """Allocated on meta: a 16k prefill chunk's fused buffer is 470 MB, and
+        what is under test is the addressing, not the bytes."""
+        import torch
+
+        from atom.compass.runtime import microbench
+
+        monkeypatch.setattr(
+            microbench, "_make_tensor",
+            lambda shape, dtype, values=None, span=None: torch.empty(
+                tuple(int(d) for d in shape), dtype=getattr(torch, dtype),
+                device="meta"))
+        return microbench._operand_tensors(op, {}, {})
+
+    #: q = fused[:, :24, :], k = fused[:, 24:28, :] over a [4, 56, 256] buffer.
+    QKV = [[0, [[14336, 256, 1], 0, 57344, 0]],
+           [1, [[14336, 256, 1], 6144, 57344, 0]]]
+
+    def test_the_view_has_the_recorded_stride(self, monkeypatch):
+        tensors = self._build(monkeypatch, self._op_with(self.QKV))
+        assert tuple(tensors[0].stride()) == (14336, 256, 1)
+        assert tuple(tensors[0].shape) == (4, 24, 256)
+
+    def test_both_views_share_one_storage(self, monkeypatch):
+        """Two windows on one buffer, as the projection wrote them."""
+        tensors = self._build(monkeypatch, self._op_with(self.QKV))
+        assert (tensors[0].untyped_storage()._cdata
+                == tensors[1].untyped_storage()._cdata)
+        assert tensors[1].storage_offset() == 6144
+
+    def test_an_argument_without_layout_is_still_dense(self, monkeypatch):
+        op = self._op_with([[0, [[14336, 256, 1], 0, 57344, 0]]])
+        tensors = self._build(monkeypatch, op)
+        assert tensors[1].is_contiguous()
+
+    def test_a_view_that_leaves_its_storage_is_refused(self, monkeypatch):
+        """The check that keeps a bad layout from becoming a memory fault."""
+        op = self._op_with([[0, [[14336, 256, 1], 0, 24576, 0]]])
+        assert self._build(monkeypatch, op) is None
+
+    def test_so_is_a_stride_of_the_wrong_rank(self, monkeypatch):
+        op = self._op_with([[0, [[14336, 256], 0, 57344, 0]]])
+        assert self._build(monkeypatch, op) is None
+
+    def test_so_is_a_shared_storage_of_two_dtypes(self, monkeypatch):
+        """One allocation cannot be rebuilt as two element sizes at once."""
+        op = self._op_with(self.QKV)
+        op["dtypes"] = ["bfloat16", "float32"]
+        assert self._build(monkeypatch, op) is None
+
+    def test_so_is_an_owner_that_is_not_itself_recorded(self, monkeypatch):
+        op = self._op_with([[1, [[14336, 256, 1], 6144, 57344, 0]]])
+        assert self._build(monkeypatch, op) is None
+
+    def test_a_prefill_chunks_views_rebuild_the_same_way(self, monkeypatch):
+        """The shape that actually goes unpriced today: 16384 tokens, not 4.
+
+        The stride is the same 14336 either way -- it is a property of the
+        projection, not of the chunk -- so only the storage grows, and the last
+        row of q must still land inside it.
+        """
+        fused = 16384 * 56 * 256
+        op = self._op_with(
+            [[0, [[14336, 256, 1], 0, fused, 0]],
+             [1, [[14336, 256, 1], 6144, fused, 0]]],
+            shapes=((16384, 24, 256), (16384, 4, 256)))
+        tensors = self._build(monkeypatch, op)
+        assert tuple(tensors[0].stride()) == (14336, 256, 1)
+        assert (tensors[0].untyped_storage()._cdata
+                == tensors[1].untyped_storage()._cdata)
+        last = (16383 * 14336) + (23 * 256) + 255
+        assert last < fused, "q's final element stays inside the buffer"
+
+
+#: `_fused_qk_norm_single_kernel`, as it declares itself in layernorm.py. The
+#: first six positions are the tensors; the guard only ever looks past them.
+QK_NORM_PARAMS = [
+    [0, "q_ptr"], [1, "k_ptr"], [2, "q_out_ptr"], [3, "k_out_ptr"],
+    [4, "q_weight_ptr"], [5, "k_weight_ptr"],
+    [6, "eps"], [7, "num_tokens"], [8, "head_dim"],
+    [9, "q_in_stride0"], [10, "k_in_stride0"],
+    [11, "q_out_stride0"], [12, "k_out_stride0"],
+    [13, "num_q_heads"], [14, "num_k_heads"],
+]
+
+
+def _qk_norm(tokens, layouts=(), params=QK_NORM_PARAMS):
+    """The recorded signature at a given chunk size, both norms alike.
+
+    At decode the refusal fires on `q_in_stride0 = 14336`; at a 16k prefill
+    chunk it fired first on `num_tokens = 16384`, and the two must be told
+    apart by what the kernel calls them, not by which is bigger.
+    """
+    op = _op(shapes=[(tokens, 24, 256), (tokens, 4, 256),
+                     (tokens, 24, 256), (tokens, 4, 256), (256,), (256,)],
+             dtypes=["bfloat16"] * 6,
+             scalars=[("#6", 1e-6), ("#7", tokens), ("#8", 256),
+                      ("#9", 14336), ("#10", 14336), ("#11", 6144),
+                      ("#12", 1024), ("#13", 24), ("#14", 4)])
+    op["name"] = "triton::_fused_qk_norm_single_kernel"
+    op["layouts"] = list(layouts)
+    op["param_names"] = list(params)
+    return op
+
+
+#: q and k as the fused projection hands them over, at that chunk size.
+def _qkv_layout(tokens):
+    fused = tokens * 56 * 256
+    return [[0, [[14336, 256, 1], 0, fused, 0]],
+            [1, [[14336, 256, 1], 6144, fused, 0]]]
+
+
+class TestTellingAStrideFromACountByItsDeclaredName:
+    """The size test cannot do it, and the kernel's own signature can.
+
+    At batch 4 the refusal fires on `q_in_stride0 = 14336`, which is real. At a
+    16k prefill chunk it fires first on `num_tokens = 16384`, which addresses
+    nothing -- so the whole family went unpriced at every long-domain shape for
+    a number that was never a stride. Both are exercised here; passing the
+    decode case alone would not show the difference.
+    """
+
+    def test_the_decode_norm_refuses_its_unrecorded_stride(self):
+        from atom.compass.runtime.microbench import _stride_past_its_tensors
+
+        assert _stride_past_its_tensors(_qk_norm(4)) == ("#9", 14336, 6144)
+
+    def test_and_prices_once_the_layout_is_recorded(self):
+        from atom.compass.runtime.microbench import _stride_past_its_tensors
+
+        op = _qk_norm(4, layouts=_qkv_layout(4))
+        assert _stride_past_its_tensors(op) is None
+
+    def test_the_prefill_norm_does_not_refuse_its_token_count(self):
+        """16384 is `num_tokens`. The kernel says so; its size says nothing."""
+        from atom.compass.runtime.microbench import _stride_past_its_tensors
+
+        op = _qk_norm(16384, layouts=_qkv_layout(16384))
+        assert _stride_past_its_tensors(op) is None
+
+    def test_but_still_refuses_the_stride_when_the_layout_is_absent(self):
+        from atom.compass.runtime.microbench import _stride_past_its_tensors
+
+        assert _stride_past_its_tensors(_qk_norm(16384)) == ("#9", 14336, 6144)
+
+    def test_an_undeclared_stride_is_refused_whatever_the_layout_says(self):
+        """A layout for q does not vouch for a stride belonging to nothing."""
+        from atom.compass.runtime.microbench import _stride_past_its_tensors
+
+        op = _qk_norm(4, layouts=_qkv_layout(4))
+        op["scalars"] = [["#9", 28672]]
+        assert _stride_past_its_tensors(op) == ("#9", 28672, 6144)
+
+    def test_a_graph_without_names_keeps_the_old_size_test(self):
+        """Including its over-refusal: the prefill token count is refused.
+
+        An artifact written before names were recorded has nothing better to go
+        on, and relaxing it on the strength of a *later* graph's evidence would
+        price it against a rebuild it never described.
+        """
+        from atom.compass.runtime.microbench import _stride_past_its_tensors
+
+        op = _qk_norm(16384, params=[])
+        assert _stride_past_its_tensors(op) == ("#7", 16384, 6144)
