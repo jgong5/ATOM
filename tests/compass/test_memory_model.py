@@ -848,8 +848,8 @@ QWEN3_27B = {"hidden_size": 5120, "intermediate_size": 17408,
              "linear_num_value_heads": 48, "linear_value_head_dim": 128}
 
 
-class TestTheMaximalInstantIsNotTheSameOneAtEveryWidth:
-    """The gate is a maximum over instants, so its width behaviour is too."""
+class TestAnInstantBelongsToTheProgramItWasWitnessedIn:
+    """The history is an Inductor run and the walk is not, so they don't mix."""
 
     def test_the_widths_come_out_of_the_config_and_nowhere_else(self):
         widths = gdn_activation_widths(QWEN3_27B)
@@ -860,6 +860,11 @@ class TestTheMaximalInstantIsNotTheSameOneAtEveryWidth:
         assert widths["attn_value"] == 6_144
         assert widths["hidden"] == 5_120
 
+    def test_each_instant_names_the_program_it_came_from(self):
+        assert (GDN_ACTIVATION_INSTANTS["linear_attn"]["compile_mode"]
+                == "inductor")
+        assert GDN_ACTIVATION_INSTANTS["mlp_down"]["compile_mode"] == "eager"
+
     def test_the_two_instants_hold_the_mixes_the_witnesses_recorded(self):
         widths = gdn_activation_widths(QWEN3_27B)
         for name, expected in (("linear_attn", (74_848, 15_360)),
@@ -869,57 +874,63 @@ class TestTheMaximalInstantIsNotTheSameOneAtEveryWidth:
             replicated = sum(widths[k] for k in instant["replicated"])
             assert (sharded, replicated) == expected
 
-    def test_tp1_lands_on_the_measured_gate_bar_the_known_replay_gap(self):
-        best = activation_instant_bytes(QWEN3_27B, 16_384, 1)
+    def test_a_mode_with_no_witness_refuses_rather_than_borrowing_one(self):
+        with pytest.raises(UnfoundedActivation, match="not evidence about"):
+            activation_instant_bytes(QWEN3_27B, 16_384, 1,
+                                     compile_mode="cudagraph")
+
+    def test_the_compiled_mode_lands_on_the_measured_gate_bar_the_replay_gap(self):
+        best = activation_instant_bytes(QWEN3_27B, 16_384, 1,
+                                        compile_mode="inductor")
         assert best["instant"] == "linear_attn"
         assert best["bytes"] == 2_955_935_744
         # The one measurement of the source config, and the gap it leaves.
         assert 2_956_984_320 - best["bytes"] == 1_048_576
+        assert best["is_candidate"] is True
 
-    def test_the_maximum_moves_to_the_other_instant_at_tp2(self):
-        best = activation_instant_bytes(QWEN3_27B, 16_384, 2)
-        assert best["instant"] == "mlp_down"
-        assert best["bytes"] == 2_030_043_136
-        assert activation_instant_bytes(QWEN3_27B, 16_384, 4) == {
-            "instant": "mlp_down", "bytes": 1_602_224_128,
-            "sharded": 52_224, "replicated": 35_840,
-            "witness": GDN_ACTIVATION_INSTANTS["mlp_down"]["witness"],
-            "collective_witnessed": True}
+    def test_the_compiled_mode_reports_what_it_cannot_count_above_one_rank(self):
+        one = activation_instant_bytes(QWEN3_27B, 16_384, 1,
+                                       compile_mode="inductor")
+        assert one["uncounted"] == ()
+        for width, expected in ((2, 1_729_626_112), (4, 1_116_471_296)):
+            best = activation_instant_bytes(QWEN3_27B, 16_384, width,
+                                            compile_mode="inductor")
+            assert best["bytes"] == expected
+            assert len(best["uncounted"]) == 1
+            assert "unwitnessed" in best["uncounted"][0]
 
-    def test_the_collective_destination_is_counted_only_above_one_rank(self):
-        # TP=1 runs no collective, so the seventh hidden buffer has no
-        # operator to produce it; above one rank it is live at the same site.
+    def test_the_eager_mode_carries_the_collective_destination_it_witnessed(self):
         assert activation_instant_bytes(
-            QWEN3_27B, 16_384, 1,
-            instants={"m": GDN_ACTIVATION_INSTANTS["mlp_down"]})["bytes"] \
-            == 2_717_908_992
+            QWEN3_27B, 16_384, 1, compile_mode="eager")["bytes"] == 2_717_908_992
         for width, expected in ((2, 2_030_043_136), (4, 1_602_224_128)):
-            got = activation_instant_bytes(
-                QWEN3_27B, 16_384, width,
-                instants={"m": GDN_ACTIVATION_INSTANTS["mlp_down"]})
-            assert got["bytes"] == expected
-            assert got["replicated"] - 30_720 == 5_120
+            best = activation_instant_bytes(QWEN3_27B, 16_384, width,
+                                            compile_mode="eager")
+            assert best["bytes"] == expected
+            assert best["uncounted"] == ()
+            assert best["replicated"] - 30_720 == 5_120
 
-    def test_transporting_the_tp1_set_would_understate_the_wider_ones(self):
-        only = {"linear_attn": GDN_ACTIVATION_INSTANTS["linear_attn"]}
-        for width, shortfall in ((2, 0.148), (4, 0.303)):
-            transported = activation_instant_bytes(
-                QWEN3_27B, 16_384, width, instants=only)["bytes"]
-            maximal = activation_instant_bytes(QWEN3_27B, 16_384, width)["bytes"]
-            assert transported < maximal
-            assert abs((maximal - transported) / maximal - shortfall) < 0.001
-
-    def test_the_linear_attn_instant_says_its_collective_side_is_unwitnessed(self):
-        assert GDN_ACTIVATION_INSTANTS["linear_attn"]["collective"] == ()
-        assert not GDN_ACTIVATION_INSTANTS["linear_attn"]["collective_witnessed"]
+    def test_the_two_modes_disagree_at_tp1_in_both_directions(self):
+        widths = gdn_activation_widths(QWEN3_27B)
+        held = 16_384 * 2 * (widths["in_proj_qkvzba"] + widths["attn_value"])
+        reused = 16_384 * 2 * 3 * widths["hidden"]
+        assert held == 741_343_232          # compiled run holds these longer
+        assert reused == 503_316_480        # ... and reuses these
+        eager = activation_instant_bytes(QWEN3_27B, 16_384, 1,
+                                         compile_mode="eager")["bytes"]
+        compiled = activation_instant_bytes(QWEN3_27B, 16_384, 1,
+                                            compile_mode="inductor")["bytes"]
+        assert eager + held - reused == compiled
 
     def test_it_scales_with_tokens_and_dtype_and_nothing_else(self):
-        one = activation_instant_bytes(QWEN3_27B, 1, 1)["bytes"]
+        one = activation_instant_bytes(QWEN3_27B, 1, 1,
+                                       compile_mode="inductor")["bytes"]
         assert activation_instant_bytes(
-            QWEN3_27B, 16_384, 1)["bytes"] == 16_384 * one
+            QWEN3_27B, 16_384, 1, compile_mode="inductor")["bytes"] == 16_384 * one
         assert activation_instant_bytes(
-            QWEN3_27B, 16_384, 1, dtype_bytes=4)["bytes"] == 2 * 16_384 * one
+            QWEN3_27B, 16_384, 1, compile_mode="inductor",
+            dtype_bytes=4)["bytes"] == 2 * 16_384 * one
 
     def test_a_width_that_does_not_divide_the_shard_refuses(self):
         with pytest.raises(UnfoundedActivation, match="not the split"):
-            activation_instant_bytes(QWEN3_27B, 16_384, 3)
+            activation_instant_bytes(QWEN3_27B, 16_384, 3,
+                                     compile_mode="inductor")

@@ -806,22 +806,39 @@ def _prediction_calibration(profile: Mapping, load, refuse, source: str):
 
 
 #: The instants at which the activation high-water mark has been witnessed on
-#: the source config, and what each holds. ``sharded`` widths are split across
-#: ranks; ``replicated`` ones are not; ``collective`` ones exist only when
-#: there is more than one rank, because they are the destinations of the
-#: collectives a single rank never runs.
+#: the source config, each tagged with the program it was witnessed in.
+#:
+#: The two are **not the same program**, which is why they may not be combined.
+#: The TP=1 warmup allocation history was recorded from an Inductor-compiled
+#: run -- its frames pass through ``/tmp/torchinductor_root/...`` and
+#: ``torch/_inductor/utils.py:3220`` -- while the device-free walk graphs carry
+#: ``compilation_level: 0``. Inductor decides buffer reuse and lifetimes in its
+#: own scheduler, so the two disagree in both directions at TP=1: the compiled
+#: run holds the layer's attention buffers through that layer's MLP (+741 343
+#: 232 B) and reuses hidden-sized buffers the eager walk keeps separate
+#: (-503 316 480 B). Taking a maximum across them would be a maximum over two
+#: different programs, not a bound on either.
+#:
+#: ``sharded`` widths are split across ranks; ``replicated`` ones are not;
+#: ``collective`` ones exist only above one rank.
 GDN_ACTIVATION_INSTANTS = {
     "linear_attn": {
-        "witness": "TP=1 warmup allocation history (S27), block by block; O16",
+        "compile_mode": "inductor",
+        "witness": "TP=1 warmup allocation history (S27), matched allocation "
+                   "by allocation; peak at the act_fn allocation inside layer "
+                   "1's MLP, with that layer's in_proj and core-attention "
+                   "buffers still live",
         "sharded": ("mlp_gate_up", "mlp_act", "in_proj_qkvzba", "attn_value"),
         "replicated": ("hidden", "hidden", "hidden"),
-        # No history exists at TP>1 for this instant, so whether it also gains
-        # collective destinations there is unwitnessed. Leaving it empty can
-        # only understate the instant, which keeps the maximum a lower bound.
+        # The peak falls before the down-projection, so no collective
+        # destination for it exists yet; whether an earlier one is still live
+        # at that point is unwitnessed, since no compiled history exists above
+        # TP=1. Left out, and reported as uncounted.
         "collective": (),
         "collective_witnessed": False,
     },
     "mlp_down": {
+        "compile_mode": "eager",
         "witness": "device-free walk high-water mark on the pinned recapture; "
                    "same module path and same non-collective ordinal 72 at "
                    "TP=1, 2 and 4",
@@ -856,46 +873,43 @@ def gdn_activation_widths(config: Mapping) -> dict:
 
 
 def activation_instant_bytes(config: Mapping, tokens: int, world_size: int = 1,
-                             *, dtype_bytes: int = 2,
+                             *, compile_mode: str, dtype_bytes: int = 2,
                              instants: Optional[Mapping] = None) -> dict:
-    """The activation term as a maximum over witnessed instants, per width.
+    """A candidate for the activation term, within one compile mode.
 
-    The gate is ``peak_torch - current_torch``, a maximum over instants, so the
-    width behaviour of the term is the width behaviour of *whichever* instant
-    is largest at that width -- which need not be the one that is largest at
-    TP=1. Two instants are witnessed on the source config and they hold
-    different mixes: linear attention 74 848 sharded elements against 15 360
-    replicated, the MLP one 52 224 against 30 720. The sharded side falls as
-    1/W and the replicated side does not, so the more sharded instant falls
-    faster and is overtaken at TP=2.
+    **A candidate, not a bound.** Each instant is an approximation of the live
+    set at one point of one program, and a maximum over approximations is only
+    a lower bound if each input is one. Neither is established as such, so the
+    result is labelled and used as a candidate.
 
-    The maximal instant does not move *semantically* -- on the pinned
-    recapture the walk peaks at ``layers.1.mlp.down_proj`` at non-collective
-    ordinal 72 at every width, and the raw index only moves because TP>1
-    inserts collectives ahead of it. What moves is what is live there: at TP>1
-    the down-projection's collective destination is a storage of its own,
-    alive alongside the GEMM output it reduces, so the instant holds a seventh
-    hidden-sized buffer that TP=1 has no operator to produce. That is the
-    ``collective`` entry, and it is why the walk's own curve at the TP=1 peak's
-    site understates the TP=2 peak by 167 772 160 B.
+    ``compile_mode`` is required and is not a formality. The gate the predictor
+    has to match is ``peak_torch - current_torch`` of the deployment as it
+    actually runs; the two witnessed instants come from two different programs
+    (see ``GDN_ACTIVATION_INSTANTS``), and mixing them is refused rather than
+    silently maximised.
 
-    Both instants are source-only and neither is fitted: the widths come from
-    ``config.json``, the linear-attention live set from the TP=1 warmup
-    allocation history, and the MLP one from the device-free derivation, which
-    performs no collective and reads no output. No TP=2 or TP=4 measurement is
-    opened.
+    Within a mode the widths come from ``config.json`` via
+    ``gdn_activation_widths`` and the live sets from that mode's witness.
+    Nothing is fitted and no TP=2 or TP=4 measurement is opened.
 
-    The maximum is over the instants that happen to be witnessed, so it is a
-    lower bound on the true maximum, and it is known to be one: at TP=1 the
-    allocator's own ``peak - current`` is 2 956 984 320 B and this returns
-    2 955 935 744 B, short by the 1 048 576 B replay gap, which is reported
-    rather than absorbed. The linear-attention instant carries a second
-    reservation -- no history exists for it above TP=1, so any collective
-    destination it holds there is uncounted.
+    The returned ``uncounted`` names what the mode's witness cannot cover at
+    this width, so a caller can see the reservation instead of inheriting it
+    silently.
     """
     widths = gdn_activation_widths(config)
+    chosen = {name: instant
+              for name, instant in (instants or GDN_ACTIVATION_INSTANTS).items()
+              if instant.get("compile_mode") == compile_mode}
+    if not chosen:
+        raise UnfoundedActivation(
+            "no activation instant is witnessed for compile mode %r; the "
+            "witnessed modes are %s, and an instant from one program is not "
+            "evidence about another"
+            % (compile_mode,
+               sorted({i.get("compile_mode")
+                       for i in (instants or GDN_ACTIVATION_INSTANTS).values()})))
     best = None
-    for name, instant in sorted((instants or GDN_ACTIVATION_INSTANTS).items()):
+    for name, instant in sorted(chosen.items()):
         sharded = sum(widths[key] for key in instant["sharded"])
         replicated = sum(widths[key] for key in instant["replicated"])
         if world_size > 1:
@@ -908,11 +922,16 @@ def activation_instant_bytes(config: Mapping, tokens: int, world_size: int = 1,
                 % (name, sharded, world_size))
         total = tokens * dtype_bytes * (sharded // world_size + replicated)
         if best is None or total > best["bytes"]:
+            uncounted = []
+            if world_size > 1 and not instant.get("collective_witnessed"):
+                uncounted.append(
+                    "collective destinations live at this instant above one "
+                    "rank are unwitnessed for %r and are not counted" % name)
             best = {"instant": name, "bytes": int(total),
+                    "compile_mode": compile_mode,
                     "sharded": sharded, "replicated": replicated,
                     "witness": instant["witness"],
-                    "collective_witnessed": bool(
-                        instant.get("collective_witnessed"))}
+                    "is_candidate": True, "uncounted": tuple(uncounted)}
     return best
 
 
