@@ -18,6 +18,54 @@ computed, so a real run with it on and a simulated run with it off are not the
 same experiment; it is off on both sides, always, and any gate run that turns it
 on is a different row.
 
+## Final acceptance is end-to-end cc-traces — registered 2026-09-11
+
+**Every gate in this file is finally proved on an end-to-end replay of the
+cc-traces corpus, and on nothing else.** Registered 2026-09-11 at the user's
+direction. What that changes:
+
+* Throughput, TPOT/ITL and TTFT accuracy (G2a–c), feasible-configuration
+  selection, ranking, ties and regret (G1, G1b, G1c), prediction outside the
+  calibration configurations (G4) and the integrated GPU-free ≥ 5× timing with
+  acquisition and amortisation (G5a, G5c) are end-to-end cc-traces quantities.
+  Independent per-term memory and KV validation (G3a, G3b) and the deliberate
+  infeasible rejection (G3c) must correspond to **those same deployment
+  configurations**.
+* The synthetic 64 × 1024/128 workload, the standalone primitive prices and the
+  covered single-step checks (E7 at TP2, E8 at TP4) are **diagnostics**. They
+  are retained in full as dated history and none of them may be cited as gate
+  evidence. The rows below that still rest on them are marked accordingly.
+* `agent_scratch/cc_pilot.jsonl` — the first 20 requests of the corpus — is a
+  **development and regression workload**. The cost model was iterated against
+  it; §3 already says so about E1. It is never held out on workload.
+* The held-out axis the PoC is asked for is **configuration**. Every held-out
+  axis is named per prediction, and evaluated TP2/TP4 full-engine measurements
+  stay out of calibration.
+* Before final evaluation the dataset version, workload scope, short/long regime
+  definitions, selection rules, request identities and order, token lengths and
+  actual usage, arrival pacing, preparation protocol and hashes are frozen.
+  Cases are not selected or shrunk after errors are seen, and real arrival
+  semantics are respected — a heterogeneous paced trace is not silently turned
+  into a homogeneous burst.
+
+`PROTOCOL.md` §8 still declares the legacy diagnostic cells (the synthetic short
+workload and the first-20 `cc_pilot` long workload); its stamped results and lock
+history are preserved as they stand and are not relabelled. The end-to-end
+cc-traces acceptance registration that supersedes it is being written
+separately. **Until that registration exists and is stamped, no row in §1 may be
+moved on cc-traces evidence.**
+
+Three properties of the corpus do not survive the current replay path, and they
+bound what any cc-traces cell can claim (`agent_scratch/cctraces.py`): prefix
+reuse is dropped — the trace's `hash_ids` carry 64-token block sharing, while
+`replay.py` sends synthetic prompts that share no prefix and the engine runs with
+prefix caching off; `in` is a **block count**, not a tokenizer count, accurate in
+distribution and approximate per request; and recorded arrivals are
+**open-loop**, so a faster engine sees the same arrivals a slower one did. The
+source is `semianalysisai/cc-traces-weka-062126-256k`, cached at
+`/md1/users/jgong5/hf_cache/cc-traces-256k/traces.jsonl` (568 864 747 B; full
+corpus 1 847 151 435 B), 393 sessions / 98 827 requests.
+
 ---
 
 ## 0. Metric definitions — fixed here, before evaluation
@@ -75,7 +123,7 @@ not), **UNPROVEN** (no valid measurement yet).
 | **G3a** | Non-KV memory terms | each within 10% | **PARTIAL** | E3b: 27B at TP=1/2/4. weights +1.6/−0.1/−3.3%, non-torch +4.9/+1.2/+1.3%, graph pool +0.0% everywhere, load residue −3.3/−6.7% at TP≥2. Three terms outside: load residue at TP=1 (−93%, 0.01% of budget), persistent (−51%, 0.07% of budget), activations (no prefill-shaped graph for this model) |
 | **G3b** | KV block count | within 5% | **PARTIAL** | E3: −0.09% (27B TP=2), −0.02/−0.02/+0.07% (0.6B TP=1/2/4). Not yet predicted from a profile at 27B TP=1/4 — the measured ground truth now exists (112 740 / 265 520 / 584 880 blocks) |
 | **G3c** | One infeasible configuration rejected for the right reason | same error as the engine | **UNPROVEN** | — |
-| **G4** | Prediction outside the calibration configurations | stated per prediction | **PARTIAL — one forward step, not a serving quantity** | E7 (2026-09-11): a TP2 decode step frozen with its fifteen input hashes at 06:21:54Z, then measured. **20.970 ms frozen against 19.845 ms, +5.7%** (rank 1 +4.9%), on `kind=decode, tp=2, bucket=32, cohort=32, tokens_each=1, context=1151`; all four matching rows retained. This is a `ModelRunner.forward` decode-step check against a 10% criterion — **not** a passed serving TPOT gate, and it moves no G1/G2/G3 row. What it does establish, at one point: no TP2 step or serving time entered the prediction. `G4_TRANSFER.md` §12. E6 (2026-09-11) is its coverage precondition — a priced body at TP=1 (23.122 ms, 2423/2439 operators) and TP=2 (15.467 ms, 2552/2568) |
+| **G4** | Prediction outside the calibration configurations | stated per prediction | **UNPROVEN on the acceptance source; the two step-level diagnostics split, one within and one outside** | No end-to-end cc-traces transfer has been run, and the gate is an end-to-end quantity. Diagnostics, both `ModelRunner.forward` decode steps frozen before measurement with no target timing among their inputs: **E7, TP2, 20.970 ms frozen against 19.845 ms, +5.7%** — within 10% (`G4_TRANSFER.md` §12). **E8, TP4, 16.157 ms frozen against 12.807 ms, +26.2% — outside 10%, a failed prediction** (§13). E8's miss is localised: rank 1's body price was measured 17.1% high by one contaminated pricing process, reproduced as such by a repeat run into a separate directory, and the other three ranks predicted +5.1 to +5.5%. That diagnosis explains the number and does not license a corrected one — the frozen prediction stands as it was frozen. Both share the shape `bucket=32, cohort=32, tokens_each=1, context=1151`. E6 is their coverage precondition — a priced body at TP=1 (23.122 ms, 2423/2439 operators) and TP=2 (15.467 ms, 2552/2568) |
 | **G5a** | Replay speedup | ≥ 5× | **PARTIAL** | Observed, device-free, at 27B: 36 s of serving → 1.46 s (24.7×), or 133 s → 23 s (5.8×) including server startup. That is the replay speed and it is measured. It is not yet a gate pass because G5c — capture and calibration cost reported separately and amortised — is a distinct gate and is unmeasured; an earlier 309 s → 3 s figure is superseded, its simulated half still held the model on a GPU |
 | **G5b** | GPU-free replay after capture | no device | **PASS at 0.6B and 27B** | E5: served 32/32 (0.6B) and 64/64 (27B) in `xiaobizh_n18_cpu`, a container with **no `/dev/kfd` and no `/dev/dri`** — zero driver handles and no KFD process registration in any process of the tree. Both reproduce the GPU-resident simulator's schedule step for step and its TTFT/TPOT/latency distributions exactly; at 27B ten of 64 requests sit in a different slot of that same schedule, which is the burst's admission order, not the GPU-free path (E5). This is the no-device gate only; G5a and G5c are separate and still open |
 | **G5c** | Capture / calibration / startup / load / execution costs reported separately, with amortisation | reported | **UNPROVEN** | — |
@@ -88,12 +136,37 @@ workload at one width, G5a and G5c are separate from G5b and open, and the
 honest reading of the whole matrix is still that the pilot is closed and the
 gates are open.
 
-**G4 moved to PARTIAL on 2026-09-11, and the word is load-bearing.** E7 is a
-real prediction — frozen before the measurement, with no target timing among its
-inputs — but of a single `ModelRunner.forward` decode step at one shape and one
-width. A step-level result is not a serving result. Every accuracy gate in this
-matrix (G2a/G2b/G2c) and every ranking gate (G1/G1b/G1c) is measured over a
-whole serving run, and none of them moves on E7.
+**G4 was moved to PARTIAL on 2026-09-11 morning and back to UNPROVEN the same
+afternoon.** Two things moved it back, and both matter. The first is the
+acceptance registration above: G4 is an end-to-end quantity, and a step-level
+check — passing or failing — cannot carry it. The second is E8. The TP4 step,
+frozen at 07:22:04Z and measured an hour later, came in at **+26.2%, outside the
+criterion**. The morning's PARTIAL rested on E7 alone; by evening the same method
+at the next width had produced a miss five times larger, and a row that reads
+PARTIAL on the strength of one of two diagnostics while the other fails is a row
+that flatters itself.
+
+**E8 is preserved as a failure, not as a pending item.** Its cause is understood
+— one of twenty-three frozen inputs was measured wrong — and understanding the
+cause does not retroactively make the prediction right. No corrected TP4 number
+may be computed against that capture by anyone, because the capture has now been
+seen. A second TP4 transfer claim needs a fresh freeze over re-measured inputs
+and a fresh capture.
+
+What E7 and E8 do establish jointly, at two points: no target-width step or
+serving time entered either prediction, and the composition reproduces itself
+byte-for-byte across widths (`tpN_frozen.py` at TP=2 regenerates
+`tp2_frozen.txt` exactly, which is the precondition that licensed the TP4 run).
+What they do not establish is any accuracy gate in this matrix (G2a/G2b/G2c) or
+any ranking gate (G1/G1b/G1c): those are measured over a whole serving run, and
+none of them moves on either experiment.
+
+**Method gap E8 exposed, now open as item 10 in §7.** Nothing in the freeze path
+checked a price against a second measurement of itself. `PriceLibrary` already
+has the mechanism — a 5% conflict band, `library.py:373` — and it would have
+caught rank 1 had the body been priced twice. The repeat run cost about five
+minutes at TP4 against the GPU-hours a wasted capture costs. **No future freeze
+should accept a price measured once.**
 
 ---
 
@@ -463,6 +536,55 @@ should not be made without witnessing it.
   `40c1b3caf9e021314efe9e543c1150a2caba1c30bbc1c1028280d02b1eb54134`, verified
   equal on node 18 and the host. Full record in `G4_TRANSFER.md` §12.
 
+### E8 — a frozen TP4 forward step, then measured — **it misses** (run 2026-09-11)
+
+* **Procedure** E7's, at the next width, with one precondition added. The frozen
+  script was generalised to either width (`tpN_frozen.py`) and `freeze_tp4.sh`
+  **refuses to freeze** unless that script first reproduces `tp2_frozen.txt`
+  byte for byte; it did, RC=0, recorded in `dec32/tpN_equivalence_at_tp2.txt`.
+  Twenty-three inputs hashed into `dec32/tp4_frozen.sha256`, timestamped
+  **07:22:04Z**, both outputs then `chmod a-w`. The TP4 deployment was stood up
+  and captured afterwards.
+* **Span and shape** as E7: the whole of `ModelRunner.forward`, at
+  `kind=decode, tp=4, bucket=32, cohort=32, tokens_each=1, context=1151`. Eight
+  matching rows — two scheduler ticks × four ranks — all retained.
+* **Result** frozen **16.157 ms** against a measured **12.807 ms**, **+26.2%**.
+  **Outside the 10% criterion. The prediction fails.** Per rank: r0 +5.5%,
+  **r1 +26.2%**, r2 +5.1%, r3 +5.1%.
+* **Where it went wrong, and where it did not.** The frozen prediction carried a
+  21% rank asymmetry (rank 1 at 16.157 ms, the others at 13.45–13.51); that
+  asymmetry was visible in the frozen text and was flagged before the capture
+  ran. The hardware shows none — all four ranks measured 12.792–12.807 ms, a
+  0.1% spread. 2.671 ms of rank 1's 2.692 ms excess is `aiter::gemm_a16w16`
+  (6.398 → 9.070 ms, +42%). A repeat of the body pricing into a separate
+  directory (`dec32/repeat_2026-09-11/`, rc=0, 07:33:52Z) reproduced rank 1 at
+  **13.106 ms, 17.1% below the frozen input**, with the other three ranks within
+  0.5%. One pricing process was disturbed; the transfer method was not refuted
+  at this width, and neither was it confirmed.
+* **What this does not license.** No corrected TP4 number. The capture has been
+  seen, so any re-run of the composition against it would be fitting. E8 stands
+  as a **failed prediction**; a second TP4 claim needs a fresh freeze over
+  re-measured inputs and a fresh capture. The repeat is filed under
+  `diagnostic/` in the archive, apart from the frozen inputs, for that reason.
+* **Held-out region terms, reported.** postprocess −9.0 to −11.4%, prepare +
+  remainder −22.5 to −23.7% — together about 0.06 ms of a 12.8 ms step. A real
+  residual in the TP1-calibrated region model, and far too small to be the miss.
+* **Method sensitivity: none at this width.** The two copy-path measurements of
+  the body's all-reduce agreed to 0.83%, inside `PriceLibrary`'s 5% conflict
+  band, so no conflict was recorded and the frozen text names no sensitivity.
+  That is a result about the two methods at TP4, not an omission; the question of
+  which path matches production remains open.
+* **Reproducibility** `checkpoint_tpN.py` regenerates the frozen text
+  byte-identically (`regenerated == frozen True`), 23 inputs unchanged, **21 tree
+  modules** hashed, torch 2.10.0+rocm7.2.4.git3d3aa833.
+* **Artifacts** `agent_scratch/g4/archive/tp4_2026-09-11/` — 53 files, 7.0 M,
+  under `MANIFEST.sha256`, tarball
+  `834732b042c372b1699f87b6454c2469d092e43edeb3ff2cd74601e0f2edb7a0`. Full
+  record in `G4_TRANSFER.md` §13.
+* **Status under the acceptance registration.** A diagnostic, like E7. It moves
+  no gate row in either direction; it is recorded here because a failed
+  prediction is evidence and deleting it would be the only way to lose it.
+
 ## 3. What is and is not held out (G4)
 
 | prediction | measured on the evaluated point? | honest label |
@@ -472,15 +594,24 @@ should not be made without witnessing it.
 | `warmup_seconds` | yes, first-use, per deployment | a calibrated first-use input — §4 |
 | 27B TP=2 priced oracle (`POC_SUMMARY` §3.1) | overhead constants came from the 0.6B | held out on model for those two constants only; the price list was measured on the 27B at TP=2 |
 | **E7 frozen TP2 decode step** (`G4_TRANSFER` §12) | **no** — frozen at 06:21:54Z with its input hashes, captured afterwards; no TP2 step or serving time among the fifteen inputs | **a genuine prediction, on one forward step.** +5.7% against a 10% criterion. Its region term (`SOURCE_27B_TP1`) is TP1-calibrated and applied unchanged, so that part is held out on width too |
+| **E8 frozen TP4 decode step** (`G4_TRANSFER` §13) | **no** — frozen at 07:22:04Z with twenty-three input hashes, captured afterwards; no TP4 step or serving time among them | **a genuine prediction, on one forward step, and it missed.** +26.2% against a 10% criterion. Same held-out axes as E7 (width for the region term, target timings entirely). Diagnosed to one contaminated input, which does not un-fail it |
 
-**The technical bet — capture at TP=1, derive TP=2/4 — has been evaluated at one
-point, on one quantity.** E7 froze a TP2 `ModelRunner.forward` decode step from
-CPU-derived graphs plus standalone TP2 primitive prices and a TP1 region model,
-and it landed +5.7% against the measurement. That is a forward-step result. It
-is **not** a serving result: TPOT, throughput, TTFT and the TP ranking are
-end-to-end quantities, none is claimed by E7, and all still require the complete
-short/long matrix of E2. The remaining width, TP=4, is unmeasured, and so is
-every prefill shape.
+**Naming every held-out axis, because "held out" without an axis is a claim
+about nothing.** E7 and E8 are held out on: the evaluated width's full-engine
+step and serving timings (none entered), and — for the region term
+`SOURCE_27B_TP1` — width itself. They are **not** held out on: the model, the
+hardware, the operator set, or the standalone primitive prices, which were
+measured at the evaluated width and are named as calibrated hardware-library
+inputs. They are held out on workload only in the trivial sense that a single
+decode step has no workload.
+
+**The technical bet — capture at TP=1, derive TP=2/4 — has now been evaluated at
+two points, both on one quantity, and it split.** E7 landed +5.7% at TP2; E8
+landed +26.2% at TP4 and failed. Both are forward-step results. Neither is a
+serving result: TPOT, throughput, TTFT and the TP ranking are end-to-end
+quantities and, under the acceptance registration above, are proved on cc-traces
+and on nothing else. Every prefill shape is still unmeasured, as is the
+transfer's behaviour over a whole serving run at any width.
 
 ---
 
@@ -572,17 +703,36 @@ Promoted from the retrospective's findings. A gate row may not cite a run that
 fails any of these, and the check must run at the real client/consumer boundary
 rather than over source text.
 
-| check | state |
-| --- | --- |
-| every request in the workload joins an engine record | **partial** — `cc_compare.py` warns and continues |
-| repeat count matches what was requested | **missing** — `spread.py` silently skips absent repeats |
-| `arrival ≤ first dispatch ≤ first token ≤ finish` for every request | **partial** — `queue_wait.py` accepts dispatch before arrival and does not fail the process |
-| arrival-barrier timeout reaches the result | **missing** — set on the scheduler, never exported |
-| workload / input lengths / time scale match on both sides | **partial** — warns |
-| the final trace is fully drained | **missing** |
-| clock domains not mixed (`perf_counter` fallback vs engine clock) | **partial** |
-| metadata identifies **server** code, model, calibration and config | **missing** — manifests carry the client's git revision, `revision: null` on the remote runs |
-| artifacts preserved per run, with hashes | **new** — `agent_scratch/poc/preserve.py` |
+**Table reconciled 2026-09-11.** The states below were written against the pilot
+scripts — `agent_scratch/cc_compare.py`, `spread.py`, `queue_wait.py` — which
+printed warnings and continued. Those scripts still exist, are not on the gate
+path, and are not what a gate row may cite. The gate path is
+`scripts/compass/compare.py`, whose `check_run` and `check_pair` return a list of
+reasons and whose caller refuses the run when the list is non-empty; it is
+covered by `tests/compass/test_run_validity.py`. Each row now names the check
+that enforces it.
+
+| check | state | enforced by |
+| --- | --- | --- |
+| every request in the workload joins an engine record | **refuses** — a missing record is a refusal, not a printed count | `check_run`, the `missing` list |
+| declared request count matches the saved workload, and the expected count | **refuses** | `check_run`, `--expect-requests` |
+| `arrival ≤ first token ≤ finish` for every request | **refuses**, and separately refuses a reported `ttft`/`latency` that disagrees with its own timestamps by > 1 ms | `check_run`, per-request ordering loop |
+| arrival-barrier timeout reaches the result | **exported and refuses** — `scheduler.py:1271` sets it, the manifest carries it, `compare.py:171` refuses on it | `check_run` |
+| workload / input lengths / time scale / model match on both sides | **refuses** — on `trace_sha256`, `time_scale`, `model`, request count and per-request lengths | `check_pair` |
+| produced token counts equal on both sides | **refuses** — different `usage.completion_tokens` means throughput and TPOT are not comparable quantities | `check_pair` |
+| every response carries `usage.completion_tokens` | **refuses** — the requested length is never substituted | `check_run` |
+| the final trace is fully drained | **refuses** — `engine_records != len(workload)` | `check_run` |
+| preparation finished before the earliest measured arrival, on the engine clock | **refuses** | `check_run`, `prepare.boundary_engine_time` |
+| prompt lengths verified against the workload | **refuses** unless the run was replayed `--check-lengths` | `check_run` |
+| metadata identifies server code, model and calibration | **refuses** — `server_revision` **or** `server_code_sha256` (the GPU nodes are rsync copies, not checkouts), `model_revision`, and a digest for every file-valued oracle option | `check_run`, `require_provenance` |
+| clock domains not mixed | **structurally closed** — there is no `perf_counter` path left in `replay.py` or `compare.py`; all timings come from the engine's `/compass/requests` records | — |
+| artifacts preserved per run, with hashes | **in use** — `agent_scratch/poc/preserve.py` | — |
+
+**Two of these are still weaker than they read.** `require_provenance` is a
+parameter, so a caller may switch the provenance block off; no gate row may cite
+a run compared with it off, and that is a convention rather than an enforced
+property. And the length check accepts the manifest's own `"passed"` string —
+it verifies that the replay ran the verification, not the verification itself.
 
 ### 5.1 The test suite, and what it takes to collect it
 
@@ -813,14 +963,29 @@ no GPU held, 0% CPU) and is left to exit on its own timeout.
 
 ## 7. Open items, ranked by which gate they block
 
+Re-ranked 2026-09-11 under the cc-traces acceptance registration. Items that
+block only a diagnostic are marked as such and no longer compete for priority
+with items that block a gate.
+
 | # | item | blocks |
 | --- | --- | --- |
-| 1 | witness the token lifecycle on both sides; settle E2a-b | G2, every latency gate |
-| 2 | calibrate `warmup_seconds` for this deployment; cold first forward is ~6.9s and unmodelled (E2a-a) | G2 |
-| 3 | diagnose the long-sweep device fault (E2b); the long half cannot run until then | G1, G1b, G1c, G2a |
-| 4 | A timed workload with capture/calibration/startup costs separated and amortised | G5a, G5c |
-| 5 | predict TP=2/4 from a TP=1 capture | G4 |
-| 6 | 27B memory at TP=1 and TP=4, per term | G3a |
-| 7 | reject an infeasible configuration for ATOM's own reason | G3c |
-| 8 | promote the §5 validity checks and test them at the client boundary | every gate that cites a run |
-| 9 | outlier rejection by region (the 4-MAD pass drops 83% of sub-1024-token prefill rows) | fit quality, not a gate unless it moves one |
+| 1 | register the end-to-end cc-traces acceptance protocol: dataset version, scope, short/long regime definitions, selection rules, request identities and order, lengths, arrival pacing, preparation protocol, hashes | **every gate** — until this is stamped, no gate row can move |
+| 2 | cc-traces coverage: what fraction of the corpus's shapes the price library covers, and the structural cache's cost and hit rate at that coverage | every gate, via the oracle the matrix runs on |
+| 3 | the full short/long × TP{1,2,4} cc-traces serving matrix | G1, G1b, G1c, G2a, G2b, G2c, G4 |
+| 4 | a timed cc-traces workload with capture, calibration and startup costs separated and amortised | G5a, G5c |
+| 5 | per-term memory and KV validation *at the matrix's own deployments*, and an infeasible configuration rejected for ATOM's own reason | G3a, G3b, G3c |
+| 6 | diagnose the long-sweep device fault (E2b) — it blocks any long cc-traces cell that needs a calibration sweep | items 2 and 3 |
+| 7 | witness the token lifecycle on both sides; settle E2a-b | G2, if any synthetic diagnostic is to stay interpretable |
+| 8 | calibrate `warmup_seconds` for this deployment; the cold first forward is ~6.9 s and unmodelled (E2a-a) | G2, and the preparation protocol in item 1 |
+| 9 | prefix-reuse replay from `hash_ids`, so a cc-traces cell can be run with native cache policy rather than with prefix caching off | the scope boundary of item 1, not a gate as currently registered |
+| 10 | **require a repeat pricing run before any freeze** — E8's miss was one price measured once (§2 E8) | the credibility of every future frozen prediction |
+| 11 | outlier rejection by region (the 4-MAD pass drops 83% of sub-1024-token prefill rows) | fit quality, not a gate unless it moves one |
+
+**Closed since the last ranking.** Item 5 of the old list — "predict TP=2/4 from
+a TP=1 capture" — is done as a *diagnostic* and is not coming back in that form:
+E7 answered it at TP2 (+5.7%) and E8 answered it at TP4 (+26.2%, failed). The
+gate version of the question is item 3, over a serving run. Old item 8 —
+"promote the §5 validity checks and test them at the client boundary" — is done;
+§5's table above names the check that enforces each row and
+`tests/compass/test_run_validity.py` covers them. Two residual weaknesses in
+that work are stated at the end of §5 rather than left implicit here.

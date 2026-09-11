@@ -835,3 +835,171 @@ Held on node 18's `xiaobizh_n18` and on the host under the same path; the
 tarball hash above was verified equal on both, and `sha256sum -c` over all 33
 files passes on the host copy. Built by `agent_scratch/g4/archive_tp2.sh`
 (`5cc465f185e64409e837231e133fa9e584f1cc2ea757d2111bb064eeae9d6272`).
+
+---
+
+## 13. A frozen TP4 forward step, then measured — and it misses, 2026-09-11
+
+**Result: frozen 16.157 ms against a measured 12.807 ms step, +26.2%, outside
+the 10% criterion.** The prediction fails. This section records why, and the
+"why" turns out to be one bad input rather than the transfer, which is a
+different problem with a different fix — but the fix is a *new* prediction
+against a *new* capture, not a revision of this one.
+
+### The freeze
+
+Frozen `2026-09-11T07:22:04Z`, before any TP4 full step was measured, by
+`agent_scratch/g4/tpN_frozen.py` — `tp2_frozen.py` generalised to either width.
+The generalisation is not asserted, it is checked: run at TP=2 the new script
+reproduces `dec32/tp2_frozen.txt` **byte for byte**, and `freeze_tp4.sh` runs
+that diff as a precondition and refuses to freeze if it fails
+(`tpN_equivalence_at_tp2.txt` in the archive). So the TP4 number comes out of
+the same composition as the TP2 one, not a second model that resembles it. The
+TP2 artifacts were not touched.
+
+Twenty-three inputs, all hashed into `dec32/tp4_frozen.sha256`: four per-rank
+body graphs, four head graphs, eight generic price lists, the two all-reduce
+probe files, the all-gather probe file, the frozen script, `library.py`,
+`regions.py` and the frozen text itself. `checkpoint_tpN.py` then re-executed
+the composition in-process and recorded the 21 tree modules Python actually
+imported: **regenerated text byte-identical to the frozen text, all 23 inputs
+unchanged**, torch 2.10.0+rocm7.2.4.
+
+Predicted, per rank: rank 0 13.510 ms, **rank 1 16.157 ms**, rank 2 13.459 ms,
+rank 3 13.452 ms. The maximum is the step, because the step ends when the last
+rank does. That 21% rank asymmetry was visible in the frozen text and was
+flagged before the capture ran; it is the whole of the failure.
+
+### The measurement
+
+`capture_dec32.sh` at TP=4 on devices 0–3, server up in 85 s, 64 requests, 0
+failed, 260 rows per rank. Eight rows match the frozen shape — two scheduler
+ticks seen by all four ranks — matched on the full key (kind, tp, bucket 32,
+cohort 32, one token each, context 1151), with rank alignment verified from
+each row's own `rank_coords` rather than from the filename.
+
+| rank | measured forward | predicted | error |
+| --- | --- | --- | --- |
+| 0 | 12.807 ms | 13.510 ms | **+5.5%** |
+| 1 | 12.804 ms | 16.157 ms | **+26.2%** |
+| 2 | 12.805 ms | 13.459 ms | **+5.1%** |
+| 3 | 12.805 ms | 13.452 ms | **+5.1%** |
+| **max over ranks** | **12.807 ms** | **16.157 ms** | **+26.2% — THE CHECK** |
+
+The hardware shows no rank asymmetry at all: 12.792–12.807 ms across four ranks
+and two ticks, a spread of 0.1%. The prediction claimed 21%.
+
+Held-out terms, on every rank: postprocess −9.0% to −11.4% (predicted 0.131 ms,
+measured 0.143–0.148), prepare + remainder −22.5% to −23.7% (predicted 0.131 ms,
+measured 0.166–0.172). Both are TP1-calibrated and applied unchanged at TP4.
+They are small in absolute terms — together about 0.06 ms of a 12.8 ms step —
+and they under-predict, so they are not what made this fail. They are a real
+residual and are recorded as one.
+
+### Which input, and the evidence that it is the input
+
+Per-operator, rank 1's frozen body price list is 15.818 ms against 13.112–13.126
+ms on the other three, and **2.671 ms of the 2.692 ms difference is
+`aiter::gemm_a16w16`** — 6.398 ms at rank 0, 9.070 ms at rank 1, +42%. The
+dense GEMM shapes are identical across ranks at TP4; there is no structural
+reason for one rank to differ.
+
+So the body pricing was repeated, at the same width on the same four devices,
+into a separate directory (`repeat_price_tp4.sh` → `dec32/repeat_2026-09-11/`,
+rc=0, `2026-09-11T07:33:52Z`). It writes nowhere near the frozen inputs.
+
+| rank | frozen body | repeat body | change | gemm frozen → repeat |
+| --- | --- | --- | --- | --- |
+| 0 | 13.126 ms | 13.113 ms | −0.1% | 6.398 → 6.311 |
+| 1 | **15.818 ms** | **13.106 ms** | **−17.1%** | **9.070 → 6.369** |
+| 2 | 13.112 ms | 13.077 ms | −0.3% | 6.305 → 6.367 |
+| 3 | 13.121 ms | 13.056 ms | −0.5% | 6.276 → 6.352 |
+
+Three ranks reproduce to within 0.5%. Rank 1 does not reproduce, and on repeat
+it agrees with the others. The frozen prediction was built on a one-off
+measurement that was 21% high on one rank, and the maximum-over-ranks rule then
+made that one rank the whole answer.
+
+### What this does and does not license
+
+It **does not** license a corrected number. The capture has now been seen;
+re-running the composition against it would be fitting, which is the one thing
+this whole construction exists to avoid. For the record, and as arithmetic on
+numbers already in this document rather than as a result: the three ranks whose
+prices did reproduce predicted +5.5%, +5.1% and +5.1%, close to TP2's +5.7%. A
+claim that TP4 transfers at that accuracy needs a new freeze on new prices and
+a new capture, and until that exists, **G4 at TP4 is failed, not pending**.
+
+It **does** identify a gap in the method. Nothing in the freeze path checks a
+price against a second measurement of itself. `PriceLibrary` already refuses to
+silently resolve same-signature records that disagree by more than 5% — the
+mechanism exists and is used for the two all-reduce measurement methods — but
+it only fires when two files are loaded. Pricing twice into two files and
+refusing to freeze while any signature disagrees would have caught this before
+the GPU-hours of a capture were spent. At TP4 the repeat cost about five
+minutes.
+
+### One real TP2/TP4 difference, separate from the failure
+
+The frozen TP4 text names **no** method sensitivity, where the TP2 text named a
+13.5% one. This is a result, not an omission: at TP4 the two copy-path
+measurements of the body's all-reduce agree to 0.83% (11.618 µs from the probe,
+11.715 µs from the generic pricing run), inside the library's 5% threshold, so
+no conflict is recorded and there is no gap to carry onto the registered price.
+At TP2 the same two methods differed by 13.5%. Which method matches production
+is still open at both widths; at TP4 the two answers are close enough that it
+would not move the step.
+
+A second observation, recorded and not chased: re-pricing the all-gather after
+the stage guard moved the 1-row `all_gather_unreg` shape by −59.7% (81.881 →
+33.000 µs) while the 32-row shape the head actually uses at bucket 32 moved
+−0.5% (118.440 → 117.840 µs). The shape in use is stable; the 1-row shape is
+not.
+
+### Archive
+
+`agent_scratch/g4/archive/tp4_2026-09-11/`, 53 files, 7.0 M. Tarball
+`834732b042c372b1699f87b6454c2469d092e43edeb3ff2cd74601e0f2edb7a0`, verified
+equal on node 18 and on the host, with `sha256sum -c MANIFEST.sha256` passing
+over all 53 files on the host copy. It holds the frozen text and both
+manifests, the TP2 equivalence record, all 23 inputs under their manifest
+names, the scripts, all four per-rank capture files with the workload and
+server logs, the comparison as produced, the eight paired rows, and — filed
+separately under `diagnostic/` so it can never be mistaken for a frozen input —
+the repeat pricing run. Built by `agent_scratch/g4/archive_tp4.sh`.
+
+## 14. What this ledger is now for — registered 2026-09-11
+
+**G4 is finally proved on an end-to-end cc-traces replay, and everything in
+§§1–13 is a diagnostic.** Registered 2026-09-11 at the user's direction and
+recorded in `POC_STATUS.md` under "Final acceptance is end-to-end cc-traces".
+This file does not become history: §1's ledger — what a transfer prediction may
+and may not read — is exactly as binding on a cc-traces prediction as it was on
+E7 and E8, and those boundaries are the experiment either way. What changes is
+what counts as a *result*.
+
+Three things follow.
+
+**A forward-step check can no longer move the G4 row, passing or failing.** E7
+(+5.7% at TP2) and E8 (+26.2% at TP4) are the two step-level evaluations this
+ledger has produced, and the row they justified is back to UNPROVEN. That is not
+a demotion of the work: the freeze discipline, the byte-identical equivalence
+precondition and the input manifests are the machinery a cc-traces transfer claim
+will also need, and they exist because these two ran. It is a statement about
+what a single decode step evidences, which is one decode step.
+
+**The held-out axis is configuration, and it is named per prediction.** The
+source is TP=1 full-engine measurement; TP=2 and TP=4 are evaluation targets and
+their full-engine step or serving timings never enter a fit. Standalone primitive
+measurements at the target width remain allowed hardware-library inputs under
+§1.B and are declared as such. `cc_pilot.jsonl` is a development and regression
+workload — the cost model was iterated against it — so a cell built on it is not
+held out on workload, and no prediction in this file has ever claimed to be.
+
+**E8's failure carries one requirement forward.** Nothing in the freeze path
+checked a price against a second measurement of itself, and that is what let a
+17.1%-high body price be frozen. `PriceLibrary` already has the mechanism — the
+5% conflict band at `library.py:373` — but it fires only when a price is loaded
+twice. **A price measured once may not be frozen again.** The repeat run cost
+about five minutes at TP4; the capture it would have saved cost four cards and
+the better part of an hour.
