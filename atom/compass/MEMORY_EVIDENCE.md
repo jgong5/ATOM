@@ -280,15 +280,30 @@ Input ledger at TP=1, the width full-engine source calibration is allowed at:
 | `load_residue` | 1 MiB | C06 | `DEFAULT_LOAD_RESIDUE[1]` -- 93% low here; recalibratable as S27 at this width |
 | `persistent` | 118 MiB | C06 | `DEFAULT_PERSISTENT` -- known 51% low against this model; recalibratable as S27 at this width, though a mechanism is preferable |
 | `non_torch` | 926 MiB | C06 | `DEFAULT_NON_TORCH[1]`, **headroom excluded** as X27; the model offset is recalibratable as S27 at this width |
-| `activations` | **OPEN** | S | `peak_activation_bytes` of a TP=1 meta trace at the warmup token count |
+| `activations` | 2 956 984 320 | S27 | `peak_torch - current_torch` at the TP=1 source configuration, which is the warmup prefill and nothing else; measured, not walked -- see O2 below |
 | `graph_pool` | `floor + slope x sum(ladder)` | C06 | `measured_graph_pool_bytes`, ladder (1,2,4,8,16,32) is a deployment flag |
 
-Two of the five inputs that were open are now closed and exact (finding 5).
-One remains: `activations`, which needs a TP=1 meta trace at the warmup token
-count. Beside it sit three terms that are present but wrong -- `load_residue`
-at -93%, `persistent` at -51%, and `non_torch`, whose C06 value is -18.5% here
-and whose device reading is itself unstable (phase A, 0.33 rung). Those four
-are the whole remaining gap, and together they are 6% of `peak_torch`.
+**No input in this ledger is open any more.** Two of the five were closed
+exactly by the meta build (finding 5), three by source calibration at TP=1, and
+the last -- `activations` -- is closed empirically rather than analytically
+(O2). The three terms that were present but wrong are replaced: `load_residue`
+was -93%, `persistent` -51%, `non_torch` -18.5%.
+
+Running the ledger through `modelled_readings` and `blocks_from_readings` gives
+`peak_torch` **57 971 260 416**, `non_torch` **1 157 627 904**, pool
+**591 396 864**, and a plan of **112 772 KV blocks and 32 state slots** -- which
+is what the source run recorded, to the block.
+
+**That agreement is a residual and nothing more.** Four of the five terms in
+`peak_torch` were read off this very record, so the arithmetic reconstructing
+it demonstrates the arithmetic and not the model. What it does establish is
+narrower and still worth stating: the ledger is complete, every input carries a
+class, and the budget closes end to end without a single class X27 number. The
+one place the model and the record genuinely differ is `free` -- 147 012 764 672
+modelled against 149 866 676 224 recorded, because the model assumes a clean box
+and the record has the neighbours in it. It changes no answer here: the
+utilization budget binds well below `free` on both sides, which is exactly the
+condition a record has to meet before it may be replayed at all.
 
 Under the corrected calibration boundary, three of the four are addressable at
 the declared TP=1, util 0.90 source configuration: see "Source calibration at
@@ -380,6 +395,70 @@ that says nothing about `non_torch`. That is wanted where the calibrated run
 already contains the headroom and wrong everywhere else, so the validator hands
 the mapping over only at a width the term was actually measured at. At TP=2 and
 TP=4 the non-torch row is unchanged from before this work.
+## O2: what the existing prefill graphs can and cannot say about activations
+
+The term was open because it wanted a TP=1 trace at the warmup shape. Two
+things had to be settled: *which* graph is the warmup step, and whether that
+graph carries liveness at all.
+
+**Which graph.** `warmup_model` resets the peak, runs one dummy prefill, reads
+the peak back -- so the reading belongs to that step and no other. At the
+source configuration the arithmetic (`model_runner.py`, `warmup_model`) is
+`num_seqs = max(1, min(16384 // 262144, 32)) = 1` and `seq_len = min(262144,
+16384 // 1) = 16384`: **one request, 16 384 query tokens, no history**, since
+the sequences it builds are fresh and nothing is cached.
+
+Exactly one derived graph has that shape -- `s27prefhead.tp1.r0.json`, from
+`pref_chunk16k_head.json` (`query_lens [16384]`, `context_lens [16384]`). Its
+neighbour `s27prefdeep.tp1.r0.json` is the trap: same 16 384 tokens, but
+`context_lens [114688]`, so 98 304 tokens of history and 7x the KV to read.
+**The two graphs have identical keys** -- `batch_signature [16384]` both -- so
+`graph_tokens` cannot separate them, and anything matching on the token total
+takes whichever it is handed. The distinguishing shape is in
+`provenance.batch_spec`, which is what `traced_shape` now reads and
+`warmup_mismatch` now checks. A different token *count* is not a mismatch:
+scaling across counts is the claim the row exists to test.
+
+**Whether it carries liveness. It does not.** Both graphs are `source:
+"derivation", device: "meta"`, and across 2 439 operators **not one** records a
+`dies_at`. Nothing runs on meta, so no finalizer fires; liveness at a shape is
+a device observation and a derivation cannot have made it. The alias
+distribution says the same thing from the other side: the meta graphs read
+2 067 in-place against 193 allocated, where an on-device capture of the same
+model reads 648 allocated against 83 in-place.
+
+Walking `s27prefhead.tp1` anyway returns **570 425 344 B**, all of it from 64
+`aten::empty.memory_format (16384, 17408)` allocations with no recorded death.
+Against the measured term of 2 956 984 320 B that is 19.3% -- a 2.4 GB
+understatement, in the direction that sizes a pool too large and starts an
+engine that cannot start. It is an artifact of the last-read fallback, not a
+model of anything, and it is now refused: `activation_bytes_at` raises
+`UnfoundedActivation` for a graph with neither recorded deaths nor a measured
+peak, and `validate_memory` prints no derived figure for one.
+
+**So the term is closed empirically rather than analytically.** At the source
+configuration `peak_torch - current_torch` is **2 956 984 320 B**, and the two
+TP=1 records -- the historical one and the exclusive phase C capture, separate
+engine starts -- agree **to the byte**. That is class S27: a full-engine run at
+the declared TP=1 source configuration, and it carries its shape with it.
+
+What it does not close:
+
+* **Width.** TP=2 reads 1 730 150 400 B and TP=4 1 191 969 280 B. Both are
+  class X27 -- measurements at the configuration being predicted -- so neither
+  is an input, and `mapping` does not offer this term above width one.
+  Activations at TP=2 and TP=4 remain **underived**, and that is now the last
+  open input in the candidate budget at those widths.
+* **Shape.** The constant is the peak at 1x16384 cold. A deployment that
+  changes `max_num_batched_tokens`, `max_model_len` or `max_num_seqs` changes
+  the warmup shape, so `SourceRun.matches` now holds all three and the
+  constant is withheld rather than stretched.
+* **Mechanism.** A constant is not a model. Closing this analytically needs a
+  device capture at the warmup shape -- one prefill, 16 384 tokens, no history,
+  with deaths recorded -- which is an empirical need for a later lease. The
+  only on-device 27B captures that exist are decode-shaped (4 requests x 1
+  token at context 66, `activation_peak_bytes` 3 104 256).
+
 ## G3 phase A: the frozen ladder, run on the device
 
 Predictions were frozen in `tests/compass/memory_records/frozen_util_predictions.json`
@@ -647,12 +726,27 @@ question separates a residual (the fit reported back to itself, worth nothing
 as agreement) from a repeat (reproducibility evidence, worth something).
 
 The two questions are now two calls. `classify(term, config, producer=...)`
-takes a **producer**: the `host` / `pid` / `started_at` triple, which is the
-vocabulary the harness already uses -- `compare.py` reads `blob["run"]`,
-`merge_sweep.py` labels fresh-process shards by `started_at`, `residual.py`
-and `step_accounting.py` attribute steps by `pid`. No second run-ID scheme.
-`integrity(term, sha)` takes the hash and says `intact` / `altered` /
-`unknown`.
+takes a **producer**, and the identity is CC's rather than a second scheme:
+`compass.execution/1`, an `execution_id` minted in `cc_traces_run.py` at the
+instant the server process is launched, derived from the launch facts recorded
+beside it so that any reader can re-derive it. `integrity(term, sha)` takes the
+hash and says `intact` / `altered` / `unknown`.
+
+`atom/compass/core/execution_id.py` holds that definition once, stdlib-only and
+with no engine imports, because the harness that mints an id and the classifier
+that reads one must not drift apart -- and `cc_traces_run.py` cannot be
+imported for its two functions alone, since it loads sibling campaign modules
+at import time. The rule is pinned against a vector taken from CC's own
+implementation at `f4e06b0c`, with a cross-check that re-derives it from that
+file wherever the harness is in the tree.
+
+An id is **never inferred**. A block naming a host and a pid is not an
+execution identity and is not promoted into one; an id that does not follow
+from its own recorded inputs is damaged or transplanted, which is worse than
+unidentified rather than better; an id under an unknown schema cannot be
+checked. All three read as "cannot tell". Reading an identity out of a payload
+hash would assert a producer nobody observed, which is the specific error the
+hash-keyed first cut made.
 
 Two conservative rules, both of which cost the calibration credit rather than
 grant it:
@@ -673,15 +767,17 @@ block**, so `producers` is empty on both source runs, every row reads
 C executions are witnessed -- engine pids 695009, 751439, 775417 across
 08:55:09Z-09:03:34Z in the ownership log -- but that witness lives in a
 gitignored sampler log beside the records, not inside them, so it cannot be
-machine-checked and is not asserted as identity. That is O12.
+machine-checked and is not asserted as identity. Those records also predate
+`compass.execution/1` entirely, and nothing here back-fills them: a legacy
+record stays unidentified. That is O12.
 
 ## Open items
 
 | # | item | needs | status |
 |---|---|---|---|
 | O1 | `parameters` / `buffers` for the 27B at TP=1/2/4 | meta build | **closed** -- exact at all three widths, finding 5 |
-| O2 | 27B activation trace at TP=1, prefill-shaped | meta trace, no device | open; the lead's CPU cardinality tracer derives 27B graphs in a device-free container, so this does not need the GPU -- coordinate reuse of that import bootstrap |
-| O3 | source-only candidate budget, frozen, vs the recorded budget | O2 | open; the other four inputs are now closed or calibrated |
+| O2 | 27B activation trace at TP=1, prefill-shaped | GPU, TP=1, one prefill | **closed as a constant, open as a mechanism** -- the term is 2 956 984 320 B, measured at the source configuration and exact across two independent engine starts. It could not be walked: the only TP=1 prefill graphs at this shape are meta derivations, and a derivation cannot record liveness because nothing runs and no finalizer fires. What remains is a device capture at the warmup shape (1 request x 16 384 tokens, no history, deaths recorded) -- an empirical need for a later lease, not a blocker on the budget |
+| O3 | source-only candidate budget, frozen, vs the recorded budget | O2 | **closed at TP=1** -- every input classed S, C06 or S27, and the budget reproduces the source run's 112 772 blocks. A residual by construction: it is not evidence of transfer, and the widths where transfer would be tested need O2's activation term at TP=2 and TP=4, which is class X27 today and therefore underived |
 | O4 | `persistent` -- was 51% low | -- | **closed by calibration**, exact at TP=1, -0.004% at TP=4; a mechanism would still be better than a constant |
 | O5 | `persistent` / activations / pool as functions of `max_num_seqs` | GPU, TP=1 | open, and now the main conditionality left; all three are proven flat in *utilization* (phase A) but untested in concurrency |
 | O6 | physical start-up at `--max-num-seqs 1551` and 1400 | GPU, TP=1 | open; superseded as the acceptance gate by the utilization axis, kept as a diagnostic |
@@ -690,4 +786,4 @@ machine-checked and is not asserted as identity. That is O12.
 | O9 | `MODEL_HEADROOM` provenance: which run, which config | lead / history | open; until then it stays disallowed and is not to be relabelled as source |
 | O10 | manifest-derived acceptance lengths | final CC workload | **closed** -- CC protocol `47917ade`: long 107 328 + 2 413 (6 859 blocks), short 2 560 + 21 (162) |
 | O11 | what the 486 MiB `non_torch` excursion was | unknown; three controls failed to reproduce it | open, and the one thing the calibrated `non_torch` does not bound |
-| O12 | a producer block in the memory record: `host` / `pid` / `started_at`, written by `_write_memory` | **lead** -- `atom/compass/runtime/runner.py` is shared, not mine to edit | open; until it lands, every calibrated row reads `residual (run unidentified)` and the phase C repeats cannot be machine-checked. `_write_replay_target` already writes a `hardware` block in the same function's neighbourhood, so the shape is precedented |
+| O12 | a `run.execution` block in the memory record, carrying CC's `compass.execution/1` `execution_id` and its `id_inputs`, written by `_write_memory` | **lead** -- `_write_memory` is shared | open; until it lands, every calibrated row reads `residual (run unidentified)` and the phase C repeats cannot be machine-checked. The identity is CC's, not a second scheme: `atom/compass/core/execution_id.py` holds the one definition, stdlib-only, and `producer_key` reads it. `_write_replay_target` already writes a `hardware` block in the same neighbourhood, so the shape is precedented |
