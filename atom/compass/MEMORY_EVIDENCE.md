@@ -1466,6 +1466,123 @@ two errors of opposite sign partly cancelling, 503 MB against 822 MB. Any
 correction fitted to the -8.1% would be fitting a difference of two unrelated
 mistakes, which is the specific thing O16 says not to do.
 
+## The graph pool: what capture pins is the LM head, and the width was never the rule
+
+O8 reads the pool term +26.8% high at TP=4. The term it reads is a line fitted
+to six 0.6B ladders at width one and a flat 104 MiB above it, and the flat part
+was justified by an observation with no mechanism under it: the *allocated*
+delta at TP=2, 4 and 8 was 79 692 800 B over ladders from 31 to 1071 tokens,
+identical to the byte. The reading taken from that -- "the graphs are not
+pinning sharded activations" -- was the wrong half of the story.
+
+### The runner captures the LM head only at width one
+
+    self.logits_in_graph = self.world_size == 1 and not is_tbo   # :4104
+    ...
+    model_output = self.model(input_ids[:num_tokens], model_positions)
+    outputs[:num_tokens] = model_output                          # :4237
+    if self.logits_in_graph:
+        graph_logits = self.model.compute_logits(outputs[:num_tokens])  # :4297
+    ...
+    self.graph_logits[(bs, max_q_len)] = graph_logits            # :4305
+
+(`atom/model_engine/model_runner.py`.) Three things follow, and all three are
+readable from source rather than from a device.
+
+* The logits tensor is allocated *inside* `torch.cuda.graph(...)`, so it comes
+  from the graph's private pool, and the runner keeps it in a dict, so it stays
+  live after capture. It is pinned, per bucket.
+* Capture builds decode metadata, so `ParallelLMHead.forward`
+  (`atom/model_ops/embed_head.py:243`) takes no last-token index: the tensor is
+  `[num_tokens, vocab_size]` whole. At TP>1 it would also be all-gathered to
+  full vocabulary -- but at TP>1 it is not captured at all.
+* The model *output* is not in the pool. `outputs[:num_tokens] = model_output`
+  writes into the preallocated `forward_vars["outputs"]`, the same buffer as
+  O19, which was allocated at engine init and is already inside `current_torch`.
+
+So the pinned set is a residue plus `vocab_size x dtype_bytes x Σ(captured
+num_tokens)` when the head is in the graph, and the residue alone when it is
+not. On the 27B's TP=1 record, with the vocabulary from the checkpoint's own
+`config.json` (248 320, under `text_config`):
+
+    110 981 120 - 63 x 248 320 x 2 = 79 692 800
+
+The residue is **the same 79 692 800 B** that the 0.6B showed at TP=2, 4 and 8.
+Two models that differ by 45x in parameters, three widths, ladders from 31 to
+1071 tokens: the same number to the byte. It is not the model, not the width and
+not the ladder.
+
+### What that buys, with no constant fitted to a target
+
+`capture_pinned_bytes` takes the residue from the TP=1 record (S27) and the
+vocabulary from the checkpoint, and has no free parameter left. Against the
+recorded allocated deltas:
+
+| record | predicted | recorded | error |
+|---|---:|---:|---:|
+| 27B TP=1 | 110 981 120 | 110 981 120 | **+0.0%** |
+| 27B TP=1 exclusive | 110 981 120 | 110 981 120 | **+0.0%** |
+| 27B TP=2 rank0 | 79 692 800 | 79 692 800 | **+0.0%** |
+| 27B TP=4 rank0/1 | 79 692 800 | 79 692 800 | **+0.0%** |
+
+The first row is exact by construction -- it is where the residue came from --
+and the second is an independent engine start of the same configuration. The
+TP=2 and TP=4 rows are class X27 and are read here as **evaluation, not input**:
+nothing in the derivation saw them, and the prediction at those widths is
+whatever `logits_in_graph` says, which is the residue.
+
+The switch is the predicate, not the width. A TP=1 run with TBO enabled also
+drops the head, and a model keyed on `world_size == 1` would over-read it by the
+whole ladder term -- 31 288 320 B on this ladder. That is why the new term takes
+`tbo` and refuses (`UnfoundedPrediction`) rather than guessing when the head is
+captured and no vocabulary was supplied.
+
+**For the cost model, not just the memory model**: at TP>1 `compute_logits` is
+outside the graph, so every decode step pays an eager LM-head GEMM plus an
+all-gather that the TP=1 replay does not. That is a per-step cost difference
+that follows from the same predicate.
+
+### Why the number it was being checked against is not the pool
+
+The recorded `graph_pool.reserved` is a **global** difference:
+
+    _rsv_before_capture = torch.cuda.memory_reserved()            # :4120
+    ...
+    _pool_bytes = max(torch.cuda.memory_reserved() - _rsv_before_capture, 0)  # :4346
+
+and the window between them contains a full **eager** warmup forward per bucket
+(`:4229`), whose segments grow the ordinary pool; in piecewise capture
+`torch.cuda.empty_cache` is patched to a no-op inside it, and `pause_gc`
+disables the collector across the whole loop. Anything released elsewhere in the
+process lands in it too, and `max(..., 0)` reads a net release as a pool of
+zero. Across the four 27B records the gap between reserved and allocated is
+16.2, 26.0 and 6.0 MiB at TP=1, 2 and 4 -- it does not scale with the ladder,
+the width or the pinned set, which is what a bookkeeping term looks like.
+
+Pool-scoped residency does not have to be inferred from a global delta:
+`torch.cuda.memory_snapshot(mempool_id)` and `MemPool.snapshot()` take exactly
+the id that `graph.pool()` returns. That is the probe that would identify the
+79 692 800 B residue -- 76 MiB plus 1 KiB, allocated once inside the capture
+window, model- and width-independent, and still unidentified. It is a probe to
+coordinate, not a constant to widen.
+
+### Two capture modes, two pool topologies, one term
+
+The reserved side also has a structural reason not to be one number.
+PIECEWISE capture takes **one private pool per `num_tokens` bucket** by default
+(`ATOM_PER_BUCKET_POOL=1`, `atom/utils/cuda_graph.py`), because sharing one pool
+across buckets corrupts DeepSeek-V4 decode -- the module header carries the
+accuracy measurements. FULL capture takes the opposite topology: the first
+graph's pool becomes `self.graph_pool` and every later bucket captures into it
+(`model_runner.py:4301`). Per-bucket pools cannot reuse each other's freed
+blocks; one shared pool can.
+
+The header also records what that costs on DSV4 TP8: 1.11 GB per rank of
+*reserved*, with the capture-time **allocated** delta identical at 14.71 GB
+either way. Topology moves the bookkeeping and leaves the pinned set alone,
+which is the second reason to model the pinned set and report the reserved
+delta rather than predict it.
+
 ## Open items
 
 | # | item | needs | status |
@@ -1477,7 +1594,7 @@ mistakes, which is the specific thing O16 says not to do.
 | O5 | `persistent` / activations / pool as functions of `max_num_seqs` | GPU, TP=1 | open, and now the main conditionality left; all three are proven flat in *utilization* (phase A) but untested in concurrency |
 | O6 | physical start-up at `--max-num-seqs 1551` and 1400 | GPU, TP=1 | open; superseded as the acceptance gate by the utilization axis, kept as a diagnostic |
 | O7 | `non_torch` from an exclusive-device source run at util 0.90 | GPU, exclusive | **closed by phase C** -- three byte-identical runs, calibrated at TP=1, exact at three unseen utilizations; the +42.2% excursion it cannot bound is carried with it |
-| O8 | graph pool at TP=4, where the model reads +26.8% | GPU, 4 devices | open, and now with a candidate cause that is not the model: any derived-graph walk at TP>1 counts each in-place `all_reduce_` as a fresh immortal allocation (O15). Whether the pool figure goes through that walk is the first thing to check, before anything in the pool model is changed. See also O17: the estimate and the reserved pool are two quantities |
+| O8 | graph pool at TP=4, where the model reads +26.8% | GPU, 4 devices | **open for the reserved delta, closed for the pinned set.** The +26.8% is against `graph_pool.reserved`, which is a global `memory_reserved()` difference across a window containing an eager warmup forward per bucket and a patched-out `empty_cache` -- not private-pool residency. The pinned set has a mechanism now: `capture_pinned_bytes` = fixed residue + `vocab x dtype x Σ(captured tokens)` when `logits_in_graph` (`world_size == 1 and not is_tbo`, `model_runner.py:4104`), which reproduces the recorded allocated delta at **+0.0% on all four 27B records**, the TP=2/TP=4 rows being evaluation (X27) against a derivation that never saw them. The old candidate cause -- a derived-graph walk counting each `all_reduce_` as an immortal allocation (O15) -- is not in this path at all: the recorded pool is measured, not walked. What is still open is the residue's identity (76 MiB + 1 KiB, model- and width-independent) and the reserved delta, which needs `memory_snapshot(mempool_id)` on `graph.pool()` rather than a global difference |
 | O9 | `MODEL_HEADROOM` provenance: which run, which config | lead / history | open; until then it stays disallowed and is not to be relabelled as source |
 | O10 | manifest-derived acceptance lengths | final CC workload | **closed** -- CC protocol `47917ade`: long 107 328 + 2 413 (6 859 blocks), short 2 560 + 21 (162) |
 | O11 | what the 486 MiB `non_torch` excursion was | unknown; three controls failed to reproduce it | open, and the one thing the calibrated `non_torch` does not bound |
@@ -1486,7 +1603,7 @@ mistakes, which is the specific thing O16 says not to do.
 | O14 | `_storage_of` returns 0 for every meta tensor (`runtime/meta.py`), so alias and provenance tracking collapse on any derived graph | **lead** -- shared runtime | open; fix is `untyped_storage()._cdata` when `data_ptr()` is 0, negated so it cannot collide with a device address. Patched locally in `agent_scratch/memval/lifetime/capture_lifetimes.py` |
 | O15 | the collective the derivation records has no output tensor of its own: nothing is watched, so it can never die, and the meta stand-in (`_collective_stand_in`) returns the *input object*, which is the opposite error | **lead** -- shared runtime | open. Cost: 21.9 GiB against a true 2.5 GiB at TP=2, and **it sits under every derived-graph memory walk at TP>1, O8's graph pool included**. The in-place reading is withdrawn: the live implementation allocates a fresh output on every path (packet P2) |
 | O16 | why the derived activation term over-reads at width: +21.5% at TP=2, +40.4% at TP=4 | GPU, TP=1 source only -- the allocation history across `warmup_model`'s step, requested in `agent_scratch/memval/producer_packet/tp1_probe/REQUEST.md` | open, and **narrowed**: the residue is defined at TP=1 by difference, so a replicated over-count is absorbed by it and cancels at every width. The error is in the sharded fraction -- being exact at TP=1 and TP=2 needs ~2.45 GB that divides by width against the walk's 1.71 GB. Allocations made inside opaque custom operators are where a dispatch trace cannot look, and the allocation history can. **No term is to be chosen by the size of the error it removes**. **Narrowed by the allocation history**: 1 761 607 680 B of the 3 036 676 096 B live at the peak -- 58% -- is allocated inside `aiter/tuned_gemm.py:450`, i.e. inside `aiter::gemm_a16w16`, which is exactly where the dispatch trace cannot look. The region is now located rather than suspected  **The region is now measured, not suspected**: at the walk peak 822 083 584 B lives on the device that the walk cannot see -- 541 065 216 B and 79 691 776 B inside `tuned_gemm.py:450`, 201 326 592 B inside `linear_attention_with_output_base` -- against a 503 316 480 B over-count of replicated hidden-width buffers. Opposite signs, so the -8.1% residual is not a coefficient. |
-| O17 | the graph pool budget *estimate* and the pool the engine actually reserves are different quantities and are not to be compared as one | -- | open, and separate from O8. O8 is the +26.8% error in the predicted pool at TP=4; this is the prior question of which two numbers that percentage is between |
+| O17 | the graph pool budget *estimate* and the pool the engine actually reserves are different quantities and are not to be compared as one | -- | **open, and now three quantities rather than two.** The engine's estimator (`graph_pool_bytes`, 0.2 x peak activations, 4.6x over on the 27B at TP=1) is kept as its own row and is untouched. The recorded reserved delta is bookkeeping-contaminated by construction (see O8), so it is reported rather than predicted. The third is what capture *pins*, which is the one with a mechanism and the one a budget should carry. Capture mode is a fourth thing the reserved side depends on and the pinned side does not: PIECEWISE takes one private pool per bucket (`ATOM_PER_BUCKET_POOL=1`), FULL shares one pool across buckets (`model_runner.py:4301`), and on DSV4 TP8 the two differ by 1.11 GB reserved per rank at an identical 14.71 GB allocated |
 | O18 | `OpSpec` records the dtype of each *argument* and never of an output, so every consumer that needs an output's size reads `dtypes[0]` and assumes promotion changed nothing | **lead** -- shared schema (`core/graph.py`, `runtime/meta.py`) | open. `aiter::masked_embedding` takes int32 ids and returns bfloat16: `dtypes[0]` sizes one hidden-width buffer at 335 544 320 B instead of 167 772 160, which is the whole `walk_bytes` / `visible_peak_bytes` gap in the frozen candidate. Fix is an `output_dtypes` field filled from the real outputs and a schema bump (packet P4). Until then the walk on this branch sizes an output by PyTorch's own promotion rule when the graph records no dtype -- float beats int, and float16 with bfloat16 gives float32 -- labels the basis `recorded`, `unanimous` or `promoted`, and reports every non-`recorded` output through `dtype_ambiguities`. The masked_embedding case is now right by rule rather than by name, and the ad-hoc correction that was subtracting 167 772 160 B is deleted. Refusal is available but not the default: `strict_dtypes=True` raises `UnfoundedActivation` on the first output the graph does not record, which is what a consumer that must not guess should pass |
 | O19 | the tracer's "unseen destination is a fresh allocation" rule cannot tell a buffer allocated before the traced region from one allocated invisibly inside a custom operator | **lead** -- shared runtime | open. `forward_vars["outputs"]` (`model_runner.py:1290`) is 167 772 160 B allocated at engine init, so it is inside `current_torch` and cannot be part of `peak - current`; the walk counts a write into it as an allocation. Fix is to seed the seen-set with the storages that exist when the region opens. Note this is a *replicated* over-count and therefore cancels at width -- it is a TP=1 accuracy item, not the cause of O16. The seed set is no longer hypothetical: all 29 `forward_vars` are live at the peak and every one has a pre-forward address, 172 704 716 B in total. `outputs` is the sharp case -- `embed_head.py:177` allocates a second block of the identical 167 772 160 B and shape during the forward, so the two are separable by address and by nothing else |
 | O20 | mutability, alias and output-dtype contracts of the fused computation operators, not just the collectives | source + registered schema, CPU only -- done | **closed, and it found nothing wrong with the walk.** `silu_and_mul` and `_fused_qk_rmsnorm_group_quant_kernel` are destination-passing and record no output; `gemm_a16w16`, `linear_attention_with_output_base` and `unified_attention_with_output_base` return genuinely fresh tensors, by schema and by implementation (`base_attention.py:403`). No double count. Two by-products: `mutates_args="unknown"` marks weight arguments mutable, so `(a!)` in this registry is not evidence of mutation (O22), and `fused_allreduce_rmsnorm_` is absent from the 27B's graph at every width |

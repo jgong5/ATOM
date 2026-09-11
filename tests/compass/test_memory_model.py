@@ -11,7 +11,8 @@ import struct
 import pytest
 
 from atom.compass.core.memory_model import (
-    DEFAULT_NON_TORCH, DEFAULT_PERSISTENT, DEFAULT_POOL_FLOOR,
+    CAPTURE_FIXED_PINNED, DEFAULT_NON_TORCH, DEFAULT_PERSISTENT,
+    DEFAULT_POOL_FLOOR, capture_pinned_bytes,
     activation_bytes_at, activation_curve, graph_pool_bytes,
     load_residue_bytes, measured_graph_pool_bytes, modelled_readings,
     non_torch_bytes, peak_activation_bytes, scratch_bytes_per_token,
@@ -725,3 +726,61 @@ class TestAPredictionThatCannotBeMadeIsRefused:
         profile, load = _founded()
         readings, _ = derived_readings(profile, warmup_tokens=200, load=load)
         assert readings["non_torch"] == 1157627904
+
+
+class TestWhatCapturePins:
+    """The pinned half of capture, as a mechanism instead of a width constant.
+
+    `measured_graph_pool_bytes` predicts the reserved delta with a line fitted
+    at one width and a constant above it. This one states what is in the pool:
+    a fixed residue, plus the LM head when the runner captures it.
+    """
+
+    #: The 27B's TP=1 source record: ladder, vocabulary, and the allocated
+    #: delta capture reported (`tests/compass/memory_records/27b.tp1.memory
+    #: .json`, `qwen3_5_27b.config.json`).
+    LADDER = (1, 2, 4, 8, 16, 32)
+    VOCAB = 248320
+    RECORDED_ALLOCATED = 110981120
+
+    def test_the_source_record_is_reproduced_to_the_byte(self):
+        assert capture_pinned_bytes(self.LADDER,
+                                    vocab_size=self.VOCAB) == self.RECORDED_ALLOCATED
+
+    def test_the_head_leaves_the_graph_above_width_one(self):
+        """`logits_in_graph = world_size == 1 and not is_tbo`. Above width one
+        nothing in the pinned set scales with the ladder, which is the whole
+        content of the `DEFAULT_POOL_SHARDED` constant."""
+        for width in (2, 4, 8):
+            assert (capture_pinned_bytes(self.LADDER, world_size=width)
+                    == capture_pinned_bytes((1,), world_size=width)
+                    == CAPTURE_FIXED_PINNED)
+
+    def test_tbo_at_width_one_drops_the_head_as_well(self):
+        """The predicate is not the width, which is why it is not read as one.
+        A run that read `world_size == 1` would over-read by the whole ladder
+        term here."""
+        assert capture_pinned_bytes(self.LADDER, vocab_size=self.VOCAB,
+                                    tbo=True) == CAPTURE_FIXED_PINNED
+
+    def test_a_captured_head_with_no_vocabulary_refuses(self):
+        with pytest.raises(UnfoundedPrediction):
+            capture_pinned_bytes(self.LADDER)
+
+    def test_the_ladder_enters_as_tokens_not_as_batches(self):
+        """Buckets are `bs x max_q_len`; a spec-decode run captures q>1, and
+        the head is sized in tokens."""
+        assert (capture_pinned_bytes(self.LADDER, vocab_size=self.VOCAB, q_len=4)
+                - CAPTURE_FIXED_PINNED
+                == 4 * (self.RECORDED_ALLOCATED - CAPTURE_FIXED_PINNED))
+
+    def test_capturing_nothing_pins_nothing(self):
+        assert capture_pinned_bytes((), vocab_size=self.VOCAB) == 0
+        assert capture_pinned_bytes(self.LADDER, vocab_size=self.VOCAB,
+                                    enforce_eager=True) == 0
+
+    def test_the_residue_is_calibratable_without_touching_the_mechanism(self):
+        pinned = capture_pinned_bytes(
+            self.LADDER, vocab_size=self.VOCAB,
+            calibration={"graph_pool": {"fixed_pinned": 1000}})
+        assert pinned == 1000 + self.VOCAB * 2 * sum(self.LADDER)

@@ -45,6 +45,7 @@ __all__ = ["peak_activation_bytes", "activation_curve", "weight_bytes",
            "UnfoundedActivation", "UnfoundedPrediction",
            "derived_readings", "CALIBRATED_TERMS", "traced_width",
            "graph_pool_bytes", "measured_graph_pool_bytes", "ELEMENT_BYTES",
+           "capture_pinned_bytes", "CAPTURE_FIXED_PINNED",
            "dtype_ambiguities", "lineage_keys", "width_classes",
            "width_coverage"]
 
@@ -900,6 +901,17 @@ DEFAULT_POOL_PER_TOKEN = 0.3033 * MIB
 #: six runs. It is segment bookkeeping around one fixed 76.0 MiB of pinned
 #: memory, so the largest is taken rather than the mean -- under-reserving buys
 #: dropped capture buckets.
+#:
+#: **Superseded as a reading, kept as a number.** The identical bytes are not
+#: evidence that the graphs pin nothing sharded: at TP>1 the runner does not
+#: capture the LM head at all (`logits_in_graph = world_size == 1 and not
+#: is_tbo`, `model_runner.py:4104`), and the head is the only part of the
+#: pinned set that scales with the ladder. So this is the *whole* pinned set
+#: with its one variable term removed, which `capture_pinned_bytes` states
+#: directly and which predicts TP=1 to the byte. The switch is the predicate,
+#: not the width -- a TP=1 TBO run also drops the head. The AITER collective
+#: buffer remains outside the torch allocator, but it is not what this
+#: measures.
 DEFAULT_POOL_SHARDED = 104 * MIB
 
 
@@ -925,7 +937,21 @@ def measured_graph_pool_bytes(capture_sizes, world_size: int = 1,
     192 GB card nothing has ever been dropped, which is exactly why this went
     unnoticed.
 
-    Above width one the ladder stops mattering -- see `DEFAULT_POOL_SHARDED`.
+    Above width one the ladder stops mattering -- see `DEFAULT_POOL_SHARDED`,
+    and `capture_pinned_bytes` for why that is the LM head leaving the graph
+    rather than a property of width.
+
+    **What it is compared against is not private-pool residency.** The number
+    in the record is `memory_reserved()` differenced across the whole capture
+    window (`model_runner.py:4120`, `:4346`), and that window contains a full
+    eager warmup forward per bucket (`:4229`) whose segments grow the *global*
+    pool, with `empty_cache` patched out inside piecewise capture
+    (`cuda_graph.py`). A release anywhere else in the process lands in it too,
+    and `max(..., 0)` reads a net release as a pool of zero. The allocated
+    delta beside it is the sounder target, and pool-scoped residency is
+    readable directly -- `torch.cuda.memory_snapshot(mempool_id)` takes the
+    id that `graph.pool()` returns -- which is what a future capture probe
+    should use instead of a global difference.
     """
     if enforce_eager:
         return 0
@@ -938,6 +964,80 @@ def measured_graph_pool_bytes(capture_sizes, world_size: int = 1,
     floor = float(settings.get("floor", DEFAULT_POOL_FLOOR))
     per_token = float(settings.get("per_token", DEFAULT_POOL_PER_TOKEN))
     return int(floor + per_token * sum(sizes))
+
+
+#: The capture-time *allocated* delta that is not the LM head, in bytes.
+#:
+#: Read off the 27B's TP=1 record (S27) as the residue after the logits term
+#: below, not fitted to anything: 110 981 120 - 63 x 248 320 x 2. The same
+#: 79 692 800 B appears on the 0.6B (C06) at TP=2, 4 and 8 over ladders from 31
+#: to 1071 tokens, so it moves with neither the model, the width nor the
+#: ladder. What it *is* has not been identified -- 76 MiB plus 1 KiB, allocated
+#: once inside the capture window and never returned. Identifying it needs a
+#: snapshot taken against the capture pool's own id, which is a probe to
+#: coordinate, not a constant to widen.
+CAPTURE_FIXED_PINNED = 79_692_800
+
+
+def capture_pinned_bytes(capture_sizes, *, vocab_size: int = 0,
+                         dtype_bytes: int = 2, q_len: int = 1,
+                         world_size: int = 1, tbo: bool = False,
+                         logits_in_graph: Optional[bool] = None,
+                         enforce_eager: bool = False,
+                         calibration: Optional[Mapping] = None) -> int:
+    """What capture *pins*, as a mechanism rather than as a width constant.
+
+    The engine captures a warmup forward per bucket and, at TP=1 only, the LM
+    head with it::
+
+        self.logits_in_graph = self.world_size == 1 and not is_tbo
+        ...
+        if self.logits_in_graph:
+            graph_logits = self.model.compute_logits(outputs[:num_tokens])
+
+    (`model_runner.py:4104`, `:4297`.) The logits tensor is allocated inside
+    the capture, so it comes from the graph's private pool, and the runner
+    keeps it in `self.graph_logits[(bs, max_q_len)]`, so it stays live. Capture
+    builds decode metadata, so `ParallelLMHead.forward` takes no last-token
+    index and the tensor is `[num_tokens, vocab_size]` whole -- at TP>1 it
+    would also be all-gathered, but at TP>1 it is not captured at all.
+
+    So the term is `vocab_size x dtype_bytes x sum(captured num_tokens)` when
+    the head is in the graph, and nothing when it is not, over a fixed residue.
+    On the 27B's TP=1 record that is 79 692 800 + 63 x 248 320 x 2 =
+    110 981 120 B, which is the recorded allocated delta **to the byte**.
+
+    **The switch is `logits_in_graph`, not the width.** Reading it as a width
+    law -- which `measured_graph_pool_bytes` still does -- gets the right
+    answer for the wrong reason at TP>1 and the wrong answer at TP=1 under TBO,
+    where the head leaves the graph while the width stays one.
+
+    The model output is not in this term: the capture writes it into the
+    preallocated `forward_vars["outputs"]` (`model_runner.py:4237`), the same
+    buffer as O19, which was allocated at engine init and is already inside
+    `current_torch`.
+
+    Raises `UnfoundedPrediction` when the head is in the graph and no
+    vocabulary was given, rather than quietly returning the residue alone.
+    """
+    if enforce_eager:
+        return 0
+    sizes = [int(s) for s in (capture_sizes or ()) if int(s) > 0]
+    if not sizes:
+        return 0
+    settings = (calibration or {}).get("graph_pool") or {}
+    fixed = int(settings.get("fixed_pinned", CAPTURE_FIXED_PINNED))
+    if logits_in_graph is None:
+        logits_in_graph = (int(world_size) == 1) and not tbo
+    if not logits_in_graph:
+        return fixed
+    if not vocab_size:
+        raise UnfoundedPrediction(
+            "the LM head is captured at this configuration, so the pinned "
+            "pool contains vocab_size x %d x %d tokens, and no vocabulary "
+            "was given" % (int(dtype_bytes), sum(sizes) * int(q_len)))
+    tokens = sum(sizes) * int(q_len)
+    return fixed + int(vocab_size) * int(dtype_bytes) * tokens
 
 
 def graph_pool_bytes(activation_bytes: int, *, enforce_eager: bool = False,

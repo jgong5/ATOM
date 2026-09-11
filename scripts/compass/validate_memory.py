@@ -51,11 +51,12 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
 from atom.compass.core.kv_geometry import (  # noqa: E402
     InsufficientPoolBudget, blocks_from_readings, gdn_state_bytes,
-    layer_types_disagree, paged_block_bytes)
+    layer_types_disagree, paged_block_bytes, text_config)
 from atom.compass.core.memory import MemoryReadings  # noqa: E402
 from atom.compass.core.memory_calibration import for_model  # noqa: E402
 from atom.compass.core.memory_model import (  # noqa: E402
-    DEFAULT_PERSISTENT, activation_curve, graph_pool_bytes,
+    DEFAULT_PERSISTENT, UnfoundedPrediction, activation_curve,
+    capture_pinned_bytes, graph_pool_bytes,
     load_residue_bytes, measured_graph_pool_bytes, non_torch_bytes,
     peak_activation_bytes, liveness_is_recorded, traced_shape, weight_bytes)
 
@@ -635,6 +636,30 @@ def main() -> int:
                   % ("", "", "", "", "",
                      "of which %.1f MiB allocated; the rest is segment "
                      "bookkeeping" % (allocated / (1 << 20))))
+            # The pinned half, against a mechanism rather than a fitted line.
+            # Silent without `--model-config` for the same reason the KV rows
+            # are: the vocabulary is the checkpoint's to state.
+            vocab = 0
+            if args.model_config:
+                try:
+                    with open(args.model_config, encoding="utf-8") as fh:
+                        native = json.load(fh) or {}
+                    vocab = int(text_config(native).get("vocab_size") or 0)
+                except (OSError, ValueError, TypeError):
+                    vocab = 0
+            if vocab or world > 1:
+                try:
+                    pinned = capture_pinned_bytes(
+                        capture_sizes, vocab_size=vocab, world_size=world,
+                        tbo=bool(config.get("enable_tbo")))
+                except UnfoundedPrediction as exc:
+                    print("  %-14s %s" % ("capture pinned", exc))
+                else:
+                    row("capture pinned", pinned, allocated,
+                        "fixed residue %s the LM head, which the runner "
+                        "captures only at width one"
+                        % ("plus" if world == 1 else "without"),
+                        sizing_budget)
 
         kv_rows(config, readings, tp, world, blob, args.model_config)
 
