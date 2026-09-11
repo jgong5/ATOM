@@ -17,6 +17,8 @@ from atom.compass.core.memory_model import (
     load_residue_bytes, measured_graph_pool_bytes, modelled_readings,
     non_torch_bytes, peak_activation_bytes, scratch_bytes_per_token,
     liveness_is_recorded, traced_shape, UnfoundedActivation,
+    allocator_block_bytes, allocator_segment_bytes, capture_reserved_parts,
+    ALLOCATOR_SMALL_BUFFER, ALLOCATOR_LARGE_BUFFER,
     UnfoundedPrediction, derived_readings, weight_bytes)
 
 
@@ -784,3 +786,57 @@ class TestWhatCapturePins:
             self.LADDER, vocab_size=self.VOCAB,
             calibration={"graph_pool": {"fixed_pinned": 1000}})
         assert pinned == 1000 + self.VOCAB * 2 * sum(self.LADDER)
+
+
+class TestTheReservedSideFollowsTheAllocatorsOwnRules:
+    """The reserved delta is not the allocated one rounded.
+
+    Every figure checked here comes from the S27 TP=1 pool-id probe
+    (`agent_scratch/memval/pool_probe/att2_artifact.json`) and the constants
+    come from `c10/core/AllocatorConfig.h`. Neither was fitted.
+    """
+
+    def test_a_request_under_the_block_size_still_costs_a_block(self):
+        assert allocator_block_bytes(8) == 512
+        assert allocator_block_bytes(513) == 1024
+
+    def test_the_three_segment_classes_are_the_allocators_not_ours(self):
+        assert allocator_segment_bytes(8) == ALLOCATOR_SMALL_BUFFER
+        assert allocator_segment_bytes(1_048_576) == ALLOCATOR_SMALL_BUFFER
+        # over kSmallSize but under kMinLargeAlloc: a whole large segment
+        assert allocator_segment_bytes(1_048_577) == ALLOCATOR_LARGE_BUFFER
+        assert allocator_segment_bytes(9_000_000) == ALLOCATOR_LARGE_BUFFER
+        # at or over kMinLargeAlloc: its own segment, rounded to 2 MiB
+        assert allocator_segment_bytes(10_485_760) == 10_485_760
+        assert allocator_segment_bytes(15_892_480) == 16_777_216
+
+    def test_the_fixed_residue_maps_the_bytes_that_were_observed(self):
+        """76 MiB exactly, plus a whole 2 MiB segment for 1 KiB of scalars."""
+        parts = capture_reserved_parts(46_137_344)
+        assert parts["outside_pools"] == 81_788_928
+        assert parts["outside_pools_derived"] is True
+
+    def test_the_allocated_constant_is_not_its_reserved_cost(self):
+        parts = capture_reserved_parts(46_137_344)
+        assert parts["outside_pools"] != CAPTURE_FIXED_PINNED
+        assert parts["outside_pools"] - CAPTURE_FIXED_PINNED == 2_096_128
+
+    def test_the_window_total_is_reproduced_only_with_the_measured_pool(self):
+        """The observed reserved delta, once the pool is supplied.
+
+        Supplied, not predicted: the pool half is the high-water mark of the
+        captured forward, and `capture_reserved_parts` says so by taking it as
+        an argument.
+        """
+        parts = capture_reserved_parts(46_137_344)
+        assert parts["total"] == 127_926_272
+        assert parts["pool_reserved_derived"] is False
+
+    def test_the_pinned_set_does_not_predict_the_pool(self):
+        """Why the pool half is an input: the same rule over what capture
+        pins reads 82% high against the pool that was measured."""
+        pinned = (15_892_480, 7_946_240, 3_973_120,
+                  1_986_560, 993_280, 496_640)
+        naive = sum(allocator_segment_bytes(size) for size in pinned)
+        assert naive == 83_886_080
+        assert naive - 46_137_344 == 37_748_736

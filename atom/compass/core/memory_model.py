@@ -988,13 +988,19 @@ def measured_graph_pool_bytes(capture_sizes, world_size: int = 1,
 #: 76 MiB that depends on neither model nor width is what makes the same value
 #: appear on the 0.6B (C06) at TP=2, 4 and 8 over ladders from 31 to 1071
 #: tokens. The TP=1 warmup allocation history already on disk
-#: (`probe_tp1/out/warmup_history.959476.pickle`) carries a 79 691 776 B
-#: `segment_alloc` whose frames run `aiter/tuned_gemm.py:450:torch_gemm` <-
-#: `gemm_a16w16` <- the inductor region of the GDN linear-attention forward,
-#: which makes an AITER tuned-GEMM workspace the named candidate for the site.
-#: That attribution is *inference by size across two windows*: the probe
-#: recorded no frames, so the capture-window block itself is unattributed.
-#:
+#: (`agent_scratch/memval/producer_packet/tp1_probe/out/warmup_history.959476.pickle`)
+#: carries a 79 691 776 B `segment_alloc` whose frames run
+#: `aiter/tuned_gemm.py:450:torch_gemm` <- `gemm_a16w16` <- the inductor region
+#: of the GDN linear-attention forward, which looked like the site. It is
+#: probably not. That block is **token-shaped**: at the run's own 16 384
+#: `max_num_batched_tokens` it is 16 384 x 2432 x 2 B -- equally readable as a
+#: 2432-token chunk of the 16 384-wide `in_proj_qkvz`, since the product is the
+#: same -- and 16 384 x 2432 x 2 is exactly 76 MiB by arithmetic. The
+#: capture-window block cannot be that tensor: it is unchanged on a different
+#: model and at TP=2/4/8, and the captured buckets are at most 32 tokens. So
+#: the equal size is **coincidence unless shown otherwise**, and the
+#: capture-window block, which carries no frames, stays unattributed. Naming it
+#: needs allocation history recorded *inside* the capture window.
 #: The constant therefore stays a calibrated number rather than a derived one,
 #: and stays overridable via `calibration["graph_pool"]["fixed_pinned"]`: it is
 #: a property of the AITER/ROCm build, not of the model. Its value must not
@@ -1093,6 +1099,85 @@ def capture_pinned_bytes(capture_sizes, *, vocab_size: int = 0,
             "was given" % (int(dtype_bytes), sum(sizes) * int(q_len)))
     tokens = sum(sizes) * int(q_len)
     return fixed + int(vocab_size) * int(dtype_bytes) * tokens
+
+
+#: The caching allocator's own size constants, read off the shipped header
+#: `torch/include/c10/core/AllocatorConfig.h` rather than inferred from a
+#: measurement. They are what turns a *requested* size into mapped bytes, so
+#: they are what separates the reserved side from the allocated side.
+ALLOCATOR_MIN_BLOCK = 512          #: kMinBlockSize -- every request rounds up
+ALLOCATOR_SMALL_SIZE = 1_048_576   #: kSmallSize -- largest "small" allocation
+ALLOCATOR_SMALL_BUFFER = 2_097_152  #: kSmallBuffer -- small segment size
+ALLOCATOR_MIN_LARGE_ALLOC = 10_485_760  #: kMinLargeAlloc
+ALLOCATOR_ROUND_LARGE = 2_097_152  #: kRoundLarge -- oversize segments round here
+ALLOCATOR_LARGE_BUFFER = 20_971_520  #: kLargeBuffer -- large segment size
+
+
+def allocator_block_bytes(requested: int) -> int:
+    """What a request of `requested` bytes occupies as a *block*."""
+    n = int(requested)
+    if n < ALLOCATOR_MIN_BLOCK:
+        return ALLOCATOR_MIN_BLOCK
+    return ALLOCATOR_MIN_BLOCK * (
+        (n + ALLOCATOR_MIN_BLOCK - 1) // ALLOCATOR_MIN_BLOCK)
+
+
+def allocator_segment_bytes(requested: int) -> int:
+    """What the allocator *maps* to satisfy a fresh request of that size.
+
+    The three cases are the allocator's, not ours: a small request takes a
+    whole `kSmallBuffer` segment, a request under `kMinLargeAlloc` takes a
+    whole `kLargeBuffer` segment, and anything larger gets its own segment
+    rounded to `kRoundLarge`. A later request may be packed into an existing
+    segment's free tail instead, which is why this is an upper bound per
+    allocation and only exact for one that has to map new memory.
+    """
+    n = allocator_block_bytes(requested)
+    if n <= ALLOCATOR_SMALL_SIZE:
+        return ALLOCATOR_SMALL_BUFFER
+    if n < ALLOCATOR_MIN_LARGE_ALLOC:
+        return ALLOCATOR_LARGE_BUFFER
+    return ALLOCATOR_ROUND_LARGE * (
+        (n + ALLOCATOR_ROUND_LARGE - 1) // ALLOCATOR_ROUND_LARGE)
+
+
+def capture_reserved_parts(pool_reserved: int, *,
+                           fixed_pinned: int = CAPTURE_FIXED_PINNED) -> dict:
+    """Split the capture window's *reserved* delta into what is derivable.
+
+    The allocated side has a mechanism (`capture_pinned_bytes`). The reserved
+    side does not have one whole mechanism -- it has two halves, and only one
+    of them follows from the allocator's rules:
+
+    * **Outside the capture pools.** The fixed residue is one ~76 MiB request
+      plus two 512 B blocks, so the allocator maps
+      `allocator_segment_bytes(76 MiB) + allocator_segment_bytes(512)`. On the
+      S27 TP=1 window that is 79 691 776 + 2 097 152 = 81 788 928 B, which is
+      the observed figure with **no residual** and no fitted parameter. Note
+      what it says: 1 024 B of live scalars cost a whole 2 MiB segment, so the
+      allocated constant (79 692 800) and its reserved cost (81 788 928) are
+      different numbers.
+    * **Inside the capture pools.** Not derivable from what capture pins. On
+      the same window the pool holds 46 137 344 B reserved while the same rule
+      over the pinned blocks alone predicts 83 886 080 B -- 82% high -- and one
+      of its four segments holds no live block at all. The pool's segments are
+      the high-water mark of the *whole* captured forward, nearly all of which
+      is freed before the window closes. Predicting it needs the captured
+      forward's activation peak, which is O16's quantity, not this one.
+
+    So `pool_reserved` is an input here, not an output. Pass the engine's
+    recorded figure and this reports the split; it does not invent the half
+    that has no derivation yet.
+    """
+    outside = (allocator_segment_bytes(fixed_pinned - 2 * ALLOCATOR_MIN_BLOCK)
+               + allocator_segment_bytes(ALLOCATOR_MIN_BLOCK))
+    return {
+        "outside_pools": int(outside),
+        "outside_pools_derived": True,
+        "pool_reserved": int(pool_reserved),
+        "pool_reserved_derived": False,
+        "total": int(outside) + int(pool_reserved),
+    }
 
 
 def graph_pool_bytes(activation_bytes: int, *, enforce_eager: bool = False,
