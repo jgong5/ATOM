@@ -10,6 +10,7 @@ to say which one.
 
 import inspect
 import json
+from types import SimpleNamespace
 
 import pytest
 
@@ -283,15 +284,21 @@ class TestTheContractWithTheServedPath:
             "atom.compass.runtime.source_oracle.source_cost_oracle")
         assert resolved is source_cost_oracle
 
-    def test_the_runner_will_not_offer_it_a_rank_it_does_not_take(self):
+    def test_the_factory_names_the_rank_so_the_runner_offers_it_one(self):
         """`_build_oracle` passes `rank_coords` only to an oracle that names it.
 
-        This one does not: a shape carries its own rank coordinates, and an
-        unexpected keyword would fail the build at TP>1 only -- the one place
-        it would be hardest to see.
+        It decides by ``inspect.signature(...).parameters``, and a bare
+        ``**kwargs`` names nothing -- so while this factory declared only
+        ``**kwargs`` the injection never fired, and every rank of a TP>1 run
+        built the same composition off rank 0's artifacts. The failure was
+        silent: each rank read a file that existed and answered.
         """
-        assert "rank_coords" not in inspect.signature(
-            source_cost_oracle).parameters
+        params = inspect.signature(source_cost_oracle).parameters
+        assert "rank_coords" in params
+        assert (params["rank_coords"].kind
+                is inspect.Parameter.KEYWORD_ONLY)
+        # And it reaches the builder, which is where it does the work.
+        assert "rank_coords" in inspect.signature(build_source_oracle).parameters
 
     def test_a_mistyped_option_is_an_error_and_not_a_default(self, tmp_path):
         with pytest.raises(TypeError):
@@ -302,4 +309,176 @@ class TestTheContractWithTheServedPath:
     def test_the_composition_names_what_a_report_has_to_state(self):
         assert SourceComposition._fields == (
             "oracle", "body_graphs", "head_graphs", "deriver", "build_seconds",
-            "allocation")
+            "allocation", "rank_coords", "rank_artifacts")
+
+
+def _rank_price_file(tmp_path, name, signature):
+    """A library file whose one signature says which file it came from."""
+    path = tmp_path / name
+    path.write_text(json.dumps({
+        "provenance": {"topology": {"tp": 2}, "registration": "unregistered"},
+        "prices": {signature: {"seconds": 1.0e-5}},
+        "unpriced": {},
+    }), encoding="utf-8")
+    return str(path)
+
+
+class _Runner:
+    """The two attributes `_build_oracle` reads, and its real methods.
+
+    Bound off `CompassPredictMixin` rather than reimplemented: the question
+    these tests answer is what the *served* path does, and a stub that decided
+    for itself whether to inject the rank would answer a different question.
+    The mixin is the definition both real runners inherit -- see
+    `test_both_runners_inherit_this_definition` -- and it is the half of the
+    runner that is deliberately device-free, so this runs with no GPU.
+    """
+
+    from atom.compass.runtime.predict import CompassPredictMixin as _real
+
+    _topology = _real._topology
+    _rank_coords = _real._rank_coords
+    _build_oracle = _real._build_oracle
+    del _real
+
+    def __init__(self, tp, rank):
+        self.config = SimpleNamespace(tensor_parallel_size=tp,
+                                      parallel_config=None)
+        self.rank = rank
+
+
+def _oracle_config(price, template):
+    from atom.compass.config import CompassConfig
+
+    return CompassConfig(
+        enabled=True,
+        oracle_qualname="atom.compass.runtime.source_oracle.source_cost_oracle",
+        oracle_options={"price": price, "template": template, "derive": 0,
+                        "require_complete": 0})
+
+
+class TestTheRankTheServedPathActuallyBuildsWith:
+    """Through `_build_oracle`, because that is where the gap was.
+
+    The factory built correctly in isolation the whole time. What did not
+    happen was the runner handing it a rank, and no test of the factory alone
+    could see that.
+    """
+
+    def test_both_runners_inherit_this_definition(self):
+        """So `_Runner` above is the served path and not a second copy of it.
+
+        Checked by reading the class statements rather than by importing them:
+        `CompassModelRunner` inherits `ModelRunner`, which imports `aiter`,
+        which resolves the chip at import time. These tests run where there is
+        no chip -- which is the whole point of the split predict.py describes.
+        """
+        for module, line in (
+                ("atom/compass/runtime/runner.py",
+                 "class CompassModelRunner(CompassPredictMixin, ModelRunner):"),
+                ("atom/compass/replay/runner.py",
+                 "class ReplayModelRunner(CompassPredictMixin):")):
+            with open(module, encoding="utf-8") as fh:
+                assert line in fh.read(), module
+
+    def test_each_rank_loads_its_own_price_file(self, tmp_path):
+        shared = _rank_price_file(tmp_path, "prices.json", "sig::shared")
+        _rank_price_file(tmp_path, "prices.tp1.json", "sig::rank1")
+        template = _template_file(tmp_path)
+        config = _oracle_config(shared, template)
+
+        at_zero = _Runner(tp=2, rank=0)._build_oracle(config)
+        at_one = _Runner(tp=2, rank=1)._build_oracle(config)
+
+        assert at_zero.library.sources == [shared]
+        assert at_one.library.sources == [str(tmp_path / "prices.tp1.json")]
+
+    def test_a_rank_with_no_file_of_its_own_reads_the_shared_one(self, tmp_path):
+        """Which is correct in a symmetric group, and a different claim.
+
+        `SourceComposition.rank_artifacts` is what makes the difference
+        reportable; the oracle alone cannot say it.
+        """
+        shared = _rank_price_file(tmp_path, "prices.json", "sig::shared")
+        template = _template_file(tmp_path)
+        oracle = _Runner(tp=2, rank=3)._build_oracle(
+            _oracle_config(shared, template))
+        assert oracle.library.sources == [shared]
+
+        built = build_source_oracle(price=shared, template=template, derive=0,
+                                    require_complete=0,
+                                    rank_coords={"tp": 3})
+        assert built.rank_coords == {"tp": 3}
+        assert built.rank_artifacts[shared]["rank_own"] is False
+
+    def test_the_composition_records_the_rank_it_was_built_for(self, tmp_path):
+        shared = _rank_price_file(tmp_path, "prices.json", "sig::shared")
+        own = _rank_price_file(tmp_path, "prices.tp1.json", "sig::rank1")
+        built = build_source_oracle(price=shared,
+                                    template=_template_file(tmp_path),
+                                    derive=0, require_complete=0,
+                                    rank_coords={"tp": 1})
+        assert built.rank_coords == {"tp": 1}
+        assert built.rank_artifacts[shared] == {"resolved": own,
+                                                "rank_own": True}
+
+    def test_a_single_rank_run_asks_for_no_suffix_at_all(self, tmp_path):
+        """TP1 is frozen. `_build_oracle` guards on the topology, not the rank.
+
+        The decoy would be read if the guard moved, and TP1 results would stop
+        being the results that were frozen.
+        """
+        shared = _rank_price_file(tmp_path, "prices.json", "sig::shared")
+        _rank_price_file(tmp_path, "prices.tp0.json", "sig::decoy")
+        oracle = _Runner(tp=1, rank=0)._build_oracle(
+            _oracle_config(shared, _template_file(tmp_path)))
+        assert oracle.library.sources == [shared]
+
+    def test_rank_zero_of_a_wide_group_is_also_unchanged(self, tmp_path):
+        """The injection fires, resolves to rank 0's own name, and that is the
+        name every frozen TP2/TP4 artifact was written under."""
+        shared = _rank_price_file(tmp_path, "prices.json", "sig::shared")
+        _rank_price_file(tmp_path, "prices.tp0.json", "sig::rank0")
+        oracle = _Runner(tp=2, rank=0)._build_oracle(
+            _oracle_config(shared, _template_file(tmp_path)))
+        assert oracle.library.sources == [str(tmp_path / "prices.tp0.json")]
+
+    def test_an_explicit_option_is_not_overridden_by_the_runner(self, tmp_path):
+        """`_build_oracle` only fills a rank the options did not already set."""
+        shared = _rank_price_file(tmp_path, "prices.json", "sig::shared")
+        _rank_price_file(tmp_path, "prices.tp1.json", "sig::rank1")
+        config = _oracle_config(shared, _template_file(tmp_path))
+        config.oracle_options["rank_coords"] = "tp:1"
+        oracle = _Runner(tp=2, rank=0)._build_oracle(config)
+        assert oracle.library.sources == [str(tmp_path / "prices.tp1.json")]
+
+    def test_a_rank_one_shape_is_served_by_the_rank_zero_template(self, tmp_path):
+        """End to end: the miss the rank injection would otherwise have caused.
+
+        Every frozen template is keyed at rank 0, and `template_key` carries
+        the rank -- so handing rank 1 its own coordinates turns every template
+        hit into a refusal unless the representative fallback stands in.
+        """
+        from atom.compass.core.cost.base import StepShape
+
+        # As a TP2 derivation writes one: the width it was derived for, and
+        # rank 0, because that is the rank the simulated group reports.
+        path = tmp_path / "body.tp2.json"
+        path.write_text(json.dumps({
+            "ops": [],
+            "key": {"topology": [["tp", 2]], "rank_coords": [["tp", 0]]},
+            "provenance": {
+                "batch_spec": {"kind": "decode", "query_lens": [1, 1],
+                               "context_lens": [1025, 1025]},
+                "execution": {"capture_bucket": 2},
+            },
+        }), encoding="utf-8")
+        built = build_source_oracle(price=_price_file(tmp_path),
+                                    template=str(path), derive=0,
+                                    require_complete=0, rank_coords={"tp": 1})
+        at_one = StepShape(
+            num_scheduled_tokens=(1, 1), context_lens=(4096, 4096),
+            num_prefill_tokens=0, topology={"tp": 2}, rank_coords={"tp": 1},
+            capture_bucket=2, compiled=None, produces_output=True)
+        assert built.body_graphs.graph_for(at_one) is not None
+        assert built.body_graphs.representative_hits == 1

@@ -296,23 +296,52 @@ class TemplateGraphs:
     structures it has not seen. Counts hits, binds, derivations and refusals,
     because the only claim worth making about a cache is one measured on a real
     schedule.
+
+    ``representative_rank`` is the rank whose graph stands for the group.
+    :func:`template_key` carries this rank's coordinates, and derivation
+    produces rank 0's shard whatever rank is asked for -- it builds a one-rank
+    gloo group and tells it to report the wider width, leaving
+    ``rank_in_group`` at 0. So every template frozen so far is keyed at rank 0,
+    and at TP>1 a shape from rank 1 matches none of them. Falling back to the
+    representative is the predeclared aggregation: one uniformly sharded rank
+    stands for its peers, which is what the derivation was already doing
+    silently. ``representative_hits`` counts the subset of ``hits`` served that
+    way, because "rank 3 was priced from rank 0's graph" is a different claim
+    from "rank 3 was priced from rank 3's graph" and a report has to be able to
+    tell them apart. A template keyed at the asking rank always wins; the
+    fallback only fires on a miss.
     """
 
-    def __init__(self, templates=None, derive=None, allocation=None) -> None:
+    def __init__(self, templates=None, derive=None, allocation=None,
+                 representative_rank: int = 0) -> None:
         self._templates = dict(templates or {})
         self._derive = derive
         self._allocation = allocation
+        self._representative = int(representative_rank)
         self.hits = 0
         self.binds = 0
         self.derivations = 0
+        self.representative_hits = 0
         self.refusals = {}
 
     def add(self, shape: StepShape, graph: dict) -> None:
         self._templates[template_key(shape)] = graph
 
+    def _representative_key(self, key):
+        """``key`` with every rank coordinate moved to the representative."""
+        coords = tuple((group, self._representative)
+                       for group, _ in (key[3] or ()))
+        return key[:3] + (coords,) + key[4:]
+
     def graph_for(self, shape: StepShape) -> Optional[dict]:
         key = template_key(shape)
         template = self._templates.get(key)
+        if template is None:
+            standin = self._representative_key(key)
+            if standin != key:
+                template = self._templates.get(standin)
+                if template is not None:
+                    self.representative_hits += 1
         if template is None:
             if self._derive is None:
                 self.refusals[key] = "no template and no deriver"
@@ -336,6 +365,9 @@ class TemplateGraphs:
     def describe(self) -> str:
         where = (self._allocation.describe() if self._allocation
                  else "no allocation source")
+        stood_in = (f", {self.representative_hits} of them from rank "
+                    f"{self._representative}'s graph"
+                    if self.representative_hits else "")
         return (f"TemplateGraphs({len(self._templates)} templates, "
-                f"{self.hits} hits, {self.derivations} derivations, "
+                f"{self.hits} hits{stood_in}, {self.derivations} derivations, "
                 f"{self.binds} binds, {len(self.refusals)} refused; {where})")

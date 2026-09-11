@@ -256,3 +256,50 @@ def test_template_graphs_without_an_allocation_source_refuses():
     cache.add(shape([1] * 4, [1151] * 4), template_for([(1, 1151)] * 4))
     assert cache.graph_for(shape([1] * 4, [4096] * 4)) is None
     assert "AllocationSource" in str(list(cache.refusals.values())[0])
+
+
+class TestTheRepresentativeRank:
+    """A rank-1 shape and a rank-0 template, which is every frozen template.
+
+    Derivation builds a one-rank gloo group, tells it to report the wider
+    width, and leaves ``rank_in_group`` at 0 -- so every graph it produces is
+    rank 0's shard whatever rank asked, and every template on disk is keyed at
+    rank 0. `template_key` carries the rank, so before this fallback a served
+    rank 1 matched none of them and either re-derived the same graph or, with
+    derivation off, was refused. Both were silent.
+    """
+
+    def test_a_rank_is_served_by_the_representative_and_the_borrow_is_counted(self):
+        cache = TemplateGraphs(allocation=carried())
+        cache.add(shape([1] * 4, [1151] * 4, tp=2, rank=0),
+                  template_for([(1, 1151)] * 4))
+        assert cache.graph_for(shape([1] * 4, [4096] * 4, tp=2, rank=1))
+        assert cache.hits == 1
+        assert cache.representative_hits == 1
+        assert "rank 0's graph" in cache.describe()
+
+    def test_a_rank_with_its_own_template_does_not_borrow(self):
+        """Precedence, for the day a derivation really is per-rank."""
+        cache = TemplateGraphs(allocation=carried())
+        cache.add(shape([1] * 4, [1151] * 4, tp=2, rank=0),
+                  template_for([(1, 1151)] * 4))
+        cache.add(shape([1] * 4, [1151] * 4, tp=2, rank=1),
+                  template_for([(1, 1151)] * 4))
+        assert cache.graph_for(shape([1] * 4, [4096] * 4, tp=2, rank=1))
+        assert cache.hits == 1 and cache.representative_hits == 0
+
+    def test_the_representative_is_not_a_wildcard_over_structure(self):
+        """Only the rank moves. A different batch structure is still a miss."""
+        cache = TemplateGraphs(allocation=carried())
+        cache.add(shape([1] * 4, [1151] * 4, tp=2, rank=0),
+                  template_for([(1, 1151)] * 4))
+        assert cache.graph_for(shape([1] * 8, [1151] * 8, tp=2, rank=1)) is None
+        assert cache.hits == 0 and cache.representative_hits == 0
+
+    def test_rank_zero_is_unchanged_so_frozen_results_are_unchanged(self):
+        """The fallback cannot fire where the key already matches."""
+        cache = TemplateGraphs(allocation=carried())
+        cache.add(shape([1] * 4, [1151] * 4, tp=2, rank=0),
+                  template_for([(1, 1151)] * 4))
+        assert cache.graph_for(shape([1] * 4, [4096] * 4, tp=2, rank=0))
+        assert cache.hits == 1 and cache.representative_hits == 0

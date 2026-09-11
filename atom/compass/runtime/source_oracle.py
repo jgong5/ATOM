@@ -85,23 +85,65 @@ def _flag(value, what: str) -> bool:
                      f"got {value!r}")
 
 
-def price_specs(entries):
+def _rank_coords(value):
+    """This rank's coordinates, from what a `KEY=VALUE` command line carries.
+
+    ``tp:2`` or ``tp:2,dp:1``; a programmatic caller may pass the dict
+    directly. Refused rather than guessed at, because a coordinate map read
+    wrongly is worse than none at all: it sends every artifact lookup to a
+    rank's file that is not this rank's, and both the read and the prediction
+    succeed.
+    """
+    if not value:
+        return {}
+    if isinstance(value, dict):
+        return {str(k): int(v) for k, v in value.items()}
+    coords = {}
+    for entry in _entries(value, "rank_coords"):
+        group, sep, index = entry.partition(":")
+        if not sep:
+            group, sep, index = entry.partition("=")
+        if not sep or not group.strip():
+            raise ValueError(
+                f"rank_coords {entry!r}: expected GROUP:INDEX, as in tp:2")
+        try:
+            coords[group.strip()] = int(index)
+        except ValueError:
+            raise ValueError(
+                f"rank_coords {entry!r}: {index!r} is not a rank index") from None
+    return coords
+
+
+def price_specs(entries, coords=None):
     """``prices.json[:graph.json[:regime]]`` triples, as `PriceLibrary` takes.
 
     The graph is optional and worth supplying: without it a price matches by
     signature alone, and a signature does not carry layout. The third element
     names the collective registration regime for a list whose provenance
     predates the field.
+
+    With ``coords``, each path is resolved through
+    :func:`~atom.compass.core.artifacts.resolve_rank_path` -- the same
+    convention the write side uses and the calibrated oracle already reads, so
+    a rank's own price list is preferred where one was written and the
+    unsuffixed one is used where it was not. That fallback is the predeclared
+    semantics of a symmetric TP group and is not changed here.
     """
+    from atom.compass.core.artifacts import resolve_rank_path
+
+    def resolved(path):
+        return resolve_rank_path(path, coords)[0] if path and coords else path
+
     loaded = []
     for entry in entries or ():
         parts = entry.split(":")
         if len(parts) == 1:
-            loaded.append((parts[0], None))
+            loaded.append((resolved(parts[0]), None))
         elif len(parts) == 2:
-            loaded.append((parts[0], parts[1] or None))
+            loaded.append((resolved(parts[0]), resolved(parts[1]) or None))
         elif len(parts) == 3:
-            loaded.append((parts[0], parts[1] or None, parts[2]))
+            loaded.append((resolved(parts[0]), resolved(parts[1]) or None,
+                           parts[2]))
         else:
             raise ValueError(f"price {entry!r}: expected at most "
                              "prices.json:graph.json:regime")
@@ -161,14 +203,26 @@ def template_shape(graph: dict):
     )
 
 
-def seeded_graphs(paths, derive, allocation):
-    """A `TemplateGraphs` holding the graphs already on disk, keyed by spec."""
+def seeded_graphs(paths, derive, allocation, coords=None):
+    """A `TemplateGraphs` holding the graphs already on disk, keyed by spec.
+
+    ``coords`` resolves each path to this rank's file where one was written,
+    by the same rule as the prices. It does *not* rewrite the key: a template
+    is keyed by the coordinates in its own provenance, because that is the rank
+    the graph is a graph of. Re-keying one to the rank that happens to be
+    reading it would erase the difference between a graph derived for this rank
+    and one borrowed from the representative. `TemplateGraphs` serves the
+    borrow deliberately, on a miss, and counts it as a representative hit.
+    """
     import json
 
+    from atom.compass.core.artifacts import resolve_rank_path
     from atom.compass.runtime.templates import TemplateGraphs, template_key
 
     graphs = {}
     for path in paths:
+        if coords:
+            path = resolve_rank_path(path, coords)[0]
         with open(path, encoding="utf-8") as fh:
             graph = json.load(fh)
         graphs[template_key(template_shape(graph))] = graph
@@ -195,16 +249,33 @@ class SourceComposition(NamedTuple):
     #: rather than read back off the cache, because it is an explicitly
     #: unmeasured assumption and a report has to be able to say it was made.
     allocation: object = None
+    #: Which rank this composition was built to serve, as the runner supplied
+    #: it. :func:`build_source_oracle` always fills this in, empty under TP1
+    #: where the runner passes nothing and there is one rank to be. ``None``
+    #: means a composition assembled by hand rather than built.
+    rank_coords: Optional[dict] = None
+    #: Whether each resolved artifact was this rank's own file or the shared
+    #: unsuffixed one, by path. A report that says "rank 3" has to be able to
+    #: say which of rank 3's files actually existed.
+    rank_artifacts: Optional[dict] = None
 
 
-def source_cost_oracle(**kwargs):
+def source_cost_oracle(*, rank_coords=None, **kwargs):
     """The frozen composition as a plain oracle, for `oracle_qualname`.
 
     This is the entry point a served run names. It takes exactly the arguments
     :func:`build_source_oracle` documents and returns only the oracle, because
     that is what `_build_oracle` expects to get back.
+
+    ``rank_coords`` is named explicitly rather than swept into ``**kwargs``,
+    and that is the whole reason it is in this signature: `_build_oracle`
+    offers the rank only to an oracle that names it, by
+    ``inspect.signature(...).parameters``, and a bare ``**kwargs`` names
+    nothing. Under TP>1 the injection silently did not fire, so every rank of
+    a served run built the same composition and resolved the same artifacts --
+    rank 0's, wherever a per-rank file existed.
     """
-    return build_source_oracle(**kwargs).oracle
+    return build_source_oracle(rank_coords=rank_coords, **kwargs).oracle
 
 
 def build_source_oracle(
@@ -227,6 +298,7 @@ def build_source_oracle(
     require_complete: bool = True,
     carry_allocation: bool = False,
     derive: bool = True,
+    rank_coords=None,
 ):
     """The frozen composition, from names and paths alone.
 
@@ -234,6 +306,30 @@ def build_source_oracle(
     settings are what building a deriver costs; they are required only when
     ``derive`` is on, so a run that seeds every template it needs can leave the
     model out and never load one.
+
+    ``rank_coords`` is this rank's coordinates, as ``tp:2`` or a dict. It
+    selects artifacts and nothing else, and the distinction is worth being
+    exact about, because two different things are per-rank here:
+
+    * *Artifacts* -- price lists and seeded templates -- resolve through
+      `resolve_rank_path`, preferring a file written for this rank and falling
+      back to the shared one. That fallback is the predeclared semantics for a
+      symmetric TP group, unchanged.
+    * *Derivation* does not. `ModelTracer.build` initialises a one-rank group
+      and calls `simulate_group_width`, which raises the reported ``world_size``
+      to the logical width and leaves ``rank_in_group`` at 0 -- its own log line
+      says "deriving rank 0 of a TP%d deployment". Every graph this deriver
+      produces is rank 0's shard, whatever rank the shape asks for, and the
+      shape's coordinates reach only the graph's key. For a uniformly sharded
+      dense model the two coincide (`num_embeddings // tp_size` is the same on
+      every rank) but that is a property of the model, not a guarantee of the
+      derivation, so it is declared here rather than assumed.
+
+    The consequence a caller has to know: `template_key` includes the rank
+    coordinates, and a seeded template carries the rank its provenance names.
+    So at TP>1 a shape from rank 1 does not match a template derived at rank 0.
+    It falls through to derivation, or -- with ``derive=0`` -- is refused. That
+    is reported at build time rather than as a hundred identical misses later.
     """
     from atom.compass.core.cost.library import LibraryCostOracle, PriceLibrary
     from atom.compass.core.cost.regions import region_model
@@ -243,6 +339,7 @@ def build_source_oracle(
     require_complete = _flag(require_complete, "require_complete")
     carry_allocation = _flag(carry_allocation, "carry_allocation")
     derive = _flag(derive, "derive")
+    coords = _rank_coords(rank_coords)
 
     templates = _entries(template, "template")
     head_templates = _entries(head_template, "head_template")
@@ -252,8 +349,11 @@ def build_source_oracle(
             "refused for want of a graph. Seed a template or turn derivation "
             "on.")
 
-    library = PriceLibrary.load(price_specs(_entries(price, "price")))
+    price_entries = price_specs(_entries(price, "price"), coords)
+    library = PriceLibrary.load(price_entries)
     regions_model = region_model(regions)
+    rank_artifacts = _rank_artifacts(
+        coords, _entries(price, "price"), templates, head_templates)
 
     allocation = None
     if carry_allocation:
@@ -292,9 +392,11 @@ def build_source_oracle(
         if head:
             head_deriver = ShapeDeriver(tracer, region="head", **common)
 
-    body_graphs = seeded_graphs(templates, body_deriver, allocation)
-    head_graphs = (seeded_graphs(head_templates, head_deriver, allocation)
+    body_graphs = seeded_graphs(templates, body_deriver, allocation, coords)
+    head_graphs = (seeded_graphs(head_templates, head_deriver, allocation,
+                                 coords)
                    if head else None)
+    _report_rank_binding(coords, body_graphs, head_graphs, derive)
     oracle = LibraryCostOracle(
         library, body_graphs,
         seconds_per_launch=float(seconds_per_launch),
@@ -303,4 +405,61 @@ def build_source_oracle(
         require_complete=require_complete,
     )
     return SourceComposition(oracle, body_graphs, head_graphs, body_deriver,
-                             build_seconds, allocation)
+                             build_seconds, allocation, coords, rank_artifacts)
+
+
+def _rank_artifacts(coords, prices, templates, head_templates) -> dict:
+    """Which of the artifacts asked for were this rank's own file.
+
+    Recorded per requested path, not per resolved one, so a report can say
+    "rank 3 asked for prices.json and got prices.json" -- which is the shared
+    list, and a legitimate thing to do in a symmetric group, but not the same
+    claim as having measured rank 3.
+    """
+    if not coords:
+        return {}
+    from atom.compass.core.artifacts import resolve_rank_path
+
+    found = {}
+    for entry in list(prices or ()) + list(templates or ()) + list(
+            head_templates or ()):
+        for path in str(entry).split(":"):
+            if not path:
+                continue
+            resolved, own = resolve_rank_path(path, coords)
+            found[path] = {"resolved": resolved, "rank_own": bool(own)}
+    return found
+
+
+def _report_rank_binding(coords, body_graphs, head_graphs, derive) -> None:
+    """Say once, at build time, which rank's graphs this rank will be served.
+
+    `template_key` carries the rank coordinates, and every template frozen so
+    far was derived at rank 0 -- derivation simulates the group's width from
+    one gloo rank and leaves ``rank_in_group`` there. So a rank-1 shape matches
+    none of them by its own key and is served by `TemplateGraphs`'
+    representative fallback instead. That is the predeclared aggregation and
+    not a defect, but it should be stated once here rather than inferred later
+    from a hit count.
+    """
+    rank = int((coords or {}).get("tp", 0))
+    if not rank:
+        return
+    import logging
+
+    logger = logging.getLogger(__name__)
+    seeded = []
+    for source in (body_graphs, head_graphs):
+        for key in list(getattr(source, "_templates", {}) or {}):
+            # `template_key` puts the coordinate pairs fourth.
+            seeded.extend(index for name, index in (key[3] or ())
+                          if name == "tp")
+    elsewhere = sorted({index for index in seeded if index != rank})
+    if elsewhere:
+        logger.info(
+            "ATOMCompass: serving tp rank %d from templates derived at tp "
+            "rank(s) %s. Uniform sharding makes those graphs this rank's "
+            "graphs in every field that prices; they are counted as "
+            "representative hits, not as this rank's own.%s",
+            rank, elsewhere,
+            "" if derive else " derive is off, so nothing else is available.")
