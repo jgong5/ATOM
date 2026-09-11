@@ -22,6 +22,12 @@ tell what it is. That is what this module holds. The rules it enforces:
   two are different claims and `classify` refuses to conflate them -- comparing
   a calibration against the run it came from reports `residual`, and only a run
   the fit never saw reports `validation`.
+* **Identity is not integrity.** Which *execution* wrote a record is what
+  separates a residual from an independent repeat, and a content hash cannot
+  answer it: the three source runs here wrote byte-identical records, and
+  re-serialising any one of them changes its hash without a second execution
+  happening. `classify` takes a producer, `integrity` takes a hash, and a
+  record whose producer is unidentified is classified as the weaker claim.
 
 `non_torch` is here too, but on stricter terms than the others. It is
 `(total - free) - reserved`, which is device-wide: it charges this
@@ -44,7 +50,44 @@ __all__ = [
     "SourceCalibration",
     "SourceRun",
     "for_model",
+    "producer_key",
 ]
+
+#: The fields that name one execution. Taken from the vocabulary the campaign
+#: harness already writes -- `compare.py` reads a run manifest out of a record's
+#: `run` block, `merge_sweep.py` labels fresh-process shards by `started_at`,
+#: and `residual.py`/`step_accounting.py` attribute steps by `pid`. A second
+#: run-ID scheme would have to be reconciled with those; this one is them.
+PRODUCER_FIELDS = ("host", "pid", "started_at")
+
+
+def producer_key(run: Mapping | None) -> str | None:
+    """Which execution wrote a record, or None when the record cannot say.
+
+    **A content hash is integrity, not identity.** It answers "are these the
+    same bytes", and the two questions come apart in both directions. Three
+    phase C repeats of the 27B's source configuration -- three processes, three
+    device allocations, three teardowns -- wrote byte-identical records, so
+    equal hashes there mean three executions and not one. Re-serialising one
+    record with a different indent changes its hash without there having been a
+    second execution at all. Neither case is exotic; the first is this module's
+    own evidence.
+
+    So identity comes from fields that name the execution, and all of them are
+    required: a partial identity would collide across runs exactly where it
+    matters, and a collision here silently upgrades a residual into a repeat.
+    None means unidentified, and callers are expected to treat that as "cannot
+    tell" rather than as "no match".
+    """
+    if not run:
+        return None
+    values = []
+    for field_name in PRODUCER_FIELDS:
+        value = run.get(field_name)
+        if value in (None, ""):
+            return None
+        values.append(str(value))
+    return "|".join(values)
 
 
 @dataclass(frozen=True)
@@ -66,6 +109,14 @@ class SourceRun:
     record: str
     record_sha256: str
     role: str = "source"
+    #: Which *executions* the fit was made from, as `producer_key` spells them.
+    #: Empty means the executions are unidentified, which is the common case and
+    #: is why `classify` has to be conservative rather than clever.
+    producers: tuple = ()
+    #: Where those identities came from. A record that does not carry its own
+    #: producer leaves only external witnesses, and a reader has to be told
+    #: which it is looking at.
+    producer_basis: str = ""
 
     def matches(self, config: Mapping) -> bool:
         """Whether `config` is this same configuration, not merely this model."""
@@ -114,7 +165,12 @@ class SourceCalibration:
         return out
 
     def classify(
-        self, term: str, config: Mapping, *, record_sha256: str | None = None
+        self,
+        term: str,
+        config: Mapping,
+        *,
+        record_sha256: str | None = None,
+        producer: Mapping | None = None,
     ) -> str:
         """What a comparison against this record is worth: three answers.
 
@@ -128,17 +184,57 @@ class SourceCalibration:
           constant was fitted against, so it cannot show the constant transfers.
         * `validation` -- a run at a configuration the fit never saw.
 
-        `repeat` needs the record's hash to tell it from `residual`; without one
-        the two are indistinguishable, so the stricter of the two is returned.
+        Residual and repeat differ by *execution*, so only `producer` can
+        separate them. The first cut used the record's hash, which cannot: this
+        calibration's own source record is byte-identical across three separate
+        runs, so a hash match there is three executions, and a re-serialised
+        copy of one run mismatches without a second execution existing. See
+        `producer_key`.
+
+        Unidentified producer is answered `residual` -- the weaker claim. An
+        unknown run reported as a repeat would credit the constant with
+        reproducibility nobody observed; reported as a residual it credits the
+        constant with nothing at all, which is what is actually known. Pass
+        `record_sha256` to `integrity` instead, where bytes are the question.
         """
         entry = self.terms.get(term)
         if entry is None:
             return "underived"
-        if record_sha256 and record_sha256 == entry.run.record_sha256:
-            return "residual"
-        if entry.run.matches(config):
-            return "repeat" if record_sha256 else "residual"
-        return "validation"
+        if not entry.run.matches(config):
+            return "validation"
+        key = producer_key(producer)
+        if key and entry.run.producers:
+            return "residual" if key in entry.run.producers else "repeat"
+        return "residual"
+
+    def identifies(self, term: str, producer: Mapping | None) -> bool:
+        """Whether this producer names the execution the term was read off.
+
+        The precondition for `integrity` being worth *reporting*. A hash
+        mismatch on a record nobody claimed was the fitted artifact only means
+        "a different record", which a row saying `validation` already says;
+        it is when the producer says *this is that run* that a mismatch means
+        the bytes moved under it.
+        """
+        entry = self.terms.get(term)
+        if entry is None:
+            return False
+        key = producer_key(producer)
+        return bool(key) and key in entry.run.producers
+
+    def integrity(self, term: str, record_sha256: str | None) -> str:
+        """Whether a record is the *bytes* the term was fitted on.
+
+        Separate from `classify` because it answers a separate question, and
+        conflating the two is what made a repeat look like a residual. `altered`
+        does not mean a different run -- re-serialising a record changes its
+        hash and nothing else -- it means the comparison is no longer against
+        the artifact the constant was read off.
+        """
+        entry = self.terms.get(term)
+        if entry is None or not record_sha256:
+            return "unknown"
+        return "intact" if record_sha256 == entry.run.record_sha256 else "altered"
 
 
 #: The 27B's TP=1 source run: `max_num_seqs 32`, the cc-traces capture ladder,
@@ -156,6 +252,12 @@ _QWEN27B_TP1 = SourceRun(
     enable_prefix_caching=False,
     record="tests/compass/memory_records/27b.tp1.memory.json",
     record_sha256="6233290081fde7197b221f489145dc74997e2788e19bc8f9c1cada7212d2e17e",
+    producer_basis=(
+        "Unidentified. The record predates any ownership sampling and carries "
+        "no run block, so which execution wrote it is not recoverable -- and "
+        "its `non_torch` is 32 MiB above the exclusive run's, which is the one "
+        "term that would most want to name its neighbours."
+    ),
 )
 
 #: The same configuration again, on a device nobody else was on: three runs,
@@ -171,6 +273,17 @@ _QWEN27B_TP1_EXCLUSIVE = SourceRun(
     enable_prefix_caching=False,
     record="tests/compass/memory_records/27b.tp1.exclusive.memory.json",
     record_sha256="4ff602796143df38166131f12ed4c1b728cc051fbb9c78be3bfd4540f417258e",
+    producer_basis=(
+        "Three executions, witnessed from outside the record: the ownership "
+        "sampler saw three disjoint process cohorts on the device -- engine "
+        "pids 695009, 751439 and 775417, each with its own launcher pair -- "
+        "across 08:55:09Z-09:03:34Z, and all three wrote byte-identical "
+        "records. `producers` is left empty all the same: the records "
+        "themselves carry no run block, so nothing a reader is handed can be "
+        "matched against those identities, and `classify` answers `residual` "
+        "for every one of them. Making that answer better needs the writer to "
+        "record its own producer -- see MEMORY_EVIDENCE.md, O12."
+    ),
 )
 
 _QWEN27B = SourceCalibration(

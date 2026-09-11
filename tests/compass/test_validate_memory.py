@@ -113,3 +113,43 @@ def test_the_pinned_bytes_are_the_same_on_both_models_above_width_one():
     """
     for name in ("27b.tp2.rank0.memory.json", "27b.tp4.rank0.memory.json"):
         assert _script().recorded_pool(_record(name))[1] == 79692800
+
+
+def test_a_row_on_another_record_is_not_accused_of_tampering():
+    """The note the exclusive record's rows were carrying, wrongly.
+
+    `persistent` and `load_residue` were fitted on the historical TP=1 record.
+    Reading the *exclusive* capture, every one of their rows printed `bytes
+    altered` -- because the hash differed, which for a different file it must.
+    The record is intact; it is simply not that record. Integrity now waits
+    for a producer to claim otherwise.
+    """
+    import dataclasses
+
+    from atom.compass.core.memory_calibration import (SourceCalibration,
+                                                      for_model, producer_key)
+
+    script = _script()
+    calib = for_model("Qwen/Qwen3.8-27B")
+    config = _record("27b.tp1.exclusive.memory.json")["config"]
+    foreign_sha = "0" * 64
+
+    note = script._cal_note(calib, calib.mapping(1), config, foreign_sha, None,
+                            "persistent", "held through the allocator")
+    assert "residual (run unidentified)" in note
+    assert "altered" not in note and "re-serialised" not in note
+
+    # And the note that *is* worth printing, once a run claims to be the fit.
+    run = {"host": "hjbog-srdc-18", "pid": 695009,
+           "started_at": "2026-09-11T08:55:40Z"}
+    entry = calib.terms["persistent"]
+    identified = SourceCalibration(
+        model=calib.model,
+        terms={"persistent": dataclasses.replace(
+            entry,
+            run=dataclasses.replace(entry.run, producers=(producer_key(run),)),
+        )},
+    )
+    note = script._cal_note(identified, identified.mapping(1), config,
+                            foreign_sha, run, "persistent", "held")
+    assert "re-serialised since it was fitted" in note

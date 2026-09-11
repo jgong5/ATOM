@@ -8,7 +8,9 @@ import pytest
 
 from atom.compass.core.feasibility import blocks_from_readings
 from atom.compass.core.memory import MemoryReadings
-from atom.compass.core.memory_calibration import for_model
+from atom.compass.core.memory_calibration import (CalibratedTerm,
+                                                  SourceCalibration, SourceRun,
+                                                  for_model, producer_key)
 
 RECORDS = Path(__file__).parent / "memory_records"
 MODEL = "Qwen/Qwen3.8-27B"
@@ -222,42 +224,133 @@ def test_the_one_run_the_constant_does_not_predict():
     )
 
 
+#: One run of the source configuration, named the way the campaign harness
+#: names runs: `compare.py` reads a record's `run` block, `merge_sweep.py`
+#: labels fresh-process shards by `started_at`, `residual.py` attributes steps
+#: by `pid`.
+def _run_block(pid: int, started_at: str) -> dict:
+    return {"host": "hjbog-srdc-18", "pid": pid, "started_at": started_at}
+
+
+def _calibration_with_producers(*producers: str) -> SourceCalibration:
+    """A calibration whose source run names the executions it was fitted on.
+
+    The shipped one cannot: its records carry no producer block, so its
+    `producers` is empty by construction and every classification falls to the
+    conservative answer. The distinction still has to be tested.
+    """
+    run = SourceRun(
+        model=MODEL, tensor_parallel=1, gpu_memory_utilization=0.9,
+        max_num_seqs=32, max_model_len=262144,
+        capture_sizes=(1, 2, 4, 8, 16, 32), enable_prefix_caching=False,
+        record="tests/compass/memory_records/27b.tp1.exclusive.memory.json",
+        record_sha256=_sha(RECORDS / "27b.tp1.exclusive.memory.json"),
+        producers=producers,
+        producer_basis="synthetic, for the test",
+    )
+    return SourceCalibration(
+        model=MODEL,
+        terms={"persistent": CalibratedTerm(
+            term="persistent", value=252339712, run=run, basis="test")},
+    )
+
+
 def test_a_rerun_of_the_source_configuration_is_a_repeat_not_a_residual():
     """Same configuration, different run: reproducibility, not transfer.
 
-    `persistent` was fitted on the original TP=1 record and the exclusive-device
-    record is a second run of that same configuration. Calling the agreement a
-    validation would overclaim -- nothing about the configuration changed -- and
-    calling it a residual would hide that two independent runs agree. It needs
-    the record's hash to tell them apart, so without one the stricter answer
-    stands.
+    Calling the agreement a validation would overclaim -- nothing about the
+    configuration changed -- and calling it a residual would hide that two
+    independent runs agree. The separator is the producer, not the bytes.
     """
-    calib = for_model(MODEL)
-    original = _record("27b.tp1.memory.json")
-    exclusive = _record("27b.tp1.exclusive.memory.json")
-    fitted_on = calib.terms["persistent"].run.record_sha256
+    first = _run_block(695009, "2026-09-11T08:55:40Z")
+    second = _run_block(751439, "2026-09-11T09:00:40Z")
+    calib = _calibration_with_producers(producer_key(first))
+    config = _record("27b.tp1.exclusive.memory.json")["config"]
 
+    assert calib.classify("persistent", config, producer=first) == "residual"
+    assert calib.classify("persistent", config, producer=second) == "repeat"
     assert (
-        calib.classify("persistent", original["config"], record_sha256=fitted_on)
-        == "residual"
-    )
-    assert (
-        calib.classify(
-            "persistent",
-            exclusive["config"],
-            record_sha256=_sha(RECORDS / "27b.tp1.exclusive.memory.json"),
-        )
-        == "repeat"
-    )
-    assert calib.classify("persistent", exclusive["config"]) == "residual"
-    assert (
-        calib.classify(
-            "persistent",
-            _record("27b.tp4.rank0.memory.json")["config"],
-            record_sha256="whatever",
-        )
+        calib.classify("persistent",
+                       _record("27b.tp4.rank0.memory.json")["config"],
+                       producer=second)
         == "validation"
     )
+
+
+def test_identical_bytes_are_not_one_run_and_the_hash_cannot_say_otherwise():
+    """The phase C case, which is why identity stopped being a hash.
+
+    Three executions of the source configuration -- three processes, three
+    device allocations, three teardowns, witnessed by the ownership sampler --
+    wrote records that are equal byte for byte. A classifier keyed on the hash
+    reads that as one run and reports two repeats as residuals, which is the
+    direction that overstates nothing and understates the only reproducibility
+    evidence the calibration has.
+    """
+    first, second, third = (_run_block(695009, "2026-09-11T08:55:40Z"),
+                            _run_block(751439, "2026-09-11T09:00:40Z"),
+                            _run_block(775417, "2026-09-11T09:02:30Z"))
+    assert len({producer_key(r) for r in (first, second, third)}) == 3
+
+    calib = _calibration_with_producers(producer_key(first))
+    config = _record("27b.tp1.exclusive.memory.json")["config"]
+    sha = _sha(RECORDS / "27b.tp1.exclusive.memory.json")
+
+    # One artifact, three producers: the bytes are the same in all three.
+    assert calib.integrity("persistent", sha) == "intact"
+    assert [calib.classify("persistent", config, producer=run)
+            for run in (first, second, third)] == ["residual", "repeat",
+                                                   "repeat"]
+
+
+def test_a_reserialised_record_is_the_same_run_with_a_different_hash():
+    """The other direction: bytes change, the execution does not.
+
+    Re-indenting a record produces a file no hash-keyed classifier recognises,
+    and a classifier that treated an unrecognised hash as a different run would
+    manufacture a repeat out of a text edit. The producer is unchanged, so the
+    classification is unchanged; the integrity answer is the one that moves.
+    """
+    calib = _calibration_with_producers(producer_key(_run_block(695009, "t0")))
+    blob = _record("27b.tp1.exclusive.memory.json")
+    reserialised = hashlib.sha256(
+        json.dumps(blob, indent=4).encode("utf-8")).hexdigest()
+
+    assert reserialised != calib.terms["persistent"].run.record_sha256
+    assert calib.integrity("persistent", reserialised) == "altered"
+    assert (
+        calib.classify("persistent", blob["config"],
+                       producer=_run_block(695009, "t0"))
+        == "residual"
+    )
+
+
+def test_an_unidentified_run_is_classified_as_the_weaker_claim():
+    """Which is every record the campaign has written so far.
+
+    A partial identity is treated as none: `producer_key` requires all of its
+    fields, because a key that collided across two runs would upgrade a
+    residual to a repeat silently, and that is the error this classification
+    exists to prevent.
+    """
+    assert producer_key(None) is None
+    assert producer_key({"pid": 695009}) is None
+    assert producer_key({"host": "h", "pid": 1, "started_at": ""}) is None
+
+    calib = for_model(MODEL)
+    exclusive = _record("27b.tp1.exclusive.memory.json")
+    # The shipped calibration names no producers, so even a well-formed one
+    # cannot promote the answer.
+    assert calib.terms["non_torch"].run.producers == ()
+    assert calib.classify("non_torch", exclusive["config"]) == "residual"
+    assert (
+        calib.classify("non_torch", exclusive["config"],
+                       producer=_run_block(999999, "2026-09-11T09:00:00Z"))
+        == "residual"
+    )
+    assert calib.classify("persistent",
+                          _record("27b.tp4.rank0.memory.json")["config"]) \
+        == "validation"
 
 
 def test_the_two_tp1_records_are_different_runs_of_one_configuration():
@@ -278,3 +371,40 @@ def test_the_two_tp1_records_are_different_runs_of_one_configuration():
     ):
         assert original[term] == exclusive[term], term
     assert original["non_torch"] - exclusive["non_torch"] == 33554432
+
+
+def test_only_the_fitted_run_can_have_its_bytes_called_altered():
+    """`integrity` answers a question nobody asked of an unrelated record.
+
+    A hash mismatch means "not the fitted artifact", and for a record that was
+    never the fitted artifact -- a different capture, another TP -- that is
+    already what `classify` says. Reporting it as tampering there fired on
+    every row of every record but one. `identifies` is the guard: the bytes
+    are only worth challenging once the producer claims to be that run.
+    """
+    fitted = _run_block(695009, "2026-09-11T08:55:40Z")
+    other = _run_block(751439, "2026-09-11T09:00:40Z")
+    calib = _calibration_with_producers(producer_key(fitted))
+    foreign_sha = _sha(RECORDS / "27b.tp1.memory.json")
+
+    assert calib.integrity("persistent", foreign_sha) == "altered"
+    assert calib.identifies("persistent", fitted) is True
+    assert calib.identifies("persistent", other) is False
+    assert calib.identifies("persistent", None) is False
+    assert calib.identifies("no_such_term", fitted) is False
+
+
+def test_the_shipped_calibration_identifies_nobody():
+    """Not a limitation of the guard -- of the records.
+
+    Neither source record carries a run block, so no producer can match, and
+    every shipped term answers the conservative way: a residual that names no
+    execution, and bytes that are never challenged. This test is what will
+    fail, loudly and correctly, once the runner starts writing a run block
+    and the constants are refitted against an identified execution.
+    """
+    calib = for_model(MODEL)
+    producer = _run_block(695009, "2026-09-11T08:55:40Z")
+    for term in calib.terms:
+        assert calib.terms[term].run.producers == ()
+        assert calib.identifies(term, producer) is False
