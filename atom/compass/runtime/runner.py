@@ -926,61 +926,53 @@ class CompassModelRunner(CompassPredictMixin, ModelRunner):
         return seqs * max(1, min(length, budget // seqs))
 
     def _modelled_readings(self) -> Optional[dict]:
-        """The five readings derived from a profile, or None if none was given.
+        """The five readings derived from a profile, or None if none was named.
 
         This is what makes a configuration nobody has run sizable: no term here
-        came off a device. `total` is the target card's capacity, which is the
-        one thing that has to be supplied, and `free` is modelled as a clean
-        box rather than as whatever the neighbours left.
+        came off a device.
+
+        **It fails closed.** Naming a profile is a request for a *derived*
+        prediction, so a term that cannot be derived is an error and not an
+        occasion to read the card instead. The earlier version defaulted a
+        missing activation peak to zero, took `total` off the live device and
+        caught every exception on the way to device sizing -- three different
+        ways for a run that was asked to predict to quietly report a
+        measurement. The refusal is the useful answer: it names the term that
+        has nothing behind it. The two diagnostic modes are unaffected and stay
+        distinct -- live measurement (no flag) and record replay
+        (`--compass-memory-in`) both still size from what a device reported,
+        because that is what they are for.
         """
         path = (self._compass_config.memory_model or "").strip()
         if not path:
             return None
         if getattr(self, "_modelled", "unset") != "unset":
             return self._modelled
-        self._modelled = None
-        try:
-            from atom.compass.core.memory_model import (
-                activation_bytes_at, modelled_readings)
-
-            with open(path, encoding="utf-8") as fh:
-                profile = json.load(fh)
-            calibration = None
-            if profile.get("calibration"):
-                with open(profile["calibration"], encoding="utf-8") as fh:
-                    calibration = json.load(fh)
-            activation = 0
-            if profile.get("graph"):
-                with open(profile["graph"], encoding="utf-8") as fh:
-                    activation = activation_bytes_at(json.load(fh),
-                                                     self._warmup_tokens())
-            total = int(profile.get("total") or 0)
-            if not total:
-                import torch
-
-                total = int(torch.cuda.mem_get_info()[1])
-                logger.info("ATOMCompass: the profile names no card capacity, "
-                            "so this device's %.1f GB is used for `total`",
-                            total / 2**30)
-            self._modelled = modelled_readings(
-                total_bytes=total,
-                world_size=int(profile.get("world_size") or 1),
-                parameters=int(profile["parameters"]),
-                buffers=int(profile.get("buffers") or 0),
-                activation_bytes=activation, calibration=calibration,
-                enforce_eager=bool(getattr(self.config, "enforce_eager", False)))
-            logger.info(
-                "ATOMCompass: sizing from a modelled budget, not from any "
-                "device (peak_torch %.2f GB, non_torch %.2f GB, activations "
-                "%.2f GB over %d warmup tokens)",
-                self._modelled["peak_torch"] / 2**30,
-                self._modelled["non_torch"] / 2**30, activation / 2**30,
-                self._warmup_tokens())
-        except Exception as exc:  # noqa: BLE001 - never fail a run over a model
-            logger.warning("ATOMCompass WARNING: could not model the memory "
-                           "budget from %s (%s); sizing from this device",
-                           path, exc)
+        self._modelled = self._derived_readings(path)
         return self._modelled
+
+    def _derived_readings(self, path: str) -> dict:
+        """Read the profile off disk and let the model refuse or derive.
+
+        The judgement lives in `memory_model.derived_readings` so that it can
+        be exercised without a device; this end owns only the file system.
+        """
+        from atom.compass.core.memory_model import derived_readings
+
+        def load(where: str):
+            with open(where, encoding="utf-8") as fh:
+                return json.load(fh)
+
+        tokens = self._warmup_tokens()
+        readings, activation = derived_readings(
+            load(path), warmup_tokens=tokens, load=load, source=path,
+            enforce_eager=bool(getattr(self.config, "enforce_eager", False)))
+        logger.info(
+            "ATOMCompass: sizing from a modelled budget, not from any device "
+            "(peak_torch %.2f GB, non_torch %.2f GB, activations %.2f GB over "
+            "%d warmup tokens)", readings["peak_torch"] / 2**30,
+            readings["non_torch"] / 2**30, activation / 2**30, tokens)
+        return readings
 
     def _expected_non_torch(self) -> Optional[int]:
         """What the collective terms say this width should hold outside torch.

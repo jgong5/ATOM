@@ -162,12 +162,40 @@ Every one of those is a class-**T** number.
 Passing that file to `modelled_readings(calibration=...)` would make the
 modelled budget a restatement of the target's own readings, and every term
 downstream of it circular. Nothing does so today: `holdout.py` calibrates
-through `step_accounting.py`, a different path. But `runtime/runner.py` loads
-`profile["calibration"]` straight into `modelled_readings`, so the circular
-wiring is one profile field away and nothing refuses it. **Dependency for the
-lead** (that file is not mine to edit): `_modelled_readings` should refuse, or
-at minimum record, a calibration whose provenance is the model under
-evaluation.
+through `step_accounting.py`, a different path. `runtime/runner.py` used to load
+`profile["calibration"]` straight into `modelled_readings`, leaving the
+circular wiring one profile field away with nothing to refuse it. **Closed**
+(2026-09-11, with the lead's authorisation for this one method): a derived
+prediction now refuses a calibration that carries no provenance block, or whose
+provenance for `persistent`, `non_torch` or the load residue names a class in
+the target family. The numbers above are class **T** and would be rejected by
+name.
+
+### 4a. What a derived prediction now refuses
+
+`_modelled_readings` was three fallbacks in one method. A profile naming no
+graph defaulted the activation peak to **zero** -- the largest derived term in
+the budget, 2.96 GB at the 27B source config, so the KV pool grew by that much
+and the engine died at steady state instead of at start-up. A profile naming no
+`total` read `torch.cuda.mem_get_info()` and sized the prediction to whichever
+card the modelling run happened to land on. And a bare `except Exception`
+turned every failure above into device sizing with a warning. All three
+produced a budget that read as a forecast and was a measurement of something
+else.
+
+The judgement now lives in `memory_model.derived_readings`, which returns the
+five readings and the activation peak or raises `UnfoundedPrediction` naming
+the term that has nothing behind it. `runtime/runner.py` owns only the file
+system. The refusals: no `total`, no `parameters`, no warmup shape, no graph,
+a graph with neither recorded deaths nor a measured peak (`UnfoundedActivation`,
+which is now a subclass and so propagates the same way), no calibration, a
+calibration missing any of the three terms it supplies, a calibration with no
+provenance block or with a term the provenance does not cover, and a
+target-class fit.
+
+The two diagnostic modes are untouched and stay distinct: a run with no flag
+measures this device, and `--compass-memory-in` replays what a device recorded.
+Both are labelled as measurements because that is what they are.
 
 ### 5. The weights term is source-exact, and that is the one clean transfer
 
