@@ -11,7 +11,13 @@ went missing before scalars were recorded at all.
 
 import pytest
 
-from atom.compass.runtime.microbench import _rebuild_args, signature_of
+from atom.compass.runtime.microbench import (
+    ArgumentStructureRefusal,
+    _group_for_schema,
+    _index_output_shape,
+    _rebuild_args,
+    signature_of,
+)
 
 
 def _op(shapes=(), dtypes=(), scalars=()):
@@ -694,3 +700,323 @@ class TestTellingAStrideFromACountByItsDeclaredName:
 
         op = _qk_norm(16384, params=[])
         assert _stride_past_its_tensors(op) == ("#7", 16384, 6144)
+
+
+class _Type:
+    """A schema argument type, which is only ever read as its text."""
+
+    def __init__(self, text):
+        self._text = text
+
+    def __str__(self):
+        return self._text
+
+
+class _Schema:
+    def __init__(self, *types, name=None, overload_name=None):
+        self.arguments = [type("Arg", (), {"type": _Type(t)})() for t in types]
+        if name is not None:
+            self.name = name
+        if overload_name is not None:
+            self.overload_name = overload_name
+
+
+class _Op:
+    """An operator that carries a schema, as a torch OpOverload does."""
+
+    def __init__(self, *types, name=None, overload_name=None):
+        self._schema = _Schema(*types, name=name, overload_name=overload_name)
+
+
+def _index_op(self_shape, out_shape):
+    """A recorded `aten::index.Tensor`, as `_build_arg_sets` would see it."""
+    return {"name": "aten::index.Tensor",
+            "scalars": [],
+            "output_shapes": [list(out_shape)] if out_shape else [],
+            "input_shapes": [list(self_shape)]}
+
+
+class TestATensorListArgument:
+    """`aten::index.Tensor(Tensor self, Tensor?[] indices)`.
+
+    The graph records tensors as one flat list, so the index tensor arrives
+    where a container belongs. Handed a bare tensor, torch iterates it: a
+    24-element index becomes 24 indices into a 2-D tensor and the call raises
+    `IndexError: too many indices`, which is why every prefill head's region
+    went unpriced while its gemm priced fine.
+
+    A plain `Tensor[]` has no empty slots, so the recorded tensors fill it in
+    order and there is nothing to settle. `Tensor?[]` is the hard case and has
+    its own tests below.
+    """
+
+    def test_the_trailing_tensors_become_one_list(self):
+        fn = _Op("Tensor[]", "int")
+        assert _group_for_schema(fn, ["a", "b"], {}) == [["a", "b"]]
+
+    def test_a_list_after_a_tensor_takes_what_is_left(self):
+        fn = _Op("Tensor", "Tensor[]")
+        assert _group_for_schema(fn, ["s", "i", "j"], {}) == ["s", ["i", "j"]]
+
+    def test_the_list_survives_rebuilding_with_scalars(self):
+        fn = _Op("Tensor", "Tensor[]")
+        args, _ = _rebuild_args(_op(), _group_for_schema(fn, ["s", "i"], {}))
+        assert args == ["s", ["i"]], "the list must stay one argument"
+
+    def test_an_operator_without_a_list_is_untouched(self):
+        fn = _Op("Tensor", "Tensor", "float")
+        assert _group_for_schema(fn, ["a", "b"], {}) == ["a", "b"]
+
+    def test_no_schema_at_all_is_untouched(self):
+        assert _group_for_schema(object(), ["a", "b"], {}) == ["a", "b"]
+
+
+class TestWhenTheSchemaLeavesAChoice:
+    """Refuse rather than reconstruct something no one can check."""
+
+    def test_two_tensor_lists_are_refused(self):
+        fn = _Op("Tensor[]", "Tensor[]")
+        with pytest.raises(ArgumentStructureRefusal) as exc:
+            _group_for_schema(fn, ["a", "b", "c"], {})
+        assert "cannot be divided" in str(exc.value)
+
+    def test_an_optional_tensor_beside_a_list_is_refused(self):
+        """The graph does not record which optional arguments were present."""
+        fn = _Op("Tensor", "Tensor?", "Tensor?[]")
+        with pytest.raises(ArgumentStructureRefusal) as exc:
+            _group_for_schema(fn, ["self", "idx"], {})
+        assert "optional" in str(exc.value)
+
+    def test_too_few_tensors_for_the_schema_is_refused(self):
+        fn = _Op("Tensor", "Tensor", "Tensor[]")
+        with pytest.raises(ArgumentStructureRefusal):
+            _group_for_schema(fn, ["only_one"], {})
+
+
+class TestAnOptionalListOnAnUnmodelledOperator:
+    """The placement rule below is advanced indexing's, not a general law.
+
+    Recovering where a `None` sat needs the operator's own shape rule. One is
+    written out here, for `aten::index.Tensor`. Applying it to the next
+    operator that happens to declare a `Tensor?[]` would be assuming its
+    semantics; those are refused, and stay refused, until someone models them.
+    """
+
+    def test_an_unnamed_operator_with_an_optional_list_is_refused(self):
+        fn = _Op("Tensor", "Tensor?[]")
+        with pytest.raises(ArgumentStructureRefusal) as exc:
+            _group_for_schema(fn, ["self", "idx"], _index_op((8, 8), (3, 8)))
+        assert "not an operator whose placement of None is modelled" in str(
+            exc.value)
+
+    def test_a_different_named_operator_is_refused_by_name(self):
+        fn = _Op("Tensor", "Tensor?[]",
+                 name="aten::_unsafe_index", overload_name="Tensor")
+        with pytest.raises(ArgumentStructureRefusal) as exc:
+            _group_for_schema(fn, ["self", "idx"], _index_op((8, 8), (3, 8)))
+        assert "aten::_unsafe_index.Tensor" in str(exc.value)
+
+
+class TestNonePlaceholdersInATensorList:
+    """`x[:, idx]` records its indices as `[None, idx]` -- minus the None.
+
+    Only the tensors are recorded, so one index tensor is consistent with
+    indexing dimension 0 and with indexing dimension 1, and something has to
+    say which. That something is arithmetic: each candidate placement's output
+    shape is predicted from the recorded shapes and kept only if exactly one
+    candidate reproduces the recorded output. Nothing is launched to find out.
+    """
+
+    @staticmethod
+    def _idx(torch, n, dtype=None):
+        return torch.arange(n, dtype=dtype or torch.int64)
+
+    def test_the_prefill_head_gather_places_its_index_on_dim_0(self):
+        """The real case: last token of each request out of the hidden rows."""
+        torch = pytest.importorskip("torch")
+        fn = torch.ops.aten.index.Tensor
+        hidden = torch.zeros(1536, 5120, dtype=torch.bfloat16)
+        idx = self._idx(torch, 3)
+        grouped = _group_for_schema(fn, [hidden, idx],
+                                    _index_op((1536, 5120), (3, 5120)))
+        assert grouped[1] == [idx], "no placeholder in front of it"
+        args, kw = _rebuild_args(_index_op((1536, 5120), (3, 5120)), grouped)
+        assert tuple(fn(*args, **kw).shape) == (3, 5120)
+
+    def test_a_column_gather_recovers_the_leading_placeholder(self):
+        """`x[:, idx]` -- the same one recorded tensor, the other axis."""
+        torch = pytest.importorskip("torch")
+        fn = torch.ops.aten.index.Tensor
+        hidden = torch.zeros(1536, 5120, dtype=torch.bfloat16)
+        idx = self._idx(torch, 3)
+        grouped = _group_for_schema(fn, [hidden, idx],
+                                    _index_op((1536, 5120), (1536, 3)))
+        assert grouped[1][0] is None and grouped[1][1] is idx
+        args, kw = _rebuild_args(_index_op((1536, 5120), (1536, 3)), grouped)
+        assert tuple(fn(*args, **kw).shape) == (1536, 3)
+
+    def test_two_placements_of_the_same_shape_are_refused(self):
+        """A square tensor and a full-length index: the counterexample.
+
+        Both placements return `[8, 8]`, so replaying one and checking the
+        shape afterwards cannot tell them apart -- it would confirm a guess.
+        This asserts the ambiguity is real by running both, then asserts the
+        module refuses without running either.
+        """
+        torch = pytest.importorskip("torch")
+        fn = torch.ops.aten.index.Tensor
+        square = torch.zeros(8, 8, dtype=torch.bfloat16)
+        idx = self._idx(torch, 8)
+        rows = fn(square, [idx])
+        cols = fn(square, [None, idx])
+        assert tuple(rows.shape) == tuple(cols.shape) == (8, 8), (
+            "the premise: the output shape does not distinguish them")
+
+        with pytest.raises(ArgumentStructureRefusal) as exc:
+            _group_for_schema(fn, [square, idx], _index_op((8, 8), (8, 8)))
+        assert "2 placements" in str(exc.value)
+        assert "does not say which axes" in str(exc.value)
+
+    def test_a_full_width_list_has_no_slot_for_a_placeholder(self):
+        """Every axis indexed: the reconstruction is forced by the count."""
+        torch = pytest.importorskip("torch")
+        fn = torch.ops.aten.index.Tensor
+        t = torch.zeros(4, 5, dtype=torch.bfloat16)
+        i, j = self._idx(torch, 3), self._idx(torch, 3)
+        grouped = _group_for_schema(fn, [t, i, j], _index_op((4, 5), (3,)))
+        assert grouped[1] == [i, j]
+
+    def test_a_record_with_no_output_shape_is_refused(self):
+        """An older graph cannot settle a placement, so it does not get one."""
+        torch = pytest.importorskip("torch")
+        fn = torch.ops.aten.index.Tensor
+        with pytest.raises(ArgumentStructureRefusal) as exc:
+            _group_for_schema(fn, [torch.zeros(4, 5), self._idx(torch, 3)],
+                              _index_op((4, 5), None))
+        assert "cannot be settled" in str(exc.value)
+
+    def test_an_output_no_placement_reaches_is_refused(self):
+        torch = pytest.importorskip("torch")
+        fn = torch.ops.aten.index.Tensor
+        with pytest.raises(ArgumentStructureRefusal) as exc:
+            _group_for_schema(fn, [torch.zeros(4, 5), self._idx(torch, 3)],
+                              _index_op((4, 5), (7, 7)))
+        assert "no placement" in str(exc.value)
+
+    def test_a_boolean_mask_is_refused(self):
+        """A mask selects a data-dependent count; a shape cannot pin it down."""
+        torch = pytest.importorskip("torch")
+        fn = torch.ops.aten.index.Tensor
+        mask = torch.zeros(4, dtype=torch.bool)
+        with pytest.raises(ArgumentStructureRefusal) as exc:
+            _group_for_schema(fn, [torch.zeros(4, 5), mask],
+                              _index_op((4, 5), (0, 5)))
+        assert "boolean mask" in str(exc.value)
+
+    def test_an_index_that_is_not_one_dimensional_is_refused(self):
+        torch = pytest.importorskip("torch")
+        fn = torch.ops.aten.index.Tensor
+        with pytest.raises(ArgumentStructureRefusal) as exc:
+            _group_for_schema(fn, [torch.zeros(4, 5),
+                                   torch.zeros(2, 2, dtype=torch.int64)],
+                              _index_op((4, 5), (2, 2, 5)))
+        assert "one-dimensional" in str(exc.value)
+
+    def test_more_indices_than_dimensions_is_refused(self):
+        torch = pytest.importorskip("torch")
+        fn = torch.ops.aten.index.Tensor
+        with pytest.raises(ArgumentStructureRefusal) as exc:
+            _group_for_schema(fn, [torch.zeros(4), self._idx(torch, 2),
+                                   self._idx(torch, 2)],
+                              _index_op((4,), (2,)))
+        assert "1-dimensional tensor" in str(exc.value)
+
+
+class TestThePredictedShapeIsTorchsShape:
+    """The predictor stands in for the operator, so hold it to the operator.
+
+    These compare the arithmetic against what torch actually returns, on the
+    CPU. They are evidence for the rule, not the gate the runtime uses: the
+    runtime never calls the operator to decide how to call the operator.
+    """
+
+    def test_each_axis_of_a_matrix(self):
+        torch = pytest.importorskip("torch")
+        fn = torch.ops.aten.index.Tensor
+        t = torch.zeros(6, 7)
+        idx = torch.arange(3)
+        assert _index_output_shape((6, 7), (0,), (3,)) == tuple(
+            fn(t, [idx]).shape)
+        assert _index_output_shape((6, 7), (1,), (3,)) == tuple(
+            fn(t, [None, idx]).shape)
+
+    def test_adjacent_axes_keep_the_broadcast_in_place(self):
+        torch = pytest.importorskip("torch")
+        fn = torch.ops.aten.index.Tensor
+        t = torch.zeros(2, 3, 4)
+        idx = torch.arange(5) % 2
+        assert _index_output_shape((2, 3, 4), (0, 1), (5,)) == tuple(
+            fn(t, [idx, idx]).shape)
+
+    def test_separated_axes_move_the_broadcast_to_the_front(self):
+        """The rule that makes a non-adjacent placement distinguishable."""
+        torch = pytest.importorskip("torch")
+        fn = torch.ops.aten.index.Tensor
+        t = torch.zeros(2, 3, 4)
+        idx = torch.arange(5) % 2
+        assert _index_output_shape((2, 3, 4), (0, 2), (5,)) == tuple(
+            fn(t, [idx, None, idx]).shape)
+
+    def test_a_separated_placement_is_recovered_from_its_output(self):
+        torch = pytest.importorskip("torch")
+        fn = torch.ops.aten.index.Tensor
+        t = torch.zeros(2, 3, 4)
+        idx = torch.arange(5) % 2
+        grouped = _group_for_schema(fn, [t, idx, idx],
+                                    _index_op((2, 3, 4), (5, 3)))
+        assert grouped[1][1] is None, "the middle axis was not indexed"
+        args, kw = _rebuild_args(_index_op((2, 3, 4), (5, 3)), grouped)
+        assert tuple(fn(*args, **kw).shape) == (5, 3)
+
+
+class TestAgainstTheOperatorsOwnSchema:
+    """Read the real schemas, not a remembered spelling of them.
+
+    This torch prints `index.Tensor`'s indices as `List[Optional[Tensor]]`; the
+    schema language spells the same type `Tensor?[]`. A first cut of this fix
+    matched the spelling, classified the argument as "not a list", and left the
+    bug exactly where it was -- passing its own hand-written tests. These call
+    torch, on the CPU, so a spelling change fails here instead of in a GPU run.
+    """
+
+    def test_the_optional_list_is_seen_as_one(self):
+        torch = pytest.importorskip("torch")
+        from atom.compass.runtime.microbench import (
+            _MAYBE_TENSOR_LIST,
+            _ONE_TENSOR,
+            _schema_kinds,
+        )
+
+        fn = torch.ops.aten.index.Tensor
+        assert _schema_kinds(fn) == [_ONE_TENSOR, _MAYBE_TENSOR_LIST]
+
+    def test_a_list_of_int_is_not_a_list_of_tensor(self):
+        """convolution's stride is `List[int]` and must stay one argument."""
+        torch = pytest.importorskip("torch")
+        fn = torch.ops.aten.convolution.default
+        assert _group_for_schema(fn, ["in", "w"], {}) == ["in", "w"]
+
+    def test_a_plain_gemm_is_untouched(self):
+        torch = pytest.importorskip("torch")
+        fn = torch.ops.aten.addmm.default
+        assert _group_for_schema(fn, ["c", "a", "b"], {}) == ["c", "a", "b"]
+
+    def test_ungrouped_the_recorded_prefill_call_still_raises(self):
+        """The bug this fixes, kept as the reason the grouping is there."""
+        torch = pytest.importorskip("torch")
+        fn = torch.ops.aten.index.Tensor
+        hidden = torch.zeros(1536, 8, dtype=torch.bfloat16)
+        idx = torch.arange(3)
+        with pytest.raises(IndexError):
+            fn(hidden, idx)
+        assert tuple(fn(hidden, [idx]).shape) == (3, 8)
