@@ -19,13 +19,22 @@ What each row compares:
   warmup prefill are the same shape, which the script checks and says.
 * **non-torch** -- not modelled. Recorded directly; the table over several
   topologies is what a model would have to fit.
-* **graph pool** -- derived from the engine's own formula without a device,
-  against the recorded estimate, and separately against the pool the capture
-  loop measured if a log is given. The first says the derivation reproduces the
-  engine's decision; only the second says the decision was right.
+* **pool estimate** -- the mirror of `_estimate_cudagraph_overhead` against
+  that estimator's own output. An identity, and labelled as one: it read
+  `+0.0%` at every width because both sides are `0.2 x (peak_torch -
+  current_torch)` computed from the same record. Worth keeping as a drift check
+  on the mirror, worth nothing as evidence about the pool.
+* **graph pool** -- the term itself: what capture is predicted to reserve,
+  against what capture did reserve. That measurement has been in every record
+  since the terms were split and nothing was reading it.
+* **kv blocks** -- the block count, derived from the checkpoint's own
+  `config.json` and sized by ATOM's own `plan_pools`. The only row here with no
+  fitted constant anywhere in it, which is what makes a disagreement
+  attributable: it can only be in the readings.
 
     python scripts/compass/validate_memory.py compass_ops/mem_*.json \
-        [--graph compass_ops/g.prefill.json] [--checkpoint DIR] [--log run.log]
+        [--graph compass_ops/g.prefill.json] [--checkpoint DIR] \
+        [--model-config DIR/config.json] [--log run.log]
 """
 from __future__ import annotations
 
@@ -38,9 +47,14 @@ import sys
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 
+from atom.compass.core.kv_geometry import (  # noqa: E402
+    InsufficientPoolBudget, blocks_from_readings, gdn_state_bytes,
+    layer_types_disagree, paged_block_bytes)
+from atom.compass.core.memory import MemoryReadings  # noqa: E402
 from atom.compass.core.memory_model import (  # noqa: E402
     DEFAULT_PERSISTENT, activation_curve, graph_pool_bytes,
-    load_residue_bytes, non_torch_bytes, peak_activation_bytes, weight_bytes)
+    load_residue_bytes, measured_graph_pool_bytes, non_torch_bytes,
+    peak_activation_bytes, weight_bytes)
 
 GB = float(1 << 30)
 
@@ -82,6 +96,99 @@ def measured_pool(log_path: str) -> int:
     return int(float(found[-1]) * GB) if found else 0
 
 
+def recorded_pool(blob: dict) -> tuple:
+    """What capture reserved, allocated and captured, out of the record itself.
+
+    `_measured_graph_pool` has been writing this into every record since the
+    terms were split, and nothing read it: the graph-pool row compared the
+    derivation against `cudagraph_overhead`, which is the *engine's estimate*
+    of the pool and not the pool. Both sides of that comparison are
+    `0.2 x (peak_torch - current_torch)`, so it reported +0.0% at every width
+    and could not have reported anything else.
+
+    Returns ``(reserved, allocated, capture_sizes)``, all zero or empty for a
+    record written before the measurement existed.
+    """
+    pool = blob.get("graph_pool") or {}
+    return (int(pool.get("reserved") or 0), int(pool.get("allocated") or 0),
+            tuple(int(s) for s in (pool.get("capture_sizes") or ())))
+
+
+#: How many bytes an element of the KV cache takes, by the name the record
+#: keeps. Enough to price a block; a quantized cache also carries a scale,
+#: which `paged_block_bytes` adds in fp32 regardless.
+KV_DTYPE_BYTES = {"bf16": 2, "fp16": 2, "float16": 2, "bfloat16": 2,
+                  "fp8": 1, "fp8_e4m3": 1, "fp8_e5m2": 1, "int8": 1}
+
+
+def kv_rows(config: dict, readings: dict, tp: int, world: int, blob: dict,
+            model_config: str) -> None:
+    """The block count, derived from the model's own geometry.
+
+    The last term, and the one every other term exists to serve: a
+    configuration's capacity is its block count. It is also the only term whose
+    derivation carries no fitted constant at all -- `config.json` gives the
+    layer split and the head geometry, `plan_pools` is ATOM's own, and the five
+    readings come from the record. So when this disagrees with a run, the
+    disagreement is in the readings and nowhere else.
+
+    Silent without `--model-config`, because guessing the checkpoint from the
+    record's model name would be a download.
+    """
+    if not model_config:
+        return
+    try:
+        with open(model_config, encoding="utf-8") as fh:
+            native = json.load(fh)
+    except (OSError, ValueError) as exc:
+        print("  %-14s %s" % ("kv blocks", "cannot read %s: %s"
+                              % (model_config, exc)))
+        return
+
+    disagreement = layer_types_disagree(native)
+    if disagreement:
+        print("  %-14s %s" % ("", "WARNING: " + disagreement))
+
+    block_size = int(config.get("block_size") or 0)
+    kv_bytes = KV_DTYPE_BYTES.get(str(config.get("kv_cache_dtype")), 2)
+    recorded_blocks = ((blob.get("blocks") or {}).get("num_kvcache_blocks"))
+    try:
+        plan = blocks_from_readings(
+            native, MemoryReadings(
+                total=int(readings["total"]), free=int(readings["free"]),
+                peak_torch=int(readings["peak_torch"]),
+                non_torch=int(readings["non_torch"]),
+                cudagraph_overhead=int(readings["cudagraph_overhead"])),
+            utilization=float(config.get("gpu_memory_utilization") or 0),
+            max_num_seqs=int(config.get("max_num_seqs") or 0),
+            tensor_parallel=tp, block_size=block_size,
+            kv_dtype_bytes=kv_bytes)
+    except InsufficientPoolBudget as exc:
+        print("  %-14s %s" % ("kv blocks", "INFEASIBLE: the state floor needs "
+                              "%.2fGB of %.2fGB"
+                              % (exc.reserved_bytes / GB,
+                                 exc.available_bytes / GB)))
+        return
+    except (KeyError, TypeError, ValueError, ZeroDivisionError) as exc:
+        print("  %-14s %s" % ("kv blocks", "not derivable: %s" % exc))
+        return
+
+    block_bytes = paged_block_bytes(native, tensor_parallel=tp,
+                                    block_size=block_size,
+                                    kv_dtype_bytes=kv_bytes)
+    state_bytes = gdn_state_bytes(native, tensor_parallel=tp)
+    if recorded_blocks:
+        error = (plan.paged_entries - recorded_blocks) / recorded_blocks * 100
+        print("  %-14s %8d %8d  %+5.2f%% %7s  %s"
+              % ("kv blocks", plan.paged_entries, recorded_blocks, error, "",
+                 "derived from config.json; %d B a block, %.1f MiB a request "
+                 "of state" % (block_bytes, state_bytes / (1 << 20))))
+    else:
+        print("  %-14s %8d %8s  %6s %7s  %s"
+              % ("kv blocks", plan.paged_entries, "-", "-", "",
+                 "derived; no recorded count in this record"))
+
+
 def row(name: str, derived, recorded, note: str = "", budget: int = 0) -> None:
     """One term, its own error, and what that error is worth.
 
@@ -114,7 +221,7 @@ def write_calibration(records, path: str) -> None:
     what the box it was taken on is worth.
     """
     per_width: dict = {}
-    for _, config, readings, tp in records:
+    for _, config, readings, tp, _blob in records:
         parameters = readings.get("parameter_bytes")
         allocated = readings.get("weights_torch")
         if parameters is None or allocated is None:
@@ -200,7 +307,13 @@ def main() -> int:
     ap.add_argument("records", nargs="+", help="memory records, globs allowed")
     ap.add_argument("--graph", help="traced op graph, for the activation term")
     ap.add_argument("--checkpoint", help="model directory, for the weight term")
-    ap.add_argument("--log", help="run log, for the measured graph pool")
+    ap.add_argument("--log", help="run log, for the measured graph pool "
+                                  "(records now carry it; only needed for one "
+                                  "written before they did)")
+    ap.add_argument("--model-config",
+                    help="the checkpoint's own config.json, for the KV block "
+                         "geometry. Not the checkpoint directory: this reads "
+                         "one file and downloads nothing")
     ap.add_argument("--max-num-batched-tokens", type=int, default=0,
                     help="not in the record; needed to know the warmup shape")
     ap.add_argument("--curve", action="store_true",
@@ -222,11 +335,11 @@ def main() -> int:
         if not readings:
             continue
         tp = int((config.get("topology") or {}).get("tp", 1) or 1)
-        non_torch_seen.append((os.path.basename(path), config, readings, tp))
+        non_torch_seen.append((os.path.basename(path), config, readings, tp, blob))
 
     print("  %-14s %8s %8s  %6s %7s  %s"
           % ("term", "derived", "recorded", "error", "of bgt", "note"))
-    for name, config, readings, tp in non_torch_seen:
+    for name, config, readings, tp, blob in non_torch_seen:
         print("\n%s  --  %s tp=%d max_model_len=%s"
               % (name, config.get("model"), tp, config.get("max_model_len")))
 
@@ -318,11 +431,52 @@ def main() -> int:
         row("non-torch", non_torch_bytes(world), readings.get("non_torch"),
             "device-wide reading; a neighbour is charged here", sizing_budget)
 
+        # Two questions that were being asked as one. `graph_pool_bytes`
+        # mirrors `_estimate_cudagraph_overhead`, and `cudagraph_overhead` *is*
+        # that estimator's output, so the two agree by construction: both are
+        # 0.2 x (peak_torch - current_torch) computed from the same record.
+        # That row is an identity check -- worth keeping, because a drift in
+        # the mirror would show here first -- and it is now labelled as one
+        # rather than read as a validated term.
         derived_pool = graph_pool_bytes(warmup_act) if warmup_act else None
-        row("graph pool", derived_pool, readings.get("cudagraph_overhead"),
-            "vs the engine's estimate")
-        if pool_seen:
-            row("graph pool", derived_pool, pool_seen, "vs the measured pool")
+        estimate = readings.get("cudagraph_overhead")
+        identity = (derived_pool is not None and derived_pool == estimate)
+        row("pool estimate", derived_pool, estimate,
+            "identity: both sides are the engine's own estimator"
+            if identity else "the mirror has drifted from the engine's "
+                             "estimator", sizing_budget)
+
+        # The term itself: what capture reserved, against what capture was
+        # predicted to reserve. `graph_pool.reserved` is in the record; a
+        # `--log` is only needed for a record written before it was.
+        reserved, allocated, capture_sizes = recorded_pool(blob)
+        seen = reserved or pool_seen
+        if seen:
+            row("graph pool", measured_graph_pool_bytes(capture_sizes, world),
+                seen,
+                "vs the %d MiB capture actually reserved over %d buckets"
+                % (seen / (1 << 20), len(capture_sizes)), sizing_budget)
+            if estimate:
+                # Which way the estimator is wrong is not fixed. It is 0.2x the
+                # peak activations, so it scales with the model while the pool
+                # does not: on the 0.6B it was 19x under, and here it is over.
+                # A term whose error changes sign with the model is not a term
+                # that is merely mis-calibrated.
+                over = estimate > seen
+                print("  %-14s %8s %8s  %6s %7s  %s"
+                      % ("", "", "", "", "",
+                         "the engine budgeted %.3fG; capture took %.3fG -- "
+                         "%.1fx %s"
+                         % (estimate / GB, seen / GB,
+                            (estimate / seen) if over else (seen / estimate),
+                            "over" if over else "under")))
+        if allocated:
+            print("  %-14s %8s %8s  %6s %7s  %s"
+                  % ("", "", "", "", "",
+                     "of which %.1f MiB allocated; the rest is segment "
+                     "bookkeeping" % (allocated / (1 << 20))))
+
+        kv_rows(config, readings, tp, world, blob, args.model_config)
 
     if args.calibrate:
         write_calibration(non_torch_seen, args.calibrate)
@@ -334,7 +488,7 @@ def main() -> int:
         print("\nthe terms with no model yet, across configurations")
         print("  %-22s %-12s %3s %9s %9s %9s"
               % ("record", "model", "tp", "params", "residue", "non_torch"))
-        for name, config, readings, tp in non_torch_seen:
+        for name, config, readings, tp, _blob in non_torch_seen:
             parameters = readings.get("parameter_bytes")
             allocated = readings.get("weights_torch")
             residue = (allocated - parameters
