@@ -331,7 +331,7 @@ class SourceComposition(NamedTuple):
     #: off the argument that asked for it -- ``interpolate=true`` names no
     #: number, and the number is the part a reader has to be able to check.
     #: ``None`` means no price could be fitted at all.
-    interpolation_limit: Optional[float] = None
+    interpolation_limit: float | None = None
 
 
 def source_cost_oracle(*, rank_coords=None, **kwargs):
