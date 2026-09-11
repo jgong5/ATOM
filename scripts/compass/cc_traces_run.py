@@ -200,6 +200,16 @@ verify_execution_id = execution_id.verify_execution_id
 stamp_of = execution_id.stamp_of
 file_digest = execution_id.file_digest
 
+#: What a run is *for*, carried in every execution record and in the stamp
+#: inside every artifact. Acceptance is the default, so nothing written before
+#: this field existed becomes diagnostic by omission; a diagnostic has to say
+#: so. It travels inside the artifacts rather than in a file beside them
+#: because a marker beside them is lost the moment somebody copies the
+#: interesting files into a cell directory.
+ACCEPTANCE = "acceptance"
+DIAGNOSTIC = "diagnostic"
+PURPOSES = (ACCEPTANCE, DIAGNOSTIC)
+
 
 # --------------------------------------------------------------------------
 # the seams: processes, health, provenance, time
@@ -292,6 +302,7 @@ class SideRun:
         health_interval: float = HEALTH_INTERVAL,
         host=None,
         probe=process_identity,
+        purpose: str = ACCEPTANCE,
     ):
         self.plan = cell_plan
         self.side = side
@@ -309,6 +320,8 @@ class SideRun:
         #: checked rather than believed; injectable because the tests run
         #: against processes that were never started
         self.probe = probe
+        #: acceptance or diagnostic, stamped into every record this run writes
+        self.purpose = purpose
         #: step id -> the handle we started, so nothing is signalled by name
         self.running: dict[str, dict] = {}
         #: repeat -> its execution record, minted when its process launched
@@ -374,6 +387,9 @@ class SideRun:
                 "ended_at": None,
                 "exit": None,
             },
+            # What this run is for. In the record and in every artifact stamp,
+            # so a diagnostic stays a diagnostic after it is copied.
+            "purpose": self.purpose,
             "replay": None,
             "source": self._source(step),
             "config": self._config(step, command),
@@ -829,7 +845,11 @@ class SideRun:
         still that execution, and a reader who has the file has the id. The
         digest is taken after stamping, so it describes the bytes that exist.
         """
-        blob["execution"] = stamp_of(execution)
+        stamp = stamp_of(execution)
+        # Beyond the canonical identity fields, which the runtime package owns:
+        # what the run was for, so a reader holding only this file can tell.
+        stamp["purpose"] = execution.get("purpose", ACCEPTANCE)
+        blob["execution"] = stamp
         path.write_text(json.dumps(blob, indent=1) + "\n")
         execution["artifacts"][path.name] = file_digest(path)
 
@@ -1006,6 +1026,7 @@ class SideRun:
                     "schema": EXECUTION_SCHEMA,
                     "cell": str(self.cell),
                     "side": self.side,
+                    "purpose": self.purpose,
                     "host": self.host,
                     "tp": self.plan["tp"],
                     "class": self.plan["class"],
@@ -1127,7 +1148,9 @@ def side(args) -> int:
             file=sys.stderr,
         )
         return 2
-    runner = SideRun(_cell_plan(args), args.side)
+    runner = SideRun(
+        _cell_plan(args), args.side, purpose=getattr(args, "purpose", ACCEPTANCE)
+    )
     code = runner.run()
     for reason in runner.failures:
         print(reason, file=sys.stderr)
@@ -1196,6 +1219,16 @@ def main(argv=None) -> int:
     s.add_argument("--oracle-option", action="append", default=[])
     s.add_argument("--replay-target", default=None)
     s.add_argument("--corpus", default=None)
+    s.add_argument(
+        "--purpose",
+        default=ACCEPTANCE,
+        choices=PURPOSES,
+        help=(
+            "what this run is for. Diagnostic runs are stamped into every "
+            "execution record and artifact, and the validator refuses a cell "
+            "built from them however the directory is named"
+        ),
+    )
     s.set_defaults(func=side)
 
     c = sub.add_parser("costs", help="merge the cell's cost terms")

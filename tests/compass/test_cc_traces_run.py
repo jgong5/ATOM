@@ -1186,3 +1186,77 @@ class TestOnlyTheServerThisRepeatStartedCounts:
         assert any(
             "not the process this repeat launched" in f for f in runner.failures
         ), runner.failures
+
+
+class TestARunSaysWhatItWasFor:
+    """So that a diagnostic cannot be laundered into a cell by copying.
+
+    The harness is the same one either way -- that is the point of running a
+    plumbing diagnostic through it. What separates the two is the question
+    being asked, and the only place that can live is in what the run writes.
+    """
+
+    def test_acceptance_is_the_default(self, tmp_path):
+        runner = _runner(tmp_path, "modelled")
+        assert runner.run() == 0
+        assert _journal(runner)["purpose"] == "acceptance"
+
+    def test_a_diagnostic_says_so_in_its_journal(self, tmp_path):
+        runner = _runner(tmp_path, "modelled", purpose="diagnostic")
+        assert runner.run() == 0
+        assert _journal(runner)["purpose"] == "diagnostic"
+
+    def test_every_execution_record_carries_it(self, tmp_path):
+        runner = _runner(tmp_path, "modelled", purpose="diagnostic")
+        runner.run()
+        executions = _journal(runner)["executions"]
+        assert executions
+        assert all(e["purpose"] == "diagnostic" for e in executions)
+
+    def test_the_record_beside_the_artifacts_carries_it(self, tmp_path):
+        runner = _runner(tmp_path, "modelled", purpose="diagnostic")
+        runner.run()
+        written = sorted(runner.cell.glob("execution.modelled.r*.json"))
+        assert written
+        for path in written:
+            assert json.loads(path.read_text())["purpose"] == "diagnostic"
+
+    def test_the_stamp_inside_each_artifact_carries_it(self, tmp_path):
+        """The one that survives a copy into somebody else's directory."""
+        runner = _runner(tmp_path, "modelled", purpose="diagnostic")
+        runner.run()
+        stamped = sorted(runner.cell.glob("modelled.r*.json"))
+        assert stamped
+        for path in stamped:
+            stamp = json.loads(path.read_text())["execution"]
+            assert stamp["purpose"] == "diagnostic"
+
+    def test_the_purpose_does_not_reach_the_id(self, tmp_path):
+        """A diagnostic and an acceptance run are not different schemes.
+
+        The id identifies a process launch. Folding the purpose into it would
+        make two ids for one execution and break every record already minted.
+        """
+        runner = _runner(tmp_path, "modelled", purpose="diagnostic")
+        runner.run()
+        for execution in _journal(runner)["executions"]:
+            assert "purpose" not in execution["id_inputs"]
+            assert run_mod.verify_execution_id(execution) is True
+
+    def test_the_cli_offers_only_the_two_purposes(self):
+        with pytest.raises(SystemExit):
+            run_mod.main(
+                [
+                    "side",
+                    "--cell",
+                    "/tmp/x/tp2_long",
+                    "--side",
+                    "modelled",
+                    "--tp",
+                    "2",
+                    "--class",
+                    "long",
+                    "--purpose",
+                    "acceptance-ish",
+                ]
+            )

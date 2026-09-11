@@ -1238,3 +1238,102 @@ class TestTheArtifactsMustSayWhoServed:
         assert run(cell_dir) == 1
         verdict = json.loads((Path(cell_dir) / "cc_traces_cell.json").read_text())
         return verdict["failures"]
+
+
+class TestADiagnosticIsNotACellHoweverItIsNamed:
+    """The same harness, the same file names, a different question.
+
+    A plumbing diagnostic runs `cc_traces_run.py` for real and writes
+    `modelled.r1.json`, `run.modelled.json`, an execution record -- everything
+    a cell has. What it does not have is a real side, three repeats, or a
+    predictor that was not fitted to the run it is predicting. Nothing about
+    the directory says so, and renaming it says even less, so the purpose
+    travels in the evidence.
+    """
+
+    def _mark(self, cell_dir):
+        (Path(cell_dir) / "DIAGNOSTIC.json").write_text(
+            json.dumps({"not_acceptance": True})
+        )
+
+    def test_the_marker_file_refuses_the_cell(self, cell):
+        self._mark(cell)
+        assert any("DIAGNOSTIC.json is present" in r for r in self._fail(cell))
+
+    def test_an_acceptance_named_directory_is_still_refused(self, cell, tmp_path):
+        """The directory is named exactly what the plan names a cell."""
+        assert Path(cell).name == "tp2_long"
+        self._mark(cell)
+        assert run(cell) == 1
+
+    def test_a_journal_run_for_something_else_refuses(self, cell):
+        path = Path(cell) / "run.modelled.json"
+        journal = json.loads(path.read_text())
+        journal["purpose"] = "diagnostic"
+        path.write_text(json.dumps(journal))
+        assert any("not acceptance" in r for r in self._fail(cell))
+
+    def test_one_diagnostic_execution_refuses_the_whole_cell(self, cell):
+        path = Path(cell) / "run.real.json"
+        journal = json.loads(path.read_text())
+        journal["executions"][0]["purpose"] = "diagnostic"
+        path.write_text(json.dumps(journal))
+        assert any("run for 'diagnostic'" in r for r in self._fail(cell))
+
+    def test_an_artifact_carries_its_purpose_through_a_copy(self, cell):
+        """The point of the stamp being inside the file.
+
+        Copying a diagnostic's artifact into a cell directory leaves the
+        journal, the marker and the path behind. The stamp comes with it.
+        """
+        path = Path(cell) / "modelled.r1.json"
+        blob = json.loads(path.read_text())
+        blob["execution"] = {"purpose": "diagnostic"}
+        _write(path, blob)
+        assert any(
+            "copied here rather than produced here" in r for r in self._fail(cell)
+        )
+
+    def test_silence_still_means_acceptance(self, cell):
+        """Artifacts written before the field existed are not diagnostics."""
+        path = Path(cell) / "run.real.json"
+        journal = json.loads(path.read_text())
+        journal.pop("purpose", None)
+        for execution in journal["executions"]:
+            execution.pop("purpose", None)
+        path.write_text(json.dumps(journal))
+        assert run(cell) == 0
+
+    def test_a_passing_verdict_beside_a_marker_is_refused_by_the_matrix(
+        self, cell, capsys
+    ):
+        """A verdict is a file, and files travel."""
+        blob = {"cell": str(cell), "class": "long", "tp": 2, "passed": True}
+        (Path(cell) / "cc_traces_cell.json").write_text(json.dumps(blob))
+        self._mark(cell)
+        assert validate.main(["matrix", str(cell)]) == 1
+        assert "DIAGNOSTIC.json is present" in capsys.readouterr().out
+
+    def test_a_verdict_written_for_a_diagnostic_is_refused_by_the_matrix(
+        self, cell, capsys
+    ):
+        blob = {
+            "cell": str(cell),
+            "class": "long",
+            "tp": 2,
+            "passed": True,
+            "purpose": "diagnostic",
+        }
+        (Path(cell) / "cc_traces_cell.json").write_text(json.dumps(blob))
+        assert validate.main(["matrix", str(cell)]) == 1
+        assert "not acceptance" in capsys.readouterr().out
+
+    def test_the_verdict_says_what_it_was_computed_for(self, cell):
+        assert run(cell) == 0
+        blob = json.loads((Path(cell) / "cc_traces_cell.json").read_text())
+        assert blob["purpose"] == "acceptance"
+
+    def _fail(self, cell_dir):
+        assert run(cell_dir) == 1
+        verdict = json.loads((Path(cell_dir) / "cc_traces_cell.json").read_text())
+        return verdict["failures"]

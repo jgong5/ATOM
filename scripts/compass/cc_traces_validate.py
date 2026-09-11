@@ -806,6 +806,70 @@ def check_gpu_free(cell_dir: Path, modelled_paths: list) -> list[str]:
 
 
 # --------------------------------------------------------------------------
+#: A cell directory carrying this file is a diagnostic, whatever it is called.
+#: The name is not the evidence -- a diagnostic can be renamed, and an
+#: acceptance cell can be given a frightening name and still be one.
+DIAGNOSTIC_MARKER = "DIAGNOSTIC.json"
+
+#: The only purpose an acceptance verdict may be computed from. Absent means
+#: acceptance: the field is newer than some artifacts, and treating silence as
+#: diagnostic would refuse runs that predate it. A diagnostic has to say so,
+#: and `cc_traces_run.py --purpose diagnostic` writes it into every execution
+#: record and into the stamp inside every artifact.
+ACCEPTANCE_PURPOSE = "acceptance"
+
+
+def _purpose_of(blob) -> str:
+    return (blob or {}).get("purpose") or ACCEPTANCE_PURPOSE
+
+
+def check_not_diagnostic(cell_dir: Path, journals: dict, manifests: dict) -> list[str]:
+    """Whether anything here says this was run for something else.
+
+    A diagnostic exercises the same harness, writes the same file names and
+    produces the same shapes. What separates it from a cell is what it was
+    *for*, and that is not a property of the directory: copying the artifacts
+    somewhere better-named changes the path and nothing else. So the purpose
+    travels in the execution evidence -- the journal, each execution record,
+    and the stamp inside each artifact -- and any one of them saying
+    `diagnostic` refuses the cell.
+
+    Refusing rather than noting, and refusing on the marker file as well: a
+    diagnostic that reaches the validator at all is a mistake somewhere
+    upstream, and the cheap failure is the one that happens here.
+    """
+    problems = []
+    if (cell_dir / DIAGNOSTIC_MARKER).exists():
+        problems.append(
+            f"{DIAGNOSTIC_MARKER} is present: this directory was written as a "
+            f"diagnostic, and a diagnostic has no acceptance verdict to give "
+            f"however it is named"
+        )
+    for side, journal in journals.items():
+        said = _purpose_of(journal)
+        if said != ACCEPTANCE_PURPOSE:
+            problems.append(
+                f"{side}: run.{side}.json was written for {said!r}, not " f"acceptance"
+            )
+        for index, execution in enumerate((journal or {}).get("executions") or []):
+            said = _purpose_of(execution)
+            if said != ACCEPTANCE_PURPOSE:
+                problems.append(
+                    f"{side}[{index}]: this execution was run for {said!r}, "
+                    f"not acceptance"
+                )
+    for side, blobs in manifests.items():
+        for index, blob in enumerate(blobs):
+            said = _purpose_of((blob or {}).get("execution"))
+            if said != ACCEPTANCE_PURPOSE:
+                problems.append(
+                    f"{side}[{index}]: the artifact carries the stamp of a "
+                    f"{said!r} run, so it was copied here rather than "
+                    f"produced here"
+                )
+    return problems
+
+
 # the cell
 
 
@@ -1057,18 +1121,29 @@ def cell(args) -> int:
 
     failures += check_gpu_free(cell_dir, modelled_paths)
 
+    journals, blobs = {}, {}
+    for side, paths in (("real", real_paths), ("modelled", modelled_paths)):
+        journal_path = cell_dir / f"run.{side}.json"
+        journals[side] = (
+            json.loads(journal_path.read_text()) if journal_path.exists() else None
+        )
+        blobs[side] = [json.loads(p.read_text()) for p in paths]
+
+    # Before anything is measured: a diagnostic run exercises this same harness
+    # and writes these same file names, so what separates it from a cell is
+    # what it was for. That is carried in the evidence rather than in the path,
+    # and it is refused here whatever the directory is called.
+    failures += check_not_diagnostic(cell_dir, journals, blobs)
+
     # A matching code digest says the server was built from this tree; it does
     # not say the replies came from the process this cell launched. The harness
     # checks that live and writes down what it saw. Recheck it here from the
     # artifacts, because a check that only ever runs live cannot be audited
     # after the process is gone.
-    for side, paths in (("real", real_paths), ("modelled", modelled_paths)):
-        journal_path = cell_dir / f"run.{side}.json"
-        journal = (
-            json.loads(journal_path.read_text()) if journal_path.exists() else None
+    for side in ("real", "modelled"):
+        failures += check_who_served(
+            journals[side], [(b.get("run") or {}) for b in blobs[side]], side
         )
-        manifests = [(json.loads(p.read_text()).get("run") or {}) for p in paths]
-        failures += check_who_served(journal, manifests, side)
 
     # Every step table this cell wrote, whichever repeat wrote it and whichever
     # rank suffix the engine appended: a predictor calibrated on any of them is
@@ -1116,6 +1191,7 @@ def cell(args) -> int:
         "class": klass,
         "tp": args.tp,
         "workload_sha256": workload_sha,
+        "purpose": ACCEPTANCE_PURPOSE,
         "repeats": len(reports),
         "costs": costs,
         "isolation": isolation.get("verdict"),
@@ -1356,6 +1432,21 @@ def matrix(args) -> int:
             refused.append(f"{where}: no cc_traces_cell.json; run `cell` first")
             continue
         verdict = json.loads(path.read_text())
+        # A verdict is a file, and a file can be written by hand or copied out
+        # of a diagnostic. `cell` refuses a diagnostic outright, so a passing
+        # verdict beside a marker did not come from this validator.
+        if (Path(where) / DIAGNOSTIC_MARKER).exists():
+            refused.append(
+                f"{where}: {DIAGNOSTIC_MARKER} is present, so this directory "
+                f"is a diagnostic and cannot contribute to a decision"
+            )
+            continue
+        if _purpose_of(verdict) != ACCEPTANCE_PURPOSE:
+            refused.append(
+                f"{where}: this verdict was written for "
+                f"{_purpose_of(verdict)!r}, not acceptance"
+            )
+            continue
         (cells if verdict.get("passed") else refused).append(
             verdict
             if verdict.get("passed")
