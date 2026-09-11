@@ -439,6 +439,21 @@ def _where(exc: BaseException) -> str:
     return f" at {last.filename.split('/atom/')[-1]}:{last.lineno}"
 
 
+# Why an operator cannot be rebuilt and called, per `OpSpec.abi` value. Kept as
+# text rather than a flag because these land in the artifact's `unpriced` map,
+# which is what a reader consults to find out what a step's cost leaves out.
+_ABI_REFUSALS = {
+    "unverified": (
+        "its argument tuple is inferred from a declaration, not recorded from "
+        "a dispatched call, so it cannot be rebuilt and called; verify against "
+        "a real multi-rank call first"),
+    "live-state": (
+        "two of its arguments are a live communicator handle and IPC pool "
+        "address, which belong to the process that ran the step and not to the "
+        "step; price it by performing the real collective in a real group"),
+}
+
+
 def _is_collective_op(op: dict) -> bool:
     """Whether running this operator makes the rank talk to its peers.
 
@@ -1109,6 +1124,20 @@ def price_graph(graph_path: str, iters: int = 2000, warmup: int = 20,
         # Per signature, not once: an operator that rebuilds the context from
         # its arguments leaves that context behind for whatever is priced next.
         reset_forward_context()
+        # An operator the dispatcher did not record is refused before anything
+        # is resolved or allocated. Not because calling it would fail -- because
+        # it might not. `aiter::all_gather_unreg` takes `(_fa, inp, reg_buffer,
+        # out, reg_bytes, dim)`, two of which are raw addresses, and a rebuilt
+        # call that invents them reads whatever is mapped there. A wrong price
+        # is recoverable; a kernel dereferencing an invented pointer partway
+        # through a pricing run is not, and the number it would produce is not a
+        # measurement of anything. See `OpSpec.abi` for the two reasons.
+        abi = op.get("abi") or ""
+        if abi:
+            unpriced[sig] = _ABI_REFUSALS.get(
+                abi, f"its arguments are recorded as {abi!r}, which this "
+                     "bench does not know how to rebuild")
+            continue
         triton_kernel = op["name"].partition("::")[0] in ("triton", "inductor")
         fn = _resolve_triton(op) if triton_kernel else _resolve(op["name"])
         if fn is None:

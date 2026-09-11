@@ -112,17 +112,65 @@ class CompassModelRunner(CompassPredictMixin, ModelRunner):
 
         began = torch.cuda.Event(enable_timing=True)
         ended = torch.cuda.Event(enable_timing=True)
+        # Opened for this forward only, so the event pairs recorded by the
+        # overrides below belong to a step the table will have a row for, and
+        # the same methods called during capture or a dummy run record nothing.
+        self._subspans = {}
         began.record()
-        output = ModelRunner.forward(self, batch)
+        try:
+            output = ModelRunner.forward(self, batch)
+        finally:
+            # Closed even if the forward raises. A window left open would still
+            # be open during the next CUDA graph capture, and the overrides
+            # would then record their events *into* the graph.
+            spans, self._subspans = self._subspans, None
         ended.record()
         self._last_forward_ended = time.perf_counter()
         # The ids are read now rather than when the pair is drained: the batch
         # is the scheduler's and does not survive the step.
         self._pending.append((shape, began, ended, gap, list(batch.req_ids),
                               started_at,
-                              getattr(batch, "compass_decision", None)))
+                              getattr(batch, "compass_decision", None), spans))
         self._drain_pending()
         return output
+
+    # -- sub-spans ------------------------------------------------------------
+    #
+    # The outer pair above spans the whole of ``ModelRunner.forward``: input
+    # preparation and its H2D staging, then ``run_model`` (the body and
+    # ``compute_logits``), then ``postprocess`` (the sampler, any logprobs, the
+    # TP broadcast and the sampled-id enqueue) -- plus whatever device idle the
+    # host leaves inside it. A composed prediction that covers only the body and
+    # the head is a strict subset of that, so comparing the two answers a
+    # different question than it appears to.
+    #
+    # These inner pairs make the subset measurable. They are recorded on the
+    # same stream and drained the same way, never synchronised: a sync here
+    # would reintroduce exactly the 33% distortion the docstring above exists to
+    # avoid, and would do it to the number the model is fitted against.
+
+    def _timed_span(self, name: str, fn, *args, **kwargs):
+        """Run one region of the forward inside its own event pair."""
+        import torch
+
+        spans = getattr(self, "_subspans", None)
+        if spans is None:
+            return fn(*args, **kwargs)
+        began = torch.cuda.Event(enable_timing=True)
+        ended = torch.cuda.Event(enable_timing=True)
+        began.record()
+        out = fn(*args, **kwargs)
+        ended.record()
+        spans[name] = (began, ended)
+        return out
+
+    def run_model(self, *args, **kwargs):
+        return self._timed_span("run_model", ModelRunner.run_model,
+                                self, *args, **kwargs)
+
+    def postprocess(self, *args, **kwargs):
+        return self._timed_span("postprocess", ModelRunner.postprocess,
+                                self, *args, **kwargs)
 
     def _drain_pending(self) -> None:
         """Write out every timed step whose events have completed.
@@ -132,14 +180,18 @@ class CompassModelRunner(CompassPredictMixin, ModelRunner):
         anyway, never by waiting for it.
         """
         while self._pending:
-            shape, began, ended, gap, req_ids, started_at, decision = \
+            shape, began, ended, gap, req_ids, started_at, decision, spans = \
                 self._pending[0]
             if not ended.query():
                 return
             self._pending.popleft()
+            # The outer `ended` is the last event of the step, so an inner pair
+            # that was recorded at all has completed by now.
+            sub = {name: b.elapsed_time(e) / 1000.0
+                   for name, (b, e) in (spans or {}).items()}
             self._count_and_record(shape, began.elapsed_time(ended) / 1000.0,
                                    gap, req_ids=req_ids, started_at=started_at,
-                                   decision=decision)
+                                   decision=decision, spans=sub)
 
 
 

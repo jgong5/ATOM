@@ -60,6 +60,53 @@ def simulate_group_width(logical: int, physical: int = 1) -> None:
     )
 
 
+def head_gather_opspec(group, input_, dim: int = -1, group_name: str = "tp"):
+    """The head all-gather as one operator, for both recording and pricing.
+
+    One definition, because the two uses have to agree exactly. A derivation
+    records this operator into a graph; a two-rank harness performs the real
+    collective and writes a price under this operator's signature. If those
+    signatures are built by two pieces of code they will agree on most fields
+    and drift on one, and the symptom is not an error -- it is a lookup miss,
+    which prices tensor-parallel communication at zero.
+
+    ``dim`` is the axis production gathers along, and the output shape follows
+    from it and the group's width: that axis grows by the width, every other is
+    untouched. The width comes from ``group.world_size``, which under simulated
+    TP is already the logical deployment width even though one rank is running.
+
+    Two of the operator's six declared arguments -- ``(_fa, inp, reg_buffer,
+    out, reg_bytes, dim)`` -- are raw addresses, and they are deliberately not
+    recorded. An address is not a property of the step, and a signature
+    carrying one would never match twice. That is also why ``abi`` is
+    ``"live-state"``: this operator is priced by being performed, never by
+    being rebuilt.
+    """
+    from atom.compass.core.graph import OpSpec
+
+    width = int(group.world_size)
+    shape = list(int(d) for d in input_.shape)
+    axis = dim % len(shape)
+    shape[axis] *= width
+    return OpSpec(
+        name="aiter::all_gather_unreg",
+        input_shapes=(tuple(int(d) for d in input_.shape),),
+        output_shapes=(tuple(shape),),
+        dtypes=(str(input_.dtype).replace("torch.", ""),),
+        group=group_name,
+        # The group, explicitly, rather than left to be inferred from the ratio
+        # of the two shapes. A pricer for this operator does not rebuild a call
+        # -- it performs the real collective -- so it needs to know which group
+        # and how wide, and a width recovered by dividing shapes is a guess
+        # that happens to be right.
+        context=(("group", str(group.unique_name)),
+                 ("group_world_size", width)),
+        scalars=(("#0", str(group.unique_name)),
+                 ("#5", int(axis))),
+        abi="live-state",
+    )
+
+
 class record_collectives:
     """Record collectives that simulated TP performs no operation for.
 
@@ -78,6 +125,55 @@ class record_collectives:
     The recorded name matches what the dispatcher records on real hardware
     (``aiter::all_reduce_``), so a derived graph and a captured one can be
     compared operator for operator rather than merely in spirit.
+
+    ``all_gather`` needs the same treatment for a different reason. Simulated TP
+    does not pass it through -- it cannot, because an all-gather grows its
+    output -- so it *reimplements* it locally: allocate the full buffer, copy
+    this rank's shard in, movedim, reshape. Those are real operators and the
+    tracer records them, so the graph looks covered. It is not: what it holds is
+    the cost of a local copy where production has a cross-rank transfer, and the
+    LM head at TP2 or TP4 would come out near free. The local reimplementation
+    is therefore replaced rather than recorded, and the collective recorded in
+    its place.
+
+    Which collective, and on which branch, was settled by running one -- two
+    ranks on real devices through the real ``GroupCoordinator``, no model, no
+    replayed handles (``agent_scratch/g4/ag_probe.py``). Four things came out of
+    it, and the first is the one that matters most:
+
+    *The dispatcher sees no all-gather.* ``outplace_all_gather``'s
+    ``@torch.library.custom_op`` decorator is commented out in the installed
+    aiter, and the kernel below it is a plain pybind function, so a
+    ``TorchDispatchMode`` wrapped around a real two-rank call records exactly
+    ``view.dtype``, ``detach``, ``empty``, ``view.dtype``, ``detach`` -- the
+    output's allocation and nothing else. A *captured* TP2 graph therefore has
+    no head collective in it either. This is not a defect of derivation that
+    capture would fix; it is the same hole in both, and recording the operator
+    here is what closes it. The name is consequently chosen rather than
+    observed, and no captured graph will ever contain it.
+
+    *The tuple is confirmed.* ``all_gather_unreg`` was handed
+    ``(_fa=293897648, inp[1,124160]bf16, reg_buffer=139848155398144,
+    out[1,248320]bf16, reg_bytes=1073741824, dim=1)`` -- the declaration's
+    order exactly, with ``dim`` the resolved positive axis.
+
+    *The transfer is real.* Each rank filled its shard with its own rank+1 and
+    the gathered row read ``[1.0, 2.0]``, so the output is peers' data and not
+    a right-shaped buffer of zeros.
+
+    *The head is eager at every width that has a collective.*
+    ``ModelRunner.logits_in_graph`` is ``world_size == 1 and not is_tbo``, so
+    the head is only ever inside a CUDA graph at TP1 -- where ``all_gather``
+    returns early and there is no collective at all. At TP>1 it is always the
+    eager branch, which is ``all_gather_unreg``. The capture branch
+    (``all_gather_reg``, four arguments) is unreachable for this call.
+
+    So ``abi`` is ``"live-state"`` rather than ``"unverified"``: the tuple is
+    known, and knowing it is what shows the call cannot be rebuilt from a graph.
+    Two of those six arguments are a live communicator handle and a live IPC
+    pool address. They belong to the process, not to the step, and no artifact
+    carries them. The microbench refuses to reconstruct it and says so; a price
+    for it has to come from performing the real collective in a real group.
     """
 
     def __init__(self, graph, group_name: str = "tp") -> None:
@@ -85,6 +181,7 @@ class record_collectives:
         self.group_name = group_name
         self._group = None
         self._original = None
+        self._original_gather = None
 
     def __enter__(self) -> "record_collectives":
         try:
@@ -139,12 +236,27 @@ class record_collectives:
 
         group.all_reduce = all_reduce
         self._group, self._original = group, original
+
+        original_gather = group.all_gather
+
+        def all_gather(input_, use_custom: bool = False, dim: int = -1):
+            import torch
+
+            spec = head_gather_opspec(group, input_, dim, group_name=name)
+            recorder.add(spec)
+            return torch.empty(spec.output_shapes[0], dtype=input_.dtype,
+                               device=input_.device)
+
+        group.all_gather = all_gather
+        self._original_gather = original_gather
         return self
 
     def __exit__(self, *exc) -> None:
         if self._group is not None and self._original is not None:
             self._group.all_reduce = self._original
-            self._group = self._original = None
+            if self._original_gather is not None:
+                self._group.all_gather = self._original_gather
+            self._group = self._original = self._original_gather = None
 
 
 class redirect_device_factories:

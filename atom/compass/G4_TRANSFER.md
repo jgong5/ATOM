@@ -714,3 +714,124 @@ acceptance test. Every limit in §10 still stands -- the 16 refused operators,
 the LM head and runner work outside the traced body, level 0 against level 3,
 and a domain of one decode point. The long-context and chunked-prefill graphs
 are derived but not yet priced.
+
+## 12. A frozen TP2 forward step, then measured, 2026-09-11
+
+The first prediction in this document written down *before* the thing it
+predicts was run. A TP2 decode step was predicted from the ledger's allowed
+inputs alone, the number and its report were frozen with their input hashes at
+**2026-09-11T06:21:54Z**, and only then was a TP2 deployment stood up and
+captured.
+
+    frozen   20.970 ms   measured   19.845 ms   +5.7%
+
+### What the frozen number is a prediction of
+
+`ModelRunner.forward` for one decode step: prepare_model + run_model +
+postprocess, which is exactly the span a capture row records as `seconds`. The
+shape is written out rather than implied, because a comparison against a
+neighbouring shape is a different claim:
+
+    kind=decode, tp=2, bucket=32, cohort=32, tokens_each=1, context=1151
+
+### Inputs, against the §1 ledger
+
+Fifteen files, all hashed into `dec32/tp2_frozen.sha256` at the freeze:
+
+| what | files | ledger class |
+|---|---|---|
+| per-rank body/head graphs, TP2 | `b27dec32.tp2.r{0,1}.json`, `h27dec32.tp2.r{0,1}.json` | structure, derived on CPU |
+| per-rank price lists | `p27bdec32.tp2.r{0,1}.json`, `p27hdec32.tp2.r{0,1}.json` | B: standalone TP2 primitives |
+| registered/unregistered all-reduce | `ar_prices_tp2_graph_{capture,plain}.json` | B: real group, real communicator |
+| head all-gather | `ag_prices_tp2.json` | B |
+| region model | `regions.py` (`SOURCE_27B_TP1`) | A: TP1 source capture, applied unchanged |
+| composition code | `tp2_frozen.py`, `library.py` | -- |
+
+No TP2 step time and no TP2 serving time entered the prediction. Class C stayed
+out, which is the whole point of freezing it first.
+
+### Reproducibility
+
+`checkpoint_tp2.py` re-executes the frozen script in-process, hashes every
+`sys.modules` entry whose file lives under the working tree, and compares its
+output to the frozen text. **20 modules** hashed; the regenerated text is
+byte-identical; torch 2.10.0+rocm7.2.4.git3d3aa833, Python 3.12.3. It never
+writes `tp2_frozen.txt` -- a prediction that can be rewritten afterwards is not
+frozen.
+
+### The measurement, matched on the full key
+
+Captured 06:26-06:28 the same day, devices 4 and 5, 64 requests. Two steps match
+the key, at scheduler ticks 130 and 260 (cohorts 0-31 and 32-63), each seen by
+both ranks -- four rows, all four retained and reported, none dropped.
+
+Rank alignment is **read, not assumed**: every row carries the `rank_coords` the
+runner recorded, each per-rank file contains exactly its own rank, and the
+comparison exits if that does not hold. What remains assumed is only that those
+coords index the same tp group the graphs were derived per-rank against -- both
+come from `get_tp_group().rank_in_group`.
+
+| | rank 0 | rank 1 | step (max over ranks) |
+|---|---|---|---|
+| **full forward, frozen** | **20.970 ms** | **20.814 ms** | **20.970 ms** |
+| full forward, measured | 19.845 ms | 19.845 ms | 19.845 ms |
+| | **+5.7%** | **+4.9%** | **+5.7%** |
+| run_model predicted / measured | 20.708 / 19.593 | 20.552 / 19.588 | +5.7% |
+| postprocess predicted / measured | 0.131 / 0.140 | 0.131 / 0.142 | -6.3% / -7.5% |
+| prepare predicted / measured | 0.131 / 0.112 | 0.131 / 0.116 | +16.8% / +12.5% |
+
+The step is the max over ranks because it ends when the last rank does; the
+per-rank numbers are reported beside it because a per-rank error is not a step
+error. The two rows agree to 5 us on each rank.
+
+The one thing the comparison changes is where it *charges* the TP broadcast:
+into the `postprocess` span, which is the span that physically contains it
+(`regions.py:26`). That moves 0.029 ms between two held-out lines and leaves
+every predicted total exactly as frozen. It is an attribution fix, not a refit.
+
+### What this result is, and what it is not
+
+It is a `ModelRunner.forward` decode-step check on one covered shape, judged
+against a 10% criterion, which it meets at +5.7%.
+
+It is **not** a passed serving TPOT gate. TPOT, throughput, TTFT and the
+configuration ranking are end-to-end quantities measured over a whole serving
+run; none of them is claimed or tested here, and all of them still require the
+complete short/long serving matrix of §4. Nothing in G1, G2 or G3 moves on this.
+
+Within that scope: the kernel side is the transfer -- graphs are structure,
+prices are standalone TP2 primitives, and that composition lands within 5.7% of
+a real TP2 production step it never saw. The region model is the held-out part:
+`SOURCE_27B_TP1` was calibrated on a TP1 capture and applied unchanged, carrying
+the falsifiable claim that postprocess runs on TP-invariant shapes. It survives
+at -6.3% / -7.5% on a term worth 0.7% of the step; `prepare` transfers less well
+in relative terms but misses by 0.019 ms absolute.
+
+### Method sensitivity -- separate from the result above
+
+The frozen text named one sensitivity in advance: the two copy-path measurement
+methods of the body all-reduce disagree by 13.5%, worth 0.223 ms across the
+body's 129 reductions. Applied on its own it gives 21.193 ms, +6.8% -- it would
+worsen this comparison. That is the whole of the statement. It does not identify
+any component of the +1.115 ms residual and does not rule any component out. The
+residual is recorded here and not attributed; the sensitivity stays an open
+question about the two methods, to be settled by a registered-path measurement
+taken the second way.
+
+### Archive
+
+`agent_scratch/` is git-ignored, so the archive is the durable copy and this
+section cites it by hash. `agent_scratch/g4/archive/tp2_2026-09-11/` holds the
+frozen text and its timestamp, the 15-input manifest **and the fifteen input
+files themselves**, the 20-module reproducibility record, the four paired
+capture rows (`paired_rows.jsonl`), both complete per-rank step files, the
+server and replay logs, the comparison as produced, and the four scripts. 33
+files, hashed in `MANIFEST.sha256`.
+
+    tp2_2026-09-11.tar.gz
+      40c1b3caf9e021314efe9e543c1150a2caba1c30bbc1c1028280d02b1eb54134
+
+Held on node 18's `xiaobizh_n18` and on the host under the same path; the
+tarball hash above was verified equal on both, and `sha256sum -c` over all 33
+files passes on the host copy. Built by `agent_scratch/g4/archive_tp2.sh`
+(`5cc465f185e64409e837231e133fa9e584f1cc2ea757d2111bb064eeae9d6272`).

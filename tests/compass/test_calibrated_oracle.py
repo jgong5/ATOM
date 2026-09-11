@@ -388,16 +388,25 @@ class TestEventDraining:
         stub._measured_by_kind = {}
         stub._written = []
         stub._record_measurement = (
-            lambda shape, seconds, gap=None, req_ids=None, started_at=None, decision=None: stub._written.append(
-                (shape, seconds, gap)
+            lambda shape, seconds, gap=None, req_ids=None, started_at=None,
+            decision=None, spans=None: stub._written.append(
+                (shape, seconds, gap, spans)
             )
         )
         return stub
 
+    def _step(self, ready=True, ms=2.0, spans=None):
+        """One entry as `_forward_measured` appends it.
+
+        The last slot holds the inner event pairs -- the regions of the forward
+        timed separately inside the outer pair. None where a step recorded none.
+        """
+        return (decode(), self.FakeEvent(), self.FakeEvent(ready=ready, ms=ms),
+                None, None, None, None, spans)
+
     def test_an_unfinished_step_is_not_written_yet(self):
         stub = self._runner()
-        stub._pending.append(
-            (decode(), self.FakeEvent(), self.FakeEvent(ready=False), None, None, None, None))
+        stub._pending.append(self._step(ready=False))
         stub._drain_pending()
         assert stub._written == []
         assert len(stub._pending) == 1
@@ -405,26 +414,41 @@ class TestEventDraining:
     def test_finished_steps_are_written_in_order(self):
         stub = self._runner()
         for ms in (2.0, 4.0, 8.0):
-            stub._pending.append(
-                (decode(), self.FakeEvent(), self.FakeEvent(ms=ms), None, None, None, None)
-            )
+            stub._pending.append(self._step(ms=ms))
         stub._drain_pending()
-        assert [s for _, s, _g in stub._written] == [0.002, 0.004, 0.008]
+        assert [s for _, s, _g, _sp in stub._written] == [0.002, 0.004, 0.008]
         assert not stub._pending
 
     def test_draining_stops_at_the_first_unfinished_step(self):
         """Order matters: a later step must not be written before an earlier
         one, or the table's rows stop corresponding to the run's sequence."""
         stub = self._runner()
-        stub._pending.append(
-            (decode(), self.FakeEvent(), self.FakeEvent(ms=2.0), None, None, None, None))
-        stub._pending.append(
-            (decode(), self.FakeEvent(), self.FakeEvent(ready=False), None, None, None, None))
-        stub._pending.append(
-            (decode(), self.FakeEvent(), self.FakeEvent(ms=8.0), None, None, None, None))
+        stub._pending.append(self._step(ms=2.0))
+        stub._pending.append(self._step(ready=False))
+        stub._pending.append(self._step(ms=8.0))
         stub._drain_pending()
-        assert [s for _, s, _g in stub._written] == [0.002]
+        assert [s for _, s, _g, _sp in stub._written] == [0.002]
         assert len(stub._pending) == 2
+
+    def test_inner_spans_are_resolved_alongside_the_outer_one(self):
+        """The sub-spans exist so the modelled region can be told apart from the
+        rest of the forward. Draining must convert them the same way, and to
+        seconds, or a row reports a body in milliseconds next to a step in
+        seconds."""
+        stub = self._runner()
+        pair = (self.FakeEvent(), self.FakeEvent(ms=6.0))
+        stub._pending.append(self._step(ms=10.0, spans={"run_model": pair}))
+        stub._drain_pending()
+        (_shape, seconds, _gap, spans), = stub._written
+        assert seconds == 0.010
+        assert spans == {"run_model": 0.006}
+
+    def test_a_step_without_inner_spans_still_drains(self):
+        """Capture predates the inner pairs, or the region was never entered."""
+        stub = self._runner()
+        stub._pending.append(self._step(ms=4.0, spans=None))
+        stub._drain_pending()
+        assert stub._written[0][3] == {}
 
     def test_warmup_is_counted_per_kind(self):
         """Prefill happens a handful of times in a whole run, so a warmup
@@ -440,7 +464,60 @@ class TestEventDraining:
         stub._count_and_record(decode(), 0.001)       # first decode: dropped
         stub._count_and_record(prefill(256), 0.05)    # kept
         stub._count_and_record(decode(), 0.002)       # kept
-        assert [s for _, s, _g in stub._written] == [0.05, 0.002]
+        assert [s for _, s, _g, _sp in stub._written] == [0.05, 0.002]
+
+
+class TestTheSubSpanWindowIsOnlyOpenForAMeasuredStep:
+    """`run_model` is called by more than measured forwards.
+
+    Graph capture and dummy runs go through it too, and an event recorded while
+    a capture is active is recorded *into the graph* -- so it would then be
+    replayed on every subsequent step, timing nothing and corrupting the graph
+    it sits in. The window is therefore opened by `_forward_measured` alone, and
+    `_timed_span` passes straight through whenever it is shut.
+    """
+
+    @staticmethod
+    def _stub():
+        from atom.compass.runtime.runner import CompassModelRunner
+
+        return CompassModelRunner.__new__(CompassModelRunner)
+
+    def test_a_shut_window_records_nothing(self):
+        stub = self._stub()
+        assert not hasattr(stub, "_subspans")
+        assert stub._timed_span("run_model", lambda: "out") == "out"
+
+    def test_an_explicitly_shut_window_records_nothing(self):
+        stub = self._stub()
+        stub._subspans = None
+        assert stub._timed_span("run_model", lambda: "out") == "out"
+        assert stub._subspans is None
+
+    def test_an_open_window_collects_the_region(self):
+        stub = self._stub()
+        stub._subspans = {}
+        assert stub._timed_span("run_model", lambda: "out") == "out"
+        assert list(stub._subspans) == ["run_model"]
+        began, ended = stub._subspans["run_model"]
+        assert began is not ended
+
+    def test_a_raising_region_does_not_leave_the_window_open(self):
+        """A forward that raises must still shut it, or the next graph capture
+        runs with the window open -- which is the failure this class exists to
+        prevent, arriving by a different route."""
+        stub = self._stub()
+        stub._subspans = {}
+
+        def boom():
+            raise RuntimeError("kernel")
+
+        with pytest.raises(RuntimeError):
+            stub._timed_span("run_model", boom)
+        # `_timed_span` itself leaves the window alone; `_forward_measured`'s
+        # `finally` is what shuts it. What must hold here is that the failure
+        # did not record a half-pair that a later drain would read as timing.
+        assert "run_model" not in stub._subspans
 
 
 class TestEmpiricalOracle:

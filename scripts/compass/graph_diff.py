@@ -73,6 +73,169 @@ _REGION_EXCLUDES = {
 }
 
 
+def _head_placement(args, spec, notes) -> dict:
+    """Whether production runs this step's LM head inside the replayed body.
+
+    Not a function of TP. `run_model` reaches `compute_logits` down three
+    different branches, and only one of them consults `logits_in_graph`:
+
+      * `if not forward_mode.use_cudagraph:` -- prefill, or a decode forced
+        eager -- calls `compute_logits(hidden_states)` directly
+        (model_runner.py:3182). Eager at every width, TP1 included.
+      * the PIECEWISE decode path calls it directly too
+        (model_runner.py:3230), again at every width: the dense pieces
+        self-capture, the head is not among them.
+      * only the manual whole-forward (FULL) decode replay asks
+        `if self.logits_in_graph` (model_runner.py:3238), and
+        `logits_in_graph = world_size == 1 and not is_tbo` (:4104).
+
+    So a prefill at TP1 has an eager head, and so does a PIECEWISE decode at
+    TP1, and classifying either from TP alone puts the head in a graph that
+    does not contain it. Four conditions, all required: decode, FULL cudagraph
+    mode, TP1, TBO off.
+
+    `cudagraph_mode` is a declared deployment input, not something a derivation
+    can observe, so without it the answer is `None` -- recorded as unanswered.
+    A consumer must refuse rather than read `None` as `False`.
+    """
+    region = getattr(args, "region", "body")
+    mode = getattr(args, "cudagraph_mode", None)
+    kind = _step_kind(args, spec)
+    if mode is None or kind is None:
+        in_replay = None
+        why = ("undetermined: needs both the step kind and --cudagraph-mode; "
+               "TP alone does not decide this")
+    else:
+        in_replay = (kind == "decode" and mode == "full" and args.tp == 1)
+        why = (f"{kind} step, cudagraph mode {mode}, tp={args.tp}, TBO assumed "
+               "off")
+    return {
+        # What this graph holds, which follows `--region` and nothing else.
+        "in_this_graph": region in ("head", "both"),
+        # What production does, which is the question a composition needs.
+        "in_replayed_body_graph": in_replay,
+        "why": why,
+        "rule": ("decode AND cudagraph_mode==FULL AND tensor_parallel_size==1 "
+                 "AND not is_tbo; model_runner.py:3182 (eager branch), :3230 "
+                 "(piecewise branch), :3238-3241 (full-replay branch), :4104 "
+                 "(logits_in_graph)"),
+        "assumes": "two-batch overlap off",
+        # The head's rows are not the body's. A FULL capture projects the whole
+        # padded bucket, `compute_logits(outputs[:num_tokens])` with
+        # `num_tokens = bs * max_q_len` (:4297), and the replay slices
+        # `graph_logits[key][:num_tokens]` afterwards (:3239). Every eager head
+        # instead receives hidden states already cut to `scheduled_bs *
+        # max_q_len` (:3189, :3228-3230). This graph is the eager shape.
+        "rows_padded_to_capture_bucket": False,
+        "rows_into_compute_logits": notes.get("hidden_rows"),
+    }
+
+
+def _collective_registration(args, spec) -> dict:
+    """Which data path this region's collectives take in production.
+
+    `CustomAllreduce` runs one operator over two of them and the recorded
+    signature carries neither: with `registered_input=True` the peers read the
+    input buffer directly, with False it is copied into the IPC pool first and
+    reduced from there. The branch is `CustomAllreduce._IS_CAPTURING`
+    (custom_all_reduce.py:1231), which only `CustomAllreduce.capture()` sets --
+    entered by `parallel_state.graph_capture()`, which `model_runner.py:4158`
+    wraps its capture in, and not by a bare `torch.cuda.graph`. Measured rather
+    than read off the source: `agent_scratch/g4/ar_probe/README.md`, where the
+    same 4x5120 reduction costs 6.29 us on one path and 9.06 us on the other.
+
+    So a body production replays from a FULL decode capture reduces on the
+    registered path, and an eager region -- an eager body, and the TP>1 head,
+    which the runner computes after the replay -- takes the copy path. The
+    PIECEWISE case is left unanswered: its pieces are captured by the compiler's
+    wrapper rather than by `model_runner`'s own `graph_capture()`, and that has
+    not been audited. Unanswered is also what an undeclared `--cudagraph-mode`
+    gets, for the reason `_head_placement` gives: a derivation cannot observe a
+    deployment input, and a consumer must refuse rather than read `None` as
+    either path.
+    """
+    region = getattr(args, "region", "body")
+    mode = getattr(args, "cudagraph_mode", None)
+    kind = _step_kind(args, spec)
+    if region == "head":
+        # `compute_logits` runs outside any replay at TP>1 (model_runner.py:
+        # 3182, 3230); at TP1 the head holds no collective to price.
+        return {"regime": "unregistered",
+                "why": "the head runs eagerly after the replay, and an eager "
+                       "call takes the copy path"}
+    if mode is None or kind is None:
+        return {"regime": None,
+                "why": "undetermined: needs both the step kind and "
+                       "--cudagraph-mode; neither is observable from a trace"}
+    if mode == "eager":
+        return {"regime": "unregistered",
+                "why": "an eager step captures nothing, so the communicator is "
+                       "never armed"}
+    if mode == "full":
+        if kind == "decode":
+            return {"regime": "registered",
+                    "why": "a FULL decode replays a graph captured inside "
+                           "parallel_state.graph_capture() "
+                           "(model_runner.py:4158), which arms the "
+                           "communicator"}
+        return {"regime": "unregistered",
+                "why": f"a {kind} step runs eagerly even under FULL cudagraph "
+                       "mode, which captures decode buckets only"}
+    return {"regime": None,
+            "why": "PIECEWISE pieces are captured by the compiler's wrapper "
+                   "rather than model_runner's graph_capture(); not audited, "
+                   "so not claimed"}
+
+
+def _step_kind(args, spec):
+    """``"prefill"``, ``"decode"``, or ``None`` when nothing says.
+
+    The branch `run_model` takes turns on this, so a graph that cannot state it
+    cannot state where its head runs either.
+    """
+    if spec is None:
+        return None
+    if getattr(spec, "num_prefill_tokens", 0):
+        return "prefill"
+    lens = tuple(getattr(spec, "query_lens", ()) or ())
+    if not lens:
+        return None
+    return "decode" if max(lens) == 1 else "prefill"
+
+
+def _execution_record(args, spec, notes) -> dict:
+    """What this graph's operators were traced over, against what production
+    executes.
+
+    Both counts, because they differ and the difference is not visible in the
+    operators. A decode of 20 sequences whose graph was captured at
+    `running_bs` 32 forwards 32 rows -- `self.model(input_ids[:num_tokens_pad])`
+    with `num_tokens_pad = running_bs * max_q_len` (model_runner.py:3192, 3841)
+    -- and slices to `scheduled_bs * max_q_len` only afterwards (:3189, :3234).
+    A body graph traced at 20 rows is therefore the *eager* body; charging it
+    for a bucketed replay undercounts every dense operator in the step.
+
+    `capture_bucket` is a declared input for the same reason `cudagraph_mode`
+    is: a derivation cannot see which bucket a deployment snapped to. Absent,
+    it is recorded as unknown rather than assumed equal to the real count.
+    """
+    bucket = getattr(args, "capture_bucket", None)
+    return {
+        "step_kind": _step_kind(args, spec),
+        "cudagraph_mode": getattr(args, "cudagraph_mode", None),
+        # Rows this trace put through the model.
+        "body_rows_traced": notes.get("body_rows"),
+        # Rows the step really has, before any padding.
+        "rows_real": spec.num_tokens if spec is not None else args.tokens,
+        # Rows a replay would forward, when the step replays one.
+        "body_rows_executed": bucket,
+        "capture_bucket": bucket,
+        "head_rows_traced": notes.get("hidden_rows"),
+        "regions_traced": _REGION_INCLUDES[getattr(args, "region", "body")],
+        "regions_not_traced": _REGION_EXCLUDES[getattr(args, "region", "body")],
+    }
+
+
 def _init_env(tp: int) -> None:
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
     os.environ.setdefault("MASTER_PORT", os.environ.get("MASTER_PORT") or _free_port())
@@ -131,6 +294,11 @@ def _trace(model, input_ids, positions, topology=None, on_meta=False,
     if region not in ("body", "head", "both"):
         raise ValueError(f"unknown region {region!r}")
 
+    # Only when the body's operators are this graph's. A head region runs a
+    # forward too, but into a graph that is thrown away, so reporting its rows
+    # here would describe work the artifact does not contain.
+    notes: dict = ({} if region == "head"
+                   else {"body_rows": int(input_ids.shape[0])})
     with factories, installed, torch.inference_mode():
         if region == "head":
             # The forward still has to run, because the head needs its hidden
@@ -146,6 +314,7 @@ def _trace(model, input_ids, positions, topology=None, on_meta=False,
             with record_collectives(scratch.graph), \
                     TritonLaunchTracer(graph=scratch.graph), scratch:
                 hidden = model(input_ids, positions)
+            notes["hidden_rows"] = int(hidden.shape[0])
             t0 = time.perf_counter()
             with collectives, triton, ops:
                 model.compute_logits(hidden)
@@ -158,7 +327,7 @@ def _trace(model, input_ids, positions, topology=None, on_meta=False,
             with collectives, triton, ops:
                 model(input_ids, positions)
         trace_s = time.perf_counter() - t0
-    return ops.graph, trace_s, getattr(factories, "redirected", 0)
+    return ops.graph, trace_s, getattr(factories, "redirected", 0), notes
 
 
 def _trace_cmd(args) -> int:
@@ -257,7 +426,7 @@ def _trace_cmd(args) -> int:
     prev_dtype = torch.get_default_dtype()
     torch.set_default_dtype(config.torch_dtype)
     try:
-        graph, trace_s, redirected = _trace(
+        graph, trace_s, redirected, trace_notes = _trace(
             model, *inputs, topology={"tp": args.tp},
             on_meta=device.type == "meta", spec=spec,
             region=getattr(args, "region", "body"),
@@ -275,6 +444,7 @@ def _trace_cmd(args) -> int:
         # alike -- the spec below is what tells them apart.
         batch_signature=spec.query_lens if spec else (args.tokens,),
     )
+    registration = _collective_registration(args, spec)
     graph.provenance = {
         "source": "derivation" if device.type == "meta" else "capture",
         "device": device.type,
@@ -289,6 +459,51 @@ def _trace_cmd(args) -> int:
         "region": getattr(args, "region", "body"),
         "includes": _REGION_INCLUDES[getattr(args, "region", "body")],
         "excludes": _REGION_EXCLUDES[getattr(args, "region", "body")],
+        # How each collective's identity was established, because "verified"
+        # means two different things here. The all-reduce is a real custom op
+        # and a capture records it, so its name is observed. The all-gather is
+        # not: the decorator above it is commented out in the installed aiter,
+        # so nothing reaches the dispatcher and no capture -- of this graph or
+        # any other -- will contain it. Its name is a chosen label for a call
+        # confirmed by running two real ranks, and a reader comparing this graph
+        # against a captured one should expect that operator to be present here
+        # and absent there. See `atom.compass.runtime.derive.record_collectives`.
+        "collectives": {
+            "aiter::all_reduce_": "dispatcher-recorded",
+            "aiter::all_gather_unreg": "two-rank probe; not dispatcher-visible",
+        },
+        # Which of the communicator's two data paths those collectives run on
+        # in production, and why. The signature carries the message and not the
+        # path, so a price measured on the other one matches exactly; a library
+        # lookup reads this field and refuses when it is null rather than
+        # spending whichever measurement was loaded.
+        #
+        # "required" is the whole of the name. This is what the region needs,
+        # not what any benchmark did: a generic pricing run measures the path it
+        # actually took, which for `microbench`'s bare `torch.cuda.graph` is the
+        # copy path whatever the graph it was pricing requires. The price side
+        # records `collective_registration_measured` and the library refuses to
+        # read this key from a price list at all.
+        "collective_registration_required": registration["regime"],
+        "collective_registration_required_why": registration["why"],
+        # Where the LM head runs relative to a *graph*, which is not the same
+        # answer at every width and is how a step gets counted twice.
+        # `ModelRunner.logits_in_graph = self.world_size == 1 and not is_tbo`
+        # (model_runner.py:4104), with `self.world_size` the tensor-parallel
+        # size (model_runner.py:642). At TP1 a level-3 capture replays
+        # `compute_logits` inside the body graph; at TP>1 the runner computes
+        # logits eagerly after the replay and the body graph genuinely does not
+        # contain them.
+        #
+        # This graph is a level-0 eager derivation and traces one region at a
+        # time, so `in_this_graph` follows `region` and nothing else. The second
+        # field is about the level-3 graph of the same configuration -- the
+        # thing a transfer is measured against -- and it is recorded here
+        # because a source step whose body already contains the head must not
+        # then be given a head term, nor have one folded into a body
+        # correction.
+        "head_placement": _head_placement(args, spec, trace_notes),
+        "execution": _execution_record(args, spec, trace_notes),
     }
     if getattr(args, "region", "body") in ("head", "both"):
         # Whether production runs this head at all, which is not a property of
@@ -435,6 +650,20 @@ def main() -> int:
                          "the LM-head GEMM and its TP all-gather, which no "
                          "body graph contains and which is therefore priced "
                          "at zero today), or the two together.")
+    tr.add_argument("--cudagraph-mode", default=None,
+                    choices=["full", "piecewise", "eager"],
+                    help="The deployment's cudagraph mode, a declared config "
+                         "input. Without it a graph cannot say whether "
+                         "production runs its LM head inside the replayed body "
+                         "-- that depends on the branch run_model takes, not "
+                         "on TP alone -- and the artifact records the question "
+                         "as unanswered rather than guessing an answer.")
+    tr.add_argument("--capture-bucket", type=int, default=None,
+                    help="Rows the replayed body actually executes, when the "
+                         "step replays a graph. A decode of 20 sequences whose "
+                         "graph was captured at running_bs 32 forwards 32 "
+                         "rows and slices to 20 afterwards; a graph traced at "
+                         "20 is then the eager body, not the replayed one.")
     tr.add_argument("-o", "--out", required=True)
     tr.set_defaults(func=_trace_cmd)
 

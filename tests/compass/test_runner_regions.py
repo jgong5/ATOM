@@ -1,0 +1,149 @@
+"""The parts of a step that are neither the body graph nor the head graph.
+
+A prediction composed of two graphs is a prediction of `run_model`. The runner
+also prepares inputs and postprocesses logits, and at TP>1 broadcasts the
+sampled ids, and none of that is in either graph. What these check is that the
+region model supplies it from measurement and refuses everywhere else -- a
+region model that answers for any shape has stopped being a measurement and
+become a fitted constant.
+"""
+
+import json
+
+import pytest
+
+from atom.compass.core.cost.base import StepShape
+from atom.compass.core.cost.library import (
+    LibraryCostOracle, PriceLibrary, StaticGraphs)
+from atom.compass.core.cost.regions import SOURCE_27B_TP1, Measured
+
+
+def _decode(seqs=32, context=1151, tp=1):
+    return StepShape(num_scheduled_tokens=(1,) * seqs,
+                     context_lens=(context,) * seqs,
+                     topology={"tp": tp}, capture_bucket=32)
+
+
+def _prefill(seqs=16, tokens=16384, tp=1):
+    per = tokens // seqs
+    return StepShape(num_scheduled_tokens=(per,) * seqs,
+                     context_lens=(per,) * seqs,
+                     num_prefill_tokens=tokens, topology={"tp": tp})
+
+
+class TestTheDomainIsTheMeasurement:
+
+    def test_the_measured_decode_is_answered(self):
+        assert SOURCE_27B_TP1.refusal(_decode()) is None
+        parts = SOURCE_27B_TP1.breakdown(_decode())
+        assert set(parts) == {"<postprocess>", "<prepare>"}
+        assert SOURCE_27B_TP1.seconds(_decode()) == pytest.approx(2.333e-4)
+
+    def test_an_unmeasured_batch_size_is_refused(self):
+        why = SOURCE_27B_TP1.refusal(_decode(seqs=20))
+        assert why is not None and "20 sequences" in why
+        with pytest.raises(ValueError, match="no measured region"):
+            SOURCE_27B_TP1.seconds(_decode(seqs=20))
+
+    def test_an_unmeasured_width_is_refused(self):
+        why = SOURCE_27B_TP1.refusal(_decode(tp=8))
+        assert why is not None and "tp=8" in why
+
+    def test_a_prefill_outside_the_measured_extent_is_refused(self):
+        why = SOURCE_27B_TP1.refusal(_prefill(seqs=16, tokens=1024))
+        assert why is not None and "1024 tokens" in why
+
+    def test_the_measured_prefill_is_answered(self):
+        assert SOURCE_27B_TP1.refusal(_prefill()) is None
+        # Prefill preparation is an order of magnitude above decode's: it
+        # stages a whole chunk's ids and block tables, not one token each.
+        assert (SOURCE_27B_TP1.breakdown(_prefill())["<prepare>"]
+                > 8 * SOURCE_27B_TP1.breakdown(_decode())["<prepare>"])
+
+
+class TestTheOneThingTPChanges:
+
+    def test_the_broadcast_is_charged_only_above_one_rank(self):
+        assert "<tp-broadcast>" not in SOURCE_27B_TP1.breakdown(_decode(tp=1))
+        for tp in (2, 4):
+            parts = SOURCE_27B_TP1.breakdown(_decode(tp=tp))
+            assert parts["<tp-broadcast>"] == pytest.approx(2.86e-5)
+
+    def test_the_rest_of_postprocess_does_not_move_with_tp(self):
+        # `compute_logits` all-gathers the vocab shards before postprocess sees
+        # them, so the sampler runs on the same shape at every width. This is
+        # the claim that lets a TP1 calibration transfer with one added term.
+        one = SOURCE_27B_TP1.breakdown(_decode(tp=1))
+        two = SOURCE_27B_TP1.breakdown(_decode(tp=2))
+        assert one["<postprocess>"] == two["<postprocess>"]
+        assert one["<prepare>"] == two["<prepare>"]
+
+
+class TestTheNumbersCarryTheirOwnSpread:
+
+    def test_the_band_brackets_the_point_estimate(self):
+        for shape in (_decode(), _decode(tp=2), _prefill()):
+            low, high = SOURCE_27B_TP1.band(shape)
+            assert low <= SOURCE_27B_TP1.seconds(shape) <= high
+
+    def test_each_region_says_how_it_was_measured(self):
+        text = SOURCE_27B_TP1.describe()
+        for fragment in ("p50", "n=255", "bcast_probe", "cap_subspan"):
+            assert fragment in text
+
+    def test_the_cold_first_use_row_is_not_in_the_warm_model(self):
+        # Five prefills were captured and four are used. The first is the first
+        # use of that shape -- 7.071 s against 4.47-4.98 s -- and the acceptance
+        # protocol is warmed, so it stays classified as cold rather than being
+        # averaged into a warm constant.
+        assert SOURCE_27B_TP1.postprocess_prefill.samples == 4
+        assert SOURCE_27B_TP1.prepare_prefill.samples == 4
+        assert "warm" in SOURCE_27B_TP1.prepare_prefill.how
+
+    def test_a_measured_value_describes_itself(self):
+        m = Measured(1e-4, 9e-5, 1.1e-4, 7, "p50 [p10,p90] of something")
+        assert "0.1000 ms" in m.describe() and "n=7" in m.describe()
+
+
+class TestTheOracleChargesTheRegionsItWasGiven:
+
+    def _oracle(self, tmp_path, **kwargs):
+        op = {"name": "aiter::gemm", "input_shapes": [[32, 4096], [4096, 4096]],
+              "dtypes": ["bfloat16"]}
+        from atom.compass.runtime.microbench import signature_of
+        blob = {"prices": {signature_of(op): {
+                    "name": op["name"], "seconds": 1e-3, "occurrences": 1,
+                    "kernels": {"k0": 1e-3}}},
+                "unpriced": {}, "coverage": {},
+                "provenance": {"topology": {"tp": 1}}}
+        path = tmp_path / "p.json"
+        path.write_text(json.dumps(blob))
+        shape = _decode()
+        graphs = StaticGraphs({StaticGraphs.key(shape): {
+            "ops": [op], "key": {"topology": [["tp", 1]]},
+            "provenance": {"execution": {"body_rows_traced": 32}}}})
+        return shape, LibraryCostOracle(
+            PriceLibrary.load([(str(path), None)]), graphs, **kwargs)
+
+    def test_the_regions_appear_by_name_in_the_breakdown(self, tmp_path):
+        shape, oracle = self._oracle(tmp_path, regions=SOURCE_27B_TP1)
+        cost = oracle.estimate(shape)
+        assert cost.breakdown["<postprocess>"] == pytest.approx(1.019e-4)
+        assert cost.breakdown["<prepare>"] == pytest.approx(1.314e-4)
+        assert cost.seconds == pytest.approx(1e-3 + 2.333e-4)
+
+    def test_a_shape_outside_the_domain_is_refused_not_answered(self, tmp_path):
+        shape, oracle = self._oracle(tmp_path, regions=SOURCE_27B_TP1)
+        wide = StepShape(num_scheduled_tokens=shape.num_scheduled_tokens,
+                         context_lens=shape.context_lens,
+                         topology={"tp": 8}, capture_bucket=32)
+        # The graph lookup would answer; the region model is what refuses.
+        oracle.graphs._graphs[StaticGraphs.key(wide)] = (
+            oracle.graphs._graphs[StaticGraphs.key(shape)])
+        with pytest.raises(ValueError, match="no measured region"):
+            oracle.estimate(wide)
+
+    def test_a_scalar_and_a_region_model_are_not_both_accepted(self, tmp_path):
+        with pytest.raises(ValueError, match="twice"):
+            self._oracle(tmp_path, regions=SOURCE_27B_TP1,
+                         extra_seconds=2.3e-4)

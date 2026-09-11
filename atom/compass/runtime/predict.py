@@ -262,7 +262,8 @@ class CompassPredictMixin:
                           gap: Optional[float] = None,
                           req_ids: Optional[list] = None,
                           started_at: Optional[float] = None,
-                          decision: Optional[dict] = None) -> None:
+                          decision: Optional[dict] = None,
+                          spans: Optional[dict] = None) -> None:
         kind = "prefill" if shape.is_prefill else "decode"
         seen = self._measured_by_kind.get(kind, 0) + 1
         self._measured_by_kind[kind] = seen
@@ -272,13 +273,15 @@ class CompassPredictMixin:
         # sample there is.
         if seen > self._compass_config.measure_warmup_steps:
             self._record_measurement(shape, seconds, gap, req_ids=req_ids,
-                                     started_at=started_at, decision=decision)
+                                     started_at=started_at, decision=decision,
+                                     spans=spans)
 
     def _record_measurement(self, shape: StepShape, seconds: float,
                             gap: Optional[float] = None,
                             req_ids: Optional[list] = None,
                             started_at: Optional[float] = None,
-                            decision: Optional[dict] = None) -> None:
+                            decision: Optional[dict] = None,
+                            spans: Optional[dict] = None) -> None:
         """Append one timed step to the table.
 
         Appended and flushed per step rather than collected and written at exit.
@@ -337,6 +340,18 @@ class CompassPredictMixin:
             # rather than reconstructed, so queueing can be measured instead of
             # inferred.
             "started_at": started_at,
+            # Regions of the forward, each with its own event pair inside the
+            # outer one. `seconds` covers all of ModelRunner.forward; a cost
+            # model that composes a body and an LM head covers `run_model`
+            # alone, and without these the difference cannot be told from a
+            # modelling error. What `seconds` has that these do not -- input
+            # preparation, H2D staging, and any device idle the host leaves
+            # between the regions -- is the unaccounted remainder, and is meant
+            # to be read as one.
+            #
+            # Absent on captures taken before the inner pairs existed and on the
+            # no-device path, where there is nothing asynchronous to separate.
+            **({"span_seconds": spans} if spans else {}),
         }) + "\n")
         self._measure_fh.flush()
 

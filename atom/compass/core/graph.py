@@ -176,6 +176,39 @@ class OpSpec:
             decides how much work runs. Without both, a recorded Triton launch
             describes a kernel nobody can call back -- which left the KV gather
             of every chunked prefill unpriced. Empty for everything else.
+        abi: How this operator's argument tuple came to be known, and hence
+            whether pricing may rebuild the call. Three values.
+
+            ``""`` -- the dispatcher recorded it, so the arguments here are the
+            ones the operator was given. Rebuildable.
+
+            ``"unverified"`` -- an interceptor above the dispatcher recorded it
+            and the tuple was *inferred* from reading the production call chain.
+            The name may be right and the shapes are, but the positions, count
+            and types of the rest are not established. Pricing refuses, because
+            a wrong tuple is not a safe failure: ``all_gather_unreg`` takes
+            ``(_fa, inp, reg_buffer, out, reg_bytes, dim)``, two of which are
+            raw addresses, and an operator handed a guessed address can read
+            whatever happens to be mapped rather than faulting.
+
+            ``"live-state"`` -- the tuple has been confirmed against a real
+            call, and confirming it is what showed the call cannot be rebuilt
+            from a graph at all. Two of that same operator's six arguments are
+            the communicator handle and the IPC input-pool address of a live
+            process. Those are not properties of the step, they are properties
+            of the process that ran it, and no artifact can carry them. Such an
+            operator is priced by performing the real collective in a real
+            group, never by reconstruction.
+
+            Note what ``""`` does not mean. The eager head all-gather emits
+            *nothing* through the dispatcher: ``outplace_all_gather``'s
+            ``@torch.library.custom_op`` decorator is commented out in the
+            installed aiter, and the kernel below it is a plain pybind function,
+            so a real two-rank call records only the output's ``aten::empty``
+            and two dtype views. The name such an operator is recorded under is
+            chosen, not observed, and a captured graph will not contain it. That
+            is a property of the operator rather than a defect in the recording;
+            the alternative is a TP graph whose head transfer costs nothing.
     """
 
     name: str
@@ -190,6 +223,7 @@ class OpSpec:
     int_ranges: tuple[tuple[int, tuple[int, int, bool]], ...] = ()
     layouts: tuple[tuple[int, tuple], ...] = ()
     param_names: tuple[tuple[int, str], ...] = ()
+    abi: str = ""
     inputs_from: tuple[int, ...] = ()
     output_aliases: tuple = ()
     dies_at: tuple = ()
@@ -264,6 +298,7 @@ class OpGraph:
                     "layouts": [[i, [list(v[0]), v[1], v[2], v[3]]]
                                 for i, v in op.layouts],
                     "param_names": [[i, n] for i, n in op.param_names],
+                    "abi": op.abi,
                     "inputs_from": list(op.inputs_from),
                     "output_aliases": list(op.output_aliases),
                     "dies_at": list(op.dies_at),
@@ -316,6 +351,7 @@ class OpGraph:
                         (int(i), str(n))
                         for i, n in op.get("param_names") or ()
                     ),
+                    abi=str(op.get("abi") or ""),
                     inputs_from=tuple(
                         int(i) for i in op.get("inputs_from") or ()),
                     output_aliases=tuple(

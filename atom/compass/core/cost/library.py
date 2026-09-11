@@ -49,7 +49,7 @@ from atom.compass.core.cost.base import StepCost, StepShape
 logger = logging.getLogger(__name__)
 
 __all__ = ["Coverage", "PriceLibrary", "GraphSource", "StaticGraphs",
-           "LibraryCostOracle"]
+           "LibraryCostOracle", "head_placement", "executed_body_rows"]
 
 
 def _signature_of(op: dict) -> str:
@@ -80,6 +80,61 @@ def _layout_fingerprint(op: dict) -> str:
     return json.dumps([[int(pos), list(tuple(value))]
                        for pos, value in (tuple(x) for x in layouts)],
                       sort_keys=True)
+
+
+def head_placement(graph: dict) -> str:
+    """Whether this graph's operators already include the LM head.
+
+    Three answers, and the third is not the same as the second.
+
+    ``"inside"`` -- the graph contains ``compute_logits``. One kind of step is:
+    a decode replayed through a manually captured whole-forward graph at TP1,
+    where ``ModelRunner.logits_in_graph = world_size == 1 and not is_tbo`` is
+    true and the runner takes its logits from ``graph_logits`` rather than
+    calling the head (model_runner.py:3238-3241). Adding a head term to such a
+    graph charges the projection, the sampling gather and their launches twice.
+
+    ``"outside"`` -- the graph declares it does not. Most steps are here, and
+    TP1 does not exclude a step from this list: a prefill calls
+    ``compute_logits`` eagerly at every width (model_runner.py:3182), and so
+    does a piecewise-compiled decode (:3230). Neither consults
+    ``logits_in_graph``, so width alone never decides this. A head term is then
+    required, not optional: the work is real and this sum does not contain it.
+
+    ``"unknown"`` -- the graph predates the field or was not written by our
+    deriver. Not treated as "outside": an unstated placement is the case where
+    a double count is invisible, so the caller refuses instead of guessing.
+    """
+    placement = (graph.get("provenance") or {}).get("head_placement")
+    if not isinstance(placement, dict) or "in_this_graph" not in placement:
+        return "unknown"
+    return "inside" if placement["in_this_graph"] else "outside"
+
+
+def _max_q_len(shape: StepShape) -> int:
+    return max(shape.num_scheduled_tokens) if shape.num_scheduled_tokens else 0
+
+
+def executed_body_rows(shape: StepShape) -> int:
+    """How many rows this step's body actually runs.
+
+    Not the token count. A replayed step runs its padded bucket: the runner
+    computes ``num_tokens_pad = running_bs * max_q_len`` and the captured graph
+    executes all of it, the real count being used only to slice the result
+    afterwards (model_runner.py:3189-3192, 3841-3843). An eager step has no
+    bucket and runs the tokens it was given.
+    """
+    if shape.capture_bucket is None:
+        return shape.total_tokens
+    return shape.capture_bucket * _max_q_len(shape)
+
+
+def _traced_body_rows(graph: dict) -> Optional[int]:
+    """The row count a body graph was traced over, or None if it does not say."""
+    rows = ((graph.get("provenance") or {})
+            .get("execution", {})
+            .get("body_rows_traced"))
+    return int(rows) if isinstance(rows, int) else None
 
 
 @dataclass(frozen=True)
@@ -146,18 +201,108 @@ class Coverage:
         return f"{head}; UNPRICED {self.operators - self.priced}: {missing}"
 
 
-class PriceLibrary:
-    """Signature-keyed operator prices, with where each one came from.
+#: The two data paths one collective operator runs over, which its signature
+#: does not carry. On the ``registered`` path the peers read the input buffer
+#: directly, because its address was registered with them when the graph was
+#: captured; on the ``unregistered`` path the input is copied into a
+#: pre-registered IPC pool buffer first and reduced from there.
+#: `CustomAllreduce.all_reduce` picks between them from `_IS_CAPTURING`, which
+#: only `CustomAllreduce.capture()` sets -- entered by
+#: `parallel_state.graph_capture()`, which `model_runner.py:4158` uses, and
+#: *not* by a bare `torch.cuda.graph`, which is how `microbench` times. Same
+#: operator, same signature, 6.29 us against 9.06 us for the same 4x5120
+#: bfloat16 reduction at TP2 (`agent_scratch/g4/ar_probe/README.md`).
+REGISTERED = "registered"
+UNREGISTERED = "unregistered"
+_REGIMES = (REGISTERED, UNREGISTERED)
 
-    Assembled from one or more pricing runs. Merging is allowed and is not
-    silent: a signature priced by two runs keeps the first and records the
-    disagreement, and any run that was narrowed with ``--only`` marks the whole
-    library partial, because a narrowed run's coverage counts describe what was
-    asked for and not what a graph contains.
+
+#: Two fields, deliberately not one name. A *graph* records the path its
+#: region requires in production; a *price list* records the path its benchmark
+#: was observed to take. They are different claims about different artifacts,
+#: and a generic benchmark run against a graph that requires the registered
+#: path still measures whichever path it actually ran. Sharing one key would
+#: let a requirement be copied forward as though it were an observation, which
+#: is the failure this whole distinction exists to prevent -- so the reader of
+#: each side accepts only its own key.
+REQUIRED_KEY = "collective_registration_required"
+MEASURED_KEY = "collective_registration_measured"
+
+
+def _declared_registration(price_blob: dict, prices_path: str):
+    """Which data path a price list's collectives were *observed* on, or None.
+
+    ``None`` means the list does not say, and a list that does not say cannot
+    have its collectives spent on a step that requires a named path -- the same
+    rule the group width already follows, for the same reason: the signature
+    carries neither, so a price from the other path matches exactly and is
+    spent silently.
+
+    A price list is read only for what it observed. If it carries the graph
+    side's requirement key that is a copied field, not a measurement, and it is
+    an error rather than an answer: `microbench` captures into a bare
+    `torch.cuda.graph` and does not arm the communicator, so a run priced
+    against a registered-path graph has still measured the copy path.
+    """
+    provenance = price_blob.get("provenance") or {}
+    if REQUIRED_KEY in provenance:
+        raise ValueError(
+            f"{prices_path} carries {REQUIRED_KEY}, which is a graph's "
+            "requirement and not a measurement of this run. A benchmark "
+            "records the path it was observed to take; it does not inherit the "
+            f"path its subject needs. Use {MEASURED_KEY}, or leave it unstated "
+            "and name the scope at load.")
+    declared = provenance.get(MEASURED_KEY)
+    if declared in _REGIMES:
+        return declared
+    if declared is not None:
+        raise ValueError(
+            f"{prices_path}: {MEASURED_KEY} is {declared!r}, not one of "
+            f"{list(_REGIMES)}")
+    # A probe that watched the communicator per call rather than declaring a
+    # label: `registered_input` as the communicator actually received it.
+    observed = provenance.get("observed_registered_input")
+    if isinstance(observed, dict) and observed:
+        seen = {bool(v) for v in observed.values()}
+        if len(seen) == 1:
+            return REGISTERED if seen.pop() else UNREGISTERED
+    return None
+
+
+def _same_scope(a: dict, b: dict) -> bool:
+    return (a.get("registration") == b.get("registration")
+            and (a.get("topology") or None) == (b.get("topology") or None))
+
+
+def _scope_note(scope: dict) -> str:
+    width = scope.get("topology")
+    return (f"{scope.get('registration') or 'undeclared path'} at "
+            f"{width or 'undeclared width'}")
+
+
+class PriceLibrary:
+    """Signature-keyed operator prices, with the scope each one is valid in.
+
+    Assembled from one or more pricing runs. For a collective the signature is
+    not a key on its own: it carries the message and neither the group width
+    nor which of the communicator's two data paths ran. Two measurements that
+    differ in either are measurements of different things that hash the same,
+    so they are kept side by side under one signature and selected between
+    explicitly. Keeping the first and dropping the rest would make correctness
+    depend on the order the files were loaded in.
+
+    Within one scope the older rule stands: the first price wins and a later
+    one that differs by more than 5% is recorded as a conflict. Any run
+    narrowed with ``--only`` marks the whole library partial, because a
+    narrowed run's coverage counts describe what was asked for and not what a
+    graph contains.
     """
 
     def __init__(self) -> None:
-        self._prices: dict[str, dict] = {}
+        #: signature -> the records priced under it, each with the scope it was
+        #: measured in: ``{"topology": ..., "registration": ...}``. A list and
+        #: not a record, for the reason in the class docstring.
+        self._prices: dict[str, list] = {}
         self._refusals: dict[str, str] = {}
         #: signature -> layout fingerprint of the operator it was measured from,
         #: where the graph that was priced is available to say.
@@ -165,13 +310,6 @@ class PriceLibrary:
         self.sources: list[str] = []
         self.partial: list[str] = []
         self.conflicts: dict[str, list[float]] = {}
-        #: signature -> the parallel width its price was measured at. A
-        #: collective's signature carries its message and not its group width,
-        #: so a TP4 all-reduce price matches a TP2 call exactly and would be
-        #: spent silently. `priced` found this and refuses it; the same refusal
-        #: belongs here, per signature, because this library is assembled from
-        #: runs at more than one width on purpose.
-        self._topology: dict[str, dict] = {}
 
     @classmethod
     def load(cls, pairs) -> "PriceLibrary":
@@ -182,15 +320,24 @@ class PriceLibrary:
         the library knows which arrangement of memory each price was measured
         against and can refuse a lookup that would answer a strided call with a
         dense call's price.
+
+        A third element names the collective registration regime for a list
+        whose own provenance predates the field. It states the scope the
+        measurement already had; it cannot change it, and disagreeing with what
+        the file says is an error.
         """
         lib = cls()
         for entry in pairs:
-            price_path, graph_path = (entry if isinstance(entry, (tuple, list))
-                                      else (entry, None))
-            lib.add(price_path, graph_path)
+            if isinstance(entry, (tuple, list)):
+                price_path, graph_path = entry[0], entry[1]
+                registration = entry[2] if len(entry) > 2 else None
+            else:
+                price_path, graph_path, registration = entry, None, None
+            lib.add(price_path, graph_path, registration)
         return lib
 
-    def add(self, price_path: str, graph_path: Optional[str] = None) -> None:
+    def add(self, price_path: str, graph_path: Optional[str] = None,
+            registration: Optional[str] = None) -> None:
         from atom.compass.core.cost.priced import _declared_topology
 
         with open(price_path, encoding="utf-8") as fh:
@@ -198,6 +345,19 @@ class PriceLibrary:
         self.sources.append(price_path)
         provenance = blob.get("provenance") or {}
         topology = _declared_topology(blob, price_path)
+        declared = _declared_registration(blob, price_path)
+        if registration is not None:
+            if registration not in _REGIMES:
+                raise ValueError(f"registration must be one of "
+                                 f"{list(_REGIMES)}, not {registration!r}")
+            if declared is not None and declared != registration:
+                raise ValueError(
+                    f"{price_path} was measured on the {declared} path and is "
+                    f"being loaded as {registration}: a caller may name the "
+                    "scope a file leaves unstated, not overrule the one it "
+                    "states")
+        scope = {"topology": topology,
+                 "registration": declared or registration}
         if provenance.get("only"):
             # A narrowed run priced one family and counted its coverage over
             # that family. Read as a library it is a library of one family, and
@@ -205,14 +365,15 @@ class PriceLibrary:
             # otherwise.
             self.partial.append(f"{price_path} (--only {provenance['only']})")
         for sig, record in (blob.get("prices") or {}).items():
-            if sig in self._prices:
-                was = float(self._prices[sig]["seconds"])
+            kept = self._prices.setdefault(sig, [])
+            same = [r for r in kept if _same_scope(r["scope"], scope)]
+            if same:
+                was = float(same[0]["seconds"])
                 now = float(record["seconds"])
                 if was and abs(now - was) / was > 0.05:
                     self.conflicts.setdefault(sig, [was]).append(now)
                 continue
-            self._prices[sig] = dict(record, source=price_path)
-            self._topology[sig] = topology
+            kept.append(dict(record, source=price_path, scope=scope))
         for sig, why in (blob.get("unpriced") or {}).items():
             self._refusals.setdefault(sig, why)
         if graph_path:
@@ -221,25 +382,30 @@ class PriceLibrary:
                     self._layouts.setdefault(_signature_of(op),
                                              _layout_fingerprint(op))
 
-    def lookup(self, op: dict, topology=None):
+    def lookup(self, op: dict, topology=None, registration=None):
         """``(record, source)`` for one operator, or ``(None, reason)``.
 
-        ``topology`` is the width the *graph* is of, which a collective must be
-        paid for at.
+        ``topology`` is the width the *graph* is of and ``registration`` is the
+        data path this region's collectives take. Those are the two things a
+        collective must be paid for at and the two things its signature does
+        not carry, so both are required of one and neither is inferred: a
+        lookup that cannot name the path it needs is refused, because the only
+        alternative is spending a price measured on the other one.
         """
-        from atom.compass.core.cost.priced import _collectives_transferable
         from atom.compass.runtime.microbench import _is_collective_op
 
         sig = _signature_of(op)
-        record = self._prices.get(sig)
-        if record is None:
+        candidates = self._prices.get(sig) or []
+        if not candidates:
             refusal = self._refusals.get(sig)
             return None, (f"refused when priced: {refusal}" if refusal
                           else "no entry for this signature")
-        if _is_collective_op(op) and not _collectives_transferable(
-                topology, self._topology.get(sig)):
-            return None, ("its price was measured at a different group width, "
-                          "which a collective's signature does not carry")
+        if _is_collective_op(op):
+            record, why = self._collective(candidates, topology, registration)
+            if record is None:
+                return None, why
+        else:
+            record = candidates[0]
         measured = self._layouts.get(sig)
         if measured is not None:
             mine = _layout_fingerprint(op)
@@ -250,7 +416,39 @@ class PriceLibrary:
                               f"({measured or 'dense'} vs {mine or 'dense'})")
         return record, record.get("source", "?")
 
-    def body(self, graph_blob: dict) -> tuple[float, Coverage, int]:
+    @staticmethod
+    def _collective(candidates, topology, registration):
+        """Select among same-signature collective prices, or say why not.
+
+        Width first, then path. Both must match and the caller must have named
+        the path: an unnamed one is a question the library cannot answer for
+        it, not a licence to pick.
+        """
+        from atom.compass.core.cost.priced import _collectives_transferable
+
+        fits = [r for r in candidates
+                if _collectives_transferable(topology, r["scope"]["topology"])]
+        if not fits:
+            return None, ("its price was measured at a different group width, "
+                          "which a collective's signature does not carry "
+                          f"(have: {'; '.join(sorted({_scope_note(r['scope']) for r in candidates}))})")
+        if registration is None:
+            return None, (
+                "the registration regime this region's collectives run on was "
+                "not declared, and the signature does not carry it: a "
+                "registered and an unregistered price are prices of different "
+                "work under the same key "
+                f"(have: {'; '.join(sorted({_scope_note(r['scope']) for r in fits}))})")
+        matched = [r for r in fits if r["scope"]["registration"] == registration]
+        if not matched:
+            return None, (
+                f"this region reduces on the {registration} path and no price "
+                "under this signature was measured on it "
+                f"(have: {'; '.join(sorted({_scope_note(r['scope']) for r in fits}))})")
+        return matched[0], ""
+
+    def body(self, graph_blob: dict,
+             registration: Optional[str] = None) -> tuple[float, Coverage, int]:
         """Sum a graph's operators against the library.
 
         Returns the seconds, the coverage, and the launch count -- the last
@@ -258,10 +456,21 @@ class PriceLibrary:
         execution term is paid per launch. The count comes from what the
         benchmark saw the operator launch, so it is only known for operators
         that were priced.
+
+        ``registration`` is the data path this region's collectives take in
+        production, from the caller when it knows and otherwise from the
+        graph's own ``provenance.collective_registration_required``. A graph
+        that states neither and contains collectives has those collectives
+        refused by name rather than priced from whichever measurement was
+        loaded. This is a *requirement*: what the region needs, never what any
+        benchmark was observed to do.
         """
         from atom.compass.core.cost.priced import HOST_SYNC
 
         topology = dict(((graph_blob.get("key") or {}).get("topology") or []))
+        if registration is None:
+            declared = (graph_blob.get("provenance") or {}).get(REQUIRED_KEY)
+            registration = declared if declared in _REGIMES else None
         ops = [op for op in (graph_blob.get("ops") or [])
                if op.get("name", "") not in HOST_SYNC]
         total, priced, launches = 0.0, 0, 0
@@ -269,7 +478,7 @@ class PriceLibrary:
         reasons: dict[str, str] = {}
         sources: dict[str, int] = {}
         for op in ops:
-            record, detail = self.lookup(op, topology)
+            record, detail = self.lookup(op, topology, registration)
             if record is None:
                 refused[op["name"]] = refused.get(op["name"], 0) + 1
                 reasons.setdefault(op["name"], detail)
@@ -287,9 +496,11 @@ class PriceLibrary:
         partial = f", PARTIAL: {'; '.join(self.partial)}" if self.partial else ""
         conflict = (f", {len(self.conflicts)} signatures disagree across runs"
                     if self.conflicts else "")
+        scoped = sum(1 for recs in self._prices.values() if len(recs) > 1)
+        multi = (f", {scoped} held in more than one scope" if scoped else "")
         return (f"PriceLibrary({len(self._prices)} signatures from "
                 f"{len(self.sources)} runs, {len(self._layouts)} with a "
-                f"recorded layout{partial}{conflict})")
+                f"recorded layout{multi}{partial}{conflict})")
 
 
 class GraphSource(Protocol):
@@ -363,22 +574,59 @@ class LibraryCostOracle:
     def __init__(self, library: PriceLibrary, graphs: GraphSource,
                  seconds_per_launch: float = 0.0,
                  extra_seconds: float = 0.0,
+                 head_graphs: Optional[GraphSource] = None,
                  floor_seconds: float = 0.0,
-                 require_complete: bool = False) -> None:
+                 require_complete: bool = False,
+                 body_registration: Optional[str] = None,
+                 head_registration: Optional[str] = None,
+                 regions=None) -> None:
         self.library = library
         self.graphs = graphs
         self.seconds_per_launch = seconds_per_launch
-        #: Work a production step does that the traced body never contained --
-        #: the LM head and the runner's own device work. Zero until it is
-        #: measured, and zero is wrong; it is left visible here rather than
-        #: folded into a fitted constant, so that a prediction carrying none of
-        #: it can be told from one that does.
+        #: The LM head as a second region of the same step -- its own graph,
+        #: priced through the same library -- rather than a scalar correction.
+        #: It has to be a graph: the head's cost is a projection whose N is the
+        #: number of output-producing rows, and at TP>1 a collective whose
+        #: price is a real two-rank measurement keyed on its own signature.
+        #: Neither survives being averaged into one number.
+        #:
+        #: Kept apart from `extra_seconds` because where the head runs is a
+        #: property of the width: at TP1 a level-3 graph replays it inside the
+        #: body, at TP>1 the runner computes it eagerly afterwards. A head
+        #: folded into an undifferentiated correction cannot be checked against
+        #: the body graph that may already contain it.
+        self.head_graphs = head_graphs
+        #: Work a production step does that neither region contains -- the
+        #: runner's own device work. Zero until it is measured, and zero is
+        #: wrong; it is left visible here rather than folded into a fitted
+        #: constant, so that a prediction carrying none of it can be told from
+        #: one that does.
         self.extra_seconds = extra_seconds
         self.floor_seconds = floor_seconds
         #: Refuse rather than answer from a partial sum. Off by default because
         #: a partial answer with its coverage attached is useful; on where a
         #: gate requires a complete one.
         self.require_complete = require_complete
+        #: Which of the communicator's two data paths each region's collectives
+        #: run on, per region because the answer differs between them: a
+        #: replayed body was captured under `graph_capture()` and reduces on the
+        #: registered path, while the TP>1 head runs eagerly after the replay
+        #: and takes the copy path. Left None where the graph's own provenance
+        #: states it; a graph that states neither has its collectives refused.
+        self.body_registration = body_registration
+        self.head_registration = head_registration
+        #: The runner's own regions -- postprocess, input preparation, and the
+        #: TP broadcast of the sampled ids -- as a `RunnerRegions` measured on
+        #: the source and refusing outside its domain. It supersedes
+        #: `extra_seconds`, which is the same quantity as one number for a
+        #: caller that has only that; setting both would charge it twice, so
+        #: it is refused.
+        if regions is not None and extra_seconds:
+            raise ValueError(
+                "extra_seconds and regions are the same term measured two "
+                "ways; supplying both charges the runner's work twice. Pass "
+                "the region model alone.")
+        self.regions = regions
         self.last_coverage: Optional[Coverage] = None
 
     def estimate(self, shape: StepShape) -> StepCost:
@@ -388,19 +636,142 @@ class LibraryCostOracle:
                 f"no graph for {len(shape.num_scheduled_tokens)} requests, "
                 f"{shape.total_tokens} tokens: derive one rather than "
                 "answering from a neighbouring shape")
-        body, coverage, launches = self.library.body(graph)
+        self._check_body_rows(graph, shape)
+        body, coverage, launches = self.library.body(
+            graph, self.body_registration)
+        head, head_coverage, head_launches = self._head_for(graph, shape)
+        if head_coverage is not None:
+            # One step, one coverage record: a head whose all-gather is unpriced
+            # has to make the *step* incomplete, not sit in a second record that
+            # `require_complete` never reads.
+            coverage = coverage.merged(head_coverage)
         self.last_coverage = coverage
         if self.require_complete and not coverage.complete:
             raise ValueError("incomplete: " + coverage.describe())
-        overhead = launches * self.seconds_per_launch
-        total = max(body + overhead + self.extra_seconds, self.floor_seconds)
+        overhead = (launches + head_launches) * self.seconds_per_launch
         breakdown = {"<body>": body, "<overhead>": overhead}
-        if self.extra_seconds:
-            breakdown["<runner>"] = self.extra_seconds
+        if head_coverage is not None:
+            # Recorded even at zero seconds, because "the head ran and priced
+            # to nothing" and "no head was added" are different claims.
+            breakdown["<head>"] = head
+        if self.regions is not None:
+            # Named per region rather than summed, so a reader can see which
+            # measured region each part of the step came from. Outside the
+            # calibrated domain this raises rather than answering.
+            breakdown.update(self.regions.breakdown(shape))
+            runner = sum(v for k, v in breakdown.items()
+                         if k not in ("<body>", "<overhead>", "<head>"))
+        else:
+            runner = self.extra_seconds
+            if runner:
+                breakdown["<runner>"] = runner
+        total = max(body + overhead + head + runner, self.floor_seconds)
         return StepCost(seconds=total, breakdown=breakdown)
 
+    def _check_body_rows(self, graph: dict, shape: StepShape) -> None:
+        """Refuse a body graph traced over a different number of rows.
+
+        A replayed step does not execute its batch; it executes its bucket. The
+        runner pads to `running_bs * max_q_len` and runs every one of those rows
+        through the body (model_runner.py:3192, 3841-3843), then slices the
+        result back down. So a graph traced with twenty rows describes twenty
+        rows of work, and charging it for a step that replays a thirty-two-row
+        bucket understates the body by the padding -- silently, because both are
+        "the decode-20 graph" by name.
+
+        Only graphs that state their traced row count are checked. An older
+        graph without the field is priced as before rather than refused: this
+        guard exists to catch a mismatch it can see, not to invalidate every
+        artifact derived before the field existed. Which of those two a caller
+        wants is `require_complete`'s question, not this one's.
+        """
+        traced = _traced_body_rows(graph)
+        if traced is None:
+            return
+        executed = executed_body_rows(shape)
+        if traced == executed:
+            return
+        raise ValueError(
+            f"this body graph was traced over {traced} rows but the step "
+            f"executes {executed}"
+            + (f" ({shape.capture_bucket} bucket x "
+               f"{_max_q_len(shape)} query length)"
+               if shape.capture_bucket is not None else " (eager, unpadded)")
+            + ": a replay runs the padded bucket, not the batch, so pricing "
+              "the narrower trace would drop the padding's work. Derive the "
+              "graph at the shape the step actually runs.")
+
+    def _head_for(self, graph: dict, shape: StepShape):
+        """The head region of this step: seconds, coverage and launches.
+
+        Absent -- `(0.0, None, 0)` -- for two reasons that are not gaps: no
+        head graphs were supplied, or the step produces no output position, so
+        the runner skips `compute_logits` entirely.
+
+        Two refusals, both about composition rather than about the head itself.
+        A body graph that already contains the head cannot also be given one:
+        at TP1 `ModelRunner.logits_in_graph` is true and a level-3 replay runs
+        the projection and its sampling inside the body, so adding a second
+        region charges them twice. And a graph that does not say where its head
+        is gets a refusal rather than a guess -- it is the one case where either
+        answer is silently wrong, because a prediction quietly missing an LM
+        head reads exactly like one quietly charging two.
+        """
+        if self.head_graphs is None:
+            return 0.0, None, 0
+        if not shape.produces_output:
+            # `is_pure_middle_chunk(batch)` -> `logits = None`
+            # (model_runner.py:3174). Nothing is projected and nothing is
+            # sampled, so there is no head to charge.
+            return 0.0, None, 0
+        placement = head_placement(graph)
+        if placement == "inside":
+            raise ValueError(
+                "this body graph already contains the LM head, so adding the "
+                "head region would count it twice: it was derived at a width "
+                "where ModelRunner.logits_in_graph is true (TP1), which puts "
+                "compute_logits inside the replayed body. Price the step from "
+                "that graph alone, or use a body graph that excludes the head.")
+        if placement == "unknown":
+            raise ValueError(
+                "this body graph does not say whether it contains the LM head, "
+                "and a head region cannot be added to a graph whose head "
+                "placement is unstated -- both answers are plausible and both "
+                "failures are silent. Re-derive it so provenance carries "
+                "'head_placement'.")
+        head_graph = self.head_graphs.graph_for(shape)
+        if head_graph is None:
+            raise KeyError(
+                f"no head graph for {len(shape.num_scheduled_tokens)} "
+                f"requests, {shape.total_tokens} tokens: this step samples, so "
+                "its head is real work. Derive one rather than dropping it.")
+        if head_placement(head_graph) == "outside":
+            raise ValueError(
+                "the head graph says it does not contain the head; it is a "
+                "body graph. Derive it with --region head.")
+        padded = ((head_graph.get("provenance") or {})
+                  .get("head_placement", {})
+                  .get("rows_padded_to_capture_bucket"))
+        if padded and shape.capture_bucket is None:
+            # A head traced over a capture bucket's padded rows is a wider GEMM
+            # than the one an eager step runs: the capture projects
+            # `outputs[:bs * max_q_len]` and slices `graph_logits` afterwards
+            # (model_runner.py:4297, 3239), while the eager head is handed
+            # hidden states already cut to the real count (model_runner.py:
+            # 3237-3241). Twenty requests are twenty rows in one and a bucket's
+            # worth in the other.
+            raise ValueError(
+                "this head graph projects a capture bucket's padded rows, but "
+                "the step runs eagerly and projects only its real ones. "
+                "Derive the head for the eager shape rather than charging the "
+                "padded GEMM.")
+        return self.library.body(head_graph, self.head_registration)
+
     def describe(self) -> str:
+        head = ("no head region" if self.head_graphs is None
+                else f"head {self.head_graphs.describe()}")
         return (f"LibraryCostOracle({self.library.describe()}, "
                 f"{self.graphs.describe()}, "
                 f"+{self.seconds_per_launch * 1e6:.2f}us/launch, "
+                f"{head}, "
                 f"runner {self.extra_seconds * 1e3:.3f}ms)")

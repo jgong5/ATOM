@@ -75,7 +75,7 @@ not), **UNPROVEN** (no valid measurement yet).
 | **G3a** | Non-KV memory terms | each within 10% | **PARTIAL** | E3b: 27B at TP=1/2/4. weights +1.6/−0.1/−3.3%, non-torch +4.9/+1.2/+1.3%, graph pool +0.0% everywhere, load residue −3.3/−6.7% at TP≥2. Three terms outside: load residue at TP=1 (−93%, 0.01% of budget), persistent (−51%, 0.07% of budget), activations (no prefill-shaped graph for this model) |
 | **G3b** | KV block count | within 5% | **PARTIAL** | E3: −0.09% (27B TP=2), −0.02/−0.02/+0.07% (0.6B TP=1/2/4). Not yet predicted from a profile at 27B TP=1/4 — the measured ground truth now exists (112 740 / 265 520 / 584 880 blocks) |
 | **G3c** | One infeasible configuration rejected for the right reason | same error as the engine | **UNPROVEN** | — |
-| **G4** | Prediction outside the calibration configurations | stated per prediction | **UNPROVEN** | see §3 — nothing evaluated today is held out on the TP axis. E6 (2026-09-11) closed the attention context gap and prices a **body** at TP=1 (23.122 ms, 2423/2439 operators) and TP=2 (15.467 ms, 2552/2568): coverage and a predicted body cost, not an accepted step time, and not yet compared to a measured step |
+| **G4** | Prediction outside the calibration configurations | stated per prediction | **PARTIAL — one forward step, not a serving quantity** | E7 (2026-09-11): a TP2 decode step frozen with its fifteen input hashes at 06:21:54Z, then measured. **20.970 ms frozen against 19.845 ms, +5.7%** (rank 1 +4.9%), on `kind=decode, tp=2, bucket=32, cohort=32, tokens_each=1, context=1151`; all four matching rows retained. This is a `ModelRunner.forward` decode-step check against a 10% criterion — **not** a passed serving TPOT gate, and it moves no G1/G2/G3 row. What it does establish, at one point: no TP2 step or serving time entered the prediction. `G4_TRANSFER.md` §12. E6 (2026-09-11) is its coverage precondition — a priced body at TP=1 (23.122 ms, 2423/2439 operators) and TP=2 (15.467 ms, 2552/2568) |
 | **G5a** | Replay speedup | ≥ 5× | **PARTIAL** | Observed, device-free, at 27B: 36 s of serving → 1.46 s (24.7×), or 133 s → 23 s (5.8×) including server startup. That is the replay speed and it is measured. It is not yet a gate pass because G5c — capture and calibration cost reported separately and amortised — is a distinct gate and is unmeasured; an earlier 309 s → 3 s figure is superseded, its simulated half still held the model on a GPU |
 | **G5b** | GPU-free replay after capture | no device | **PASS at 0.6B and 27B** | E5: served 32/32 (0.6B) and 64/64 (27B) in `xiaobizh_n18_cpu`, a container with **no `/dev/kfd` and no `/dev/dri`** — zero driver handles and no KFD process registration in any process of the tree. Both reproduce the GPU-resident simulator's schedule step for step and its TTFT/TPOT/latency distributions exactly; at 27B ten of 64 requests sit in a different slot of that same schedule, which is the burst's admission order, not the GPU-free path (E5). This is the no-device gate only; G5a and G5c are separate and still open |
 | **G5c** | Capture / calibration / startup / load / execution costs reported separately, with amortisation | reported | **UNPROVEN** | — |
@@ -87,6 +87,13 @@ blanket "nothing here is a pass yet" no longer described the matrix. Corrected
 workload at one width, G5a and G5c are separate from G5b and open, and the
 honest reading of the whole matrix is still that the pilot is closed and the
 gates are open.
+
+**G4 moved to PARTIAL on 2026-09-11, and the word is load-bearing.** E7 is a
+real prediction — frozen before the measurement, with no target timing among its
+inputs — but of a single `ModelRunner.forward` decode step at one shape and one
+width. A step-level result is not a serving result. Every accuracy gate in this
+matrix (G2a/G2b/G2c) and every ranking gate (G1/G1b/G1c) is measured over a
+whole serving run, and none of them moves on E7.
 
 ---
 
@@ -428,6 +435,34 @@ should not be made without witnessing it.
   `agent_scratch/g4/sprices_decode4_tp{1,2}*.json` (prices),
   `agent_scratch/g4/sdecode4_tp2.run` (run log, `rc=0`).
 
+### E7 — a frozen TP2 forward step, then measured (run 2026-09-11)
+
+* **Procedure** Predict one TP2 decode step from the G4 ledger's allowed inputs
+  only; write the number and its full report to `dec32/tp2_frozen.txt`; hash the
+  fifteen inputs into `dec32/tp2_frozen.sha256`, timestamped **06:21:54Z**; only
+  then stand up a TP2 deployment and capture. The comparison re-hashes all
+  fifteen before reading a number, and reads the frozen terms rather than
+  recomputing them.
+* **Span and shape** the whole of `ModelRunner.forward` — prepare_model +
+  run_model + postprocess, which is what a capture row's `seconds` records —
+  at `kind=decode, tp=2, bucket=32, cohort=32, tokens_each=1, context=1151`.
+* **Result** frozen **20.970 ms** against a measured **19.845 ms**, **+5.7%**;
+  per rank 20.970/+5.7% and 20.814/+4.9%. Four matching rows (ticks 130 and 260
+  × two ranks), all retained. Rank alignment read from each row's `rank_coords`,
+  not assumed from filenames.
+* **Reproducibility** `checkpoint_tp2.py` re-executes the frozen script and
+  regenerates the text byte-identically, hashing the **20 tree modules** the
+  composition actually imported, plus torch/Python versions.
+* **Scope, stated narrowly.** A `ModelRunner.forward` decode-step check against
+  a 10% criterion. **Not** a passed serving TPOT gate; TPOT, throughput, TTFT
+  and ranking are end-to-end quantities and still need E2's matrix. The named
+  +0.223 ms copy-path sensitivity is reported separately: applied on its own it
+  would worsen this comparison, and it identifies no component of the residual.
+* **Artifacts** `agent_scratch/g4/archive/tp2_2026-09-11/` — 33 files under
+  `MANIFEST.sha256`, tarball
+  `40c1b3caf9e021314efe9e543c1150a2caba1c30bbc1c1028280d02b1eb54134`, verified
+  equal on node 18 and the host. Full record in `G4_TRANSFER.md` §12.
+
 ## 3. What is and is not held out (G4)
 
 | prediction | measured on the evaluated point? | honest label |
@@ -436,12 +471,16 @@ should not be made without witnessing it.
 | E1 admission constant | yes, per deployment | a calibrated per-deployment input |
 | `warmup_seconds` | yes, first-use, per deployment | a calibrated first-use input — §4 |
 | 27B TP=2 priced oracle (`POC_SUMMARY` §3.1) | overhead constants came from the 0.6B | held out on model for those two constants only; the price list was measured on the 27B at TP=2 |
+| **E7 frozen TP2 decode step** (`G4_TRANSFER` §12) | **no** — frozen at 06:21:54Z with its input hashes, captured afterwards; no TP2 step or serving time among the fifteen inputs | **a genuine prediction, on one forward step.** +5.7% against a 10% criterion. Its region term (`SOURCE_27B_TP1`) is TP1-calibrated and applied unchanged, so that part is held out on width too |
 
-**The technical bet — capture at TP=1, derive TP=2/4 — has not been evaluated.**
-`derive.py` produces a graph at any width on meta tensors and
-`simulate_group_width` runs a symmetric group from one process, so the machinery
-exists; no prediction has yet been made at a width whose graph and prices were
-not measured at that width.
+**The technical bet — capture at TP=1, derive TP=2/4 — has been evaluated at one
+point, on one quantity.** E7 froze a TP2 `ModelRunner.forward` decode step from
+CPU-derived graphs plus standalone TP2 primitive prices and a TP1 region model,
+and it landed +5.7% against the measurement. That is a forward-step result. It
+is **not** a serving result: TPOT, throughput, TTFT and the TP ranking are
+end-to-end quantities, none is claimed by E7, and all still require the complete
+short/long matrix of E2. The remaining width, TP=4, is unmeasured, and so is
+every prefill shape.
 
 ---
 
