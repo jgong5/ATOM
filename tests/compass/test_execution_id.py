@@ -10,13 +10,15 @@ reproducibility evidence the calibration has.
 
 import ast
 import hashlib
+import importlib.util
 from pathlib import Path
 
 import pytest
 
-from atom.compass.core.execution_id import (EXECUTION_SCHEMA, ID_INPUTS,
-                                            ID_RULE, derive_execution_id,
-                                            verify_execution_id)
+from atom.compass.core.execution_id import (EXECUTION_SCHEMA, ID_FIELDS,
+                                            ID_INPUTS, ID_RULE, STAMP_FIELDS,
+                                            derive_execution_id, read_stamp,
+                                            stamp_of, verify_execution_id)
 
 #: Taken from `cc_traces_run.py` at f4e06b0c by executing that file's own
 #: `derive_execution_id` on these arguments. Pinned as a literal because the
@@ -26,8 +28,19 @@ CC_INPUTS = ("hjbog-srdc-18", "RESULTS/tp2_long", "real", 1, 31337,
              1757500000000000000)
 CC_VECTOR = "cx-f118d05298843dc2"
 
-HARNESS = (Path(__file__).resolve().parents[2]
-           / "scripts/compass/cc_traces_run.py")
+ROOT = Path(__file__).resolve().parents[2]
+HARNESS = ROOT / "scripts/compass/cc_traces_run.py"
+CANONICAL = ROOT / "atom/compass/core/execution_id.py"
+SCRIPT_HELPER = ROOT / "scripts/compass/execution_id.py"
+
+
+def _record():
+    return {"schema": EXECUTION_SCHEMA,
+            "execution_id": derive_execution_id(*CC_INPUTS),
+            "id_rule": ID_RULE,
+            "id_inputs": dict(zip(ID_FIELDS, CC_INPUTS)),
+            "cell": "RESULTS/tp2_long", "side": "real", "repeat": 1,
+            "server_pid": 31337, "source": "not travelling with the artifact"}
 
 
 def test_the_vector_from_ccs_implementation_still_derives():
@@ -83,3 +96,66 @@ def test_the_two_ends_agree_where_the_harness_is_on_the_box():
                  namespace)
     assert namespace["EXECUTION_SCHEMA"] == EXECUTION_SCHEMA
     assert namespace["derive_execution_id"](*CC_INPUTS) == CC_VECTOR
+
+
+def test_the_two_names_for_the_field_order_are_one_object():
+    """The memory side called it `ID_INPUTS`, the script side `ID_FIELDS`.
+
+    Kept as an alias rather than a rename so neither caller had to change on
+    the commit that made this module canonical. Asserting identity, not
+    equality: two tuples that happen to match today are exactly the drift this
+    module exists to prevent.
+    """
+    assert ID_INPUTS is ID_FIELDS
+
+
+def test_a_stamp_carries_what_a_reader_needs_and_not_the_rest():
+    """Enough to re-derive the id, nothing that goes stale when copied."""
+    stamp = stamp_of(_record())
+    assert tuple(stamp) == STAMP_FIELDS
+    assert verify_execution_id(stamp)
+    assert "source" not in stamp and "server_pid" not in stamp
+
+    stamp["id_inputs"]["server_pid"] = 31338
+    assert verify_execution_id(_record()), "the stamp was not a live view"
+
+
+def test_an_artifact_that_names_no_execution_says_so():
+    assert read_stamp({"execution": _record()})["execution_id"] == CC_VECTOR
+    assert read_stamp({}) is None
+    assert read_stamp({"execution": "cx-f118d05298843dc2"}) is None
+    assert read_stamp(None) is None
+
+
+def test_the_module_verifies_an_id_without_importing_the_engine():
+    """Loaded from the file alone: no `atom` package, no torch, no AITER.
+
+    This is the loader a script may use when it wants the rule and nothing
+    else. It is tested because it is offered in the module docstring, and an
+    untested recipe is a recipe that stops working.
+    """
+    spec = importlib.util.spec_from_file_location("_execution_id", CANONICAL)
+    loaded = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(loaded)
+    assert loaded.derive_execution_id(*CC_INPUTS) == CC_VECTOR
+    assert loaded.ID_RULE == ID_RULE
+
+
+def test_the_script_helper_delegates_rather_than_copies():
+    """When CC's helper is merged here, it must not carry its own derivation.
+
+    A second copy would pass this suite on the day it landed and diverge
+    silently afterwards, so what is checked is delegation itself -- the same
+    function object -- not merely the same answer.
+    """
+    if not SCRIPT_HELPER.exists():
+        pytest.skip("scripts/compass/execution_id.py is not in this tree")
+    spec = importlib.util.spec_from_file_location("_cc_execution_id",
+                                                  SCRIPT_HELPER)
+    helper = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(helper)
+    assert helper.derive_execution_id is derive_execution_id
+    assert helper.verify_execution_id is verify_execution_id
+    assert helper.EXECUTION_SCHEMA == EXECUTION_SCHEMA
+    assert tuple(helper.ID_FIELDS) == ID_FIELDS
+    assert "sha256" not in SCRIPT_HELPER.read_text(encoding="utf-8")

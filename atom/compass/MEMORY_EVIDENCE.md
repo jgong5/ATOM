@@ -740,6 +740,21 @@ at import time. The rule is pinned against a vector taken from CC's own
 implementation at `f4e06b0c`, with a cross-check that re-derives it from that
 file wherever the harness is in the tree.
 
+It is the **canonical** copy, not one of two: `scripts/compass/execution_id.py`
+delegates its constants and both functions here and keeps only the script and
+file helpers. Two byte-compatible copies would pass on the day they landed and
+diverge afterwards without failing loudly, which is the same silent-caution
+failure the schema exists to prevent, so the suite checks delegation by
+function identity rather than by answer. The module carries both names for the
+field order -- `ID_FIELDS` and `ID_INPUTS`, the same tuple object -- so neither
+caller had to be edited on the commit that merged them, and it exports the
+stamp shape (`STAMP_FIELDS`, `stamp_of`, `read_stamp`) that lets an artifact
+carry enough to re-verify its own id after it has been copied. Importing it as
+a package module pulls `atom/__init__.py` and `atom/compass/__init__.py` and
+nothing heavier -- no torch, no AITER, checked on the device-free box -- and a
+caller that wants not even that can load the file by path, a recipe the
+docstring offers and the suite exercises.
+
 An id is **never inferred**. A block naming a host and a pid is not an
 execution identity and is not promoted into one; an id that does not follow
 from its own recorded inputs is damaged or transplanted, which is worse than

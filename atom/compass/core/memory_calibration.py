@@ -45,7 +45,7 @@ from __future__ import annotations
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 
-from atom.compass.core.execution_id import (EXECUTION_SCHEMA,
+from atom.compass.core.execution_id import (EXECUTION_SCHEMA, read_stamp,
                                             verify_execution_id)
 
 __all__ = [
@@ -86,9 +86,7 @@ def producer_key(run: Mapping | None) -> str | None:
     """
     if not run:
         return None
-    execution = run.get("execution")
-    if not isinstance(execution, Mapping):
-        execution = run
+    execution = read_stamp(run) or run
     schema = execution.get("schema")
     if schema and schema != EXECUTION_SCHEMA:
         return None
