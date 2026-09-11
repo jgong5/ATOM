@@ -128,13 +128,38 @@ class TestTheFileTheAuditReads:
     def test_a_neighbour_in_the_baseline_is_seen_through_the_sampler(
         self, tmp_path, monkeypatch, clock
     ):
-        """A card already holding a gigabyte before our server starts."""
+        """A card already holding a gigabyte before our server starts.
+
+        The mask is set here rather than inherited: whether card0 is a
+        neighbour or one of ours is the whole difference between this verdict
+        and the next test's, and the harness that runs this suite sets a mask
+        of its own.
+        """
+        monkeypatch.setenv("HIP_VISIBLE_DEVICES", "1")
         busy = FakeSmi(cards=_cards(used_bytes=1 << 30, use=44.0, vram=1))
         monkeypatch.setattr(sampler_mod, "_smi_json", busy)
         s = _sampler(tmp_path, clock, interval=1.0, phase="baseline")
         s.run(limit=2)
         verdict = isolation.audit(isolation.read(s.out))
         assert verdict["verdict"] == "node_busy"
+
+    def test_the_same_busy_card_is_worse_news_when_it_is_ours(
+        self, tmp_path, monkeypatch, clock
+    ):
+        """Identical readings, opposite meanings.
+
+        A busy neighbour costs bandwidth we might notice in a timing. A busy
+        card of our own puts somebody else's bytes inside our device-wide
+        memory readings, which no later subtraction recovers.
+        """
+        monkeypatch.setenv("HIP_VISIBLE_DEVICES", "0")
+        busy = FakeSmi(cards=_cards(used_bytes=1 << 30, use=44.0, vram=1))
+        monkeypatch.setattr(sampler_mod, "_smi_json", busy)
+        s = _sampler(tmp_path, clock, interval=1.0, phase="baseline")
+        s.run(limit=2)
+        verdict = isolation.audit(isolation.read(s.out))
+        assert verdict["verdict"] == "own_contaminated"
+        assert "already in use at the baseline" in verdict["problems"][0]
 
     def test_the_visible_mask_is_recorded_as_isolation_spells_it(
         self, tmp_path, smi, clock, monkeypatch
