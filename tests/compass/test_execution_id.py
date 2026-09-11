@@ -158,4 +158,7 @@ def test_the_script_helper_delegates_rather_than_copies():
     assert helper.verify_execution_id is verify_execution_id
     assert helper.EXECUTION_SCHEMA == EXECUTION_SCHEMA
     assert tuple(helper.ID_FIELDS) == ID_FIELDS
-    assert "sha256" not in SCRIPT_HELPER.read_text(encoding="utf-8")
+    assert helper.ID_RULE == ID_RULE
+    # Deliberately not "the file contains no sha256": the helper hashes
+    # artifacts and is meant to. What must not come back is a second copy of
+    # the derivation, and function identity above is what says so.
