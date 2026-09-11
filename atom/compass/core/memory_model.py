@@ -805,6 +805,117 @@ def _prediction_calibration(profile: Mapping, load, refuse, source: str):
     return calibration
 
 
+#: The instants at which the activation high-water mark has been witnessed on
+#: the source config, and what each holds. ``sharded`` widths are split across
+#: ranks; ``replicated`` ones are not; ``collective`` ones exist only when
+#: there is more than one rank, because they are the destinations of the
+#: collectives a single rank never runs.
+GDN_ACTIVATION_INSTANTS = {
+    "linear_attn": {
+        "witness": "TP=1 warmup allocation history (S27), block by block; O16",
+        "sharded": ("mlp_gate_up", "mlp_act", "in_proj_qkvzba", "attn_value"),
+        "replicated": ("hidden", "hidden", "hidden"),
+        # No history exists at TP>1 for this instant, so whether it also gains
+        # collective destinations there is unwitnessed. Leaving it empty can
+        # only understate the instant, which keeps the maximum a lower bound.
+        "collective": (),
+        "collective_witnessed": False,
+    },
+    "mlp_down": {
+        "witness": "device-free walk high-water mark on the pinned recapture; "
+                   "same module path and same non-collective ordinal 72 at "
+                   "TP=1, 2 and 4",
+        "sharded": ("mlp_gate_up", "mlp_act"),
+        "replicated": ("hidden",) * 6,
+        "collective": ("hidden",),
+        "collective_witnessed": True,
+    },
+}
+
+
+def gdn_activation_widths(config: Mapping) -> dict:
+    """The trailing widths of the GDN-hybrid activation buffers, off a config.
+
+    Nothing here is measured. ``in_proj_qkvzba`` is the concatenation the
+    module actually projects to -- q and k at ``linear_num_key_heads`` x
+    ``linear_key_head_dim``, v and z at ``linear_num_value_heads`` x
+    ``linear_value_head_dim``, then b and a at one element per value head --
+    and on the 27B that is 16 384 + 96, which is the width the device-free walk
+    produces at ``linear_attn.in_proj_qkvzba`` and shards to 8240 and 4120.
+    """
+    hidden = int(config["hidden_size"])
+    intermediate = int(config["intermediate_size"])
+    heads = int(config["linear_num_value_heads"])
+    key = int(config["linear_num_key_heads"]) * int(config["linear_key_head_dim"])
+    value = heads * int(config["linear_value_head_dim"])
+    return {"hidden": hidden,
+            "mlp_gate_up": 2 * intermediate,
+            "mlp_act": intermediate,
+            "attn_value": value,
+            "in_proj_qkvzba": 2 * key + 2 * value + 2 * heads}
+
+
+def activation_instant_bytes(config: Mapping, tokens: int, world_size: int = 1,
+                             *, dtype_bytes: int = 2,
+                             instants: Optional[Mapping] = None) -> dict:
+    """The activation term as a maximum over witnessed instants, per width.
+
+    The gate is ``peak_torch - current_torch``, a maximum over instants, so the
+    width behaviour of the term is the width behaviour of *whichever* instant
+    is largest at that width -- which need not be the one that is largest at
+    TP=1. Two instants are witnessed on the source config and they hold
+    different mixes: linear attention 74 848 sharded elements against 15 360
+    replicated, the MLP one 52 224 against 30 720. The sharded side falls as
+    1/W and the replicated side does not, so the more sharded instant falls
+    faster and is overtaken at TP=2.
+
+    The maximal instant does not move *semantically* -- on the pinned
+    recapture the walk peaks at ``layers.1.mlp.down_proj`` at non-collective
+    ordinal 72 at every width, and the raw index only moves because TP>1
+    inserts collectives ahead of it. What moves is what is live there: at TP>1
+    the down-projection's collective destination is a storage of its own,
+    alive alongside the GEMM output it reduces, so the instant holds a seventh
+    hidden-sized buffer that TP=1 has no operator to produce. That is the
+    ``collective`` entry, and it is why the walk's own curve at the TP=1 peak's
+    site understates the TP=2 peak by 167 772 160 B.
+
+    Both instants are source-only and neither is fitted: the widths come from
+    ``config.json``, the linear-attention live set from the TP=1 warmup
+    allocation history, and the MLP one from the device-free derivation, which
+    performs no collective and reads no output. No TP=2 or TP=4 measurement is
+    opened.
+
+    The maximum is over the instants that happen to be witnessed, so it is a
+    lower bound on the true maximum, and it is known to be one: at TP=1 the
+    allocator's own ``peak - current`` is 2 956 984 320 B and this returns
+    2 955 935 744 B, short by the 1 048 576 B replay gap, which is reported
+    rather than absorbed. The linear-attention instant carries a second
+    reservation -- no history exists for it above TP=1, so any collective
+    destination it holds there is uncounted.
+    """
+    widths = gdn_activation_widths(config)
+    best = None
+    for name, instant in sorted((instants or GDN_ACTIVATION_INSTANTS).items()):
+        sharded = sum(widths[key] for key in instant["sharded"])
+        replicated = sum(widths[key] for key in instant["replicated"])
+        if world_size > 1:
+            replicated += sum(widths[key]
+                              for key in instant.get("collective") or ())
+        if sharded % world_size:
+            raise UnfoundedActivation(
+                "instant %r sums to %d sharded elements, which %d ranks do not "
+                "divide; that is not the split the module makes"
+                % (name, sharded, world_size))
+        total = tokens * dtype_bytes * (sharded // world_size + replicated)
+        if best is None or total > best["bytes"]:
+            best = {"instant": name, "bytes": int(total),
+                    "sharded": sharded, "replicated": replicated,
+                    "witness": instant["witness"],
+                    "collective_witnessed": bool(
+                        instant.get("collective_witnessed"))}
+    return best
+
+
 def activation_bytes_at(graph, tokens: int, *,
                         strict_dtypes: bool = False) -> int:
     """The activation peak at a token count the graph was not traced at.
