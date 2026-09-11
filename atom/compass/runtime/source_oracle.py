@@ -371,6 +371,7 @@ def build_source_oracle(
     seconds_per_launch: float = 0.0,
     require_complete: bool = True,
     carry_allocation: bool = False,
+    allocation: str = "",
     derive: bool = True,
     interpolate=None,
     rank_coords=None,
@@ -417,7 +418,8 @@ def build_source_oracle(
     """
     from atom.compass.core.cost.library import LibraryCostOracle
     from atom.compass.core.cost.regions import region_model
-    from atom.compass.runtime.templates import CarriedAllocation
+    from atom.compass.runtime.templates import (CarriedAllocation,
+                                                 NativeAllocation)
 
     head = _flag(head, "head")
     require_complete = _flag(require_complete, "require_complete")
@@ -439,7 +441,34 @@ def build_source_oracle(
     rank_artifacts = _rank_artifacts(
         coords, _entries(price, "price"), templates, head_templates)
 
+    allocation_choice = str(allocation or "").strip().lower()
+    if allocation_choice and carry_allocation:
+        raise ValueError(
+            "allocation and carry_allocation both name where the block "
+            "assignment comes from, and they disagree. Pass one.")
     allocation = None
+    if allocation_choice == "native":
+        # The bridge a served run takes: the oracle holds the source,
+        # and the runner offers it the scheduler's own assignment
+        # before asking for a cost. Offline -- a CLI, a diagnostic --
+        # nothing offers, and every shape whose template carries
+        # allocator fields is refused with that as the reason. That is
+        # the intended behaviour and not a misconfiguration: an
+        # unattended run stops rather than reusing a template's blocks.
+        if not block_size or not max_model_len:
+            raise ValueError(
+                "allocation=native encodes the scheduler's block table "
+                "through BatchSpec, so it needs block_size and "
+                "max_model_len")
+        allocation = NativeAllocation(
+            block_size=int(block_size), max_model_len=int(max_model_len),
+            position_rows=int(position_rows))
+    elif allocation_choice not in ("", "carry", "none"):
+        raise ValueError(
+            f"allocation must be native, carry or none, not "
+            f"{allocation_choice!r}")
+    if allocation_choice == "carry":
+        carry_allocation = True
     if carry_allocation:
         # Names the approximation rather than the caller that asked for it:
         # the same assumption is the same assumption whether a CLI flag or an
@@ -488,6 +517,14 @@ def build_source_oracle(
         regions=regions_model,
         require_complete=require_complete,
     )
+    # How a served run reaches the allocation source without knowing how
+    # the composition was assembled: `source_cost_oracle` hands back the
+    # oracle alone, and the runner has to be able to offer this step's
+    # assignment to it. Attached only when it is the native source --
+    # there is nothing to offer a carried one, and a runner that finds
+    # the attribute absent knows the oracle is not taking allocations.
+    if allocation is not None and getattr(allocation, "measured", False):
+        oracle.native_allocation = allocation
     return SourceComposition(oracle, body_graphs, head_graphs, body_deriver,
                              build_seconds, allocation, coords, rank_artifacts,
                              getattr(library, "max_gap_ratio", None))

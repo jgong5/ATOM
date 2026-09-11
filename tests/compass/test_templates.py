@@ -321,3 +321,195 @@ class TestTheRepresentativeRank:
                   template_for([(1, 1151)] * 4))
         assert cache.graph_for(shape([1] * 4, [4096] * 4, tp=2, rank=0))
         assert cache.hits == 1 and cache.representative_hits == 0
+
+
+# -- the native allocation ---------------------------------------------------
+
+def native(**kw):
+    """A source over a 16-token block and this deployment's 256k context."""
+    from atom.compass.runtime.templates import NativeAllocation
+
+    kw.setdefault("block_size", 16)
+    kw.setdefault("max_model_len", 262144)
+    return NativeAllocation(**kw)
+
+
+def offered(source, rows, tables, slots=(0, 1), prefill_seqs=0,
+            state_rows=None):
+    from atom.compass.runtime.templates import NativeStepAllocation
+
+    source.offer(NativeStepAllocation(
+        rows=rows, block_tables=tables,
+        state_slots=(None if slots is None else list(slots)),
+        state_rows=state_rows,
+        num_prefill_seqs=prefill_seqs,
+        source="test", rank_coords={"tp": 0}))
+    return source
+
+
+def test_the_scheduler_s_own_blocks_reach_the_bound_graph():
+    """The whole point of the bridge: these slots are not the template's.
+
+    Two requests at context 32 hold two 16-token blocks each. The scheduler put
+    them at blocks 7,8 and 3,4, so the decode token of each is the last slot of
+    its second block -- 8*16+15 and 4*16+15. Nothing here is a model of an
+    allocator: the block ids come from the record and the arithmetic is
+    `BatchSpec`'s, the same code that describes a captured batch.
+    """
+    rows = [(1, 32), (1, 32)]
+    source = offered(native(), rows, [[7, 8], [3, 4]])
+    bound = bind_cohort(template_for(rows), shape([1, 1], [32, 32], bucket=2),
+                        source)
+    context = dict(map(tuple, bound["ops"][1]["context"]))
+    assert context["slot_mapping"] == [8 * 16 + 15, 4 * 16 + 15]
+    binding = bound["provenance"]["binding"]
+    assert binding["allocation_measured"] is True
+    assert binding["allocation_padding"] == {}
+    assert set(binding["allocation_fields"]) == set(ALLOCATOR_FIELDS)
+
+
+def test_a_step_nobody_offered_an_allocation_for_is_refused():
+    """The offline case, and the one that keeps an unattended run honest.
+
+    A `NativeAllocation` with no record does not fall back to the template's
+    blocks. It says so, and every shape whose template carries allocator fields
+    is refused -- which is what `allocation=native` does in a CLI, where no
+    runner is offering anything.
+    """
+    rows = [(1, 32), (1, 32)]
+    with pytest.raises(BindRefusal, match="no native allocation was offered"):
+        bind_cohort(template_for(rows), shape([1, 1], [32, 32], bucket=2),
+                    native())
+
+
+def test_the_previous_step_s_allocation_is_not_this_step_s():
+    """A record is checked against the shape rather than trusted.
+
+    The failure this prevents is the quiet one: a runner that offers on some
+    steps and not others would otherwise price the second step with the first
+    step's blocks and report the result as measured.
+    """
+    source = offered(native(), [(1, 32), (1, 32)], [[7, 8], [3, 4]])
+    with pytest.raises(BindRefusal, match="another step"):
+        bind_cohort(template_for([(1, 48), (1, 48)]),
+                    shape([1, 1], [48, 48], bucket=2), source)
+
+
+def test_a_batch_with_no_state_slots_is_refused_not_defaulted():
+    """`gdn_context` defaults the slots to the batch order. That default is
+    what a fresh pool hands out and nothing else, so a bridge that took it
+    would price a fragmented pool as a fresh one and call it measured."""
+    rows = [(1, 32), (1, 32)]
+    source = offered(native(), rows, [[7, 8], [3, 4]], slots=None)
+    with pytest.raises(BindRefusal, match="no state slots"):
+        bind_cohort(template_for(rows), shape([1, 1], [32, 32], bucket=2),
+                    source)
+
+
+def test_the_capture_s_padding_is_kept_and_counted():
+    """A capture at a wider rung records the buffer, not the active rows.
+
+    The active entries are the scheduler's; the tail is whatever the runner
+    left in the padded buffer, and it stays -- overwriting it would invent an
+    assignment for rows that are not running, and dropping it would resize a
+    buffer the graph's own shapes still describe.
+    """
+    rows = [(1, 32), (1, 32)]
+    template = template_for(rows)
+    context = template["ops"][1]["context"]
+    for entry in context:
+        if entry[0] == "slot_mapping":
+            entry[1] = [-1, -1, -1, -1]
+    source = offered(native(), rows, [[7, 8], [3, 4]])
+    bound = bind_cohort(template, shape([1, 1], [32, 32], bucket=4), source)
+    slots = dict(map(tuple, bound["ops"][1]["context"]))["slot_mapping"]
+    assert slots == [8 * 16 + 15, 4 * 16 + 15, -1, -1]
+    assert bound["provenance"]["binding"]["allocation_padding"] == {
+        "slot_mapping": 2}
+
+
+def test_a_mixed_prefill_decode_batch_is_refused_by_name():
+    """The representation gap cc-traces will hit, surfaced rather than papered
+    over.
+
+    `BatchSpec` carries one `kind` for the whole batch, and so does the engine:
+    `backends.py` sends any batch holding a prefill token down
+    `prepare_prefill`, which prepares metadata for
+    `batch.total_seqs_num_prefill` leading rows only. So a batch of one
+    prefilling request and one decoding one has no encoding here -- and the
+    tempting shortcut, reading the batch's prefill *token* count and calling
+    the whole thing a prefill, is exactly the inference that would misplace the
+    decode row's slot. Closing this needs a per-request kind in `BatchSpec` and
+    a deriver that can trace such a batch.
+    """
+    rows = [(8, 40), (1, 32)]
+    source = offered(native(), rows, [[7, 8, 9], [3, 4, 5]], prefill_seqs=1)
+    with pytest.raises(BindRefusal, match="1 prefill rows and 1 decode rows"):
+        bind_cohort(template_for(rows),
+                    shape([8, 1], [40, 32], bucket=2, prefill=8), source)
+
+
+def test_an_all_prefill_batch_takes_the_prefill_encoding():
+    """The other side of the same rule: the kind comes from the scheduler's
+    request count, not from the token count. Both requests are prefilling, so
+    every scheduled token gets a slot in its request's own blocks -- request
+    one's four tokens land in block 7 and request two's two in block 3."""
+    rows = [(4, 4), (2, 2)]
+    source = offered(native(), rows, [[7], [3]], prefill_seqs=2)
+    template = template_for(rows)
+    for entry in template["ops"][1]["context"]:
+        if entry[0] == "slot_mapping":
+            # A prefill's buffer is one entry per scheduled token, not per
+            # request; the helper's default is a decode-shaped one.
+            entry[1] = [0] * 6
+    bound = bind_cohort(template,
+                        shape([4, 2], [4, 2], bucket=2, prefill=6), source)
+    context = dict(map(tuple, bound["ops"][1]["context"]))
+    assert context["slot_mapping"] == [7 * 16 + i for i in range(4)] + [
+        3 * 16 + i for i in range(2)]
+
+
+def test_state_slots_are_placed_by_row_not_by_list_position():
+    """`state_slots_committed` is a filtered list, so its index is not the
+    batch index. Here the state-bearing requests are rows 1 and 2 of three, and
+    their slots are 5 and 9; reading the list positionally would give row 0 the
+    slot 5 that belongs to row 1."""
+    rows = [(1, 32), (1, 32), (1, 32)]
+    source = offered(native(), rows, [[7, 8], [3, 4], [1, 2]],
+                     slots=(5, 9), state_rows=[1, 2])
+    with pytest.raises(BindRefusal, match=r"rows \[0\] of 3 hold no state"):
+        bind_cohort(template_for(rows), shape([1] * 3, [32] * 3, bucket=4),
+                    source)
+
+    source = offered(native(), rows, [[7, 8], [3, 4], [1, 2]],
+                     slots=(9, 5, 2), state_rows=[2, 0, 1])
+    bound = bind_cohort(template_for(rows, extra=[
+        ["non_spec_state_indices_tensor", [[0, 0, 0], "int32"]]]),
+        shape([1] * 3, [32] * 3, bucket=4), source)
+    context = dict(map(tuple, bound["ops"][1]["context"]))
+    assert context["non_spec_state_indices_tensor"] == [[5, 2, 9], "int32"]
+
+
+def test_an_active_count_below_the_capture_bucket_pads_every_field():
+    """Two running requests bound to a graph captured at four.
+
+    The template's buffers are four-wide, and they stay four-wide: the two
+    active entries are the scheduler's and the tail is the capture's, counted
+    per field so a reader can see how much of the bound metadata was not this
+    step's. Overwriting the tail would invent an assignment for rows that are
+    not running.
+    """
+    rows = [(1, 32), (1, 32)]
+    template = template_for(rows, extra=[
+        ["non_spec_state_indices_tensor", [[0, 0, 0, 0], "int32"]]])
+    for entry in template["ops"][1]["context"]:
+        if entry[0] == "slot_mapping":
+            entry[1] = [-1, -1, -1, -1]
+    source = offered(native(), rows, [[7, 8], [3, 4]], slots=(5, 9),
+                     state_rows=[0, 1])
+    bound = bind_cohort(template, shape([1, 1], [32, 32], bucket=4), source)
+    context = dict(map(tuple, bound["ops"][1]["context"]))
+    assert context["slot_mapping"] == [8 * 16 + 15, 4 * 16 + 15, -1, -1]
+    assert context["non_spec_state_indices_tensor"] == [[5, 9, 0, 0], "int32"]
+    assert bound["provenance"]["binding"]["allocation_padding"] == {
+        "slot_mapping": 2, "non_spec_state_indices_tensor": 2}

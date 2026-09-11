@@ -174,6 +174,7 @@ class CompassPredictMixin:
         # which is the defect the validity check exists to catch, so the field
         # is left absent instead.
         started_at = getattr(batch, "compass_started_at", None)
+        self._offer_allocation(batch)
         shape = self._describe(batch)
         cost = self._oracle.estimate(shape)
         # Record what was predicted, in the same format a measure run records
@@ -374,6 +375,59 @@ class CompassPredictMixin:
     def _compilation_level(self) -> Optional[int]:
         compilation = getattr(self.config, "compilation_config", None)
         return getattr(compilation, "level", None)
+
+    def _offer_allocation(self, batch: ScheduledBatch) -> None:
+        """Hand the oracle this step's own block and state assignment.
+
+        The scheduler has already decided where this batch's KV blocks
+        and state slots are before the runner is called, and it holds
+        them on the batch: `block_tables` is one row per request
+        (`seq.block_table`), `state_slots_committed` is the committed
+        state slot of each state-bearing request. Nothing is computed
+        here and nothing is modelled -- the record is passed through, and
+        the oracle's allocation source encodes it the way a capture
+        records it.
+
+        An oracle that takes no allocation has no attribute and this is
+        a no-op, so an analytical or calibrated oracle is unaffected.
+
+        The assignment is not per-rank: one scheduler owns the
+        sequences, and every rank of the TP group is handed this same
+        batch. That is declared on the record rather than assumed by the
+        consumer, so a producer for which it is false can say so."""
+        allocation = getattr(self._oracle, "native_allocation", None)
+        if allocation is None:
+            return
+        from atom.compass.runtime.templates import NativeStepAllocation
+
+        tables = list(getattr(batch, "block_tables", None) or ())
+        rows = list(zip((int(n) for n in batch.num_scheduled_tokens),
+                        (int(c) for c in batch.context_lens)))
+        if len(tables) != len(rows):
+            # A request with no block table is one the block manager has
+            # not given blocks to. Offering a short table would silently
+            # re-align every row after it, so the step is left with no
+            # record at all and binding refuses it by name.
+            allocation.clear()
+            return
+        slots = getattr(batch, "state_slots_committed", None)
+        # Which batch row each of those slots belongs to. The scheduler's list
+        # holds only the state-bearing requests, so reading it positionally
+        # against the batch is wrong the moment a batch mixes kinds; the batch
+        # records the rows alongside it and they are carried through unaltered.
+        # An older batch that does not carry them offers no mapping, and
+        # binding refuses rather than assuming the identity.
+        state_rows = getattr(batch, "state_rows", None)
+        allocation.offer(NativeStepAllocation(
+            rows=rows,
+            block_tables=tables,
+            state_slots=(list(slots) if slots else None),
+            state_rows=(list(state_rows) if state_rows is not None else None),
+            num_prefill_seqs=int(getattr(batch, "total_seqs_num_prefill", 0)),
+            source="ScheduledBatch",
+            rank_coords=self._rank_coords(),
+            shared_across_ranks=True,
+        ))
 
     def _describe(self, batch: ScheduledBatch) -> StepShape:
         """Translate an ATOM batch into the oracle's engine-agnostic input.

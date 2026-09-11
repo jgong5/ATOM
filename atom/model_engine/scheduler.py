@@ -632,11 +632,18 @@ class ScheduledBatch:
         # whose committed slot was never claimed carries the -1 sentinel in a
         # one-element list, which is truthy, and letting it through would shift
         # every list positionally aligned with this one.
-        state_seqs = [
-            seq
-            for seq in seqs.values()
-            if seq.has_per_req_cache and seq.state_slot >= 0
-        ]
+        state_rows: list[int] = []
+        state_seqs = []
+        for _row, seq in enumerate(seqs.values()):
+            if seq.has_per_req_cache and seq.state_slot >= 0:
+                state_rows.append(_row)
+                state_seqs.append(seq)
+        # Batch row of each entry in the state lists below. Those lists are a
+        # *filtered* view of the batch, so their index is not the batch index;
+        # a consumer that reads them positionally misassigns every slot in a
+        # batch that mixes state-bearing requests with requests that hold no
+        # per-request cache.
+        self.state_rows = state_rows
         self.state_slots = [seq.state_slots for seq in state_seqs]
         # Column 0 broken out, because it is what every non-speculative backend
         # wants and rebuilding it per step in each of them would cost the same

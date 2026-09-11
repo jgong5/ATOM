@@ -34,10 +34,13 @@ price key, ``block_tables`` deliberately is not.
 Binding therefore **refuses** unless the caller supplies an allocation for the
 cohort. Three answers are admissible and the module makes the caller pick one:
 
-* :class:`NativeAllocation` -- wrap the real scheduler/block manager and take
-  its actual assignment for this batch. Correct by construction; needs the
-  engine's own CPU-side allocator, which is why it is a protocol here rather
-  than an implementation.
+* :class:`NativeAllocation` -- take the scheduler's own assignment for this
+  batch, offered per step by whatever drives the step. Correct by
+  construction, and encoded through :class:`BatchSpec` so that the same
+  code turns a block table into a ``slot_mapping`` here and in a capture.
+  It refuses when nothing was offered, when the record is a previous
+  step's, when the batch mixes prefill and decode, and when a
+  state-bearing batch carries no state slots.
 * an abstraction that has been **measured** against the native allocator and
   carries the scope that measurement covers;
 * :class:`CarriedAllocation` -- keep the template's own allocation and say so.
@@ -56,6 +59,7 @@ from typing import Optional, Protocol
 from atom.compass.core.cost.base import StepShape
 
 __all__ = ["BindRefusal", "AllocationSource", "CarriedAllocation",
+           "NativeAllocation", "NativeStepAllocation",
            "template_key", "bind_cohort", "TemplateGraphs",
            "ALLOCATOR_FIELDS", "BOUND_FIELDS", "CARRIED_CONSTANTS"]
 
@@ -120,6 +124,242 @@ class CarriedAllocation:
     def describe(self) -> str:
         return f"CarriedAllocation(unmeasured; {self.why})"
 
+
+class NativeStepAllocation:
+    """One step's assignment, exactly as the scheduler already holds it.
+
+    Not a model of an allocator: nothing here computes a block id or a slot.
+    Every field is read off `ScheduledBatch`, which the scheduler has already
+    filled in before the runner is called:
+
+    * ``block_tables`` -- one row per request in batch order, each the
+      request's own list of physical block ids
+      (`ScheduledBatch.block_tables`, itself `[seq.block_table for seq ...]`).
+    * ``state_slots`` with ``state_rows`` -- the committed state slot of each
+      state-bearing request (`state_slots_committed`) and *which batch row each
+      one belongs to*. The two are separate because the scheduler's list is
+      already filtered: it holds one entry per seq with
+      ``has_per_req_cache and state_slot >= 0``, so its index is not the batch
+      index and reading it positionally would hand row 5's slot to row 3 in any
+      batch that mixes state-bearing requests with requests that hold none.
+    * ``num_prefill_seqs`` -- how many leading rows are doing prefill, as
+      `ScheduledBatch.total_seqs_num_prefill` counts them. Prefills lead the
+      batch: the scheduler indexes them as ``batch.req_ids[:num_prefill]`` and
+      `CommonAttentionBuilder.prepare_prefill` walks ``range(bs)`` with
+      ``bs = batch.total_seqs_num_prefill``. It is carried rather than derived
+      from the token count, because "this batch contains prefill tokens" and
+      "every request in it is prefilling" are different statements and only the
+      scheduler knows the second.
+
+    ``rows`` is carried so the record can be checked against the shape it is
+    offered for rather than trusted: a record from the previous step describes
+    a different batch and would otherwise be spliced in silently.
+
+    ``shared_across_ranks`` is true for the ATOM scheduler because the
+    assignment is not a rank's: `Sequence.block_table` and `Sequence.state_slot`
+    live on the request, one scheduler owns them, and every rank in the TP
+    group is handed the same batch. It is a field rather than an assumption so
+    that a producer for which it is false can say so and be refused.
+    """
+
+    __slots__ = ("rows", "block_tables", "state_slots", "state_rows",
+                 "num_prefill_seqs", "source", "rank_coords",
+                 "shared_across_ranks")
+
+    def __init__(self, *, rows, block_tables, state_slots, num_prefill_seqs,
+                 state_rows=None, source="", rank_coords=None,
+                 shared_across_ranks=True) -> None:
+        self.rows = tuple((int(q), int(c)) for q, c in rows)
+        self.block_tables = tuple(tuple(int(b) for b in row)
+                                  for row in block_tables)
+        self.state_slots = (None if state_slots is None
+                            else tuple(int(s) for s in state_slots))
+        #: Batch row per entry of ``state_slots``. Defaults to the leading rows
+        #: only when the two lengths already agree, which is the case where the
+        #: filtered list and the batch coincide; otherwise it is required.
+        if state_rows is not None:
+            self.state_rows = tuple(int(r) for r in state_rows)
+        elif self.state_slots is not None and len(self.state_slots) == len(
+                self.rows):
+            self.state_rows = tuple(range(len(self.rows)))
+        else:
+            self.state_rows = None
+        self.num_prefill_seqs = int(num_prefill_seqs)
+        self.source = str(source)
+        self.rank_coords = dict(rank_coords or {})
+        self.shared_across_ranks = bool(shared_across_ranks)
+
+
+class NativeAllocation:
+    """The scheduler's own assignment, encoded the way a capture records it.
+
+    Holds no allocator and reimplements none. The step's record is *offered*
+    by whatever is driving the step -- the runner, before it asks for a cost --
+    and this turns it into the recorded metadata fields by handing it to
+    :class:`BatchSpec`, the same object that describes a captured batch. So the
+    encoding of ``slot_mapping`` from a block table, and of the padded
+    ``block_tables`` row, is written once and is the same on both sides.
+
+    It refuses in every direction rather than filling in:
+
+    * no record offered for this step -- the offline case, and the one that
+      makes an unattended run stop instead of quietly reusing a template's
+      blocks;
+    * a record whose per-request rows are not the shape's, which is a stale
+      record;
+    * a record read at another rank, unless its producer declared the
+      assignment shared;
+    * a batch that is part prefill and part decode, which has no single
+      :class:`BatchSpec` kind and so no single encoding here;
+    * a batch with state-bearing layers and no state slots.
+
+    :attr:`measured` is true: the fields are the allocator's own output, not an
+    abstraction of it. What that does *not* claim is that the price keyed on
+    them was measured at this assignment -- coverage says that separately.
+    """
+
+    measured = True
+
+    def __init__(self, *, block_size: int, max_model_len: int,
+                 position_rows: int = 1, num_spec_step: int = 0,
+                 needs_state: bool = True) -> None:
+        self.block_size = int(block_size)
+        self.max_model_len = int(max_model_len)
+        self.position_rows = int(position_rows)
+        self.num_spec_step = int(num_spec_step)
+        #: Whether a record without state slots is a refusal. True for this
+        #: deployment, whose GDN layers index a state pool every step.
+        self.needs_state = bool(needs_state)
+        self._record = None
+        self.offered = 0
+        self.answered = 0
+
+    def offer(self, record: NativeStepAllocation) -> None:
+        """Hand this step's assignment over. Replaces any previous one."""
+        self._record = record
+        self.offered += 1
+
+    def clear(self) -> None:
+        self._record = None
+
+    def allocation_for(self, shape: StepShape) -> dict:
+        record = self._record
+        if record is None:
+            raise BindRefusal(
+                "no native allocation was offered for this step. The block "
+                "and state assignment is the scheduler's, and nothing here "
+                "invents one: drive this oracle from a runner that offers the "
+                "batch's own allocation, or say explicitly with "
+                "CarriedAllocation that a template's assignment is being "
+                "reused unmeasured.")
+        rows = _rows(shape)
+        if record.rows != rows:
+            raise BindRefusal(
+                f"the offered allocation is for {len(record.rows)} requests "
+                f"{record.rows[:3]}... and this shape has {len(rows)} "
+                f"{rows[:3]}...; a record from another step is not this "
+                "step's assignment")
+        coords = {str(k): int(v) for k, v in (shape.rank_coords or {}).items()}
+        if coords != record.rank_coords and not record.shared_across_ranks:
+            raise BindRefusal(
+                f"the allocation was read at {record.rank_coords} and this "
+                f"shape is rank {coords}; its producer did not declare the "
+                "assignment shared across ranks")
+        prefilling = record.num_prefill_seqs
+        if prefilling and prefilling != len(rows):
+            # The gap, named rather than papered over. `BatchSpec` has one
+            # `kind` for the whole batch, and so does the engine: at
+            # `atom/model_ops/attentions/backends.py:613` a batch with any
+            # prefill token goes down `prepare_prefill`, which walks
+            # `range(batch.total_seqs_num_prefill)` and writes metadata for the
+            # leading prefill rows alone. Encoding all of the rows here would
+            # produce a `slot_mapping` longer than the one the runner builds,
+            # and encoding the leading rows would drop the decode rows'
+            # allocation entirely. Neither is this step's assignment, so it is
+            # refused. Closing it needs a per-request kind in `BatchSpec` and a
+            # deriver that can trace such a batch -- and first, evidence from
+            # the engine that it produces one, since the backend as written
+            # would not serve it either.
+            raise BindRefusal(
+                f"this batch has {prefilling} prefill rows and "
+                f"{len(rows) - prefilling} decode rows. BatchSpec carries one "
+                "kind for the batch, and the attention backend takes the "
+                "whole batch down the prefill path while preparing metadata "
+                "for the prefill rows only, so neither encoding is this "
+                "step's assignment.")
+
+        from atom.compass.runtime.batch_spec import BatchSpec
+
+        spec = BatchSpec(
+            # The engine's own rule, not an inference from the token count:
+            # a batch whose scheduler says no request is prefilling is a
+            # decode batch, and one where every request is prefilling is a
+            # prefill batch. The mixed case never reaches here.
+            kind="prefill" if prefilling else "decode",
+            query_lens=tuple(q for q, _ in rows),
+            context_lens=tuple(c for _, c in rows),
+            block_size=self.block_size,
+            max_model_len=self.max_model_len,
+            capture_bucket=shape.capture_bucket,
+            num_spec_step=self.num_spec_step,
+            block_tables=record.block_tables,
+            position_rows=self.position_rows,
+        )
+        try:
+            attention = dict(spec.attention_context())
+        except ValueError as exc:
+            raise BindRefusal(
+                f"the scheduler's assignment does not describe a runnable "
+                f"batch: {exc}") from exc
+        supplied = {"slot_mapping": attention["slot_mapping"],
+                    "block_tables": attention["block_tables"]}
+        if record.state_slots is not None:
+            if record.state_rows is None:
+                raise BindRefusal(
+                    f"the allocation carries {len(record.state_slots)} state "
+                    f"slots for {len(rows)} requests and does not say which "
+                    "row each belongs to. The scheduler's own list holds only "
+                    "the state-bearing requests, so its index is not the "
+                    "batch index, and this module will not guess which row is "
+                    "which.")
+            if len(record.state_rows) != len(record.state_slots):
+                raise BindRefusal(
+                    "the allocation carries "
+                    f"{len(record.state_rows)} state rows for "
+                    f"{len(record.state_slots)} state slots")
+            by_row = dict(zip(record.state_rows, record.state_slots))
+            missing = [i for i in range(len(rows)) if i not in by_row]
+            if missing:
+                raise BindRefusal(
+                    f"rows {missing[:4]} of {len(rows)} hold no state slot. "
+                    "The recorded metadata is one index per request, so a "
+                    "batch that mixes state-bearing requests with requests "
+                    "that hold none has no encoding here -- and filling the "
+                    "gaps with row numbers is the fresh-pool assumption under "
+                    "another name.")
+            ordered = [by_row[i] for i in range(len(rows))]
+            gdn = dict(spec.gdn_context(state_slots=ordered))
+            supplied["non_spec_state_indices_tensor"] = gdn[
+                "non_spec_state_indices_tensor"]
+            supplied["non_spec_state_indices_in_tensor"] = gdn[
+                "non_spec_state_indices_in_tensor"]
+        elif self.needs_state:
+            raise BindRefusal(
+                "the offered allocation carries no state slots, and this "
+                "deployment's linear-attention layers index a state pool "
+                "every step. A missing slot set is refused rather than "
+                "defaulted to the batch order, which is only what a fresh "
+                "pool happens to hand out.")
+        self.answered += 1
+        return supplied
+
+    def describe(self) -> str:
+        record = self._record
+        held = ("none offered" if record is None
+                else f"{len(record.rows)} requests from {record.source}")
+        return (f"NativeAllocation(block_size={self.block_size}, "
+                f"state={'required' if self.needs_state else 'optional'}; "
+                f"{held}; offered {self.offered}, answered {self.answered})")
 
 def _rows(shape: StepShape):
     """``(query_len, context_len)`` per request, in the batch's own order.
@@ -231,6 +471,51 @@ def _bind(key, template_value, rows):
     raise BindRefusal(f"no rule for context field {key!r}")
 
 
+def _fit_allocation(key, template_value, native_value, padding):
+    """The allocator's value, in the layout the template recorded.
+
+    A capture at bucket 32 running twenty requests writes a padded buffer, and
+    what `forward_ctx` records is the buffer, not the twenty active entries.
+    The scheduler's record is the active batch and nothing else. So where the
+    template is longer, the active entries are written over its head and its
+    own tail -- the capture's pad, whatever the runner filled it with -- is
+    kept and counted. Where the native value is longer, binding refuses: an
+    allocation that does not fit the buffer it is being written into is not
+    this step's allocation.
+
+    ``block_tables`` is excepted and replaced whole. Its length is
+    ``rows * used``, where ``used`` is the column count the longest context
+    needs, so the two sides differing in length is the cohort changing, which
+    is the entire point of binding. It is also the one allocator field
+    `signature_of` deliberately keeps out of the price key.
+    """
+    if key == "block_tables":
+        return list(native_value)
+    if (isinstance(template_value, list) and len(template_value) == 2
+            and isinstance(template_value[0], list)):
+        # ``[values, dtype]``, as the state-index tensors are recorded.
+        if native_value[1] != template_value[1]:
+            raise BindRefusal(
+                f"{key} is {native_value[1]} in the allocation and "
+                f"{template_value[1]} in the template")
+        inner = _fit_allocation(key, template_value[0], native_value[0],
+                                padding)
+        return [inner, template_value[1]]
+    if not isinstance(template_value, list):
+        raise BindRefusal(
+            f"{key} is not a list in the template; this module has no rule "
+            f"for writing an allocation into a {type(template_value).__name__}")
+    if len(native_value) == len(template_value):
+        return list(native_value)
+    if len(native_value) < len(template_value):
+        padding[key] = len(template_value) - len(native_value)
+        return list(native_value) + list(template_value[len(native_value):])
+    raise BindRefusal(
+        f"the allocation supplies {len(native_value)} entries for {key} and "
+        f"the template records {len(template_value)}; a longer allocation "
+        "does not fit the buffer the capture recorded")
+
+
 def bind_cohort(template: dict, shape: StepShape,
                 allocation: Optional[AllocationSource] = None) -> dict:
     """A copy of ``template`` whose per-request metadata describes ``shape``.
@@ -251,6 +536,7 @@ def bind_cohort(template: dict, shape: StepShape,
             "abstraction, or CarriedAllocation to say explicitly that the "
             "template's assignment is being reused unmeasured.")
     supplied = allocation.allocation_for(shape) if allocation else {}
+    padding: dict = {}
 
     ops, rebound = [], 0
     for op in template["ops"]:
@@ -262,7 +548,23 @@ def bind_cohort(template: dict, shape: StepShape,
         for entry in context:
             key, value = tuple(entry)
             if key in ALLOCATOR_FIELDS:
-                bound = supplied.get(key, value)
+                if key in supplied:
+                    bound = _fit_allocation(key, value, supplied[key],
+                                            padding)
+                elif allocation.measured:
+                    # A measured source that answered without this
+                    # field does not know where this batch's blocks
+                    # or state slots are. Falling back to the
+                    # template's is the carried approximation under
+                    # another name, and it would arrive stamped
+                    # `allocation_measured: true`.
+                    raise BindRefusal(
+                        f"the allocation source supplied no {key!r}, and "
+                        "it reports itself measured. The template's own "
+                        "value is this cohort's only if something says so "
+                        "explicitly.")
+                else:
+                    bound = value
             else:
                 bound = _bind(key, value, rows)
             new.append([key, bound])
@@ -283,6 +585,10 @@ def bind_cohort(template: dict, shape: StepShape,
         "allocation_measured": bool(allocation and allocation.measured),
         "allocation_fields": [k for k in ALLOCATOR_FIELDS
                               if k in supplied] if supplied else [],
+        # Where the template's buffer was wider than the batch, and by
+        # how much: those entries are the capture's pad, not this
+        # step's assignment, and a reader has to be able to tell.
+        "allocation_padding": dict(padding),
         "carried_constants": {k: why for k, why in CARRIED_CONSTANTS.items()},
     }
     bound_graph["provenance"] = provenance
