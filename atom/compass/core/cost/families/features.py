@@ -52,7 +52,7 @@ See :func:`aligns`.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Iterable, Optional
+from typing import Any, Optional
 
 __all__ = [
     "FAMILY_CONTRACTS",

@@ -299,7 +299,7 @@ def test_a_step_priced_entirely_by_interpolation_is_not_complete(tmp_path):
     library = _library_with(tmp_path, {32: 1e-4, 64: 2e-4})
     graph = {"ops": [gemm(48)], "provenance": {}}
 
-    seconds, coverage, launches = library.body(graph)
+    seconds, coverage, _launches = library.body(graph)
 
     assert seconds > 0.0
     split = coverage_split(library, graph)

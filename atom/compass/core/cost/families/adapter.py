@@ -56,7 +56,6 @@ import logging
 from typing import Optional
 
 from atom.compass.core.cost.families.features import (
-    aligns,
     contract_for,
     grouping_key,
     infer_rows,
