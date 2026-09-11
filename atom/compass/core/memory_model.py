@@ -718,6 +718,14 @@ def derived_readings(profile: Mapping, *, warmup_tokens: int,
     `load` reads a path and returns parsed JSON; the caller owns the file
     system so that this stays testable off a device.
 
+    There are two ways to reach the activation term and the profile picks one.
+    With `graph`, the device-free walk over a graph traced at the target width
+    -- unchanged, and still refused if the graph was traced anywhere else. With
+    `model_config`, the config-derived instant, which needs no per-width graph
+    but does need `compile_mode`: the instant is witnessed in one program, and
+    defaulting the mode would choose a program for the caller. `model_config`
+    wins when both are given.
+
     Returns `(readings, activation_bytes)`. Raises `UnfoundedPrediction`, or
     `UnfoundedActivation` from the walk.
     """
@@ -737,24 +745,45 @@ def derived_readings(profile: Mapping, *, warmup_tokens: int,
         refuse("a configuration with no `max_num_batched_tokens` or "
                "`max_model_len`, so there is no warmup shape to evaluate the "
                "activation peak at")
-    graph_path = str(profile.get("graph") or "").strip()
-    if not graph_path:
-        refuse("no operator graph, so the activation peak has no evidence")
-
-    graph = load(graph_path)
     width = int(profile.get("world_size") or 1)
-    traced = traced_width(graph)
-    if traced is None:
-        refuse("an operator graph that does not record the tensor-parallel "
-               "width it was traced at (`key.topology`), and the activation "
-               "peak is the one term that shards")
-    if traced != width:
-        refuse("an operator graph traced at TP=%d for a prediction at TP=%d. "
-               "The activation peak shards and the walk cannot be re-sharded "
-               "after the fact; trace the graph at the target width"
-               % (traced, width))
+    config_path = str(profile.get("model_config") or "").strip()
+    if config_path:
+        # The config-derived instant. It needs no graph at the target width,
+        # because the instant is witnessed once at the source and its widths
+        # come from the checkpoint -- but it is witnessed in one *program*, so
+        # the profile has to say which program it is asking about.
+        mode = str(profile.get("compile_mode") or "").strip()
+        if not mode:
+            refuse("a model config for a config-derived activation term but no "
+                   "`compile_mode`. The activation instant is witnessed "
+                   "per-program: an instant from an Inductor-compiled run is "
+                   "not evidence about an eager one, and defaulting the mode "
+                   "would pick a program on the caller's behalf")
+        config = load(config_path)
+        config = config.get("text_config", config)
+        instant = activation_instant_bytes(
+            config, int(warmup_tokens), width, compile_mode=mode,
+            dtype_bytes=int(profile.get("dtype_bytes") or 2))
+        activation = int(instant["bytes"])
+    else:
+        graph_path = str(profile.get("graph") or "").strip()
+        if not graph_path:
+            refuse("neither an operator graph nor a model config, so the "
+                   "activation peak has no evidence")
 
-    activation = activation_bytes_at(graph, int(warmup_tokens))
+        graph = load(graph_path)
+        traced = traced_width(graph)
+        if traced is None:
+            refuse("an operator graph that does not record the tensor-parallel "
+                   "width it was traced at (`key.topology`), and the activation "
+                   "peak is the one term that shards")
+        if traced != width:
+            refuse("an operator graph traced at TP=%d for a prediction at TP=%d. "
+                   "The activation peak shards and the walk cannot be re-sharded "
+                   "after the fact; trace the graph at the target width"
+                   % (traced, width))
+
+        activation = activation_bytes_at(graph, int(warmup_tokens))
     calibration = _prediction_calibration(profile, load, refuse, source)
     readings = modelled_readings(
         total_bytes=total, world_size=int(profile.get("world_size") or 1),
