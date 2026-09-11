@@ -193,6 +193,17 @@ calibration missing any of the three terms it supplies, a calibration with no
 provenance block or with a term the provenance does not cover, and a
 target-class fit.
 
+One more, and it is the one that matters for the target: a graph traced at a
+**different tensor-parallel width** than the prediction asks for, or one that
+does not record its width at all. The activation peak is the only term in the
+budget that shards -- everything else is either flat in width or carries its
+own per-width table -- and a walk cannot be re-sharded after the fact. Silence
+is refused rather than read as width one, because that reading is exactly the
+failure: a TP=1 peak, four ranks too wide, sitting inside a TP=4 budget with
+nothing in the five readings to show for it. This is the gate a TP=2 or TP=4
+prediction stops at today, and stopping is the correct answer until a graph
+exists at that width.
+
 The two diagnostic modes are untouched and stay distinct: a run with no flag
 measures this device, and `--compass-memory-in` replays what a device recorded.
 Both are labelled as measurements because that is what they are.
@@ -740,6 +751,21 @@ at import time. The rule is pinned against a vector taken from CC's own
 implementation at `f4e06b0c`, with a cross-check that re-derives it from that
 file wherever the harness is in the tree.
 
+It is the **canonical** copy, not one of two: `scripts/compass/execution_id.py`
+delegates its constants and both functions here and keeps only the script and
+file helpers. Two byte-compatible copies would pass on the day they landed and
+diverge afterwards without failing loudly, which is the same silent-caution
+failure the schema exists to prevent, so the suite checks delegation by
+function identity rather than by answer. The module carries both names for the
+field order -- `ID_FIELDS` and `ID_INPUTS`, the same tuple object -- so neither
+caller had to be edited on the commit that merged them, and it exports the
+stamp shape (`STAMP_FIELDS`, `stamp_of`, `read_stamp`) that lets an artifact
+carry enough to re-verify its own id after it has been copied. Importing it as
+a package module pulls `atom/__init__.py` and `atom/compass/__init__.py` and
+nothing heavier -- no torch, no AITER, checked on the device-free box -- and a
+caller that wants not even that can load the file by path, a recipe the
+docstring offers and the suite exercises.
+
 An id is **never inferred**. A block naming a host and a pid is not an
 execution identity and is not promoted into one; an id that does not follow
 from its own recorded inputs is damaged or transplanted, which is worse than
@@ -787,3 +813,4 @@ record stays unidentified. That is O12.
 | O10 | manifest-derived acceptance lengths | final CC workload | **closed** -- CC protocol `47917ade`: long 107 328 + 2 413 (6 859 blocks), short 2 560 + 21 (162) |
 | O11 | what the 486 MiB `non_torch` excursion was | unknown; three controls failed to reproduce it | open, and the one thing the calibrated `non_torch` does not bound |
 | O12 | a `run.execution` block in the memory record, carrying CC's `compass.execution/1` `execution_id` and its `id_inputs`, written by `_write_memory` | **lead** -- `_write_memory` is shared | open; until it lands, every calibrated row reads `residual (run unidentified)` and the phase C repeats cannot be machine-checked. The identity is CC's, not a second scheme: `atom/compass/core/execution_id.py` holds the one definition, stdlib-only, and `producer_key` reads it. `_write_replay_target` already writes a `hardware` block in the same neighbourhood, so the shape is precedented |
+| O13 | an operator graph at the **target** width -- the 27B warmup prefill shape (1 request, 16 384 query tokens, no history) traced at TP=2 and at TP=4, with tensor deaths recorded | GPU, 2 and 4 devices; source-side capture only | open, and the **single remaining blocker to a TP=2 or TP=4 derived budget**. Everything else at those widths is already source-derivable: `total` is the card, `parameters` from `weight_bytes(checkpoint, tensor_parallel)`, `persistent` is flat in width, and `non_torch` and `load_residue` fall to the width-specific 0.6B tables (C06). Only the activation peak shards and is walked, and `derived_readings` now refuses a graph of the wrong width outright. The TP=2 and TP=4 peaks that exist -- 1 730 150 400 B and 1 191 969 280 B -- are class X27 and may never be the input; they are a bound to check a derivation against, once there is one |
