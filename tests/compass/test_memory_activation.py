@@ -572,3 +572,114 @@ def test_a_module_path_is_needed_for_every_operator():
     with pytest.raises(ValueError) as raised:
         module_path_keys(graphs[1], paths[1][:-1])
     assert "every operator" in str(raised.value)
+
+
+EMBED = "parameter:model.embed_tokens.weight"
+IDS = "forward-input:input_ids"
+O_PROJ = "parameter:model.layers.0.self_attn.o_proj.weight"
+
+
+def _three_widths_with_origins():
+    """The same three graphs, plus what each unproduced input actually is.
+
+    `inputs_from == -1` is two facts in one number: an input from outside the
+    graph, which is a real thing an aligned pair can be compared on, and a
+    producer the tracer lost, which is nothing at all. The sidecar
+    `capture_lifetimes.py` writes names the first kind, and the embedding is
+    the awkward case on purpose: `F.embedding(weight, ids)` at TP=1 against
+    `masked_embedding(ids, weight)` above it, the same two externals with the
+    argument positions swapped.
+    """
+    graphs, paths = _three_widths_with_paths()
+    origins = {
+        1: [[EMBED, IDS], ["", O_PROJ], ["", ""]],
+        2: [[IDS, EMBED], ["", O_PROJ], [""], ["", ""]],
+    }
+    origins[4] = [list(row) for row in origins[2]]
+    return graphs, paths, origins
+
+
+def test_named_externals_check_what_the_ancestry_could_not():
+    """The 692 unreadable alignments are graded, not counted as agreement."""
+    from atom.compass.core.memory_model import alignment_integrity
+
+    graphs, paths, origins = _three_widths_with_origins()
+    blind = alignment_integrity(graphs, paths)
+    assert blind["ancestry_unknown"] == 2
+    assert blind["origin_agrees"] == 0  # nothing to check with
+
+    graded = alignment_integrity(graphs, paths, origins)
+    # the ancestry is exactly as unreadable as it was: the count does not move
+    assert graded["ancestry_unknown"] == 2
+    assert graded["ancestry_agrees"] == blind["ancestry_agrees"]
+    # ...but both of those operators read a named weight, and it is the same
+    # weight at every width
+    assert graded["origin_agrees"] == 2
+    assert graded["origin_contradicts"] == 0
+    assert graded["origin_unresolved"] == 0
+    assert graded["safe"] is True
+
+
+def test_a_different_weight_at_the_same_position_ends_the_alignment():
+    """Names that disagree are evidence against, exactly as ancestry is."""
+    from atom.compass.core.memory_model import (alignment_integrity,
+                                                width_classes)
+
+    graphs, paths, origins = _three_widths_with_origins()
+    origins[4][1][1] = "parameter:model.layers.0.mlp.down_proj.weight"
+
+    graded = alignment_integrity(graphs, paths, origins)
+    assert graded["origin_contradicts"] == 1
+    assert graded["safe"] is False
+    with pytest.raises(ValueError):
+        width_classes(graphs, paths, origins)
+
+
+def test_an_unnamed_input_buys_no_agreement():
+    """A lost producer reads -1 like a weight does and must not look alike.
+
+    This is the real residue on the 27B graphs: 226 of the 692 have an input
+    the trace never recorded -- the rotary cos/sin gather, the attention
+    output-base, and at TP>1 the all-reduce result, whose producer the
+    collective recorder never enters. Those stay unresolved.
+    """
+    from atom.compass.core.memory_model import alignment_integrity
+
+    graphs, paths, origins = _three_widths_with_origins()
+    origins[2][1][1] = ""
+
+    graded = alignment_integrity(graphs, paths, origins)
+    assert graded["origin_agrees"] == 1
+    assert graded["origin_unresolved"] == 1
+    assert graded["origin_contradicts"] == 0
+    assert graded["safe"] is True  # unresolved is not evidence against
+
+
+def test_a_swapped_argument_order_is_not_a_misalignment():
+    """Only while the operator is the same operator is a position comparable.
+
+    The embedding reads the table and the ids at both widths, in the other
+    order, under a different name. Swap the same two names *without* renaming
+    the operator and the position does mean something, and the swap is then a
+    contradiction.
+    """
+    from atom.compass.core.memory_model import alignment_integrity
+
+    graphs, paths, origins = _three_widths_with_origins()
+    assert alignment_integrity(graphs, paths, origins)["origin_agrees"] == 2
+
+    for tp in (2, 4):
+        graphs[tp]["ops"][0]["name"] = "aten::embedding"
+    graded = alignment_integrity(graphs, paths, origins)
+    assert graded["origin_contradicts"] == 1
+    assert graded["safe"] is False
+
+
+def test_an_origin_row_is_needed_for_every_operator():
+    from atom.compass.core.memory_model import alignment_integrity
+
+    graphs, paths, origins = _three_widths_with_origins()
+    origins[2] = origins[2][:-1]
+    with pytest.raises(ValueError) as raised:
+        alignment_integrity(graphs, paths, origins)
+    assert "origin rows" in str(raised.value)

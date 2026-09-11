@@ -1407,6 +1407,12 @@ pass:
   counted apart from the agreements, because a check that could not run is not
   a check that passed.
 
+**3014 aligned outputs is coverage, not correspondence.** It is the count of
+outputs the ordinals paired up. Whether each pair is the same operator is a
+separate question, and 692 of the 2999 operators behind those outputs had no
+readable ancestry to answer it with. Zero contradictions among the 2307 that
+could be checked is evidence about those 2307 and about nothing else.
+
 | | ancestry key | module-path key |
 |---|---:|---:|
 | aligned | 12 | **3014** |
@@ -1418,6 +1424,89 @@ one O23 predicted: `aten::embedding` at TP=1 against `aiter::masked_embedding`
 above it, `[16384, 5120]` at every width, classified replicated. A join the
 module tree licenses but the names do not is recorded on the entry as `names`
 and counted in coverage as `renamed`, so it is visible rather than silent.
+
+### What the 692 unreadable alignments actually are
+
+"Not checkable" was a placeholder, not a finding. `-1` in `inputs_from` is
+documented as *"a weight, an embedding table, a buffer allocated before the
+forward"* -- an input from outside the graph, which is a real thing two
+aligned operators can be compared on -- but the tracer writes the same `-1`
+when it loses a producer it should have recorded, and those two are not the
+same evidence. The artifact kept no way to tell them apart, so the first pass
+guessed from the shape, which collides: a `(5120,)` input is a norm weight in
+one operator and a hidden-state row in another.
+
+`capture_lifetimes.py` now records the *identity* of every input whose storage
+belonged to a parameter, a registered buffer, or a tensor the runner built
+before the forward, and writes it as a second sidecar
+(`<graph>.origins.json`). The storage is in hand at dispatch, so the name is
+too. Over the three real captures, every `-1` edge:
+
+| | TP=1 | TP=2 | TP=4 | what it is |
+|---|---:|---:|---:|---|
+| parameter | 434 | 434 | 434 | named weight, e.g. `layers.7.mlp.down_proj.weight` |
+| buffer | 32 | 32 | 32 | the rotary cos/sin cache, `[262144, 1, 1, 32]` |
+| forward-input | 33 | 33 | 33 | token ids, positions, attention metadata |
+| unnamed | **97** | **226** | **226** | a producer the trace did not record |
+| total | 596 | 725 | 725 | |
+
+The unnamed are not a residue of unknown character. Every one of them carries
+the token dimension -- none is parameter-shaped -- and they fall into four
+groups, each with its operator and the operator that ran immediately before:
+
+| edges (TP=1 / TP>1) | operator | ran after | reading |
+|---:|---|---|---|
+| 0 / 130 | `aten::view` | `aiter::all_reduce_` | the collective's own output |
+| 32 / 32 | `aten::cat` | `aten::add.Tensor`, `aten::cat` | rotary, in `self_attn.rotary_emb` |
+| 32 / 32 | `aten::squeeze` | `aten::slice.Tensor` | rotary, same module |
+| 16 / 16 | `unified_attention_with_output_base` | `aten::cat`, `aten::reshape` | attention's output base |
+| 16 / 16 | `aten::sigmoid` | attention | storage the trace *had* seen |
+
+The 130 at TP>1 are O15 with a name on it: `record_collectives` builds the
+all-reduce's `OpSpec` by hand, outside the dispatch tracer, so the collective's
+output never enters the producer map and its consumer reads `-1`. That is the
+entire TP=1-to-TP>1 rise, 129 edges, and the fix belongs in the shared tracer.
+The 16 `sigmoid` edges are a different defect: the storage *was* seen earlier,
+so a producer entry existed and was dropped -- the finalizer in `_died` forgets
+an address while a view of it is still alive. Both are tracer bookkeeping, not
+model structure.
+
+### Grading the alignment with the names
+
+Names that survive are evidence. An operator reading
+`layers.7.mlp.down_proj.weight` aligned against one reading the same parameter
+at another width did not have to match, and a pair reading different
+parameters would be evidence against the alignment. `alignment_integrity` now
+takes the origins and reports three grades instead of two buckets:
+
+| grade | count | what it rests on |
+|---|---:|---|
+| `ancestry_agrees` | 2307 | the producer chain agrees at all three widths |
+| `origin_agrees` | **466** | the ancestry could not run; the named externals match |
+| `origin_unresolved` | **226** | neither check reached it; the ordinals alone |
+| `ancestry_contradicts` / `origin_contradicts` | 0 / 0 | |
+
+2307 + 466 + 226 = 2999. So two thirds of the previously-unreadable 692 are now
+checked by something, and **226 operators remain aligned on the module tree and
+the ordinal alone** -- exactly the 226 whose inputs the tracer lost. That is the
+honest confidence: not "the alignment is verified", but 77% ancestry-checked,
+16% name-checked, 7% unchecked, 0 contradictions anywhere.
+
+One comparison had to be made signature-aware rather than positional, and the
+reason is the case O23 named. `VocabParallelEmbedding` calls
+`F.embedding(weight, ids)` at TP=1 and `masked_embedding(ids, weight)` above
+it: the same two externals, the argument positions swapped. Compared by
+position that reads as a contradiction and would have ended the alignment
+(`safe: false`) on an operator-signature difference. Positions are compared
+only while the operator name is the same at every width; where the name
+differs, only the set of names is comparable. A swap under an *unchanged*
+operator name is still a contradiction, and `test_a_swapped_argument_order_is_
+not_a_misalignment` pins both halves.
+
+Equal per-path operator counts remain a guard, not a proof. A module that ran
+the same number of operators at two widths can still have run different ones;
+what the counts rule out is the specific failure where an inserted or removed
+operator renumbers every ordinal after it.
 
 ### The withdrawn trailing-dimension rule got nothing wrong at the peak
 
@@ -1512,6 +1601,15 @@ Two models that differ by 45x in parameters, three widths, ladders from 31 to
 1071 tokens: the same number to the byte. It is not the model, not the width and
 not the ladder.
 
+What it *is* has not been witnessed. Invariance is a strong constraint on the
+explanation, and it is not the explanation: 76 MiB + 1 KiB allocated once inside
+the capture window could be a reusable workspace, an allocator size-class
+rounding, or a block the pool keeps per capture. So the number is carried as
+**source calibration** -- taken from the TP=1 source record (S27), labelled as
+taken rather than derived -- and it stays that way until a pool-scoped
+allocation probe names the mechanism. `CAPTURE_FIXED_PINNED` is a calibratable
+argument for exactly that reason: a caller holding the mechanism passes its own.
+
 ### What that buys, with no constant fitted to a target
 
 `capture_pinned_bytes` takes the residue from the TP=1 record (S27) and the
@@ -1530,6 +1628,15 @@ and the second is an independent engine start of the same configuration. The
 TP=2 and TP=4 rows are class X27 and are read here as **evaluation, not input**:
 nothing in the derivation saw them, and the prediction at those widths is
 whatever `logits_in_graph` says, which is the residue.
+
+Two limits on how much those four rows are worth. They were checked against
+records that were already on disk when the term was written, so the agreement is
+**retrospective evidence, not a fresh frozen evaluation** -- the term was not
+registered and then met by a run made afterwards, and only the second kind
+closes a prediction. And all four are the capture-time **allocated** delta,
+which is not the quantity O8 reads at +26.8%: that is `graph_pool.reserved`.
+Agreement at +0.0% on the allocated side leaves the reserved-pool gate exactly
+as open as it was.
 
 The switch is the predicate, not the width. A TP=1 run with TBO enabled also
 drops the head, and a model keyed on `world_size == 1` would over-read it by the
@@ -1594,14 +1701,14 @@ delta rather than predict it.
 | O5 | `persistent` / activations / pool as functions of `max_num_seqs` | GPU, TP=1 | open, and now the main conditionality left; all three are proven flat in *utilization* (phase A) but untested in concurrency |
 | O6 | physical start-up at `--max-num-seqs 1551` and 1400 | GPU, TP=1 | open; superseded as the acceptance gate by the utilization axis, kept as a diagnostic |
 | O7 | `non_torch` from an exclusive-device source run at util 0.90 | GPU, exclusive | **closed by phase C** -- three byte-identical runs, calibrated at TP=1, exact at three unseen utilizations; the +42.2% excursion it cannot bound is carried with it |
-| O8 | graph pool at TP=4, where the model reads +26.8% | GPU, 4 devices | **open for the reserved delta, closed for the pinned set.** The +26.8% is against `graph_pool.reserved`, which is a global `memory_reserved()` difference across a window containing an eager warmup forward per bucket and a patched-out `empty_cache` -- not private-pool residency. The pinned set has a mechanism now: `capture_pinned_bytes` = fixed residue + `vocab x dtype x Σ(captured tokens)` when `logits_in_graph` (`world_size == 1 and not is_tbo`, `model_runner.py:4104`), which reproduces the recorded allocated delta at **+0.0% on all four 27B records**, the TP=2/TP=4 rows being evaluation (X27) against a derivation that never saw them. The old candidate cause -- a derived-graph walk counting each `all_reduce_` as an immortal allocation (O15) -- is not in this path at all: the recorded pool is measured, not walked. What is still open is the residue's identity (76 MiB + 1 KiB, model- and width-independent) and the reserved delta, which needs `memory_snapshot(mempool_id)` on `graph.pool()` rather than a global difference |
+| O8 | graph pool at TP=4, where the model reads +26.8% | GPU, 4 devices | **open for the reserved delta, closed for the pinned set.** The +26.8% is against `graph_pool.reserved`, which is a global `memory_reserved()` difference across a window containing an eager warmup forward per bucket and a patched-out `empty_cache` -- not private-pool residency. The pinned set has a mechanism now: `capture_pinned_bytes` = fixed residue + `vocab x dtype x Σ(captured tokens)` when `logits_in_graph` (`world_size == 1 and not is_tbo`, `model_runner.py:4104`), which reproduces the recorded allocated delta at **+0.0% on all four 27B records**, the TP=2/TP=4 rows being evaluation (X27) against a derivation that never saw them. The old candidate cause -- a derived-graph walk counting each `all_reduce_` as an immortal allocation (O15) -- is not in this path at all: the recorded pool is measured, not walked. The four +0.0% rows are **retrospective evidence, not a fresh frozen evaluation** -- the records predate the term -- and they are the *allocated* delta, not the reserved one this item reads. What is still open is the residue's identity (76 MiB + 1 KiB, model- and width-independent, carried as **source calibration until witnessed**) and the reserved delta, which needs `memory_snapshot(mempool_id)` on `graph.pool()` rather than a global difference |
 | O9 | `MODEL_HEADROOM` provenance: which run, which config | lead / history | open; until then it stays disallowed and is not to be relabelled as source |
 | O10 | manifest-derived acceptance lengths | final CC workload | **closed** -- CC protocol `47917ade`: long 107 328 + 2 413 (6 859 blocks), short 2 560 + 21 (162) |
 | O11 | what the 486 MiB `non_torch` excursion was | unknown; three controls failed to reproduce it | open, and the one thing the calibrated `non_torch` does not bound |
 | O12 | a `run.execution` block in the memory record, carrying CC's `compass.execution/1` `execution_id` and its `id_inputs`, written by `_write_memory` | **lead** -- `_write_memory` is shared | open; until it lands, every calibrated row reads `residual (run unidentified)` and the phase C repeats cannot be machine-checked. The identity is CC's, not a second scheme: `atom/compass/core/execution_id.py` holds the one definition, stdlib-only, and `producer_key` reads it. `_write_replay_target` already writes a `hardware` block in the same neighbourhood, so the shape is precedented |
-| O13 | tensor lifetime at the **source** width, and the sharded/replicated derivation of it for TP=2 and TP=4 | CPU only -- done | **restated and partly closed.** The original item asked for a TP=2/TP=4 warmup capture; that is a target measurement under a source label and is withdrawn. Lifetime is now captured at TP=1 on no device (2999 ops, 2790 deaths) and the width mechanism is read off the shapes. The frozen candidate reads +21.5% at TP=2 and +40.4% at TP=4 against the class-X27 peaks, so the *mechanism* is open: see O16. Three instrumentation defects found on the way (D1-D3), all in files this worker does not own  **Width alignment is no longer the blocker**: the module-path key aligns all 3014 outputs under an integrity check (O23), and the withdrawn trailing-dimension rule, now scorable, gets all 8 tensors at the walk peak right -- 100% of 2 717 908 992 B, 0 wrong, +0.0% at TP=2 and TP=4. It is wrong on 224 aligned outputs elsewhere, none of them live at the peak, so it is eliminated as a cause of O16 rather than reinstated. |
+| O13 | tensor lifetime at the **source** width, and the sharded/replicated derivation of it for TP=2 and TP=4 | CPU only -- done | **restated and partly closed.** The original item asked for a TP=2/TP=4 warmup capture; that is a target measurement under a source label and is withdrawn. Lifetime is now captured at TP=1 on no device (2999 ops, 2790 deaths) and the width mechanism is read off the shapes. The frozen candidate reads +21.5% at TP=2 and +40.4% at TP=4 against the class-X27 peaks, so the *mechanism* is open: see O16. Three instrumentation defects found on the way (D1-D3), all in files this worker does not own  **Width alignment is no longer the blocker**: the module-path key pairs up all 3014 outputs and the integrity check grades the correspondence -- 2307 ancestry-checked, 466 name-checked, 226 on the module tree and ordinal alone, 0 contradictions (O23); and the withdrawn trailing-dimension rule, now scorable, gets all 8 tensors at the walk peak right -- 100% of 2 717 908 992 B, 0 wrong, +0.0% at TP=2 and TP=4. It is wrong on 224 aligned outputs elsewhere, none of them live at the peak, so it is eliminated as a cause of O16 rather than reinstated. |
 | O14 | `_storage_of` returns 0 for every meta tensor (`runtime/meta.py`), so alias and provenance tracking collapse on any derived graph | **lead** -- shared runtime | open; fix is `untyped_storage()._cdata` when `data_ptr()` is 0, negated so it cannot collide with a device address. Patched locally in `agent_scratch/memval/lifetime/capture_lifetimes.py` |
-| O15 | the collective the derivation records has no output tensor of its own: nothing is watched, so it can never die, and the meta stand-in (`_collective_stand_in`) returns the *input object*, which is the opposite error | **lead** -- shared runtime | open. Cost: 21.9 GiB against a true 2.5 GiB at TP=2, and **it sits under every derived-graph memory walk at TP>1, O8's graph pool included**. The in-place reading is withdrawn: the live implementation allocates a fresh output on every path (packet P2) |
+| O15 | the collective the derivation records has no output tensor of its own: nothing is watched, so it can never die, and the meta stand-in (`_collective_stand_in`) returns the *input object*, which is the opposite error | **lead** -- shared runtime | open. Cost: 21.9 GiB against a true 2.5 GiB at TP=2, and **it sits under every derived-graph memory walk at TP>1, O8's graph pool included**. The in-place reading is withdrawn: the live implementation allocates a fresh output on every path (packet P2). **Now witnessed by name rather than inferred**: at TP>1 the 130 aligned `aten::view` operators that read the all-reduce output have no recorded producer and no external identity, which is the entire 596 -> 725 rise in unresolved source edges and the largest of the four unnamed groups in O23 |
 | O16 | why the derived activation term over-reads at width: +21.5% at TP=2, +40.4% at TP=4 | GPU, TP=1 source only -- the allocation history across `warmup_model`'s step, requested in `agent_scratch/memval/producer_packet/tp1_probe/REQUEST.md` | open, and **narrowed**: the residue is defined at TP=1 by difference, so a replicated over-count is absorbed by it and cancels at every width. The error is in the sharded fraction -- being exact at TP=1 and TP=2 needs ~2.45 GB that divides by width against the walk's 1.71 GB. Allocations made inside opaque custom operators are where a dispatch trace cannot look, and the allocation history can. **No term is to be chosen by the size of the error it removes**. **Narrowed by the allocation history**: 1 761 607 680 B of the 3 036 676 096 B live at the peak -- 58% -- is allocated inside `aiter/tuned_gemm.py:450`, i.e. inside `aiter::gemm_a16w16`, which is exactly where the dispatch trace cannot look. The region is now located rather than suspected  **The region is now measured, not suspected**: at the walk peak 822 083 584 B lives on the device that the walk cannot see -- 541 065 216 B and 79 691 776 B inside `tuned_gemm.py:450`, 201 326 592 B inside `linear_attention_with_output_base` -- against a 503 316 480 B over-count of replicated hidden-width buffers. Opposite signs, so the -8.1% residual is not a coefficient. |
 | O17 | the graph pool budget *estimate* and the pool the engine actually reserves are different quantities and are not to be compared as one | -- | **open, and now three quantities rather than two.** The engine's estimator (`graph_pool_bytes`, 0.2 x peak activations, 4.6x over on the 27B at TP=1) is kept as its own row and is untouched. The recorded reserved delta is bookkeeping-contaminated by construction (see O8), so it is reported rather than predicted. The third is what capture *pins*, which is the one with a mechanism and the one a budget should carry. Capture mode is a fourth thing the reserved side depends on and the pinned side does not: PIECEWISE takes one private pool per bucket (`ATOM_PER_BUCKET_POOL=1`), FULL shares one pool across buckets (`model_runner.py:4301`), and on DSV4 TP8 the two differ by 1.11 GB reserved per rank at an identical 14.71 GB allocated |
 | O18 | `OpSpec` records the dtype of each *argument* and never of an output, so every consumer that needs an output's size reads `dtypes[0]` and assumes promotion changed nothing | **lead** -- shared schema (`core/graph.py`, `runtime/meta.py`) | open. `aiter::masked_embedding` takes int32 ids and returns bfloat16: `dtypes[0]` sizes one hidden-width buffer at 335 544 320 B instead of 167 772 160, which is the whole `walk_bytes` / `visible_peak_bytes` gap in the frozen candidate. Fix is an `output_dtypes` field filled from the real outputs and a schema bump (packet P4). Until then the walk on this branch sizes an output by PyTorch's own promotion rule when the graph records no dtype -- float beats int, and float16 with bfloat16 gives float32 -- labels the basis `recorded`, `unanimous` or `promoted`, and reports every non-`recorded` output through `dtype_ambiguities`. The masked_embedding case is now right by rule rather than by name, and the ad-hoc correction that was subtracting 167 772 160 B is deleted. Refusal is available but not the default: `strict_dtypes=True` raises `UnfoundedActivation` on the first output the graph does not record, which is what a consumer that must not guess should pass |
@@ -1609,5 +1716,5 @@ delta rather than predict it.
 | O20 | mutability, alias and output-dtype contracts of the fused computation operators, not just the collectives | source + registered schema, CPU only -- done | **closed, and it found nothing wrong with the walk.** `silu_and_mul` and `_fused_qk_rmsnorm_group_quant_kernel` are destination-passing and record no output; `gemm_a16w16`, `linear_attention_with_output_base` and `unified_attention_with_output_base` return genuinely fresh tensors, by schema and by implementation (`base_attention.py:403`). No double count. Two by-products: `mutates_args="unknown"` marks weight arguments mutable, so `(a!)` in this registry is not evidence of mutation (O22), and `fused_allreduce_rmsnorm_` is absent from the 27B's graph at every width |
 | O21 | the 2999-operator TP=1 lifetime trace against the 2439-operator body graph | the two artifacts, CPU only -- done | **closed.** Same region, device, compilation level, redirections and scope; the only difference is step kind, and the operator arithmetic closes with no remainder: 2999 - 416 (GDN chunked-prefill path) - 144 (drift) + 32 (decode's mrope and `aten::min`) = 2439. The prefill graph is the one shaped like `warmup_model`; the decode graph never was a candidate. The two caveats that remain on the prefill graph are its own: `compilation_level: 0`, and a scope that excludes `compute_logits` and the sampler |
 | O22 | whether `torch_compile_guard(mutates_args="unknown")` declares mutation the implementation does not perform | one schema read, CPU only -- done | **closed, and it does.** `aiter::gemm_a16w16(Tensor(a0!) A, Tensor(a1!) B, ...)` marks the weight matrix mutable; `fused_allreduce_rmsnorm_` marks the norm weight mutable. The usable half of the schema is the return annotation: an aliasing return must be declared, and `all_reduce_ -> Tensor` is unannotated, so the schema independently confirms the collective is out-of-place |
-| O23 | `lineage_keys` aligns 12 of 3014 outputs across the three real widths | CPU only; a module path per operator | **closed by a different key, and the diagnosis was half right.** Re-measured on fresh captures the ancestry key aligns 12, not 71. The `VocabParallelEmbedding` name split is real but is not the cause: the graph does not know its own ancestry at width -- 725 of 4378 source edges are `-1` at TP=2/4 against 596 at TP=1 (O14, O15), and an ancestry key is recursive, so every descendant inherits the break. `module_path_keys` keys on the module path plus an ordinal among the non-collective operators of that module, from a `.modules.json` sidecar rather than a shared-schema field, and aligns **3014 of 3014** -- 1382 replicated, 1632 sharded, 0 unresolved. It is ordinal alignment, so it is guarded: `alignment_integrity` requires equal per-path non-collective counts at every width (2999 / 2999 / 2999, no path disagreeing) and requires surviving ancestry to agree where it can be read (2307 agree, **0 contradict**, 692 not checkable and counted apart), and `width_classes` raises rather than key on paths when either fails. The one renamed join is the predicted `aten::embedding` / `aiter::masked_embedding` pair, replicated, and reported as `renamed` rather than joined silently. The candidate bytes still do not depend on this |
+| O23 | `lineage_keys` aligns 12 of 3014 outputs across the three real widths | CPU only; a module path per operator | **closed for coverage, graded for correspondence.** Re-measured on fresh captures the ancestry key aligns 12, not 71. The `VocabParallelEmbedding` name split is real but is not the cause: the graph does not know its own ancestry at width -- 725 of 4378 source edges are `-1` at TP=2/4 against 596 at TP=1 (O14, O15), and an ancestry key is recursive, so every descendant inherits the break. `module_path_keys` keys on the module path plus an ordinal among the non-collective operators of that module, from a `.modules.json` sidecar rather than a shared-schema field, and pairs up **3014 of 3014** outputs -- 1382 replicated, 1632 sharded, 0 unresolved. **That 3014 is coverage, not correspondence**: it says the ordinals paired everything, not that each pair is the same operator. Correspondence is graded, and the three grades do not add up to one number: 2307 checked by surviving ancestry, 466 checked by the recorded identity of their external inputs (parameter, buffer or forward-input name, compared positionally when the operator name is identical at every width and as a multiset when it is not -- `F.embedding(weight, ids)` becomes `masked_embedding(ids, weight)`), and **226 resting on the module tree and the ordinal alone**. 0 contradictions in either checkable grade, which is evidence about the 2773 that could be checked and about nothing else. The 226 were audited rather than assumed: every one has an input whose producer the trace *lost*, not an external it legitimately read -- 130 `aten::view` on the all-reduce output at TP>1 (O15: `record_collectives` builds the OpSpec outside the dispatch tracer, so the output never enters `_producers`; this is the whole 596 -> 725 rise), 32 `aten::cat` + 32 `aten::squeeze` in `rotary_emb`, 16 `unified_attention_with_output_base`, 16 `aten::sigmoid` whose storage *was* seen earlier (a `_died` finalizer dropping an address while a view is still alive). None is parameter-shaped, so the name evidence and the shape heuristic agree. `alignment_integrity` reports the grades separately and `width_classes` raises when either checkable grade contradicts; equal per-path non-collective counts (2999 / 2999 / 2999, no path disagreeing) remain a guard against a missing operator, not a proof of correspondence. The one renamed join is the predicted `aten::embedding` / `aiter::masked_embedding` pair, replicated, reported as `renamed` rather than joined silently. The candidate bytes still do not depend on this |
 | O24 | a TP=1 *target* cell for a device-free replay: the committed TP=1 records carry readings, blocks and config but no run identity and no hardware identity | CPU only, read-only | **closed as a question, and a correction**. No cell need be assembled: node 18 preserves two genuine TP=1 target/table pairs (`g4/cap_subspan/`, `poc/g5_27b/`) and CC has one. `27b.tp1.exclusive.memory.json` agrees with the target on all eight shared fields, but agreement is not identity -- the phase C repeats already showed byte-identical payloads from distinct runs, and the epochs here are disjoint (2026-09-11T04:37:55Z and 2026-09-10T13:12:42Z on `visible_devices 5`, vs phase C at 08:53:49Z..09:03:38Z). Compatible independent evidence, identity unproven. The 32.0 MiB `non_torch` gap between the two committed records is observed and unexplained; the earlier neighbour attribution is withdrawn |

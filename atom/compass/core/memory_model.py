@@ -968,14 +968,18 @@ def measured_graph_pool_bytes(capture_sizes, world_size: int = 1,
 
 #: The capture-time *allocated* delta that is not the LM head, in bytes.
 #:
-#: Read off the 27B's TP=1 record (S27) as the residue after the logits term
-#: below, not fitted to anything: 110 981 120 - 63 x 248 320 x 2. The same
-#: 79 692 800 B appears on the 0.6B (C06) at TP=2, 4 and 8 over ladders from 31
-#: to 1071 tokens, so it moves with neither the model, the width nor the
-#: ladder. What it *is* has not been identified -- 76 MiB plus 1 KiB, allocated
-#: once inside the capture window and never returned. Identifying it needs a
-#: snapshot taken against the capture pool's own id, which is a probe to
-#: coordinate, not a constant to widen.
+#: **Source calibration, not a derivation.** Read off the 27B's TP=1 record
+#: (S27) as the residue after the logits term below -- 110 981 120 -
+#: 63 x 248 320 x 2 -- and carried as a taken number, not an explained one. The
+#: same 79 692 800 B appears on the 0.6B (C06) at TP=2, 4 and 8 over ladders
+#: from 31 to 1071 tokens, so it moves with neither the model, the width nor
+#: the ladder; that invariance constrains the explanation and is not the
+#: explanation. What it *is* has not been witnessed -- 76 MiB plus 1 KiB,
+#: allocated once inside the capture window and never returned, which could be
+#: a reusable workspace, an allocator size-class rounding or a per-pool block.
+#: Until a snapshot taken against the capture pool's own id names it, this stays
+#: calibration: pass `calibration["graph_pool"]["fixed_pinned"]` to override it.
+#: The probe is one to coordinate, not a constant to widen.
 CAPTURE_FIXED_PINNED = 79_692_800
 
 
@@ -1006,6 +1010,13 @@ def capture_pinned_bytes(capture_sizes, *, vocab_size: int = 0,
     the head is in the graph, and nothing when it is not, over a fixed residue.
     On the 27B's TP=1 record that is 79 692 800 + 63 x 248 320 x 2 =
     110 981 120 B, which is the recorded allocated delta **to the byte**.
+
+    That row is exact by construction -- it is where the residue came from --
+    and the TP=2/TP=4 rows that also land at +0.0% were checked against records
+    already on disk, so they are **retrospective evidence, not a fresh frozen
+    evaluation**. All of it is the capture-time *allocated* delta. The reserved
+    delta the engine records is a different quantity (see
+    `measured_graph_pool_bytes`) and agreement here says nothing about it.
 
     **The switch is `logits_in_graph`, not the width.** Reading it as a width
     law -- which `measured_graph_pool_bytes` still does -- gets the right
@@ -1215,10 +1226,62 @@ def module_path_keys(graph, module_paths) -> list:
     return keys
 
 
-def alignment_integrity(graphs: Mapping, module_paths: Mapping) -> dict:
+def _named_externals(resolved, row) -> dict:
+    """The recorded identity of each input no operator in the graph produced.
+
+    Keyed by argument position, and "" where the trace has no name for it --
+    an input whose producer the tracer lost reads -1 exactly as a weight does,
+    and the two must not be allowed to look alike here.
+    """
+    outside = {}
+    for position, source in enumerate(resolved):
+        if source >= 0:
+            continue
+        outside[position] = (row[position] if position < len(row) else "")
+    return outside
+
+
+def _origin_verdict(outside: Mapping, widths, keyed: bool) -> str:
+    """Whether the named externals of one aligned operator match across widths.
+
+    Only positions unreadable at *every* width are compared: a position
+    readable at one width and not another says something about the tracer's
+    coverage, not about whether the two operators correspond, and an unnamed
+    input says nothing at all.
+
+    `keyed` is whether the operator has the same name at every width. When it
+    does, the argument position means the same thing on both sides and the
+    names are compared position by position. When it does not, the position
+    means nothing across the pair and only the set of names is comparable:
+    `VocabParallelEmbedding` calls `F.embedding(weight, ids)` at TP=1 and
+    `masked_embedding(ids, weight)` at TP>1 (`embed_head.py:168-178`), which is
+    the same two externals in the other order and is not evidence of a
+    misalignment.
+    """
+    if len(outside) != len(widths):
+        return "unresolved"
+    if not keyed:
+        if any(not name for row in outside.values() for name in row.values()):
+            return "unresolved"
+        distinct = {tuple(sorted(row.values())) for row in outside.values()}
+        return "agrees" if len(distinct) == 1 else "contradicts"
+    common = set.intersection(*(set(row) for row in outside.values()))
+    named = [p for p in common if all(outside[w].get(p) for w in outside)]
+    if not named:
+        return "unresolved"
+    first = widths[0]
+    for position in named:
+        if any(outside[w][position] != outside[first][position]
+               for w in outside):
+            return "contradicts"
+    return "agrees" if len(named) == len(common) else "unresolved"
+
+
+def alignment_integrity(graphs: Mapping, module_paths: Mapping,
+                        input_origins: Optional[Mapping] = None) -> dict:
     """Whether a module-path alignment may be read at these widths.
 
-    Two checks, both structural, neither fitted to any measured quantity:
+    Structural checks, none of them fitted to any measured quantity:
 
     * every module path holds the same number of non-collective operators at
       every width. A path whose count differs is a module that did different
@@ -1226,11 +1289,24 @@ def alignment_integrity(graphs: Mapping, module_paths: Mapping) -> dict:
     * where the ancestry survives at *every* width -- no unknown source on
       either side, collectives walked through -- it must agree with the
       alignment the ordinals give. Ancestry that is present is evidence, and
-      evidence that contradicts the alignment ends it.
+      evidence that contradicts the alignment ends it;
+    * where it does not survive, `input_origins` -- one recorded identity per
+      input, as `capture_lifetimes.py` writes beside the graph -- can still be
+      compared. An operator reading `layers.7.mlp.down_proj.weight` aligned
+      against one reading the same parameter at another width is evidence of
+      correspondence; one reading a different parameter is evidence against.
 
-    `ancestry_unknown` is the count the second check could not examine. It is
-    reported rather than counted as agreement: a check that cannot run is not
-    a check that passed.
+    Counting discipline, because these three are not the same claim:
+
+    * `ancestry_agrees` / `ancestry_contradicts` -- the ancestry ran;
+    * `origin_agrees` / `origin_contradicts` -- the ancestry could not run and
+      the named externals were compared instead. Weaker: it says the aligned
+      operators read the same outside tensors, not that they sit at the same
+      place in the graph;
+    * `ancestry_unknown` counts every case the ancestry could not examine, and
+      `origin_unresolved` the ones that neither check reached. A check that
+      cannot run is not a check that passed, and an alignment resting on the
+      ordinals alone stays labelled as resting on the ordinals alone.
     """
     widths = sorted(int(w) for w in graphs)
     if len(widths) < 2:
@@ -1261,42 +1337,66 @@ def alignment_integrity(graphs: Mapping, module_paths: Mapping) -> dict:
     disagreeing = sorted(path for path in every_path
                          if len({counts[w].get(path, 0) for w in widths}) > 1)
 
+    origins = None
+    if input_origins is not None:
+        origins = {w: pick(input_origins, w) for w in widths}
+        for width in widths:
+            if len(origins[width]) != len(ops[width]):
+                raise ValueError("width %d has %d operators and %d origin rows"
+                                 % (width, len(ops[width]),
+                                    len(origins[width])))
+
     base = widths[0]
     agrees = contradicts = unknown = 0
+    named = misnamed = unresolved = 0
     lengths = {w: len(positions[w]) for w in widths}
     if len(set(lengths.values())) == 1 and not disagreeing:
         rank = {w: {index: n for n, index in enumerate(positions[w])}
                 for w in widths}
         for n in range(lengths[base]):
             chains = {}
-            checkable = True
+            outside = {}
             for width in widths:
                 index = positions[width][n]
                 sources = list(ops[width][index].get("inputs_from") or ())
                 resolved = [_resolve_through_collectives(ops[width], s)
                             for s in sources]
                 if any(s < 0 for s in resolved):
-                    checkable = False
-                    break
-                chains[width] = [rank[width].get(s) for s in resolved]
-            if not checkable:
+                    outside[width] = _named_externals(
+                        resolved,
+                        origins[width][index] if origins is not None else ())
+                else:
+                    chains[width] = [rank[width].get(s) for s in resolved]
+            if outside:
                 unknown += 1
+                if origins is None:
+                    continue
+                keyed = len({ops[w][positions[w][n]].get("name")
+                             for w in widths}) == 1
+                verdict = _origin_verdict(outside, widths, keyed)
+                named += verdict == "agrees"
+                misnamed += verdict == "contradicts"
+                unresolved += verdict == "unresolved"
             elif len({tuple(c) for c in chains.values()}) == 1:
                 agrees += 1
             else:
                 contradicts += 1
 
     safe = (not disagreeing and len(set(lengths.values())) == 1
-            and contradicts == 0)
+            and contradicts == 0 and misnamed == 0)
     return {"widths": widths, "operators_per_width": lengths,
             "paths_disagreeing": disagreeing,
             "ancestry_agrees": agrees,
             "ancestry_contradicts": contradicts,
             "ancestry_unknown": unknown,
+            "origin_agrees": named,
+            "origin_contradicts": misnamed,
+            "origin_unresolved": unresolved,
             "safe": safe}
 
 
-def width_classes(graphs: Mapping, module_paths: Mapping = None) -> dict:
+def width_classes(graphs: Mapping, module_paths: Mapping = None,
+                  input_origins: Mapping = None) -> dict:
     """How each tensor's shape actually behaves with width, read off the graphs.
 
     `graphs` maps a tensor-parallel width to a graph derived at that width. For
@@ -1336,7 +1436,7 @@ def width_classes(graphs: Mapping, module_paths: Mapping = None) -> dict:
         raise ValueError("width classification needs graphs at two or more "
                          "tensor-parallel widths; got %r" % (widths,))
     if module_paths is not None:
-        integrity = alignment_integrity(graphs, module_paths)
+        integrity = alignment_integrity(graphs, module_paths, input_origins)
         if not integrity["safe"]:
             raise ValueError(
                 "module-path alignment is not safe to read at these widths: "
@@ -1411,16 +1511,24 @@ def _classify_shapes(shapes: Mapping, base: int) -> tuple:
     return "unresolved", None
 
 
-def width_coverage(graphs: Mapping, module_paths: Mapping = None) -> dict:
+def width_coverage(graphs: Mapping, module_paths: Mapping = None,
+                   input_origins: Mapping = None) -> dict:
     """How much of each graph the width classification could align at all.
 
     A classification that quietly drops half the graph is worse than no
     classification, so the count is reported next to it: outputs aligned,
     outputs present only at a wider width (a collective's own result), and
     outputs at the base width with no counterpart.
+
+    `aligned` is coverage, not correspondence. It counts the outputs the
+    ordinals paired up; whether each pair is really the same operator is what
+    `integrity` reports, and it reports it in grades -- ancestry checked, named
+    externals checked, neither -- because those are different strengths of
+    evidence and collapsing them into one number reads as a verification that
+    did not happen.
     """
     widths = sorted(int(w) for w in graphs)
-    classes = width_classes(graphs, module_paths)
+    classes = width_classes(graphs, module_paths, input_origins)
     counts = {}
     for width in widths:
         graph = graphs[width] if width in graphs else graphs[str(width)]
@@ -1435,5 +1543,6 @@ def width_coverage(graphs: Mapping, module_paths: Mapping = None) -> dict:
                                    if v["class"] == name)
                          for name in ("replicated", "sharded", "unresolved")}}
     if module_paths is not None:
-        out["integrity"] = alignment_integrity(graphs, module_paths)
+        out["integrity"] = alignment_integrity(graphs, module_paths,
+                                               input_origins)
     return out
