@@ -578,6 +578,180 @@ def check_calibration(
 
 
 # --------------------------------------------------------------------------
+# the source-derived predictor, as it was actually invoked
+
+
+#: The factory the integrated source oracle is reached through, exactly as it
+#: must appear after `--compass-oracle`. Compared whole: a module path that
+#: resolves to something else, or an older name, is a different predictor with
+#: the same story told about it.
+SOURCE_FACTORY = "atom.compass.runtime.source_oracle.source_cost_oracle"
+
+#: Every keyword the factory accepts. `source_cost_oracle` takes `**kwargs` and
+#: forwards, so a misspelling does raise -- but it raises inside the factory,
+#: and only inside the factory this list was taken from. Keeping the list here
+#: means a record naming an option nobody implements is refused rather than
+#: read as a setting that took effect.
+SOURCE_FACTORY_OPTIONS = (
+    "model",
+    "tp",
+    "device",
+    "replay_target",
+    "block_size",
+    "max_model_len",
+    "position_rows",
+    "block_policy",
+    "cudagraph_mode",
+    "price",
+    "template",
+    "head_template",
+    "head",
+    "regions",
+    "seconds_per_launch",
+    "require_complete",
+    "carry_allocation",
+    "derive",
+)
+
+#: Options an acceptance run must state rather than default. Each has a working
+#: default, which is the problem: tp, require_complete, head and regions all
+#: decide how much of the model is actually priced, and a value nobody chose is
+#: not coverage.
+SOURCE_FACTORY_STATED = ("tp", "require_complete", "head", "regions")
+
+
+def _factory_flag(value):
+    """What the factory would make of this, or None if it would refuse it.
+
+    `arg_utils` converts a value that parses as a number, so `head=1` is
+    recorded as `1` and `head=true` as `"true"`. Both reach the factory; both
+    are read the same way here.
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        return bool(value) if value in (0, 1) else None
+    if isinstance(value, str):
+        word = value.strip().lower()
+        if word in ("1", "true", "yes", "on"):
+            return True
+        if word in ("0", "false", "no", "off"):
+            return False
+    return None
+
+
+def _given(options: dict, name: str) -> bool:
+    """Whether the run stated this option, as opposed to taking the default."""
+    return name in options and options[name] is not None and options[name] != ""
+
+
+def check_source_factory(modelled, tp: int, label: str) -> list[str]:
+    """The source factory options, against what the factory does with them.
+
+    This says nothing about *which* oracle an acceptance run must name; that
+    binding belongs to whoever integrates the predictor. It says that a run
+    which does name this factory must have configured it so that the whole
+    model was priced -- an unsupported or half-stated configuration must not
+    reach a verdict looking like a complete one.
+
+    Every rule below is read off the factory rather than chosen here, except
+    the three the protocol adds: completeness is required, the head region is
+    priced, and the carried-allocation approximation -- which the factory
+    itself documents as unmeasured -- is not available to a run being graded.
+    """
+    compass = (modelled.manifest.get("server") or {}).get("compass") or {}
+    if compass.get("oracle") != SOURCE_FACTORY:
+        return []
+    bad = []
+    options = dict(compass.get("oracle_options") or {})
+
+    unknown = sorted(set(options) - set(SOURCE_FACTORY_OPTIONS))
+    if unknown:
+        bad.append(
+            f"{label}: the modelled server passed {unknown} to "
+            f"{SOURCE_FACTORY}, which takes no such option: whatever those "
+            f"were meant to set, they did not set it"
+        )
+
+    flags = {}
+    for name in ("head", "require_complete", "carry_allocation", "derive"):
+        if name not in options:
+            continue
+        flags[name] = _factory_flag(options[name])
+        if flags[name] is None:
+            bad.append(
+                f"{label}: {name}={options[name]!r} is not a boolean the "
+                f"factory reads, so what it was set to is unknown"
+            )
+    # An absent flag is its documented default, which is what the factory used.
+    head = flags.get("head", False)
+    require_complete = flags.get("require_complete", True)
+    carry_allocation = flags.get("carry_allocation", False)
+    derive = flags.get("derive", True)
+
+    for name in SOURCE_FACTORY_STATED:
+        if not _given(options, name):
+            bad.append(
+                f"{label}: the modelled server left {name} to the factory "
+                f"default rather than stating it, so the record does not say "
+                f"what was predicted"
+            )
+
+    if require_complete is False:
+        bad.append(
+            f"{label}: require_complete is off, so a shape the predictor "
+            f"could not price was answered with an approximation instead of "
+            f"refused: the prediction is not complete-only"
+        )
+    if head is False:
+        bad.append(
+            f"{label}: head is off, so the head region was not priced at all "
+            f"and nothing in the numbers says it is missing"
+        )
+    if carry_allocation is True:
+        bad.append(
+            f"{label}: carry_allocation is on, which the factory documents as "
+            f"an explicitly unmeasured assumption: it may be reported, not "
+            f"graded"
+        )
+
+    stated_tp = options.get("tp")
+    served_tp = (modelled.manifest.get("server") or {}).get("tensor_parallel_size")
+    if stated_tp is not None:
+        if str(stated_tp) != str(tp):
+            bad.append(
+                f"{label}: the factory was given tp={stated_tp!r} in a TP={tp} "
+                f"cell, so the predictor was built for another width"
+            )
+        if served_tp is not None and str(stated_tp) != str(served_tp):
+            bad.append(
+                f"{label}: the factory was given tp={stated_tp!r} but the "
+                f"server reports tensor_parallel_size={served_tp!r}"
+            )
+
+    # What the factory itself refuses, or silently has nothing to answer with.
+    if derive:
+        for name in ("model", "block_size", "max_model_len"):
+            if not _given(options, name):
+                bad.append(
+                    f"{label}: derive is on and {name} was not given; the "
+                    f"factory needs it to trace the shapes no template covers"
+                )
+    else:
+        if not _given(options, "template"):
+            bad.append(
+                f"{label}: derive is off and no template was given, so every "
+                f"shape would be refused for want of a graph"
+            )
+        if head and not _given(options, "head_template"):
+            bad.append(
+                f"{label}: head is on with derive off and no head_template, "
+                f"so the head region has neither a graph nor a deriver"
+            )
+    return bad
+
+
+# --------------------------------------------------------------------------
 # the device-free proof
 
 
@@ -1177,6 +1351,7 @@ def cell(args) -> int:
         failures += [
             f"repeat {index}: {reason}" for reason in check_side_roles(real, modelled)
         ]
+        failures += check_source_factory(modelled, args.tp, f"repeat {index}")
         if registry is not None:
             failures += [
                 f"repeat {index}: {reason}"

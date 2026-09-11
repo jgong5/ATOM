@@ -16,6 +16,7 @@ import json
 import math
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -1337,3 +1338,195 @@ class TestADiagnosticIsNotACellHoweverItIsNamed:
         assert run(cell_dir) == 1
         verdict = json.loads((Path(cell_dir) / "cc_traces_cell.json").read_text())
         return verdict["failures"]
+
+
+# --------------------------------------------------------------------------
+# the source factory, as it was actually invoked
+
+
+#: A configuration of the integrated factory that this validator has nothing
+#: to say against: every option is one the factory takes, the four that decide
+#: coverage are stated, and the seeded-template branch is consistent.
+GOOD_FACTORY = {
+    "tp": 2,
+    "require_complete": "true",
+    "head": "true",
+    "regions": "source-27b-tp2",
+    "derive": "false",
+    "template": "body.json",
+    "head_template": "head.json",
+    "price": "prices.json:graph.json",
+    "seconds_per_launch": 0.0,
+}
+
+
+def _factory(options, *, tp=2, served_tp=None):
+    """A modelled side that named the source factory, in manifest shape."""
+    server = _server(
+        served_tp if served_tp is not None else tp, mode="predict", virtual=True
+    )
+    server["compass"]["oracle"] = validate.SOURCE_FACTORY
+    server["compass"]["oracle_options"] = dict(options)
+    return SimpleNamespace(manifest={"server": server})
+
+
+class TestTheSourceFactoryWasGivenAWholeModel:
+    """Option pass-through, checked against what the factory does with it.
+
+    The factory has a working default for everything, so a run that states
+    almost nothing still starts, still answers, and still produces numbers that
+    print. What it does not do is predict the whole model -- and the record of
+    such a run is indistinguishable from a complete one unless the options are
+    read the way the factory reads them.
+    """
+
+    def _reasons(self, options, **kwargs):
+        return validate.check_source_factory(_factory(options, **kwargs), 2, "repeat 0")
+
+    def test_the_known_good_configuration_passes(self):
+        assert self._reasons(GOOD_FACTORY) == []
+
+    def test_another_oracle_is_not_this_check(self):
+        """The protocol does not bind acceptance to this factory; lead does."""
+        side = _factory(GOOD_FACTORY)
+        side.manifest["server"]["compass"]["oracle"] = "atom.compass.core.cost.x.Y"
+        assert validate.check_source_factory(side, 2, "repeat 0") == []
+
+    def test_a_near_miss_qualname_is_a_different_predictor(self):
+        side = _factory(GOOD_FACTORY)
+        side.manifest["server"]["compass"][
+            "oracle"
+        ] = "source_oracle.source_cost_oracle"
+        assert validate.check_source_factory(side, 2, "repeat 0") == []
+
+    def test_the_implemented_qualname_is_the_one_checked(self):
+        assert (
+            validate.SOURCE_FACTORY
+            == "atom.compass.runtime.source_oracle.source_cost_oracle"
+        )
+
+    def test_the_option_list_is_exactly_what_the_factory_takes(self):
+        assert set(validate.SOURCE_FACTORY_OPTIONS) == {
+            "model",
+            "tp",
+            "device",
+            "replay_target",
+            "block_size",
+            "max_model_len",
+            "position_rows",
+            "block_policy",
+            "cudagraph_mode",
+            "price",
+            "template",
+            "head_template",
+            "head",
+            "regions",
+            "seconds_per_launch",
+            "require_complete",
+            "carry_allocation",
+            "derive",
+        }
+
+    def test_an_option_the_factory_does_not_take_is_refused(self):
+        reasons = self._reasons({**GOOD_FACTORY, "require_complete_": "true"})
+        assert any("takes no such option" in r for r in reasons)
+
+    def test_every_documented_option_passes_through_unremarked(self):
+        """None of the eighteen is itself a complaint."""
+        options = {
+            **GOOD_FACTORY,
+            "model": "/models/qwen3-27b",
+            "device": "meta",
+            "replay_target": "target.json",
+            "block_size": 16,
+            "max_model_len": 262144,
+            "position_rows": 1,
+            "block_policy": "rounds",
+            "cudagraph_mode": "FULL",
+            "carry_allocation": "false",
+            "derive": "true",
+        }
+        assert set(options) == set(validate.SOURCE_FACTORY_OPTIONS)
+        assert self._reasons(options) == []
+
+    def test_incomplete_pricing_is_refused(self):
+        reasons = self._reasons({**GOOD_FACTORY, "require_complete": "false"})
+        assert any("complete-only" in r for r in reasons)
+
+    def test_a_defaulted_require_complete_is_still_refused_as_unstated(self):
+        """Its default is on, so the run would be complete -- but nobody said so."""
+        options = {k: v for k, v in GOOD_FACTORY.items() if k != "require_complete"}
+        reasons = self._reasons(options)
+        assert any("left require_complete to the factory default" in r for r in reasons)
+
+    def test_the_head_region_must_be_priced(self):
+        reasons = self._reasons({**GOOD_FACTORY, "head": "false"})
+        assert any("head is off" in r for r in reasons)
+
+    def test_a_defaulted_head_is_off_and_unstated(self):
+        options = {k: v for k, v in GOOD_FACTORY.items() if k != "head"}
+        reasons = self._reasons(options)
+        assert any("left head to the factory default" in r for r in reasons)
+        assert any("head is off" in r for r in reasons)
+
+    def test_the_region_model_must_be_named(self):
+        options = {k: v for k, v in GOOD_FACTORY.items() if k != "regions"}
+        assert any("left regions" in r for r in self._reasons(options))
+
+    def test_an_unmeasured_carried_allocation_cannot_be_graded(self):
+        reasons = self._reasons({**GOOD_FACTORY, "carry_allocation": "1"})
+        assert any("unmeasured" in r for r in reasons)
+
+    def test_a_flag_the_factory_would_refuse_is_not_read_as_false(self):
+        reasons = self._reasons({**GOOD_FACTORY, "head": "on-ish"})
+        assert any("not a boolean" in r for r in reasons)
+
+    def test_a_numeric_flag_is_read_the_way_arg_utils_delivers_it(self):
+        """`head=1` reaches the server as an int, not the string it was typed as."""
+        assert self._reasons({**GOOD_FACTORY, "head": 1}) == []
+
+    def test_the_width_must_be_the_width_of_the_cell(self):
+        reasons = self._reasons({**GOOD_FACTORY, "tp": 1})
+        assert any("built for another width" in r for r in reasons)
+
+    def test_the_width_must_be_the_width_the_server_was_launched_at(self):
+        reasons = self._reasons({**GOOD_FACTORY, "tp": 2}, served_tp=4)
+        assert any("tensor_parallel_size=4" in r for r in reasons)
+
+    def test_a_defaulted_width_is_refused_rather_than_assumed(self):
+        options = {k: v for k, v in GOOD_FACTORY.items() if k != "tp"}
+        assert any("left tp" in r for r in self._reasons(options))
+
+    def test_derivation_on_needs_what_the_tracer_needs(self):
+        options = {k: v for k, v in GOOD_FACTORY.items() if k != "derive"}
+        options["derive"] = "true"
+        reasons = self._reasons(options)
+        assert any("derive is on and model" in r for r in reasons)
+        assert any("derive is on and block_size" in r for r in reasons)
+        assert any("derive is on and max_model_len" in r for r in reasons)
+
+    def test_derivation_on_with_the_tracer_inputs_is_accepted(self):
+        options = {
+            **GOOD_FACTORY,
+            "derive": "true",
+            "model": "/models/qwen3-27b",
+            "block_size": 16,
+            "max_model_len": 262144,
+        }
+        assert self._reasons(options) == []
+
+    def test_derivation_off_with_no_template_prices_nothing(self):
+        options = {k: v for k, v in GOOD_FACTORY.items() if k != "template"}
+        reasons = self._reasons(options)
+        assert any("refused for want of a graph" in r for r in reasons)
+
+    def test_derivation_off_with_no_head_template_prices_no_head(self):
+        options = {k: v for k, v in GOOD_FACTORY.items() if k != "head_template"}
+        reasons = self._reasons(options)
+        assert any("neither a graph nor a deriver" in r for r in reasons)
+
+    def test_an_empty_option_is_not_a_stated_one(self):
+        """`regions=` parses, arrives as an empty string, and sets nothing."""
+        assert any(
+            "left regions" in r for r in self._reasons({**GOOD_FACTORY, "regions": ""})
+        )
