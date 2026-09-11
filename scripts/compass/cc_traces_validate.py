@@ -825,6 +825,151 @@ def _digest(path: Path):
     return hashlib.sha256(path.read_bytes()).hexdigest() if path.exists() else None
 
 
+def _same_host(left, right) -> bool:
+    """Short names: one side may carry a domain the other does not."""
+    return str(left or "").split(".")[0] == str(right or "").split(".")[0]
+
+
+def _who_answered(execution, where: str) -> list[str]:
+    """Re-derive, from the raw fields, that the launched process answered.
+
+    The harness makes this check while it runs and writes down a verdict. A
+    verdict is not evidence. What is recomputed here is the comparison itself,
+    from `said` (the server's account of which process it is) and `observed`
+    (what the harness read out of `/proc`), so a run whose recorded conclusion
+    does not follow from its own recorded facts is refused rather than
+    believed.
+    """
+    seen = execution.get("server_process")
+    if not isinstance(seen, dict) or not seen:
+        return [
+            (
+                f"{where}: nothing recorded about which process answered, so this "
+                f"repeat cannot be attributed to the server it launched -- a "
+                f"matching code digest says only that some server was built from "
+                f"the same tree"
+            )
+        ]
+    said, observed = seen.get("said"), seen.get("observed")
+    if not isinstance(said, dict) or not isinstance(observed, dict):
+        return [
+            (
+                f"{where}: the record of who answered is incomplete, so there is "
+                f"nothing to recompute it from"
+            )
+        ]
+    wrong = []
+    pid, launched = said.get("pid"), observed.get("launched_pid")
+    ancestry = observed.get("ancestry") or []
+    if pid is None or launched is None:
+        wrong.append("neither account names a process")
+    elif launched not in ancestry:
+        wrong.append(
+            f"pid {pid} answered but is neither the launched process "
+            f"{launched} nor a descendant of it"
+        )
+    if said.get("start_ticks") != observed.get("start_ticks"):
+        wrong.append(
+            f"pid {pid} reports start tick {said.get('start_ticks')!r} where "
+            f"the harness read {observed.get('start_ticks')!r}, so that pid "
+            f"named a different process than the one that answered"
+        )
+    if not _same_host(said.get("host"), observed.get("host")):
+        wrong.append(
+            f"the server answered from {said.get('host')!r} but the repeat "
+            f"was launched on {observed.get('host')!r}"
+        )
+    if (
+        said.get("boot_id")
+        and observed.get("boot_id")
+        and said["boot_id"] != observed["boot_id"]
+    ):
+        wrong.append("the server reports a different boot than the harness")
+    if observed.get("alive_at_provenance") is not True:
+        wrong.append(
+            "the launched process was not alive when the server answered, so "
+            "whatever answered was not it"
+        )
+    problems = [f"{where}: {reason}" for reason in wrong]
+    if seen.get("verified") is not True:
+        problems.append(
+            f"{where}: the run does not claim the server was verified, so "
+            f"nothing attributes these numbers to a known process"
+        )
+    elif wrong:
+        problems.append(
+            f"{where}: the run records the server as verified, but its own "
+            f"evidence does not support that"
+        )
+    return problems
+
+
+def _who_served(execution, manifest, where: str) -> list[str]:
+    """And that the process checked at startup is the one that served.
+
+    The harness reads `/compass/provenance` when the server comes up. The
+    replay client reads it again, from a different process, during the run it
+    is recording. Startup and service are different moments, and only the
+    second one is the one the numbers come from, so the two accounts have to
+    name the same process.
+    """
+    seen = execution.get("server_process") or {}
+    said = seen.get("said") if isinstance(seen, dict) else None
+    if not isinstance(said, dict):
+        return []  # already refused by the check above
+    theirs = (manifest.get("server") or {}).get("server_process")
+    if not isinstance(theirs, dict) or not theirs:
+        return [
+            (
+                f"{where}: the replay artifact records no account of which "
+                f"process served the requests, so the check made at startup "
+                f"covers only startup"
+            )
+        ]
+    for field in ("pid", "start_ticks", "boot_id"):
+        if theirs.get(field) != said.get(field):
+            return [
+                (
+                    f"{where}: the server checked at startup reports "
+                    f"{field}={said.get(field)!r} but the server that served the "
+                    f"replay reports {theirs.get(field)!r}, so the requests were "
+                    f"answered by a different process than the one verified"
+                )
+            ]
+    return []
+
+
+def check_who_served(journal, manifests: list, label: str) -> list[str]:
+    """Whether this side's numbers can be attributed to processes it launched.
+
+    Offline, from what the run wrote down. The harness refuses at the time,
+    but a refusal that only ever happens live is a refusal nobody can audit
+    afterwards, and the artifacts outlive the process that made them.
+    """
+    if not isinstance(journal, dict) or not journal:
+        return [
+            (
+                f"{label}: no run.{label}.json, so nothing records which process "
+                f"served these repeats"
+            )
+        ]
+    executions = journal.get("executions") or []
+    if not executions:
+        return [f"{label}: run.{label}.json records no executions"]
+    problems = []
+    if len(executions) != len(manifests):
+        problems.append(
+            f"{label}: {len(executions)} executions recorded against "
+            f"{len(manifests)} saved repeats, so they cannot be matched up"
+        )
+    for index, execution in enumerate(executions):
+        where = f"{label}[{index}]"
+        problems += _who_answered(execution, where)
+        if index < len(manifests):
+            problems += _who_served(execution, manifests[index], where)
+    return problems
+
+
 def cell(args) -> int:
     cell_dir = Path(args.dir)
     if not cell_dir.is_dir():
@@ -911,6 +1056,19 @@ def cell(args) -> int:
         )
 
     failures += check_gpu_free(cell_dir, modelled_paths)
+
+    # A matching code digest says the server was built from this tree; it does
+    # not say the replies came from the process this cell launched. The harness
+    # checks that live and writes down what it saw. Recheck it here from the
+    # artifacts, because a check that only ever runs live cannot be audited
+    # after the process is gone.
+    for side, paths in (("real", real_paths), ("modelled", modelled_paths)):
+        journal_path = cell_dir / f"run.{side}.json"
+        journal = (
+            json.loads(journal_path.read_text()) if journal_path.exists() else None
+        )
+        manifests = [(json.loads(p.read_text()).get("run") or {}) for p in paths]
+        failures += check_who_served(journal, manifests, side)
 
     # Every step table this cell wrote, whichever repeat wrote it and whichever
     # rank suffix the engine appended: a predictor calibrated on any of them is

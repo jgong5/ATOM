@@ -46,8 +46,26 @@ TABLE_SHA = "b" * 64
 WORKLOAD_ROW_KEYS = ("arrival_s", "input_tokens", "output_tokens")
 
 
-def _server(tp, *, mode, virtual, options=None, digests=None, files=None):
+PROC_HOST = "cell-host"
+PROC_BOOT = "8b0a7a2c-5d31-4f6e-9a11-77c0d2e4b900"
+KEEP = object()
+
+
+def _identity(pid=4242, *, ppid=4240, ticks=132307571, host=PROC_HOST, boot=PROC_BOOT):
+    """What a server says about itself, in the shape `/proc` gives it."""
     return {
+        "pid": pid,
+        "ppid": ppid,
+        "host": host,
+        "boot_id": boot,
+        "start_ticks": ticks,
+        "ticks_per_second": 100,
+    }
+
+
+def _server(tp, *, mode, virtual, options=None, digests=None, files=None, process=KEEP):
+    served = _identity() if process is KEEP else process
+    provenance = {
         "server_revision": "abc123",
         "server_code_sha256": "c" * 64,
         "model": "Qwen/Qwen3.8-27B",
@@ -68,6 +86,44 @@ def _server(tp, *, mode, virtual, options=None, digests=None, files=None):
             "admission_seconds": 0.0,
         },
     }
+    if served is not None:
+        provenance["server_process"] = served
+    return provenance
+
+
+def _journal(cell_dir, side, repeats, *, executions=None):
+    """The run journal `cc_traces_run.py` leaves beside the artifacts."""
+    if executions is None:
+        executions = [
+            {
+                "execution_id": f"cx-{side}{index}",
+                "server_process": {
+                    "said": _identity(),
+                    "observed": {
+                        "launched_pid": 4240,
+                        "host": PROC_HOST,
+                        "boot_id": PROC_BOOT,
+                        "start_ticks": 132307571,
+                        "ancestry": [4242, 4240, 1],
+                        "alive_at_provenance": True,
+                    },
+                    "verified": True,
+                },
+            }
+            for index in range(repeats)
+        ]
+    blob = {
+        "schema": "compass.execution/1",
+        "cell": str(cell_dir),
+        "side": side,
+        "executions": executions,
+        "refused": False,
+        "failures": [],
+        "steps": [],
+    }
+    path = Path(cell_dir) / f"run.{side}.json"
+    path.write_text(json.dumps(blob))
+    return path, blob
 
 
 def _side(
@@ -90,6 +146,7 @@ def _side(
     ttft=0.5,
     service=1.0,
     records=None,
+    process=KEEP,
 ):
     """One saved run, in the shape `replay.py` writes."""
     results, engine_records = [], []
@@ -141,6 +198,7 @@ def _side(
             options=options,
             digests=digests,
             files=files,
+            process=process,
         ),
         "prepare": (
             {
@@ -246,6 +304,8 @@ def cell(tmp_path, monkeypatch):
         digests={"prices": PRICES_SHA},
         files={"prices": {"prices.json": PRICES_SHA}},
     )
+    _journal(cell_dir, "real", 1)
+    _journal(cell_dir, "modelled", 1)
     (cell_dir / "cc_traces_protocol.json").write_text(
         json.dumps(
             {
@@ -1040,3 +1100,141 @@ class TestTheRankingGate:
             (where / "cc_traces_cell.json").write_text(json.dumps(blob))
             dirs.append(str(where))
         assert validate.main(["matrix"] + dirs) == 1
+
+
+class TestTheArtifactsMustSayWhoServed:
+    """A live refusal nobody can re-run is not evidence after the fact.
+
+    `cc_traces_run.py` checks, while the repeat is running, that the process
+    answering `/compass/provenance` is the one it launched. That check ends
+    with the process. These tests are about the other reader: someone holding
+    only the directory, months later, asking the same question of the files.
+    """
+
+    def _journal_of(self, cell_dir, side):
+        return json.loads((Path(cell_dir) / f"run.{side}.json").read_text())
+
+    def _rewrite(self, cell_dir, side, journal):
+        (Path(cell_dir) / f"run.{side}.json").write_text(json.dumps(journal))
+
+    def test_a_cell_carrying_its_journals_passes(self, cell):
+        assert run(cell) == 0
+
+    def test_a_cell_with_no_journal_cannot_say_who_served(self, cell):
+        (Path(cell) / "run.real.json").unlink()
+        assert run(cell) == 1
+
+    def test_a_journal_recording_no_executions_is_refused(self, cell):
+        journal = self._journal_of(cell, "modelled")
+        journal["executions"] = []
+        self._rewrite(cell, "modelled", journal)
+        assert run(cell) == 1
+
+    def test_an_execution_with_no_process_evidence_is_refused(self, cell):
+        journal = self._journal_of(cell, "real")
+        journal["executions"][0].pop("server_process")
+        self._rewrite(cell, "real", journal)
+        assert run(cell) == 1
+
+    def test_half_a_record_is_refused(self, cell):
+        journal = self._journal_of(cell, "real")
+        journal["executions"][0]["server_process"] = {"verified": True}
+        self._rewrite(cell, "real", journal)
+        assert run(cell) == 1
+
+    def test_an_unverified_repeat_is_refused(self, cell):
+        journal = self._journal_of(cell, "modelled")
+        journal["executions"][0]["server_process"]["verified"] = False
+        self._rewrite(cell, "modelled", journal)
+        assert run(cell) == 1
+
+    def test_a_verdict_its_own_evidence_contradicts_is_refused(self, cell):
+        """The stale server, seen from the files.
+
+        Same tree, same flags, same port, so every configuration field in the
+        provenance matches. The pid that answered is simply not one this
+        repeat started, and the journal nonetheless says verified.
+        """
+        journal = self._journal_of(cell, "real")
+        journal["executions"][0]["server_process"]["said"]["pid"] = 9999
+        journal["executions"][0]["server_process"]["observed"]["ancestry"] = [1]
+        self._rewrite(cell, "real", journal)
+        failures = self._fail(cell)
+        assert any("descendant" in reason for reason in failures)
+        assert any("does not support that" in reason for reason in failures)
+
+    def test_a_reused_pid_is_caught_by_its_start_tick(self, cell):
+        journal = self._journal_of(cell, "real")
+        journal["executions"][0]["server_process"]["said"]["start_ticks"] = 7
+        self._rewrite(cell, "real", journal)
+        assert any("start tick" in r for r in self._fail(cell))
+
+    def test_an_answer_from_another_host_is_refused(self, cell):
+        journal = self._journal_of(cell, "modelled")
+        journal["executions"][0]["server_process"]["said"]["host"] = "elsewhere"
+        self._rewrite(cell, "modelled", journal)
+        assert any("answered from" in r for r in self._fail(cell))
+
+    def test_a_domain_suffix_is_not_a_different_host(self, cell):
+        journal = self._journal_of(cell, "modelled")
+        said = journal["executions"][0]["server_process"]["said"]
+        said["host"] = f"{PROC_HOST}.example.com"
+        self._rewrite(cell, "modelled", journal)
+        assert run(cell) == 0
+
+    def test_an_answer_from_before_the_reboot_is_refused(self, cell):
+        journal = self._journal_of(cell, "real")
+        journal["executions"][0]["server_process"]["said"]["boot_id"] = "0" * 36
+        self._rewrite(cell, "real", journal)
+        assert any("different boot" in r for r in self._fail(cell))
+
+    def test_a_process_gone_by_provenance_time_is_refused(self, cell):
+        journal = self._journal_of(cell, "modelled")
+        journal["executions"][0]["server_process"]["observed"][
+            "alive_at_provenance"
+        ] = False
+        self._rewrite(cell, "modelled", journal)
+        assert any("not alive" in r for r in self._fail(cell))
+
+    def test_a_forked_child_answering_is_accepted(self, cell):
+        """Ancestry, not equality: the engine may answer from a child."""
+        journal = self._journal_of(cell, "real")
+        assert (
+            4240 in journal["executions"][0]["server_process"]["observed"]["ancestry"]
+        )
+        assert run(cell) == 0
+
+    def test_fewer_executions_than_repeats_is_refused(self, cell):
+        journal = self._journal_of(cell, "real")
+        journal["executions"] = journal["executions"] * 2
+        self._rewrite(cell, "real", journal)
+        assert any("cannot be matched up" in r for r in self._fail(cell))
+
+    def test_a_replay_artifact_silent_about_the_server_is_refused(self, cell):
+        """The startup check covers startup only, unless the run says more."""
+        path = Path(cell) / "modelled.r1.json"
+        blob = json.loads(path.read_text())
+        blob["run"]["server"].pop("server_process")
+        _write(path, blob)
+        assert any("covers only startup" in r for r in self._fail(cell))
+
+    def test_a_different_process_serving_the_replay_is_refused(self, cell):
+        """Startup and service are different moments.
+
+        The harness fetched provenance when the server came up; the replay
+        client fetched it again, from its own process, during the run these
+        numbers come from. If the two name different processes, the repeat was
+        verified against a server that did not serve it.
+        """
+        path = Path(cell) / "real.r1.json"
+        blob = json.loads(path.read_text())
+        blob["run"]["server"]["server_process"]["start_ticks"] = 555
+        _write(path, blob)
+        assert any(
+            "different process than the one verified" in r for r in self._fail(cell)
+        )
+
+    def _fail(self, cell_dir):
+        assert run(cell_dir) == 1
+        verdict = json.loads((Path(cell_dir) / "cc_traces_cell.json").read_text())
+        return verdict["failures"]
