@@ -295,6 +295,25 @@ class Clock:
         self.t += seconds
 
 
+def _a_workload_on_disk(tmp_path, monkeypatch, klass="long"):
+    """Bytes where the runner looks for the workload, for the digest checks.
+
+    The runner digests whatever is at `ROOT/atom/compass/
+    cc_traces_<class>.jsonl` and refuses a replay whose trace digest differs.
+    Those registered files are reproduced from the corpus rather than
+    committed, so a test about that plumbing supplies its own workload instead
+    of depending on a checkout having the acceptance inputs in it.
+    """
+    root = tmp_path / "repo"
+    path = root / "atom" / "compass" / f"cc_traces_{klass}.jsonl"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps({
+        "arrival_s": 0.0, "input_tokens": 640,
+        "input_blocks": 10, "output_tokens": 23}) + "\n")
+    monkeypatch.setattr(run_mod, "ROOT", root)
+    return path
+
+
 def _plan(tmp_path, tp=2, klass="long"):
     built = plan_mod.cell_steps(
         tp,
@@ -885,7 +904,8 @@ class TestEveryRepeatIsAnExecutionWithAName:
             assert execution["replay"]["exit"] == 0
             assert execution["replay"]["started_at"] <= execution["replay"]["ended_at"]
 
-    def test_an_execution_records_its_source_and_configuration(self, tmp_path):
+    def test_an_execution_records_its_source_and_configuration(self, tmp_path, monkeypatch):
+        _a_workload_on_disk(tmp_path, monkeypatch)
         runner = _runner(tmp_path, "modelled")
         runner.run()
         for execution in self._executions(runner):
@@ -1045,8 +1065,9 @@ class TestTheProducersAreCheckedAtTheirOwnFieldNames:
         assert runner.run() == 1
         assert any("tensor_parallel_size=4" in f for f in runner.failures)
 
-    def test_a_replay_of_another_trace_is_refused(self, tmp_path):
+    def test_a_replay_of_another_trace_is_refused(self, tmp_path, monkeypatch):
         """The frozen corpus, by its bytes rather than by its path."""
+        _a_workload_on_disk(tmp_path, monkeypatch)
         procs = FakeProcesses(cell=tmp_path)
         original = procs._write_artifact
 

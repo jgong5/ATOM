@@ -112,9 +112,65 @@ WALL_CLOCK = "wall"
 ARRIVAL_DRIFT_S = 2.0
 
 
+def workload_manifest(path: Path) -> Path:
+    """The manifest that registers a workload file: its sibling, by name."""
+    return path.with_name(path.name[: -len(".jsonl")] + ".manifest.json")
+
+
+def registered_workload(klass: str) -> Path:
+    """The registered workload file, or a refusal that says how to get it.
+
+    The `.jsonl` are not in the repository. They are a slice of a 568 MB
+    licensed corpus, and a checkout is not where acceptance inputs should come
+    from in any case: the manifest beside the file is the registration, and the
+    file itself is reproduced from the corpus by the same rule that first
+    emitted it.
+
+    A missing file is therefore a stop, never a prompt to invent one. There is
+    no fallback, no smaller default and no synthesised stand-in, and the
+    refusal carries the emit command -- class, corpus and emission time -- so
+    that reproducing it does not require reading this module.
+
+    A file that is present is checked against its manifest's digest when it has
+    one. A substituted workload with no manifest beside it is left alone: that
+    is a caller supplying its own rows on purpose, and what a run actually read
+    is separately digested into the run record.
+    """
+    path = WORKLOADS[klass]
+    manifest = workload_manifest(path)
+    registered = (json.loads(manifest.read_text()) if manifest.exists()
+                  else None)
+    if not path.exists():
+        if registered is None:
+            raise SystemExit(
+                f"cc-traces: there is no {klass} workload at {path} and no "
+                f"manifest at {manifest} to say what it should be. Refusing "
+                "to guess one.")
+        raise SystemExit(
+            f"cc-traces: the registered {klass} workload is not at {path}.\n"
+            "It is reproduced from the corpus, not committed:\n"
+            "  python scripts/compass/cc_traces_workload.py emit "
+            f"--class {klass} \\\n"
+            f"      --corpus <corpus>/{registered['corpus']['file']} \\\n"
+            f"      --out {path} --manifest {manifest} \\\n"
+            f"      --at {registered['emitted_at']}\n"
+            f"the corpus being {registered['corpus']['dataset']} (sha256 "
+            f"{registered['corpus']['sha256'][:16]}...). The rule's constants "
+            "are fixed in that file, so the emission is deterministic and the "
+            f"result must hash to {registered['sha256'][:16]}...")
+    if registered is not None and _digest(path) != registered["sha256"]:
+        raise SystemExit(
+            f"cc-traces: {path} is not the registered {klass} workload (it "
+            f"hashes to {_digest(path)[:16]}..., the manifest registers "
+            f"{registered['sha256'][:16]}...). Neither the manifest nor a "
+            "locked workload is edited to make a run pass; re-emit from the "
+            "corpus, or find out what changed the file.")
+    return path
+
+
 def registered_rows(klass: str) -> list[dict]:
     rows = []
-    for line in WORKLOADS[klass].read_text().splitlines():
+    for line in registered_workload(klass).read_text().splitlines():
         if line.strip():
             rows.append(json.loads(line))
     return rows

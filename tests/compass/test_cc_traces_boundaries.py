@@ -155,10 +155,16 @@ class TestThePlanSpeaksReplaysLanguage:
         assert "--pace" in real[0] and "--prepare" in real[0]
         assert "--pace" not in modelled[0] and "--prepare" not in modelled[0]
 
-    def test_the_trace_the_plan_names_is_a_file_that_exists(self):
+    def test_the_trace_the_plan_names_is_a_registered_workload(self):
+        """Not that the file is there -- it is reproduced, not committed --
+        but that the plan names something the repository actually registers.
+        """
         for command in _commands("replay"):
             trace = ROOT / command[command.index("--trace") + 1]
-            assert trace.exists(), trace
+            manifest = trace.with_name(
+                trace.name.replace(".jsonl", ".manifest.json"))
+            assert manifest.exists(), manifest
+            assert not trace.exists() or trace.is_file()
 
     def test_the_refusal_exit_the_harness_expects_is_the_one_replay_uses(self):
         run_mod = _load("cc_traces_run")

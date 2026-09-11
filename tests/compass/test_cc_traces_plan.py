@@ -211,7 +211,10 @@ class TestTheTwoSidesAreNotRunTheSameWay:
             assert replays
             for step in replays:
                 assert expected in step["command"]
-                assert (ROOT / expected).exists()
+                # The `.jsonl` itself is reproduced from the corpus rather
+                # than committed, so what must be in the checkout is the
+                # manifest that registers it.
+                assert (ROOT / expected.replace(".jsonl", ".manifest.json")).exists()
 
     def test_the_repeat_count_is_the_protocol_s_on_both_sides(self, plan):
         for cell in plan["cells"]:

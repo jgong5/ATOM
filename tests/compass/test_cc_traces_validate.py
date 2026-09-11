@@ -1712,3 +1712,89 @@ class TestTheSourceFactoryWasGivenAWholeModel:
         assert any(
             "left regions" in r for r in self._reasons({**GOOD_FACTORY, "regions": ""})
         )
+
+
+class TestTheRegisteredWorkloadIsNotInTheCheckout:
+    """The `.jsonl` are reproduced from the corpus, so absence must stop a run.
+
+    They used to be committed, which made a clean checkout look like a complete
+    acceptance environment. They are a slice of a licensed 568 MB corpus and
+    the manifest beside them is the registration, so the file is now emitted by
+    `cc_traces_workload.py emit`. The failure mode that costs something is not
+    the missing file -- it is a run that reacts to a missing file by going
+    ahead with anything else.
+    """
+
+    def _registered(self, tmp_path, klass="short", rows=("a", "b")):
+        path = tmp_path / f"cc_traces_{klass}.jsonl"
+        path.write_text("".join(json.dumps({"n": r}) + "\n" for r in rows))
+        manifest = validate.workload_manifest(path)
+        manifest.write_text(json.dumps({
+            "class": klass,
+            "corpus": {"dataset": "semianalysisai/cc-traces-weka-062126-256k",
+                       "file": "traces.jsonl", "sha256": "e39cd2ff" + "0" * 56},
+            "emitted_at": "2026-09-11T00:00:00Z",
+            "sha256": validate._digest(path),
+            "file": path.name,
+        }))
+        return path, manifest
+
+    def test_the_registered_bytes_are_read_when_they_are_there(
+            self, tmp_path, monkeypatch):
+        path, _ = self._registered(tmp_path)
+        monkeypatch.setitem(validate.WORKLOADS, "short", path)
+        assert validate.registered_workload("short") == path
+        assert [r["n"] for r in validate.registered_rows("short")] == ["a", "b"]
+
+    def test_an_absent_workload_says_how_to_reproduce_it(
+            self, tmp_path, monkeypatch):
+        path, _ = self._registered(tmp_path)
+        path.unlink()
+        monkeypatch.setitem(validate.WORKLOADS, "short", path)
+        with pytest.raises(SystemExit) as raised:
+            validate.registered_workload("short")
+        said = str(raised.value)
+        # The command, the class, the corpus and the emission time: enough to
+        # produce the same bytes without reading the validator.
+        assert "cc_traces_workload.py emit" in said
+        assert "--class short" in said
+        assert "2026-09-11T00:00:00Z" in said
+        assert "semianalysisai/cc-traces-weka-062126-256k" in said
+
+    def test_nothing_is_synthesised_in_place_of_the_absent_file(
+            self, tmp_path, monkeypatch):
+        path, _ = self._registered(tmp_path)
+        path.unlink()
+        monkeypatch.setitem(validate.WORKLOADS, "short", path)
+        with pytest.raises(SystemExit):
+            validate.registered_rows("short")
+        assert not path.exists()
+
+    def test_with_neither_file_nor_manifest_it_still_refuses(
+            self, tmp_path, monkeypatch):
+        path, manifest = self._registered(tmp_path)
+        path.unlink()
+        manifest.unlink()
+        monkeypatch.setitem(validate.WORKLOADS, "short", path)
+        with pytest.raises(SystemExit) as raised:
+            validate.registered_workload("short")
+        assert "Refusing to guess one" in str(raised.value)
+
+    def test_a_file_that_is_not_the_registered_one_is_refused(
+            self, tmp_path, monkeypatch):
+        path, _ = self._registered(tmp_path)
+        path.write_text(json.dumps({"n": "a"}) + "\n")
+        monkeypatch.setitem(validate.WORKLOADS, "short", path)
+        with pytest.raises(SystemExit) as raised:
+            validate.registered_workload("short")
+        assert "not the registered short workload" in str(raised.value)
+
+    def test_a_substituted_workload_with_no_manifest_is_left_alone(
+            self, tmp_path, monkeypatch):
+        # What the validator's own fixtures do: supply rows directly. There is
+        # no registration beside them to check against, and what the run read
+        # is digested into its record either way.
+        path = tmp_path / "cc_traces_short.jsonl"
+        path.write_text(json.dumps({"n": "a"}) + "\n")
+        monkeypatch.setitem(validate.WORKLOADS, "short", path)
+        assert validate.registered_workload("short") == path

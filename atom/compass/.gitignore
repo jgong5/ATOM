@@ -1,0 +1,15 @@
+# Generated HTML dumps of the maintained Markdown beside them. A tool wrote
+# them from DESIGN_NOTES.md and POC_SUMMARY.md; the .md are the source and
+# stay tracked.
+DESIGN_NOTES.html
+POC_SUMMARY.html
+
+# Dated backup copies of the maintained RETROSPECTIVE.md, which stays tracked.
+RETROSPECTIVE_[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9].md
+
+# The registered cc-traces acceptance workloads. These are a slice of a
+# licensed 568 MB corpus, reproduced by `cc_traces_workload.py emit` from the
+# manifest beside them; the manifest, the protocol and the lock stay tracked
+# and are what registers them. See `registered_workload` in
+# scripts/compass/cc_traces_validate.py for the refusal when one is absent.
+cc_traces_*.jsonl

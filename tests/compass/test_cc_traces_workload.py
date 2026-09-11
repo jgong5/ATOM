@@ -427,6 +427,25 @@ class TestReproducibility:
         assert workload.main(["verify", "--manifest", str(man)]) == 1
 
 
+def _workload_bytes(klass: str):
+    """The registered workload file, or a skip that says how to get it.
+
+    The `.jsonl` are not in the repository: they are a slice of a licensed
+    568 MB corpus, reproduced by `emit` from the manifest that is committed
+    beside them. These checks are about those exact bytes, so in a checkout
+    without them there is nothing to check rather than something that failed.
+    A run that needs them refuses instead -- see `registered_workload` in
+    `cc_traces_validate.py`.
+    """
+    path = ROOT / "atom" / "compass" / f"cc_traces_{klass}.jsonl"
+    if not path.exists():
+        pytest.skip(
+            f"{path.name} is not in this checkout; reproduce it with "
+            f"`cc_traces_workload.py emit --class {klass}` against the corpus "
+            f"named in cc_traces_{klass}.manifest.json")
+    return path
+
+
 class TestRegisteredArtifacts:
     """The files the protocol names are the ones the rule produces."""
 
@@ -435,7 +454,7 @@ class TestRegisteredArtifacts:
         here = ROOT / "atom" / "compass"
         manifest = json.loads((here / f"cc_traces_{klass}.manifest.json").read_text())
         assert (
-            workload.digest_file(here / f"cc_traces_{klass}.jsonl")
+            workload.digest_file(_workload_bytes(klass))
             == manifest["sha256"]
         )
         assert manifest["corpus"]["sha256"] == workload.CORPUS["sha256"]
@@ -449,9 +468,7 @@ class TestRegisteredArtifacts:
         """Every registered request has a length the engine can be asked for."""
         rows = [
             json.loads(line)
-            for line in (ROOT / "atom" / "compass" / f"cc_traces_{klass}.jsonl")
-            .read_text()
-            .splitlines()
+            for line in _workload_bytes(klass).read_text().splitlines()
             if line.strip()
         ]
         assert rows
@@ -472,9 +489,7 @@ class TestRegisteredArtifacts:
         assert manifest["outputs_altered"] == 0
         rows = [
             json.loads(line)
-            for line in (ROOT / "atom" / "compass" / f"cc_traces_{klass}.jsonl")
-            .read_text()
-            .splitlines()
+            for line in _workload_bytes(klass).read_text().splitlines()
             if line.strip()
         ]
         for row in rows:
