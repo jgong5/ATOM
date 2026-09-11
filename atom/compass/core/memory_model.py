@@ -43,7 +43,9 @@ __all__ = ["peak_activation_bytes", "activation_curve", "weight_bytes",
            "scratch_bytes_per_token", "liveness_is_recorded", "traced_shape",
            "UnfoundedActivation", "UnfoundedPrediction",
            "derived_readings", "CALIBRATED_TERMS", "traced_width",
-           "graph_pool_bytes", "measured_graph_pool_bytes", "ELEMENT_BYTES"]
+           "graph_pool_bytes", "measured_graph_pool_bytes", "ELEMENT_BYTES",
+           "dtype_ambiguities", "lineage_keys", "width_classes",
+           "width_coverage"]
 
 ELEMENT_BYTES = {
     "float64": 8, "int64": 8, "double": 8,
@@ -59,6 +61,108 @@ def _bytes_of(shape, dtype: str) -> int:
     for dim in shape:
         count *= int(dim)
     return count * ELEMENT_BYTES.get(dtype, 2)
+
+
+_FLOAT_DTYPES = ("float64", "double", "float32", "float", "bfloat16",
+                 "float16", "half", "float8_e4m3fnuz", "float8_e4m3fn",
+                 "float8_e5m2")
+
+
+def _promote(dtypes) -> Optional[str]:
+    """The dtype PyTorch's promotion rules give these arguments together.
+
+    Not a guess about a particular operator: promotion is defined, and the one
+    part of it that matters for sizing is that a floating point argument beats
+    every integer one whatever the widths -- `int32` ids and a `bfloat16`
+    weight promote to `bfloat16`, never to 4 bytes. Among floats the wider
+    wins, except that `float16` with `bfloat16` promotes to `float32`, neither
+    being able to hold the other.
+
+    This is still an inference about an operator that did not say, so the
+    callers keep it separate from a recorded dtype and `dtype_ambiguities`
+    reports every output it was applied to.
+    """
+    known = [d for d in dtypes if d in ELEMENT_BYTES]
+    if not known:
+        return None
+    floats = [d for d in known if d in _FLOAT_DTYPES]
+    if not floats:
+        return max(known, key=lambda d: ELEMENT_BYTES[d])
+    widest = max(ELEMENT_BYTES[d] for d in floats)
+    at_width = {d for d in floats if ELEMENT_BYTES[d] == widest}
+    if widest == 2 and {"float16", "half"} & at_width and "bfloat16" in at_width:
+        return "float32"
+    return sorted(at_width)[0]
+
+
+def _output_dtype(op, position: int) -> tuple:
+    """The dtype of an operator's output, and on what basis.
+
+    `OpSpec.dtypes` is the dtype of each *argument*. Nothing records what an
+    operator produced, so a walk that needs an output's size has been taking
+    argument 0's and hoping promotion changed nothing. It does change things:
+    `aiter::masked_embedding` takes int32 token ids and a bfloat16 weight and
+    returns a bfloat16 hidden-width activation, and argument 0's dtype sizes
+    one 16 384 x 5 120 buffer at 335 544 320 B instead of 167 772 160.
+
+    Three bases, and the caller is told which it got:
+
+    * `"recorded"` -- the producer wrote `output_dtypes` (O18 asks for it).
+    * `"unanimous"` -- every argument has the same dtype, so promotion has
+      nothing to choose between and argument 0 is not a guess.
+    * `"promoted"` -- the arguments disagree and `_promote` decided. A stated
+      rule rather than a per-operator correction, and reported as an ambiguity
+      because the rule is not what the operator said.
+
+    `(None, "none")` when the graph gives no argument dtypes at all.
+    """
+    recorded = op.get("output_dtypes") or ()
+    if position < len(recorded) and recorded[position]:
+        return str(recorded[position]), "recorded"
+    dtypes = tuple(op.get("dtypes") or ())
+    if not dtypes:
+        return None, "none"
+    if len(set(dtypes)) == 1:
+        return dtypes[0], "unanimous"
+    promoted = _promote(dtypes)
+    if promoted is None:
+        return None, "none"
+    return promoted, "promoted"
+
+
+def dtype_ambiguities(graph) -> list:
+    """Every output whose dtype this graph did not record, and what it costs.
+
+    Reported rather than quietly sized, because the difference between a rule
+    and a record is exactly what a memory term is being asked about. Each entry
+    carries the bytes the promotion rule gives and the bytes argument 0 would
+    have given, so a reader can see whether the ambiguity matters -- most
+    operators with mixed argument dtypes produce something small, and the one
+    that does not is the embedding.
+    """
+    out = []
+    for index, op in enumerate(graph.get("ops") or ()):
+        aliases = op.get("output_aliases") or ()
+        for position, shape in enumerate(op.get("output_shapes") or ()):
+            if position < len(aliases) and aliases[position] is not None:
+                continue  # written into, not allocated: never sized
+            dtype, basis = _output_dtype(op, position)
+            if basis in ("recorded", "unanimous"):
+                continue
+            dtypes = tuple(op.get("dtypes") or ())
+            out.append({
+                "operator": index,
+                "name": op.get("name"),
+                "position": position,
+                "basis": basis,
+                "shape": list(shape),
+                "argument_dtypes": list(dtypes),
+                "chosen_dtype": dtype,
+                "bytes_chosen": _bytes_of(shape, dtype) if dtype else 0,
+                "bytes_if_argument_0": _bytes_of(shape, dtypes[0])
+                if dtypes else 0,
+            })
+    return out
 
 
 def _canonical(ops) -> list:
@@ -210,7 +314,7 @@ def traced_shape(graph) -> tuple:
     return (tuple(int(n) for n in signature), ())
 
 
-def activation_curve(graph) -> list:
+def activation_curve(graph, *, strict_dtypes: bool = False) -> list:
     """How much activation memory is live at each operator.
 
     The activation term is a curve and its peak is one point on it. Comparing
@@ -238,12 +342,27 @@ def activation_curve(graph) -> list:
             if key in held:
                 live -= held.pop(key)
         if canonical[index] == index:
-            dtypes = op.get("dtypes") or ()
-            dtype = dtypes[0] if dtypes else "bfloat16"
             aliases = op.get("output_aliases") or ()
             for position, shape in enumerate(op.get("output_shapes") or ()):
                 if position < len(aliases) and aliases[position] is not None:
                     continue  # written into, not allocated
+                dtype, basis = _output_dtype(op, position)
+                if basis != "recorded" and strict_dtypes:
+                    # A strict walk takes the graph's word and nothing else.
+                    raise UnfoundedActivation(
+                        "operator %d (%s) produces an output the graph records "
+                        "no dtype for; its arguments are (%s) and the walk "
+                        "would size it as %s by %s. Record `output_dtypes`, or "
+                        "walk with `strict_dtypes=False` and read "
+                        "`dtype_ambiguities`"
+                        % (index, op.get("name"),
+                           ", ".join(op.get("dtypes") or ()) or "none",
+                           dtype, basis))
+                if dtype is None:
+                    # No argument dtype at all. Two bytes is the model's own
+                    # activation dtype and it is written down here as the guess
+                    # it is; `dtype_ambiguities` lists the output.
+                    dtype = "bfloat16"
                 size = _bytes_of(shape, dtype)
                 if size:
                     held[(index, position)] = size
@@ -252,7 +371,7 @@ def activation_curve(graph) -> list:
     return curve
 
 
-def peak_activation_bytes(graph) -> int:
+def peak_activation_bytes(graph, *, strict_dtypes: bool = False) -> int:
     """The most activation memory live at once, by walking the graph.
 
     A tensor is live from the operator that produced it until its last
@@ -262,15 +381,20 @@ def peak_activation_bytes(graph) -> int:
     activation, and counting it here would double it against the weight term.
     Nor is an in-place operator's output, which is not a new tensor.
 
-    Two approximations, both stated rather than hidden. Output dtype is not
-    recorded, so an operator's outputs are counted at its *first input's* dtype,
-    which is right for the elementwise and matmul operators that hold the memory
-    and wrong for a cast. And a tensor with no reader in the graph is freed
-    immediately, where the engine frees it whenever the last Python reference
-    goes -- so this is a lower bound on the high-water mark, not a bound on what
-    the allocator reserves.
+    Output dtype comes from the graph where the graph records it, from the
+    arguments where they all agree, and otherwise from PyTorch's promotion
+    rule, with `dtype_ambiguities` listing every output that was not recorded.
+    `strict_dtypes=True` refuses anything but a recorded dtype. Sizing an
+    output at argument 0's dtype -- the rule until now -- is how one
+    `aiter::masked_embedding` came to be counted at int32: 335 544 320 B for a
+    buffer that is 167 772 160.
+
+    One approximation remains, stated rather than hidden: a tensor with no
+    reader in the graph is freed immediately, where the engine frees it whenever
+    the last Python reference goes -- so this is a lower bound on the high-water
+    mark, not a bound on what the allocator reserves.
     """
-    return max(activation_curve(graph) or [0])
+    return max(activation_curve(graph, strict_dtypes=strict_dtypes) or [0])
 
 
 def _safetensors_header(path: str) -> Optional[dict]:
@@ -518,7 +642,7 @@ def load_residue_bytes(world_size: int,
 DEFAULT_PERSISTENT = 118 * MIB
 
 
-def scratch_bytes_per_token(graph) -> float:
+def scratch_bytes_per_token(graph, *, strict_dtypes: bool = False) -> float:
     """Activation memory per token that no recorded operator output explains.
 
     A dispatch tracer sees what crosses the dispatcher. `torch.empty` called
@@ -546,7 +670,8 @@ def scratch_bytes_per_token(graph) -> float:
                  ((graph.get("key") or {}).get("batch_signature") or ()))
     if not measured or not tokens:
         return 0.0
-    return max(0.0, (int(measured) - peak_activation_bytes(graph)) / tokens)
+    return max(0.0, (int(measured) - peak_activation_bytes(
+        graph, strict_dtypes=strict_dtypes)) / tokens)
 
 
 class UnfoundedPrediction(ValueError):
@@ -678,7 +803,8 @@ def _prediction_calibration(profile: Mapping, load, refuse, source: str):
     return calibration
 
 
-def activation_bytes_at(graph, tokens: int) -> int:
+def activation_bytes_at(graph, tokens: int, *,
+                        strict_dtypes: bool = False) -> int:
     """The activation peak at a token count the graph was not traced at.
 
     Linear in tokens, which is not an assumption but a measurement: the walk
@@ -700,14 +826,16 @@ def activation_bytes_at(graph, tokens: int) -> int:
             "this graph records neither tensor deaths nor a measured "
             "activation peak, so there is no liveness in it to scale: "
             "%s" % ((graph.get("provenance") or {}).get("source") or "unknown"))
-    peak = peak_activation_bytes(graph)
+    peak = peak_activation_bytes(graph, strict_dtypes=strict_dtypes)
     traced = sum(int(n) for n in
                  ((graph.get("key") or {}).get("batch_signature") or ()))
     if not (traced and tokens):
         return peak
     # The walk scales, and so does what the walk cannot see -- both are
     # activation memory and both are linear in tokens.
-    return int(peak * tokens / traced + scratch_bytes_per_token(graph) * tokens)
+    return int(peak * tokens / traced
+               + scratch_bytes_per_token(
+                   graph, strict_dtypes=strict_dtypes) * tokens)
 
 
 def modelled_readings(*, total_bytes: int, world_size: int, parameters: int,
@@ -850,3 +978,171 @@ def graph_pool_bytes(activation_bytes: int, *, enforce_eager: bool = False,
         captured.append(num_tokens)
         acc += num_tokens
     return int(per_token * acc)
+
+
+def _is_collective(op) -> bool:
+    """Whether this operator exists only because the model is sharded.
+
+    `group` is set for every collective the tracer or the recorder produced;
+    the name test catches a hand-built `OpSpec` that omitted it.
+    """
+    name = (op.get("name") or "").lower()
+    return bool(op.get("group")) or "all_reduce" in name or "all_gather" in name
+
+
+def lineage_keys(graph) -> list:
+    """A width-invariant identity for each operator, from its ancestry.
+
+    Aligning two graphs by operator index only works while the graphs have the
+    same operators, and tensor parallelism is precisely the case where they do
+    not: every row-parallel matmul gains an all-reduce after it, so index *i*
+    at TP=2 is a different operator from index *i* at TP=1, and the further
+    into the model the further the drift.
+
+    So identity comes from ancestry instead: an operator is the one that ran
+    this name, on values produced by *those* operators, which is recursive and
+    unique in a feed-forward graph -- the second layer's `gemm` has a different
+    chain from the first layer's because its chain contains the first layer.
+    Shapes and dtypes are deliberately not in the key: they are what the
+    comparison is *for*, and putting them in would make every sharded tensor a
+    non-match and report nothing.
+
+    Collectives are transparent. A collective is not a value the model computes,
+    it is a value made whole, and it exists at one width and not another; making
+    it pass its input's identity through is what keeps the operator after it
+    aligned with the operator after the matmul at TP=1. A shape-changing
+    collective (`all_gather`) is passed through for *alignment* only -- its own
+    outputs have no counterpart at TP=1 and are reported as such.
+
+    Returns one key per operator, interned so that equal ancestry gives an
+    equal key across graphs.
+    """
+    ops = graph.get("ops") or ()
+    interned: dict = {}
+    keys: list = []
+    for op in ops:
+        sources = tuple(op.get("inputs_from") or ())
+        if _is_collective(op):
+            # Pass the first produced input's identity through.
+            through = next((keys[s] for s in sources
+                            if 0 <= s < len(keys)), None)
+            keys.append(through if through is not None else "external")
+            continue
+        parents = tuple(keys[s] if 0 <= s < len(keys) else "external"
+                        for s in sources)
+        structure = (op.get("name"), parents)
+        key = interned.get(structure)
+        if key is None:
+            key = "L%d" % len(interned)
+            interned[structure] = key
+        keys.append(key)
+    return keys
+
+
+def width_classes(graphs: Mapping) -> dict:
+    """How each tensor's shape actually behaves with width, read off the graphs.
+
+    `graphs` maps a tensor-parallel width to a graph derived at that width. For
+    every output that can be aligned across all of them by `lineage_keys`, this
+    reports what the widths did to its shape:
+
+    * `"replicated"` -- the same shape at every width;
+    * `"sharded"` -- exactly one axis divides by the width ratio, the rest
+      unchanged, and the axis is named;
+    * `"unresolved"` -- anything else, including a shape that changes by a
+      ratio the width does not explain. Reported, not classified.
+
+    This is the check that the trailing-dimension rule could not make. At TP=1
+    an attention output is `[tokens, heads * head_dim]`, and `heads * head_dim`
+    *is* the hidden size, so it is indistinguishable by shape from the residual
+    stream -- and it shards while the residual does not. Reading the width
+    behaviour from graphs derived at each width asks ATOM's own sharding
+    arithmetic instead of guessing from one width's shape, which is a source
+    derivation and not a fit to any measured peak.
+
+    Outputs that exist at one width and not another -- a collective's own
+    result, an all-gather's widened tensor -- are absent from the result rather
+    than guessed at; `width_coverage` says how many those were.
+    """
+    widths = sorted(int(w) for w in graphs)
+    if len(widths) < 2:
+        raise ValueError("width classification needs graphs at two or more "
+                         "tensor-parallel widths; got %r" % (widths,))
+    base = widths[0]
+    per_width = {}
+    for width in widths:
+        graph = graphs[width] if width in graphs else graphs[str(width)]
+        keys = lineage_keys(graph)
+        table = {}
+        for index, op in enumerate(graph.get("ops") or ()):
+            if _is_collective(op):
+                continue
+            for position, shape in enumerate(op.get("output_shapes") or ()):
+                table[(keys[index], position)] = (op.get("name"),
+                                                  tuple(int(d) for d in shape))
+        per_width[width] = table
+
+    out = {}
+    for ident, (name, base_shape) in per_width[base].items():
+        shapes = {base: list(base_shape)}
+        missing = False
+        for width in widths[1:]:
+            entry = per_width[width].get(ident)
+            if entry is None:
+                missing = True
+                break
+            shapes[width] = list(entry[1])
+        if missing:
+            continue
+        classification, axis = _classify_shapes(shapes, base)
+        out[ident] = {"name": name, "position": ident[1], "shapes": shapes,
+                      "class": classification, "axis": axis}
+    return out
+
+
+def _classify_shapes(shapes: Mapping, base: int) -> tuple:
+    base_shape = shapes[base]
+    if all(list(s) == list(base_shape) for s in shapes.values()):
+        return "replicated", None
+    for axis, extent in enumerate(base_shape):
+        ok = True
+        for width, shape in shapes.items():
+            if len(shape) != len(base_shape):
+                ok = False
+                break
+            ratio = width // base
+            for other, size in enumerate(shape):
+                want = (extent // ratio if other == axis
+                        else base_shape[other])
+                if size != want or (other == axis and extent % ratio):
+                    ok = False
+                    break
+            if not ok:
+                break
+        if ok:
+            return "sharded", axis
+    return "unresolved", None
+
+
+def width_coverage(graphs: Mapping) -> dict:
+    """How much of each graph the width classification could align at all.
+
+    A classification that quietly drops half the graph is worse than no
+    classification, so the count is reported next to it: outputs aligned,
+    outputs present only at a wider width (a collective's own result), and
+    outputs at the base width with no counterpart.
+    """
+    widths = sorted(int(w) for w in graphs)
+    classes = width_classes(graphs)
+    counts = {}
+    for width in widths:
+        graph = graphs[width] if width in graphs else graphs[str(width)]
+        counts[width] = sum(
+            len(op.get("output_shapes") or ())
+            for op in (graph.get("ops") or ()) if not _is_collective(op))
+    return {"aligned": len(classes),
+            "outputs_per_width": counts,
+            "unaligned_at_base": counts[widths[0]] - len(classes),
+            "by_class": {name: sum(1 for v in classes.values()
+                                   if v["class"] == name)
+                         for name in ("replicated", "sharded", "unresolved")}}

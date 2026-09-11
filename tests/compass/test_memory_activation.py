@@ -184,18 +184,27 @@ def test_live_set_at_the_peak_adds_up_to_the_walk(frozen):
         assert correction in (0, WARMUP_TOKENS * HIDDEN * 2), width
 
 
-def test_width_mechanism_is_read_off_each_tensors_own_shape(frozen):
-    """Trailing dimension == hidden size means the residual stream.
+def test_the_frozen_artifacts_per_tensor_width_rule_is_withdrawn(frozen):
+    """What the `shards` flag in the frozen artifact meant, and why it is wrong.
 
-    That is the whole rule, and it is a statement about the tensor rather than
-    about the term: a buffer as wide as the model is replicated on every rank,
-    anything wider is a column-parallel projection and the graph derived at
-    that width already carries the narrower shape.
+    The rule was: trailing dimension equal to the hidden size means the
+    residual stream, therefore replicated. It cannot tell the residual stream
+    from an attention projection's input, because at TP=1 `heads * head_dim`
+    *is* the hidden size and that tensor shards. The flag is consistent with
+    the rule that produced it -- this pins that it was applied uniformly, so
+    nothing was hand-set -- and the rule itself is replaced by `width_classes`,
+    which reads each tensor's behaviour from the graphs derived at the other
+    widths.
+
+    The frozen candidate's *bytes* do not rest on it: `visible_peak_bytes` at
+    each width is the walk over that width's own derived graph, so the flag was
+    an annotation. It is still withdrawn, and a reader comparing the artifact
+    against a later one has to know which field changed meaning.
     """
     for width, entry in frozen["widths"].items():
         for tensor in entry["live_at_peak"]:
-            replicated = tensor["shape"][-1] == HIDDEN
-            assert tensor["shards"] is not replicated, (width, tensor["name"])
+            assert tensor["shards"] is (tensor["shape"][-1] != HIDDEN), (
+                width, tensor["name"])
 
 
 def test_derived_widths_narrow_the_projections_and_leave_the_stream_alone(
@@ -208,8 +217,201 @@ def test_derived_widths_narrow_the_projections_and_leave_the_stream_alone(
     assert widths_of(1, "") == [17408, 34816]
     assert widths_of(2, "") == [8704, 17408]
     assert widths_of(4, "") == [4352, 8704]
+    # The projections narrow with the width in the derived graphs themselves,
+    # which is ATOM's own sharding arithmetic and is what the candidate's bytes
+    # rest on. Hidden-width tensors stay 5120 at every width -- but that is a
+    # shape, not a class: `width_classes` decides which of them shard, because
+    # at TP=1 an attention projection's input is `heads * head_dim` = 5120 too.
     for tp in (1, 2, 4):
         stream = [t for t in frozen["widths"][str(tp)]["live_at_peak"]
                   if t["shape"][-1] == HIDDEN]
         assert stream, tp
-        assert all(not t["shards"] for t in stream), tp
+
+
+def _graph(ops):
+    return {"ops": ops, "key": {"topology": {"tp": 1}}}
+
+
+def test_a_recorded_output_dtype_is_used_over_any_rule():
+    from atom.compass.core.memory_model import (dtype_ambiguities,
+                                                peak_activation_bytes)
+
+    op = {"name": "aiter::masked_embedding", "output_shapes": [[16384, 5120]],
+          "dtypes": ["int32", "bfloat16"], "output_dtypes": ["bfloat16"],
+          "dies_at": [-1]}
+    assert peak_activation_bytes(_graph([op])) == 16384 * 5120 * 2
+    assert dtype_ambiguities(_graph([op])) == []
+    # and a recorded dtype is the only thing a strict walk accepts
+    assert peak_activation_bytes(_graph([op]), strict_dtypes=True) \
+        == 16384 * 5120 * 2
+
+
+def test_agreeing_arguments_settle_the_dtype_without_a_record():
+    from atom.compass.core.memory_model import (dtype_ambiguities,
+                                                peak_activation_bytes)
+
+    op = {"name": "aiter::gemm_a16w16", "output_shapes": [[16384, 5120]],
+          "dtypes": ["bfloat16", "bfloat16"], "dies_at": [-1]}
+    assert peak_activation_bytes(_graph([op])) == 16384 * 5120 * 2
+    assert dtype_ambiguities(_graph([op])) == []
+
+
+def test_promotion_is_a_rule_not_a_per_operator_correction():
+    """int32 ids and a bfloat16 weight make a bfloat16 activation.
+
+    The rule is PyTorch's own: a float argument beats every integer one. It
+    replaces both the argument-0 approximation and the ad-hoc "if this is
+    masked_embedding, subtract 167 772 160" correction that the frozen
+    candidate had to carry.
+    """
+    from atom.compass.core.memory_model import _promote
+
+    assert _promote(["int32", "bfloat16"]) == "bfloat16"
+    assert _promote(["int64", "float32", "bfloat16"]) == "float32"
+    assert _promote(["int32", "int64"]) == "int64"
+    assert _promote(["float16", "bfloat16"]) == "float32"
+    assert _promote(["bfloat16", "bfloat16"]) == "bfloat16"
+    assert _promote([]) is None
+
+
+def test_a_promoted_output_is_sized_by_the_rule_and_still_reported():
+    from atom.compass.core.memory_model import (dtype_ambiguities,
+                                                peak_activation_bytes)
+
+    op = {"name": "aiter::masked_embedding", "output_shapes": [[16384, 5120]],
+          "dtypes": ["int32", "bfloat16"], "dies_at": [-1]}
+    graph = _graph([op])
+    assert peak_activation_bytes(graph) == 16384 * 5120 * 2
+    ambiguous = dtype_ambiguities(graph)
+    assert len(ambiguous) == 1
+    entry = ambiguous[0]
+    assert entry["name"] == "aiter::masked_embedding"
+    assert entry["basis"] == "promoted"
+    assert entry["chosen_dtype"] == "bfloat16"
+    assert entry["bytes_chosen"] == 167772160
+    assert entry["bytes_if_argument_0"] == 335544320
+
+
+def test_a_strict_walk_takes_the_graphs_word_and_nothing_else():
+    from atom.compass.core.memory_model import (UnfoundedActivation,
+                                                peak_activation_bytes)
+
+    for dtypes in (["int32", "bfloat16"], ["bfloat16", "bfloat16"]):
+        op = {"name": "aiter::masked_embedding",
+              "output_shapes": [[16384, 5120]], "dtypes": dtypes,
+              "dies_at": [-1]}
+        with pytest.raises(UnfoundedActivation) as raised:
+            peak_activation_bytes(_graph([op]), strict_dtypes=True)
+        assert "output_dtypes" in str(raised.value)
+
+
+def test_an_in_place_output_raises_no_dtype_question_at_all():
+    """No dtype is needed for a tensor the operator did not allocate."""
+    from atom.compass.core.memory_model import dtype_ambiguities
+
+    ops = [{"name": "aiter::gemm_a16w16", "output_shapes": [[16384, 5120]],
+            "dtypes": ["bfloat16"], "dies_at": [1]},
+           {"name": "aiter::rmsnorm2d_fwd_", "output_shapes": [[16384, 5120]],
+            "dtypes": ["bfloat16", "float32"], "output_aliases": [0],
+            "dies_at": [-1]}]
+    assert dtype_ambiguities(_graph(ops)) == []
+
+
+# --- width behaviour is read across widths, never guessed from one ----------
+
+HEADS_TIMES_HEAD_DIM = 5120  # at TP=1 this *is* the hidden size
+
+
+def _three_widths():
+    """The same model at three widths, with the two tensors that look alike.
+
+    `attn_out` is the attention projection's input: `heads * head_dim`, which
+    at TP=1 is 5120 and at TP=2 is 2560 -- it shards. `residual` is the
+    residual stream: 5120 at every width -- it does not. At TP=1 they have the
+    same shape, which is exactly why one width cannot classify them.
+    """
+    def model(tp, collective):
+        ops = [
+            {"name": "aten::embedding", "output_shapes": [[16384, 5120]],
+             "dtypes": ["bfloat16"], "inputs_from": [-1, -1]},
+            {"name": "aiter::gemm_a16w16",
+             "output_shapes": [[16384, HEADS_TIMES_HEAD_DIM // tp]],
+             "dtypes": ["bfloat16"], "inputs_from": [0, -1]},
+        ]
+        if collective:
+            ops.append({"name": "aiter::all_reduce_", "group": "tp",
+                        "output_shapes": [[16384, 5120]],
+                        "dtypes": ["bfloat16"], "inputs_from": [1]})
+        ops.append({"name": "aiter::add_rmsnorm",
+                    "output_shapes": [[16384, 5120]], "dtypes": ["bfloat16"],
+                    "inputs_from": [len(ops) - 1, 0]})
+        return {"ops": ops, "key": {"topology": {"tp": tp}}}
+
+    return {1: model(1, False), 2: model(2, True), 4: model(4, True)}
+
+
+def test_lineage_alignment_survives_the_collectives_width_adds():
+    """Index 2 is a different operator at each width; ancestry is not."""
+    from atom.compass.core.memory_model import lineage_keys
+
+    graphs = _three_widths()
+    at_1 = lineage_keys(graphs[1])
+    at_2 = lineage_keys(graphs[2])
+    assert len(at_1) == 3 and len(at_2) == 4
+    # the all-reduce passes its input's identity through, so the norm after it
+    # aligns with the norm that follows the matmul directly at TP=1
+    assert at_2[2] == at_2[1]
+    assert at_1[-1] == at_2[-1]
+    assert graphs[1]["ops"][2]["name"] != graphs[2]["ops"][2]["name"]
+
+
+def test_a_hidden_width_tensor_can_still_be_sharded():
+    """The failure the trailing-dimension rule could not see.
+
+    Both tensors are [16384, 5120] at TP=1. The rule said "trailing dimension
+    is the hidden size, therefore replicated" and got one of them wrong, which
+    is an over-read at every width above 1.
+    """
+    from atom.compass.core.memory_model import width_classes
+
+    classes = width_classes(_three_widths())
+    by_name = {entry["name"]: entry for entry in classes.values()}
+    assert by_name["aiter::gemm_a16w16"]["class"] == "sharded"
+    assert by_name["aiter::gemm_a16w16"]["axis"] == 1
+    assert by_name["aiter::gemm_a16w16"]["shapes"][1] == [16384, 5120]
+    assert by_name["aiter::add_rmsnorm"]["class"] == "replicated"
+    assert by_name["aten::embedding"]["class"] == "replicated"
+    # what the withdrawn rule would have said about the same two tensors
+    for entry in (by_name["aiter::gemm_a16w16"], by_name["aiter::add_rmsnorm"]):
+        assert entry["shapes"][1][-1] == 5120
+
+
+def test_a_ratio_the_width_does_not_explain_is_not_classified():
+    from atom.compass.core.memory_model import width_classes
+
+    graphs = _three_widths()
+    graphs[4]["ops"][1]["output_shapes"] = [[16384, 999]]
+    classes = width_classes(graphs)
+    by_name = {entry["name"]: entry for entry in classes.values()}
+    assert by_name["aiter::gemm_a16w16"]["class"] == "unresolved"
+    assert by_name["aiter::gemm_a16w16"]["axis"] is None
+
+
+def test_coverage_is_reported_beside_the_classification():
+    """A classification that drops half the graph must say so."""
+    from atom.compass.core.memory_model import width_coverage
+
+    coverage = width_coverage(_three_widths())
+    assert coverage["aligned"] == 3
+    assert coverage["unaligned_at_base"] == 0
+    assert coverage["outputs_per_width"] == {1: 3, 2: 3, 4: 3}
+    assert coverage["by_class"] == {"replicated": 2, "sharded": 1,
+                                    "unresolved": 0}
+
+
+def test_one_width_cannot_be_classified_at_all():
+    from atom.compass.core.memory_model import width_classes
+
+    with pytest.raises(ValueError) as raised:
+        width_classes({1: _three_widths()[1]})
+    assert "two or more" in str(raised.value)

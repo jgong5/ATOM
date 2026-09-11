@@ -838,7 +838,7 @@ alone. `scripts/compass/graph_diff.py` builds its own tracer and discards them.
 | # | where | what | consequence |
 |---|---|---|---|
 | D1 | `atom/compass/runtime/meta.py::_storage_of` | asks a meta tensor for `data_ptr()`, which is always 0 | every output looks like the same buffer: `_canonical` folds the graph into one alias chain, `inputs_from` credits every input to whichever operator ran last, and the walk finds **2 live tensors in 2999 operators**. `untyped_storage()._cdata` is a working identity (`probe_meta_storage.py`: views share it, separate buffers do not) |
-| D2 | `atom/compass/runtime/derive.py::record_collectives` | hand-builds the `aiter::all_reduce_` `OpSpec` with no `output_aliases` and no death watch | the walk reads 128 fresh, immortal residual-stream allocations at TP=2. The first TP=2/TP=4 derivations came out at **21.9 and 21.5 GiB** against a TP=1 walk of 2.5. `all_reduce_` is in-place -- the trailing underscore is the name -- so `output_aliases=(-1,)` is the fix. **This defect sits under any derived-graph walk at TP>1, which includes the graph-pool figure in O8** |
+| D2 | `atom/compass/runtime/derive.py::record_collectives` | hand-builds the `aiter::all_reduce_` `OpSpec`, returns the simulated passthrough, and never watches an output | the walk reads 128 immortal residual-stream allocations at TP=2: **21.9 and 21.5 GiB** against a TP=1 walk of 2.5. The first fix written here was `output_aliases=(-1,)`, and it was **wrong** -- see the correction below. The defect is that no output is watched, so nothing can die. **It sits under any derived-graph walk at TP>1, which includes the graph-pool figure in O8** |
 | D3 | `scripts/compass/graph_diff.py::_trace` | never stamps deaths | the actual reason meta graphs carry no `dies_at`. `_stamp_deaths` belongs in `MetaOpTracer`, where both paths reach it |
 
 All three are patched locally, each documented as the upstream change it
@@ -863,6 +863,16 @@ saying plainly, because that derivation was built on the assumption it did.
 
 ### The width mechanism is read off the shapes, not fitted
 
+> **Withdrawn, and replaced.** The per-tensor rule below -- trailing dimension
+> equal to hidden means replicated -- cannot distinguish the residual stream
+> from an attention output, which is `num_heads * head_dim` and therefore also
+> 5120 at TP=1. It is superseded by the lineage-aligned cross-width
+> classification in *A tensor's width class is not readable from its shape at
+> one width*. The **bytes** below do not rest on it: each width's number is the
+> walk over that width's own derived graph, and the flag was an annotation on
+> the live set. The paragraph is kept as written so the correction has
+> something to be a correction of.
+
 Each live tensor is classed by its trailing dimension: `== hidden (5120)` is
 the residual stream, replicated at every width; wider is a column-parallel
 projection, and the graph derived at that width already carries the narrower
@@ -870,9 +880,17 @@ shape. The derivation confirms it operator by operator -- gate_up [16384,
 34816] -> [16384, 17408] -> [16384, 8704], silu [16384, 17408] -> [16384,
 8704] -> [16384, 4352], hidden-width buffers unchanged at all three.
 
-One named bias: at TP>1 `aiter::masked_embedding` is counted at its int32
-first-input dtype, 335 544 320 B instead of 167 772 160. That is one
-hidden-width activation of over-count, stated, not corrected by fitting.
+The three gate_up and silu chains above are the part that survives: they are
+column-parallel and the lineage classification agrees. What the rule had no
+right to say is anything about the six hidden-width buffers, and that is
+exactly where an attention output would hide.
+
+One named bias, now removed: at TP>1 `aiter::masked_embedding` was counted at
+its int32 first-input dtype, 335 544 320 B instead of 167 772 160. The walk
+takes PyTorch's promotion rule instead of the first argument's dtype, so the
+operator is sized correctly by rule rather than by name, and the frozen
+candidate's `walk_bytes` / `visible_peak_bytes` gap is now that rule's
+arithmetic rather than a named subtraction (O18).
 
 ### Frozen, then checked exactly once
 
@@ -916,6 +934,119 @@ tracks the three measured widths more closely (residues 16 608 / 13 424 /
 16 424 B per token). That is a post-hoc observation over three points, it
 contradicts the operator walk about where the high-water mark sits, and it is
 written down only so that a later mechanism cannot be mistaken for it.
+## The collective is out-of-place: a correction, and what it changes
+
+The fix recorded above as D2 -- mark `aiter::all_reduce_` in-place, because the
+trailing underscore says so -- was wrong, and the naming was the only evidence
+for it. Read from the live group instead (`aiter/dist/parallel_state.py` and
+`dist/device_communicators/`, in the container image):
+
+* `GroupCoordinator.all_reduce`: *"PyTorch custom ops do not support mutation or
+  returning a new tensor in the same op. So we always make the all-reduce
+  operation out-of-place."* It returns `input_` unchanged only when
+  `world_size == 1`.
+* every live path allocates its own output -- quick reduce and custom
+  all-reduce `out = torch.empty_like(inp)`, the non-capturing warmup branch
+  `torch.zeros_like(input)` ("to mimic the allocation pattern since custom
+  allreduce is out-of-place"), pynccl `out_tensor = torch.empty_like(in_tensor)`,
+  the torch.distributed fallback `input_.clone()`.
+* the IPC-registered pool is on the **input** side (`reg_inp = self._pool
+  ["input"].data_ptr`); `registered_input` says whether the *input* is already
+  registered. The output is not a registered buffer and is not input 0.
+
+So the operator allocates, and `output_aliases` for it must be `None`. What is
+actually broken is liveness: the hand-built `OpSpec` has no output tensor of
+its own, nothing is watched, and nothing can die -- 128 immortal buffers, not
+128 aliased ones. The meta dispatch path has the mirror-image defect:
+`_collective_stand_in` returns `tensors[0]`, the input object itself, so a
+collective that dispatches on meta is recorded as writing into its own input
+and the input's death at the call site disappears. `atom/model_ops/linear.py`
+line 1115 is `y = tensor_model_parallel_all_reduce(y)`: the row-parallel
+matmul's output loses its last reference *at* the collective. One hidden-width
+buffer live across the call is the right answer; zero and one-per-call-forever
+are the two wrong ones, and the derivation has been making both.
+
+`DESIGN_NOTES`'s 0.6B table reports the TP=2 activation term moving from +12.6%
+to -0.7% when in-place all-reduces were marked. If that came from a captured
+graph, it was compensating for an input death that was never seen, and it needs
+re-deriving on the C06 artifacts before it is trusted in either direction.
+
+Two consequences beyond the activation term. Under CUDA-graph capture the
+collective's `empty_like` is served from the capture's private pool, so a
+collective inside a captured region is **graph-pool** bytes and the same
+operator in eager is activation bytes -- O8 and O17 both need to say which they
+are counting. And the packet's P2 is now a different change from the one first
+proposed: allocate a fresh stand-in, register it, watch it.
+
+## Why a replicated over-count cannot be the width error
+
+`forward_vars["outputs"]` is `torch.empty(max_num_batched_tokens, hidden_size,
+bf16)` in `ModelRunner.allocate_forward_vars` (`model_runner.py:1290`) --
+167 772 160 B, allocated at engine init, before `warmup_model` runs, and
+therefore inside `current_torch`. It cannot appear in `peak_torch -
+current_torch` however alive it is, and `hidden_size` comes from the HF config,
+so it is the same size at every width. The walk credits a write into it as an
+allocation. That is a real over-count, found from source ownership rather than
+from the size of any residual.
+
+It is also not the answer, and the decomposition says why. The candidate is
+`sharded(tp) + replicated + residue`, and the residue is *defined* at TP=1 as
+`measured - derived`. Remove a replicated term and the residue grows by exactly
+as much; the totals at TP=2 and TP=4 do not move. **Any error in a replicated
+term cancels at every width.** The +21.5% / +40.4% therefore lives in the
+sharded fraction.
+
+Solving the form against the two source-legal anchors: exactness at TP=1 and
+TP=2 needs about 2.45 GB that divides by the width, against the walk's 1.71 GB.
+Roughly 0.74 GB of what the walk holds replicated -- or never sees at all --
+must really shard. The allocations inside the opaque custom operators are the
+obvious place for it to be hiding, and no dispatch trace on any device can see
+them. This is arithmetic on the open error, not a term: nothing has been
+changed to match it, and the frozen candidate stands where it was.
+## A tensor's width class is not readable from its shape at one width
+
+The frozen candidate annotates each tensor live at the peak with whether a
+wider group makes it smaller, and the rule was: trailing dimension equal to the
+hidden size means the residual stream, therefore replicated. That rule cannot
+be right. At TP=1 an attention projection's input is `num_heads * head_dim`,
+and `num_heads * head_dim` **is** the hidden size -- 5120 here -- so the
+residual stream and a tensor that halves at TP=2 are the same shape and the
+rule calls both replicated. Reshapes and views of a head-indexed tensor have
+the same problem, and a fused operator's outputs need not agree with each
+other.
+
+What replaces it asks ATOM's own sharding arithmetic instead of guessing from
+one width. `lineage_keys` gives each operator a width-invariant identity from
+its ancestry -- the operator that ran this name, on values produced by *those*
+operators, recursively -- and makes collectives transparent, passing their
+input's identity through, so the operator after an all-reduce at TP=2 still
+aligns with the operator after the matmul at TP=1. Index alignment cannot do
+this: every row-parallel matmul gains a collective, so index *i* drifts further
+from its counterpart the deeper into the model it sits. `width_classes` then
+reads each aligned output's shape at TP=1, 2 and 4 and reports `replicated`,
+`sharded` with the axis named, or `unresolved` -- a ratio the width does not
+explain is reported, not rounded. `width_coverage` says how much of the graph
+aligned at all, because a classification that silently drops half a graph is
+worse than none.
+
+**What this does not do is explain the width error.** The candidate's bytes at
+each width are the walk over *that width's own derived graph*, not a projection
+from TP=1 through the flag; the flag was an annotation on the live set. So
++21.5% and +40.4% stand exactly where they were. Said plainly because the
+convenient reading -- "the width rule was wrong, that was the bug" -- is
+available here and is not true.
+
+What could still move those numbers is the next audit, which is the same method
+applied to computation rather than communication: whether any operator's meta
+or derived behaviour disagrees with its native one about *mutation*. A fused
+add-and-norm or an activation that writes in place on the device, but whose
+meta path returns a fresh tensor, invents a live buffer per call -- replicated,
+hidden-width, exactly the shape that would inflate a walk at every width. The
+collective audit found precisely this class of disagreement in both directions,
+so the fused add/RMSNorm, the silu/MLP destinations and the attention output
+handling are to be read the same way: the registered schema and the
+implementation, not the trailing underscore.
+
 ## Open items
 
 | # | item | needs | status |
@@ -934,6 +1065,11 @@ written down only so that a later mechanism cannot be mistaken for it.
 | O12 | a `run.execution` block in the memory record, carrying CC's `compass.execution/1` `execution_id` and its `id_inputs`, written by `_write_memory` | **lead** -- `_write_memory` is shared | open; until it lands, every calibrated row reads `residual (run unidentified)` and the phase C repeats cannot be machine-checked. The identity is CC's, not a second scheme: `atom/compass/core/execution_id.py` holds the one definition, stdlib-only, and `producer_key` reads it. `_write_replay_target` already writes a `hardware` block in the same neighbourhood, so the shape is precedented |
 | O13 | tensor lifetime at the **source** width, and the sharded/replicated derivation of it for TP=2 and TP=4 | CPU only -- done | **restated and partly closed.** The original item asked for a TP=2/TP=4 warmup capture; that is a target measurement under a source label and is withdrawn. Lifetime is now captured at TP=1 on no device (2999 ops, 2790 deaths) and the width mechanism is read off the shapes. The frozen candidate reads +21.5% at TP=2 and +40.4% at TP=4 against the class-X27 peaks, so the *mechanism* is open: see O16. Three instrumentation defects found on the way (D1-D3), all in files this worker does not own |
 | O14 | `_storage_of` returns 0 for every meta tensor (`runtime/meta.py`), so alias and provenance tracking collapse on any derived graph | **lead** -- shared runtime | open; fix is `untyped_storage()._cdata` when `data_ptr()` is 0, negated so it cannot collide with a device address. Patched locally in `agent_scratch/memval/lifetime/capture_lifetimes.py` |
-| O15 | the hand-built `aiter::all_reduce_` `OpSpec` (`runtime/derive.py`) declares no `output_aliases`, so an in-place collective reads as a fresh immortal allocation | **lead** -- shared runtime | open, and **it sits under every derived-graph memory walk at TP>1, O8's graph pool included**. Cost: 21.9 GiB against a true 2.5 at TP=2 |
-| O16 | why the derived activation term over-reads at width: +21.5% at TP=2, +40.4% at TP=4 | GPU, TP=1 source only -- the allocation curve across `warmup_model`'s step | open. Leading mechanism: buffers preallocated before the forward are inside `current_torch` and so cannot appear in `peak - current`, but the walk counts them. Decidable at the source. **No term here is to be chosen by the size of the error it removes** |
+| O15 | the collective the derivation records has no output tensor of its own: nothing is watched, so it can never die, and the meta stand-in (`_collective_stand_in`) returns the *input object*, which is the opposite error | **lead** -- shared runtime | open. Cost: 21.9 GiB against a true 2.5 GiB at TP=2, and **it sits under every derived-graph memory walk at TP>1, O8's graph pool included**. The in-place reading is withdrawn: the live implementation allocates a fresh output on every path (packet P2) |
+| O16 | why the derived activation term over-reads at width: +21.5% at TP=2, +40.4% at TP=4 | GPU, TP=1 source only -- the allocation history across `warmup_model`'s step, requested in `agent_scratch/memval/producer_packet/tp1_probe/REQUEST.md` | open, and **narrowed**: the residue is defined at TP=1 by difference, so a replicated over-count is absorbed by it and cancels at every width. The error is in the sharded fraction -- being exact at TP=1 and TP=2 needs ~2.45 GB that divides by width against the walk's 1.71 GB. Allocations made inside opaque custom operators are where a dispatch trace cannot look, and the allocation history can. **No term is to be chosen by the size of the error it removes** |
 | O17 | the graph pool budget *estimate* and the pool the engine actually reserves are different quantities and are not to be compared as one | -- | open, and separate from O8. O8 is the +26.8% error in the predicted pool at TP=4; this is the prior question of which two numbers that percentage is between |
+| O18 | `OpSpec` records the dtype of each *argument* and never of an output, so every consumer that needs an output's size reads `dtypes[0]` and assumes promotion changed nothing | **lead** -- shared schema (`core/graph.py`, `runtime/meta.py`) | open. `aiter::masked_embedding` takes int32 ids and returns bfloat16: `dtypes[0]` sizes one hidden-width buffer at 335 544 320 B instead of 167 772 160, which is the whole `walk_bytes` / `visible_peak_bytes` gap in the frozen candidate. Fix is an `output_dtypes` field filled from the real outputs and a schema bump (packet P4). Until then the walk on this branch sizes an output by PyTorch's own promotion rule when the graph records no dtype -- float beats int, and float16 with bfloat16 gives float32 -- labels the basis `recorded`, `unanimous` or `promoted`, and reports every non-`recorded` output through `dtype_ambiguities`. The masked_embedding case is now right by rule rather than by name, and the ad-hoc correction that was subtracting 167 772 160 B is deleted. Refusal is available but not the default: `strict_dtypes=True` raises `UnfoundedActivation` on the first output the graph does not record, which is what a consumer that must not guess should pass |
+| O19 | the tracer's "unseen destination is a fresh allocation" rule cannot tell a buffer allocated before the traced region from one allocated invisibly inside a custom operator | **lead** -- shared runtime | open. `forward_vars["outputs"]` (`model_runner.py:1290`) is 167 772 160 B allocated at engine init, so it is inside `current_torch` and cannot be part of `peak - current`; the walk counts a write into it as an allocation. Fix is to seed the seen-set with the storages that exist when the region opens. Note this is a *replicated* over-count and therefore cancels at width -- it is a TP=1 accuracy item, not the cause of O16 |
+| O20 | the derived graphs' mutability and output-dtype contracts for computation, not just collectives: a fused add/RMSNorm or activation that the native path writes in place but a meta or derived path returns fresh from, invents one replicated hidden-width buffer per call | source + registered schema, CPU only | open, and the first thing that could still move O16. Method is the one the collective audit used: the implementation and the `torch_compile_guard` schema, never the name. `aiter::fused_allreduce_rmsnorm_` is in the same list -- its registered fake returns two fresh tensors, one possibly padded wider than hidden (`x_pad_to_multiple`), and if the 27B routes through it at TP>1 there is an operator in the width mechanism that has not been modelled at all |
+| O21 | the 2999-operator TP=1 lifetime trace against the 2439-operator v2 body graph: neither is the native warmup allocation graph until the difference is accounted for | the two artifacts, CPU only | open. Four candidate causes and a discriminator for each: region scope (an op-name prefix histogram shows whether preparation/head are in or out), compile mode (a `@support_torch_compile` region captured on device can be one fused dispatch where eager meta walks it operator by operator), meta substitutions for operators with no meta kernel, and the collectives a width adds. To be settled before either graph is called the warmup graph |
+| O22 | `torch_compile_guard(mutates_args="unknown")` is the default for `aiter::all_reduce_`, so the *declared* schema's mutability annotation is unread: if "unknown" marks every tensor argument `Tensor(a!)`, the registered schema says mutation where the implementation is out-of-place | **lead** -- one read of `aiter/jit/utils/torch_guard.py:95-197` | open; matters because a producer that keys alias or death information off schema annotations would take the conservative marking as fact |
