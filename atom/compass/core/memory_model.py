@@ -46,6 +46,7 @@ __all__ = ["peak_activation_bytes", "activation_curve", "weight_bytes",
            "derived_readings", "CALIBRATED_TERMS", "traced_width",
            "graph_pool_bytes", "measured_graph_pool_bytes", "ELEMENT_BYTES",
            "capture_pinned_bytes", "CAPTURE_FIXED_PINNED",
+           "AllocatorPool", "allocator_pool_bytes",
            "dtype_ambiguities", "lineage_keys", "width_classes",
            "width_coverage"]
 
@@ -1369,13 +1370,177 @@ def allocator_charged_bytes(requested: int, *, fresh_segment: bool = True) -> di
             "split_off": remaining if splits else 0, "fresh_segment": True}
 
 
-def capture_reserved_parts(pool_reserved: int, *,
+class _PoolSegment:
+    """One `hipMalloc`ed mapping inside a private pool."""
+
+    __slots__ = ("size", "small", "index")
+
+    def __init__(self, size: int, small: bool, index: int):
+        self.size = size
+        self.small = small
+        self.index = index
+
+
+class _PoolBlock:
+    """One block inside a segment, in the segment's address-ordered list."""
+
+    __slots__ = ("segment", "offset", "size", "allocated", "prev", "next")
+
+    def __init__(self, segment: _PoolSegment, offset: int, size: int):
+        self.segment = segment
+        self.offset = offset
+        self.size = size
+        self.allocated = False
+        self.prev = None
+        self.next = None
+
+
+class AllocatorPool:
+    """The caching allocator's own bookkeeping for one private pool.
+
+    Given a request/free *stream* this decides for itself how many segments to
+    map and how big each one is. No observed segment size, address or block
+    layout is an input, which is what makes the result a prediction rather than
+    a restatement. `reserved` is the sum of what it mapped.
+
+    Provenance of each rule, kept apart on purpose:
+
+    * **Source-proven.** The size constants (`ALLOCATOR_*` above), read off the
+      shipped `c10/core/AllocatorConfig.h`.
+    * **Empirical.** `should_split` (`remaining > kSmallSize` in the large
+      pool, `>= kMinBlockSize` in the small one), best-fit block selection and
+      coalescing on free. `should_split` and `get_free_block` live in a `.cpp`
+      the wheel does not ship. The split threshold is witnessed from both sides
+      in the S27 warmup snapshot (O27); the selection and coalescing rules are
+      *not* independently witnessed, and are this class's main unproven
+      assumption.
+
+    Validated at the 27B capture window: fed the source TP=1 capture request
+    order it maps four segments for 46 137 344 B, the recorded pool residency
+    to the byte, and its live blocks at the end sum to 31 288 320 B, also
+    exact. See O28/O29.
+    """
+
+    def __init__(self):
+        self.segments: list = []
+        self.free: list = []
+        self.reserved = 0
+        self.maps: list = []          # (forcing request, segment size), in order
+
+    @staticmethod
+    def _round(size: int) -> int:
+        return allocator_block_bytes(size)
+
+    @staticmethod
+    def _segment_for(size: int) -> int:
+        return allocator_segment_bytes(size)
+
+    @staticmethod
+    def _should_split(block: _PoolBlock, size: int) -> bool:
+        remaining = block.size - size
+        if block.segment.small:
+            return remaining >= ALLOCATOR_MIN_BLOCK
+        return remaining > ALLOCATOR_SMALL_SIZE
+
+    def _get_free_block(self, size: int, small: bool):
+        best = None
+        for block in self.free:
+            if block.segment.small != small or block.size < size:
+                continue
+            key = (block.size, block.segment.index, block.offset)
+            if best is None or key < (best.size, best.segment.index, best.offset):
+                best = block
+        return best
+
+    def _map_segment(self, size: int, small: bool, request: int) -> _PoolBlock:
+        segment = _PoolSegment(size, small, len(self.segments))
+        self.segments.append(segment)
+        self.reserved += size
+        self.maps.append((request, size))
+        block = _PoolBlock(segment, 0, size)
+        self.free.append(block)
+        return block
+
+    def malloc(self, request: int) -> _PoolBlock:
+        size = self._round(request)
+        small = size <= ALLOCATOR_SMALL_SIZE
+        block = self._get_free_block(size, small)
+        if block is None:
+            block = self._map_segment(self._segment_for(size), small, request)
+        self.free.remove(block)
+        if self._should_split(block, size):
+            tail = _PoolBlock(block.segment, block.offset + size,
+                              block.size - size)
+            tail.prev, tail.next = block, block.next
+            if block.next is not None:
+                block.next.prev = tail
+            block.next = tail
+            block.size = size
+            self.free.append(tail)
+        block.allocated = True
+        return block
+
+    def free_block(self, block: _PoolBlock) -> None:
+        block.allocated = False
+        self.free.append(block)
+        for neighbour in (block.prev, block.next):
+            if neighbour is None or neighbour.allocated or neighbour not in self.free:
+                continue
+            first, second = ((neighbour, block)
+                             if neighbour.offset < block.offset
+                             else (block, neighbour))
+            first.size += second.size
+            first.next = second.next
+            if second.next is not None:
+                second.next.prev = first
+            self.free.remove(second)
+            if second is block:
+                block = first
+
+
+def allocator_pool_bytes(stream) -> dict:
+    """Replay a capture pool's request/free `stream` through the allocator.
+
+    `stream` is an ordered iterable of `(op, key, size)`, where `op` is
+    ``"alloc"`` or ``"free"`` and `key` pairs a free with its allocation. It is
+    a *program*, not a measurement: the sizes are requests the captured forward
+    makes, and where they come from is the caller's problem -- a recorded
+    history at the source width, or a source-derived transformation of one.
+
+    Returns the reserved bytes, the segments in the order they were mapped, the
+    request that forced each, and what is still live at the end.
+
+    A free with no matching allocation is ignored rather than raising: a
+    transformation may legitimately drop a source branch (for example the
+    `logits_in_graph` statement above one rank) and leave its free behind.
+    """
+    pool = AllocatorPool()
+    blocks: dict = {}
+    for op, key, size in stream:
+        if op == "alloc":
+            blocks[key] = pool.malloc(int(size))
+        elif op == "free":
+            block = blocks.pop(key, None)
+            if block is not None:
+                pool.free_block(block)
+        else:
+            raise ValueError("unknown stream op %r" % (op,))
+    return {
+        "reserved": pool.reserved,
+        "segments": [size for _, size in pool.maps],
+        "forced_by": [request for request, _ in pool.maps],
+        "live_at_end": sum(block.size for block in blocks.values()),
+        "segments_mapped": len(pool.segments),
+    }
+
+
+def capture_reserved_parts(pool_reserved: Optional[int] = None, *,
+                           pool_stream=None,
                            fixed_pinned: int = CAPTURE_FIXED_PINNED) -> dict:
     """Split the capture window's *reserved* delta into what is derivable.
 
     The allocated side has a mechanism (`capture_pinned_bytes`). The reserved
-    side does not have one whole mechanism -- it has two halves, and only one
-    of them follows from the allocator's rules:
+    side has two halves:
 
     * **Outside the capture pools.** The fixed residue is one ~76 MiB request
       plus two 512 B blocks, so the allocator maps
@@ -1385,20 +1550,42 @@ def capture_reserved_parts(pool_reserved: int, *,
       what it says: 1 024 B of live scalars cost a whole 2 MiB segment, so the
       allocated constant (79 692 800) and its reserved cost (81 788 928) are
       different numbers.
-    * **Inside the capture pools.** Not derivable from what capture pins. On
-      the same window the pool holds 46 137 344 B reserved while the same rule
-      over the pinned blocks alone predicts 83 886 080 B -- 82% high -- and one
-      of its four segments holds no live block at all. The pool's segments are
-      the high-water mark of the *whole* captured forward, nearly all of which
-      is freed before the window closes. Predicting it needs the captured
-      forward's activation peak, which is O16's quantity, not this one.
+    * **Inside the capture pools.** Not derivable from what capture *pins*: on
+      the S27 window the pool holds 46 137 344 B reserved while the same rule
+      over the pinned blocks alone reads 83 886 080 B -- 82% high -- and one of
+      its four segments holds no live block at all. It *is* derivable from what
+      capture *requests*, in order. Pass `pool_stream` and the pool half is
+      replayed through `allocator_pool_bytes`; pass `pool_reserved` and the
+      figure is taken as given, as it was before.
 
-    So `pool_reserved` is an input here, not an output. Pass the engine's
-    recorded figure and this reports the split; it does not invent the half
-    that has no derivation yet.
+    `pool_reserved_derived` reports which of the two happened, so a caller can
+    tell a prediction from a restatement. Exactly one of the two arguments is
+    required.
+
+    The stream for a width other than the one that was recorded is a
+    *transformation* of the recorded one, and the transformation carries its
+    own assumptions -- which statements the target program does not run
+    (`logits_in_graph`), which widths shard, and above all that the execution
+    order is unchanged. None of that lives here; this function replays whatever
+    program it is handed.
     """
     outside = (allocator_segment_bytes(fixed_pinned - 2 * ALLOCATOR_MIN_BLOCK)
                + allocator_segment_bytes(ALLOCATOR_MIN_BLOCK))
+    if (pool_stream is None) == (pool_reserved is None):
+        raise UnfoundedPrediction(
+            "the capture pool's reserved half needs either a recorded figure "
+            "(`pool_reserved`) or the request order to replay (`pool_stream`), "
+            "and exactly one of them")
+    if pool_stream is not None:
+        replay = allocator_pool_bytes(pool_stream)
+        return {
+            "outside_pools": int(outside),
+            "outside_pools_derived": True,
+            "pool_reserved": int(replay["reserved"]),
+            "pool_reserved_derived": True,
+            "pool_replay": replay,
+            "total": int(outside) + int(replay["reserved"]),
+        }
     return {
         "outside_pools": int(outside),
         "outside_pools_derived": True,
