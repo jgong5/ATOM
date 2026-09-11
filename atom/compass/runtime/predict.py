@@ -389,6 +389,12 @@ class CompassPredictMixin:
             # dispatch the same operators when traced, because tracing forces
             # eager. Only the engine knows, so it says.
             compiled=(self._compilation_level() or 0) > 0,
+            # Whether the LM head runs at all. Asked of the scheduler's own
+            # predicate rather than reconstructed from the lengths, because
+            # "is this a request's final chunk" is not in them -- and it is the
+            # same predicate the runner asks before skipping `compute_logits`
+            # entirely on a pure middle chunk.
+            produces_output=not is_pure_middle_chunk(batch),
         )
 
     def _capture_bucket(self, batch_size: int,

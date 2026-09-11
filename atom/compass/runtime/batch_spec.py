@@ -119,6 +119,18 @@ class BatchSpec:
     #: MRoPE models lay positions out as [3, N]. Recorded because the tracer
     #: reads the flattened tensor and its length is otherwise unexplainable.
     position_rows: int = 1
+    #: Per request, is this step computing the last chunk of its prompt?
+    #:
+    #: Not derivable from the lengths. A chunk covering tokens 98305..114688 of
+    #: a 119360-token prompt and one covering 98305..114688 of a 114688-token
+    #: prompt have identical query and context lengths, and only the second is
+    #: final. The scheduler knows; a spec that does not say leaves it None, and
+    #: anything that needs the answer must then refuse rather than assume.
+    #:
+    #: What reads it: the LM head. A batch where no request is on its final
+    #: chunk samples nothing, and the runner skips `compute_logits` outright,
+    #: so on a long chunked prefill most chunks pay no head at all.
+    is_final_chunk: Optional[tuple[bool, ...]] = None
     notes: dict = field(default_factory=dict)
 
     # -- reading one off disk ------------------------------------------------
@@ -143,6 +155,8 @@ class BatchSpec:
         for name in ("query_lens", "context_lens", "prompt_lens"):
             if kw.get(name) is not None:
                 kw[name] = tuple(int(v) for v in kw[name])
+        if kw.get("is_final_chunk") is not None:
+            kw["is_final_chunk"] = tuple(bool(v) for v in kw["is_final_chunk"])
         if kw.get("block_tables") is not None:
             kw["block_tables"] = tuple(tuple(int(b) for b in row)
                                        for row in kw["block_tables"])
@@ -207,6 +221,23 @@ class BatchSpec:
         """
         return self.prompt_lens or self.cached_lens
 
+    def produces_output(self) -> Optional[bool]:
+        """Does this step sample a token, and so run the LM head?
+
+        The same rule the scheduler applies (`produces_output` in
+        `atom/model_engine/scheduler.py`), against a spec instead of a batch: a
+        decode always samples; a prefill samples only if some request is on its
+        final chunk. ``None`` means the spec did not say -- not "no", and not
+        "yes". A caller that needs the answer refuses on None; it is exactly
+        the case where guessing costs a whole LM head per chunk in one
+        direction or the other.
+        """
+        if self.kind == "decode":
+            return True
+        if self.is_final_chunk is None:
+            return None
+        return any(bool(x) for x in self.is_final_chunk)
+
     def tables(self) -> list[list[int]]:
         if self.block_tables is not None:
             return [list(t) for t in self.block_tables]
@@ -227,6 +258,9 @@ class BatchSpec:
             raise ValueError("a batch has at least one request")
         if len(self.query_lens) != len(self.context_lens):
             raise ValueError("one context length per request")
+        if (self.is_final_chunk is not None
+                and len(self.is_final_chunk) != len(self.query_lens)):
+            raise ValueError("one final-chunk flag per request")
         if self.block_size <= 0:
             raise ValueError("block size must be positive")
         for i, (q, c) in enumerate(zip(self.query_lens, self.context_lens)):
@@ -374,6 +408,24 @@ class BatchSpec:
             ("non_spec_state_indices_tensor", [slots, "int32"]),
             ("non_spec_state_indices_in_tensor", [slots, "int32"]),
         ]
+        # Which prefills continue a sequence whose convolution state is already
+        # in the pool. The conv takes it as a pointer, not a flag: absent, the
+        # kernel does not take a cheaper branch, it fails to compile --
+        # "'NoneType' object has no attribute 'type'" at the
+        # `tl.load(has_initial_states_ptr + idx_seq)` -- and all 48 DeltaNet
+        # layers of a long prefill go unpriced.
+        #
+        # The rule is the backend's own, where the metadata is built: per
+        # prefill row, `num_cached_tokens > 0`, and an all-False tensor rather
+        # than None where nothing is cached. `cached_lens` is that quantity, so
+        # a first chunk, a continuation and a mixed batch of both differ row by
+        # row -- which is also the difference in work, since a row with an
+        # incoming state reads it and a row without does not. Decode leaves the
+        # field None, as the backend does.
+        if prefill:
+            recorded.append(
+                ("has_initial_state",
+                 [[1 if c > 0 else 0 for c in self.cached_lens], "bool"]))
         return tuple(recorded)
 
 

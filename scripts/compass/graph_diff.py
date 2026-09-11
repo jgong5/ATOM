@@ -57,6 +57,22 @@ def _free_port() -> str:
         return str(sock.getsockname()[1])
 
 
+# Named per region so a graph says what it holds, and a sum over two graphs
+# can be checked for double counting or for a hole. `sampler` and
+# `input preparation` are excluded everywhere because no region traces them;
+# they are the remaining named gap in the step, not a covered term.
+_REGION_INCLUDES = {
+    "body": ["model forward"],
+    "head": ["compute_logits"],
+    "both": ["model forward", "compute_logits"],
+}
+_REGION_EXCLUDES = {
+    "body": ["compute_logits", "sampler", "input preparation"],
+    "head": ["model forward", "sampler", "input preparation"],
+    "both": ["sampler", "input preparation"],
+}
+
+
 def _init_env(tp: int) -> None:
     os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
     os.environ.setdefault("MASTER_PORT", os.environ.get("MASTER_PORT") or _free_port())
@@ -65,8 +81,32 @@ def _init_env(tp: int) -> None:
 
 
 def _trace(model, input_ids, positions, topology=None, on_meta=False,
-           spec=None):
-    """Run one forward under the tracers, returning the combined graph."""
+           spec=None, region="body"):
+    """Run one forward under the tracers, returning the combined graph.
+
+    ``region`` says what is recorded.
+
+    ``body`` is the model forward, and is what every graph before this one
+    held. ``head`` is the runner's ``compute_logits``: the LM-head projection
+    and, at TP>1, the all-gather over its vocab shard. No body graph contains
+    either, so both were priced at zero -- the failure mode this project keeps
+    naming, an unmeasured family summed as nothing and the step called
+    complete. ``both`` records the two together.
+
+    For ``head`` the forward still runs, because the head needs its hidden
+    states, but outside the tracers so its operators are not counted twice.
+
+    The head is not a projection of the whole chunk. `ParallelLMHead.forward`
+    reads the forward context and, on prefill, keeps one row per sequence
+    (`x[cu_seqlens_q[1:] - 1]`); on decode it keeps every row, because decode
+    already has one row per sequence. So this must be traced with the batch
+    spec installed, exactly as attention is, or a 16384-token prefill would
+    record a head 16384 rows wide against the 1 row production computes.
+
+    Still outside every region: sampling, input preparation, and the runner's
+    own host work. Those are named in the graph's provenance rather than left
+    for a reader to assume covered.
+    """
     from atom.compass.runtime.derive import (record_collectives,
                                              redirect_device_factories)
     from atom.compass.runtime.meta import MetaOpTracer
@@ -88,11 +128,37 @@ def _trace(model, input_ids, positions, topology=None, on_meta=False,
         installed = bs.install(spec)
     else:
         installed = contextlib.nullcontext()
-    t0 = time.perf_counter()
-    with factories, installed, collectives, triton, ops, torch.inference_mode():
-        model(input_ids, positions)
-    return (ops.graph, time.perf_counter() - t0,
-            getattr(factories, "redirected", 0))
+    if region not in ("body", "head", "both"):
+        raise ValueError(f"unknown region {region!r}")
+
+    with factories, installed, torch.inference_mode():
+        if region == "head":
+            # The forward still has to run, because the head needs its hidden
+            # states -- but its operators are not this graph's, so they go
+            # into a graph that is thrown away.
+            #
+            # It cannot simply run untraced. On meta a Triton launch reaches
+            # the real Triton runtime and dies there ("0 active drivers"),
+            # so the launch tracer is not only a recorder: it is what makes a
+            # device-free forward possible at all. Hence a second, discarded
+            # tracer rather than no tracer.
+            scratch = MetaOpTracer(topology=topology)
+            with record_collectives(scratch.graph), \
+                    TritonLaunchTracer(graph=scratch.graph), scratch:
+                hidden = model(input_ids, positions)
+            t0 = time.perf_counter()
+            with collectives, triton, ops:
+                model.compute_logits(hidden)
+        elif region == "both":
+            t0 = time.perf_counter()
+            with collectives, triton, ops:
+                model.compute_logits(model(input_ids, positions))
+        else:
+            t0 = time.perf_counter()
+            with collectives, triton, ops:
+                model(input_ids, positions)
+        trace_s = time.perf_counter() - t0
+    return ops.graph, trace_s, getattr(factories, "redirected", 0)
 
 
 def _trace_cmd(args) -> int:
@@ -194,6 +260,7 @@ def _trace_cmd(args) -> int:
         graph, trace_s, redirected = _trace(
             model, *inputs, topology={"tp": args.tp},
             on_meta=device.type == "meta", spec=spec,
+            region=getattr(args, "region", "body"),
         )
     finally:
         torch.set_default_dtype(prev_dtype)
@@ -216,7 +283,22 @@ def _trace_cmd(args) -> int:
         # How many device-typed factory calls were sent to meta so the
         # operator after them could dispatch. Recorded, not hidden.
         "device_factories_redirected": redirected,
+        # What this graph is a graph of, and -- as important -- what it is
+        # still not. A reader summing it must be able to see the gap without
+        # reading this script.
+        "region": getattr(args, "region", "body"),
+        "includes": _REGION_INCLUDES[getattr(args, "region", "body")],
+        "excludes": _REGION_EXCLUDES[getattr(args, "region", "body")],
     }
+    if getattr(args, "region", "body") in ("head", "both"):
+        # Whether production runs this head at all, which is not a property of
+        # the shape. A batch of pure middle chunks samples nothing and the
+        # runner skips `compute_logits` entirely, so the graph below is then a
+        # template for the step that *would* run it -- correct to derive, wrong
+        # to charge. Recorded so a reader of the artifact cannot sum it without
+        # meeting the question.
+        graph.provenance["head_runs"] = (spec.produces_output()
+                                         if spec is not None else None)
     if spec is not None:
         # The batch this graph is a graph of, written down in full, block
         # table included. Without it "4 tokens" is all a reader gets, and four
@@ -345,6 +427,14 @@ def main() -> int:
                          "trace is a bare --tokens body pass with no forward "
                          "context, and every attention operator comes out "
                          "unpriceable.")
+    tr.add_argument("--region", default="body",
+                    choices=["body", "head", "both"],
+                    help="What to record: the model forward (body, the "
+                         "default, so every existing invocation and artifact "
+                         "is unchanged), the runner's compute_logits (head -- "
+                         "the LM-head GEMM and its TP all-gather, which no "
+                         "body graph contains and which is therefore priced "
+                         "at zero today), or the two together.")
     tr.add_argument("-o", "--out", required=True)
     tr.set_defaults(func=_trace_cmd)
 

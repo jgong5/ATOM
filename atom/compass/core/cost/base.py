@@ -42,6 +42,15 @@ class StepShape:
             pay a replay's per-launch boundary. Measured, its idle is 5.7ms
             against the 21.5ms the eager term charges -- see the step-accounting
             section of DESIGN_NOTES.
+        produces_output: Whether this step samples a token, which is what
+            decides whether the LM head runs at all. A batch of pure middle
+            chunks produces nothing, and the runner then sets ``logits = None``
+            without calling ``compute_logits`` -- so on a long chunked prefill
+            most chunks pay no head, and charging every chunk for one would be
+            as wrong as charging none. It cannot be recovered from the lengths:
+            whether a chunk is a request's last is the scheduler's to know, so
+            the engine says, through the same ``produces_output()`` the runner
+            asks. Defaults to True, which is right for every decode.
     """
 
     num_scheduled_tokens: tuple[int, ...]
@@ -51,6 +60,7 @@ class StepShape:
     rank_coords: Mapping[str, int] = field(default_factory=dict)
     capture_bucket: int | None = None
     compiled: bool | None = None
+    produces_output: bool = True
 
     @property
     def batch_size(self) -> int:

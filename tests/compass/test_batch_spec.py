@@ -195,6 +195,48 @@ class TestPrefillIsNotDecodeWithTheSameShapes:
         assert derived["num_decodes"] == 0
 
 
+class TestWhichPrefillsAlreadyHaveAConvState:
+    """`has_initial_state`, which the convolution takes as a pointer.
+
+    Absent it does not fall back: the Triton kernel fails to compile on the
+    `tl.load(has_initial_states_ptr + idx_seq)`, and the whole linear-attention
+    half of the model goes unpriced. The backend builds it as
+    `num_cached_tokens > 0` per prefill row, all-False rather than None when
+    nothing is cached, and that is what is reproduced here.
+    """
+
+    def _prefill(self, query_lens, context_lens):
+        return BatchSpec(kind="prefill", query_lens=query_lens,
+                         context_lens=context_lens, block_size=16,
+                         max_model_len=131072)
+
+    def test_a_first_chunk_has_none_but_still_says_so(self):
+        """All-False, not absent: the kernel reads the pointer either way."""
+        derived = dict(self._prefill((16384,), (16384,)).gdn_context())
+        assert derived["has_initial_state"] == [[0], "bool"]
+
+    def test_a_deep_chunk_continues_a_cached_prefix(self):
+        derived = dict(self._prefill((16384,), (114688,)).gdn_context())
+        assert derived["has_initial_state"] == [[1], "bool"]
+
+    def test_a_tail_chunk_does_too(self):
+        derived = dict(self._prefill((4672,), (119360,)).gdn_context())
+        assert derived["has_initial_state"] == [[1], "bool"]
+
+    def test_a_mixed_batch_answers_per_request(self):
+        """One blanket value would price both rows as the other one."""
+        spec = self._prefill((4096, 4096, 4096),
+                             (4096, 40960, 4096))
+        assert dict(spec.gdn_context())["has_initial_state"] == [
+            [0, 1, 0], "bool"]
+
+    def test_decode_leaves_it_out_as_the_backend_does(self):
+        spec = BatchSpec(kind="decode", query_lens=(1, 1),
+                         context_lens=(66, 66), block_size=16,
+                         max_model_len=4096)
+        assert "has_initial_state" not in dict(spec.gdn_context())
+
+
 class TestWhatCanBeCheckedWithoutADevice:
     """A spec that describes a step no engine could run must not price."""
 
