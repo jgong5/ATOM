@@ -34,11 +34,17 @@ import json
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional
 
-from atom.compass.core.kv_geometry import (
-    InsufficientPoolBudget, blocks_from_readings)
+from atom.compass.core.kv_geometry import InsufficientPoolBudget, blocks_from_readings
 
-__all__ = ["Request", "Verdict", "longest_request", "trace_requests",
-           "blocks_for", "admission_refusal", "assess"]
+__all__ = [
+    "Request",
+    "Verdict",
+    "longest_request",
+    "trace_requests",
+    "blocks_for",
+    "admission_refusal",
+    "assess",
+]
 
 
 @dataclass(frozen=True)
@@ -83,8 +89,12 @@ def trace_requests(path: str) -> list:
             if not line:
                 continue
             row = json.loads(line)
-            requests.append(Request(int(row.get("input_tokens") or 0),
-                                    int(row.get("output_tokens") or 0)))
+            requests.append(
+                Request(
+                    int(row.get("input_tokens") or 0),
+                    int(row.get("output_tokens") or 0),
+                )
+            )
     return requests
 
 
@@ -109,13 +119,20 @@ def blocks_for(tokens: int, block_size: int, dcp_world_size: int = 1) -> int:
     if dcp_world_size > 1:
         raise NotImplementedError(
             "dcp>1 shards a sequence across ranks by an interleave this does "
-            "not model; use BlockManager.num_pool_blocks")
+            "not model; use BlockManager.num_pool_blocks"
+        )
     return (int(tokens) + int(block_size) - 1) // int(block_size)
 
 
-def admission_refusal(request: Request, *, blocks: int, block_size: int,
-                      max_model_len: int, max_num_batched_tokens: int,
-                      enable_chunked_prefill: bool = True) -> Optional[str]:
+def admission_refusal(
+    request: Request,
+    *,
+    blocks: int,
+    block_size: int,
+    max_model_len: int,
+    max_num_batched_tokens: int,
+    enable_chunked_prefill: bool = True,
+) -> Optional[str]:
     """Why this request can never be scheduled here, or None.
 
     The three static rules of `Scheduler._unschedulable_reason`, in its order,
@@ -123,27 +140,46 @@ def admission_refusal(request: Request, *, blocks: int, block_size: int,
     """
     total = request.total_tokens
     if max_model_len and total > max_model_len:
-        return ("tokens=%d > max_model_len=%d at its longest (input %d + "
-                "output %d)" % (total, max_model_len, request.input_tokens,
-                                request.output_tokens))
-    if (not enable_chunked_prefill and max_num_batched_tokens
-            and request.input_tokens > max_num_batched_tokens):
-        return ("input tokens=%d > max_num_batched_tokens=%d with chunked "
-                "prefill off" % (request.input_tokens, max_num_batched_tokens))
+        return (
+            "tokens=%d > max_model_len=%d at its longest (input %d + "
+            "output %d)"
+            % (total, max_model_len, request.input_tokens, request.output_tokens)
+        )
+    if (
+        not enable_chunked_prefill
+        and max_num_batched_tokens
+        and request.input_tokens > max_num_batched_tokens
+    ):
+        return (
+            "input tokens=%d > max_num_batched_tokens=%d with chunked "
+            "prefill off" % (request.input_tokens, max_num_batched_tokens)
+        )
     needed = blocks_for(total, block_size)
     if needed > blocks:
-        return ("needs %d KV blocks for %d tokens > total pool blocks=%d"
-                % (needed, total, blocks))
+        return "needs %d KV blocks for %d tokens > total pool blocks=%d" % (
+            needed,
+            total,
+            blocks,
+        )
     return None
 
 
-def assess(config: Mapping[str, Any], readings, *, utilization: float,
-           max_num_seqs: int, max_model_len: int,
-           max_num_batched_tokens: int = 0, tensor_parallel: int = 1,
-           block_size: int = 16, kv_dtype_bytes: int = 2,
-           state_dtype_bytes: int = 2, num_spec: int = 0,
-           enable_chunked_prefill: bool = True,
-           request: Optional[Request] = None) -> Verdict:
+def assess(
+    config: Mapping[str, Any],
+    readings,
+    *,
+    utilization: float,
+    max_num_seqs: int,
+    max_model_len: int,
+    max_num_batched_tokens: int = 0,
+    tensor_parallel: int = 1,
+    block_size: int = 16,
+    kv_dtype_bytes: int = 2,
+    state_dtype_bytes: int = 2,
+    num_spec: int = 0,
+    enable_chunked_prefill: bool = True,
+    request: Optional[Request] = None,
+) -> Verdict:
     """Both gates, in the order the engine would hit them.
 
     `request` is the workload's longest; omit it and only the pool gate is
@@ -153,34 +189,49 @@ def assess(config: Mapping[str, Any], readings, *, utilization: float,
     """
     try:
         plan = blocks_from_readings(
-            config, readings, utilization=utilization,
-            max_num_seqs=max_num_seqs, tensor_parallel=tensor_parallel,
-            block_size=block_size, kv_dtype_bytes=kv_dtype_bytes,
-            state_dtype_bytes=state_dtype_bytes, num_spec=num_spec)
+            config,
+            readings,
+            utilization=utilization,
+            max_num_seqs=max_num_seqs,
+            tensor_parallel=tensor_parallel,
+            block_size=block_size,
+            kv_dtype_bytes=kv_dtype_bytes,
+            state_dtype_bytes=state_dtype_bytes,
+            num_spec=num_spec,
+        )
     except InsufficientPoolBudget as exc:
         return Verdict(
-            False, "pool",
+            False,
+            "pool",
             "state pool needs %.2fGB of %.2fGB available for %d entries"
-            % (exc.reserved_bytes / 2**30, exc.available_bytes / 2**30,
-               exc.entries),
-            state_entries=exc.entries)
+            % (exc.reserved_bytes / 2**30, exc.available_bytes / 2**30, exc.entries),
+            state_entries=exc.entries,
+        )
 
     blocks = plan.paged_entries
-    state_entries = sum(count for name, count in plan.entries.items()
-                        if name != plan.paged_class)
+    state_entries = sum(
+        count for name, count in plan.entries.items() if name != plan.paged_class
+    )
     if blocks <= 0:
-        return Verdict(False, "pool", "the pool sized to zero blocks",
-                       blocks=0, state_entries=state_entries)
+        return Verdict(
+            False,
+            "pool",
+            "the pool sized to zero blocks",
+            blocks=0,
+            state_entries=state_entries,
+        )
     if request is None:
         return Verdict(True, None, None, blocks, state_entries)
 
     refusal = admission_refusal(
-        request, blocks=blocks, block_size=block_size,
+        request,
+        blocks=blocks,
+        block_size=block_size,
         max_model_len=max_model_len,
         max_num_batched_tokens=max_num_batched_tokens,
-        enable_chunked_prefill=enable_chunked_prefill)
+        enable_chunked_prefill=enable_chunked_prefill,
+    )
     needed = blocks_for(request.total_tokens, block_size)
     if refusal:
-        return Verdict(False, "admission", refusal, blocks, state_entries,
-                       needed)
+        return Verdict(False, "admission", refusal, blocks, state_entries, needed)
     return Verdict(True, None, None, blocks, state_entries, needed)

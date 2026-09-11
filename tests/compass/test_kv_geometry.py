@@ -34,9 +34,16 @@ from pathlib import Path
 import pytest
 
 from atom.compass.core.kv_geometry import (
-    InsufficientPoolBudget, blocks_from_readings, gdn_hybrid_specs,
-    gdn_state_bytes, layer_counts, layer_types_disagree, paged_block_bytes,
-    plan_from_specs, text_config)
+    InsufficientPoolBudget,
+    blocks_from_readings,
+    gdn_hybrid_specs,
+    gdn_state_bytes,
+    layer_counts,
+    layer_types_disagree,
+    paged_block_bytes,
+    plan_from_specs,
+    text_config,
+)
 from atom.compass.core.memory import MemoryReadings
 
 RECORDS = Path(__file__).parent / "memory_records"
@@ -55,13 +62,20 @@ def _record(name: str) -> dict:
 def _readings(record: dict) -> MemoryReadings:
     got = record["readings"]
     return MemoryReadings(
-        total=got["total"], free=got["free"], peak_torch=got["peak_torch"],
+        total=got["total"],
+        free=got["free"],
+        peak_torch=got["peak_torch"],
         non_torch=got["non_torch"],
-        cudagraph_overhead=got["cudagraph_overhead"])
+        cudagraph_overhead=got["cudagraph_overhead"],
+    )
 
 
-ALL_RECORDS = ["27b.tp1.memory.json", "27b.tp2.rank0.memory.json",
-               "27b.tp4.rank0.memory.json", "27b.tp4.rank1.memory.json"]
+ALL_RECORDS = [
+    "27b.tp1.memory.json",
+    "27b.tp2.rank0.memory.json",
+    "27b.tp4.rank0.memory.json",
+    "27b.tp4.rank1.memory.json",
+]
 
 
 # ── geometry, from the checkpoint alone ───────────────────────────────────
@@ -90,11 +104,14 @@ def test_layer_types_disagreement_is_reported_not_absorbed():
     assert layer_types_disagree({"text_config": text})
 
 
-@pytest.mark.parametrize("tp,block,state", [
-    (1, 1056768, 78446592),
-    (2, 528384, 39223296),
-    (4, 264192, 19611648),
-])
+@pytest.mark.parametrize(
+    "tp,block,state",
+    [
+        (1, 1056768, 78446592),
+        (2, 528384, 39223296),
+        (4, 264192, 19611648),
+    ],
+)
 def test_entry_sizes_halve_with_width(tp, block, state):
     """Both entry classes shard cleanly, and to the byte the run recorded.
 
@@ -116,8 +133,7 @@ def test_the_fp32_scale_is_not_optional():
     """
     config = _config()
     text = text_config(config)
-    cache_only = (2 * 16 * 16 * text["num_key_value_heads"]
-                  * text["head_dim"] * 2)
+    cache_only = 2 * 16 * 16 * text["num_key_value_heads"] * text["head_dim"] * 2
     assert paged_block_bytes(config, tensor_parallel=1) - cache_only == 8192
 
 
@@ -137,11 +153,13 @@ def test_block_count_is_exact_at_every_width(name):
     deployed = record["config"]
 
     plan = blocks_from_readings(
-        config, _readings(record),
+        config,
+        _readings(record),
         utilization=deployed["gpu_memory_utilization"],
         max_num_seqs=deployed["max_num_seqs"],
         tensor_parallel=deployed["topology"]["tp"],
-        block_size=deployed["block_size"])
+        block_size=deployed["block_size"],
+    )
 
     assert plan.paged_entries == got["num_kvcache_blocks"]
     assert plan.entries == got["pool_entries"]
@@ -163,10 +181,13 @@ def test_the_ranks_of_one_run_disagree_and_the_geometry_is_not_why():
         record = _record(name)
         deployed = record["config"]
         plan = blocks_from_readings(
-            config, _readings(record),
+            config,
+            _readings(record),
             utilization=deployed["gpu_memory_utilization"],
             max_num_seqs=deployed["max_num_seqs"],
-            tensor_parallel=4, block_size=deployed["block_size"])
+            tensor_parallel=4,
+            block_size=deployed["block_size"],
+        )
         counts[name] = plan.paged_entries
         assert plan.paged_entries == record["blocks"]["num_kvcache_blocks"]
 
