@@ -313,8 +313,13 @@ def test_attention_contract_marks_allocator_state_unmeasured():
 # -- measured and interpolated must stay apart ---------------------------
 
 
-def _library_with(tmp_path, widths: dict[int, float]) -> ParametricPriceLibrary:
-    """A library holding one gemm priced at each of several widths."""
+def _library_with(tmp_path, widths: dict[int, float],
+                  kernels: dict | None = None) -> ParametricPriceLibrary:
+    """A library holding one gemm priced at each of several widths.
+
+    ``kernels`` names the kernel each width was served by, where a test cares.
+    Everything else gets one name, so every bracket is on a single curve.
+    """
     from atom.compass.runtime.microbench import signature_of
 
     library = ParametricPriceLibrary(max_gap_ratio=2.0)
@@ -322,8 +327,9 @@ def _library_with(tmp_path, widths: dict[int, float]) -> ParametricPriceLibrary:
         op = gemm(rows)
         graph = {"ops": [op],
                  "provenance": {"execution": {"body_rows_traced": rows}}}
+        kernel = (kernels or {}).get(rows, "k")
         prices = {"prices": {signature_of(op): {
-            "seconds": seconds, "kernels": {"k": seconds},
+            "seconds": seconds, "kernels": {kernel: seconds},
             "occurrences": 1, "name": op["name"]}}}
         gpath = tmp_path / f"g{rows}.json"
         ppath = tmp_path / f"p{rows}.json"
@@ -423,3 +429,62 @@ def test_the_four_states_of_an_operator_stay_distinguishable(tmp_path):
     assert split["accounted"] == 2
     assert not split["complete_accounted"]
     assert not split["complete_measured"]
+
+
+# -- the kernel switch has to survive the whole library path --------------
+
+#: Both tiles, the two rung times CC measured either side of the switch, and
+#: the row count whose interpolation the delivery reports as 12.21% high.
+SWITCH_WIDTHS = {16: 9.707e-4, 32: 1.1603e-3}
+SWITCH_KERNELS = {16: "gemm_MT64x16x256", 32: "gemm_MT128x32x128"}
+
+
+def test_the_library_refuses_a_row_count_across_a_tile_switch(tmp_path):
+    """A refusal in the support region has to arrive as a refusal here.
+
+    The adapter is where a `Refusal` becomes `(None, reason)`, and a reason
+    that lost the kernel names would leave a reader to rediscover why 20 rows
+    is not answerable from 16 and 32.
+    """
+    library = _library_with(tmp_path, SWITCH_WIDTHS, kernels=SWITCH_KERNELS)
+    record, detail = library.lookup(gemm(20))
+    assert record is None
+    assert "same kernel" in detail
+    assert "MT64x16x256" in detail and "MT128x32x128" in detail
+    assert "measured at [16, 32]" in detail
+
+
+def test_the_same_ladder_on_one_tile_still_answers(tmp_path):
+    # The refusal above is the switch and not the ladder: identical row counts
+    # and identical times, one tile, and 20 rows is priced.
+    library = _library_with(tmp_path, SWITCH_WIDTHS)
+    record, source = library.lookup(gemm(20))
+    assert record is not None, source
+    assert record["interpolated"] is True
+
+
+def test_a_switched_bracket_is_counted_refused_and_not_interpolated(tmp_path):
+    """It lands in the refused column, with its reason, not the priced one.
+
+    The standing rule is that the four states stay apart and every refusal
+    keeps its provenance. A switch that was counted as coverage would be the
+    12.21% error reported as a prediction.
+    """
+    library = _library_with(tmp_path, SWITCH_WIDTHS, kernels=SWITCH_KERNELS)
+    graph = {"ops": [gemm(16), gemm(20)], "provenance": {}}
+
+    split = coverage_split(library, graph)
+    assert split["measured"] == 1
+    assert split["interpolated"] == 0
+    assert split["refused"] == 1
+    assert not split["complete_measured"]
+
+    _seconds, coverage, _launches = library.body(graph)
+    assert coverage.refused == {"aiter::gemm_a16w16": 1}
+    assert not coverage.complete
+    # `refused` and `reasons` are keyed by operator name, so a switched
+    # bracket has to show up under the family it was refused for, not as a bare
+    # count that could have come from anywhere.
+    reason = coverage.reasons["aiter::gemm_a16w16"]
+    assert "same kernel" in reason
+    assert "MT64x16x256" in reason and "MT128x32x128" in reason
