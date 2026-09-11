@@ -148,9 +148,17 @@ def liveness_is_recorded(graph) -> bool:
     reporting an activation figure has to be able to tell that apart from a
     walk over recorded liveness, so this is the question asked separately.
 
-    A graph derived on meta never has it: nothing runs, so no finalizer fires.
-    Liveness at a shape is a *device* observation, and the only honest answer
-    from a derivation is that it was not observed.
+    A meta-derived graph has carried no `dies_at` to date, but not because a
+    derivation cannot observe liveness: `MetaOpTracer` watches every output and
+    records its death, and `agent_scratch/memval/probe_deaths.py` shows the
+    finalizers fire identically on meta and on cpu, under `inference_mode` and
+    `no_grad` alike. What is missing is the *writing*: only `runner.py::
+    _stamp_deaths` puts the observations onto the graph, and it runs on the
+    device capture path alone, so the derivation path in `graph_diff.py` drops
+    them on the floor. Liveness under refcounting is a property of the code
+    that runs, not of the device it runs on. Until the stamping is shared this
+    question still has to be asked separately: a graph that answers False was
+    walked by last-read, whatever produced it.
     """
     return any(
         death is not None and death >= 0

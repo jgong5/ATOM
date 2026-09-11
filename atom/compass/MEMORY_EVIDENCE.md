@@ -797,20 +797,143 @@ machine-checked and is not asserted as identity. Those records also predate
 `compass.execution/1` entirely, and nothing here back-fills them: a legacy
 record stays unidentified. That is O12.
 
+## O13: tensor lifetime at the source width, on no device at all
+
+O13 asked for the wrong thing. It asked for the 27B warmup prefill traced at
+TP=2 and TP=4 with deaths recorded, and called that the single blocker to a
+wider budget. Those are the target configurations. A tensor lifetime read off
+a TP=4 run is a TP=4 measurement whoever captures it and whatever the capture
+is called; feeding it to a TP=4 prediction is class X27 with a source-side
+label on it. The item is restated here: **capture lifetime at the declared
+TP=1 source, derive the sharded and replicated components for TP=2 and TP=4.**
+
+### The premise underneath it was false
+
+The stated reason a TP=1 walk was impossible was that the only TP=1 graphs at
+the warmup shape are meta derivations, and that "a derivation cannot record
+liveness because nothing runs and no finalizer fires". That sentence was in
+`liveness_is_recorded`'s docstring and in O2's row, and it is wrong.
+
+`MetaOpTracer._watch` puts a `weakref.finalize` on every output it sees and
+`_died` writes the index at which it fired, on meta as on a device. Nothing
+about meta suppresses it: a meta tensor is a Python object with a refcount,
+and lifetime under refcounting is a property of the code that runs, not of the
+device the code runs on. `agent_scratch/memval/probe_deaths.py` runs the same
+five-operator body on meta and on cpu, under `inference_mode` and under
+`no_grad`, through the real tracer:
+
+```
+meta  inference ops= 5 deaths= 5 producers=0 seen=0 input_storages=[0]
+cpu   inference ops= 5 deaths= 5 producers=0 seen=3 input_storages=[207317824, ...]
+```
+
+Five operators, five observed deaths, on both devices, in both grad modes. The
+recorder holds no strong reference that would defer them. What was missing was
+never the observation -- it was the *writing*: only `runner.py::_stamp_deaths`
+copies `tracer.deaths` onto the graph, and it runs on the device capture path
+alone. `scripts/compass/graph_diff.py` builds its own tracer and discards them.
+
+### Three instrumentation defects, none in a file this worker owns
+
+| # | where | what | consequence |
+|---|---|---|---|
+| D1 | `atom/compass/runtime/meta.py::_storage_of` | asks a meta tensor for `data_ptr()`, which is always 0 | every output looks like the same buffer: `_canonical` folds the graph into one alias chain, `inputs_from` credits every input to whichever operator ran last, and the walk finds **2 live tensors in 2999 operators**. `untyped_storage()._cdata` is a working identity (`probe_meta_storage.py`: views share it, separate buffers do not) |
+| D2 | `atom/compass/runtime/derive.py::record_collectives` | hand-builds the `aiter::all_reduce_` `OpSpec` with no `output_aliases` and no death watch | the walk reads 128 fresh, immortal residual-stream allocations at TP=2. The first TP=2/TP=4 derivations came out at **21.9 and 21.5 GiB** against a TP=1 walk of 2.5. `all_reduce_` is in-place -- the trailing underscore is the name -- so `output_aliases=(-1,)` is the fix. **This defect sits under any derived-graph walk at TP>1, which includes the graph-pool figure in O8** |
+| D3 | `scripts/compass/graph_diff.py::_trace` | never stamps deaths | the actual reason meta graphs carry no `dies_at`. `_stamp_deaths` belongs in `MetaOpTracer`, where both paths reach it |
+
+All three are patched locally, each documented as the upstream change it
+stands in for, in `agent_scratch/memval/lifetime/capture_lifetimes.py`. They
+are the lead's to place.
+
+### What the source capture gives
+
+`capture_lifetimes.py --tp 1 --batch-spec warmup_tp1.spec.json`, one CPU
+process, no device, no weights, no data, 11 s: **2999 operators, 2790 with an
+observed death.** The batch spec is the warmup step as `warmup_model` builds
+it -- 1 request, 16 384 query tokens, no history -- recorded in
+`agent_scratch/memval/lifetime/warmup_tp1.spec.json`.
+
+The peak is **not in the GDN**. It is in the MLP, at 2 717 908 992 B live:
+`aiter::gemm_a16w16` [16384, 34816] at 1 140 850 688, its silu [16384, 17408]
+at 570 425 344, and six hidden-width [16384, 5120] buffers at 167 772 160
+each. The separately derived gated-delta-rule workspace total
+(`memory_activation.py`, 2 684 878 848 B at TP=1) sits *below* that, so the
+opaque region does not set the high-water mark at any width -- which is worth
+saying plainly, because that derivation was built on the assumption it did.
+
+### The width mechanism is read off the shapes, not fitted
+
+Each live tensor is classed by its trailing dimension: `== hidden (5120)` is
+the residual stream, replicated at every width; wider is a column-parallel
+projection, and the graph derived at that width already carries the narrower
+shape. The derivation confirms it operator by operator -- gate_up [16384,
+34816] -> [16384, 17408] -> [16384, 8704], silu [16384, 17408] -> [16384,
+8704] -> [16384, 4352], hidden-width buffers unchanged at all three.
+
+One named bias: at TP>1 `aiter::masked_embedding` is counted at its int32
+first-input dtype, 335 544 320 B instead of 167 772 160. That is one
+hidden-width activation of over-count, stated, not corrected by fitting.
+
+### Frozen, then checked exactly once
+
+`tests/compass/memory_records/frozen_activation_candidates.json`
+(`compass.activation.candidate/1`) was written before any comparison, with
+`frozen_before_any_comparison_with` naming the TP=2/TP=4 measured peaks:
+
+| width | candidate | X27 actual (evaluation-only) | error |
+|---|---|---|---|
+| 1 | 2 956 984 320 | 2 956 984 320 | 0, **by construction** -- the TP=1 shortfall of 239 075 328 B between the walk and the source measurement is carried as a declared `unexplained_residue` term, replicated across widths. It is a residual, not a prediction |
+| 2 | 2 101 346 304 | 1 730 150 400 | **+21.5%** |
+| 4 | 1 673 527 296 | 1 191 969 280 | **+40.4%** |
+
+Per token: 165 888 / 113 664 / 87 552 B modelled against 180 480 / 105 600 /
+72 752 B measured. Not a shape artifact -- `max_num_batched_tokens` is 16 384
+in all three memory records, and `peak_torch - current_torch` reproduces each
+recorded activation peak exactly, so the three widths are being compared at
+one warmup shape.
+
+The direction matters for what the term is for: over-stating activations
+under-sizes the KV budget, which is the conservative failure. It is still
+wrong, and it is wrong in a way that grows with width, which is exactly the
+axis being transferred.
+
+### What is actually open here
+
+The walk holds six hidden-width buffers live at the peak, three of them from
+`aten::empty_like`. The measured term is `peak_torch - current_torch`, so any
+buffer allocated *before* the warmup forward -- a preallocated forward
+variable -- is already inside `current_torch` and cannot appear in the
+difference, however alive it is. The walk counts them anyway. That is a
+mechanism that over-counts, it points the right way, and it is decidable
+entirely at the source: a TP=1 device capture of the allocation curve across
+the warmup step says which of those buffers are fresh. Two of the six would
+close most of the TP=4 gap, which is precisely why it must be *measured* at
+TP=1 and not chosen to fit -- no term here is to be selected by the size of
+the error it removes.
+
+Recorded and not used: a peak taken in the GDN region instead of the MLP
+tracks the three measured widths more closely (residues 16 608 / 13 424 /
+16 424 B per token). That is a post-hoc observation over three points, it
+contradicts the operator walk about where the high-water mark sits, and it is
+written down only so that a later mechanism cannot be mistaken for it.
 ## Open items
 
 | # | item | needs | status |
 |---|---|---|---|
 | O1 | `parameters` / `buffers` for the 27B at TP=1/2/4 | meta build | **closed** -- exact at all three widths, finding 5 |
-| O2 | 27B activation trace at TP=1, prefill-shaped | GPU, TP=1, one prefill | **closed as a constant, open as a mechanism** -- the term is 2 956 984 320 B, measured at the source configuration and exact across two independent engine starts. It could not be walked: the only TP=1 prefill graphs at this shape are meta derivations, and a derivation cannot record liveness because nothing runs and no finalizer fires. What remains is a device capture at the warmup shape (1 request x 16 384 tokens, no history, deaths recorded) -- an empirical need for a later lease, not a blocker on the budget |
+| O2 | 27B activation trace at TP=1, prefill-shaped | GPU, TP=1, one prefill | **closed as a constant, open as a mechanism** -- the term is 2 956 984 320 B, measured at the source configuration and exact across two independent engine starts. The walk is now possible after all: the claim that a derivation cannot record liveness was false (O13), and a device-free TP=1 lifetime capture gives 2999 operators, 2790 deaths, peak 2 717 908 992 B in the MLP. What is still wanted on a device is the *allocation curve* across the warmup step -- which of the six hidden-width buffers live at the peak were preallocated, and so already inside `current_torch` |
 | O3 | source-only candidate budget, frozen, vs the recorded budget | O2 | **closed at TP=1** -- every input classed S, C06 or S27, and the budget reproduces the source run's 112 772 blocks. A residual by construction: it is not evidence of transfer, and the widths where transfer would be tested need O2's activation term at TP=2 and TP=4, which is class X27 today and therefore underived |
 | O4 | `persistent` -- was 51% low | -- | **closed by calibration**, exact at TP=1, -0.004% at TP=4; a mechanism would still be better than a constant |
 | O5 | `persistent` / activations / pool as functions of `max_num_seqs` | GPU, TP=1 | open, and now the main conditionality left; all three are proven flat in *utilization* (phase A) but untested in concurrency |
 | O6 | physical start-up at `--max-num-seqs 1551` and 1400 | GPU, TP=1 | open; superseded as the acceptance gate by the utilization axis, kept as a diagnostic |
 | O7 | `non_torch` from an exclusive-device source run at util 0.90 | GPU, exclusive | **closed by phase C** -- three byte-identical runs, calibrated at TP=1, exact at three unseen utilizations; the +42.2% excursion it cannot bound is carried with it |
-| O8 | graph pool at TP=4, where the model reads +26.8% | GPU, 4 devices | open |
+| O8 | graph pool at TP=4, where the model reads +26.8% | GPU, 4 devices | open, and now with a candidate cause that is not the model: any derived-graph walk at TP>1 counts each in-place `all_reduce_` as a fresh immortal allocation (O15). Whether the pool figure goes through that walk is the first thing to check, before anything in the pool model is changed. See also O17: the estimate and the reserved pool are two quantities |
 | O9 | `MODEL_HEADROOM` provenance: which run, which config | lead / history | open; until then it stays disallowed and is not to be relabelled as source |
 | O10 | manifest-derived acceptance lengths | final CC workload | **closed** -- CC protocol `47917ade`: long 107 328 + 2 413 (6 859 blocks), short 2 560 + 21 (162) |
 | O11 | what the 486 MiB `non_torch` excursion was | unknown; three controls failed to reproduce it | open, and the one thing the calibrated `non_torch` does not bound |
 | O12 | a `run.execution` block in the memory record, carrying CC's `compass.execution/1` `execution_id` and its `id_inputs`, written by `_write_memory` | **lead** -- `_write_memory` is shared | open; until it lands, every calibrated row reads `residual (run unidentified)` and the phase C repeats cannot be machine-checked. The identity is CC's, not a second scheme: `atom/compass/core/execution_id.py` holds the one definition, stdlib-only, and `producer_key` reads it. `_write_replay_target` already writes a `hardware` block in the same neighbourhood, so the shape is precedented |
-| O13 | an operator graph at the **target** width -- the 27B warmup prefill shape (1 request, 16 384 query tokens, no history) traced at TP=2 and at TP=4, with tensor deaths recorded | GPU, 2 and 4 devices; source-side capture only | open, and the **single remaining blocker to a TP=2 or TP=4 derived budget**. Everything else at those widths is already source-derivable: `total` is the card, `parameters` from `weight_bytes(checkpoint, tensor_parallel)`, `persistent` is flat in width, and `non_torch` and `load_residue` fall to the width-specific 0.6B tables (C06). Only the activation peak shards and is walked, and `derived_readings` now refuses a graph of the wrong width outright. The TP=2 and TP=4 peaks that exist -- 1 730 150 400 B and 1 191 969 280 B -- are class X27 and may never be the input; they are a bound to check a derivation against, once there is one |
+| O13 | tensor lifetime at the **source** width, and the sharded/replicated derivation of it for TP=2 and TP=4 | CPU only -- done | **restated and partly closed.** The original item asked for a TP=2/TP=4 warmup capture; that is a target measurement under a source label and is withdrawn. Lifetime is now captured at TP=1 on no device (2999 ops, 2790 deaths) and the width mechanism is read off the shapes. The frozen candidate reads +21.5% at TP=2 and +40.4% at TP=4 against the class-X27 peaks, so the *mechanism* is open: see O16. Three instrumentation defects found on the way (D1-D3), all in files this worker does not own |
+| O14 | `_storage_of` returns 0 for every meta tensor (`runtime/meta.py`), so alias and provenance tracking collapse on any derived graph | **lead** -- shared runtime | open; fix is `untyped_storage()._cdata` when `data_ptr()` is 0, negated so it cannot collide with a device address. Patched locally in `agent_scratch/memval/lifetime/capture_lifetimes.py` |
+| O15 | the hand-built `aiter::all_reduce_` `OpSpec` (`runtime/derive.py`) declares no `output_aliases`, so an in-place collective reads as a fresh immortal allocation | **lead** -- shared runtime | open, and **it sits under every derived-graph memory walk at TP>1, O8's graph pool included**. Cost: 21.9 GiB against a true 2.5 at TP=2 |
+| O16 | why the derived activation term over-reads at width: +21.5% at TP=2, +40.4% at TP=4 | GPU, TP=1 source only -- the allocation curve across `warmup_model`'s step | open. Leading mechanism: buffers preallocated before the forward are inside `current_torch` and so cannot appear in `peak - current`, but the walk counts them. Decidable at the source. **No term here is to be chosen by the size of the error it removes** |
+| O17 | the graph pool budget *estimate* and the pool the engine actually reserves are different quantities and are not to be compared as one | -- | open, and separate from O8. O8 is the +26.8% error in the predicted pool at TP=4; this is the prior question of which two numbers that percentage is between |
