@@ -957,3 +957,73 @@ class TestAnInstantBelongsToTheProgramItWasWitnessedIn:
         with pytest.raises(UnfoundedActivation, match="not the split"):
             activation_instant_bytes(QWEN3_27B, 16_384, 3,
                                      compile_mode="inductor")
+
+
+class TestAPredictionCanReachTheInstantWithoutAGraph:
+    """The second route into the activation term, and what it costs to use it.
+
+    The walk needs a graph traced at the target width, which is why every TP>1
+    prediction stopped at that gate. The config-derived instant does not: its
+    widths come from the checkpoint and the instant itself is witnessed once,
+    at the source. What it needs instead is the *program* -- the same instant
+    is not the same number under Inductor as under eager -- so the profile has
+    to name the compile mode, and a profile that does not is refused rather
+    than defaulted onto whichever program the witness happened to be.
+    """
+
+    @staticmethod
+    def _with_config(profile=None):
+        """`_founded`, plus a checkpoint config the loader can hand back."""
+        base, load = _founded(profile)
+        def loader(path):
+            if path == "config.json":
+                return {"text_config": QWEN3_27B}
+            return load(path)
+        return base, loader
+
+    def test_a_config_and_a_mode_reach_a_width_no_graph_was_traced_at(self):
+        """The gate a TP=4 prediction used to stop at, passed on config alone."""
+        profile, load = self._with_config(
+            {"model_config": "config.json", "compile_mode": "inductor",
+             "graph": None, "world_size": 4})
+        _, activation = derived_readings(
+            profile, warmup_tokens=16_384, load=load)
+        assert activation == 1_116_471_296
+
+    def test_a_config_without_a_mode_is_refused_and_not_defaulted(self):
+        """Choosing the program is the caller's, and it is not a small choice.
+
+        The two witnessed instants differ by 238 MB at the source config. A
+        default would pick one, and the prediction would carry no sign of which.
+        """
+        profile, load = self._with_config(
+            {"model_config": "config.json", "graph": None, "world_size": 4})
+        with pytest.raises(UnfoundedPrediction, match="compile_mode"):
+            derived_readings(profile, warmup_tokens=16_384, load=load)
+
+    def test_the_config_is_taken_over_the_graph_when_both_are_named(self):
+        """One term, one derivation: the walk is not a second opinion."""
+        profile, load = self._with_config(
+            {"model_config": "config.json", "compile_mode": "eager"})
+        _, activation = derived_readings(profile, warmup_tokens=200, load=load)
+        assert activation == activation_instant_bytes(
+            QWEN3_27B, 200, 1, compile_mode="eager")["bytes"]
+        assert activation != 4000        # what the graph would have walked
+
+    def test_a_refusal_from_the_instant_reaches_the_caller_intact(self):
+        """`UnfoundedActivation` is not caught and re-dressed on the way out."""
+        profile, load = self._with_config(
+            {"model_config": "config.json", "compile_mode": "cudagraph",
+             "graph": None})
+        with pytest.raises(UnfoundedActivation, match="not evidence about"):
+            derived_readings(profile, warmup_tokens=16_384, load=load)
+
+    def test_naming_neither_still_refuses(self):
+        profile, load = self._with_config({"graph": None})
+        with pytest.raises(UnfoundedPrediction, match="activation"):
+            derived_readings(profile, warmup_tokens=16_384, load=load)
+
+    def test_a_profile_with_no_config_walks_the_graph_exactly_as_before(self):
+        profile, load = self._with_config()
+        _, activation = derived_readings(profile, warmup_tokens=200, load=load)
+        assert activation == 4000
