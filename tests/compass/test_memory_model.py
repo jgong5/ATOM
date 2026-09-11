@@ -11,12 +11,16 @@ import struct
 import pytest
 
 from atom.compass.core.memory_model import (
-    DEFAULT_NON_TORCH, DEFAULT_PERSISTENT, DEFAULT_POOL_FLOOR,
+    CAPTURE_FIXED_PINNED, DEFAULT_NON_TORCH, DEFAULT_PERSISTENT,
+    DEFAULT_POOL_FLOOR, capture_pinned_bytes,
     activation_bytes_at, activation_curve, graph_pool_bytes,
     load_residue_bytes, measured_graph_pool_bytes, modelled_readings,
     non_torch_bytes, peak_activation_bytes, scratch_bytes_per_token,
     liveness_is_recorded, liveness_instrumentation, traced_shape,
     LIVENESS_INSTRUMENTATION, UNVERSIONED_LIVENESS, UnfoundedActivation,
+    allocator_block_bytes, allocator_segment_bytes, capture_reserved_parts,
+    ALLOCATOR_SMALL_BUFFER, ALLOCATOR_LARGE_BUFFER,
+    GDN_ACTIVATION_INSTANTS, activation_instant_bytes, gdn_activation_widths,
     UnfoundedPrediction, derived_readings, weight_bytes)
 
 
@@ -748,3 +752,208 @@ class TestAPredictionThatCannotBeMadeIsRefused:
         profile, load = _founded()
         readings, _ = derived_readings(profile, warmup_tokens=200, load=load)
         assert readings["non_torch"] == 1157627904
+
+
+class TestWhatCapturePins:
+    """The pinned half of capture, as a mechanism instead of a width constant.
+
+    `measured_graph_pool_bytes` predicts the reserved delta with a line fitted
+    at one width and a constant above it. This one states what is in the pool:
+    a fixed residue, plus the LM head when the runner captures it.
+    """
+
+    #: The 27B's TP=1 source record: ladder, vocabulary, and the allocated
+    #: delta capture reported (`tests/compass/memory_records/27b.tp1.memory
+    #: .json`, `qwen3_5_27b.config.json`).
+    LADDER = (1, 2, 4, 8, 16, 32)
+    VOCAB = 248320
+    RECORDED_ALLOCATED = 110981120
+
+    def test_the_source_record_is_reproduced_to_the_byte(self):
+        assert capture_pinned_bytes(self.LADDER,
+                                    vocab_size=self.VOCAB) == self.RECORDED_ALLOCATED
+
+    def test_the_head_leaves_the_graph_above_width_one(self):
+        """`logits_in_graph = world_size == 1 and not is_tbo`. Above width one
+        nothing in the pinned set scales with the ladder, which is the whole
+        content of the `DEFAULT_POOL_SHARDED` constant."""
+        for width in (2, 4, 8):
+            assert (capture_pinned_bytes(self.LADDER, world_size=width)
+                    == capture_pinned_bytes((1,), world_size=width)
+                    == CAPTURE_FIXED_PINNED)
+
+    def test_tbo_at_width_one_drops_the_head_as_well(self):
+        """The predicate is not the width, which is why it is not read as one.
+        A run that read `world_size == 1` would over-read by the whole ladder
+        term here."""
+        assert capture_pinned_bytes(self.LADDER, vocab_size=self.VOCAB,
+                                    tbo=True) == CAPTURE_FIXED_PINNED
+
+    def test_a_captured_head_with_no_vocabulary_refuses(self):
+        with pytest.raises(UnfoundedPrediction):
+            capture_pinned_bytes(self.LADDER)
+
+    def test_the_ladder_enters_as_tokens_not_as_batches(self):
+        """Buckets are `bs x max_q_len`; a spec-decode run captures q>1, and
+        the head is sized in tokens."""
+        assert (capture_pinned_bytes(self.LADDER, vocab_size=self.VOCAB, q_len=4)
+                - CAPTURE_FIXED_PINNED
+                == 4 * (self.RECORDED_ALLOCATED - CAPTURE_FIXED_PINNED))
+
+    def test_capturing_nothing_pins_nothing(self):
+        assert capture_pinned_bytes((), vocab_size=self.VOCAB) == 0
+        assert capture_pinned_bytes(self.LADDER, vocab_size=self.VOCAB,
+                                    enforce_eager=True) == 0
+
+    def test_the_residue_is_calibratable_without_touching_the_mechanism(self):
+        pinned = capture_pinned_bytes(
+            self.LADDER, vocab_size=self.VOCAB,
+            calibration={"graph_pool": {"fixed_pinned": 1000}})
+        assert pinned == 1000 + self.VOCAB * 2 * sum(self.LADDER)
+
+
+class TestTheReservedSideFollowsTheAllocatorsOwnRules:
+    """The reserved delta is not the allocated one rounded.
+
+    Every figure checked here comes from the S27 TP=1 pool-id probe
+    (`agent_scratch/memval/pool_probe/att2_artifact.json`) and the constants
+    come from `c10/core/AllocatorConfig.h`. Neither was fitted.
+    """
+
+    def test_a_request_under_the_block_size_still_costs_a_block(self):
+        assert allocator_block_bytes(8) == 512
+        assert allocator_block_bytes(513) == 1024
+
+    def test_the_three_segment_classes_are_the_allocators_not_ours(self):
+        assert allocator_segment_bytes(8) == ALLOCATOR_SMALL_BUFFER
+        assert allocator_segment_bytes(1_048_576) == ALLOCATOR_SMALL_BUFFER
+        # over kSmallSize but under kMinLargeAlloc: a whole large segment
+        assert allocator_segment_bytes(1_048_577) == ALLOCATOR_LARGE_BUFFER
+        assert allocator_segment_bytes(9_000_000) == ALLOCATOR_LARGE_BUFFER
+        # at or over kMinLargeAlloc: its own segment, rounded to 2 MiB
+        assert allocator_segment_bytes(10_485_760) == 10_485_760
+        assert allocator_segment_bytes(15_892_480) == 16_777_216
+
+    def test_the_fixed_residue_maps_the_bytes_that_were_observed(self):
+        """76 MiB exactly, plus a whole 2 MiB segment for 1 KiB of scalars."""
+        parts = capture_reserved_parts(46_137_344)
+        assert parts["outside_pools"] == 81_788_928
+        assert parts["outside_pools_derived"] is True
+
+    def test_the_allocated_constant_is_not_its_reserved_cost(self):
+        parts = capture_reserved_parts(46_137_344)
+        assert parts["outside_pools"] != CAPTURE_FIXED_PINNED
+        assert parts["outside_pools"] - CAPTURE_FIXED_PINNED == 2_096_128
+
+    def test_the_window_total_is_reproduced_only_with_the_measured_pool(self):
+        """The observed reserved delta, once the pool is supplied.
+
+        Supplied, not predicted: the pool half is the high-water mark of the
+        captured forward, and `capture_reserved_parts` says so by taking it as
+        an argument.
+        """
+        parts = capture_reserved_parts(46_137_344)
+        assert parts["total"] == 127_926_272
+        assert parts["pool_reserved_derived"] is False
+
+    def test_the_pinned_set_does_not_predict_the_pool(self):
+        """Why the pool half is an input: the same rule over what capture
+        pins reads 82% high against the pool that was measured."""
+        pinned = (15_892_480, 7_946_240, 3_973_120,
+                  1_986_560, 993_280, 496_640)
+        naive = sum(allocator_segment_bytes(size) for size in pinned)
+        assert naive == 83_886_080
+        assert naive - 46_137_344 == 37_748_736
+
+
+QWEN3_27B = {"hidden_size": 5120, "intermediate_size": 17408,
+             "linear_num_key_heads": 16, "linear_key_head_dim": 128,
+             "linear_num_value_heads": 48, "linear_value_head_dim": 128}
+
+
+class TestAnInstantBelongsToTheProgramItWasWitnessedIn:
+    """The history is an Inductor run and the walk is not, so they don't mix."""
+
+    def test_the_widths_come_out_of_the_config_and_nowhere_else(self):
+        widths = gdn_activation_widths(QWEN3_27B)
+        # q, k, v, z at 2 x 2048 + 2 x 6144, then b and a at one per value head.
+        assert widths["in_proj_qkvzba"] == 16_480
+        assert widths["mlp_gate_up"] == 34_816
+        assert widths["mlp_act"] == 17_408
+        assert widths["attn_value"] == 6_144
+        assert widths["hidden"] == 5_120
+
+    def test_each_instant_names_the_program_it_came_from(self):
+        assert (GDN_ACTIVATION_INSTANTS["linear_attn"]["compile_mode"]
+                == "inductor")
+        assert GDN_ACTIVATION_INSTANTS["mlp_down"]["compile_mode"] == "eager"
+
+    def test_the_two_instants_hold_the_mixes_the_witnesses_recorded(self):
+        widths = gdn_activation_widths(QWEN3_27B)
+        for name, expected in (("linear_attn", (74_848, 15_360)),
+                               ("mlp_down", (52_224, 30_720))):
+            instant = GDN_ACTIVATION_INSTANTS[name]
+            sharded = sum(widths[k] for k in instant["sharded"])
+            replicated = sum(widths[k] for k in instant["replicated"])
+            assert (sharded, replicated) == expected
+
+    def test_a_mode_with_no_witness_refuses_rather_than_borrowing_one(self):
+        with pytest.raises(UnfoundedActivation, match="not evidence about"):
+            activation_instant_bytes(QWEN3_27B, 16_384, 1,
+                                     compile_mode="cudagraph")
+
+    def test_the_compiled_mode_lands_on_the_measured_gate_bar_the_replay_gap(self):
+        best = activation_instant_bytes(QWEN3_27B, 16_384, 1,
+                                        compile_mode="inductor")
+        assert best["instant"] == "linear_attn"
+        assert best["bytes"] == 2_955_935_744
+        # The one measurement of the source config, and the gap it leaves.
+        assert 2_956_984_320 - best["bytes"] == 1_048_576
+        assert best["is_candidate"] is True
+
+    def test_the_compiled_mode_reports_what_it_cannot_count_above_one_rank(self):
+        one = activation_instant_bytes(QWEN3_27B, 16_384, 1,
+                                       compile_mode="inductor")
+        assert one["uncounted"] == ()
+        for width, expected in ((2, 1_729_626_112), (4, 1_116_471_296)):
+            best = activation_instant_bytes(QWEN3_27B, 16_384, width,
+                                            compile_mode="inductor")
+            assert best["bytes"] == expected
+            assert len(best["uncounted"]) == 1
+            assert "unwitnessed" in best["uncounted"][0]
+
+    def test_the_eager_mode_carries_the_collective_destination_it_witnessed(self):
+        assert activation_instant_bytes(
+            QWEN3_27B, 16_384, 1, compile_mode="eager")["bytes"] == 2_717_908_992
+        for width, expected in ((2, 2_030_043_136), (4, 1_602_224_128)):
+            best = activation_instant_bytes(QWEN3_27B, 16_384, width,
+                                            compile_mode="eager")
+            assert best["bytes"] == expected
+            assert best["uncounted"] == ()
+            assert best["replicated"] - 30_720 == 5_120
+
+    def test_the_two_modes_disagree_at_tp1_in_both_directions(self):
+        widths = gdn_activation_widths(QWEN3_27B)
+        held = 16_384 * 2 * (widths["in_proj_qkvzba"] + widths["attn_value"])
+        reused = 16_384 * 2 * 3 * widths["hidden"]
+        assert held == 741_343_232          # compiled run holds these longer
+        assert reused == 503_316_480        # ... and reuses these
+        eager = activation_instant_bytes(QWEN3_27B, 16_384, 1,
+                                         compile_mode="eager")["bytes"]
+        compiled = activation_instant_bytes(QWEN3_27B, 16_384, 1,
+                                            compile_mode="inductor")["bytes"]
+        assert eager + held - reused == compiled
+
+    def test_it_scales_with_tokens_and_dtype_and_nothing_else(self):
+        one = activation_instant_bytes(QWEN3_27B, 1, 1,
+                                       compile_mode="inductor")["bytes"]
+        assert activation_instant_bytes(
+            QWEN3_27B, 16_384, 1, compile_mode="inductor")["bytes"] == 16_384 * one
+        assert activation_instant_bytes(
+            QWEN3_27B, 16_384, 1, compile_mode="inductor",
+            dtype_bytes=4)["bytes"] == 2 * 16_384 * one
+
+    def test_a_width_that_does_not_divide_the_shard_refuses(self):
+        with pytest.raises(UnfoundedActivation, match="not the split"):
+            activation_instant_bytes(QWEN3_27B, 16_384, 3,
+                                     compile_mode="inductor")

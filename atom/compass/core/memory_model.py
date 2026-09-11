@@ -33,6 +33,7 @@ for a shape nobody traced.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from typing import Mapping, Optional
@@ -44,7 +45,10 @@ __all__ = ["peak_activation_bytes", "activation_curve", "weight_bytes",
            "liveness_instrumentation", "UNVERSIONED_LIVENESS",
            "UnfoundedActivation", "UnfoundedPrediction",
            "derived_readings", "CALIBRATED_TERMS", "traced_width",
-           "graph_pool_bytes", "measured_graph_pool_bytes", "ELEMENT_BYTES"]
+           "graph_pool_bytes", "measured_graph_pool_bytes", "ELEMENT_BYTES",
+           "capture_pinned_bytes", "CAPTURE_FIXED_PINNED",
+           "dtype_ambiguities", "lineage_keys", "width_classes",
+           "width_coverage"]
 
 ELEMENT_BYTES = {
     "float64": 8, "int64": 8, "double": 8,
@@ -60,6 +64,108 @@ def _bytes_of(shape, dtype: str) -> int:
     for dim in shape:
         count *= int(dim)
     return count * ELEMENT_BYTES.get(dtype, 2)
+
+
+_FLOAT_DTYPES = ("float64", "double", "float32", "float", "bfloat16",
+                 "float16", "half", "float8_e4m3fnuz", "float8_e4m3fn",
+                 "float8_e5m2")
+
+
+def _promote(dtypes) -> Optional[str]:
+    """The dtype PyTorch's promotion rules give these arguments together.
+
+    Not a guess about a particular operator: promotion is defined, and the one
+    part of it that matters for sizing is that a floating point argument beats
+    every integer one whatever the widths -- `int32` ids and a `bfloat16`
+    weight promote to `bfloat16`, never to 4 bytes. Among floats the wider
+    wins, except that `float16` with `bfloat16` promotes to `float32`, neither
+    being able to hold the other.
+
+    This is still an inference about an operator that did not say, so the
+    callers keep it separate from a recorded dtype and `dtype_ambiguities`
+    reports every output it was applied to.
+    """
+    known = [d for d in dtypes if d in ELEMENT_BYTES]
+    if not known:
+        return None
+    floats = [d for d in known if d in _FLOAT_DTYPES]
+    if not floats:
+        return max(known, key=lambda d: ELEMENT_BYTES[d])
+    widest = max(ELEMENT_BYTES[d] for d in floats)
+    at_width = {d for d in floats if ELEMENT_BYTES[d] == widest}
+    if widest == 2 and {"float16", "half"} & at_width and "bfloat16" in at_width:
+        return "float32"
+    return sorted(at_width)[0]
+
+
+def _output_dtype(op, position: int) -> tuple:
+    """The dtype of an operator's output, and on what basis.
+
+    `OpSpec.dtypes` is the dtype of each *argument*. Nothing records what an
+    operator produced, so a walk that needs an output's size has been taking
+    argument 0's and hoping promotion changed nothing. It does change things:
+    `aiter::masked_embedding` takes int32 token ids and a bfloat16 weight and
+    returns a bfloat16 hidden-width activation, and argument 0's dtype sizes
+    one 16 384 x 5 120 buffer at 335 544 320 B instead of 167 772 160.
+
+    Three bases, and the caller is told which it got:
+
+    * `"recorded"` -- the producer wrote `output_dtypes` (O18 asks for it).
+    * `"unanimous"` -- every argument has the same dtype, so promotion has
+      nothing to choose between and argument 0 is not a guess.
+    * `"promoted"` -- the arguments disagree and `_promote` decided. A stated
+      rule rather than a per-operator correction, and reported as an ambiguity
+      because the rule is not what the operator said.
+
+    `(None, "none")` when the graph gives no argument dtypes at all.
+    """
+    recorded = op.get("output_dtypes") or ()
+    if position < len(recorded) and recorded[position]:
+        return str(recorded[position]), "recorded"
+    dtypes = tuple(op.get("dtypes") or ())
+    if not dtypes:
+        return None, "none"
+    if len(set(dtypes)) == 1:
+        return dtypes[0], "unanimous"
+    promoted = _promote(dtypes)
+    if promoted is None:
+        return None, "none"
+    return promoted, "promoted"
+
+
+def dtype_ambiguities(graph) -> list:
+    """Every output whose dtype this graph did not record, and what it costs.
+
+    Reported rather than quietly sized, because the difference between a rule
+    and a record is exactly what a memory term is being asked about. Each entry
+    carries the bytes the promotion rule gives and the bytes argument 0 would
+    have given, so a reader can see whether the ambiguity matters -- most
+    operators with mixed argument dtypes produce something small, and the one
+    that does not is the embedding.
+    """
+    out = []
+    for index, op in enumerate(graph.get("ops") or ()):
+        aliases = op.get("output_aliases") or ()
+        for position, shape in enumerate(op.get("output_shapes") or ()):
+            if position < len(aliases) and aliases[position] is not None:
+                continue  # written into, not allocated: never sized
+            dtype, basis = _output_dtype(op, position)
+            if basis in ("recorded", "unanimous"):
+                continue
+            dtypes = tuple(op.get("dtypes") or ())
+            out.append({
+                "operator": index,
+                "name": op.get("name"),
+                "position": position,
+                "basis": basis,
+                "shape": list(shape),
+                "argument_dtypes": list(dtypes),
+                "chosen_dtype": dtype,
+                "bytes_chosen": _bytes_of(shape, dtype) if dtype else 0,
+                "bytes_if_argument_0": _bytes_of(shape, dtypes[0])
+                if dtypes else 0,
+            })
+    return out
 
 
 def _canonical(ops) -> list:
@@ -267,7 +373,7 @@ def traced_shape(graph) -> tuple:
     return (tuple(int(n) for n in signature), ())
 
 
-def activation_curve(graph) -> list:
+def activation_curve(graph, *, strict_dtypes: bool = False) -> list:
     """How much activation memory is live at each operator.
 
     The activation term is a curve and its peak is one point on it. Comparing
@@ -295,12 +401,27 @@ def activation_curve(graph) -> list:
             if key in held:
                 live -= held.pop(key)
         if canonical[index] == index:
-            dtypes = op.get("dtypes") or ()
-            dtype = dtypes[0] if dtypes else "bfloat16"
             aliases = op.get("output_aliases") or ()
             for position, shape in enumerate(op.get("output_shapes") or ()):
                 if position < len(aliases) and aliases[position] is not None:
                     continue  # written into, not allocated
+                dtype, basis = _output_dtype(op, position)
+                if basis != "recorded" and strict_dtypes:
+                    # A strict walk takes the graph's word and nothing else.
+                    raise UnfoundedActivation(
+                        "operator %d (%s) produces an output the graph records "
+                        "no dtype for; its arguments are (%s) and the walk "
+                        "would size it as %s by %s. Record `output_dtypes`, or "
+                        "walk with `strict_dtypes=False` and read "
+                        "`dtype_ambiguities`"
+                        % (index, op.get("name"),
+                           ", ".join(op.get("dtypes") or ()) or "none",
+                           dtype, basis))
+                if dtype is None:
+                    # No argument dtype at all. Two bytes is the model's own
+                    # activation dtype and it is written down here as the guess
+                    # it is; `dtype_ambiguities` lists the output.
+                    dtype = "bfloat16"
                 size = _bytes_of(shape, dtype)
                 if size:
                     held[(index, position)] = size
@@ -309,7 +430,7 @@ def activation_curve(graph) -> list:
     return curve
 
 
-def peak_activation_bytes(graph) -> int:
+def peak_activation_bytes(graph, *, strict_dtypes: bool = False) -> int:
     """The most activation memory live at once, by walking the graph.
 
     A tensor is live from the operator that produced it until its last
@@ -319,15 +440,20 @@ def peak_activation_bytes(graph) -> int:
     activation, and counting it here would double it against the weight term.
     Nor is an in-place operator's output, which is not a new tensor.
 
-    Two approximations, both stated rather than hidden. Output dtype is not
-    recorded, so an operator's outputs are counted at its *first input's* dtype,
-    which is right for the elementwise and matmul operators that hold the memory
-    and wrong for a cast. And a tensor with no reader in the graph is freed
-    immediately, where the engine frees it whenever the last Python reference
-    goes -- so this is a lower bound on the high-water mark, not a bound on what
-    the allocator reserves.
+    Output dtype comes from the graph where the graph records it, from the
+    arguments where they all agree, and otherwise from PyTorch's promotion
+    rule, with `dtype_ambiguities` listing every output that was not recorded.
+    `strict_dtypes=True` refuses anything but a recorded dtype. Sizing an
+    output at argument 0's dtype -- the rule until now -- is how one
+    `aiter::masked_embedding` came to be counted at int32: 335 544 320 B for a
+    buffer that is 167 772 160.
+
+    One approximation remains, stated rather than hidden: a tensor with no
+    reader in the graph is freed immediately, where the engine frees it whenever
+    the last Python reference goes -- so this is a lower bound on the high-water
+    mark, not a bound on what the allocator reserves.
     """
-    return max(activation_curve(graph) or [0])
+    return max(activation_curve(graph, strict_dtypes=strict_dtypes) or [0])
 
 
 def _safetensors_header(path: str) -> Optional[dict]:
@@ -575,7 +701,7 @@ def load_residue_bytes(world_size: int,
 DEFAULT_PERSISTENT = 118 * MIB
 
 
-def scratch_bytes_per_token(graph) -> float:
+def scratch_bytes_per_token(graph, *, strict_dtypes: bool = False) -> float:
     """Activation memory per token that no recorded operator output explains.
 
     A dispatch tracer sees what crosses the dispatcher. `torch.empty` called
@@ -603,7 +729,8 @@ def scratch_bytes_per_token(graph) -> float:
                  ((graph.get("key") or {}).get("batch_signature") or ()))
     if not measured or not tokens:
         return 0.0
-    return max(0.0, (int(measured) - peak_activation_bytes(graph)) / tokens)
+    return max(0.0, (int(measured) - peak_activation_bytes(
+        graph, strict_dtypes=strict_dtypes)) / tokens)
 
 
 class UnfoundedPrediction(ValueError):
@@ -735,7 +862,138 @@ def _prediction_calibration(profile: Mapping, load, refuse, source: str):
     return calibration
 
 
-def activation_bytes_at(graph, tokens: int) -> int:
+#: The instants at which the activation high-water mark has been witnessed on
+#: the source config, each tagged with the program it was witnessed in.
+#:
+#: The two are **not the same program**, which is why they may not be combined.
+#: The TP=1 warmup allocation history was recorded from an Inductor-compiled
+#: run -- its frames pass through ``/tmp/torchinductor_root/...`` and
+#: ``torch/_inductor/utils.py:3220`` -- while the device-free walk graphs carry
+#: ``compilation_level: 0``. Inductor decides buffer reuse and lifetimes in its
+#: own scheduler, so the two disagree in both directions at TP=1: the compiled
+#: run holds the layer's attention buffers through that layer's MLP (+741 343
+#: 232 B) and reuses hidden-sized buffers the eager walk keeps separate
+#: (-503 316 480 B). Taking a maximum across them would be a maximum over two
+#: different programs, not a bound on either.
+#:
+#: ``sharded`` widths are split across ranks; ``replicated`` ones are not;
+#: ``collective`` ones exist only above one rank.
+GDN_ACTIVATION_INSTANTS = {
+    "linear_attn": {
+        "compile_mode": "inductor",
+        "witness": "TP=1 warmup allocation history (S27), matched allocation "
+                   "by allocation; peak at the act_fn allocation inside layer "
+                   "1's MLP, with that layer's in_proj and core-attention "
+                   "buffers still live",
+        "sharded": ("mlp_gate_up", "mlp_act", "in_proj_qkvzba", "attn_value"),
+        "replicated": ("hidden", "hidden", "hidden"),
+        # The peak falls before the down-projection, so no collective
+        # destination for it exists yet; whether an earlier one is still live
+        # at that point is unwitnessed, since no compiled history exists above
+        # TP=1. Left out, and reported as uncounted.
+        "collective": (),
+        "collective_witnessed": False,
+    },
+    "mlp_down": {
+        "compile_mode": "eager",
+        "witness": "device-free walk high-water mark on the pinned recapture; "
+                   "same module path and same non-collective ordinal 72 at "
+                   "TP=1, 2 and 4",
+        "sharded": ("mlp_gate_up", "mlp_act"),
+        "replicated": ("hidden",) * 6,
+        "collective": ("hidden",),
+        "collective_witnessed": True,
+    },
+}
+
+
+def gdn_activation_widths(config: Mapping) -> dict:
+    """The trailing widths of the GDN-hybrid activation buffers, off a config.
+
+    Nothing here is measured. ``in_proj_qkvzba`` is the concatenation the
+    module actually projects to -- q and k at ``linear_num_key_heads`` x
+    ``linear_key_head_dim``, v and z at ``linear_num_value_heads`` x
+    ``linear_value_head_dim``, then b and a at one element per value head --
+    and on the 27B that is 16 384 + 96, which is the width the device-free walk
+    produces at ``linear_attn.in_proj_qkvzba`` and shards to 8240 and 4120.
+    """
+    hidden = int(config["hidden_size"])
+    intermediate = int(config["intermediate_size"])
+    heads = int(config["linear_num_value_heads"])
+    key = int(config["linear_num_key_heads"]) * int(config["linear_key_head_dim"])
+    value = heads * int(config["linear_value_head_dim"])
+    return {"hidden": hidden,
+            "mlp_gate_up": 2 * intermediate,
+            "mlp_act": intermediate,
+            "attn_value": value,
+            "in_proj_qkvzba": 2 * key + 2 * value + 2 * heads}
+
+
+def activation_instant_bytes(config: Mapping, tokens: int, world_size: int = 1,
+                             *, compile_mode: str, dtype_bytes: int = 2,
+                             instants: Optional[Mapping] = None) -> dict:
+    """A candidate for the activation term, within one compile mode.
+
+    **A candidate, not a bound.** Each instant is an approximation of the live
+    set at one point of one program, and a maximum over approximations is only
+    a lower bound if each input is one. Neither is established as such, so the
+    result is labelled and used as a candidate.
+
+    ``compile_mode`` is required and is not a formality. The gate the predictor
+    has to match is ``peak_torch - current_torch`` of the deployment as it
+    actually runs; the two witnessed instants come from two different programs
+    (see ``GDN_ACTIVATION_INSTANTS``), and mixing them is refused rather than
+    silently maximised.
+
+    Within a mode the widths come from ``config.json`` via
+    ``gdn_activation_widths`` and the live sets from that mode's witness.
+    Nothing is fitted and no TP=2 or TP=4 measurement is opened.
+
+    The returned ``uncounted`` names what the mode's witness cannot cover at
+    this width, so a caller can see the reservation instead of inheriting it
+    silently.
+    """
+    widths = gdn_activation_widths(config)
+    chosen = {name: instant
+              for name, instant in (instants or GDN_ACTIVATION_INSTANTS).items()
+              if instant.get("compile_mode") == compile_mode}
+    if not chosen:
+        raise UnfoundedActivation(
+            "no activation instant is witnessed for compile mode %r; the "
+            "witnessed modes are %s, and an instant from one program is not "
+            "evidence about another"
+            % (compile_mode,
+               sorted({i.get("compile_mode")
+                       for i in (instants or GDN_ACTIVATION_INSTANTS).values()})))
+    best = None
+    for name, instant in sorted(chosen.items()):
+        sharded = sum(widths[key] for key in instant["sharded"])
+        replicated = sum(widths[key] for key in instant["replicated"])
+        if world_size > 1:
+            replicated += sum(widths[key]
+                              for key in instant.get("collective") or ())
+        if sharded % world_size:
+            raise UnfoundedActivation(
+                "instant %r sums to %d sharded elements, which %d ranks do not "
+                "divide; that is not the split the module makes"
+                % (name, sharded, world_size))
+        total = tokens * dtype_bytes * (sharded // world_size + replicated)
+        if best is None or total > best["bytes"]:
+            uncounted = []
+            if world_size > 1 and not instant.get("collective_witnessed"):
+                uncounted.append(
+                    "collective destinations live at this instant above one "
+                    "rank are unwitnessed for %r and are not counted" % name)
+            best = {"instant": name, "bytes": int(total),
+                    "compile_mode": compile_mode,
+                    "sharded": sharded, "replicated": replicated,
+                    "witness": instant["witness"],
+                    "is_candidate": True, "uncounted": tuple(uncounted)}
+    return best
+
+
+def activation_bytes_at(graph, tokens: int, *,
+                        strict_dtypes: bool = False) -> int:
     """The activation peak at a token count the graph was not traced at.
 
     Linear in tokens, which is not an assumption but a measurement: the walk
@@ -757,14 +1015,16 @@ def activation_bytes_at(graph, tokens: int) -> int:
             "this graph records neither tensor deaths nor a measured "
             "activation peak, so there is no liveness in it to scale: "
             "%s" % ((graph.get("provenance") or {}).get("source") or "unknown"))
-    peak = peak_activation_bytes(graph)
+    peak = peak_activation_bytes(graph, strict_dtypes=strict_dtypes)
     traced = sum(int(n) for n in
                  ((graph.get("key") or {}).get("batch_signature") or ()))
     if not (traced and tokens):
         return peak
     # The walk scales, and so does what the walk cannot see -- both are
     # activation memory and both are linear in tokens.
-    return int(peak * tokens / traced + scratch_bytes_per_token(graph) * tokens)
+    return int(peak * tokens / traced
+               + scratch_bytes_per_token(
+                   graph, strict_dtypes=strict_dtypes) * tokens)
 
 
 def modelled_readings(*, total_bytes: int, world_size: int, parameters: int,
@@ -828,6 +1088,17 @@ DEFAULT_POOL_PER_TOKEN = 0.3033 * MIB
 #: six runs. It is segment bookkeeping around one fixed 76.0 MiB of pinned
 #: memory, so the largest is taken rather than the mean -- under-reserving buys
 #: dropped capture buckets.
+#:
+#: **Superseded as a reading, kept as a number.** The identical bytes are not
+#: evidence that the graphs pin nothing sharded: at TP>1 the runner does not
+#: capture the LM head at all (`logits_in_graph = world_size == 1 and not
+#: is_tbo`, `model_runner.py:4104`), and the head is the only part of the
+#: pinned set that scales with the ladder. So this is the *whole* pinned set
+#: with its one variable term removed, which `capture_pinned_bytes` states
+#: directly and which predicts TP=1 to the byte. The switch is the predicate,
+#: not the width -- a TP=1 TBO run also drops the head. The AITER collective
+#: buffer remains outside the torch allocator, but it is not what this
+#: measures.
 DEFAULT_POOL_SHARDED = 104 * MIB
 
 
@@ -853,7 +1124,21 @@ def measured_graph_pool_bytes(capture_sizes, world_size: int = 1,
     192 GB card nothing has ever been dropped, which is exactly why this went
     unnoticed.
 
-    Above width one the ladder stops mattering -- see `DEFAULT_POOL_SHARDED`.
+    Above width one the ladder stops mattering -- see `DEFAULT_POOL_SHARDED`,
+    and `capture_pinned_bytes` for why that is the LM head leaving the graph
+    rather than a property of width.
+
+    **What it is compared against is not private-pool residency.** The number
+    in the record is `memory_reserved()` differenced across the whole capture
+    window (`model_runner.py:4120`, `:4346`), and that window contains a full
+    eager warmup forward per bucket (`:4229`) whose segments grow the *global*
+    pool, with `empty_cache` patched out inside piecewise capture
+    (`cuda_graph.py`). A release anywhere else in the process lands in it too,
+    and `max(..., 0)` reads a net release as a pool of zero. The allocated
+    delta beside it is the sounder target, and pool-scoped residency is
+    readable directly -- `torch.cuda.memory_snapshot(mempool_id)` takes the
+    id that `graph.pool()` returns -- which is what a future capture probe
+    should use instead of a global difference.
     """
     if enforce_eager:
         return 0
@@ -866,6 +1151,236 @@ def measured_graph_pool_bytes(capture_sizes, world_size: int = 1,
     floor = float(settings.get("floor", DEFAULT_POOL_FLOOR))
     per_token = float(settings.get("per_token", DEFAULT_POOL_PER_TOKEN))
     return int(floor + per_token * sum(sizes))
+
+
+#: The capture-time *allocated* delta that is not the LM head, in bytes.
+#:
+#: **Source calibration, now witnessed.** The value was read off the 27B's
+#: TP=1 record (S27) as the residue after the logits term below --
+#: 110 981 120 - 63 x 248 320 x 2 -- and carried as a taken number. A pool-id
+#: scoped capture probe on the same source config (S27, TP=1, node18 GPU0,
+#: `agent_scratch/memval/pool_probe/att2_artifact.json`) has since named what
+#: the residue is, by diffing the *global* segment list across the capture
+#: window. Nothing was released; six segments appeared, and the residue is two
+#: allocations that live **outside every capture pool**:
+#:
+#:   * one 79 691 776 B (76 MiB exactly) block, `requested_size == size`, in
+#:     its own exactly-sized oversize `large` segment -- a fixed-size
+#:     workspace request, not a tensor of any model dimension; and
+#:   * two 512 B blocks of an 8 B request each, in a `small` segment.
+#:
+#: 79 691 776 + 2 x 512 = 79 692 800, the constant, to the byte. So it is
+#: neither private-pool residency nor a size-class rounding of the logits
+#: (the logits round by 0 B; see the docstring below). A request for exactly
+#: 76 MiB that depends on neither model nor width is what makes the same value
+#: appear on the 0.6B (C06) at TP=2, 4 and 8 over ladders from 31 to 1071
+#: tokens. The TP=1 warmup allocation history already on disk
+#: (`agent_scratch/memval/producer_packet/tp1_probe/out/warmup_history.959476.pickle`)
+#: carries a 79 691 776 B `segment_alloc` whose frames run
+#: `aiter/tuned_gemm.py:450:torch_gemm` <- `gemm_a16w16` <- the inductor region
+#: of the GDN linear-attention forward. **Equal size settles nothing in either
+#: direction**, and neither does factoring it: any size divides many ways, and
+#: 2432 is not a width this checkpoint produces. What is witnessed about the
+#: *warmup* block is its life, not its shape. It is allocated once, at the
+#: second event of the window, and is still live when the window closes -- the
+#: window's whole net allocated retention, 79 691 776 B, is this one block.
+#: `tuned_gemm.py` contains no workspace at all (no `workspace` appears in the
+#: file); `torch_gemm` ends in `F.linear(inp, weights, bias)`, so what it
+#: returns is a GEMM output of shape `[M, N]` where `N` is a weight output
+#: width -- of the config's widths only `in_proj_qkvz` = 16 384 divides
+#: 39 845 888, which would make `M` 2432 tokens.
+#:
+#: The *capture-window* block is a different observation and stays
+#: unattributed: it carries no frames, and all six segments new in that window
+#: are on the capture stream (460554448) while the 313 pre-existing segments
+#: are on stream 0 -- so it was requested on the side stream capture runs on,
+#: outside the graph's private pool. A per-stream cache would explain both a
+#: fixed size and a second allocation after warmup already made one; so would
+#: several other things. Naming it needs allocation history recorded *inside*
+#: the capture window, and no prediction waits on that: the term is
+#: source-calibrated by construction.
+#:
+#: One thing is settled and matters more for the gate. The warmup block is
+#: retained across its window, so it is in `peak` and in `current` alike and
+#: **cancels in `peak - current`**. It is excluded from the activation term
+#: once, there, and is not also carried as a residue anywhere else.
+#: The constant therefore stays a calibrated number rather than a derived one,
+#: and stays overridable via `calibration["graph_pool"]["fixed_pinned"]`: it is
+#: a property of the AITER/ROCm build, not of the model. Its value must not
+#: move -- frozen predictions were made with it.
+CAPTURE_FIXED_PINNED = 79_692_800
+
+
+def capture_pinned_bytes(capture_sizes, *, vocab_size: int = 0,
+                         dtype_bytes: int = 2, q_len: int = 1,
+                         world_size: int = 1, tbo: bool = False,
+                         logits_in_graph: Optional[bool] = None,
+                         enforce_eager: bool = False,
+                         calibration: Optional[Mapping] = None) -> int:
+    """What capture *pins*, as a mechanism rather than as a width constant.
+
+    The engine captures a warmup forward per bucket and, at TP=1 only, the LM
+    head with it::
+
+        self.logits_in_graph = self.world_size == 1 and not is_tbo
+        ...
+        if self.logits_in_graph:
+            graph_logits = self.model.compute_logits(outputs[:num_tokens])
+
+    (`model_runner.py:4104`, `:4297`.) The logits tensor is allocated inside
+    the capture, so it comes from the graph's private pool, and the runner
+    keeps it in `self.graph_logits[(bs, max_q_len)]`, so it stays live. Capture
+    builds decode metadata, so `ParallelLMHead.forward` takes no last-token
+    index and the tensor is `[num_tokens, vocab_size]` whole -- at TP>1 it
+    would also be all-gathered, but at TP>1 it is not captured at all.
+
+    So the term is `vocab_size x dtype_bytes x sum(captured num_tokens)` when
+    the head is in the graph, and nothing when it is not, over a fixed residue.
+    On the 27B's TP=1 record that is 79 692 800 + 63 x 248 320 x 2 =
+    110 981 120 B, which is the recorded allocated delta **to the byte**.
+
+    That row is exact by construction -- it is where the residue came from --
+    and the TP=2/TP=4 rows that also land at +0.0% were checked against records
+    already on disk, so they are **retrospective evidence, not a fresh frozen
+    evaluation**. All of it is the capture-time *allocated* delta. The reserved
+    delta the engine records is a different quantity (see
+    `measured_graph_pool_bytes`) and agreement here says nothing about it.
+
+    The pool-id scoped probe (S27, TP=1) checks the *mechanism* of the logits
+    term rather than just its total. Six captures, one private pool `(1, 0)`,
+    runner keys `(bs, max_q_len)` = (32,1) (16,1) (8,1) (4,1) (2,1) (1,1), so
+    `sum` = 63. Inside that pool six new live blocks appeared, one per bucket,
+    of 15 892 480 / 7 946 240 / 3 973 120 / 1 986 560 / 993 280 / 496 640 B --
+    each exactly `bs x 248 320 x 2` and each with `requested_size == size`, so
+    the term rounds by **0 B**, not approximately. They sum to 31 288 320 B =
+    `63 x 248 320 x 2`. Five separated counters for that pool: reserved
+    residency 46 137 344, active allocated 31 288 320, active requested
+    31 288 320, internal rounding 0, inactive capacity 14 849 024 B.
+
+    Two things follow. The residue above is *not* in the pool -- pool active
+    allocated is the logits term alone -- so a pool-scoped search could never
+    have found it; it took a global before/after block diff. And the reserved
+    side is a different decomposition again: the window's reserved delta was
+    127 926 272 B from six new segments with none released -- four in the
+    capture pool (46 137 344 B) and two outside (the 79 691 776 B oversize
+    segment plus a whole 2 097 152 B small segment holding only the 1 024 B of
+    8-byte scalars). The allocated-side constant is 79 692 800 B; the same
+    residue costs 81 788 928 B of *reserved*. Do not use one for the other.
+
+    All of this is source-only (S27) diagnostic evidence for how the term is
+    built. It explains the global reserved gate; it does not redefine it, and
+    it is not target validation -- that remains the frozen e2e cc-traces gates.
+
+    **The switch is `logits_in_graph`, not the width.** Reading it as a width
+    law -- which `measured_graph_pool_bytes` still does -- gets the right
+    answer for the wrong reason at TP>1 and the wrong answer at TP=1 under TBO,
+    where the head leaves the graph while the width stays one.
+
+    The model output is not in this term: the capture writes it into the
+    preallocated `forward_vars["outputs"]` (`model_runner.py:4237`), the same
+    buffer as O19, which was allocated at engine init and is already inside
+    `current_torch`.
+
+    Raises `UnfoundedPrediction` when the head is in the graph and no
+    vocabulary was given, rather than quietly returning the residue alone.
+    """
+    if enforce_eager:
+        return 0
+    sizes = [int(s) for s in (capture_sizes or ()) if int(s) > 0]
+    if not sizes:
+        return 0
+    settings = (calibration or {}).get("graph_pool") or {}
+    fixed = int(settings.get("fixed_pinned", CAPTURE_FIXED_PINNED))
+    if logits_in_graph is None:
+        logits_in_graph = (int(world_size) == 1) and not tbo
+    if not logits_in_graph:
+        return fixed
+    if not vocab_size:
+        raise UnfoundedPrediction(
+            "the LM head is captured at this configuration, so the pinned "
+            "pool contains vocab_size x %d x %d tokens, and no vocabulary "
+            "was given" % (int(dtype_bytes), sum(sizes) * int(q_len)))
+    tokens = sum(sizes) * int(q_len)
+    return fixed + int(vocab_size) * int(dtype_bytes) * tokens
+
+
+#: The caching allocator's own size constants, read off the shipped header
+#: `torch/include/c10/core/AllocatorConfig.h` rather than inferred from a
+#: measurement. They are what turns a *requested* size into mapped bytes, so
+#: they are what separates the reserved side from the allocated side.
+ALLOCATOR_MIN_BLOCK = 512          #: kMinBlockSize -- every request rounds up
+ALLOCATOR_SMALL_SIZE = 1_048_576   #: kSmallSize -- largest "small" allocation
+ALLOCATOR_SMALL_BUFFER = 2_097_152  #: kSmallBuffer -- small segment size
+ALLOCATOR_MIN_LARGE_ALLOC = 10_485_760  #: kMinLargeAlloc
+ALLOCATOR_ROUND_LARGE = 2_097_152  #: kRoundLarge -- oversize segments round here
+ALLOCATOR_LARGE_BUFFER = 20_971_520  #: kLargeBuffer -- large segment size
+
+
+def allocator_block_bytes(requested: int) -> int:
+    """What a request of `requested` bytes occupies as a *block*."""
+    n = int(requested)
+    if n < ALLOCATOR_MIN_BLOCK:
+        return ALLOCATOR_MIN_BLOCK
+    return ALLOCATOR_MIN_BLOCK * (
+        (n + ALLOCATOR_MIN_BLOCK - 1) // ALLOCATOR_MIN_BLOCK)
+
+
+def allocator_segment_bytes(requested: int) -> int:
+    """What the allocator *maps* to satisfy a fresh request of that size.
+
+    The three cases are the allocator's, not ours: a small request takes a
+    whole `kSmallBuffer` segment, a request under `kMinLargeAlloc` takes a
+    whole `kLargeBuffer` segment, and anything larger gets its own segment
+    rounded to `kRoundLarge`. A later request may be packed into an existing
+    segment's free tail instead, which is why this is an upper bound per
+    allocation and only exact for one that has to map new memory.
+    """
+    n = allocator_block_bytes(requested)
+    if n <= ALLOCATOR_SMALL_SIZE:
+        return ALLOCATOR_SMALL_BUFFER
+    if n < ALLOCATOR_MIN_LARGE_ALLOC:
+        return ALLOCATOR_LARGE_BUFFER
+    return ALLOCATOR_ROUND_LARGE * (
+        (n + ALLOCATOR_ROUND_LARGE - 1) // ALLOCATOR_ROUND_LARGE)
+
+
+def capture_reserved_parts(pool_reserved: int, *,
+                           fixed_pinned: int = CAPTURE_FIXED_PINNED) -> dict:
+    """Split the capture window's *reserved* delta into what is derivable.
+
+    The allocated side has a mechanism (`capture_pinned_bytes`). The reserved
+    side does not have one whole mechanism -- it has two halves, and only one
+    of them follows from the allocator's rules:
+
+    * **Outside the capture pools.** The fixed residue is one ~76 MiB request
+      plus two 512 B blocks, so the allocator maps
+      `allocator_segment_bytes(76 MiB) + allocator_segment_bytes(512)`. On the
+      S27 TP=1 window that is 79 691 776 + 2 097 152 = 81 788 928 B, which is
+      the observed figure with **no residual** and no fitted parameter. Note
+      what it says: 1 024 B of live scalars cost a whole 2 MiB segment, so the
+      allocated constant (79 692 800) and its reserved cost (81 788 928) are
+      different numbers.
+    * **Inside the capture pools.** Not derivable from what capture pins. On
+      the same window the pool holds 46 137 344 B reserved while the same rule
+      over the pinned blocks alone predicts 83 886 080 B -- 82% high -- and one
+      of its four segments holds no live block at all. The pool's segments are
+      the high-water mark of the *whole* captured forward, nearly all of which
+      is freed before the window closes. Predicting it needs the captured
+      forward's activation peak, which is O16's quantity, not this one.
+
+    So `pool_reserved` is an input here, not an output. Pass the engine's
+    recorded figure and this reports the split; it does not invent the half
+    that has no derivation yet.
+    """
+    outside = (allocator_segment_bytes(fixed_pinned - 2 * ALLOCATOR_MIN_BLOCK)
+               + allocator_segment_bytes(ALLOCATOR_MIN_BLOCK))
+    return {
+        "outside_pools": int(outside),
+        "outside_pools_derived": True,
+        "pool_reserved": int(pool_reserved),
+        "pool_reserved_derived": False,
+        "total": int(outside) + int(pool_reserved),
+    }
 
 
 def graph_pool_bytes(activation_bytes: int, *, enforce_eager: bool = False,
@@ -907,3 +1422,459 @@ def graph_pool_bytes(activation_bytes: int, *, enforce_eager: bool = False,
         captured.append(num_tokens)
         acc += num_tokens
     return int(per_token * acc)
+
+
+def _is_collective(op) -> bool:
+    """Whether this operator exists only because the model is sharded.
+
+    `group` is set for every collective the tracer or the recorder produced;
+    the name test catches a hand-built `OpSpec` that omitted it.
+    """
+    name = (op.get("name") or "").lower()
+    return bool(op.get("group")) or "all_reduce" in name or "all_gather" in name
+
+
+def lineage_keys(graph) -> list:
+    """A width-invariant identity for each operator, from its ancestry.
+
+    Aligning two graphs by operator index only works while the graphs have the
+    same operators, and tensor parallelism is precisely the case where they do
+    not: every row-parallel matmul gains an all-reduce after it, so index *i*
+    at TP=2 is a different operator from index *i* at TP=1, and the further
+    into the model the further the drift.
+
+    So identity comes from ancestry instead: an operator is the one that ran
+    this name, on values produced by *those* operators, which is recursive and
+    unique in a feed-forward graph -- the second layer's `gemm` has a different
+    chain from the first layer's because its chain contains the first layer.
+    Shapes and dtypes are deliberately not in the key: they are what the
+    comparison is *for*, and putting them in would make every sharded tensor a
+    non-match and report nothing.
+
+    Collectives are transparent. A collective is not a value the model computes,
+    it is a value made whole, and it exists at one width and not another; making
+    it pass its input's identity through is what keeps the operator after it
+    aligned with the operator after the matmul at TP=1. A shape-changing
+    collective (`all_gather`) is passed through for *alignment* only -- its own
+    outputs have no counterpart at TP=1 and are reported as such.
+
+    Returns one key per operator, as a digest of the ancestry itself, so
+    that equal ancestry gives an equal key in two graphs that discovered
+    their operators in different orders -- which two widths do, because a
+    width inserts operators.
+    """
+    ops = graph.get("ops") or ()
+    interned: dict = {}
+    keys: list = []
+    for op in ops:
+        sources = tuple(op.get("inputs_from") or ())
+        if _is_collective(op):
+            # Pass the first produced input's identity through.
+            through = next((keys[s] for s in sources
+                            if 0 <= s < len(keys)), None)
+            keys.append(through if through is not None else "external")
+            continue
+        parents = tuple(keys[s] if 0 <= s < len(keys) else "external"
+                        for s in sources)
+        structure = (op.get("name"), parents)
+        key = interned.get(structure)
+        if key is None:
+            # A digest of the structure, not the order it was met in: an
+            # ordinal would make two graphs agree whenever they happened
+            # to discover the same number of ancestries first, which is
+            # index alignment wearing a different name.
+            key = hashlib.blake2b(repr(structure).encode("utf-8"),
+                                  digest_size=8).hexdigest()
+            interned[structure] = key
+        keys.append(key)
+    return keys
+
+
+def _non_collective_positions(ops) -> list:
+    """Indices of the operators that exist at every width."""
+    return [index for index, op in enumerate(ops) if not _is_collective(op)]
+
+
+def _resolve_through_collectives(ops, index: int) -> int:
+    """Follow a source index past any collectives to the value's real producer.
+
+    A collective is a value made whole, not a value computed, so an operator
+    whose input came from an all-reduce was really fed by whatever fed the
+    all-reduce. Walking through keeps the comparison with TP=1 -- where no
+    collective stands in the way -- an honest one.
+    """
+    seen = 0
+    while 0 <= index < len(ops) and _is_collective(ops[index]):
+        sources = ops[index].get("inputs_from") or ()
+        index = next((s for s in sources if s >= 0), -1)
+        seen += 1
+        if seen > len(ops):          # a cycle cannot happen, but do not hang
+            return -1
+    return index
+
+
+def module_path_keys(graph, module_paths) -> list:
+    """A width-invariant identity taken from the module tree, not the graph.
+
+    `lineage_keys` asks the graph who produced each input, and at TP>1 the
+    graph frequently does not know. In the derived 27B graphs 725 of 4378
+    source edges are -1 at TP=2 and TP=4 against 596 at TP=1, because
+    `_storage_of` collapses on meta tensors (O14) and the collective stand-in
+    returns its own input (O15). An unknown source breaks the ancestry chain
+    and every descendant inherits the break, which is why ancestry alone
+    aligns 12 of 3014 outputs across the three real widths.
+
+    A module path needs the graph to know nothing. It is recorded at trace
+    time by the module hooks, the module tree is the same tree at every width
+    -- only the shard sizes inside it change -- and an operator's ordinal
+    among the *non-collective* operators of its own module separates siblings
+    without a global index that an inserted collective would shift.
+
+    This is ordinal alignment inside a module, and ordinal alignment is the
+    thing `lineage_keys` was written to avoid. So it is not to be used
+    unchecked: `alignment_integrity` is the check, and `width_classes` refuses
+    these keys when that check fails.
+    """
+    ops = graph.get("ops") or ()
+    if len(module_paths) != len(ops):
+        raise ValueError("a module path is needed for every operator: got %d "
+                         "paths for %d operators"
+                         % (len(module_paths), len(ops)))
+    keys: list = []
+    seen: dict = {}
+    for index, op in enumerate(ops):
+        if _is_collective(op):
+            # A collective consumes no ordinal, or the operator after it would
+            # be renumbered at exactly the widths where it appears.
+            sources = tuple(op.get("inputs_from") or ())
+            keys.append(next((keys[s] for s in sources
+                              if 0 <= s < len(keys)), "external"))
+            continue
+        path = module_paths[index] or ""
+        ordinal = seen.get(path, 0)
+        seen[path] = ordinal + 1
+        keys.append(hashlib.blake2b(repr((path, ordinal)).encode("utf-8"),
+                                    digest_size=8).hexdigest())
+    return keys
+
+
+def _named_externals(resolved, row) -> dict:
+    """The recorded identity of each input no operator in the graph produced.
+
+    Keyed by argument position, and "" where the trace has no name for it --
+    an input whose producer the tracer lost reads -1 exactly as a weight does,
+    and the two must not be allowed to look alike here.
+    """
+    outside = {}
+    for position, source in enumerate(resolved):
+        if source >= 0:
+            continue
+        outside[position] = (row[position] if position < len(row) else "")
+    return outside
+
+
+def _origin_verdict(outside: Mapping, widths, keyed: bool) -> str:
+    """Whether the named externals of one aligned operator match across widths.
+
+    Only positions unreadable at *every* width are compared: a position
+    readable at one width and not another says something about the tracer's
+    coverage, not about whether the two operators correspond, and an unnamed
+    input says nothing at all.
+
+    `keyed` is whether the operator has the same name at every width. When it
+    does, the argument position means the same thing on both sides and the
+    names are compared position by position. When it does not, the position
+    means nothing across the pair and only the set of names is comparable:
+    `VocabParallelEmbedding` calls `F.embedding(weight, ids)` at TP=1 and
+    `masked_embedding(ids, weight)` at TP>1 (`embed_head.py:168-178`), which is
+    the same two externals in the other order and is not evidence of a
+    misalignment.
+    """
+    if len(outside) != len(widths):
+        return "unresolved"
+    if not keyed:
+        if any(not name for row in outside.values() for name in row.values()):
+            return "unresolved"
+        distinct = {tuple(sorted(row.values())) for row in outside.values()}
+        return "agrees" if len(distinct) == 1 else "contradicts"
+    common = set.intersection(*(set(row) for row in outside.values()))
+    named = [p for p in common if all(outside[w].get(p) for w in outside)]
+    if not named:
+        return "unresolved"
+    first = widths[0]
+    for position in named:
+        if any(outside[w][position] != outside[first][position]
+               for w in outside):
+            return "contradicts"
+    return "agrees" if len(named) == len(common) else "unresolved"
+
+
+def alignment_integrity(graphs: Mapping, module_paths: Mapping,
+                        input_origins: Optional[Mapping] = None) -> dict:
+    """Whether a module-path alignment may be read at these widths.
+
+    Structural checks, none of them fitted to any measured quantity:
+
+    * every module path holds the same number of non-collective operators at
+      every width. A path whose count differs is a module that did different
+      work at width, and its ordinals then mean different things;
+    * where the ancestry survives at *every* width -- no unknown source on
+      either side, collectives walked through -- it must agree with the
+      alignment the ordinals give. Ancestry that is present is evidence, and
+      evidence that contradicts the alignment ends it;
+    * where it does not survive, `input_origins` -- one recorded identity per
+      input, as `capture_lifetimes.py` writes beside the graph -- can still be
+      compared. An operator reading `layers.7.mlp.down_proj.weight` aligned
+      against one reading the same parameter at another width is evidence of
+      correspondence; one reading a different parameter is evidence against.
+
+    Counting discipline, because these three are not the same claim:
+
+    * `ancestry_agrees` / `ancestry_contradicts` -- the ancestry ran;
+    * `origin_agrees` / `origin_contradicts` -- the ancestry could not run and
+      the named externals were compared instead. Weaker: it says the aligned
+      operators read the same outside tensors, not that they sit at the same
+      place in the graph;
+    * `ancestry_unknown` counts every case the ancestry could not examine, and
+      `origin_unresolved` the ones that neither check reached. A check that
+      cannot run is not a check that passed, and an alignment resting on the
+      ordinals alone stays labelled as resting on the ordinals alone.
+    """
+    widths = sorted(int(w) for w in graphs)
+    if len(widths) < 2:
+        raise ValueError("alignment integrity needs graphs at two or more "
+                         "tensor-parallel widths; got %r" % (widths,))
+
+    def pick(mapping, width):
+        return mapping[width] if width in mapping else mapping[str(width)]
+
+    ops = {w: (pick(graphs, w).get("ops") or ()) for w in widths}
+    paths = {w: pick(module_paths, w) for w in widths}
+    for width in widths:
+        if len(paths[width]) != len(ops[width]):
+            raise ValueError("width %d has %d operators and %d module paths"
+                             % (width, len(ops[width]), len(paths[width])))
+    positions = {w: _non_collective_positions(ops[w]) for w in widths}
+
+    counts = {}
+    for width in widths:
+        table: dict = {}
+        for index in positions[width]:
+            path = paths[width][index] or ""
+            table[path] = table.get(path, 0) + 1
+        counts[width] = table
+    every_path = set()
+    for table in counts.values():
+        every_path |= set(table)
+    disagreeing = sorted(path for path in every_path
+                         if len({counts[w].get(path, 0) for w in widths}) > 1)
+
+    origins = None
+    if input_origins is not None:
+        origins = {w: pick(input_origins, w) for w in widths}
+        for width in widths:
+            if len(origins[width]) != len(ops[width]):
+                raise ValueError("width %d has %d operators and %d origin rows"
+                                 % (width, len(ops[width]),
+                                    len(origins[width])))
+
+    base = widths[0]
+    agrees = contradicts = unknown = 0
+    named = misnamed = unresolved = 0
+    lengths = {w: len(positions[w]) for w in widths}
+    if len(set(lengths.values())) == 1 and not disagreeing:
+        rank = {w: {index: n for n, index in enumerate(positions[w])}
+                for w in widths}
+        for n in range(lengths[base]):
+            chains = {}
+            outside = {}
+            for width in widths:
+                index = positions[width][n]
+                sources = list(ops[width][index].get("inputs_from") or ())
+                resolved = [_resolve_through_collectives(ops[width], s)
+                            for s in sources]
+                if any(s < 0 for s in resolved):
+                    outside[width] = _named_externals(
+                        resolved,
+                        origins[width][index] if origins is not None else ())
+                else:
+                    chains[width] = [rank[width].get(s) for s in resolved]
+            if outside:
+                unknown += 1
+                if origins is None:
+                    continue
+                keyed = len({ops[w][positions[w][n]].get("name")
+                             for w in widths}) == 1
+                verdict = _origin_verdict(outside, widths, keyed)
+                named += verdict == "agrees"
+                misnamed += verdict == "contradicts"
+                unresolved += verdict == "unresolved"
+            elif len({tuple(c) for c in chains.values()}) == 1:
+                agrees += 1
+            else:
+                contradicts += 1
+
+    safe = (not disagreeing and len(set(lengths.values())) == 1
+            and contradicts == 0 and misnamed == 0)
+    return {"widths": widths, "operators_per_width": lengths,
+            "paths_disagreeing": disagreeing,
+            "ancestry_agrees": agrees,
+            "ancestry_contradicts": contradicts,
+            "ancestry_unknown": unknown,
+            "origin_agrees": named,
+            "origin_contradicts": misnamed,
+            "origin_unresolved": unresolved,
+            "safe": safe}
+
+
+def width_classes(graphs: Mapping, module_paths: Mapping = None,
+                  input_origins: Mapping = None) -> dict:
+    """How each tensor's shape actually behaves with width, read off the graphs.
+
+    `graphs` maps a tensor-parallel width to a graph derived at that width. For
+    every output that can be aligned across all of them by `lineage_keys`, this
+    reports what the widths did to its shape:
+
+    * `"replicated"` -- the same shape at every width;
+    * `"sharded"` -- exactly one axis divides by the width ratio, the rest
+      unchanged, and the axis is named;
+    * `"unresolved"` -- anything else, including a shape that changes by a
+      ratio the width does not explain. Reported, not classified.
+
+    This is the check that the trailing-dimension rule could not make. At TP=1
+    an attention output is `[tokens, heads * head_dim]`, and `heads * head_dim`
+    *is* the hidden size, so it is indistinguishable by shape from the residual
+    stream -- and it shards while the residual does not. Reading the width
+    behaviour from graphs derived at each width asks ATOM's own sharding
+    arithmetic instead of guessing from one width's shape, which is a source
+    derivation and not a fit to any measured peak.
+
+    Outputs that exist at one width and not another -- a collective's own
+    result, an all-gather's widened tensor -- are absent from the result rather
+    than guessed at; `width_coverage` says how many those were.
+
+    `module_paths` is optional and maps each width to one module path per
+    operator, as `capture_lifetimes.py` writes beside the graph. Given it,
+    alignment comes from `module_path_keys` rather than `lineage_keys`, and is
+    refused outright unless `alignment_integrity` passes. On the real graphs
+    that is the only alignment available at all: ancestry reaches 12 of 3014
+    outputs there, because the tracer records an unknown producer for a sixth
+    of the source edges at TP>1 (O14, O15). An entry whose operator *name*
+    differs across widths keeps a `names` field, so a join the module tree
+    licenses but the names do not is visible instead of silent.
+    """
+    widths = sorted(int(w) for w in graphs)
+    if len(widths) < 2:
+        raise ValueError("width classification needs graphs at two or more "
+                         "tensor-parallel widths; got %r" % (widths,))
+    if module_paths is not None:
+        integrity = alignment_integrity(graphs, module_paths, input_origins)
+        if not integrity["safe"]:
+            raise ValueError(
+                "module-path alignment is not safe to read at these widths: "
+                "%r" % (integrity,))
+
+    base = widths[0]
+    per_width = {}
+    for width in widths:
+        graph = graphs[width] if width in graphs else graphs[str(width)]
+        if module_paths is None:
+            keys = lineage_keys(graph)
+        else:
+            paths = (module_paths[width] if width in module_paths
+                     else module_paths[str(width)])
+            keys = module_path_keys(graph, paths)
+        table = {}
+        for index, op in enumerate(graph.get("ops") or ()):
+            if _is_collective(op):
+                continue
+            for position, shape in enumerate(op.get("output_shapes") or ()):
+                table[(keys[index], position)] = (op.get("name"),
+                                                  tuple(int(d) for d in shape))
+        per_width[width] = table
+
+    out = {}
+    for ident, (name, base_shape) in per_width[base].items():
+        shapes = {base: list(base_shape)}
+        missing = False
+        for width in widths[1:]:
+            entry = per_width[width].get(ident)
+            if entry is None:
+                missing = True
+                break
+            shapes[width] = list(entry[1])
+        if missing:
+            continue
+        classification, axis = _classify_shapes(shapes, base)
+        entry = {"name": name, "position": ident[1], "shapes": shapes,
+                 "class": classification, "axis": axis}
+        # Two widths can run the same module through different operators --
+        # `VocabParallelEmbedding` emits `aten::embedding` at TP=1 and
+        # `aiter::masked_embedding` above it. A module-path alignment is
+        # right to join those, and wrong to do it silently.
+        names = {w: per_width[w][ident][0] for w in widths}
+        if len(set(names.values())) > 1:
+            entry["names"] = names
+        out[ident] = entry
+    return out
+
+
+def _classify_shapes(shapes: Mapping, base: int) -> tuple:
+    base_shape = shapes[base]
+    if all(list(s) == list(base_shape) for s in shapes.values()):
+        return "replicated", None
+    for axis, extent in enumerate(base_shape):
+        ok = True
+        for width, shape in shapes.items():
+            if len(shape) != len(base_shape):
+                ok = False
+                break
+            ratio = width // base
+            for other, size in enumerate(shape):
+                want = (extent // ratio if other == axis
+                        else base_shape[other])
+                if size != want or (other == axis and extent % ratio):
+                    ok = False
+                    break
+            if not ok:
+                break
+        if ok:
+            return "sharded", axis
+    return "unresolved", None
+
+
+def width_coverage(graphs: Mapping, module_paths: Mapping = None,
+                   input_origins: Mapping = None) -> dict:
+    """How much of each graph the width classification could align at all.
+
+    A classification that quietly drops half the graph is worse than no
+    classification, so the count is reported next to it: outputs aligned,
+    outputs present only at a wider width (a collective's own result), and
+    outputs at the base width with no counterpart.
+
+    `aligned` is coverage, not correspondence. It counts the outputs the
+    ordinals paired up; whether each pair is really the same operator is what
+    `integrity` reports, and it reports it in grades -- ancestry checked, named
+    externals checked, neither -- because those are different strengths of
+    evidence and collapsing them into one number reads as a verification that
+    did not happen.
+    """
+    widths = sorted(int(w) for w in graphs)
+    classes = width_classes(graphs, module_paths, input_origins)
+    counts = {}
+    for width in widths:
+        graph = graphs[width] if width in graphs else graphs[str(width)]
+        counts[width] = sum(
+            len(op.get("output_shapes") or ())
+            for op in (graph.get("ops") or ()) if not _is_collective(op))
+    out = {"aligned": len(classes),
+            "outputs_per_width": counts,
+            "renamed": sum(1 for v in classes.values() if "names" in v),
+            "unaligned_at_base": counts[widths[0]] - len(classes),
+            "by_class": {name: sum(1 for v in classes.values()
+                                   if v["class"] == name)
+                         for name in ("replicated", "sharded", "unresolved")}}
+    if module_paths is not None:
+        out["integrity"] = alignment_integrity(graphs, module_paths,
+                                               input_origins)
+    return out
