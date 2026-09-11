@@ -283,18 +283,22 @@ def test_coverage_split_separates_measured_from_interpolated(tmp_path):
     assert split["complete_measured"] is False
 
 
-def test_a_step_priced_entirely_by_interpolation_is_not_complete(tmp_path):
-    """The property lead's PRICING_API.md asks for, stated as a test.
+def test_a_step_priced_entirely_by_interpolation_is_complete_but_not_measured(
+        tmp_path):
+    """The two completeness questions are different questions.
 
-    ``PriceLibrary.body`` returns a ``Coverage`` whose ``complete`` is
-    ``priced == operators``. An interpolated record increments ``priced`` like
-    any other, so a step summed entirely from interpolations reports itself
-    complete and the distinction is gone from every downstream report.
+    ``complete`` asks whether anything was refused -- whether every operator
+    has a predicted cost at all. A validated in-support interpolation counts,
+    and it has to: predictive coverage is the claim being made, and a rule that
+    made any fitted step incomplete forever would put that claim out of reach.
 
-    This test is expected to fail until ``Coverage`` in
-    ``atom/compass/core/cost/library.py`` carries an ``interpolated`` count of
-    its own and excludes it from ``complete``. That file is the lead's; this is
-    the failing test requested against it.
+    ``complete_measured`` asks the stricter thing: whether none of it was
+    fitted. A step summed entirely from interpolations answers yes to the first
+    and no to the second, and a report that cannot tell them apart overstates
+    its evidence.
+
+    Named against the seam in ``agent_scratch/COVERAGE_SEAM.md``; the counts are
+    asserted explicitly so neither is recoverable only by subtraction.
     """
     library = _library_with(tmp_path, {32: 1e-4, 64: 2e-4})
     graph = {"ops": [gemm(48)], "provenance": {}}
@@ -305,17 +309,11 @@ def test_a_step_priced_entirely_by_interpolation_is_not_complete(tmp_path):
     split = coverage_split(library, graph)
     assert split["interpolated"] == 1 and split["measured"] == 0
 
-    assert hasattr(coverage, "interpolated"), (
-        "Coverage does not distinguish an interpolated price from a measured "
-        "one, so a step summed entirely from interpolations is indistinguishable "
-        "from one summed from measurements")
     assert coverage.interpolated == 1
     assert coverage.measured == 0
-    # Not an acceptance failure: a validated interpolation may well be enough
-    # for complete predictive coverage. What must survive into the report is
-    # that this step was covered by a model and not by a measurement, so the
-    # two completeness questions are asked separately.
-    assert coverage.complete_accounted
+    assert coverage.zero_work == 0
+    assert coverage.priced == 1
+    assert coverage.complete
     assert not coverage.complete_measured
 
 

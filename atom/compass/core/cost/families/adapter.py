@@ -39,14 +39,20 @@ support it was evaluated inside, and the uncertainty those measurements imply.
 Its source string starts with ``interpolated://``, so it is distinguishable from
 a measured source by inspection and not by convention.
 
-That is deliberately not sufficient. ``Coverage`` counts ``priced`` against
-``operators`` and calls the step complete when they match; an interpolated
-record increments ``priced`` like any other, and a step summed entirely from
-interpolations would report itself complete. Keeping the two apart in the
-*counts* is a change to ``Coverage`` in ``library.py``, which is not this
-module's file. :func:`coverage_split` computes the split from a graph so the
-caller can assert on it today, and ``tests/compass/test_family_prices.py``
-carries the test that fails until ``Coverage`` itself carries the third count.
+That is deliberately not sufficient on its own. The markers only matter if the
+*counts* keep them apart, which is ``Coverage`` in ``library.py`` -- not this
+module's file. That split has been agreed and specified in
+``agent_scratch/COVERAGE_SEAM.md``: ``Coverage`` classifies each record as
+zero-work, then interpolated, then measured, in that order, and reports
+``complete`` (nothing refused) separately from ``complete_measured`` (nothing
+fitted either).
+
+Both questions are real and neither subsumes the other. A validated in-support
+interpolation is allowed to make a step ``complete``, because predictive
+coverage is the claim; it is not allowed to make it ``complete_measured``,
+because that would overstate the evidence. :func:`coverage_split` computes the
+same four-way split directly from a graph, so a caller can assert on it
+regardless of which half of the seam it is running against.
 """
 
 from __future__ import annotations
@@ -71,8 +77,21 @@ logger = logging.getLogger(__name__)
 
 __all__ = ["ParametricPriceLibrary", "coverage_split", "INTERPOLATED_SCHEME"]
 
-#: Prefix marking a source string as not a measurement.
-INTERPOLATED_SCHEME = "interpolated://"
+#: The record markers and source prefix the consumer classifies on. They belong
+#: to ``library.py``, which is what reads them; this module takes them from
+#: there as soon as that file exports them, and carries its own copies until
+#: then so the two halves can land in either order. A literal restated in two
+#: files that must agree is how they stop agreeing.
+try:  # pragma: no cover - exercised by whichever half lands second
+    from atom.compass.core.cost.library import (
+        INTERPOLATED_FLAG,
+        INTERPOLATED_SOURCE_PREFIX as INTERPOLATED_SCHEME,
+        ZERO_WORK_FLAG,
+    )
+except ImportError:
+    INTERPOLATED_FLAG = "interpolated"
+    ZERO_WORK_FLAG = "zero_work"
+    INTERPOLATED_SCHEME = "interpolated://"
 
 #: The one refusal a family module is allowed to answer.
 _OPEN_QUESTION = "no entry for this signature"
@@ -203,9 +222,10 @@ class ParametricPriceLibrary(PriceLibrary):
             # The curve already holds this width from another file; that is a
             # measurement, and it is reported as one.
             return (dict(_record(answer, curve, verified_rows),
-                         interpolated=False),
+                         **{INTERPOLATED_FLAG: False}),
                     answer.sources[0])
-        return (dict(_record(answer, curve, verified_rows), interpolated=True),
+        return (dict(_record(answer, curve, verified_rows),
+                     **{INTERPOLATED_FLAG: True}),
                 f"{INTERPOLATED_SCHEME}{contract.family}/rows={verified_rows}")
 
     def _curve_for(self, op: dict):
@@ -356,13 +376,13 @@ def coverage_split(library: PriceLibrary, graph_blob: dict,
             split["refusal_reasons"].setdefault(op.get("name", "?"), detail)
             continue
         seconds = float(record["seconds"])
-        if record.get("zero_work"):
+        if record.get(ZERO_WORK_FLAG):
             # Not a cheap measurement and not a gap: a case the engine is known
             # not to run at all, such as a collective at group width one or the
             # head on a chunk that produces no token. It is fully accounted for
             # and it is not a measurement, so it gets its own count.
             split["zero_work"] += 1
-        elif record.get("interpolated"):
+        elif record.get(INTERPOLATED_FLAG):
             split["interpolated"] += 1
             split["interpolated_seconds"] += seconds
             family = op.get("name", "?")
