@@ -1249,6 +1249,115 @@ distributed GPU work, and it must not carry TP=1's capacity -- 112 772 blocks
 for a rank that owned a whole MI308X -- into a wider cell. Where that line
 falls is the lead's to set, not this guard's.
 
+## The allocation history: what `peak - current` is made of, by address
+
+The activation gate quantity is unchanged and stays `peak_torch - current_torch`
+= 2 956 984 320 B. Nothing below replaces it. What the bounded TP=1 probe adds
+is the *composition* of that number: which storages are live when the allocator
+reaches its high-water mark, identified by address rather than by a count of
+buffers assumed to be preallocated.
+
+The probe wrapped `ModelRunner.warmup_model` in the engine worker, recorded the
+live set immediately before the forward, ran `_record_memory_history` across it,
+and read the allocator's own counters afterwards. Reader:
+`agent_scratch/memval/producer_packet/tp1_probe/read_alloc_probe.py`.
+
+### The replay reconciles at both endpoints, and the second one cost a correction
+
+Replaying 1012 allocations and 1011 frees on top of the 1013 blocks that
+predate the forward gives a running total. Two points on that curve are known
+independently, from `memory_stats()`:
+
+| | replay | allocator |
+|---|---|---|
+| end | 55 014 276 096 | 55 014 276 096 |
+| peak | 57 971 260 416 | 57 971 260 416 |
+
+The first attempt reconciled the end exactly and missed the peak by 1 048 576 B,
+and the reason is worth keeping. The trace records the size *requested*; the
+allocator counts `block->size`. Those differ when a fresh large segment cannot
+be split, because the large pool only splits when the remainder exceeds
+`kSmallSize` (1 MiB) -- a remainder of exactly 1 MiB is absorbed into the block
+and charged. Two segments in this run are in that state: a 541 065 216 B segment
+serving a 540 016 640 B request, and a 2 097 152 B segment serving a 1 048 576 B
+request. Charging the segment in exactly those two cases moves the replayed peak
+from event #132 to event #174 and onto the allocator's figure.
+
+The consequence for the model is small and real: **`peak_torch` includes 1 048 576 B
+that corresponds to no tensor.** A walk that sums tensor bytes cannot reproduce
+the gate quantity exactly. It is 0.035% here, and it is a floor on how close any
+shape-derived walk can get without modelling segment rounding.
+
+### The named preallocated buffers are all outside the gate, and that is now an address match, not a subtraction
+
+All 29 entries of `forward_vars` are live at the peak, and **every one of them
+has an address in the pre-forward live set**. Together they are 172 704 716 B,
+and none of it is in `peak - current`. This is what O19 asked for: the seed set
+for a walk's seen-storages is not a guessed buffer count, it is these addresses.
+
+The sharpest case is `outputs`. It is 167 772 160 B, `[16384, 5120]` bfloat16, at
+address 139699547013120, preallocated and live throughout. During the forward
+`embed_head.py:177` allocates *another* 167 772 160 B block, at address
+139693404454912, and that one is in the gate. Two buffers of identical size and
+shape, one inside `current_torch` and one inside the gap, distinguishable only by
+address. A rule that recognises the preallocated output by its shape would
+suppress the wrong one.
+
+### Eight blocks at the peak, and three of them are allocated inside an opaque operator
+
+| bytes | allocating frame |
+|---:|---|
+| 1 140 850 688 | `aiter/tuned_gemm.py:450 torch_gemm` |
+| 570 425 344 | inductor `c5fb7q7n...py:1227 call` |
+| 541 065 216 | `aiter/tuned_gemm.py:450 torch_gemm` |
+| 201 326 592 | `atom/model_ops/base_attention.py:403 linear_attention_with_output_base` |
+| 167 772 160 | `atom/model_ops/embed_head.py:177 forward` |
+| 167 772 160 | inductor `cwfrpmhu...py:322 call` |
+| 167 772 160 | inductor `c5fb7q7n...py:1212 call` |
+| 79 691 776 | `aiter/tuned_gemm.py:450 torch_gemm` |
+
+Total 3 036 676 096 B across 8 blocks; no block that predates the forward is
+freed during it. 1 761 607 680 B of the peak -- 58% -- is allocated inside
+`aiter::gemm_a16w16`'s implementation, which is the place a dispatch trace
+cannot see into. That is the region O16 named as the candidate for the sharded
+fraction, and it is now located rather than suspected.
+
+### The two components, and why neither is the gate
+
+One block survives the step: 79 691 776 B, allocated at `tuned_gemm.py:450` and
+still live when `current_torch` is read. So
+
+    3 036 676 096  allocated in the forward and live at the peak
+      - 79 691 776  still live at the end, and therefore inside current_torch
+    = 2 956 984 320  peak - current
+
+exactly. Peak-before-baseline and retained-after are the two explanatory
+components of that identity. They are not acceptance metrics and no gate is to
+be restated in terms of them; they say where the gate's bytes come from and
+where the 79 691 776 B the gate does not see has gone.
+
+### A 32 MiB segment is released inside warmup, and the size is a coincidence until it is not
+
+The first event in the trace is `empty_cache` at `model_runner.py:1203`
+releasing a 33 554 432 B segment -- warmup's own bracketing, untouched by the
+probe. A record taken after that release, with the device reading unchanged,
+would show `non_torch` 32 MiB higher and the block count correspondingly lower,
+which is the exact shape of the gap between the two committed TP=1 records
+(O24: `non_torch` +33 554 432, blocks -32). This is a mechanism of the right
+size in the right phase. It is not a demonstration that it is *the* mechanism,
+and the two records still have no run identity to join them on. O11 and O24 stay
+open on the same terms as before.
+
+### What this run does and does not establish about perturbation
+
+The record this run wrote reproduces the exclusive S27 record term for term, and
+the `after` counters match the record the same run emitted. The second of those
+is internal consistency and proves nothing about the probe. The first says the
+probe perturbed no *budgeted* quantity -- the same weights, `non_torch`,
+cudagraph overhead and 112 772 blocks came out. It is not a proof that all
+behaviour was unperturbed, and it is a fourth byte-identical payload, which is
+one more reason not to read byte-identity as identity.
+
 ## Open items
 
 | # | item | needs | status |
@@ -1268,10 +1377,10 @@ falls is the lead's to set, not this guard's.
 | O13 | tensor lifetime at the **source** width, and the sharded/replicated derivation of it for TP=2 and TP=4 | CPU only -- done | **restated and partly closed.** The original item asked for a TP=2/TP=4 warmup capture; that is a target measurement under a source label and is withdrawn. Lifetime is now captured at TP=1 on no device (2999 ops, 2790 deaths) and the width mechanism is read off the shapes. The frozen candidate reads +21.5% at TP=2 and +40.4% at TP=4 against the class-X27 peaks, so the *mechanism* is open: see O16. Three instrumentation defects found on the way (D1-D3), all in files this worker does not own |
 | O14 | `_storage_of` returns 0 for every meta tensor (`runtime/meta.py`), so alias and provenance tracking collapse on any derived graph | **lead** -- shared runtime | open; fix is `untyped_storage()._cdata` when `data_ptr()` is 0, negated so it cannot collide with a device address. Patched locally in `agent_scratch/memval/lifetime/capture_lifetimes.py` |
 | O15 | the collective the derivation records has no output tensor of its own: nothing is watched, so it can never die, and the meta stand-in (`_collective_stand_in`) returns the *input object*, which is the opposite error | **lead** -- shared runtime | open. Cost: 21.9 GiB against a true 2.5 GiB at TP=2, and **it sits under every derived-graph memory walk at TP>1, O8's graph pool included**. The in-place reading is withdrawn: the live implementation allocates a fresh output on every path (packet P2) |
-| O16 | why the derived activation term over-reads at width: +21.5% at TP=2, +40.4% at TP=4 | GPU, TP=1 source only -- the allocation history across `warmup_model`'s step, requested in `agent_scratch/memval/producer_packet/tp1_probe/REQUEST.md` | open, and **narrowed**: the residue is defined at TP=1 by difference, so a replicated over-count is absorbed by it and cancels at every width. The error is in the sharded fraction -- being exact at TP=1 and TP=2 needs ~2.45 GB that divides by width against the walk's 1.71 GB. Allocations made inside opaque custom operators are where a dispatch trace cannot look, and the allocation history can. **No term is to be chosen by the size of the error it removes** |
+| O16 | why the derived activation term over-reads at width: +21.5% at TP=2, +40.4% at TP=4 | GPU, TP=1 source only -- the allocation history across `warmup_model`'s step, requested in `agent_scratch/memval/producer_packet/tp1_probe/REQUEST.md` | open, and **narrowed**: the residue is defined at TP=1 by difference, so a replicated over-count is absorbed by it and cancels at every width. The error is in the sharded fraction -- being exact at TP=1 and TP=2 needs ~2.45 GB that divides by width against the walk's 1.71 GB. Allocations made inside opaque custom operators are where a dispatch trace cannot look, and the allocation history can. **No term is to be chosen by the size of the error it removes**. **Narrowed by the allocation history**: 1 761 607 680 B of the 3 036 676 096 B live at the peak -- 58% -- is allocated inside `aiter/tuned_gemm.py:450`, i.e. inside `aiter::gemm_a16w16`, which is exactly where the dispatch trace cannot look. The region is now located rather than suspected |
 | O17 | the graph pool budget *estimate* and the pool the engine actually reserves are different quantities and are not to be compared as one | -- | open, and separate from O8. O8 is the +26.8% error in the predicted pool at TP=4; this is the prior question of which two numbers that percentage is between |
 | O18 | `OpSpec` records the dtype of each *argument* and never of an output, so every consumer that needs an output's size reads `dtypes[0]` and assumes promotion changed nothing | **lead** -- shared schema (`core/graph.py`, `runtime/meta.py`) | open. `aiter::masked_embedding` takes int32 ids and returns bfloat16: `dtypes[0]` sizes one hidden-width buffer at 335 544 320 B instead of 167 772 160, which is the whole `walk_bytes` / `visible_peak_bytes` gap in the frozen candidate. Fix is an `output_dtypes` field filled from the real outputs and a schema bump (packet P4). Until then the walk on this branch sizes an output by PyTorch's own promotion rule when the graph records no dtype -- float beats int, and float16 with bfloat16 gives float32 -- labels the basis `recorded`, `unanimous` or `promoted`, and reports every non-`recorded` output through `dtype_ambiguities`. The masked_embedding case is now right by rule rather than by name, and the ad-hoc correction that was subtracting 167 772 160 B is deleted. Refusal is available but not the default: `strict_dtypes=True` raises `UnfoundedActivation` on the first output the graph does not record, which is what a consumer that must not guess should pass |
-| O19 | the tracer's "unseen destination is a fresh allocation" rule cannot tell a buffer allocated before the traced region from one allocated invisibly inside a custom operator | **lead** -- shared runtime | open. `forward_vars["outputs"]` (`model_runner.py:1290`) is 167 772 160 B allocated at engine init, so it is inside `current_torch` and cannot be part of `peak - current`; the walk counts a write into it as an allocation. Fix is to seed the seen-set with the storages that exist when the region opens. Note this is a *replicated* over-count and therefore cancels at width -- it is a TP=1 accuracy item, not the cause of O16 |
+| O19 | the tracer's "unseen destination is a fresh allocation" rule cannot tell a buffer allocated before the traced region from one allocated invisibly inside a custom operator | **lead** -- shared runtime | open. `forward_vars["outputs"]` (`model_runner.py:1290`) is 167 772 160 B allocated at engine init, so it is inside `current_torch` and cannot be part of `peak - current`; the walk counts a write into it as an allocation. Fix is to seed the seen-set with the storages that exist when the region opens. Note this is a *replicated* over-count and therefore cancels at width -- it is a TP=1 accuracy item, not the cause of O16. The seed set is no longer hypothetical: all 29 `forward_vars` are live at the peak and every one has a pre-forward address, 172 704 716 B in total. `outputs` is the sharp case -- `embed_head.py:177` allocates a second block of the identical 167 772 160 B and shape during the forward, so the two are separable by address and by nothing else |
 | O20 | mutability, alias and output-dtype contracts of the fused computation operators, not just the collectives | source + registered schema, CPU only -- done | **closed, and it found nothing wrong with the walk.** `silu_and_mul` and `_fused_qk_rmsnorm_group_quant_kernel` are destination-passing and record no output; `gemm_a16w16`, `linear_attention_with_output_base` and `unified_attention_with_output_base` return genuinely fresh tensors, by schema and by implementation (`base_attention.py:403`). No double count. Two by-products: `mutates_args="unknown"` marks weight arguments mutable, so `(a!)` in this registry is not evidence of mutation (O22), and `fused_allreduce_rmsnorm_` is absent from the 27B's graph at every width |
 | O21 | the 2999-operator TP=1 lifetime trace against the 2439-operator body graph | the two artifacts, CPU only -- done | **closed.** Same region, device, compilation level, redirections and scope; the only difference is step kind, and the operator arithmetic closes with no remainder: 2999 - 416 (GDN chunked-prefill path) - 144 (drift) + 32 (decode's mrope and `aten::min`) = 2439. The prefill graph is the one shaped like `warmup_model`; the decode graph never was a candidate. The two caveats that remain on the prefill graph are its own: `compilation_level: 0`, and a scope that excludes `compute_logits` and the sampler |
 | O22 | whether `torch_compile_guard(mutates_args="unknown")` declares mutation the implementation does not perform | one schema read, CPU only -- done | **closed, and it does.** `aiter::gemm_a16w16(Tensor(a0!) A, Tensor(a1!) B, ...)` marks the weight matrix mutable; `fused_allreduce_rmsnorm_` marks the norm weight mutable. The usable half of the schema is the return annotation: an aliasing return must be declared, and `all_reduce_ -> Tensor` is unannotated, so the schema independently confirms the collective is out-of-place |
