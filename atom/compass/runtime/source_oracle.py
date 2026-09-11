@@ -85,6 +85,74 @@ def _flag(value, what: str) -> bool:
                      f"got {value!r}")
 
 
+#: "interpolate at whatever density the provider itself declares". A sentinel
+#: rather than the number, so turning interpolation on from a command line does
+#: not restate a constant that lives in the provider and could drift from it.
+_DEFAULT_GAP_RATIO = "provider default"
+
+
+def _gap_ratio(value, what: str = "interpolate"):
+    """The declared sampling density, or `None` for exact prices only.
+
+    A ratio and not a flag, because that is the thing the caller is actually
+    asserting: the widest ratio between two adjacent measured row counts their
+    evidence supports interpolating across. ``true`` is accepted as the
+    family default so a command line can turn it on without also choosing a
+    number, and a ratio below 1 is refused rather than clamped -- it would name
+    a gap narrower than no gap at all.
+    """
+    if value in (None, "", False, 0):
+        return None
+    if value is True:
+        return _DEFAULT_GAP_RATIO
+    if isinstance(value, str) and value.strip().lower() in (
+            "1", "true", "yes", "on"):
+        return _DEFAULT_GAP_RATIO
+    if isinstance(value, str) and value.strip().lower() in (
+            "false", "no", "off"):
+        return None
+    try:
+        ratio = float(value)
+    except (TypeError, ValueError):
+        raise ValueError(
+            f"{what}: expected a max gap ratio, true, or off, "
+            f"got {value!r}") from None
+    if ratio < 1.0:
+        raise ValueError(f"{what}: {ratio} is narrower than adjacent measured "
+                         "points, so nothing could ever be interpolated")
+    return ratio
+
+
+def _price_library(entries, gap_ratio):
+    """The exact-signature library, or the family provider in front of it.
+
+    The provider is a subclass that overrides `lookup` alone, so everything
+    downstream -- `PriceLibrary.body`, the `Coverage` split, `LibraryCostOracle`
+    -- is the same code either way, and a derived price arrives carrying its own
+    ``interpolated`` marker rather than being counted as a measurement.
+
+    Off by default. An interpolated price is a claim about a row count nobody
+    ran, and a run that did not ask for one should not silently get one.
+    """
+    from atom.compass.core.cost.library import PriceLibrary
+
+    if gap_ratio is None:
+        return PriceLibrary.load(entries)
+
+    from atom.compass.core.cost.families import ParametricPriceLibrary
+
+    library = (ParametricPriceLibrary()
+               if gap_ratio is _DEFAULT_GAP_RATIO
+               else ParametricPriceLibrary(max_gap_ratio=gap_ratio))
+    for entry in entries:
+        if isinstance(entry, (tuple, list)):
+            library.add(entry[0], entry[1] if len(entry) > 1 else None,
+                        entry[2] if len(entry) > 2 else None)
+        else:
+            library.add(entry, None, None)
+    return library
+
+
 def _rank_coords(value):
     """This rank's coordinates, from what a `KEY=VALUE` command line carries.
 
@@ -298,6 +366,7 @@ def build_source_oracle(
     require_complete: bool = True,
     carry_allocation: bool = False,
     derive: bool = True,
+    interpolate=None,
     rank_coords=None,
 ):
     """The frozen composition, from names and paths alone.
@@ -306,6 +375,15 @@ def build_source_oracle(
     settings are what building a deriver costs; they are required only when
     ``derive`` is on, so a run that seeds every template it needs can leave the
     model out and never load one.
+
+    ``interpolate`` selects the per-family price provider and declares the
+    sampling density it may work over: the widest ratio between two adjacent
+    measured row counts it may interpolate across. ``true`` takes the
+    provider's own declared default; leaving it out means exact prices only,
+    and an operator at a row count nobody measured is refused with the reason
+    rather than answered from a fit. What it changes is which prices exist, not
+    how they are counted: a fitted price arrives marked, so `Coverage` reports
+    it as interpolated and `complete_measured` goes false.
 
     ``rank_coords`` is this rank's coordinates, as ``tp:2`` or a dict. It
     selects artifacts and nothing else, and the distinction is worth being
@@ -331,7 +409,7 @@ def build_source_oracle(
     It falls through to derivation, or -- with ``derive=0`` -- is refused. That
     is reported at build time rather than as a hundred identical misses later.
     """
-    from atom.compass.core.cost.library import LibraryCostOracle, PriceLibrary
+    from atom.compass.core.cost.library import LibraryCostOracle
     from atom.compass.core.cost.regions import region_model
     from atom.compass.runtime.templates import CarriedAllocation
 
@@ -350,7 +428,7 @@ def build_source_oracle(
             "on.")
 
     price_entries = price_specs(_entries(price, "price"), coords)
-    library = PriceLibrary.load(price_entries)
+    library = _price_library(price_entries, _gap_ratio(interpolate))
     regions_model = region_model(regions)
     rank_artifacts = _rank_artifacts(
         coords, _entries(price, "price"), templates, head_templates)

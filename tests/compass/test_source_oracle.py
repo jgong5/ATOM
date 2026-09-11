@@ -482,3 +482,69 @@ class TestTheRankTheServedPathActuallyBuildsWith:
             capture_bucket=2, compiled=None, produces_output=True)
         assert built.body_graphs.graph_for(at_one) is not None
         assert built.body_graphs.representative_hits == 1
+
+
+class TestAskingForFittedPrices:
+    """The family provider, reachable from the same command line.
+
+    It is off unless asked for. An interpolated price is an answer about a row
+    count nobody ran, and the difference between "we measured this" and "we
+    fitted this" is the difference the whole coverage split exists to keep -- so
+    a served run gets one only by saying so, and the ratio it says names the
+    sampling density its own evidence supports.
+    """
+
+    @staticmethod
+    def _built(tmp_path, **over):
+        return build_source_oracle(
+            price=f"{_price_file(tmp_path)}:{_template_file(tmp_path)}",
+            template=_template_file(tmp_path), derive=0,
+            regions="source-27b-tp1-conc-v2", **over)
+
+    def test_prices_are_exact_unless_interpolation_is_asked_for(self, tmp_path):
+        from atom.compass.core.cost.families import ParametricPriceLibrary
+
+        library = self._built(tmp_path).oracle.library
+        assert not isinstance(library, ParametricPriceLibrary)
+
+    def test_asking_for_it_by_the_word_takes_the_declared_density(self, tmp_path):
+        """`true` is the provider's own default, not a number restated here."""
+        from atom.compass.core.cost.families import ParametricPriceLibrary
+
+        library = self._built(tmp_path, interpolate="true").oracle.library
+        assert isinstance(library, ParametricPriceLibrary)
+        assert library.max_gap_ratio == ParametricPriceLibrary().max_gap_ratio
+
+    def test_a_ratio_is_carried_through_as_given(self, tmp_path):
+        # `arg_utils` turns `interpolate=1.5` on a command line into a float,
+        # and a programmatic caller passes one; both reach the provider.
+        assert self._built(tmp_path,
+                           interpolate=1.5).oracle.library.max_gap_ratio == 1.5
+
+    def test_a_ratio_under_one_is_refused_rather_than_clamped(self, tmp_path):
+        with pytest.raises(ValueError) as exc:
+            self._built(tmp_path, interpolate=0.5)
+        assert "interpolate" in str(exc.value)
+
+    def test_a_value_that_is_neither_is_refused(self, tmp_path):
+        with pytest.raises(ValueError):
+            self._built(tmp_path, interpolate="sometimes")
+
+    def test_the_graph_reaches_the_provider_and_not_just_the_price_list(
+            self, tmp_path):
+        """Without the graph a family has no structure to read a feature off.
+
+        The triple is split before the library is built, so a provider handed
+        only the first part would load every file as exact-signature-only.
+        What it says about the file is how the two cases are told apart: given
+        the graph it names that graph and what the graph itself lacks, and
+        given no graph it says there was none.
+        """
+        graph = _template_file(tmp_path)
+        library = self._built(tmp_path, interpolate="true").oracle.library
+        assert graph in "".join(library.unbuildable.values())
+        bare = build_source_oracle(
+            price=_price_file(tmp_path), template=_template_file(tmp_path),
+            derive=0, regions="source-27b-tp1-conc-v2",
+            interpolate="true").oracle.library
+        assert "no graph supplied" in "".join(bare.unbuildable.values())
