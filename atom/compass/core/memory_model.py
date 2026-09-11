@@ -42,7 +42,7 @@ __all__ = ["peak_activation_bytes", "activation_curve", "weight_bytes",
            "modelled_readings", "activation_bytes_at",
            "scratch_bytes_per_token", "liveness_is_recorded", "traced_shape",
            "UnfoundedActivation", "UnfoundedPrediction",
-           "derived_readings", "CALIBRATED_TERMS",
+           "derived_readings", "CALIBRATED_TERMS", "traced_width",
            "graph_pool_bytes", "measured_graph_pool_bytes", "ELEMENT_BYTES"]
 
 ELEMENT_BYTES = {
@@ -157,6 +157,20 @@ def liveness_is_recorded(graph) -> bool:
         for op in (graph.get("ops") or ())
         for death in (op.get("dies_at") or ())
     )
+
+
+def traced_width(graph) -> Optional[int]:
+    """The tensor-parallel width the graph was traced at, or None.
+
+    From `key.topology`, which is how a graph records the group it ran in.
+    None means the graph does not say -- not "width one". The difference
+    matters: the activation peak is the one term that shards, so a graph whose
+    width is unknown cannot be scaled to a target of known width, and guessing
+    one is how a TP=1 peak ends up inside a TP=4 budget.
+    """
+    topology = dict((graph.get("key") or {}).get("topology") or ())
+    width = topology.get("tp")
+    return int(width) if width else None
 
 
 def traced_shape(graph) -> tuple:
@@ -592,7 +606,20 @@ def derived_readings(profile: Mapping, *, warmup_tokens: int,
     if not graph_path:
         refuse("no operator graph, so the activation peak has no evidence")
 
-    activation = activation_bytes_at(load(graph_path), int(warmup_tokens))
+    graph = load(graph_path)
+    width = int(profile.get("world_size") or 1)
+    traced = traced_width(graph)
+    if traced is None:
+        refuse("an operator graph that does not record the tensor-parallel "
+               "width it was traced at (`key.topology`), and the activation "
+               "peak is the one term that shards")
+    if traced != width:
+        refuse("an operator graph traced at TP=%d for a prediction at TP=%d. "
+               "The activation peak shards and the walk cannot be re-sharded "
+               "after the fact; trace the graph at the target width"
+               % (traced, width))
+
+    activation = activation_bytes_at(graph, int(warmup_tokens))
     calibration = _prediction_calibration(profile, load, refuse, source)
     readings = modelled_readings(
         total_bytes=total, world_size=int(profile.get("world_size") or 1),

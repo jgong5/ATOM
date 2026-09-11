@@ -573,7 +573,7 @@ _FOUNDED_PROFILE = {
 
 def _founded(profile=None, calibration=None, graph=None):
     """A profile, a loader for its side files, and whatever was overridden."""
-    walked = {"key": {"batch_signature": [100]},
+    walked = {"key": {"batch_signature": [100], "topology": [["tp", 1]]},
               "ops": [_op([1000], dtype="bfloat16", dies_at=0)]}
     files = {"graph.json": graph if graph is not None else walked,
              "calibration.json": dict(_FOUNDED_CALIBRATION, **(calibration or {}))}
@@ -592,6 +592,31 @@ class TestAPredictionThatCannotBeMadeIsRefused:
     every one of them is that it raises, and that the message names the term --
     a refusal nobody can act on is only a different kind of dead end.
     """
+
+    def test_a_graph_traced_at_another_width_is_not_stretched_to_this_one(self):
+        """The activation peak is the one term that shards.
+
+        Everything else in the budget is either flat in width or has its own
+        per-width table; the peak is walked from a graph, and a walk cannot be
+        re-sharded after the fact. Handing a TP=1 graph to a TP=4 prediction
+        would have produced a number four ranks wide in a budget one rank wide,
+        with nothing in the readings to show for it. This is the gate a TP>1
+        prediction currently stops at, and stopping is correct until a graph is
+        traced at that width.
+        """
+        profile, load = _founded({"world_size": 4})
+        with pytest.raises(UnfoundedPrediction) as refusal:
+            derived_readings(profile, warmup_tokens=200, load=load)
+        assert "TP=1" in str(refusal.value) and "TP=4" in str(refusal.value)
+
+    def test_a_graph_that_does_not_say_its_width_is_not_assumed_narrow(self):
+        """Silence is not width one -- that guess is the whole failure."""
+        profile, load = _founded(
+            graph={"key": {"batch_signature": [100]},
+                   "ops": [_op([1000], dtype="bfloat16", dies_at=0)]})
+        with pytest.raises(UnfoundedPrediction) as refusal:
+            derived_readings(profile, warmup_tokens=200, load=load)
+        assert "topology" in str(refusal.value)
 
     def test_a_founded_profile_derives_all_five(self):
         profile, load = _founded()
@@ -629,7 +654,7 @@ class TestAPredictionThatCannotBeMadeIsRefused:
 
     def test_a_graph_with_nothing_to_walk_reaches_the_caller(self):
         """`UnfoundedActivation` is a refusal too, and must not be swallowed."""
-        graph = {"key": {"batch_signature": [100]},
+        graph = {"key": {"batch_signature": [100], "topology": [["tp", 1]]},
                  "ops": [dict(_op([1000], dtype="bfloat16"), dies_at=[-1])]}
         profile, load = _founded(graph=graph)
         with pytest.raises(UnfoundedActivation):
