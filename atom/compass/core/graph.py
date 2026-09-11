@@ -74,7 +74,18 @@ class OpSpec:
             `__torch_dispatch__` runs below the mode. At TP=1 the MLP's silu
             destination is 13.6 MB a layer and is exactly where the allocator's
             high-water mark sits.
-        dtypes: Dtype of each tensor argument, in order.
+        dtypes: Dtype of each tensor argument, in order. Inputs only; the name
+            is historical and is not being changed, because it is part of the
+            key every frozen price was written under.
+        output_dtypes: Dtype of each tensor result, positionally alongside
+            `output_shapes`. An operator's output dtype is not a function of
+            its inputs': `aiter::masked_embedding` takes int32 ids and returns
+            bfloat16 activations, so a reader sizing its output at the first
+            input's dtype counts a 16384x5120 buffer at 335 MB where it is 167.
+            Empty in a graph written before this was recorded, and empty means
+            *not known* rather than *the same as the input* -- a reader has to
+            be able to tell those apart, because the second is a guess that is
+            usually right and is exactly wrong where it matters.
         group: For a collective, the communication group it ran on. ``None``
             for local computation.
         int_values: Contents of the small integer tensor arguments, as
@@ -215,6 +226,7 @@ class OpSpec:
     input_shapes: tuple[tuple[int, ...], ...] = ()
     output_shapes: tuple[tuple[int, ...], ...] = ()
     dtypes: tuple[str, ...] = ()
+    output_dtypes: tuple[str, ...] = ()
     group: Optional[str] = None
     scalars: tuple[tuple[str, Any], ...] = ()
     int_values: tuple[tuple[int, tuple[int, ...]], ...] = ()
@@ -275,7 +287,14 @@ class OpGraph:
 
     def to_dict(self) -> dict:
         return {
-            "version": 2,
+            # 3 adds `output_dtypes`. The bump is what lets a reader tell an
+            # operator whose outputs were recorded as having no dtype -- there
+            # are none, or none shaped -- from one written before the field
+            # existed, where the absence says nothing at all. Version 2 and 1
+            # still load; they simply cannot answer that question, and a
+            # consumer that needs an output dtype from them has to say so
+            # rather than reach for the input's.
+            "version": 3,
             "key": None if self.key is None else {
                 "model_id": self.key.model_id,
                 "topology": [list(t) for t in self.key.topology],
@@ -289,6 +308,7 @@ class OpGraph:
                     "input_shapes": [list(s) for s in op.input_shapes],
                     "output_shapes": [list(s) for s in op.output_shapes],
                     "dtypes": list(op.dtypes),
+                    "output_dtypes": list(op.output_dtypes),
                     "group": op.group,
                     "scalars": [list(kv) for kv in op.scalars],
                     "int_values": [[i, list(v)] for i, v in op.int_values],
@@ -310,7 +330,7 @@ class OpGraph:
     @classmethod
     def from_dict(cls, data: dict) -> "OpGraph":
         version = data.get("version")
-        if version not in (1, 2):
+        if version not in (1, 2, 3):
             raise ValueError(f"unsupported op-graph version: {version!r}")
         key = None
         raw_key = data.get("key")
@@ -329,6 +349,11 @@ class OpGraph:
                     input_shapes=tuple(tuple(s) for s in op["input_shapes"]),
                     output_shapes=tuple(tuple(s) for s in op["output_shapes"]),
                     dtypes=tuple(op["dtypes"]),
+                    # Absent below version 3, and left empty rather than
+                    # filled from `dtypes`: a reconstructed value would be
+                    # indistinguishable from a recorded one and would carry
+                    # the old assumption forward under a new field's name.
+                    output_dtypes=tuple(op.get("output_dtypes") or ()),
                     group=op["group"],
                     # Absent from graphs written before scalars were recorded;
                     # those simply cannot be replayed to price their operators.

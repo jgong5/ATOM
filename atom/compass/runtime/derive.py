@@ -93,6 +93,9 @@ def head_gather_opspec(group, input_, dim: int = -1, group_name: str = "tp"):
         input_shapes=(tuple(int(d) for d in input_.shape),),
         output_shapes=(tuple(shape),),
         dtypes=(str(input_.dtype).replace("torch.", ""),),
+        # A gather concatenates its inputs; it does not convert them. Recorded
+        # rather than left empty, because here it is known and not inferred.
+        output_dtypes=(str(input_.dtype).replace("torch.", ""),),
         group=group_name,
         # The group, explicitly, rather than left to be inferred from the ratio
         # of the two shapes. A pricer for this operator does not rebuild a call
@@ -247,6 +250,10 @@ class record_collectives:
                 input_shapes=(tuple(int(d) for d in input_.shape),),
                 output_shapes=(tuple(int(d) for d in input_.shape),),
                 dtypes=(str(input_.dtype).replace("torch.", ""),),
+                # A sum over ranks, in the dtype it reduces. Every native path
+                # allocates with `empty_like`/`zeros_like`/`clone`, all of
+                # which take the input's dtype.
+                output_dtypes=(str(input_.dtype).replace("torch.", ""),),
                 group=name,
                 scalars=(("#1", str(group.unique_name)),
                          ("#2", bool(flags["ca_use_new"])),

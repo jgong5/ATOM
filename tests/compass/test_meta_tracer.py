@@ -292,3 +292,74 @@ class TestTheCollectiveStandIn:
         assert tracer.graph.ops[-1].inputs_from == (index,)
         # The gemm's output died at the collective, not at the end of the step.
         assert tracer.deaths.get((0, 0)) == index
+
+
+class TestTheOutputDtypeIsRecordedNotInferred:
+    """The one dtype a graph could not previously state.
+
+    A reader that needs an output's dtype had one place to get it: the first
+    input's. That is right for the elementwise and matmul operators holding
+    most of the memory, and wrong for exactly the operator that converts --
+    which is also the first operator of the step. `aiter::masked_embedding`
+    takes int32 token ids and returns bfloat16 activations, so the assumption
+    sizes a 16384x5120 output at 4 bytes an element instead of 2.
+    """
+
+    @pytest.mark.parametrize("device", ["cpu", "meta"])
+    def test_a_converting_operator_reports_its_own_dtype(self, device):
+        tracer = MetaOpTracer()
+        ids = torch.zeros(8, dtype=torch.int32, device=device)
+        table = torch.zeros(16, 4, dtype=torch.bfloat16, device=device)
+        with tracer:
+            torch.embedding(table, ids.to(torch.int64))
+        cast, emb = tracer.graph.ops[0], tracer.graph.ops[-1]
+        # The cast, where input0's dtype is plainly the wrong answer.
+        assert cast.dtypes[0] == "int32"
+        assert cast.output_dtypes == ("int64",)
+        # The lookup: ids in, activations out, at the table's dtype and not
+        # at whichever argument happens to come first.
+        assert emb.name == "aten::embedding"
+        assert emb.output_dtypes == ("bfloat16",)
+
+    @pytest.mark.parametrize("device", ["cpu", "meta"])
+    def test_it_stays_positional_with_the_shapes(self, device):
+        tracer, _ = _trace(device)
+        for op in tracer.graph.ops:
+            assert len(op.output_dtypes) == len(op.output_shapes)
+            assert len(op.output_dtypes) == len(op.output_aliases)
+
+    @pytest.mark.parametrize("device", ["cpu", "meta"])
+    def test_a_recovered_destination_is_dtyped_as_an_output(self, device):
+        """The out-variant path assigns `outs` after the dtypes would be read.
+
+        Computing them any earlier gives this operator an empty tuple beside a
+        one-element `output_shapes`, which is the positional mismatch the test
+        above would then catch somewhere else entirely.
+        """
+        tracer = MetaOpTracer()
+        x = torch.ones(4, 4, device=device)
+        out = torch.empty(4, 4, device=device)
+        with tracer:
+            torch.ops.compass_test.fill_(out, x)
+        op = tracer.graph.ops[0]
+        assert op.output_shapes == ((4, 4),)
+        assert op.output_dtypes == ("float32",)
+
+    def test_it_survives_a_round_trip_and_an_old_graph_does_not_invent_one(self):
+        from atom.compass.core.graph import OpGraph
+
+        graph = OpGraph()
+        graph.add(OpSpec(name="aiter::masked_embedding",
+                         output_shapes=((16384, 5120),),
+                         dtypes=("int32",), output_dtypes=("bfloat16",)))
+        data = graph.to_dict()
+        assert data["version"] == 3
+        assert OpGraph.from_dict(data).ops[0].output_dtypes == ("bfloat16",)
+
+        # A graph written before the field existed. Empty, not back-filled
+        # from `dtypes` -- a reconstructed value would be indistinguishable
+        # from a recorded one, and it is the reconstruction that was wrong.
+        old = dict(data, version=2)
+        old["ops"] = [{k: v for k, v in op.items() if k != "output_dtypes"}
+                      for op in old["ops"]]
+        assert OpGraph.from_dict(old).ops[0].output_dtypes == ()

@@ -721,6 +721,12 @@ class MetaOpTracer(TorchDispatchMode):
                 outs = (unseen,)
                 out_shapes = (_shape_of(unseen),)
                 output_aliases = (None,)
+        # After the recovery, so a destination recovered as this operator's
+        # output is dtyped as one. Same filter as `out_shapes`, so the two stay
+        # positional with each other and with `output_aliases`.
+        out_dtypes = tuple(
+            str(o.dtype).replace("torch.", "")
+            for o in outs if _shape_of(o) is not None)
         self._seen.update(
             key for key in (_storage_of(t) for t in tensors
                             if isinstance(t, torch.Tensor))
@@ -733,6 +739,7 @@ class MetaOpTracer(TorchDispatchMode):
                     input_shapes=in_shapes,
                     output_shapes=out_shapes,
                     dtypes=dtypes,
+                    output_dtypes=out_dtypes,
                     group=_resolve_group(name, self.topology),
                     scalars=_scalars_of(args, kwargs),
                     int_values=_int_values_of(tensors),
