@@ -15,7 +15,8 @@ from atom.compass.core.memory_model import (
     activation_bytes_at, activation_curve, graph_pool_bytes,
     load_residue_bytes, measured_graph_pool_bytes, modelled_readings,
     non_torch_bytes, peak_activation_bytes, scratch_bytes_per_token,
-    weight_bytes)
+    liveness_is_recorded, traced_shape, UnfoundedActivation,
+    UnfoundedPrediction, derived_readings, weight_bytes)
 
 
 def _write_checkpoint(directory, tied, tensors):
@@ -362,11 +363,11 @@ class TestSizingWithoutADevice:
 class TestScalingToAShapeNobodyTraced:
     def test_the_peak_is_linear_in_tokens(self):
         graph = {"key": {"batch_signature": [100]},
-                 "ops": [_op([1000], dtype="bfloat16")]}
+                 "ops": [_op([1000], dtype="bfloat16", dies_at=0)]}
         assert activation_bytes_at(graph, 200) == 2 * peak_activation_bytes(graph)
 
     def test_a_graph_that_names_no_shape_is_taken_as_it_stands(self):
-        graph = {"ops": [_op([1000], dtype="bfloat16")]}
+        graph = {"ops": [_op([1000], dtype="bfloat16", dies_at=0)]}
         assert activation_bytes_at(graph, 200) == peak_activation_bytes(graph)
 
 
@@ -431,7 +432,7 @@ class TestWhatTheTracerCannotSee:
 
     def _graph(self, measured=None, tokens=100):
         graph = {"key": {"batch_signature": [tokens]},
-                 "ops": [_op([1000], dtype="bfloat16")]}
+                 "ops": [_op([1000], dtype="bfloat16", dies_at=0)]}
         if measured is not None:
             graph["provenance"] = {"activation_peak_bytes": measured}
         return graph
@@ -467,3 +468,235 @@ class TestWhatTheTracerCannotSee:
         at100 = activation_bytes_at(graph, 100)
         at200 = activation_bytes_at(graph, 200)
         assert at200 == pytest.approx(2 * at100, rel=1e-6)
+
+
+class TestWhatTheGraphDoesNotSay:
+    """Two questions the walk was answering by guessing, now asked out loud."""
+
+    def test_a_derivation_records_no_deaths_and_says_so(self):
+        """The 27B's meta-derived prefill graphs, in miniature.
+
+        Nothing runs on meta, so no finalizer fires and no `dies_at` is
+        written. `_deaths` still returns a map -- it falls back to last-read --
+        and the walk still returns a number. On `s27prefhead.tp1` that number
+        is 570 425 344 B against a measured 2 956 984 320 B: 19.3% of the term,
+        all of it from 64 `aten::empty.memory_format` allocations with no
+        recorded death. The figure is not wrong so much as unfounded, and the
+        caller has to be able to tell.
+        """
+        derived = {"ops": [dict(_op([1024]), dies_at=[-1]),
+                           dict(_op([1024], inputs_from=[0]), dies_at=[-1])]}
+        captured = {"ops": [_op([1024], dies_at=1), _op([1024], inputs_from=[0])]}
+
+        assert liveness_is_recorded(derived) is False
+        assert liveness_is_recorded(captured) is True
+        # And the walk answers anyway, which is the point.
+        assert peak_activation_bytes(derived) > 0
+
+    def test_a_graph_with_no_dies_at_field_at_all_is_not_recorded_liveness(self):
+        graph = {"ops": [{"name": "aten::x", "output_shapes": [[1024]],
+                          "dtypes": ["float32"], "output_aliases": [None],
+                          "inputs_from": []}]}
+        assert liveness_is_recorded(graph) is False
+
+    def test_the_shape_is_queries_and_history_not_a_token_total(self):
+        """`s27prefhead` and `s27prefdeep` have identical keys.
+
+        Both are `batch_signature [16384]`; one starts cold and the other
+        carries 98 304 cached tokens. Anything matching on the sum takes
+        whichever it is handed. The spec the derivation was asked for is in
+        the provenance, and that is where the difference lives.
+        """
+        head = {"key": {"batch_signature": [16384]},
+                "provenance": {"batch_spec": {"query_lens": [16384],
+                                              "context_lens": [16384]}}}
+        deep = {"key": {"batch_signature": [16384]},
+                "provenance": {"batch_spec": {"query_lens": [16384],
+                                              "context_lens": [114688]}}}
+        assert head["key"] == deep["key"]
+        assert traced_shape(head) == ((16384,), (16384,))
+        assert traced_shape(deep) == ((16384,), (114688,))
+
+    def test_a_capture_says_its_shape_in_its_own_words(self):
+        """`provenance.shape`, which is what a device trace writes."""
+        graph = {"key": {"batch_signature": [3494]},
+                 "provenance": {"shape": {"num_scheduled_tokens": [3494],
+                                          "context_lens": [3494]}}}
+        assert traced_shape(graph) == ((3494,), (3494,))
+
+    def test_an_unlabelled_graph_reports_no_history_rather_than_zero(self):
+        """`()` is "unknown", and the caller must not read it as "cold"."""
+        assert traced_shape({"key": {"batch_signature": [512, 512]}}) == (
+            (512, 512), ())
+
+    def test_a_budget_is_refused_rather_than_built_on_a_guess(self):
+        """`activation_bytes_at` is the budget-facing entry point.
+
+        Refusing is the whole point: a caller sizing a configuration nobody has
+        run has nothing to fall back on, so a quiet 19% understatement becomes
+        a pool sized too large and an engine that cannot start. A measured peak
+        is enough on its own -- `scratch_bytes_per_token` carries whatever the
+        walk missed -- so only a graph with neither is refused.
+        """
+        guessed = {"key": {"batch_signature": [100]},
+                   "ops": [dict(_op([1000], dtype="bfloat16"), dies_at=[-1])]}
+        with pytest.raises(UnfoundedActivation):
+            activation_bytes_at(guessed, 200)
+
+        measured = dict(guessed,
+                        provenance={"activation_peak_bytes": 4000})
+        assert activation_bytes_at(measured, 100) == 4000
+
+        walked = {"key": {"batch_signature": [100]},
+                  "ops": [_op([1000], dtype="bfloat16", dies_at=0)]}
+        assert activation_bytes_at(walked, 200) == 4000
+
+
+#: A calibration that could found a prediction: every term the model would
+#: otherwise default, and a provenance class for each saying it was fitted at
+#: the source configuration rather than read off the target.
+_FOUNDED_CALIBRATION = {
+    "persistent": 252339712,
+    "non_torch": {"1": 1157627904},
+    "load_residue": {"1": 14924832},
+    "provenance": {"persistent": "S27", "non_torch": "S27",
+                   "load_residue": "S27"},
+}
+
+#: The 27B at TP=1 on an MI308X, as a profile naming its two side files.
+_FOUNDED_PROFILE = {
+    "total": 206141652992, "world_size": 1, "parameters": 54713457120,
+    "buffers": 33554432, "graph": "graph.json",
+    "calibration": "calibration.json",
+}
+
+
+def _founded(profile=None, calibration=None, graph=None):
+    """A profile, a loader for its side files, and whatever was overridden."""
+    walked = {"key": {"batch_signature": [100]},
+              "ops": [_op([1000], dtype="bfloat16", dies_at=0)]}
+    files = {"graph.json": graph if graph is not None else walked,
+             "calibration.json": dict(_FOUNDED_CALIBRATION, **(calibration or {}))}
+    return dict(_FOUNDED_PROFILE, **(profile or {})), files.__getitem__
+
+
+class TestAPredictionThatCannotBeMadeIsRefused:
+    """`derived_readings` fails closed, term by term.
+
+    The failure this guards against is not a wrong number, it is a *mislabelled*
+    one. Every refusal here was, until now, a silent substitution: a missing
+    activation peak became zero, an absent `total` became whatever card the run
+    happened to land on, a missing calibration became constants fitted on a
+    0.6B, and any exception on the way became device sizing. Each produced a
+    budget that a reader could not distinguish from a forecast. So the test for
+    every one of them is that it raises, and that the message names the term --
+    a refusal nobody can act on is only a different kind of dead end.
+    """
+
+    def test_a_founded_profile_derives_all_five(self):
+        profile, load = _founded()
+        readings, activation = derived_readings(
+            profile, warmup_tokens=200, load=load)
+        assert sorted(readings) == ["cudagraph_overhead", "free", "non_torch",
+                                    "peak_torch", "total"]
+        assert readings["total"] == 206141652992
+        assert activation == 4000
+        assert readings["peak_torch"] == (
+            54713457120 + 33554432 + 14924832 + 252339712 + 4000)
+
+    def test_no_capacity_is_not_this_cards_capacity(self):
+        """The one term that cannot be derived, and so has to be given.
+
+        Reading it from `mem_get_info` sized the prediction to whichever box
+        the modelling run was launched on, which is the one input a prediction
+        for another machine must not take from here.
+        """
+        profile, load = _founded({"total": 0})
+        with pytest.raises(UnfoundedPrediction, match="total"):
+            derived_readings(profile, warmup_tokens=200, load=load)
+
+    def test_no_graph_is_not_a_zero_activation(self):
+        """Zero was the old default and it is not a small error.
+
+        The activation term is the single largest derived quantity in the
+        budget -- 2.96 GB at the 27B source config. Defaulting it to zero frees
+        that much for KV, and the engine dies at steady state rather than at
+        start-up, where the cause would have been obvious.
+        """
+        profile, load = _founded({"graph": None})
+        with pytest.raises(UnfoundedPrediction, match="activation"):
+            derived_readings(profile, warmup_tokens=200, load=load)
+
+    def test_a_graph_with_nothing_to_walk_reaches_the_caller(self):
+        """`UnfoundedActivation` is a refusal too, and must not be swallowed."""
+        graph = {"key": {"batch_signature": [100]},
+                 "ops": [dict(_op([1000], dtype="bfloat16"), dies_at=[-1])]}
+        profile, load = _founded(graph=graph)
+        with pytest.raises(UnfoundedActivation):
+            derived_readings(profile, warmup_tokens=200, load=load)
+        assert issubclass(UnfoundedActivation, UnfoundedPrediction)
+
+    def test_no_warmup_shape_is_refused(self):
+        """A peak is a peak *at a shape*; without one there is nothing to scale."""
+        profile, load = _founded()
+        with pytest.raises(UnfoundedPrediction, match="max_num_batched_tokens"):
+            derived_readings(profile, warmup_tokens=0, load=load)
+
+    def test_no_parameters_is_refused(self):
+        profile, load = _founded({"parameters": 0})
+        with pytest.raises(UnfoundedPrediction, match="parameter"):
+            derived_readings(profile, warmup_tokens=200, load=load)
+
+    def test_no_calibration_is_not_the_built_in_defaults(self):
+        """The defaults are a fallback wearing the clothes of a derivation.
+
+        `DEFAULT_PERSISTENT` and `DEFAULT_NON_TORCH` were fitted on a different
+        model at a different width. Standing in for a missing calibration is
+        the same substitution the device fallback made, in a smaller place and
+        harder to see.
+        """
+        profile, load = _founded({"calibration": None})
+        with pytest.raises(UnfoundedPrediction, match="calibration"):
+            derived_readings(profile, warmup_tokens=200, load=load)
+
+    @pytest.mark.parametrize("term", ["persistent", "non_torch",
+                                      "load_residue"])
+    def test_a_calibration_missing_a_term_names_it(self, term):
+        profile, load = _founded(calibration={term: None})
+        with pytest.raises(UnfoundedPrediction, match=term):
+            derived_readings(profile, warmup_tokens=200, load=load)
+
+    def test_a_calibration_without_provenance_is_refused(self):
+        """Numbers without an origin cannot be checked against the rule below."""
+        profile, load = _founded(calibration={"provenance": {}})
+        with pytest.raises(UnfoundedPrediction, match="provenance"):
+            derived_readings(profile, warmup_tokens=200, load=load)
+
+    @pytest.mark.parametrize("term", ["persistent", "non_torch",
+                                      "load_residue"])
+    def test_provenance_has_to_cover_every_term_it_supplies(self, term):
+        provenance = dict(_FOUNDED_CALIBRATION["provenance"])
+        provenance[term] = ""
+        profile, load = _founded(calibration={"provenance": provenance})
+        with pytest.raises(UnfoundedPrediction, match=term):
+            derived_readings(profile, warmup_tokens=200, load=load)
+
+    def test_a_term_fitted_on_the_target_is_refused_outright(self):
+        """Class X is a measurement of the configuration being predicted.
+
+        Not a weaker prediction -- not one at all. The number would agree with
+        the target because it *is* the target, and the agreement would be
+        reported as a successful forecast. There is no use for the result, so
+        it is refused rather than flagged.
+        """
+        provenance = dict(_FOUNDED_CALIBRATION["provenance"],
+                          non_torch="X27")
+        profile, load = _founded(calibration={"provenance": provenance})
+        with pytest.raises(UnfoundedPrediction, match="non_torch"):
+            derived_readings(profile, warmup_tokens=200, load=load)
+
+    def test_the_source_class_is_not_caught_by_the_target_rule(self):
+        """S27 is an authorised source-configuration fit and stays allowed."""
+        profile, load = _founded()
+        readings, _ = derived_readings(profile, warmup_tokens=200, load=load)
+        assert readings["non_torch"] == 1157627904

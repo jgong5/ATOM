@@ -40,7 +40,9 @@ from typing import Mapping, Optional
 __all__ = ["peak_activation_bytes", "activation_curve", "weight_bytes",
            "resident_bytes", "non_torch_bytes", "load_residue_bytes",
            "modelled_readings", "activation_bytes_at",
-           "scratch_bytes_per_token",
+           "scratch_bytes_per_token", "liveness_is_recorded", "traced_shape",
+           "UnfoundedActivation", "UnfoundedPrediction",
+           "derived_readings", "CALIBRATED_TERMS",
            "graph_pool_bytes", "measured_graph_pool_bytes", "ELEMENT_BYTES"]
 
 ELEMENT_BYTES = {
@@ -133,6 +135,57 @@ def _deaths(ops, canonical) -> dict:
         for position in range(max(1, len(op.get("output_shapes") or ()))):
             dies[(index, position)] = death
     return dies
+
+
+def liveness_is_recorded(graph) -> bool:
+    """Whether the graph says when its tensors died, or is being guessed at.
+
+    `_deaths` falls back to last-read when no `dies_at` survives, and that
+    fallback is silent -- it returns a number either way. The number it
+    returned on the 27B's meta-derived prefill graphs is 570 425 344 B against
+    a measured 2 956 984 320 B, 19.3% of the term, and all of it from 64
+    `aten::empty.memory_format` allocations the walk had no death for. A caller
+    reporting an activation figure has to be able to tell that apart from a
+    walk over recorded liveness, so this is the question asked separately.
+
+    A graph derived on meta never has it: nothing runs, so no finalizer fires.
+    Liveness at a shape is a *device* observation, and the only honest answer
+    from a derivation is that it was not observed.
+    """
+    return any(
+        death is not None and death >= 0
+        for op in (graph.get("ops") or ())
+        for death in (op.get("dies_at") or ())
+    )
+
+
+def traced_shape(graph) -> tuple:
+    """The step's shape as `(query_lens, context_lens)`, per request.
+
+    Not the token total. Two graphs of the same total are not the same step:
+    the 27B's `s27prefhead` and `s27prefdeep` are both `batch_signature
+    [16384]` -- identical keys -- and differ by 98 304 tokens of history, which
+    is 7x the KV to read and a different attention branch. Matching on the sum
+    picks whichever was traced last.
+
+    Read from `provenance.batch_spec` (what a derivation was asked for) or
+    `provenance.shape` (what a capture observed), in that order. Falling back
+    to `key.batch_signature` gives the queries and `()` for the context, which
+    is "history unknown" and not "history zero" -- the caller has to decide
+    what an unknown history is worth, and for warmup matching it is worth
+    nothing.
+    """
+    provenance = graph.get("provenance") or {}
+    spec = provenance.get("batch_spec") or {}
+    if spec.get("query_lens"):
+        return (tuple(int(n) for n in spec["query_lens"]),
+                tuple(int(n) for n in (spec.get("context_lens") or ())))
+    shape = provenance.get("shape") or {}
+    if shape.get("num_scheduled_tokens"):
+        return (tuple(int(n) for n in shape["num_scheduled_tokens"]),
+                tuple(int(n) for n in (shape.get("context_lens") or ())))
+    signature = (graph.get("key") or {}).get("batch_signature") or ()
+    return (tuple(int(n) for n in signature), ())
 
 
 def activation_curve(graph) -> list:
@@ -474,13 +527,144 @@ def scratch_bytes_per_token(graph) -> float:
     return max(0.0, (int(measured) - peak_activation_bytes(graph)) / tokens)
 
 
+class UnfoundedPrediction(ValueError):
+    """A derived prediction was asked for and a term has nothing behind it.
+
+    Raised rather than defaulted. The caller asked what a configuration
+    *would* do; a number taken from the box it was asked on answers a
+    different question, and answering it silently is how a fallback comes to
+    be reported as a forecast.
+    """
+
+
+class UnfoundedActivation(UnfoundedPrediction):
+    """The graph cannot support an activation figure, at any token count.
+
+    Raised rather than returned so that a budget is never built on a number
+    nobody observed. A caller that would rather size from a device catches it;
+    a caller sizing a configuration nobody has run has to hear it, because for
+    that caller there is nothing else to fall back on.
+    """
+
+
+#: The terms `modelled_readings` would otherwise take from built-in defaults.
+#: Each was fitted somewhere, on some width of some model; a prediction has to
+#: say where, which is why a profile that names no calibration is refused
+#: rather than quietly given these.
+CALIBRATED_TERMS = ("persistent", "non_torch", "load_residue")
+
+
+def derived_readings(profile: Mapping, *, warmup_tokens: int,
+                     load, enforce_eager: bool = False,
+                     source: str = "the profile"):
+    """The five readings and the activation peak, or a refusal naming what is missing.
+
+    Fails closed, which is the entire point of the function. Asking for a
+    derived prediction and receiving a device reading is worse than receiving
+    nothing: the number looks like a forecast, is a measurement of a different
+    configuration, and nothing downstream can tell the two apart. So every term
+    that would otherwise be defaulted, inferred from the running box or skipped
+    on an exception is a refusal here instead.
+
+    `load` reads a path and returns parsed JSON; the caller owns the file
+    system so that this stays testable off a device.
+
+    Returns `(readings, activation_bytes)`. Raises `UnfoundedPrediction`, or
+    `UnfoundedActivation` from the walk.
+    """
+    def refuse(what: str):
+        raise UnfoundedPrediction(
+            "%s carries %s. A prediction cannot fall back to the device it is "
+            "running on: that device is a different configuration, which is "
+            "the reason for modelling it. Supply the term, or ask for a "
+            "measurement instead." % (source, what))
+
+    total = int(profile.get("total") or 0)
+    if total <= 0:
+        refuse("no card capacity (`total`)")
+    if not int(profile.get("parameters") or 0):
+        refuse("no parameter bytes")
+    if not int(warmup_tokens or 0):
+        refuse("a configuration with no `max_num_batched_tokens` or "
+               "`max_model_len`, so there is no warmup shape to evaluate the "
+               "activation peak at")
+    graph_path = str(profile.get("graph") or "").strip()
+    if not graph_path:
+        refuse("no operator graph, so the activation peak has no evidence")
+
+    activation = activation_bytes_at(load(graph_path), int(warmup_tokens))
+    calibration = _prediction_calibration(profile, load, refuse, source)
+    readings = modelled_readings(
+        total_bytes=total, world_size=int(profile.get("world_size") or 1),
+        parameters=int(profile["parameters"]),
+        buffers=int(profile.get("buffers") or 0),
+        activation_bytes=activation, calibration=calibration,
+        enforce_eager=enforce_eager)
+    return readings, activation
+
+
+def _prediction_calibration(profile: Mapping, load, refuse, source: str):
+    """The calibration behind a prediction, with its provenance checked.
+
+    Two separate demands. The terms have to be *there*: the built-in defaults
+    were fitted at another width on another model, and standing in for a
+    missing calibration is the same fallback in a smaller place. And the
+    provenance has to say where each came from, because a term fitted on the
+    target configuration turns the prediction into a restatement of the
+    measurement it is meant to anticipate. That one is refused outright rather
+    than reported -- there is no use for the answer.
+    """
+    cal_path = str(profile.get("calibration") or "").strip()
+    if not cal_path:
+        refuse("no calibration, so `persistent`, `non_torch` and the load "
+               "residue would come from defaults fitted at another width on "
+               "another model")
+    calibration = load(cal_path)
+    missing = [t for t in CALIBRATED_TERMS if not calibration.get(t)]
+    if missing:
+        refuse("a calibration with no %s" % ", ".join(missing))
+    provenance = calibration.get("provenance") or {}
+    if not provenance:
+        refuse("a calibration with no provenance block, so nothing says "
+               "whether its terms were fitted at the source or read off the "
+               "target")
+    unstated = [t for t in CALIBRATED_TERMS
+                if not str(provenance.get(t) or "").strip()]
+    if unstated:
+        refuse("a calibration whose provenance does not cover %s"
+               % ", ".join(unstated))
+    target = sorted(t for t in CALIBRATED_TERMS
+                    if str(provenance[t]).strip().upper().startswith("X"))
+    if target:
+        raise UnfoundedPrediction(
+            "%s calibrates %s on the target configuration itself. A prediction "
+            "fitted on the thing it predicts is not one."
+            % (cal_path, ", ".join(target)))
+    return calibration
+
+
 def activation_bytes_at(graph, tokens: int) -> int:
     """The activation peak at a token count the graph was not traced at.
 
     Linear in tokens, which is not an assumption but a measurement: the walk
     scaled from a 3494-token trace lands on the independently measured 4096-token
     warmup peak to +0.0% at TP=1, 2 and 4 alike.
+
+    Refuses a graph that neither recorded liveness nor measured a peak. Such a
+    graph still walks -- `_deaths` falls back to last-read -- and on the 27B's
+    meta-derived prefill graphs the walk returns 570 425 344 B against a
+    measured 2 956 984 320 B, understating the term by 2.4 GB out of
+    allocations it never saw freed. A measured peak is enough on its own:
+    `scratch_bytes_per_token` carries whatever the walk missed, so the answer
+    at the traced shape is the measurement however poor the walk. Neither is
+    not enough, and the honest failure is louder than a quiet 19%.
     """
+    if not liveness_is_recorded(graph) and not (
+            (graph.get("provenance") or {}).get("activation_peak_bytes")):
+        raise UnfoundedActivation(
+            "this graph records neither tensor deaths nor a measured "
+            "activation peak, so there is no liveness in it to scale: "
+            "%s" % ((graph.get("provenance") or {}).get("source") or "unknown"))
     peak = peak_activation_bytes(graph)
     traced = sum(int(n) for n in
                  ((graph.get("key") or {}).get("batch_signature") or ()))
