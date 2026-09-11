@@ -403,7 +403,7 @@ class ModelTracer:
     """
 
     def __init__(self, *, model, config, arch, device, tp, model_path,
-                 build_s, bootstrap=None):
+                 build_s, bootstrap=None, rank: int = 0):
         self.model = model
         self.config = config
         self.arch = arch
@@ -411,6 +411,15 @@ class ModelTracer:
         self.tp = tp
         self.model_path = model_path
         self.build_s = build_s
+        #: Which logical rank of the TP group the built modules currently hold.
+        #: Moved by `set_rank`, which `trace` calls when a request asks for a
+        #: rank this model is not on.
+        self.rank = rank
+        #: How many times that move has happened, and how many modules the last
+        #: one touched -- recorded so a graph says whether its rank was built
+        #: or rebound.
+        self.rank_rebinds = 0
+        self.rank_modules_rebound = 0
         #: What `install_from_target` reported, when a replay target was used
         #: to answer the chip question off a GPU box. `None` when the machine
         #: answered for itself.
@@ -421,8 +430,12 @@ class ModelTracer:
     @classmethod
     def build(cls, model_path: str, tp: int, device: str = "meta", *,
               replay_target: Optional[str] = None,
-              on_duplicate: str = "refuse") -> "ModelTracer":
+              on_duplicate: str = "refuse", rank: int = 0) -> "ModelTracer":
         """Pay the once-per-process cost: env, process group, config, weights.
+
+        ``rank`` is which logical rank of the TP group the layers are built at.
+        It is not a second build axis: one process builds once, and `trace`
+        moves the built model between ranks through `set_rank`.
 
         ``replay_target`` answers the chip question off a GPU box. AITER
         resolves the architecture at import time by shelling out to
@@ -481,7 +494,11 @@ class ModelTracer:
         if tp > 1:
             from atom.compass.runtime.derive import simulate_group_width
 
-            simulate_group_width(tp)
+            # The rank the layers are *constructed* at; `set_rank` moves it.
+            simulate_group_width(tp, rank=rank)
+        elif rank:
+            raise BuildRefusal(
+                f"tp=1 has only rank 0; a tracer cannot build rank {rank}.")
         arch = config.hf_config.architectures[0]
         model_class = resolve_obj_by_qualname(support_model_arch_dict[arch])
 
@@ -504,7 +521,30 @@ class ModelTracer:
 
         _BUILT = model_path
         return cls(model=model, config=config, arch=arch, device=dev, tp=tp,
-                   model_path=model_path, build_s=build_s, bootstrap=bootstrap)
+                   model_path=model_path, build_s=build_s, bootstrap=bootstrap,
+                   rank=rank)
+
+    def set_rank(self, rank: int) -> int:
+        """Move the built model onto logical ``rank``. Returns modules moved.
+
+        A tracer cannot build a second model (see :meth:`build`), so a process
+        that prices every rank of a TP4 deployment moves one model between them
+        instead. What moves is enumerated and refusable in
+        :func:`~atom.compass.runtime.derive.rebind_logical_rank`; what does not
+        move -- every shard *shape* -- is rank-independent by construction.
+        """
+        if rank == self.rank:
+            return 0
+        if self.tp == 1:
+            raise BuildRefusal(
+                f"tp=1 has only rank 0; this tracer cannot serve rank {rank}.")
+        from atom.compass.runtime.derive import rebind_logical_rank
+
+        moved = rebind_logical_rank(self.model, rank, logical=self.tp)
+        self.rank = rank
+        self.rank_rebinds += 1
+        self.rank_modules_rebound = moved
+        return moved
 
     def trace(self, spec=None, *, request: Optional[TraceRequest] = None,
               rank: int = 0, region: str = "body",
@@ -533,6 +573,9 @@ class ModelTracer:
                 f"this tracer built the model at tp={self.tp}; a request at "
                 f"tp={request.tp} would key a graph the shards do not match. "
                 "Build a tracer per width.")
+        # Before the forward, not after the key is stamped. `rank_coords` was
+        # previously a label written onto rank 0's graph whatever rank asked.
+        self.set_rank(request.rank)
 
         if spec is None:
             from atom.compass.runtime.meta import derived_inputs
@@ -599,6 +642,14 @@ class ModelTracer:
             "liveness_instrumentation": LIVENESS_INSTRUMENTATION,
             "compilation_level": 0,  # a bare model call is never compiled
             "tokens": request.tokens,
+            # Which logical rank of the TP group this graph is of, and whether
+            # the model was constructed on that rank or moved onto it after the
+            # fact. A reader comparing two ranks' graphs from one process needs
+            # to know the second is a rebind and what the rebind touched.
+            "logical_rank": self.rank,
+            "rank_binding": "built" if self.rank_rebinds == 0 else "rebound",
+            "rank_rebinds": self.rank_rebinds,
+            "rank_modules_rebound": self.rank_modules_rebound,
             # How many device-typed factory calls were sent to meta so the
             # operator after them could dispatch. Recorded, not hidden.
             "device_factories_redirected": redirected,

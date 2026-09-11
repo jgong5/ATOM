@@ -140,6 +140,20 @@ class CompassConfig:
     bench_iters: int = 2000
     bench_cache: str = "hot"
     filler_token_id: int = 100
+    # How a step's duration is taken from a TP group's ranks when one process
+    # stands in for all of them. A real deployment's step ends when its slowest
+    # rank ends, but a GPU-free replay runs one executor and would otherwise
+    # price whichever rank it calls itself -- rank 0, always. `slowest` asks the
+    # oracle once per logical rank and keeps the maximum; `rank0` is the old
+    # behaviour, kept because it is what every frozen diagnostic was produced
+    # under, and it has to be *chosen* rather than arrived at.
+    #
+    # `slowest` is an approximation and is recorded as one. It is exact when one
+    # rank is slowest in every phase of the step; it is an upper bound when the
+    # bottleneck alternates between ranks across the collective-delimited
+    # phases, because `StepCost` carries a total and an unordered breakdown, not
+    # a phase sequence that could be maximised phase by phase.
+    rank_aggregation: str = "rank0"
 
     def __post_init__(self) -> None:
         if self.enabled and self.epoch is None:
@@ -158,6 +172,10 @@ class CompassConfig:
             raise ValueError(
                 f"mode must be 'predict', 'trace' or 'measure', got {self.mode!r}"
             )
+        if self.rank_aggregation not in ("rank0", "slowest"):
+            raise ValueError(
+                "rank_aggregation must be 'rank0' or 'slowest', got "
+                f"{self.rank_aggregation!r}")
         if self.mode == "trace" and not self.graph_out:
             raise ValueError("mode='trace' needs graph_out to write the graph to")
         if self.mode == "measure" and not self.measure_out:

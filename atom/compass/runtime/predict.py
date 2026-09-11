@@ -176,7 +176,7 @@ class CompassPredictMixin:
         started_at = getattr(batch, "compass_started_at", None)
         self._offer_allocation(batch)
         shape = self._describe(batch)
-        cost = self._oracle.estimate(shape)
+        cost, ranks = self._estimate_over_ranks(shape)
         # Record what was predicted, in the same format a measure run records
         # what was timed. Without it a simulated run leaves no trace of *which
         # steps it ran*, and the shape distribution is an output of the
@@ -188,7 +188,8 @@ class CompassPredictMixin:
         self._record_measurement(shape, cost.seconds, None,
                                  req_ids=list(batch.req_ids),
                                  started_at=started_at,
-                                 decision=getattr(batch, "compass_decision", None))
+                                 decision=getattr(batch, "compass_decision", None),
+                                 ranks=ranks)
         self._step_count = getattr(self, "_step_count", 0) + 1
         logger.debug(
             "COMPASS step %d: reqs=%d tokens=%d prefill_tokens=%d cost=%.6fs",
@@ -259,6 +260,67 @@ class CompassPredictMixin:
             compass_step_seconds=cost.seconds,
         )
 
+    def _estimate_over_ranks(self, shape: StepShape):
+        """Price the step on every logical rank; return the step's cost and the
+        per-rank record.
+
+        One physical executor stands in for a whole TP group here, and it calls
+        itself rank 0. Pricing only what it calls itself is not "the group's
+        step": it is one rank's, and the ranks are not interchangeable -- the
+        TP4 head measurements have rank 1 at 16.158 ms against 13.45-13.51 ms
+        for the other three.
+
+        `slowest` is a maximum of whole-rank totals. That is the group's step
+        time exactly when one rank is slowest throughout, and an upper bound
+        when the bottleneck alternates between ranks across the step's
+        collective-delimited phases: the oracle returns a total and an unordered
+        breakdown, so there is no phase sequence here to maximise phase by
+        phase. The record says which it is rather than leaving a reader to
+        assume the exact reading.
+        """
+        policy = getattr(self._compass_config, "rank_aggregation", "rank0")
+        width = int((shape.topology or {}).get("tp", 1) or 1)
+        if policy == "rank0" or width <= 1:
+            cost = self._oracle.estimate(shape)
+            if width <= 1:
+                return cost, None
+            return cost, {
+                "policy": "rank0",
+                "priced_ranks": [int((shape.rank_coords or {}).get("tp", 0))],
+                "group_width": width,
+                # Named so a reader cannot mistake one rank's step for the
+                # group's. Under TP>1 this number is a rank's, not a step's.
+                "exactness": "one rank only; not the group's step time",
+            }
+
+        import dataclasses
+
+        seconds_by_rank: dict[str, float] = {}
+        slowest = None
+        for r in range(width):
+            at_rank = dataclasses.replace(
+                shape, rank_coords={**dict(shape.rank_coords or {}), "tp": r})
+            # No try/except: an oracle that cannot price rank r must refuse
+            # here. Falling back to rank 0's price is exactly the silent
+            # averaging-away this policy exists to stop.
+            cost_r = self._oracle.estimate(at_rank)
+            seconds_by_rank[str(r)] = cost_r.seconds
+            if slowest is None or cost_r.seconds > slowest[1].seconds:
+                slowest = (r, cost_r)
+        assert slowest is not None
+        spread = max(seconds_by_rank.values()) - min(seconds_by_rank.values())
+        return slowest[1], {
+            "policy": "slowest",
+            "priced_ranks": list(range(width)),
+            "group_width": width,
+            "seconds_by_rank": seconds_by_rank,
+            "slowest_rank": slowest[0],
+            "spread_seconds": spread,
+            "exactness": "approximation: max of whole-rank totals, an upper "
+                         "bound if the phase bottleneck alternates between "
+                         "ranks",
+        }
+
     def _count_and_record(self, shape: StepShape, seconds: float,
                           gap: Optional[float] = None,
                           req_ids: Optional[list] = None,
@@ -282,7 +344,8 @@ class CompassPredictMixin:
                             req_ids: Optional[list] = None,
                             started_at: Optional[float] = None,
                             decision: Optional[dict] = None,
-                            spans: Optional[dict] = None) -> None:
+                            spans: Optional[dict] = None,
+                            ranks: Optional[dict] = None) -> None:
         """Append one timed step to the table.
 
         Appended and flushed per step rather than collected and written at exit.
@@ -353,6 +416,10 @@ class CompassPredictMixin:
             # Absent on captures taken before the inner pairs existed and on the
             # no-device path, where there is nothing asynchronous to separate.
             **({"span_seconds": spans} if spans else {}),
+            # Which ranks this step's number came from, and how they were
+            # reduced to one. Absent at TP1, where there is one rank and the
+            # question does not arise.
+            **({"rank_aggregation": ranks} if ranks else {}),
         }) + "\n")
         self._measure_fh.flush()
 

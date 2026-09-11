@@ -27,36 +27,124 @@ import logging
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["simulate_group_width", "record_collectives",
+__all__ = ["simulate_group_width", "rebind_logical_rank", "record_collectives",
            "redirect_device_factories"]
 
 
-def simulate_group_width(logical: int, physical: int = 1) -> None:
-    """Make the TP group report ``logical`` ranks over a ``physical``-rank group.
+class RankRebindRefusal(RuntimeError):
+    """A module holds rank-derived state this code does not know how to move."""
+
+
+def _forward_reads_rank(cls) -> bool:
+    """Does ``cls.forward``'s own source read anything rank-derived?
+
+    Asked of the source rather than answered from an allow-list, because the
+    list is the thing that goes stale: a layer that starts reading its rank in
+    `forward` next month has to make this refuse, not pass.
+    """
+    import inspect
+
+    cached = getattr(cls, "_compass_forward_reads_rank", None)
+    if cached is not None:
+        return cached
+    try:
+        src = inspect.getsource(cls.forward)
+    except (OSError, TypeError, AttributeError):
+        # No source to read -- a builtin, a C extension, a lambda from exec.
+        # Unknown is not the same as no.
+        return True
+    body = [line.split("#", 1)[0] for line in src.splitlines()]
+    answer = any(("self.tp_rank" in line or "self.vocab_start_idx" in line
+                  or "self.vocab_end_idx" in line) for line in body)
+    try:
+        cls._compass_forward_reads_rank = answer
+    except (AttributeError, TypeError):
+        pass
+    return answer
+
+
+def rebind_logical_rank(model, rank: int, *, logical: int,
+                        physical: int = 1) -> int:
+    """Re-point an already-built model at logical ``rank``. Returns how many
+    modules moved.
+
+    The model cannot be rebuilt per rank: ATOM registers attention layers in a
+    global table at construction, so a second build in one process is wrong
+    (see `ModelTracer.build`). Rank, unlike width, is recoverable after the
+    fact -- in this tree it enters a `forward` only as the vocab-shard bounds
+    that `VocabParallelEmbedding` and `ParallelLMHead` pass to their masked
+    lookup. Everywhere else it is read by a `weight_loader`, which a derivation
+    on dummy weights never calls.
+
+    Any module that caches `tp_rank` and whose `forward` reads something
+    rank-derived this function does not recompute is refused by name. That is
+    the alternative to quietly serving one rank's offsets under another rank's
+    label.
+    """
+    simulate_group_width(logical, physical, rank=rank)
+    moved = 0
+    for name, module in model.named_modules():
+        if not hasattr(module, "tp_rank"):
+            continue
+        if hasattr(module, "num_embeddings_per_partition"):
+            per = module.num_embeddings_per_partition
+            module.tp_rank = rank
+            module.vocab_start_idx = per * rank
+            module.vocab_end_idx = module.vocab_start_idx + per
+            moved += 1
+            continue
+        if _forward_reads_rank(type(module)):
+            raise RankRebindRefusal(
+                f"{name} ({type(module).__name__}) reads a rank-derived value "
+                f"in its forward that this code cannot recompute, so it would "
+                f"keep rank {module.tp_rank}'s value while the graph is "
+                f"labelled rank {rank}.")
+        # Rank reaches this module's weight loader only, which a dummy-weight
+        # derivation does not call; move it anyway so nothing holds two answers.
+        module.tp_rank = rank
+        moved += 1
+    return moved
+
+
+def simulate_group_width(logical: int, physical: int = 1, rank: int = 0) -> None:
+    """Make the TP group report ``logical`` ranks and ``rank`` as its own.
 
     Call after the process group exists and before the model is built: layers
-    read the width while they are being constructed, so patching afterwards
-    changes nothing that has already been sized.
+    read the width *and the rank* while they are being constructed, so patching
+    afterwards changes nothing that has already been sized or offset.
+
+    Re-callable. `_patch_group` restores the group before patching it again, so
+    a process may derive rank 0, then rank 1, then rank 0 again without the
+    second patch closing over the first patch's simulated numbers.
     """
+    if not 0 <= rank < max(logical, 1):
+        raise ValueError(f"rank {rank} is outside a TP{logical} group.")
     if logical <= physical:
+        if rank:
+            raise RuntimeError(
+                f"cannot derive rank {rank}: a TP{logical} group over "
+                f"{physical} physical ranks is not simulated, so this process "
+                "is whichever rank it really is.")
         return
 
     from aiter.dist.parallel_state import get_tp_group
 
-    from atom.distributed.simulated_tp import _patch_group
+    from atom.distributed.simulated_tp import _patch_group, restore_group
 
     group = get_tp_group()
+    restore_group(group)
     if group.world_size != physical:
         raise RuntimeError(
             f"TP group has {group.world_size} ranks, expected {physical}. "
             "Derivation builds the group at world size one and simulates the "
             "rest; something else initialised it."
         )
-    _patch_group(group, logical, physical)
+    _patch_group(group, logical, physical, logical_rank=rank)
     logger.info(
-        "ATOMCompass: deriving rank 0 of a TP%d deployment from a %d-rank group. "
-        "Shapes match TP%d; no collective is performed and no output is read.",
-        logical, physical, logical,
+        "ATOMCompass: deriving rank %d of a TP%d deployment from a %d-rank "
+        "group. Shapes match TP%d; no collective is performed and no output is "
+        "read.",
+        rank, logical, physical, logical,
     )
 
 

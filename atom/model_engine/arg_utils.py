@@ -68,6 +68,7 @@ class EngineArgs:
     compass_bench_out: str = ""
     compass_bench_iters: int = 2000
     compass_bench_cache: str = "hot"
+    compass_rank_aggregation: str = "rank0"
     enable_prefix_caching: bool = True
     port: int = 8006
     kv_cache_dtype: str = "bf16"
@@ -263,6 +264,20 @@ class EngineArgs:
             "'graph' captures the calls into a CUDA graph, removing the ~30us "
             "per-call launch cost that otherwise swamps a decode-shape kernel "
             "and is what production removes too.",
+        )
+        parser.add_argument(
+            "--compass-rank-aggregation",
+            type=str,
+            default="rank0",
+            choices=["rank0", "slowest"],
+            help="How a TP group's step time is taken when one process stands "
+            "in for every rank. 'rank0' prices the rank this executor calls "
+            "itself, which at TP>1 is one rank's step and not the group's. "
+            "'slowest' prices every logical rank and keeps the maximum -- the "
+            "group's step time exactly when one rank is slowest throughout, "
+            "and an upper bound when the bottleneck alternates between ranks "
+            "across the step's phases. Each row records which was used, the "
+            "per-rank seconds and the spread.",
         )
         parser.add_argument(
             "--compass-op-timings-out",
@@ -852,7 +867,11 @@ class EngineArgs:
         compass_bench_out = kwargs.pop("compass_bench_out", "")
         compass_bench_iters = kwargs.pop("compass_bench_iters", 2000)
         compass_bench_cache = kwargs.pop("compass_bench_cache", "hot")
+        compass_rank_aggregation = kwargs.pop("compass_rank_aggregation",
+                                              "rank0")
         compass_kwargs = {"enabled": compass_enabled, "mode": compass_mode}
+        if compass_rank_aggregation != "rank0":
+            compass_kwargs["rank_aggregation"] = compass_rank_aggregation
         if compass_oracle:
             compass_kwargs["oracle_qualname"] = compass_oracle
         if compass_graph_out:
