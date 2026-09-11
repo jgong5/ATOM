@@ -495,3 +495,108 @@ SOURCE_27B_TP1_CONC = BucketedRunnerRegions(
                 "logprobs requested, no speculative decoding, PP=1, prefix "
                 "caching off"),
 )
+
+
+#: The same ten cells, re-measured on a second server, with bands that survive
+#: the restart.
+#:
+#: `/1` above is preserved exactly as published, including its truncated
+#: `(32, exact)` cell. It is not corrected here and its numbers are not
+#: adjusted: a profile that rewrites what it recorded is a profile no later
+#: reader can check.
+#:
+#: What produced this one: `cap_conc3` re-ran `cap_conc`'s entire ladder --
+#: N in [1,3,5,8,16,17,20,31,32], three bursts each, same interleaving, same
+#: 5%-agreement admission rule, same preparation burst, same card, same
+#: weights, same capture code -- on a second server process, and ended with a
+#: short drain burst so the lazy flush could not eat the last step of the last
+#: measured burst. It did not. All nine concurrencies were admitted (worst
+#: per-burst spread 0.69%), every measurement cohort holds its full 128 decode
+#: steps, and each one's context ladder runs 1025..1152 with no gaps.
+#:
+#: **The reason this exists is not the one lost row.** Two independent server
+#: instances measuring the same seven cells disagree about prepare by +4.0% to
+#: +5.0%, uniformly, across every cell and both padding states -- while
+#: agreeing about postprocess to within 0.43%. Neither instance's own [p10,p90]
+#: is wide enough to contain the other's median, so a band taken from one
+#: server is a band that will be wrong the next time a server starts. Every
+#: two-instance cell below carries the union of both instances' bands, which is
+#: 3.7%-5.3% half-width, and says which instances measured it.
+#:
+#: The three cells cap_conc3 did not re-run -- `(2, exact)`, `(4, exact)` and
+#: `(16, padded)`, which only `cap_conc2` measured -- keep their
+#: single-instance bands and are marked. Their true between-instance width is
+#: unmeasured, and on the evidence of the other seven it is likely wider than
+#: what they state.
+#:
+#: What the second instance does reproduce is the shape. The level shifts
+#: uniformly; the structure does not move. In particular the drop at the top
+#: rung -- a batch of exactly 32 preparing faster than a batch of 17, 20 or 31
+#: padded up to 32 -- is -9.01% on the first instance and -9.18% on the second.
+SOURCE_27B_TP1_CONC_V2 = BucketedRunnerRegions(
+    postprocess_decode=Measured(
+        seconds=1.026e-4, low=1.006e-4, high=1.060e-4, samples=5376,
+        how="p50 [p10,p90] of span_seconds.postprocess over every decode step "
+            "of both capture sessions, fourteen concurrencies. The one region "
+            "that reproduces across a restart: the first instance's own pooled "
+            "p50 was 1.0216e-4, this is 1.0260e-4, +0.43%"),
+    prepare_decode_cells=(
+        ((1, False), Measured(
+            seconds=1.079e-4, low=1.012e-4, high=1.121e-4, samples=384,
+            how="p50 of seconds - run_model - postprocess at N=1 on the second "
+                "instance; band is the union of both instances' [p10,p90], "
+                "whose p50s differ by +4.09%")),
+        ((2, False), Measured(
+            seconds=1.138e-4, low=1.112e-4, high=1.177e-4, samples=384,
+            how="p50 [p10,p90], N=2. ONE INSTANCE (cap_conc2 only): the "
+                "between-instance width the other cells show is not in this "
+                "band")),
+        ((4, True), Measured(
+            seconds=1.127e-4, low=1.050e-4, high=1.168e-4, samples=384,
+            how="p50 at N=3 padded to 4, second instance; union band, "
+                "+4.96% between instances")),
+        ((4, False), Measured(
+            seconds=1.080e-4, low=1.052e-4, high=1.120e-4, samples=384,
+            how="p50 [p10,p90], N=4. ONE INSTANCE (cap_conc2 only)")),
+        ((8, True), Measured(
+            seconds=1.154e-4, low=1.078e-4, high=1.196e-4, samples=384,
+            how="p50 at N=5 padded to 8, second instance; union band, "
+                "+4.98% between instances")),
+        ((8, False), Measured(
+            seconds=1.116e-4, low=1.046e-4, high=1.152e-4, samples=384,
+            how="p50 at N=8, second instance; union band, +4.18%")),
+        ((16, True), Measured(
+            seconds=1.239e-4, low=1.193e-4, high=1.281e-4, samples=1152,
+            how="p50 pooled over N=9,12,15 padded to 16. ONE INSTANCE "
+                "(cap_conc2 only); the three per-N p50s spread 3.9% and are "
+                "not monotone in N")),
+        ((16, False), Measured(
+            seconds=1.201e-4, low=1.126e-4, high=1.242e-4, samples=384,
+            how="p50 at N=16, second instance; union band, +4.64%")),
+        ((32, True), Measured(
+            seconds=1.442e-4, low=1.350e-4, high=1.485e-4, samples=1152,
+            how="p50 pooled over N=17,20,31 padded to 32, second instance; "
+                "union band, +4.40%")),
+        ((32, False), Measured(
+            seconds=1.309e-4, low=1.240e-4, high=1.336e-4, samples=384,
+            how="p50 at N=32, second instance; union band, +4.21%. The full "
+                "384 steps: this is the cell /1 recorded at 383, and the drain "
+                "burst is why")),
+    ),
+    postprocess_prefill=SOURCE_27B_TP1.postprocess_prefill,
+    prepare_prefill=SOURCE_27B_TP1.prepare_prefill,
+    tp_broadcast=SOURCE_27B_TP1.tp_broadcast,
+    decode_context=(1025, 1152),
+    prefill_sequences=(15, 16),
+    prefill_tokens=(15360, 16384),
+    topologies=(1, 2, 4),
+    capture_sizes=(1, 2, 4, 8, 16, 32),
+    version="source-27b-tp1-conc/2",
+    provenance=("cap_conc3 (the seven cells it re-ran, and the second instance "
+                "of each) + cap_conc2 (the three it did not) + cap_conc (the "
+                "first instance, for the union bands), Qwen3.8-27B TP1 on node "
+                "18, runner.py 474ec80e0554c412 byte-identical across all "
+                "three sessions; prefill and broadcast terms carried unchanged "
+                "from SOURCE_27B_TP1; no logprobs requested, no speculative "
+                "decoding, PP=1, prefix caching off"),
+)

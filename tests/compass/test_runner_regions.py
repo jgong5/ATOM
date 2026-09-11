@@ -16,7 +16,7 @@ from atom.compass.core.cost.base import StepShape
 from atom.compass.core.cost.library import (
     LibraryCostOracle, PriceLibrary, StaticGraphs)
 from atom.compass.core.cost.regions import (
-    SOURCE_27B_TP1, SOURCE_27B_TP1_CONC, Measured)
+    SOURCE_27B_TP1, SOURCE_27B_TP1_CONC, SOURCE_27B_TP1_CONC_V2, Measured)
 
 
 def _decode(seqs=32, context=1151, tp=1):
@@ -277,3 +277,92 @@ class TestTheFrozenProfileDidNotMove:
         new = SOURCE_27B_TP1_CONC.breakdown(_decode())["<prepare>"]
         assert old != new
         assert abs(old - new) / old == pytest.approx(0.044, abs=0.005)
+
+
+class TestTheSecondInstanceProfile:
+    """`/2` exists because a second server disagreed with the first.
+
+    Not because a row was lost. The lost row is one cell's sample count; the
+    between-instance shift is every prepare cell's band.
+    """
+
+    def _dec(self, seqs, bucket, context=1151, tp=1):
+        return StepShape(num_scheduled_tokens=(1,) * seqs,
+                         context_lens=(context,) * seqs,
+                         topology={"tp": tp}, capture_bucket=bucket)
+
+    def test_the_first_profile_was_not_edited(self):
+        """Including the cell whose capture was truncated. A published number
+        that changes later is a number nobody can check."""
+        cells = dict(SOURCE_27B_TP1_CONC.prepare_decode_cells)
+        assert cells[(32, False)].samples == 383
+        assert cells[(32, False)].seconds == pytest.approx(1.256e-4)
+        assert SOURCE_27B_TP1_CONC.version == "source-27b-tp1-conc/1"
+
+    def test_the_re_measured_cell_has_its_full_three_bursts(self):
+        cells = dict(SOURCE_27B_TP1_CONC_V2.prepare_decode_cells)
+        assert cells[(32, False)].samples == 384
+        assert all(m.samples in (384, 1152)
+                   for _, m in SOURCE_27B_TP1_CONC_V2.prepare_decode_cells)
+
+    def test_every_band_contains_the_other_instances_answer(self):
+        """The property a one-server band did not have.
+
+        For the seven cells both servers measured, `/1`'s number falls inside
+        `/2`'s band. That is what makes `/2` usable for a prediction about a
+        server that has not started yet.
+        """
+        one = dict(SOURCE_27B_TP1_CONC.prepare_decode_cells)
+        two = dict(SOURCE_27B_TP1_CONC_V2.prepare_decode_cells)
+        shared = [c for c in two if "ONE INSTANCE" not in two[c].how]
+        assert len(shared) == 7
+        for cell in shared:
+            assert two[cell].low <= one[cell].seconds <= two[cell].high, cell
+
+    def test_the_single_instance_cells_say_so(self):
+        """Three cells only one server ever measured. Their bands are narrower
+        than the others' for a reason that is not precision."""
+        two = dict(SOURCE_27B_TP1_CONC_V2.prepare_decode_cells)
+        alone = {c for c in two if "ONE INSTANCE" in two[c].how}
+        assert alone == {(2, False), (4, False), (16, True)}
+
+    def test_the_shift_is_a_level_and_not_a_shape(self):
+        """Every shared cell moved up by between 4.0% and 5.0%. A shift that
+        uniform is the server, not the batch: if it varied by cell, the profile
+        would be measuring different work, not the same work more slowly."""
+        one = dict(SOURCE_27B_TP1_CONC.prepare_decode_cells)
+        two = dict(SOURCE_27B_TP1_CONC_V2.prepare_decode_cells)
+        shifts = [two[c].seconds / one[c].seconds - 1
+                  for c in two if "ONE INSTANCE" not in two[c].how]
+        assert min(shifts) > 0.039 and max(shifts) < 0.051
+
+    def test_the_padding_drop_reproduced_on_a_second_server(self):
+        """The structural finding, independently. A batch of exactly 32
+        prepares faster than a batch of 17, 20 or 31 padded up to 32 -- about
+        9% faster on both instances, which is why it is the shape and not the
+        level that this profile claims to have measured."""
+        for profile in (SOURCE_27B_TP1_CONC, SOURCE_27B_TP1_CONC_V2):
+            cells = dict(profile.prepare_decode_cells)
+            drop = cells[(32, False)].seconds / cells[(32, True)].seconds - 1
+            assert drop == pytest.approx(-0.091, abs=0.004)
+
+    def test_postprocess_is_the_one_region_that_survived_the_restart(self):
+        """0.43% apart across two servers, against prepare's 4-5%. Whatever
+        the restart changed, it did not change this."""
+        one = SOURCE_27B_TP1_CONC.postprocess_decode.seconds
+        two = SOURCE_27B_TP1_CONC_V2.postprocess_decode.seconds
+        assert abs(two / one - 1) < 0.01
+
+    def test_it_answers_the_same_shapes_and_refuses_the_same_ones(self):
+        """A newer profile, not a wider one: same ladder, same domain."""
+        assert SOURCE_27B_TP1_CONC_V2.refusal(self._dec(20, 32)) is None
+        assert SOURCE_27B_TP1_CONC_V2.refusal(self._dec(9, 32)) is not None
+        assert SOURCE_27B_TP1_CONC_V2.refusal(self._dec(1, None)) is not None
+        assert SOURCE_27B_TP1_CONC_V2.refusal(
+            self._dec(32, 32, context=109_741)) is not None
+        assert SOURCE_27B_TP1_CONC_V2.version == "source-27b-tp1-conc/2"
+
+    def test_the_prefill_terms_are_still_the_older_profiles_own_objects(self):
+        assert (SOURCE_27B_TP1_CONC_V2.prepare_prefill
+                is SOURCE_27B_TP1.prepare_prefill)
+        assert SOURCE_27B_TP1_CONC_V2.tp_broadcast is SOURCE_27B_TP1.tp_broadcast
