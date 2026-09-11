@@ -381,9 +381,13 @@ says nothing about it, so the C06 table keeps those widths.
 
 The TP=1 source record reads 1 191 182 336 B; the same configuration on an
 exclusively-held device reads 1 157 627 904 B (phase C, three byte-identical
-runs). The 33 554 432 B between them is, as far as this evidence goes, a
-neighbour, so the calibrated value is the exclusive one and the busy record is
-not a calibration input. That is the whole reason phase C was run.
+runs). The 33 554 432 B between them is *observed* and not
+explained: the exclusive record's ownership sample covers its own run and shows
+one foreign KFD attachment holding 0 B throughout, and no sample was taken
+during the other run at all, so nothing here identifies what held those bytes.
+What makes the exclusive record the calibration input is therefore the sampled
+ownership of the device it was taken on, not a diagnosis of the gap. That is
+the whole reason phase C was run.
 
 Substituting the constant for the reading predicts the frozen ladder exactly:
 1583 blocks at util 0.33 settled, 15 238 at 0.40, 17 188 at 0.41, each on the
@@ -1162,6 +1166,89 @@ structure and needs no comparison with any measured peak.
 Nothing above changes a byte of the candidate: `candidate_bytes` is still
 {1: 2 956 984 320, 2: 2 101 346 304, 4: 1 673 527 296}, each width's own walk.
 
+## The TP=1 target was preserved, and it is not any record we hold
+
+O24 asked how a TP=1 target cell could be assembled honestly. It need not be:
+node 18 preserves two genuine TP=1 target/table pairs for this configuration,
+`agent_scratch/g4/cap_subspan/` and `agent_scratch/poc/g5_27b/`, read-only and
+the lead's, and CC has the first of them. Nothing has to be synthesised, and
+the rest of this section is about a mistake this worker made while checking
+that, because the mistake is the reusable part.
+
+The pairs carry what the committed memory records lack:
+
+    run.server_code_sha256  dafd70f14ee5eac5e37b75ce9df9186f679423223c074ba44...
+    run.model_revision      hf:1d4bf0f2ff6012fd82039f2fa52739d0dd7c60c0
+    hardware.arch           gfx942:sramecc+:xnack-
+    hardware.device_name    AMD Instinct MI308X   device_count 1
+    hardware.torch_version  2.10.0+rocm7.2.4.git3d3aa833
+    server.visible_devices  5
+
+and lack what the records carry: `target.json` has `config`, `hardware`,
+`blocks` and `graph` and no `readings`, and `capture.json` names no memory term
+at all. Those runs' memory numbers survive only as the engine's budget line in
+`capture.server.log`, at two decimals -- `peak_torch=53.99GB, non_torch=1.08GB,
+cudagraph_est=0.55GB, total_gpu=191.98GB, block_bytes=1056768,
+num_kvcache_blocks=112772`.
+
+### Eight of eight is not an identity, and this document already said so
+
+`27b.tp1.exclusive.memory.json` agrees with that target on every field the two
+share: exactly on `num_kvcache_blocks` 112 772, `pool_entries {state: 32, kv:
+112772}`, graph pool 127 926 272 B and capture sizes `[1,2,4,8,16,32]`, and to
+the log's two decimals on `total`, `peak_torch`, `non_torch` and
+`cudagraph_overhead`. Eight of eight, including a block count derived from free
+memory after every other term.
+
+This worker read that as a join -- "the record *is* that run" -- and it is not
+one. Numeric agreement cannot establish run identity, and the evidence against
+it is two sections above: *Identity is not integrity* is the finding that the
+three phase C repeats produced **byte-identical payloads from demonstrably
+distinct runs**. A reading that repeats exactly is what a stable configuration
+on a quiet device looks like; it is not a fingerprint, and treating a
+sensitive-looking derived field as one is the same error in a more flattering
+costume.
+
+Timestamps settle it, and they settle it the other way:
+
+| artifact | when it ran | on what |
+|---|---|---|
+| `poc/g5_27b` | 2026-09-10T13:12:42Z (`compass_config.epoch`) | `visible_devices "5"` |
+| `g4/cap_subspan` | 2026-09-11T04:37:55Z (`compass_config.epoch`) | `visible_devices "5"` |
+| phase C repeats -> `27b.tp1.exclusive` | 2026-09-11T08:53:49Z..09:03:38Z (`ownership.txt`) | this agent's own container |
+
+Disjoint: four hours after the one, a day after the other. The exclusive record
+is **not** either target run, and the right label for the relationship is
+*compatible independent evidence at the same configuration* -- two captures of
+the same knobs on the same chip that agree, which is worth having and is not an
+identity. `27b.tp1.memory.json` has no provenance at all and is unproven in
+both directions.
+
+### The 32 MiB is an observation, not a neighbour
+
+The two committed TP=1 records differ by `non_torch` +33 554 432 B (32.0 MiB)
+and `num_kvcache_blocks` -32, and 32 MiB / 1 056 768 B per block is 31.75,
+floored to 32 -- so the block difference is *arithmetically downstream* of the
+`non_torch` difference. That is all that is established. This worker wrote that
+a neighbour's allocation caused it; nothing here shows that. The ownership
+sample belongs to the phase C run and shows a foreign KFD attachment holding
+0 B throughout, so it cannot speak for whatever the other record's device held,
+and no sample was taken during that run at all. The cause is open, and O11's
+486 MiB `non_torch` excursion is the older form of the same unanswered
+question.
+
+### One physical executor is a mechanism, not a TP=1 ceiling
+
+An earlier note here treated `replay/local_proc.py:43` -- one rank in one
+process -- as fixing device-free replay at TP=1. It does not: one physical CPU
+executor is the intended emulation mechanism, and a *logical* TP=2 or TP=4
+prediction may run on it provided the target topology, the per-rank geometry
+and pools, the per-rank cost semantics and the provenance of each are
+explicitly right. What it must not do is perform or present itself as real
+distributed GPU work, and it must not carry TP=1's capacity -- 112 772 blocks
+for a rank that owned a whole MI308X -- into a wider cell. Where that line
+falls is the lead's to set, not this guard's.
+
 ## Open items
 
 | # | item | needs | status |
@@ -1189,4 +1276,4 @@ Nothing above changes a byte of the candidate: `candidate_bytes` is still
 | O21 | the 2999-operator TP=1 lifetime trace against the 2439-operator body graph | the two artifacts, CPU only -- done | **closed.** Same region, device, compilation level, redirections and scope; the only difference is step kind, and the operator arithmetic closes with no remainder: 2999 - 416 (GDN chunked-prefill path) - 144 (drift) + 32 (decode's mrope and `aten::min`) = 2439. The prefill graph is the one shaped like `warmup_model`; the decode graph never was a candidate. The two caveats that remain on the prefill graph are its own: `compilation_level: 0`, and a scope that excludes `compute_logits` and the sampler |
 | O22 | whether `torch_compile_guard(mutates_args="unknown")` declares mutation the implementation does not perform | one schema read, CPU only -- done | **closed, and it does.** `aiter::gemm_a16w16(Tensor(a0!) A, Tensor(a1!) B, ...)` marks the weight matrix mutable; `fused_allreduce_rmsnorm_` marks the norm weight mutable. The usable half of the schema is the return annotation: an aliasing return must be declared, and `all_reduce_ -> Tensor` is unannotated, so the schema independently confirms the collective is out-of-place |
 | O23 | `lineage_keys` aligns 71 of 3014 outputs across the three real widths, and misclassifies one that it does align | CPU only; a module path per operator | open, and it blocks any use of `width_class` at width. Cause is read from source: `VocabParallelEmbedding.forward` (`embed_head.py:168-178`) emits `aiter::masked_embedding` at TP>1 and `aten::embedding` at TP=1, and an ancestry key that interns operator names propagates that one branch through the whole graph. Fix is a module path stamped per operator -- width-invariant by construction, already named by `@mark_trace` at trace time, and absent from `OpSpec`. The candidate's bytes do not depend on this |
-| O24 | a TP=1 *target* cell for a device-free replay: the committed TP=1 records carry readings, blocks and config but no run identity and no hardware identity | **lead** + CC | open. The memory-side TP=1 source evidence exists and is committed (`27b.tp1.memory.json`, `27b.tp1.exclusive.memory.json` with its ownership sample, `g3_util_phasea/phasebc.json`, `qwen3_5_27b.config.json`); what is missing is the identity O12 would supply. A diagnostic-only cell assembled from them must label every term with where it came from, must not be described as a capture of a run it cannot name, and must not carry TP=1's 112 740 blocks into a TP=2 or TP=4 cell -- the pool is a per-rank quantity and a one-process CPU replay can only execute rank 0 (`replay/local_proc.py:43`) |
+| O24 | a TP=1 *target* cell for a device-free replay: the committed TP=1 records carry readings, blocks and config but no run identity and no hardware identity | CPU only, read-only | **closed as a question, and a correction**. No cell need be assembled: node 18 preserves two genuine TP=1 target/table pairs (`g4/cap_subspan/`, `poc/g5_27b/`) and CC has one. `27b.tp1.exclusive.memory.json` agrees with the target on all eight shared fields, but agreement is not identity -- the phase C repeats already showed byte-identical payloads from distinct runs, and the epochs here are disjoint (2026-09-11T04:37:55Z and 2026-09-10T13:12:42Z on `visible_devices 5`, vs phase C at 08:53:49Z..09:03:38Z). Compatible independent evidence, identity unproven. The 32.0 MiB `non_torch` gap between the two committed records is observed and unexplained; the earlier neighbour attribution is withdrawn |
