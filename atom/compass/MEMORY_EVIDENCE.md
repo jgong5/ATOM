@@ -1047,6 +1047,121 @@ so the fused add/RMSNorm, the silu/MLP destinations and the attention output
 handling are to be read the same way: the registered schema and the
 implementation, not the trailing underscore.
 
+## The two graphs differ by step kind, and nothing else
+
+The TP=1 lifetime trace records 2999 operators; the body graph the cost side
+prices records 2439. Until that gap has a cause, neither can be called the
+native warmup allocation graph, so the cause was read off the two graphs'
+own provenance and operator names (`agent_scratch/memval/lifetime/parity.py`).
+
+Everything that could have made them incomparable is identical: `region: body`,
+`device: meta`, `compilation_level: 0`, 129 device factories redirected, and
+the same `includes` / `excludes` (`model forward`; not `compute_logits`, not
+the sampler, not input preparation). The one difference is the batch: one
+prefill of 16 384 tokens against four decodes at context 66.
+
+The names say the same thing, and the arithmetic closes exactly. 416 operators
+appear only in the prefill graph -- `aten::cat` 64, `aten::chunk` 32,
+`aten::index.Tensor` 32, `aten::slice.Tensor` 64, `aten::squeeze` 64,
+`aten::sub.Tensor` 32, `aten::to.dtype` 64, `aten::unsqueeze` 64, plus 176
+operators of shared-name drift (`aten::mul.Tensor` -128, `aten::add.Tensor`
+-32, `aten::view` -32, `aten::reshape` -16, `aten::empty_like` +32) -- which is
+the gated-delta-rule's chunked-prefill path. 32 appear only in the decode graph:
+`triton::_mrope_qk_kernel` 16 and `aten::min` 16, decode's rotary path.
+2999 - 416 - 144 = 2439, with no remainder.
+
+So the gap is not scope, not compile mode and not a meta substitution: it is
+two different step kinds, and the 2439 graph is a cost artifact that was never
+a candidate for the warmup allocation graph. The prefill graph is the one
+shaped like `warmup_model`'s dummy run -- one request, `max_num_batched_tokens`
+query tokens, no history -- which is what the memory work needs. Two caveats
+stay attached to it and are **not** closed by this: it is traced at
+`compilation_level: 0`, where the native warmup runs the compiled region, and
+its scope excludes `compute_logits` and the sampler, which the native peak may
+not.
+
+## What the fused operators actually promise
+
+The collective audit's method -- registered schema and implementation, never
+the name -- applied to computation. The schemas below are this process's own
+dispatcher entries, read on CPU
+(`agent_scratch/memval/lifetime/schema_audit.py`), against the operators the
+TP=1 graph actually records.
+
+| operator | schema | what it means |
+|---|---|---|
+| `aiter::silu_and_mul` | `(Tensor(a0!) out, Tensor(a1!) input, float limit) -> ()` | destination-passing, returns nothing. The graph records `output_shapes: []` and the destination in `inputs_from`: counted once, correct |
+| `aiter::_fused_qk_rmsnorm_group_quant_kernel` | ten optional `Tensor(aN!)` destinations `-> ()` | same shape, same correct record |
+| `aiter::gemm_a16w16` | `(Tensor(a0!) A, Tensor(a1!) B, ...) -> Tensor` | **unannotated return**: the output is fresh, not an alias. Counted once, correct |
+| `aiter::linear_attention_with_output_base` | `(Tensor mixed_qkv, Tensor b, Tensor a, Tensor core_attn_out, str layer_name) -> Tensor` | `mutates_args=[]`, and the implementation is `ret = torch.empty_like(core_attn_out)` (`atom/model_ops/base_attention.py:403`). The name promises destination-passing and the source refuses it: `core_attn_out` and the return are two live buffers, on the device as much as in the graph |
+| `aiter::unified_attention_with_output_base` | same shape, no alias annotations | same |
+
+**No double count was found.** Every custom operator in the TP=1 graph either
+records no output and writes into a buffer the trace already counted, or
+records a fresh output the implementation really does allocate. The walk's
+treatment of the fused operators is right, which is worth stating as plainly as
+a defect would have been.
+
+Two things did fall out of reading the schemas. First, `mutates_args="unknown"`
+-- the default in `aiter/jit/utils/torch_guard.py` -- marks *every* tensor
+argument `Tensor(a!)`, including `gemm_a16w16`'s weight matrix `B` and
+`fused_allreduce_rmsnorm_`'s norm weight `w`. A producer that read mutability
+off these schemas would conclude the model mutates its own weights. **In this
+registry `(a!)` is not evidence of mutation.** Second, the asymmetry that *is*
+usable: an operator returning a tensor that aliases an argument would have to
+say so in the return annotation, and none of them do. `aiter::all_reduce_
+(Tensor(a0!) tensor, str group_name, ...) -> Tensor` declares an unaliased
+return, which is the schema agreeing with the implementation's own comment that
+the all-reduce is out-of-place -- the collective correction now rests on the
+schema as well as the source. `aiter::fused_allreduce_rmsnorm_(Tensor(a0!) inp,
+Tensor(a1!) res_inp, Tensor(a2!) w, ...) -> (Tensor, Tensor)` returns two
+unaliased tensors; it does not appear in the 27B's graph at any width, so it is
+recorded here and not modelled.
+
+## The lineage classification does not yet align these graphs
+
+Run over the real TP=1/2/4 derived graphs, `width_coverage` reports 71 of 3014
+outputs aligned across all three widths -- 2.4% -- and 2943 unaligned at the
+base width. Every tensor live at the TP=2 and TP=4 peaks is `unaligned`. The
+classification is therefore **not usable yet**, and the honest reading of the
+`width_class` field in the current candidate is that it is populated at TP=1
+and empty of meaning at width.
+
+The first run of this check reported 98, from a defect in the key it was
+checking. `lineage_keys` interned each distinct ancestry to `L0`, `L1`, `L2`
+-- the *order* the ancestry was first met in -- so two graphs agreed whenever
+they happened to meet the same number of distinct ancestries first, which is
+index alignment wearing a different name and exactly what the function was
+written to avoid. The key is now a digest of the ancestry itself. The
+correction lowered the coverage rather than raising it, which is the direction
+worth noticing: a defect that flatters a number is the kind that survives.
+
+The cause is in the key, and the source names it. `VocabParallelEmbedding.
+forward` (`atom/model_ops/embed_head.py:168-178`) branches on width: `tp_size >
+1` takes `masked_embedding` followed by an all-reduce, and `tp_size == 1` takes
+`F.embedding`. So operator 0 is `aten::embedding` at TP=1 and
+`aiter::masked_embedding` at TP=2 and 4 -- the same module, two operator names
+-- and `lineage_keys` interns the name into the ancestry key, so the divergence
+propagates to every descendant. One width-conditional branch at the root
+poisons the whole graph. It also produces a wrong answer where it does align:
+the silu destination `aten::empty.memory_format [16384, 17408]`, which visibly
+becomes `[16384, 8704]` at TP=2, is classed `replicated`, meaning it aligned
+against something that is not its counterpart.
+
+The fix is not a bigger equivalence table. Operator names are the wrong
+identity because ATOM's width behaviour is a property of *modules*: the module
+path -- `model.layers.31.mlp.gate_up_proj` -- is the same string at every
+width, and the module decides both the branch and the sharding. `OpSpec`
+carries no module field today, and `@mark_trace` (`atom/utils/decorators.py`)
+already wraps every module forward with a named region, so the information
+exists at trace time and is thrown away. Stamping a module path per operator,
+aligning within a module's span, and dropping collectives from the ordinal --
+collectives being exactly what a width adds -- is a derivation over ATOM's own
+structure and needs no comparison with any measured peak.
+
+Nothing above changes a byte of the candidate: `candidate_bytes` is still
+{1: 2 956 984 320, 2: 2 101 346 304, 4: 1 673 527 296}, each width's own walk.
+
 ## Open items
 
 | # | item | needs | status |
@@ -1070,6 +1185,8 @@ implementation, not the trailing underscore.
 | O17 | the graph pool budget *estimate* and the pool the engine actually reserves are different quantities and are not to be compared as one | -- | open, and separate from O8. O8 is the +26.8% error in the predicted pool at TP=4; this is the prior question of which two numbers that percentage is between |
 | O18 | `OpSpec` records the dtype of each *argument* and never of an output, so every consumer that needs an output's size reads `dtypes[0]` and assumes promotion changed nothing | **lead** -- shared schema (`core/graph.py`, `runtime/meta.py`) | open. `aiter::masked_embedding` takes int32 ids and returns bfloat16: `dtypes[0]` sizes one hidden-width buffer at 335 544 320 B instead of 167 772 160, which is the whole `walk_bytes` / `visible_peak_bytes` gap in the frozen candidate. Fix is an `output_dtypes` field filled from the real outputs and a schema bump (packet P4). Until then the walk on this branch sizes an output by PyTorch's own promotion rule when the graph records no dtype -- float beats int, and float16 with bfloat16 gives float32 -- labels the basis `recorded`, `unanimous` or `promoted`, and reports every non-`recorded` output through `dtype_ambiguities`. The masked_embedding case is now right by rule rather than by name, and the ad-hoc correction that was subtracting 167 772 160 B is deleted. Refusal is available but not the default: `strict_dtypes=True` raises `UnfoundedActivation` on the first output the graph does not record, which is what a consumer that must not guess should pass |
 | O19 | the tracer's "unseen destination is a fresh allocation" rule cannot tell a buffer allocated before the traced region from one allocated invisibly inside a custom operator | **lead** -- shared runtime | open. `forward_vars["outputs"]` (`model_runner.py:1290`) is 167 772 160 B allocated at engine init, so it is inside `current_torch` and cannot be part of `peak - current`; the walk counts a write into it as an allocation. Fix is to seed the seen-set with the storages that exist when the region opens. Note this is a *replicated* over-count and therefore cancels at width -- it is a TP=1 accuracy item, not the cause of O16 |
-| O20 | the derived graphs' mutability and output-dtype contracts for computation, not just collectives: a fused add/RMSNorm or activation that the native path writes in place but a meta or derived path returns fresh from, invents one replicated hidden-width buffer per call | source + registered schema, CPU only | open, and the first thing that could still move O16. Method is the one the collective audit used: the implementation and the `torch_compile_guard` schema, never the name. `aiter::fused_allreduce_rmsnorm_` is in the same list -- its registered fake returns two fresh tensors, one possibly padded wider than hidden (`x_pad_to_multiple`), and if the 27B routes through it at TP>1 there is an operator in the width mechanism that has not been modelled at all |
-| O21 | the 2999-operator TP=1 lifetime trace against the 2439-operator v2 body graph: neither is the native warmup allocation graph until the difference is accounted for | the two artifacts, CPU only | open. Four candidate causes and a discriminator for each: region scope (an op-name prefix histogram shows whether preparation/head are in or out), compile mode (a `@support_torch_compile` region captured on device can be one fused dispatch where eager meta walks it operator by operator), meta substitutions for operators with no meta kernel, and the collectives a width adds. To be settled before either graph is called the warmup graph |
-| O22 | `torch_compile_guard(mutates_args="unknown")` is the default for `aiter::all_reduce_`, so the *declared* schema's mutability annotation is unread: if "unknown" marks every tensor argument `Tensor(a!)`, the registered schema says mutation where the implementation is out-of-place | **lead** -- one read of `aiter/jit/utils/torch_guard.py:95-197` | open; matters because a producer that keys alias or death information off schema annotations would take the conservative marking as fact |
+| O20 | mutability, alias and output-dtype contracts of the fused computation operators, not just the collectives | source + registered schema, CPU only -- done | **closed, and it found nothing wrong with the walk.** `silu_and_mul` and `_fused_qk_rmsnorm_group_quant_kernel` are destination-passing and record no output; `gemm_a16w16`, `linear_attention_with_output_base` and `unified_attention_with_output_base` return genuinely fresh tensors, by schema and by implementation (`base_attention.py:403`). No double count. Two by-products: `mutates_args="unknown"` marks weight arguments mutable, so `(a!)` in this registry is not evidence of mutation (O22), and `fused_allreduce_rmsnorm_` is absent from the 27B's graph at every width |
+| O21 | the 2999-operator TP=1 lifetime trace against the 2439-operator body graph | the two artifacts, CPU only -- done | **closed.** Same region, device, compilation level, redirections and scope; the only difference is step kind, and the operator arithmetic closes with no remainder: 2999 - 416 (GDN chunked-prefill path) - 144 (drift) + 32 (decode's mrope and `aten::min`) = 2439. The prefill graph is the one shaped like `warmup_model`; the decode graph never was a candidate. The two caveats that remain on the prefill graph are its own: `compilation_level: 0`, and a scope that excludes `compute_logits` and the sampler |
+| O22 | whether `torch_compile_guard(mutates_args="unknown")` declares mutation the implementation does not perform | one schema read, CPU only -- done | **closed, and it does.** `aiter::gemm_a16w16(Tensor(a0!) A, Tensor(a1!) B, ...)` marks the weight matrix mutable; `fused_allreduce_rmsnorm_` marks the norm weight mutable. The usable half of the schema is the return annotation: an aliasing return must be declared, and `all_reduce_ -> Tensor` is unannotated, so the schema independently confirms the collective is out-of-place |
+| O23 | `lineage_keys` aligns 71 of 3014 outputs across the three real widths, and misclassifies one that it does align | CPU only; a module path per operator | open, and it blocks any use of `width_class` at width. Cause is read from source: `VocabParallelEmbedding.forward` (`embed_head.py:168-178`) emits `aiter::masked_embedding` at TP>1 and `aten::embedding` at TP=1, and an ancestry key that interns operator names propagates that one branch through the whole graph. Fix is a module path stamped per operator -- width-invariant by construction, already named by `@mark_trace` at trace time, and absent from `OpSpec`. The candidate's bytes do not depend on this |
+| O24 | a TP=1 *target* cell for a device-free replay: the committed TP=1 records carry readings, blocks and config but no run identity and no hardware identity | **lead** + CC | open. The memory-side TP=1 source evidence exists and is committed (`27b.tp1.memory.json`, `27b.tp1.exclusive.memory.json` with its ownership sample, `g3_util_phasea/phasebc.json`, `qwen3_5_27b.config.json`); what is missing is the identity O12 would supply. A diagnostic-only cell assembled from them must label every term with where it came from, must not be described as a capture of a run it cannot name, and must not carry TP=1's 112 740 blocks into a TP=2 or TP=4 cell -- the pool is a per-rank quantity and a one-process CPU replay can only execute rank 0 (`replay/local_proc.py:43`) |

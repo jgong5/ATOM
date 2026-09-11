@@ -415,3 +415,26 @@ def test_one_width_cannot_be_classified_at_all():
     with pytest.raises(ValueError) as raised:
         width_classes({1: _three_widths()[1]})
     assert "two or more" in str(raised.value)
+
+
+def test_a_width_conditional_branch_defeats_a_name_keyed_lineage():
+    """The limitation the real graphs showed, pinned so it cannot be forgotten.
+
+    `VocabParallelEmbedding.forward` takes `masked_embedding` plus an
+    all-reduce at TP>1 and `F.embedding` at TP=1 (`embed_head.py:168-178`), so
+    the *same module* emits two operator names. An ancestry key that interns
+    the name diverges at operator 0 and stays diverged, which is why alignment
+    over the real TP=1/2/4 graphs reaches 98 of 3014 outputs. Until an operator
+    carries its module path, `width_class` is not to be read at width.
+    """
+    from atom.compass.core.memory_model import width_coverage
+
+    graphs = _three_widths()
+    for tp in (2, 4):
+        graphs[tp]["ops"][0]["name"] = "aiter::masked_embedding"
+    coverage = width_coverage(graphs)
+
+    assert coverage["aligned"] == 0
+    assert coverage["unaligned_at_base"] == len(graphs[1]["ops"])
+    assert coverage["by_class"] == {"replicated": 0, "sharded": 0,
+                                    "unresolved": 0}

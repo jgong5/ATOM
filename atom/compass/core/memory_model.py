@@ -33,6 +33,7 @@ for a shape nobody traced.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 from typing import Mapping, Optional
@@ -1014,8 +1015,10 @@ def lineage_keys(graph) -> list:
     collective (`all_gather`) is passed through for *alignment* only -- its own
     outputs have no counterpart at TP=1 and are reported as such.
 
-    Returns one key per operator, interned so that equal ancestry gives an
-    equal key across graphs.
+    Returns one key per operator, as a digest of the ancestry itself, so
+    that equal ancestry gives an equal key in two graphs that discovered
+    their operators in different orders -- which two widths do, because a
+    width inserts operators.
     """
     ops = graph.get("ops") or ()
     interned: dict = {}
@@ -1033,7 +1036,12 @@ def lineage_keys(graph) -> list:
         structure = (op.get("name"), parents)
         key = interned.get(structure)
         if key is None:
-            key = "L%d" % len(interned)
+            # A digest of the structure, not the order it was met in: an
+            # ordinal would make two graphs agree whenever they happened
+            # to discover the same number of ancestries first, which is
+            # index alignment wearing a different name.
+            key = hashlib.blake2b(repr(structure).encode("utf-8"),
+                                  digest_size=8).hexdigest()
             interned[structure] = key
         keys.append(key)
     return keys
