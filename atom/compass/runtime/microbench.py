@@ -330,6 +330,256 @@ def _rebuild_args(op: dict, tensors: list) -> tuple[list, dict]:
     return args, keywords
 
 
+class ArgumentStructureRefusal(Exception):
+    """The recorded tensors do not fit the containers the schema declares."""
+
+
+#: How a schema argument takes tensors, if it takes any at all.
+_ONE_TENSOR = "tensor"
+_TENSOR_LIST = "tensor_list"
+_MAYBE_TENSOR_LIST = "optional_tensor_list"
+_MAYBE_TENSOR = "optional_tensor"
+
+#: The only operator whose ``Tensor?[]`` this module knows how to place.
+#:
+#: A ``Tensor?[]`` records only its tensors, so where the ``None`` placeholders
+#: sat has to be recovered from somewhere. Recovering it needs the operator's
+#: own shape rule, which is written out here for this one operator and for no
+#: other. Any other operator carrying a ``Tensor?[]`` is refused rather than
+#: grouped by analogy: the rule below is advanced indexing's, not a general
+#: law about optional lists.
+_MODELLED_OPTIONAL_LIST = "aten::index.Tensor"
+
+
+def _argument_kind(declared):
+    """Whether an argument takes one tensor, a container of them, or neither.
+
+    Read from the type's structure rather than from how it prints. This torch
+    prints ``index.Tensor``'s indices as ``List[Optional[Tensor]]`` while the
+    schema language spells the same thing ``Tensor?[]``; a check written
+    against either spelling alone quietly classifies the argument as "not a
+    tensor list", which is the bug this exists to fix. ``List[int]`` is a list
+    and is not one of these -- convolution's stride must not be taken for a
+    container of tensors.
+
+    A list of optional tensors is kept distinct from a list of tensors. The
+    difference is not cosmetic: ``Tensor[]`` has no empty slots, so the
+    recorded tensors fill it in order and the reconstruction is forced, while
+    ``Tensor?[]`` may hold ``None`` in any position and the record does not say
+    which.
+    """
+    kind = declared.kind() if hasattr(declared, "kind") else None
+    if kind == "TensorType":
+        return _ONE_TENSOR
+    if kind in ("OptionalType", "ListType"):
+        inner = declared.getElementType()
+        inner_kind = inner.kind() if hasattr(inner, "kind") else None
+        if kind == "OptionalType":
+            return _MAYBE_TENSOR if inner_kind == "TensorType" else None
+        if inner_kind == "OptionalType":
+            inner = inner.getElementType()
+            inner_kind = inner.kind() if hasattr(inner, "kind") else None
+            return _MAYBE_TENSOR_LIST if inner_kind == "TensorType" else None
+        return _TENSOR_LIST if inner_kind == "TensorType" else None
+    if kind is not None:
+        return None
+    # No structural API to read: fall back to the schema language's spelling.
+    return {"Tensor": _ONE_TENSOR, "Tensor?": _MAYBE_TENSOR,
+            "Tensor[]": _TENSOR_LIST,
+            "Tensor?[]": _MAYBE_TENSOR_LIST}.get(str(declared))
+
+
+def _schema_kinds(fn) -> list | None:
+    """What each argument takes, in order, or ``None`` if there is no schema."""
+    arguments = getattr(getattr(fn, "_schema", None), "arguments", None)
+    if not arguments:
+        return None
+    try:
+        return [_argument_kind(a.type) for a in arguments]
+    except Exception:  # noqa: BLE001 - a schema can be any shape of object
+        return None
+
+
+def _schema_name(fn) -> str | None:
+    """``aten::index.Tensor``, from the schema rather than from a label."""
+    schema = getattr(fn, "_schema", None)
+    name = getattr(schema, "name", None)
+    if not name:
+        return None
+    overload = getattr(schema, "overload_name", None)
+    return f"{name}.{overload}" if overload else str(name)
+
+
+def _broadcast_of_1d(lengths: list) -> tuple | None:
+    """The shape 1-D index tensors broadcast to, or ``None`` if they cannot."""
+    width = 1
+    for length in lengths:
+        if length == 1:
+            continue
+        if width == 1:
+            width = length
+        elif width != length:
+            return None
+    return (width,)
+
+
+def _index_output_shape(self_shape: tuple, axes: tuple, broadcast: tuple):
+    """Advanced indexing's shape rule, arithmetic only.
+
+    ``self[.., i, ..]`` replaces the indexed axes with the broadcast shape of
+    the indices, in place when the indexed axes are adjacent and at the front
+    when they are not. Everything here is integer arithmetic on shapes the
+    graph already recorded, so it can be evaluated before anything is launched.
+    """
+    from itertools import pairwise
+
+    if len(axes) > 1 and any(b - a != 1 for a, b in pairwise(axes)):
+        return broadcast + tuple(d for i, d in enumerate(self_shape)
+                                 if i not in axes)
+    return (tuple(self_shape[:axes[0]]) + broadcast
+            + tuple(self_shape[axes[-1] + 1:]))
+
+
+def _index_placements(self_shape: tuple, index_shapes: list,
+                      recorded_out: list) -> list:
+    """Every axis assignment that reproduces the recorded output shape.
+
+    The caller must refuse unless exactly one comes back. Two placements that
+    agree on the output shape are a real ambiguity, not a tie to be broken: a
+    square tensor indexed by a full-length vector has the same shape whether
+    the rows or the columns were selected, and no amount of looking at the
+    result tells them apart. Choosing one and running it would price a call
+    the step may never have made.
+    """
+    from itertools import combinations
+
+    broadcast = _broadcast_of_1d([s[0] for s in index_shapes])
+    if broadcast is None:
+        return []
+    wanted = [tuple(s) for s in recorded_out]
+    return [axes
+            for axes in combinations(range(len(self_shape)),
+                                     len(index_shapes))
+            if [_index_output_shape(self_shape, axes, broadcast)] == wanted]
+
+
+def _optional_list_contents(fn, self_tensor, indices: list, op: dict) -> list:
+    """Where the ``None`` placeholders sat in a recorded ``Tensor?[]``.
+
+    Nothing here launches anything. The placement is settled by predicting each
+    candidate's output shape from the recorded shapes and keeping it only if
+    exactly one candidate reproduces the output the graph recorded. Replaying a
+    guess and checking the shape afterwards would be both too weak and too
+    late: too weak because same-shape placements are indistinguishable once the
+    call has returned, and too late because a wrong axis is an out-of-bounds
+    index, which on a GPU is a device-side assert that takes the process with
+    it long before any check runs. The validator is arithmetic, not a kernel.
+    """
+    name = _schema_name(fn)
+    if name != _MODELLED_OPTIONAL_LIST:
+        raise ArgumentStructureRefusal(
+            f"its schema takes a Tensor?[] and {name or 'it'} is not an "
+            "operator whose placement of None is modelled here")
+    for t in indices:
+        if getattr(t, "dim", None) is None or t.dim() != 1:
+            raise ArgumentStructureRefusal(
+                "one of its recorded indices is not one-dimensional")
+        dtype = getattr(t, "dtype", None)
+        if getattr(dtype, "is_floating_point", False) or str(dtype) in (
+                "torch.bool",):
+            raise ArgumentStructureRefusal(
+                f"one of its recorded indices has dtype {dtype}; a boolean "
+                "mask selects a data-dependent count, which a recorded shape "
+                "cannot pin down")
+    self_shape = tuple(self_tensor.shape)
+    if len(indices) > len(self_shape):
+        raise ArgumentStructureRefusal(
+            f"it records {len(indices)} indices for a {len(self_shape)}-"
+            "dimensional tensor")
+    if len(indices) == len(self_shape):
+        # Every axis is indexed, so there is no slot a None could occupy.
+        return list(indices)
+    recorded_out = op.get("output_shapes") or ()
+    if len(recorded_out) != 1:
+        raise ArgumentStructureRefusal(
+            "its Tensor?[] has free slots and the graph records "
+            f"{len(recorded_out)} output shapes, so which axes were indexed "
+            "cannot be settled")
+    axes = _index_placements(self_shape, [tuple(t.shape) for t in indices],
+                             list(recorded_out))
+    if not axes:
+        raise ArgumentStructureRefusal(
+            f"no placement of its indices in {self_shape} produces the "
+            f"recorded output {[tuple(s) for s in recorded_out]}")
+    if len(axes) > 1:
+        raise ArgumentStructureRefusal(
+            f"{len(axes)} placements of its indices -- axes {list(axes)} -- "
+            f"all produce the recorded output {tuple(recorded_out[0])}, so "
+            "the record does not say which axes were indexed")
+    placed = [None] * (axes[0][-1] + 1)
+    for axis, t in zip(axes[0], indices):
+        placed[axis] = t
+    return placed
+
+
+def _group_for_schema(fn, tensors: list, op: dict) -> list:
+    """Put the recorded tensors back into the containers the schema declares.
+
+    The tracer records an operator's tensor arguments as one flat ordered list,
+    which loses the difference between a tensor argument and a container of
+    tensors. For nearly every operator that costs nothing, because each tensor
+    argument is its own. For ``aten::index.Tensor(Tensor self, Tensor?[]
+    indices)`` it is the whole call: handed a bare tensor where a list belongs,
+    torch iterates it, so a 24-element index tensor arrives as 24 separate
+    indices into a 2-D tensor and the call raises ``IndexError: too many
+    indices``. That is why every prefill head went unpriced.
+
+    The grouping is read from the operator's own schema and from nothing else,
+    and only where that schema leaves no choice: exactly one container, and
+    every other tensor argument a plain required ``Tensor``, so the container's
+    width is the count left over rather than a guess. Two containers, or an
+    optional ``Tensor?`` that may or may not be present in the record, are
+    refused -- a reconstruction nobody can check is worse than an unpriced
+    signature. A ``Tensor?[]`` needs one thing more, the position of its empty
+    slots; ``_optional_list_contents`` settles that or refuses.
+    """
+    kinds = _schema_kinds(fn)
+    if kinds is None:
+        return tensors
+    containers = [k for k in kinds if k in (_TENSOR_LIST, _MAYBE_TENSOR_LIST)]
+    if not containers:
+        return tensors
+    if len(containers) > 1:
+        raise ArgumentStructureRefusal(
+            f"its schema declares {len(containers)} tensor-list arguments, so "
+            "the recorded tensors cannot be divided between them")
+    singles = [k for k in kinds if k == _ONE_TENSOR]
+    if any(k == _MAYBE_TENSOR for k in kinds):
+        raise ArgumentStructureRefusal(
+            "its schema has both a tensor list and an optional tensor, and "
+            "the graph does not record which optional arguments were present")
+    width = len(tensors) - len(singles)
+    if width < 0:
+        raise ArgumentStructureRefusal(
+            f"its schema wants {len(singles)} tensor arguments beside the "
+            f"list and the graph recorded {len(tensors)} tensors")
+
+    grouped, rest = [], list(tensors)
+    for kind in kinds:
+        if not rest and len(grouped) >= len(singles) + 1:
+            break
+        if kind in (_TENSOR_LIST, _MAYBE_TENSOR_LIST):
+            listed = [rest.pop(0) for _ in range(width)]
+            if kind == _MAYBE_TENSOR_LIST:
+                listed = _optional_list_contents(fn, grouped[0] if grouped
+                                                 else None, listed, op)
+            grouped.append(listed)
+        elif kind == _ONE_TENSOR and rest:
+            grouped.append(rest.pop(0))
+    grouped.extend(rest)
+    return grouped
+
+
 def _operand_tensors(op: dict, recorded: dict, spans: dict):
     """One fresh set of tensor arguments, as views into what held them.
 
@@ -594,7 +844,9 @@ def _build_arg_sets(op: dict, cache: str, fn) -> Optional[list]:
         tensors = _operand_tensors(op, recorded, spans)
         if tensors is None:
             return None
-        return _rebuild_args(op, tensors)
+        # Grouping refuses before this returns if the record does not settle
+        # the arguments' structure, so nothing below launches a guess.
+        return _rebuild_args(op, _group_for_schema(fn, tensors, op))
 
     first = one()
     if first is None:
@@ -1187,6 +1439,12 @@ def price_graph(graph_path: str, iters: int = 2000, warmup: int = 20,
                     _variants[i % len(_variants)]()
         try:
             sets = _build_arg_sets(op, cache, fn)
+        except ArgumentStructureRefusal as exc:
+            # Say which reconstruction was refused and why. "could not build
+            # inputs: ArgumentStructureRefusal" would send a reader back to the
+            # source to learn something this already knows.
+            unpriced[sig] = str(exc)
+            continue
         except Exception as exc:  # noqa: BLE001 - allocation can fail many ways
             unpriced[sig] = f"could not build inputs: {type(exc).__name__}"
             continue
