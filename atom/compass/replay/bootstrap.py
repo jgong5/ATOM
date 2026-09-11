@@ -59,6 +59,7 @@ logger = logging.getLogger(__name__)
 __all__ = ["install", "install_from_target", "state", "ArchUnavailable"]
 
 _STATE: dict = {"installed": False, "arch": None, "gpu_archs": None,
+                "redundant_installs": 0,
                 "source": None, "reason": None, "calls": 0,
                 "chip_info_hook": False, "chip_info_calls": 0}
 
@@ -153,6 +154,37 @@ def _seed_chip_info(arch: str) -> None:
     _STATE["chip_info_hook"] = True
 
 
+def _process_state():
+    """The bootstrap state of this *process*, which may not be this module's.
+
+    `_sitedir/sitecustomize.py` loads this very file by path, under the name
+    `atom_compass_replay_bootstrap`, so that a spawned child pays for stdlib
+    and one module instead of importing all of `atom` at interpreter startup.
+    That copy is a different module object with its own `_STATE`, while the
+    thing it installs -- the `sys.meta_path` finder and the `jax` stub -- is
+    per-process. So by the time the engine core imports
+    `atom.compass.replay.bootstrap` the child is bootstrapped, and this module
+    object is the only thing that does not know it.
+
+    That is how a correctly bootstrapped worker came to refuse the tracer's
+    `install_from_target` with "this process bootstrapped None": not a late
+    bootstrap, which the guard is right to refuse, but the same bootstrap seen
+    through the other copy. Read back rather than re-derived, so the adopted
+    state keeps the original call's source and counters.
+    """
+    here = os.path.abspath(__file__)
+    for name, module in list(sys.modules.items()):
+        if module is None or name == __name__:
+            continue
+        path = getattr(module, "__file__", None)
+        if not path or os.path.abspath(path) != here:
+            continue
+        other = getattr(module, "_STATE", None)
+        if isinstance(other, dict) and other.get("installed"):
+            return dict(other), name
+    return None
+
+
 def install(arch: str, *, source: str = "unknown") -> dict:
     """Make the architecture query answerable with ``arch``.
 
@@ -166,11 +198,32 @@ def install(arch: str, *, source: str = "unknown") -> dict:
             "must record one -- re-capture with a build that writes "
             "`hardware.arch`, or pass the architecture explicitly.")
     if "aiter" in sys.modules:
+        # Already imported. Before deciding that nothing answered, ask the
+        # process rather than this module object: under `_sitedir` the answer
+        # lives in a second copy of this file. See `_process_state`.
+        if not _STATE["installed"]:
+            found = _process_state()
+            if found is not None:
+                adopted, where = found
+                _STATE.update(adopted)
+                _STATE["adopted_from"] = where
+        # Already answered, with the architecture being asked for: the
+        # derivation path's second call is redundant rather than wrong.
+        # Refusing it here is what stopped a device-free `derive=1` server
+        # from reaching a single step.
+        if _STATE["installed"] and str(_STATE["arch"]) == str(arch):
+            # Not "calls", which counts architecture queries answered. Its
+            # own field, so a report can say the derivation path asked again
+            # rather than the second call leaving no trace at all.
+            _STATE["redundant_installs"] = (
+                _STATE.get("redundant_installs", 0) + 1)
+            return state()
         raise RuntimeError(
             "ATOMCompass: aiter is already imported, so its cached "
             "architecture is already resolved and this call would change "
-            "nothing. Bootstrap the replay before importing atom.")
-
+            f"nothing (this process bootstrapped {_STATE['arch']!r} and is "
+            f"now asked for {str(arch)!r}). Bootstrap the replay before "
+            "importing atom.")
     live = _live_arch()
     if live is not None:
         # A device is visible. Triton will answer and the fallback is never

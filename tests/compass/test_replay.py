@@ -357,6 +357,48 @@ class TestTheArchComesFromTheCaptureNotTheHost:
         with pytest.raises(RuntimeError, match="already imported"):
             bootstrap.install("gfx942", source="test")
 
+    def test_a_second_call_in_a_bootstrapped_process_is_a_no_op(self,
+                                                                monkeypatch):
+        """The engine core worker is already bootstrapped when it gets here.
+
+        `_sitedir` bootstraps the child at interpreter startup, which is what
+        lets it import AITER on a machine with no device at all. The tracer's
+        `derive=1` path then calls `install_from_target` again, before its own
+        `import aiter`, because in a fresh derivation process that is the call
+        that makes the import possible. Refusing the second call stopped a
+        device-free predicting server from reaching a single step: the worker
+        died in `load model runner`, the manager reported only an unexpected
+        SHUTDOWN, and the arch it was asked for was the one already installed.
+        """
+        bootstrap = self._clean(monkeypatch)
+        bootstrap.install("gfx942:sramecc+:xnack-", source="sitedir")
+        monkeypatch.setitem(sys.modules, "aiter", types.ModuleType("aiter"))
+
+        state = bootstrap.install("gfx942:sramecc+:xnack-", source="tracer")
+        assert state["installed"] is True
+        assert state["arch"] == "gfx942:sramecc+:xnack-"
+        # Still the first call's source: the second changed nothing, and
+        # saying otherwise would credit the answer to the wrong caller.
+        assert state["source"] == "sitedir"
+        # "calls" counts architecture queries answered, and the second install
+        # answered none; the redundant call is counted where it belongs.
+        assert state["calls"] == 0
+        assert state["redundant_installs"] == 1
+
+    def test_a_second_call_for_a_different_arch_still_refuses(self,
+                                                              monkeypatch):
+        # This is the case the refusal is actually about: the resolved answer
+        # is one architecture and the caller wants another, which no later
+        # call can deliver. Both are named so the mismatch is readable.
+        bootstrap = self._clean(monkeypatch)
+        bootstrap.install("gfx942:sramecc+:xnack-", source="sitedir")
+        monkeypatch.setitem(sys.modules, "aiter", types.ModuleType("aiter"))
+
+        with pytest.raises(RuntimeError, match="already imported") as excinfo:
+            bootstrap.install("gfx950", source="tracer")
+        assert "gfx942:sramecc+:xnack-" in str(excinfo.value)
+        assert "gfx950" in str(excinfo.value)
+
     def test_a_target_without_hardware_says_to_recapture(self, monkeypatch,
                                                          tmp_path):
         bootstrap = self._clean(monkeypatch)
@@ -455,6 +497,45 @@ class TestTheChildProcessesAreToldToo:
                  "ATOM_COMPASS_REPLAY_ARCH": "gfx942"},
             capture_output=True, text=True, timeout=120)
         assert out.stdout.strip() == "yes", out.stderr
+
+    def test_the_spawned_child_s_canonical_module_finds_the_bootstrap(self):
+        """The engine core's own sequence, in a real child interpreter.
+
+        `_sitedir/sitecustomize.py` loads `bootstrap.py` by path under the name
+        `atom_compass_replay_bootstrap`, so the module object that installs the
+        hook is not the one `atom.compass.replay.bootstrap` resolves to. The
+        hook is per-process and worked; the canonical module's `_STATE` was
+        empty, and the tracer's `derive=1` call therefore refused a child that
+        was correctly bootstrapped. A predicting server died in `load model
+        runner` with the manager reporting only an unexpected SHUTDOWN.
+
+        `aiter` is stubbed here only to keep this test off a multi-second real
+        import -- it stands for "already imported", which is the whole
+        condition. Everything else is the real startup path.
+        """
+        root = Path(__file__).resolve().parents[2]
+        out = subprocess.run(
+            [sys.executable, "-c",
+             ("import sys, types;"
+              " sys.modules['aiter'] = types.ModuleType('aiter');"
+              " from atom.compass.replay import bootstrap as b;"
+              " s = b.install('gfx942:sramecc+:xnack-', source='tracer');"
+              " print(s['installed'], s['arch'], s['source'],"
+              " s.get('adopted_from'))")],
+            env={**self._blind(), "PYTHONPATH": os.pathsep.join(
+                [str(self._sitedir()), str(root)]),
+                "ATOM_COMPASS_REPLAY_ARCH": "gfx942:sramecc+:xnack-",
+                "ATOM_COMPASS_REPLAY_ARCH_SOURCE": "sitedir"},
+            capture_output=True, text=True, check=False)
+        assert out.returncode == 0, out.stderr
+        installed, arch, source, adopted = out.stdout.split()
+        assert installed == "True"
+        assert arch == "gfx942:sramecc+:xnack-"
+        # The first call's provenance, not the tracer's: the adopted state is
+        # read back rather than re-derived, so it still says where it was
+        # installed from and that this module was not the one that did it.
+        assert source == "sitedir"
+        assert adopted == "atom_compass_replay_bootstrap"
 
 
 def _tp4(tmp_path):
