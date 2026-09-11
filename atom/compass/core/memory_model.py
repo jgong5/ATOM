@@ -991,16 +991,32 @@ def measured_graph_pool_bytes(capture_sizes, world_size: int = 1,
 #: (`agent_scratch/memval/producer_packet/tp1_probe/out/warmup_history.959476.pickle`)
 #: carries a 79 691 776 B `segment_alloc` whose frames run
 #: `aiter/tuned_gemm.py:450:torch_gemm` <- `gemm_a16w16` <- the inductor region
-#: of the GDN linear-attention forward, which looked like the site. It is
-#: probably not. That block is **token-shaped**: at the run's own 16 384
-#: `max_num_batched_tokens` it is 16 384 x 2432 x 2 B -- equally readable as a
-#: 2432-token chunk of the 16 384-wide `in_proj_qkvz`, since the product is the
-#: same -- and 16 384 x 2432 x 2 is exactly 76 MiB by arithmetic. The
-#: capture-window block cannot be that tensor: it is unchanged on a different
-#: model and at TP=2/4/8, and the captured buckets are at most 32 tokens. So
-#: the equal size is **coincidence unless shown otherwise**, and the
-#: capture-window block, which carries no frames, stays unattributed. Naming it
-#: needs allocation history recorded *inside* the capture window.
+#: of the GDN linear-attention forward. **Equal size settles nothing in either
+#: direction**, and neither does factoring it: any size divides many ways, and
+#: 2432 is not a width this checkpoint produces. What is witnessed about the
+#: *warmup* block is its life, not its shape. It is allocated once, at the
+#: second event of the window, and is still live when the window closes -- the
+#: window's whole net allocated retention, 79 691 776 B, is this one block.
+#: `tuned_gemm.py` contains no workspace at all (no `workspace` appears in the
+#: file); `torch_gemm` ends in `F.linear(inp, weights, bias)`, so what it
+#: returns is a GEMM output of shape `[M, N]` where `N` is a weight output
+#: width -- of the config's widths only `in_proj_qkvz` = 16 384 divides
+#: 39 845 888, which would make `M` 2432 tokens.
+#:
+#: The *capture-window* block is a different observation and stays
+#: unattributed: it carries no frames, and all six segments new in that window
+#: are on the capture stream (460554448) while the 313 pre-existing segments
+#: are on stream 0 -- so it was requested on the side stream capture runs on,
+#: outside the graph's private pool. A per-stream cache would explain both a
+#: fixed size and a second allocation after warmup already made one; so would
+#: several other things. Naming it needs allocation history recorded *inside*
+#: the capture window, and no prediction waits on that: the term is
+#: source-calibrated by construction.
+#:
+#: One thing is settled and matters more for the gate. The warmup block is
+#: retained across its window, so it is in `peak` and in `current` alike and
+#: **cancels in `peak - current`**. It is excluded from the activation term
+#: once, there, and is not also carried as a residue anywhere else.
 #: The constant therefore stays a calibrated number rather than a derived one,
 #: and stays overridable via `calibration["graph_pool"]["fixed_pinned"]`: it is
 #: a property of the AITER/ROCm build, not of the model. Its value must not
