@@ -15,6 +15,15 @@ evidence -- rows measured at 4, 20, 32, 4672 and 16384 -- that refuses almost
 everything, which is the correct reading of five points spanning three orders
 of magnitude, and it states exactly what an acquisition has to fill.
 
+Distance is not the only way a bracket can fail. Two measured points can sit
+one doubling apart and still be on different curves, because the library
+switched kernel between them: the prefill ladder serves ``MT64x16x256`` up to
+16 rows and ``MT128x32x128`` from 20, so interpolating 16 to 32 -- a ratio of
+exactly the declared 2.0 -- crossed the switch and missed the measured 20- and
+24-row points by 12.21% and 8.23%. Where two bracketing points name different
+kernels the price is refused, and where at least one names none the price says
+the identity went unchecked rather than implying it was confirmed.
+
 Every answer carries where it came from. An interpolated price names both
 bracketing measurements and their files; an exact one names its own. The
 uncertainty is assembled from what the measurements show -- the spread across
@@ -133,8 +142,12 @@ class RowSupport:
                 for a, b in zip(rows, rows[1:]) if b / a > self.max_gap_ratio]
         note = (f", gaps too wide to interpolate: {'; '.join(gaps)}"
                 if gaps else "")
+        switches = [f"{a}->{b}" for a, b in zip(rows, rows[1:])
+                    if _switches(self.curve.points[a], self.curve.points[b])]
+        switch_note = (f", kernel switches inside a bracket: "
+                       f"{'; '.join(switches)}" if switches else "")
         return (f"{self.curve.family}: measured at {rows}"
-                f", max gap ratio {self.max_gap_ratio}{note}")
+                f", max gap ratio {self.max_gap_ratio}{note}{switch_note}")
 
     def price(self, rows: int) -> Price | Refusal:
         curve = self.curve
@@ -179,7 +192,22 @@ class RowSupport:
                 component="rows")
 
         left, right = curve.points[lo], curve.points[hi]
+        if _switches(left, right):
+            return Refusal(
+                f"{rows} rows falls between {lo} and {hi}, which the library "
+                f"does not serve with the same kernel: {_names(left.kernels)} "
+                f"at {lo} rows and {_names(right.kernels)} at {hi}. An "
+                "interpolant between two points is a claim about one curve, "
+                "and a kernel switch inside the bracket says there are two of "
+                "them; the ladder needs a point on this side of the switch",
+                component="kernel_switch")
+
         seconds = _log_interpolate(rows, lo, left.value, hi, right.value)
+        # Either point's kernels stand for the interpolant only because the two
+        # agree -- the refusal above is what makes that safe. Where one of them
+        # recorded none, the price says the identity went unchecked rather than
+        # leaving a reader to assume it was.
+        unchecked = not (left.kernels and right.kernels)
         return Price(
             seconds=seconds,
             kernels=left.kernels or right.kernels,
@@ -192,8 +220,36 @@ class RowSupport:
             basis="interpolated",
             sources=left.sources + right.sources,
             detail=(f"interpolated between {lo} and {hi} rows "
-                    f"(x{ratio:.2f} apart)"),
+                    f"(x{ratio:.2f} apart)"
+                    + ("; kernel identity across the bracket is unchecked, "
+                       "because one of the two points recorded no kernel names"
+                       if unchecked else "")),
         )
+
+
+def _names(kernels: tuple[str, ...]) -> str:
+    """Kernel names for a refusal, short enough to read in one line."""
+    if len(kernels) <= 2:
+        return "/".join(kernels)
+    return "/".join(kernels[:2]) + f" (+{len(kernels) - 2} more)"
+
+
+def _switches(left: MeasuredPoint, right: MeasuredPoint) -> bool:
+    """Whether the library changes kernel between two measured points.
+
+    Two points whose names differ are two curves, not one, and the switch is
+    where the second departs from the first: the prefill ladder runs
+    `MT64x16x256` to 16 rows and `MT128x32x128` from 20, and a straight
+    interpolation across that bracket missed the measured 20- and 24-row
+    points by 12.21% and 8.23%. The gap ratio does not catch it -- 16 to 32 is
+    exactly the declared x2.0 -- because the objection is not distance.
+
+    Unknown is not a switch. Two points that recorded no kernel names say
+    nothing about each other, and `price` reports that as unchecked rather
+    than refusing on an absence.
+    """
+    return bool(left.kernels and right.kernels
+                and left.kernels != right.kernels)
 
 
 def _log_interpolate(x: float, x0: float, y0: float,

@@ -165,6 +165,95 @@ def test_interpolation_uncertainty_grows_with_the_gap():
     assert wide.price(120).uncertainty > narrow.price(120).uncertainty
 
 
+# -- a bracket can be close enough and still be two curves ----------------
+
+#: The decode rungs the prefill campaign interpolated from, in seconds, and the
+#: tile the library served each with. From CC's head delivery
+#: (`results_prefill/prefill_gemm_validation.json`, campaign val_commit_3e04c166
+#: on MI308X): 16 rows is the last point served by MT64x16x256 and 32 is served
+#: by MT128x32x128, with the switch itself at 20.
+PREFILL_RUNGS = {8: 0.0009640, 16: 0.0009707, 32: 0.0011603}
+SMALL_TILE = ("aiter::gemm_a16w16_MT64x16x256",)
+LARGE_TILE = ("aiter::gemm_a16w16_MT128x32x128",)
+
+
+def switched_curve(kernels_by_rows: dict[int, tuple]) -> MeasuredCurve:
+    curve = MeasuredCurve(template_key="t", family="aiter::gemm_a16w16")
+    for rows, kernels in kernels_by_rows.items():
+        curve.add(rows, PREFILL_RUNGS[rows], f"file_{rows}.json", kernels)
+    return curve
+
+
+def test_a_bracket_that_crosses_a_kernel_switch_is_refused():
+    """16 to 32 is a ratio of exactly 2.0, so the gap rule lets it through.
+
+    It should not go through. The library serves 16 rows with one tile and 32
+    with another, and pricing 20 or 24 off a line between them missed the
+    measured points by 12.21% and 8.23%.
+    """
+    support = RowSupport(switched_curve({16: SMALL_TILE, 32: LARGE_TILE}),
+                         max_gap_ratio=2.0)
+    for rows in (20, 24):
+        refusal = support.price(rows)
+        assert isinstance(refusal, Refusal), rows
+        assert refusal.component == "kernel_switch"
+        assert "MT64x16x256" in refusal.reason
+        assert "MT128x32x128" in refusal.reason
+
+
+def test_the_gap_rule_on_its_own_would_have_allowed_that_bracket():
+    """The same two row counts, same times, one tile: priced.
+
+    So the refusal above is about kernel identity and not about distance --
+    which is the whole point, because the distance test passes here.
+    """
+    support = RowSupport(switched_curve({16: SMALL_TILE, 32: SMALL_TILE}),
+                         max_gap_ratio=2.0)
+    price = support.price(20)
+    assert not isinstance(price, Refusal)
+    assert price.basis == "interpolated"
+
+
+def test_a_switch_outside_the_bracket_is_not_this_bracket_s_problem():
+    # 8 and 16 are both on the small tile; the switch at 32 is further up the
+    # ladder and says nothing about a 12-row price.
+    support = RowSupport(
+        switched_curve({8: SMALL_TILE, 16: SMALL_TILE, 32: LARGE_TILE}),
+        max_gap_ratio=2.0)
+    price = support.price(12)
+    assert not isinstance(price, Refusal)
+    assert price.kernels == SMALL_TILE
+
+
+def test_an_unlabelled_bracket_is_priced_and_says_it_was_not_checked():
+    """An absence is not a switch, and it is not a confirmation either.
+
+    A producer that recorded no kernel names leaves the identity unknown. The
+    price still stands -- refusing on an absence would discard every older
+    artifact -- but it carries that it was never checked.
+    """
+    support = RowSupport(switched_curve({16: (), 32: LARGE_TILE}),
+                         max_gap_ratio=2.0)
+    price = support.price(20)
+    assert not isinstance(price, Refusal)
+    assert "unchecked" in price.detail
+
+
+def test_a_checked_bracket_does_not_claim_to_be_unchecked():
+    support = RowSupport(switched_curve({16: SMALL_TILE, 32: SMALL_TILE}),
+                         max_gap_ratio=2.0)
+    assert "unchecked" not in support.price(20).detail
+
+
+def test_describe_names_the_switch_so_an_acquisition_can_see_it():
+    support = RowSupport(switched_curve({16: SMALL_TILE, 32: LARGE_TILE}),
+                         max_gap_ratio=2.0)
+    said = support.describe()
+    assert "kernel switches inside a bracket: 16->32" in said
+    # And not as a gap: the gap rule has no objection to this ladder.
+    assert "gaps too wide" not in said
+
+
 # -- the fallback fires behind one refusal and no other -------------------
 
 
