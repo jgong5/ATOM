@@ -41,6 +41,8 @@ __all__ = [
     "Verdict",
     "longest_request",
     "trace_requests",
+    "within_window",
+    "window_upper_bound",
     "blocks_for",
     "admission_refusal",
     "assess",
@@ -78,9 +80,13 @@ class Verdict:
 def trace_requests(path: str) -> list:
     """Every request in a cc-traces JSONL, as lengths.
 
-    The trace is the workload, so the longest request in it is a property of
-    the workload and not of any deployment -- which is what makes it a
-    legitimate feasibility input. Nothing measured on the target is read.
+    Lengths read here are a property of the workload and not of any deployment,
+    which is what makes them a legitimate feasibility input -- nothing measured
+    on the target is read. But a captured slice is not automatically the
+    workload: if the campaign manifest bounds prompt length, the slice may hold
+    requests that will never be sent, and the longest of those is a stress
+    figure rather than an acceptance figure. Pass the manifest's own trace here
+    once it exists; until then bound the slice with `within_window`.
     """
     requests = []
     with open(path, encoding="utf-8") as fh:
@@ -96,6 +102,38 @@ def trace_requests(path: str) -> list:
                 )
             )
     return requests
+
+
+def within_window(requests, *, max_input_tokens: int) -> list:
+    """The requests a workload window admits, by prompt length.
+
+    A trace slice and the workload a campaign accepts against are not the same
+    thing. The slice on disk is whatever was captured; the workload is what the
+    manifest says will be replayed, and a manifest that caps prompts at N makes
+    every longer request in the slice irrelevant to feasibility, because it will
+    never be sent.
+    """
+    return [r for r in requests if r.input_tokens <= int(max_input_tokens)]
+
+
+def window_upper_bound(requests, *, max_input_tokens: int) -> Optional[Request]:
+    """The longest request a window *could* contain, not the longest it did.
+
+    The input cap paired with the longest output the admitted requests show.
+    That deliberately pairs two different requests' extremes: a feasibility
+    bound has to hold for the worst request the window can produce, and a slice
+    that happens not to contain a cap-length prompt answering at its longest is
+    evidence about the slice, not about the window.
+
+    This is a stand-in for a number nobody has yet. Once the workload manifest
+    is locked, take the lengths from it via `trace_requests` and
+    `longest_request` instead -- a bound that is never replaced quietly becomes
+    a claim about a workload that was never measured.
+    """
+    inside = within_window(requests, max_input_tokens=max_input_tokens)
+    if not inside:
+        return None
+    return Request(int(max_input_tokens), max(r.output_tokens for r in inside))
 
 
 def longest_request(requests) -> Optional[Request]:

@@ -1,0 +1,138 @@
+{
+ "version": 1,
+ "what": "G3 phase A: the frozen utilization ladder, run on the device",
+ "predictions_frozen_in": "tests/compass/memory_records/frozen_util_predictions.json",
+ "predictions_sha256": "520a40b0a831ef6ff12e308c602eff115801879eca11a47321633c42e823d6c6",
+ "run": {
+  "host": "hjbog-srdc-18.amd.com",
+  "container": "xiaobizh_n18",
+  "devices": "HIP_VISIBLE_DEVICES=0, exclusive lease",
+  "tree": "/workspace/ATOM/agent_scratch/memval/tree",
+  "script": "agent_scratch/mem/g3_util_ladder.sh",
+  "started_utc": "2026-09-11T08:31:14Z",
+  "finished_utc": "2026-09-11T08:39:20Z",
+  "shell_exit": 0
+ },
+ "source_sha256": {},
+ "weights_from_meta_build": {
+  "tp1": {
+   "parameters": 54713457120,
+   "buffers": 33554432,
+   "parameters_plus_buffers": 54747011552
+  },
+  "tp2": {
+   "parameters": 27818133472,
+   "buffers": 33554432,
+   "parameters_plus_buffers": 27851687904
+  },
+  "tp4": {
+   "parameters": 14370471648,
+   "buffers": 33554432,
+   "parameters_plus_buffers": 14404026080
+  }
+ },
+ "rungs": {
+  "0.32": {
+   "run_exit": 1,
+   "engine_started": false,
+   "exception_chain": [
+    "atom.model_ops.attentions.sub_pool_spec.InsufficientPoolBudget",
+    "RuntimeError"
+   ],
+   "insufficient_pool_budget": {
+    "reserved_bytes": 2510290944,
+    "available_bytes": 2122210714,
+    "entries": 32
+   },
+   "runtime_error_message": "Per-request cache tensor (2.34GB for 32 slots) exceeds available KV budget (1.98GB) at --gpu-memory-utilization 0.32. Set --gpu-memory-utilization >= 0.33 (this only zeroes out the deficit; use a higher value for actual KV capacity) or reduce --max-num-seqs (currently 32).",
+   "min_util_hint": 0.33
+  },
+  "0.33": {
+   "run_exit": 0,
+   "engine_started": true,
+   "num_kvcache_blocks": 1091,
+   "readings": {
+    "total": 206141652992,
+    "free": 149346582528,
+    "peak_torch": 57971260416,
+    "weights_torch": 54761936384,
+    "parameter_bytes": 54747011552,
+    "buffer_bytes": 33554432,
+    "current_torch": 55014276096,
+    "non_torch": 1677721600,
+    "cudagraph_overhead": 591396864
+   },
+   "graph_pool": {
+    "reserved": 127926272,
+    "allocated": 110981120,
+    "capture_sizes": [
+     1,
+     2,
+     4,
+     8,
+     16,
+     32
+    ],
+    "graphs": 6
+   }
+  },
+  "0.40": {
+   "run_exit": 0,
+   "engine_started": true,
+   "num_kvcache_blocks": 15238,
+   "readings": {
+    "total": 206141652992,
+    "free": 149866676224,
+    "peak_torch": 57971260416,
+    "weights_torch": 54761936384,
+    "parameter_bytes": 54747011552,
+    "buffer_bytes": 33554432,
+    "current_torch": 55014276096,
+    "non_torch": 1157627904,
+    "cudagraph_overhead": 591396864
+   },
+   "graph_pool": {
+    "reserved": 127926272,
+    "allocated": 110981120,
+    "capture_sizes": [
+     1,
+     2,
+     4,
+     8,
+     16,
+     32
+    ],
+    "graphs": 6
+   }
+  },
+  "0.41": {
+   "run_exit": 0,
+   "engine_started": true,
+   "num_kvcache_blocks": 17188,
+   "readings": {
+    "total": 206141652992,
+    "free": 149866676224,
+    "peak_torch": 57971260416,
+    "weights_torch": 54761936384,
+    "parameter_bytes": 54747011552,
+    "buffer_bytes": 33554432,
+    "current_torch": 55014276096,
+    "non_torch": 1157627904,
+    "cudagraph_overhead": 591396864
+   },
+   "graph_pool": {
+    "reserved": 127926272,
+    "allocated": 110981120,
+    "capture_sizes": [
+     1,
+     2,
+     4,
+     8,
+     16,
+     32
+    ],
+    "graphs": 6
+   }
+  }
+ }
+}
