@@ -49,15 +49,58 @@ class FakeProc:
         return self.returncode
 
 
+#: What `/compass/provenance` actually returns, field for field, from
+#: `atom/entrypoints/openai/api_server.py::compass_provenance`. A fake thinner
+#: than the producer lets the harness pass a check the real server would fail.
+SERVER_CODE = "a" * 64
+
+
+def fake_provenance(mode, *, tp=2, code=SERVER_CODE, **over):
+    said = {
+        "server_revision": "deadbeef",
+        "server_code_sha256": code,
+        "model": plan_mod.MODEL,
+        "model_revision": "m-rev",
+        "tensor_parallel_size": tp,
+        "max_model_len": 262144,
+        "enable_prefix_caching": False,
+        "compass": {
+            "enabled": True,
+            "mode": mode,
+            "oracle": "atom.compass.oracles.transfer.TransferOracle",
+            "oracle_options": {},
+            "oracle_option_sha256": {},
+            "virtual_clock": mode == "predict",
+            "admission_seconds": None,
+        },
+        "calibration_sha256": None,
+        "visible_devices": None if mode == "predict" else "0",
+    }
+    said.update(over)
+    return said
+
+
 class FakeProcesses:
     """Every start, run and stop, in order, and nothing that looks anything up.
 
     `stop` takes the handle it was given, so a test can assert that the harness
     only ever signalled processes it started -- by the pid it recorded, never
-    by a name.
+    by a name. What it writes for a replay is `replay.py`'s manifest shape and
+    what it writes for the sampler is `gpu_sampler.py`'s, so a check that
+    passes here is a check that could pass there.
     """
 
-    def __init__(self, *, exits=None, dies_after=None, cell=None, artifacts=True):
+    def __init__(
+        self,
+        *,
+        exits=None,
+        dies_after=None,
+        cell=None,
+        artifacts=True,
+        wall=None,
+        served=SERVER_CODE,
+        sampler=True,
+    ):
         self.started = []
         self.ran = []
         self.stopped = []
@@ -65,6 +108,9 @@ class FakeProcesses:
         self.dies_after = dies_after
         self.cell = cell
         self.artifacts = artifacts
+        self.served = served
+        self.sampler = sampler
+        self.wall = wall or (lambda: 1_700_000_000.0)
         self._pid = 4000
 
     def start(self, command, *, log, cwd=None, env=None):
@@ -76,8 +122,11 @@ class FakeProcesses:
     def run(self, command, *, log, cwd=None, env=None):
         self.ran.append(list(command))
         key = self._key(command)
-        if self.cell is not None and "replay.py" in " ".join(command):
+        text = " ".join(command)
+        if self.cell is not None and "replay.py" in text:
             self._write_artifact(command)
+        if self.cell is not None and "gpu_sampler.py" in text:
+            self._gpu_sample(command, "baseline")
         if self.dies_after == key and self.started:
             self.started[-1].returncode = 1
         return self.exits.get(key, 0)
@@ -87,6 +136,8 @@ class FakeProcesses:
 
     def stop(self, proc, grace=None):
         self.stopped.append(proc.pid)
+        if self.cell is not None and "gpu_sampler.py" in " ".join(proc.command):
+            self._gpu_sample(proc.command, "window")
         if proc.returncode is None:
             proc.returncode = 0
         return proc.returncode
@@ -98,14 +149,54 @@ class FakeProcesses:
             return Path(command[command.index("--out") + 1]).name
         return text
 
+    def _gpu_sample(self, command, phase):
+        if not self.sampler:
+            return
+        # The path the sampler was told to write, the way the real one does.
+        path = Path(next(a for a in command if a.endswith("gpu.jsonl")))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        with path.open("a", encoding="utf-8") as fh:
+            fh.write(
+                json.dumps(
+                    {
+                        "t": self.wall(),
+                        "phase": phase,
+                        "visible": "0",
+                        "own_pids": [],
+                        "smi": {"card0": {"VRAM Total Used Memory (B)": "0"}},
+                        "pids": {},
+                    }
+                )
+                + "\n"
+            )
+
     def _write_artifact(self, command):
         out = Path(command[command.index("--out") + 1])
         if not self.artifacts:
             return
         side = "modelled" if "modelled" in out.name else "real"
-        manifest = {"paced": side == "real"}
+        trace = Path(command[command.index("--trace") + 1])
+        full = ROOT / trace
+        manifest = {
+            "paced": side == "real",
+            "trace": str(trace),
+            "trace_sha256": (run_mod.file_digest(full) or {}).get("sha256"),
+            "requests": 0,
+            "server": fake_provenance(
+                "measure" if side == "real" else "predict", code=self.served
+            ),
+            "server_code_sha256": self.served,
+            "prepare": None,
+        }
         if side == "real":
-            manifest["prepare"] = {"requests": 3, "drained": True}
+            manifest["prepare"] = {
+                "requested": 3,
+                "returned": 3,
+                "drained": True,
+                "drained_records": 3,
+                "store_empty_after_drain": True,
+                "declared_workload_size": False,
+            }
         out.parent.mkdir(parents=True, exist_ok=True)
         out.write_text(json.dumps({"run": manifest, "workload": [], "results": []}))
 
@@ -144,9 +235,9 @@ def _runner(tmp_path, side, *, processes=None, health=None, provenance=None, **k
     return run_mod.SideRun(
         _plan(tmp_path),
         side,
-        processes=processes or FakeProcesses(cell=tmp_path),
+        processes=processes or FakeProcesses(cell=tmp_path, wall=clock.wall),
         health=health or (lambda url: {}),
-        provenance=provenance or (lambda url: {"compass": {"mode": mode}}),
+        provenance=provenance or (lambda url: fake_provenance(mode)),
         now=clock.now,
         wall=clock.wall,
         sleep=clock.sleep,
@@ -663,3 +754,144 @@ class TestEveryRepeatIsAnExecutionWithAName:
         for entry in _journal(runner)["steps"]:
             if entry.get("execution_id") is not None:
                 assert entry["execution_id"] in known
+
+
+class TestTheProducersAreCheckedAtTheirOwnFieldNames:
+    """Each check below reads a field some other component writes.
+
+    The names come from `api_server.compass_provenance` and from the manifest
+    `replay.py` writes, so what is asserted here is agreement between the two
+    sides of a boundary rather than agreement between the harness and itself.
+    """
+
+    def test_a_server_with_compass_off_is_not_a_compass_result(self, tmp_path):
+        said = fake_provenance("predict")
+        said["compass"]["enabled"] = False
+        runner = _runner(tmp_path, "modelled", provenance=lambda url: said)
+        assert runner.run() == 1
+        assert any("compass disabled" in f for f in runner.failures)
+
+    def test_a_predictor_on_no_virtual_clock_is_refused(self, tmp_path):
+        """`replay.py::_clock_of` reads this exact field to decide whether to
+        refuse a warmed predictor. False here means that refusal never fires."""
+        said = fake_provenance("predict")
+        said["compass"]["virtual_clock"] = False
+        runner = _runner(tmp_path, "modelled", provenance=lambda url: said)
+        assert runner.run() == 1
+        assert any("virtual clock" in f for f in runner.failures)
+
+    def test_a_measuring_server_on_a_virtual_clock_is_refused(self, tmp_path):
+        said = fake_provenance("measure")
+        said["compass"]["virtual_clock"] = True
+        runner = _runner(tmp_path, "real", provenance=lambda url: said)
+        assert runner.run() == 1
+        assert any("modelled ones and not measurements" in f for f in runner.failures)
+
+    def test_a_server_at_the_wrong_width_is_refused(self, tmp_path):
+        runner = _runner(
+            tmp_path,
+            "modelled",
+            provenance=lambda url: fake_provenance("predict", tp=4),
+        )
+        assert runner.run() == 1
+        assert any("tensor_parallel_size=4" in f for f in runner.failures)
+
+    def test_a_replay_of_another_trace_is_refused(self, tmp_path):
+        """The frozen corpus, by its bytes rather than by its path."""
+        procs = FakeProcesses(cell=tmp_path)
+        original = procs._write_artifact
+
+        def other_trace(command):
+            original(command)
+            out = Path(command[command.index("--out") + 1])
+            blob = json.loads(out.read_text())
+            blob["run"]["trace_sha256"] = "b" * 64
+            out.write_text(json.dumps(blob))
+
+        procs._write_artifact = other_trace
+        runner = _runner(tmp_path, "modelled", processes=procs)
+        assert runner.run() == 1
+        assert any("frozen workload" in f for f in runner.failures)
+
+    def test_an_artifact_answered_by_another_server_is_refused(self, tmp_path):
+        """Something else listening on the port is the failure that looks
+        most like a success."""
+        procs = FakeProcesses(cell=tmp_path, served="c" * 64)
+        runner = _runner(tmp_path, "modelled", processes=procs)
+        assert runner.run() == 1
+        assert any("listening on that port" in f for f in runner.failures)
+
+    def test_an_artifact_with_no_server_provenance_is_refused(self, tmp_path):
+        procs = FakeProcesses(cell=tmp_path)
+        original = procs._write_artifact
+
+        def anonymous(command):
+            original(command)
+            out = Path(command[command.index("--out") + 1])
+            blob = json.loads(out.read_text())
+            blob["run"]["server"] = None
+            out.write_text(json.dumps(blob))
+
+        procs._write_artifact = anonymous
+        runner = _runner(tmp_path, "modelled", processes=procs)
+        assert runner.run() == 1
+        assert any("no server provenance" in f for f in runner.failures)
+
+    @pytest.mark.parametrize(
+        ("field", "value", "says"),
+        [
+            ("store_empty_after_drain", False, "not empty after the drain"),
+            ("drained_records", 0, "drained no engine records"),
+        ],
+    )
+    def test_a_preparation_that_did_not_really_drain_is_refused(
+        self, tmp_path, field, value, says
+    ):
+        procs = FakeProcesses(cell=tmp_path)
+        original = procs._write_artifact
+
+        def undrained(command):
+            original(command)
+            out = Path(command[command.index("--out") + 1])
+            blob = json.loads(out.read_text())
+            if blob["run"].get("prepare"):
+                blob["run"]["prepare"][field] = value
+                out.write_text(json.dumps(blob))
+
+        procs._write_artifact = undrained
+        runner = _runner(tmp_path, "real", processes=procs)
+        assert runner.run() == 1
+        assert any(says in f for f in runner.failures)
+
+
+class TestTheWatchHasToCoverTheWindow:
+    """A clean audit over four seconds of a forty-minute window is not
+    evidence that the node was quiet."""
+
+    def test_a_sampler_that_wrote_nothing_fails_the_side(self, tmp_path):
+        runner = _runner(
+            tmp_path, "real", processes=FakeProcesses(cell=tmp_path, sampler=False)
+        )
+        assert runner.run() == 1
+        assert any("went unwatched" in f for f in runner.failures)
+
+    def test_samples_without_a_baseline_fail_the_side(self, tmp_path):
+        procs = FakeProcesses(cell=tmp_path)
+        original = procs._gpu_sample
+        procs._gpu_sample = lambda command, phase: original(command, "window")
+        runner = _runner(tmp_path, "real", processes=procs)
+        assert runner.run() == 1
+        assert any("no baseline sample" in f for f in runner.failures)
+
+    def test_a_watch_that_started_late_fails_the_side(self, tmp_path):
+        clock = Clock()
+        procs = FakeProcesses(cell=tmp_path, wall=lambda: clock.wall() + 600.0)
+        runner = _runner(tmp_path, "real", processes=procs)
+        assert runner.run() == 1
+        assert any("after the first server did" in f for f in runner.failures)
+
+    def test_a_watch_that_stopped_early_fails_the_side(self, tmp_path):
+        procs = FakeProcesses(cell=tmp_path, wall=lambda: 1_600_000_000.0)
+        runner = _runner(tmp_path, "real", processes=procs)
+        assert runner.run() == 1
+        assert any("before the last server did" in f for f in runner.failures)

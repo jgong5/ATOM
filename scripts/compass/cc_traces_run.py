@@ -52,7 +52,6 @@ did, including when what they did was fail.
 from __future__ import annotations
 
 import argparse
-import hashlib
 import importlib.util
 import json
 import math
@@ -79,6 +78,7 @@ def _load(name: str):
 
 compare = _load("compare")
 plan_module = _load("cc_traces_plan")
+execution_id = _load("execution_id")
 
 #: Seconds to wait for a server to answer /health before giving up on it. A
 #: 262k-context model at TP=4 loads weights and captures graphs inside this.
@@ -137,58 +137,18 @@ SUPPLIED_TERMS = ("capture", "calibration", "derivation", "load")
 #: Two repeats of one cell can produce byte-identical artifacts and still be
 #: independent executions, so nothing here is derived from payload content:
 #: the id is minted from where and when the process was launched.
-EXECUTION_SCHEMA = "compass.execution/1"
-
-ID_RULE = (
-    "sha256 of the id_inputs values joined by NUL, in the order "
-    "host, cell, side, repeat, server_pid, launched_at_ns; first 16 hex "
-    "characters, prefixed 'cx-'"
-)
-
-
-def derive_execution_id(host, cell, side, repeat, server_pid, launched_at_ns) -> str:
-    """The one identifier, from the facts of the launch.
-
-    Derived rather than random so that it can be checked: everything it is made
-    of is recorded beside it, and `verify_execution_id` re-computes it. A pid is
-    reused by the kernel eventually and a clock can be set backwards, which is
-    why neither is the id on its own.
-    """
-    parts = [
-        str(host),
-        str(cell),
-        str(side),
-        str(repeat),
-        str(server_pid),
-        str(launched_at_ns),
-    ]
-    digest = hashlib.sha256("\0".join(parts).encode("utf-8")).hexdigest()
-    return f"cx-{digest[:16]}"
-
-
-def verify_execution_id(record: dict) -> bool:
-    """Does this record's id follow from its own recorded inputs?"""
-    inputs = record.get("id_inputs") or {}
-    try:
-        expected = derive_execution_id(
-            inputs["host"],
-            inputs["cell"],
-            inputs["side"],
-            inputs["repeat"],
-            inputs["server_pid"],
-            inputs["launched_at_ns"],
-        )
-    except KeyError:
-        return False
-    return expected == record.get("execution_id")
-
-
-def file_digest(path: Path):
-    """A file's digest and size, or None if it is not there."""
-    if not Path(path).exists():
-        return None
-    data = Path(path).read_bytes()
-    return {"sha256": hashlib.sha256(data).hexdigest(), "bytes": len(data)}
+# The rule itself lives in `execution_id.py`, which imports nothing but the
+# standard library, so every reader of these artifacts -- this harness, the
+# MEMORY classifier, a notebook opening one file -- verifies an id with the
+# same code that minted it. A second implementation would be a second scheme,
+# however carefully it was copied.
+EXECUTION_SCHEMA = execution_id.EXECUTION_SCHEMA
+ID_RULE = execution_id.ID_RULE
+ID_FIELDS = execution_id.ID_FIELDS
+derive_execution_id = execution_id.derive_execution_id
+verify_execution_id = execution_id.verify_execution_id
+stamp_of = execution_id.stamp_of
+file_digest = execution_id.file_digest
 
 
 # --------------------------------------------------------------------------
@@ -490,6 +450,41 @@ class SideRun:
                 f"{self.side} side, which needs {want!r}"
             )
             return None
+        # Field names below are the server's, from
+        # `atom/entrypoints/openai/api_server.py::compass_provenance`.
+        compass = said.get("compass") or {}
+        if not compass.get("enabled"):
+            self.failures.append(
+                f"{step['id']}: the server reports compass disabled, so "
+                f"--compass did not take and nothing it serves is a "
+                f"Compass result"
+            )
+            return None
+        # `replay.py::_clock_of` decides whether to refuse a warmed predictor
+        # by reading exactly this field. A predicting server that reports no
+        # virtual clock would never trigger that refusal, so the protection
+        # the modelled side depends on would be silently absent.
+        virtual = bool(compass.get("virtual_clock"))
+        if self.side == "modelled" and not virtual:
+            self.failures.append(
+                f"{step['id']}: the predicting server reports no virtual "
+                f"clock, so replay.py would not refuse a warmed predictor "
+                f"and the protection this side depends on is absent"
+            )
+            return None
+        if self.side == "real" and virtual:
+            self.failures.append(
+                f"{step['id']}: the measuring server is on a virtual clock, "
+                f"so its seconds are modelled ones and not measurements"
+            )
+            return None
+        declared = said.get("tensor_parallel_size")
+        if declared is not None and int(declared) != int(self.plan["tp"]):
+            self.failures.append(
+                f"{step['id']}: the server reports tensor_parallel_size="
+                f"{declared}, and this cell is tp{self.plan['tp']}"
+            )
+            return None
         path = self.cell / f"provenance.{self.side}.r{step['repeat']}.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(said, indent=1) + "\n")
@@ -564,16 +559,29 @@ class SideRun:
             return False
         manifest = blob.get("run") or {}
         bad = []
+        # Manifest field names below are `replay.py`'s, from the dict it
+        # writes as `run`.
+        prepare = manifest.get("prepare") or {}
         if self.side == "real":
             if not manifest.get("paced"):
                 bad.append(
                     "it was not paced, so its arrivals were declared to a "
                     "server that stamps on receipt"
                 )
-            if not (manifest.get("prepare") or {}).get("drained"):
+            if not prepare.get("drained"):
                 bad.append(
                     "it carries no drained preparation, and the drain is "
                     "where the measurement starts"
+                )
+            elif not prepare.get("store_empty_after_drain"):
+                bad.append(
+                    "the engine's record store was not empty after the "
+                    "drain, so a preparation row can enter the measurement"
+                )
+            elif not prepare.get("drained_records"):
+                bad.append(
+                    "the preparation drained no engine records at all, so "
+                    "nothing shows it reached the engine it was warming"
                 )
         else:
             if manifest.get("paced"):
@@ -583,6 +591,33 @@ class SideRun:
                     "it was prepared, which lands inside every declared "
                     "arrival's TTFT"
                 )
+        # The frozen corpus, checked by its bytes rather than by its path:
+        # the replay records the digest of the trace it actually read.
+        want_trace = (execution.get("source") or {}).get("workload_sha256")
+        got_trace = manifest.get("trace_sha256")
+        if want_trace and got_trace and want_trace != got_trace:
+            bad.append(
+                f"it replayed a trace whose digest is {got_trace[:12]}, and "
+                f"this cell's frozen workload is {want_trace[:12]}"
+            )
+        # And the server it reached. `replay.py` embeds the server's own
+        # `/compass/provenance` under `run.server`; if that is not the process
+        # this harness started, something else was listening on the port and
+        # the repeat measured a server nobody recorded.
+        served = manifest.get("server") or {}
+        mine = (execution["config"].get("provenance") or {}).get("server_code_sha256")
+        theirs = served.get("server_code_sha256")
+        if not served:
+            bad.append(
+                "it carries no server provenance, so which process answered "
+                "it cannot be recovered from the artifact"
+            )
+        elif mine and theirs and mine != theirs:
+            bad.append(
+                f"it was answered by a server whose code digest is "
+                f"{theirs[:12]}, and the process this repeat started reports "
+                f"{mine[:12]}: something else was listening on that port"
+            )
         stamped = (blob.get("execution") or {}).get("execution_id")
         if stamped and stamped != execution["execution_id"]:
             # An artifact that already belongs to another execution: a stale
@@ -614,15 +649,7 @@ class SideRun:
         still that execution, and a reader who has the file has the id. The
         digest is taken after stamping, so it describes the bytes that exist.
         """
-        blob["execution"] = {
-            "schema": EXECUTION_SCHEMA,
-            "execution_id": execution["execution_id"],
-            "id_rule": ID_RULE,
-            "id_inputs": dict(execution["id_inputs"]),
-            "cell": dict(execution["cell"]),
-            "side": execution["side"],
-            "repeat": execution["repeat"],
-        }
+        blob["execution"] = stamp_of(execution)
         path.write_text(json.dumps(blob, indent=1) + "\n")
         execution["artifacts"][path.name] = file_digest(path)
 
@@ -638,7 +665,81 @@ class SideRun:
             execution["process"]["ended_at"] = self.wall()
             execution["process"]["exit"] = code
             self._write_execution(execution)
-        self._record(step, pid=held["pid"], exit=code, ok=True)
+        watched = True
+        if held["step"]["role"] == "sample":
+            # Now that it has stopped, ask what it saw -- before the run ends
+            # and the answer is somebody else's problem.
+            watched = self._check_sampler(step, self.cell / "gpu.jsonl")
+        self._record(step, pid=held["pid"], exit=code, ok=watched)
+        return watched
+
+    def _check_sampler(self, step, path) -> bool:
+        """Did the watch actually cover the window it was meant to cover?
+
+        `isolation.py` judges what the samples say; this asks the question
+        before that one -- whether there are samples spanning the repeats at
+        all. A sampler that died after its first tick leaves a file that audits
+        clean, and a clean audit over four seconds of a forty-minute window is
+        not evidence that the node was quiet.
+        """
+        if not path.exists():
+            self.failures.append(
+                f"{step['id']}: {path.name} was not written, so the real "
+                f"window went unwatched and no repeat in it can be attributed"
+            )
+            return False
+        times, phases = [], set()
+        for line in path.read_text().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                sample = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(sample.get("t"), (int, float)):
+                times.append(float(sample["t"]))
+            if sample.get("phase"):
+                phases.add(sample["phase"])
+        if not times:
+            self.failures.append(
+                f"{step['id']}: {path.name} carries no timed sample, so "
+                f"nothing in it can be placed against a repeat"
+            )
+            return False
+        if "baseline" not in phases:
+            # The only sample that can show a card was already somebody
+            # else's: everything after the first server starts includes us.
+            self.failures.append(
+                f"{step['id']}: {path.name} has no baseline sample, so "
+                f"whether the cards were already busy cannot be told"
+            )
+            return False
+        launches = [
+            e["process"]["launched_at"]
+            for e in self.executions.values()
+            if e["process"].get("launched_at") is not None
+        ]
+        ends = [
+            e["process"]["ended_at"]
+            for e in self.executions.values()
+            if e["process"].get("ended_at") is not None
+        ]
+        first, last = min(times), max(times)
+        if launches and first > min(launches):
+            self.failures.append(
+                f"{step['id']}: the watch starts {first - min(launches):.1f}s "
+                f"after the first server did, so that much of the window is "
+                f"unobserved"
+            )
+            return False
+        if ends and last < max(ends):
+            self.failures.append(
+                f"{step['id']}: the watch stops {max(ends) - last:.1f}s "
+                f"before the last server did, so that much of the window is "
+                f"unobserved"
+            )
+            return False
         return True
 
     def _write_execution(self, execution):
