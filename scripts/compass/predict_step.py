@@ -32,7 +32,7 @@ shapes says so; it does not report an average over the 40.
         --replay-target target.json \
         --block-size 16 --max-model-len 262144 --position-rows 3 \
         --price prices.json:graph.json:unregistered \
-        --head-price hprices.json:hgraph.json:unregistered \
+        --price hprices.json:hgraph.json:unregistered \
         --template graph.json --head-template hgraph.json \
         --regions source-27b-tp1 --cudagraph-mode full \
         --shapes shapes.json -o out.json
@@ -47,15 +47,6 @@ import argparse
 import json
 import sys
 import time
-
-#: Region models, by the name a caller may ask for. A name that is not here is
-#: an error rather than a default: running with no region model at all and
-#: running with the source's is a difference of tens of percent in the step, and
-#: a typo must not silently pick one.
-REGION_MODELS = {
-    "source-27b-tp1": ("atom.compass.core.cost.regions", "SOURCE_27B_TP1"),
-    "none": None,
-}
 
 
 def _shape_from(raw: dict):
@@ -82,82 +73,17 @@ def _shape_from(raw: dict):
     )
 
 
-def _coords(saved):
-    """A coordinate map as saved: a dict, or the pair list JSON turned it into."""
-    if not saved:
-        return {}
-    if isinstance(saved, dict):
-        return dict(saved)
-    return {k: v for k, v in saved}
-
-
-def _template_shape(graph: dict):
-    """The structure a graph on disk is a graph of, from its own provenance.
-
-    A derived artifact records the batch it was traced over
-    (`provenance.batch_spec`). Reading it back is the only way to key a
-    pre-derived graph that does not involve the caller restating the batch and
-    getting it wrong -- and a graph whose provenance does not carry one cannot
-    be used as a template at all, because nothing says what it is a template
-    *for*.
-    """
-    from atom.compass.core.cost.base import StepShape
-
-    prov = graph.get("provenance") or {}
-    spec = prov.get("batch_spec")
-    if not spec:
-        raise ValueError(
-            "this graph records no batch_spec, so nothing says which structure "
-            "it is a template for. Derive it with --batch-spec.")
-    key = graph.get("key") or {}
-    # A saved key writes its coordinate dicts as pair lists, because JSON has
-    # no dict-of-tuples. Reading one back as a dict is not a conversion, it is
-    # the inverse of how it was written.
-    topology = _coords(key.get("topology"))
-    rank_coords = _coords(key.get("rank_coords"))
-    queries = tuple(spec["query_lens"])
-    contexts = tuple(spec["context_lens"])
-    prefill = 0 if spec.get("kind") == "decode" else sum(queries)
-    # Which bucket a graph was captured at is an execution fact, and that is
-    # where the tracer records it -- not in the batch spec, which describes the
-    # requests. A graph derived with no bucket declared keys as None: it is a
-    # template for the uncaptured structure, and claiming a bucket it was not
-    # traced at would make it answer for a padded graph nobody derived.
-    execution = prov.get("execution") or {}
-    return StepShape(
-        num_scheduled_tokens=queries,
-        context_lens=contexts,
-        num_prefill_tokens=prefill,
-        topology=topology, rank_coords=rank_coords,
-        capture_bucket=execution.get("capture_bucket"),
-        compiled=None,
-        produces_output=True,
-    )
-
-
-def _load_prices(entries):
-    """``prices.json[:graph.json[:regime]]`` triples, as PriceLibrary takes."""
-    loaded = []
-    for entry in entries or ():
-        parts = entry.split(":")
-        if len(parts) == 1:
-            loaded.append((parts[0], None))
-        elif len(parts) == 2:
-            loaded.append((parts[0], parts[1] or None))
-        elif len(parts) == 3:
-            loaded.append((parts[0], parts[1] or None, parts[2]))
-        else:
-            raise ValueError(f"--price {entry!r}: expected at most "
-                             "prices.json:graph.json:regime")
-    return loaded
-
-
 def main() -> int:
+    # Imported before the parser is built, because `--regions` takes its choices
+    # from the one registry that holds them. That makes even `--help` load the
+    # engine package -- which this script needs for every real invocation
+    # anyway, and the alternative is a second list of names to keep in step.
+    from atom.compass.core.cost.regions import REGION_MODELS
+
     ap = argparse.ArgumentParser(
         description="price step shapes through the frozen composition")
     ap.add_argument("--model", required=True)
     ap.add_argument("--tp", type=int, default=1)
-    ap.add_argument("--rank", type=int, default=0)
     ap.add_argument("--device", default="meta",
                     choices=["meta", "cuda", "cpu"])
     ap.add_argument("--replay-target", default=None,
@@ -202,65 +128,38 @@ def main() -> int:
     ap.add_argument("-o", "--out", default=None)
     args = ap.parse_args()
 
-    from atom.compass.core.cost.library import (LibraryCostOracle,
-                                                PriceLibrary)
-    from atom.compass.runtime.templates import (CarriedAllocation,
-                                                TemplateGraphs, template_key)
+    from atom.compass.runtime.source_oracle import build_source_oracle
 
     with open(args.shapes, encoding="utf-8") as fh:
         raw_shapes = json.load(fh)
     shapes = [_shape_from(r) for r in raw_shapes]
     labels = [r.get("label") or f"#{i}" for i, r in enumerate(raw_shapes)]
 
-    regions = None
-    if REGION_MODELS[args.regions] is not None:
-        module, name = REGION_MODELS[args.regions]
-        regions = getattr(__import__(module, fromlist=[name]), name)
-
-    library = PriceLibrary.load(_load_prices(args.price))
-
-    allocation = None
-    if args.carry_allocation:
-        allocation = CarriedAllocation(
-            "predict_step --carry-allocation: the template's block assignment "
-            "is reused for every cohort bound to it")
-
-    # The deriver, and the model it needs. Built once, before the loop, because
-    # that is the whole reason this is a process and not a shell loop.
-    tracer = deriver = head_deriver = None
-    build_s = 0.0
-    if not args.no_derive:
-        from atom.compass.runtime.tracer import ModelTracer, ShapeDeriver
-
-        t0 = time.perf_counter()
-        tracer = ModelTracer.build(args.model, args.tp, args.device,
-                                   replay_target=args.replay_target)
-        build_s = time.perf_counter() - t0
-        common = dict(block_size=args.block_size,
-                      max_model_len=args.max_model_len,
-                      position_rows=args.position_rows,
-                      block_policy=args.block_policy,
-                      cudagraph_mode=args.cudagraph_mode)
-        deriver = ShapeDeriver(tracer, region="body", **common)
-        if args.head:
-            head_deriver = ShapeDeriver(tracer, region="head", **common)
-
-    def seed(paths, source):
-        graphs = {}
-        for path in paths or ():
-            with open(path, encoding="utf-8") as fh:
-                graph = json.load(fh)
-            graphs[template_key(_template_shape(graph))] = graph
-        return TemplateGraphs(graphs, derive=source, allocation=allocation)
-
-    body_graphs = seed(args.template, deriver)
-    head_graphs = seed(args.head_template, head_deriver) if args.head else None
-
-    oracle = LibraryCostOracle(library, body_graphs,
-                               seconds_per_launch=args.seconds_per_launch,
-                               head_graphs=head_graphs,
-                               regions=regions,
-                               require_complete=args.require_complete)
+    # One construction, shared with the served path. The model is loaded once,
+    # before the loop, because that is the whole reason this is a process and
+    # not a shell loop -- `build_source_oracle` does that and reports what it
+    # cost, so this script and a served run cannot compose different oracles
+    # and call them both the frozen one.
+    built = build_source_oracle(
+        model=args.model, tp=args.tp, device=args.device,
+        replay_target=args.replay_target,
+        block_size=args.block_size, max_model_len=args.max_model_len,
+        position_rows=args.position_rows, block_policy=args.block_policy,
+        cudagraph_mode=args.cudagraph_mode,
+        price=args.price, template=args.template,
+        head_template=args.head_template, head=args.head,
+        regions=args.regions,
+        seconds_per_launch=args.seconds_per_launch,
+        require_complete=args.require_complete,
+        carry_allocation=args.carry_allocation,
+        derive=not args.no_derive,
+    )
+    oracle = built.oracle
+    body_graphs = built.body_graphs
+    deriver = built.deriver
+    build_s = built.build_seconds
+    allocation = built.allocation
+    head_graphs = built.head_graphs
 
     rows, refused = [], 0
     wall0 = time.perf_counter()

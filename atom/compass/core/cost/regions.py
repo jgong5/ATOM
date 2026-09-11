@@ -600,3 +600,40 @@ SOURCE_27B_TP1_CONC_V2 = BucketedRunnerRegions(
                 "from SOURCE_27B_TP1; no logprobs requested, no speculative "
                 "decoding, PP=1, prefix caching off"),
 )
+
+
+#: The region models a caller may ask for by name, and the only place that
+#: mapping lives.
+#:
+#: A name rather than an import path because the callers are command lines --
+#: `predict_step.py --regions`, and `--compass-oracle-option regions=...` on a
+#: served run -- and a command line that can name any importable object can
+#: name the wrong one. A typo here is an error; a typo in an import path is a
+#: different region model, silently.
+#:
+#: `"none"` maps to `None` and means *no region model*, which is a real and
+#: different claim: body plus head alone, priced without the runner's own
+#: work. It is spelled out for the same reason the rest are -- so a prediction
+#: that carries no prepare or postprocess term says so in the same field that
+#: would have named the model.
+REGION_MODELS = {
+    "source-27b-tp1": SOURCE_27B_TP1,
+    "source-27b-tp1-conc": SOURCE_27B_TP1_CONC,
+    "source-27b-tp1-conc-v2": SOURCE_27B_TP1_CONC_V2,
+    "none": None,
+}
+
+
+def region_model(name):
+    """The named region model, or ``None`` for ``"none"``.
+
+    Raises rather than falling back to a default: running with the source's
+    region model and running without one differ by tens of percent in the step,
+    so an unrecognised name must not resolve to either.
+    """
+    try:
+        return REGION_MODELS[name]
+    except KeyError:
+        raise ValueError(
+            f"unknown region model {name!r}; known: "
+            f"{', '.join(sorted(REGION_MODELS))}") from None
