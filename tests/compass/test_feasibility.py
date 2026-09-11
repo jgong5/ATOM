@@ -37,6 +37,8 @@ from atom.compass.core.feasibility import (
     blocks_for,
     longest_request,
     trace_requests,
+    window_upper_bound,
+    within_window,
 )
 from atom.compass.core.kv_geometry import gdn_state_bytes
 from atom.compass.core.memory import MemoryReadings
@@ -50,11 +52,19 @@ from tests.conftest import MockConfig
 RECORDS = Path(__file__).parent / "memory_records"
 
 #: The longest request in `cc_pilot.jsonl` (62 requests, sha256 bf4049f8...),
-#: the cc-traces slice the campaign runs against. Its two lengths are a
-#: property of the workload, so they are stated here rather than shipped as
-#: another copy of the trace -- and `test_the_trace_still_says_this` checks
-#: them against the trace whenever it is on the box.
-CC_LONGEST = Request(input_tokens=249344, output_tokens=5690)
+#: which is the old full-trace evidence and NOT the workload the campaign
+#: accepts against. It is kept as a named stress diagnostic: a prompt longer
+#: than anything the acceptance window will send, useful for showing where the
+#: admission gate bites and useless as a verdict on the final workload.
+STRESS_LONGEST = Request(input_tokens=249344, output_tokens=5690)
+
+#: CC's provisional long-acceptance window caps input at 107328 tokens. Of the
+#: 62 requests in `cc_pilot.jsonl`, 46 are longer than that -- which is the
+#: measurement that says the slice is not the workload. Inside the window the
+#: longest is 96960 + 260 = 97220 tokens (6077 blocks). PROVISIONAL: replace
+#: with manifest-derived lengths once the final CC workload is locked; until
+#: then no admission verdict here is a verdict on the final workload.
+WINDOW_MAX_INPUT_TOKENS = 107328
 
 #: The deployment everything was recorded at, other than the concurrency.
 DEPLOYED = dict(
@@ -94,7 +104,7 @@ def test_the_recorded_deployment_is_feasible_and_for_the_right_reason():
     nowhere near binding.
     """
     verdict = assess(
-        _config(), _tp1_readings(), max_num_seqs=32, request=CC_LONGEST, **DEPLOYED
+        _config(), _tp1_readings(), max_num_seqs=32, request=STRESS_LONGEST, **DEPLOYED
     )
     assert verdict
     assert verdict.gate is None
@@ -112,7 +122,11 @@ def test_the_state_floor_alone_can_refuse_the_deployment():
     is the boundary being pinned.
     """
     verdict = assess(
-        _config(), _tp1_readings(), max_num_seqs=1551, request=CC_LONGEST, **DEPLOYED
+        _config(),
+        _tp1_readings(),
+        max_num_seqs=1551,
+        request=STRESS_LONGEST,
+        **DEPLOYED,
     )
     assert not verdict
     assert verdict.gate == "pool"
@@ -132,7 +146,11 @@ def test_a_healthy_deployment_that_cannot_serve_the_workload():
     as long as the deployment lives.
     """
     verdict = assess(
-        _config(), _tp1_readings(), max_num_seqs=1400, request=CC_LONGEST, **DEPLOYED
+        _config(),
+        _tp1_readings(),
+        max_num_seqs=1400,
+        request=STRESS_LONGEST,
+        **DEPLOYED,
     )
     assert not verdict
     assert verdict.gate == "admission"
@@ -268,7 +286,7 @@ def test_blocks_for_rounds_up_and_refuses_to_guess_under_dcp():
 
 
 def test_the_trace_still_says_this():
-    """`CC_LONGEST` against the trace itself, when the trace is on the box.
+    """`STRESS_LONGEST` against the trace itself, when the trace is on the box.
 
     Skipped rather than shipped: the trace is the workload and belongs with
     the campaign's artifacts, not in the test tree. The two numbers are pinned
@@ -281,7 +299,7 @@ def test_the_trace_still_says_this():
     if not trace.exists():
         pytest.skip("cc_pilot.jsonl is not on this box")
     worst = longest_request(trace_requests(str(trace)))
-    assert worst == CC_LONGEST
+    assert worst == STRESS_LONGEST
 
 
 def test_state_floor_is_what_makes_concurrency_expensive_here():
@@ -333,10 +351,52 @@ def test_the_frozen_predictions_are_still_what_the_model_says():
             _config(),
             _tp1_readings(),
             max_num_seqs=32,
-            request=CC_LONGEST,
+            request=STRESS_LONGEST,
             **{**DEPLOYED, "utilization": want["gpu_memory_utilization"]},
         )
         assert verdict.blocks == want["predicted_num_kvcache_blocks"]
         assert verdict.gate == want["predicted_gate"]
         assert verdict.reason == want["predicted_reason"]
         assert (verdict.gate != "pool") is want["expect_engine_starts"]
+
+
+def test_the_window_bounds_a_slice_that_overshoots_it():
+    """`within_window` / `window_upper_bound` on the acceptance window.
+
+    The bound pairs the window's input cap with the longest output among the
+    admitted requests, which is not any single observed request -- that is the
+    point. A feasibility bound has to survive the worst request the window can
+    produce, not the worst one this slice happened to contain.
+    """
+    requests = [
+        Request(96960, 260),
+        Request(107328, 96),
+        Request(249344, 5690),  # STRESS_LONGEST, outside the window
+    ]
+    inside = within_window(requests, max_input_tokens=WINDOW_MAX_INPUT_TOKENS)
+    assert STRESS_LONGEST not in inside
+    assert len(inside) == 2
+
+    bound = window_upper_bound(requests, max_input_tokens=WINDOW_MAX_INPUT_TOKENS)
+    assert bound == Request(107328, 260)
+    assert blocks_for(bound.total_tokens, 16) == 6725
+    assert bound.total_tokens < STRESS_LONGEST.total_tokens
+    assert window_upper_bound([STRESS_LONGEST], max_input_tokens=1024) is None
+
+
+def test_the_stress_request_is_not_the_acceptance_request():
+    """Why the 0.33 and 0.40 rungs are diagnostics, not acceptance verdicts.
+
+    Both rungs refuse `STRESS_LONGEST`, and both would admit a request at the
+    window's cap: 6077 blocks against pools of 1551 and 15206. So the 0.40
+    verdict flips on which workload you ask about, and reporting it as a
+    property of the deployment would be reporting the trace slice as the
+    workload. The 0.32 rung is different -- it never starts, so no request
+    length rescues it.
+    """
+    window_blocks = blocks_for(97220, 16)
+    assert window_blocks == 6077
+    assert blocks_for(STRESS_LONGEST.total_tokens, 16) == 15940
+
+    assert window_blocks > 1551  # 0.33 refuses the window request too
+    assert window_blocks < 15206  # 0.40 admits it, while refusing the stress one
