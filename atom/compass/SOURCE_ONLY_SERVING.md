@@ -141,9 +141,19 @@ would hide the thing worth looking at.
      the batch's prefill *token* count. A batch holding both prefill and decode
      rows is refused: `BatchSpec` carries one kind for the batch, and the
      attention backend sends the whole batch down `prepare_prefill` while
-     preparing metadata for the leading prefill rows only. Closing this — and
-     cc-traces will need it closed — means a per-request kind in `BatchSpec`
-     and a deriver that can trace such a batch.
+     preparing metadata for the leading prefill rows only. This is not a gap
+     cc-traces needs closed: with TBO off the scheduler cannot build such a
+     batch. Its prefill branch returns unconditionally (`scheduler.py:1991`),
+     every real `ScheduledBatch(` construction site is of one kind,
+     `model_runner.py:481-483` still carries `# TODO: remove this when we
+     support mixed prefill and decode in one batch`, and TBO is a runner-side
+     split of an already-formed batch (`enable_tbo`/`enable_tbo_decode`
+     default False, and `scheduler.py` does not mention TBO at all).
+     `tests/compass/test_mixed_batch_reachability.py` drives the real
+     scheduler and shows a prompt arriving mid-decode starting its own prefill
+     batch, and every batch of a staggered workload being of one kind. No
+     per-request kind is being added to `BatchSpec` for a batch the engine
+     does not emit; if that TODO is ever done, this refusal is where to look.
    - **which row a state slot belongs to.** A row with no slot is refused, not
      filled with its batch index, which is only what a fresh pool happens to
      hand out.
