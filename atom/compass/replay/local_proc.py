@@ -16,11 +16,31 @@ whatever the crossing is worth has to be modelled, not assumed to be zero.
 `CompassModelRunner` already records `gap_seconds` on a measured run for exactly
 this comparison.
 
-**One rank.** Collapsing N ranks into one process would mean either running N
-runners with no collectives between them -- which deadlocks the moment anything
-synchronises -- or pretending a rank's work is the group's. Neither is honest,
-so this refuses. A multi-rank configuration is predicted from a rank-0 capture
-plus a modelled collective, which is a cost-model question, not a transport one.
+**One executor, any logical width.** These are two numbers and the replay keeps
+them apart:
+
+- the *logical target TP*, ``config.tensor_parallel_size``, which is how wide
+  the deployment being predicted is. It shards every weight, sizes every
+  collective, places the LM head, decides the pool and block specs, and is what
+  the run reports as the configuration it predicted. It comes from the target
+  record, which came from a device, so it is source-derived and not a label.
+- the *physical executor count*, ``config.tp_world_size``, which is how many
+  processes hold a runner. For a GPU-free replay it is 1 -- ``Config`` collapses
+  it there -- because there is no device for a second one to occupy and no
+  forward for it to run: the step is priced, not executed.
+
+Collapsing them the other way round is what must not happen. Running the one
+executor and calling its work the group's would be a TP1 result wearing a TP4
+label; so the single executor is rank 0 of the logical group, and the group's
+cost is the oracle's answer at those rank coordinates plus the modelled
+collectives, which is a cost-model question rather than a transport one. Nothing
+here weakens that: the rank-aggregation and head-placement semantics are the
+same ones a device-backed run uses, reached with the same logical width.
+
+What this does refuse is a configuration whose parallelism genuinely needs more
+than one *process* for reasons the cost model does not cover -- prefill context
+parallel, pipeline stages -- because there the second process is not an executor
+of the same step but a different stage of it.
 """
 
 from __future__ import annotations
@@ -38,13 +58,25 @@ class LocalProcManager:
     """``AsyncIOProcManager``'s interface, served from this process."""
 
     def __init__(self, finalizer, proc_num: int, runner: str, *args, **kwargs):
+        config = args[0] if args else None
+        self.logical_tp = int(
+            getattr(config, "tensor_parallel_size", 1) or 1)
         if proc_num != 1:
+            # `Config.tp_world_size` is already 1 under a replay, so the only
+            # way to arrive here is a parallelism that multiplies it: prefill
+            # context parallel, in `EngineCore`. Name what it actually is
+            # rather than blaming the logical width, which is legitimately
+            # wide and is not the problem.
+            pcp = int(getattr(config, "prefill_context_parallel_size", 1) or 1)
             raise ValueError(
-                f"ATOMCompass: GPU-free replay runs one rank in one process, "
-                f"and this deployment asks for {proc_num}. Ranks of a parallel "
-                f"group synchronise with each other; there is no honest way to "
-                f"run them in a single thread. Replay TP=1 and predict the "
-                f"wider configuration from it."
+                f"ATOMCompass: a GPU-free replay runs one executor, and this "
+                f"deployment asks for {proc_num} "
+                f"(prefill_context_parallel_size={pcp}). A logical TP of "
+                f"{self.logical_tp} is fine and is predicted from rank 0 plus "
+                f"modelled collectives; context-parallel ranks are not, "
+                f"because each holds a different slice of the same prefill and "
+                f"no cost model here composes them. Replay with "
+                f"prefill_context_parallel_size=1."
             )
         self.parent_finalizer = finalizer
         self.proc_num = proc_num
@@ -57,8 +89,10 @@ class LocalProcManager:
         self.procs: list = []
         runner_class = resolve_obj_by_qualname(runner)
         self.runner = runner_class(0, *args, **kwargs)
-        logger.info("%s: runner constructed in-process, no workers spawned",
-                    self.label)
+        logger.info(
+            "%s: 1 executor for a logical TP%d deployment, runner constructed "
+            "in-process as rank 0, no workers spawned",
+            self.label, self.logical_tp)
 
     def call_func(self, func_name: str, *args, wait_out: bool = False):
         """Dispatch by name, exactly as the broadcast queue does.

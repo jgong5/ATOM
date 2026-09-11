@@ -133,6 +133,7 @@ class ReplayModelRunner(CompassPredictMixin):
                 f"observe a real forward; there is none here to observe."
             )
         self.target = TargetRecord.load(getattr(compass, "replay_target", ""))
+        self._check_parallel_contract(config)
         differences = self.target.disagreements(config)
         if differences:
             logger.warning(
@@ -150,10 +151,73 @@ class ReplayModelRunner(CompassPredictMixin):
 
         self._init_compass_state()
         logger.info(
-            "ATOMCompass: GPU-free replay, target %s (%d KV blocks, %d capture "
-            "sizes), no device acquired",
-            self.target.source, self.target.blocks.get("num_kvcache_blocks", 0),
+            "ATOMCompass: GPU-free replay of a logical TP%d deployment on %d "
+            "executor, target %s (%d KV blocks, %d capture sizes), no device "
+            "acquired",
+            self.logical_tp, self.physical_executors, self.target.source,
+            self.target.blocks.get("num_kvcache_blocks", 0),
             len(self.capture_sizes))
+
+    # -- the parallelism contract --------------------------------------------
+
+    def _check_parallel_contract(self, config) -> None:
+        """Separate the width being predicted from the count doing the work.
+
+        Three numbers, and conflating any two of them is a different wrong
+        answer:
+
+        `logical_tp` is how wide the deployment under evaluation is. It governs
+        the topology the oracle is asked about, the rank coordinates its
+        artifacts are keyed on, where the LM head sits, and the block and pool
+        specification -- everything except who runs the step.
+
+        `physical_executors` is how many processes hold a runner, and in a
+        GPU-free replay it is one: there is no device for a second to occupy
+        and no forward for it to run. That one executor is *rank 0 of the
+        logical group*, not a TP1 deployment. Its step costs what the oracle
+        says the group's rank-0 work plus the modelled collectives cost.
+
+        The record's own `tensor_parallel_size` is a third number, and it is
+        the one enforced here. The startup answers -- block count, pool
+        entries, state runtime -- were measured at *that* width, and block
+        count is close to linear in it. Replaying them under a different
+        logical width is not a transfer prediction, it is the wrong deployment
+        sized by the wrong record, so it refuses rather than warns. Predicting
+        a wider configuration is done by deriving a record at that width from
+        the memory model and replaying against that; the difference is that the
+        derived record's numbers are attributable to the width they claim.
+        """
+        self.logical_tp = int(getattr(config, "tensor_parallel_size", 1) or 1)
+        # Not read from the config: asserted. `Config.tp_world_size` collapses
+        # to one under a replay and `LocalProcManager` refuses anything else,
+        # so this records the contract rather than discovering it.
+        self.physical_executors = 1
+
+        pp = int(getattr(config, "pipeline_parallel_size", 1) or 1)
+        if pp > 1:
+            raise ValueError(
+                f"ATOMCompass: a GPU-free replay has one executor and this "
+                f"deployment asks for {pp} pipeline stages. Stages are not "
+                f"ranks of one step -- each runs a different slice of the "
+                f"model and the schedule between them is the thing a pipeline "
+                f"configuration is evaluated for. Nothing here models it."
+            )
+
+        captured_tp = int(self.target.config.get("tensor_parallel_size") or 0)
+        if captured_tp and captured_tp != self.logical_tp:
+            raise ValueError(
+                f"ATOMCompass: {self.target.source} records the startup "
+                f"answers of a TP{captured_tp} deployment and this replay is "
+                f"of a logical TP{self.logical_tp} one. "
+                f"{self.target.blocks.get('num_kvcache_blocks', 0)} KV blocks "
+                f"and the pool entries beside them were sized at TP"
+                f"{captured_tp}; handing them to a TP{self.logical_tp} "
+                f"scheduler would let it admit a workload the target cannot "
+                f"hold, and the resulting throughput would be read as a "
+                f"prediction. Derive a target record at TP{self.logical_tp} "
+                f"from the memory model and replay against that, so its "
+                f"numbers are attributable to the width they claim."
+            )
 
     # -- the startup RPCs, answered from the record ---------------------------
 

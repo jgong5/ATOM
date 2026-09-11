@@ -87,11 +87,21 @@ class TestTheRecordIsTheBoundary:
 
     def test_replaying_another_configuration_is_reported_not_refused(
             self, tmp_path, caplog):
-        """Predicting TP=4 from a TP=1 capture is the point; silence is not."""
-        config = _config(_target(tmp_path), tensor_parallel_size=4)
+        """Predicting a configuration the record was not captured from is the
+        point; silence about the difference is not.
+
+        This used to be asserted with `tensor_parallel_size`, and that one case
+        has since moved to a refusal -- see
+        `TestTheLogicalWidthAndTheExecutorCount`. The block count and pool
+        entries here *were* measured at the record's width and move with it, so
+        carrying them into a wider replay sizes the wrong deployment; a
+        difference in how many sequences the scheduler may admit does not.
+        The reporting contract is unchanged and is what this still guards.
+        """
+        config = _config(_target(tmp_path), max_num_seqs=64)
         with caplog.at_level("WARNING"):
             runner = ReplayModelRunner(0, config)
-        assert "captured 1, replaying 4" in caplog.text
+        assert "max_num_seqs: captured 32, replaying 64" in caplog.text
         assert runner.get_num_blocks()["num_kvcache_blocks"] == 4096
 
 
@@ -176,8 +186,11 @@ class TestThePoolWithoutProcesses:
         with pytest.raises(AttributeError, match="start_profiler"):
             mgr.call_func("start_profiler", wait_out=True)
 
-    def test_more_than_one_rank_is_refused_with_the_reason(self, tmp_path):
-        with pytest.raises(ValueError, match="one rank in one process"):
+    def test_more_than_one_executor_is_refused_with_the_reason(self, tmp_path):
+        # The message names the executor count, not the logical width: see
+        # `TestTheLogicalWidthAndTheExecutorCount`, where the two are pulled
+        # apart. A wide deployment is replayable; a second executor is not.
+        with pytest.raises(ValueError, match="runs one executor"):
             LocalProcManager(lambda: None, 4,
                              "atom.compass.replay.runner.ReplayModelRunner",
                              _config(_target(tmp_path)))
@@ -442,3 +455,119 @@ class TestTheChildProcessesAreToldToo:
                  "ATOM_COMPASS_REPLAY_ARCH": "gfx942"},
             capture_output=True, text=True, timeout=120)
         assert out.stdout.strip() == "yes", out.stderr
+
+
+def _tp4(tmp_path):
+    """A target and a config that agree on a logical width of four."""
+    target = _target(tmp_path, config={
+        "model": "Qwen/Qwen3.8-27B", "tensor_parallel_size": 4,
+        "max_model_len": 262144, "max_num_seqs": 32,
+        "gpu_memory_utilization": 0.9})
+    return _config(target, tensor_parallel_size=4)
+
+
+class TestTheLogicalWidthAndTheExecutorCount:
+    """Two numbers that a single-process replay makes it tempting to conflate.
+
+    The logical width is how wide the deployment under evaluation is: it shards
+    the weights, sizes the collectives, places the head, and is what the run
+    says it predicted. The executor count is how many processes hold a runner,
+    and here it is one, because the step is priced rather than run.
+
+    Collapsing them in the direction that matters -- running one executor and
+    reporting its work as a TP4 group's -- is a TP1 result wearing a TP4 label.
+    So the one executor is rank 0 *of the logical group*, and the group's cost
+    is the oracle's answer at those coordinates plus the modelled collectives.
+    """
+
+    def test_a_wide_deployment_replays_on_one_executor(self, tmp_path):
+        mgr = LocalProcManager(lambda: None, 1,
+                               "atom.compass.replay.runner.ReplayModelRunner",
+                               _tp4(tmp_path))
+        assert mgr.logical_tp == 4
+        assert mgr.procs == []
+        assert mgr.runner.logical_tp == 4
+        assert mgr.runner.physical_executors == 1
+
+    def test_the_oracle_is_asked_about_the_group_not_the_executor(self, tmp_path):
+        """The seam the whole contract rests on.
+
+        `StepShape` carries `topology` and `rank_coords` to the oracle. If the
+        topology reported the executor count, every price would be a TP1 price
+        and the collectives would vanish -- the label would say TP4 and nothing
+        underneath it would.
+        """
+        runner = ReplayModelRunner(0, _tp4(tmp_path))
+        assert runner._topology() == {"tp": 4}
+        # Rank 0 of four, not the whole of one.
+        assert runner._rank_coords() == {"tp": 0}
+
+    def test_a_record_sized_at_another_width_is_refused(self, tmp_path):
+        """Refused rather than warned, because block count moves with width.
+
+        Everything else in `disagreements` is reported and carried; this one is
+        not, because handing a TP1 block count to a TP4 scheduler lets it admit
+        a workload the target cannot hold and then reports the throughput of
+        the schedule that followed.
+        """
+        config = _config(_target(tmp_path), tensor_parallel_size=4)
+        with pytest.raises(ValueError, match="TP1 deployment.*logical TP4"):
+            ReplayModelRunner(0, config)
+
+    def test_pipeline_stages_are_refused_by_name(self, tmp_path):
+        config = _config(_target(tmp_path), pipeline_parallel_size=2)
+        with pytest.raises(ValueError, match="pipeline stages"):
+            ReplayModelRunner(0, config)
+
+    def test_more_than_one_executor_names_what_asked_for_it(self, tmp_path):
+        """`tp_world_size` is already 1 under a replay, so TP is not the cause.
+
+        Blaming the logical width here would send a reader to lower `-tp`,
+        which is the one thing that is legitimately wide.
+        """
+        config = _config(_target(tmp_path), prefill_context_parallel_size=2)
+        with pytest.raises(ValueError, match="one executor.*context-parallel"):
+            LocalProcManager(lambda: None, 2,
+                             "atom.compass.replay.runner.ReplayModelRunner",
+                             config)
+
+
+class TestConfigCollapsesTheExecutorCountNotTheWidth:
+    """`Config.tp_world_size`, exercised as the function it is.
+
+    Building a real `Config` needs a model on disk and a device to count, and
+    neither is available to a unit test. So the two properties are borrowed --
+    both of them, because `tp_world_size` reads the other one, and a stub
+    carrying only plain attributes raises on the read rather than exercising
+    it.
+    """
+
+    @staticmethod
+    def _fget(**attrs):
+        from atom.config import Config
+
+        stub = type("_ConfigStub", (), {
+            "tp_world_size": Config.tp_world_size,
+            "_compass_replay_active": Config._compass_replay_active,
+        })()
+        for name, value in attrs.items():
+            setattr(stub, name, value)
+        return stub.tp_world_size
+
+    def test_a_replay_gets_one_executor_at_any_width(self):
+        compass = CompassConfig(enabled=True, mode="predict",
+                                replay_target="/tmp/t.json", measure_out="")
+        assert self._fget(tensor_parallel_size=4, fake_eplb=False,
+                          compass_config=compass) == 1
+
+    def test_a_compass_run_without_a_replay_target_is_untouched(self):
+        # Predict on real hardware: the forward is priced, but there are still
+        # four ranks each holding a quarter of the model, and each still needs
+        # a process. Only the replay has no device for them to hold.
+        compass = CompassConfig(enabled=True, mode="predict")
+        assert self._fget(tensor_parallel_size=4, fake_eplb=False,
+                          compass_config=compass) == 4
+
+    def test_a_run_with_no_compass_at_all_is_untouched(self):
+        assert self._fget(tensor_parallel_size=4, fake_eplb=False,
+                          compass_config=None) == 4

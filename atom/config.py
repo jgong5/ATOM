@@ -1652,13 +1652,39 @@ class Config:
         without it, an oversized `-tp` keeps raising in ModelRunner instead of
         silently running smaller. A property, not a field: `enable_dp_attention`
         rewrites `tensor_parallel_size` after Config is built.
+
+        A GPU-free ATOMCompass replay is the second case, and it separates the
+        two numbers further than `--fake-eplb` does: one executor, whatever the
+        logical width, because the forward is priced rather than run. See
+        `atom/compass/replay/local_proc.py`.
         """
         tp = self.tensor_parallel_size
+        if self._compass_replay_active:
+            # Not `min(tp, ...)`: exactly one, and not conditioned on how many
+            # devices are visible, because a replay uses none of them. The
+            # logical width stays `tensor_parallel_size` and keeps governing
+            # every shard, group and pool computation; what collapses is only
+            # who executes.
+            return 1
         if not self.fake_eplb:
             return tp
         # Does not create a CUDA context, so it is safe in the parent process.
         visible = torch.cuda.device_count()
         return visible if 0 < visible < tp else tp
+
+    @property
+    def _compass_replay_active(self) -> bool:
+        """Is this the GPU-free replay, as opposed to any other Compass mode?
+
+        The same test `__post_init__` selects the replay runner and pool with,
+        kept in one place so the three cannot drift apart -- a run with the
+        replay pool and a physical world size above one refuses at startup, and
+        a run with the physical world size collapsed but a device-backed pool
+        would spawn workers for ranks whose runner no longer exists.
+        """
+        compass = getattr(self, "compass_config", None)
+        return bool(compass is not None and compass.enabled
+                    and compass.replay_target)
 
     @property
     def capture_sizes(self) -> list[int]:
