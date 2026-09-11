@@ -269,6 +269,9 @@ def main() -> int:
             "step_seconds": cost.seconds,
             "breakdown": dict(cost.breakdown),
             "coverage": cov.describe() if cov is not None else None,
+            # The same record as categories, because the sentence above is
+            # truncated and a grader reads the file rather than the log.
+            "coverage_split": cov.as_dict() if cov is not None else None,
             "seconds_to_answer": time.perf_counter() - t0,
         })
     wall = time.perf_counter() - wall0
@@ -280,6 +283,10 @@ def main() -> int:
         "inputs": _inputs(args),
         "shapes": len(shapes), "priced": len(priced), "refused": refused,
         "build_seconds": build_s,
+        # The limit fitted prices were actually allowed over, off the provider
+        # rather than off the flag: `--interpolate true` names no number, and
+        # the number is what a reader has to be able to check.
+        "interpolation_limit": built.interpolation_limit,
         "predict_seconds": wall,
         "seconds_per_shape": (wall / len(shapes)) if shapes else None,
         "body_cache": body_graphs.describe(),

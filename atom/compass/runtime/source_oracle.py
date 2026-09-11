@@ -48,7 +48,7 @@ once; a served run asking for the source composition wants the measured one.
 from typing import NamedTuple, Optional
 
 __all__ = ["source_cost_oracle", "build_source_oracle", "SourceComposition",
-           "price_specs", "template_shape", "seeded_graphs"]
+           "price_specs", "template_shape", "seeded_graphs", "gap_ratio"]
 
 
 def _entries(value, what: str):
@@ -91,7 +91,7 @@ def _flag(value, what: str) -> bool:
 _DEFAULT_GAP_RATIO = "provider default"
 
 
-def _gap_ratio(value, what: str = "interpolate"):
+def gap_ratio(value, what: str = "interpolate"):
     """The declared sampling density, or `None` for exact prices only.
 
     A ratio and not a flag, because that is the thing the caller is actually
@@ -326,6 +326,12 @@ class SourceComposition(NamedTuple):
     #: unsuffixed one, by path. A report that says "rank 3" has to be able to
     #: say which of rank 3's files actually existed.
     rank_artifacts: Optional[dict] = None
+    #: The widest ratio between adjacent measured row counts a fitted price was
+    #: allowed to span, read back off the provider that holds it rather than
+    #: off the argument that asked for it -- ``interpolate=true`` names no
+    #: number, and the number is the part a reader has to be able to check.
+    #: ``None`` means no price could be fitted at all.
+    interpolation_limit: Optional[float] = None
 
 
 def source_cost_oracle(*, rank_coords=None, **kwargs):
@@ -428,7 +434,7 @@ def build_source_oracle(
             "on.")
 
     price_entries = price_specs(_entries(price, "price"), coords)
-    library = _price_library(price_entries, _gap_ratio(interpolate))
+    library = _price_library(price_entries, gap_ratio(interpolate))
     regions_model = region_model(regions)
     rank_artifacts = _rank_artifacts(
         coords, _entries(price, "price"), templates, head_templates)
@@ -483,7 +489,8 @@ def build_source_oracle(
         require_complete=require_complete,
     )
     return SourceComposition(oracle, body_graphs, head_graphs, body_deriver,
-                             build_seconds, allocation, coords, rank_artifacts)
+                             build_seconds, allocation, coords, rank_artifacts,
+                             getattr(library, "max_gap_ratio", None))
 
 
 def _rank_artifacts(coords, prices, templates, head_templates) -> dict:

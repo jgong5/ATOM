@@ -617,6 +617,7 @@ SOURCE_FACTORY_OPTIONS = (
     "require_complete",
     "carry_allocation",
     "derive",
+    "interpolate",
 )
 
 #: Options an acceptance run must state rather than default. Each has a working
@@ -732,6 +733,36 @@ def check_source_factory(modelled, tp: int, label: str) -> list[str]:
             f"an explicitly unmeasured assumption: it may be reported, not "
             f"graded"
         )
+    # Interpolation is allowed in an acceptance cell -- a fitted price inside
+    # the support its own measurements declare is a prediction, and the
+    # coverage record says which operators were fitted. What is not allowed is
+    # a density nobody can read: `interpolate=maybe` reaches the factory, which
+    # refuses it, so a record carrying one describes a run that never started.
+    if _given(options, "interpolate"):
+        from atom.compass.runtime.source_oracle import gap_ratio
+
+        try:
+            limit = gap_ratio(options["interpolate"])
+        except ValueError as exc:
+            bad.append(
+                f"{label}: interpolate={options['interpolate']!r} is not a "
+                f"sampling density the factory reads ({exc}), so what fitted "
+                f"prices were allowed to span is unknown"
+            )
+        else:
+            # `true` builds a working predictor at the provider's own default,
+            # which is the right default and the wrong record: the manifest
+            # keeps the option as written, so a cell graded under `true` has
+            # nothing in it saying how wide a gap was crossed, and the answer
+            # moves if the provider's default ever does.
+            if not isinstance(limit, float):
+                bad.append(
+                    f"{label}: interpolate={options['interpolate']!r} takes "
+                    f"whatever density the provider currently defaults to, so "
+                    f"the record does not state the support fitted prices were "
+                    f"allowed over; state the ratio"
+                )
+
     if _factory_flag(options.get("regions")) is False or str(
         options.get("regions", "")
     ).strip().lower() in ("none", "null"):

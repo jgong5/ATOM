@@ -1574,6 +1574,7 @@ class TestTheSourceFactoryWasGivenAWholeModel:
             "require_complete",
             "carry_allocation",
             "derive",
+            "interpolate",
         }
 
     def test_an_option_the_factory_does_not_take_is_refused(self):
@@ -1581,7 +1582,7 @@ class TestTheSourceFactoryWasGivenAWholeModel:
         assert any("takes no such option" in r for r in reasons)
 
     def test_every_documented_option_passes_through_unremarked(self):
-        """None of the eighteen is itself a complaint."""
+        """None of the nineteen is itself a complaint."""
         options = {
             **GOOD_FACTORY,
             "model": "/models/qwen3-27b",
@@ -1594,9 +1595,41 @@ class TestTheSourceFactoryWasGivenAWholeModel:
             "cudagraph_mode": "FULL",
             "carry_allocation": "false",
             "derive": "true",
+            "interpolate": 2.0,
         }
         assert set(options) == set(validate.SOURCE_FACTORY_OPTIONS)
         assert self._reasons(options) == []
+
+    def test_fitted_prices_are_allowed_when_the_density_is_stated(self):
+        """A fit inside its own declared support is a prediction, not a gap.
+
+        The coverage record counts it apart from a measurement, so a cell that
+        used one stays legible as what it is. Refusing it outright would make
+        the only truthful way to report interpolation also the only way to
+        fail.
+        """
+        assert self._reasons({**GOOD_FACTORY, "interpolate": 2.0}) == []
+
+    def test_a_density_the_factory_cannot_read_is_refused(self):
+        reasons = self._reasons({**GOOD_FACTORY, "interpolate": "maybe"})
+        assert any("not a sampling density" in r for r in reasons)
+
+    def test_a_ratio_under_one_is_refused_here_as_it_is_there(self):
+        reasons = self._reasons({**GOOD_FACTORY, "interpolate": 0.5})
+        assert any("not a sampling density" in r for r in reasons)
+
+    def test_taking_the_providers_default_does_not_state_the_support(self):
+        """`true` runs; what it does not do is say how wide a gap was crossed.
+
+        The manifest keeps the option as written, so the record would move if
+        the provider's default ever did, and nothing in the file would say so.
+        """
+        reasons = self._reasons({**GOOD_FACTORY, "interpolate": "true"})
+        assert any("does not state the support" in r for r in reasons)
+
+    def test_leaving_it_out_is_exact_prices_and_no_complaint(self):
+        assert "interpolate" not in GOOD_FACTORY
+        assert self._reasons(GOOD_FACTORY) == []
 
     def test_incomplete_pricing_is_refused(self):
         reasons = self._reasons({**GOOD_FACTORY, "require_complete": "false"})

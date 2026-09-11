@@ -249,6 +249,32 @@ class Coverage:
             sources=sources,
         )
 
+    def as_dict(self) -> dict:
+        """The same record as data, for a report that will be read by machine.
+
+        `describe` is for a person reading a log line and truncates the refusals
+        to the five commonest; a saved report is the thing an acceptance run is
+        graded from, and a category that only ever appeared inside a sentence
+        cannot be checked. The four ways an operator is accounted for are each
+        their own key, and the two derived answers are written out rather than
+        left to be recomputed from them by a reader who might recompute them
+        differently.
+        """
+        return {
+            "operators": self.operators,
+            "measured": self.measured,
+            "interpolated": self.interpolated,
+            "zero_work": self.zero_work,
+            "refused": self.operators - self.priced,
+            "priced": self.priced,
+            "complete": self.complete,
+            "complete_measured": self.complete_measured,
+            "seconds": self.seconds,
+            "refused_operators": dict(self.refused),
+            "refusal_reasons": dict(self.reasons),
+            "sources": dict(self.sources),
+        }
+
     def describe(self) -> str:
         head = (f"{self.priced}/{self.operators} operators, "
                 f"{self.seconds * 1e3:.3f} ms")

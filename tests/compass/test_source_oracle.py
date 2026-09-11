@@ -309,7 +309,8 @@ class TestTheContractWithTheServedPath:
     def test_the_composition_names_what_a_report_has_to_state(self):
         assert SourceComposition._fields == (
             "oracle", "body_graphs", "head_graphs", "deriver", "build_seconds",
-            "allocation", "rank_coords", "rank_artifacts")
+            "allocation", "rank_coords", "rank_artifacts",
+            "interpolation_limit")
 
 
 def _rank_price_file(tmp_path, name, signature):
@@ -548,3 +549,16 @@ class TestAskingForFittedPrices:
             derive=0, regions="source-27b-tp1-conc-v2",
             interpolate="true").oracle.library
         assert "no graph supplied" in "".join(bare.unbuildable.values())
+
+    def test_the_limit_recorded_is_the_one_the_provider_holds(self, tmp_path):
+        """`interpolate=true` names no number, and the number is the check.
+
+        A report that says "interpolation: true" says nothing a reader can
+        verify and moves silently if the provider's default ever does.
+        """
+        from atom.compass.core.cost.families import ParametricPriceLibrary
+
+        assert self._built(tmp_path).interpolation_limit is None
+        asked = self._built(tmp_path, interpolate="true")
+        assert asked.interpolation_limit == ParametricPriceLibrary().max_gap_ratio
+        assert self._built(tmp_path, interpolate=1.5).interpolation_limit == 1.5

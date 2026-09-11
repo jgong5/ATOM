@@ -847,3 +847,23 @@ class TestAFittedPriceIsNotAMeasurement:
         assert (both.measured, both.interpolated, both.operators) == (1, 1, 2)
         # And a reader of the line is told what the 2/2 is made of.
         assert "1 measured, 1 interpolated" in both.describe()
+
+    def test_the_split_is_readable_as_data_and_not_only_as_a_sentence(
+            self, tmp_path):
+        """A grader reads the saved report, and `describe` is a sentence.
+
+        It also truncates its refusals to the commonest five, which is right
+        for a log line and wrong for the file an acceptance run is judged from.
+        The same four categories are keys, and the two derived answers are
+        written out rather than left to a reader to recompute.
+        """
+        fitted = _interpolate(_price_list(tmp_path, "f.json", [self.GEMM], 1e-3))
+        library = PriceLibrary.load([(fitted, None)])
+        _, coverage, _ = library.body(_graph([self.GEMM, self.NORM]))
+        split = coverage.as_dict()
+        assert (split["measured"], split["interpolated"],
+                split["zero_work"]) == (0, 1, 0)
+        assert split["refused"] == 1
+        assert split["complete"] is False
+        assert split["complete_measured"] is False
+        assert "triton::norm" in split["refused_operators"]
