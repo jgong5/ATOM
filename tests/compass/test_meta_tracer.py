@@ -19,7 +19,13 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from atom.compass.core.graph import OpSpec  # noqa: E402
-from atom.compass.runtime.meta import MetaOpTracer, _storage_of  # noqa: E402
+from atom.compass.runtime.meta import (  # noqa: E402
+    MetaOpTracer,
+    _collective_stand_in,
+    _storage_of,
+    fresh_like,
+    fresh_shape,
+)
 
 
 def _tensor(device):
@@ -227,3 +233,62 @@ def test_a_reused_key_is_not_credited_to_the_tensor_that_died(device):
     tracer._producers[("storage", 9)] = 5
     tracer._died(3, 0, ("storage", 9))
     assert tracer._producers[("storage", 9)] == 5
+
+
+class TestTheCollectiveStandIn:
+    """A collective that cannot run still has to produce a tensor of its own.
+
+    Every live path through ATOM's all-reduce allocates its output --
+    `GroupCoordinator.all_reduce` makes it out of place because a PyTorch
+    custom op cannot both mutate and return, and each implementation under it
+    opens with `empty_like`, `zeros_like` or `clone`. Only `world_size == 1`
+    returns the input, and that is the branch derivation stands in *for*.
+
+    Handing the input back was wrong in both directions at once: the collective
+    got no tensor to watch, so no death was recorded for it, and the input's own
+    death at the call site vanished behind the shared storage. `linear.py` does
+    `y = tensor_model_parallel_all_reduce(y)`, which releases the row-parallel
+    matmul's output there; aliased, that buffer reads as immortal.
+    """
+
+    def test_the_stand_in_is_a_new_storage(self):
+        x = torch.zeros(4, 4, device="meta")
+        out = _collective_stand_in("aiter::all_reduce_", [x])
+        assert out is not x
+        assert _storage_of(out) != _storage_of(x)
+        assert out.shape == x.shape and out.dtype == x.dtype
+
+    def test_allocating_it_records_no_operator(self):
+        """Otherwise a derived graph gains an `empty_like` a capture has not."""
+        tracer = MetaOpTracer()
+        x = torch.zeros(4, 4, device="meta")
+        with tracer:
+            fresh_like(x)
+            fresh_shape((8, 4), x)
+        assert [op.name for op in tracer.graph.ops] == []
+
+    def test_a_shape_changing_collective_is_still_refused(self):
+        """The fresh output is not licence to guess an all-gather's shape."""
+        x = torch.zeros(4, 4, device="meta")
+        assert _collective_stand_in("aiter::all_gather_unreg", [x]) is None
+        assert _collective_stand_in("aiter::reduce_scatter", [x]) is None
+
+    def test_the_tracer_sees_the_stand_in_as_the_collective_s_product(self):
+        """Which is the whole point: it is watched, and its death is recorded."""
+        tracer = MetaOpTracer()
+        x = torch.zeros(4, 4, device="meta")
+        w = torch.ones(4, 4, device="meta")
+        with tracer:
+            h = torch.mm(x, w)
+            out = _collective_stand_in("aiter::all_reduce_", [h])
+            tracer.note_operator(
+                OpSpec(name="aiter::all_reduce_", input_shapes=((4, 4),),
+                       output_shapes=((4, 4),), dtypes=("bfloat16",),
+                       group="tp", output_aliases=(None,)),
+                inputs=(h,), outputs=(out,))
+            index = len(tracer.graph.ops) - 1
+            del h                      # what `y = all_reduce(y)` does
+            torch.relu(out)
+        assert tracer.graph.ops[-1].inputs_from == (index,)
+        # The gemm's output died at the collective, not at the end of the step.
+        assert tracer.deaths.get((0, 0)) == index

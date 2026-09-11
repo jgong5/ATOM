@@ -33,6 +33,7 @@ __all__ = [
     "MissingMetaKernel", "MetaTrace", "MetaOpTracer",
     "LIVENESS_INSTRUMENTATION",
     "derived_inputs", "AMBIGUOUS_GROUP",
+    "fresh_like", "fresh_shape",
 ]
 
 # Collectives name the group they ran on; everything else is local compute.
@@ -85,10 +86,10 @@ def _resolve_group(name: str, topology: Optional[dict]) -> Optional[str]:
     return candidates[0] if len(candidates) == 1 else AMBIGUOUS_GROUP
 
 
-#: Collectives whose output has the same shape as their input, and which ATOM
-#: performs in place. These can be stood in for on meta by handing back the
-#: tensor that went in — the graph still records that the collective happened,
-#: on which group, over how many bytes, which is all a cost model needs.
+#: Collectives whose output has the same shape and dtype as their input. These
+#: can be stood in for on meta by a fresh tensor of that shape — the graph
+#: still records that the collective happened, on which group, over how many
+#: bytes, which is all a cost model needs.
 #:
 #: Deliberately not a catch-all. ``all_gather`` grows its output and
 #: ``reduce_scatter`` shrinks it, so guessing "same shape" for those would
@@ -97,11 +98,59 @@ def _resolve_group(name: str, topology: Optional[dict]) -> Optional[str]:
 _SHAPE_PRESERVING = ("all_reduce", "allreduce", "broadcast")
 
 
+def fresh_like(tensor):
+    """An unrecorded tensor of ``tensor``'s shape and dtype.
+
+    Unrecorded because the allocation is not an operator the step performs: it
+    stands in for one the native implementation makes inside a call this
+    process cannot make. Left to dispatch normally it would appear in the graph
+    as an ``empty_like`` beside every collective, and a graph derived here would
+    stop being comparable operator-for-operator with a captured one.
+    """
+    from torch.utils._python_dispatch import _disable_current_modes
+
+    with _disable_current_modes():
+        return torch.empty_like(tensor)
+
+
+def fresh_shape(shape, like):
+    """An unrecorded tensor of ``shape``, in ``like``'s dtype and device.
+
+    For a collective whose output is not its input's shape -- the head's
+    all-gather, which grows one axis by the group's width. Same reason as
+    :func:`fresh_like` for not recording the allocation.
+    """
+    from torch.utils._python_dispatch import _disable_current_modes
+
+    with _disable_current_modes():
+        return torch.empty(tuple(int(d) for d in shape), dtype=like.dtype,
+                           device=like.device)
+
+
 def _collective_stand_in(name: str, tensors: list) -> Optional[Any]:
-    """Result of a collective that cannot run, or None if we must not guess."""
+    """Result of a collective that cannot run, or None if we must not guess.
+
+    A *fresh* tensor, not the input. Every live path through ATOM's all-reduce
+    allocates its own output -- ``GroupCoordinator.all_reduce`` says so in as
+    many words ("PyTorch custom ops do not support mutation or returning a new
+    tensor in the same op. So we always make the all-reduce operation
+    out-of-place"), and each implementation under it opens with
+    ``torch.empty_like``, ``torch.zeros_like`` or ``input_.clone()``. The IPC
+    pool that ``registered_input`` refers to is on the input side. Only
+    ``world_size == 1`` returns the input itself, and that is the branch a
+    derivation is standing in *for*, not the one it is modelling.
+
+    Handing back ``tensors[0]`` recorded the collective as writing into its own
+    input: the operator gained no tensor of its own, so nothing was watched and
+    no death was recorded, and the input's death at the call site was hidden
+    too. `atom/model_ops/linear.py` does ``y = tensor_model_parallel_all_reduce(y)``,
+    which drops the last reference to the row-parallel matmul's output right
+    there -- one hidden-width buffer live across the call, rather than one per
+    call held forever.
+    """
     lowered = name.lower()
     if any(h in lowered for h in _SHAPE_PRESERVING) and tensors:
-        return tensors[0]
+        return fresh_like(tensors[0])
     return None
 
 

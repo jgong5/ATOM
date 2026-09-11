@@ -216,6 +216,7 @@ class record_collectives:
             return self
 
         from atom.compass.core.graph import OpSpec
+        from atom.compass.runtime.meta import fresh_like, fresh_shape
 
         import inspect
 
@@ -265,14 +266,24 @@ class record_collectives:
                 output_aliases=(None,),
             )
             out = original(input_, *args, **kwargs)
-            # Under the passthrough `out` *is* `input_`, one storage where
-            # production has two. So the graph records the collective as the
-            # producer of that storage -- which is what a reader downstream
-            # sees in production -- but the input's death cannot be told from
-            # the output's, and the derived curve holds the input for the
-            # collective's life as well as its own. One collective-sized
-            # tensor per layer, in the conservative direction, and it is not
-            # observable from this side of the passthrough.
+            if out is input_ and input_.device.type == "meta":
+                # Simulated TP's passthrough returned the input, because at a
+                # physical world size of one that is what
+                # `GroupCoordinator.all_reduce` does. Production does not: every
+                # path with a peer allocates its own output. Handed back as it
+                # came, the collective has no tensor of its own -- nothing is
+                # watched, no death is recorded, and the input's death at the
+                # call site is hidden behind it. `linear.py` does
+                # `y = tensor_model_parallel_all_reduce(y)`, which drops the
+                # last reference to the matmul's output right there; with one
+                # storage for two tensors that release is invisible and the
+                # buffer reads as immortal. 128 of them at TP2.
+                #
+                # Meta only. On a device, a physical-world-size-one microbench
+                # under simulated TP would then really allocate, which is a cost
+                # it does not pay today; there the passthrough stands and the
+                # aliasing above is what the graph records.
+                out = fresh_like(input_)
             record(spec, inputs=(input_,), outputs=(out,))
             return out
 
@@ -282,11 +293,8 @@ class record_collectives:
         original_gather = group.all_gather
 
         def all_gather(input_, use_custom: bool = False, dim: int = -1):
-            import torch
-
             spec = head_gather_opspec(group, input_, dim, group_name=name)
-            out = torch.empty(spec.output_shapes[0], dtype=input_.dtype,
-                              device=input_.device)
+            out = fresh_shape(spec.output_shapes[0], input_)
             record(spec, inputs=(input_,), outputs=(out,))
             return out
 
