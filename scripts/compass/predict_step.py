@@ -82,6 +82,15 @@ def _shape_from(raw: dict):
     )
 
 
+def _coords(saved):
+    """A coordinate map as saved: a dict, or the pair list JSON turned it into."""
+    if not saved:
+        return {}
+    if isinstance(saved, dict):
+        return dict(saved)
+    return {k: v for k, v in saved}
+
+
 def _template_shape(graph: dict):
     """The structure a graph on disk is a graph of, from its own provenance.
 
@@ -101,17 +110,26 @@ def _template_shape(graph: dict):
             "this graph records no batch_spec, so nothing says which structure "
             "it is a template for. Derive it with --batch-spec.")
     key = graph.get("key") or {}
-    topology = key.get("topology") or {}
-    rank_coords = key.get("rank_coords") or {}
+    # A saved key writes its coordinate dicts as pair lists, because JSON has
+    # no dict-of-tuples. Reading one back as a dict is not a conversion, it is
+    # the inverse of how it was written.
+    topology = _coords(key.get("topology"))
+    rank_coords = _coords(key.get("rank_coords"))
     queries = tuple(spec["query_lens"])
     contexts = tuple(spec["context_lens"])
     prefill = 0 if spec.get("kind") == "decode" else sum(queries)
+    # Which bucket a graph was captured at is an execution fact, and that is
+    # where the tracer records it -- not in the batch spec, which describes the
+    # requests. A graph derived with no bucket declared keys as None: it is a
+    # template for the uncaptured structure, and claiming a bucket it was not
+    # traced at would make it answer for a padded graph nobody derived.
+    execution = prov.get("execution") or {}
     return StepShape(
         num_scheduled_tokens=queries,
         context_lens=contexts,
         num_prefill_tokens=prefill,
         topology=topology, rank_coords=rank_coords,
-        capture_bucket=spec.get("capture_bucket"),
+        capture_bucket=execution.get("capture_bucket"),
         compiled=None,
         produces_output=True,
     )
