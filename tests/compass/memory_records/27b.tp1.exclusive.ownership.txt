@@ -1,0 +1,29 @@
+# rocm-smi KFD process sample, one line per ~35 s, spanning the three
+# phase C source repeats (08:53:49Z-09:03:38Z) plus settle either side.
+# pids 683041/687805/743169/746614/768638/773643 and the gpu1-indexed
+# engine pids 695009/751439 are this agent's own container. pid 1685833
+# is a long-lived foreign KFD attachment present since 08:31Z, attributed
+# 0 B of VRAM in every sample; dev0_used at idle is 297 689 088 B in every
+# sample, which is the device's own floor and is charged to non_torch.
+2026-09-11T08:55:09Z pid=1685833(UNKNOWN,gpu0,vram=0) dev0_used=297689088
+2026-09-11T08:55:51Z pid=1685833(UNKNOWN,gpu0,vram=0) dev0_used=297689088
+2026-09-11T08:56:28Z pid=683041(UNKNOWN,gpu0,vram=0) pid=687805(UNKNOWN,gpu0,vram=0) pid=1685833(UNKNOWN,gpu0,vram=0) dev0_used=297934848
+2026-09-11T08:57:06Z pid=683041(UNKNOWN,gpu0,vram=0) pid=687805(UNKNOWN,gpu0,vram=0) pid=1685833(UNKNOWN,gpu0,vram=0) pid=695009(UNKNOWN,gpu1,vram=55229394944) dev0_used=55536754688
+2026-09-11T08:57:44Z pid=683041(UNKNOWN,gpu0,vram=0) pid=687805(UNKNOWN,gpu0,vram=0) pid=1685833(UNKNOWN,gpu0,vram=0) pid=695009(UNKNOWN,gpu1,vram=55229394944) dev0_used=55607504896
+2026-09-11T08:58:23Z pid=683041(UNKNOWN,gpu0,vram=0) pid=687805(UNKNOWN,gpu0,vram=0) pid=1685833(UNKNOWN,gpu0,vram=0) pid=695009(UNKNOWN,gpu1,vram=55531405312) dev0_used=55933607936
+2026-09-11T08:59:03Z pid=683041(UNKNOWN,gpu0,vram=0) pid=687805(UNKNOWN,gpu0,vram=0) pid=1685833(UNKNOWN,gpu0,vram=0) pid=695009(UNKNOWN,gpu1,vram=55532572672) dev0_used=55934922752
+2026-09-11T08:59:44Z pid=683041(UNKNOWN,gpu0,vram=0) pid=1685833(UNKNOWN,gpu0,vram=0) dev0_used=49349455872
+2026-09-11T09:00:21Z pid=743169(UNKNOWN,gpu0,vram=0) pid=1685833(UNKNOWN,gpu0,vram=0) pid=746614(UNKNOWN,gpu0,vram=0) dev0_used=297897984
+2026-09-11T09:01:01Z pid=743169(UNKNOWN,gpu0,vram=0) pid=751439(UNKNOWN,gpu1,vram=55531405312) pid=1685833(UNKNOWN,gpu0,vram=0) pid=746614(UNKNOWN,gpu0,vram=0) dev0_used=55933067264
+2026-09-11T09:01:37Z pid=768638(UNKNOWN,gpu0,vram=0) pid=743169(UNKNOWN,gpu0,vram=0) pid=751439(UNKNOWN,gpu1,vram=177392308224) pid=1685833(UNKNOWN,gpu0,vram=0) pid=746614(UNKNOWN,gpu0,vram=0) dev0_used=177951195136
+2026-09-11T09:02:13Z pid=773643(UNKNOWN,gpu0,vram=0) pid=774589(UNKNOWN,gpu0,vram=0) pid=1685833(UNKNOWN,gpu0,vram=0) dev0_used=297885696
+2026-09-11T09:02:49Z pid=773643(UNKNOWN,gpu0,vram=0) pid=774589(UNKNOWN,gpu0,vram=0) pid=1685833(UNKNOWN,gpu0,vram=0) pid=775417(UNKNOWN,gpu1,vram=55531405312) dev0_used=55932973056
+2026-09-11T09:03:34Z pid=773643(UNKNOWN,gpu0,vram=0) pid=774589(UNKNOWN,gpu0,vram=0) pid=1685833(UNKNOWN,gpu0,vram=0) pid=775417(UNKNOWN,gpu1,vram=175583326208) dev0_used=175481729024
+2026-09-11T09:04:15Z pid=1685833(UNKNOWN,gpu0,vram=0) dev0_used=297689088
+2026-09-11T09:04:50Z pid=1685833(UNKNOWN,gpu0,vram=0) dev0_used=297689088
+2026-09-11T09:05:27Z pid=1685833(UNKNOWN,gpu0,vram=0) dev0_used=297689088
+2026-09-11T09:06:04Z pid=1685833(UNKNOWN,gpu0,vram=0) dev0_used=297689088
+2026-09-11T09:06:41Z pid=1685833(UNKNOWN,gpu0,vram=0) dev0_used=297689088
+2026-09-11T09:07:19Z pid=1685833(UNKNOWN,gpu0,vram=0) dev0_used=297689088
+2026-09-11T09:07:55Z pid=1685833(UNKNOWN,gpu0,vram=0) dev0_used=297689088
+2026-09-11T09:08:32Z pid=1685833(UNKNOWN,gpu0,vram=0) dev0_used=297689088

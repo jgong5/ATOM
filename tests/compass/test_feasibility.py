@@ -46,7 +46,6 @@ from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.scheduler import Scheduler
 from atom.model_engine.sequence import Sequence
 from atom.sampling_params import SamplingParams
-
 from tests.conftest import MockConfig
 
 RECORDS = Path(__file__).parent / "memory_records"
@@ -58,22 +57,27 @@ RECORDS = Path(__file__).parent / "memory_records"
 #: admission gate bites and useless as a verdict on the final workload.
 STRESS_LONGEST = Request(input_tokens=249344, output_tokens=5690)
 
-#: CC's provisional long-acceptance window caps input at 107328 tokens. Of the
-#: 62 requests in `cc_pilot.jsonl`, 46 are longer than that -- which is the
-#: measurement that says the slice is not the workload. Inside the window the
-#: longest is 96960 + 260 = 97220 tokens (6077 blocks). PROVISIONAL: replace
-#: with manifest-derived lengths once the final CC workload is locked; until
-#: then no admission verdict here is a verdict on the final workload.
+#: CC's long-acceptance window caps input at 107328 tokens. Of the 62 requests
+#: in `cc_pilot.jsonl`, 46 are longer than that -- which is the measurement
+#: that says the slice is not the workload. Inside the window the longest is
+#: 96960 + 260 = 97220 tokens (6077 blocks).
 WINDOW_MAX_INPUT_TOKENS = 107328
 
+#: The registered CC protocol `47917ade`, which supersedes the bound derived
+#: from the slice: two arms, and the long one is the request the deployment has
+#: to admit. Note the output length -- 2413 against the 260 the slice suggested,
+#: which is why a slice-derived bound was only ever a stand-in.
+CC_LONG = Request(input_tokens=107328, output_tokens=2413)
+CC_SHORT = Request(input_tokens=2560, output_tokens=21)
+
 #: The deployment everything was recorded at, other than the concurrency.
-DEPLOYED = dict(
-    utilization=0.9,
-    max_model_len=262144,
-    max_num_batched_tokens=16384,
-    tensor_parallel=1,
-    block_size=16,
-)
+DEPLOYED = {
+    "utilization": 0.9,
+    "max_model_len": 262144,
+    "max_num_batched_tokens": 16384,
+    "tensor_parallel": 1,
+    "block_size": 16,
+}
 
 
 def _config() -> dict:
@@ -288,8 +292,8 @@ def test_blocks_for_rounds_up_and_refuses_to_guess_under_dcp():
 def test_the_trace_still_says_this():
     """`STRESS_LONGEST` against the trace itself, when the trace is on the box.
 
-    Skipped rather than shipped: the trace is the workload and belongs with
-    the campaign's artifacts, not in the test tree. The two numbers are pinned
+    Skipped rather than shipped: the trace belongs with the campaign's
+    artifacts, not in the test tree. The two numbers are pinned
     above so the rest of this module runs anywhere.
     """
     trace = (
@@ -400,3 +404,39 @@ def test_the_stress_request_is_not_the_acceptance_request():
 
     assert window_blocks > 1551  # 0.33 refuses the window request too
     assert window_blocks < 15206  # 0.40 admits it, while refusing the stress one
+
+
+def test_the_registered_protocol_supersedes_the_slice_derived_bound():
+    """`47917ade`: the acceptance lengths are now measured, not inferred.
+
+    `window_upper_bound` paired the window's input cap with the longest output
+    the slice contained, 260 tokens, and said in its own docstring that it was
+    standing in for a number nobody had. The number arrived: 2413. The bound
+    was 134 blocks light, which is small, and light in the direction that
+    matters, which is not.
+    """
+    slice_ = [Request(96960, 260), Request(107328, 96), STRESS_LONGEST]
+    inferred = window_upper_bound(slice_, max_input_tokens=WINDOW_MAX_INPUT_TOKENS)
+    assert inferred == Request(107328, 260)
+    assert blocks_for(inferred.total_tokens, 16) == 6725
+
+    assert CC_LONG.total_tokens == 109741
+    assert blocks_for(CC_LONG.total_tokens, 16) == 6859
+    assert blocks_for(CC_SHORT.total_tokens, 16) == 162
+    assert blocks_for(CC_LONG.total_tokens, 16) > blocks_for(inferred.total_tokens, 16)
+
+
+def test_the_ladder_rungs_against_the_registered_long_arm():
+    """Which utilizations admit the workload CC actually registered.
+
+    0.33 refuses it on either of its two readings and 0.40 admits it with room
+    over. The rungs are the engine's own block counts from the frozen ladder,
+    so this is an admission arithmetic check against measured pools, not a
+    prediction.
+    """
+    needed = blocks_for(CC_LONG.total_tokens, 16)
+    assert needed == 6859
+    assert 1091 < needed and 1583 < needed  # util 0.33, phase A and settled
+    assert 15238 > needed and 17188 > needed  # util 0.40 and 0.41
+    # And the short arm fits even the rung that refuses the long one.
+    assert blocks_for(CC_SHORT.total_tokens, 16) < 1091
