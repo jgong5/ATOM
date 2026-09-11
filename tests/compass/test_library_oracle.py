@@ -8,12 +8,12 @@ silently contributing zero.
 """
 
 import json
+import pathlib
 
 import pytest
 
 from atom.compass.core.cost.base import StepShape
-from atom.compass.core.cost.library import (
-    LibraryCostOracle, PriceLibrary, StaticGraphs)
+from atom.compass.core.cost.library import LibraryCostOracle, PriceLibrary, StaticGraphs
 
 
 def _op(name, shapes, dtypes=("bfloat16",), layouts=None, context=None):
@@ -730,3 +730,120 @@ class TestADomainRefusalIsAskedBeforeTheWorkItWouldDiscard:
         oracle = LibraryCostOracle(PriceLibrary.load([(priced, None)]), graphs)
         assert oracle.estimate(self._decode(20)).seconds > 0
         assert graphs.asked == 1
+
+
+def _interpolate(path, *, seconds=None):
+    """Mark every entry in a written price list as derived, not measured.
+
+    The seam between the two modules is exactly this field: the module that
+    fits family curves sets `"interpolated": true` on the record it returns,
+    and this one reads it. Written here as JSON rather than imported so the
+    test fails if the flag is renamed on either side.
+    """
+    blob = json.loads(pathlib.Path(path).read_text())
+    for record in blob["prices"].values():
+        record["interpolated"] = True
+        if seconds is not None:
+            record["seconds"] = seconds
+            record["kernels"] = {"k0": seconds}
+    pathlib.Path(path).write_text(json.dumps(blob))
+    return path
+
+
+def _declare_zero_work(path):
+    """Mark every entry as an operator the configuration does not run."""
+    blob = json.loads(pathlib.Path(path).read_text())
+    for record in blob["prices"].values():
+        record["zero_work"] = True
+    pathlib.Path(path).write_text(json.dumps(blob))
+    return path
+
+
+class TestAFittedPriceIsNotAMeasurement:
+    """Complete coverage may contain interpolation; it may not be *called*
+    measurement.
+
+    The failure this prevents is silent and terminal for the claim: a step
+    summed entirely from fitted values reports `1/1 operators` exactly as a
+    step summed from timings does, and every report downstream inherits the
+    confusion. The counts are kept apart rather than recovered by subtraction,
+    because a reader who has to subtract has already been told the wrong thing.
+    """
+
+    GEMM = _op("aiter::gemm_a16w16", [[4, 5120], [5120, 17408]])
+    NORM = _op("triton::norm", [[4, 5120]])
+
+    def test_an_interpolated_price_is_counted_apart_from_a_measured_one(
+            self, tmp_path):
+        measured = _price_list(tmp_path, "m.json", [self.GEMM], 1e-3)
+        fitted = _interpolate(_price_list(tmp_path, "f.json", [self.NORM], 2e-4))
+        library = PriceLibrary.load([(measured, None), (fitted, None)])
+        _, coverage, _ = library.body(_graph([self.GEMM, self.NORM]))
+        assert (coverage.measured, coverage.interpolated) == (1, 1)
+        assert coverage.priced == 2
+
+    def test_a_step_priced_entirely_by_fitting_is_complete_but_not_measured(
+            self, tmp_path):
+        """The distinction the PoC needs both halves of.
+
+        It is complete -- there is a predicted cost for every operator, which
+        is what a predictive claim requires. It is not direct measurement, and
+        `complete_measured` is the question an acceptance gate asks.
+        """
+        fitted = _interpolate(_price_list(tmp_path, "f.json", [self.GEMM], 1e-3))
+        library = PriceLibrary.load([(fitted, None)])
+        seconds, coverage, _ = library.body(_graph([self.GEMM]))
+        assert seconds > 0.0
+        assert coverage.complete
+        assert not coverage.complete_measured
+        assert (coverage.interpolated, coverage.measured) == (1, 0)
+
+    def test_an_operator_declared_not_to_run_is_counted_apart(self, tmp_path):
+        """Accounted for, and not a timing.
+
+        A collective at group width one, or a head on a chunk producing no
+        token, is known not to run. Counting it as measured inflates the
+        measured share with operators nothing was timed for; counting it as
+        refused makes a fully-accounted step look incomplete. It is neither.
+        """
+        free = _declare_zero_work(
+            _price_list(tmp_path, "z.json", [self.GEMM], 0.0))
+        library = PriceLibrary.load([(free, None)])
+        _, coverage, _ = library.body(_graph([self.GEMM]))
+        assert (coverage.zero_work, coverage.measured) == (1, 0)
+        assert coverage.complete and coverage.complete_measured
+
+    def test_a_zero_time_alone_is_not_a_declaration_that_it_does_not_run(
+            self, tmp_path):
+        """Both markers are read, neither is inferred.
+
+        A measurement can round to zero at the timer's floor. Promoting that to
+        "the engine is known not to run this" turns a resolution limit into a
+        structural claim about the configuration, which is the kind of error
+        that reads as a stronger result than was obtained.
+        """
+        free = _price_list(tmp_path, "z0.json", [self.GEMM], 0.0)
+        library = PriceLibrary.load([(free, None)])
+        _, coverage, _ = library.body(_graph([self.GEMM]))
+        assert (coverage.zero_work, coverage.measured) == (0, 1)
+
+    def test_a_fit_that_lands_on_zero_is_still_a_fit(self, tmp_path):
+        fitted = _interpolate(
+            _price_list(tmp_path, "fz.json", [self.GEMM], 1e-3), seconds=0.0)
+        library = PriceLibrary.load([(fitted, None)])
+        _, coverage, _ = library.body(_graph([self.GEMM]))
+        assert (coverage.interpolated, coverage.zero_work) == (1, 0)
+        assert not coverage.complete_measured
+
+    def test_the_split_survives_merging_two_regions_and_is_printed(
+            self, tmp_path):
+        """A body and a head are one step, and one coverage line."""
+        measured = _price_list(tmp_path, "m.json", [self.GEMM], 1e-3)
+        fitted = _interpolate(_price_list(tmp_path, "f.json", [self.NORM], 2e-4))
+        library = PriceLibrary.load([(measured, None), (fitted, None)])
+        _, body, _ = library.body(_graph([self.GEMM]))
+        _, head, _ = library.body(_graph([self.NORM]))
+        both = body.merged(head)
+        assert (both.measured, both.interpolated, both.operators) == (1, 1, 2)
+        # And a reader of the line is told what the 2/2 is made of.
+        assert "1 measured, 1 interpolated" in both.describe()

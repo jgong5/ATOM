@@ -137,6 +137,26 @@ def _traced_body_rows(graph: dict) -> Optional[int]:
     return int(rows) if isinstance(rows, int) else None
 
 
+#: The one marker that makes a derived price distinguishable from a measured
+#: one by inspection. A record carrying ``"interpolated": True`` was fitted
+#: from neighbouring points; a measured record carries no such field at all,
+#: so absence is the measured case and nothing has to be back-filled onto the
+#: measurements. Deliberately a plain field rather than a type or an import:
+#: the module that derives prices depends on this one, not the other way
+#: round, and a flag on the record survives the record being serialised.
+INTERPOLATED_FLAG = "interpolated"
+#: The prefix that same module puts on its source string, so the split is also
+#: legible in `Coverage.sources` and in any report that prints it.
+INTERPOLATED_SOURCE_PREFIX = "interpolated://"
+#: The separate declaration that an operator does no work in this
+#: configuration -- a collective at group width one, a head on a chunk that
+#: produces no token. Fully accounted for and not a measurement, so it is its
+#: own count. Declared, never inferred from a zero time: a real measurement can
+#: round to zero, and reading that as "known not to run" would turn a timing
+#: floor into a structural claim.
+ZERO_WORK_FLAG = "zero_work"
+
+
 @dataclass(frozen=True)
 class Coverage:
     """What a summed cost is a sum *of*.
@@ -147,11 +167,37 @@ class Coverage:
     sixteen attention signatures launched once, so a count of signatures
     describes the library and a count of operators describes the step. Only the
     second is what a coverage claim is about.
+
+    An answered operator is answered in one of three ways, counted apart and
+    none of them recoverable by subtraction. ``measured`` is a timing of this
+    operator at this signature. ``interpolated`` is a value derived from
+    timings of neighbouring points in the same family -- legitimate inside its
+    support, and still not a measurement of this point. ``zero_work`` is an
+    operator the configuration is known not to run at all -- a collective at
+    group width one, a head on a chunk producing no token. It is fully
+    accounted for and it is not a timing, so a coverage claim resting on it is
+    a different claim from one resting on a measurement.
+
+    ``complete`` means nothing was refused: the step has a predicted cost for
+    every operator in it, and validated in-support interpolation may be part
+    of that. ``complete_measured`` is the stricter claim that none of it was
+    fitted. Both are published, because the PoC needs the first and may only
+    call the second direct measurement.
     """
 
     operators: int
-    priced: int
+    #: Priced from a timing of this operator at this signature.
+    measured: int
     seconds: float
+    #: Priced from neighbouring measurements in the same family. The seam is a
+    #: plain field on the record -- ``record["interpolated"] is True`` -- so
+    #: this module reads the marker without importing the module that derives
+    #: it; `atom/compass/core/cost/families/adapter.py` sets it and labels its
+    #: source string ``interpolated://<family>/...``.
+    interpolated: int = 0
+    #: Declared not to run in this configuration, by the record's own
+    #: ``zero_work`` field. Never inferred from a zero time.
+    zero_work: int = 0
     #: Operator counts by name for what could not be priced, with one reason
     #: each -- named, because "4% unpriced" and "4% unpriced, all of it
     #: attention" are different situations.
@@ -163,8 +209,19 @@ class Coverage:
     sources: dict[str, int] = field(default_factory=dict)
 
     @property
+    def priced(self) -> int:
+        """Answered, however answered. Kept as the total the reports already read."""
+        return self.measured + self.interpolated + self.zero_work
+
+    @property
     def complete(self) -> bool:
+        """Every operator has a price. Some of them may be fitted."""
         return self.priced == self.operators
+
+    @property
+    def complete_measured(self) -> bool:
+        """Every operator has a price and none of it was interpolated."""
+        return self.complete and self.interpolated == 0
 
     def merged(self, other: "Coverage") -> "Coverage":
         """One record over two regions of the same step.
@@ -183,8 +240,10 @@ class Coverage:
             sources[name] = sources.get(name, 0) + n
         return Coverage(
             operators=self.operators + other.operators,
-            priced=self.priced + other.priced,
+            measured=self.measured + other.measured,
             seconds=self.seconds + other.seconds,
+            interpolated=self.interpolated + other.interpolated,
+            zero_work=self.zero_work + other.zero_work,
             refused=refused,
             reasons={**self.reasons, **other.reasons},
             sources=sources,
@@ -193,6 +252,17 @@ class Coverage:
     def describe(self) -> str:
         head = (f"{self.priced}/{self.operators} operators, "
                 f"{self.seconds * 1e3:.3f} ms")
+        # Stated whenever any of it is fitted or free, and stated in the same
+        # line as the total: a reader who sees only "1/1 operators" of an
+        # interpolated step has been told the step is covered and not told
+        # what by.
+        if self.interpolated or self.zero_work:
+            parts = [f"{self.measured} measured"]
+            if self.interpolated:
+                parts.append(f"{self.interpolated} interpolated")
+            if self.zero_work:
+                parts.append(f"{self.zero_work} zero-work")
+            head = f"{head} ({', '.join(parts)})"
         if self.complete:
             return head
         missing = ", ".join(f"{n}x {name}"
@@ -473,7 +543,8 @@ class PriceLibrary:
             registration = declared if declared in _REGIMES else None
         ops = [op for op in (graph_blob.get("ops") or [])
                if op.get("name", "") not in HOST_SYNC]
-        total, priced, launches = 0.0, 0, 0
+        total, launches = 0.0, 0
+        measured = interpolated = zero_work = 0
         refused: dict[str, int] = {}
         reasons: dict[str, str] = {}
         sources: dict[str, int] = {}
@@ -483,12 +554,24 @@ class PriceLibrary:
                 refused[op["name"]] = refused.get(op["name"], 0) + 1
                 reasons.setdefault(op["name"], detail)
                 continue
-            total += float(record["seconds"])
+            seconds = float(record["seconds"])
+            total += seconds
             launches += max(1, len(record.get("kernels") or {}))
-            priced += 1
+            # Three counts, decided here and not by subtraction downstream, and
+            # both markers are read rather than inferred. A zero *time* is not
+            # a zero-work operator -- a measurement can round to zero and a fit
+            # can land on it -- so only the record's own declaration promotes
+            # one, in the same order `coverage_split` uses.
+            if record.get(ZERO_WORK_FLAG):
+                zero_work += 1
+            elif record.get(INTERPOLATED_FLAG):
+                interpolated += 1
+            else:
+                measured += 1
             sources[detail] = sources.get(detail, 0) + 1
         return (total,
-                Coverage(operators=len(ops), priced=priced, seconds=total,
+                Coverage(operators=len(ops), measured=measured, seconds=total,
+                         interpolated=interpolated, zero_work=zero_work,
                          refused=refused, reasons=reasons, sources=sources),
                 launches)
 
