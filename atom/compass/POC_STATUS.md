@@ -60,12 +60,29 @@ within-session request timing is taken raw rather than clipped at a 60 s idle
 ceiling, and short-session start alignment is declared explicitly before
 registration rather than by assigning an arbitrary 1 s arrival.
 
+A **provisional** selection exists as of 2026-09-11 and is recorded here so that
+CPU-side coverage work has something real to aim at, not because it is settled.
+Long: session `0470d446a4514dfe0c6ad0be92853bd13287`, window index 6, 20
+requests, 1 594 624 input tokens (median 91 008, max 107 328), 15 833 output
+tokens, native span 262.828 s. Short: 64 source session openings with declared
+start alignment at 0, 36 480 input / 1 377 output, source lengths unmodified.
+**Neither is locked.** CC is auditing whether nested subagent requests inside a
+selected window belong in it — a wrapper event is not a request, but its
+children can be — and that audit can change both manifests. Nothing derived from
+these numbers is gate evidence, and no §1 row moves on them.
+
 Three properties of the corpus do not survive the current replay path, and they
 bound what any cc-traces cell can claim (`agent_scratch/cctraces.py`): prefix
 reuse is dropped — the trace's `hash_ids` carry 64-token block sharing, while
 `replay.py` sends synthetic prompts that share no prefix and the engine runs with
-prefix caching off; `in` is a **block count**, not a tokenizer count, accurate in
-distribution and approximate per request; and recorded arrivals are
+prefix caching off; `in` is a **block-derived token count**, not a tokenizer
+count — a CC source audit on 2026-09-11 established that it is already in token
+units, equal to `len(hash_ids) × block_size` across 28 444 top-level real
+request rows, so it is a true length quantised up to a 64-token boundary rather
+than a count of blocks awaiting multiplication. An earlier sentence here called
+it a block count; that was wrong, and any conversion that multiplied it would
+have been 64× too long. It stays accurate in distribution and approximate per
+request, because the quantisation is real; and recorded arrivals are
 **open-loop**, so a faster engine sees the same arrivals a slower one did. The
 source is `semianalysisai/cc-traces-weka-062126-256k`, cached at
 `/md1/users/jgong5/hf_cache/cc-traces-256k/traces.jsonl` (568 864 747 B; full
