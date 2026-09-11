@@ -27,7 +27,8 @@ def _script():
     """`validate_memory.py` as a module. It is a script, and lives in
     `scripts/`, so there is no package to import it from."""
     spec = importlib.util.spec_from_file_location(
-        "compass_validate_memory", ROOT / "scripts/compass/validate_memory.py")
+        "compass_validate_memory", ROOT / "scripts/compass/validate_memory.py"
+    )
     module = importlib.util.module_from_spec(spec)
     spec.loader.exec_module(module)
     return module
@@ -46,8 +47,7 @@ def test_the_pool_measurement_is_read_off_the_record():
     for -- and the allocated delta is beside it because the difference between
     them is segment bookkeeping rather than pinned memory.
     """
-    reserved, allocated, sizes = _script().recorded_pool(
-        _record("27b.tp1.memory.json"))
+    reserved, allocated, sizes = _script().recorded_pool(_record("27b.tp1.memory.json"))
     assert reserved == 127926272
     assert allocated == 110981120
     assert sizes == (1, 2, 4, 8, 16, 32)
@@ -67,20 +67,27 @@ def test_the_old_graph_pool_row_was_an_identity():
     same two readings.
     """
     module = _script()
-    for name in ("27b.tp1.memory.json", "27b.tp2.rank0.memory.json",
-                 "27b.tp4.rank0.memory.json"):
+    for name in (
+        "27b.tp1.memory.json",
+        "27b.tp2.rank0.memory.json",
+        "27b.tp4.rank0.memory.json",
+    ):
         got = _record(name)["readings"]
         warmup_act = got["peak_torch"] - got["current_torch"]
         assert module.graph_pool_bytes(warmup_act) == got["cudagraph_overhead"]
 
 
-@pytest.mark.parametrize("name,reserved,estimate_over", [
-    ("27b.tp1.memory.json", 127926272, True),
-    ("27b.tp2.rank0.memory.json", 106954752, True),
-    ("27b.tp4.rank0.memory.json", 85983232, True),
-])
+@pytest.mark.parametrize(
+    "name,reserved,estimate_over",
+    [
+        ("27b.tp1.memory.json", 127926272, True),
+        ("27b.tp2.rank0.memory.json", 106954752, True),
+        ("27b.tp4.rank0.memory.json", 85983232, True),
+    ],
+)
 def test_the_engines_estimate_is_over_on_this_model_and_was_under_on_the_other(
-        name, reserved, estimate_over):
+    name, reserved, estimate_over
+):
     """The estimator's error changes sign with the model, so it is not a bias.
 
     `0.2 x peak activations` scales with the model; the pool does not. On the

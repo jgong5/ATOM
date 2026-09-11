@@ -37,12 +37,25 @@ from typing import Any, Mapping, Optional
 
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_ops.attentions.sub_pool_spec import (
-    InsufficientPoolBudget, PoolPlan, page_pool, plan_pools, state_pool)
+    InsufficientPoolBudget,
+    PoolPlan,
+    page_pool,
+    plan_pools,
+    state_pool,
+)
 
-__all__ = ["text_config", "layer_counts", "layer_types_disagree",
-           "paged_block_bytes", "gdn_state_bytes", "gdn_hybrid_specs",
-           "plan_from_specs", "blocks_from_readings",
-           "InsufficientPoolBudget", "GDN_HYBRID_MODEL_TYPES"]
+__all__ = [
+    "text_config",
+    "layer_counts",
+    "layer_types_disagree",
+    "paged_block_bytes",
+    "gdn_state_bytes",
+    "gdn_hybrid_specs",
+    "plan_from_specs",
+    "blocks_from_readings",
+    "InsufficientPoolBudget",
+    "GDN_HYBRID_MODEL_TYPES",
+]
 
 #: Model types whose attention is the GDN hybrid these formulas describe: a
 #: paged pool over the full-attention layers only, and a per-request recurrent
@@ -102,15 +115,23 @@ def layer_types_disagree(config: Mapping[str, Any]) -> Optional[str]:
     full_listed = sum(1 for t in listed if t == "full_attention")
     full_rule, _ = layer_counts(config)
     if full_listed == full_rule and len(listed) == int(
-            text.get("num_hidden_layers") or 0):
+        text.get("num_hidden_layers") or 0
+    ):
         return None
-    return ("checkpoint lists %d full-attention layers of %d, the interval "
-            "rule sizes for %d" % (full_listed, len(listed), full_rule))
+    return (
+        "checkpoint lists %d full-attention layers of %d, the interval "
+        "rule sizes for %d" % (full_listed, len(listed), full_rule)
+    )
 
 
-def paged_block_bytes(config: Mapping[str, Any], *, tensor_parallel: int = 1,
-                      block_size: int = 16, kv_dtype_bytes: int = 2,
-                      num_draft_layers: int = 0) -> int:
+def paged_block_bytes(
+    config: Mapping[str, Any],
+    *,
+    tensor_parallel: int = 1,
+    block_size: int = 16,
+    kv_dtype_bytes: int = 2,
+    num_draft_layers: int = 0,
+) -> int:
     """What one paged KV block costs, on one rank.
 
     Two tensors, not one. The cache itself is
@@ -134,8 +155,13 @@ def paged_block_bytes(config: Mapping[str, Any], *, tensor_parallel: int = 1,
     return cache + scale
 
 
-def gdn_state_bytes(config: Mapping[str, Any], *, tensor_parallel: int = 1,
-                    state_dtype_bytes: int = 2, num_spec: int = 0) -> int:
+def gdn_state_bytes(
+    config: Mapping[str, Any],
+    *,
+    tensor_parallel: int = 1,
+    state_dtype_bytes: int = 2,
+    num_spec: int = 0,
+) -> int:
     """What one in-flight request's recurrent state costs, on one rank.
 
     Per linear-attention layer, a convolution window and a temporal state:
@@ -172,10 +198,16 @@ def gdn_state_bytes(config: Mapping[str, Any], *, tensor_parallel: int = 1,
     return linear * (conv + temporal)
 
 
-def gdn_hybrid_specs(config: Mapping[str, Any], *, tensor_parallel: int = 1,
-                     block_size: int = 16, kv_dtype_bytes: int = 2,
-                     state_dtype_bytes: int = 2, num_spec: int = 0,
-                     num_draft_layers: int = 0) -> list:
+def gdn_hybrid_specs(
+    config: Mapping[str, Any],
+    *,
+    tensor_parallel: int = 1,
+    block_size: int = 16,
+    kv_dtype_bytes: int = 2,
+    state_dtype_bytes: int = 2,
+    num_spec: int = 0,
+    num_draft_layers: int = 0,
+) -> list:
     """The entry-class declarations `plan_pools` sizes from.
 
     `entries_per_req` is `1 + num_spec` for the baseline GDN state, which keeps
@@ -185,19 +217,29 @@ def gdn_hybrid_specs(config: Mapping[str, Any], *, tensor_parallel: int = 1,
     deployment would over-reserve rather than under-reserve.
     """
     return [
-        page_pool(paged_block_bytes(
-            config, tensor_parallel=tensor_parallel, block_size=block_size,
-            kv_dtype_bytes=kv_dtype_bytes, num_draft_layers=num_draft_layers)),
-        state_pool(STATE_SLOT_CLASS,
-                   gdn_state_bytes(config, tensor_parallel=tensor_parallel,
-                                   state_dtype_bytes=state_dtype_bytes,
-                                   num_spec=num_spec),
-                   entries_per_req=1 + int(num_spec)),
+        page_pool(
+            paged_block_bytes(
+                config,
+                tensor_parallel=tensor_parallel,
+                block_size=block_size,
+                kv_dtype_bytes=kv_dtype_bytes,
+                num_draft_layers=num_draft_layers,
+            )
+        ),
+        state_pool(
+            STATE_SLOT_CLASS,
+            gdn_state_bytes(
+                config,
+                tensor_parallel=tensor_parallel,
+                state_dtype_bytes=state_dtype_bytes,
+                num_spec=num_spec,
+            ),
+            entries_per_req=1 + int(num_spec),
+        ),
     ]
 
 
-def plan_from_specs(specs: list, available_bytes: int,
-                    max_num_seqs: int) -> PoolPlan:
+def plan_from_specs(specs: list, available_bytes: int, max_num_seqs: int) -> PoolPlan:
     """ATOM's own sizing, called rather than reimplemented.
 
     Raises ATOM's own `InsufficientPoolBudget` when the state floor leaves
@@ -208,11 +250,19 @@ def plan_from_specs(specs: list, available_bytes: int,
     return plan_pools(specs, int(available_bytes), int(max_num_seqs))
 
 
-def blocks_from_readings(config: Mapping[str, Any], readings,
-                         *, utilization: float, max_num_seqs: int,
-                         tensor_parallel: int = 1, block_size: int = 16,
-                         kv_dtype_bytes: int = 2, state_dtype_bytes: int = 2,
-                         num_spec: int = 0, extra_reserve: int = 0) -> PoolPlan:
+def blocks_from_readings(
+    config: Mapping[str, Any],
+    readings,
+    *,
+    utilization: float,
+    max_num_seqs: int,
+    tensor_parallel: int = 1,
+    block_size: int = 16,
+    kv_dtype_bytes: int = 2,
+    state_dtype_bytes: int = 2,
+    num_spec: int = 0,
+    extra_reserve: int = 0,
+) -> PoolPlan:
     """The block count a set of readings and this geometry produce together.
 
     `readings` is anything with the five attributes `MemoryReadings` has, so a
@@ -221,14 +271,20 @@ def blocks_from_readings(config: Mapping[str, Any], readings,
     fitted constant at all, so when this disagrees with a run, the disagreement
     is in the readings.
     """
-    overheads = (readings.peak_torch + readings.non_torch
-                 + readings.cudagraph_overhead
-                 + int(readings.total * SAFETY_FRACTION))
+    overheads = (
+        readings.peak_torch
+        + readings.non_torch
+        + readings.cudagraph_overhead
+        + int(readings.total * SAFETY_FRACTION)
+    )
     budget = int(readings.total * utilization) - overheads - int(extra_reserve)
     available = min(budget, readings.free)
-    specs = gdn_hybrid_specs(config, tensor_parallel=tensor_parallel,
-                             block_size=block_size,
-                             kv_dtype_bytes=kv_dtype_bytes,
-                             state_dtype_bytes=state_dtype_bytes,
-                             num_spec=num_spec)
+    specs = gdn_hybrid_specs(
+        config,
+        tensor_parallel=tensor_parallel,
+        block_size=block_size,
+        kv_dtype_bytes=kv_dtype_bytes,
+        state_dtype_bytes=state_dtype_bytes,
+        num_spec=num_spec,
+    )
     return plan_from_specs(specs, available, max_num_seqs)

@@ -31,8 +31,13 @@ from pathlib import Path
 import pytest
 
 from atom.compass.core.feasibility import (
-    Request, admission_refusal, assess, blocks_for, longest_request,
-    trace_requests)
+    Request,
+    admission_refusal,
+    assess,
+    blocks_for,
+    longest_request,
+    trace_requests,
+)
 from atom.compass.core.kv_geometry import gdn_state_bytes
 from atom.compass.core.memory import MemoryReadings
 from atom.model_engine.block_manager import BlockManager
@@ -52,9 +57,13 @@ RECORDS = Path(__file__).parent / "memory_records"
 CC_LONGEST = Request(input_tokens=249344, output_tokens=5690)
 
 #: The deployment everything was recorded at, other than the concurrency.
-DEPLOYED = dict(utilization=0.9, max_model_len=262144,
-                max_num_batched_tokens=16384, tensor_parallel=1,
-                block_size=16)
+DEPLOYED = dict(
+    utilization=0.9,
+    max_model_len=262144,
+    max_num_batched_tokens=16384,
+    tensor_parallel=1,
+    block_size=16,
+)
 
 
 def _config() -> dict:
@@ -66,9 +75,12 @@ def _tp1_readings() -> MemoryReadings:
     with open(RECORDS / "27b.tp1.memory.json", encoding="utf-8") as fh:
         got = json.load(fh)["readings"]
     return MemoryReadings(
-        total=got["total"], free=got["free"], peak_torch=got["peak_torch"],
+        total=got["total"],
+        free=got["free"],
+        peak_torch=got["peak_torch"],
         non_torch=got["non_torch"],
-        cudagraph_overhead=got["cudagraph_overhead"])
+        cudagraph_overhead=got["cudagraph_overhead"],
+    )
 
 
 # ── the two gates ─────────────────────────────────────────────────────────
@@ -81,8 +93,9 @@ def test_the_recorded_deployment_is_feasible_and_for_the_right_reason():
     needed, so the longest request fits seven times over and concurrency is
     nowhere near binding.
     """
-    verdict = assess(_config(), _tp1_readings(), max_num_seqs=32,
-                     request=CC_LONGEST, **DEPLOYED)
+    verdict = assess(
+        _config(), _tp1_readings(), max_num_seqs=32, request=CC_LONGEST, **DEPLOYED
+    )
     assert verdict
     assert verdict.gate is None
     assert verdict.blocks == 112740
@@ -98,16 +111,16 @@ def test_the_state_floor_alone_can_refuse_the_deployment():
     is 113.31 GB against a 113.30 GB budget -- one request over the line, which
     is the boundary being pinned.
     """
-    verdict = assess(_config(), _tp1_readings(), max_num_seqs=1551,
-                     request=CC_LONGEST, **DEPLOYED)
+    verdict = assess(
+        _config(), _tp1_readings(), max_num_seqs=1551, request=CC_LONGEST, **DEPLOYED
+    )
     assert not verdict
     assert verdict.gate == "pool"
     assert "113.31GB of 113.30GB" in verdict.reason
     assert verdict.state_entries == 1551
 
     # And one request below it, the engine starts.
-    assert assess(_config(), _tp1_readings(), max_num_seqs=1550,
-                  **DEPLOYED).feasible
+    assert assess(_config(), _tp1_readings(), max_num_seqs=1550, **DEPLOYED).feasible
 
 
 def test_a_healthy_deployment_that_cannot_serve_the_workload():
@@ -118,8 +131,9 @@ def test_a_healthy_deployment_that_cannot_serve_the_workload():
     longest request in the trace needs 15 940, so it is refused on arrival for
     as long as the deployment lives.
     """
-    verdict = assess(_config(), _tp1_readings(), max_num_seqs=1400,
-                     request=CC_LONGEST, **DEPLOYED)
+    verdict = assess(
+        _config(), _tp1_readings(), max_num_seqs=1400, request=CC_LONGEST, **DEPLOYED
+    )
     assert not verdict
     assert verdict.gate == "admission"
     assert verdict.blocks == 11190
@@ -155,30 +169,36 @@ class _SchedulerScalars:
         self.max_model_len = DEPLOYED["max_model_len"]
         self.max_num_batched_tokens = DEPLOYED["max_num_batched_tokens"]
         self.enable_chunked_prefill = True
-        self.block_manager = BlockManager(MockConfig(
-            num_kvcache_blocks=blocks, kv_cache_block_size=16,
-            max_model_len=DEPLOYED["max_model_len"],
-            max_num_batched_tokens=DEPLOYED["max_num_batched_tokens"],
-            enable_chunked_prefill=True, max_num_seqs=32))
+        self.block_manager = BlockManager(
+            MockConfig(
+                num_kvcache_blocks=blocks,
+                kv_cache_block_size=16,
+                max_model_len=DEPLOYED["max_model_len"],
+                max_num_batched_tokens=DEPLOYED["max_num_batched_tokens"],
+                enable_chunked_prefill=True,
+                max_num_seqs=32,
+            )
+        )
 
 
 def _engine_reason(blocks: int, tokens: int):
     """ATOM's own verdict on a request of `tokens` against a pool of `blocks`."""
-    return Scheduler._unschedulable_reason(_SchedulerScalars(blocks),
-                                           _sequence(tokens))
+    return Scheduler._unschedulable_reason(_SchedulerScalars(blocks), _sequence(tokens))
 
 
 def _sequence(tokens: int) -> Sequence:
     return Sequence([1] * tokens, 16, sampling_params=SamplingParams())
 
 
-@pytest.mark.parametrize("blocks,tokens,refused", [
-    (11190, 255034, True),    # the 1400-seq pool, the longest cc-traces request
-    (112740, 255034, False),  # the 32-seq pool, the same request
-    (11190, 24384, False),    # the same pool, the longest cc_small prompt
-])
-def test_atoms_scheduler_agrees_with_the_admission_mirror(blocks, tokens,
-                                                          refused):
+@pytest.mark.parametrize(
+    "blocks,tokens,refused",
+    [
+        (11190, 255034, True),  # the 1400-seq pool, the longest cc-traces request
+        (112740, 255034, False),  # the 32-seq pool, the same request
+        (11190, 24384, False),  # the same pool, the longest cc_small prompt
+    ],
+)
+def test_atoms_scheduler_agrees_with_the_admission_mirror(blocks, tokens, refused):
     """The mirrored rule and `Scheduler._unschedulable_reason` decide alike.
 
     The mirror exists because reaching the original needs a BlockManager, a
@@ -192,9 +212,12 @@ def test_atoms_scheduler_agrees_with_the_admission_mirror(blocks, tokens,
     """
     engine_reason = _engine_reason(blocks, tokens)
     mirror = admission_refusal(
-        Request(tokens, 0), blocks=blocks, block_size=16,
+        Request(tokens, 0),
+        blocks=blocks,
+        block_size=16,
         max_model_len=DEPLOYED["max_model_len"],
-        max_num_batched_tokens=DEPLOYED["max_num_batched_tokens"])
+        max_num_batched_tokens=DEPLOYED["max_num_batched_tokens"],
+    )
 
     assert (engine_reason is not None) == refused
     assert (mirror is not None) == refused
@@ -212,9 +235,12 @@ def test_the_over_long_prompt_rule_agrees_too():
     too_long = DEPLOYED["max_model_len"] + 1
     assert "max_model_len" in _engine_reason(112740, too_long)
     assert "max_model_len" in admission_refusal(
-        Request(too_long, 0), blocks=112740, block_size=16,
+        Request(too_long, 0),
+        blocks=112740,
+        block_size=16,
         max_model_len=DEPLOYED["max_model_len"],
-        max_num_batched_tokens=DEPLOYED["max_num_batched_tokens"])
+        max_num_batched_tokens=DEPLOYED["max_num_batched_tokens"],
+    )
 
 
 # ── the workload's own numbers ────────────────────────────────────────────
@@ -248,8 +274,10 @@ def test_the_trace_still_says_this():
     the campaign's artifacts, not in the test tree. The two numbers are pinned
     above so the rest of this module runs anywhere.
     """
-    trace = (Path(__file__).resolve().parents[2]
-             / "agent_scratch/mem/evidence/traces/cc_pilot.jsonl")
+    trace = (
+        Path(__file__).resolve().parents[2]
+        / "agent_scratch/mem/evidence/traces/cc_pilot.jsonl"
+    )
     if not trace.exists():
         pytest.skip("cc_pilot.jsonl is not on this box")
     worst = longest_request(trace_requests(str(trace)))
@@ -266,3 +294,49 @@ def test_state_floor_is_what_makes_concurrency_expensive_here():
     per_request = gdn_state_bytes(_config(), tensor_parallel=1)
     assert per_request == 78446592
     assert 1400 * per_request / 2**30 == pytest.approx(102.3, abs=0.1)
+
+
+# ── the frozen utilization-axis acceptance configuration ──────────────────
+
+
+def test_the_frozen_predictions_are_still_what_the_model_says():
+    """`frozen_util_predictions.json`, recomputed.
+
+    The acceptance configuration moves `gpu_memory_utilization` and nothing
+    else: `max_num_seqs` stays at the cc-traces 32 and the capture ladder stays
+    at (1, 2, 4, 8, 16, 32), so `peak_torch`, `non_torch`, the activation peak
+    and the capture pool all keep the shape they were measured at. The byte
+    budget is the only thing that moves, which is the input the pool gate
+    reads.
+
+    That makes the configuration *sensitive* in a way the deployed one is not.
+    At 0.90 the KV budget is 113 GB and a 100 MB error in the non-KV terms
+    moves the block count by 0.08%; at 0.33 the budget is 4.15 GB and the same
+    100 MB moves it by 2.4%. The four predictions below are therefore a much
+    sharper test of the non-KV terms than the deployed configuration is, and
+    they are frozen before any run at those settings so the comparison cannot
+    be revised into agreement afterwards.
+
+    The refusal at 0.32 is ATOM's, and the threshold it reports (>= 0.33) is
+    the engine's own arithmetic in `get_num_blocks`, not this module's.
+    """
+    with open(RECORDS / "frozen_util_predictions.json", encoding="utf-8") as fh:
+        frozen = json.load(fh)
+
+    assert frozen["max_num_seqs"] == 32
+    assert frozen["capture_ladder"] == [1, 2, 4, 8, 16, 32]
+    assert frozen["enable_prefix_caching"] is False
+    assert frozen["geometry_from_config"]["state_bytes_per_request"] == 78446592
+
+    for want in frozen["predictions"]:
+        verdict = assess(
+            _config(),
+            _tp1_readings(),
+            max_num_seqs=32,
+            request=CC_LONGEST,
+            **{**DEPLOYED, "utilization": want["gpu_memory_utilization"]},
+        )
+        assert verdict.blocks == want["predicted_num_kvcache_blocks"]
+        assert verdict.gate == want["predicted_gate"]
+        assert verdict.reason == want["predicted_reason"]
+        assert (verdict.gate != "pool") is want["expect_engine_starts"]
