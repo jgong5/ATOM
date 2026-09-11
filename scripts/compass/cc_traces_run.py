@@ -154,6 +154,18 @@ MEASURED_TERMS = (
 )
 SUPPLIED_TERMS = ("capture", "calibration", "derivation", "load")
 
+#: The cost record's schema. Version 2 names the clock every duration was
+#: taken on, because version 1 wrote the modelled side's *virtual* served
+#: window into `execution_modelled` -- a number that says how long the
+#: prediction thinks the workload takes, not what producing it cost. A reader
+#: that cannot tell the two apart cannot compute a speedup, so a record
+#: without this schema is refused rather than reinterpreted.
+COSTS_SCHEMA = "compass.costs/2"
+
+#: The clock a duration a human would time with a stopwatch is taken on. The
+#: only one a runtime cost may be measured on.
+WALL_CLOCK = "wall"
+
 
 # --------------------------------------------------------------------------
 # what an execution is
@@ -1042,50 +1054,84 @@ class SideRun:
         )
 
     def _write_costs(self):
-        """This side's own seconds: launch to healthy, and the window itself.
+        """This side's own seconds, on both clocks, each one named.
 
-        The window comes from `compare.metrics`, the same implementation the
-        comparison reads, so a cost term and a metric cannot disagree about
-        what the measured window was. Every repeat is kept; the term is the
-        median, under the repository's one quantile convention.
+        Two different durations were both called "the execution" before, and
+        on the modelled side they differ by more than an order of magnitude:
+
+        * the **served window**, from `compare.metrics` -- the same
+          implementation the comparison reads, so a cost term and a metric
+          cannot disagree about what was served. On a predicting server that
+          window is on the engine's *virtual* clock: it is how long the
+          prediction says the workload would have taken, which is a statement
+          about accuracy, not about what running the predictor cost.
+        * the **wall window**, the replay's own stopwatch around the client.
+          That is the machine time the modelled path actually spent, and it is
+          what a speedup over serving for real is a ratio of.
+
+        So both are written, both are labelled with the clock they were taken
+        on, and the cost term `execution_<side>` is the wall one. Every repeat
+        is kept; the term is the median, under the one quantile convention.
         """
         startups = [
             e["startup_s"]
             for e in self.journal
             if e["role"] == "serve" and e.get("startup_s") is not None
         ]
-        executions, per_execution = [], []
+        executions, served_windows, per_execution = [], [], []
+        clocks = set()
         for entry in self.journal:
             if entry["role"] != "replay" or not entry.get("ok"):
                 continue
             path = self.cell / f"{self.side}.r{entry['repeat']}.json"
             run = compare.load_run(str(path), f"{self.side}[{entry['repeat']}]")
-            window = compare.metrics(run, sorted(run.joined))["window_s"]
-            executions.append(window)
+            served = compare.metrics(run, sorted(run.joined))["window_s"]
+            # The client's own elapsed, already recorded when the replay ran.
+            wall = entry.get("seconds")
+            clocks.add(run.clock)
+            executions.append(wall)
+            served_windows.append(served)
             # Each second attributed to the execution that spent it, so a
             # reader can tell a source residual from an independent repeat.
             per_execution.append(
                 {
                     "execution_id": entry.get("execution_id"),
                     "repeat": entry["repeat"],
-                    "execution_s": window,
+                    "execution_s": wall,
+                    "served_window_s": served,
                     "startup_s": (self.executions.get(entry["repeat"]) or {})
                     .get("process", {})
                     .get("startup_s"),
                 }
             )
         payload = {
+            "cost_schema": COSTS_SCHEMA,
             "side": self.side,
             "repeats": len(executions),
             "startup_s": startups,
             "execution_s": executions,
+            "served_window_s": served_windows,
+            # Declared, not inferred from the side: the artifact says which
+            # clock its records were stamped on, and that is what is recorded.
+            "clocks": {
+                "startup": WALL_CLOCK,
+                "execution": WALL_CLOCK,
+                "served_window": (
+                    sorted(clocks) if len(clocks) > 1 else (next(iter(clocks), "?"))
+                ),
+            },
             "per_execution": per_execution,
             f"startup_{self.side}": _median(startups),
             f"execution_{self.side}": _median(executions),
+            f"served_window_{self.side}": _median(served_windows),
             "convention": compare.QUANTILE_CONVENTION,
             "means": (
-                "startup is launch to the first /health answer; execution is "
-                "the replay's own window, from compare.metrics"
+                "seconds. startup is launch to the first /health answer, on "
+                "the wall clock. execution is the replay's own wall-clock "
+                "window: the machine time this side spent. served_window is "
+                "the window the engine reports having served, from "
+                "compare.metrics, on the engine's own clock -- virtual on a "
+                "predicting server, and never a runtime cost"
             ),
         }
         (self.cell / f"costs.{self.side}.json").write_text(
@@ -1172,6 +1218,28 @@ def costs(args) -> int:
             missing.append(f"{path.name} (the {name} side has not run)")
             continue
         partial = json.loads(path.read_text())
+        # Which clock this side's execution term was taken on travels with it.
+        # Without it a later reader cannot tell a machine-time cost from a
+        # predicted duration, and the two differ by an order of magnitude.
+        said = partial.get("cost_schema")
+        clock = (partial.get("clocks") or {}).get("execution")
+        if said != COSTS_SCHEMA:
+            missing.append(
+                f"cost_schema in {path.name} (it says {said!r}, not "
+                f"{COSTS_SCHEMA!r}, so which clock its seconds were taken on "
+                f"is unrecorded)"
+            )
+        elif clock != WALL_CLOCK:
+            missing.append(
+                f"a wall-clock execution term in {path.name} (it was taken on "
+                f"the {clock!r} clock, which is a predicted duration and not "
+                f"a runtime cost)"
+            )
+        else:
+            merged.setdefault("execution_clocks", {})[name] = clock
+            served = partial.get(f"served_window_{name}")
+            if isinstance(served, (int, float)) and math.isfinite(served):
+                merged[f"served_window_{name}"] = float(served)
         for term in (f"startup_{name}", f"execution_{name}"):
             value = partial.get(term)
             if not isinstance(value, (int, float)) or not math.isfinite(value):
@@ -1193,9 +1261,13 @@ def costs(args) -> int:
             file=sys.stderr,
         )
         return 2
+    merged["cost_schema"] = COSTS_SCHEMA
     merged["means"] = (
         "seconds; startup and execution measured by cc_traces_run.py from "
-        "this cell's own repeats, the rest supplied at merge time"
+        "this cell's own repeats, on the wall clock, the rest supplied at "
+        "merge time. served_window_* is what the engine reports having "
+        "served -- virtual on a predicting server -- and is carried for "
+        "comparison, never as a cost"
     )
     merged["supplied"] = list(SUPPLIED_TERMS)
     merged["measured"] = list(MEASURED_TERMS)

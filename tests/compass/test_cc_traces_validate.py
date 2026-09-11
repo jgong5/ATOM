@@ -349,7 +349,13 @@ def cell(tmp_path, monkeypatch):
         )
     )
     (cell_dir / "costs.json").write_text(
-        json.dumps({t: 10.0 for t in validate.COST_TERMS})
+        json.dumps(
+            {
+                **{t: 10.0 for t in validate.COST_TERMS},
+                "cost_schema": "compass.costs/2",
+                "execution_clocks": {"real": "wall", "modelled": "wall"},
+            }
+        )
     )
     (cell_dir / "isolation.json").write_text(
         json.dumps({"verdict": "clean", "isolated": True})
@@ -749,6 +755,7 @@ class TestCostAndSpeedup:
             "execution_real": 300.0,
             "execution_modelled": 10.0,
             "load": 0.0,
+            "execution_clocks": {"real": "wall", "modelled": "wall"},
         }
         one = validate._speedup(costs, reuse_cells=1)
         assert one["replay_ratio"] == pytest.approx(30.0)
@@ -773,6 +780,7 @@ class TestCostAndSpeedup:
             "execution_real": 300.0,
             "execution_modelled": 10.0,
             "load": 0.0,
+            "execution_clocks": {"real": "wall", "modelled": "wall"},
         }
         got = validate._speedup(costs, reuse_cells=1)
         assert got["replay_ratio"] == pytest.approx(300.0 / 60.0)
@@ -791,9 +799,69 @@ class TestCostAndSpeedup:
             "execution_real": 310.0,
             "execution_modelled": 10.0,
             "load": 0.0,
+            "execution_clocks": {"real": "wall", "modelled": "wall"},
         }
         got = validate._speedup(costs, reuse_cells=2)
         assert got["break_even_cells"] == 2  # 600 acquisition, 300 saved a cell
+
+    def _wall_costs(self, **over):
+        costs = {
+            "capture": 0.0,
+            "calibration": 0.0,
+            "derivation": 0.0,
+            "startup_real": 0.0,
+            "startup_modelled": 0.0,
+            "execution_real": 300.0,
+            "execution_modelled": 10.0,
+            "load": 0.0,
+            "execution_clocks": {"real": "wall", "modelled": "wall"},
+        }
+        costs.update(over)
+        return costs
+
+    def test_a_virtual_execution_term_is_not_a_runtime_cost(self):
+        """The engine's own window is what the prediction says the workload
+        would take. Dividing the real side by it reports how fast the machine
+        being modelled is, not how fast modelling it was."""
+        costs = self._wall_costs(
+            execution_clocks={"real": "wall", "modelled": "virtual"}
+        )
+        got = validate._speedup(costs, reuse_cells=1)
+        assert got["meets_gate"] is None
+        assert got["replay_ratio"] is None
+        assert "wall-clock" in got["reason"]
+        assert "modelled='virtual'" in got["reason"]
+
+    def test_a_cost_record_that_names_no_clock_is_not_read_as_wall(self):
+        """Silence is the old record, which called a virtual window
+        `execution_modelled` and said nothing. It is not evidence of a wall."""
+        costs = self._wall_costs()
+        del costs["execution_clocks"]
+        got = validate._speedup(costs, reuse_cells=1)
+        assert got["meets_gate"] is None
+        assert "real=None" in got["reason"] and "modelled=None" in got["reason"]
+
+    def test_the_served_windows_are_reported_beside_the_gate_not_inside_it(self):
+        """A 98.87 s prediction against a 3.53 s replay is the TP1 diagnostic.
+        The gate has to divide the 3.53, and the 98.87 has to stay visible."""
+        costs = self._wall_costs(
+            execution_real=60.0,
+            execution_modelled=3.53,
+            served_window_modelled=98.87,
+            served_window_real=59.0,
+        )
+        got = validate._speedup(costs, reuse_cells=1)
+        assert got["replay_ratio"] == pytest.approx(60.0 / 3.53)
+        assert got["meets_gate"] is True
+        # The gate did not touch the virtual number even though it is bigger
+        # and would have made every ratio here look better.
+        assert 60.0 / 98.87 < validate.SPEEDUP_MIN
+
+    def test_a_cell_whose_costs_name_a_virtual_execution_is_refused(self, cell):
+        costs = json.loads((cell / "costs.json").read_text())
+        costs["execution_clocks"] = {"real": "wall", "modelled": "virtual"}
+        (cell / "costs.json").write_text(json.dumps(costs))
+        assert run(cell) == 1
 
     def test_an_unwatched_cell_is_refused(self, cell):
         (cell / "isolation.json").unlink()

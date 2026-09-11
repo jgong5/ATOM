@@ -541,7 +541,7 @@ class TestTheCostsItCanMeasure:
         monkeypatch.setattr(
             run_mod.compare,
             "load_run",
-            lambda path, label: types.SimpleNamespace(joined={}),
+            lambda path, label: types.SimpleNamespace(joined={}, clock="virtual"),
         )
         monkeypatch.setattr(
             run_mod.compare,
@@ -551,9 +551,52 @@ class TestTheCostsItCanMeasure:
         runner = _runner(tmp_path, "modelled")
         assert runner.run() == 0
         costs = json.loads((runner.cell / "costs.modelled.json").read_text())
-        assert costs["execution_modelled"] == 12.0
+        wall = [
+            e["seconds"]
+            for e in _journal(runner)["steps"]
+            if e["role"] == "replay" and e["ok"]
+        ]
+        # The cost term is the client's own stopwatch, not the window the
+        # engine reported serving: on a predicting server that window is a
+        # prediction about duration.
+        assert costs["execution_s"] == wall
+        assert costs["execution_modelled"] == run_mod._median(wall)
+        assert costs["served_window_s"] == [12.0, 12.0, 12.0]
+        assert costs["served_window_modelled"] == 12.0
         assert len(costs["execution_s"]) == 3
         assert costs["convention"] == run_mod.compare.QUANTILE_CONVENTION
+
+    def test_the_two_clocks_are_named_and_the_cost_one_is_the_wall(
+        self, tmp_path, monkeypatch
+    ):
+        """A virtual window and a wall window are both seconds and are not the
+        same quantity, so the record says which clock each was taken on.
+
+        The numbers are the TP1 plumbing diagnostic's: a 98.87 s served window
+        against a replay that took about three and a half seconds. Dividing a
+        real side by the first would have reported a speedup nobody measured.
+        """
+        monkeypatch.setattr(
+            run_mod.compare,
+            "load_run",
+            lambda path, label: types.SimpleNamespace(joined={}, clock="virtual"),
+        )
+        monkeypatch.setattr(
+            run_mod.compare,
+            "metrics",
+            lambda run, indices: {"window_s": 98.87},
+        )
+        runner = _runner(tmp_path, "modelled")
+        assert runner.run() == 0
+        costs = json.loads((runner.cell / "costs.modelled.json").read_text())
+        assert costs["cost_schema"] == run_mod.COSTS_SCHEMA
+        assert costs["clocks"]["startup"] == run_mod.WALL_CLOCK
+        assert costs["clocks"]["execution"] == run_mod.WALL_CLOCK
+        assert costs["clocks"]["served_window"] == "virtual"
+        assert costs["execution_modelled"] != 98.87
+        assert costs["served_window_modelled"] == 98.87
+        assert costs["per_execution"][0]["served_window_s"] == 98.87
+        assert costs["per_execution"][0]["execution_s"] == costs["execution_s"][0]
 
     def test_a_failed_side_writes_no_cost_partial(self, tmp_path):
         procs = FakeProcesses(cell=tmp_path, exits={"modelled.r1.json": 1})
@@ -561,14 +604,26 @@ class TestTheCostsItCanMeasure:
         runner.run()
         assert not (runner.cell / "costs.modelled.json").exists()
 
-    def _partials(self, cell):
+    def _partials(self, cell, **over):
         cell.mkdir(parents=True, exist_ok=True)
-        (cell / "costs.real.json").write_text(
-            json.dumps({"startup_real": 100.0, "execution_real": 300.0})
-        )
-        (cell / "costs.modelled.json").write_text(
-            json.dumps({"startup_modelled": 9.0, "execution_modelled": 30.0})
-        )
+        wall = {"startup": run_mod.WALL_CLOCK, "execution": run_mod.WALL_CLOCK}
+        real = {
+            "cost_schema": run_mod.COSTS_SCHEMA,
+            "clocks": dict(wall, served_window="wall"),
+            "startup_real": 100.0,
+            "execution_real": 300.0,
+            "served_window_real": 299.0,
+        }
+        modelled = {
+            "cost_schema": run_mod.COSTS_SCHEMA,
+            "clocks": dict(wall, served_window="virtual"),
+            "startup_modelled": 9.0,
+            "execution_modelled": 30.0,
+            "served_window_modelled": 300.0,
+        }
+        modelled.update(over)
+        (cell / "costs.real.json").write_text(json.dumps(real))
+        (cell / "costs.modelled.json").write_text(json.dumps(modelled))
 
     def test_the_merge_needs_the_terms_nothing_here_measures(self, tmp_path, capsys):
         cell = tmp_path / "tp2_long"
@@ -621,6 +676,50 @@ class TestTheCostsItCanMeasure:
         for term in validate.COST_TERMS:
             assert isinstance(costs[term], float)
         assert costs["supplied"] == list(run_mod.SUPPLIED_TERMS)
+        # The gate reads this to check it is dividing wall seconds by wall
+        # seconds, and the served windows travel beside it, not inside it.
+        assert costs["execution_clocks"] == {
+            "real": run_mod.WALL_CLOCK,
+            "modelled": run_mod.WALL_CLOCK,
+        }
+        assert costs["cost_schema"] == run_mod.COSTS_SCHEMA
+        assert costs["served_window_modelled"] == 300.0
+        assert costs["execution_modelled"] == 30.0
+
+    def test_a_partial_from_the_old_schema_is_not_merged(self, tmp_path, capsys):
+        """The old record called a virtual window `execution_modelled`, and
+        nothing in it says so. It cannot be read as if it were the new one."""
+        cell = tmp_path / "tp2_long"
+        self._partials(cell)
+        (cell / "costs.modelled.json").write_text(
+            json.dumps({"startup_modelled": 9.0, "execution_modelled": 98.87})
+        )
+        assert run_mod.main(self._argv(cell)) == 2
+        assert run_mod.COSTS_SCHEMA in capsys.readouterr().err
+        assert not (cell / "costs.json").exists()
+
+    def test_a_partial_whose_execution_is_not_wall_is_not_merged(
+        self, tmp_path, capsys
+    ):
+        cell = tmp_path / "tp2_long"
+        self._partials(cell, clocks={"startup": "wall", "execution": "virtual"})
+        assert run_mod.main(self._argv(cell)) == 2
+        assert "wall-clock" in capsys.readouterr().err
+        assert not (cell / "costs.json").exists()
+
+    def _argv(self, cell):
+        return [
+            "costs",
+            str(cell),
+            "--capture",
+            "412",
+            "--calibration",
+            "1980",
+            "--derivation",
+            "31.5",
+            "--load",
+            "96",
+        ]
 
 
 class TestTheSidesCannotBeRunWrong:

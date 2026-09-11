@@ -99,6 +99,12 @@ TOLERANCE_PCT = {"throughput_tok_s": 10.0, "tpot": 10.0, "ttft": 15.0}
 RHO_MIN = 0.90
 SPEEDUP_MIN = 5.0
 
+#: The only clock a runtime cost may be measured on, and the value
+#: `cc_traces_run.py` writes into a cost record's `execution_clocks`. A
+#: predicting engine serves on a virtual clock, so its reported window is a
+#: prediction about duration rather than time anything spent.
+WALL_CLOCK = "wall"
+
 #: How far a paced arrival may land from where the workload declared it. The
 #: real side sleeps until each moment and the engine stamps on receipt, so some
 #: drift is the client's scheduler and the socket; a large one means the
@@ -1307,6 +1313,15 @@ def cell(args) -> int:
             f"speedup claim cannot be separated from the capture "
             f"and calibration it rests on"
         )
+    off_wall = _off_wall_clocks(costs)
+    if off_wall:
+        failures.append(
+            f"costs.json does not record both execution terms as wall-clock "
+            f"seconds ({', '.join(off_wall)}): a predicting engine serves on "
+            f"a virtual clock, so the window it reports is what the "
+            f"prediction says the workload would take and not what producing "
+            f"the prediction cost"
+        )
 
     isolation_path = cell_dir / "isolation.json"
     isolation = (
@@ -1490,6 +1505,22 @@ def _across_repeats(reports: list[dict]) -> dict:
     return out
 
 
+def _off_wall_clocks(costs: dict) -> list:
+    """Which execution terms this record does not say are wall-clock seconds.
+
+    Silence counts as off-wall. The record this replaced wrote the engine's
+    served window into `execution_modelled` and said nothing about it, so a
+    missing declaration is exactly the case that has to be refused rather than
+    read as a wall.
+    """
+    clocks = costs.get("execution_clocks")
+    return [
+        f"{side}={(clocks or {}).get(side)!r}"
+        for side in ("real", "modelled")
+        if not isinstance(clocks, dict) or clocks.get(side) != WALL_CLOCK
+    ]
+
+
 def _speedup(costs: dict, reuse_cells: int) -> dict:
     """The gate ratio, and every cost the gate does not include.
 
@@ -1519,6 +1550,24 @@ def _speedup(costs: dict, reuse_cells: int) -> dict:
             "amortised_ratio": None,
             "meets_gate": None,
             "reason": "costs.json does not carry both execution terms",
+        }
+    # A speedup is a ratio of machine time. A predicting engine serves on a
+    # virtual clock, so the window it reports is how long the prediction says
+    # the workload would take -- a statement about accuracy, and off the wall
+    # clock by more than an order of magnitude. Both sides have to say which
+    # clock their execution term was taken on, and both have to say wall.
+    off_wall = _off_wall_clocks(costs)
+    if off_wall:
+        return {
+            "replay_ratio": None,
+            "amortised_ratio": None,
+            "meets_gate": None,
+            "reason": (
+                "costs.json does not record both execution terms as wall-clock "
+                "seconds (" + ", ".join(off_wall) + "): a predicted duration "
+                "is not what running the predictor cost, and a ratio of the "
+                "two is not a speedup"
+            ),
         }
     derivation = float(costs.get("derivation") or 0.0)
     acquisition = sum(float(costs.get(t) or 0.0) for t in ("capture", "calibration"))
