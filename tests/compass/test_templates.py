@@ -145,6 +145,24 @@ def test_a_template_without_allocation_needs_no_source():
     assert bound["provenance"]["binding"]["allocation"] == "none needed"
 
 
+def test_the_collectives_group_is_carried_and_not_refused():
+    """A TP>1 head graph carries the group its all-gather runs in.
+
+    `derive.py` writes the group's name and width into the synthesized
+    operator's context, so a head template at TP>1 has two context fields no
+    attention call ever has. Before there was a rule for them, binding refused
+    the whole head graph -- so the served composition priced the body at TP2
+    and TP4 and answered nothing at all for the head.
+    """
+    template = template_for([(1, 1151)] * 4,
+                            extra=[["group", "tp:0-1"],
+                                   ["group_world_size", 2]])
+    bound = bind_cohort(template, shape([1] * 4, [4096] * 4, tp=2), carried())
+    context = dict(map(tuple, bound["ops"][1]["context"]))
+    assert context["group"] == "tp:0-1"
+    assert context["group_world_size"] == 2
+
+
 def test_binding_refuses_a_context_field_it_has_no_rule_for():
     template = template_for([(1, 1151)] * 4,
                             extra=[["seqlen_agnostic_thing", [1, 2, 3, 4]]])

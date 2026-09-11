@@ -412,6 +412,22 @@ class TestTheRankTheServedPathActuallyBuildsWith:
         assert built.rank_coords == {"tp": 3}
         assert built.rank_artifacts[shared]["rank_own"] is False
 
+    def test_the_registration_regime_is_not_recorded_as_an_artifact(self,
+                                                                    tmp_path):
+        """``prices.json:graph.json:unregistered`` names two files, not three.
+
+        The third field states how the collectives in that list were timed. It
+        was being resolved as a path, so a served TP4 run recorded
+        ``unregistered.tp0`` among the files rank 0 owned -- a rank-own claim
+        about something that is not a file.
+        """
+        shared = _rank_price_file(tmp_path, "prices.json", "sig::shared")
+        template = _template_file(tmp_path)
+        built = build_source_oracle(
+            price=f"{shared}:{template}:unregistered", template=template,
+            derive=0, require_complete=0, rank_coords={"tp": 1})
+        assert set(built.rank_artifacts) == {shared, template}
+
     def test_the_composition_records_the_rank_it_was_built_for(self, tmp_path):
         shared = _rank_price_file(tmp_path, "prices.json", "sig::shared")
         own = _rank_price_file(tmp_path, "prices.tp1.json", "sig::rank1")

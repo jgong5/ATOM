@@ -220,6 +220,14 @@ def _bind(key, template_value, rows):
         # Structure, not cohort: fixed by the template key, and a cohort that
         # changed one of them would need its own template.
         return template_value
+    if key in ("group", "group_world_size"):
+        # The process group a collective runs in, and how wide it is, written
+        # by `derive.py` where it synthesizes the operator. Topology, not
+        # cohort: `template_key` already carries the topology, so a template
+        # keyed at this width is never bound to a cohort at another one, and
+        # rebinding the name would name a group the pricer then has to perform
+        # the real collective in.
+        return template_value
     raise BindRefusal(f"no rule for context field {key!r}")
 
 

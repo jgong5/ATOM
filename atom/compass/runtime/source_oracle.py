@@ -508,7 +508,10 @@ def _rank_artifacts(coords, prices, templates, head_templates) -> dict:
     found = {}
     for entry in list(prices or ()) + list(templates or ()) + list(
             head_templates or ()):
-        for path in str(entry).split(":"):
+        # At most the price list and its graph. A third field is the
+        # collective registration regime, not a path, and resolving it as one
+        # put `unregistered.tp0` in the record as an artifact this rank owned.
+        for path in str(entry).split(":")[:2]:
             if not path:
                 continue
             resolved, own = resolve_rank_path(path, coords)
