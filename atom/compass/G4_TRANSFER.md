@@ -916,9 +916,23 @@ rc=0, `2026-09-11T07:33:52Z`). It writes nowhere near the frozen inputs.
 | 3 | 13.121 ms | 13.056 ms | −0.5% | 6.276 → 6.352 |
 
 Three ranks reproduce to within 0.5%. Rank 1 does not reproduce, and on repeat
-it agrees with the others. The frozen prediction was built on a one-off
-measurement that was 21% high on one rank, and the maximum-over-ranks rule then
-made that one rank the whole answer.
+it agrees with the others.
+
+**What that is evidence of, stated exactly.** Rank 1's body price is *unstable*:
+two measurements of the same quantity under the same script at the same width
+differ by 17.1%. It is **not** evidence of which measurement is correct, and it
+is **not** evidence of a cause. "The frozen one was disturbed" is a hypothesis
+that fits — so does "the device is intermittently slow", and so does "the repeat
+happened to land in a quiet window". Two samples distinguish none of them. The
+agreement of the repeat with the other three ranks and with the capture makes
+the frozen value the odd one out, which is a reason to suspect it and not a
+demonstration that it is wrong; a value can be anomalous and still be the true
+one under conditions nobody has characterised. Settling it needs repeated
+measurement under a method declared in advance, and that has not been run.
+
+What *is* established without any hypothesis about cause: the frozen prediction
+rested on a quantity measured once that does not hold still, and the
+maximum-over-ranks rule then made that one rank the whole answer.
 
 ### What this does and does not license
 
@@ -930,14 +944,23 @@ prices did reproduce predicted +5.5%, +5.1% and +5.1%, close to TP2's +5.7%. A
 claim that TP4 transfers at that accuracy needs a new freeze on new prices and
 a new capture, and until that exists, **G4 at TP4 is failed, not pending**.
 
-It **does** identify a gap in the method. Nothing in the freeze path checks a
-price against a second measurement of itself. `PriceLibrary` already refuses to
+It **does** identify a gap in the method. Nothing in the freeze path establishes
+that a price holds still before freezing it. `PriceLibrary` already refuses to
 silently resolve same-signature records that disagree by more than 5% — the
-mechanism exists and is used for the two all-reduce measurement methods — but
-it only fires when two files are loaded. Pricing twice into two files and
-refusing to freeze while any signature disagrees would have caught this before
-the GPU-hours of a capture were spent. At TP4 the repeat cost about five
-minutes.
+mechanism exists and is used for the two all-reduce measurement methods — but it
+only fires when two files are loaded. Pricing twice into two files and refusing
+to freeze while any signature disagrees would have surfaced this before the
+GPU-hours of a capture were spent. At TP4 the repeat cost about five minutes.
+
+The requirement has to be written so that it cannot become its own hole. The
+repeat count, the statistic over the repeats and the band a spread must fall
+inside are **declared in the freeze script before the measurements are taken**,
+and an out-of-band spread is a refusal to freeze — not an invitation to pick the
+value that looks better. Choosing among repeats by which one moves the
+prediction toward a target observation is the same error this file exists to
+prevent, arriving through a side door. That is also why the repeat run above is
+a diagnostic and cannot be substituted into E8's frozen inputs: it was taken
+after the comparison was read.
 
 ### One real TP2/TP4 difference, separate from the failure
 
@@ -997,9 +1020,14 @@ workload — the cost model was iterated against it — so a cell built on it is
 held out on workload, and no prediction in this file has ever claimed to be.
 
 **E8's failure carries one requirement forward.** Nothing in the freeze path
-checked a price against a second measurement of itself, and that is what let a
-17.1%-high body price be frozen. `PriceLibrary` already has the mechanism — the
-5% conflict band at `library.py:373` — but it fires only when a price is loaded
-twice. **A price measured once may not be frozen again.** The repeat run cost
-about five minutes at TP4; the capture it would have saved cost four cards and
-the better part of an hour.
+established that a price holds still before freezing it, and that is how a body
+price that does not reproduce — 17.1% apart on two measurements of the same
+quantity — came to carry a prediction. `PriceLibrary` has the mechanism already,
+the 5% conflict band at `library.py:373`, but it fires only when a price is
+loaded twice. **A price measured once may not be frozen again, and the repeat
+protocol must be declared before the measurements rather than chosen after
+them** — count, statistic and acceptance band in the freeze script, an
+out-of-band spread refusing the freeze, and no selection among repeats by which
+value moves a residual. Improved primitive measurement under that method is
+available to the fresh end-to-end cc-traces checks; it does not rewrite E8,
+whose numbers stand as frozen and as measured.

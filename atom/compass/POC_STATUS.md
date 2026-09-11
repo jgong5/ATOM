@@ -49,11 +49,16 @@ direction. What that changes:
   into a homogeneous burst.
 
 `PROTOCOL.md` §8 still declares the legacy diagnostic cells (the synthetic short
-workload and the first-20 `cc_pilot` long workload); its stamped results and lock
-history are preserved as they stand and are not relabelled. The end-to-end
-cc-traces acceptance registration that supersedes it is being written
-separately. **Until that registration exists and is stamped, no row in §1 may be
-moved on cc-traces evidence.**
+workload and the first-20 `cc_pilot` long workload); it, its lock and its stamped
+results are preserved as they stand and are not relabelled. The acceptance
+registration is a **separate, new pair** — `atom/compass/CC_TRACES_PROTOCOL.md`
+and `atom/compass/cc_traces_protocol.lock.json` — in preparation on the
+`compass/cc-acceptance` task branch. **Until that pair exists here and is
+stamped, no row in §1 may be moved on cc-traces evidence, and no workload is
+locked.** Two drafting decisions are recorded as open at the time of writing:
+within-session request timing is taken raw rather than clipped at a 60 s idle
+ceiling, and short-session start alignment is declared explicitly before
+registration rather than by assigning an arbitrary 1 s arrival.
 
 Three properties of the corpus do not survive the current replay path, and they
 bound what any cc-traces cell can claim (`agent_scratch/cctraces.py`): prefix
@@ -120,11 +125,11 @@ not), **UNPROVEN** (no valid measurement yet).
 | **G2a** | Throughput error | ≤ 10% | **FAIL** | E2a, 27B short-input: **+27.3% / +37.0% / +85.9%** at TP=1/2/4. Measured, not missing — the modelled run finishes the same 64 requests in 27.5/16.3/8.5 s against 35.1/22.3/15.9 s real. The error grows with TP, which is the signature of a fixed per-step cost the model does not carry |
 | **G2b** | TPOT / ITL error | ≤ 10% | **FAIL on short, PARTIAL on long** | E2a short-input median **−49.6% / −45.9% / −39.7%** at TP=1/2/4, and the modelled TPOT is near-constant across requests (p90 ≈ median) where the real one is not. E1 long-input passes at TP=4 |
 | **G2c** | TTFT error | ≤ 15% | **FAIL on short, PARTIAL on long** | E2a short-input median **−10.4% / −20.5% / −46.1%** at TP=1/2/4 — within bar at TP=1 only. E1 long-input at TP=4: mean −0.14%, p90 −0.27%, median −6.4%, on the workload the model was developed against |
-| **G3a** | Non-KV memory terms | each within 10% | **PARTIAL** | E3b: 27B at TP=1/2/4. weights +1.6/−0.1/−3.3%, non-torch +4.9/+1.2/+1.3%, graph pool +0.0% everywhere, load residue −3.3/−6.7% at TP≥2. Three terms outside: load residue at TP=1 (−93%, 0.01% of budget), persistent (−51%, 0.07% of budget), activations (no prefill-shaped graph for this model) |
+| **G3a** | Non-KV memory terms | each within 10% | **PARTIAL, and the graph-pool term is under correction** | E3b: 27B at TP=1/2/4. weights +1.6/−0.1/−3.3%, non-torch +4.9/+1.2/+1.3%, load residue −3.3/−6.7% at TP≥2. Terms outside: load residue at TP=1 (−93%, 0.01% of budget), persistent (−51%, 0.07% of budget), activations (no prefill-shaped graph for this model). **The "graph pool +0.0% everywhere" claim in this row is retracted pending integration**: an independent comparison on the `compass/memory-validation` branch puts TP4 at **+26.8%**, outside the bar. See the note under this table |
 | **G3b** | KV block count | within 5% | **PARTIAL** | E3: −0.09% (27B TP=2), −0.02/−0.02/+0.07% (0.6B TP=1/2/4). Not yet predicted from a profile at 27B TP=1/4 — the measured ground truth now exists (112 740 / 265 520 / 584 880 blocks) |
 | **G3c** | One infeasible configuration rejected for the right reason | same error as the engine | **UNPROVEN** | — |
-| **G4** | Prediction outside the calibration configurations | stated per prediction | **UNPROVEN on the acceptance source; the two step-level diagnostics split, one within and one outside** | No end-to-end cc-traces transfer has been run, and the gate is an end-to-end quantity. Diagnostics, both `ModelRunner.forward` decode steps frozen before measurement with no target timing among their inputs: **E7, TP2, 20.970 ms frozen against 19.845 ms, +5.7%** — within 10% (`G4_TRANSFER.md` §12). **E8, TP4, 16.157 ms frozen against 12.807 ms, +26.2% — outside 10%, a failed prediction** (§13). E8's miss is localised: rank 1's body price was measured 17.1% high by one contaminated pricing process, reproduced as such by a repeat run into a separate directory, and the other three ranks predicted +5.1 to +5.5%. That diagnosis explains the number and does not license a corrected one — the frozen prediction stands as it was frozen. Both share the shape `bucket=32, cohort=32, tokens_each=1, context=1151`. E6 is their coverage precondition — a priced body at TP=1 (23.122 ms, 2423/2439 operators) and TP=2 (15.467 ms, 2552/2568) |
-| **G5a** | Replay speedup | ≥ 5× | **PARTIAL** | Observed, device-free, at 27B: 36 s of serving → 1.46 s (24.7×), or 133 s → 23 s (5.8×) including server startup. That is the replay speed and it is measured. It is not yet a gate pass because G5c — capture and calibration cost reported separately and amortised — is a distinct gate and is unmeasured; an earlier 309 s → 3 s figure is superseded, its simulated half still held the model on a GPU |
+| **G4** | Prediction outside the calibration configurations | stated per prediction | **UNPROVEN on the acceptance source; the two step-level diagnostics split, one within and one outside** | No end-to-end cc-traces transfer has been run, and the gate is an end-to-end quantity. Diagnostics, both `ModelRunner.forward` decode steps frozen before measurement with no target timing among their inputs: **E7, TP2, 20.970 ms frozen against 19.845 ms, +5.7%** — within 10% (`G4_TRANSFER.md` §12). **E8, TP4, 16.157 ms frozen against 12.807 ms, +26.2% — outside 10%, a failed prediction** (§13). E8's miss is localised to one input: rank 1's frozen body price is 17.1% above what a later repeat measurement of the same thing produced, and the other three ranks predicted +5.1 to +5.5%. **A repeat that does not reproduce a value establishes that the value is unstable; it does not establish which of the two is right, nor what made them differ.** No corrected number follows from it either way — the frozen prediction stands as it was frozen. Both share the shape `bucket=32, cohort=32, tokens_each=1, context=1151`. E6 is their coverage precondition — a priced body at TP=1 (23.122 ms, 2423/2439 operators) and TP=2 (15.467 ms, 2552/2568) |
+| **G5a** | Replay speedup, **after capture** | ≥ 5× | **UNPROVEN on the acceptance source** | The bar is what it has always been: replay-after-capture ≥ 5×, GPU-free. It is **not** an amortised-cost threshold — G5c reports acquisition and amortisation separately and is a different row, and folding the two would silently raise this bar. Observed on the diagnostic workload, device-free, at 27B: 36 s of serving → 1.46 s (**24.7×**), or 133 s → 23 s (5.8×) including server startup. That is measured and it clears 5×; what is missing is the acceptance workload, not the arithmetic. An earlier 309 s → 3 s figure is superseded — its simulated half still held the model on a GPU |
 | **G5b** | GPU-free replay after capture | no device | **PASS at 0.6B and 27B** | E5: served 32/32 (0.6B) and 64/64 (27B) in `xiaobizh_n18_cpu`, a container with **no `/dev/kfd` and no `/dev/dri`** — zero driver handles and no KFD process registration in any process of the tree. Both reproduce the GPU-resident simulator's schedule step for step and its TTFT/TPOT/latency distributions exactly; at 27B ten of 64 requests sit in a different slot of that same schedule, which is the burst's admission order, not the GPU-free path (E5). This is the no-device gate only; G5a and G5c are separate and still open |
 | **G5c** | Capture / calibration / startup / load / execution costs reported separately, with amortisation | reported | **UNPROVEN** | — |
 
@@ -136,6 +141,18 @@ workload at one width, G5a and G5c are separate from G5b and open, and the
 honest reading of the whole matrix is still that the pilot is closed and the
 gates are open.
 
+**The graph-pool memory term, flagged 2026-09-11, not yet integrated.** E3b
+reported graph pool at +0.0% at every width, and an independent comparison being
+built on the `compass/memory-validation` task branch reports **+26.8% at TP4**.
+The two disagree, one of them is wrong, and until the comparison is integrated
+here with its source and import hashes there is no basis in this file for
+choosing. The G3a row therefore no longer claims that term. It is recorded now,
+before integration, because a retracted claim that sits unmarked until the
+correction lands is the same failure this document was written to prevent —
+`RETROSPECTIVE.md` has four instances of it. The provenance is explicit: branch
+`compass/memory-validation`, audit in progress, no ready hash reported, nothing
+from it merged. **G3a stays PARTIAL and G3 stays open.**
+
 **G4 was moved to PARTIAL on 2026-09-11 morning and back to UNPROVEN the same
 afternoon.** Two things moved it back, and both matter. The first is the
 acceptance registration above: G4 is an end-to-end quantity, and a step-level
@@ -146,12 +163,16 @@ at the next width had produced a miss five times larger, and a row that reads
 PARTIAL on the strength of one of two diagnostics while the other fails is a row
 that flatters itself.
 
-**E8 is preserved as a failure, not as a pending item.** Its cause is understood
-— one of twenty-three frozen inputs was measured wrong — and understanding the
-cause does not retroactively make the prediction right. No corrected TP4 number
-may be computed against that capture by anyone, because the capture has now been
-seen. A second TP4 transfer claim needs a fresh freeze over re-measured inputs
-and a fresh capture.
+**E8 is preserved as a failure, not as a pending item.** One of its
+twenty-three inputs is now known to be unstable — a later repeat of the same
+measurement came out 17.1% lower — and *that is the whole of what is known*. The
+cause is not established: an unreproduced measurement says the quantity does not
+hold still, not which value is the right one and not what made them differ.
+Whatever the explanation turns out to be, it cannot make the prediction right
+after the fact. No corrected TP4 number may be computed against that capture by
+anyone, because the capture has now been seen. A second TP4 transfer claim needs
+a fresh freeze over inputs measured under a declared stability method, and a
+fresh capture.
 
 What E7 and E8 do establish jointly, at two points: no target-width step or
 serving time entered either prediction, and the composition reproduces itself
@@ -162,11 +183,27 @@ any ranking gate (G1/G1b/G1c): those are measured over a whole serving run, and
 none of them moves on either experiment.
 
 **Method gap E8 exposed, now open as item 10 in §7.** Nothing in the freeze path
-checked a price against a second measurement of itself. `PriceLibrary` already
-has the mechanism — a 5% conflict band, `library.py:373` — and it would have
-caught rank 1 had the body been priced twice. The repeat run cost about five
-minutes at TP4 against the GPU-hours a wasted capture costs. **No future freeze
-should accept a price measured once.**
+established that a price holds still before freezing it. `PriceLibrary` already
+has a mechanism — a 5% conflict band, `library.py:373` — and it would have
+flagged rank 1 had the body been priced twice. The requirement that follows has
+to be stated carefully, because the obvious version of it is a hole:
+
+* **Predeclared.** The repeat count, the statistic taken over the repeats and
+  the band a spread must fall inside are fixed *before* the measurements, in the
+  freeze script, and recorded with the prices. A price whose spread exceeds the
+  band is a refusal to freeze, not a choice between values.
+* **Never residual-driven.** A price may not be re-measured, re-selected or
+  preferred because it moves the prediction toward a target observation. The
+  repeat that followed E8 was run after the comparison, which is exactly why it
+  is filed as a diagnostic and cannot be substituted into the frozen input set —
+  and why "the repeat agrees with the measurement better" is not an argument
+  that would have been allowed to pick it.
+* **Cheap relative to what it protects.** Re-pricing the body cost about five
+  minutes at TP4; the capture it would have spared cost four cards for the
+  better part of an hour.
+
+Improved primitive measurement under such a method is available to the fresh
+end-to-end cc-traces checks. It does not rewrite E8, whose numbers stand.
 
 ---
 
@@ -557,10 +594,13 @@ should not be made without witnessing it.
   ran. The hardware shows none — all four ranks measured 12.792–12.807 ms, a
   0.1% spread. 2.671 ms of rank 1's 2.692 ms excess is `aiter::gemm_a16w16`
   (6.398 → 9.070 ms, +42%). A repeat of the body pricing into a separate
-  directory (`dec32/repeat_2026-09-11/`, rc=0, 07:33:52Z) reproduced rank 1 at
-  **13.106 ms, 17.1% below the frozen input**, with the other three ranks within
-  0.5%. One pricing process was disturbed; the transfer method was not refuted
-  at this width, and neither was it confirmed.
+  directory (`dec32/repeat_2026-09-11/`, rc=0, 07:33:52Z) did **not** reproduce
+  that +42%: rank 1 came out at **13.106 ms, 17.1% below the frozen input**,
+  with the other three ranks within 0.5%. **What that establishes is that the
+  quantity is unstable at rank 1 — not that either value is the correct one, and
+  not what made them differ.** Naming a cause would need a third measurement
+  under a declared method, which has not been taken. On the evidence that does
+  exist, the transfer method was neither refuted at this width nor confirmed.
 * **What this does not license.** No corrected TP4 number. The capture has been
   seen, so any re-run of the composition against it would be fitting. E8 stands
   as a **failed prediction**; a second TP4 claim needs a fresh freeze over
@@ -594,7 +634,7 @@ should not be made without witnessing it.
 | `warmup_seconds` | yes, first-use, per deployment | a calibrated first-use input — §4 |
 | 27B TP=2 priced oracle (`POC_SUMMARY` §3.1) | overhead constants came from the 0.6B | held out on model for those two constants only; the price list was measured on the 27B at TP=2 |
 | **E7 frozen TP2 decode step** (`G4_TRANSFER` §12) | **no** — frozen at 06:21:54Z with its input hashes, captured afterwards; no TP2 step or serving time among the fifteen inputs | **a genuine prediction, on one forward step.** +5.7% against a 10% criterion. Its region term (`SOURCE_27B_TP1`) is TP1-calibrated and applied unchanged, so that part is held out on width too |
-| **E8 frozen TP4 decode step** (`G4_TRANSFER` §13) | **no** — frozen at 07:22:04Z with twenty-three input hashes, captured afterwards; no TP4 step or serving time among them | **a genuine prediction, on one forward step, and it missed.** +26.2% against a 10% criterion. Same held-out axes as E7 (width for the region term, target timings entirely). Diagnosed to one contaminated input, which does not un-fail it |
+| **E8 frozen TP4 decode step** (`G4_TRANSFER` §13) | **no** — frozen at 07:22:04Z with twenty-three input hashes, captured afterwards; no TP4 step or serving time among them | **a genuine prediction, on one forward step, and it missed.** +26.2% against a 10% criterion. Same held-out axes as E7 (width for the region term, target timings entirely). Localised to one input later shown to be unstable, which neither explains it nor un-fails it |
 
 **Naming every held-out axis, because "held out" without an axis is a claim
 about nothing.** E7 and E8 are held out on: the evaluated width's full-engine
@@ -978,7 +1018,7 @@ with items that block a gate.
 | 7 | witness the token lifecycle on both sides; settle E2a-b | G2, if any synthetic diagnostic is to stay interpretable |
 | 8 | calibrate `warmup_seconds` for this deployment; the cold first forward is ~6.9 s and unmodelled (E2a-a) | G2, and the preparation protocol in item 1 |
 | 9 | prefix-reuse replay from `hash_ids`, so a cc-traces cell can be run with native cache policy rather than with prefix caching off | the scope boundary of item 1, not a gate as currently registered |
-| 10 | **require a repeat pricing run before any freeze** — E8's miss was one price measured once (§2 E8) | the credibility of every future frozen prediction |
+| 10 | **a predeclared stability method for every frozen price** — repeat count, statistic and acceptance band fixed in the freeze script before measurement, spread recorded with the price, an out-of-band spread refusing the freeze rather than choosing a value; never re-measured or re-selected because it moves a residual (§1) | the credibility of every future frozen prediction |
 | 11 | outlier rejection by region (the 4-MAD pass drops 83% of sub-1024-token prefill rows) | fit quality, not a gate unless it moves one |
 
 **Closed since the last ranking.** Item 5 of the old list — "predict TP=2/4 from
