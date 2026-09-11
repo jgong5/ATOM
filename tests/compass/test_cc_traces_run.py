@@ -695,6 +695,56 @@ class TestTheCostsItCanMeasure:
         assert costs["served_window_modelled"] == 300.0
         assert costs["execution_modelled"] == 30.0
 
+    def test_a_journal_places_each_derivation_by_its_own_interval(self, tmp_path):
+        """The split is measured on both sides: the journal stamps each
+        derivation's wall interval and the side record stamps each window's,
+        so which contains which is an intersection rather than a claim."""
+        cell = tmp_path / "tp2_long"
+        self._partials(
+            cell,
+            per_execution=[
+                {
+                    "repeat": 0,
+                    "startup_window": [1000.0, 1040.0],
+                    "execution_window": [1050.0, 1100.0],
+                }
+            ],
+        )
+        journal = tmp_path / "derivations.jsonl"
+        journal.write_text(
+            # One while the server came up, one mid-schedule, one in neither.
+            json.dumps({"t0": 1005.0, "t1": 1035.0})
+            + "\n"
+            + json.dumps({"t0": 1060.0, "t1": 1080.0})
+            + "\n"
+            + json.dumps({"t0": 1041.0, "t1": 1044.0})
+            + "\n"
+        )
+        argv = [a for a in self._argv(cell) if a not in ("--derivation-within", "none")]
+        argv += ["--derivation-journal", str(journal)]
+        assert run_mod.main(argv) == 0
+        parts = json.loads((cell / "costs.json").read_text())["derivation"]
+        by_window = {p["within"]: p["seconds"] for p in parts}
+        assert by_window["startup_modelled"] == pytest.approx(30.0)
+        assert by_window["execution_modelled"] == pytest.approx(20.0)
+        assert by_window[None] == pytest.approx(3.0)
+        # The manual --derivation number was not read; the journal decided.
+        assert sum(by_window.values()) == pytest.approx(53.0)
+
+    def test_a_journal_without_the_windows_it_needs_is_not_guessed_at(
+        self, tmp_path, capsys
+    ):
+        """An interval means nothing without the windows it would fall inside,
+        and inventing them is exactly the assertion this replaces."""
+        cell = tmp_path / "tp2_long"
+        self._partials(cell, per_execution=[{"repeat": 0}])
+        journal = tmp_path / "derivations.jsonl"
+        journal.write_text(json.dumps({"t0": 1.0, "t1": 2.0}) + "\n")
+        argv = self._argv(cell) + ["--derivation-journal", str(journal)]
+        assert run_mod.main(argv) == 2
+        assert "startup_window" in capsys.readouterr().err
+        assert not (cell / "costs.json").exists()
+
     def test_a_derivation_with_no_stated_container_is_not_merged(
         self, tmp_path, capsys
     ):

@@ -1368,20 +1368,31 @@ def cell(args) -> int:
                 f"was charged twice by every total that read one. Re-merge "
                 f"the cell rather than reinterpreting the old number"
             )
-        elif not (isinstance(value, dict) and _finite(value.get("seconds"))):
+            continue
+        parts = _parts(costs, term)
+        if not parts or not all(_finite(p.get("seconds")) for p in parts):
             missing.append(term)
-        elif not value.get("source"):
-            failures.append(
-                f"costs.json does not say where {term} came from: a supplied "
-                f"second without its artifact cannot be told from a measured "
-                f"one"
-            )
-        elif "within" not in value:
-            failures.append(
-                f"costs.json does not say what contains {term}: unstated is "
-                f"not the same as contained by nothing, and a term whose "
-                f"containment is unknown cannot be summed either way"
-            )
+            continue
+        for index, part in enumerate(parts):
+            where = f"{term}[{index}]" if len(parts) > 1 else term
+            if not part.get("source"):
+                failures.append(
+                    f"costs.json does not say where {where} came from: a "
+                    f"supplied second without its artifact cannot be told "
+                    f"from a measured one"
+                )
+            elif "within" not in part:
+                failures.append(
+                    f"costs.json does not say what contains {where}: unstated "
+                    f"is not the same as contained by nothing, and a term "
+                    f"whose containment is unknown cannot be summed either way"
+                )
+            elif part.get("within") not in (None,) + MEASURED_COST_TERMS:
+                failures.append(
+                    f"costs.json says {where} happens inside "
+                    f"{part.get('within')!r}, which is not a window this cell "
+                    f"measures ({', '.join(MEASURED_COST_TERMS)})"
+                )
     if missing:
         failures.append(
             f"costs.json does not record {', '.join(missing)}: the "
@@ -1596,33 +1607,64 @@ def _off_wall_clocks(costs: dict) -> list:
     ]
 
 
-def _supplied_seconds(costs: dict, term: str) -> float:
-    """The term's own duration, however deep it sits inside a window.
+def _parts(costs: dict, term: str) -> list:
+    """A supplied term's parts, whether it was written as one or as several.
 
-    A `compass.costs/3` supplied term is an object; a bare number is a version
-    2 record, which `_costs` refuses before reaching here. Returning 0.0 for a
-    shape this does not recognise keeps the arithmetic from inventing seconds.
+    A structure the oracle derives on demand is derived when the schedule
+    first shows it, which may be while the server is coming up or may be in
+    the middle of serving -- `TemplateGraphs.graph_for` calls its deriver on a
+    miss, and a miss has no phase. So one derivation total can straddle two
+    measured windows, and a single container for the whole term cannot say
+    that. A term is therefore a list of parts, each with its own container,
+    and a lone object is the one-part case.
+
+    A bare number is a version 2 record, which `_costs` refuses before
+    reaching here. Returning nothing for a shape this does not recognise keeps
+    the arithmetic from inventing seconds.
     """
     value = costs.get(term)
     if isinstance(value, dict):
-        seconds = value.get("seconds")
-        return float(seconds) if _finite(seconds) else 0.0
-    return 0.0
+        return [value]
+    if isinstance(value, list):
+        return [p for p in value if isinstance(p, dict)]
+    return []
+
+
+def _supplied_seconds(costs: dict, term: str) -> float:
+    """The term's whole duration, however deep each part sits inside a window."""
+    total = 0.0
+    for part in _parts(costs, term):
+        seconds = part.get("seconds")
+        if _finite(seconds):
+            total += float(seconds)
+    return total
+
+
+def _outside(costs: dict, term: str, *windows: str) -> float:
+    """The part of the term that none of `windows` already contains.
+
+    `load` is inside `startup_real`, so a real-side total that adds it beside
+    that startup counts the same work twice -- which is what version 2 of this
+    record did, asymmetrically, inflating the real side by `load` and the
+    modelled side by `derivation`. The seconds a window already holds are
+    dropped here; the seconds outside every named window are real and are
+    added. Passing no window asks for the parts contained by nothing at all.
+    """
+    total = 0.0
+    for part in _parts(costs, term):
+        seconds = part.get("seconds")
+        if not _finite(seconds):
+            continue
+        within = part.get("within")
+        if within and (not windows or within in windows):
+            continue
+        total += float(seconds)
+    return total
 
 
 def _uncontained(costs: dict, term: str) -> float:
-    """The part of the term a total may add: nothing, if a window has it.
-
-    `load` is inside `startup_real` and `derivation` is (pending measurement)
-    inside `startup_modelled`. Those seconds are already in the measured
-    window, so adding the term beside it counts the same work twice -- which
-    is what version 2 of this record did, asymmetrically, inflating the real
-    side by `load` and the modelled side by `derivation`.
-    """
-    value = costs.get(term)
-    if isinstance(value, dict) and value.get("within"):
-        return 0.0
-    return _supplied_seconds(costs, term)
+    """The part no measured window holds, which an end-to-end total may add."""
+    return _outside(costs, term)
 
 
 def _speedup(costs: dict, reuse_cells: int) -> dict:
@@ -1673,9 +1715,19 @@ def _speedup(costs: dict, reuse_cells: int) -> dict:
                 "two is not a speedup"
             ),
         }
+    # Deriving this candidate's graphs is work the prediction needs, so the
+    # gate's denominator has to include all of it -- and exactly once. A
+    # structure first seen mid-schedule is derived inside the served window, so
+    # those seconds are already in `execution_modelled`; adding the whole term
+    # beside it charges them twice and makes the replay look slower than it
+    # was. A structure derived while the server came up is not in that window
+    # and is added. Nothing here decides which is which: a part that does not
+    # say what contains it is refused by `_costs` before this runs.
     derivation = _supplied_seconds(costs, "derivation")
+    derivation_added = _outside(costs, "derivation", "execution_modelled")
+    derivation_in_execution = derivation - derivation_added
     acquisition = sum(_supplied_seconds(costs, t) for t in ("capture", "calibration"))
-    predict_once = execution_modelled + derivation
+    predict_once = execution_modelled + derivation_added
     replay_ratio = execution_real / predict_once if predict_once > 0 else None
 
     startup_real = float(costs.get("startup_real") or 0.0)
@@ -1694,10 +1746,15 @@ def _speedup(costs: dict, reuse_cells: int) -> dict:
     saved_per_cell = real_total - modelled_total
     return {
         "gate": (
-            f"execution_real / (execution_modelled + derivation) >= " f"{SPEEDUP_MIN}"
+            f"execution_real / (execution_modelled + the derivation that "
+            f"window does not already contain) >= {SPEEDUP_MIN}"
         ),
         "replay_ratio": replay_ratio,
         "derivation_included_s": derivation,
+        # The same seconds, split by who already counted them, so a reader can
+        # check that the denominator holds every derivation exactly once.
+        "derivation_added_to_gate_s": derivation_added,
+        "derivation_inside_execution_s": derivation_in_execution,
         "acquisition_s": acquisition,
         "acquisition_terms": {
             "capture": _supplied_seconds(costs, "capture"),

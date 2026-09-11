@@ -858,6 +858,76 @@ class TestCostAndSpeedup:
         assert got["replay_ratio"] == pytest.approx(300.0 / 40.0)
         assert got["startup_inclusive_ratio"] == pytest.approx(300.0 / 50.0)
 
+    def test_derivation_inside_the_served_window_is_not_added_to_it(self):
+        """A structure first seen mid-schedule is derived while the server is
+        serving, so its seconds are already in `execution_modelled`. Adding the
+        whole derivation term beside that window charges the mid-schedule part
+        twice and makes the replay look slower than it was."""
+        costs = self._wall_costs(
+            execution_real=300.0,
+            execution_modelled=50.0,
+            derivation=_supplied(
+                20.0, source="derivations.jsonl", within="execution_modelled"
+            ),
+        )
+        got = validate._speedup(costs, reuse_cells=1)
+        # 300 / 50, not 300 / 70: the 20 s is inside the 50.
+        assert got["replay_ratio"] == pytest.approx(6.0)
+        assert got["derivation_included_s"] == pytest.approx(20.0)
+        assert got["derivation_inside_execution_s"] == pytest.approx(20.0)
+        assert got["derivation_added_to_gate_s"] == pytest.approx(0.0)
+        assert got["meets_gate"] is True
+        # And the criterion itself did not move.
+        assert validate.SPEEDUP_MIN == 5.0
+
+    def test_a_derivation_that_straddles_phases_is_counted_once_each_way(self):
+        """Oracle construction happens during startup and a first-seen
+        structure is derived mid-schedule, so one run's derivation is two
+        durations with two containers. The gate adds the part the served
+        window does not already hold, and adds it exactly once."""
+        costs = self._wall_costs(
+            execution_real=300.0,
+            execution_modelled=50.0,
+            startup_modelled=40.0,
+            derivation=[
+                _supplied(30.0, source="derivations.jsonl", within="startup_modelled"),
+                _supplied(
+                    20.0, source="derivations.jsonl", within="execution_modelled"
+                ),
+            ],
+        )
+        got = validate._speedup(costs, reuse_cells=1)
+        assert got["derivation_included_s"] == pytest.approx(50.0)
+        assert got["derivation_inside_execution_s"] == pytest.approx(20.0)
+        assert got["derivation_added_to_gate_s"] == pytest.approx(30.0)
+        # 300 / (50 + 30). The 20 is in the 50 already; the 30 is not.
+        assert got["replay_ratio"] == pytest.approx(300.0 / 80.0)
+        # The startup part is in `startup_modelled`, so the end-to-end total
+        # does not add it a second time either.
+        assert got["startup_inclusive_ratio"] == pytest.approx(300.0 / 90.0)
+
+    def test_a_part_naming_a_window_this_cell_does_not_measure_is_refused(self, cell):
+        """`within` has to name a window whose seconds exist, or the
+        subtraction it licenses is against nothing."""
+        costs = json.loads((cell / "costs.json").read_text())
+        costs["derivation"] = {
+            "seconds": 30.0,
+            "source": "derivations.jsonl",
+            "within": "warmup",
+        }
+        (cell / "costs.json").write_text(json.dumps(costs))
+        assert run(cell) == 1
+
+    def test_every_part_of_a_split_term_is_checked(self, cell):
+        """A term written as parts is only as good as its worst part."""
+        costs = json.loads((cell / "costs.json").read_text())
+        costs["derivation"] = [
+            _supplied(30.0, within="startup_modelled"),
+            {"seconds": 20.0, "source": "derivations.jsonl"},  # no `within`
+        ]
+        (cell / "costs.json").write_text(json.dumps(costs))
+        assert run(cell) == 1
+
     def test_a_bare_supplied_number_is_refused_not_reinterpreted(self, cell):
         """A version 2 record never said what contained its supplied terms.
         Reading one now means guessing the containment that was the bug."""

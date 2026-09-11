@@ -492,10 +492,20 @@ def build_source_oracle(
             raise ValueError("derive is on, so block_size and max_model_len "
                              "are needed: they decide the block table a "
                              "derived graph is traced against")
+        from atom.compass.runtime import derivation_log
+
+        # Recorded on the same wall clock as the on-demand derivations in
+        # `TemplateGraphs.graph_for`, so one journal holds every derivation a
+        # run paid for and the cost record can place each by interval. This
+        # one lands inside the server's startup; a first-seen structure lands
+        # inside the served window. Neither phase is asserted here.
+        began = derivation_log.now()
         started = time.perf_counter()
         tracer = ModelTracer.build(model, int(tp), device,
                                    replay_target=replay_target)
         build_seconds = time.perf_counter() - started
+        derivation_log.record(began, derivation_log.now(),
+                              what="model_tracer_build", on_demand=False)
         common = dict(block_size=int(block_size),
                       max_model_len=int(max_model_len),
                       position_rows=int(position_rows),
