@@ -149,10 +149,15 @@ class CompassConfig:
     # under, and it has to be *chosen* rather than arrived at.
     #
     # `slowest` is an approximation and is recorded as one. It is exact when one
-    # rank is slowest in every phase of the step; it is an upper bound when the
-    # bottleneck alternates between ranks across the collective-delimited
-    # phases, because `StepCost` carries a total and an unordered breakdown, not
-    # a phase sequence that could be maximised phase by phase.
+    # rank is slowest in every phase of the step. When the bottleneck alternates
+    # between ranks across the collective-delimited phases it is *not* an upper
+    # bound: a maximum of whole-rank totals is never more than the sum of the
+    # per-phase maxima of the same prices, so it sits at or below the
+    # serial-phase reading. We cannot take that reading, because `StepCost`
+    # carries a total and an unordered breakdown, not a phase sequence that
+    # could be maximised phase by phase. Against measured engine time neither
+    # reading is a bound in either direction -- the component prices have their
+    # own error.
     rank_aggregation: str = "rank0"
 
     def __post_init__(self) -> None:

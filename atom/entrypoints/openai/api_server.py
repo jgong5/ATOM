@@ -2656,6 +2656,11 @@ async def compass_provenance():
             "oracle_option_files": option_files,
             "virtual_clock": compass.virtual_clock,
             "admission_seconds": compass.admission_seconds,
+            # Which rank's step the modelled side is reporting. A plan that
+            # asks for `slowest` and gets a server still on `rank0` is priced
+            # from one rank of the group, which no step row would contradict --
+            # so the choice is served, not only passed.
+            "rank_aggregation": getattr(compass, "rank_aggregation", "rank0"),
         },
         # Which process is replying. Everything above describes a build and a
         # configuration, all of which a stale server on this port reproduces

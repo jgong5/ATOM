@@ -72,6 +72,9 @@ def fake_provenance(mode, *, tp=2, code=SERVER_CODE, **over):
             "oracle_option_sha256": {},
             "virtual_clock": mode == "predict",
             "admission_seconds": None,
+            # The plan names this on the modelled side; the server echoes what
+            # it is actually serving under.
+            "rank_aggregation": "slowest" if mode == "predict" else "rank0",
         },
         "calibration_sha256": None,
         "visible_devices": None if mode == "predict" else "0",
@@ -1013,6 +1016,25 @@ class TestTheProducersAreCheckedAtTheirOwnFieldNames:
         runner = _runner(tmp_path, "real", provenance=lambda url: said)
         assert runner.run() == 1
         assert any("modelled ones and not measurements" in f for f in runner.failures)
+
+    def test_a_predictor_pricing_only_its_own_rank_is_refused(self, tmp_path):
+        """One process stands in for the group. On `rank0` it reports the rank
+        it calls itself, which no step row and no gate below contradicts, so
+        the TP4 rank-1 outlier would be dropped without a trace."""
+        said = fake_provenance("predict")
+        said["compass"]["rank_aggregation"] = "rank0"
+        runner = _runner(tmp_path, "modelled", provenance=lambda url: said)
+        assert runner.run() == 1
+        assert any("rank_aggregation='rank0'" in f for f in runner.failures)
+
+    def test_a_server_too_old_to_declare_its_aggregation_is_refused(self, tmp_path):
+        # An absent field is not a passing one: a server built before the flag
+        # existed prices rank 0 and cannot say so.
+        said = fake_provenance("predict")
+        said["compass"].pop("rank_aggregation")
+        runner = _runner(tmp_path, "modelled", provenance=lambda url: said)
+        assert runner.run() == 1
+        assert any("rank_aggregation=None" in f for f in runner.failures)
 
     def test_a_server_at_the_wrong_width_is_refused(self, tmp_path):
         runner = _runner(

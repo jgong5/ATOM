@@ -271,12 +271,21 @@ class CompassPredictMixin:
         for the other three.
 
         `slowest` is a maximum of whole-rank totals. That is the group's step
-        time exactly when one rank is slowest throughout, and an upper bound
-        when the bottleneck alternates between ranks across the step's
-        collective-delimited phases: the oracle returns a total and an unordered
-        breakdown, so there is no phase sequence here to maximise phase by
-        phase. The record says which it is rather than leaving a reader to
-        assume the exact reading.
+        time exactly when one rank is slowest in every phase. When the
+        bottleneck alternates between ranks across the step's
+        collective-delimited phases it is not an upper bound but the opposite:
+        max_r sum_p t[r,p] <= sum_p max_r t[r,p], so a maximum taken over whole
+        ranks sits at or *below* the serial-phase reading of the same prices,
+        and the gap is every phase whose slow rank is not the slow rank
+        overall. We cannot take the serial-phase reading here: the oracle
+        returns a total and an unordered breakdown, so there is no phase
+        sequence to maximise phase by phase.
+
+        Neither reading bounds measured engine time. Both are assembled from
+        component prices that carry their own error in both directions, so
+        "approximation" here is a statement about which model of the group is
+        being evaluated, not a guarantee about the hardware. The record says
+        which it is rather than leaving a reader to assume the exact one.
         """
         policy = getattr(self._compass_config, "rank_aggregation", "rank0")
         width = int((shape.topology or {}).get("tp", 1) or 1)
@@ -316,9 +325,17 @@ class CompassPredictMixin:
             "seconds_by_rank": seconds_by_rank,
             "slowest_rank": slowest[0],
             "spread_seconds": spread,
-            "exactness": "approximation: max of whole-rank totals, an upper "
-                         "bound if the phase bottleneck alternates between "
-                         "ranks",
+            "exactness": "approximation: max of whole-rank totals; exact only "
+                         "if one rank is slowest in every phase, otherwise at "
+                         "or below the serial-phase reading sum_p max_r t[r,p] "
+                         "of the same prices",
+            # Stated as a direction so a consumer cannot read "approximation"
+            # as "conservative". It is signed only against the serial-phase
+            # model of these same prices; against the engine it is unsigned,
+            # because the component prices have their own error.
+            "bound_direction": "at or below the serial-phase model of the same "
+                               "prices; not a bound on measured engine time in "
+                               "either direction",
         }
 
     def _count_and_record(self, shape: StepShape, seconds: float,

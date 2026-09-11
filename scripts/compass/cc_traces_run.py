@@ -724,6 +724,20 @@ class SideRun:
                 f"so its seconds are modelled ones and not measurements"
             )
             return None
+        # The plan names `slowest` on the modelled side above tp1. Left at the
+        # default the server would price the one rank it calls itself, which no
+        # step row contradicts and no gate below would notice, so the group's
+        # slow rank would be dropped silently rather than refused.
+        aggregation = compass.get("rank_aggregation")
+        if (self.side == "modelled" and int(self.plan["tp"]) > 1
+                and aggregation != "slowest"):
+            self.failures.append(
+                f"{step['id']}: the predicting server reports "
+                f"rank_aggregation={aggregation!r} at tp{self.plan['tp']}, so "
+                f"it prices the rank it calls itself and not the group's "
+                f"slowest; this cell needs 'slowest'"
+            )
+            return None
         declared = said.get("tensor_parallel_size")
         if declared is not None and int(declared) != int(self.plan["tp"]):
             self.failures.append(

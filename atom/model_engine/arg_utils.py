@@ -274,9 +274,11 @@ class EngineArgs:
             "in for every rank. 'rank0' prices the rank this executor calls "
             "itself, which at TP>1 is one rank's step and not the group's. "
             "'slowest' prices every logical rank and keeps the maximum -- the "
-            "group's step time exactly when one rank is slowest throughout, "
-            "and an upper bound when the bottleneck alternates between ranks "
-            "across the step's phases. Each row records which was used, the "
+            "group's step time exactly when one rank is slowest in every "
+            "phase, and at or below the serial-phase reading of the same "
+            "prices when the bottleneck alternates between ranks, which is the "
+            "opposite direction from an upper bound. Neither is a bound on "
+            "measured engine time. Each row records which was used, the "
             "per-rank seconds and the spread.",
         )
         parser.add_argument(

@@ -187,6 +187,14 @@ def _serve(
         "predict" if modelled else "measure",
     ]
     if modelled:
+        # Named here rather than left at the parser default. One process stands
+        # in for the whole group, so `rank0` would price the rank it calls
+        # itself and quietly drop the TP4 rank-1 outlier -- the ranks are not
+        # symmetric, and nothing in this plan establishes that they are. This
+        # side is therefore evaluated on every logical rank; `rank_aggregation`
+        # in each row says what the number is and in which direction it
+        # approximates.
+        cmd += ["--compass-rank-aggregation", "slowest"]
         if oracle:
             cmd += ["--compass-oracle", oracle]
         for option in options:

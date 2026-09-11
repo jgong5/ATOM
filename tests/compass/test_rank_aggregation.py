@@ -11,8 +11,13 @@ TP4 head measurements are not interchangeable -- 13.510 / 16.158 / 13.459 /
 13.452 ms -- so this is a real number, not a tidiness point.
 
 `slowest` prices every logical rank and keeps the maximum. That is the group's
-step exactly when one rank is slowest throughout and an upper bound when the
-bottleneck alternates across the step's phases, and the row says which.
+step exactly when one rank is slowest in every phase. When the bottleneck
+alternates it is *not* an upper bound -- max_r sum_p t[r,p] <= sum_p max_r
+t[r,p], so a maximum of whole-rank totals sits at or below the serial-phase
+reading of the same prices. `test_alternating_phases_are_under_not_over` is the
+counterexample. Against measured engine time neither reading is a bound in
+either direction, because the component prices carry their own error. The row
+says which reading it is.
 """
 
 import types
@@ -98,6 +103,47 @@ def test_the_slow_rank_is_not_averaged_away():
     cost, _ = _runner("slowest", oracle)._estimate_over_ranks(_shape(4))
     mean = sum(HEAD_MS.values()) / 4 / 1000
     assert cost.seconds > mean
+
+
+def test_alternating_phases_are_under_not_over():
+    # Two ranks, two collective-delimited phases, in milliseconds:
+    #
+    #             attn   mlp   whole-rank total
+    #   rank 0    10.0   1.0   11.0
+    #   rank 1     2.0   8.0   10.0
+    #
+    # A step that synchronises between the phases takes max(10, 2) +
+    # max(1, 8) = 18.0 ms: rank 0 holds everyone up in the first phase, rank 1
+    # in the second. `slowest` answers 11.0 -- the largest whole-rank total --
+    # which is 39% *under* that, not over it. The arithmetic is general:
+    # max_r sum_p t[r,p] <= sum_p max_r t[r,p] for any table, with equality
+    # only when one rank attains the maximum in every phase.
+    phases = {0: (0.010, 0.001), 1: (0.002, 0.008)}
+    oracle = _PerRankOracle({r: sum(p) for r, p in phases.items()})
+    cost, ranks = _runner("slowest", oracle)._estimate_over_ranks(_shape(2))
+
+    serial_phase = sum(max(phases[r][p] for r in phases) for p in (0, 1))
+    assert serial_phase == pytest.approx(0.018)
+    assert cost.seconds == pytest.approx(0.011)
+    assert cost.seconds < serial_phase
+
+    # And the record has to say so in that direction. A reader who took
+    # "approximation" for "conservative" would size a deployment from a number
+    # that is short by seven milliseconds a step.
+    assert "upper" not in ranks["exactness"]
+    assert "at or below" in ranks["bound_direction"]
+    assert "not a bound on measured engine time" in ranks["bound_direction"]
+
+
+def test_one_rank_slowest_in_every_phase_is_the_exact_case():
+    # Same shape of table, but rank 0 leads both phases, so the whole-rank
+    # maximum and the serial-phase reading agree. This is the symmetry-like
+    # condition under which `slowest` is not an approximation at all.
+    phases = {0: (0.010, 0.008), 1: (0.002, 0.001)}
+    oracle = _PerRankOracle({r: sum(p) for r, p in phases.items()})
+    cost, _ = _runner("slowest", oracle)._estimate_over_ranks(_shape(2))
+    serial_phase = sum(max(phases[r][p] for r in phases) for p in (0, 1))
+    assert cost.seconds == pytest.approx(serial_phase)
 
 
 def test_tp1_has_no_rank_question_to_answer():

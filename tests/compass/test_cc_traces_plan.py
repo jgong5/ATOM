@@ -162,6 +162,19 @@ class TestTheTwoSidesAreNotRunTheSameWay:
         assert steps["serve-real-1"]["where"] == "gpu"
         assert steps["serve-modelled-1"]["where"] == "device_free"
 
+    def test_the_modelled_side_names_the_rank_aggregation(self, plan):
+        """Left at the default the one executor prices the rank it calls
+        itself, and the TP4 rank-1 outlier disappears with nothing to show
+        that it did. The choice is in the plan, not in a parser default."""
+        for cell in plan["cells"]:
+            for step in _role(cell, "serve", "modelled"):
+                cmd = step["command"]
+                assert cmd[cmd.index("--compass-rank-aggregation") + 1] == "slowest"
+            for step in _role(cell, "serve", "real"):
+                # The real side runs one process per rank and has no such
+                # question: each reports its own step.
+                assert "--compass-rank-aggregation" not in step["command"]
+
     def test_the_modelled_side_serves_through_the_device_free_entry_point(self, plan):
         """The module entry point asks the driver for the chip at import, which
         on a machine with no device fails before a flag could be parsed."""
