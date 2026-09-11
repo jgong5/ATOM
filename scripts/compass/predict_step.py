@@ -44,9 +44,87 @@ artifacts instead of deriving what has already been derived.
 """
 
 import argparse
+import importlib.util
 import json
 import sys
 import time
+from pathlib import Path
+
+
+def _file_digest(path):
+    """The one digest helper, loaded by path rather than restated here.
+
+    `scripts/compass/execution_id.py` owns it. Loaded the way that module loads
+    the identity rule -- by file, not by importing `scripts.compass`, which is
+    not a package on every invocation of this script.
+    """
+    name = "scripts_compass_execution_id"
+    module = sys.modules.get(name)
+    if module is None:
+        spec = importlib.util.spec_from_file_location(
+            name, Path(__file__).resolve().parent / "execution_id.py")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        spec.loader.exec_module(module)
+    return module.file_digest(path)
+
+
+def _inputs(args) -> dict:
+    """Every file and every scalar this report's numbers depend on.
+
+    A report that states a step time without stating what it was priced from is
+    not attributable: the same shape through two price lists is two different
+    answers with the same shape written at the top. The artifacts are recorded
+    by digest rather than by path because a path is a name and the thing that
+    has to match later is the bytes -- `agent_scratch/g4/` holds two files
+    called `h27dec32.tp1.r0.json` with different contents, which is exactly the
+    ambiguity a path cannot resolve.
+
+    `--price` is a `prices[:graph[:registration]]` triple, and each part is
+    recorded separately: the graph is what lets a layout mismatch be refused
+    rather than answered from a dense price, and the registration is one of the
+    two things a collective's signature does not carry.
+    """
+    prices = []
+    for spec in args.price:
+        parts = spec.split(":")
+        prices.append({
+            "prices": parts[0],
+            "prices_digest": _file_digest(parts[0]),
+            "graph": parts[1] if len(parts) > 1 and parts[1] else None,
+            "graph_digest": (_file_digest(parts[1])
+                             if len(parts) > 1 and parts[1] else None),
+            "registration": parts[2] if len(parts) > 2 else None,
+        })
+    return {
+        "prices": prices,
+        "templates": [{"path": p, "digest": _file_digest(p)}
+                      for p in args.template],
+        "head_templates": [{"path": p, "digest": _file_digest(p)}
+                           for p in args.head_template],
+        "replay_target": ({"path": args.replay_target,
+                           "digest": _file_digest(args.replay_target)}
+                          if args.replay_target else None),
+        "shapes_file": {"path": args.shapes, "digest": _file_digest(args.shapes)},
+        # Scalars that change the answer rather than the presentation. `head`
+        # decides whether a second region is priced at all; `require_complete`
+        # decides whether an incomplete sum is a number or a refusal, and a
+        # report produced with it off may not feed acceptance.
+        "settings": {
+            "model": args.model, "tp": args.tp, "device": args.device,
+            "block_size": args.block_size,
+            "max_model_len": args.max_model_len,
+            "position_rows": args.position_rows,
+            "block_policy": args.block_policy,
+            "cudagraph_mode": args.cudagraph_mode,
+            "regions": args.regions,
+            "head": bool(args.head),
+            "seconds_per_launch": args.seconds_per_launch,
+            "require_complete": bool(args.require_complete),
+            "carry_allocation": bool(args.carry_allocation),
+            "derive": not args.no_derive,
+        },
+    }
 
 
 def _shape_from(raw: dict):
@@ -186,6 +264,7 @@ def main() -> int:
     report = {
         "model": args.model, "tp": args.tp, "device": args.device,
         "regions": args.regions,
+        "inputs": _inputs(args),
         "shapes": len(shapes), "priced": len(priced), "refused": refused,
         "build_seconds": build_s,
         "predict_seconds": wall,
