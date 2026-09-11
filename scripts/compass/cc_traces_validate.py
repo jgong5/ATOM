@@ -646,22 +646,34 @@ def _given(options: dict, name: str) -> bool:
 
 
 def check_source_factory(modelled, tp: int, label: str) -> list[str]:
-    """The source factory options, against what the factory does with them.
+    """The predictor an acceptance cell ran, and how it was configured.
 
-    This says nothing about *which* oracle an acceptance run must name; that
-    binding belongs to whoever integrates the predictor. It says that a run
-    which does name this factory must have configured it so that the whole
-    model was priced -- an unsupported or half-stated configuration must not
-    reach a verdict looking like a complete one.
+    The binding is decided: a cc-traces acceptance cell is a cell predicted by
+    the declared complete transfer factory. Another oracle is not a weaker
+    acceptance run, it is a different experiment -- so it is refused here
+    rather than skipping this check and quietly counting as one. The
+    explicitly diagnostic route exists for that case, and `check_not_diagnostic`
+    is what keeps the two apart.
 
-    Every rule below is read off the factory rather than chosen here, except
-    the three the protocol adds: completeness is required, the head region is
-    priced, and the carried-allocation approximation -- which the factory
-    itself documents as unmeasured -- is not available to a run being graded.
+    Naming the factory is not enough on its own. The run must also have
+    configured it so that the whole model was priced: an unsupported or
+    half-stated configuration must not reach a verdict looking like a complete
+    one. Every coupling below is read off the factory rather than chosen here,
+    except the four the protocol adds -- completeness is required, the head
+    region is priced, the region profile is a real one rather than `none`, and
+    the carried-allocation approximation, which the factory itself documents as
+    unmeasured, is not available to a run being graded.
     """
     compass = (modelled.manifest.get("server") or {}).get("compass") or {}
-    if compass.get("oracle") != SOURCE_FACTORY:
-        return []
+    named = compass.get("oracle")
+    if named != SOURCE_FACTORY:
+        return [
+            (
+                f"{label}: the modelled side was predicted by {named!r} rather "
+                f"than the declared acceptance factory {SOURCE_FACTORY}; "
+                f"whatever it measured, it is not a cc-traces acceptance cell"
+            )
+        ]
     bad = []
     options = dict(compass.get("oracle_options") or {})
 
@@ -713,6 +725,14 @@ def check_source_factory(modelled, tp: int, label: str) -> list[str]:
             f"{label}: carry_allocation is on, which the factory documents as "
             f"an explicitly unmeasured assumption: it may be reported, not "
             f"graded"
+        )
+    if _factory_flag(options.get("regions")) is False or str(
+        options.get("regions", "")
+    ).strip().lower() in ("none", "null"):
+        bad.append(
+            f"{label}: regions={options.get('regions')!r} is not a source "
+            f"region profile, so the prediction is not attributed to any "
+            f"region model at all"
         )
 
     stated_tp = options.get("tp")
@@ -985,16 +1005,32 @@ def check_gpu_free(cell_dir: Path, modelled_paths: list) -> list[str]:
 #: acceptance cell can be given a frightening name and still be one.
 DIAGNOSTIC_MARKER = "DIAGNOSTIC.json"
 
-#: The only purpose an acceptance verdict may be computed from. Absent means
-#: acceptance: the field is newer than some artifacts, and treating silence as
-#: diagnostic would refuse runs that predate it. A diagnostic has to say so,
-#: and `cc_traces_run.py --purpose diagnostic` writes it into every execution
-#: record and into the stamp inside every artifact.
+#: The only purpose an acceptance verdict may be computed from. New execution
+#: evidence has to say this word: `cc_traces_run.py` writes the purpose into
+#: every execution record, every journal and the stamp inside every artifact,
+#: so a run that says nothing was either produced by something else or edited,
+#: and neither is a run we can grade. Stored verdicts are the exception --
+#: those predate the field, and a verdict with no purpose keeps the protocol
+#: it was computed under rather than being retroactively refused.
 ACCEPTANCE_PURPOSE = "acceptance"
 
 
 def _purpose_of(blob) -> str:
+    """The purpose of a stored verdict, with silence meaning acceptance."""
     return (blob or {}).get("purpose") or ACCEPTANCE_PURPOSE
+
+
+def _stated_purpose(blob):
+    """The purpose an execution record actually states, or None if it does not.
+
+    Deliberately not `_purpose_of`: for evidence being graded now, the
+    difference between "this says acceptance" and "this says nothing" is the
+    whole point. Silence is not a weak yes.
+    """
+    said = (blob or {}).get("purpose")
+    if said is None or (isinstance(said, str) and not said.strip()):
+        return None
+    return said
 
 
 def check_not_diagnostic(cell_dir: Path, journals: dict, manifests: dict) -> list[str]:
@@ -1008,6 +1044,13 @@ def check_not_diagnostic(cell_dir: Path, journals: dict, manifests: dict) -> lis
     and the stamp inside each artifact -- and any one of them saying
     `diagnostic` refuses the cell.
 
+    Evidence that says nothing is refused too. A missing purpose used to read
+    as acceptance, which made the weakest possible artifact -- one that never
+    declared what it was for -- the one that passed unquestioned. The harness
+    has written the field for as long as the acceptance protocol has existed,
+    so anything reaching this validator without it was produced by some other
+    tool or edited afterwards.
+
     Refusing rather than noting, and refusing on the marker file as well: a
     diagnostic that reaches the validator at all is a mistake somewhere
     upstream, and the cheap failure is the one that happens here.
@@ -1020,22 +1063,37 @@ def check_not_diagnostic(cell_dir: Path, journals: dict, manifests: dict) -> lis
             f"however it is named"
         )
     for side, journal in journals.items():
-        said = _purpose_of(journal)
-        if said != ACCEPTANCE_PURPOSE:
+        said = _stated_purpose(journal)
+        if said is None:
+            problems.append(
+                f"{side}: run.{side}.json does not say what it was run for, "
+                f"and an acceptance cell has to say so"
+            )
+        elif said != ACCEPTANCE_PURPOSE:
             problems.append(
                 f"{side}: run.{side}.json was written for {said!r}, not " f"acceptance"
             )
         for index, execution in enumerate((journal or {}).get("executions") or []):
-            said = _purpose_of(execution)
-            if said != ACCEPTANCE_PURPOSE:
+            said = _stated_purpose(execution)
+            if said is None:
+                problems.append(
+                    f"{side}[{index}]: this execution does not say what it "
+                    f"was run for, so it cannot be counted as acceptance"
+                )
+            elif said != ACCEPTANCE_PURPOSE:
                 problems.append(
                     f"{side}[{index}]: this execution was run for {said!r}, "
                     f"not acceptance"
                 )
     for side, blobs in manifests.items():
         for index, blob in enumerate(blobs):
-            said = _purpose_of((blob or {}).get("execution"))
-            if said != ACCEPTANCE_PURPOSE:
+            said = _stated_purpose((blob or {}).get("execution"))
+            if said is None:
+                problems.append(
+                    f"{side}[{index}]: the artifact's stamp does not say what "
+                    f"the run was for, so it is not acceptance evidence"
+                )
+            elif said != ACCEPTANCE_PURPOSE:
                 problems.append(
                     f"{side}[{index}]: the artifact carries the stamp of a "
                     f"{said!r} run, so it was copied here rather than "

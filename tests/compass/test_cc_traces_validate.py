@@ -46,6 +46,21 @@ CODE_SHA = "f" * 64
 TABLE_SHA = "b" * 64
 WORKLOAD_ROW_KEYS = ("arrival_s", "input_tokens", "output_tokens")
 
+#: What the passing cell's modelled side told the acceptance factory: the whole
+#: model, priced completely, at the width the cell is for. Anything less is a
+#: different experiment, so the fixture that is supposed to pass states it all.
+CELL_FACTORY_OPTIONS = {
+    "tp": 2,
+    "require_complete": "true",
+    "head": "true",
+    "regions": "source-27b-tp2",
+    "derive": "true",
+    "model": "Qwen/Qwen3.8-27B",
+    "block_size": 16,
+    "max_model_len": 262144,
+    "price": "/x/prices.json",
+}
+
 
 PROC_HOST = "cell-host"
 PROC_BOOT = "8b0a7a2c-5d31-4f6e-9a11-77c0d2e4b900"
@@ -64,7 +79,17 @@ def _identity(pid=4242, *, ppid=4240, ticks=132307571, host=PROC_HOST, boot=PROC
     }
 
 
-def _server(tp, *, mode, virtual, options=None, digests=None, files=None, process=KEEP):
+def _server(
+    tp,
+    *,
+    mode,
+    virtual,
+    options=None,
+    digests=None,
+    files=None,
+    process=KEEP,
+    oracle="Oracle",
+):
     served = _identity() if process is KEEP else process
     provenance = {
         "server_revision": "abc123",
@@ -79,7 +104,7 @@ def _server(tp, *, mode, virtual, options=None, digests=None, files=None, proces
         "compass": {
             "enabled": True,
             "mode": mode,
-            "oracle": "Oracle",
+            "oracle": oracle,
             "oracle_options": options or {},
             "oracle_option_sha256": digests or {},
             "oracle_option_files": files or {},
@@ -98,6 +123,7 @@ def _journal(cell_dir, side, repeats, *, executions=None):
         executions = [
             {
                 "execution_id": f"cx-{side}{index}",
+                "purpose": "acceptance",
                 "server_process": {
                     "said": _identity(),
                     "observed": {
@@ -117,6 +143,7 @@ def _journal(cell_dir, side, repeats, *, executions=None):
         "schema": "compass.execution/1",
         "cell": str(cell_dir),
         "side": side,
+        "purpose": "acceptance",
         "executions": executions,
         "refused": False,
         "failures": [],
@@ -148,6 +175,7 @@ def _side(
     service=1.0,
     records=None,
     process=KEEP,
+    oracle="Oracle",
 ):
     """One saved run, in the shape `replay.py` writes."""
     results, engine_records = [], []
@@ -200,6 +228,7 @@ def _side(
             digests=digests,
             files=files,
             process=process,
+            oracle=oracle,
         ),
         "prepare": (
             {
@@ -215,6 +244,9 @@ def _side(
     }
     blob = {
         "run": manifest,
+        # The stamp the harness puts inside every artifact. An acceptance cell
+        # has to state its purpose, so the passing fixture states it.
+        "execution": {"purpose": "acceptance"},
         "workload": [{k: r[k] for k in WORKLOAD_ROW_KEYS} for r in rows],
         "results": results,
         "engine": {
@@ -301,9 +333,10 @@ def cell(tmp_path, monkeypatch):
         virtual=True,
         origin=0.0,
         prepare=False,
-        options={"prices": "/x/prices.json"},
-        digests={"prices": PRICES_SHA},
-        files={"prices": {"prices.json": PRICES_SHA}},
+        oracle=validate.SOURCE_FACTORY,
+        options=dict(CELL_FACTORY_OPTIONS),
+        digests={"price": PRICES_SHA},
+        files={"price": {"prices.json": PRICES_SHA}},
     )
     _journal(cell_dir, "real", 1)
     _journal(cell_dir, "modelled", 1)
@@ -986,13 +1019,13 @@ class TestCalibrationProvenanceIsTransitive:
         assert run(cell) == 0
 
     def _modelled_files(self, cell, members, digest=None):
-        """Say the modelled server loaded these files for its `prices` option."""
+        """Say the modelled server loaded these files for its `price` option."""
         path = cell / "modelled.r1.json"
         blob = json.loads(path.read_text())
         compass = blob["run"]["server"]["compass"]
-        compass["oracle_option_files"] = {"prices": dict(members)}
+        compass["oracle_option_files"] = {"price": dict(members)}
         if digest is not None:
-            compass["oracle_option_sha256"] = {"prices": digest}
+            compass["oracle_option_sha256"] = {"price": digest}
         _write(path, blob)
 
 
@@ -1295,15 +1328,36 @@ class TestADiagnosticIsNotACellHoweverItIsNamed:
             "copied here rather than produced here" in r for r in self._fail(cell)
         )
 
-    def test_silence_still_means_acceptance(self, cell):
-        """Artifacts written before the field existed are not diagnostics."""
+    def test_evidence_that_says_nothing_is_not_acceptance_evidence(self, cell):
+        """Silence is not a weak yes.
+
+        Reading a missing purpose as acceptance made the artifact that never
+        declared anything the one that passed unquestioned -- which is exactly
+        the artifact a diagnostic becomes once its journal is dropped.
+        """
         path = Path(cell) / "run.real.json"
         journal = json.loads(path.read_text())
         journal.pop("purpose", None)
         for execution in journal["executions"]:
             execution.pop("purpose", None)
         path.write_text(json.dumps(journal))
-        assert run(cell) == 0
+        reasons = self._fail(cell)
+        assert any("does not say what it was run for" in r for r in reasons)
+        assert any("cannot be counted as acceptance" in r for r in reasons)
+
+    def test_an_artifact_with_no_stamp_is_refused(self, cell):
+        path = Path(cell) / "modelled.r1.json"
+        blob = json.loads(path.read_text())
+        blob.pop("execution", None)
+        _write(path, blob)
+        assert any("does not say what the run was for" in r for r in self._fail(cell))
+
+    def test_a_stored_verdict_with_no_purpose_keeps_its_history(self, cell, capsys):
+        """The exception: verdicts predate the field and are not re-graded."""
+        blob = {"cell": str(cell), "class": "long", "tp": 2, "passed": True}
+        (Path(cell) / "cc_traces_cell.json").write_text(json.dumps(blob))
+        assert validate.main(["matrix", str(cell)]) == 0
+        capsys.readouterr()
 
     def test_a_passing_verdict_beside_a_marker_is_refused_by_the_matrix(
         self, cell, capsys
@@ -1386,18 +1440,45 @@ class TestTheSourceFactoryWasGivenAWholeModel:
     def test_the_known_good_configuration_passes(self):
         assert self._reasons(GOOD_FACTORY) == []
 
-    def test_another_oracle_is_not_this_check(self):
-        """The protocol does not bind acceptance to this factory; lead does."""
+    def test_another_oracle_is_refused_rather_than_skipped(self):
+        """The binding: a different predictor is a different experiment.
+
+        It is not a weaker acceptance run. Returning no reasons here would let
+        any oracle at all past the one check that reads what the predictor was
+        actually given.
+        """
         side = _factory(GOOD_FACTORY)
         side.manifest["server"]["compass"]["oracle"] = "atom.compass.core.cost.x.Y"
-        assert validate.check_source_factory(side, 2, "repeat 0") == []
+        reasons = validate.check_source_factory(side, 2, "repeat 0")
+        assert any("not a cc-traces acceptance cell" in r for r in reasons)
 
     def test_a_near_miss_qualname_is_a_different_predictor(self):
         side = _factory(GOOD_FACTORY)
         side.manifest["server"]["compass"][
             "oracle"
         ] = "source_oracle.source_cost_oracle"
-        assert validate.check_source_factory(side, 2, "repeat 0") == []
+        reasons = validate.check_source_factory(side, 2, "repeat 0")
+        assert any("not a cc-traces acceptance cell" in r for r in reasons)
+
+    def test_naming_no_oracle_at_all_is_refused(self):
+        side = _factory(GOOD_FACTORY)
+        side.manifest["server"]["compass"].pop("oracle")
+        assert validate.check_source_factory(side, 2, "repeat 0") != []
+
+    def test_a_region_profile_of_none_is_not_a_profile(self):
+        assert any(
+            "not attributed to any region model" in r
+            for r in self._reasons({**GOOD_FACTORY, "regions": "none"})
+        )
+
+    def test_regions_switched_off_is_not_a_profile(self):
+        assert any(
+            "not attributed to any region model" in r
+            for r in self._reasons({**GOOD_FACTORY, "regions": "false"})
+        )
+
+    def test_a_named_profile_is_accepted(self):
+        assert self._reasons({**GOOD_FACTORY, "regions": "source-27b-tp4"}) == []
 
     def test_the_implemented_qualname_is_the_one_checked(self):
         assert (

@@ -76,6 +76,33 @@ def load_run(path: str, label: str) -> Run:
 # validity
 
 
+#: Extensions an oracle option's value carries when it names something read off
+#: disk. A colon-separated list of them is still a list of files.
+DATA_SUFFIXES = (".json", ".jsonl", ".csv", ".tsv", ".yaml", ".yml", ".npz",
+                 ".npy", ".pt", ".parquet")
+
+
+def _names_a_file(value) -> bool:
+    """Whether an oracle option names something that should have a digest.
+
+    Not every string option is a path. The source factory is configured with
+    flags (`require_complete=true`), widths and region-profile names alongside
+    its tables, and demanding a calibration digest for `head=true` refused
+    runs for a reason that was not a defect -- the same mistake this check
+    already made once for the measured side.
+
+    Fail-closed on the interesting case: anything written as a path, and
+    anything carrying a data extension, has to be digested. A bare slash is
+    not enough on its own -- `model=Qwen/Qwen3.8-27B` is a checkpoint id, not
+    a file, and it is attributed through `model_revision` instead.
+    """
+    if not isinstance(value, str) or not value:
+        return False
+    parts = value.split(":")
+    return any(p.startswith(("/", "./", "../", "~")) or p.endswith(DATA_SUFFIXES)
+               for p in parts)
+
+
 def check_run(run: Run, *, expect_requests: int | None = None,
               require_length_check: bool = True,
               require_provenance: bool = True) -> list[str]:
@@ -193,7 +220,7 @@ def check_run(run: Run, *, expect_requests: int | None = None,
         # defect.
         oracle = ((m.get("server") or {}).get("compass") or {})
         named = {k: v for k, v in (oracle.get("oracle_options") or {}).items()
-                 if isinstance(v, str) and v}
+                 if _names_a_file(v)}
         digests = oracle.get("oracle_option_sha256") or {}
         missing = sorted(k for k in named if not digests.get(k))
         if missing:

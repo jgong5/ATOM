@@ -338,6 +338,42 @@ class TestTheComparisonRefusesAnInvalidRun:
         assert compare.main(["--real", str(real), "--modelled", str(modelled)]) == 1
         assert "read no such file" in capsys.readouterr().out
 
+    def test_a_setting_that_is_not_a_file_needs_no_digest(
+            self, tmp_path, trace, capsys):
+        """The source factory is configured with flags as well as tables.
+
+        `require_complete=true` is not a path and has no digest to report.
+        Demanding one refused every run of the integrated factory for a reason
+        that was not a defect -- the same mistake this check made once for the
+        measured side.
+        """
+        real, modelled = tmp_path / "real.json", tmp_path / "modelled.json"
+        _run(_Stub(), trace, real)
+        _run(_Stub(oracle="atom.compass.runtime.source_oracle.source_cost_oracle",
+                   ttft=1.1), trace, modelled)
+        blob = json.loads(modelled.read_text())
+        blob["run"]["server"]["compass"]["oracle_options"] = {
+            "require_complete": "true", "head": "true",
+            "regions": "source-27b-tp2", "model": "Qwen/Qwen3.8-27B"}
+        modelled.write_text(json.dumps(blob))
+        assert compare.main(["--real", str(real), "--modelled", str(modelled)]) == 0
+        assert "read no such file" not in capsys.readouterr().out
+
+    @pytest.mark.parametrize("value", ["/m/prices.json", "./prices.json",
+                                       "~/prices.json", "prices.jsonl",
+                                       "prices.json:graph.json"])
+    def test_anything_written_as_a_file_still_needs_one(
+            self, tmp_path, trace, capsys, value):
+        real, modelled = tmp_path / "real.json", tmp_path / "modelled.json"
+        _run(_Stub(), trace, real)
+        _run(_Stub(oracle="atom.compass.runtime.source_oracle.source_cost_oracle",
+                   ttft=1.1), trace, modelled)
+        blob = json.loads(modelled.read_text())
+        blob["run"]["server"]["compass"]["oracle_options"] = {"price": value}
+        modelled.write_text(json.dumps(blob))
+        assert compare.main(["--real", str(real), "--modelled", str(modelled)]) == 1
+        assert "read no such file" in capsys.readouterr().out
+
     def test_an_unverified_length_check_fails(self, tmp_path, trace, capsys):
         real, modelled = _pair(tmp_path, trace)
         blob = json.loads(real.read_text())
