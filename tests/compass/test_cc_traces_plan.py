@@ -336,11 +336,16 @@ class TestTheServerListensWhereTheHarnessLooks:
                 assert step["health"] == f"http://127.0.0.1:{port}/health"
 
     def test_the_engine_internal_port_is_not_given_the_listener_port(self, plan):
-        """`--port` is the engine's own port; setting it to the listener's is
-        what left the listener on its default."""
+        """`--port` is the engine's own rendezvous port; setting it to the
+        listener's is what left the listener on its default. It is named, at
+        its own value, rather than left to the engine to pick."""
         for cell in plan["cells"]:
             for step in _role(cell, "serve"):
-                assert "--port" not in step["command"]
+                command = step["command"]
+                listener = command[command.index("--server-port") + 1]
+                rendezvous = command[command.index("--port") + 1]
+                assert rendezvous != listener
+                assert rendezvous == str(plan_mod.ENGINE_PORT)
 
     def test_the_replay_client_still_dials_with_port(self, plan):
         """The client's `--port` is the address it connects to, not a server
@@ -367,3 +372,57 @@ class TestTheServerListensWhereTheHarnessLooks:
         ).read_text()
         assert "port=args.server_port," in source
         assert '"--server-port",' in source
+
+
+class TestTheTwoPortsAreChosenSeparately:
+    """The listener and the engine's rendezvous port are different sockets.
+
+    Only the listener was ever named. The rendezvous port was left at the
+    engine's own default, so every server on a host asked for the same one:
+    two cells alive at once collide on it, and at TP>1 the collision is
+    between rendezvous groups rather than between binds.
+    """
+
+    def test_each_scope_is_named_with_the_flag_that_carries_it(self, plan):
+        for cell in plan["cells"]:
+            for step in _role(cell, "serve"):
+                ports = step["ports"]
+                command = step["command"]
+                assert set(ports) == {"http_listener", "engine_rendezvous"}
+                for scope in ports.values():
+                    flag = scope["flag"]
+                    assert command[command.index(flag) + 1] == str(scope["port"])
+                assert (
+                    ports["http_listener"]["port"] != ports["engine_rendezvous"]["port"]
+                )
+
+    def test_the_rendezvous_port_can_be_chosen_per_run(self):
+        got = json.loads(_run(["--root", "/r", "--engine-port", "53117"]))
+        for cell in got["cells"]:
+            for step in _role(cell, "serve"):
+                command = step["command"]
+                assert command[command.index("--port") + 1] == "53117"
+                assert step["ports"]["engine_rendezvous"]["port"] == 53117
+
+    def test_one_socket_cannot_serve_both_scopes(self):
+        with pytest.raises(SystemExit) as raised:
+            plan_mod.cell_steps(
+                2,
+                "long",
+                root="/r",
+                oracle=None,
+                options=(),
+                port=8006,
+                engine_port=8006,
+                repeats=1,
+            )
+        assert "8006" in str(raised.value)
+
+    def test_the_engine_flag_is_the_one_the_engine_parses(self):
+        """Cross-checked against the engine, so a rename there is caught here
+        rather than by two runs quietly sharing a rendezvous group."""
+        source = (ROOT / "atom" / "model_engine" / "arg_utils.py").read_text()
+        assert '"--port",' in source
+        assert f"default={plan_mod.ENGINE_PORT}," in source
+        runner = (ROOT / "atom" / "model_engine" / "model_runner.py").read_text()
+        assert 'os.environ["MASTER_PORT"] = str(self.config.port)' in runner

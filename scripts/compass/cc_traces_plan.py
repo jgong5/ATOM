@@ -56,7 +56,19 @@ CLASSES = ("short", "long")
 REPEATS = 3
 
 MODEL = "Qwen/Qwen3.8-27B"
+
+#: The HTTP listener: what the health check polls and the replay client dials.
+#: `--server-port` on the entry point's parser.
 PORT = 8000
+
+#: The engine's internal rendezvous port -- `--port` on that same parser, and
+#: what `model_runner.py` exports as `MASTER_PORT` for torch.distributed. It is
+#: not the listener and it is not free for the taking either: two servers alive
+#: at once on one host collide on it even when their listeners differ, and at
+#: TP>1 the collision is between rendezvous groups, so the second server can
+#: join the first one's. Chosen explicitly per run rather than left to the
+#: engine's default, and checked for a conflict beside the listener.
+ENGINE_PORT = 8006
 
 #: Seconds between `rocm-smi` samples across the real side's whole window. Five
 #: is short enough that `isolation.py`'s two-sample sustained rule needs ten
@@ -127,7 +139,16 @@ GAPS = (
 
 
 def _serve(
-    tp: int, n: int, *, modelled: bool, oracle, options, port: int, cell: str, target
+    tp: int,
+    n: int,
+    *,
+    modelled: bool,
+    oracle,
+    options,
+    port: int,
+    engine_port: int,
+    cell: str,
+    target,
 ):
     """The server command for one side of one cell.
 
@@ -154,6 +175,10 @@ def _serve(
         # own default and the harness waiting on a port nothing ever bound.
         "--server-port",
         str(port),
+        # The engine's internal rendezvous port, named because leaving it at
+        # the engine's default means every server on this host asks for 8006.
+        "--port",
+        str(engine_port),
         "-tp",
         str(tp),
         *ENGINE_ARGS,
@@ -211,6 +236,7 @@ def _lifecycle(
     cell: str,
     where: str,
     port: int,
+    engine_port: int,
     oracle,
     options,
     target,
@@ -236,11 +262,19 @@ def _lifecycle(
                 oracle=oracle,
                 options=options,
                 port=port,
+                engine_port=engine_port,
                 cell=cell,
                 target=target,
             ),
             "background": True,
             "health": f"http://127.0.0.1:{port}/health",
+            # Named by scope, and by the flag that carries each one, so the
+            # harness checks the right port for a conflict and the manifest
+            # does not have to guess which of the two "port" means.
+            "ports": {
+                "http_listener": {"port": port, "flag": "--server-port"},
+                "engine_rendezvous": {"port": engine_port, "flag": "--port"},
+            },
             "produces": (
                 [f"server.{side}.r{n}.log", f"provenance.{side}.r{n}.json"]
                 + ([] if modelled else [f"real.r{n}_steps.jsonl"])
@@ -299,10 +333,17 @@ def cell_steps(
     options,
     port: int,
     repeats: int,
+    engine_port: int = ENGINE_PORT,
     target=None,
     corpus: str = "$CC_TRACES_CORPUS",
 ):
     """Every step of one cell, in the order it has to happen."""
+    if port == engine_port:
+        raise SystemExit(
+            f"the HTTP listener and the engine's rendezvous port are both "
+            f"{port}: they are two different sockets on one host and the "
+            f"server cannot bind one of them"
+        )
     cell = f"{root.rstrip('/')}/tp{tp}_{klass}"
     steps = [
         {
@@ -386,6 +427,7 @@ def cell_steps(
             cell=cell,
             where="gpu",
             port=port,
+            engine_port=engine_port,
             oracle=None,
             options=(),
             target=None,
@@ -427,6 +469,7 @@ def cell_steps(
             cell=cell,
             where="device_free",
             port=port,
+            engine_port=engine_port,
             oracle=oracle,
             options=options,
             target=target,
@@ -503,6 +546,7 @@ def build(args) -> dict:
             oracle=args.oracle,
             options=args.oracle_option,
             port=args.port,
+            engine_port=args.engine_port,
             repeats=args.repeats,
             target=getattr(args, "replay_target", None),
             corpus=getattr(args, "corpus", None) or "$CC_TRACES_CORPUS",
@@ -590,7 +634,15 @@ def main(argv=None) -> int:
     ap.add_argument(
         "--corpus", default=None, help="the cc-traces corpus to verify against"
     )
-    ap.add_argument("--port", type=int, default=PORT)
+    ap.add_argument(
+        "--port", type=int, default=PORT, help="the HTTP listener (--server-port)"
+    )
+    ap.add_argument(
+        "--engine-port",
+        type=int,
+        default=ENGINE_PORT,
+        help="the engine's internal rendezvous port (--port on the engine)",
+    )
     ap.add_argument("--repeats", type=int, default=REPEATS)
     ap.add_argument("--out", default=None, help="write the plan as JSON here")
     ap.add_argument(

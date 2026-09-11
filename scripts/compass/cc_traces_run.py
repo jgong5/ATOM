@@ -127,6 +127,48 @@ def server_default_port():
     return None
 
 
+def engine_default_port():
+    """The engine's internal rendezvous port when `--port` is absent.
+
+    Read from the engine's own parser for the same reason as
+    `server_default_port`: a default written down twice is a default that will
+    disagree with itself. None when it cannot be read.
+    """
+    source = ROOT / "atom" / "model_engine" / "arg_utils.py"
+    try:
+        lines = source.read_text().splitlines()
+    except OSError:
+        return None
+    for index, line in enumerate(lines):
+        if line.strip().strip(",") != '"--port"':
+            continue
+        for tail in lines[index : index + 6]:
+            _, sep, value = tail.partition("default=")
+            if sep and value.strip().strip(",").isdigit():
+                return value.strip().strip(",")
+    return None
+
+
+def listeners_on(ports) -> set:
+    """Which of these ports something is already listening on, locally.
+
+    A connect that succeeds is a socket that answered, which is the only
+    reading that matters before launching: the health check cannot tell a
+    server this run started from one an earlier run left behind, and at TP>1 a
+    rendezvous port held by somebody else is not even a visible failure --
+    the new group joins the old one.
+    """
+    held = set()
+    for port in ports:
+        if not port:
+            continue
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
+            sock.settimeout(0.25)
+            if sock.connect_ex(("127.0.0.1", int(port))) == 0:
+                held.add(int(port))
+    return held
+
+
 #: Seconds to wait for a server to answer /health before giving up on it. A
 #: 262k-context model at TP=4 loads weights and captures graphs inside this.
 STARTUP_TIMEOUT = 1800.0
@@ -296,6 +338,19 @@ def http_get(url: str, timeout: float = 5.0):
 # one side of one cell
 
 
+def _int_or_none(value):
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _after(command, flag):
+    """The word after `flag` in a command, or None when it is not there."""
+    command = list(command or ())
+    return command[command.index(flag) + 1] if flag in command else None
+
+
 class SideRun:
     """The steps of one side, in order, with what each of them did."""
 
@@ -314,6 +369,7 @@ class SideRun:
         health_interval: float = HEALTH_INTERVAL,
         host=None,
         probe=process_identity,
+        ports_in_use=listeners_on,
         purpose: str = ACCEPTANCE,
     ):
         self.plan = cell_plan
@@ -332,6 +388,9 @@ class SideRun:
         #: checked rather than believed; injectable because the tests run
         #: against processes that were never started
         self.probe = probe
+        #: which of a set of ports already has something listening; injectable
+        #: because a test describing a held port must not need one held
+        self.ports_in_use = ports_in_use
         #: acceptance or diagnostic, stamped into every record this run writes
         self.purpose = purpose
         #: step id -> the handle we started, so nothing is signalled by name
@@ -442,6 +501,47 @@ class SideRun:
             "oracle_options": options,
         }
 
+    def _ports(self, step, after) -> dict:
+        """Every port this step uses, by scope, and who said so.
+
+        Two different sockets were both called "the port" before. They are
+        recorded under names that say what each is for, each with the flag it
+        came from -- or, when the flag is absent, the producer whose default
+        was read, so a reader can tell a port this run chose from one it
+        inherited. A client has one scope; a server has both.
+        """
+        if step["role"] != "serve":
+            return {
+                "http_dial": {
+                    "port": _int_or_none(after("--port")),
+                    "producer": "--port on scripts/compass/replay.py",
+                }
+            }
+        listener, listener_from = after("--server-port"), "--server-port"
+        if listener is None:
+            listener, listener_from = (
+                server_default_port(),
+                "DEFAULT_PORT in atom/entrypoints/openai/api_server.py",
+            )
+        rendezvous, rendezvous_from = after("--port"), "--port"
+        if rendezvous is None:
+            rendezvous, rendezvous_from = (
+                engine_default_port(),
+                "--port's default in atom/model_engine/arg_utils.py",
+            )
+        return {
+            "http_listener": {
+                "port": _int_or_none(listener),
+                "producer": listener_from,
+            },
+            # What model_runner.py exports as MASTER_PORT: the group this
+            # server's ranks find each other on, not anything a client dials.
+            "engine_rendezvous": {
+                "port": _int_or_none(rendezvous),
+                "producer": rendezvous_from,
+            },
+        }
+
     def _config(self, step, command) -> dict:
         """The configuration as launched. What served it is filled in later."""
 
@@ -455,18 +555,58 @@ class SideRun:
             # or the one a client dials. A server's is `--server-port`, or the
             # entry point's own default when the flag is absent -- never its
             # `--port`, which is the engine's internal port and a different
-            # thing. The internal port is left to the engine's own default and
-            # is not what a client reaches.
+            # thing, recorded under its own scope in `ports`.
             "port": (
                 (after("--server-port") or server_default_port())
                 if step["role"] == "serve"
                 else after("--port")
             ),
+            "ports": self._ports(step, after),
             "mode": after("--compass-mode"),
             "engine_args": list(plan_module.ENGINE_ARGS),
             "provenance": None,
             "provenance_sha256": None,
         }
+
+    def _port_conflicts(self, step):
+        """Why this server cannot have the sockets it is about to ask for.
+
+        Both scopes are checked, not just the listener. A held listener is at
+        least loud -- the new server exits, or the health check reaches
+        somebody else's -- and the stale-server refusal downstream catches
+        what gets past that. A held rendezvous port is quiet: at TP>1 the
+        ranks of this server can join a group that is still up from the last
+        one, and every number that comes out afterwards is of a machine that
+        was never configured the way the cell says.
+        """
+        scopes = self._ports(step, lambda flag: _after(step["command"], flag))
+        unknown = sorted(name for name, held in scopes.items() if held["port"] is None)
+        if unknown:
+            return (
+                f"the command does not say which port it uses for "
+                f"{', '.join(unknown)}, and neither does the producer's own "
+                f"default: an unknown port cannot be checked for a conflict"
+            )
+        numbers = {name: held["port"] for name, held in scopes.items()}
+        if len(set(numbers.values())) != len(numbers):
+            both = ", ".join(f"{name}={port}" for name, port in sorted(numbers.items()))
+            return (
+                f"two scopes want the same socket ({both}): they are "
+                f"different ports on one host and one of them will not bind"
+            )
+        busy = set(self.ports_in_use(numbers.values())) & set(numbers.values())
+        if busy:
+            named = ", ".join(
+                f"{name} {port}"
+                for name, port in sorted(numbers.items())
+                if port in busy
+            )
+            return (
+                f"something is already listening on {named}: this repeat "
+                f"would either fail to bind or be answered by a process it "
+                f"did not start"
+            )
+        return None
 
     def _serve(self, step) -> bool:
         """Start this repeat's server, wait for health, read what it is."""
@@ -484,6 +624,11 @@ class SideRun:
                 f"process and this one would have inherited a warmed server"
             )
             self._record(step, ok=False, reason="previous process still running")
+            return False
+        conflict = self._port_conflicts(step)
+        if conflict:
+            self.failures.append(f"{step['id']}: {conflict}")
+            self._record(step, ok=False, reason=conflict)
             return False
         started = self.now()
         proc = self.processes.start(step["command"], log=self._log(step))
@@ -1160,6 +1305,7 @@ def _cell_plan(args) -> dict:
         oracle=getattr(args, "oracle", None),
         options=getattr(args, "oracle_option", ()) or (),
         port=args.port,
+        engine_port=args.engine_port,
         repeats=args.repeats,
         target=getattr(args, "replay_target", None),
         corpus=getattr(args, "corpus", None) or "$CC_TRACES_CORPUS",
@@ -1286,7 +1432,18 @@ def main(argv=None) -> int:
     s.add_argument("--tp", type=int, required=True)
     s.add_argument("--class", dest="klass", required=True, choices=("short", "long"))
     s.add_argument("--repeats", type=int, default=plan_module.REPEATS)
-    s.add_argument("--port", type=int, default=plan_module.PORT)
+    s.add_argument(
+        "--port",
+        type=int,
+        default=plan_module.PORT,
+        help="the HTTP listener this cell's servers bind (--server-port)",
+    )
+    s.add_argument(
+        "--engine-port",
+        type=int,
+        default=plan_module.ENGINE_PORT,
+        help="the engine's internal rendezvous port, a different socket",
+    )
     s.add_argument("--oracle", default=None)
     s.add_argument("--oracle-option", action="append", default=[])
     s.add_argument("--replay-target", default=None)

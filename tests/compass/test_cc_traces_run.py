@@ -307,7 +307,15 @@ def _plan(tmp_path, tp=2, klass="long"):
 
 
 def _runner(
-    tmp_path, side, *, processes=None, health=None, provenance=None, probe=None, **kw
+    tmp_path,
+    side,
+    *,
+    processes=None,
+    health=None,
+    provenance=None,
+    probe=None,
+    held_ports=(),
+    **kw,
 ):
     clock = Clock()
     mode = "predict" if side == "modelled" else "measure"
@@ -320,6 +328,9 @@ def _runner(
         health=health or (lambda url: {}),
         provenance=lambda url: _with_process(said(url), procs),
         probe=probe or FakeProbe(procs),
+        # Nothing is listening unless the test says so: the real reading
+        # would connect to whatever happens to be up on this machine.
+        ports_in_use=lambda ports: {p for p in map(int, ports) if p in held_ports},
         host=HOST,
         now=clock.now,
         wall=clock.wall,
@@ -892,9 +903,10 @@ class TestEveryRepeatIsAnExecutionWithAName:
         runner.run()
         for execution in self._executions(runner):
             command = execution["process"]["command"]
-            assert "--port" not in command
             listener = command[command.index("--server-port") + 1]
+            rendezvous = command[command.index("--port") + 1]
             assert execution["config"]["port"] == listener
+            assert execution["config"]["port"] != rendezvous
 
     def test_the_internal_port_is_not_read_as_the_http_port(self, tmp_path):
         """`--port` on the server parser is the engine's internal port. A
@@ -1359,3 +1371,109 @@ class TestARunSaysWhatItWasFor:
                     "acceptance-ish",
                 ]
             )
+
+
+class TestBothPortsAreCheckedBeforeAnythingIsLaunched:
+    """A held listener is loud; a held rendezvous port is not.
+
+    At TP>1 the ranks of a server whose rendezvous port is already held join
+    the group that is holding it, and nothing about the run says so: the cell
+    then reports numbers from a configuration it never had. So both scopes are
+    checked, and the check happens before the process is started rather than
+    after a health probe times out.
+    """
+
+    def _held(self, tmp_path, port):
+        runner = _runner(tmp_path, "modelled", held_ports={port})
+        assert runner.run() == 1
+        return runner
+
+    def test_a_held_rendezvous_port_stops_the_repeat(self, tmp_path):
+        runner = self._held(tmp_path, plan_mod.ENGINE_PORT)
+        assert any("engine_rendezvous" in f for f in runner.failures)
+        assert not runner.processes.started
+
+    def test_a_held_listener_stops_the_repeat(self, tmp_path):
+        runner = self._held(tmp_path, plan_mod.PORT)
+        assert any("http_listener" in f for f in runner.failures)
+        assert not runner.processes.started
+
+    def test_a_free_pair_launches(self, tmp_path):
+        runner = _runner(tmp_path, "modelled", held_ports={plan_mod.PORT + 1000})
+        assert runner.run() == 0
+
+    def test_two_scopes_on_one_socket_stop_the_repeat(self, tmp_path):
+        runner = _runner(tmp_path, "modelled")
+        step = {
+            "role": "serve",
+            "id": "serve-modelled-1",
+            "command": [
+                "python",
+                "-m",
+                "atom.entrypoints.openai.api_server",
+                "--server-port",
+                "9",
+                "--port",
+                "9",
+            ],
+        }
+        reason = runner._port_conflicts(step)
+        assert "same socket" in reason
+
+    def test_a_port_nobody_declares_cannot_be_checked(self, tmp_path, monkeypatch):
+        """With the flag absent and the producer's default unreadable, the
+        port is unknown, and an unknown port is not a free one."""
+        monkeypatch.setattr(run_mod, "engine_default_port", lambda: None)
+        runner = _runner(tmp_path, "modelled")
+        step = {
+            "role": "serve",
+            "id": "serve-modelled-1",
+            "command": ["python", "-m", "atom.entrypoints.openai.api_server"],
+        }
+        reason = runner._port_conflicts(step)
+        assert "engine_rendezvous" in reason and "cannot be checked" in reason
+
+    def test_the_manifest_names_each_port_by_scope_and_producer(self, tmp_path):
+        runner = _runner(tmp_path, "modelled")
+        runner.run()
+        for execution in json.loads((runner.cell / "run.modelled.json").read_text())[
+            "executions"
+        ]:
+            ports = execution["config"]["ports"]
+            assert ports["http_listener"] == {
+                "port": plan_mod.PORT,
+                "producer": "--server-port",
+            }
+            assert ports["engine_rendezvous"] == {
+                "port": plan_mod.ENGINE_PORT,
+                "producer": "--port",
+            }
+
+    def test_an_unflagged_port_is_recorded_against_the_default_it_came_from(
+        self, tmp_path
+    ):
+        runner = _runner(tmp_path, "modelled")
+        step = {
+            "role": "serve",
+            "id": "serve-modelled-1",
+            "command": ["python", "-m", "atom.entrypoints.openai.api_server"],
+        }
+        ports = runner._ports(step, lambda flag: None)
+        assert ports["http_listener"]["port"] == int(run_mod.server_default_port())
+        assert "api_server.py" in ports["http_listener"]["producer"]
+        assert ports["engine_rendezvous"]["port"] == int(run_mod.engine_default_port())
+        assert "arg_utils.py" in ports["engine_rendezvous"]["producer"]
+
+    def test_the_engine_default_is_read_from_the_engine(self):
+        assert run_mod.engine_default_port() == str(plan_mod.ENGINE_PORT)
+
+    def test_a_client_step_has_only_the_address_it_dials(self, tmp_path):
+        runner = _runner(tmp_path, "modelled")
+        step = {
+            "role": "replay",
+            "id": "replay-modelled-1",
+            "command": ["python", "scripts/compass/replay.py", "--port", "8000"],
+        }
+        ports = runner._ports(step, lambda flag: run_mod._after(step["command"], flag))
+        assert set(ports) == {"http_dial"}
+        assert ports["http_dial"]["port"] == 8000
