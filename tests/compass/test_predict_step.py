@@ -76,7 +76,8 @@ class TestTheReportRecordsItsOwnInputs:
             "block_policy": "rounds", "cudagraph_mode": "full",
             "regions": "source-27b-tp1", "head": True,
             "seconds_per_launch": 0.0, "require_complete": True,
-            "carry_allocation": False, "no_derive": False}
+            "carry_allocation": False, "no_derive": False,
+            "interpolate": None}
         base.update(over)
         return argparse.Namespace(**base), prices, graph
 
@@ -115,6 +116,16 @@ class TestTheReportRecordsItsOwnInputs:
         assert settings["head"] is False
         assert settings["regions"] == "source-27b-tp1"
         assert settings["derive"] is True
+
+    def test_the_density_fitted_prices_were_allowed_over_is_recorded(
+            self, tmp_path):
+        """Two densities over one shape are two claims, not one with a note."""
+        assert self._settings(tmp_path)["interpolate"] is None
+        assert self._settings(tmp_path, interpolate="2.0")["interpolate"] == "2.0"
+
+    def _settings(self, tmp_path, **over):
+        args, _, _ = self._args(tmp_path, **over)
+        return predict_step._inputs(args)["settings"]
 
     def test_the_digest_helper_is_the_shared_one(self):
         """Not a second implementation: same function, loaded by path."""

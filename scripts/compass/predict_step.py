@@ -123,6 +123,11 @@ def _inputs(args) -> dict:
             "require_complete": bool(args.require_complete),
             "carry_allocation": bool(args.carry_allocation),
             "derive": not args.no_derive,
+            # None is exact prices only. A number is the declared sampling
+            # density fitted prices were allowed over, and it belongs here for
+            # the same reason `require_complete` does: the same shape under two
+            # densities is two claims, and nothing else in the file says which.
+            "interpolate": args.interpolate,
         },
     }
 
@@ -186,6 +191,13 @@ def main() -> int:
                     help="Price the LM head as a second region of the step. "
                          "Without it the step is body only, which is a "
                          "different claim and is recorded as one.")
+    ap.add_argument("--interpolate", default=None, metavar="MAX_GAP_RATIO",
+                    help="Price an operator at a row count nobody measured "
+                         "from the measured ones either side, where the gap "
+                         "between them is no wider than this ratio. Omitted, "
+                         "an unmeasured row count is refused with its reason. "
+                         "A fitted price is reported apart from a measured "
+                         "one, so coverage stays truthful either way.")
     ap.add_argument("--regions", default="source-27b-tp1",
                     choices=sorted(REGION_MODELS))
     ap.add_argument("--seconds-per-launch", type=float, default=0.0)
@@ -231,6 +243,7 @@ def main() -> int:
         require_complete=args.require_complete,
         carry_allocation=args.carry_allocation,
         derive=not args.no_derive,
+        interpolate=args.interpolate,
     )
     oracle = built.oracle
     body_graphs = built.body_graphs
