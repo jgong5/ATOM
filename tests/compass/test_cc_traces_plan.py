@@ -439,3 +439,86 @@ class TestTheTwoPortsAreChosenSeparately:
         assert f"default={plan_mod.ENGINE_PORT}," in source
         runner = (ROOT / "atom" / "model_engine" / "model_runner.py").read_text()
         assert 'os.environ["MASTER_PORT"] = str(self.config.port)' in runner
+
+
+class TestTheRegistryIsWhereTheConfigurationComesFrom:
+    """`--artifact-root` in place of a dozen hand-typed options.
+
+    The modelled side's oracle configuration was free text on the command
+    line: one qualname and twelve `KEY=VALUE` strings, none of them reachable
+    by a test. An artifact resolved from the wrong width prices a different
+    deployment and the run says nothing about it, so the set is data now and
+    the plan reads it.
+    """
+
+    def test_naming_a_root_configures_every_modelled_server(self):
+        got = json.loads(_run(["--root", "/r", "--artifact-root", "/a"]))
+        for cell in got["cells"]:
+            tp = cell["tp"]
+            for step in _role(cell, "serve"):
+                command = step["command"]
+                if "--compass-oracle" not in command:
+                    continue
+                assert (command[command.index("--compass-oracle") + 1]
+                        == plan_mod.registry.ORACLE)
+                supplied = [command[i + 1] for i, token in enumerate(command)
+                            if token == "--compass-oracle-option"]
+                assert supplied == plan_mod.registry.options(tp, "/a")
+
+    def test_the_real_side_is_given_no_oracle_at_all(self):
+        # It is the thing being predicted. A price list on that side would be
+        # an input from the engine under test.
+        got = json.loads(_run(["--root", "/r", "--artifact-root", "/a"]))
+        for cell in got["cells"]:
+            for step in _role(cell, "serve"):
+                if "--compass-mode" not in step["command"]:
+                    continue
+                command = step["command"]
+                mode = command[command.index("--compass-mode") + 1]
+                if mode == "measure":
+                    assert "--compass-oracle" not in command
+                    assert "--compass-rank-aggregation" not in command
+
+    def test_a_typed_option_still_wins_over_the_registry(self):
+        got = json.loads(_run(["--root", "/r", "--artifact-root", "/a",
+                               "--oracle-option", "derive=0"]))
+        for cell in got["cells"]:
+            for step in _role(cell, "serve"):
+                command = step["command"]
+                if "--compass-oracle-option" not in command:
+                    continue
+                supplied = [command[i + 1] for i, token in enumerate(command)
+                            if token == "--compass-oracle-option"]
+                assert supplied == ["derive=0"]
+
+    def test_without_a_root_nothing_is_invented(self):
+        # The plan has always been allowed to print a cell whose oracle the
+        # operator supplies later. Naming no root keeps that, rather than
+        # silently resolving paths under a default that does not exist.
+        got = json.loads(_run(["--root", "/r"]))
+        for cell in got["cells"]:
+            for step in _role(cell, "serve"):
+                assert "--compass-oracle" not in step["command"]
+
+    def test_the_aggregation_is_the_registry_s_and_not_a_second_copy(self):
+        assert plan_mod.registry.RANK_AGGREGATION == "slowest"
+        got = json.loads(_run(["--root", "/r", "--artifact-root", "/a"]))
+        seen = 0
+        for cell in got["cells"]:
+            for step in _role(cell, "serve"):
+                command = step["command"]
+                if "--compass-rank-aggregation" not in command:
+                    continue
+                seen += 1
+                assert (command[command.index("--compass-rank-aggregation") + 1]
+                        == plan_mod.registry.RANK_AGGREGATION)
+        assert seen == 6 * got["repeats"]
+
+    def test_native_allocation_is_selected_at_every_width(self):
+        # `carry_allocation=1` reuses the template's blocks and declares them
+        # unmeasured. It is inadmissible for acceptance, and the way it would
+        # arrive is by being typed once and never noticed again.
+        for tp in plan_mod.TPS:
+            options = plan_mod.registry.options(tp, "/a")
+            assert "allocation=native" in options
+            assert not any(o.startswith("carry_allocation=") for o in options)

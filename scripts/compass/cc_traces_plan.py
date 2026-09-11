@@ -38,12 +38,39 @@ that would fail at 3 a.m. on a leased node.
 from __future__ import annotations
 
 import argparse
+import importlib.util
 import json
 import shlex
 import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[2]
+
+
+def _load(name: str):
+    """A sibling script as a module, the way `cc_traces_run.py` loads them."""
+    path = ROOT / "scripts" / "compass" / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(f"compass_{name}", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+#: The six cells' configuration as data. The plan used to take the modelled
+#: side's oracle and its dozen options as free text on the command line, which
+#: is the part of a matrix run most expensive to mistype and the part no test
+#: could reach. Naming `--artifact-root` resolves them from here instead.
+registry = _load("cc_traces_registry")
+
+
+def _registry_oracle(args):
+    return registry.ORACLE if getattr(args, "artifact_root", None) else None
+
+
+def _registry_options(args, tp: int) -> list:
+    root = getattr(args, "artifact_root", None)
+    return registry.options(tp, root) if root else []
+
 
 #: The matrix. TP=1 is the source width and its cells are a fit statistic, not
 #: a prediction; they are here because the residual is reported, not because
@@ -194,7 +221,7 @@ def _serve(
         # side is therefore evaluated on every logical rank; `rank_aggregation`
         # in each row says what the number is and in which direction it
         # approximates.
-        cmd += ["--compass-rank-aggregation", "slowest"]
+        cmd += ["--compass-rank-aggregation", registry.RANK_AGGREGATION]
         if oracle:
             cmd += ["--compass-oracle", oracle]
         for option in options:
@@ -551,8 +578,8 @@ def build(args) -> dict:
             tp,
             klass,
             root=args.root,
-            oracle=args.oracle,
-            options=args.oracle_option,
+            oracle=args.oracle or _registry_oracle(args),
+            options=args.oracle_option or _registry_options(args, tp),
             port=args.port,
             engine_port=args.engine_port,
             repeats=args.repeats,
@@ -650,6 +677,13 @@ def main(argv=None) -> int:
         type=int,
         default=ENGINE_PORT,
         help="the engine's internal rendezvous port (--port on the engine)",
+    )
+    ap.add_argument(
+        "--artifact-root",
+        default=None,
+        help=("resolve the modelled side's oracle and its options from "
+              "cc_traces_registry.py against this directory, instead of "
+              "typing them; --oracle/--oracle-option still override"),
     )
     ap.add_argument("--repeats", type=int, default=REPEATS)
     ap.add_argument("--out", default=None, help="write the plan as JSON here")
