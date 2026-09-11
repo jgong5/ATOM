@@ -1316,6 +1316,59 @@ def allocator_segment_bytes(requested: int) -> int:
         (n + ALLOCATOR_ROUND_LARGE - 1) // ALLOCATOR_ROUND_LARGE)
 
 
+def allocator_charged_bytes(requested: int, *, fresh_segment: bool = True) -> dict:
+    """What `allocated_bytes` charges for one request, which is not the request.
+
+    Four different quantities get called "the size of an allocation" and the
+    prediction needs them apart:
+
+    * **requested** -- what the caller asked for. This is what a trace entry's
+      `size` carries (the artifact settles it: the capture window contains
+      2-byte allocations, and no block is ever smaller than `kMinBlockSize`).
+    * **block** -- the request rounded up to `kMinBlockSize`.
+    * **segment** -- what `hipMalloc` maps, per `allocator_segment_bytes`.
+    * **charged** -- what the allocator adds to `allocated_bytes`, which is the
+      *block it hands out*, and that is where the surprise lives.
+
+    When a fresh segment is mapped, the allocator splits the remainder off into
+    a free block only if it is worth splitting. In the large pool that test is
+    `remaining > kSmallSize`; in the small pool it is `remaining >=
+    kMinBlockSize`. A remainder that fails the test is **not** split -- it stays
+    inside the handed-out block, and `allocated_bytes` charges the whole thing.
+    So a request can be charged more than it asked for while nothing is wasted
+    anywhere a snapshot would show as free.
+
+    The rule is witnessed, not assumed: `should_split` lives in a `.cpp` that
+    the wheel does not ship, so it was read off the shipped binary's behaviour
+    in the S27 TP=1 warmup snapshot. Of 305 large segments, 213 hold a single
+    active block filling the segment, and their excess over the request is
+    either 0 (210 of them) or exactly 1 048 576 (3) -- never more. 49 hold an
+    active block plus a split-off tail, and the smallest such tail is 1 114 112
+    -- never less. The boundary sits exactly at `kSmallSize`, with no
+    counterexample either side.
+
+    `fresh_segment=False` means the request was served out of an existing
+    segment's free space, where the host block's size is a property of the
+    history and not of this request; the charge is then at least the block and
+    this returns that lower bound.
+    """
+    block = allocator_block_bytes(requested)
+    segment = allocator_segment_bytes(requested)
+    if not fresh_segment:
+        return {"requested": int(requested), "block": block,
+                "segment": None, "charged": block, "retained": 0,
+                "split_off": None, "fresh_segment": False}
+    remaining = segment - block
+    if block <= ALLOCATOR_SMALL_SIZE:
+        splits = remaining >= ALLOCATOR_MIN_BLOCK
+    else:
+        splits = remaining > ALLOCATOR_SMALL_SIZE
+    charged = block if splits else segment
+    return {"requested": int(requested), "block": block, "segment": segment,
+            "charged": charged, "retained": 0 if splits else remaining,
+            "split_off": remaining if splits else 0, "fresh_segment": True}
+
+
 def capture_reserved_parts(pool_reserved: int, *,
                            fixed_pinned: int = CAPTURE_FIXED_PINNED) -> dict:
     """Split the capture window's *reserved* delta into what is derivable.

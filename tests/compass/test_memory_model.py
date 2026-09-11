@@ -17,7 +17,8 @@ from atom.compass.core.memory_model import (
     load_residue_bytes, measured_graph_pool_bytes, modelled_readings,
     non_torch_bytes, peak_activation_bytes, scratch_bytes_per_token,
     liveness_is_recorded, traced_shape, UnfoundedActivation,
-    allocator_block_bytes, allocator_segment_bytes, capture_reserved_parts,
+    allocator_block_bytes, allocator_segment_bytes, allocator_charged_bytes,
+    capture_reserved_parts, ALLOCATOR_SMALL_SIZE,
     ALLOCATOR_SMALL_BUFFER, ALLOCATOR_LARGE_BUFFER,
     GDN_ACTIVATION_INSTANTS, activation_instant_bytes, gdn_activation_widths,
     UnfoundedPrediction, derived_readings, weight_bytes)
@@ -1004,3 +1005,76 @@ class TestAPredictionCanReachTheInstantWithoutAGraph:
         profile, load = self._with_config()
         _, activation = derived_readings(profile, warmup_tokens=200, load=load)
         assert activation == 4000
+
+
+class TestWhatTheAllocatorChargesIsNotWhatWasAsked:
+    """The 1 MiB the source prediction was missing, as a rule rather than a fit.
+
+    `allocated_bytes` charges the block the allocator hands out. When a fresh
+    segment's leftover is too small to be worth splitting off, it is not split
+    off -- it stays inside that block, and the charge is the whole segment. A
+    snapshot shows nothing free, because nothing is free.
+
+    The threshold was read off the shipped binary's behaviour, since the rule
+    lives in a `.cpp` the wheel does not ship: in the S27 TP=1 warmup snapshot
+    the largest retained remainder is 1 048 576 and the smallest split-off tail
+    is 1 114 112, so the boundary is exactly `kSmallSize`, witnessed from both
+    sides.
+    """
+
+    def test_the_source_in_proj_request_retains_exactly_one_mebibyte(self):
+        """16 384 x 16 480 x 2 B, and the gap the diagnostic could not close.
+
+        The warmup history witnesses this allocation directly: a segment of
+        541 065 216 B mapped, the 540 016 640 B request served at the same
+        address, no allocation ever at the tail address, and the segment freed
+        as one unit.
+        """
+        charged = allocator_charged_bytes(16_384 * 16_480 * 2)
+        assert charged["requested"] == 540_016_640
+        assert charged["block"] == 540_016_640
+        assert charged["segment"] == 541_065_216
+        assert charged["retained"] == 1_048_576
+        assert charged["charged"] == 541_065_216
+
+    def test_a_remainder_one_block_over_the_threshold_is_split_off(self):
+        """The other side of the boundary, so the rule is not one-sided."""
+        charged = allocator_charged_bytes(541_065_216 - 1_048_576 - 512)
+        assert charged["retained"] == 0
+        assert charged["split_off"] > ALLOCATOR_SMALL_SIZE
+        assert charged["charged"] == charged["block"]
+
+    @pytest.mark.parametrize("width,tail", [(1, 1_048_576), (2, 524_288),
+                                            (4, 0)])
+    def test_it_does_not_simply_halve_with_width(self, width, tail):
+        """The reason this is a rule and not a per-width constant.
+
+        Halving the shard halves the request but not the rounding: at TP=4 the
+        remainder lands at 1 310 720, *over* `kSmallSize`, so it is split off
+        and there is nothing retained at all. A term fitted at TP=1 and halved
+        would have claimed 262 144 B here.
+        """
+        assert 16_480 % width == 0
+        charged = allocator_charged_bytes(16_384 * (16_480 // width) * 2)
+        assert charged["retained"] == tail
+
+    def test_every_other_tensor_in_the_instant_rounds_exactly(self):
+        """Which is why one allocation accounts for the whole source gap."""
+        for elements in (34_816, 17_408, 6_144, 5_120):
+            charged = allocator_charged_bytes(16_384 * elements * 2)
+            assert charged["retained"] == 0
+            assert charged["charged"] == charged["requested"]
+
+    def test_a_request_served_from_existing_space_claims_only_the_block(self):
+        """Whose segment it lands in is history, not a property of the request."""
+        charged = allocator_charged_bytes(540_016_640, fresh_segment=False)
+        assert charged["segment"] is None
+        assert charged["charged"] == 540_016_640
+        assert charged["retained"] == 0
+
+    def test_a_small_request_is_charged_its_block_and_not_its_buffer(self):
+        """The small pool splits down to `kMinBlockSize`, so 2 B costs 512 B."""
+        charged = allocator_charged_bytes(2)
+        assert charged["block"] == 512
+        assert charged["segment"] == ALLOCATOR_SMALL_BUFFER
+        assert charged["charged"] == 512
