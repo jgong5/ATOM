@@ -45,6 +45,15 @@ is a claim about these regions at these widths, not a general one.
 
 Outside the calibrated domain this refuses. A region model that answers
 anywhere is a region model that has stopped being a measurement.
+
+Two profiles live here, and the older one is not superseded.
+`SOURCE_27B_TP1` is what the frozen TP2 and TP4 transfer reports were computed
+from, so editing it would silently move predictions that have already been
+made and checked; it stays as it was measured. `SOURCE_27B_TP1_CONC` is a
+second, separately versioned profile from a second pair of captures, covering
+fourteen decode concurrencies instead of one and keyed by the capture rung
+rather than the sequence count. New work should ask the newer one and get a
+refusal where it has not looked.
 """
 
 from __future__ import annotations
@@ -205,4 +214,284 @@ SOURCE_27B_TP1 = RunnerRegions(
                 "(runner.py 82800aad3fa9, predict.py a913f289b09c), plus "
                 "bcast_probe.py standalone group measurements; no logprobs "
                 "requested, no speculative decoding, PP=1"),
+)
+
+
+@dataclass(frozen=True)
+class BucketedRunnerRegions:
+    """The same two regions, keyed by what the engine actually ran.
+
+    `RunnerRegions` above carries one decode number because its capture held
+    one decode concurrency. Driven at fourteen instead, preparation is not one
+    number: it is not even monotone in the batch. Two sequences cost 0.1138 ms
+    and eight cost 0.1072 ms, so a model rising with batch size would be wrong
+    in the wrong direction over a range serving traffic actually visits.
+
+    What it does track is the pair `(capture_bucket, padded)` -- the rung the
+    step replayed at, and whether that rung was wider than the batch. That
+    pairing is not a fit: `ForwardMode.decide` selects the smallest rung at
+    least the unified batch size, attention metadata is built at the rung, and
+    the engine stamped its own `capture_bucket` on all 5 375 measured decode
+    steps in agreement with that rule at every one of the fourteen sizes.
+
+    Padded cells read above their exact neighbour at the two wide rungs --
+    0.1239 against 0.1148 at sixteen, 0.1381 against 0.1256 at thirty-two --
+    and that is *consistent with* the padded-row contract costing something to
+    fill (`context_lens=0`, `slot_mapping=-1`, repeated `kv_indptr`, zeroed
+    `input_ids`). It is not a measurement of padding-fill cost: nothing here
+    separated that work from the rest of preparation, and at rung four the
+    padded cell reads marginally *below* the exact one. The cells are a lookup
+    over what was observed, and the ordering between them is reported, not
+    explained.
+
+    Within a padded cell the active size is pooled across the sizes measured in
+    it, spreading 3.9% at rung sixteen and 2.0% at rung thirty-two, in neither
+    case monotone in the size. The quoted band covers that spread. Pooling is
+    the claim that the cell is the grouping the data supports -- not that the
+    active size provably cannot matter at all inside one.
+
+    Two boundaries this refuses at, both of them real:
+
+    * **Context.** Every burst ran 1024-token prompts to 128 outputs, so the
+      whole table sits between 1025 and 1152 tokens of history. Preparation has
+      a term that grows with history -- `pack_rows` copies
+      `ceil(context/block_size)` int32 per sequence -- but at 65-72 int32 a row
+      it is below the ~500-int32 threshold that function's own docstring gives
+      as where the bytes start to matter, so this calibration never exercised
+      it. The cc-traces acceptance corpus reaches 109 741 tokens, about 6 859
+      int32 a row, an order of magnitude past that threshold. The other two
+      terms -- the `dst[:n_rows] = 0` memset and the `copy_to_gpu(bs)` upload
+      -- are `rows x block_table_cols`, and `block_table_cols` is
+      `max_num_blocks_per_seq // block_ratio`, a configuration constant rather
+      than the live context. So the rise measured here is row-count driven and
+      the history-driven term is the one left unmeasured. Extending past 1152
+      needs a TP1 source capture at long context, not a wider tuple here.
+
+    * **Eager.** `capture_bucket=None` means nothing was replayed. Every row in
+      this table is a captured replay, so a step that ran eager is outside the
+      calibration rather than at its first rung.
+    """
+
+    #: Postprocess over decode, one constant: measured flat from one sequence
+    #: to thirty-two, which `RunnerRegions` could only infer from prefill rows.
+    postprocess_decode: Measured
+    #: `(capture_bucket, padded) -> Measured` for preparation over decode.
+    prepare_decode_cells: tuple
+    #: Prefill and the broadcast are unchanged measurements, carried from the
+    #: profile below rather than re-declared, so one capture backs one number.
+    postprocess_prefill: Measured
+    prepare_prefill: Measured
+    tp_broadcast: Measured
+    #: Inclusive bounds on every request's history, in tokens.
+    decode_context: tuple
+    prefill_sequences: tuple
+    prefill_tokens: tuple
+    topologies: tuple
+    #: The engine's capture ladder, for callers resolving a rung themselves.
+    #: Not used to fill in a shape's missing bucket -- see `refusal`.
+    capture_sizes: tuple = ()
+    version: str = ""
+    provenance: str = ""
+
+    def _cells(self) -> dict:
+        return {(int(b), bool(p)): m for (b, p), m in self.prepare_decode_cells}
+
+    def bucket_for(self, sequences: int):
+        """The rung `ForwardMode.decide` would pick, or None above the ladder.
+
+        Offered for callers that resolve the ladder themselves -- a ladder
+        derivation, a shape list being written. `refusal` uses it only to check
+        a rung a shape has already declared, never to supply one it has not: a
+        shape says which rung it ran at, and a region model that guesses one
+        has stopped reading the capture.
+        """
+        for size in self.capture_sizes:
+            if size >= sequences:
+                return size
+        return None
+
+    def refusal(self, shape) -> Optional[str]:
+        """Why this shape is outside the calibration, or None if it is inside."""
+        tp = int((dict(shape.topology) if shape.topology else {}).get("tp", 1))
+        if tp not in self.topologies:
+            return (f"tp={tp} is outside the measured widths "
+                    f"{list(self.topologies)}")
+        seqs = len(shape.num_scheduled_tokens)
+        if shape.num_prefill_tokens:
+            if seqs not in self.prefill_sequences:
+                return (f"prefill over {seqs} sequences, measured only at "
+                        f"{list(self.prefill_sequences)}")
+            lo, hi = self.prefill_tokens
+            if not lo <= shape.total_tokens <= hi:
+                return (f"prefill of {shape.total_tokens} tokens, measured "
+                        f"only over [{lo}, {hi}]")
+            return None
+        bucket = shape.capture_bucket
+        if bucket is None:
+            return ("this decode step replayed no captured graph; every "
+                    "measured row here is a replay, so an eager step is "
+                    "outside the calibration rather than at its first rung")
+        if bucket < seqs:
+            return (f"capture bucket {bucket} is narrower than the {seqs} "
+                    "sequences scheduled, which the engine does not do")
+        rung = self.bucket_for(seqs)
+        if rung is not None and int(bucket) != rung:
+            return (f"{seqs} sequences at capture bucket {bucket}: the ladder "
+                    f"{list(self.capture_sizes)} replays {seqs} at {rung}, so "
+                    f"this pairing did not occur in the capture and the cell "
+                    f"for bucket {bucket} was filled by the batches that do "
+                    "reach it, padded a different distance")
+        cell = (int(bucket), bucket != seqs)
+        if cell not in self._cells():
+            measured = sorted((b, "padded" if p else "exact")
+                              for b, p in self._cells())
+            return (f"{seqs} sequences at capture bucket {bucket} is the "
+                    f"{'padded' if cell[1] else 'exact'} cell of bucket "
+                    f"{bucket}, measured only at {measured}")
+        lo, hi = self.decode_context
+        histories = [int(c) for c in shape.context_lens]
+        if histories and not (lo <= min(histories) and max(histories) <= hi):
+            return (f"decode over histories {min(histories)}-{max(histories)} "
+                    f"tokens, measured only over [{lo}, {hi}]; preparation has "
+                    "a term that grows with history and this capture did not "
+                    "reach it")
+        return None
+
+    def _decode_prepare(self, shape) -> Measured:
+        seqs = len(shape.num_scheduled_tokens)
+        return self._cells()[(int(shape.capture_bucket),
+                              shape.capture_bucket != seqs)]
+
+    def _parts(self, shape) -> list:
+        why = self.refusal(shape)
+        if why is not None:
+            raise ValueError(f"no measured region for this shape: {why}")
+        prefill = bool(shape.num_prefill_tokens)
+        tp = int((dict(shape.topology) if shape.topology else {}).get("tp", 1))
+        parts = [("<postprocess>", self.postprocess_prefill if prefill
+                  else self.postprocess_decode),
+                 ("<prepare>", self.prepare_prefill if prefill
+                  else self._decode_prepare(shape))]
+        if tp > 1:
+            parts.append(("<tp-broadcast>", self.tp_broadcast))
+        return parts
+
+    def breakdown(self, shape) -> dict:
+        """Each region's seconds for this shape, by name.
+
+        Raises if the shape is outside the domain: a caller that wanted a
+        partial answer should not have supplied a region model.
+        """
+        return {name: m.seconds for name, m in self._parts(shape)}
+
+    def seconds(self, shape) -> float:
+        return sum(self.breakdown(shape).values())
+
+    def band(self, shape) -> tuple:
+        """(low, high) over the same regions, from the observed spreads."""
+        parts = [m for _, m in self._parts(shape)]
+        return (sum(m.low for m in parts), sum(m.high for m in parts))
+
+    def describe(self) -> str:
+        lines = [f"version             : {self.version}",
+                 f"postprocess decode : {self.postprocess_decode.describe()}",
+                 f"postprocess prefill: {self.postprocess_prefill.describe()}"]
+        for (bucket, padded), m in sorted(self.prepare_decode_cells,
+                                          key=lambda kv: (kv[0][0], kv[0][1])):
+            tag = f"bucket {bucket} {'padded' if padded else 'exact'}"
+            lines.append(f"prepare+idle {tag:<18}: {m.describe()}")
+        lines += [
+            f"prepare+idle prefill: {self.prepare_prefill.describe()}",
+            f"tp broadcast        : {self.tp_broadcast.describe()}",
+            f"domain              : decode over histories "
+            f"{list(self.decode_context)} tokens at the cells above, prefill "
+            f"{list(self.prefill_sequences)} seqs over "
+            f"{list(self.prefill_tokens)} tokens, tp {list(self.topologies)}",
+            f"provenance          : {self.provenance}",
+        ]
+        return "\n".join(lines)
+
+
+#: The 27B deployment's regions over fourteen decode concurrencies.
+#:
+#: `SOURCE_27B_TP1` above is **not** superseded and must not be edited: the
+#: frozen TP2 and TP4 transfer reports were produced from it, and a prediction
+#: already made does not improve by being recomputed. This is a second,
+#: separately versioned profile from a second pair of captures.
+#:
+#: `agent_scratch/g4/cap_conc` and `agent_scratch/g4/cap_conc2`: the same TP1
+#: Qwen3.8-27B server, knob for knob, driven at N in
+#: [1,2,3,4,5,8,9,12,15,16,17,20,31,32]. Each N ran as three independent bursts
+#: in a fixed interleaved order, so drift across a session cannot alias onto N;
+#: the statistic is the p50 over all decode steps of the three, with p10/p90 as
+#: the band; and a concurrency was admitted only if the three per-burst p50s
+#: agreed within 5% of their median. All fourteen admitted, worst 0.86%.
+#:
+#: Steps were assigned to bursts by request cohort -- the engine's own request
+#: counter, minted once per admitted request for the life of the server -- not
+#: by file-line windows, which the measure file's lazy flush moves. Both
+#: partitions were checked complete and disjoint before any statistic was
+#: taken, and the preparation burst of each session was excluded as a set fact
+#: about its request ids rather than by a row number.
+#:
+#: Prefill and the broadcast are `SOURCE_27B_TP1`'s own `Measured` objects.
+#: Neither capture here ran a prefill shape in that domain and neither ran at
+#: TP>1, so re-stating them would be copying, not measuring.
+SOURCE_27B_TP1_CONC = BucketedRunnerRegions(
+    postprocess_decode=Measured(
+        seconds=1.026e-4, low=1.005e-4, high=1.061e-4, samples=5375,
+        how="p50 [p10,p90] of span_seconds.postprocess over every decode step "
+            "of all fourteen concurrencies -- flat from 1 to 32 sequences "
+            "(0.1011-0.1046 ms by N), which the single-concurrency profile "
+            "could only infer from prefill rows"),
+    prepare_decode_cells=(
+        ((1, False), Measured(
+            seconds=1.037e-4, low=1.012e-4, high=1.069e-4, samples=384,
+            how="p50 [p10,p90] of seconds - run_model - postprocess, N=1")),
+        ((2, False), Measured(
+            seconds=1.138e-4, low=1.112e-4, high=1.177e-4, samples=384,
+            how="p50 [p10,p90], N=2")),
+        ((4, True), Measured(
+            seconds=1.074e-4, low=1.050e-4, high=1.105e-4, samples=384,
+            how="p50 [p10,p90], N=3 padded to 4")),
+        ((4, False), Measured(
+            seconds=1.080e-4, low=1.052e-4, high=1.120e-4, samples=384,
+            how="p50 [p10,p90], N=4")),
+        ((8, True), Measured(
+            seconds=1.100e-4, low=1.078e-4, high=1.134e-4, samples=384,
+            how="p50 [p10,p90], N=5 padded to 8")),
+        ((8, False), Measured(
+            seconds=1.072e-4, low=1.046e-4, high=1.106e-4, samples=384,
+            how="p50 [p10,p90], N=8")),
+        ((16, True), Measured(
+            seconds=1.239e-4, low=1.193e-4, high=1.281e-4, samples=1152,
+            how="p50 [p10,p90] pooled over N=9,12,15 padded to 16; the three "
+                "per-N p50s spread 3.9% and not monotone in N")),
+        ((16, False), Measured(
+            seconds=1.148e-4, low=1.126e-4, high=1.184e-4, samples=384,
+            how="p50 [p10,p90], N=16")),
+        ((32, True), Measured(
+            seconds=1.381e-4, low=1.350e-4, high=1.414e-4, samples=1152,
+            how="p50 [p10,p90] pooled over N=17,20,31 padded to 32; the three "
+                "per-N p50s spread 2.0% and not monotone in N")),
+        ((32, False), Measured(
+            seconds=1.256e-4, low=1.240e-4, high=1.281e-4, samples=383,
+            how="p50 [p10,p90], N=32; the last burst's final decode step was "
+                "lost to the measure file's lazy flush, hence 383 not 384")),
+    ),
+    postprocess_prefill=SOURCE_27B_TP1.postprocess_prefill,
+    prepare_prefill=SOURCE_27B_TP1.prepare_prefill,
+    tp_broadcast=SOURCE_27B_TP1.tp_broadcast,
+    decode_context=(1025, 1152),
+    prefill_sequences=(15, 16),
+    prefill_tokens=(15360, 16384),
+    topologies=(1, 2, 4),
+    capture_sizes=(1, 2, 4, 8, 16, 32),
+    version="source-27b-tp1-conc/1",
+    provenance=("cap_conc + cap_conc2 captures of the Qwen3.8-27B TP1 server "
+                "on node 18 (runner.py 474ec80e0554c412, predict.py "
+                "a913f289b09ca9dc, replay.py 02736b4601c4e0c7); prefill and "
+                "broadcast terms carried unchanged from SOURCE_27B_TP1; no "
+                "logprobs requested, no speculative decoding, PP=1, prefix "
+                "caching off"),
 )

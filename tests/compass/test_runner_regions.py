@@ -15,7 +15,8 @@ import pytest
 from atom.compass.core.cost.base import StepShape
 from atom.compass.core.cost.library import (
     LibraryCostOracle, PriceLibrary, StaticGraphs)
-from atom.compass.core.cost.regions import SOURCE_27B_TP1, Measured
+from atom.compass.core.cost.regions import (
+    SOURCE_27B_TP1, SOURCE_27B_TP1_CONC, Measured)
 
 
 def _decode(seqs=32, context=1151, tp=1):
@@ -147,3 +148,132 @@ class TestTheOracleChargesTheRegionsItWasGiven:
         with pytest.raises(ValueError, match="twice"):
             self._oracle(tmp_path, regions=SOURCE_27B_TP1,
                          extra_seconds=2.3e-4)
+
+
+class TestTheConcurrencyProfileIsKeyedOnTheRungThatRan:
+    """`SOURCE_27B_TP1_CONC`: fourteen decode concurrencies, ten cells.
+
+    What the single-concurrency profile could not say, and what the cells say
+    instead -- including where they still refuse.
+    """
+
+    def _dec(self, seqs, bucket, context=1151, tp=1):
+        return StepShape(num_scheduled_tokens=(1,) * seqs,
+                         context_lens=(context,) * seqs,
+                         topology={"tp": tp}, capture_bucket=bucket)
+
+    def test_a_concurrency_the_old_profile_refused_is_answered(self):
+        """Sixteen sequences was outside a domain measured only at 32."""
+        assert SOURCE_27B_TP1.refusal(self._dec(16, 16)) is not None
+        assert SOURCE_27B_TP1_CONC.refusal(self._dec(16, 16)) is None
+
+    def test_a_padded_batch_is_priced_from_its_padded_cell(self):
+        """Twenty sequences replays bucket 32, and does not cost what 32 does."""
+        padded = SOURCE_27B_TP1_CONC.breakdown(self._dec(20, 32))["<prepare>"]
+        exact = SOURCE_27B_TP1_CONC.breakdown(self._dec(32, 32))["<prepare>"]
+        assert padded == pytest.approx(1.381e-4)
+        assert exact == pytest.approx(1.256e-4)
+        assert padded > exact
+
+    def test_preparation_is_not_monotone_in_the_batch(self):
+        """Why a cell table and not a curve: two sequences cost more than
+        eight, so anything rising with batch size is wrong here."""
+        two = SOURCE_27B_TP1_CONC.breakdown(self._dec(2, 2))["<prepare>"]
+        eight = SOURCE_27B_TP1_CONC.breakdown(self._dec(8, 8))["<prepare>"]
+        assert two > eight
+
+    def test_postprocess_is_one_constant_across_every_measured_batch(self):
+        one = SOURCE_27B_TP1_CONC.breakdown(self._dec(1, 1))["<postprocess>"]
+        for seqs, bucket in ((2, 2), (16, 16), (20, 32), (32, 32)):
+            assert (SOURCE_27B_TP1_CONC.breakdown(
+                self._dec(seqs, bucket))["<postprocess>"] == one)
+
+    def test_a_pairing_the_ladder_never_produces_is_refused(self):
+        """Nine sequences replay bucket 16, so nine at bucket 32 never ran.
+
+        The (32, padded) cell is real -- N=17, 20 and 31 filled it. It is not
+        an answer for nine, which the engine sends to a different rung and pads
+        a different distance.
+        """
+        why = SOURCE_27B_TP1_CONC.refusal(self._dec(9, 32))
+        assert why is not None and "replays 9 at 16" in why
+        assert SOURCE_27B_TP1_CONC.refusal(self._dec(9, 16)) is None
+
+    def test_a_bucket_off_the_ladder_is_refused_against_the_cells(self):
+        """Above the ladder there is no rung to check a declared bucket
+        against, so the measured cells do the refusing instead."""
+        why = SOURCE_27B_TP1_CONC.refusal(self._dec(33, 64))
+        assert why is not None and "measured only at" in why
+
+    def test_a_bucket_narrower_than_the_batch_is_refused(self):
+        why = SOURCE_27B_TP1_CONC.refusal(self._dec(20, 16))
+        assert why is not None and "narrower" in why
+
+    def test_an_eager_step_is_refused_rather_than_read_as_the_first_rung(self):
+        """`capture_bucket=None` means nothing replayed; every measured row
+        here replayed."""
+        why = SOURCE_27B_TP1_CONC.refusal(self._dec(1, None))
+        assert why is not None and "replayed no captured graph" in why
+
+    def test_a_long_history_is_refused_because_nothing_measured_one(self):
+        """The bursts ran 1024-token prompts to 128 outputs. cc-traces reaches
+        109 741 tokens, where the term that grows with history is no longer
+        below its dispatch threshold."""
+        why = SOURCE_27B_TP1_CONC.refusal(self._dec(32, 32, context=109_741))
+        assert why is not None and "grows with history" in why
+        assert SOURCE_27B_TP1_CONC.refusal(self._dec(32, 32, context=1152)) is None
+
+    def test_a_mixed_batch_is_refused_on_its_longest_history(self):
+        shape = StepShape(num_scheduled_tokens=(1, 1),
+                          context_lens=(1100, 40_000),
+                          topology={"tp": 1}, capture_bucket=2)
+        assert "40000" in SOURCE_27B_TP1_CONC.refusal(shape)
+
+    def test_the_broadcast_is_still_added_at_width(self):
+        at_one = SOURCE_27B_TP1_CONC.breakdown(self._dec(16, 16))
+        at_two = SOURCE_27B_TP1_CONC.breakdown(self._dec(16, 16, tp=2))
+        assert "<tp-broadcast>" not in at_one
+        assert at_two["<tp-broadcast>"] == pytest.approx(2.86e-5)
+
+    def test_the_band_covers_the_pooled_spread(self):
+        low, high = SOURCE_27B_TP1_CONC.band(self._dec(20, 32))
+        assert low < SOURCE_27B_TP1_CONC.seconds(self._dec(20, 32)) < high
+
+    def test_the_prefill_terms_are_the_older_profiles_own_objects(self):
+        """Carried, not re-stated: neither capture ran a prefill in that
+        domain, so a second copy of the number would be copying."""
+        assert (SOURCE_27B_TP1_CONC.prepare_prefill
+                is SOURCE_27B_TP1.prepare_prefill)
+        assert (SOURCE_27B_TP1_CONC.postprocess_prefill
+                is SOURCE_27B_TP1.postprocess_prefill)
+        assert SOURCE_27B_TP1_CONC.tp_broadcast is SOURCE_27B_TP1.tp_broadcast
+
+    def test_the_ladder_is_offered_but_not_used_to_fill_a_missing_bucket(self):
+        """A caller may resolve a rung; the region model may not guess one."""
+        assert SOURCE_27B_TP1_CONC.bucket_for(12) == 16
+        assert SOURCE_27B_TP1_CONC.bucket_for(32) == 32
+        assert SOURCE_27B_TP1_CONC.bucket_for(33) is None
+        assert SOURCE_27B_TP1_CONC.refusal(self._dec(12, None)) is not None
+
+
+class TestTheFrozenProfileDidNotMove:
+    """The TP2/TP4 transfer reports were computed from `SOURCE_27B_TP1`.
+
+    A newer measurement does not improve a prediction that has already been
+    made and checked against a target, so these pin the old numbers against the
+    new ones rather than migrating them.
+    """
+
+    def test_the_decode_constants_are_what_they_were_measured_at(self):
+        assert SOURCE_27B_TP1.prepare_decode.seconds == pytest.approx(1.314e-4)
+        assert SOURCE_27B_TP1.postprocess_decode.seconds == pytest.approx(1.019e-4)
+        assert SOURCE_27B_TP1.decode_sequences == (32,)
+
+    def test_the_two_profiles_disagree_and_that_is_the_point(self):
+        """0.1314 ms from 64 paced requests settling at 32, 0.1256 ms from 32
+        released in lockstep -- 4.4% apart, un-attributed. Reconciling them by
+        overwriting one would hide the disagreement, not resolve it."""
+        old = SOURCE_27B_TP1.breakdown(_decode())["<prepare>"]
+        new = SOURCE_27B_TP1_CONC.breakdown(_decode())["<prepare>"]
+        assert old != new
+        assert abs(old - new) / old == pytest.approx(0.044, abs=0.005)
