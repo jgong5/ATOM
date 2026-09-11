@@ -317,3 +317,53 @@ class TestWhatItPrints:
         out = tmp_path / "plan.json"
         assert plan_mod.main(["--root", "/r", "--out", str(out)]) == 0
         assert json.loads(out.read_text())["cells"]
+
+
+class TestTheServerListensWhereTheHarnessLooks:
+    """A server that binds a different port than the plan polls is a hang.
+
+    The api_server parser carries two ports: `--server-port` is the HTTP
+    listener, and `--port` is the engine's internal port. Naming the wrong one
+    costs a whole lease before anyone sees why.
+    """
+
+    def test_the_listener_port_is_the_one_the_health_check_polls(self, plan):
+        for cell in plan["cells"]:
+            for step in _role(cell, "serve"):
+                command = step["command"]
+                assert "--server-port" in command, command
+                port = command[command.index("--server-port") + 1]
+                assert step["health"] == f"http://127.0.0.1:{port}/health"
+
+    def test_the_engine_internal_port_is_not_given_the_listener_port(self, plan):
+        """`--port` is the engine's own port; setting it to the listener's is
+        what left the listener on its default."""
+        for cell in plan["cells"]:
+            for step in _role(cell, "serve"):
+                assert "--port" not in step["command"]
+
+    def test_the_replay_client_still_dials_with_port(self, plan):
+        """The client's `--port` is the address it connects to, not a server
+        flag, and it stays."""
+        for cell in plan["cells"]:
+            for step in _role(cell, "replay"):
+                command = step["command"]
+                port = command[command.index("--port") + 1]
+                serve = _role(cell, "serve", step["side"])[0]["command"]
+                assert port == serve[serve.index("--server-port") + 1]
+
+    def test_the_chosen_port_reaches_both_sides(self):
+        got = json.loads(_run(["--root", "/r", "--port", "53013"]))
+        for cell in got["cells"]:
+            for step in _role(cell, "serve"):
+                command = step["command"]
+                assert command[command.index("--server-port") + 1] == "53013"
+
+    def test_the_flag_is_the_one_the_entry_point_binds(self):
+        """Cross-check against the server itself, so a rename there is not a
+        silent hang here."""
+        source = (
+            ROOT / "atom" / "entrypoints" / "openai" / "api_server.py"
+        ).read_text()
+        assert "port=args.server_port," in source
+        assert '"--server-port",' in source

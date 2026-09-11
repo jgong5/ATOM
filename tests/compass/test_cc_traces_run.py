@@ -786,6 +786,39 @@ class TestEveryRepeatIsAnExecutionWithAName:
             assert config["provenance"]["compass"]["mode"] == "predict"
             assert config["engine_args"] == list(plan_mod.ENGINE_ARGS)
 
+    def test_an_execution_records_the_port_the_server_listened_on(self, tmp_path):
+        """Not the engine's internal port. The stale-server refusal names this
+        port, and a server is only reachable on the one it bound."""
+        runner = _runner(tmp_path, "modelled")
+        runner.run()
+        for execution in self._executions(runner):
+            command = execution["process"]["command"]
+            assert "--port" not in command
+            listener = command[command.index("--server-port") + 1]
+            assert execution["config"]["port"] == listener
+
+    def test_the_internal_port_is_not_read_as_the_http_port(self, tmp_path):
+        """`--port` on the server parser is the engine's internal port. A
+        manifest that fell back to it would name a port nothing bound, and the
+        stale-server refusal would name it too."""
+        runner = _runner(tmp_path, "modelled")
+        step = {"role": "serve", "id": "serve-modelled-1"}
+        command = ["python", "-m", "atom.entrypoints.openai.api_server", "--port", "1"]
+        assert runner._config(step, command)["port"] == run_mod.server_default_port()
+        assert runner._config(step, command)["port"] != "1"
+
+    def test_the_default_listener_port_is_read_from_the_entry_point(self):
+        """Not restated here: a change there has to show up here."""
+        source = (
+            run_mod.ROOT / "atom" / "entrypoints" / "openai" / "api_server.py"
+        ).read_text()
+        declared = [
+            line.partition("=")[2].strip()
+            for line in source.splitlines()
+            if line.partition("=")[0].strip() == "DEFAULT_PORT"
+        ]
+        assert declared == [run_mod.server_default_port()]
+
     def test_an_execution_records_what_it_produced(self, tmp_path):
         runner = _runner(tmp_path, "modelled")
         runner.run()

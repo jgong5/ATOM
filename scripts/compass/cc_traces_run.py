@@ -106,6 +106,27 @@ plan_module = _load("cc_traces_plan")
 execution_id = _load("execution_id")
 process_identity = _core("process_identity")
 
+
+def server_default_port():
+    """The port ATOM's entry point listens on when `--server-port` is absent.
+
+    Read from the entry point itself, not assumed here and not taken from
+    `--port`: on that parser `--port` is the engine's internal port, so using
+    it as a fallback would record a port the server never bound. None when the
+    default cannot be read, so "unknown" stays unknown.
+    """
+    source = ROOT / "atom" / "entrypoints" / "openai" / "api_server.py"
+    try:
+        text = source.read_text()
+    except OSError:
+        return None
+    for line in text.splitlines():
+        head, sep, tail = line.partition("=")
+        if sep and head.strip() == "DEFAULT_PORT" and tail.strip().isdigit():
+            return tail.strip()
+    return None
+
+
 #: Seconds to wait for a server to answer /health before giving up on it. A
 #: 262k-context model at TP=4 loads weights and captures graphs inside this.
 STARTUP_TIMEOUT = 1800.0
@@ -402,7 +423,17 @@ class SideRun:
         return {
             "model": after("--model"),
             "tp": after("-tp"),
-            "port": after("--port"),
+            # The HTTP port this step is about: the listener a server binds,
+            # or the one a client dials. A server's is `--server-port`, or the
+            # entry point's own default when the flag is absent -- never its
+            # `--port`, which is the engine's internal port and a different
+            # thing. The internal port is left to the engine's own default and
+            # is not what a client reaches.
+            "port": (
+                (after("--server-port") or server_default_port())
+                if step["role"] == "serve"
+                else after("--port")
+            ),
             "mode": after("--compass-mode"),
             "engine_args": list(plan_module.ENGINE_ARGS),
             "provenance": None,

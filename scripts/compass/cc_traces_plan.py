@@ -148,7 +148,11 @@ def _serve(
     cmd += [
         "--model",
         MODEL,
-        "--port",
+        # The HTTP listener, which is what the health check and the replay
+        # client talk to. `--port` on this parser is a different thing -- the
+        # engine's internal port -- so naming it here left the listener on its
+        # own default and the harness waiting on a port nothing ever bound.
+        "--server-port",
         str(port),
         "-tp",
         str(tp),
