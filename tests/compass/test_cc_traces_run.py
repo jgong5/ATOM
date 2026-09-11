@@ -80,6 +80,83 @@ def fake_provenance(mode, *, tp=2, code=SERVER_CODE, **over):
     return said
 
 
+HOST = "test-host"
+BOOT = "11111111-2222-3333-4444-555555555555"
+
+
+def fake_process_identity(pid, *, host=HOST, boot=BOOT, ticks=None, ppid=1):
+    """What `atom.compass.core.process_identity.identity()` returns.
+
+    Start ticks default to a function of the pid so that no two processes in a
+    test share one -- which is what the real reading gives, and exactly what
+    pid reuse violates.
+    """
+    return {
+        "pid": pid,
+        "ppid": ppid,
+        "host": host,
+        "boot_id": boot,
+        "start_ticks": 900_000 + pid if ticks is None else ticks,
+        "ticks_per_second": 100,
+    }
+
+
+class FakeProbe:
+    """A `/proc` that knows only the processes this test started.
+
+    The harness reads through this rather than calling the module directly, so
+    a test can describe a machine -- a pid that no longer exists, a pid reused
+    by something else, a forked descendant -- without starting anything.
+    """
+
+    def __init__(self, processes, *, boot=BOOT, ticks=None, parents=None, missing=()):
+        self.processes = processes
+        self.boot = boot
+        self.ticks = dict(ticks or {})
+        self.parents = dict(parents or {})
+        self.missing = set(missing)
+
+    def _known(self, pid):
+        return pid in {p.pid for p in self.processes.started} | set(self.ticks)
+
+    def start_ticks(self, pid):
+        if pid in self.missing:
+            return None
+        if pid in self.ticks:
+            return self.ticks[pid]
+        return 900_000 + pid if self._known(pid) else None
+
+    def parent_of(self, pid):
+        parent = self.parents.get(pid)
+        # A callable lets a test name a parent that does not exist until the
+        # harness has actually launched something.
+        return parent(self.processes) if callable(parent) else parent
+
+    def boot_id(self):
+        return self.boot
+
+
+def _serving(processes):
+    """The pid of the most recent server -- not the sampler, which outlives it."""
+    for proc in reversed(processes.started):
+        text = " ".join(proc.command)
+        if "api_server" in text or "replay_server.py" in text:
+            return proc.pid
+    return None
+
+
+def _with_process(said, processes):
+    """Say who answered, unless the test is making a point about that.
+
+    A test that wants to describe a server which will not identify itself
+    passes `server_process` explicitly; anything else gets the process the
+    harness actually launched, which is the honest default.
+    """
+    if isinstance(said, dict) and "server_process" not in said:
+        return dict(said, server_process=fake_process_identity(_serving(processes)))
+    return said
+
+
 class FakeProcesses:
     """Every start, run and stop, in order, and nothing that looks anything up.
 
@@ -229,15 +306,21 @@ def _plan(tmp_path, tp=2, klass="long"):
     return built
 
 
-def _runner(tmp_path, side, *, processes=None, health=None, provenance=None, **kw):
+def _runner(
+    tmp_path, side, *, processes=None, health=None, provenance=None, probe=None, **kw
+):
     clock = Clock()
     mode = "predict" if side == "modelled" else "measure"
+    procs = processes or FakeProcesses(cell=tmp_path, wall=clock.wall)
+    said = provenance or (lambda url: fake_provenance(mode))
     return run_mod.SideRun(
         _plan(tmp_path),
         side,
-        processes=processes or FakeProcesses(cell=tmp_path, wall=clock.wall),
+        processes=procs,
         health=health or (lambda url: {}),
-        provenance=provenance or (lambda url: fake_provenance(mode)),
+        provenance=lambda url: _with_process(said(url), procs),
+        probe=probe or FakeProbe(procs),
+        host=HOST,
         now=clock.now,
         wall=clock.wall,
         sleep=clock.sleep,
@@ -895,3 +978,178 @@ class TestTheWatchHasToCoverTheWindow:
         runner = _runner(tmp_path, "real", processes=procs)
         assert runner.run() == 1
         assert any("before the last server did" in f for f in runner.failures)
+
+
+class TestOnlyTheServerThisRepeatStartedCounts:
+    """A code digest is a fact about bytes on disk, not about who replied.
+
+    The case these cover is ordinary rather than exotic: a server from an
+    earlier repeat is still holding the port, so it is already warm and
+    answers `/health` at once, while the process this repeat launched is still
+    loading weights. Every configuration field matches, because it is the same
+    tree and the same flags. Without an identity for the process itself, the
+    repeat gets measured against a server nobody meant to start.
+    """
+
+    def _stale(self, tmp_path, side="modelled", **over):
+        procs = FakeProcesses(cell=tmp_path)
+        mode = "predict" if side == "modelled" else "measure"
+        stale_pid = 999_111
+        runner = _runner(
+            tmp_path,
+            side,
+            processes=procs,
+            # Same digest, same config, same mode, and a process that really
+            # does exist on this machine -- just not one of ours.
+            provenance=lambda url: fake_provenance(
+                mode, server_process=fake_process_identity(stale_pid, **over)
+            ),
+            probe=FakeProbe(procs, ticks={stale_pid: 900_000 + stale_pid}),
+        )
+        return runner, stale_pid
+
+    def test_a_stale_server_with_identical_code_is_refused(self, tmp_path):
+        runner, stale_pid = self._stale(tmp_path)
+        assert runner.run() == 1
+        assert any(
+            "not the process this repeat launched" in f for f in runner.failures
+        ), runner.failures
+        # The thing that would have waved it through, had we asked only that.
+        said = runner.provenance("http://x/compass/provenance")
+        assert said["server_code_sha256"] == SERVER_CODE
+        assert said["server_process"]["pid"] == stale_pid
+
+    def test_the_refusal_says_why_a_matching_digest_was_not_enough(self, tmp_path):
+        runner, _ = self._stale(tmp_path)
+        runner.run()
+        why = " ".join(runner.failures)
+        assert "built from the same tree" in why, why
+
+    def test_a_pid_reused_by_another_process_is_refused(self, tmp_path):
+        """Our pid, someone else's process. Start time is what tells them apart."""
+        procs = FakeProcesses(cell=tmp_path)
+        runner = _runner(
+            tmp_path,
+            "modelled",
+            processes=procs,
+            provenance=lambda url: fake_provenance(
+                "predict",
+                server_process=fake_process_identity(_serving(procs), ticks=12_345),
+            ),
+        )
+        assert runner.run() == 1
+        assert any("reused" in f for f in runner.failures), runner.failures
+
+    def test_a_descendant_of_the_launched_process_is_accepted(self, tmp_path):
+        """A launcher may fork; the socket is then held by a child of ours."""
+        procs = FakeProcesses(cell=tmp_path)
+        forked = 777_333
+        runner = _runner(
+            tmp_path,
+            "modelled",
+            processes=procs,
+            provenance=lambda url: fake_provenance(
+                "predict", server_process=fake_process_identity(forked)
+            ),
+            probe=FakeProbe(
+                procs,
+                ticks={forked: 900_000 + forked},
+                parents={forked: _serving},
+            ),
+        )
+        assert runner.run() == 0, runner.failures
+
+    def test_a_server_that_will_not_say_which_process_it_is_is_refused(self, tmp_path):
+        runner = _runner(
+            tmp_path,
+            "modelled",
+            provenance=lambda url: fake_provenance("predict", server_process=None),
+        )
+        assert runner.run() == 1
+        assert any(
+            "does not report which process it is" in f for f in runner.failures
+        ), runner.failures
+
+    def test_a_reply_from_another_machine_is_refused(self, tmp_path):
+        """`/proc` here cannot vouch for a process somewhere else."""
+        procs = FakeProcesses(cell=tmp_path)
+        runner = _runner(
+            tmp_path,
+            "modelled",
+            processes=procs,
+            provenance=lambda url: fake_provenance(
+                "predict",
+                server_process=fake_process_identity(_serving(procs), host="elsewhere"),
+            ),
+        )
+        assert runner.run() == 1
+        assert any("another machine" in f for f in runner.failures), runner.failures
+
+    def test_a_reply_from_before_this_boot_is_refused(self, tmp_path):
+        """Ticks are counted from boot, so they only compare within one."""
+        procs = FakeProcesses(cell=tmp_path)
+        runner = _runner(
+            tmp_path,
+            "modelled",
+            processes=procs,
+            provenance=lambda url: fake_provenance(
+                "predict",
+                server_process=fake_process_identity(
+                    _serving(procs), boot="99999999-9999-9999-9999-999999999999"
+                ),
+            ),
+        )
+        assert runner.run() == 1
+        assert any("different boot" in f for f in runner.failures), runner.failures
+
+    def test_a_child_that_died_before_answering_is_refused(self, tmp_path):
+        """It lost the bind race and exited; the warm one replied instead."""
+        procs = FakeProcesses(cell=tmp_path)
+
+        def answers_after_ours_dies(url):
+            procs.started[-1].returncode = 1
+            return fake_provenance(
+                "predict", server_process=fake_process_identity(999_111)
+            )
+
+        runner = _runner(
+            tmp_path, "modelled", processes=procs, provenance=answers_after_ours_dies
+        )
+        assert runner.run() == 1
+        assert any("had already exited" in f for f in runner.failures), runner.failures
+
+    def test_the_two_accounts_are_kept_apart_in_the_record(self, tmp_path):
+        """The server's word and ours are recorded separately.
+
+        A harness stamp on its own proves nothing about who served the
+        requests -- it is the harness talking about itself. What makes it
+        evidence is that an independent reading agrees with it, and that is
+        only visible if the two are not written from each other.
+        """
+        runner = _runner(tmp_path, "modelled")
+        assert runner.run() == 0, runner.failures
+        record = runner.executions[1]
+        seen = record["server_process"]
+        assert seen["verified"] is True
+        assert seen["said"]["pid"] == seen["observed"]["launched_pid"]
+        assert seen["observed"]["start_ticks"] == seen["said"]["start_ticks"]
+        # The launch fact stays the harness's own and is not restated from
+        # what the server said.
+        assert record["id_inputs"]["server_pid"] == seen["observed"]["launched_pid"]
+        assert "start_ticks" not in record["id_inputs"]
+
+    def test_a_refused_repeat_still_keeps_what_the_server_said(self, tmp_path):
+        """Evidence of the wrong server is evidence, and worth keeping."""
+        runner, stale_pid = self._stale(tmp_path)
+        runner.run()
+        seen = runner.executions[1]["server_process"]
+        assert seen["verified"] is False
+        assert seen["said"]["pid"] == stale_pid
+        assert seen["observed"]["launched_pid"] != stale_pid
+
+    def test_the_check_runs_on_the_real_side_too(self, tmp_path):
+        runner, _ = self._stale(tmp_path, side="real")
+        assert runner.run() == 1
+        assert any(
+            "not the process this repeat launched" in f for f in runner.failures
+        ), runner.failures

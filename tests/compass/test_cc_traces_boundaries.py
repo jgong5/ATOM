@@ -37,6 +37,16 @@ def _load(name: str):
     return module
 
 
+def _core(name: str):
+    """The runtime package module, by path: importing `atom` starts an engine."""
+    path = ROOT / "atom" / "compass" / "core" / f"{name}.py"
+    spec = importlib.util.spec_from_file_location(f"atom_compass_core_{name}", path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 plan_mod = _load("cc_traces_plan")
 replay_mod = _load("replay")
 
@@ -271,3 +281,101 @@ class TestTheModelledEntryPointIsTheOneThatExists:
         assert serves
         for command in serves:
             assert command[1:3] == ["-m", "atom.entrypoints.openai.api_server"]
+
+
+class TestWhoAnsweredIsSomethingTheServerReports:
+    """The harness refuses a reply it cannot attribute to a process it started.
+
+    That refusal is only meaningful if the server actually reports which
+    process it is, and if the numbers it reports are the ones a caller can
+    read back out of `/proc`. Both are checked here against the real module
+    rather than against a fake, because a fake would report whatever shape the
+    harness happens to want.
+    """
+
+    ENDPOINT = ROOT / "atom/entrypoints/openai/api_server.py"
+    SHARED = ROOT / "atom/compass/core/process_identity.py"
+
+    def _endpoint_source(self):
+        source = self.ENDPOINT.read_text()
+        start = source.index("async def compass_provenance")
+        return source[start : source.index("\n@app.", start)]
+
+    def test_the_endpoint_says_which_process_answered(self):
+        assert '"server_process"' in self._endpoint_source()
+
+    def test_the_server_reads_it_from_the_shared_module(self):
+        """Not a second copy of the `/proc` parsing, for the same reason the
+        identity rule is not copied: two readings can disagree."""
+        source = self.ENDPOINT.read_text()
+        assert "from atom.compass.core import process_identity" in source
+        assert "process_identity.identity()" in source
+        assert "/proc/" not in source, "the endpoint should not parse /proc itself"
+
+    def test_the_shared_reading_gives_what_the_harness_compares(self):
+        shared = _core("process_identity")
+        said = shared.identity()
+        for field in (
+            "pid",
+            "ppid",
+            "host",
+            "boot_id",
+            "start_ticks",
+            "ticks_per_second",
+        ):
+            assert field in said, field
+        import os
+
+        assert said["pid"] == os.getpid()
+        assert said["host"] == os.uname().nodename
+        assert said["start_ticks"] == shared.start_ticks("self")
+        assert isinstance(said["start_ticks"], int)
+
+    def test_the_harness_reads_the_very_same_file(self):
+        run_mod = _load("cc_traces_run")
+        assert Path(run_mod.process_identity.__file__).resolve() == self.SHARED
+
+    def test_two_processes_do_not_share_an_identity(self):
+        """The property the whole check rests on."""
+        shared = _core("process_identity")
+        other = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(10)"])
+        try:
+            import os
+
+            assert other.pid != os.getpid()
+            theirs = shared.start_ticks(other.pid)
+            assert isinstance(theirs, int)
+            assert shared.parent_of(other.pid) == os.getpid()
+        finally:
+            other.kill()
+            other.wait()
+
+    def test_a_pid_nobody_is_using_reads_as_unknown(self):
+        """Which is what makes a stale pid refusable rather than an exception."""
+        shared = _core("process_identity")
+        assert shared.start_ticks(2**22) is None
+        assert shared.parent_of(2**22) is None
+
+    def test_asking_who_answered_does_not_import_the_engine(self):
+        """A machine with no device still has to be able to check this."""
+        done = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                (
+                    "import importlib.util, sys\n"
+                    "spec = importlib.util.spec_from_file_location('p', sys.argv[1])\n"
+                    "m = importlib.util.module_from_spec(spec)\n"
+                    "spec.loader.exec_module(m)\n"
+                    "assert m.identity()['pid'] > 0\n"
+                    "print([n for n in sys.modules if n.split('.')[0] == 'atom'])\n"
+                ),
+                str(self.SHARED),
+            ],
+            capture_output=True,
+            text=True,
+            timeout=120,
+            check=False,
+        )
+        assert done.returncode == 0, done.stderr
+        assert done.stdout.strip() == "[]", done.stdout

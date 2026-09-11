@@ -76,9 +76,35 @@ def _load(name: str):
     return module
 
 
+def _core(name: str):
+    """A stdlib-only module from the runtime package, loaded by path.
+
+    Not imported as `atom.compass.core.<name>`: `atom/__init__.py` imports the
+    sglang plugin, so a package import pulls in the engine, and checking who
+    answered a request would then need a device. The same reasoning as
+    `scripts/compass/execution_id.py`, for the same reason.
+    """
+    path = ROOT / "atom" / "compass" / "core" / f"{name}.py"
+    if not path.exists():
+        raise ImportError(
+            f"the shared reading of process identity is missing: {path}. "
+            f"Without it the harness cannot tell the server it launched from "
+            f"one left over on the same port."
+        )
+    key = f"atom_compass_core_{name}"
+    if key in sys.modules:
+        return sys.modules[key]
+    spec = importlib.util.spec_from_file_location(key, path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[key] = module
+    spec.loader.exec_module(module)
+    return module
+
+
 compare = _load("compare")
 plan_module = _load("cc_traces_plan")
 execution_id = _load("execution_id")
+process_identity = _core("process_identity")
 
 #: Seconds to wait for a server to answer /health before giving up on it. A
 #: 262k-context model at TP=4 loads weights and captures graphs inside this.
@@ -131,6 +157,9 @@ SUPPLIED_TERMS = ("capture", "calibration", "derivation", "load")
 #:                     replay_target_sha256, oracle, oracle_options},
 #:   "config":        {model, tp, port, mode, engine_args, provenance,
 #:                     provenance_sha256},
+#:   "server_process": {"said":     the server's own account of itself,
+#:                      "observed": what we read from /proc ourselves,
+#:                      "verified": whether the two are the same process},
 #:   "artifacts":     {name: {"sha256", "bytes"}}
 #: }
 #:
@@ -241,6 +270,7 @@ class SideRun:
         startup_timeout: float = STARTUP_TIMEOUT,
         health_interval: float = HEALTH_INTERVAL,
         host=None,
+        probe=process_identity,
     ):
         self.plan = cell_plan
         self.side = side
@@ -254,6 +284,10 @@ class SideRun:
         self.startup_timeout = startup_timeout
         self.health_interval = health_interval
         self.host = host or socket.gethostname()
+        #: reads /proc for us, so the server's account of itself can be
+        #: checked rather than believed; injectable because the tests run
+        #: against processes that were never started
+        self.probe = probe
         #: step id -> the handle we started, so nothing is signalled by name
         self.running: dict[str, dict] = {}
         #: repeat -> its execution record, minted when its process launched
@@ -322,6 +356,10 @@ class SideRun:
             "replay": None,
             "source": self._source(step),
             "config": self._config(step, command),
+            # Filled in once the server answers: the server's own account of
+            # which process it is, and ours, kept apart. None until then, so
+            # "never checked" never reads as "checked and fine".
+            "server_process": None,
             "artifacts": {},
         }
         self.executions[step["repeat"]] = record
@@ -415,7 +453,11 @@ class SideRun:
             return False
         said = self.provenance(step["health"].replace("/health", "/compass/provenance"))
         entry["provenance"] = self._check_provenance(step, said, execution)
-        return entry["provenance"] is not None
+        if entry["provenance"] is None:
+            return False
+        # Health and the configuration fields are all answerable by a server
+        # left over on this port. Who actually replied is not.
+        return self._check_server_process(step, said, execution, proc)
 
     def _await_health(self, step, proc, started):
         """Poll until it answers, it dies, or we run out of patience."""
@@ -494,6 +536,113 @@ class SideRun:
         )
         execution["artifacts"][path.name] = file_digest(path)
         return said
+
+    def _ancestry(self, pid, stop, limit=12) -> list:
+        """The chain from `pid` upward, stopping at `stop` if we reach it.
+
+        A server need not be the process we spawned. A launcher may fork, and
+        then the thing holding the socket is a descendant of it. Being inside
+        the tree this repeat started is the claim worth checking, and it is
+        precisely the claim a leftover server cannot make.
+        """
+        chain, seen = [pid], {pid}
+        while len(chain) < limit and chain[-1] not in (stop, 0, 1, None):
+            parent = self.probe.parent_of(chain[-1])
+            if parent is None or parent in seen:
+                break
+            seen.add(parent)
+            chain.append(parent)
+        return chain
+
+    def _check_server_process(self, step, said, execution, proc) -> bool:
+        """Whether the process that answered is the one this repeat launched.
+
+        `server_code_sha256` is a fact about bytes on disk, not about who
+        replied. A server left over from an earlier repeat, holding this port
+        and started from the same tree with the same flags, matches on every
+        build-and-configuration field this endpoint has. Health answers too --
+        it answers *sooner*, because it is already warm, which is the failure
+        worth worrying about: our own process is still loading weights, the
+        stale one replies first, and the repeat is measured against a server
+        nobody meant to start.
+
+        So this compares what the server says about itself against what we can
+        read out of `/proc` ourselves. The two accounts are kept apart in the
+        record: `said` is the server's, `observed` is ours, and neither is
+        written from the other.
+        """
+        theirs = said.get("server_process")
+        port = (execution.get("config") or {}).get("port")
+        if not isinstance(theirs, dict) or not theirs.get("pid"):
+            self.failures.append(
+                f"{step['id']}: the server does not report which process it "
+                f"is (no server_process in /compass/provenance), so a reply "
+                f"from a server left over on port {port} cannot "
+                f"be told from a reply from the one this repeat launched"
+            )
+            return False
+        observed = {
+            "launched_pid": proc.pid,
+            "host": self.host,
+            "boot_id": self.probe.boot_id(),
+            "start_ticks": self.probe.start_ticks(theirs["pid"]),
+            "ancestry": self._ancestry(theirs["pid"], proc.pid),
+            "alive_at_provenance": self.processes.alive(proc),
+        }
+        execution["server_process"] = {
+            "said": theirs,
+            "observed": observed,
+            "verified": False,
+        }
+
+        def refuse(why):
+            self.failures.append(f"{step['id']}: {why}")
+            return False
+
+        if not observed["alive_at_provenance"]:
+            return refuse(
+                f"the server this repeat launched (pid {proc.pid}) had "
+                f"already exited when /compass/provenance was answered, so "
+                f"pid {theirs['pid']} answering on port {port} "
+                f"is a different server; see {self._log(step)}"
+            )
+        short = str(theirs.get("host") or "").split(".")[0]
+        if short and short != str(self.host).split(".")[0]:
+            return refuse(
+                f"the server reports host {theirs['host']!r} but this repeat "
+                f"was launched on {self.host!r}, so the reply came from "
+                f"another machine and /proc here cannot vouch for it"
+            )
+        ours_boot = observed["boot_id"]
+        if theirs.get("boot_id") and ours_boot and theirs["boot_id"] != ours_boot:
+            return refuse(
+                "the server reports a different boot than this one, so it "
+                "is not a process this machine is currently running"
+            )
+        if proc.pid not in observed["ancestry"]:
+            return refuse(
+                f"pid {theirs['pid']} answered on port {port} "
+                f"but it is not the process this repeat launched (pid "
+                f"{proc.pid}) nor a descendant of it -- a server from an "
+                f"earlier run is still holding the port, and its code digest "
+                f"matching proves only that it was built from the same tree"
+            )
+        if observed["start_ticks"] is None:
+            return refuse(
+                f"pid {theirs['pid']} claims to have served this repeat but "
+                f"no such process exists here, so nothing served it that we "
+                f"can identify"
+            )
+        if theirs.get("start_ticks") != observed["start_ticks"]:
+            return refuse(
+                f"pid {theirs['pid']} started at tick "
+                f"{theirs.get('start_ticks')!r} by its own account but at "
+                f"{observed['start_ticks']!r} by ours, so the pid has been "
+                f"reused and names a different process than the one that "
+                f"answered"
+            )
+        execution["server_process"]["verified"] = True
+        return True
 
     def _replay(self, step) -> bool:
         """This repeat's replay, against the server this repeat started."""

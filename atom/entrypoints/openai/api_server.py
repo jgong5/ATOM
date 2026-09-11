@@ -2562,6 +2562,29 @@ def _model_identity(path) -> "str | None":
         return None
 
 
+def _server_process_identity() -> dict:
+    """Which process is answering -- not which code it was built from.
+
+    `server_code_sha256` establishes that the bytes on disk match. It cannot
+    establish that a reply came from the process the caller started: a server
+    left over from an earlier run, holding this port and built from the same
+    tree, produces an identical digest and an identical configuration. On
+    every other field of this endpoint a stale process and a fresh one are
+    indistinguishable.
+
+    The reading itself lives in `atom.compass.core.process_identity`, which is
+    stdlib-only and imports nothing from ATOM, so a caller can load it and
+    check these numbers against `/proc` without starting an engine. Nothing
+    here is meant to be taken on trust.
+    """
+    try:
+        from atom.compass.core import process_identity
+
+        return process_identity.identity()
+    except Exception:  # noqa: BLE001 - provenance is best effort
+        return {}
+
+
 @app.get("/compass/provenance")
 async def compass_provenance():
     """What this server is, so a result can be attributed to something.
@@ -2634,6 +2657,10 @@ async def compass_provenance():
             "virtual_clock": compass.virtual_clock,
             "admission_seconds": compass.admission_seconds,
         },
+        # Which process is replying. Everything above describes a build and a
+        # configuration, all of which a stale server on this port reproduces
+        # exactly; only this says who served the request.
+        "server_process": _server_process_identity(),
         "calibration_sha256": option_digests.get("table"),
         "visible_devices": os.environ.get("HIP_VISIBLE_DEVICES")
         or os.environ.get("CUDA_VISIBLE_DEVICES"),
