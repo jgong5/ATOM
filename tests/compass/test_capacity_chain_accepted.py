@@ -37,6 +37,20 @@ def _sha(path):
         return hashlib.sha256(handle.read()).hexdigest()
 
 
+def _load_beside(profile_path):
+    """Read a file the profile names, as the reader does.
+
+    `derived_readings` takes the file system as an argument so it stays
+    testable off a device; the paths a profile names are absolute here, so
+    this is the plain read.
+    """
+    def load(path):
+        with open(path, encoding="utf-8") as handle:
+            return json.load(handle)
+
+    return load
+
+
 def _runner(tmp_path, **over):
     """A real replay runner that has chosen and published a budget."""
     from atom.compass.replay.runner import ReplayModelRunner
@@ -313,15 +327,104 @@ class TestTheRealArtifactsOnThisNode:
         assert os.path.basename(blob["calibration"]).startswith("calibration")
 
     def test_a_real_profile_is_refused_for_another_width(self):
-        """`world_size` is a guard, not a label: a profile describing a TP1
-        deployment cannot size a TP4 one, and the reader says so rather than
-        scaling it."""
+        """`world_size` is a guard, not a label, and this drives the guard.
+
+        Every width-dependent term is keyed off the profile's own
+        `world_size`, and the calibration tables answer a width they have no
+        entry for from the widest one below it. So a TP1 profile handed to a
+        TP4 run does not fail -- it silently sizes TP1 and reports it as a
+        forecast for TP4. `derived_readings` refuses instead, and that refusal
+        is what is checked here rather than the field it reads.
+        """
         from atom.compass.core.loaded_input import load_json
+        from atom.compass.core.memory_model import (
+            UnfoundedPrediction,
+            derived_readings,
+        )
 
         path = f"{self.PROFILES}/profile.tp1.json"
         if not os.path.exists(path):
             pytest.skip(f"{path} is not on this node")
 
         blob, _ = load_json(path, role="runtime.memory_model")
-
         assert blob["world_size"] == 1
+
+        with pytest.raises(UnfoundedPrediction) as refused:
+            derived_readings(blob, source=path, warmup_tokens=16384,
+                             load=_load_beside(path),
+                             world_size=4)
+
+        assert "4" in str(refused.value)
+
+    def test_the_same_profile_is_accepted_at_its_own_width(self):
+        """The other side of the guard: it refuses a mismatch, not a
+        profile."""
+        from atom.compass.core.loaded_input import load_json
+        from atom.compass.core.memory_model import derived_readings
+
+        path = f"{self.PROFILES}/profile.tp1.json"
+        if not os.path.exists(path):
+            pytest.skip(f"{path} is not on this node")
+
+        blob, _ = load_json(path, role="runtime.memory_model")
+        readings, _activation = derived_readings(
+            blob, source=path, warmup_tokens=16384, world_size=1,
+            load=_load_beside(path))
+
+        assert readings["total"] > 0
+
+
+class TestThroughTheActualProvenanceEndpoint:
+    """The one seam the rest of this file stubs.
+
+    Everything above builds the compass block the way a saved run carries it,
+    which is the shape `/compass/provenance` emits -- but writing that shape by
+    hand is a claim about the endpoint, not a reading of it. This passes a real
+    runner's retained record through the real endpoint and then into the real
+    capacity validation.
+    """
+
+    def _endpoint(self):
+        import importlib
+
+        try:
+            return importlib.import_module("atom.entrypoints.openai.api_server")
+        except Exception:  # noqa: BLE001 - environment-dependent
+            pytest.skip("api_server import unavailable")
+
+    def test_a_real_runners_record_survives_the_endpoint(self, monkeypatch,
+                                                         tmp_path):
+        import asyncio
+        import types
+
+        from atom.compass.config import CompassConfig
+
+        api_server = self._endpoint()
+        runner = _runner(tmp_path, profile=mem._profile(tmp_path, 1))
+        manifest = runner.compass_input_manifest()
+
+        engine = types.SimpleNamespace(
+            config=types.SimpleNamespace(
+                compass_config=CompassConfig(
+                    enabled=True,
+                    oracle_qualname=validate.SOURCE_FACTORY,
+                    oracle_options={}),
+                model_config=None, parallel_config=None),
+            get_compass_inputs=lambda timeout=10.0: {"ranks": [manifest]})
+        monkeypatch.setattr(api_server, "engine", engine)
+
+        blob = asyncio.run(api_server.compass_provenance())
+
+        published = blob["compass"]["loaded_inputs"]["ranks"][0]
+        assert published["budget_source"]["kind"] == SOURCE_DERIVED
+        assert any(row["role"].startswith("runtime.")
+                   for row in published["inputs"])
+        # A capacity input is not an oracle option and must not be filed as
+        # one: the option mapping covers `oracle.*` roles only.
+        assert not blob["compass"]["oracle_option_files"]
+
+        modelled = _modelled(blob)
+        assert validate.check_capacity_inputs(modelled, "x") == []
+        assert validate.check_capacity_provenance(
+            modelled, _registry_from_disk(blob), 2, "d" * 64, {}) == []
+        assert validate.check_reference_budget_is_measured(modelled, "x")

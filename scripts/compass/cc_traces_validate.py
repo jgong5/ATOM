@@ -1027,6 +1027,27 @@ def check_reference_budget_is_measured(real, label: str) -> list[str]:
     return bad
 
 
+#: The snapshot schema this reads. Held here rather than imported so the
+#: validator stays loadable without `atom`, and checked rather than assumed:
+#: a record of another schema has fields that do not necessarily mean what is
+#: read from them below.
+REGION_SNAPSHOT_SCHEMA = "compass.regions.selected/1"
+
+
+def _region_digest(snapshot: dict) -> str:
+    """The digest a region snapshot's own fields hash to.
+
+    The same canonical serialisation the producer used: every field except
+    the digest itself, sorted, with no incidental whitespace. Recomputable
+    here precisely because a region preset is values rather than bytes on some
+    other machine -- which is what makes a copied digest catchable.
+    """
+    body = {key: value for key, value in snapshot.items() if key != "sha256"}
+    return hashlib.sha256(
+        json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
 def check_region_calibration(
     modelled, registry: dict, tp: int, workload_sha: str, forbidden: dict
 ) -> list[str]:
@@ -1062,6 +1083,8 @@ def check_region_calibration(
         for entry in (registry.get("artifacts") or [])
         if isinstance(entry, dict)
     }
+    option = ((modelled.manifest.get("server") or {}).get("compass") or {})
+    asked = (option.get("oracle_options") or {}).get("regions")
     bad = []
     for index, rank in enumerate(_rank_records(modelled)):
         where = f"rank {index}"
@@ -1073,10 +1096,38 @@ def check_region_calibration(
                 f"attributed to a name at best and to nothing at worst"
             )
             continue
-        if snapshot.get("parameters") is None:
-            continue  # `none`: no coefficients, nothing to attribute
-        sha = snapshot.get("sha256")
+        if snapshot.get("schema") != REGION_SNAPSHOT_SCHEMA:
+            bad.append(
+                f"{where} records a region snapshot of schema "
+                f"{snapshot.get('schema')!r}, not {REGION_SNAPSHOT_SCHEMA}: "
+                f"its fields do not necessarily mean what is read here"
+            )
+            continue
         name = snapshot.get("requested")
+        if asked is not None and str(name) != str(asked):
+            bad.append(
+                f"{where} priced with region preset {name!r} and the server "
+                f"was asked for {asked!r}: the record describes a different "
+                f"selection from the one the run was configured with"
+            )
+        # Absent and null are different answers. `none` is a choice -- body
+        # plus head with no runner term -- and a snapshot that simply omits
+        # its coefficients has not made it.
+        if "parameters" not in snapshot:
+            bad.append(
+                f"{where} records a region snapshot with no parameters field "
+                f"at all; selecting no region model is spelled `none`, and "
+                f"omitting the coefficients is not the same claim"
+            )
+            continue
+        if snapshot["parameters"] is None:
+            if str(name) != "none":
+                bad.append(
+                    f"{where} records region preset {name!r} carrying no "
+                    f"coefficients; only `none` selects nothing"
+                )
+            continue  # `none`: nothing to attribute
+        sha = snapshot.get("sha256")
         if not _hexish(sha):
             bad.append(
                 f"{where} records region preset {name!r} with no digest over "
@@ -1084,6 +1135,20 @@ def check_region_calibration(
             )
             continue
         tag = f"{where} regions={name!r}"
+        # Recomputed, not taken. These are values, and they are right here --
+        # unlike a file's bytes, which the validator cannot re-read because
+        # they may be on another machine. So a snapshot that carries a digest
+        # of something other than itself is caught before the registry is
+        # consulted at all: copying a valid preset's digest onto changed or
+        # omitted coefficients would otherwise satisfy every check below.
+        recomputed = _region_digest(snapshot)
+        if recomputed != sha:
+            bad.append(
+                f"{tag} carries digest {sha[:16]} but its own values hash to "
+                f"{recomputed[:16]}: the coefficients recorded are not the "
+                f"ones the digest attributes them to"
+            )
+            continue
         entry = by_sha.get(sha)
         if entry is None:
             bad.append(

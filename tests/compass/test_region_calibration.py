@@ -45,6 +45,16 @@ def _snap(name):
     return region_snapshot(name, region_model(name))
 
 
+def _digest_of(snapshot):
+    """The digest a snapshot hashes to, as both sides compute it."""
+    import hashlib
+
+    body = {k: v for k, v in snapshot.items() if k != "sha256"}
+    return hashlib.sha256(
+        json.dumps(body, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+
+
 def _failures(cell_dir):
     return verdict(cell_dir)["failures"]
 
@@ -231,18 +241,84 @@ class TestTheValidatorReadsTheSnapshot:
     def test_the_passing_cell_passes(self, cell):
         assert run(cell) == 0
 
+    def test_a_changed_coefficient_under_a_copied_digest_is_refused(self, cell):
+        """The shape a bare registry lookup cannot catch.
 
-    def test_a_changed_coefficient_stops_matching_the_declaration(self, cell):
-        """The registry still declares the preset it was told about; the run
-        priced from different numbers, so the digest no longer meets it."""
+        The coefficients are moved and the digest of the *valid* preset is
+        kept, so the registry would find a declaration and every check after
+        it would pass. The values are right here, though -- unlike a file's
+        bytes, which may be on another machine -- so they are hashed again and
+        the record is caught contradicting itself before the registry is
+        consulted at all.
+        """
+        moved = copy.deepcopy(base.region_snapshot_of(PRESET))
+        valid = moved["sha256"]
+        moved["parameters"]["postprocess_decode"]["seconds"] *= 1.2
+        _rank(cell, regions=moved)
+
+        assert run(cell) == 1
+        assert any("are not the ones the digest attributes them to" in f
+                   for f in _failures(cell))
+        assert any(valid[:16] in f for f in _failures(cell))
+
+    def test_an_omitted_coefficient_under_a_copied_digest_is_refused(self, cell):
+        """Dropping a coefficient is the same attack with less typing."""
+        moved = copy.deepcopy(base.region_snapshot_of(PRESET))
+        moved["parameters"].pop("tp_broadcast")
+        _rank(cell, regions=moved)
+
+        assert run(cell) == 1
+        assert any("are not the ones the digest attributes them to" in f
+                   for f in _failures(cell))
+
+    def test_a_changed_coefficient_honestly_digested_is_still_refused(self, cell):
+        """The other half: a snapshot that hashes itself correctly over
+        numbers nobody declared. Self-consistent, and unattributed."""
         moved = copy.deepcopy(base.region_snapshot_of(PRESET))
         moved["parameters"]["postprocess_decode"]["seconds"] *= 1.2
-        moved["sha256"] = "7" * 64
+        moved["sha256"] = _digest_of(moved)
         _rank(cell, regions=moved)
 
         assert run(cell) == 1
         assert any("either the preset is unregistered, or its numbers have "
                    "moved" in f for f in _failures(cell))
+
+    def test_a_snapshot_of_another_preset_is_refused(self, cell):
+        """Self-consistent, declared, and not what the run was asked for."""
+        _rank(cell, regions=copy.deepcopy(
+            base.region_snapshot_of("source-27b-tp1")))
+
+        assert run(cell) == 1
+        assert any("describes a different selection" in f
+                   for f in _failures(cell))
+
+    def test_a_snapshot_of_another_schema_is_refused(self, cell):
+        moved = copy.deepcopy(base.region_snapshot_of(PRESET))
+        moved["schema"] = "compass.regions.selected/99"
+        _rank(cell, regions=moved)
+
+        assert run(cell) == 1
+        assert any("not compass.regions.selected/1" in f
+                   for f in _failures(cell))
+
+    def test_omitting_the_parameters_is_not_selecting_none(self, cell):
+        """Absent and null are different answers, and only one of them is a
+        claim the run is entitled to make."""
+        moved = copy.deepcopy(base.region_snapshot_of(PRESET))
+        moved.pop("parameters")
+        _rank(cell, regions=moved)
+
+        assert run(cell) == 1
+        assert any("no parameters field at all" in f for f in _failures(cell))
+
+    def test_claiming_no_coefficients_under_a_presets_name_is_refused(self, cell):
+        moved = copy.deepcopy(base.region_snapshot_of(PRESET))
+        moved["parameters"] = None
+        moved["sha256"] = _digest_of(moved)
+        _rank(cell, regions=moved)
+
+        assert run(cell) == 1
+        assert any("only `none` selects nothing" in f for f in _failures(cell))
 
 
     def test_a_preset_declared_as_something_else_is_refused(self, cell):
