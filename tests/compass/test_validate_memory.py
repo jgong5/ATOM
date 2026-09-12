@@ -98,6 +98,30 @@ def _digests(*paths) -> dict:
             for path in every}
 
 
+def _plan_entries(script, blob, config_path) -> int:
+    """The block count a plan from this record's readings arrives at.
+
+    The same call `kv_rows` makes, so a test can say what the modelled count
+    is without restating ATOM's planner.
+    """
+    with open(config_path, encoding="utf-8") as fh:
+        native = json.load(fh)
+    config, readings = blob["config"], blob["readings"]
+    plan = script.blocks_from_readings(
+        native,
+        script.MemoryReadings(
+            total=int(readings["total"]), free=int(readings["free"]),
+            peak_torch=int(readings["peak_torch"]),
+            non_torch=int(readings["non_torch"]),
+            cudagraph_overhead=int(readings["cudagraph_overhead"])),
+        utilization=float(config["gpu_memory_utilization"]),
+        max_num_seqs=int(config["max_num_seqs"]),
+        tensor_parallel=1, block_size=int(config["block_size"]),
+        kv_dtype_bytes=script.KV_DTYPE_BYTES.get(
+            str(config.get("kv_cache_dtype")), 2))
+    return int(plan.paged_entries)
+
+
 def test_the_pool_measurement_is_read_off_the_record():
     """No `--log` needed: the run wrote the measurement into the record.
 
@@ -402,6 +426,82 @@ class TestTheGateAcceptanceRunsOn:
         assert attest["attested"] == {"/p.json": "bb", "/c.json": "cc",
                                       "/m.json": "dd"}
 
+    def test_the_budget_is_read_out_of_the_artifact_that_saved_it(
+            self, tmp_path):
+        """Nothing writes a standalone budget file, and nothing should.
+
+        The runner publishes the object; provenance saves it nested inside the
+        per-rank artifact. The readback reads that same object rather than
+        anyone adding a second writer and a second schema for the same bytes.
+        """
+        script = _script()
+        budget = {"kind": "source-derived",
+                  "inputs": {"inputs": [{"role": script.PROFILE_ROLE,
+                                         "path": "/p.json", "sha256": "bb"}]}}
+        saved = tmp_path / "provenance.modelled.r0.json"
+        saved.write_text(json.dumps(
+            {"compass": {"loaded_inputs": {"ranks": [{"budget_source": budget}]}}}))
+        attest = script.profile_from_budget_source(str(saved))
+        assert attest["profile"] == "/p.json"
+
+    def test_the_other_saved_spelling_is_read_too(self, tmp_path):
+        script = _script()
+        budget = {"kind": "source-derived",
+                  "inputs": {"inputs": [{"role": script.PROFILE_ROLE,
+                                         "path": "/p.json", "sha256": "bb"}]}}
+        saved = tmp_path / "modelled.r0.json"
+        saved.write_text(json.dumps({"run": {"server": {"compass": {
+            "loaded_inputs": {"ranks": [{"budget_source": budget}]}}}}}))
+        assert script.profile_from_budget_source(str(saved))["profile"] \
+            == "/p.json"
+
+    def test_one_physical_record_carries_the_whole_width(self, tmp_path):
+        """`ranks[i]` is a physical predictor record, not a TP rank.
+
+        A GPU-free replay writes one record and that record holds the budget
+        for all four ranks. Reading it as "rank 0's budget" and then wanting
+        three more would be asking for evidence nobody wrote.
+        """
+        script = _script()
+        budget = {"kind": "source-derived",
+                  "lineage": {"world_size": 4},
+                  "inputs": {"inputs": [{"role": script.PROFILE_ROLE,
+                                         "path": "/p4.json", "sha256": "bb"}]}}
+        saved = tmp_path / "provenance.modelled.r0.json"
+        saved.write_text(json.dumps(
+            {"compass": {"loaded_inputs": {"ranks": [{"budget_source": budget}]}}}))
+        attest = script.profile_from_budget_source(str(saved), world=4)
+        assert attest["lineage"]["world_size"] == 4
+
+    def test_an_artifact_holding_several_budgets_is_not_guessed_at(
+            self, tmp_path):
+        script = _script()
+
+        def entry(width):
+            return {"budget_source": {
+                "kind": "source-derived", "lineage": {"world_size": width},
+                "inputs": {"inputs": [
+                    {"role": script.PROFILE_ROLE,
+                     "path": "/p%d.json" % width, "sha256": "bb"}]}}}
+
+        saved = tmp_path / "provenance.modelled.r0.json"
+        saved.write_text(json.dumps({"compass": {"loaded_inputs": {
+            "ranks": [entry(2), entry(4)]}}}))
+        with pytest.raises(SystemExit) as raised:
+            script.profile_from_budget_source(str(saved))
+        assert "will not guess" in str(raised.value)
+        picked = script.profile_from_budget_source(str(saved), world=4)
+        assert picked["profile"] == "/p4.json"
+
+    def test_an_artifact_that_saved_no_budget_is_refused(self, tmp_path):
+        script = _script()
+        saved = tmp_path / "provenance.modelled.r0.json"
+        saved.write_text(json.dumps(
+            {"compass": {"loaded_inputs": {"ranks": [{"inputs": []}]}}}))
+        with pytest.raises(SystemExit) as raised:
+            script.profile_from_budget_source(str(saved))
+        assert "no entry in it saved a budget_source" in str(raised.value)
+
     def test_one_path_attested_at_two_digests_is_refused(self, tmp_path):
         """One of the two reads is the one being compared, and there is no
         way to tell which."""
@@ -578,11 +678,55 @@ class TestTheGateAcceptanceRunsOn:
         script.PROBLEMS.append("mem_*.tp1.json was asked for and matched no file")
         assert script.gate("record") is False
 
-    def test_a_served_count_the_record_disagrees_with_is_a_problem(self):
-        """The record is written by the process that was handed the budget."""
+    def test_a_forecast_that_misses_the_real_count_is_still_a_forecast(self):
+        """The published count is modelled, and so is the plan: a run whose
+        forecast came in 1% over the blocks it actually got is exactly the
+        thing this gate exists to measure, not an inconsistency to refuse.
+
+        Requiring the published count to equal the *recorded* one rejected
+        every non-exact prediction -- which is every prediction worth making.
+        """
         script = _script()
         blob = _record("27b.tp1.memory.json")
-        served = int(blob["blocks"]["num_kvcache_blocks"]) + 1
+        config_path = str(RECORDS / "qwen3_5_27b.config.json")
+        plan = _plan_entries(script, blob, config_path)
+        # The run forecast `plan` blocks and published that; the device went
+        # on to give it 1% fewer. A 1% miss is a pass.
+        real = int(plan / 1.01)
+        blob = dict(blob, blocks=dict(blob["blocks"], num_kvcache_blocks=real))
         script.kv_rows(blob["config"], blob["readings"], 1, 1, blob,
-                       str(RECORDS / "qwen3_5_27b.config.json"), served=served)
-        assert any("published" in problem for problem in script.PROBLEMS)
+                       config_path, predicted=blob["readings"], served=plan)
+        assert script.PROBLEMS == []
+        assert abs(script.SEEN["kv blocks"] - 1.0) < 0.05
+        for name in script.REQUIRED_TERMS:
+            script.SEEN.setdefault(name, 0.0)
+        assert script.gate("a 1% forecast miss") is True
+
+    def test_a_published_count_the_plan_does_not_reproduce_is_refused(self):
+        """Identity, not accuracy: both sides here are the model's own.
+
+        The run stored the capacity its forecast arrived at. If re-deriving
+        that forecast lands somewhere else, the plan being gated is not the
+        plan the run was sized by.
+        """
+        script = _script()
+        blob = _record("27b.tp1.memory.json")
+        config_path = str(RECORDS / "qwen3_5_27b.config.json")
+        served = _plan_entries(script, blob, config_path) + 1
+        script.kv_rows(blob["config"], blob["readings"], 1, 1, blob,
+                       config_path, predicted=blob["readings"], served=served)
+        assert any("re-deriving its own plan" in problem
+                   for problem in script.PROBLEMS)
+
+    def test_a_record_with_no_measured_count_does_not_borrow_the_forecast(self):
+        """Comparing the prediction with itself reads +0.00% and tests
+        nothing, so the term goes uncovered and the gate fails."""
+        script = _script()
+        blob = _record("27b.tp1.memory.json")
+        config_path = str(RECORDS / "qwen3_5_27b.config.json")
+        served = _plan_entries(script, blob, config_path)
+        blob = dict(blob, blocks={})
+        script.kv_rows(blob["config"], blob["readings"], 1, 1, blob,
+                       config_path, predicted=blob["readings"], served=served)
+        assert script.SEEN["kv blocks"] is None
+        assert script.gate("no measured count") is False

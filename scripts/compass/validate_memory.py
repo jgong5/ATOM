@@ -263,11 +263,19 @@ def kv_rows(config: dict, readings: dict, tp: int, world: int, blob: dict,
     engine planned from exactly those numbers -- so a 5% gate over it would
     pass without testing anything.
 
-    `served` is the count the run itself published in its budget source. Where
-    both it and the record state a count they have to be the same number: the
-    record is written by the process that was handed the budget, so a
-    disagreement means the record belongs to a different run than the manifest
-    and neither can be trusted to describe the other.
+    `served` is the count the run published in its budget source, and that is a
+    *modelled* number, not a measured one -- it is what the prediction sized the
+    deployment at. So it answers identity, never accuracy: re-deriving the
+    plan here has to reproduce it, and if it does not, this is not the forecast
+    that sized the run. It is never compared to the recorded count and never
+    stands in for it. Both mistakes were live: equality against the record
+    rejected a perfectly good 2% forecast as an inconsistency, and falling back
+    to it when the record had no count compared the prediction with itself and
+    read +0.00%.
+
+    The recorded count is the independent half, and without it there is nothing
+    to be accurate against -- the row goes uncovered rather than borrowing the
+    forecast.
 
     Silent without `--model-config`, because guessing the checkpoint from the
     record's model name would be a download.
@@ -289,12 +297,6 @@ def kv_rows(config: dict, readings: dict, tp: int, world: int, blob: dict,
     block_size = int(config.get("block_size") or 0)
     kv_bytes = KV_DTYPE_BYTES.get(str(config.get("kv_cache_dtype")), 2)
     recorded_blocks = ((blob.get("blocks") or {}).get("num_kvcache_blocks"))
-    if served is not None:
-        if recorded_blocks and int(served) != int(recorded_blocks):
-            PROBLEMS.append(
-                "the run published %d KV blocks and this record states %d"
-                % (int(served), int(recorded_blocks)))
-        recorded_blocks = recorded_blocks or int(served)
     plan_from = predicted or readings
     try:
         plan = blocks_from_readings(
@@ -321,6 +323,17 @@ def kv_rows(config: dict, readings: dict, tp: int, world: int, blob: dict,
                                     block_size=block_size,
                                     kv_dtype_bytes=kv_bytes)
     state_bytes = gdn_state_bytes(native, tensor_parallel=tp)
+    # Identity, not accuracy: both sides here are the model's. The run stored
+    # the capacity its forecast arrived at, and re-deriving that forecast from
+    # the same profile has to land on the same block count. A difference means
+    # the plan being gated is not the plan the run was sized by -- a different
+    # revision, a different cell -- and the comparison below would be about
+    # some other forecast than the one that shipped.
+    if served is not None and predicted and int(served) != plan.paged_entries:
+        PROBLEMS.append(
+            "the run published a modelled %d KV blocks and re-deriving its own "
+            "plan from the same profile gives %d" % (int(served),
+                                                     plan.paged_entries))
     if recorded_blocks:
         error = (plan.paged_entries - recorded_blocks) / recorded_blocks * 100
         # Only a plan made from the model's own readings is evidence about the
@@ -336,9 +349,14 @@ def kv_rows(config: dict, readings: dict, tp: int, world: int, blob: dict,
                     "the record's own (arithmetic only)",
                     block_bytes, state_bytes / (1 << 20))))
     else:
+        # No independent count, so nothing here is evidence about the model.
+        # The published forecast is not borrowed to fill the column: that would
+        # compare the prediction with itself.
+        note_term("kv blocks", None)
         print("  %-14s %8d %8s  %6s %7s  %s"
               % ("kv blocks", plan.paged_entries, "-", "-", "",
-                 "derived; no recorded count in this record"))
+                 "derived; this record states no measured block count, so the "
+                 "term is uncovered"))
 
 
 def record_sha(path: str) -> str:
@@ -382,7 +400,99 @@ def _cal_note(calib, cal_map: dict, config: dict, sha: str, producer,
     return note
 
 
-def profile_from_budget_source(path: str) -> dict:
+#: Where a saved budget source sits inside the provenance artifacts that carry
+#: it. Nothing writes a standalone budget file: the runner publishes the object
+#: as a runtime attribute and provenance saves it nested, so the readback reads
+#: the same object out of the artifact rather than anyone adding a second
+#: writer and a second schema for the same bytes.
+BUDGET_CONTAINERS = (
+    ("compass", "loaded_inputs", "ranks"),
+    ("run", "server", "compass", "loaded_inputs", "ranks"),
+)
+
+
+def _dig(blob, keys):
+    for key in keys:
+        if not isinstance(blob, Mapping):
+            return None
+        blob = blob.get(key)
+    return blob
+
+
+def budget_source_object(blob, path: str, world=None, coords=None):
+    """The budget object itself, wherever it was saved.
+
+    Takes either the object (a `compass.memory.budget_source/1` blob) or the
+    provenance artifact that contains one, and returns the object.
+
+    The index into `ranks` is a *physical predictor record*, not a TP rank: a
+    GPU-free replay writes one physical record and that record carries the
+    whole width's budget, so there are widths where `ranks` has one entry and
+    the deployment has four. Selection is therefore by what the record says
+    about itself -- its coordinates, its width -- and an artifact holding
+    several that cannot be told apart is refused. Picking one, or spreading one
+    budget across the ranks that did not write it, would be inventing per-rank
+    evidence out of a single reading.
+    """
+    if not isinstance(blob, Mapping):
+        raise SystemExit("%s is not a JSON object" % path)
+    if blob.get("inputs") or str(blob.get("schema") or "").startswith(
+            "compass.memory.budget_source"):
+        return blob
+    for keys in BUDGET_CONTAINERS:
+        ranks = _dig(blob, keys)
+        if not isinstance(ranks, (list, tuple)) or not ranks:
+            continue
+        found = [(i, entry.get("budget_source")) for i, entry in enumerate(ranks)
+                 if isinstance(entry, Mapping) and entry.get("budget_source")]
+        if not found:
+            raise SystemExit(
+                "%s carries %s but no entry in it saved a budget_source, so "
+                "nothing there says what this run was sized from."
+                % (path, ".".join(keys)))
+        if len(found) > 1:
+            wanted = [(i, obj) for i, obj in found
+                      if _budget_matches(obj, world, coords)]
+            if len(wanted) != 1:
+                raise SystemExit(
+                    "%s saved %d budget sources and %s. The index into `ranks` "
+                    "is a physical predictor record, not a TP rank, so this "
+                    "script will not guess which one describes this record -- "
+                    "name the record's own coordinates, or point "
+                    "--budget-source at the entry."
+                    % (path, len(found),
+                       "none of them matches this record"
+                       if not wanted else "several of them match this record"))
+            found = wanted
+        return found[0][1]
+    raise SystemExit(
+        "%s is neither a budget source nor a saved provenance artifact "
+        "carrying one (looked under %s)"
+        % (path, " and ".join(".".join(k) for k in BUDGET_CONTAINERS)))
+
+
+def _budget_matches(obj, world, coords) -> bool:
+    """Whether a saved budget describes the record being read back.
+
+    Deliberately narrow. A budget states the width it sized and the deployment
+    coordinates it was written at; anything it does not state cannot be
+    matched, and a near-miss is not a match.
+    """
+    if not isinstance(obj, Mapping):
+        return False
+    lineage = obj.get("lineage") or {}
+    stated = lineage.get("world_size", (obj.get("deployment") or {}).get(
+        "world_size"))
+    if world is not None and stated is not None and int(stated) != int(world):
+        return False
+    if coords:
+        got = (obj.get("deployment") or {}).get("coords") or obj.get("coords")
+        if got is not None and dict(got) != dict(coords):
+            return False
+    return True
+
+
+def profile_from_budget_source(path: str, world=None, coords=None) -> dict:
     """Everything the run attested about the budget it chose.
 
     Both runners publish `compass.memory.budget_source/1` at the branch that
@@ -405,7 +515,8 @@ def profile_from_budget_source(path: str) -> dict:
     than only to what it recorded.
     """
     with open(path, encoding="utf-8") as fh:
-        blob = json.load(fh)
+        saved = json.load(fh)
+    blob = budget_source_object(saved, path, world=world, coords=coords)
     rows = list((blob.get("inputs") or {}).get("inputs") or ())
     profiles = [r for r in rows if r.get("role") == PROFILE_ROLE]
     if not profiles:
@@ -786,10 +897,22 @@ def main() -> int:
                     help="write the collective constants measured from these "
                          "records to this path, for memory_model to read")
     ap.add_argument("--budget-source",
-                    help="the run's saved compass.memory.budget_source/1. The "
+                    help="the run's saved compass.memory.budget_source/1, or "
+                         "the provenance artifact that contains it "
+                         "(provenance.modelled.rN.json, modelled.rN.json). The "
                          "profile is taken from its input manifest, so the "
                          "derived column is the prediction that actually "
                          "sized the run")
+    ap.add_argument("--budget-width", type=int,
+                    help="which saved budget to read, by the width it sized, "
+                         "when the artifact holds several. The index into "
+                         "`ranks` is a physical predictor record and not a TP "
+                         "rank -- a GPU-free replay writes one record for the "
+                         "whole width -- so the selection is by what the "
+                         "budget says about itself")
+    ap.add_argument("--budget-coords",
+                    help="which saved budget to read, by the deployment "
+                         "coordinates it was written at, as JSON")
     ap.add_argument("--profile",
                     help="the memory profile, where no budget source was "
                          "saved. Names the file but cannot attest the run "
@@ -803,7 +926,10 @@ def main() -> int:
 
     attest = None
     if args.budget_source:
-        attest = profile_from_budget_source(args.budget_source)
+        coords = json.loads(args.budget_coords) if args.budget_coords else None
+        attest = profile_from_budget_source(args.budget_source,
+                                            world=args.budget_width,
+                                            coords=coords)
         if args.profile and (os.path.abspath(args.profile)
                              != os.path.abspath(attest["profile"])):
             raise SystemExit(
