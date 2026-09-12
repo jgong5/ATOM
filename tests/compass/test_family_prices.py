@@ -621,3 +621,62 @@ def test_the_gather_is_not_answered_across_the_height_it_gathers_from():
 
     assert infer_rows(gather(2, 16384), gather(1, 16384), 1) == 2
     assert infer_rows(gather(2, 16384), gather(2, 640), 2) is None
+
+
+def _gather(selected: int, height: int) -> dict:
+    """The head's last-token gather: `selected` rows out of a `height` state."""
+    return {"name": "aten::index.Tensor",
+            "input_shapes": [[height, 5120], [selected]],
+            "dtypes": ["bfloat16", "int32"]}
+
+
+def test_the_gather_refuses_a_pair_that_moved_the_height_with_the_width():
+    """The height must not be solved along with the rows.
+
+    Holding the height fixed and moving the selected count -- which is what
+    the test above does -- never exercises this: at a fixed height the height
+    is equal on both sides and passes on the equality branch. The failure
+    needs the two to move TOGETHER. 2 out of 8192 and 4 out of 16384 share a
+    coefficient of 4096 on the height and 1 on the count, so without a
+    declaration they read as one operator at two widths, and a request for 3
+    out of 12288 is solved from them at a source height nobody measured.
+    """
+    assert infer_rows(_gather(3, 12288), _gather(2, 8192), 2) is None
+    assert infer_rows(_gather(4, 16384), _gather(2, 8192), 2) is None
+    assert not aligns(_gather(4, 16384), 4, _gather(2, 8192), 2)
+
+
+def test_the_gather_still_scales_at_one_height(tmp_path):
+    """The case the head actually needs is not collateral damage.
+
+    A fixed source height with a moving selected count is the ordinary head
+    step, and it must still reach a price: the declaration fixes one extent,
+    it does not turn the family into exact-match.
+    """
+    assert infer_rows(_gather(4, 16384), _gather(2, 16384), 2) == 4
+    assert aligns(_gather(4, 16384), 4, _gather(2, 16384), 2)
+
+    from atom.compass.runtime.microbench import signature_of
+
+    library = ParametricPriceLibrary(max_gap_ratio=2.0)
+    for selected, seconds in ((2, 2e-06), (4, 4e-06)):
+        op = _gather(selected, 16384)
+        graph = {"ops": [op],
+                 "provenance": {"execution": {"body_rows_traced": 16384}}}
+        prices = {"prices": {signature_of(op): {
+            "seconds": seconds, "kernels": {"k": seconds},
+            "occurrences": 1, "name": op["name"]}}}
+        gpath = tmp_path / f"gg{selected}.json"
+        ppath = tmp_path / f"gp{selected}.json"
+        gpath.write_text(json.dumps(graph))
+        ppath.write_text(json.dumps(prices))
+        library.add(str(ppath), str(gpath))
+
+    record, source = library.lookup(_gather(3, 16384))
+    assert record is not None, source
+    assert record["interpolation"]["measured_rows"] == [2, 4]
+    assert record["interpolation"]["rows"] == 3
+
+    # ... and the same request against an unmeasured height is refused.
+    record, why = library.lookup(_gather(3, 12288))
+    assert record is None

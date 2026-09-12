@@ -113,6 +113,15 @@ class FamilyContract:
     #: the measurement came from, which is what every family did before the
     #: head region needed otherwise. See :func:`executed_rows`.
     rows_from: Optional[tuple[int, int]] = None
+    #: operand dimensions that must match exactly rather than scale with the
+    #: row count, as ``(operand position, dimension)``. Empty for almost every
+    #: family, and load-bearing for the few whose key holds a second extent
+    #: that is independent of the width: :func:`aligns` accepts any integer
+    #: that is the same multiple of its own row count, so without a declaration
+    #: here a training pair that moved BOTH extents together lets
+    #: :func:`infer_rows` solve the second one along with the rows. See
+    #: :func:`_values`, which is where the declaration takes effect.
+    fixed_dims: tuple[tuple[int, int], ...] = ()
     #: why this family is parameterised the way it is
     rationale: str = ""
 
@@ -240,18 +249,24 @@ FAMILY_CONTRACTS["aten::sub.Tensor"] = FamilyContract(
 
 # The gather that selects the last token of each request out of the hidden
 # state. Its width is the number selected -- operand 1's length -- while the
-# height it selects FROM is operand 0 dimension 0 and is a second independent
-# dimension. That height stays an exact-match component of the grouping key,
-# so this contract makes no claim across it: a request gathering 2 rows out of
-# 16384 is not answered from a measurement that gathered 2 out of 640. The
-# standalone grid measured both heights so the claim can be checked later
-# rather than assumed now.
+# height it selects FROM is operand 0 dimension 0 and is a second, independent
+# extent. It is declared `fixed_dims` rather than left to the grouping key,
+# which records only each operand's rank and so says nothing about the value:
+# two measurements that moved the selected count and the source height
+# together -- 2 out of 8192 and 4 out of 16384 -- are otherwise read as one
+# operator at two widths with a coefficient of 4096, and a request gathering 3
+# out of 12288 is then solved and interpolated from them, against a source
+# height nobody measured. With the declaration those two are not the same
+# operator at all, which is the honest answer: the height is not the width.
+# A fixed height with a moving selected count still interpolates, which is the
+# case the head region actually needs.
 FAMILY_CONTRACTS["aten::index.Tensor"] = FamilyContract(
     family="aten::index.Tensor",
     kind="rows",
     rows_from=(1, 0),
+    fixed_dims=((0, 0),),
     rationale=("gathers operand 1's rows out of operand 0; the selected count "
-               "is the width and the source height stays exact-match"),
+               "is the width and the source height is fixed, never scaled"),
 )
 
 # `aten::slice.Tensor` is deliberately absent. Its operand is the cumulative
@@ -371,6 +386,29 @@ def grouping_key(op: dict) -> tuple:
     )
 
 
+def _fixed_shapes(op: dict) -> Any:
+    """``input_shapes`` with the family's fixed dimensions marked as fixed.
+
+    A marked dimension is carried as a string rather than an integer, so both
+    :func:`aligns` and :func:`infer_rows` reach it on their equality branch and
+    never on their multiple-of-the-rows branch. That is the whole mechanism:
+    no separate comparison pass, no position arithmetic on the flattened key,
+    and nothing to keep in step between the two functions.
+    """
+    shapes = op.get("input_shapes") or ()
+    contract = contract_for(op.get("name", ""))
+    fixed = contract.fixed_dims if contract is not None else ()
+    if not fixed:
+        return shapes
+    out = [list(s) if isinstance(s, (list, tuple)) else s for s in shapes]
+    for position, dimension in fixed:
+        if position >= len(out) or not isinstance(out[position], list):
+            continue
+        if dimension < len(out[position]):
+            out[position][dimension] = f"fixed:{out[position][dimension]}"
+    return out
+
+
 def _values(op: dict) -> list:
     """Every value in the operator's key, in a fixed order.
 
@@ -388,7 +426,7 @@ def _values(op: dict) -> list:
         else:
             out.append(value)
 
-    walk(op.get("input_shapes") or ())
+    walk(_fixed_shapes(op))
     walk(tuple(op.get("dtypes") or ()))
     # Addresses summarised to (count, void count) first, on the same rule the
     # cost key uses. The parametric path has to reach the cost key's verdict:
