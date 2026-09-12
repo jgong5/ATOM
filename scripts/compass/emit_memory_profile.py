@@ -53,7 +53,7 @@ if ROOT not in sys.path:
 from atom.compass.core.memory_calibration import for_model  # noqa: E402
 from atom.compass.core.memory_capture import capture_stream  # noqa: E402
 from atom.compass.core.memory_model import (  # noqa: E402
-    capture_reserved_parts, weight_bytes)
+    built_parameter_bytes, capture_reserved_parts, weight_bytes)
 from atom.compass.core.memory_topology import (  # noqa: E402
     TOPOLOGY_CONDITIONS, TOPOLOGY_PROVENANCE, compose_calibration,
     topology_delta)
@@ -210,6 +210,15 @@ def main(argv=None) -> int:
                         help="the checkpoint's config.json")
     parser.add_argument("--widths", type=int, nargs="+", default=[1, 2, 4])
     parser.add_argument("--model", default=MODEL)
+    parser.add_argument("--weights-from", choices=("built", "headers"),
+                        default="built",
+                        help="where the weight term comes from: ATOM's own "
+                             "meta build (default, the engine's rule) or the "
+                             "checkpoint headers (the approximation)")
+    parser.add_argument("--replay-target",
+                        help="target.json to answer AITER's architecture query "
+                             "from, so --weights-from built works in a "
+                             "container with no device")
     args = parser.parse_args(argv)
 
     if not os.path.isdir(args.checkpoint):
@@ -262,11 +271,28 @@ def main(argv=None) -> int:
 
     emitted = []
     for width in args.widths:
-        params = weight_bytes(args.checkpoint, width)
-        if not params:
+        header_params = weight_bytes(args.checkpoint, width)
+        if not header_params:
             print("REFUSED: could not read checkpoint headers at %s"
                   % args.checkpoint)
             return 2
+        # The headers are a table of contents, not an inventory of what the
+        # engine builds: a checkpoint can ship tensors for a module the
+        # configured model class never constructs, and summing the headers
+        # counts them. Ask the build, and keep the headers as the fallback and
+        # as a stated cross-check rather than a silent one.
+        params, buffers, route = header_params, BUFFERS, "headers"
+        if args.weights_from == "built":
+            built = built_parameter_bytes(args.model, width,
+                                          replay_target=args.replay_target)
+            if built is None:
+                print("WARNING: could not build %s on meta at TP=%d; the "
+                      "weight term falls back to the checkpoint headers"
+                      % (args.model, width))
+            else:
+                params, buffers = built
+                route = "built"
+        delta = int(header_params) - int(params)
         calibration = compose_calibration(base, width, env={})
         calibration["capture_reserved"] = {
             str(width): capture_prediction(trace, text_config, width,
@@ -279,7 +305,7 @@ def main(argv=None) -> int:
             "total": TOTAL,
             "world_size": width,
             "parameters": int(params),
-            "buffers": BUFFERS,
+            "buffers": int(buffers),
             "model_config": config_path,
             "compile_mode": COMPILE_MODE,
             "dtype_bytes": DTYPE_BYTES,
@@ -287,9 +313,18 @@ def main(argv=None) -> int:
             "provenance": dict(
                 inputs,
                 width=width,
-                parameters="checkpoint safetensors headers at TP=%d, 2-D "
-                           "tensors sharded and 1-D replicated; tied "
-                           "embeddings counted once" % width,
+                parameters=(
+                    "ATOM's own meta build at TP=%d, counted once per storage "
+                    "(resident_bytes); the checkpoint headers read %d B, %d B "
+                    "more, which is what the engine does not construct"
+                    % (width, header_params, delta)
+                    if route == "built" else
+                    "checkpoint safetensors headers at TP=%d, 2-D "
+                    "tensors sharded and 1-D replicated; tied "
+                    "embeddings counted once" % width),
+                parameters_route=route,
+                parameters_headers=int(header_params),
+                parameters_headers_excess=delta,
                 topology_delta=topology_delta(width, env={}),
                 calibration_sha256=sha256(cal_path),
             ),

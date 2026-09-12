@@ -628,6 +628,82 @@ def resident_bytes(model, tied_head: bool = False) -> tuple:
     return parameters, buffers
 
 
+def built_parameter_bytes(model: str, tensor_parallel: int = 1,
+                          replay_target: Optional[str] = None) -> tuple:
+    """``(parameters, buffers)`` ATOM's own build holds, per rank, no device.
+
+    The same build `scripts/compass/meta_probe.py` does, behind one call, so
+    that a profile can take its weight term from the engine's materialization
+    rule rather than from the checkpoint's table of contents. The two are not
+    the same thing: a checkpoint may ship tensors for a module the configured
+    model class never constructs, and `weight_bytes` -- which sums every header
+    entry -- counts them. On the 27B that is the ``mtp.*`` draft block, 849 398
+    784 B, the whole of the weight term's error at TP=1.
+
+    ``replay_target`` bootstraps AITER's architecture query from a recorded
+    target, as `replay_server` does, which is what lets this run in a container
+    with no device nodes. Without it AITER shells out to ``rocminfo`` and a
+    CPU-only container raises.
+
+    Returns ``None`` rather than raising if the model cannot be built here; the
+    caller decides whether to fall back to the headers, and should say which
+    route it took.
+    """
+    import os
+    import socket
+
+    if replay_target:
+        from atom.compass.replay.bootstrap import install_from_target
+
+        install_from_target(replay_target, role="bootstrap.weight_inventory")
+
+    import torch
+
+    # ATOM's parallel layers query their communication group while being
+    # constructed, so the group has to exist before the model does.
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        os.environ.setdefault("MASTER_PORT", str(sock.getsockname()[1]))
+    os.environ.setdefault("RANK", "0")
+    os.environ.setdefault("WORLD_SIZE", "1")
+    from aiter import init_dist_env
+
+    init_dist_env(1, rankID=0, backend="gloo",
+                  distributed_init_method="env://", local_rank=0)
+    from atom.compass.runtime.derive import simulate_group_width
+
+    # One real rank however wide the configuration being modelled, and patched
+    # before the build: layers read the width while being constructed.
+    simulate_group_width(max(1, tensor_parallel), physical=1)
+
+    from atom.config import Config, set_current_atom_config
+    from atom.model_engine.model_runner import support_model_arch_dict
+    from atom.utils import resolve_obj_by_qualname
+
+    config = Config(model=model, tensor_parallel_size=max(1, tensor_parallel))
+    set_current_atom_config(config)
+    qualname = support_model_arch_dict.get(config.hf_config.architectures[0])
+    if qualname is None:
+        return None
+    model_class = resolve_obj_by_qualname(qualname)
+
+    # The model's dtype is the config's, not torch's default; without this the
+    # meta build comes out float32 and every byte is twice what is resident.
+    was = torch.get_default_dtype()
+    try:
+        torch.set_default_dtype(config.torch_dtype)
+        with torch.device("meta"):
+            built = model_class(config)
+    except Exception:  # noqa: BLE001  -- the caller falls back to the headers
+        return None
+    finally:
+        torch.set_default_dtype(was)
+
+    tied = bool(getattr(config.hf_config, "tie_word_embeddings", False))
+    return resident_bytes(built, tied_head=tied)
+
+
 #: What a rank holds outside the torch allocator, and what the collective
 #: libraries take through it, measured on this box (MiB, per rank).
 #:
