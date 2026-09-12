@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import subprocess
 import sys
 from pathlib import Path
 
@@ -67,10 +68,32 @@ SHARED_OPTIONS = (
     ("position_rows", "3"),
     ("cudagraph_mode", "full"),
     ("head", "1"),
-    ("regions", "source-27b-tp1-conc-v2"),
+    # `prefill-cells`, not the older `conc-v2`: runs 5 and 6 -- the only two
+    # replays whose composition was actually exercised -- passed
+    # `source-27b-tp1-prefill-cells`, the source carrying the measured
+    # 1-sequence prefill cells. `conc-v2` has been this file's value since it
+    # was written and no run has selected it.
+    ("regions", "source-27b-tp1-prefill-cells"),
+    # Family-price mode, explicitly on. Without it `gap_ratio(None)` is None,
+    # `_price_library` builds a plain `PriceLibrary` with no curves, and every
+    # parametric family -- the head row ladder below above all -- is dead
+    # weight: each refusal reads "no entry for this signature" with no
+    # parametric reason attached. Run 5 omitted it and that is what it cost.
+    ("interpolate", "1"),
     ("require_complete", "1"),
     ("allocation", "native"),
     ("derive", "1"),
+    # The deployment the ragged attention laws are asked under. Without it
+    # `_declared_scope` returns {}, `_request_scope` returns None, and every
+    # ragged request is silent on the keys the laws are specific about: run 5
+    # declared nothing and its 64 attention operators were all refused by name
+    # while agreeing on backend, KV layout, geometry and treatment.
+    #
+    # `xacq`, not `b2acq`, which is what run 6 declared. The two SCOPE records
+    # differ only in KV variants -- 16 against 32, and the blocks-per-variant
+    # and pointers that follow -- and `kv_regions` is a treatment field, so
+    # they are two deployments and the V=16 law is fitted for this one.
+    ("attention_scope", "{root}/xacq/SCOPE.json"),
 )
 
 #: Options no acceptance cell may carry, with why. Checked rather than trusted:
@@ -90,6 +113,205 @@ INADMISSIBLE = {
 #: `SOURCE_ONLY_SERVING.md` has the loop that builds the links.
 _TP1 = "{root}/g4/src1"
 _WIDE = "{root}/serving/src_tp{tp}"
+
+#: The rest of the source-width price tree. Two decode-32 pairs under `_TP1`
+#: were this file's whole TP=1 list; the run that was actually exercised
+#: staged the forty-odd files below and refused far less. They are named here
+#: rather than left in `agent_scratch/stage/dev_serve5.sh` so that the
+#: registry is the price list rather than a subset of one.
+_CARD = "{root}/g4/card"
+_PC = "{root}/pricing_coverage"
+_HG = "{root}/headgrid"
+
+#: The measurement repetition every price in the list below is read from. One
+#: value for the whole list on purpose: mixing repetitions across a family is
+#: how a curve acquires a step nobody measured.
+_REP = "rep3"
+
+#: Head-GEMM row ladder widths. `_HEAD_ROWS` is the original ladder; it stops
+#: at 16 and resumes at 24 because those widths do not dispatch the same
+#: kernel (MT64x16x256_MI16x16x1 against MT128x32x128_MI32x32x1), and the
+#: library refused everything between rather than interpolate across the
+#: switch. `_HEAD_ROWS_NATIVE` is the boundary scan that located it: the
+#: switch is at 17, so [1,16] and [17,32] are two dispatch-supported regimes,
+#: each readable inside.
+#:
+#: M=20 and M=27 are deliberately absent from both. 20 was a source holdout
+#: and was refused, and 27 was the blind far-regime holdout predicted at
+#: 1.134536e-03 and then measured at 1.144763e-03. Staging either here would
+#: convert the only out-of-sample evidence the head curve has into a lookup.
+_HEAD_ROWS = (1, 2, 3, 4, 6, 8, 12, 16, 24, 32)
+_HEAD_ROWS_NATIVE = (17, 18, 19, 21, 22)
+
+#: The V=16 cached-unified campaign: the nine admitted designs and the graph
+#: each was priced against, from `mixed_freeze/v2/FROZEN.json` sha256
+#: a247addcdfa4cfd3a8efa08f2fecbe17039b9fc6036c6461525abcaf9d5a2e9e. Four
+#: repeats per design, 36 records; `MANIFEST.json` lists 40 and excludes all
+#: four P4 repeats, which are a cold diagnostic and not a cached training
+#: point.
+#:
+#: K1's graph is `b1_C1`, not `b1_K1`. That is the freeze's own pairing and is
+#: copied rather than regularised.
+#:
+#: The law these fit -- `unified.prefill.cached`, `paired_work`
+#: 2.192033574230628e-10 and `history_rows` 1.1275685856067372e-07 per unit,
+#: with `calls` and `query_rows` held at zero by active bounds -- carries known
+#: small-design residuals: K1 -11.514%, K2 -31.884%, K3 +28.052%, against
+#: within 1.6% for the six larger designs. It is a candidate with that
+#: limitation recorded, not a clean fit, and its contribution is to be read off
+#: the end-to-end gate rather than argued from the component.
+_XACQ = "{root}/xacq/training"
+
+#: The B2 GDN training pairs, from `mixed_freeze/v1/FROZEN.json` sha256
+#: 6f7c0c8e71f0b616fd0f0d42b65235016317e581322dc84661fb23222813e3f1. These are
+#: the fitted `gdn.prefill` family and nothing here supersedes them: v2 states
+#: outright that "No GDN or cold-MHA candidate is modified", and its
+#: `preserved_unchanged` block names this file read-only. Two body-prefill
+#: files above do not substitute for them -- those carry the serving
+#: deployment's own GDN observations, which is a different thing.
+#:
+#: G1's rep1 is absent by the freeze's own rule -- cold first use -- so the
+#: repeat sets are not uniform. 39 pairs.
+_B2ACQ = "{root}/b2acq/training"
+_B2_GDN = (
+    ("C1", (1, 2, 3, 4)),
+    ("C2", (1, 2, 3, 4)),
+    ("C3", (1, 2, 3, 4)),
+    ("G1", (2, 3, 4)),
+    ("G2", (1, 2, 3, 4)),
+    ("G3", (1, 2, 3, 4)),
+    ("G4", (1, 2, 3, 4)),
+    ("G5", (1, 2, 3, 4)),
+    ("G6", (1, 2, 3, 4)),
+    ("G7", (1, 2, 3, 4)),
+)
+
+#: The cold-MHA companion of the V=16 campaign: `xacq` P4, four repeats,
+#: `realized_cache` `["graph"]`, 0 histories against 16384 queries, graph
+#: `b1_G4`. v2 excludes it from the cached fit and says why -- "P4 is the cold
+#: diagnostic bridge; it is not a cached training point and never enters this
+#: fit" -- which is exactly what makes it this deployment's cold observation.
+#:
+#: B2's own cold MHA (P1-P4 under `b2acq`) is V=32. `kv_regions` is a treatment
+#: field and the declared deployment is the V=16 one, so B2's cold set is not
+#: this deployment's cold measurement; loading it beside this one would put two
+#: treatments in the cold domain, which is the ambiguity the composition
+#: refuses. It is archived below rather than dropped silently.
+_V16_COLD = (("P4", "{root}/b1graphs/b1_G4.reduced.json"),)
+
+_V16_DESIGNS = (
+    ("K1", "{root}/b1graphs/b1_C1.reduced.json"),
+    ("K2", "{root}/b1graphs/b1_K2.reduced.json"),
+    ("K3", "{root}/b1graphs/b1_K3.reduced.json"),
+    ("K4", "{root}/b1graphs/b1_K4.reduced.json"),
+    ("K5", "{root}/b1graphs/b1_K5.reduced.json"),
+    ("X2", "{root}/xgraphs/x_X2.reduced.json"),
+    ("X3", "{root}/xgraphs/x_X3.reduced.json"),
+    ("X4", "{root}/xgraphs/x_X4.reduced.json"),
+    ("X5", "{root}/xgraphs/x_X5.reduced.json"),
+)
+_V16_REPEATS = (1, 2, 3, 4)
+
+#: The cached-MHA inputs this book used to carry, kept as a name rather than
+#: as a load. Both are still on disk and both remain the evidence for what
+#: they measured; neither is in `options` any more, because each is its own
+#: `kv_regions` treatment and loading them beside V=16 is the ambiguity the
+#: composition refuses. Listed so that "archived" is a fact in the registry
+#: and not only in a handoff.
+ARCHIVED_CACHED_MHA = (
+    ("{root}/pricing_coverage/agg_att_q16384_c16384.tp1.json",
+     "unified.prefill.cached, kv_regions=1"),
+    ("{root}/pricing_coverage/p_caseb/AGG_caseb_unified_q16384_c32768.json",
+     "unified.prefill.cached, kv_regions=32"),
+    ("{root}/b2acq/training/PRICE_K{1..5}.rep{1..4}.json",
+     "unified.prefill.cached, kv_regions=32 -- the superseded B2 population, "
+     "20 files, still frozen in mixed_freeze/v1"),
+    ("{root}/b2acq/training/PRICE_P{1..4}.rep{1..4}.json",
+     "unified.prefill.COLD, kv_regions=32 -- 16 files; archived for the same "
+     "treatment reason, not because the cold candidate changed"),
+)
+
+
+def _tp1_prices() -> tuple:
+    """The source-width price list, as `prices:graph:regime` specs.
+
+    Verbatim in content from the run whose composition was exercised; the
+    paths are `{root}`-relative here and were absolute there.
+    """
+    spec = []
+
+    def add(prices: str, graph: str = "") -> None:
+        spec.append(f"{prices}:{graph}:unregistered")
+
+    # The two decode-32 pairs: the body and head templates' own prices.
+    add(f"{_TP1}/p27bdec32.tp1.r0.json", f"{_TP1}/b27dec32.tp1.r0.json")
+    add(f"{_TP1}/p27hdec32.tp1.r0.json", f"{_TP1}/h27dec32.tp1.r0.json")
+
+    # The 640- and 16384-token prefill cells.
+    p640 = f"{_PC}/p640"
+    add(f"{p640}/p27_body_640.tp1.r0.{_REP}.json",
+        f"{p640}/graphs/b27_tp1_r0_pref_body_640.json")
+    add(f"{p640}/p27_head_640.tp1.r0.{_REP}.json",
+        f"{p640}/graphs/b27_tp1_r0_pref_head_640.json")
+    # No graph: a narrowed `--only` job prices the LM-head GEMM alone.
+    add(f"{p640}/p27_headgemm3_640.tp1.r0.{_REP}.json")
+    add(f"{_PC}/p16384/p27_body_16384.tp1.r0.{_REP}.json",
+        f"{_PC}/p16384/graphs/b27_tp1_r0_pref_body_16384.json")
+
+    # The long-context cells and the mixed step.
+    for stem in ("ctx_b32_c4096", "ctx_b32_c16384", "mix_b32"):
+        add(f"{_PC}/long/p27_{stem}.tp1.r0.{_REP}.json",
+            f"{_CARD}/b27_tp1_r0_{stem}.json")
+
+    # The one-sequence body ladder, and the cell at its context boundary.
+    add(f"{_PC}/g1b/p27_ctx_b32_c1151.tp1.r0.{_REP}.json",
+        f"{_CARD}/b27_tp1_r0_ctx_b32_c1151.json")
+    for batch in (1, 2, 4, 8, 16, 32):
+        add(f"{_PC}/g1b/p27_lad_b{batch}.tp1.r0.{_REP}.json",
+            f"{_CARD}/b27_tp1_r0_lad_b{batch}.json")
+
+    # The cached-MHA calibration inputs: the V=16 campaign, and nothing else.
+    #
+    # What used to stand here was two aggregated attention files, and asking
+    # the library rather than their names showed they were two *different*
+    # cached populations -- `agg_att_q16384_c16384` at `kv_regions=1` and
+    # `AGG_caseb_unified_q16384_c32768` at `kv_regions=32`, 16 observations
+    # each. `kv_regions` is a treatment field, so those are two laws by
+    # identity; with the B2 V=32 set that is three, and a deployment that
+    # declares none of them is refused for ambiguity rather than priced.
+    #
+    # Replacing both with the V=16 set leaves exactly one cached treatment in
+    # the book, so `_treatment_for` resolves without a declaration. The cold
+    # MHA observations are NOT touched: they come from the two body-prefill
+    # files above at `('cache', 'graph')`, a different regime, and dropping
+    # the cached files leaves them exactly as they were.
+    for design, graph in _V16_DESIGNS:
+        for rep in _V16_REPEATS:
+            add(f"{_XACQ}/PRICE_{design}.rep{rep}.json", graph)
+
+    # The cold-MHA observation of the same deployment, and the fitted B2 GDN
+    # family. Neither is supplied by the body-prefill files above: those carry
+    # the serving deployment's own attention observations, under the serving
+    # scope, and the two ragged laws this book has to answer from were fitted
+    # from these.
+    for design, graph in _V16_COLD:
+        for rep in _V16_REPEATS:
+            add(f"{_XACQ}/PRICE_{design}.rep{rep}.json", graph)
+    for design, repeats in _B2_GDN:
+        for rep in repeats:
+            add(f"{_B2ACQ}/PRICE_{design}.rep{rep}.json",
+                f"{{root}}/b1graphs/b1_{design}.reduced.json")
+
+    # The head row ladder, both passes per width: the whole-graph job prices
+    # the three metadata operators and a narrowed `--only` job takes the LM
+    # head GEMM. Without these the head GEMM at any width below 32 refuses as
+    # an extrapolation from the single measured width.
+    for rows, sub in ((_HEAD_ROWS, ""), (_HEAD_ROWS_NATIVE, "_native")):
+        for m in rows:
+            for pass_ in ("all", "gemm"):
+                add(f"{_HG}/prices{sub}/head_h16384_m{m}.{pass_}.{_REP}.json",
+                    f"{_HG}/graphs{sub}/head_h16384_m{m}.json")
+    return tuple(spec)
 
 
 #: The record a modelled server builds its `Config` from, per width.
@@ -147,14 +369,10 @@ def memory_model(tp: int, root) -> str:
 def per_width_options(tp: int) -> tuple:
     """The options this width adds to `SHARED_OPTIONS`, unresolved."""
     if tp == 1:
-        body = (f"{_TP1}/p27bdec32.tp1.r0.json"
-                f":{_TP1}/b27dec32.tp1.r0.json:unregistered")
-        head = (f"{_TP1}/p27hdec32.tp1.r0.json"
-                f":{_TP1}/h27dec32.tp1.r0.json:unregistered")
         return (
             ("tp", "1"),
             ("replay_target", _CAPTURED_TARGET),
-            ("price", f"{body},{head}"),
+            ("price", ",".join(_tp1_prices())),
             ("template", f"{_TP1}/b27dec32.tp1.r0.json"),
             ("head_template", f"{_TP1}/h27dec32.tp1.r0.json"),
         )
@@ -269,12 +487,17 @@ def resolution(tp: int, root) -> dict:
 #: at the first decode step with a running-request count of 31.
 OPEN_REFUSALS = {
     "head_rows": {
-        "what": "the head is priced at 32 rows and nowhere else; any other "
-                "running-request count is refused, and one measured point "
-                "fits nothing",
-        "cells": CELLS,
-        "closes": "a head price sweep over the running-request counts the "
-                  "registered workloads actually reach",
+        # Closed at TP=1 and only there. The row ladder in `_tp1_prices`
+        # measures the source width at 1..32 across both dispatch regimes,
+        # which is every running-request count `max_num_seqs=32` can reach.
+        # TP=2 and TP=4 still stage the single decode-32 head price out of
+        # `_WIDE`, so the original refusal stands at those widths unchanged.
+        "what": "at TP>1 the head is priced at 32 rows and nowhere else; any "
+                "other running-request count is refused, and one measured "
+                "point fits nothing",
+        "cells": tuple(c for c in CELLS if not c.startswith("tp1-")),
+        "closes": "the source-width row ladder, re-measured or transferred at "
+                  "each width, over the counts the workloads actually reach",
         "first_met": True,
     },
     "seeded_structure": {
@@ -367,6 +590,75 @@ COST_TERMS = {
 }
 
 OWED_TERMS = tuple(k for k, v in COST_TERMS.items() if v["state"] == "owed")
+
+
+def verify(tp: int, root) -> dict:
+    """Build this width's oracle from its own options and report what loaded.
+
+    `check` resolves paths; this resolves *configuration*. The two answer
+    different questions and the difference is not academic: a file that exists
+    and a file the composition read are the same thing only when nothing is
+    quietly declining it. Run 5's whole family-price path was inert with every
+    artifact present, because one option was absent -- `check` would have
+    called that configuration complete.
+
+    So this calls `build_source_group` with the registry's own options, builds
+    the price library's identities, and reports the object that resulted: the
+    provider class actually selected, the interpolation gap it will honour,
+    which price files contributed a family and which are exact-signature only,
+    and the region model taken. No shape is priced and nothing is derived.
+
+    `build_source_group` rather than `source_cost_oracle`: the served entry
+    point discards everything but the oracle, and the composition is where the
+    gap ratio and the rank artifacts are. One width per process -- ATOM
+    registers attention layers in a global table at construction and refuses a
+    second build -- so `main` forks rather than looping.
+    """
+    from atom.compass.runtime.source_oracle import build_source_group
+
+    kwargs = {}
+    for item in options(tp, root):
+        key, _, value = item.partition("=")
+        kwargs[key] = value
+    built = build_source_group(**kwargs)
+
+    library = getattr(built.oracle, "library", None)
+    # The library takes its identities lazily, so a report written before this
+    # would show an empty read list for a composition that reads forty files.
+    build = getattr(library, "_build", None)
+    if callable(build):
+        build()
+    unbuildable = dict(getattr(library, "unbuildable", {}) or {})
+    requested = [spec.split(":")[0]
+                 for item in options(tp, root) if item.startswith("price=")
+                 for spec in item.partition("=")[2].split(",")]
+    return {
+        "tp": tp,
+        "root": str(Path(root)),
+        "provider": type(library).__name__ if library is not None else None,
+        # Off the library, not off the group: `build_source_group` returns
+        # `SourceGroup`, which has no such field, and reading it there would
+        # report `null` for a composition that is interpolating.
+        "max_gap_ratio": getattr(library, "max_gap_ratio", None),
+        "interpolating": getattr(library, "max_gap_ratio", None) is not None,
+        "regions": next((o.partition("=")[2] for o in options(tp, root)
+                         if o.startswith("regions=")), None),
+        "region_snapshot": bool(
+            getattr(built.oracle, "compass_region_snapshot", None)),
+        "price_files_requested": len(requested),
+        "price_files_exact_only": {Path(p).name: why
+                                   for p, why in sorted(unbuildable.items())},
+        "loaded_inputs": len(getattr(built, "loaded_inputs", ()) or ()),
+        "build_seconds": getattr(built, "build_seconds", None),
+        "means": (
+            "the composition this width's options actually build; a price "
+            "file listed under price_files_exact_only was read but "
+            "contributes no family, and provider names the path that will "
+            "answer a lookup. At TP>1 the group holds one library per rank "
+            "and this describes the one the group oracle exposes, so it "
+            "speaks for that rank's load and not for the spread across them"
+        ),
+    }
 
 
 def cell_config(tp: int, klass: str, root) -> dict:
@@ -467,7 +759,43 @@ def main(argv=None) -> int:
     ap.add_argument("--root", required=True,
                     help="directory the artifact paths resolve against")
     ap.add_argument("--json", action="store_true")
+    ap.add_argument("--verify", action="store_true",
+                    help="also build each width's oracle and report the "
+                         "configuration that actually loaded, not only the "
+                         "files that resolve")
+    ap.add_argument("--verify-tp", type=int, choices=TPS,
+                    help="verify one width in this process; what --verify "
+                         "forks per width")
     args = ap.parse_args(argv)
+
+    if args.verify_tp:
+        try:
+            report = verify(args.verify_tp, args.root)
+        except Exception as error:  # noqa: BLE001 - a refusal is the result
+            report = {"tp": args.verify_tp,
+                      "error": f"{type(error).__name__}: {error}"}
+        print(json.dumps(report, indent=2))
+        return 0 if "error" not in report else 1
+
+    if args.verify:
+        # A child per width, because a second build in one process is refused:
+        # ATOM registers attention layers in a global table at construction.
+        # Only the child's last JSON object is read -- the model build writes
+        # to stdout too, and a report that swallowed that would be unreadable.
+        built = []
+        for tp in TPS:
+            done = subprocess.run(
+                [sys.executable, __file__, "--root", str(args.root),
+                 "--verify-tp", str(tp)],
+                capture_output=True, text=True)
+            tail = done.stdout[done.stdout.rfind("\n{"):] or done.stdout
+            try:
+                built.append(json.loads(tail))
+            except ValueError:
+                built.append({"tp": tp, "error": "child produced no report",
+                              "stderr": done.stderr[-400:]})
+        print(json.dumps(built, indent=2))
+        return 0 if all("error" not in b for b in built) else 1
 
     report = check(args.root)
     print(json.dumps(report, indent=2) if args.json else render(report))
