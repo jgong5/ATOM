@@ -135,6 +135,9 @@ _CARD = "{root}/g4/card"
 _PC = "{root}/pricing_coverage"
 _HG = "{root}/headgrid"
 
+#: The body row ladder acquired to close the 32..640 and 640..16384 gaps.
+_LAD = "{root}/pricing_coverage/bodyladder"
+
 #: The measurement repetition every price in the list below is read from. One
 #: value for the whole list on purpose: mixing repetitions across a family is
 #: how a curve acquires a step nobody measured.
@@ -290,6 +293,35 @@ def _tp1_prices() -> tuple:
     add(f"{p640}/p27_headgemm3_640.tp1.r0.{_REP}.json")
     add(f"{_PC}/p16384/p27_body_16384.tp1.r0.{_REP}.json",
         f"{_PC}/p16384/graphs/b27_tp1_r0_pref_body_16384.json")
+
+    # The rest of the body row ladder.
+    #
+    # `RowSupport` refuses a lookup whose row count falls in a gap between
+    # adjacent measured rows wider than `max_gap_ratio`, and the body rows
+    # this list carried were the decode ladder 1,2,4,8,16,32 plus the two
+    # prefill cells above. Run 8 asked for 9216 rows and was refused -- "falls
+    # in the unsampled gap 640..16384 (x25.6)" -- for 42 signatures, which
+    # left 2118 of 2443 operators unpriced. A short final chunk would have hit
+    # 32..640 (x20) the same way. Fixing `interpolate=1` restored the declared
+    # bound to its 2.0 default and closed neither gap: that takes measurement.
+    #
+    # 512 and 1024 were acquired alongside 640 as its interpolation brackets
+    # and have been on disk since; they were simply never named here. The rest
+    # were measured by `agent_scratch/stage/job_bodyladder.sh`, on the
+    # snapshot that priced 16384.
+    #
+    # Adjacent ratios across the axis are now 32:64, 64:128, 128:256, 256:512,
+    # 1024:2048, 2048:4096, 4096:8192 and 8192:16384 all exactly 2.0, plus
+    # 512:640 at 1.25 and 640:1024 at 1.6. The rule refuses `ratio >
+    # max_gap_ratio`, so exactly 2.0 is inside support; every rung is a power
+    # of two, which is the boundary the kernels dispatch on, and 640 is a
+    # measured deployment shape rather than a ladder rung.
+    for n in (512, 1024):
+        add(f"{p640}/p27_body_{n}.tp1.r0.{_REP}.json",
+            f"{p640}/graphs/b27_tp1_r0_pref_body_{n}.json")
+    for n in (64, 128, 256, 2048, 4096, 8192):
+        add(f"{_LAD}/p27_body_{n}.tp1.r0.{_REP}.json",
+            f"{_LAD}/graphs/b27_tp1_r0_pref_body_{n}.json")
 
     # The long-context cells and the mixed step.
     for stem in ("ctx_b32_c4096", "ctx_b32_c16384", "mix_b32"):
