@@ -18,7 +18,8 @@ from atom.compass.core.memory_model import (
     non_torch_bytes, peak_activation_bytes, scratch_bytes_per_token,
     liveness_is_recorded, liveness_instrumentation, traced_shape,
     LIVENESS_INSTRUMENTATION, UNVERSIONED_LIVENESS, UnfoundedActivation,
-    allocator_block_bytes, allocator_segment_bytes, capture_reserved_parts,
+    allocator_block_bytes, allocator_segment_bytes, allocator_charged_bytes,
+    capture_reserved_parts, ALLOCATOR_SMALL_SIZE, allocator_pool_bytes,
     ALLOCATOR_SMALL_BUFFER, ALLOCATOR_LARGE_BUFFER,
     GDN_ACTIVATION_INSTANTS, activation_instant_bytes, gdn_activation_widths,
     UnfoundedPrediction, derived_readings, weight_bytes)
@@ -1027,3 +1028,177 @@ class TestAPredictionCanReachTheInstantWithoutAGraph:
         profile, load = self._with_config()
         _, activation = derived_readings(profile, warmup_tokens=200, load=load)
         assert activation == 4000
+
+
+class TestWhatTheAllocatorChargesIsNotWhatWasAsked:
+    """The 1 MiB the source prediction was missing, as a rule rather than a fit.
+
+    `allocated_bytes` charges the block the allocator hands out. When a fresh
+    segment's leftover is too small to be worth splitting off, it is not split
+    off -- it stays inside that block, and the charge is the whole segment. A
+    snapshot shows nothing free, because nothing is free.
+
+    The threshold was read off the shipped binary's behaviour, since the rule
+    lives in a `.cpp` the wheel does not ship: in the S27 TP=1 warmup snapshot
+    the largest retained remainder is 1 048 576 and the smallest split-off tail
+    is 1 114 112, so the boundary is exactly `kSmallSize`, witnessed from both
+    sides.
+    """
+
+    def test_the_source_in_proj_request_retains_exactly_one_mebibyte(self):
+        """16 384 x 16 480 x 2 B, and the gap the diagnostic could not close.
+
+        The warmup history witnesses this allocation directly: a segment of
+        541 065 216 B mapped, the 540 016 640 B request served at the same
+        address, no allocation ever at the tail address, and the segment freed
+        as one unit.
+        """
+        charged = allocator_charged_bytes(16_384 * 16_480 * 2)
+        assert charged["requested"] == 540_016_640
+        assert charged["block"] == 540_016_640
+        assert charged["segment"] == 541_065_216
+        assert charged["retained"] == 1_048_576
+        assert charged["charged"] == 541_065_216
+
+    def test_a_remainder_one_block_over_the_threshold_is_split_off(self):
+        """The other side of the boundary, so the rule is not one-sided."""
+        charged = allocator_charged_bytes(541_065_216 - 1_048_576 - 512)
+        assert charged["retained"] == 0
+        assert charged["split_off"] > ALLOCATOR_SMALL_SIZE
+        assert charged["charged"] == charged["block"]
+
+    @pytest.mark.parametrize("width,tail", [(1, 1_048_576), (2, 524_288),
+                                            (4, 0)])
+    def test_it_does_not_simply_halve_with_width(self, width, tail):
+        """The reason this is a rule and not a per-width constant.
+
+        Halving the shard halves the request but not the rounding: at TP=4 the
+        remainder lands at 1 310 720, *over* `kSmallSize`, so it is split off
+        and there is nothing retained at all. A term fitted at TP=1 and halved
+        would have claimed 262 144 B here.
+        """
+        assert 16_480 % width == 0
+        charged = allocator_charged_bytes(16_384 * (16_480 // width) * 2)
+        assert charged["retained"] == tail
+
+    def test_every_other_tensor_in_the_instant_rounds_exactly(self):
+        """Which is why one allocation accounts for the whole source gap."""
+        for elements in (34_816, 17_408, 6_144, 5_120):
+            charged = allocator_charged_bytes(16_384 * elements * 2)
+            assert charged["retained"] == 0
+            assert charged["charged"] == charged["requested"]
+
+    def test_a_request_served_from_existing_space_claims_only_the_block(self):
+        """Whose segment it lands in is history, not a property of the request."""
+        charged = allocator_charged_bytes(540_016_640, fresh_segment=False)
+        assert charged["segment"] is None
+        assert charged["charged"] == 540_016_640
+        assert charged["retained"] == 0
+
+    def test_a_small_request_is_charged_its_block_and_not_its_buffer(self):
+        """The small pool splits down to `kMinBlockSize`, so 2 B costs 512 B."""
+        charged = allocator_charged_bytes(2)
+        assert charged["block"] == 512
+        assert charged["segment"] == ALLOCATOR_SMALL_BUFFER
+        assert charged["charged"] == 512
+
+
+class TestThePoolIsReplayedFromRequestsNotFromWhatSurvived:
+    """The capture pool's reserved half, derived rather than supplied.
+
+    `capture_pinned_bytes` explains what capture *pins*. The same rule over
+    those pinned blocks reads 82% high against the pool that was measured,
+    because the pool's segments are the high-water mark of the whole captured
+    forward and nearly all of it is freed before the window closes. What the
+    allocator responds to is the *order* of requests and frees, so that is what
+    `allocator_pool_bytes` is handed.
+    """
+
+    def test_a_free_lets_the_next_request_reuse_the_segment(self):
+        """Two requests, one segment -- because the first died first."""
+        stream = [("alloc", "a", 300_000), ("free", "a", 0),
+                  ("alloc", "b", 300_000)]
+        replay = allocator_pool_bytes(stream)
+        assert replay["segments_mapped"] == 1
+        assert replay["reserved"] == ALLOCATOR_SMALL_BUFFER
+
+    def test_the_same_requests_in_a_different_order_cost_different_bytes(self):
+        """Order, not the set of sizes, is what the allocator responds to.
+
+        Three 900 000 B requests. Two blocks fit in one 2 MiB buffer and the
+        third does not, so held together they cost two segments; freed as they
+        go they cost one. Same three sizes either way.
+        """
+        together = allocator_pool_bytes([("alloc", "a", 900_000),
+                                         ("alloc", "b", 900_000),
+                                         ("alloc", "c", 900_000)])
+        serial = allocator_pool_bytes([("alloc", "a", 900_000),
+                                       ("free", "a", 0),
+                                       ("alloc", "b", 900_000),
+                                       ("free", "b", 0),
+                                       ("alloc", "c", 900_000)])
+        assert together["segments_mapped"] == 2
+        assert together["reserved"] == 2 * ALLOCATOR_SMALL_BUFFER
+        assert serial["segments_mapped"] == 1
+        assert serial["reserved"] == ALLOCATOR_SMALL_BUFFER
+    def test_two_small_requests_share_one_small_segment(self):
+        """A 2 MiB buffer holds both, because the remainder splits off."""
+        stream = [("alloc", "a", 900_000), ("alloc", "b", 900_000)]
+        replay = allocator_pool_bytes(stream)
+        assert replay["segments_mapped"] == 1
+        assert replay["reserved"] == ALLOCATOR_SMALL_BUFFER
+
+    def test_a_segment_is_reported_with_the_request_that_forced_it(self):
+        """Which request mapped a segment is not which tensor ends up in it.
+
+        This is the whole reason the pool cannot be predicted from what capture
+        pins: in the S27 window every pool segment was forced by a transient,
+        and the survivors landed in the space those transients left.
+        """
+        stream = [("alloc", "big", 1_054_720), ("free", "big", 0),
+                  ("alloc", "survivor", 2_000_000)]
+        replay = allocator_pool_bytes(stream)
+        assert replay["forced_by"] == [1_054_720]
+        assert replay["segments"] == [ALLOCATOR_LARGE_BUFFER]
+        assert replay["live_at_end"] == allocator_block_bytes(2_000_000)
+
+    def test_a_freed_large_block_does_not_serve_a_small_request(self):
+        """The two size pools are separate, so 20 MiB free buys nothing."""
+        stream = [("alloc", "big", 1_054_720), ("free", "big", 0),
+                  ("alloc", "small", 496_640)]
+        replay = allocator_pool_bytes(stream)
+        assert replay["segments"] == [ALLOCATOR_LARGE_BUFFER,
+                                      ALLOCATOR_SMALL_BUFFER]
+        assert replay["forced_by"] == [1_054_720, 496_640]
+    def test_a_free_with_no_allocation_is_ignored(self):
+        """A transformation may drop a source branch and leave its free.
+
+        `logits_in_graph` is the case in hand: above one rank the statement at
+        `model_runner.py:4298` does not run, so a stream derived from a TP=1
+        history has frees whose allocations are gone.
+        """
+        replay = allocator_pool_bytes([("free", "never-allocated", 0)])
+        assert replay["reserved"] == 0
+        assert replay["segments_mapped"] == 0
+
+    def test_an_unknown_op_is_refused_rather_than_skipped(self):
+        with pytest.raises(ValueError):
+            allocator_pool_bytes([("realloc", "a", 1)])
+
+    def test_the_parts_say_whether_the_pool_was_derived(self):
+        supplied = capture_reserved_parts(46_137_344)
+        assert supplied["pool_reserved_derived"] is False
+        derived = capture_reserved_parts(pool_stream=[("alloc", "a", 300_000)])
+        assert derived["pool_reserved_derived"] is True
+        assert derived["pool_reserved"] == ALLOCATOR_SMALL_BUFFER
+        assert derived["total"] == derived["outside_pools"] + ALLOCATOR_SMALL_BUFFER
+
+    def test_neither_a_figure_nor_a_program_is_refused(self):
+        with pytest.raises(UnfoundedPrediction):
+            capture_reserved_parts()
+
+    def test_both_a_figure_and_a_program_is_refused(self):
+        """A recorded figure and a replay are two different claims."""
+        with pytest.raises(UnfoundedPrediction):
+            capture_reserved_parts(46_137_344,
+                                   pool_stream=[("alloc", "a", 300_000)])
