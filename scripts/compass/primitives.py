@@ -219,6 +219,32 @@ def main() -> int:
         t0 = time.perf_counter()
         stood_up = stand_up_layers(config, args.graph, args.layers)
         model_s = time.perf_counter() - t0
+    else:
+        # Standing up layers is also what imports the modules that REGISTER the
+        # aiter operators, and without that `_resolve` finds no
+        # `torch.ops.aiter.gemm_a16w16` and refuses it as "not registered in
+        # this process" -- true, and an artifact of this script rather than
+        # anything about the operator.
+        #
+        # It is `atom.model_ops.linear` that registers it, not `aiter`:
+        # importing aiter itself leaves `torch.ops.aiter` present but empty of
+        # this operator. ATOM registers the kernel it calls, so ATOM is what
+        # has to be imported.
+        #
+        # It bit the LM head specifically: a head graph has no attention layer
+        # to stand up, and its dominant operator is the vocabulary projection.
+        # Registration is a separate concern from building a model, so it is
+        # done separately rather than by standing up layers the region has not
+        # got.
+        # `atom.model_ops.linear` specifically, not the package: importing the
+        # package alone leaves `torch.ops.aiter.gemm_a16w16` absent. Verified
+        # one import per fresh process, because once the submodule has
+        # registered the operator every later import in that process looks
+        # sufficient.
+        try:
+            import atom.model_ops.linear  # noqa: F401 - for its registrations
+        except ImportError as exc:
+            print(f"### atom.model_ops.linear not importable: {exc}", flush=True)
 
     from atom.compass.runtime.microbench import load_ops, price_graph
 
