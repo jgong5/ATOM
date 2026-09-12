@@ -110,9 +110,9 @@ def test_the_required_artifacts_are_read_out_of_the_options():
     artifacts = registry.required_artifacts(2, "/r")
     assert artifacts["template"] == "/r/serving/src_tp2/b27dec32.json"
     assert artifacts["head_template"] == "/r/serving/src_tp2/h27dec32.json"
-    assert artifacts["replay_target"] == "/r/serving/src_tp2/target.tp2.json"
+    assert artifacts["replay_target"] == "/r/serving/src_tp2/target.tp2.r22.json"
     assert artifacts["memory_model"] == (
-        "/r/memval/capture_replay/profile_r21/profile.tp2.json"
+        "/r/memval/capture_replay/profile_r22/profile.tp2.json"
     )
     # Five price specs at a wide width; the two with a graph beside them
     # contribute both files.
@@ -127,9 +127,23 @@ def test_each_width_replays_a_target_of_its_own_width():
     # -- which is what one --replay-target for the whole matrix does -- is
     # therefore not a mistake the run survives to report.
     assert registry.replay_target(1, "/r") == "/r/poc/g5_27b/target.json"
-    assert registry.replay_target(2, "/r") == "/r/serving/src_tp2/target.tp2.json"
-    assert registry.replay_target(4, "/r") == "/r/serving/src_tp4/target.tp4.json"
+    assert registry.replay_target(2, "/r") == "/r/serving/src_tp2/target.tp2.r22.json"
+    assert registry.replay_target(4, "/r") == "/r/serving/src_tp4/target.tp4.r22.json"
     assert len({registry.replay_target(tp, "/r") for tp in registry.TPS}) == 3
+
+
+def test_the_derived_targets_come_from_the_same_profile_set_as_the_budget():
+    # A derived record is derived from a profile, so the record and the profile
+    # in one cell have to be the same set. The unsuffixed `target.tp{2,4}.json`
+    # beside these were derived from the oldest `capture_replay/profile/` set;
+    # naming them here while the pool is sized from r22 would mix two weight
+    # terms in a single run -- the budget from one, the parallel contract and
+    # the state-runtime wire form from the other. Both old records stay on
+    # disk, which is why this has to be asserted rather than assumed.
+    for tp in (2, 4):
+        target = registry.replay_target(tp, "/r")
+        assert target.endswith(f"/serving/src_tp{tp}/target.tp{tp}.r22.json")
+        assert "r22" in registry.memory_model(tp, "/r")
 
 
 def test_every_width_is_sized_by_the_analytical_profile_of_its_width():
@@ -139,7 +153,7 @@ def test_every_width_is_sized_by_the_analytical_profile_of_its_width():
     # is already known.
     for tp in registry.TPS:
         assert registry.memory_model(tp, "/r") == (
-            f"/r/memval/capture_replay/profile_r21/profile.tp{tp}.json"
+            f"/r/memval/capture_replay/profile_r22/profile.tp{tp}.json"
         )
 
 
@@ -278,7 +292,7 @@ def test_a_rank_reading_another_rank_s_file_is_named_not_counted_present(tmp_pat
     # The target derived at this width, and the profile it is sized from --
     # which lives with MEMORY's other profiles, not under the width's
     # directory.
-    (wide / "target.tp2.json").write_text("{}")
+    Path(registry.replay_target(2, tmp_path)).write_text("{}")
     profile = Path(registry.memory_model(2, tmp_path))
     profile.parent.mkdir(parents=True, exist_ok=True)
     profile.write_text("{}")
@@ -307,10 +321,10 @@ def test_the_report_says_which_rank_is_missing_which_file(tmp_path):
 def test_the_target_and_the_profile_are_not_per_rank_artifacts(tmp_path):
     # They are per *width*: one record builds the Config and one profile sizes
     # the pool, and every rank of the group gets the same pair. Asking rank 3
-    # for `target.tp4.tp3.json` would invent a file nothing produces.
+    # for `target.tp4.r22.tp3.json` would invent a file nothing produces.
     found = registry.resolution(4, tmp_path)
     for rank in range(4):
-        assert found[rank]["replay_target"]["path"].endswith("target.tp4.json")
+        assert found[rank]["replay_target"]["path"].endswith("target.tp4.r22.json")
         assert found[rank]["replay_target"]["own"] is True
         assert found[rank]["memory_model"]["path"].endswith("profile.tp4.json")
         assert found[rank]["memory_model"]["own"] is True
@@ -420,20 +434,22 @@ def test_each_refusal_says_what_would_close_it(tmp_path):
         assert f"closed by: {term['closes']}" in text, key
 
 
-def test_all_three_widths_are_sized_from_the_frozen_r21_profiles():
-    # The routing test for the profile set, not for the per-width suffix. Two
-    # directories exist: `profile/`, which past diagnostics cite by path and
-    # which therefore stays on disk, and `profile_r21/`, which carries
-    # `capture_history` and the calibration files MEMORY's 8ef965dc gate
-    # reads. Only the second is the frozen plan's input, and a default that
-    # silently reverts to the first would size all six cells from the retired
-    # set while every other artifact stayed current -- an absence nothing else
-    # in the readiness report would show, because both paths resolve.
+def test_all_three_widths_are_sized_from_the_staged_r22_profiles():
+    # The routing test for the profile set, not for the per-width suffix.
+    # Three directories exist and all three stay on disk, because published
+    # results cite their own set by path: `profile/`, `profile_r21/`, and
+    # `profile_r22/`, whose weight term is ATOM's own build of the resolved
+    # checkpoint rather than the checkpoint's safetensors headers. Only the
+    # last is this plan's input, and a default that silently reverted to
+    # either retired set would size all twenty-four cells from a weight term
+    # nobody chose while every other artifact stayed current -- an absence
+    # nothing in the readiness report would show, because all three resolve.
     for tp in registry.TPS:
         assert registry.memory_model(tp, "/r") == (
-            f"/r/memval/capture_replay/profile_r21/profile.tp{tp}.json"
+            f"/r/memval/capture_replay/profile_r22/profile.tp{tp}.json"
         )
         assert "/capture_replay/profile/" not in registry.memory_model(tp, "/r")
+        assert "/profile_r21/" not in registry.memory_model(tp, "/r")
     assert len({registry.memory_model(tp, "/r") for tp in registry.TPS}) == 3
 
 

@@ -527,8 +527,27 @@ def _tp1_prices() -> tuple:
 #: claims and is what the source oracle was built from. TP=2 and TP=4 replay
 #: a record derived at that width from the memory model. The pool every one
 #: of them is sized from is the analytical profile below, not the record.
+#:
+#: The derived records are the `.r22.` ones, not the unsuffixed pair beside
+#: them. A derived record is derived *from a profile*, and the unsuffixed pair
+#: came from the oldest `capture_replay/profile/` set -- their own
+#: `derivation.lineage` says so. Pointing the profile at r22 and leaving the
+#: record on `profile/` would put two weight terms in one cell: the budget
+#: from r22, the parallel contract and the state-runtime wire form from a
+#: retired set. Both old records stay on disk unmodified; results already
+#: published cite them by path.
+#:
+#: The `.r22.` pair was derived at the settings this plan actually runs
+#: (`ENGINE_ARGS`): utilization 0.90, `max_model_len` 262144, `max_num_seqs`
+#: 32, `max_num_batched_tokens` 16384, block size 16, bf16 KV, prefix caching
+#: off. 266 768 blocks at TP=2 and 588 518 at TP=4, against 266 835 and
+#: 590 328 from the retired set; the whole difference is the weight term, and
+#: it is small because weights are a small share of the wide budgets. Nothing
+#: measured at TP=2 or TP=4 enters either record -- the state layout, capture
+#: sizes and card are borrowed from the TP=1 *source* capture and named in
+#: `derivation.borrowed`.
 _CAPTURED_TARGET = "{root}/poc/g5_27b/target.json"
-_DERIVED_TARGET = "{root}/serving/src_tp{tp}/target.tp{tp}.json"
+_DERIVED_TARGET = "{root}/serving/src_tp{tp}/target.tp{tp}.r22.json"
 
 #: The memory profile every width sizes its pool from, including TP=1. The
 #: acceptance question is whether every non-KV term and the KV budget survive
@@ -543,12 +562,21 @@ _DERIVED_TARGET = "{root}/serving/src_tp{tp}/target.tp{tp}.json"
 #: a delivery convention invented here: a profile is per *width*, never rank
 #: resolved.
 #:
-#: `profile_r21` rather than the older `profile/`: the r21 set carries
-#: `capture_history`, so a profile records what was captured beside the terms
-#: it derives, and its calibration files are the ones MEMORY's 8ef965dc gate
-#: reads. The older directory is left in place -- past diagnostics cite it by
-#: path and must keep resolving -- but nothing in the frozen plan selects it.
-_PROFILE = "{root}/memval/capture_replay/profile_r21/profile.tp{tp}.json"
+#: `profile_r22` rather than `profile_r21` or the older `profile/`. All three
+#: stay on disk: past diagnostics and every forecast already published cite
+#: their set by path, and a path that stops resolving turns a reviewed result
+#: into an unreadable one. Nothing else selects r22; this line is what does.
+#:
+#: What r22 changes is the weight term and nothing else. Its
+#: `calibration.tp{1,2,4}.json` and `model_config.json` are byte-identical to
+#: r21's, so MEMORY's 8ef965dc gate reads the same calibration files it read
+#: before and `capture_history` is the same probe. The weight term is now
+#: ATOM's own meta build of the resolved checkpoint (revision 1d4bf0f2,
+#: config.json 191e0af2) counted once per storage, rather than the
+#: checkpoint's safetensors headers: -849 398 784 B at TP=1, +35 590 656 B at
+#: TP=2, +478 085 376 B at TP=4, which is the difference between what the
+#: checkpoint holds and what the engine constructs.
+_PROFILE = "{root}/memval/capture_replay/profile_r22/profile.tp{tp}.json"
 
 
 def replay_target(tp: int, root) -> str:

@@ -235,7 +235,7 @@ class TestTheTwoSidesAreNotRunTheSameWay:
             for step in _role(cell, "serve", "modelled"):
                 command = step["command"]
                 assert command[command.index("--compass-memory-model") + 1] == (
-                    f"/a/memval/capture_replay/profile_r21/profile.tp{cell['tp']}.json"
+                    f"/a/memval/capture_replay/profile_r22/profile.tp{cell['tp']}.json"
                 )
 
     def test_the_real_side_is_never_handed_either(self):
