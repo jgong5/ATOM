@@ -901,3 +901,62 @@ def test_a_slice_with_no_recorded_alias_is_refused_rather_than_assumed():
     record, why = library.lookup(silent)
     assert record is None
     assert "not known" in why
+
+
+def test_a_view_stays_structural_when_the_ragged_attention_law_is_live(
+        tmp_path):
+    """The view branch is tested before the ragged branch, and that order
+    carries weight rather than reading well.
+
+    `_parametric` asks three questions in sequence: is this a view, is it a
+    row family, otherwise hand it to the ragged law. The third is a
+    catch-all -- anything whose kind is not "rows" reaches it -- so a view
+    only escapes the fitted attention law because it is intercepted first.
+    Swap the two and the slice stops being structural. Verified by mutation
+    rather than asserted: moving the ragged branch ahead of the view branch
+    makes this test fail, and the observed failure is a refusal, not a wrong
+    number -- the law declines an operator it has no design point for, the
+    structural zero is lost, and a head graph that was fully accounted
+    becomes incomplete. That is the mild version of the hazard. The severe
+    version is a library whose law does match, which would answer with
+    seconds for work that was never dispatched; this test cannot exhibit
+    that, and does not claim to.
+    A library with no attention observations cannot show this. `_modelled`
+    refuses immediately when `_attention_obs` is empty, so a misordered
+    dispatch would still produce a refusal and the test would pass for the
+    wrong reason. This builds the library from the attention fixtures first,
+    so the law is genuinely live, and only then asks for the slice.
+    """
+    from tests.compass.test_attention_family import _cold_designs, _library
+
+    library = _library(tmp_path, _cold_designs())
+    library._build()
+    assert library._attention_obs  # the law is live, not an empty stub
+
+    viewed = {
+        "name": "aten::slice.Tensor",
+        "input_shapes": [[3]],
+        "output_shapes": [[2]],
+        "dtypes": ["int32"],
+        "output_dtypes": ["int32"],
+        "output_aliases": [-1],
+        "int_values": [],
+    }
+    record, source = library.lookup(viewed, {"tp": 1}, None)
+    assert record is not None
+    assert record["seconds"] == 0.0
+    assert record["zero_work"] is True
+    assert record["structural"]["basis"] == "alias"
+    assert source.startswith("structural://")
+    # and it did NOT come from the law, which would have marked it a
+    # prediction rather than a structural absence
+    assert not record.get("interpolated")
+    assert "interpolated://" not in source
+
+    # The same operator, with the alias evidence removed, refuses -- it does
+    # not fall through to the law either. Not known is not not-allocated, and
+    # it is not an invitation to model.
+    unaliased = dict(viewed, output_aliases=[])
+    record, why = library.lookup(unaliased, {"tp": 1}, None)
+    assert record is None
+    assert "output_aliases" in why
