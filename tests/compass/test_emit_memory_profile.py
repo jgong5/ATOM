@@ -16,6 +16,8 @@ source-only and stays honest about where it got its inputs.
 
 import importlib.util
 import json
+import pickle
+import struct
 from pathlib import Path
 
 import pytest
@@ -120,3 +122,158 @@ class TestTheBaseCalibrationComesFromTheRegistry:
         with pytest.raises(SystemExit) as raised:
             emitter.base_calibration("Qwen/Qwen3-0.6B")
         assert "no default to fall back to" in str(raised.value)
+
+
+def _shard(path, tensors):
+    header, offset = {}, 0
+    for name, shape in tensors.items():
+        size = 2
+        for dim in shape:
+            size *= dim
+        header[name] = {"dtype": "BF16", "shape": list(shape),
+                        "data_offsets": [offset, offset + size]}
+        offset += size
+    blob = json.dumps(header).encode()
+    with open(path, "wb") as fh:
+        fh.write(struct.pack("<Q", len(blob)))
+        fh.write(blob)
+        fh.write(b"\0" * offset)
+    return offset
+
+
+@pytest.fixture
+def emitter_inputs(tmp_path):
+    """A checkpoint and a capture history the emitter will accept."""
+    checkpoint = tmp_path / "snapshot-deadbeef"
+    checkpoint.mkdir()
+    total = _shard(str(checkpoint / "model.safetensors"),
+                   {"model.layers.0.weight": (64, 32)})
+    (checkpoint / "config.json").write_text(json.dumps(CONFIG))
+    (checkpoint / "model.safetensors.index.json").write_text(json.dumps(
+        {"metadata": {"total_size": total},
+         "weight_map": {"model.layers.0.weight": "model.safetensors"}}))
+
+    history = tmp_path / "capture_history.pickle"
+    with open(history, "wb") as fh:
+        pickle.dump({"device_traces": [_trace()]}, fh)
+
+    config = tmp_path / "config.json"
+    config.write_text(json.dumps(CONFIG))
+    return checkpoint, history, config
+
+
+class TestTheEmitterPathAcrossWidths:
+    """The loop the emitter actually runs: TP1, then TP2, then TP4, in one
+    process. Every width after the first runs in a process the previous width
+    has already configured, which is where the sequencing bugs live."""
+
+    @staticmethod
+    def _stub_build(emitter, seen, checkpoint):
+        """Record what each width was asked, and answer as a build would."""
+        def rank_inventory(model, width, replay_target=None, identity=None):
+            seen.append((model, width))
+            per_rank = (64 // width * 32 * 2, 4096)
+            answer = {"ranks": {r: per_rank for r in range(width)},
+                      "uniform": True, "parameters": per_rank[0],
+                      "buffers": per_rank[1], "spread": 0,
+                      "identity": {"requested": model,
+                                   "resolved_path": str(checkpoint),
+                                   "architectures": ["Stub"],
+                                   "geometry": {}}}
+            if identity is not None:
+                identity.update(answer["identity"])
+            return answer
+        emitter.rank_inventory = rank_inventory
+
+    def test_it_emits_every_width_in_one_process(self, tmp_path,
+                                                 emitter_inputs):
+        checkpoint, history, config = emitter_inputs
+        emitter, seen = _emitter(), []
+        self._stub_build(emitter, seen, checkpoint)
+        out = tmp_path / "set"
+
+        assert emitter.main([
+            "--out", str(out), "--checkpoint", str(checkpoint),
+            "--capture-history", str(history), "--model-config", str(config),
+            "--widths", "1", "2", "4", "--rank-inventory"]) == 0
+
+        assert [width for _, width in seen] == [1, 2, 4]
+        manifest = json.loads((out / "MANIFEST.json").read_text())
+        assert sorted(manifest["widths"]) == ["1", "2", "4"]
+        for width in (1, 2, 4):
+            profile = json.loads((out / ("profile.tp%d.json" % width)).read_text())
+            assert profile["world_size"] == width
+            assert profile["parameters"] == 64 // width * 32 * 2
+            assert profile["buffers"] == 4096
+            provenance = profile["provenance"]
+            assert provenance["parameters_route"] == "built"
+            assert provenance["parameters_rank_uniform"] is True
+            assert sorted(provenance["parameters_by_rank"]) == [
+                str(r) for r in range(width)]
+
+    def test_the_build_is_the_resolved_snapshot_not_the_hub_name(
+            self, tmp_path, emitter_inputs):
+        """A hub name carries no revision: the cache decides what it means,
+        and a newer download decides differently. Counting from the name while
+        recording the checkpoint's digests would let the weight term and the
+        provenance describe different weights, with nothing saying so."""
+        checkpoint, history, config = emitter_inputs
+        emitter, seen = _emitter(), []
+        self._stub_build(emitter, seen, checkpoint)
+        out = tmp_path / "set"
+
+        assert emitter.main([
+            "--out", str(out), "--checkpoint", str(checkpoint),
+            "--capture-history", str(history), "--model-config", str(config),
+            "--widths", "1", "--rank-inventory"]) == 0
+
+        assert [model for model, _ in seen] == [str(checkpoint)]
+        profile = json.loads((out / "profile.tp1.json").read_text())
+        assert profile["provenance"]["parameters_build_input"] == str(checkpoint)
+        assert profile["provenance"]["model"] == "Qwen/Qwen3.8-27B"
+
+    def test_a_build_that_resolved_elsewhere_is_refused(self, tmp_path,
+                                                        emitter_inputs):
+        checkpoint, history, config = emitter_inputs
+        emitter, seen = _emitter(), []
+        self._stub_build(emitter, seen, tmp_path / "somewhere-else")
+        out = tmp_path / "set"
+
+        assert emitter.main([
+            "--out", str(out), "--checkpoint", str(checkpoint),
+            "--capture-history", str(history), "--model-config", str(config),
+            "--widths", "1", "--rank-inventory"]) == 2
+
+    def test_a_config_that_is_not_the_checkpoints_is_refused(self, tmp_path,
+                                                             emitter_inputs):
+        """Three terms, three inputs. Each is correct about its own input, so
+        if they are not the same model nothing in the set says so."""
+        checkpoint, history, _ = emitter_inputs
+        other = tmp_path / "other.json"
+        other.write_text(json.dumps(dict(CONFIG, vocab_size=7)))
+        emitter, seen = _emitter(), []
+        self._stub_build(emitter, seen, checkpoint)
+
+        assert emitter.main([
+            "--out", str(tmp_path / "set"), "--checkpoint", str(checkpoint),
+            "--capture-history", str(history), "--model-config", str(other),
+            "--widths", "1", "--rank-inventory"]) == 2
+
+    def test_the_notes_are_carried_into_every_profile(self, tmp_path,
+                                                      emitter_inputs):
+        checkpoint, history, config = emitter_inputs
+        emitter, seen = _emitter(), []
+        self._stub_build(emitter, seen, checkpoint)
+        out = tmp_path / "set"
+
+        assert emitter.main([
+            "--out", str(out), "--checkpoint", str(checkpoint),
+            "--capture-history", str(history), "--model-config", str(config),
+            "--widths", "1", "2", "--rank-inventory",
+            "--note", "a residual nobody has explained"]) == 0
+
+        for width in (1, 2):
+            profile = json.loads(
+                (out / ("profile.tp%d.json" % width)).read_text())
+            assert profile["provenance"]["notes"] == [
+                "a residual nobody has explained"]

@@ -6,8 +6,9 @@ the same plain `open`, from the runner's own working directory. So every
 reference emitted here is **absolute**: a relative sibling path works when the
 emitter's cwd happens to match the server's and silently fails otherwise.
 
-Every term is filled -- `parameters` comes from the checkpoint's own
-safetensors headers at each width -- and each profile carries a `provenance`
+Every term is filled -- `parameters` is what ATOM's own build holds at each
+width, with the checkpoint's safetensors headers kept beside it as the stated
+cross-check -- and each profile carries a `provenance`
 block naming the model, the config, the checkpoint revision, the topology
 probe, the environment the width deltas are only valid in, and a digest per
 input. `derived_readings` ignores the block; it is there so a served
@@ -33,8 +34,18 @@ bearing.
   `measured_graph_pool_bytes`, whose flat 104 MiB above TP=1 its own docstring
   marks superseded.
 
+One model, not three. The headers are read from `--checkpoint`, the geometry
+from `--model-config` and the weights from a build, and each of those is
+individually correct about its own input -- so if the inputs are not the same
+model, nothing about the set says so. `--model-config` must equal the
+checkpoint's own `config.json`, the build is done from the resolved snapshot
+rather than from `--model` (a hub name has no revision in it and the cache
+decides what it means), and what the build resolved to is recorded per width.
+
     emit_memory_profile.py --out DIR --checkpoint DIR --capture-history FILE
                            [--model-config FILE] [--widths 1 2 4]
+                           [--weights-from built|headers] [--rank-inventory]
+                           [--build-from checkpoint|model] [--replay-target F]
 """
 from __future__ import annotations
 
@@ -53,7 +64,8 @@ if ROOT not in sys.path:
 from atom.compass.core.memory_calibration import for_model  # noqa: E402
 from atom.compass.core.memory_capture import capture_stream  # noqa: E402
 from atom.compass.core.memory_model import (  # noqa: E402
-    capture_reserved_parts, weight_bytes)
+    built_parameter_bytes, capture_reserved_parts, rank_inventory,
+    weight_bytes)
 from atom.compass.core.memory_topology import (  # noqa: E402
     TOPOLOGY_CONDITIONS, TOPOLOGY_PROVENANCE, compose_calibration,
     topology_delta)
@@ -209,7 +221,36 @@ def main(argv=None) -> int:
     parser.add_argument("--model-config", default=DEFAULT_CONFIG,
                         help="the checkpoint's config.json")
     parser.add_argument("--widths", type=int, nargs="+", default=[1, 2, 4])
-    parser.add_argument("--model", default=MODEL)
+    parser.add_argument("--model", default=MODEL,
+                        help="the logical identity recorded in the set. It is "
+                             "not what gets built: a hub name carries no "
+                             "revision, so the build uses --checkpoint")
+    parser.add_argument("--build-from", choices=("checkpoint", "model"),
+                        default="checkpoint",
+                        help="what the weight term is built from. The default "
+                             "is the resolved snapshot the headers were read "
+                             "from, which is the only way the two terms are "
+                             "known to describe the same weights. 'model' "
+                             "builds from the hub name and lets the cache "
+                             "decide, and is recorded as such")
+    parser.add_argument("--weights-from", choices=("built", "headers"),
+                        default="built",
+                        help="where the weight term comes from: ATOM's own "
+                             "meta build (default, the engine's rule) or the "
+                             "checkpoint headers (the approximation)")
+    parser.add_argument("--replay-target",
+                        help="target.json to answer AITER's architecture query "
+                             "from, so --weights-from built works in a "
+                             "container with no device")
+    parser.add_argument("--rank-inventory", action="store_true",
+                        help="build every rank of each width instead of rank 0 "
+                             "alone, take the largest, and record the per-rank "
+                             "figures. A profile states one number per width, "
+                             "which is only well defined if the ranks agree")
+    parser.add_argument("--note", action="append", default=[], metavar="TEXT",
+                        help="a known discrepancy or caveat to carry in the "
+                             "provenance of every profile in the set; repeat "
+                             "for more than one")
     args = parser.parse_args(argv)
 
     if not os.path.isdir(args.checkpoint):
@@ -231,6 +272,39 @@ def main(argv=None) -> int:
     with open(config_path, "w", encoding="utf-8") as fh:
         json.dump(config, fh, indent=1, sort_keys=True)
 
+    # Three terms, three inputs: the headers come from --checkpoint, the
+    # geometry from --model-config, the weights from a build. If those are not
+    # the same model the set is internally inconsistent and nothing in it says
+    # so, because each term is individually correct about its own input. The
+    # checkpoint's own config.json is the arbiter: it is what the build will
+    # resolve, so --model-config has to equal it.
+    checkpoint_config = os.path.join(args.checkpoint, "config.json")
+    if os.path.exists(checkpoint_config):
+        with open(checkpoint_config, encoding="utf-8") as fh:
+            on_disk = json.load(fh)
+        if on_disk != config:
+            differing = sorted(
+                k for k in set(on_disk) | set(config)
+                if on_disk.get(k) != config.get(k))
+            print("REFUSED: --model-config %s is not the config.json of "
+                  "--checkpoint %s. The geometry and the weights would "
+                  "describe different models. Differing keys: %s"
+                  % (args.model_config, args.checkpoint,
+                     ", ".join(differing) or "(ordering only)"))
+            return 2
+    elif args.weights_from == "built":
+        print("REFUSED: %s has no config.json, so the build cannot be checked "
+              "against the checkpoint the headers and provenance name."
+              % args.checkpoint)
+        return 2
+
+    # What gets built. A hub name carries no revision -- the cache resolves it,
+    # and a newer download resolves it differently -- so building from the name
+    # while recording --checkpoint's digests would let the weight term come
+    # from one snapshot and the provenance from another.
+    build_model = (os.path.abspath(args.checkpoint)
+                   if args.build_from == "checkpoint" else args.model)
+
     with open(args.capture_history, "rb") as fh:
         trace = pickle.load(fh)["device_traces"][0]
     history_sha = sha256(args.capture_history)
@@ -238,7 +312,12 @@ def main(argv=None) -> int:
 
     base = base_calibration(args.model)
     inputs = {
+        # The logical identity of the deployment, which is not what was built:
+        # `build_from` says that, and the per-width provenance records what the
+        # build resolved to.
         "model": args.model,
+        "build_from": args.build_from,
+        "build_input": build_model,
         "checkpoint": _checkpoint_identity(args.checkpoint),
         "model_config_source": args.model_config,
         "model_config_sha256": sha256(config_path),
@@ -247,12 +326,29 @@ def main(argv=None) -> int:
         "topology_probe": _probe_identity(),
         "memory_topology_py_sha256": sha256(
             os.path.join(ROOT, "atom/compass/core/memory_topology.py")),
+        # Which code produced these numbers. `commit` is None whenever the
+        # emitter runs from a staged copy rather than a checkout -- which is
+        # the normal case in the CPU container -- so the digests, not the
+        # commit, are what a reader can actually check the set against.
+        "source_root": ROOT,
+        "source_sha256": {
+            rel: sha256(os.path.join(ROOT, rel))
+            for rel in ("scripts/compass/emit_memory_profile.py",
+                        "atom/compass/core/memory_model.py",
+                        "atom/compass/core/memory_calibration.py",
+                        "atom/compass/core/memory_capture.py",
+                        "atom/compass/core/memory_topology.py")
+            if os.path.exists(os.path.join(ROOT, rel))},
         "commit": _commit(),
         "composed_at_cell": CELL,
         "composition": (
             "term(width) = S27 term at TP=1 + (standalone(width) - "
             "standalone(TP=1)); the standalone TP=1 control measured zero, so "
             "width 1 is the S27 calibration unchanged"),
+        # Carried, not resolved: a caveat the set is known to have is part of
+        # its identity, and a reader who only has the profile should not have
+        # to find the write-up to learn of it.
+        "notes": list(args.note),
         "not_inputs": [
             "no 27B TP=2 or TP=4 target record (class X27)",
             "no DEFAULT_NON_TORCH / DEFAULT_LOAD_RESIDUE entry (0.6B engine)",
@@ -262,11 +358,67 @@ def main(argv=None) -> int:
 
     emitted = []
     for width in args.widths:
-        params = weight_bytes(args.checkpoint, width)
-        if not params:
+        header_params = weight_bytes(args.checkpoint, width)
+        if not header_params:
             print("REFUSED: could not read checkpoint headers at %s"
                   % args.checkpoint)
             return 2
+        # The headers are a table of contents, not an inventory of what the
+        # engine builds: a checkpoint can ship tensors for a module the
+        # configured model class never constructs, and summing the headers
+        # counts them. Ask the build, and keep the headers as the fallback and
+        # as a stated cross-check rather than a silent one.
+        params, buffers, route = header_params, BUFFERS, "headers"
+        ranks, identity = None, {}
+        if args.weights_from == "built":
+            if args.rank_inventory:
+                # One number per width is only well defined if the width's
+                # ranks hold the same bytes. Ask every rank rather than
+                # assuming it, and take the largest: a budget has to hold for
+                # the rank that carries the most.
+                ranks = rank_inventory(build_model, width,
+                                       replay_target=args.replay_target,
+                                       identity=identity)
+                built = None if ranks is None else (ranks["parameters"],
+                                                    ranks["buffers"])
+                identity = (ranks or {}).get("identity") or identity
+            else:
+                built = built_parameter_bytes(build_model, width,
+                                              replay_target=args.replay_target,
+                                              identity=identity)
+            if built is None:
+                # Say why. A fallback that only says it happened is how a set
+                # ends up on the worse of two numbers with nobody looking.
+                print("WARNING: could not build %s on meta at TP=%d (%s); the "
+                      "weight term falls back to the checkpoint headers"
+                      % (build_model, width,
+                         identity.get("error", "no reason reported")))
+            else:
+                params, buffers = built
+                route = "built"
+                if ranks and not ranks["uniform"]:
+                    print("WARNING: TP=%d ranks do not hold equal bytes "
+                          "(spread %d B); the profile states the largest"
+                          % (width, ranks["spread"]))
+                # What the build actually resolved, not what it was asked for.
+                resolved = identity.get("resolved_path")
+                if (args.build_from == "checkpoint"
+                        and resolved != os.path.abspath(args.checkpoint)):
+                    print("REFUSED: the build at TP=%d resolved to %r, not the "
+                          "checkpoint %s the headers and provenance name."
+                          % (width, resolved, args.checkpoint))
+                    return 2
+                text_cfg = config.get("text_config", config)
+                disagree = [
+                    key for key, value in (identity.get("geometry") or {}).items()
+                    if key in text_cfg and value != text_cfg[key]]
+                if disagree:
+                    print("REFUSED: the model built at TP=%d disagrees with "
+                          "--model-config on %s, so the weight term and the "
+                          "geometry are not the same model."
+                          % (width, ", ".join(sorted(disagree))))
+                    return 2
+        delta = int(header_params) - int(params)
         calibration = compose_calibration(base, width, env={})
         calibration["capture_reserved"] = {
             str(width): capture_prediction(trace, text_config, width,
@@ -279,7 +431,7 @@ def main(argv=None) -> int:
             "total": TOTAL,
             "world_size": width,
             "parameters": int(params),
-            "buffers": BUFFERS,
+            "buffers": int(buffers),
             "model_config": config_path,
             "compile_mode": COMPILE_MODE,
             "dtype_bytes": DTYPE_BYTES,
@@ -287,9 +439,37 @@ def main(argv=None) -> int:
             "provenance": dict(
                 inputs,
                 width=width,
-                parameters="checkpoint safetensors headers at TP=%d, 2-D "
-                           "tensors sharded and 1-D replicated; tied "
-                           "embeddings counted once" % width,
+                parameters=(
+                    "ATOM's own meta build at TP=%d, counted once per storage "
+                    "(resident_bytes); the checkpoint headers read %d B, %d B "
+                    "more, which is what the engine does not construct"
+                    % (width, header_params, delta)
+                    if route == "built" else
+                    "checkpoint safetensors headers at TP=%d, 2-D "
+                    "tensors sharded and 1-D replicated; tied "
+                    "embeddings counted once" % width),
+                parameters_route=route,
+                parameters_build_input=(build_model if route == "built"
+                                        else None),
+                parameters_build_identity=(identity or None
+                                           if route == "built" else None),
+                parameters_headers=int(header_params),
+                parameters_headers_excess=delta,
+                parameters_rank=(
+                    "every rank of the TP=%d group was built; they hold %s "
+                    "bytes and the profile states the largest"
+                    % (width,
+                       "equal" if ranks["uniform"] else
+                       "unequal, spread %d B," % ranks["spread"])
+                    if ranks else
+                    "rank 0 of the TP=%d group; the other ranks were not "
+                    "built, so equality across ranks is assumed rather than "
+                    "checked" % width),
+                parameters_by_rank=(
+                    {str(r): {"parameters": p, "buffers": b}
+                     for r, (p, b) in sorted(ranks["ranks"].items())}
+                    if ranks else None),
+                parameters_rank_uniform=(ranks["uniform"] if ranks else None),
                 topology_delta=topology_delta(width, env={}),
                 calibration_sha256=sha256(cal_path),
             ),
@@ -298,9 +478,14 @@ def main(argv=None) -> int:
         with open(path, "w", encoding="utf-8") as fh:
             json.dump(profile, fh, indent=1, sort_keys=True)
         emitted.append((width, path, profile, cal_path))
-        print("%s  parameters=%d  non_torch=%d  load_residue=%d  "
+        print("%s  route=%s%s  parameters=%d  non_torch=%d  load_residue=%d  "
               "capture_reserved=%d"
-              % (os.path.basename(path), profile["parameters"],
+              % (os.path.basename(path), route,
+                 "" if ranks is None else
+                 "  ranks=%d/%s" % (len(ranks["ranks"]),
+                                    "equal" if ranks["uniform"]
+                                    else "spread %d" % ranks["spread"]),
+                 profile["parameters"],
                  calibration["non_torch"][width],
                  calibration["load_residue"][width],
                  calibration["capture_reserved"][str(width)]["total"]))
@@ -312,7 +497,12 @@ def main(argv=None) -> int:
         "widths": {str(w): {"profile": p, "calibration": c,
                             "sha256": sha256(p),
                             "calibration_sha256": sha256(c),
-                            "parameters": pr["parameters"]}
+                            "parameters": pr["parameters"],
+                            "buffers": pr["buffers"],
+                            "parameters_route":
+                                pr["provenance"]["parameters_route"],
+                            "parameters_rank_uniform":
+                                pr["provenance"]["parameters_rank_uniform"]}
                    for w, p, pr, c in emitted},
         "how_to_serve": (
             "--compass-memory-model <profile.tpN.json> at a run whose tensor "

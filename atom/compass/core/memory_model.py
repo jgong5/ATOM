@@ -628,6 +628,240 @@ def resident_bytes(model, tied_head: bool = False) -> tuple:
     return parameters, buffers
 
 
+def _ensure_meta_group(replay_target: Optional[str] = None) -> None:
+    """A one-rank gloo group, once per process, so a meta build can happen.
+
+    ATOM's parallel layers query their communication group while being
+    constructed, so the group has to exist before the model does. This is
+    separate from the build because a caller that wants every rank of a width
+    builds several times in one process and `init_dist_env` is not re-entrant,
+    while `simulate_group_width` deliberately is.
+    """
+    import os
+    import socket
+
+    if replay_target:
+        from atom.compass.replay.bootstrap import install_from_target
+
+        install_from_target(replay_target, role="bootstrap.weight_inventory")
+
+    import torch
+
+    if torch.distributed.is_available() and torch.distributed.is_initialized():
+        return
+
+    os.environ.setdefault("MASTER_ADDR", "127.0.0.1")
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        os.environ.setdefault("MASTER_PORT", str(sock.getsockname()[1]))
+    os.environ.setdefault("RANK", "0")
+    os.environ.setdefault("WORLD_SIZE", "1")
+    from aiter import init_dist_env
+
+    init_dist_env(1, rankID=0, backend="gloo",
+                  distributed_init_method="env://", local_rank=0)
+
+
+def _restore_simulated_group() -> None:
+    """Put the TP group back to the one real rank it is.
+
+    `simulate_group_width` restores before it patches -- but only on the path
+    where it patches. Asked for width 1 it returns immediately, because a
+    one-rank group already *is* a TP1 group, and a patch left by an earlier
+    call is still in place. So a process that builds TP=2 and then TP=1 builds
+    the second one against a group still reporting two ranks, and the answer is
+    a TP2 shape recorded under width 1. Nothing raises; the number is simply
+    wrong. Restore explicitly instead of relying on the next patch to do it.
+    """
+    from aiter.dist.parallel_state import get_tp_group
+
+    from atom.distributed.simulated_tp import restore_group
+
+    restore_group(get_tp_group())
+
+
+def build_identity(config) -> dict:
+    """What a `Config` actually resolved to, for a profile to record.
+
+    A profile states a weight term, a checkpoint and a config, and a reader is
+    entitled to assume the first was counted from the other two. That only
+    holds if the build resolved to the same snapshot the headers were read
+    from, and a logical name like ``Qwen/Qwen3.8-27B`` does not carry a
+    revision: the hub cache decides, and it can decide differently tomorrow.
+    So record what was resolved rather than what was asked for.
+    """
+    hf = getattr(config, "hf_config", None)
+    text = getattr(hf, "text_config", None) or hf
+    try:
+        body = json.dumps(hf.to_dict(), sort_keys=True, default=str)
+        digest = hashlib.sha256(body.encode("utf-8")).hexdigest()
+    except Exception:                                       # noqa: BLE001
+        digest = None
+    return {
+        "requested": getattr(config, "model", None),
+        "resolved_path": os.path.abspath(str(config.model))
+                         if os.path.isdir(str(getattr(config, "model", "")))
+                         else None,
+        "architectures": list(getattr(hf, "architectures", []) or []),
+        "hf_config_sha256": digest,
+        "dtype": str(getattr(config, "torch_dtype", None)),
+        "geometry": {
+            key: getattr(text, key, None)
+            for key in ("num_hidden_layers", "hidden_size",
+                        "num_attention_heads", "num_key_value_heads",
+                        "vocab_size", "intermediate_size",
+                        "tie_word_embeddings")},
+    }
+
+
+def built_parameter_bytes(model: str, tensor_parallel: int = 1,
+                          replay_target: Optional[str] = None,
+                          rank: int = 0, identity: Optional[dict] = None
+                          ) -> tuple:
+    """``(parameters, buffers)`` ATOM's own build holds, per rank, no device.
+
+    The same build `scripts/compass/meta_probe.py` does, behind one call, so
+    that a profile can take its weight term from the engine's materialization
+    rule rather than from the checkpoint's table of contents. The two are not
+    the same thing: a checkpoint may ship tensors for a module the configured
+    model class never constructs, and `weight_bytes` -- which sums every header
+    entry -- counts them. On the 27B that is the ``mtp.*`` draft block, 849 398
+    784 B, the whole of the weight term's error at TP=1.
+
+    ``replay_target`` bootstraps AITER's architecture query from a recorded
+    target, as `replay_server` does, which is what lets this run in a container
+    with no device nodes. Without it AITER shells out to ``rocminfo`` and a
+    CPU-only container raises.
+
+    ``rank`` is which rank of the ``tensor_parallel`` group to build. A profile
+    carries one number per width, so it is only well defined if every rank of
+    that width holds the same bytes; `rank_inventory` asks all of them rather
+    than assuming it, and `built_parameter_bytes` on its own answers for rank 0.
+
+    ``model`` should be **the resolved snapshot directory**, not a hub name. A
+    name has no revision in it: the cache resolves it, a newer download changes
+    what it resolves to, and the count would then come from one checkpoint
+    while the profile's headers and provenance name another -- with nothing
+    anywhere saying so. Pass the same path the headers were read from. A name
+    still works, for a caller that has nothing better, and ``identity`` says
+    which one it got.
+
+    ``identity``, if given, is updated in place with `build_identity` of the
+    config that was actually built: the resolved path, the architectures, a
+    digest of the resolved HF config and the geometry fields. That is what lets
+    a caller check the build against the checkpoint and config it is recording,
+    rather than trusting that they agree.
+
+    Returns ``None`` rather than raising if the model cannot be built here; the
+    caller decides whether to fall back to the headers, and should say which
+    route it took.
+    """
+    import torch
+
+    # Everything from here is inside the fallback: the docstring promises None
+    # rather than an exception, and a caller that has a header figure to fall
+    # back to should not be taken down by a group that would not initialise or
+    # a config that would not load. `identity["error"]` carries the reason out,
+    # because a silent fallback is how a worse number gets used unnoticed.
+    was = torch.get_default_dtype()
+    try:
+        _ensure_meta_group(replay_target)
+        from atom.compass.runtime.derive import simulate_group_width
+
+        # One real rank however wide the configuration being modelled, and
+        # patched before the build: layers read the width *and the rank* while
+        # they are being constructed. Restore first, because this process may
+        # have built another width already and `simulate_group_width` does not
+        # restore on the width-1 path.
+        _restore_simulated_group()
+        simulate_group_width(max(1, tensor_parallel), physical=1, rank=rank)
+
+        from atom.config import Config, set_current_atom_config
+        from atom.model_engine.model_runner import support_model_arch_dict
+        from atom.utils import resolve_obj_by_qualname
+
+        config = Config(model=model,
+                        tensor_parallel_size=max(1, tensor_parallel))
+        set_current_atom_config(config)
+        if identity is not None:
+            identity.clear()
+            identity.update(build_identity(config))
+        qualname = support_model_arch_dict.get(
+            config.hf_config.architectures[0])
+        if qualname is None:
+            if identity is not None:
+                identity["error"] = ("no ATOM model class is registered for %s"
+                                     % config.hf_config.architectures[0])
+            return None
+        model_class = resolve_obj_by_qualname(qualname)
+
+        # The model's dtype is the config's, not torch's default; without this
+        # the meta build comes out float32 and every byte is twice what is
+        # resident.
+        torch.set_default_dtype(config.torch_dtype)
+        with torch.device("meta"):
+            built = model_class(config)
+        tied = bool(getattr(config.hf_config, "tie_word_embeddings", False))
+        return resident_bytes(built, tied_head=tied)
+    except Exception as exc:  # noqa: BLE001 -- caller falls back to headers
+        if identity is not None:
+            identity["error"] = "%s: %s" % (type(exc).__name__, exc)
+        return None
+    finally:
+        torch.set_default_dtype(was)
+
+
+def rank_inventory(model: str, tensor_parallel: int = 1,
+                   replay_target: Optional[str] = None,
+                   identity: Optional[dict] = None) -> dict:
+    """Build every rank of a width and report what each one holds.
+
+    A profile states one ``parameters`` and one ``buffers`` per width, which is
+    only meaningful if the width's ranks are interchangeable. That is an
+    expectation about the sharding, not a guarantee: a head count or an expert
+    count that does not divide by the width leaves one rank carrying the
+    remainder, and a profile written from rank 0 would then understate every
+    other rank -- silently, because nothing downstream asks.
+
+    So ask. Each rank is built at ``torch.device("meta")`` in this process,
+    which allocates nothing, and the answer is source only: no target
+    measurement is read and nothing is fitted. Returns
+
+        {"ranks": {0: (parameters, buffers), ...},
+         "uniform": bool, "parameters": int, "buffers": int,
+         "spread": int,       # max-min over ranks, 0 when uniform
+         "identity": {...}}   # `build_identity` of what was actually built
+
+    with ``parameters``/``buffers`` the maximum over ranks, because a budget
+    has to hold for the rank that carries the most. ``None`` if the model
+    cannot be built here. As with `built_parameter_bytes`, pass the resolved
+    snapshot directory rather than a hub name.
+    """
+    width = max(1, int(tensor_parallel))
+    ranks, last = {}, {}
+    for rank in range(width):
+        seen = {}
+        built = built_parameter_bytes(model, width,
+                                      replay_target=replay_target, rank=rank,
+                                      identity=seen)
+        last = seen
+        if identity is not None:
+            identity.clear()
+            identity.update(seen)
+        if built is None:
+            return None
+        ranks[rank] = (int(built[0]), int(built[1]))
+    totals = [p + b for p, b in ranks.values()]
+    return {
+        "ranks": ranks,
+        "uniform": len(set(ranks.values())) == 1,
+        "parameters": max(p for p, _ in ranks.values()),
+        "buffers": max(b for _, b in ranks.values()),
+        "spread": max(totals) - min(totals),
+        "identity": last,
+    }
+
+
 #: What a rank holds outside the torch allocator, and what the collective
 #: libraries take through it, measured on this box (MiB, per rank).
 #:
