@@ -91,6 +91,34 @@ def _identity(pid=4242, *, ppid=4240, ticks=132307571, host=PROC_HOST, boot=PROC
     }
 
 
+def _device_reading(when, *, nodes=None, handles=(), process=None):
+    """One reading as the predictor's own process takes it about itself."""
+    return {
+        "when": when,
+        "process": process or _identity(pid=4243, ppid=4242),
+        "namespaces": {"mnt": "mnt:[4026532281]", "pid": "pid:[4026532282]",
+                       "net": "net:[4026531840]", "user": "user:[4026531837]",
+                       "cgroup": "cgroup:[4026531835]"},
+        "device_cgroup": ["0::/"],
+        "device_nodes": nodes or {n: False for n in validate.DEVICE_NODES},
+        "own_driver_handles": list(handles),
+        "device_free": not any((nodes or {}).values()) and not handles,
+        # Recorded and not counted. A replay interpreter answers hardware
+        # queries from the captured target, so this describes the deployment
+        # being modelled. The fixture carries a nonzero count on purpose, to
+        # pin that it decides nothing.
+        "reported_by_runtime": {"device_count": 4, "cuda_available": True,
+                                "bootstrap_installed": True},
+        "runtime_note": "recorded, not counted",
+    }
+
+
+def _device_freedom(**over):
+    """Both readings, from one process, as the manifest carries them."""
+    return {"launch": _device_reading("launch", **over),
+            "readback": _device_reading("readback", **over)}
+
+
 def _server(
     tp,
     *,
@@ -122,6 +150,21 @@ def _server(
             "oracle_option_files": files or {},
             "virtual_clock": virtual,
             "admission_seconds": 0.0,
+            # What the ranks recorded as they read, and what the predicting
+            # process observed about itself. Only the modelled side is held to
+            # the device reading; the real side carries one because the same
+            # runner produces both records.
+            "loaded_inputs": {
+                "ranks": [
+                    {
+                        "rank_coords": {},
+                        "inputs": [],
+                        "rolled_sha256": "0" * 64,
+                        "budget_source": "measured" if mode == "measure" else None,
+                        "device_freedom": _device_freedom(),
+                    }
+                ]
+            },
         },
     }
     if served is not None:

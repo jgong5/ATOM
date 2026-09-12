@@ -85,6 +85,11 @@ class CompassPredictMixin:
         #: is unknown is not a run whose capacity was measured.
         if not hasattr(self, "compass_budget_source"):
             self.compass_budget_source = None
+        # Taken here, by the process that is about to predict, before it has
+        # served anything. The readback is taken when the record is asked for,
+        # so a device that appeared in between is a difference between the two
+        # rather than something neither reading covers.
+        self._compass_device_launch = self._observe_device_freedom("launch")
         self._graph = OpGraph()
         self._traced_steps = 0
         self._prefill_index = 0
@@ -209,7 +214,47 @@ class CompassPredictMixin:
         # run can be sized from an analytical profile with nothing in the
         # record to show it. Reported as the selector states it, or None.
         out["budget_source"] = getattr(self, "compass_budget_source", None)
+        # Both readings, from the process that produced the prediction. Carried
+        # here rather than on a second RPC because it answers the same question
+        # this one does -- what was this prediction actually made from -- and a
+        # separate channel would be a second thing to keep in step.
+        out["device_freedom"] = {
+            "launch": getattr(self, "_compass_device_launch", None),
+            "readback": self._observe_device_freedom("readback"),
+        }
         return out
+
+    def _observe_device_freedom(self, when: str) -> dict:
+        """This process's own reading, with what the runtime says recorded beside it.
+
+        The runtime's view is read here rather than in
+        `atom.compass.core.device_freedom`, which is stdlib-only and has no
+        business importing a deep-learning runtime -- least of all to answer a
+        question whose answer it does not trust. It is recorded and excluded:
+        the replay bootstrap answers hardware queries from the captured target,
+        so a device count read in this interpreter describes the deployment
+        being modelled.
+        """
+        from atom.compass.core import device_freedom
+
+        report = {}
+        try:
+            import torch
+
+            report["torch_version"] = getattr(torch, "__version__", None)
+            report["device_count"] = int(torch.cuda.device_count())
+            report["cuda_available"] = bool(torch.cuda.is_available())
+        except Exception as exc:  # torch absent or refusing: both are readings
+            report["error"] = f"{type(exc).__name__}: {exc}"
+        try:
+            from atom.compass.replay import bootstrap
+
+            state = bootstrap.state()
+            report["bootstrap_installed"] = bool(state.get("installed"))
+            report["bootstrap_arch"] = state.get("arch")
+        except Exception as exc:  # noqa: BLE001 - provenance never fails a run
+            report["bootstrap_error"] = f"{type(exc).__name__}: {exc}"
+        return device_freedom.observe(when, runtime_report=report)
 
     def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
         """Predict the step, or trace it, depending on the configured mode."""

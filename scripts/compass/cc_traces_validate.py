@@ -725,6 +725,145 @@ def check_scalar_overheads(
     return bad
 
 
+def check_predictor_device_freedom(modelled, label: str) -> list[str]:
+    """That the process which predicted could not have reached a device.
+
+    `check_gpu_free` reads a probe that ran afterwards, in its own container,
+    and hashed the artifacts it found there. That is a true statement about a
+    container and a directory -- its own output says it "does not mean that the
+    artifacts named in `covers` were produced by this exact process" -- and a
+    GPU-container replay followed by a CPU-container probe of the same shared
+    files satisfies it exactly. It is kept, because it covers the container the
+    artifacts sat in. It is no longer sufficient on its own.
+
+    What is required as well is the predictor's own reading of itself, taken
+    twice: once when its state was built, once when the record was asked for.
+    Both are read from `/proc` by the process that produced the prediction.
+
+    The binding is between two accounts that no single submission produced. The
+    API server reads its own identity, from its own `/proc`, and reports it as
+    `server_process`; the worker reads its own and reports it inside the device
+    record. A run whose predictor names a different host or a different boot
+    than the server that answered is a run whose prediction was made somewhere
+    else, whatever either account says about itself.
+
+    Nothing here reads a device count. The replay bootstrap answers hardware
+    queries from the captured target, so a count taken inside that interpreter
+    describes the deployment being modelled; it is carried in the record under
+    `reported_by_runtime` for a reader, and it decides nothing.
+    """
+    compass = (modelled.manifest.get("server") or {}).get("compass") or {}
+    ranks = ((compass.get("loaded_inputs") or {}).get("ranks")) or []
+    evidence = [
+        rank.get("device_freedom")
+        for rank in ranks
+        if isinstance(rank, dict) and isinstance(rank.get("device_freedom"), dict)
+    ]
+    if not evidence:
+        return [
+            (
+                f"{label}: the modelled run carries no device reading from the "
+                f"process that predicted, so the GPU-free claim rests on a "
+                f"probe of the container the artifacts were later found in"
+            )
+        ]
+    bad = []
+    served = (modelled.manifest.get("server") or {}).get("server_process") or {}
+    for index, record in enumerate(evidence):
+        where = f"{label}: predictor {index}"
+        launch = record.get("launch")
+        readback = record.get("readback")
+        if not isinstance(launch, dict) or not isinstance(readback, dict):
+            bad.append(
+                f"{where} reports only one device reading; a device that "
+                f"appeared after startup would be in neither"
+            )
+            continue
+        for when, reading in (("launch", launch), ("readback", readback)):
+            nodes = reading.get("device_nodes")
+            # Fail closed on absence. An empty mapping has no node set to
+            # `True`, so "reports nothing" and "reports no devices" are the
+            # same answer to `any()` -- and they are opposite claims.
+            if not isinstance(nodes, dict) or set(nodes) != set(DEVICE_NODES):
+                bad.append(
+                    f"{where} does not report every device node the protocol "
+                    f"asks about at {when} ({', '.join(DEVICE_NODES)}); a "
+                    f"reading that omits one is not a reading that found none"
+                )
+            else:
+                present = sorted(node for node, there in nodes.items() if there)
+                if present:
+                    bad.append(
+                        f"{where} could reach {', '.join(present)} at {when}"
+                    )
+            handles = reading.get("own_driver_handles")
+            if handles is None:
+                bad.append(
+                    f"{where} does not say at {when} whether it held a driver "
+                    f"handle open"
+                )
+            elif handles:
+                targets = sorted(
+                    h.get("target") for h in handles if isinstance(h, dict)
+                )
+                bad.append(
+                    f"{where} held {len(handles)} driver handle(s) open at "
+                    f"{when} ({', '.join(t for t in targets if t)})"
+                )
+        mine = launch.get("process") or {}
+        theirs = readback.get("process") or {}
+        missing = sorted(
+            field
+            for field in ("host", "boot_id", "pid", "start_ticks")
+            if not mine.get(field) or not theirs.get(field)
+        )
+        if missing:
+            bad.append(
+                f"{where} identifies the process that took its readings only "
+                f"partly ({', '.join(missing)} absent), so they cannot be "
+                f"checked against anything"
+            )
+            continue
+        # The namespaces that decide what a process can see of the machine's
+        # devices. A mount namespace that changed between the two readings is
+        # a different view of `/dev` -- which is the thing the device-node
+        # readings are readings of -- so the two would not be describing the
+        # same container even with the same pid.
+        for name in ("mnt", "pid"):
+            first = (launch.get("namespaces") or {}).get(name)
+            second = (readback.get("namespaces") or {}).get(name)
+            if not first or not second:
+                bad.append(
+                    f"{where} does not report its {name} namespace, so what "
+                    f"its device readings were readings of is unstated"
+                )
+            elif first != second:
+                bad.append(
+                    f"{where} was launched in {name} namespace {first} and "
+                    f"read back in {second}: the two readings describe "
+                    f"different views of the machine's devices"
+                )
+        for field in ("host", "boot_id", "pid", "start_ticks"):
+            if mine.get(field) != theirs.get(field):
+                bad.append(
+                    f"{where} was launched by a process reporting "
+                    f"{field}={mine.get(field)!r} and read back by one "
+                    f"reporting {theirs.get(field)!r}: two processes, and only "
+                    f"one of them predicted"
+                )
+                break
+        if served:
+            for field in ("host", "boot_id"):
+                if served.get(field) and mine.get(field) != served.get(field):
+                    bad.append(
+                        f"{where} ran on {field}={mine.get(field)!r} and the "
+                        f"server that answered the requests reports "
+                        f"{served.get(field)!r}: the prediction was made "
+                        f"somewhere other than where it was served"
+                    )
+    return bad
+
+
 def check_calibration(
     modelled, registry: dict, tp: int, workload_sha: str, forbidden: dict
 ) -> list[str]:
@@ -1723,6 +1862,7 @@ def cell(args) -> int:
             f"repeat {index}: {reason}" for reason in check_side_roles(real, modelled)
         ]
         failures += check_source_factory(modelled, args.tp, f"repeat {index}")
+        failures += check_predictor_device_freedom(modelled, f"repeat {index}")
         if registry is not None:
             failures += [
                 f"repeat {index}: {reason}"
