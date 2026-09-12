@@ -176,9 +176,22 @@ Concretely, at the declared `--max-model-len 262144` and `block_size 16`: every
 whose real contexts are a few hundred tokens -- where an eager step takes the 2D
 kernel and no reduce at all (`use_2d_kernel`, `max_seqlen_k <= 512`). **The
 derived graph declares the eager kernel for a step that replays the captured
-one.** That is the largest single divergence found, and on the frozen short
-workload (inputs 256-2 560, outputs 14-39) it is not an edge case: most of its
-decode steps sit at contexts where the two branches differ.
+one.** That is the largest single divergence found.
+
+How often the *kernel family* differs is a separate question and is not
+answered here. The 2D/3D threshold reads `max(context_lens)` over the whole
+batch, so a step falls below 512 only when every concurrent request does. On
+the frozen short workload the per-request inputs are 256-2 560 with p90 768, so
+a wide batch will usually exceed the threshold on its longest member alone and
+the two paths would agree on family while still disagreeing on the segment cap
+(128 captured, against `ceil(max(contexts)/16)` eager). A single-request or
+narrow all-short step is where the family itself flips. Counting which steps
+land where needs the replay schedule, not the manifest, and is left to the
+acquisition rather than estimated now. Below 2 048 tokens of context the eager
+cap `ceil(max(contexts)/16)` is itself under 128, so the captured graph can
+only ever have more segments than an eager step would choose -- but both are
+then clamped by an occupancy term, so whether the counts actually differ is a
+measurement, not an inference from the cap.
 
 The existing decode graphs are not invalidated by this -- they record
 `max_seqlen_k = 66` against contexts `(66,66,66,66)`, so they were traced eager
