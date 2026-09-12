@@ -212,10 +212,11 @@ def contract_for(family: str) -> Optional[FamilyContract]:
 def grouping_key(op: dict) -> tuple:
     """A cheap key that two widths of one operator are guaranteed to share.
 
-    Only structure: the name, the dtypes, and the arity and rank of the
-    operands. Never a value, because values are exactly what differs between
-    widths. Its job is to keep :func:`aligns` from being asked about obviously
-    unrelated pairs, not to decide anything.
+    Only structure: the name, the dtypes, the arity and rank of the operands,
+    and which operands are views rather than dense. Never a value, because
+    values are exactly what differs between widths. Its job is to keep
+    :func:`aligns` from being asked about obviously unrelated pairs, not to
+    decide anything.
     """
     shapes = op.get("input_shapes") or ()
     return (
@@ -224,6 +225,12 @@ def grouping_key(op: dict) -> tuple:
         tuple(len(s) if isinstance(s, (list, tuple)) else 0 for s in shapes),
         tuple(sorted(k for k, _ in (tuple(x) for x in op.get("scalars") or ()))),
         tuple(sorted(k for k, _ in (tuple(x) for x in op.get("context") or ()))),
+        # Which positions carry a recorded layout, and how many fields each
+        # records -- structure, not the stride or the offset themselves. A
+        # dense rebuild and a strided view of the same shapes are not two
+        # widths of one operator, so they do not share a group.
+        tuple(sorted((int(pos), len(tuple(value))) for pos, value in
+                     (tuple(x) for x in op.get("layouts") or ()))),
     )
 
 
@@ -253,6 +260,21 @@ def _values(op: dict) -> list:
     for key, value in (tuple(x) for x in op.get("launch") or ()):
         if key == "grid":
             walk(tuple(value))
+    # How the operands sit in memory, on the same footing as the shapes.
+    #
+    # `signature_of` excludes layout deliberately, so without this a strided
+    # view and a dense rebuild of the same shapes are indistinguishable here --
+    # and a width the dense ladder never measured would be interpolated for a
+    # strided request and then reported as covered.
+    #
+    # Carried as values rather than compared separately, so the row-adjustment
+    # rule reaches them too: an extent that scales with the rows is the same
+    # view at another width, while a stride or an offset that moves under it is
+    # a different operator. Sorted by position so two graphs that recorded the
+    # same layouts in a different order still line up.
+    walk(tuple((int(pos), tuple(value)) for pos, value in
+               sorted((tuple(x) for x in op.get("layouts") or ()),
+                      key=lambda entry: int(entry[0]))))
     return out
 
 

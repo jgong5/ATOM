@@ -1221,6 +1221,77 @@ def _time_isolated(fn, sets: list, iters: int, warmup: int) -> tuple[float, floa
     return statistics.median(samples), 0.0
 
 
+def observed_group_width() -> int | None:
+    """How many ranks this process is actually reducing over, or None.
+
+    ``None`` means torch.distributed is not initialised here, which is a real
+    answer and not an error: a single-process pricing run genuinely has no
+    group, and a graph that contains no collective is priced fine without one.
+
+    This reads the **default** group, which is what `primitives.py` builds and
+    is the whole world there, so tensor-parallel width and world size are the
+    same number in every run this currently guards. A deployment that also
+    shards along a second dimension would need the handle for the specific
+    group an operator reduces on; until one exists, a mismatch between the two
+    would be reported here as a width disagreement rather than passed silently,
+    which is the safe direction to be wrong in.
+    """
+    try:
+        import torch.distributed as dist
+    except Exception:  # noqa: BLE001 - torch may be built without it
+        return None
+    try:
+        if not dist.is_available() or not dist.is_initialized():
+            return None
+        return int(dist.get_world_size())
+    except Exception:  # noqa: BLE001 - any probe failure is "cannot say"
+        return None
+
+
+def _collective_width_refusal(op: dict, measured_topology, observed):
+    """Why this collective must not be timed here, or None to go ahead.
+
+    The graph says which width it was captured at and the process says which
+    width it is running at, and nothing made the two agree. `primitives.py`
+    builds its communicator from `--tp`, while `load_ops` labels the resulting
+    prices from the graph's own `key.topology`. Pricing a TP4 graph under
+    `--tp 2` therefore reduces over a real two-rank group and files the answer
+    as a four-rank price -- which then matches a genuine TP4 request exactly,
+    because a collective's signature carries its message and not its group.
+
+    Only collectives are checked. A GEMM shaped for a TP4 shard is a perfectly
+    ordinary single-device matrix multiply and pricing one on one GPU is both
+    legitimate and routine; its cost does not depend on how many other ranks
+    exist, so it is not asked to prove anything about them.
+    """
+    if not _is_collective_op(op):
+        return None
+    declared = None
+    if measured_topology:
+        group = op.get("group")
+        if group is not None and group in measured_topology:
+            declared = int(measured_topology[group])
+        else:
+            wide = [int(w) for w in measured_topology.values() if int(w) > 1]
+            declared = max(wide) if wide else 1
+    if declared is None:
+        # The graph does not say. Downstream already refuses to spend a price
+        # that cannot name its width, so there is nothing to contradict here.
+        return None
+    if declared <= 1:
+        return None
+    if observed is None:
+        return (f"its graph was captured over {declared} ranks and this "
+                "process has no communicator, so the reduction here would be "
+                "a local copy priced as a collective")
+    if observed != declared:
+        return (f"its graph was captured over {declared} ranks and this "
+                f"process reduces over {observed}: the signature carries the "
+                "message and not the group, so this price would match a "
+                f"{declared}-rank request exactly and be spent on it")
+    return None
+
+
 def _uncapturable(exc: Exception) -> bool:
     """Whether a failure means "this cannot be graph-captured" rather than
     "this operator is broken"."""
@@ -1230,7 +1301,8 @@ def _uncapturable(exc: Exception) -> bool:
             or "capture_begin" in text)
 
 
-def _time_over(fn, sets: list, iters: int, warmup: int) -> tuple[float, float]:
+def _time_over(fn, sets: list, iters: int, warmup: int,
+               before=None) -> tuple[float, float]:
     """Seconds per call on the device, and seconds per call on the host.
 
     Both, because one without the other cannot say what was measured. CUDA
@@ -1244,6 +1316,16 @@ def _time_over(fn, sets: list, iters: int, warmup: int) -> tuple[float, float]:
     synchronise, so it measures Python plus the dispatcher plus the operator
     wrapper plus the driver call, and nothing of the kernel. When the two agree,
     the device was idle waiting for the host and the "price" is the host's.
+
+    ``before`` is called with the iteration index before each call, the same
+    hook :func:`_time_in_graph` takes, so an operator that reaches its working
+    set through the forward context can be rotated across KV regions here too.
+    Without it this loop installs one context and makes every call against it,
+    which prices a resident working set -- and a caller that rotated for the
+    captured path and not for this one would report a region count it never
+    visited. The install lands inside the timed window rather than in a capture,
+    so it is part of the per-launch overhead this path already carries and is
+    labelled with.
     """
     import time as _time
 
@@ -1251,6 +1333,8 @@ def _time_over(fn, sets: list, iters: int, warmup: int) -> tuple[float, float]:
 
     n = len(sets)
     for i in range(warmup):
+        if before is not None:
+            before(i)
         a, k = sets[i % n]
         fn(*a, **k)
     torch.cuda.synchronize()
@@ -1259,6 +1343,8 @@ def _time_over(fn, sets: list, iters: int, warmup: int) -> tuple[float, float]:
     began.record()
     host0 = _time.perf_counter()
     for i in range(iters):
+        if before is not None:
+            before(i)
         a, k = sets[i % n]
         fn(*a, **k)
     host = _time.perf_counter() - host0
@@ -1334,6 +1420,10 @@ def price_graph(graph_path: str, iters: int = 2000, warmup: int = 20,
     run must not read back as a graph's coverage.
     """
     ops, paths, measured_topology = load_ops(graph_path)
+    # Attested once, from the process rather than from the artifact it is about
+    # to write. The graph's declared width and the communicator this run
+    # actually built are two independent facts and nothing else compares them.
+    observed_width = observed_group_width()
     if only:
         ops = [op for op in ops if only in op["name"]]
 
@@ -1389,6 +1479,14 @@ def price_graph(graph_path: str, iters: int = 2000, warmup: int = 20,
             unpriced[sig] = _ABI_REFUSALS.get(
                 abi, f"its arguments are recorded as {abi!r}, which this "
                      "bench does not know how to rebuild")
+            continue
+        # Before it is timed, not after it is labelled: a collective priced at
+        # the wrong width is indistinguishable from one priced at the right
+        # width once it is in the file.
+        width_refusal = _collective_width_refusal(op, measured_topology,
+                                                  observed_width)
+        if width_refusal is not None:
+            unpriced[sig] = width_refusal
             continue
         triton_kernel = op["name"].partition("::")[0] in ("triton", "inductor")
         fn = _resolve_triton(op) if triton_kernel else _resolve(op["name"])
@@ -1452,6 +1550,13 @@ def price_graph(graph_path: str, iters: int = 2000, warmup: int = 20,
             unpriced[sig] = "unknown dtype"
             continue
         used, kernels = cache, {}
+        # How many KV regions the timing loop *visited*, set by the branch that
+        # did the timing rather than from how many were installed. Recording
+        # `len(variants)` regardless once claimed 64 cold regions for a
+        # fallback that installed variant 0 and then never rotated, which is
+        # the one number a reader would use to decide the price was cold.
+        regions_timed = 1
+        rotated = len(variants) if rotate is not None else 1
         try:
             if cache == "graph":
                 try:
@@ -1459,6 +1564,7 @@ def price_graph(graph_path: str, iters: int = 2000, warmup: int = 20,
                         fn, sets, iters, warmup, before=rotate,
                         breakdown=PRICE_KERNELS, occurrences=counts[sig],
                         family=op["name"], covered=covered)
+                    regions_timed = min(rotated, iters) if iters else rotated
                 except Exception as exc:  # noqa: BLE001
                     if not _uncapturable(exc):
                         raise
@@ -1473,15 +1579,27 @@ def price_graph(graph_path: str, iters: int = 2000, warmup: int = 20,
                     #
                     # `used` records which, so a reader can tell one price from
                     # the other rather than finding them silently mixed.
+                    #
+                    # The rotation is carried across with it. This path used to
+                    # install variant 0 and then time every call against that
+                    # one region, so the price was of a resident working set
+                    # while the artifact still said it covered every region
+                    # that had been installed.
                     used = "over"
                     import torch
                     torch.cuda.synchronize()
                     if variants:
                         variants[0]()
-                    seconds, host_seconds = _time_over(fn, sets, iters, warmup)
+                    seconds, host_seconds = _time_over(
+                        fn, sets, iters, warmup, before=rotate)
+                    regions_timed = min(rotated, iters) if iters else rotated
             else:
                 timer = _time_isolated if cache == "isolated" else _time_over
                 seconds, host_seconds = timer(fn, sets, iters, warmup)
+                # `hot`/`isolated` install a single variant by construction
+                # above, so there is nothing to rotate and one region is the
+                # honest count.
+                regions_timed = rotated
         except Exception as exc:  # noqa: BLE001 - a call can fail many ways
             # Where it failed, not just what it said. An operator rebuilt from
             # a graph fails inside the engine's own code, and the message alone
@@ -1495,7 +1613,7 @@ def price_graph(graph_path: str, iters: int = 2000, warmup: int = 20,
             "occurrences": counts[sig],
             "cache": used,
             "arg_sets": len(sets),
-            "kv_regions": len(variants) or 1,
+            "kv_regions": regions_timed,
             # Host enqueue cost per call. Where this matches `seconds`, the
             # device was idle waiting and the price is the host's, not the
             # kernel's.
@@ -1523,6 +1641,12 @@ def price_graph(graph_path: str, iters: int = 2000, warmup: int = 20,
             # must not spend a collective price from this list; see
             # `PricedOracle._cost`.
             "topology": measured_topology,
+            # What this process was actually reducing over while it timed, as
+            # distinct from what the graph says it was captured at. A reader
+            # comparing the two can see that the label was checked rather than
+            # copied; `None` means no communicator existed here, which is the
+            # normal case for a graph with no collective in it.
+            "observed_group_width": observed_width,
             "iters": iters,
             "cache": cache,
             # Set when the run was narrowed to one family. The coverage below

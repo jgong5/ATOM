@@ -57,7 +57,6 @@ regardless of which half of the seam it is running against.
 
 from __future__ import annotations
 
-import json
 import logging
 from typing import Optional
 
@@ -92,6 +91,46 @@ INTERPOLATED_SCHEME = INTERPOLATED_SOURCE_PREFIX
 _OPEN_QUESTION = "no entry for this signature"
 
 
+def _scope_key(scope) -> tuple:
+    """A scope as a hashable key. Same two fields ``_same_scope`` compares."""
+    scope = scope or {}
+    topology = scope.get("topology") or {}
+    return (tuple(sorted(topology.items())) if isinstance(topology, dict)
+            else tuple(topology), scope.get("registration"))
+
+
+def _scope_note(key: tuple) -> str:
+    topology, registration = key
+    return (f"{dict(topology) or 'undeclared width'} on "
+            f"{registration or 'an undeclared path'}")
+
+
+#: The scope key for an operator whose cost does not depend on the group. Not
+#: `None`, so it cannot be confused with "scope not recorded".
+_LOCAL = ("local",)
+
+
+def _scope_of(op: dict, scope) -> tuple:
+    """The scope a measurement of this operator is valid in.
+
+    Only a collective's cost depends on the group it runs in, and
+    ``PriceLibrary.lookup`` scopes exact prices for collectives alone. A GEMM
+    is a GEMM: the same shapes on the same layout cost the same whether the
+    deployment around it is TP1 or TP2, and whether the collectives elsewhere
+    in that graph take the registered path or not. The body hands the graph's
+    registration to *every* lookup, so scoping local families on it would
+    refuse an in-support interpolation of a GEMM measured in an unregistered
+    price list purely because the graph asking has registered collectives --
+    while the exact-width lookup of that same GEMM succeeds. Two paths
+    disagreeing about the same operator is the bug, not the scoping.
+
+    So local families share one scope and collectives keep theirs.
+    """
+    from atom.compass.runtime.microbench import _is_collective_op
+
+    return _scope_key(scope) if _is_collective_op(op) else _LOCAL
+
+
 class ParametricPriceLibrary(PriceLibrary):
     """Exact prices first; a measured curve in rows behind the open question.
 
@@ -110,7 +149,12 @@ class ParametricPriceLibrary(PriceLibrary):
         self._ops: dict[str, dict] = {}
         #: price file -> the row count that run was measured at
         self._rows: dict[str, int] = {}
-        #: grouping key -> [(op, rows, seconds, source, kernels)]
+        #: price file -> {signature -> the operator THAT file's graph recorded}
+        #: Needed beside `_ops` because a signature does not carry layout: two
+        #: files can price the same key on differently arranged memory, and
+        #: only the per-file map says which price is which.
+        self._source_ops: dict[str, dict] = {}
+        #: (grouping key, scope key) -> [(op, rows, seconds, source, kernels)]
         self._observations: dict[tuple, list] = {}
         self._curves_built = False
         #: reasons a family could not be assembled, for describe()
@@ -122,7 +166,7 @@ class ParametricPriceLibrary(PriceLibrary):
     # -- assembly -------------------------------------------------------
 
     def add(self, price_path: str, graph_path: Optional[str] = None,
-            registration: Optional[str] = None) -> None:
+            registration: Optional[str] = None, *, coords=None) -> None:
         """Load a price file, and the graph that says what its keys mean.
 
         Without a graph this behaves exactly as the base class: prices are
@@ -130,15 +174,22 @@ class ParametricPriceLibrary(PriceLibrary):
         feature off, so the file contributes nothing to any curve. That is a
         silent loss of capability rather than of correctness, so it is
         recorded.
+
+        ``coords`` is forwarded unresolved, exactly as the base class takes
+        it, so this override cannot become a second place that resolves a
+        rank's path.
         """
-        super().add(price_path, graph_path, registration)
-        if not graph_path:
+        # `_ingest` rather than `super().add`, so the graph is parsed once and
+        # this override reads the payload the base class already has. Opening
+        # it again here would give the retained digest a second set of bytes
+        # to be a digest of.
+        _blob, graph = self._ingest(price_path, graph_path, registration,
+                                    coords)
+        if graph is None:
             self.unbuildable[price_path] = (
                 "no graph supplied, so its operators have no structure to "
                 "read a feature from; exact-signature use only")
             return
-        with open(graph_path, encoding="utf-8") as fh:
-            graph = json.load(fh)
         reading = _traced_rows(graph)
         if isinstance(reading, tuple):
             self.unbuildable[price_path] = f"{graph_path}: {reading[1]}"
@@ -154,27 +205,59 @@ class ParametricPriceLibrary(PriceLibrary):
 
         for op in graph.get("ops") or ():
             self._ops.setdefault(signature_of(op), op)
+            # Also per source. `_ops` is keyed by signature alone and keeps the
+            # first operator seen under it, which is fine for "what structure
+            # does this key have" and wrong for "what did THIS file price". A
+            # signature does not carry layout, so one file's dense rebuild and
+            # another's strided view share a key; pairing every scoped price
+            # with the first-seen operator puts both on the first layout's
+            # curve.
+            # First occurrence, matching the two readers that already choose:
+            # `microbench` keys its example operator with `example.setdefault`,
+            # and `PriceLibrary._ingest` captures the measured layout with
+            # `layouts.setdefault`. A graph holding a dense and a strided call
+            # under one signature is PRICED as the dense one, so labelling it
+            # strided here would disagree with the measurement.
+            self._source_ops.setdefault(price_path, {}).setdefault(
+                signature_of(op), op)
         self._curves_built = False
 
     def _build(self) -> None:
-        """Group every measured price by the operator it priced."""
+        """Group every measured price by the operator *it* priced.
+
+        Each record is paired with the operator from its own file's graph and
+        grouped under its own scope. Two things were collapsing here:
+
+        * **layout** -- a strided measurement was attached to the dense
+          operator, so its seconds joined the dense curve (contaminating the
+          median at every width it shared) and no strided curve existed at all,
+          so a strided request at an unmeasured width had no support to sit in.
+        * **scope** -- prices measured at different group widths or on
+          different registration paths landed on one curve, which averages
+          measurements of different work.
+        """
         if self._curves_built:
             return
         self._observations.clear()
         for sig, records in self._prices.items():
-            op = self._ops.get(sig)
-            if op is None:
-                continue
-            contract = contract_for(op.get("name", ""))
-            if contract is None or contract.kind != "rows":
-                continue
             for record in records:
-                rows = self._rows.get(record.get("source"))
+                source = record.get("source")
+                op = (self._source_ops.get(source) or {}).get(sig)
+                if op is None:
+                    # No graph from this file, so nothing says what this price
+                    # is a price of. Exact-signature use only; `unbuildable`
+                    # already records why.
+                    continue
+                contract = contract_for(op.get("name", ""))
+                if contract is None or contract.kind != "rows":
+                    continue
+                rows = self._rows.get(source)
                 seconds = record.get("seconds")
                 if rows is None or seconds is None:
                     continue
-                self._observations.setdefault(grouping_key(op), []).append(
-                    (op, rows, float(seconds), record.get("source", "?"),
+                key = (grouping_key(op), _scope_of(op, record.get("scope")))
+                self._observations.setdefault(key, []).append(
+                    (op, rows, float(seconds), source or "?",
                      tuple(record.get("kernels") or ())))
         self._curves_built = True
 
@@ -186,9 +269,10 @@ class ParametricPriceLibrary(PriceLibrary):
             # Either answered, or refused for a reason that is a finding rather
             # than a gap. Both are returned as they came.
             return record, detail
-        return self._parametric(op, detail)
+        return self._parametric(op, detail, topology, registration)
 
-    def _parametric(self, op: dict, original: str):
+    def _parametric(self, op: dict, original: str, topology=None,
+                    registration=None):
         contract = contract_for(op.get("name", ""))
         if contract is None:
             return None, (f"{original}; and {op.get('name', '?')} has no "
@@ -204,10 +288,16 @@ class ParametricPriceLibrary(PriceLibrary):
                 "nobody has measured")
 
         self._build()
-        curve, verified_rows = self._curve_for(op)
+        curve, verified_rows = self._curve_for(op, topology, registration)
         if curve is None:
+            # Scope first: "this family is measured, but not here" is a
+            # different gap from "nothing matches this operator", and only one
+            # of them is closed by measuring a new width.
+            _groups, scope_why = self._groups_for(op, topology, registration)
+            if scope_why:
+                return None, f"{original}; {scope_why}"
             return None, (f"{original}; and no measured operator matches this "
-                          "one at any width")
+                          "one at any width" + self._layout_note(op))
         support = RowSupport(curve, max_gap_ratio=self.max_gap_ratio)
         answer = support.price(verified_rows)
         if isinstance(answer, Refusal):
@@ -223,9 +313,64 @@ class ParametricPriceLibrary(PriceLibrary):
                      **{INTERPOLATED_FLAG: True}),
                 f"{INTERPOLATED_SCHEME}{contract.family}/rows={verified_rows}")
 
-    def _curve_for(self, op: dict):
+    def _layout_note(self, op: dict) -> str:
+        """Say so when operand layout is why nothing matched.
+
+        Without this the refusal reads "no measured operator matches this one
+        at any width", which is true and unhelpful: the family *was* measured,
+        at widths that bracket this one, on operands in a different memory
+        arrangement. Naming that is the difference between a gap somebody can
+        close and a gap somebody re-measures the wrong thing to close.
+        """
+        mine = _layout_note_for(op)
+        others = {_layout_note_for(measured)
+                  for key, obs in self._observations.items()
+                  if key[0][0] == op.get("name", "")
+                  for measured, *_ in obs}
+        others.discard(mine)
+        if not others:
+            return ""
+        return (f". This request's operands are {mine} while this family was "
+                f"measured on {', '.join(sorted(others))}, which is a "
+                "different operator rather than another width of this one")
+
+    def _groups_for(self, op: dict, topology, registration):
+        """The observation groups this request may be answered from.
+
+        Keyed by structure *and* scope, so a request is only ever answered from
+        measurements taken at its own group width on its own registration path.
+        A caller that names neither is allowed through only while there is one
+        scope to be: with several, picking would be the silent spend the base
+        class already refuses for collectives, so this refuses too.
+        """
+        structural = grouping_key(op)
+        present = {key[1]: obs for key, obs in self._observations.items()
+                   if key[0] == structural}
+        if not present:
+            return [], None
+        if present.keys() == {_LOCAL}:
+            # A local family: one scope by construction, and the request's
+            # topology and registration say nothing about its cost.
+            return [present[_LOCAL]], None
+        if topology is None and registration is None:
+            if len(present) == 1:
+                return list(present.values()), None
+            return [], ("this family is measured in more than one scope and "
+                        "the request named none: "
+                        + "; ".join(sorted(_scope_note(k) for k in present)))
+        wanted = _scope_key({"topology": topology,
+                             "registration": registration})
+        exact = present.get(wanted)
+        if exact is not None:
+            return [exact], None
+        return [], (f"no measurement of this family at {_scope_note(wanted)} "
+                    "(have: "
+                    + "; ".join(sorted(_scope_note(k) for k in present)) + ")")
+
+    def _curve_for(self, op: dict, topology=None, registration=None):
         """The measured curve for this operator, and the width it sits at."""
-        observations = self._observations.get(grouping_key(op)) or []
+        groups, _why = self._groups_for(op, topology, registration)
+        observations = [entry for group in groups for entry in group]
         matched: list = []
         rows_here = None
         for measured_op, rows, seconds, source, kernels in observations:
@@ -334,6 +479,15 @@ def _record(answer, curve: MeasuredCurve, rows: int) -> dict:
             "measured_sources": sorted(set(answer.sources)),
         },
     }
+
+
+def _layout_note_for(op: dict) -> str:
+    """This operator's operand layout, named for a refusal message."""
+    positions = sorted(int(pos) for pos, _ in
+                       (tuple(x) for x in op.get("layouts") or ()))
+    if not positions:
+        return "a dense rebuild"
+    return f"a recorded view at operand {positions}"
 
 
 def coverage_split(library: PriceLibrary, graph_blob: dict,
