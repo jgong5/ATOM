@@ -39,7 +39,7 @@ Every width shares these:
     --compass-oracle-option position_rows=3
     --compass-oracle-option cudagraph_mode=full
     --compass-oracle-option head=1
-    --compass-oracle-option regions=source-27b-tp1-prefill-interp
+    --compass-oracle-option regions=source-27b-tp1-prefill-seqs
     --compass-oracle-option require_complete=1
     --compass-oracle-option allocation=native
     --compass-oracle-option derive=1
@@ -60,12 +60,35 @@ measured row counts the evidence supports interpolating across. `1` used to be
 taken literally as that ratio, which no two distinct row counts can meet, and
 run 8 refused 2118 of 2443 operators for it.
 
-`regions=source-27b-tp1-prefill-interp` is the successor to
-`source-27b-tp1-conc-v2`. It carries the measured one-sequence prefill cells
+`regions=source-27b-tp1-prefill-seqs` is the successor to
+`source-27b-tp1-prefill-interp`, which is in turn the successor to
+`source-27b-tp1-conc-v2`. Both predecessors stay in the registry and are not
+edited; a prediction already made does not improve by being recomputed.
+
+The interp model carries the measured one-sequence prefill cells
 byte for byte and interpolates only between adjacent measurements of the same
 `(sequences, produces_output)` group, refusing outside their span -- run 7
 died because an exact-cell lookup cannot answer a final chunk, whose token
 count is `prompt mod chunk_budget` and so arbitrary.
+
+The seqs model adds what the corrected client workload needs and nothing else.
+Clients are top-level agent sessions, not an in-flight request cap, so eight
+clients can put more than eight requests in flight and the scheduler batches up
+to `max_num_seqs=32`; the interp model refuses every step above two sequences,
+which no longer covers the workload. Sequence counts 3 through 32 are therefore
+answered as **one pooled group interpolating on the token axis**, because at a
+fixed token count the term spreads 2.4% across 4 and 32 sequences and 9.6%
+across 3, 12 and 24, while across token counts it moves 6.8x. One and two
+sequences keep their own groups and their own published numbers -- there the
+sequence count genuinely matters, five times over -- so this is a bounded
+relaxation, not a general licence to slide along the sequence axis.
+
+Its pooled group is measured from 1536 to 16384 tokens and refuses outside
+that; 16384 is the token budget, so no step exceeds it. Three qualifications
+are carried in the model's own docstring and belong in any report that quotes
+it: a flat ~6e-04 population is reachable on this tree and sets several low
+band edges, the 5120-to-8192 interval crosses the two populations and is the
+weakest claim here, and every row was measured with `waiting: 0`.
 
 The TP1 `price=` line above is the two decode-32 seed pairs, which is where
 this set started. The list the registry passes today is longer: it adds the

@@ -78,7 +78,16 @@ SHARED_OPTIONS = (
     # unpaced source anchors and interpolates only between adjacent
     # measurements of the same (sequences, produces_output) group, refusing
     # outside their span. `conc-v2` has never been selected by any run.
-    ("regions", "source-27b-tp1-prefill-interp"),
+    #
+    # `prefill-seqs` extends that once more, and the client dimension is why.
+    # Clients are top-level agent sessions, not an in-flight request cap, so
+    # the 8-client cells can put more than eight requests in flight and the
+    # scheduler batches up to max_num_seqs=32. `prefill-interp` refuses every
+    # step above two sequences, so it cannot complete these workloads at all.
+    # `prefill-seqs` carries all of its anchors unchanged -- 1 and 2 sequences
+    # answer exactly what they answered -- and adds one pooled 3..32-sequence
+    # group on the token axis.
+    ("regions", "source-27b-tp1-prefill-seqs"),
     # Family-price mode, explicitly on. Without it `gap_ratio(None)` is None,
     # `_price_library` builds a plain `PriceLibrary` with no curves, and every
     # parametric family -- the head row ladder below above all -- is dead

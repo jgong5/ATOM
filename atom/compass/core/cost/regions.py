@@ -61,6 +61,11 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
+#: The sequence slot a pooled prefill anchor group is keyed under. Negative so
+#: it can never collide with a real sequence count, and rendered by
+#: `_seqs_label` so a refusal never reads "minus-one sequences".
+POOLED_SEQS = -1
+
 
 @dataclass(frozen=True)
 class Measured:
@@ -352,6 +357,24 @@ class BucketedRunnerRegions:
     prepare_prefill_anchors: tuple = ()
     #: The same, for postprocess.
     postprocess_prefill_anchors: tuple = ()
+    #: Inclusive `(lo, hi)` sequence counts whose prefill anchors share ONE
+    #: token axis, keyed under `POOLED_SEQS`. Empty -- every source published
+    #: before this existed -- keeps the strict per-sequence-count grouping.
+    #:
+    #: This is a deliberate, narrow relaxation of the rule three fields above,
+    #: and it is not a general licence to slide along the sequence axis. That
+    #: rule was written on the one- and two-sequence evidence, where 15360
+    #: tokens over two sequences is five times 15232 over one; pooling those
+    #: would be indefensible and this field does not, because a pooled range
+    #: starting at 3 leaves 1 and 2 as their own groups.
+    #:
+    #: What licenses pooling above that is measurement, not convenience: at a
+    #: fixed token count the spread ACROSS sequence counts is 2.4% at 16384
+    #: (4 and 32 sequences) and 9.6% at 12288 (3, 12 and 24), while across
+    #: token counts the same term moves 6.8x. Covering 3..32 as separate
+    #: groups would need roughly sixty campaigns to say something the evidence
+    #: says is not there.
+    prefill_pooled_sequences: tuple = ()
     version: str = ""
     provenance: str = ""
 
@@ -377,6 +400,21 @@ class BucketedRunnerRegions:
         """The token counts measured at this sequence count and output status."""
         return sorted(t for (s, t, o) in table
                       if s == seqs and o == produces)
+
+    def _pool(self, seqs: int) -> int:
+        """The group `seqs` is looked up under: itself, or the pooled slot."""
+        if self.prefill_pooled_sequences:
+            lo, hi = self.prefill_pooled_sequences
+            if lo <= seqs <= hi:
+                return POOLED_SEQS
+        return seqs
+
+    def _seqs_label(self, seqs: int) -> str:
+        """How a group is named in a refusal or a `how` string."""
+        if seqs == POOLED_SEQS and self.prefill_pooled_sequences:
+            lo, hi = self.prefill_pooled_sequences
+            return f"the pooled {lo}..{hi}-sequence group"
+        return f"{seqs} sequence(s)"
 
     def _interpolates(self) -> bool:
         """Whether this source asked for interpolation at all.
@@ -418,7 +456,7 @@ class BucketedRunnerRegions:
             samples=left.samples + right.samples,
             how=(f"INTERPOLATED linearly in token count between the measured "
                  f"{lo} ({left.seconds:.6e} s) and {hi} "
-                 f"({right.seconds:.6e} s) at {seqs} sequence(s) "
+                 f"({right.seconds:.6e} s) at {self._seqs_label(seqs)} "
                  f"{'producing a token' if produces else 'producing none'}; "
                  f"the band is the union of both anchors' observed ranges, "
                  f"not a narrower interpolated one. Approximation between two "
@@ -445,8 +483,11 @@ class BucketedRunnerRegions:
         return bool(ctx) and len(ctx) == len(sched)
 
     def _prefill_key(self, shape) -> tuple:
-        return (len(shape.num_scheduled_tokens), int(shape.total_tokens),
-                self._produces_output(shape))
+        # Every lookup and every refusal goes through here, so pooling is
+        # applied once, at the key, rather than at each of the five sites that
+        # build a span or quote one.
+        return (self._pool(len(shape.num_scheduled_tokens)),
+                int(shape.total_tokens), self._produces_output(shape))
 
     def _prefill_term(self, shape, cells: tuple, scalar: Measured,
                       anchors: tuple = ()) -> Measured:
@@ -499,8 +540,9 @@ class BucketedRunnerRegions:
                     # Cells only: the published lookup, cell by cell. This is
                     # the branch run 7 died in, and it must keep dying there.
                     if key not in cells:
-                        return (f"prefill of {key[1]} tokens over {key[0]} "
-                                f"sequence(s), producing {produced}, was not "
+                        return (f"prefill of {key[1]} tokens over "
+                                f"{self._seqs_label(key[0])}, producing "
+                                f"{produced}, was not "
                                 "measured; the measured token counts for that "
                                 f"group are {span}")
                     post = self._prefill_cells(self.postprocess_prefill_cells)
@@ -512,13 +554,14 @@ class BucketedRunnerRegions:
                     return None
                 if not span:
                     groups = sorted({(s, o) for (s, _t, o) in cells})
-                    return (f"prefill over {key[0]} sequence(s) producing "
+                    return (f"prefill over {self._seqs_label(key[0])} producing "
                             f"{produced} was not measured at any token count; "
                             f"the measured (sequences, produces_output) "
                             f"groups are {groups}")
                 if not span[0] <= key[1] <= span[-1]:
-                    return (f"prefill of {key[1]} tokens over {key[0]} "
-                            f"sequence(s), producing {produced}, is outside "
+                    return (f"prefill of {key[1]} tokens over "
+                            f"{self._seqs_label(key[0])}, producing "
+                            f"{produced}, is outside "
                             f"the measured token span [{span[0]}, {span[-1]}] "
                             f"for that group; the anchors there are {span}")
                 if key[2]:
@@ -657,8 +700,13 @@ class BucketedRunnerRegions:
             f"{list(self.decode_context)} tokens at the cells above, prefill "
             f"{list(self.prefill_sequences)} seqs over "
             f"{list(self.prefill_tokens)} tokens, tp {list(self.topologies)}",
-            f"provenance          : {self.provenance}",
         ]
+        if self.prefill_pooled_sequences:
+            lo, hi = self.prefill_pooled_sequences
+            lines.append(
+                f"pooled prefill group: sequence counts {lo}..{hi} share one "
+                "token axis; 1 and 2 remain separate groups")
+        lines.append(f"provenance          : {self.provenance}")
         return "\n".join(lines)
 
 
@@ -1148,6 +1196,170 @@ SOURCE_27B_TP1_PREFILL_INTERP = BucketedRunnerRegions(
 )
 
 
+#: The same model, extended to the sequence counts the scheduler can reach.
+#:
+#: `SOURCE_27B_TP1_PREFILL_INTERP` above stops at two sequences, and its own
+#: note says three or more is refused deliberately because the captures there
+#: were single points no trace shape would land on. The corrected client
+#: workload changes that premise: clients are top-level sessions, not an
+#: in-flight cap, so eight clients can put far more than eight requests in
+#: flight and the scheduler will batch up to `max_num_seqs=32`. A model that
+#: refuses everything above two sequences cannot complete the development or
+#: client workloads at all.
+#:
+#: **The published stanzas above are untouched.** Both anchor tuples and both
+#: cell tuples are carried over by reference; the one- and two-sequence groups
+#: answer exactly what they answered before, byte for byte. What is added is a
+#: third group.
+#:
+#: WHY ONE GROUP AND NOT THIRTY. `agent_scratch/stage/job_regionseqs.sh`
+#: measured eight shapes on one TP1 engine -- 32x512, 32x256, 28x512, 24x512,
+#: 20x512, 12x1024, 5x1024, and 16x1024 as a control -- joining the 3x512,
+#: 4x512, 3x4096 and 4x4096 cells of `job_regiongaps`. Across those, at a fixed
+#: token count the term barely moves with the sequence count: 12288 tokens over
+#: 3, 12 and 24 sequences spread 9.6%, and 16384 over 4 and 32 spread 2.4%.
+#: Across token counts it moves 6.8x. So the evidence says the axis is tokens,
+#: and thirty per-sequence-count groups would be roughly sixty campaigns spent
+#: resolving a difference smaller than the repeat spread. The single/two-
+#: sequence distinction is NOT pooled away -- there the sequence count really
+#: does matter, five times over at 15232 vs 15360 tokens -- so `_pool` starts
+#: the pooled range at 3.
+#:
+#: THE 4.6x CONTROL, ANSWERED. `cap_conc` published (16, 16384) at 8.458e-04 s
+#: while `regiongaps` published (4, 16384) at 3.891e-03 -- 4.6x apart at the
+#: same token count, which would have destroyed the pooling argument if it were
+#: a sequence-count effect. Re-measuring `cap_conc`'s own 16x1024 shape inside
+#: this campaign returned 4.177e-03. It is a difference between campaigns, not
+#: between shapes, so the `cap_conc` rows are excluded here rather than pooled
+#: -- the standing rule against pooling the two cached populations -- and they
+#: remain published and unedited where they already are.
+#:
+#: STATED UNCERTAINTY, three items, none of them hidden:
+#:
+#: 1. **The flat mode is reachable on this tree.** Three of today's own rows
+#:    fall into the ~6e-04 population at scattered positions, which is why the
+#:    bands below are wide at 5120, 8192 and 10240 rather than tight: the low
+#:    edge is a real observation, not a percentile artefact. A caller reading
+#:    the band rather than the central value is reading the honest range.
+#: 2. **5120 to 8192 crosses the two modes.** The 5120 anchor's centre sits in
+#:    the flat population and the 8192 one does not, so an interpolated answer
+#:    in between is the weakest claim in this model. It is also where the term
+#:    is smallest in absolute size.
+#: 3. **`waiting: 0` only.** Every burst was enqueued into an empty waiting
+#:    queue, so these rows are steps scheduled with nothing else waiting. A
+#:    served step with a backlog is a different regime and is not claimed.
+#:
+#: Below 1536 tokens and above 16384 the pooled group refuses, as it should:
+#: 16384 is the token budget, so no step exceeds it, and nothing multi-sequence
+#: shorter than 1536 was measured.
+SOURCE_27B_TP1_PREFILL_SEQS = BucketedRunnerRegions(
+    postprocess_decode=SOURCE_27B_TP1_CONC_V2.postprocess_decode,
+    prepare_decode_cells=SOURCE_27B_TP1_CONC_V2.prepare_decode_cells,
+    postprocess_prefill=SOURCE_27B_TP1_CONC_V2.postprocess_prefill,
+    prepare_prefill=SOURCE_27B_TP1_CONC_V2.prepare_prefill,
+    prepare_prefill_cells=SOURCE_27B_TP1_PREFILL_CELLS.prepare_prefill_cells,
+    postprocess_prefill_cells=(
+        SOURCE_27B_TP1_PREFILL_CELLS.postprocess_prefill_cells),
+    prepare_prefill_anchors=(
+        SOURCE_27B_TP1_PREFILL_INTERP.prepare_prefill_anchors + (
+            ((POOLED_SEQS, 1536, True), Measured(
+                seconds=9.857996e-4, low=4.5342e-4, high=1.0493e-3, samples=3,
+                how="upper median [min,max] of the 3 retained rows of the "
+                    "3x512 cell, pricing_coverage/regiongaps")),
+            ((POOLED_SEQS, 2048, True), Measured(
+                seconds=4.802168e-4, low=4.6448e-4, high=5.5421e-4, samples=3,
+                how="upper median [min,max] of the 3 retained rows of the "
+                    "4x512 cell, pricing_coverage/regiongaps")),
+            ((POOLED_SEQS, 5120, True), Measured(
+                seconds=6.021354e-4, low=5.5550e-4, high=1.8053e-3, samples=3,
+                how="upper median [min,max] of the 3 retained 5x1024 rows, "
+                    "pricing_coverage/regionseqs. The centre is in the flat "
+                    "population and the high edge is not, which is the widest "
+                    "band here and the reason item 2 above is stated")),
+            ((POOLED_SEQS, 8192, True), Measured(
+                seconds=2.344933e-3, low=6.4582e-4, high=2.4911e-3, samples=3,
+                how="upper median [min,max] of the 3 retained 32x256 rows, "
+                    "pricing_coverage/regionseqs. One of the three fell into "
+                    "the flat mode and sets the low edge; it is kept, not "
+                    "dropped")),
+            ((POOLED_SEQS, 10240, True), Measured(
+                seconds=2.871009e-3, low=7.9247e-4, high=2.8926e-3, samples=3,
+                how="upper median [min,max] of the 3 retained 20x512 rows, "
+                    "pricing_coverage/regionseqs; low edge a flat-mode row")),
+            ((POOLED_SEQS, 12288, True), Measured(
+                seconds=3.241286e-3, low=2.6858e-3, high=3.5118e-3, samples=9,
+                how="upper median [min,max] of 9 retained rows POOLED over 3, "
+                    "12 and 24 sequences -- 3x4096 from regiongaps, 12x1024 "
+                    "and 24x512 from regionseqs. Their three centres are "
+                    "2.964e-3, 3.241e-3 and 3.248e-3, 9.6% apart, which is "
+                    "the measurement this group's existence rests on")),
+            ((POOLED_SEQS, 14336, True), Measured(
+                seconds=3.602950e-3, low=3.4989e-3, high=3.7258e-3, samples=3,
+                how="upper median [min,max] of the 3 retained 28x512 rows, "
+                    "pricing_coverage/regionseqs")),
+            ((POOLED_SEQS, 16384, True), Measured(
+                seconds=3.985405e-3, low=3.8541e-3, high=4.3725e-3, samples=6,
+                how="upper median [min,max] of 6 retained rows POOLED over 4 "
+                    "and 32 sequences -- 4x4096 from regiongaps and 32x512 "
+                    "from regionseqs, centres 3.891e-3 and 3.985e-3, 2.4% "
+                    "apart at an eightfold difference in sequence count. "
+                    "32x512 is the largest step the scheduler can build: 32 "
+                    "is max_num_seqs and 16384 is the token budget")),
+        )),
+    postprocess_prefill_anchors=(
+        SOURCE_27B_TP1_PREFILL_INTERP.postprocess_prefill_anchors + (
+            ((POOLED_SEQS, 1536, True), Measured(
+                seconds=1.0380e-4, low=1.0188e-4, high=1.0448e-4, samples=3,
+                how="span_seconds.postprocess of the same 3 rows")),
+            ((POOLED_SEQS, 2048, True), Measured(
+                seconds=1.0096e-4, low=1.0064e-4, high=1.0176e-4, samples=3,
+                how="span_seconds.postprocess of the same 3 rows")),
+            ((POOLED_SEQS, 5120, True), Measured(
+                seconds=1.0160e-4, low=1.0092e-4, high=1.0844e-4, samples=3,
+                how="span_seconds.postprocess of the same 3 rows")),
+            ((POOLED_SEQS, 8192, True), Measured(
+                seconds=1.0160e-4, low=1.0076e-4, high=1.0320e-4, samples=3,
+                how="span_seconds.postprocess of the same 3 rows")),
+            ((POOLED_SEQS, 10240, True), Measured(
+                seconds=1.0060e-4, low=1.0016e-4, high=1.0360e-4, samples=3,
+                how="span_seconds.postprocess of the same 3 rows")),
+            ((POOLED_SEQS, 12288, True), Measured(
+                seconds=1.534410e-4, low=1.4944e-4, high=1.5896e-4, samples=9,
+                how="span_seconds.postprocess of the same 9 rows. Postprocess "
+                    "is bimodal across this group -- ~1.01e-4 at 1536, 2048, "
+                    "5120, 8192, 10240 and 14336, ~1.50e-4 at 12288 and 16384 "
+                    "-- and the split follows neither tokens nor sequences "
+                    "monotonically. It is 5e-5 on a millisecond term, so each "
+                    "token count is quoted from its own rows rather than "
+                    "modelled, and no cause is claimed")),
+            ((POOLED_SEQS, 14336, True), Measured(
+                seconds=1.0136e-4, low=1.0020e-4, high=1.0408e-4, samples=3,
+                how="span_seconds.postprocess of the same 3 rows")),
+            ((POOLED_SEQS, 16384, True), Measured(
+                seconds=1.500810e-4, low=1.4640e-4, high=1.5256e-4, samples=6,
+                how="span_seconds.postprocess of the same 6 rows")),
+        )),
+    prefill_pooled_sequences=(3, 32),
+    tp_broadcast=SOURCE_27B_TP1_CONC_V2.tp_broadcast,
+    decode_context=SOURCE_27B_TP1_CONC_V2.decode_context,
+    prefill_sequences=(1, 2),
+    prefill_tokens=(640, 16384),
+    topologies=(1,),
+    capture_sizes=SOURCE_27B_TP1_CONC_V2.capture_sizes,
+    version="prefill-seqs-2026-09-12",
+    provenance="source-27b-tp1-prefill-interp unchanged, plus the retained "
+               "rows of pricing_coverage/regiongaps and "
+               "pricing_coverage/regionseqs as one pooled 3..32-sequence "
+               "anchor group, acquired on GPU0 by "
+               "agent_scratch/stage/job_regionseqs.sh and "
+               "agent_scratch/stage/job_regiongaps.sh, tabulated by "
+               "agent_scratch/stage/multiseq_anchors.py. g4/cap_conc rows "
+               "above four sequences are excluded as a separate cached "
+               "population, not pooled. Steps scheduled with waiting=0 only. "
+               "TP1 only",
+)
+
+
 REGION_MODELS = {
     "source-27b-tp1": SOURCE_27B_TP1,
     "source-27b-tp1-conc": SOURCE_27B_TP1_CONC,
@@ -1155,6 +1367,7 @@ REGION_MODELS = {
     "source-27b-tp1-prefill-1x640": SOURCE_27B_TP1_PREFILL_1X640,
     "source-27b-tp1-prefill-cells": SOURCE_27B_TP1_PREFILL_CELLS,
     "source-27b-tp1-prefill-interp": SOURCE_27B_TP1_PREFILL_INTERP,
+    "source-27b-tp1-prefill-seqs": SOURCE_27B_TP1_PREFILL_SEQS,
     "none": None,
 }
 
