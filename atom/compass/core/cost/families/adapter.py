@@ -601,6 +601,11 @@ class ParametricPriceLibrary(PriceLibrary):
         #: at different ragged structures are two design points and the second
         #: would be dropped as a duplicate.
         self._attention_obs: list = []
+        #: The observations above, each classified once. `None` means "not
+        #: built"; `_collect_attention` drops it whenever `add()` changes the
+        #: observations, so it can never answer for a population it was not
+        #: built from. See `_classified_evidence`.
+        self._attention_evidence: Optional[list] = None
         #: canonical kernel symbol -> the specializations pooled under it.
         #: Empty unless `_canonical_kernel` actually substituted something.
         #: Reported by `attention_coverage`, because pooling two symbols the
@@ -799,6 +804,11 @@ class ParametricPriceLibrary(PriceLibrary):
                  _measurement_identity(record, policy), _host_seconds(record),
                  _qualification(record)))
         self._attention_model = None
+        # The classification is a fact about the population, so it dies with
+        # the population. Dropped here rather than appended to, because a
+        # record arriving now can change which regime an EARLIER record falls
+        # in -- the scope comparison is between records, not per record.
+        self._attention_evidence = None
 
     def _with_declared_scope(self, scope: dict, op: dict,
                              price_path: str) -> dict:
@@ -1243,6 +1253,53 @@ class ParametricPriceLibrary(PriceLibrary):
             },
         }, f"{INTERPOLATED_SCHEME}{contract.family}/{name}")
 
+    def _classified_evidence(self) -> list:
+        """Every observation classified once, not once per priced call.
+
+        `_launch_composition` and `_treatment_for` ask the same three
+        questions of every observation -- its family, its static operand
+        geometry, and the regime it falls in under its OWN full scope -- and
+        not one of those answers depends on the call being priced. Asking them
+        per call is what made one replay step spend over 1.35 million
+        `structure_of` calls to price 192 modelled calls.
+
+        So they are answered once per library population and dropped whenever
+        `add()` changes it. Nothing is filtered or pooled here: the per-call
+        filters still run over the whole list, so an observation that made a
+        treatment ambiguous or a composition disagree is still a candidate and
+        still refuses. The only thing that changes is how many times the same
+        question is asked of the same record.
+        """
+        if self._attention_evidence is None:
+            evidence = []
+            for entry in self._attention_obs:
+                op, _seconds, _source, obs_scope, measurement = entry[:5]
+                # The observation's own full scope: its declared scope plus
+                # the treatment it was measured under. Both callers built
+                # exactly this before classifying, and a regime read from a
+                # scope missing the treatment is a different regime.
+                full = dict(obs_scope or {})
+                full["measurement_treatment"] = measurement
+                full = attention.scoped(op, full)
+                regime = attention.regime_of(op, None, full)
+                evidence.append({
+                    "op": op,
+                    "family": op.get("name"),
+                    "geometry": attention.geometry_of(op),
+                    # The scope as WRITTEN, for `_shown_to_match`, which
+                    # compares declarations rather than the completed scope.
+                    "scope": obs_scope,
+                    "measurement": measurement,
+                    # `None` where the regime refuses, which both callers
+                    # treat as "not this law" -- a regime name is never None.
+                    "regime": (None if isinstance(regime, attention.Refusal)
+                               else regime.name),
+                    "scope_key": attention.scope_key(full),
+                    "kernels": kernels_of(measurement),
+                })
+            self._attention_evidence = evidence
+        return self._attention_evidence
+
     def _launch_composition(self, regime_name: str, fit):
         """The kernels every measurement behind this law was served by.
 
@@ -1265,18 +1322,12 @@ class ParametricPriceLibrary(PriceLibrary):
         """
         compositions = set()
         wanted = attention.scope_key(fit.scope)
-        for op, _seconds, _source, obs_scope, measurement, _host, _q in \
-                self._attention_obs:
-            obs_scope = dict(obs_scope or {})
-            obs_scope["measurement_treatment"] = measurement
-            obs_scope = attention.scoped(op, obs_scope)
-            regime = attention.regime_of(op, None, obs_scope)
-            if isinstance(regime, attention.Refusal) \
-                    or regime.name != regime_name:
+        for obs in self._classified_evidence():
+            if obs["regime"] != regime_name:
                 continue
-            if attention.scope_key(obs_scope) != wanted:
+            if obs["scope_key"] != wanted:
                 continue
-            compositions.add(kernels_of(measurement))
+            compositions.add(obs["kernels"])
         compositions.discard(())
         if not compositions:
             return None, (
@@ -1408,23 +1459,16 @@ class ParametricPriceLibrary(PriceLibrary):
         requested = dict(scope or {})
         requested.pop("measurement_treatment", None)
         treatments = set()
-        for obs_op, _s, _src, obs_scope, measurement, _host, _q in \
-                self._attention_obs:
-            if obs_op.get("name") != family:
+        for obs in self._classified_evidence():
+            if obs["family"] != family:
                 continue
-            if attention.geometry_of(obs_op) != geometry:
+            if obs["geometry"] != geometry:
                 continue
-            if not _shown_to_match(obs_scope, requested):
+            if not _shown_to_match(obs["scope"], requested):
                 continue
-            if wanted is not None:
-                full = dict(obs_scope or {})
-                full["measurement_treatment"] = measurement
-                regime = attention.regime_of(
-                    obs_op, None, attention.scoped(obs_op, full))
-                if isinstance(regime, attention.Refusal) \
-                        or regime.name != wanted:
-                    continue
-            treatments.add(measurement)
+            if wanted is not None and obs["regime"] != wanted:
+                continue
+            treatments.add(obs["measurement"])
         return treatments.pop() if len(treatments) == 1 else None
 
     def _layout_note(self, op: dict) -> str:
