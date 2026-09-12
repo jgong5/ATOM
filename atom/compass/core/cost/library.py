@@ -671,19 +671,64 @@ class StaticGraphs:
         return f"StaticGraphs({len(self._graphs)} shapes)"
 
 
-def _price_key(shape: StepShape):
+def _frozen(value):
+    """A hashable copy of a JSON value, for use inside a cache key."""
+    if isinstance(value, (list, tuple)):
+        return tuple(_frozen(v) for v in value)
+    if isinstance(value, dict):
+        return tuple(sorted((k, _frozen(v)) for k, v in value.items()))
+    return value
+
+
+def _binding_key(graph):
+    """The part of a bound graph's price key that binding can move.
+
+    `BOUND_FIELDS` are reproduced exactly from the derived graph, so the only
+    component of `signature_of` a bind rewrites is ``context`` -- and that is
+    where the allocator's `slot_mapping` and state indices land. Measured on
+    the 27B decode-32 graph: a second valid allocation for the same shape moves
+    64 of 2439 signatures and takes the priced step from 32.667 ms over 2424
+    priced operators to 28.360 ms over 2376. A cache keyed on the shape alone
+    would have answered 32.667 ms, with complete coverage, for a step that is
+    neither.
+
+    `block_tables` is left out for the same reason `signature_of` leaves it
+    out: it says which blocks are walked, not how many. Keeping it in would
+    move the key every single step and cost the cache its whole purpose.
+
+    Only operators that carry a context are looked at -- a handful per graph --
+    so this is cheap enough to compute on every step, which is what makes it
+    safe to reuse the arithmetic over the other ~2375.
+    """
+    if not graph:
+        return ()
+    out = []
+    for index, op in enumerate(graph.get("ops") or ()):
+        context = op.get("context")
+        if not context:
+            continue
+        entries = tuple(
+            (k, _frozen(v)) for k, v in (tuple(x) for x in context)
+            if k != "block_tables")
+        if entries:
+            out.append((index, entries))
+    return tuple(out)
+
+
+def _price_key(shape: StepShape, graph, head_graph):
     """What two steps must share for their priced body and head to be equal.
 
-    `StaticGraphs.key` already says what two steps must share for their derived
-    *graph* to be equal, and a price is keyed on operator names, tensor shapes
-    and dtypes -- never on tensor values -- so equal graphs price equally. Two
-    steps with the same rows and different block numbers are the same price.
+    `StaticGraphs.key` says what two steps must share for their derived *graph*
+    to be equal, and a price is keyed on operator names, tensor shapes and
+    dtypes -- never on tensor values -- so equal derived graphs price equally.
 
-    `produces_output` is the one thing added: it decides whether the LM head
-    runs at all, so it changes the priced step even where the body graph is
-    identical.
+    Two things are added. `produces_output` decides whether the LM head runs at
+    all, so it changes the priced step where the body graph is identical. And
+    `_binding_key` carries what this step's own allocation wrote into the
+    graph, for both regions, because that is in the price key too.
     """
-    return StaticGraphs.key(shape) + (bool(shape.produces_output),)
+    return (StaticGraphs.key(shape) + (bool(shape.produces_output),)
+            + (_binding_key(graph), _binding_key(head_graph)))
 
 
 class LibraryCostOracle:
@@ -789,12 +834,21 @@ class LibraryCostOracle:
                 f"{shape.total_tokens} tokens: derive one rather than "
                 "answering from a neighbouring shape")
         self._check_body_rows(graph, shape)
-        key = _price_key(shape)
+        # Every step: the head's composition refusals and its own bind are not
+        # arithmetic, so they cannot sit behind the cache. A head graph that
+        # this step cannot be given has to say so on the thousandth step as
+        # loudly as on the first.
+        head_graph = self._head_graph_for(graph, shape)
+        key = _price_key(shape, graph, head_graph)
         priced = self._priced.get(key)
         if priced is None:
             body, coverage, launches = self.library.body(
                 graph, self.body_registration)
-            head, head_coverage, head_launches = self._head_for(graph, shape)
+            if head_graph is None:
+                head, head_coverage, head_launches = 0.0, None, 0
+            else:
+                head, head_coverage, head_launches = self.library.body(
+                    head_graph, self.head_registration)
             if head_coverage is not None:
                 # One step, one coverage record: a head whose all-gather is
                 # unpriced has to make the *step* incomplete, not sit in a
@@ -864,9 +918,21 @@ class LibraryCostOracle:
               "graph at the shape the step actually runs.")
 
     def _head_for(self, graph: dict, shape: StepShape):
-        """The head region of this step: seconds, coverage and launches.
+        """The head region of this step: seconds, coverage and launches."""
+        head_graph = self._head_graph_for(graph, shape)
+        if head_graph is None:
+            return 0.0, None, 0
+        return self.library.body(head_graph, self.head_registration)
 
-        Absent -- `(0.0, None, 0)` -- for two reasons that are not gaps: no
+    def _head_graph_for(self, graph: dict, shape: StepShape):
+        """This step's head graph, or None if it has no head to charge.
+
+        Split out from pricing it so that the checks below run on every step
+        while the arithmetic over the head's operators can be reused. They are
+        different kinds of claim: one is about whether this step may be given
+        a head at all, the other is about what that head costs.
+
+        Absent -- `None` -- for two reasons that are not gaps: no
         head graphs were supplied, or the step produces no output position, so
         the runner skips `compute_logits` entirely.
 
@@ -880,12 +946,12 @@ class LibraryCostOracle:
         head reads exactly like one quietly charging two.
         """
         if self.head_graphs is None:
-            return 0.0, None, 0
+            return None
         if not shape.produces_output:
             # `is_pure_middle_chunk(batch)` -> `logits = None`
             # (model_runner.py:3174). Nothing is projected and nothing is
             # sampled, so there is no head to charge.
-            return 0.0, None, 0
+            return None
         placement = head_placement(graph)
         if placement == "inside":
             raise ValueError(
@@ -927,7 +993,7 @@ class LibraryCostOracle:
                 "the step runs eagerly and projects only its real ones. "
                 "Derive the head for the eager shape rather than charging the "
                 "padded GEMM.")
-        return self.library.body(head_graph, self.head_registration)
+        return head_graph
 
     def describe(self) -> str:
         head = ("no head region" if self.head_graphs is None

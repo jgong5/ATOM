@@ -869,6 +869,23 @@ class TestAFittedPriceIsNotAMeasurement:
         assert "triton::norm" in split["refused_operators"]
 
 
+class _Rebinds:
+    """A graph source that answers this step's binding, as the binder does.
+
+    Same shape, next allocation, so the graph it returns changes where the
+    scheduler's assignment changed it. One graph means every ask gets it.
+    """
+
+    def __init__(self, graphs):
+        self._graphs = list(graphs)
+        self.asked = 0
+
+    def graph_for(self, shape):
+        graph = self._graphs[min(self.asked, len(self._graphs) - 1)]
+        self.asked += 1
+        return graph
+
+
 class TestPricingTheSameShapeTwiceCostsOnce:
     """The replay's own CPU budget, which is an acceptance gate, not a polish.
 
@@ -955,3 +972,45 @@ class TestPricingTheSameShapeTwiceCostsOnce:
         for _ in range(2):
             with pytest.raises(KeyError):
                 oracle.estimate(want)
+
+    def test_a_new_allocation_for_the_same_shape_is_priced_again(self, tmp_path):
+        """The shape is not the whole price key: the native binder writes this
+        step's own allocation into the graph, and `signature_of` reads it.
+
+        Measured on the 27B decode-32 graph: a second valid allocation for the
+        same shape moves 64 of 2439 signatures and takes the step from 32.667ms
+        over 2424 priced operators to 28.360ms over 2376. Answering the second
+        from the first is a wrong number carrying a complete-coverage claim.
+        """
+        shape = StepShape(num_scheduled_tokens=(1,), context_lens=(16,))
+        first = _op("aiter::attn", [[1, 4096]],
+                    context=[["slot_mapping", [0]]])
+        second = _op("aiter::attn", [[1, 4096]],
+                     context=[["slot_mapping", [512]]])
+        prices = _price_list(tmp_path, "p.json", [first], 1e-3)
+        oracle = LibraryCostOracle(
+            PriceLibrary.load([(prices, None)]),
+            _Rebinds([_graph([first]), _graph([second])]),
+            require_complete=True)
+        oracle.estimate(shape)
+        with pytest.raises(ValueError, match="incomplete"):
+            oracle.estimate(shape)
+        assert (oracle.price_cache_misses, oracle.price_cache_hits) == (2, 0)
+
+    def test_an_unusable_head_is_still_refused_on_the_second_ask(self, tmp_path):
+        """Whether this step may be given a head is decided every step: the
+        cache holds the arithmetic, not the composition check."""
+        shape = StepShape(num_scheduled_tokens=(1,), context_lens=(16,),
+                          produces_output=True)
+        head_op = _op("aiter::gemm", [[1, 4096], [4096, 151936]])
+        prices = _price_list(tmp_path, "p.json", [self.OP, head_op], 1e-3)
+        oracle = LibraryCostOracle(
+            PriceLibrary.load([(prices, None)]),
+            StaticGraphs({StaticGraphs.key(shape):
+                          _graph([self.OP], head_in_graph=False)}),
+            head_graphs=_Rebinds([_graph([head_op], head_in_graph=True),
+                                  _graph([head_op], head_in_graph=False)]))
+        oracle.estimate(shape)
+        for _ in range(2):
+            with pytest.raises(ValueError, match="body graph"):
+                oracle.estimate(shape)
