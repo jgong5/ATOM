@@ -616,10 +616,71 @@ SOURCE_27B_TP1_CONC_V2 = BucketedRunnerRegions(
 #: work. It is spelled out for the same reason the rest are -- so a prediction
 #: that carries no prepare or postprocess term says so in the same field that
 #: would have named the model.
+#: The dev run's first step, and only that step.
+#:
+#: The authoritative unpaced run opens with one sequence of 640 tokens: all 62
+#: requests arrived within 3 s, the barrier completed, and the first scheduled
+#: batch was ``1 reqs, 640 new tokens``. Every source above refuses it twice --
+#: ``prefill_sequences`` is membership-tested and holds (15, 16), and
+#: ``prefill_tokens`` is range-tested over [15360, 16384] -- so the step the
+#: run begins with had no region price while its body and head were fully
+#: measured.
+#:
+#: This carries its own measured terms and declares support for that one cell.
+#: It is deliberately NOT a widening of the profile above. ``prepare_prefill``
+#: is one scalar per source, and the measurements do not permit one:
+#:
+#:     1 sequence,  640 tokens        3.9168e-4 s   single640, bulk-enqueued
+#:     2 sequences, 15360 tokens      3.8609e-3 s   calib2seq lower
+#:     2 sequences, 16384 tokens      3.8754e-3 s   calib2seq even
+#:     2 sequences, 16384 tokens      3.9316e-3 s   calib2seq observed
+#:     fifteen/sixteen, 15360-16384   1.1851e-3 s   cap_subspan, profile above
+#:
+#: Ten times between one sequence and two, and back down again at fifteen. A
+#: source spanning those cells would have to carry a term per cell the way
+#: ``prepare_decode_cells`` already does for decode, and there is no
+#: ``prepare_prefill_cells``. Until there is, one source per measured prefill
+#: cell is the honest shape: widening the tuples on the profile above would
+#: claim support at token counts nobody measured, priced with a term measured
+#: somewhere else.
+#:
+#: Decode, the broadcast and the context bound are carried from
+#: ``SOURCE_27B_TP1_CONC_V2`` unchanged, so a run that mixes this first step
+#: with the decodes that follow is priced by the same decode evidence as
+#: before.
+SOURCE_27B_TP1_PREFILL_1X640 = BucketedRunnerRegions(
+    postprocess_decode=SOURCE_27B_TP1_CONC_V2.postprocess_decode,
+    prepare_decode_cells=SOURCE_27B_TP1_CONC_V2.prepare_decode_cells,
+    postprocess_prefill=Measured(
+        seconds=1.0052e-4, low=9.956e-5, high=1.0092e-4, samples=3,
+        how="upper median [min,max] of the 3 retained warm 1x640 prefill rows "
+            "of pricing_coverage/single640, matching-shape warmup discarded "
+            "by position. Prefill-region method, not the operator gate"),
+    prepare_prefill=Measured(
+        seconds=3.916815e-4, low=3.85378e-4, high=3.92064e-4, samples=3,
+        how="upper median [min,max] of seconds - run_model - postprocess over "
+            "the same 3 rows. The remainder carries prepare_model and "
+            "whatever device idle the host leaves inside forward, which is "
+            "why it is pacing sensitive: the same cell under HTTP pacing "
+            "reads 1.1675e-3 s"),
+    tp_broadcast=SOURCE_27B_TP1_CONC_V2.tp_broadcast,
+    decode_context=SOURCE_27B_TP1_CONC_V2.decode_context,
+    prefill_sequences=(1,),
+    prefill_tokens=(640, 640),
+    topologies=(1,),
+    capture_sizes=SOURCE_27B_TP1_CONC_V2.capture_sizes,
+    version="1x640-2026-09-12",
+    provenance="pricing_coverage/single640: bulk-enqueued, matching-shape "
+               "warmup, 3 retained repeats. Decode and broadcast carried from "
+               "source-27b-tp1-conc-v2",
+)
+
+
 REGION_MODELS = {
     "source-27b-tp1": SOURCE_27B_TP1,
     "source-27b-tp1-conc": SOURCE_27B_TP1_CONC,
     "source-27b-tp1-conc-v2": SOURCE_27B_TP1_CONC_V2,
+    "source-27b-tp1-prefill-1x640": SOURCE_27B_TP1_PREFILL_1X640,
     "none": None,
 }
 
