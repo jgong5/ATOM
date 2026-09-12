@@ -393,6 +393,50 @@ def _tp1_prices() -> tuple:
         add(f"{_LAD}/p27_body_{n}.tp1.r0.{_REP}.json",
             f"{_LAD}/graphs/b27_tp1_r0_pref_body_{n}.json")
 
+    # The 9216-row rung, which is a different problem from the ladder above.
+    #
+    # The ladder closes gaps: it adds rows so that no lookup falls in an
+    # unsampled interval wider than `max_gap_ratio`. By that rule 9216 was
+    # already covered -- it sits inside 8192..16384, a ratio of exactly 2.0,
+    # which is inside support. Run 9 refused it anyway, and the refusal was
+    # right: the library selects `MT256x224x64_MI16x16x1` at 8192 and
+    # `MT256x192x64_MI32x32x1` at 16384, so the bracket spans a kernel switch,
+    # and an interpolant across it is a claim about one curve where there are
+    # two.
+    #
+    # Measured, the switch is worse than the refusal implied. 8192 rows cost
+    # 14699.541 us (1.7944 us/row) and 9216 cost 8098.374 us (0.8787 us/row):
+    # more tokens for half the time. 16384 is 0.9537 us/row and 4096 is
+    # 0.9713, so 8192 is the slow tile rather than 9216 an unusually fast one.
+    # Interpolating across the bracket predicts 14815.200 us at 9216 against
+    # 8098.374 measured -- +82.9%, and at 48 call sites, +322 ms on one step.
+    #
+    # A finer ladder would not have found this. Only a measured point on this
+    # side of the switch does, which is why no rung is added between 8192 and
+    # 16384 in the loop above: the fix is a declaration, not a finer mesh.
+    #
+    # The body files are PARTIAL by construction -- 43 priced rows, 64
+    # unpriced. They were measured `--layers none`, so the attention operators
+    # at context 113984 were never stood up; that population belongs to the
+    # cached-prefill campaign, and standing it up here would put a second
+    # treatment into a domain this rung does not own. The rung contributes
+    # non-attention body rows plus the head's last-token gather, and must not
+    # be read as a cached-attention measurement.
+    #
+    # The spec carries history on purpose. Two of the three refused signatures
+    # -- `triton::_mrope_qk_tiled_kernel` and `aten::index.Tensor|9216,5120;1`
+    # -- do not exist in a cold graph at all, so a `context_lens == query_lens`
+    # spec at 9216 would derive a graph missing two thirds of what was
+    # refused. The shape is run 9's own, taken from its refusal dump.
+    #
+    # Provenance, recipe and batch spec sit beside the prices in
+    # `pricing_coverage/switch9216/PROVENANCE.md`.
+    _sw = f"{_PC}/switch9216"
+    add(f"{_sw}/p27_body_9216.tp1.r0.{_REP}.json",
+        f"{_sw}/graphs/b27_tp1_r0_pref_body_9216.json")
+    add(f"{_sw}/p27_head_9216.tp1.r0.{_REP}.json",
+        f"{_sw}/graphs/b27_tp1_r0_pref_head_9216.json")
+
     # The long-context cells and the mixed step.
     for stem in ("ctx_b32_c4096", "ctx_b32_c16384", "mix_b32"):
         add(f"{_PC}/long/p27_{stem}.tp1.r0.{_REP}.json",
