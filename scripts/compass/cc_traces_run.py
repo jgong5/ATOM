@@ -235,7 +235,15 @@ CONTAINERS = ("none",) + MEASURED_TERMS
 #: bare floats let `load` be added beside the `startup_real` that already
 #: included it. A version 2 record cannot be reinterpreted as a version 3 one
 #: -- its containment was never stated -- so it is refused, not upgraded.
-COSTS_SCHEMA = "compass.costs/3"
+#: Version 4 says which repeat each supplied second was spent in, and what
+#: each repeat cost. Version 3 recorded the execution terms as medians over
+#: the repeats and the journalled terms as sums across all of them, so a
+#: ratio of the two was wrong by the repeat count and nothing in the record
+#: said so. It is refused, not upgraded: the attribution was never written.
+COSTS_SCHEMA = "compass.costs/4"
+
+#: What a part writes when its seconds are spent once in every repeat.
+EVERY_REPEAT = "each"
 
 #: The clock a duration a human would time with a stopwatch is taken on. The
 #: only one a runtime cost may be measured on.
@@ -780,8 +788,11 @@ class SideRun:
         # step row contradicts and no gate below would notice, so the group's
         # slow rank would be dropped silently rather than refused.
         aggregation = compass.get("rank_aggregation")
-        if (self.side == "modelled" and int(self.plan["tp"]) > 1
-                and aggregation != "slowest"):
+        if (
+            self.side == "modelled"
+            and int(self.plan["tp"]) > 1
+            and aggregation != "slowest"
+        ):
             self.failures.append(
                 f"{step['id']}: the predicting server reports "
                 f"rank_aggregation={aggregation!r} at tp{self.plan['tp']}, so "
@@ -1434,25 +1445,31 @@ def side(args) -> int:
 
 
 def _windows(cell: Path) -> dict:
-    """The modelled side's measured wall intervals, by window name.
+    """The modelled side's measured wall intervals, by window and by repeat.
 
     Read off `costs.modelled.json`'s `per_execution`, which `_write_costs`
-    stamps with each window's absolute start and end. Only the modelled side
+    stamps with each repeat's window starts and ends. Only the modelled side
     is read: derivation is work the predicting server does, so a real-side
     window cannot contain any of it.
+
+    Keyed by repeat as well as by window because the cost terms are per
+    repeat. `execution_modelled` is the median of the repeats -- what one
+    replay cost -- so a derivation has to be charged to the repeat that spent
+    it, or a sum over three repeats ends up beside one repeat's execution.
     """
     path = cell / "costs.modelled.json"
     if not path.exists():
         return {}
     found = {"startup_modelled": [], "execution_modelled": []}
     for row in json.loads(path.read_text()).get("per_execution") or []:
+        repeat = row.get("repeat")
         for name, key in (
             ("startup_modelled", "startup_window"),
             ("execution_modelled", "execution_window"),
         ):
             span = row.get(key) or []
             if len(span) == 2 and all(isinstance(t, (int, float)) for t in span):
-                found[name].append((float(span[0]), float(span[1])))
+                found[name].append((repeat, (float(span[0]), float(span[1]))))
     return {name: spans for name, spans in found.items() if spans}
 
 
@@ -1462,15 +1479,98 @@ def _overlap(span, windows) -> float:
     return sum(max(0.0, min(end, stop) - max(start, begin)) for begin, stop in windows)
 
 
+def _per_repeat(partial: dict, side: str, missing: list, where: str) -> dict:
+    """What each repeat of one side cost, or {} when there was only one.
+
+    A cell's cost terms are medians over its repeats. Anything placed beside
+    one of them has to be one repeat's worth too, so the record has to say
+    what each repeat cost rather than only what the middle one did. A side
+    that ran more than once and kept no per-repeat record cannot be merged:
+    the median it carries is not a repeat, and there is nothing to divide.
+    """
+    rows = partial.get("per_execution") or []
+    stated = partial.get("repeats")
+    many = (isinstance(stated, int) and stated > 1) or len(rows) > 1
+    if not rows:
+        if isinstance(stated, int) and stated > 1:
+            missing.append(
+                f"per_execution in {where} (it reports {stated} repeats and "
+                f"one median for them; a per-repeat cost cannot be matched "
+                f"against a median, so re-run this side with this harness)"
+            )
+        return {}
+    out = {"execution": {}, "startup": {}}
+    for row in rows:
+        repeat = row.get("repeat")
+        if repeat is None:
+            if not many:
+                # One repeat is its own median; there is nothing to divide.
+                return {}
+            missing.append(
+                f"a repeat number on every per_execution row of {where} (a "
+                f"window nobody can attribute to a repeat cannot hold one "
+                f"repeat's share of anything)"
+            )
+            return {}
+        index = str(int(repeat))
+        if index in out["execution"] or index in out["startup"]:
+            # The row that arrives second replaces the first, so a side that
+            # names one repeat twice covers fewer repeats than it lists.
+            missing.append(
+                f"one per_execution row per repeat in {where} (repeat {index} "
+                f"is described twice, so another repeat is described not at "
+                f"all)"
+            )
+            return {}
+        value = row.get("execution_s")
+        if not isinstance(value, (int, float)) or not math.isfinite(value):
+            if not many:
+                return {}
+            missing.append(
+                f"execution_s on repeat {index} of {where} (a repeat nobody "
+                f"timed is not a repeat that cost nothing)"
+            )
+            return {}
+        out["execution"][index] = float(value)
+        startup = row.get("startup_s")
+        if isinstance(startup, (int, float)) and math.isfinite(startup):
+            out["startup"][index] = float(startup)
+    if many:
+        count = stated if isinstance(stated, int) else len(rows)
+        listed = sorted(int(i) for i in out["execution"])
+        if listed != list(range(1, count + 1)):
+            missing.append(
+                f"a per_execution row for each of the {count} repeats "
+                f"{where} reports (it describes {listed}); the ones it does "
+                f"not describe are not free"
+            )
+            return {}
+    return out
+
+
+def _repeat_value(stated):
+    """A stated repeat as it goes into the record: an int, `each`, or None."""
+    if stated is None or stated == "":
+        return None
+    if str(stated) == EVERY_REPEAT:
+        return EVERY_REPEAT
+    try:
+        return int(stated)
+    except (TypeError, ValueError):
+        return None
+
+
 def _derivation_from_journal(cell: Path, paths, missing: list):
-    """Derivation split by where it actually happened, or None if unmeasured.
+    """Derivation split by where it happened and by which repeat spent it.
 
     Each journal row is one derivation with its own wall interval, written by
     `atom.compass.runtime.derivation_log` as the deriver runs. The windows come
     from this cell's own side record, on the same clock, so the split is an
     intersection of two measured intervals and nobody has to declare a phase.
-    A row that lands in no window is reported as contained by nothing, which is
-    the honest reading of an interval outside every window this cell measured.
+    A row that lands in no window is reported as contained by nothing and
+    belonging to no repeat, which is the honest reading of an interval outside
+    every window this cell measured -- and which the gate refuses rather than
+    spreads over the repeats.
     """
     if not paths:
         return None
@@ -1482,8 +1582,7 @@ def _derivation_from_journal(cell: Path, paths, missing: list):
             "would fall inside; re-run the modelled side with this harness)"
         )
         return None
-    by_container = {name: 0.0 for name in windows}
-    by_container[None] = 0.0
+    by_container = {}
     rows = 0
     for path in paths:
         for line in Path(path).read_text().splitlines():
@@ -1498,25 +1597,39 @@ def _derivation_from_journal(cell: Path, paths, missing: list):
             rows += 1
             placed = 0.0
             for name, spans in windows.items():
-                inside = _overlap((float(start), float(end)), spans)
-                by_container[name] += inside
-                placed += inside
-            by_container[None] += max(0.0, (float(end) - float(start)) - placed)
+                for repeat, span in spans:
+                    inside = _overlap((float(start), float(end)), [span])
+                    if inside <= 0.0:
+                        continue
+                    key = (name, repeat)
+                    by_container[key] = by_container.get(key, 0.0) + inside
+                    placed += inside
+            loose = max(0.0, (float(end) - float(start)) - placed)
+            if loose > 0.0:
+                by_container[(None, None)] = by_container.get((None, None), 0.0) + loose
     origin = ", ".join(str(p) for p in paths)
     parts = [
         {
             "seconds": seconds,
             "source": f"{origin} ({rows} derivations, placed by interval)",
             "within": name,
+            "repeat": repeat,
         }
-        for name, seconds in by_container.items()
+        for (name, repeat), seconds in sorted(
+            by_container.items(), key=lambda kv: (str(kv[0][0]), str(kv[0][1]))
+        )
         if seconds > 0.0
     ]
     if not parts:
         # A run that derived nothing derived nothing. Recording the zero with
         # its origin is different from leaving the term unstated.
         parts = [
-            {"seconds": 0.0, "source": f"{origin} (no derivations)", "within": None}
+            {
+                "seconds": 0.0,
+                "source": f"{origin} (no derivations)",
+                "within": None,
+                "repeat": None,
+            }
         ]
     return parts[0] if len(parts) == 1 else parts
 
@@ -1553,6 +1666,16 @@ def costs(args) -> int:
             served = partial.get(f"served_window_{name}")
             if isinstance(served, (int, float)) and math.isfinite(served):
                 merged[f"served_window_{name}"] = float(served)
+        rows = _per_repeat(partial, name, missing, path.name)
+        if rows:
+            # What each repeat cost, beside the median of them. The gate
+            # divides one repeat's execution by one repeat's derivation, and
+            # neither is recoverable from a median alone.
+            merged.setdefault("execution_by_repeat", {})[name] = rows["execution"]
+            merged.setdefault("startup_by_repeat", {})[name] = rows["startup"]
+        stated = partial.get("repeats")
+        if isinstance(stated, int):
+            merged.setdefault("repeats", {})[name] = stated
         for term in (f"startup_{name}", f"execution_{name}"):
             value = partial.get(term)
             if not isinstance(value, (int, float)) or not math.isfinite(value):
@@ -1577,18 +1700,25 @@ def costs(args) -> int:
         values = getattr(args, term) or []
         sources = getattr(args, f"{term}_source") or []
         withins = getattr(args, f"{term}_within") or []
+        repeats = getattr(args, f"{term}_repeat") or []
         if not values:
             missing.append(
                 f"--{term} (nothing in this cell measures it; it is an input. "
                 f"If it was never recorded, say so -- it is not zero)"
             )
             continue
-        if len(sources) != len(values) or len(withins) not in (0, len(values)):
+        if (
+            len(sources) != len(values)
+            or len(withins) not in (0, len(values))
+            or len(repeats) not in (0, len(values))
+        ):
             missing.append(
-                f"one --{term}-source and one --{term}-within per --{term} "
-                f"(got {len(values)} values, {len(sources)} sources, "
-                f"{len(withins)} containers; a part whose origin or container "
-                f"belongs to a different part says nothing about this one)"
+                f"one --{term}-source, one --{term}-within and at most one "
+                f"--{term}-repeat per --{term} (got {len(values)} values, "
+                f"{len(sources)} sources, {len(withins)} containers, "
+                f"{len(repeats)} repeats; a part whose origin, container or "
+                f"repeat belongs to a different part says nothing about "
+                f"this one)"
             )
             continue
         parts = []
@@ -1614,11 +1744,16 @@ def costs(args) -> int:
                     f"summed)"
                 )
                 continue
+            spent = repeats[index] if repeats else None
             parts.append(
                 {
                     "seconds": float(value),
                     "source": str(source),
                     "within": None if within == "none" else within,
+                    # Unstated is recorded as unstated. The gate refuses to
+                    # divide a second nobody placed by a repeat count it
+                    # would have to choose.
+                    "repeat": _repeat_value(spent),
                 }
             )
         if len(parts) == len(values):
@@ -1715,6 +1850,20 @@ def main(argv=None) -> int:
             action="append",
             default=None,
             help="the artifact this duration was read from",
+        )
+        c.add_argument(
+            f"--{term}-repeat",
+            action="append",
+            default=None,
+            metavar="N|each",
+            help=(
+                "which repeat spent these seconds, or 'each' for a cost "
+                "paid once per repeat. The cell's execution terms are "
+                "medians over its repeats, so a duration added beside one "
+                "has to be one repeat's worth; a duration that names no "
+                "repeat is recorded and is refused by the gate rather than "
+                "spread over them"
+            ),
         )
         c.add_argument(
             f"--{term}-within",
