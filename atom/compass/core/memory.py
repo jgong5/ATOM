@@ -28,7 +28,12 @@ import json
 from dataclasses import dataclass
 from typing import Any, Mapping, Optional
 
-__all__ = ["MemoryReadings", "RecordedMemory", "SAFETY_FRACTION"]
+__all__ = ["MemoryReadings", "RecordedMemory", "RECORD_ROLE", "SAFETY_FRACTION"]
+
+#: What a `--compass-memory-in` artifact is read *for*, in the manifest. Named
+#: after the option rather than after this class so a reader matches it to the
+#: flag that asked for it.
+RECORD_ROLE = "runtime.memory_in"
 
 #: The engine holds this back before anything else (`model_runner.py`).
 SAFETY_FRACTION = 0.02
@@ -117,11 +122,21 @@ def _key(config: Mapping[str, Any]) -> tuple:
 class RecordedMemory:
     """Readings for a configuration, from artifacts an earlier run wrote."""
 
-    def __init__(self, paths: list[str]) -> None:
+    def __init__(self, paths: list[str], *, collect=None) -> None:
+        """`collect`, when given, receives a `LoadedInput` per record read.
+
+        A recorded budget is served out of these bytes, so the run serving it
+        has to be able to say which bytes those were: the digest is taken of
+        the same `bytes` the parse ran on, at the read, rather than of whatever
+        is at the path when a report is written later.
+        """
+        from atom.compass.core.loaded_input import load_json
+
         self.records: dict[tuple, dict] = {}
         for path in paths:
-            with open(path, encoding="utf-8") as fh:
-                blob = json.load(fh)
+            blob, loaded = load_json(path, role=RECORD_ROLE)
+            if collect is not None:
+                collect.append(loaded)
             self.records[_key(blob.get("config") or {})] = blob
 
     def refusal(self, config: Mapping[str, Any],

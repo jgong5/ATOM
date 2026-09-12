@@ -763,6 +763,7 @@ CALIBRATED_TERMS = ("persistent", "non_torch", "load_residue")
 
 def derived_readings(profile: Mapping, *, warmup_tokens: int,
                      load, enforce_eager: bool = False,
+                     world_size: Optional[int] = None,
                      source: str = "the profile"):
     """The five readings and the activation peak, or a refusal naming what is missing.
 
@@ -775,6 +776,15 @@ def derived_readings(profile: Mapping, *, warmup_tokens: int,
 
     `load` reads a path and returns parsed JSON; the caller owns the file
     system so that this stays testable off a device.
+
+    `world_size` is the width the *deployment* is actually about to run at. It
+    is optional only so that device-free callers that have no deployment can
+    omit it; a caller that knows should pass it. Every width-dependent term
+    here is keyed off the profile's own `world_size`, and the calibration
+    tables are read with `_at_width`, which answers a width it has no entry for
+    from the widest one below it. So a profile written for TP=2 handed to a
+    TP=4 run does not fail -- it silently sizes TP=2 and reports it as a
+    forecast for TP=4. That is refused here instead.
 
     There are two ways to reach the activation term and the profile picks one.
     With `graph`, the device-free walk over a graph traced at the target width
@@ -804,6 +814,13 @@ def derived_readings(profile: Mapping, *, warmup_tokens: int,
                "`max_model_len`, so there is no warmup shape to evaluate the "
                "activation peak at")
     width = int(profile.get("world_size") or 1)
+    if world_size is not None and int(world_size) != width:
+        refuse("a `world_size` of %d for a deployment about to run at TP=%d. "
+               "Every width-dependent term is keyed off the profile's width "
+               "and the calibration tables answer a missing width from the "
+               "widest one below it, so this would size TP=%d and report it as "
+               "a forecast for TP=%d" % (width, int(world_size), width,
+                                         int(world_size)))
     config_path = str(profile.get("model_config") or "").strip()
     if config_path:
         # The config-derived instant. It needs no graph at the target width,
@@ -817,6 +834,19 @@ def derived_readings(profile: Mapping, *, warmup_tokens: int,
                    "per-program: an instant from an Inductor-compiled run is "
                    "not evidence about an eager one, and defaulting the mode "
                    "would pick a program on the caller's behalf")
+        # The same argument one step further out: the profile names a program
+        # and the deployment runs one, and `enforce_eager` is how the run says
+        # which. A profile that says `inductor` for a run with graphs disabled
+        # is an activation instant from a different program, and the graph-pool
+        # term is already branching the other way on the same flag.
+        if enforce_eager and mode != "eager":
+            refuse("a `compile_mode` of %r for a run with `enforce_eager` set. "
+                   "The activation instant is witnessed per-program and the "
+                   "graph pool is zero under eager, so the two halves of this "
+                   "prediction would describe different runs" % mode)
+        # Only that direction. `enforce_eager=False` is also what a caller with
+        # no opinion passes, so it is not a statement that graphs are on and
+        # cannot be read as one.
         config = load(config_path)
         config = config.get("text_config", config)
         instant = activation_instant_bytes(
@@ -889,7 +919,40 @@ def _prediction_calibration(profile: Mapping, load, refuse, source: str):
             "%s calibrates %s on the target configuration itself. A prediction "
             "fitted on the thing it predicts is not one."
             % (cal_path, ", ".join(target)))
+    _check_calibration_conditions(calibration, refuse)
     return calibration
+
+
+def _check_calibration_conditions(calibration: Mapping, refuse) -> None:
+    """A calibration may only be spent in the environment it was taken in.
+
+    Opt-in by data: only a calibration that states `conditions` is checked, so
+    nothing that predates them changes behaviour. The case this exists for is
+    the collective pools -- under `PYTORCH_HIP_ALLOC_CONF=expandable_segments`
+    or `AITER_CUSTOM_AR_RAW_INPUT_POOL` the 1 GiB input pool per instance moves
+    out of the torch allocator, so 2 GiB per rank crosses from `load_residue`
+    into `non_torch`. Both terms stay plausible and both are wrong, which is
+    exactly the failure a prediction cannot report on its own. Read from this
+    process's environment because this process is the deployment.
+    """
+    conditions = ((calibration.get("topology_delta") or {}).get("conditions")
+                  or calibration.get("conditions") or {})
+    if not conditions:
+        return
+    bad = []
+    for key, want in conditions.items():
+        got = os.environ.get(key)
+        got = None if got in (None, "") else str(got)
+        want = None if want in (None, "") else str(want)
+        if got != want:
+            bad.append("%s is %r here, %r when the calibration was measured"
+                       % (key, got, want))
+    if bad:
+        refuse("a calibration measured under a different environment: %s. "
+               "Under expandable segments or a raw collective input pool, "
+               "2 GiB per rank moves between `load_residue` and `non_torch`, "
+               "so both terms would be wrong and neither would look it"
+               % "; ".join(bad))
 
 
 #: The instants at which the activation high-water mark has been witnessed on

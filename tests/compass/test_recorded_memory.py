@@ -6,11 +6,16 @@ be taken. Reading the five readings back removes that, for configurations some
 run has taken them for.
 """
 
+import hashlib
 import json
 
 import pytest
 
-from atom.compass.core.memory import MemoryReadings, RecordedMemory
+from atom.compass.core.memory import (
+    RECORD_ROLE,
+    MemoryReadings,
+    RecordedMemory,
+)
 
 CONFIG = {
     "model": "Qwen/Qwen3-0.6B",
@@ -164,3 +169,34 @@ class TestNonTorchIsAlsoAPropertyOfTheBox:
 
     def test_one_rank_alone_cannot_say(self, tmp_path):
         assert RecordedMemory([_record(tmp_path)]).rank_disagreement(CONFIG) is None
+
+
+class TestTheBytesARecordedBudgetWasServedFrom:
+    """R13: a recorded budget can name the artifact it was served out of.
+
+    The same contract the profile path already keeps. `--compass-memory-in`
+    hands the runner five readings that go straight into a KV budget, so a run
+    that serves them has to be able to say which bytes they were, digested at
+    the read rather than restated from the path afterwards.
+    """
+
+    def test_each_record_read_is_recorded(self, tmp_path):
+        read: list = []
+        paths = [_record(tmp_path, "a.json"),
+                 _record(tmp_path, "b.json", **{"free": 180 * 2**30})]
+        RecordedMemory(paths, collect=read)
+        assert [row.role for row in read] == [RECORD_ROLE, RECORD_ROLE]
+        assert [row.path for row in read] == paths
+
+    def test_the_digest_is_of_the_bytes_that_were_parsed(self, tmp_path):
+        read: list = []
+        path = _record(tmp_path)
+        RecordedMemory([path], collect=read)
+        want = hashlib.sha256(open(path, "rb").read()).hexdigest()
+        assert read[0].sha256 == want
+        # Rewriting the file afterwards does not move what was attested to.
+        open(path, "w").write("{}")
+        assert read[0].sha256 == want
+
+    def test_collecting_is_optional(self, tmp_path):
+        assert RecordedMemory([_record(tmp_path)]).readings_for(CONFIG)
