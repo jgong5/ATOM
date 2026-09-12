@@ -960,3 +960,82 @@ def test_a_view_stays_structural_when_the_ragged_attention_law_is_live(
     record, why = library.lookup(unaliased, {"tp": 1}, None)
     assert record is None
     assert "output_aliases" in why
+
+
+def test_the_gather_refuses_a_pair_that_moved_the_feature_width_too():
+    """Fixing the source height does not fix the feature width.
+
+    The height guard above holds `input_shapes[0][0]`. It says nothing about
+    `input_shapes[0][1]`, and the bytes a gather moves are the selected count
+    times that width, so the two trade against each other inside one law: a
+    measurement at 2 rows of 256 features and one at 4 rows of 512 share a
+    coefficient of 128 on the feature width and 1 on the count. Without the
+    second declaration they read as one operator at two widths, and a request
+    for 3 rows of 384 is solved from them -- at a feature width no measurement
+    ever held still. Both dimensions are declared, so both are refused.
+    """
+    def gather(selected: int, height: int, features: int) -> dict:
+        return {"name": "aten::index.Tensor",
+                "input_shapes": [[height, features], [selected]],
+                "dtypes": ["bfloat16", "int32"]}
+
+    # Joint variation of the selected count and the feature width, at one
+    # height -- the case the height guard cannot see.
+    assert not aligns(gather(4, 16384, 512), 4, gather(2, 16384, 256), 2)
+    assert infer_rows(gather(4, 16384, 512), gather(2, 16384, 256), 2) is None
+    assert infer_rows(gather(3, 16384, 384), gather(2, 16384, 256), 2) is None
+
+    # All three moving together is refused as well, not rescued by the height.
+    assert infer_rows(gather(4, 16384, 512), gather(2, 8192, 256), 2) is None
+
+    # And the ordinary head step -- one height, one feature width, a moving
+    # selected count -- still reaches a width, as it must.
+    assert aligns(gather(4, 16384, 5120), 4, gather(2, 16384, 5120), 2)
+    assert infer_rows(gather(4, 16384, 5120), gather(2, 16384, 5120), 2) == 4
+
+
+def test_two_operators_with_one_scalar_name_and_two_values_do_not_match():
+    """Scalar VALUES are compared, and only `_values` compares them.
+
+    `grouping_key` carries scalar *names* and never a value, deliberately: it
+    is a bucketing key, not a comparison. So the whole burden of separating a
+    Triton launch at one configuration from the same kernel at another falls
+    on the value walk. If that walk stops visiting `scalars`, two operators
+    with identical names and different `num_warps`, strides or epsilons become
+    indistinguishable, one is filed as another's width, and the library
+    interpolates a price across two configurations while reporting it covered.
+    That is not a head-region fault: it reaches every body family that records
+    a scalar, which is why this test names no contract and no head operator.
+
+    The assertion is deliberately in two halves. The first shows the keys DO
+    collide -- otherwise the second would pass for the wrong reason, on a
+    bucketing difference rather than on the value comparison being alive.
+    """
+    from atom.compass.core.cost.families.features import grouping_key
+
+    def launched(warps: int, eps: float, stride: int) -> dict:
+        return {"name": "triton::fused_rms_norm",
+                "input_shapes": [[16, 5120]],
+                "dtypes": ["bfloat16"],
+                "scalars": [["num_warps", warps], ["eps", eps],
+                            ["stride", stride]]}
+
+    a = launched(4, 1e-06, 5120)
+    b = launched(8, 1e-05, 10240)
+
+    # Same family, same shapes, same scalar names: one bucket.
+    assert grouping_key(a) == grouping_key(b)
+
+    # And still not the same operator, because the values differ.
+    assert not aligns(a, 16, b, 16)
+    assert infer_rows(a, b, 16) is None
+
+    # One scalar differing is enough; it does not need all three.
+    assert not aligns(a, 16, launched(4, 1e-06, 10240), 16)
+    assert not aligns(a, 16, launched(4, 1e-05, 5120), 16)
+    assert not aligns(a, 16, launched(8, 1e-06, 5120), 16)
+
+    # An identical configuration at another width is still one operator at two
+    # widths -- the guard separates configurations, not widths.
+    wide = dict(launched(4, 1e-06, 5120), input_shapes=[[32, 5120]])
+    assert aligns(wide, 32, a, 16)

@@ -450,11 +450,23 @@ FAMILY_CONTRACTS["aten::sub.Tensor"] = FamilyContract(
 # operator at all, which is the honest answer: the height is not the width.
 # A fixed height with a moving selected count still interpolates, which is the
 # case the head region actually needs.
+#
+# The feature width, operand 0 dimension 1, is fixed for the same reason and
+# is not covered by fixing the height. The bytes the gather moves are the
+# selected count times the feature width, so the two can trade against each
+# other inside one law: measurements at (M=2, N=256) and (M=4, N=512) sit on a
+# straight line through a query at (M=3, N=384) even though no measurement
+# ever held N still, and the interpolated price would be reported as covered.
+# Fixing the width makes those two different operators, so the only thing a
+# curve can be read along is the selected count -- which is what this narrow
+# head contract claims and all it claims. This is scoped to the head's gather;
+# the conflicting-width guard the body already applies is a separate mechanism
+# and is untouched.
 FAMILY_CONTRACTS["aten::index.Tensor"] = FamilyContract(
     family="aten::index.Tensor",
     kind="rows",
     rows_from=(1, 0),
-    fixed_dims=((0, 0),),
+    fixed_dims=((0, 0), (0, 1)),
     values=(
         ValueContract(
             position=1,
@@ -689,6 +701,20 @@ def _values(op: dict) -> list:
     # then refuse a width the key itself accepts.
     walk(normalized_context(op))
     walk(_abstracted_int_values(op))
+    # Scalar VALUES, not just their names.
+    #
+    # `grouping_key` carries scalar *names* only, so this walk is the sole
+    # place a scalar's value is compared at all. Two operators with the same
+    # scalar names and different values -- a different Triton `num_warps`, a
+    # different stride, a different epsilon -- share a grouping key and must
+    # be separated here or they would align, and a curve fitted on one
+    # configuration would interpolate a width for the other.
+    #
+    # Deliberately outside the nuisance abstraction above: that abstraction
+    # applies only to declared integer payload positions, which are entries of
+    # `int_values`, never scalars. A scalar is never abstracted by any
+    # contract.
+    walk(tuple((k, v) for k, v in (tuple(x) for x in op.get("scalars") or ())))
     for key, value in (tuple(x) for x in op.get("launch") or ()):
         if key == "grid":
             walk(tuple(value))
