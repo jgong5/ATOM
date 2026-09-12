@@ -1110,9 +1110,24 @@ class SideRun:
                 )
         # The frozen corpus, checked by its bytes rather than by its path:
         # the replay records the digest of the trace it actually read.
+        # Fail-closed on either side being absent. Written as `want and got
+        # and want != got`, this clause passed every artifact that carried no
+        # trace digest at all -- which is exactly the artifact that cannot
+        # show which corpus it answered, and the one a silent acceptance is
+        # most expensive on. An unanswerable question is not a pass.
         want_trace = (execution.get("source") or {}).get("workload_sha256")
         got_trace = manifest.get("trace_sha256")
-        if want_trace and got_trace and want_trace != got_trace:
+        if not want_trace:
+            bad.append(
+                "this cell's execution records no frozen workload digest, so "
+                "there is nothing to check the replayed trace against"
+            )
+        elif not got_trace:
+            bad.append(
+                "it records no trace digest, so which corpus it replayed "
+                "cannot be recovered from the artifact"
+            )
+        elif want_trace != got_trace:
             bad.append(
                 f"it replayed a trace whose digest is {got_trace[:12]}, and "
                 f"this cell's frozen workload is {want_trace[:12]}"

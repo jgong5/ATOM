@@ -257,7 +257,10 @@ class FakeProcesses:
             return
         side = "modelled" if "modelled" in out.name else "real"
         trace = Path(command[command.index("--trace") + 1])
-        full = ROOT / trace
+        # The root the runner itself digests, which a test may have moved: a
+        # fake that reads the real checkout would hand the runner a digest of
+        # bytes the runner never looked at.
+        full = Path(run_mod.ROOT) / trace
         manifest = {
             "paced": side == "real",
             "trace": str(trace),
@@ -311,8 +314,33 @@ def _a_workload_on_disk(tmp_path, monkeypatch, klass="long"):
     path.write_text(json.dumps({
         "arrival_s": 0.0, "input_tokens": 640,
         "input_blocks": 10, "output_tokens": 23}) + "\n")
+    # The runner reads two defaults out of the tree it is pointed at -- the
+    # server's and the engine's `--port` -- so a moved root has to carry those
+    # files as well, or a test about the workload digest quietly becomes a
+    # test about a missing entry point.
+    for relative in ("atom/entrypoints/openai/api_server.py",
+                     "atom/model_engine/arg_utils.py"):
+        source = ROOT / relative
+        if not source.exists():
+            continue
+        target = root / relative
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_bytes(source.read_bytes())
     monkeypatch.setattr(run_mod, "ROOT", root)
     return path
+
+
+@pytest.fixture(autouse=True)
+def _the_workload_is_on_disk(tmp_path, monkeypatch):
+    """Every side run digests the frozen corpus, so every test needs one.
+
+    The `.jsonl` corpora are reproduced by the plan's own workload step rather
+    than committed, so a checkout does not have them and a side run in a test
+    would find nothing to digest. That used to be invisible -- the digest
+    check passed whatever it could not answer -- and is now a refusal, which
+    is the point of the check.
+    """
+    _a_workload_on_disk(tmp_path, monkeypatch)
 
 
 def _plan(tmp_path, tp=2, klass="long"):
@@ -1275,6 +1303,32 @@ class TestTheProducersAreCheckedAtTheirOwnFieldNames:
         runner = _runner(tmp_path, "modelled", processes=procs)
         assert runner.run() == 1
         assert any("frozen workload" in f for f in runner.failures)
+
+    def test_an_artifact_that_names_no_trace_at_all_is_refused(
+        self, tmp_path, monkeypatch
+    ):
+        """An unanswerable question is not a pass.
+
+        The digest check used to read `want and got and want != got`, so an
+        artifact carrying no trace digest -- precisely the one that cannot
+        show which corpus it answered -- went through silently. A replay of
+        the wrong trace was caught; a replay of an unnameable one was not.
+        """
+        _a_workload_on_disk(tmp_path, monkeypatch)
+        procs = FakeProcesses(cell=tmp_path)
+        original = procs._write_artifact
+
+        def no_trace(command):
+            original(command)
+            out = Path(command[command.index("--out") + 1])
+            blob = json.loads(out.read_text())
+            blob["run"].pop("trace_sha256")
+            out.write_text(json.dumps(blob))
+
+        procs._write_artifact = no_trace
+        runner = _runner(tmp_path, "modelled", processes=procs)
+        assert runner.run() == 1
+        assert any("no trace digest" in f for f in runner.failures)
 
     def test_an_artifact_answered_by_another_server_is_refused(self, tmp_path):
         """Something else listening on the port is the failure that looks
