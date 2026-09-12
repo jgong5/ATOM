@@ -256,3 +256,118 @@ def test_the_dense_ladder_is_unaffected(tmp_path):
     record, detail = library.lookup(gemm(48))
     assert record is not None, detail
     assert record["interpolated"] is True
+
+
+# == (3) one signature, two scopes, two layouts ============================
+#
+# `_ops` is keyed by signature alone and keeps the first operator seen under
+# it. A signature does not carry layout or scope, so one file's dense rebuild
+# and another's strided view share a key -- and pairing every scoped price with
+# the first-seen operator put both sets of seconds on the first layout's curve.
+# Two failures at once: the dense median is contaminated by strided
+# measurements, and no strided curve exists for a strided request to sit in.
+
+def _scoped(tmp_path, tag, op, seconds, rows, topology):
+    return _write(tmp_path, tag, op, seconds, topology=topology,
+                  registration=REGISTERED, rows=rows)
+
+
+def _mixed_library(tmp_path, order=("dense", "strided")):
+    """Dense at tp2 and strided at tp4, same signature, same widths."""
+    files = {
+        "dense": [
+            _scoped(tmp_path, "d32", gemm(32), 1e-4, 32, TP2),
+            _scoped(tmp_path, "d64", gemm(64), 2e-4, 64, TP2),
+        ],
+        "strided": [
+            _scoped(tmp_path, "s32", strided_gemm(32), 5e-4, 32, TP4),
+            _scoped(tmp_path, "s64", strided_gemm(64), 10e-4, 64, TP4),
+        ],
+    }
+    library = ParametricPriceLibrary(max_gap_ratio=2.0)
+    for which in order:
+        for price, graph in files[which]:
+            library.add(price, graph)
+    return library
+
+
+@pytest.mark.parametrize("order", [("dense", "strided"), ("strided", "dense")])
+def test_a_dense_interpolation_is_not_contaminated_by_strided_prices(
+        tmp_path, order):
+    """48 dense rows sits between 1e-4 and 2e-4, and nowhere near 5e-4.
+
+    The strided measurements are five times the dense ones here precisely so
+    that a contaminated median is a number no honest dense interpolation could
+    produce.
+    """
+    library = _mixed_library(tmp_path, order)
+    record, detail = library.lookup(gemm(48), topology=TP2,
+                                    registration=REGISTERED)
+    assert record is not None, detail
+    assert 1e-4 <= record["seconds"] <= 2e-4, (
+        f"dense 48 came back as {record['seconds']:.3e}, outside the dense "
+        "bracket [1e-4, 2e-4]")
+
+
+@pytest.mark.parametrize("order", [("dense", "strided"), ("strided", "dense")])
+def test_the_strided_measurements_keep_their_own_support(tmp_path, order):
+    """Strided 32 and 64 were measured, so strided 48 is interpolable.
+
+    Losing this is the quieter half: the measurements exist, were paid for,
+    and a request that should have been answered from them is refused because
+    they were filed under another layout's curve.
+    """
+    library = _mixed_library(tmp_path, order)
+    record, detail = library.lookup(strided_gemm(48), topology=TP4,
+                                    registration=REGISTERED)
+    assert record is not None, detail
+    assert record["interpolated"] is True
+    assert 5e-4 <= record["seconds"] <= 10e-4, record["seconds"]
+
+
+def test_a_scope_with_no_measurement_of_its_own_is_refused_not_borrowed(
+        tmp_path):
+    """TP2 holds only dense prices, so a TP2 strided request has no support."""
+    library = _mixed_library(tmp_path)
+    record, detail = library.lookup(strided_gemm(48), topology=TP2,
+                                    registration=REGISTERED)
+    assert record is None, f"answered from another scope's curve: {record}"
+
+
+def test_an_unnamed_scope_is_answered_while_only_one_offers_this_operator(
+        tmp_path):
+    """Dense exists at TP2 only, so there is nothing to choose between.
+
+    Scope separation must not turn into refusing everything that did not name
+    a scope: most callers never do, and a family measured in one scope has one
+    answer.
+    """
+    library = _mixed_library(tmp_path)
+    record, detail = library.lookup(gemm(48))
+    assert record is not None, detail
+    assert 1e-4 <= record["seconds"] <= 2e-4
+
+
+def test_the_same_operator_in_two_scopes_refuses_an_unnamed_request(tmp_path):
+    """Naming no scope while several offer it is the silent spend, not a default.
+
+    Here both scopes hold the *dense* gemm, so structure alone cannot decide
+    and picking one would spend a price measured at another group width --
+    exactly what the base class refuses to do for a collective.
+    """
+    library = ParametricPriceLibrary(max_gap_ratio=2.0)
+    for tag, rows, seconds, topology in (
+            ("a32", 32, 1e-4, TP2), ("a64", 64, 2e-4, TP2),
+            ("b32", 32, 8e-4, TP4), ("b64", 64, 16e-4, TP4)):
+        library.add(*_scoped(tmp_path, tag, gemm(rows), seconds, rows,
+                             topology))
+
+    record, detail = library.lookup(gemm(48))
+    assert record is None, (
+        f"picked a scope for a request that named none: {record}")
+    assert "more than one scope" in detail, detail
+
+    named, why = library.lookup(gemm(48), topology=TP4,
+                                registration=REGISTERED)
+    assert named is not None, why
+    assert 8e-4 <= named["seconds"] <= 16e-4

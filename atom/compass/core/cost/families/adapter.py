@@ -91,6 +91,20 @@ INTERPOLATED_SCHEME = INTERPOLATED_SOURCE_PREFIX
 _OPEN_QUESTION = "no entry for this signature"
 
 
+def _scope_key(scope) -> tuple:
+    """A scope as a hashable key. Same two fields ``_same_scope`` compares."""
+    scope = scope or {}
+    topology = scope.get("topology") or {}
+    return (tuple(sorted(topology.items())) if isinstance(topology, dict)
+            else tuple(topology), scope.get("registration"))
+
+
+def _scope_note(key: tuple) -> str:
+    topology, registration = key
+    return (f"{dict(topology) or 'undeclared width'} on "
+            f"{registration or 'an undeclared path'}")
+
+
 class ParametricPriceLibrary(PriceLibrary):
     """Exact prices first; a measured curve in rows behind the open question.
 
@@ -109,7 +123,12 @@ class ParametricPriceLibrary(PriceLibrary):
         self._ops: dict[str, dict] = {}
         #: price file -> the row count that run was measured at
         self._rows: dict[str, int] = {}
-        #: grouping key -> [(op, rows, seconds, source, kernels)]
+        #: price file -> {signature -> the operator THAT file's graph recorded}
+        #: Needed beside `_ops` because a signature does not carry layout: two
+        #: files can price the same key on differently arranged memory, and
+        #: only the per-file map says which price is which.
+        self._source_ops: dict[str, dict] = {}
+        #: (grouping key, scope key) -> [(op, rows, seconds, source, kernels)]
         self._observations: dict[tuple, list] = {}
         self._curves_built = False
         #: reasons a family could not be assembled, for describe()
@@ -160,27 +179,52 @@ class ParametricPriceLibrary(PriceLibrary):
 
         for op in graph.get("ops") or ():
             self._ops.setdefault(signature_of(op), op)
+            # Also per source. `_ops` is keyed by signature alone and keeps the
+            # first operator seen under it, which is fine for "what structure
+            # does this key have" and wrong for "what did THIS file price". A
+            # signature does not carry layout, so one file's dense rebuild and
+            # another's strided view share a key; pairing every scoped price
+            # with the first-seen operator puts both on the first layout's
+            # curve.
+            self._source_ops.setdefault(price_path, {})[signature_of(op)] = op
         self._curves_built = False
 
     def _build(self) -> None:
-        """Group every measured price by the operator it priced."""
+        """Group every measured price by the operator *it* priced.
+
+        Each record is paired with the operator from its own file's graph and
+        grouped under its own scope. Two things were collapsing here:
+
+        * **layout** -- a strided measurement was attached to the dense
+          operator, so its seconds joined the dense curve (contaminating the
+          median at every width it shared) and no strided curve existed at all,
+          so a strided request at an unmeasured width had no support to sit in.
+        * **scope** -- prices measured at different group widths or on
+          different registration paths landed on one curve, which averages
+          measurements of different work.
+        """
         if self._curves_built:
             return
         self._observations.clear()
         for sig, records in self._prices.items():
-            op = self._ops.get(sig)
-            if op is None:
-                continue
-            contract = contract_for(op.get("name", ""))
-            if contract is None or contract.kind != "rows":
-                continue
             for record in records:
-                rows = self._rows.get(record.get("source"))
+                source = record.get("source")
+                op = (self._source_ops.get(source) or {}).get(sig)
+                if op is None:
+                    # No graph from this file, so nothing says what this price
+                    # is a price of. Exact-signature use only; `unbuildable`
+                    # already records why.
+                    continue
+                contract = contract_for(op.get("name", ""))
+                if contract is None or contract.kind != "rows":
+                    continue
+                rows = self._rows.get(source)
                 seconds = record.get("seconds")
                 if rows is None or seconds is None:
                     continue
-                self._observations.setdefault(grouping_key(op), []).append(
-                    (op, rows, float(seconds), record.get("source", "?"),
+                key = (grouping_key(op), _scope_key(record.get("scope")))
+                self._observations.setdefault(key, []).append(
+                    (op, rows, float(seconds), source or "?",
                      tuple(record.get("kernels") or ())))
         self._curves_built = True
 
@@ -192,9 +236,10 @@ class ParametricPriceLibrary(PriceLibrary):
             # Either answered, or refused for a reason that is a finding rather
             # than a gap. Both are returned as they came.
             return record, detail
-        return self._parametric(op, detail)
+        return self._parametric(op, detail, topology, registration)
 
-    def _parametric(self, op: dict, original: str):
+    def _parametric(self, op: dict, original: str, topology=None,
+                    registration=None):
         contract = contract_for(op.get("name", ""))
         if contract is None:
             return None, (f"{original}; and {op.get('name', '?')} has no "
@@ -210,8 +255,14 @@ class ParametricPriceLibrary(PriceLibrary):
                 "nobody has measured")
 
         self._build()
-        curve, verified_rows = self._curve_for(op)
+        curve, verified_rows = self._curve_for(op, topology, registration)
         if curve is None:
+            # Scope first: "this family is measured, but not here" is a
+            # different gap from "nothing matches this operator", and only one
+            # of them is closed by measuring a new width.
+            _groups, scope_why = self._groups_for(op, topology, registration)
+            if scope_why:
+                return None, f"{original}; {scope_why}"
             return None, (f"{original}; and no measured operator matches this "
                           "one at any width" + self._layout_note(op))
         support = RowSupport(curve, max_gap_ratio=self.max_gap_ratio)
@@ -241,7 +292,7 @@ class ParametricPriceLibrary(PriceLibrary):
         mine = _layout_note_for(op)
         others = {_layout_note_for(measured)
                   for key, obs in self._observations.items()
-                  if key[0] == op.get("name", "")
+                  if key[0][0] == op.get("name", "")
                   for measured, *_ in obs}
         others.discard(mine)
         if not others:
@@ -250,9 +301,39 @@ class ParametricPriceLibrary(PriceLibrary):
                 f"measured on {', '.join(sorted(others))}, which is a "
                 "different operator rather than another width of this one")
 
-    def _curve_for(self, op: dict):
+    def _groups_for(self, op: dict, topology, registration):
+        """The observation groups this request may be answered from.
+
+        Keyed by structure *and* scope, so a request is only ever answered from
+        measurements taken at its own group width on its own registration path.
+        A caller that names neither is allowed through only while there is one
+        scope to be: with several, picking would be the silent spend the base
+        class already refuses for collectives, so this refuses too.
+        """
+        structural = grouping_key(op)
+        present = {key[1]: obs for key, obs in self._observations.items()
+                   if key[0] == structural}
+        if not present:
+            return [], None
+        if topology is None and registration is None:
+            if len(present) == 1:
+                return list(present.values()), None
+            return [], ("this family is measured in more than one scope and "
+                        "the request named none: "
+                        + "; ".join(sorted(_scope_note(k) for k in present)))
+        wanted = _scope_key({"topology": topology,
+                             "registration": registration})
+        exact = present.get(wanted)
+        if exact is not None:
+            return [exact], None
+        return [], (f"no measurement of this family at {_scope_note(wanted)} "
+                    "(have: "
+                    + "; ".join(sorted(_scope_note(k) for k in present)) + ")")
+
+    def _curve_for(self, op: dict, topology=None, registration=None):
         """The measured curve for this operator, and the width it sits at."""
-        observations = self._observations.get(grouping_key(op)) or []
+        groups, _why = self._groups_for(op, topology, registration)
+        observations = [entry for group in groups for entry in group]
         matched: list = []
         rows_here = None
         for measured_op, rows, seconds, source, kernels in observations:
