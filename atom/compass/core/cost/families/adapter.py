@@ -57,7 +57,6 @@ regardless of which half of the seam it is running against.
 
 from __future__ import annotations
 
-import json
 import logging
 from typing import Optional
 
@@ -122,7 +121,7 @@ class ParametricPriceLibrary(PriceLibrary):
     # -- assembly -------------------------------------------------------
 
     def add(self, price_path: str, graph_path: Optional[str] = None,
-            registration: Optional[str] = None) -> None:
+            registration: Optional[str] = None, *, coords=None) -> None:
         """Load a price file, and the graph that says what its keys mean.
 
         Without a graph this behaves exactly as the base class: prices are
@@ -130,15 +129,22 @@ class ParametricPriceLibrary(PriceLibrary):
         feature off, so the file contributes nothing to any curve. That is a
         silent loss of capability rather than of correctness, so it is
         recorded.
+
+        ``coords`` is forwarded unresolved, exactly as the base class takes
+        it, so this override cannot become a second place that resolves a
+        rank's path.
         """
-        super().add(price_path, graph_path, registration)
-        if not graph_path:
+        # `_ingest` rather than `super().add`, so the graph is parsed once and
+        # this override reads the payload the base class already has. Opening
+        # it again here would give the retained digest a second set of bytes
+        # to be a digest of.
+        _blob, graph = self._ingest(price_path, graph_path, registration,
+                                    coords)
+        if graph is None:
             self.unbuildable[price_path] = (
                 "no graph supplied, so its operators have no structure to "
                 "read a feature from; exact-signature use only")
             return
-        with open(graph_path, encoding="utf-8") as fh:
-            graph = json.load(fh)
         reading = _traced_rows(graph)
         if isinstance(reading, tuple):
             self.unbuildable[price_path] = f"{graph_path}: {reading[1]}"

@@ -45,6 +45,7 @@ from dataclasses import dataclass, field
 from typing import Optional, Protocol
 
 from atom.compass.core.cost.base import StepCost, StepShape
+from atom.compass.core.loaded_input import load_json
 
 logger = logging.getLogger(__name__)
 
@@ -400,12 +401,17 @@ class PriceLibrary:
         #: not a record, for the reason in the class docstring.
         self._prices: dict[str, list] = {}
         self._refusals: dict[str, str] = {}
+        #: Every artifact this library parsed, in the order it parsed them,
+        #: each carrying the digest of the exact bytes that were parsed. Empty
+        #: on a library assembled by hand, which is an honest statement that
+        #: there is no file to identify rather than a missing record.
+        self.loaded_inputs: tuple = ()
         self.sources: list[str] = []
         self.partial: list[str] = []
         self.conflicts: dict[str, list[float]] = {}
 
     @classmethod
-    def load(cls, pairs) -> "PriceLibrary":
+    def load(cls, pairs, *, coords=None) -> "PriceLibrary":
         """Build from ``(price_path, graph_path or None)`` pairs.
 
         The graph is optional and worth supplying. Without it a price can only
@@ -418,6 +424,9 @@ class PriceLibrary:
         whose own provenance predates the field. It states the scope the
         measurement already had; it cannot change it, and disagreeing with what
         the file says is an error.
+
+        ``coords`` is handed down to every ``add`` unresolved, for the reason
+        given there.
         """
         lib = cls()
         for entry in pairs:
@@ -426,15 +435,43 @@ class PriceLibrary:
                 registration = entry[2] if len(entry) > 2 else None
             else:
                 price_path, graph_path, registration = entry, None, None
-            lib.add(price_path, graph_path, registration)
+            lib.add(price_path, graph_path, registration, coords=coords)
         return lib
 
-    def add(self, price_path: str, graph_path: Optional[str] = None,
-            registration: Optional[str] = None) -> None:
+    def add(self, price_path: str, graph_path: str | None = None,
+            registration: str | None = None, *, coords=None) -> None:
+        """Load a price file and, where given, the graph it was priced from.
+
+        ``coords`` names this rank so the loader can resolve a per-rank
+        artifact. It is passed *unresolved*: resolution happens once, inside
+        the loader, which is the only place that can report both the stem a
+        caller asked for and the file this rank was actually served. Omitting
+        it is exactly today's behaviour -- no resolution, ``rank_own`` false.
+        """
+        self._ingest(price_path, graph_path, registration, coords)
+
+    def _ingest(self, price_path: str, graph_path: str | None,
+                registration: Optional[str], coords):
+        """Read both artifacts once and absorb them. Returns the payloads.
+
+        Subclasses that need the graph take it from here rather than calling
+        ``super().add`` and opening the file a second time. Two reads of one
+        path are not only wasted work: they are two chances to see different
+        bytes, and the digest retained for provenance would then describe
+        whichever read happened to be hashed.
+        """
         from atom.compass.core.cost.priced import _declared_topology
 
-        with open(price_path, encoding="utf-8") as fh:
-            blob = json.load(fh)
+        blob, loaded = load_json(price_path, role="oracle.price", coords=coords)
+        records = [loaded]
+        graph = None
+        if graph_path:
+            graph, graph_loaded = load_json(
+                graph_path, role="oracle.price_graph", coords=coords)
+            records.append(graph_loaded)
+        # Immutable, and replaced rather than mutated, so a holder that has
+        # already read it cannot be changed under by a later `add`.
+        self.loaded_inputs = self.loaded_inputs + tuple(records)
         self.sources.append(price_path)
         provenance = blob.get("provenance") or {}
         topology = _declared_topology(blob, price_path)
@@ -468,11 +505,10 @@ class PriceLibrary:
         # race had its own measurement refused, and the other scope's request
         # was answered from a price measured on a layout it does not have.
         layouts = {}
-        if graph_path:
-            with open(graph_path, encoding="utf-8") as fh:
-                for op in json.load(fh)["ops"]:
-                    layouts.setdefault(_signature_of(op),
-                                       _layout_fingerprint(op))
+        if graph is not None:
+            for op in graph["ops"]:
+                layouts.setdefault(_signature_of(op),
+                                   _layout_fingerprint(op))
         for sig, record in (blob.get("prices") or {}).items():
             kept = self._prices.setdefault(sig, [])
             same = [r for r in kept if _same_scope(r["scope"], scope)]
@@ -492,6 +528,7 @@ class PriceLibrary:
             kept.append(entry)
         for sig, why in (blob.get("unpriced") or {}).items():
             self._refusals.setdefault(sig, why)
+        return blob, graph
 
     def lookup(self, op: dict, topology=None, registration=None):
         """``(record, source)`` for one operator, or ``(None, reason)``.

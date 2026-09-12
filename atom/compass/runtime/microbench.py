@@ -1221,7 +1221,7 @@ def _time_isolated(fn, sets: list, iters: int, warmup: int) -> tuple[float, floa
     return statistics.median(samples), 0.0
 
 
-def observed_group_width() -> Optional[int]:
+def observed_group_width() -> int | None:
     """How many ranks this process is actually reducing over, or None.
 
     ``None`` means torch.distributed is not initialised here, which is a real

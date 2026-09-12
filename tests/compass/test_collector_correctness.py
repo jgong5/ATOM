@@ -18,7 +18,6 @@ import pytest
 
 from atom.compass.runtime import forward_ctx, microbench
 
-
 # == (1) the capture-unsupported fallback ==================================
 #
 # Chunked-prefill attention cannot be graph-captured, so it is timed
@@ -48,7 +47,7 @@ def fallback(tmp_path, monkeypatch):
     so "did the timed loop rotate" is answered by what the thunks saw rather
     than by inspecting the call.
     """
-    import atom.utils.forward_context as forward_context
+    from atom.utils import forward_context
 
     visited: list[int] = []
 
@@ -121,7 +120,7 @@ def _collective_graph(tmp_path, topology):
 
 @pytest.fixture
 def priceable(monkeypatch):
-    import atom.utils.forward_context as forward_context
+    from atom.utils import forward_context
 
     monkeypatch.setattr(forward_context, "reset_forward_context", lambda: None)
     monkeypatch.setattr(microbench, "_resolve", lambda n: (lambda *a, **k: None))
