@@ -66,7 +66,7 @@ class _Stub:
                  oracle: str | None = None, virtual: bool = False,
                  arrivals: str = "counter", abandon: int = 0,
                  short: int = 0, stop_early: int = 0,
-                 no_usage: bool = False):
+                 overlong: int = 0, no_usage: bool = False):
         #: How many of the requests this server abandons: it answers 503 and
         #: never produces a completion, which is what a real engine that has
         #: run out of room does and what the client saw on the TP1 run where
@@ -76,10 +76,16 @@ class _Stub:
         #: still claiming `finish_reason="length"` -- a generation the engine
         #: cut off rather than one the model ended.
         self.short = short
-        #: How many end early *legitimately*, the model having emitted its
-        #: stop. Not a shortfall, and a client that called it one would fail
-        #: every ordinary run.
+        #: How many stop on the model's own EOS one token short. The client
+        #: asks for `ignore_eos`, so this cannot happen to a request it sent;
+        #: it is here because a reply that claims it did happen still did not
+        #: replay the registered length, and must not be waved through on the
+        #: strength of its finish reason.
         self.stop_early = stop_early
+        #: How many come back with *more* output tokens than were asked for.
+        #: A mismatch in the other direction, and just as much a different
+        #: workload from the registered one.
+        self.overlong = overlong
         #: Answer without `usage.completion_tokens`, so nothing can be said
         #: about what was produced.
         self.no_usage = no_usage
@@ -104,6 +110,10 @@ class _Stub:
         self.ttft = ttft
         self.per_token = per_token
         self.break_ordering = break_ordering
+        #: Every completion body this server was sent, in arrival order, so a
+        #: test can ask what the client actually requested rather than what
+        #: it says it requests.
+        self.bodies: list[dict] = []
         self.records: list[dict] = []
         self._next_arrival = 0.0
         self._served_until = 0.0
@@ -118,6 +128,8 @@ class _Stub:
         does with a request that did not produce a completion, not how long it
         waits for one.
         """
+        with self._lock:
+            self.bodies.append(body)
         prompt_tokens = len(body["prompt"].split())
         n = int(body["max_tokens"])
         with self._lock:
@@ -131,8 +143,12 @@ class _Stub:
                 # says it stopped because it reached the length.
                 produced, reason = max(0, n - 1), "length"
             elif mine <= self.abandon + self.short + self.stop_early:
-                # Ended by the model, which is not a shortfall.
+                # Ended by the model rather than by the engine. Still short.
                 produced, reason = max(1, n - 1), "stop"
+            elif (mine <= self.abandon + self.short + self.stop_early
+                    + self.overlong):
+                # More than was asked for, reported as reaching the length.
+                produced, reason = n + 1, "length"
             arrive = {"epoch": 0.0, "serial": self._served_until}.get(
                 self.arrivals, self._next_arrival)
             self._next_arrival += 0.5
@@ -322,16 +338,46 @@ class TestARunThatDidNotCompleteExitsNonZero:
         assert (manifest["truncated"], manifest["failed"]) == (1, 0)
         assert manifest["completed"] == 2
         reason = manifest["incomplete_reasons"]["truncated"][0]["reason"]
-        assert "3 of 4 output tokens" in reason
+        assert "produced 3 output tokens where 4 were registered" in reason
 
-    def test_a_sequence_the_model_ended_itself_is_complete(self, tmp_path,
-                                                           trace):
-        """`finish_reason="stop"` is the engine saying the generation is over,
-        and no client can ask for more than that. Failing on it would fail
-        every ordinary run against a model that emits its stop token."""
+    def test_a_sequence_the_model_ended_itself_is_still_short(self, tmp_path,
+                                                              trace):
+        """`finish_reason="stop"` names the cause, not a dispensation. The
+        client asks for `ignore_eos`, so a reply that stopped early did not
+        run the registered decode lengths however it reports itself, and a
+        comparison against it would be over a different workload."""
         out = tmp_path / "run.json"
-        assert _run(_Stub(stop_early=3), trace, out) == 0
-        assert self._manifest(out)["complete"] is True
+        assert _run(_Stub(stop_early=3), trace, out) == replay.INCOMPLETE_EXIT
+        manifest = self._manifest(out)
+        assert (manifest["truncated"], manifest["completed"]) == (3, 0)
+        assert manifest["complete"] is False
+        assert "'stop'" in (
+            manifest["incomplete_reasons"]["truncated"][0]["reason"])
+
+    def test_a_reply_longer_than_asked_for_is_a_mismatch_too(self, tmp_path,
+                                                             trace):
+        """The other direction. An extra token is an extra decode step, so an
+        over-produced reply is no more the registered workload than a short
+        one -- and a `got >= want` check would have taken it."""
+        out = tmp_path / "run.json"
+        assert _run(_Stub(overlong=1), trace, out) == replay.INCOMPLETE_EXIT
+        manifest = self._manifest(out)
+        assert (manifest["truncated"], manifest["completed"]) == (1, 2)
+        reason = manifest["incomplete_reasons"]["truncated"][0]["reason"]
+        assert "produced 5 output tokens where 4 were registered" in reason
+
+    def test_fixed_length_generation_is_what_was_asked_for(self, tmp_path,
+                                                           trace):
+        """Enforcing the count is only honest if the client asked for it.
+        `CompletionRequest.ignore_eos` is what says "run the whole length"
+        (atom/entrypoints/openai/protocol.py:246 -> api_server.py:1697); this
+        client never sent it, so every request it made was free to stop early
+        and the count check below could be argued with."""
+        stub = _Stub()
+        out = tmp_path / "run.json"
+        assert _run(stub, trace, out) == 0
+        assert len(stub.bodies) == 3
+        assert all(b.get("ignore_eos") is True for b in stub.bodies)
 
     def test_a_reply_that_counts_nothing_cannot_be_read_as_complete(
             self, tmp_path, trace):

@@ -101,11 +101,24 @@ def _completion_shortfall(response, want: int):
     `usage.completion_tokens` is the server's own count and the only one worth
     reading. `compare.py` already refuses a run whose replies do not carry it,
     so a client that accepts one has written an artifact nothing downstream
-    will take. A reply that produced fewer tokens than were asked for is short
-    unless the model ended the sequence itself: `finish_reason == "stop"` is
-    the engine saying the generation is over, and no client can ask for more
-    than that. Anything else -- an abort, a "length" that is not the length
-    requested, or no reason at all -- is a request the engine gave up on.
+    will take.
+
+    The count has to be the registered one **exactly**, and the finish reason
+    does not excuse a difference. A replay's job is to run the output lengths
+    the workload registered: each token is a decode step, so a request that
+    produced three tokens where four were registered performed a different
+    step sequence, whether it stopped because the engine abandoned it or
+    because the model emitted its stop token. `finish_reason == "stop"` names
+    the cause, not a dispensation -- a short "stop" is still a short request,
+    and `compare.py` will refuse the pair for the same reason one step later.
+    Overproduction is a mismatch in the other direction and is not waved
+    through either.
+
+    There is no EOS mode here to preserve: this client has never had one, and
+    a request that may end early is not a request whose cost can be predicted
+    from the workload. Both phases now send `ignore_eos`, so an early stop is
+    not an option the client left open -- it is a reply that did not do what
+    was asked.
     """
     if not isinstance(response, dict):
         return "the server's reply was not an object"
@@ -115,13 +128,11 @@ def _completion_shortfall(response, want: int):
     got = (response.get("usage") or {}).get("completion_tokens")
     if not isinstance(got, int) or isinstance(got, bool):
         return "the reply carried no usage.completion_tokens"
-    if got >= want:
+    if got == want:
         return None
     reason = (choices[0] or {}).get("finish_reason")
-    if reason == "stop":
-        return None
-    return (f"produced {got} of {want} output tokens and finished as "
-            f"{reason!r}")
+    return (f"produced {got} output tokens where {want} were registered, "
+            f"finishing as {reason!r}")
 
 
 def _incomplete(results: list[dict], workload: list[dict]) -> dict:
@@ -308,7 +319,13 @@ def _prepare(base: str, model: str, workload: list[dict], args) -> dict:
         # the kernels, not the workload's own prefixes.
         body = {"model": model,
                 "prompt": _prompt(row["input_tokens"], _PREPARE_PROMPT_BASE + i),
-                "max_tokens": row["output_tokens"], "temperature": 0.0}
+                "max_tokens": row["output_tokens"], "temperature": 0.0,
+                # Same fixed-length generation as the measured phase below.
+                # Preparation warms the kernels the measured run will use, so
+                # it has to walk the same decode lengths; a request that ends
+                # early here warms a shorter step sequence than the one being
+                # prepared for.
+                "ignore_eos": True}
         try:
             return {"index": i, "ok": True,
                     "response": _send(base + "/v1/completions", body,
@@ -452,6 +469,16 @@ def main(argv=None) -> int:
             "prompt": _prompt(row["input_tokens"], i),
             "max_tokens": row["output_tokens"],
             "temperature": 0.0,
+            # Fixed-length generation, asked for rather than hoped for. Each
+            # output token is a decode step, so a request that stops on the
+            # model's EOS runs a shorter step sequence than the one the
+            # workload registered -- and the two sides of a comparison would
+            # stop at different places. `CompletionRequest.ignore_eos`
+            # (atom/entrypoints/openai/protocol.py:246) reaches
+            # `SamplingParams` at api_server.py:1697, and `serve_bench.py`
+            # has always sent it; this client had not, which is why the count
+            # check below could be argued with.
+            "ignore_eos": True,
         }
         if not args.pace:
             # Declared rather than delivered: against a simulated engine the
