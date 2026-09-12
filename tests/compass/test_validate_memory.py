@@ -661,6 +661,37 @@ class TestTheGateAcceptanceRunsOn:
         assert published is None
         assert "no source-derived capture prediction" in why
 
+    def test_a_published_zero_is_a_prediction_and_not_an_absence(self):
+        """Under `enforce_eager` nothing is captured and the pool is zero.
+
+        That is a claim -- one the gate can hold against a measured zero, and
+        fail against a measured anything else. Read as absence it would instead
+        excuse the term from comparison on exactly the configuration whose
+        prediction is most certain.
+        """
+        script = _script()
+        published, note = script.published_capture(
+            {"capture_reserved": {"2": {"total": 0, "provenance": "eager"}}}, 2)
+        assert (published, note) == (0, "eager")
+
+    def test_a_recorded_zero_pool_stays_zero_and_an_absent_one_stays_absent(self):
+        """`reserved: 0` measured a capture that reserved nothing.
+
+        An unstated pool is a record written before the measurement existed:
+        uncovered, and failing as such. Collapsing the two sent a measured zero
+        looking for a `--log` reading, and then reported a term that was
+        measured as one nobody measured.
+        """
+        script = _script()
+        readings = {"non_torch": 1, "cudagraph_overhead": 2}
+        stated = script.recorded_terms(
+            readings, {"graph_pool": {"reserved": 0}}, 4096)
+        assert stated["graph pool"] == 0
+        assert script.recorded_terms(readings, {}, 0)["graph pool"] is None
+        # The log answers only where the record does not, which is the case it
+        # was added for: a record written before `graph_pool` was in it.
+        assert script.recorded_terms(readings, {}, 4096)["graph pool"] == 4096
+
     def test_a_record_with_no_readings_fails_rather_than_being_skipped(self):
         """Rank 0 clean and rank 1 silent used to read as a pass.
 

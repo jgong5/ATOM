@@ -231,10 +231,14 @@ def published_capture(cal_map, world: int):
         except (TypeError, ValueError):
             continue
     entry = keyed.get(int(world))
-    if not isinstance(entry, Mapping) or not entry.get("total"):
+    total = entry.get("total") if isinstance(entry, Mapping) else None
+    if total is None:
         return None, ("the profile's calibration publishes no capture "
                       "prediction at TP=%d" % world)
-    return int(entry["total"]), str(entry.get("provenance") or "")
+    # A published zero is a prediction: a build that captured nothing reserves
+    # nothing, and that is a claim the gate can hold against a measured zero.
+    # Read as absence it would instead excuse the row from being compared.
+    return int(total), str(entry.get("provenance") or "")
 
 
 def recorded_terms(readings: dict, blob: dict, pool_seen: int = 0) -> dict:
@@ -247,14 +251,20 @@ def recorded_terms(readings: dict, blob: dict, pool_seen: int = 0) -> dict:
 
     `None` where the record does not carry both readings a term is the
     difference of. Not zero: an absent term is one nobody measured, which
-    fails as an uncovered term, and a zero would read as agreement.
+    fails as an uncovered term, and a zero would read as agreement. The
+    converse holds too -- a term the record states as zero stays zero here,
+    because a measurement of nothing is still a measurement.
     """
     allocated = readings.get("weights_torch")
     parameters = readings.get("parameter_bytes")
     buffers = readings.get("buffer_bytes")
     current = readings.get("current_torch")
     peak = readings.get("peak_torch")
-    reserved, _allocated, _sizes = recorded_pool(blob)
+    # The raw field, not `recorded_pool`'s zero-filled reading: a record that
+    # states `reserved: 0` measured a capture that reserved nothing, and a
+    # record written before the measurement existed states nothing at all.
+    # Those are different answers and the gate treats them differently.
+    reserved = (blob.get("graph_pool") or {}).get("reserved")
 
     def minus(left, right):
         return left - right if left is not None and right is not None else None
@@ -277,7 +287,10 @@ def recorded_terms(readings: dict, blob: dict, pool_seen: int = 0) -> dict:
         "reservation": readings.get("cudagraph_overhead"),
         # The reserved delta, not the allocated one: a captured graph pins its
         # intermediates, so the segments the allocator created are the cost.
-        "graph pool": (reserved or pool_seen) or None,
+        # The record first, including a zero it states; the log reading only
+        # where the record carries nothing, and only where it found a line.
+        "graph pool": (int(reserved) if reserved is not None
+                       else (pool_seen or None)),
     }
 
 
@@ -1287,7 +1300,10 @@ def main() -> int:
         # needed for a record written before it was.
         _reserved, allocated, capture_sizes = recorded_pool(blob)
         seen = recorded["graph pool"]
-        if seen:
+        # Stated, including stated as zero. A build that captured nothing
+        # reserved nothing, and that row is a comparison the same as any other;
+        # only a record that says nothing has no row to print.
+        if seen is not None:
             capture_pred, capture_note = published_capture(cal_map, world)
             row("graph pool", capture_pred, seen,
                 ("vs the %d MiB capture actually reserved over %d buckets; %s"
