@@ -442,9 +442,10 @@ def _output_rows(op: dict):
     """Rows the kernel was launched over, where the key records them.
 
     For GDN, the width `core_attn_out` was allocated with. For the unified
-    wrapper, the query rows divided by the per-row query length -- the same
-    expression the kernel itself uses. Both are read off the recorded call;
-    neither needs `capture_bucket`, which no operator context carries.
+    wrapper on a *decode* call, the query rows divided by the per-row
+    query length -- the same expression the kernel itself uses. Both are
+    read off the recorded call; neither needs `capture_bucket`, which no
+    operator context carries. Prefill is declined; see the unified branch.
     """
     name = op.get("name")
     shapes = op.get("input_shapes") or ()
@@ -460,6 +461,22 @@ def _output_rows(op: dict):
             return None
         shape = shapes[_UNIFIED_QUERY_OPERAND]
         if not isinstance(shape, (list, tuple)) or not shape:
+            return None
+        # `q.shape[0] // max_seqlen_q` is the *decode* launch rule, and it is
+        # the batch size only because every launched decode row carries the
+        # same query length. A prefill does not meet that premise: its rows
+        # are the tokens themselves, so the quotient counts neither rows nor
+        # tokens. One request of 4096 tokens gives 1 and a ragged (3,1,1,1)
+        # gives 2 -- and `geometry_of` admits whatever comes back here as a
+        # token count, so a 1 abstracts any unrelated leading axis of 1 and
+        # collapses two calls that are not the same operator onto one key.
+        #
+        # Nothing is lost by declining: a prefill's launched extent is its
+        # `query_total`, which `geometry_of` already reads directly. Only a
+        # call that says it is decode gets the decode rule; a call that does
+        # not say comes back unknown rather than plausible, which is what
+        # `bucket_pad` already falls back to `sequences` for.
+        if _context(op).get("is_prefill") is not False:
             return None
         per_row = _context(op).get("max_seqlen_q")
         try:
