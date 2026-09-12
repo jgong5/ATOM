@@ -110,6 +110,111 @@ def test_a_scalar_equal_to_the_measured_width_is_read_as_the_constant_it_is():
     assert infer_rows(wide, triton_norm(32), 32) == 4096
 
 
+# -- a launch grid that DIVIDES the rows ---------------------------------
+
+
+def mrope(rows: int) -> dict:
+    """The body's mrope as the graphs record it, at `rows` tokens.
+
+    Copied field for field off the two real refused operators (the 9216 and
+    14592 occurrences lifted out of the body graphs), parameterised only by
+    the row count. The grid is `rows // 16` blocks of 28 -- BLOCK_T is scalar
+    `#22` and holds 16 -- so it is the rows divided by a tile, not multiplied
+    by anything. That is the one position where the two refused each other.
+    """
+    return {
+        "name": "triton::_mrope_qk_tiled_kernel",
+        "input_shapes": [[rows, 6144], [rows, 1024], [rows, 6144],
+                         [rows, 1024], [3, rows],
+                         [262144, 1, 1, 32], [262144, 1, 1, 32]],
+        "dtypes": ["bfloat16", "bfloat16", "bfloat16", "bfloat16",
+                   "int64", "bfloat16", "bfloat16"],
+        "launch": [["grid", [rows // 16, 28]],
+                   ["origin",
+                    "atom.model_ops.triton_mrope:_mrope_qk_tiled_kernel"]],
+        "scalars": [["#7", 6144], ["#8", 1024], ["#9", 6144], ["#10", 1024],
+                    ["#11", rows], ["#12", 32], ["#13", 32], ["#14", rows],
+                    ["#15", 24], ["#16", 4], ["#17", 256], ["#18", 64],
+                    ["#19", 32], ["#20", 11], ["#21", 10], ["#22", 16],
+                    ["#23", 256], ["num_stages", 1], ["num_warps", 8]],
+    }
+
+
+def test_the_real_mrope_pair_lines_up_once_the_grid_divides():
+    """9216 and 14592: 576 blocks and 912 blocks, both of 16 rows.
+
+    This is the exact pair the body refused. Every other position already
+    agreed -- the shapes, the `positions[3, M]` axis, the `#11`/`#14` token
+    counts -- and the launch grid alone failed, one position out of 98,
+    because it is the only value in the key that is SMALLER than the rows.
+    No amount of further measurement could have moved it.
+    """
+    assert mrope(9216)["launch"][0] == ["grid", [576, 28]]
+    assert mrope(14592)["launch"][0] == ["grid", [912, 28]]
+
+    assert aligns(mrope(14592), 14592, mrope(9216), 9216)
+    assert aligns(mrope(9216), 9216, mrope(14592), 14592)
+
+
+def test_the_grid_solves_the_width_in_either_direction():
+    """The measured side fixes the tile; the other side's blocks give a width.
+
+    Both directions, because the two are not the same computation: solving up
+    divides the target's blocks into a tile taken from a narrow measurement,
+    solving down takes the tile from a wide one.
+    """
+    assert infer_rows(mrope(14592), mrope(9216), 9216) == 14592
+    assert infer_rows(mrope(9216), mrope(14592), 14592) == 9216
+
+
+def test_an_ordinary_scalar_that_divides_the_rows_is_still_refused():
+    """The rule is scoped to `launch.grid` and to nothing else.
+
+    A scalar holding `rows // 16` is arithmetically indistinguishable from
+    the grid dimension. It is refused anyway: `_values` marks the grid walk
+    and only the grid walk, so a sub-multiple anywhere else never reaches the
+    rule. Dropping the scalar is what makes the same pair align, which is
+    what shows the grid is not carrying the refusal.
+    """
+    def with_scalar(rows: int) -> dict:
+        op = mrope(rows)
+        op["scalars"] = op["scalars"] + [["#24", rows // 16]]
+        return op
+
+    assert not aligns(with_scalar(14592), 14592, with_scalar(9216), 9216)
+    assert infer_rows(with_scalar(14592), with_scalar(9216), 9216) is None
+    assert aligns(mrope(14592), 14592, mrope(9216), 9216)
+
+
+def test_a_grid_that_is_not_whole_tiles_is_refused():
+    """A partial last block does less work than the others, and nothing
+    here knows what that costs.
+
+    100 rows over 7 blocks is 14 rows in six blocks and 16 in one, or the
+    other way about -- the module cannot tell, and rounding to a tile of 14
+    or 15 would be inventing a launch nobody measured. It refuses, which is
+    the same fail-closed direction the rest of the module takes.
+
+    The last check is a different failure: every position must agree on ONE
+    width. There the operand shapes say 9216 rows and the grid says 7296, and
+    putting either answer back through the other position rejects it.
+    """
+    def regrid(rows: int, blocks: int) -> dict:
+        op = mrope(rows)
+        return dict(op, launch=[["grid", [blocks, 28]], op["launch"][1]])
+
+    # A grid the rows do not divide by: no tile, so no comparison.
+    assert 100 % 7 and 9216 % 7
+    assert not aligns(regrid(9216, 7), 100, mrope(9216), 9216)
+
+    # ... and the same on the measured side, where the tile comes from.
+    assert infer_rows(mrope(14592), regrid(9216, 7), 9216) is None
+
+    # Positions that imply different widths cannot both be believed: 456
+    # blocks of the measured tile is 7296 rows, and the shapes say 9216.
+    assert infer_rows(regrid(9216, 456), mrope(14592), 14592) is None
+
+
 # -- what the support region will and will not answer --------------------
 
 
@@ -643,13 +748,23 @@ def test_the_head_metadata_operators_have_contracts_and_the_slice_is_a_view():
     assert slice_contract.values == ()
 
 
-def test_the_gather_is_not_answered_across_the_height_it_gathers_from():
-    """`aten::index` has a second dimension and it is not collapsed.
+def test_the_gather_is_answered_across_the_heights_that_were_measured():
+    """`aten::index` has a second dimension and it is a bounded nuisance.
 
-    The selected count is the width; the height selected FROM stays part of
-    the key. A measurement that gathered 2 rows out of 640 does not answer a
-    request that gathers 2 out of 16384 -- that would be a claim about the
-    source height nobody has measured at a fixed width.
+    The selected count is the width. The height selected FROM is an address
+    range -- the gather reads the selected rows wherever they sit -- and it
+    WAS measured at a fixed width: at M=1 over 512, 640, 1024, 9216, 14592 and
+    16384. So a measurement that gathered 2 rows out of 640 answers a request
+    that gathers 2 out of 16384: both heights are inside the measured span,
+    and the declared band is what dropping the dimension costs.
+
+    This test used to assert the opposite. What changed is not the module's
+    caution but the evidence: before the span was measured, collapsing the
+    height would have been a claim about a dimension nobody had varied.
+
+    Outside the span nothing was measured, so the dimension is kept and the
+    two operators go on refusing each other. That bound is the point: the
+    declaration is about 512..16384, not about every prefill height.
     """
     def gather(selected: int, height: int) -> dict:
         return {"name": "aten::index.Tensor",
@@ -657,7 +772,17 @@ def test_the_gather_is_not_answered_across_the_height_it_gathers_from():
                 "dtypes": ["bfloat16", "int32"]}
 
     assert infer_rows(gather(2, 16384), gather(1, 16384), 1) == 2
-    assert infer_rows(gather(2, 16384), gather(2, 640), 2) is None
+    assert infer_rows(gather(2, 16384), gather(2, 640), 2) == 2
+    assert aligns(gather(2, 16384), 2, gather(2, 640), 2)
+
+    # 9216 and 14592 are the real pair the head refused, and the reason the
+    # dimension was looked at again.
+    assert aligns(gather(1, 14592), 1, gather(1, 9216), 1)
+
+    dim = contract_for("aten::index.Tensor").nuisance_dims[0]
+    assert (dim.low, dim.high) == (512, 16384)
+    assert not aligns(gather(2, 32768), 2, gather(2, 16384), 2)
+    assert not aligns(gather(2, 256), 2, gather(2, 16384), 2)
 
 
 def _gather(selected: int, height: int) -> dict:
@@ -667,20 +792,26 @@ def _gather(selected: int, height: int) -> dict:
             "dtypes": ["bfloat16", "int32"]}
 
 
-def test_the_gather_refuses_a_pair_that_moved_the_height_with_the_width():
+def test_the_gather_never_solves_the_height_as_though_it_were_work():
     """The height must not be solved along with the rows.
 
-    Holding the height fixed and moving the selected count -- which is what
-    the test above does -- never exercises this: at a fixed height the height
-    is equal on both sides and passes on the equality branch. The failure
-    needs the two to move TOGETHER. 2 out of 8192 and 4 out of 16384 share a
-    coefficient of 4096 on the height and 1 on the count, so without a
-    declaration they read as one operator at two widths, and a request for 3
-    out of 12288 is solved from them at a source height nobody measured.
+    2 out of 32768 and 4 out of 65536 share a coefficient of 16384 on the
+    height and 1 on the count, so a bare integer there reads as one operator
+    at two widths, and a request for 3 out of 49152 is solved from them at a
+    source height nobody measured.
+
+    Inside the measured span the hazard cannot arise -- the height is dropped
+    before any arithmetic touches it. Outside the span the dimension is kept
+    as a FIXED value rather than a bare integer, which is what keeps this
+    closed: unmeasured heights differ, and differing fixed values refuse on
+    the equality branch without ever reaching the multiple branch.
     """
-    assert infer_rows(_gather(3, 12288), _gather(2, 8192), 2) is None
-    assert infer_rows(_gather(4, 16384), _gather(2, 8192), 2) is None
-    assert not aligns(_gather(4, 16384), 4, _gather(2, 8192), 2)
+    dim = contract_for("aten::index.Tensor").nuisance_dims[0]
+    assert 32768 > dim.high and 65536 > dim.high
+
+    assert infer_rows(_gather(3, 49152), _gather(2, 32768), 2) is None
+    assert infer_rows(_gather(4, 65536), _gather(2, 32768), 2) is None
+    assert not aligns(_gather(4, 65536), 4, _gather(2, 32768), 2)
 
 
 def test_the_gather_still_scales_at_one_height(tmp_path):
@@ -714,8 +845,14 @@ def test_the_gather_still_scales_at_one_height(tmp_path):
     assert record["interpolation"]["measured_rows"] == [2, 4]
     assert record["interpolation"]["rows"] == 3
 
-    # ... and the same request against an unmeasured height is refused.
-    record, why = library.lookup(_gather(3, 12288))
+    # ... a height inside the measured span reaches the same price, because
+    # the height is not what the price is a function of ...
+    record, source = library.lookup(_gather(3, 12288))
+    assert record is not None, source
+    assert record["interpolation"]["measured_rows"] == [2, 4]
+
+    # ... and a height nobody measured is still refused.
+    record, why = library.lookup(_gather(3, 32768))
     assert record is None
 
 

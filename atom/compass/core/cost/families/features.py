@@ -58,6 +58,7 @@ from atom.compass.core.cost.identity import normalized_context
 
 __all__ = [
     "FAMILY_CONTRACTS",
+    "DimContract",
     "FamilyContract",
     "ValueContract",
     "Nuisance",
@@ -129,6 +130,11 @@ class FamilyContract:
     #: See :class:`ValueContract`, and :func:`_abstracted_int_values`, which is
     #: where a declaration takes effect.
     values: tuple["ValueContract", ...] = ()
+    #: operand dimensions the price is declared independent of, each bounded
+    #: by the span its measurement covers. Empty for every family but the
+    #: head's gather. See :class:`DimContract`, and :func:`_declared_shapes`,
+    #: which is where a declaration takes effect.
+    nuisance_dims: tuple["DimContract", ...] = ()
     #: why this family is parameterised the way it is
     rationale: str = ""
 
@@ -145,8 +151,14 @@ class FamilyContract:
         selectors declare their whole uncertainty through `values`, and
         `nuisances` is empty for them, so reading only `nuisances` returned a
         spread of 0.0 for the two families that have one.
+
+        `nuisance_dims` is the third place, and is here for the same reason:
+        dropping a dimension from the comparison costs a band, and a band that
+        does not reach `nuisance_spread` is a band that was promised and then
+        not charged.
         """
-        return self.nuisances + tuple(v.nuisance for v in self.values)
+        return (self.nuisances + tuple(v.nuisance for v in self.values)
+                + tuple(d.nuisance for d in self.nuisance_dims))
 
     @property
     def unmeasured_nuisances(self) -> tuple[str, ...]:
@@ -170,6 +182,9 @@ class FamilyContract:
             lines.append(f"    {self.rationale}")
         for v in self.values:
             lines.append(f"    values[{v.position}] {v.nuisance.describe()}")
+        for d in self.nuisance_dims:
+            lines.append(f"    shape[{d.position}][{d.dimension}] in "
+                         f"{d.low}..{d.high} {d.nuisance.describe()}")
         for n in self.nuisances:
             lines.append(f"    nuisance {n.describe()}")
         return "\n".join(lines)
@@ -215,6 +230,73 @@ class ValueContract:
     nuisance: Nuisance
     #: why the abstraction is admissible for this family
     rationale: str = ""
+
+
+@dataclass(frozen=True)
+class DimContract:
+    """When an operand DIMENSION may be dropped from the comparison.
+
+    The complement of :attr:`FamilyContract.fixed_dims`. A fixed dimension is
+    one that must match exactly because it is a second extent the width does
+    not explain; a dimension declared here is one the price does not depend on
+    at all, so two operators differing only in it are the same operator.
+
+    The one family that needs it is the head's gather, whose operand 0
+    dimension 0 is the height of the hidden state it selects FROM. Fixing that
+    dimension is what made the gather refuse at every prefill width: the
+    selected count -- the work -- was equal on both sides, and only the height
+    differed.
+
+    Two guards keep this from becoming a licence:
+
+    * :attr:`low` and :attr:`high` bound it. Inside that span the declaration
+      applies and the dimension is dropped; outside it the literal value is
+      kept and the operators go on refusing each other exactly as before. The
+      span is the hull of the heights somebody has actually measured, so the
+      declaration never reaches a height no measurement has seen.
+    * :attr:`nuisance` carries the band, measured by varying this dimension at
+      a FIXED width -- the same evidence this module demands of every other
+      nuisance -- and it reaches the price through
+      :attr:`FamilyContract.nuisance_spread` like any other.
+
+    The operator is not modified: this is the comparison's view of it, built
+    fresh by :func:`_declared_shapes`.
+    """
+
+    #: operand position whose dimension may be dropped
+    position: int
+    #: which dimension of that operand
+    dimension: int
+    #: the lowest measured value of this dimension; below it the declaration
+    #: does not apply
+    low: int
+    #: the highest measured value; above it the declaration does not apply
+    high: int
+    #: what varying this dimension at a fixed width cost, and where that was
+    #: read off
+    nuisance: Nuisance
+    #: why the dimension is not work for this family
+    rationale: str = ""
+
+    def covers(self, value) -> bool:
+        return (isinstance(value, int) and not isinstance(value, bool)
+                and self.low <= value <= self.high)
+
+
+@dataclass(frozen=True)
+class _GridDim:
+    """One dimension of a recorded launch grid, marked as derived from work.
+
+    A grid dimension is neither a constant nor a multiple of the row count: it
+    is the row count divided by the kernel's tile, so ``aligns``' multiple rule
+    -- the only rule it had -- rejected 912 against 576 and made
+    ``_mrope_qk_tiled_kernel`` refuse at EVERY width rather than at some. The
+    marker exists so the sub-multiple rule can be applied to exactly these
+    positions and to nothing else: an ordinary scalar that happens to divide
+    its row count is still compared by equality, as before.
+    """
+
+    value: int
 
 
 _INT_DTYPES = ("int8", "int16", "int32", "int64",
@@ -462,16 +544,22 @@ FAMILY_CONTRACTS["aten::sub.Tensor"] = FamilyContract(
 # The gather that selects the last token of each request out of the hidden
 # state. Its width is the number selected -- operand 1's length -- while the
 # height it selects FROM is operand 0 dimension 0 and is a second, independent
-# extent. It is declared `fixed_dims` rather than left to the grouping key,
-# which records only each operand's rank and so says nothing about the value:
-# two measurements that moved the selected count and the source height
-# together -- 2 out of 8192 and 4 out of 16384 -- are otherwise read as one
-# operator at two widths with a coefficient of 4096, and a request gathering 3
-# out of 12288 is then solved and interpolated from them, against a source
-# height nobody measured. With the declaration those two are not the same
-# operator at all, which is the honest answer: the height is not the width.
-# A fixed height with a moving selected count still interpolates, which is the
-# case the head region actually needs.
+# extent. The height is declared rather than left to the grouping key, which
+# records only each operand's rank and so says nothing about the value: two
+# measurements that moved the selected count and the source height together --
+# 2 out of 8192 and 4 out of 16384 -- would otherwise be read as one operator
+# at two widths with a coefficient of 4096, and a request gathering 3 out of
+# 12288 solved and interpolated from them. That is the hazard, and it is still
+# closed: the height never scales with the width here.
+#
+# What the height is NOT is a second thing to match exactly, which is what
+# `fixed_dims` made it and what made this family refuse at every prefill
+# width. A step gathering one row out of 14592 and a measurement gathering one
+# row out of 9216 do the same work -- one row of 5120 -- and the earlier
+# declaration called them different operators over a number that is not work.
+# So the height is now a bounded nuisance and the feature width stays fixed,
+# which keeps the two extents from trading against each other inside one law
+# while letting the selected count be read along on its own.
 #
 # The feature width, operand 0 dimension 1, is fixed for the same reason and
 # is not covered by fixing the height. The bytes the gather moves are the
@@ -484,11 +572,46 @@ FAMILY_CONTRACTS["aten::sub.Tensor"] = FamilyContract(
 # head contract claims and all it claims. This is scoped to the head's gather;
 # the conflicting-width guard the body already applies is a separate mechanism
 # and is untouched.
+_SOURCE_HEIGHT = Nuisance(
+    component="input_shapes[0][0]",
+    measured=True,
+    spread=0.121,
+    evidence=(
+        "at one selected row and a 5120 feature width the gather reads "
+        "5.788e-06 to 5.948e-06 s across six source heights -- 512, 640, "
+        "1024, 9216, 14592 and 16384 -- a 2.8% band over a 32x change in "
+        "height, no wider than the 2.3% repeat spread of its widest single "
+        "point. The 12.1% declared here is the widest disagreement between "
+        "two heights at ANY fixed width, not that one: at 32 selected rows "
+        "height 640 reads 4.681e-06..4.746e-06 s against 4.234e-06.."
+        "4.247e-06 s at height 16384, and a band bounded by the point that "
+        "made it wide is what this module declares. Read off "
+        "headgrid/prices{,_native,_holdout}/head_h*_m*.all.rep*.json, "
+        "pricing_coverage/switch9216/p27_head_9216.tp1.r0.rep*.json and "
+        "pricing_coverage/cached14592/p27_index_14592.tp1.r0.rep*.json"),
+)
+
 FAMILY_CONTRACTS["aten::index.Tensor"] = FamilyContract(
     family="aten::index.Tensor",
     kind="rows",
     rows_from=(1, 0),
-    fixed_dims=((0, 0), (0, 1)),
+    fixed_dims=((0, 1),),
+    nuisance_dims=(
+        DimContract(
+            position=0,
+            dimension=0,
+            low=512,
+            high=16384,
+            nuisance=_SOURCE_HEIGHT,
+            rationale=("the gather reads the selected rows wherever they sit, "
+                       "so the height it selects from is an address range and "
+                       "not work. The span is the hull of the heights that "
+                       "have been measured -- 512 to 16384 -- and is NOT a "
+                       "claim about every prefill height: outside it the "
+                       "literal height is kept and two operators differing in "
+                       "it go on refusing each other"),
+        ),
+    ),
     values=(
         ValueContract(
             position=1,
@@ -504,7 +627,8 @@ FAMILY_CONTRACTS["aten::index.Tensor"] = FamilyContract(
         ),
     ),
     rationale=("gathers operand 1's rows out of operand 0; the selected count "
-               "is the width and the source height is fixed, never scaled"),
+               "is the width, the feature width is fixed and never scaled, "
+               "and the source height is a nuisance inside its measured span"),
 )
 
 # `aten::slice.Tensor` is priced by its ALIAS, not by a row law. Its operand is
@@ -642,19 +766,31 @@ def grouping_key(op: dict) -> tuple:
     )
 
 
-def _fixed_shapes(op: dict) -> Any:
-    """``input_shapes`` with the family's fixed dimensions marked as fixed.
+def _declared_shapes(op: dict) -> Any:
+    """``input_shapes`` with the family's dimension declarations applied.
 
-    A marked dimension is carried as a string rather than an integer, so both
+    A fixed dimension is carried as a string rather than an integer, so both
     :func:`aligns` and :func:`infer_rows` reach it on their equality branch and
     never on their multiple-of-the-rows branch. That is the whole mechanism:
     no separate comparison pass, no position arithmetic on the flattened key,
     and nothing to keep in step between the two functions.
+
+    A :class:`DimContract` dimension is carried as the SAME string whatever its
+    value, so the two sides compare equal and the dimension drops out of the
+    comparison -- but only while the value is inside the contract's measured
+    span. Outside it the dimension is carried as a FIXED value, not as a bare
+    integer, which leaves the operators refusing each other exactly as they did
+    before the declaration existed: a height no measurement has reached is not
+    covered by a band measured somewhere else, and leaving the integer bare
+    would re-open the multiple-of-the-rows branch on a dimension that is not
+    work -- two gathers whose height and count share a coefficient would then
+    read as one operator at two widths.
     """
     shapes = op.get("input_shapes") or ()
     contract = contract_for(op.get("name", ""))
     fixed = contract.fixed_dims if contract is not None else ()
-    if not fixed:
+    dims = contract.nuisance_dims if contract is not None else ()
+    if not fixed and not dims:
         return shapes
     out = [list(s) if isinstance(s, (list, tuple)) else s for s in shapes]
     for position, dimension in fixed:
@@ -662,6 +798,14 @@ def _fixed_shapes(op: dict) -> Any:
             continue
         if dimension < len(out[position]):
             out[position][dimension] = f"fixed:{out[position][dimension]}"
+    for dim in dims:
+        if dim.position >= len(out) or not isinstance(out[dim.position], list):
+            continue
+        if dim.dimension >= len(out[dim.position]):
+            continue
+        value = out[dim.position][dim.dimension]
+        out[dim.position][dim.dimension] = (
+            "nuisance" if dim.covers(value) else f"fixed:{value}")
     return out
 
 
@@ -669,7 +813,7 @@ def _abstracted_int_values(op: dict) -> tuple:
     """``int_values`` with declared-and-validated contents reduced to extent.
 
     The operator is not modified: this is the comparison's view of it, built
-    fresh on each call, in the same spirit as :func:`_fixed_shapes`. A position
+    fresh on each call, in the same spirit as :func:`_declared_shapes`. A position
     with no declaration, or one whose contents fail the declared validation,
     is carried through with its values intact and so goes on matching nothing
     but an identical vector.
@@ -714,7 +858,7 @@ def _values(op: dict) -> list:
         else:
             out.append(value)
 
-    walk(_fixed_shapes(op))
+    walk(_declared_shapes(op))
     walk(tuple(op.get("dtypes") or ()))
     # Addresses summarised to (count, void count) first, on the same rule the
     # cost key uses. The parametric path has to reach the cost key's verdict:
@@ -739,7 +883,15 @@ def _values(op: dict) -> list:
     walk(tuple((k, v) for k, v in (tuple(x) for x in op.get("scalars") or ())))
     for key, value in (tuple(x) for x in op.get("launch") or ()):
         if key == "grid":
-            walk(tuple(value))
+            # Marked, not walked as plain integers. A grid dimension is the
+            # work divided by the kernel's tile, and the multiple rule below
+            # cannot express that: 912 blocks at 14592 rows against 576 at
+            # 9216 is one tile of 16 on both sides, and comparing the two as
+            # ordinary integers refused every pair of widths this family was
+            # ever measured at. The marker keeps the sub-multiple rule to the
+            # launch grid and away from every other integer in the key.
+            walk(tuple(_GridDim(int(v)) if isinstance(v, int)
+                       and not isinstance(v, bool) else v for v in value))
     # How the operands sit in memory, on the same footing as the shapes.
     #
     # `signature_of` excludes layout deliberately, so without this a strided
@@ -758,6 +910,38 @@ def _values(op: dict) -> list:
     return out
 
 
+def _tile_of(dim, rows: int) -> Optional[int]:
+    """The tile a grid dimension implies at this width, when it implies one.
+
+    ``None`` unless the rows divide EXACTLY by the grid dimension. A kernel
+    launched over a partial tile -- 7 blocks over 100 rows at a tile of 16 --
+    has a last block doing less work than the others, and nothing here knows
+    what that costs, so it is refused rather than rounded. That is the same
+    fail-closed direction the rest of this module takes.
+    """
+    if not isinstance(dim, _GridDim):
+        return None
+    if dim.value <= 0 or rows <= 0 or rows % dim.value:
+        return None
+    return rows // dim.value
+
+
+def _same_tile(x, rows_a: int, y, rows_b: int) -> bool:
+    """Whether two grid dimensions are one launch geometry at two widths."""
+    tile_a, tile_b = _tile_of(x, rows_a), _tile_of(y, rows_b)
+    return tile_a is not None and tile_a == tile_b
+
+
+def _plain(dim):
+    """The grid dimension as the integer it is, marker removed.
+
+    The sub-multiple rule is an ADDITION to the ordinary multiple rule, not a
+    replacement for it: a grid of ``rows * 28`` is still the proportional
+    launch it always was, and it reaches the ordinary branch through here.
+    """
+    return dim.value if isinstance(dim, _GridDim) else dim
+
+
 def aligns(op_a: dict, rows_a: int, op_b: dict, rows_b: int) -> bool:
     """Whether these are the same operator run at two widths.
 
@@ -768,6 +952,12 @@ def aligns(op_a: dict, rows_a: int, op_b: dict, rows_b: int) -> bool:
 
     At ``rows_a == rows_b`` this is exact key equality: equal values pass, and
     unequal ones cannot share a multiple of the same divisor.
+
+    A launch grid dimension can also be the rows DIVIDED by a tile, which is
+    neither of those. That case is settled by :func:`_same_tile`, and only
+    because :func:`_values` marked it -- see :class:`_GridDim`. A grid that is
+    not an equal quotient falls through to the ordinary rule, so a
+    proportional ``rows * 28`` launch is read exactly as it was before.
     """
     if rows_a <= 0 or rows_b <= 0:
         return False
@@ -777,6 +967,10 @@ def aligns(op_a: dict, rows_a: int, op_b: dict, rows_b: int) -> bool:
     for x, y in zip(va, vb):
         if x == y:
             continue
+        if isinstance(x, _GridDim) or isinstance(y, _GridDim):
+            if _same_tile(x, rows_a, y, rows_b):
+                continue
+            x, y = _plain(x), _plain(y)
         if (isinstance(x, bool) or isinstance(y, bool)
                 or not isinstance(x, int) or not isinstance(y, int)):
             return False
@@ -808,6 +1002,20 @@ def infer_rows(op: dict, measured_op: dict, measured_rows: int) -> Optional[int]
     for x, y in zip(va, vb):
         if x == y:
             continue
+        if isinstance(x, _GridDim) or isinstance(y, _GridDim):
+            # The grid says the rows directly: the measured side fixes the
+            # tile, and this side's block count times that tile is the width
+            # this operator ran at. Refused where either side is not an exact
+            # number of whole tiles, on the same rule as `_tile_of`.
+            tile = _tile_of(y, measured_rows)
+            if tile is not None and isinstance(x, _GridDim) and x.value > 0:
+                solved = x.value * tile
+                if candidate is None:
+                    candidate = solved
+                elif candidate != solved:
+                    return None
+                continue
+            x, y = _plain(x), _plain(y)
         if (isinstance(x, bool) or isinstance(y, bool)
                 or not isinstance(x, int) or not isinstance(y, int)):
             return None
