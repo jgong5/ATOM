@@ -461,7 +461,13 @@ class ModelTracer:
             # Before the `aiter` import below, which is what triggers the query.
             from atom.compass.replay.bootstrap import install_from_target
 
-            bootstrap = install_from_target(replay_target)
+            # Labelled by what this read is for. The same process may already
+            # have read the *deployment's* target to bootstrap itself; this is
+            # the file this factory's own `replay_target` option names, and a
+            # record that conflated the two would let either stand in for the
+            # other.
+            bootstrap = install_from_target(replay_target,
+                                            role="oracle.replay_target")
         from aiter import init_dist_env
 
         # Derivation builds the group at world size ONE, whatever TP width is

@@ -310,7 +310,7 @@ class TestTheContractWithTheServedPath:
         assert SourceComposition._fields == (
             "oracle", "body_graphs", "head_graphs", "deriver", "build_seconds",
             "allocation", "rank_coords", "rank_artifacts",
-            "interpolation_limit")
+            "interpolation_limit", "loaded_inputs")
 
 
 def _rank_price_file(tmp_path, name, signature):

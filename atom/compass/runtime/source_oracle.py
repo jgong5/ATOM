@@ -123,7 +123,31 @@ def gap_ratio(value, what: str = "interpolate"):
     return ratio
 
 
-def _price_library(entries, gap_ratio):
+def price_reader_resolves_ranks() -> bool:
+    """Whether `PriceLibrary` resolves this rank's price file for itself.
+
+    A transitional seam, and it is here rather than hidden in a ``try`` because
+    which side resolves decides what the record says. Resolution has to happen
+    exactly once, at the read, so that the record can hold both the stem the
+    option carried and the file this rank was actually served. While the
+    library still takes paths pre-resolved, this factory keeps resolving them
+    -- otherwise a TP>1 run would silently stop reading its own prices, which
+    is a worse outcome than a coarser record.
+
+    Delete this, and the branches it guards, once `PriceLibrary.add` takes
+    ``coords``.
+    """
+    import inspect
+
+    from atom.compass.core.cost.library import PriceLibrary
+
+    try:
+        return "coords" in inspect.signature(PriceLibrary.add).parameters
+    except (TypeError, ValueError):  # pragma: no cover - odd callables
+        return False
+
+
+def _price_library(entries, gap_ratio, coords=None):
     """The exact-signature library, or the family provider in front of it.
 
     The provider is a subclass that overrides `lookup` alone, so everything
@@ -133,23 +157,28 @@ def _price_library(entries, gap_ratio):
 
     Off by default. An interpolated price is a claim about a row count nobody
     ran, and a run that did not ask for one should not silently get one.
+
+    ``coords`` is offered only where the library resolves ranks itself; see
+    :func:`price_reader_resolves_ranks`. Both branches go through ``add``, so
+    there is one call site to add the argument to rather than two.
     """
     from atom.compass.core.cost.library import PriceLibrary
 
     if gap_ratio is None:
-        return PriceLibrary.load(entries)
+        library = PriceLibrary()
+    else:
+        from atom.compass.core.cost.families import ParametricPriceLibrary
 
-    from atom.compass.core.cost.families import ParametricPriceLibrary
-
-    library = (ParametricPriceLibrary()
-               if gap_ratio is _DEFAULT_GAP_RATIO
-               else ParametricPriceLibrary(max_gap_ratio=gap_ratio))
+        library = (ParametricPriceLibrary()
+                   if gap_ratio is _DEFAULT_GAP_RATIO
+                   else ParametricPriceLibrary(max_gap_ratio=gap_ratio))
+    extra = {"coords": coords} if coords else {}
     for entry in entries:
         if isinstance(entry, (tuple, list)):
             library.add(entry[0], entry[1] if len(entry) > 1 else None,
-                        entry[2] if len(entry) > 2 else None)
+                        entry[2] if len(entry) > 2 else None, **extra)
         else:
-            library.add(entry, None, None)
+            library.add(entry, None, None, **extra)
     return library
 
 
@@ -271,7 +300,8 @@ def template_shape(graph: dict):
     )
 
 
-def seeded_graphs(paths, derive, allocation, coords=None):
+def seeded_graphs(paths, derive, allocation, coords=None, *,
+                  role="oracle.template", collect=None):
     """A `TemplateGraphs` holding the graphs already on disk, keyed by spec.
 
     ``coords`` resolves each path to this rank's file where one was written,
@@ -281,18 +311,21 @@ def seeded_graphs(paths, derive, allocation, coords=None):
     reading it would erase the difference between a graph derived for this rank
     and one borrowed from the representative. `TemplateGraphs` serves the
     borrow deliberately, on a miss, and counts it as a representative hit.
-    """
-    import json
 
-    from atom.compass.core.artifacts import resolve_rank_path
+    ``collect``, where given, is a list each template's `LoadedInput` is
+    appended to under ``role``. The identity is taken here because here is
+    where the bytes are parsed: a caller that digested these paths afterwards
+    would describe whatever is at them *then*, and would be digesting the stem
+    the option carried rather than the per-rank file that was served.
+    """
+    from atom.compass.core.loaded_input import load_json
     from atom.compass.runtime.templates import TemplateGraphs, template_key
 
     graphs = {}
-    for path in paths:
-        if coords:
-            path = resolve_rank_path(path, coords)[0]
-        with open(path, encoding="utf-8") as fh:
-            graph = json.load(fh)
+    for requested in paths:
+        graph, loaded = load_json(requested, role=role, coords=coords)
+        if collect is not None:
+            collect.append(loaded)
         graphs[template_key(template_shape(graph))] = graph
     return TemplateGraphs(graphs, derive=derive, allocation=allocation)
 
@@ -332,6 +365,16 @@ class SourceComposition(NamedTuple):
     #: number, and the number is the part a reader has to be able to check.
     #: ``None`` means no price could be fitted at all.
     interpolation_limit: float | None = None
+    #: Every artifact this composition actually loaded, as the reader that
+    #: parsed it described it -- a `LoadedInput` per file, carrying the digest
+    #: of the bytes that were parsed and which rank's file they came from.
+    #:
+    #: Distinct from `rank_artifacts`, which answers "was this rank's own file
+    #: there?" from the paths alone and can be computed without opening
+    #: anything. This answers "what did this rank load?", which no later
+    #: reader can reconstruct: the option is a DSL over stems, and the files
+    #: it names can change after the load.
+    loaded_inputs: tuple = ()
 
 
 def source_cost_oracle(*, rank_coords=None, **kwargs):
@@ -435,11 +478,21 @@ def build_source_oracle(
             "refused for want of a graph. Seed a template or turn derivation "
             "on.")
 
-    price_entries = price_specs(_entries(price, "price"), coords)
-    library = _price_library(price_entries, gap_ratio(interpolate))
+    requested_prices = _entries(price, "price")
+    # Resolve the rank's file exactly once, and as late as possible. Where the
+    # library reads for itself, it is handed the stems the option carried and
+    # resolves as it loads, so its record holds both the stem asked for and
+    # the file served. Until then this factory keeps resolving, because a TP>1
+    # run that silently stopped reading its own prices would be a worse defect
+    # than a coarser record. See `price_reader_resolves_ranks`.
+    library_resolves = price_reader_resolves_ranks()
+    price_entries = price_specs(requested_prices,
+                                None if library_resolves else coords)
+    library = _price_library(price_entries, gap_ratio(interpolate),
+                             coords if library_resolves else None)
     regions_model = region_model(regions)
     rank_artifacts = _rank_artifacts(
-        coords, _entries(price, "price"), templates, head_templates)
+        coords, requested_prices, templates, head_templates)
 
     allocation_choice = str(allocation or "").strip().lower()
     if allocation_choice and carry_allocation:
@@ -515,9 +568,13 @@ def build_source_oracle(
         if head:
             head_deriver = ShapeDeriver(tracer, region="head", **common)
 
-    body_graphs = seeded_graphs(templates, body_deriver, allocation, coords)
+    seeded_inputs: list = []
+    body_graphs = seeded_graphs(templates, body_deriver, allocation, coords,
+                                role="oracle.template",
+                                collect=seeded_inputs)
     head_graphs = (seeded_graphs(head_templates, head_deriver, allocation,
-                                 coords)
+                                 coords, role="oracle.head_template",
+                                 collect=seeded_inputs)
                    if head else None)
     _report_rank_binding(coords, body_graphs, head_graphs, derive)
     oracle = LibraryCostOracle(
@@ -535,9 +592,55 @@ def build_source_oracle(
     # the attribute absent knows the oracle is not taking allocations.
     if allocation is not None and getattr(allocation, "measured", False):
         oracle.native_allocation = allocation
+    loaded_inputs = _loaded_inputs(library, seeded_inputs, derive)
+    # Attached to the oracle, and not only returned in the composition, for
+    # the same reason `native_allocation` is: `source_cost_oracle` is what a
+    # served run names, and it hands back the oracle alone. Everything else
+    # here would be discarded before `CompassPredictMixin` ever saw it -- so a
+    # record that lived only in the composition would describe the diagnostic
+    # path and never the served one, which is the path that has to be
+    # attributable.
+    #
+    # A tuple, so what the worker later exposes cannot be edited by anything
+    # that gets a reference to the oracle.
+    oracle.compass_loaded_inputs = loaded_inputs
     return SourceComposition(oracle, body_graphs, head_graphs, body_deriver,
                              build_seconds, allocation, coords, rank_artifacts,
-                             getattr(library, "max_gap_ratio", None))
+                             getattr(library, "max_gap_ratio", None),
+                             loaded_inputs)
+
+
+def _loaded_inputs(library, seeded, derive) -> tuple:
+    """Every artifact this composition loaded, as its reader described it.
+
+    Collected from the readers rather than re-derived from the options, which
+    is the whole point: the option is a DSL over stems and the files it names
+    can change after the load, so only the reader can say what was read.
+
+    Three sources, because there are three readers:
+
+    * the price library, which reports its own reads once it takes identities.
+      Until then it reports none, and a price is absent from this record
+      rather than misdescribed in it -- an absent input reads as "unrecorded"
+      downstream, where a guessed one would read as evidence.
+    * the seeded templates, collected as `seeded_graphs` parses them.
+    * the replay target the derivation read to answer its architecture query,
+      taken from `bootstrap.state()` rather than reopened. Filtered to the
+      oracle role: the same process may also have read the deployment's own
+      target to bootstrap itself, and that is a different input belonging to
+      the runtime side of the record.
+    """
+    from atom.compass.core.loaded_input import LoadedInput
+
+    found = list(getattr(library, "loaded_inputs", ()) or ())
+    found.extend(seeded)
+    if derive:
+        from atom.compass.replay import bootstrap
+
+        for row in bootstrap.state().get("inputs") or ():
+            if row.get("role") == "oracle.replay_target":
+                found.append(LoadedInput.from_dict(row))
+    return tuple(found)
 
 
 def _rank_artifacts(coords, prices, templates, head_templates) -> dict:
