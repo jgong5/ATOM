@@ -28,10 +28,21 @@ verdict = base.verdict
 validate = base.validate
 _write = base._write
 
+#: A modelled side's published budget: the count it served and the terms it
+#: was derived with, as the passing cell states them. The terms are what
+#: section 6's memory gate compares; without them every test here that leaves
+#: the modelled budget otherwise well-formed would fail on the missing lineage
+#: rather than on the one property it varies.
 CAPTURED = {"kind": "captured", "served": True,
-            "hardware_reference": "MI308X", "lineage": ["/x/target.json"],
+            "hardware_reference": "MI308X",
+            "num_kvcache_blocks": base.MODELLED_KV_BLOCKS,
+            "lineage": dict(base.MODELLED_MEMORY_TERMS),
             "deployment": {"num_kvcache_blocks": 4096}}
-MEASURED = dict(CAPTURED, kind="device-measured")
+#: A reference side's: sized by the device it ran on, so its lineage names the
+#: files it read rather than terms it derived from them.
+MEASURED = dict(CAPTURED, kind="device-measured",
+                num_kvcache_blocks=base.KV_BLOCKS,
+                lineage=["/x/target.json"])
 
 
 def _rank(cell_dir, side, **changes):

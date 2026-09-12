@@ -1086,6 +1086,223 @@ def check_reference_budget_is_measured(real, label: str) -> list[str]:
     return bad
 
 
+#: Protocol section 6, in numbers: "Non-KV memory terms <= 10 %, KV block count
+#: <= 5 %". The block count is the tighter of the two because it is the one the
+#: schedule is made of -- a pool wrong by 5% changes how many requests coexist,
+#: and everything the comparison measures follows from that.
+MEMORY_TERM_TOLERANCE = 0.10
+KV_BLOCK_TOLERANCE = 0.05
+
+#: The terms both sides state, by the names both sides use. `total` and `free`
+#: are here and not only the three that move: `total` says which card the
+#: profile describes, and `free` is where the weight term and the loader
+#: residue land, so a weight error that happens not to move the pool is visible
+#: in exactly one of these five and nowhere else.
+GATED_MEMORY_TERMS = (
+    "total",
+    "free",
+    "peak_torch",
+    "non_torch",
+    "cudagraph_overhead",
+)
+
+#: What the real side writes its readings as. Checked rather than assumed, for
+#: the reason every other schema here is.
+MEMORY_RECORD_VERSION = 1
+
+
+def _memory_records(cell_dir: Path, repeat: int) -> list:
+    """The real side's memory records for one repeat, one per rank.
+
+    Rank-suffixed at TP>1 (`real.r1_memory.tp2.json`) and bare at TP1, which is
+    the runner's own `rank_path` convention; globbed rather than reconstructed
+    so the validator does not have to restate it.
+    """
+    return sorted(cell_dir.glob(f"real.r{repeat}_memory*.json"))
+
+
+def _relative(modelled, real):
+    """|modelled - real| / real, or None when there is nothing to divide by.
+
+    A real zero is not a tolerance: 0 against 0 is agreement and 0 against
+    anything else is unbounded error, and neither is a percentage. The caller
+    is told which it has, rather than being handed a number that hides it.
+    """
+    if not isinstance(modelled, (int, float)) or not isinstance(real, (int, float)):
+        return None
+    if real == 0:
+        return 0.0 if modelled == 0 else float("inf")
+    return abs(float(modelled) - float(real)) / abs(float(real))
+
+
+def check_memory_terms(real, modelled, cell_dir: Path, repeat: int, label: str):
+    """The gate protocol section 6 declares and nothing implemented.
+
+    Two numbers exist for every memory term in this cell: what the card
+    reported to the engine that served the workload, and what the memory model
+    derived for the engine that predicted it. Until now they were never held
+    against each other. `check_capacity_inputs` asks where the modelled budget
+    came from and `check_reference_budget_is_measured` asks whether the real
+    one came off a card -- both are provenance questions, and a profile with
+    immaculate provenance and a gigabyte of error passed them both.
+
+    Strictly one-way. The real record is read here and nowhere else; nothing in
+    it reaches a profile, a calibration or a prediction, and the same digests
+    are added to the cell's `forbidden` set so a modelled run that read one is
+    refused. The comparison is a verdict on the model, not an input to it.
+
+    Returns `(failures, measured)` -- the second is the per-term arithmetic,
+    kept in the verdict whether it passed or failed, because a gate that
+    records only its own boolean cannot be re-read later.
+    """
+    records = _memory_records(cell_dir, repeat)
+    if not records:
+        missing = (
+            f"{label}: no real.r{repeat}_memory*.json, so the terms the card "
+            f"reported were never recorded and section 6's memory gate has no "
+            f"reference side. Pass --compass-memory-out on the real server"
+        )
+        return [missing], {}
+
+    modelled_ranks = _rank_records(modelled)
+    real_ranks = _rank_records(real)
+    bad, measured = [], {"terms": [], "blocks": []}
+
+    for index, path in enumerate(records):
+        where = f"{label}: rank {index}"
+        try:
+            record = json.loads(path.read_text())
+        except (OSError, ValueError) as exc:
+            bad.append(f"{where}: {path.name} could not be read ({exc})")
+            continue
+        if record.get("version") != MEMORY_RECORD_VERSION:
+            bad.append(
+                f"{where}: {path.name} is a version {record.get('version')!r} "
+                f"memory record, not {MEMORY_RECORD_VERSION}; its fields do "
+                f"not necessarily mean what is read from them here"
+            )
+            continue
+        readings = record.get("readings") or {}
+        if not readings:
+            bad.append(
+                f"{where}: {path.name} records no readings, so the run it "
+                f"describes cannot be the reference for anything"
+            )
+            continue
+
+        # The modelled side states its terms in the lineage of the budget it
+        # served -- the one `derived_block_info` filled in as it derived them,
+        # not a second reading taken afterwards.
+        rank = modelled_ranks[index] if index < len(modelled_ranks) else None
+        lineage = (_budget_record((rank or {}).get("budget_source")) or {}).get(
+            "lineage"
+        )
+        # A dict and only a dict. A bare list of paths is a lineage that names
+        # its sources without stating the terms it derived from them, and
+        # reading terms off one would raise rather than refuse.
+        if not isinstance(lineage, dict) or not lineage:
+            bad.append(
+                f"{where}: the modelled run states no derivation lineage with "
+                f"terms in it, so what its budget was computed with is "
+                f"unstated and cannot be compared with the card's"
+            )
+            continue
+
+        for term in GATED_MEMORY_TERMS:
+            got, want = lineage.get(term), readings.get(term)
+            if want is None:
+                bad.append(
+                    f"{where}: the real record states no {term}, so that term "
+                    f"has no reference value"
+                )
+                continue
+            if got is None:
+                bad.append(
+                    f"{where}: the modelled budget's lineage states no {term}, "
+                    f"so the term it was computed with is unrecorded"
+                )
+                continue
+            error = _relative(got, want)
+            measured["terms"].append(
+                {
+                    "rank": index,
+                    "term": term,
+                    "real": int(want),
+                    "modelled": int(got),
+                    "relative_error": error,
+                    "tolerance": MEMORY_TERM_TOLERANCE,
+                }
+            )
+            if error is None or error > MEMORY_TERM_TOLERANCE:
+                bad.append(
+                    f"{where}: {term} modelled {got} against a measured "
+                    f"{want} ({'unbounded' if error == float('inf') else f'{error:.1%}'}"
+                    f", over the {MEMORY_TERM_TOLERANCE:.0%} this protocol gates "
+                    f"non-KV terms at)"
+                )
+
+        # The block count, tighter, and taken from each side's own statement of
+        # what it served rather than recomputed here. The real record carries
+        # the engine's reply; the modelled run carries the count it published
+        # at the branch that chose it.
+        want = (record.get("blocks") or {}).get("num_kvcache_blocks")
+        got = (
+            _budget_record((rank or {}).get("budget_source")) or {}
+        ).get("num_kvcache_blocks")
+        # Cross-checked against the real side's own published count. They are
+        # the same number by two routes -- the file the engine wrote and the
+        # record the server published -- and a disagreement means one of them
+        # does not describe this run.
+        published = (
+            _budget_record(
+                (real_ranks[index] if index < len(real_ranks) else {}).get(
+                    "budget_source"
+                )
+            )
+            or {}
+        ).get("num_kvcache_blocks")
+        if want is not None and published is not None and int(want) != int(published):
+            bad.append(
+                f"{where}: the real memory record says the engine sized "
+                f"{want} KV blocks and the real server published {published}; "
+                f"one of the two is not this run"
+            )
+        if want is None or got is None:
+            bad.append(
+                f"{where}: KV block count unstated on the "
+                f"{'real' if want is None else 'modelled'} side, so the 5% "
+                f"gate has nothing to compare"
+            )
+            continue
+        error = _relative(got, want)
+        measured["blocks"].append(
+            {
+                "rank": index,
+                "real": int(want),
+                "modelled": int(got),
+                "relative_error": error,
+                "tolerance": KV_BLOCK_TOLERANCE,
+            }
+        )
+        if error is None or error > KV_BLOCK_TOLERANCE:
+            bad.append(
+                f"{where}: the modelled deployment sized {got} KV blocks "
+                f"against the real engine's {want} "
+                f"({'unbounded' if error == float('inf') else f'{error:.1%}'}, "
+                f"over {KV_BLOCK_TOLERANCE:.0%}). The pool decides how many "
+                f"requests coexist, so every other metric in this cell is "
+                f"downstream of it"
+            )
+
+    if len(records) != len(modelled_ranks):
+        bad.append(
+            f"{label}: {len(records)} real memory records against "
+            f"{len(modelled_ranks)} modelled ranks; the ranks are not "
+            f"symmetric and an unmatched one was not compared"
+        )
+    return bad, measured
+
+
 #: The snapshot schema this reads. Held here rather than imported so the
 #: validator stays loadable without `atom`, and checked rather than assumed:
 #: a record of another schema has fields that do not necessarily mean what is
@@ -2047,7 +2264,12 @@ def _runs(cell: Path, side: str) -> list[Path]:
     found = sorted(
         p
         for p in cell.glob(f"{side}*.json")
-        if not p.name.endswith(".prepare.json") and not p.name.endswith("_steps.json")
+        if not p.name.endswith(".prepare.json")
+        and not p.name.endswith("_steps.json")
+        # `real.r1_memory.json` sits beside `real.r1.json` and matches the same
+        # glob. Counted as a repeat it doubles the real side's repeat count and
+        # is then parsed as a replay record, which it is not.
+        and "_memory" not in p.name
     )
     return found
 
@@ -2493,8 +2715,18 @@ def cell(args) -> int:
         f"step table {p.name}": _digest(p)
         for p in sorted(cell_dir.glob("*_steps*.jsonl"))
     }
+    # The real side's memory readings, for the same reason and with more force:
+    # a profile carrying the card's own `peak_torch` and `non_torch` for this
+    # cell would pass the gate below by construction. It is the reference, and
+    # a run that read it sized itself from the measurement it is predicting.
+    forbidden.update(
+        {
+            f"memory record {p.name}": _digest(p)
+            for p in sorted(cell_dir.glob("real.r*_memory*.json"))
+        }
+    )
 
-    reports = []
+    reports, memory = [], []
     for index, (rp, mp) in enumerate(zip(real_paths, modelled_paths)):
         real = compare.load_run(str(rp), f"real[{index}]")
         modelled = compare.load_run(str(mp), f"modelled[{index}]")
@@ -2522,6 +2754,13 @@ def cell(args) -> int:
         failures += check_predictor_device_freedom(modelled, f"repeat {index}")
         failures += check_capacity_inputs(modelled, f"repeat {index}")
         failures += check_reference_budget_is_measured(real, f"repeat {index}")
+        # Section 6's memory gate. The repeat number the engine wrote the
+        # record under is 1-based; `index` is not.
+        memory_bad, memory_measured = check_memory_terms(
+            real, modelled, cell_dir, index + 1, f"repeat {index}"
+        )
+        failures += memory_bad
+        memory.append(memory_measured)
         if registry is not None:
             failures += [
                 f"repeat {index}: {reason}"
@@ -2577,6 +2816,11 @@ def cell(args) -> int:
         # sound and still not be the experiment.
         "accepted": not failures and bool(reports) and not short_run,
         "metrics": _across_repeats(reports),
+        # Per repeat, per rank, per term: what the card reported and what the
+        # model derived. Kept whether the gate passed or failed -- a boolean
+        # alone cannot be re-read, and the margin is what says whether a term
+        # is comfortable or one run away from refusing.
+        "memory": memory,
         "speedup": _speedup(costs, args.reuse_cells),
     }
     (cell_dir / "cc_traces_cell.json").write_text(json.dumps(verdict, indent=1) + "\n")

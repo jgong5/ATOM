@@ -70,6 +70,36 @@ TARGET_CAPTURE_SHA = "c" * 64
 CELL_REGIONS = "source-27b-tp1-conc-v2"
 
 
+#: What the card reported to the engine that served this cell, in the shape
+#: `--compass-memory-out` writes. The reference side of section 6's memory
+#: gate, and the one number in this file that nothing modelled may be derived
+#: from: it is read to judge a prediction, never to make one.
+REAL_MEMORY_READINGS = {
+    "total": 201_310_699_520,
+    "free": 187_904_819_200,
+    "peak_torch": 58_048_512_000,
+    "non_torch": 1_073_741_824,
+    "cudagraph_overhead": 2_147_483_648,
+}
+
+#: The count that engine sized, and the count the modelled side sized. Two
+#: percent apart, inside the 5% the pool is gated at.
+KV_BLOCKS = 112_773
+MODELLED_KV_BLOCKS = 115_028
+
+#: The lineage a derived budget publishes -- what it was derived from, and the
+#: five terms it was derived *with*, which is what makes it comparable. Two
+#: percent off the readings rather than equal to them: a fixture that passed by
+#: restating the reference would pass a gate that compared nothing.
+MODELLED_MEMORY_TERMS = {
+    "kind": "source-derived",
+    "profile": "/x/target.json",
+    "world_size": 2,
+    "activation_bytes": 4 * 2**30,
+    **{term: int(value * 1.02) for term, value in REAL_MEMORY_READINGS.items()},
+}
+
+
 def region_snapshot_of(name):
     """The real snapshot of a built-in preset, as a run publishes it."""
     from atom.compass.runtime.source_oracle import region_snapshot
@@ -246,7 +276,21 @@ def _server(
                             else "captured",
                             "served": True,
                             "hardware_reference": "MI308X",
-                            "lineage": ["/x/target.json"],
+                            # The count this side served, filled in by
+                            # `get_num_blocks` once the arithmetic has run, and
+                            # -- on the modelled side -- the terms the budget
+                            # was derived with. Section 6 gates both against
+                            # the card's, so a budget stating neither has
+                            # nothing to be gated on. The real side's lineage
+                            # stays a list of paths: it derived nothing.
+                            "num_kvcache_blocks": (
+                                KV_BLOCKS if mode == "measure" else MODELLED_KV_BLOCKS
+                            ),
+                            "lineage": (
+                                ["/x/target.json"]
+                                if mode == "measure"
+                                else dict(MODELLED_MEMORY_TERMS)
+                            ),
                             "deployment": {"num_kvcache_blocks": 4096},
                         },
                         # The coefficients this run priced preparation and
@@ -487,6 +531,28 @@ def _gpu_free(cell_dir, **overrides):
     return evidence
 
 
+def _memory_record(cell_dir, repeat=1, *, readings=None, blocks=KEEP, **over):
+    """The record the real server writes, as `_write_memory` shapes it.
+
+    One per rank at TP>1, rank-suffixed; the passing cell states one modelled
+    rank, so it writes the one bare record that matches.
+    """
+    record = {
+        "version": 1,
+        "readings": dict(REAL_MEMORY_READINGS if readings is None else readings),
+        "blocks": {
+            "num_kvcache_blocks": KV_BLOCKS if blocks is KEEP else blocks,
+            "pool_entries": 1,
+            "pool_entries_per_req": 1,
+        },
+        "config": {"model": "Qwen/Qwen3.8-27B", "topology": {"tp": 2}},
+    }
+    record.update(over)
+    path = Path(cell_dir) / f"real.r{repeat}_memory.json"
+    path.write_text(json.dumps(record))
+    return path
+
+
 @pytest.fixture
 def cell(tmp_path, monkeypatch):
     """A cell that passes, and the pieces to break."""
@@ -521,6 +587,10 @@ def cell(tmp_path, monkeypatch):
         digests={"price": PRICES_SHA},
         files={"price": {"prices.json": PRICES_SHA}},
     )
+    # The terms the card reported, beside the budget they sized. Written by the
+    # real server and read by nothing else: the gate is a verdict on the model,
+    # not an input to it.
+    _memory_record(cell_dir)
     _journal(cell_dir, "real", 1)
     _journal(cell_dir, "modelled", 1)
     (cell_dir / "cc_traces_protocol.json").write_text(
@@ -2991,6 +3061,9 @@ class TestTheCostRecordIsBoundToTheRunsItPriced:
             for index in (2, 3):
                 _write(Path(cell_dir) / f"{side}.r{index}.json", base)
             _journal(cell_dir, side, 3, seconds=seconds)
+        # Every repeat is gated, so every repeat records what the card said.
+        for index in (2, 3):
+            _memory_record(cell_dir, index)
         _gpu_free(cell_dir)
         (Path(cell_dir) / "costs.json").write_text(json.dumps(costs))
         return cell_dir
@@ -3090,6 +3163,8 @@ class TestTheCostRecordIsBoundToWhatTheRunsMeasured:
                 _write(Path(cell_dir) / f"{side}.r{index}.json", base)
         _journal(cell_dir, "real", 3, seconds=real)
         _journal(cell_dir, "modelled", 3, seconds=modelled)
+        for index in (2, 3):
+            _memory_record(cell_dir, index)
         _gpu_free(cell_dir)
         costs = {
             **{t: 10.0 for t in validate.MEASURED_COST_TERMS},
@@ -3222,6 +3297,8 @@ class TestTheRegisteredRepeatsAreWhatAcceptanceIsGradedAgainst:
             for index in (2, 3):
                 _write(Path(cell_dir) / f"{side}.r{index}.json", base)
             _journal(cell_dir, side, 3, seconds=20.0)
+        for index in (2, 3):
+            _memory_record(cell_dir, index)
         _gpu_free(cell_dir)
         costs = {
             **{t: 10.0 for t in validate.MEASURED_COST_TERMS},
@@ -3368,3 +3445,129 @@ class TestTheRegisteredRepeatsAreWhatAcceptanceIsGradedAgainst:
 
     def test_the_whole_registered_matrix_still_passes(self, tmp_path):
         assert validate.main(["matrix"] + _whole_matrix(tmp_path)) == 0
+
+
+class TestEveryMemoryTermIsGatedAgainstTheCard:
+    """Section 6's memory gate, which for a long time was only declared.
+
+    A prediction of a deployment is a prediction of how much of it exists. The
+    provenance checks ask where the modelled budget came from and whether the
+    real one came off a card; neither asks whether the two agree, so a profile
+    with immaculate provenance and a gigabyte of error passed both. These hold
+    the five terms at 10% and the block count they produce at 5%.
+
+    The real record is read here and nowhere else. Its digests join the cell's
+    `forbidden` set, so a modelled run that read one is refused as leakage --
+    the comparison is a verdict on the model, never an input to it.
+    """
+
+    def _budget(self, cell, side="modelled", **overrides):
+        """Rewrite one side's published budget source."""
+        path = cell / f"{side}.r1.json"
+        blob = json.loads(path.read_text())
+        ranks = blob["run"]["server"]["compass"]["loaded_inputs"]["ranks"]
+        for key, value in overrides.items():
+            if value is KEEP:
+                ranks[0]["budget_source"].pop(key, None)
+            else:
+                ranks[0]["budget_source"][key] = value
+        _write(path, blob)
+
+    def test_a_cell_whose_terms_agree_passes_and_records_the_arithmetic(
+        self, cell
+    ):
+        assert run(cell) == 0
+        measured = verdict(cell)["memory"][0]
+        assert {entry["term"] for entry in measured["terms"]} == set(
+            validate.GATED_MEMORY_TERMS
+        )
+        assert all(
+            entry["relative_error"] <= validate.MEMORY_TERM_TOLERANCE
+            for entry in measured["terms"]
+        )
+        # Kept whether it passed or failed: a gate that records only its own
+        # boolean cannot be re-read once the run is over.
+        assert measured["blocks"][0]["real"] == KV_BLOCKS
+        assert measured["blocks"][0]["modelled"] == MODELLED_KV_BLOCKS
+
+    def test_a_cell_that_never_recorded_the_card_s_terms_is_refused(self, cell):
+        """The reference side has to have been collected while the run ran.
+
+        Nothing about a finished cell can reconstruct it, which is why this is
+        a refusal and not a skip: a comparison that silently does not happen
+        reads exactly like one that passed.
+        """
+        (cell / "real.r1_memory.json").unlink()
+        assert run(cell) == 1
+        assert any("--compass-memory-out" in f for f in verdict(cell)["failures"])
+
+    def test_a_term_outside_ten_percent_is_refused(self, cell):
+        terms = dict(MODELLED_MEMORY_TERMS)
+        terms["non_torch"] = int(REAL_MEMORY_READINGS["non_torch"] * 1.11)
+        self._budget(cell, lineage=terms)
+        assert run(cell) == 1
+        assert any("non_torch modelled" in f for f in verdict(cell)["failures"])
+
+    def test_a_weight_error_that_does_not_move_the_pool_is_still_refused(
+        self, cell
+    ):
+        """Why `free` is gated and not only the three terms that move.
+
+        The block count here is the one the passing cell serves, so every
+        pool-shaped check is satisfied; what is wrong is the reading the
+        weights and the loader residue land in.
+        """
+        terms = dict(MODELLED_MEMORY_TERMS)
+        terms["free"] = int(REAL_MEMORY_READINGS["free"] * 0.8)
+        self._budget(cell, lineage=terms)
+        assert run(cell) == 1
+        assert any("free modelled" in f for f in verdict(cell)["failures"])
+
+    def test_a_block_count_outside_five_percent_is_refused(self, cell):
+        self._budget(cell, num_kvcache_blocks=int(KV_BLOCKS * 1.06))
+        assert run(cell) == 1
+        assert any("KV blocks" in f for f in verdict(cell)["failures"])
+
+    def test_a_lineage_that_states_no_terms_is_refused(self, cell):
+        """A list of paths says what was read, not what was derived."""
+        self._budget(cell, lineage=["/x/target.json"])
+        assert run(cell) == 1
+        assert any(
+            "no derivation lineage" in f for f in verdict(cell)["failures"]
+        )
+
+    def test_a_record_that_disagrees_with_the_real_server_is_refused(self, cell):
+        """Two routes to one number: the file the engine wrote and the record
+        the server published. A disagreement means one is not this run."""
+        _memory_record(cell, blocks=KV_BLOCKS + 1000)
+        assert run(cell) == 1
+        assert any("is not this run" in f for f in verdict(cell)["failures"])
+
+    def test_a_record_of_another_version_is_not_read(self, cell):
+        _memory_record(cell, version=2)
+        assert run(cell) == 1
+        assert any("memory record" in f for f in verdict(cell)["failures"])
+
+    def test_a_record_with_no_readings_is_refused(self, cell):
+        _memory_record(cell, readings={})
+        assert run(cell) == 1
+        assert any("no readings" in f for f in verdict(cell)["failures"])
+
+    def test_a_modelled_run_that_read_the_record_is_leakage(self, cell):
+        """The one thing that would make this gate a fit rather than a test."""
+        path = cell / "real.r1_memory.json"
+        blob = json.loads((cell / "modelled.r1.json").read_text())
+        ranks = blob["run"]["server"]["compass"]["loaded_inputs"]["ranks"]
+        ranks[0]["inputs"].append(
+            {
+                "role": "runtime.memory_model",
+                "requested": str(path),
+                "path": str(path),
+                "rank_own": False,
+                "sha256": validate._digest(path),
+                "size": path.stat().st_size,
+                "rank_coords": {},
+            }
+        )
+        _write(cell / "modelled.r1.json", blob)
+        assert run(cell) == 1

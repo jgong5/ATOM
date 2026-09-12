@@ -232,7 +232,14 @@ def derivation_lineage(profile, calibration, *, path, world, activation,
         "calibration_provenance": dict(calibration.get("provenance") or {}),
         "activation_bytes": int(activation),
         # The derived terms themselves, so a record built from this budget
-        # cannot state a graph pool the budget was not computed with.
+        # cannot state a graph pool the budget was not computed with. All five,
+        # because the acceptance gate is on the terms and not only on the block
+        # count they produce: `total` says which card the profile describes, and
+        # `free` is where the weights and the loader residue land -- with only
+        # the three below, a weight term wrong by a gigabyte was invisible
+        # unless it happened to move the pool by more than its own tolerance.
+        "total": int(readings.get("total") or 0),
+        "free": int(readings.get("free") or 0),
         "peak_torch": int(readings.get("peak_torch") or 0),
         "non_torch": int(readings.get("non_torch") or 0),
         "cudagraph_overhead": int(readings.get("cudagraph_overhead") or 0),

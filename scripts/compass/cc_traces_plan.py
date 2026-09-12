@@ -182,6 +182,8 @@ EVIDENCE = {
     "provenance.real.r{n}.json": "what that server said it was, read when it came up",
     "provenance.modelled.r{n}.json": "the same for the modelled repeat",
     "real.r{n}_steps.jsonl": "that repeat's step table, from that repeat's server",
+    "real.r{n}_memory.json": "the memory terms that repeat's card reported, and "
+                             "the budget the engine made of them",
     "gpu.jsonl": "rocm-smi samples across the whole window, baseline first",
     "isolation.json": "the isolation audit over those samples",
     "costs.real.json": "the seconds the real side measured of itself",
@@ -295,6 +297,16 @@ def _serve(
         # Per repeat: the engine opens this path with "w", so three repeats
         # sharing one name would leave one table and two overwritten ones.
         cmd += ["--compass-measure-out", f"{cell}/real.r{n}_steps.jsonl"]
+        # The terms the card actually reported, beside the budget they sized.
+        # Protocol section 6 gates non-KV memory terms at 10% and the KV block
+        # count at 5%, and until this flag was passed the reference side of
+        # that comparison did not exist: `budget_source` publishes the block
+        # count a run served but not the readings behind it, so there was
+        # nothing to hold the modelled `peak_torch`, `non_torch` or graph pool
+        # against. Written only here -- the modelled side derives these from a
+        # profile and recording them there would compare a prediction with
+        # itself.
+        cmd += ["--compass-memory-out", f"{cell}/real.r{n}_memory.json"]
     return cmd
 
 
@@ -393,7 +405,8 @@ def _lifecycle(
             },
             "produces": (
                 [f"server.{side}.r{n}.log", f"provenance.{side}.r{n}.json"]
-                + ([] if modelled else [f"real.r{n}_steps.jsonl"])
+                + ([] if modelled
+                   else [f"real.r{n}_steps.jsonl", f"real.r{n}_memory.json"])
             ),
         },
         {
