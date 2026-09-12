@@ -725,6 +725,154 @@ def check_scalar_overheads(
     return bad
 
 
+#: Roles that name an input deciding the deployment's actual capacity, as
+#: distinct from the ones that build the cost oracle. A run that sizes its KV
+#: budget from a file read that file; `oracle.replay_target` is a different
+#: file, read by the source factory to answer an architecture query, and it
+#: cannot stand in for a missing one of these.
+RUNTIME_CAPACITY_ROLES = (
+    "runtime.replay_target",
+    "runtime.memory_model",
+    "runtime.memory_in",
+)
+
+#: What the capacity selector may say it chose. The vocabulary is the
+#: selector's own, and only one of these is a measurement taken on the machine
+#: being reported.
+MEASURED_BUDGET_KINDS = ("device-measured",)
+BUDGET_KINDS = MEASURED_BUDGET_KINDS + (
+    "captured",
+    "recorded",
+    "source-derived",
+)
+
+
+def _budget_kind(record):
+    """The kind a budget-source record states, whatever shape it arrives in.
+
+    The selector publishes a record -- the kind, the hardware it refers to,
+    what it served, its lineage -- and that record is worth more than a bare
+    word, so it is carried whole and read here for the one field this has to
+    branch on. A plain string is accepted as the kind it names, because a
+    record that says only that is still saying it.
+    """
+    if record is None:
+        return None
+    if isinstance(record, str):
+        return record or None
+    if isinstance(record, dict):
+        return record.get("kind") or None
+    return None
+
+
+def _rank_records(modelled) -> list:
+    compass = (modelled.manifest.get("server") or {}).get("compass") or {}
+    ranks = ((compass.get("loaded_inputs") or {}).get("ranks")) or []
+    return [rank for rank in ranks if isinstance(rank, dict)]
+
+
+def check_capacity_inputs(modelled, label: str) -> list[str]:
+    """That the run says what sized it, and read something to size it from.
+
+    A prediction is only a prediction of a deployment that could exist. The
+    KV budget decides how many requests fit, which decides the schedule, which
+    is most of what the numbers are; a run that cannot say where that budget
+    came from has not said what it predicted.
+
+    Checked per rank, because sizing is per rank, and against the `runtime.*`
+    roles alone. The oracle's own inputs are a different question with a
+    different answer -- `oracle.replay_target` is read by the source factory
+    to answer AITER's architecture query, not to size anything, and a run
+    carrying only that one declared no capacity input at all.
+    """
+    ranks = _rank_records(modelled)
+    if not ranks:
+        return [
+            (
+                f"{label}: the modelled run records nothing about what its "
+                f"ranks loaded, so what sized its KV budget is unstated"
+            )
+        ]
+    bad = []
+    for index, rank in enumerate(ranks):
+        where = f"{label}: rank {index}"
+        roles = {
+            row.get("role")
+            for row in (rank.get("inputs") or [])
+            if isinstance(row, dict)
+        }
+        capacity = {
+            role
+            for role in roles
+            if role and role.split(".")[0] == "runtime"
+        }
+        if not capacity:
+            oracle_side = sorted(r for r in roles if r and r.startswith("oracle."))
+            bad.append(
+                f"{where} read no capacity input ({', '.join(RUNTIME_CAPACITY_ROLES)}"
+                f"); it read {oracle_side or 'nothing'}, which builds the cost "
+                f"oracle and sizes nothing"
+            )
+        kind = _budget_kind(rank.get("budget_source"))
+        if kind is None:
+            bad.append(
+                f"{where} does not say which reading its KV budget was made "
+                f"from, and an unrecorded source is not a measured one"
+            )
+        elif kind not in BUDGET_KINDS:
+            bad.append(
+                f"{where} declares budget source {kind!r}, which is not one "
+                f"the protocol recognises ({', '.join(BUDGET_KINDS)})"
+            )
+    return bad
+
+
+def check_reference_budget_is_measured(real, label: str) -> list[str]:
+    """The ground-truth side must have been sized by the device it ran on.
+
+    This is the one side whose capacity is not a claim being evaluated: it is
+    the reference the modelled side is compared against. Sized from an
+    analytical profile it is a second prediction, and the comparison is
+    between two models rather than between a model and a machine.
+
+    It cannot be inferred from the cost mode, which is what made this
+    invisible. `CompassConfig` forces the wall clock for `mode="measure"` and
+    says nothing about memory; `get_num_blocks` reaches the analytical path
+    without consulting the mode at all. So a measured run could be sized from
+    a modelled profile with nothing in the record to show it, and every check
+    there was looked at the clock.
+
+    Only the real side, and deliberately. A modelled run is *supposed* to be
+    sized without a device -- that is the whole capability -- so this is a
+    guard on an acceptance role, not a ban on analytical capacity.
+    """
+    ranks = _rank_records(real)
+    if not ranks:
+        return [
+            (
+                f"{label}: the real side records nothing about what sized it, "
+                f"so it cannot be shown to be a measurement of a machine"
+            )
+        ]
+    bad = []
+    for index, rank in enumerate(ranks):
+        kind = _budget_kind(rank.get("budget_source"))
+        if kind is None:
+            bad.append(
+                f"{label}: rank {index} does not say which reading its KV "
+                f"budget was made from; the reference side has to have been "
+                f"sized by the device it ran on, and silence is not that"
+            )
+        elif kind not in MEASURED_BUDGET_KINDS:
+            bad.append(
+                f"{label}: rank {index} was sized from a {kind!r} budget, so "
+                f"the ground-truth side is itself a prediction and the "
+                f"comparison is between two models rather than between a "
+                f"model and a machine"
+            )
+    return bad
+
+
 def check_predictor_device_freedom(modelled, label: str) -> list[str]:
     """That the process which predicted could not have reached a device.
 
@@ -1863,6 +2011,8 @@ def cell(args) -> int:
         ]
         failures += check_source_factory(modelled, args.tp, f"repeat {index}")
         failures += check_predictor_device_freedom(modelled, f"repeat {index}")
+        failures += check_capacity_inputs(modelled, f"repeat {index}")
+        failures += check_reference_budget_is_measured(real, f"repeat {index}")
         if registry is not None:
             failures += [
                 f"repeat {index}: {reason}"

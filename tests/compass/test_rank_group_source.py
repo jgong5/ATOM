@@ -172,6 +172,49 @@ class TestEveryRankIsPricedFromItsOwnTables:
         assert sorted(oracle.selected_ranks) == list(range(WIDTH))
 
 
+class TestTheSelectorDoesNotStandInForTheChildren:
+    """Every price comes from a real `estimate` on that rank's own oracle.
+
+    The selector holds no cache and must not grow one. `LibraryCostOracle`
+    does its body/head, context and layout validation *inside* `estimate`,
+    after the shape is bound -- so anything that answered from a key computed
+    before binding would skip the checks that make the number mean something,
+    and would do it silently.
+    """
+
+    def test_each_rank_s_own_oracle_is_called(self, tmp_path):
+        oracle = source_cost_oracle(**_group(tmp_path))
+        calls = {}
+        for rank in range(WIDTH):
+            child = oracle.oracle_for(rank)
+            real = child.estimate
+            calls[rank] = 0
+
+            def counted(shape, _rank=rank, _real=real):
+                calls[_rank] += 1
+                return _real(shape)
+
+            child.estimate = counted
+
+        _runner("slowest", oracle)._estimate_over_ranks(_shape(0))
+
+        assert calls == {rank: 1 for rank in range(WIDTH)}
+
+    def test_a_repeated_shape_is_priced_again_and_not_replayed(self, tmp_path):
+        """No memoisation at this layer. Two steps of the same shape are two
+        steps, and each one's allocation is bound before it is priced."""
+        oracle = source_cost_oracle(**_group(tmp_path))
+        child = oracle.oracle_for(1)
+        real, calls = child.estimate, []
+        child.estimate = lambda shape: (calls.append(shape), real(shape))[1]
+
+        runner = _runner("slowest", oracle)
+        runner._estimate_over_ranks(_shape(0))
+        runner._estimate_over_ranks(_shape(0))
+
+        assert len(calls) == 2
+
+
 class TestTheRecordNamesEveryRanksFiles:
 
     def test_every_rank_retains_the_identity_of_what_it_read(self, tmp_path):

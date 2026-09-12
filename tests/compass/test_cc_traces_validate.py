@@ -158,9 +158,31 @@ def _server(
                 "ranks": [
                     {
                         "rank_coords": {},
-                        "inputs": [],
+                        "inputs": [
+                            {
+                                "role": "runtime.replay_target",
+                                "requested": "/x/target.json",
+                                "path": "/x/target.json",
+                                "rank_own": False,
+                                "sha256": "f" * 64,
+                                "size": 128,
+                                "rank_coords": {},
+                            }
+                        ],
                         "rolled_sha256": "0" * 64,
-                        "budget_source": "measured" if mode == "measure" else None,
+                        # The record the capacity selector publishes: the kind
+                        # it chose, and enough lineage to say what that kind
+                        # refers to. The real side is sized by the device it
+                        # ran on; the modelled side is sized from the capture
+                        # of one, which is the whole capability.
+                        "budget_source": {
+                            "kind": "device-measured"
+                            if mode == "measure"
+                            else "captured",
+                            "hardware_reference": "MI308X",
+                            "served": {"num_kvcache_blocks": 4096},
+                            "lineage": ["/x/target.json"],
+                        },
                         "device_freedom": _device_freedom(),
                     }
                 ]
