@@ -55,7 +55,8 @@ replay_mod = _load("replay")
 def _plan_steps(**kw):
     built = plan_mod.cell_steps(
         2,
-        "long",
+        "clients_large",
+        4,
         root="/runs",
         oracle="transfer",
         options=(),
@@ -564,6 +565,141 @@ class TestTheArrivalBarrierIsOnlyArmedByTheSideThatCanFillIt:
         assert modelled and real
         assert "--pace" not in modelled[0]
         assert "--pace" in real[0]
+
+
+class TestEveryDescendantIsSubmittedAndCounted:
+    """A client is a root session, and its delegates are load, not ancestry.
+
+    The clients workloads flatten a root's whole busy episode -- its own turns
+    and every request its subagents made -- into one file, several rows of
+    which can share an instant. Nothing downstream may quietly keep a subset of
+    that: a driver that dropped the nested rows, or a count that only counted
+    the root's turns, would arm the barrier for fewer requests than the cell
+    registered, and the run would be a lighter workload wearing the cell's
+    name. These drive `replay.py::main` against the stub, so what is checked is
+    the bodies it really posts.
+    """
+
+    VIRTUAL: ClassVar[dict] = {
+        "compass": {"enabled": True, "mode": "predict", "virtual_clock": True}
+    }
+
+    #: A cell as the generator writes it: two roots, five requests, three of
+    #: them delegated, and two pairs sharing an instant. `output_tokens` is
+    #: unique per row so a posted body can be named.
+    EPISODE: ClassVar[list] = [
+        {"arrival_s": 0.0, "input_tokens": 64, "output_tokens": 11,
+         "client_index": 0, "actor": "root", "json_path": "/requests/0",
+         "agent_id": None, "subagent_type": None, "source_model": "claude-opus-4-8"},
+        {"arrival_s": 0.0, "input_tokens": 64, "output_tokens": 12,
+         "client_index": 0, "actor": "subagent", "json_path": "/requests/1/requests/0",
+         "agent_id": "sub_1", "subagent_type": "Subagent",
+         "source_model": "claude-opus-4-8"},
+        {"arrival_s": 0.02, "input_tokens": 64, "output_tokens": 13,
+         "client_index": 0, "actor": "subagent", "json_path": "/requests/1/requests/1",
+         "agent_id": "sub_1", "subagent_type": "Subagent",
+         "source_model": "claude-opus-4-8"},
+        {"arrival_s": 0.02, "input_tokens": 64, "output_tokens": 14,
+         "client_index": 1, "actor": "root", "json_path": "/requests/0",
+         "agent_id": None, "subagent_type": None, "source_model": "claude-opus-4-8"},
+        {"arrival_s": 0.05, "input_tokens": 64, "output_tokens": 15,
+         "client_index": 1, "actor": "subagent", "json_path": "/requests/2/requests/0",
+         "agent_id": "sub_2", "subagent_type": "Subagent",
+         "source_model": "claude-opus-4-8"},
+    ]
+
+    def _trace(self, tmp_path):
+        path = tmp_path / "cc_traces_clients.jsonl"
+        path.write_text("".join(json.dumps(r) + "\n" for r in self.EPISODE))
+        return path
+
+    def _run(self, base, tmp_path, *extra):
+        out = tmp_path / "out.json"
+        return (
+            replay_mod.main(
+                [
+                    "--port",
+                    base.rsplit(":", 1)[1],
+                    "--model",
+                    "m",
+                    "--trace",
+                    str(self._trace(tmp_path)),
+                    "--out",
+                    str(out),
+                    "--timeout",
+                    "20",
+                    *extra,
+                ]
+            ),
+            out,
+        )
+
+    def test_every_row_is_posted_delegates_included(self, served, tmp_path):
+        base, stub = served
+        stub.provenance = self.VIRTUAL
+        code, _ = self._run(base, tmp_path)
+        assert code == 0
+        assert sorted(b["max_tokens"] for b in stub.posted) == [11, 12, 13, 14, 15]
+
+    def test_the_barrier_is_armed_for_the_whole_episode(self, served, tmp_path):
+        """Five, not the two turns the roots themselves made. A count of two
+        opens the barrier while three requests of the cell are still to come."""
+        base, stub = served
+        stub.provenance = self.VIRTUAL
+        code, _ = self._run(base, tmp_path)
+        assert code == 0
+        assert {b["compass_workload_size"] for b in stub.posted} == {len(self.EPISODE)}
+
+    def test_two_requests_at_one_instant_are_two_arrivals(self, served, tmp_path):
+        """The overlap is what these workloads are for, so it has to survive
+        the driver: rows sharing an instant are neither merged nor nudged."""
+        base, stub = served
+        stub.provenance = self.VIRTUAL
+        self._run(base, tmp_path)
+        assert sorted(b["compass_arrival"] for b in stub.posted) == [
+            0.0,
+            0.0,
+            0.02,
+            0.02,
+            0.05,
+        ]
+
+    def test_the_provenance_a_row_carries_is_not_something_to_select_on(
+        self, served, tmp_path
+    ):
+        """`actor`, `agent_id` and `json_path` exist to trace a row back to the
+        corpus. The driver reads none of them, and a row is served the same
+        whoever issued it."""
+        base, stub = served
+        stub.provenance = self.VIRTUAL
+        self._run(base, tmp_path)
+        for body in stub.posted:
+            assert not {"actor", "agent_id", "json_path", "client_index"} & set(body)
+        assert len({b["max_tokens"] for b in stub.posted}) == len(self.EPISODE)
+
+    def test_the_paced_side_sends_the_same_requests(self, served, tmp_path):
+        """The real side is paced and so declares no count. What it must not
+        do is send a different set: the two sides of a cell are compared on
+        identical request identities."""
+        base, stub = served
+        stub.provenance = {}
+        code, _ = self._run(base, tmp_path, "--pace")
+        assert code == 0
+        assert sorted(b["max_tokens"] for b in stub.posted) == [11, 12, 13, 14, 15]
+        assert not any("compass_workload_size" in b for b in stub.posted)
+
+    def test_the_plan_asks_for_no_subset_of_the_file(self):
+        """`--num-requests` truncates a trace after sorting by arrival, which
+        on these workloads would cut the tail of the busiest episodes, and
+        `--time-scale` would compress the overlap. Neither appears on either
+        side, and both sides read the same registered file."""
+        commands = _commands("replay")
+        assert commands
+        for command in commands:
+            assert "--num-requests" not in command
+            assert "--time-scale" not in command
+        traces = {c[c.index("--trace") + 1] for c in commands}
+        assert traces == {plan_mod.workload("clients_large", 4)}
 
 
 class TestABarrierThatActuallyTimedOutFailsTheRun:

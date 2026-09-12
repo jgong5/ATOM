@@ -27,7 +27,13 @@ the width being evaluated is what made every long-input result a fit statistic.
 Cells already run under `PROTOCOL.md` keep their lock, their stamps and their
 labels. Nothing here relabels them.
 
-## 1. The workload, registered by digest
+## 1. The original two classes, registered by digest
+
+**These are the workloads of the six-cell matrix.** They remain registered, and
+the cells already run against them keep their meaning. The acceptance matrix
+this protocol now governs is §1B's, which adds an offered-load axis and replays
+the delegated-agent concurrency §1 deliberately refused. Both registrations are
+live; a cell says which one it ran.
 
 Two classes, both drawn from `semianalysisai/cc-traces-weka-062126-256k`
 (`traces.jsonl`, 568 864 747 bytes, sha256
@@ -126,6 +132,156 @@ whose throughput was the arrival rate at every width. §9.2 records the change.
 * Replay is **open loop**. Arrivals are the trace's, not a function of how fast
   the server answers; no think-time feedback is modelled and none is claimed.
 
+## 1B. The clients matrix, registered by digest
+
+§1's two classes each offer one fixed amount of work, and both refuse to overlap
+the delegated-agent requests the corpus contains (§9.7). This registration adds
+an **offered-load axis** and stops refusing that concurrency: it replays it.
+
+A **client** is one top-level root session. It is not a cap on in-flight
+requests: every eligible descendant of a root is replayed at its own recorded
+offset and contributes load, so a single client can have several requests in the
+server at once. There is no request semaphore anywhere in the driver.
+
+Selected by the rule in `scripts/compass/cc_traces_clients_workload.py`
+(sha256 `3f54059888d51f01d7c2ff282231f4d385d9f3bbd6073fbf4b4d0321b557c37a`),
+which loads `cc_traces_workload.py`
+(sha256 `d0a1dc1be2ae777408266d8a18996bd55145cd688edddb1482a179a0ad8b09ff`) for
+the corpus reader, the token identity check and the eligibility vocabulary it
+already registered. Same corpus, same digest, same development-session
+exclusion (`002001296e8a8c38ad9d7cc436d691afc602`). The rule's constants live in
+the file; the command line takes only the class, the client count and the paths,
+so a re-run cannot take a different slice, and `verify --corpus` re-runs the
+rule and compares bytes.
+
+### The episode, and how an episode is refused
+
+An **episode** is a maximal run of API-leaf intervals `[t, t + api_time)` on the
+root's clock joined by gaps of at most `G`. Both classes use **G = 0**: the
+complete busy period, the interval during which the source had at least one
+request outstanding, cut at the first instant it had none.
+
+Episodes are cut from **all** API leaves — root turns and nested requests alike
+— and then an episode is taken **entire or not at all**: if any request in it is
+unservable (below one KV block, above the class's prompt limit, or `out < 1`)
+the whole episode is refused. Dropping the bad request first would splice two
+bursts the source separated and would silently shorten a branch, which is the
+failure §9.7 was written about. Each manifest carries the census of what was
+refused on the way to the selection, by category, with the range of values that
+tripped each one.
+
+One episode per root — its first qualifying one — so no session appears twice.
+
+### The two classes
+
+| | `clients_short` | `clients_large` |
+| --- | --- | --- |
+| gap `G` | 0 s (complete busy period) | 0 s (complete busy period) |
+| prompt limit | every prompt ≤ 4 096 tokens | every prompt ≤ 262 144 tokens |
+| also requires | — | span ≤ 60 s, ≤ 400 k input tokens, ≥ 1 prompt ≥ 32 768 tokens |
+| concurrency | ≥ 1 descendant, source peak ≥ 2 | ≥ 1 descendant, source peak ≥ 2 |
+| qualifying sessions in the corpus | 21 | 127 |
+
+`clients_short` keeps the registered meaning of "short" — every prompt at or
+under 4 096 tokens — and pays for it with what §9.1 already established: this
+corpus has no short-input *session*. At G = 0 there are 99 concurrent episodes
+under a 4 096-token ceiling across 21 sessions, and **every one of them is a
+burst of sibling requests inside a single subagent branch, with no root turn in
+it**. That is disclosed, not worked around (§9.8).
+
+`clients_large` is the bounded large-prompt class. It is not §1's `long`: the
+volume registration there was one session's twenty opening turns at 1.59 M input
+tokens, and multiplying that by eight roots is not a PoC. This class instead
+bounds each root — one complete busy episode, ≤ 60 s of arrivals, ≤ 400 k input
+tokens — and requires a genuinely large prompt in it.
+
+### The fixed ordered pool of eight roots
+
+Client counts 1/2/4/8 take the **first C roots of one fixed ordered pool of 8**
+per class, in corpus order. The counts are therefore nested — c1 ⊂ c2 ⊂ c4 ⊂ c8,
+checked by request identity — so a comparison across client counts adds load
+without changing which requests were already there.
+
+`clients_large` (corpus line, session, requests, descendants, branches, source
+peak, arrival span, input, output):
+
+| line | session | reqs | desc | br | peak | span s | input | output |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 3 | `00ca01c4aaec…` | 7 | 6 | 3 | 3 | 38.5 | 379 840 | 13 887 |
+| 4 | `0196085d85d2…` | 7 | 6 | 3 | 3 | 33.8 | 373 248 | 9 800 |
+| 5 | `02bc0afb13f7…` | 3 | 2 | 1 | 2 | 36.1 | 86 592 | 2 963 |
+| 7 | `0470d446a451…` | 4 | 3 | 2 | 3 | 5.5 | 294 912 | 1 380 |
+| 8 | `04dba6fe6213…` | 6 | 6 | 1 | 5 | 11.0 | 48 384 | 13 624 |
+| 12 | `069d7bf5f1ef…` | 3 | 3 | 2 | 2 | 5.5 | 302 592 | 3 773 |
+| 14 | `07dd40536557…` | 3 | 3 | 3 | 3 | 0.6 | 157 952 | 557 |
+| 15 | `085411a4cc4b…` | 4 | 4 | 3 | 3 | 3.3 | 205 120 | 1 353 |
+
+`clients_short`:
+
+| line | session | reqs | desc | br | peak | span s | input | output |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| 58 | `208d6e28928b…` | 2 | 2 | 1 | 2 | 0.5 | 4 864 | 2 061 |
+| 60 | `212e46e294bd…` | 2 | 2 | 1 | 2 | 1.2 | 6 400 | 697 |
+| 70 | `2654d8b687d9…` | 2 | 2 | 1 | 2 | 0.4 | 6 016 | 2 216 |
+| 94 | `3cb1c6dc71a2…` | 2 | 2 | 1 | 2 | 0.5 | 5 888 | 2 444 |
+| 106 | `46350c0355fa…` | 3 | 3 | 1 | 3 | 0.0 | 8 832 | 2 705 |
+| 112 | `4b433e21f638…` | 2 | 2 | 1 | 2 | 0.0 | 4 864 | 1 330 |
+| 121 | `4dcf5b262778…` | 2 | 2 | 1 | 2 | 1.7 | 5 888 | 2 024 |
+| 125 | `509ad65c576a…` | 2 | 2 | 1 | 2 | 0.0 | 5 888 | 2 539 |
+
+Corpus lines are 1-based. §1's manifests index the same sessions 0-based; each
+clients manifest records both.
+
+### The eight registered files
+
+| class | clients | file (`atom/compass/`) | sha256 | reqs | root | desc | input | output | span s |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| short | 1 | `cc_traces_clients_short_c1.jsonl` | `fcc116645f4887b45742b7a0074b9d60692fabf2bfa80e021122bafa70188c18` | 2 | 0 | 2 | 4 864 | 2 061 | 0.5 |
+| short | 2 | `cc_traces_clients_short_c2.jsonl` | `d808bb5e25e04c965e5c54753efb13e70977e36ef78b7aaf178fb6bfd407e189` | 4 | 0 | 4 | 11 264 | 2 758 | 1.2 |
+| short | 4 | `cc_traces_clients_short_c4.jsonl` | `85ecf96ebbfeabc76d3398e6661ed6b3bae2f09d297fe2f2feabbf990f1567ea` | 8 | 0 | 8 | 23 168 | 7 418 | 1.2 |
+| short | 8 | `cc_traces_clients_short_c8.jsonl` | `2b6f03c3c4791d80c5399d2a02a16e94c9bf3f05e3d153718723d62595df6980` | 17 | 0 | 17 | 48 640 | 16 016 | 1.7 |
+| large | 1 | `cc_traces_clients_large_c1.jsonl` | `e232e42255e2bfaa9764d79093f1ea3ebed627e5dba4469e6d8a6845b3c65ab3` | 7 | 1 | 6 | 379 840 | 13 887 | 38.5 |
+| large | 2 | `cc_traces_clients_large_c2.jsonl` | `cb4967ec0757ed478e95c664cad48269d8c53439aec2c94e1176036724dc38f9` | 14 | 2 | 12 | 753 088 | 23 687 | 38.5 |
+| large | 4 | `cc_traces_clients_large_c4.jsonl` | `59e1a616fcdceda500d79bad7caf44a124633a2517ed40f6f9c50c7511d0e4c7` | 21 | 4 | 17 | 1 134 592 | 28 030 | 38.5 |
+| large | 8 | `cc_traces_clients_large_c8.jsonl` | `3ba365adc2c39bf0fb56a5e9154b372f9d44291d4d4a0d2bdc1ed67a5ca7df95` | 37 | 4 | 33 | 1 848 640 | 47 337 | 38.5 |
+
+Each has a `.manifest.json` beside it carrying the rule, the pool, the per-root
+episode record, the refusal census, and a `provenance` list that keeps every
+request's original JSON path (`/requests/5/requests/1`), its ancestry (root or
+subagent, `agent_id`, `subagent_type`), its source model label and its
+root-relative timestamp. `gaps_clipped: 0`, `outputs_altered: 0`,
+`subagents_pruned: 0`, `requests_serialised: 0` in all eight.
+
+### What is invented here, and what is not
+
+**Within a root, nothing.** Every arrival keeps its source offset, including
+descendant overlap; no gap is clipped, no branch is pruned, no request is
+serialised, and no output length is changed.
+
+**Across roots, one thing, declared:** each episode is rebased so its own first
+arrival is 0.0, and all C roots start together. The corpus times a request only
+against its own session's first turn and records no absolute clock, so a pool
+must choose something and no choice is chronology. This is the same declared
+alignment §1's short class uses (`session_start_at_zero`), extended to C roots.
+
+**No causal contract is assumed.** The dataset card documents that surviving
+`t` values keep their original relative offsets *including sub-agent overlap*,
+and documents no parent/child completion dependency; it does not define
+`api_time`, and `think_time` does not appear on it. So replay stays open loop: a
+descendant fires at its recorded offset whether or not its parent has finished.
+`api_time` is used for two things only — cutting the busy period, and reporting
+the source's peak overlap as evidence that the slice contains concurrency.
+
+**Source peak overlap is not a bound on the served engine.** Qwen's service
+times are not the trace's, so the same arrivals may reach `max_num_seqs = 32` or
+queue past it. The manifests say so at the field.
+
+**Source TTFT is not a reference.** It exists only on top-level `s` rows, so
+most replayed requests have none. It is not a gate input: §6's TTFT and TPOT
+gates compare the **real Qwen serving run against the modelled Qwen serving
+run**, over every replayed request including descendants. The corpus supplies
+lengths and arrival structure, not a reference latency.
+
 ## 2. What is held out
 
 The PoC's bet is: capture at TP=1, derive TP=2 and TP=4, predict. A cell that
@@ -148,7 +304,8 @@ So for these cells:
 | --- | --- | --- |
 | configuration (TP=2, TP=4) | **yes** | a genuine prediction: nothing measured at that width inside the target engine is an input |
 | configuration (TP=1) | **no** | the source configuration; its cells are a fit statistic and are reported as the calibration's own residual |
-| workload (both classes) | **yes, on the corpus slice** — no model was fitted or iterated on these requests | a prediction on unseen requests, from the same corpus and the same generating process as the development slice. It is not a new workload *family* |
+| workload (every class, §1 and §1B) | **yes, on the corpus slice** — no model was fitted or iterated on these requests | a prediction on unseen requests, from the same corpus and the same generating process as the development slice. It is not a new workload *family* |
+| offered load (clients 1/2/4/8) | **yes** — the counts and the pool were fixed before any cell ran, and the pool is nested so load is added without changing the requests already there | an offered-load axis, reported as scaling; not a configuration and never pooled into a rank (§6) |
 | model, hardware | no | one model, one device class throughout |
 
 The workload axis is stated this narrowly on purpose. cc_pilot's twenty requests
@@ -159,9 +316,16 @@ genuinely held out.
 
 ## 3. The cells
 
-Six cells: TP ∈ {1, 2, 4} × {short, long}. Each is run as
-`PROTOCOL.md` §§2–6 describe, with the engine configuration unchanged from the
-matrix already registered there:
+**Twenty-four cells: TP ∈ {1, 2, 4} × class ∈ {`clients_short`,
+`clients_large`} × clients ∈ {1, 2, 4, 8}.** A cell is identified by all three,
+and its directory is named `tp{tp}_{class}_c{clients}`.
+
+The six cells of §1's matrix — TP ∈ {1, 2, 4} × {short, long} — keep their
+registration, their stamps and their labels. They are not re-run and they are
+not relabelled; they are simply not the matrix this section governs.
+
+Each cell is run as `PROTOCOL.md` §§2–6 describe, with the engine configuration
+unchanged from the matrix already registered there:
 
 ```
 --model Qwen/Qwen3.8-27B --gpu-memory-utilization 0.90 --max-model-len 262144
@@ -178,6 +342,15 @@ Three on the modelled side too, and that is new — E1 reported four real runs
 against one simulated one, and one simulated run is not a distribution. A
 modelled side that is deterministic will show it by producing three identical
 results, which is a finding and costs a few CPU minutes to establish.
+
+Three is what **acceptance** is graded against, and it is not a caller's
+number. `--repeats` below three still builds and runs — a one-repeat pass over
+the matrix is a useful thing to want — but the plan says it is a diagnostic,
+`cc_traces_run.py` stamps every execution record and artifact `diagnostic`
+whatever `--purpose` was asked for, the cell verdict is written for
+`diagnostic`, and `cc_traces_validate.py matrix` refuses any cell that does not
+carry three repeats. A short run is evidence about the harness, never a cell of
+the matrix.
 
 Cells are run one at a time on an otherwise idle node, with the isolation audit
 of `scripts/compass/isolation.py` over the whole window.
@@ -299,9 +472,24 @@ digests, in a device-free container when it was asked.
 The numbers are those already registered (`PROTOCOL.md` §9); this protocol does
 not relax any of them, and adds no new one.
 
-* Throughput ≤ 10 %; TPOT/ITL ≤ 10 %; TTFT ≤ 15 %.
-* Spearman ρ ≥ 0.90 within comparable groups, over the TP × class matrix.
+* Throughput ≤ 10 %; TPOT/ITL ≤ 10 %; TTFT ≤ 15 %. The TTFT and TPOT gates
+  compare the real and the modelled Qwen serving runs over **every replayed
+  request, descendants included** — not root requests only, and not against any
+  source latency.
+* Spearman ρ ≥ 0.90 within comparable groups, over the TP axis.
 * Top-1 configuration agreement with hardware, per objective.
+
+**The comparable group is one (class, client count).** Client count is an
+offered-workload axis, not a configuration: c1 and c8 contain different numbers
+and mixtures of requests, so a rank computed over both pooled would be ranking
+workloads as well as widths. Ranking, top-1 and regret are therefore computed
+**within each fixed (class, clients) group**, comparing TP1/TP2/TP4 over the
+same replayed request set — eight groups of three. Behaviour across client
+counts is reported separately, as scaling, and is never pooled into a rank.
+
+Both sides of a cell replay the **identical selected request identities** under
+the identical timing policy: the same registered workload file, the same
+arrivals, open loop, no semaphore.
 * Non-KV memory terms ≤ 10 %, KV block count ≤ 5 %, and the deliberately
   infeasible configuration rejected for the same reason as the real engine.
 * ≥ 5× replay speedup, `execution_real / (execution_modelled + derivation)`,
@@ -324,12 +512,16 @@ is reported for every objective, in percent, alongside top-1.
 is the thing that says whether a cell counts. It fails closed.
 
 ```
-python scripts/compass/cc_traces_workload.py verify --manifest <m> --corpus <c>
+python scripts/compass/cc_traces_clients_workload.py verify --manifest <m> --corpus <c>
 python scripts/compass/cc_traces_validate.py gpu-free <cell-dir>   # in the device-free container
-python scripts/compass/cc_traces_validate.py cell   <cell-dir> --class <short|long> \
+python scripts/compass/cc_traces_validate.py cell   <cell-dir> \
+    --class <clients_short|clients_large> --clients <1|2|4|8> \
     --calibration-registry <registry.json>
 python scripts/compass/cc_traces_validate.py matrix <cell-dir>... --out verdict.json
 ```
+
+`--class` and `--clients` together name the registered workload the cell must
+have sent; a cell that sent another file is refused, not reported.
 
 `cell` refuses, rather than reports, when: the workload sent was not the
 registered one; a request has no engine record, no `usage.completion_tokens`, or
@@ -343,7 +535,10 @@ cell carries no device-free evidence, or evidence showing a reachable device, an
 open driver handle, or modelled artifacts it does not cover (§5).
 
 `matrix` computes the ranking gates of §6 from the cells it is given, states
-which cells it used, and refuses to report a ranking over an incomplete matrix.
+which cells it used, and refuses to report a ranking over an incomplete matrix —
+all twenty-four `(tp, class, clients)` cells must be present, exactly once. It
+ranks within each `(class, clients)` group and reports the client-count scaling
+beside those groups, never as one of them.
 
 ## 8. Evidence each cell keeps
 
@@ -351,7 +546,8 @@ Both server logs and the cache-regime line read from them; the drained
 preparation records and the drain assertion; both step tables with the
 preparation boundary recorded; the `modelled warm state` line; both result
 JSONs per repeat; `costs.json`; the isolation audit; the calibration registry;
-`cc_traces_protocol.json` (this file's digest and both workload digests);
+`cc_traces_protocol.json` (this file's digest and every registered workload's
+digest — §1's two and §1B's eight);
 `gpu_free.json` from the modelled side's own container; and the validator's own
 output, including for cells that failed. Failed artifacts
 are kept and labelled, never deleted.
@@ -417,13 +613,44 @@ not assumed.
    costs: neither class exercises the main-agent-plus-subagent concurrency that
    the corpus does contain. A result here is about a single agent's turn
    sequence, at these lengths and this spacing, and says nothing about a
-   session running its delegates alongside it.
+   session running its delegates alongside it. **§1B's classes replay that
+   concurrency rather than refuse it**, which is why they exist; this finding
+   still bounds §1's cells.
+8. **`clients_short` is subagent-only, and that is disclosed, not fixed.** Under
+   a 4 096-token ceiling this corpus has no concurrent episode containing a root
+   turn: at G = 0 all 99 qualifying episodes across 21 sessions are bursts of
+   sibling requests inside one subagent branch, so all 17 requests of the c8
+   cell are descendants and none is a root turn. The class keeps the registered
+   meaning of "short" — every prompt ≤ 4 096 tokens — and the cost of keeping it
+   is that this class measures a delegated agent's burst, not a user turn. A
+   third class was considered and rejected: it would have added a workload
+   family to an axis §2 already states narrowly.
+9. **Short-class concurrency is only just concurrency.** Seven of the eight
+   short roots have a source peak of 2, one has 3, and the spans are 0.0–1.7 s.
+   These are real simultaneous requests from the trace, not a construction, but
+   the per-root contention is small; what makes the c8 cell interesting is the
+   eight roots aligned at 0.0, which is the declared alignment of §1B, not an
+   observation.
+10. **The large class's bounds are constants, and they select.** ≤ 60 s of
+    arrivals, ≤ 400 k input tokens and ≥ 1 prompt of ≥ 32 768 tokens were fixed
+    before the pool was read, and the refusal census in each manifest reports
+    what they cost on the way to eight roots: 5 episodes refused for span
+    (65.0–196.3 s), 3 for volume (533 312–919 424 tokens), 616 for containing no
+    subagent request, 92 for never having two requests in flight. 127 sessions
+    qualify, so the pool is the first 8 of many rather than all that exist.
+11. **Client count is offered load, not a concurrency cap.** A client is a root
+    session; its descendants are replayed at their own offsets and can be in
+    flight beside it. So c8 does not mean eight outstanding requests — it means
+    eight roots' worth of real arrivals, 17 requests in the short class and 37
+    in the large one. The server's own admission (`max_num_seqs = 32`) is what
+    bounds concurrency, on both sides.
 
 ## 10. Immutability
 
 `scripts/compass/cc_traces_protocol.py register` writes
 `atom/compass/cc_traces_protocol.lock.json` with this file's SHA-256; `verify`
-recomputes it; `stamp` writes a cell's copy, including both workload digests, so
+recomputes it; `stamp` writes a cell's copy, including every registered workload
+digest, so
 a cell run against a re-emitted workload cannot read as a cell run against this
 one. The superseded lock is kept inside its replacement.
 
@@ -446,5 +673,12 @@ It does not claim cold start is predictable, and it does not fold startup into a
 serving result. Startup, capture and calibration are costs reported beside the
 gate in §5, never inside it; per-candidate derivation is inside it.
 
-It does not claim the delegated-agent concurrency the corpus contains: both
-classes refuse to overlap it rather than replay it (§9.7).
+It does not claim the delegated-agent concurrency the corpus contains for §1's
+two classes: those refuse to overlap it rather than replay it (§9.7). §1B's
+classes do replay it, and what they claim is bounded by §9.8–§9.11 — a
+subagent-only short class, small per-root contention, and a large class whose
+bounds are constants that select.
+
+It does not claim a scaling law over client counts. Four points, nested by
+construction, on two classes, are a scaling *report* beside eight independent
+rank comparisons — not a model of how this engine behaves as load grows.

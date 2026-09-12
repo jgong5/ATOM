@@ -1,0 +1,513 @@
+{
+ "class": "clients_large",
+ "clients": 1,
+ "client_counts": [
+  1,
+  2,
+  4,
+  8
+ ],
+ "pool_size": 8,
+ "nested_pool": "the first 1 roots of one fixed ordered pool of 8, so this cell's requests are a subset of the next client count's",
+ "rule": {
+  "kind": "clients_large",
+  "gap_s": 0.0,
+  "min_input": 64,
+  "max_input": 262144,
+  "max_span_s": 60.0,
+  "max_total_input": 400000,
+  "min_large_input": 32768,
+  "min_peak": 2,
+  "min_descendants": 1
+ },
+ "episode_definition": "a maximal run of API-leaf intervals [t, t+api_time) on the root's clock joined by gaps of at most 0.0s; cut from all leaves and accepted or rejected entire",
+ "corpus": {
+  "dataset": "semianalysisai/cc-traces-weka-062126-256k",
+  "file": "traces.jsonl",
+  "bytes": 568864747,
+  "sha256": "e39cd2ff3eba21d4a3664be51da743ac3d2149a1933898cafc7bfeac8147eeef",
+  "sessions": 393
+ },
+ "corpus_sha256_observed": "e39cd2ff3eba21d4a3664be51da743ac3d2149a1933898cafc7bfeac8147eeef",
+ "development_sessions_excluded": [
+  "002001296e8a8c38ad9d7cc436d691afc602"
+ ],
+ "context_tokens": 262144,
+ "servable_types": [
+  "s",
+  "n"
+ ],
+ "generator_sha256": "3f54059888d51f01d7c2ff282231f4d385d9f3bbd6073fbf4b4d0321b557c37a",
+ "base_generator_sha256": "d0a1dc1be2ae777408266d8a18996bd55145cd688edddb1482a179a0ad8b09ff",
+ "arrivals": {
+  "model": "source_paced_open_loop",
+  "within_root": "raw source offsets on the root's own clock, descendants included; nothing clipped, compressed or reordered",
+  "across_roots": "declared: every selected episode's first arrival at 0.0, so the C roots start together. The corpus carries no absolute start time, so this is a construction and not a chronology",
+  "causality": "none assumed. The dataset card defines no completion dependency and does not define api_time or think_time at all, so a descendant fires at its recorded offset whether or not its parent turn has finished"
+ },
+ "target_model": "Qwen/Qwen3.8-27B",
+ "source_models_declared": "the corpus served these requests with several models; every row carries its source label and every row is replayed against target_model. No descendant is dropped for a differing label",
+ "source_models": {
+  "claude-fable-5": 1,
+  "claude-haiku-4-5-20251001": 6
+ },
+ "roots_used": [
+  {
+   "corpus_line_1based": 3,
+   "corpus_index_0based": 2,
+   "id": "00ca01c4aaeccee751ae6285beb54dea262f",
+   "requests": 7,
+   "root_requests": 1,
+   "descendant_requests": 6,
+   "branches": [
+    "subagent_001_bd16facd",
+    "subagent_002_77fc326d",
+    "subagent_003_f8e1a8f5"
+   ],
+   "subagent_types": [
+    "Subagent"
+   ],
+   "source_peak_overlap": 3,
+   "source_t_first_s": 59.466,
+   "source_t_last_s": 97.932,
+   "arrival_span_s": 38.466,
+   "input_tokens": 379840,
+   "output_tokens": 13887,
+   "max_input_tokens": 83968,
+   "source_models": {
+    "claude-fable-5": 1,
+    "claude-haiku-4-5-20251001": 6
+   },
+   "paths": [
+    "/requests/4",
+    "/requests/5/requests/0",
+    "/requests/5/requests/1",
+    "/requests/6/requests/0",
+    "/requests/6/requests/1",
+    "/requests/7/requests/0",
+    "/requests/7/requests/1"
+   ]
+  }
+ ],
+ "roots_pool": [
+  {
+   "corpus_line_1based": 3,
+   "corpus_index_0based": 2,
+   "id": "00ca01c4aaeccee751ae6285beb54dea262f",
+   "requests": 7,
+   "root_requests": 1,
+   "descendant_requests": 6,
+   "branches": [
+    "subagent_001_bd16facd",
+    "subagent_002_77fc326d",
+    "subagent_003_f8e1a8f5"
+   ],
+   "subagent_types": [
+    "Subagent"
+   ],
+   "source_peak_overlap": 3,
+   "source_t_first_s": 59.466,
+   "source_t_last_s": 97.932,
+   "arrival_span_s": 38.466,
+   "input_tokens": 379840,
+   "output_tokens": 13887,
+   "max_input_tokens": 83968,
+   "source_models": {
+    "claude-fable-5": 1,
+    "claude-haiku-4-5-20251001": 6
+   },
+   "paths": [
+    "/requests/4",
+    "/requests/5/requests/0",
+    "/requests/5/requests/1",
+    "/requests/6/requests/0",
+    "/requests/6/requests/1",
+    "/requests/7/requests/0",
+    "/requests/7/requests/1"
+   ]
+  },
+  {
+   "corpus_line_1based": 4,
+   "corpus_index_0based": 3,
+   "id": "0196085d85d2075a50b74cd8795ffbdcea9a",
+   "requests": 7,
+   "root_requests": 1,
+   "descendant_requests": 6,
+   "branches": [
+    "subagent_001_a0680b81",
+    "subagent_002_5fe25116",
+    "subagent_003_1a50b604"
+   ],
+   "subagent_types": [
+    "Subagent"
+   ],
+   "source_peak_overlap": 3,
+   "source_t_first_s": 632.74,
+   "source_t_last_s": 666.502,
+   "arrival_span_s": 33.762,
+   "input_tokens": 373248,
+   "output_tokens": 9800,
+   "max_input_tokens": 170368,
+   "source_models": {
+    "claude-opus-4-7": 6,
+    "claude-opus-4-8": 1
+   },
+   "paths": [
+    "/requests/8",
+    "/requests/9/requests/0",
+    "/requests/9/requests/1",
+    "/requests/10/requests/0",
+    "/requests/10/requests/1",
+    "/requests/9/requests/2",
+    "/requests/11/requests/0"
+   ]
+  },
+  {
+   "corpus_line_1based": 5,
+   "corpus_index_0based": 4,
+   "id": "02bc0afb13f7a2d9efa86c28511261d85c0e",
+   "requests": 3,
+   "root_requests": 1,
+   "descendant_requests": 2,
+   "branches": [
+    "subagent_001_5b12db49"
+   ],
+   "subagent_types": [
+    "Subagent"
+   ],
+   "source_peak_overlap": 2,
+   "source_t_first_s": 253.48,
+   "source_t_last_s": 289.564,
+   "arrival_span_s": 36.084,
+   "input_tokens": 86592,
+   "output_tokens": 2963,
+   "max_input_tokens": 51328,
+   "source_models": {
+    "claude-haiku-4-5-20251001": 2,
+    "claude-opus-4-8": 1
+   },
+   "paths": [
+    "/requests/5",
+    "/requests/6/requests/0",
+    "/requests/6/requests/1"
+   ]
+  },
+  {
+   "corpus_line_1based": 7,
+   "corpus_index_0based": 6,
+   "id": "0470d446a4514dfe0c6ad0be92853bd13287",
+   "requests": 4,
+   "root_requests": 1,
+   "descendant_requests": 3,
+   "branches": [
+    "subagent_005_dcbbad73",
+    "subagent_007_c36dc180"
+   ],
+   "subagent_types": [
+    "Subagent"
+   ],
+   "source_peak_overlap": 3,
+   "source_t_first_s": 144455.527,
+   "source_t_last_s": 144461.009,
+   "arrival_span_s": 5.482,
+   "input_tokens": 294912,
+   "output_tokens": 1380,
+   "max_input_tokens": 116608,
+   "source_models": {
+    "claude-opus-4-6": 4
+   },
+   "paths": [
+    "/requests/374/requests/11",
+    "/requests/382",
+    "/requests/372/requests/15",
+    "/requests/374/requests/12"
+   ]
+  },
+  {
+   "corpus_line_1based": 8,
+   "corpus_index_0based": 7,
+   "id": "04dba6fe621301a1d01fd63b8d02c9645c48",
+   "requests": 6,
+   "root_requests": 0,
+   "descendant_requests": 6,
+   "branches": [
+    "subagent_001_b00fdc12"
+   ],
+   "subagent_types": [
+    "Subagent"
+   ],
+   "source_peak_overlap": 5,
+   "source_t_first_s": 85.74,
+   "source_t_last_s": 96.743,
+   "arrival_span_s": 11.003,
+   "input_tokens": 48384,
+   "output_tokens": 13624,
+   "max_input_tokens": 33664,
+   "source_models": {
+    "claude-opus-4-8": 6
+   },
+   "paths": [
+    "/requests/3/requests/1",
+    "/requests/3/requests/2",
+    "/requests/3/requests/3",
+    "/requests/3/requests/4",
+    "/requests/3/requests/5",
+    "/requests/3/requests/6"
+   ]
+  },
+  {
+   "corpus_line_1based": 12,
+   "corpus_index_0based": 11,
+   "id": "069d7bf5f1efb4e76e3c84510367e6af78a5",
+   "requests": 3,
+   "root_requests": 0,
+   "descendant_requests": 3,
+   "branches": [
+    "subagent_005_f197f2bb",
+    "subagent_006_f3c26377"
+   ],
+   "subagent_types": [
+    "Subagent"
+   ],
+   "source_peak_overlap": 2,
+   "source_t_first_s": 407.195,
+   "source_t_last_s": 412.65,
+   "arrival_span_s": 5.455,
+   "input_tokens": 302592,
+   "output_tokens": 3773,
+   "max_input_tokens": 112960,
+   "source_models": {
+    "claude-opus-4-8": 3
+   },
+   "paths": [
+    "/requests/20/requests/14",
+    "/requests/21/requests/10",
+    "/requests/20/requests/15"
+   ]
+  },
+  {
+   "corpus_line_1based": 14,
+   "corpus_index_0based": 13,
+   "id": "07dd40536557a1d6440a923557c3129dc929",
+   "requests": 3,
+   "root_requests": 0,
+   "descendant_requests": 3,
+   "branches": [
+    "subagent_001_1a28c42b",
+    "subagent_002_23b2d9e6",
+    "subagent_003_35f49cca"
+   ],
+   "subagent_types": [
+    "Subagent"
+   ],
+   "source_peak_overlap": 3,
+   "source_t_first_s": 139.243,
+   "source_t_last_s": 139.807,
+   "arrival_span_s": 0.564,
+   "input_tokens": 157952,
+   "output_tokens": 557,
+   "max_input_tokens": 62336,
+   "source_models": {
+    "claude-sonnet-4-6": 3
+   },
+   "paths": [
+    "/requests/9/requests/4",
+    "/requests/8/requests/6",
+    "/requests/10/requests/2"
+   ]
+  },
+  {
+   "corpus_line_1based": 15,
+   "corpus_index_0based": 14,
+   "id": "085411a4cc4b15108dd9b50007261a2efb65",
+   "requests": 4,
+   "root_requests": 0,
+   "descendant_requests": 4,
+   "branches": [
+    "subagent_001_1e54fd0b",
+    "subagent_002_e5977449",
+    "subagent_003_1b859269"
+   ],
+   "subagent_types": [
+    "Subagent"
+   ],
+   "source_peak_overlap": 3,
+   "source_t_first_s": 7062.046,
+   "source_t_last_s": 7065.392,
+   "arrival_span_s": 3.346,
+   "input_tokens": 205120,
+   "output_tokens": 1353,
+   "max_input_tokens": 112128,
+   "source_models": {
+    "claude-opus-4-7": 4
+   },
+   "paths": [
+    "/requests/10/requests/5",
+    "/requests/9/requests/2",
+    "/requests/8/requests/3",
+    "/requests/8/requests/4"
+   ]
+  }
+ ],
+ "requests": 7,
+ "root_requests": 1,
+ "descendant_requests": 6,
+ "branches": 3,
+ "input_tokens": {
+  "min": 34880,
+  "p10": 34880,
+  "median": 54976,
+  "p90": 83968,
+  "max": 83968,
+  "sum": 379840
+ },
+ "output_tokens": {
+  "min": 420,
+  "p10": 420,
+  "median": 2584,
+  "p90": 3473,
+  "max": 3473,
+  "sum": 13887
+ },
+ "arrival_span_s": 38.466,
+ "source_peak_overlap": 3,
+ "source_peak_overlap_means": "the most requests the source had in flight at once, as evidence that this slice contains concurrency. It is not a bound on the served engine's outstanding requests: Qwen's service times are not the trace's, so these arrivals may reach max_num_seqs or queue past it",
+ "episodes_rejected": {
+  "a development session": 1,
+  "arrivals span more than 60.0s": 5,
+  "more than 400000 input tokens in the episode": 3,
+  "no subagent request in the episode": 616,
+  "the source never has 2 of these in flight": 92
+ },
+ "episodes_rejected_value_range": {
+  "arrivals span more than 60.0s": {
+   "min": 65.0,
+   "max": 196.3
+  },
+  "more than 400000 input tokens in the episode": {
+   "min": 533312,
+   "max": 919424
+  },
+  "no subagent request in the episode": {
+   "min": 0,
+   "max": 0
+  },
+  "the source never has 2 of these in flight": {
+   "min": 1,
+   "max": 1
+  }
+ },
+ "episodes_rejected_scope": "every episode examined while filling this class's pool of 8 roots, in corpus order. Scanning stops once the pool is full, so this is a census of what was refused on the way to the selection, not of the whole corpus",
+ "gaps_clipped": 0,
+ "outputs_altered": 0,
+ "subagents_pruned": 0,
+ "requests_serialised": 0,
+ "scanned_sessions": 393,
+ "scanned_subagent_wrapper_rows": 1697,
+ "scanned_nested_requests": 39822,
+ "input_token_units": "tokens; corpus `in` is already a token count and is block-aligned (in == len(hash_ids) * block_size), never multiplied here",
+ "lengths_checked": "in == len(hash_ids) * block_size on every request",
+ "provenance": [
+  {
+   "client_index": 0,
+   "session": "00ca01c4aaeccee751ae6285beb54dea262f",
+   "json_path": "/requests/4",
+   "actor": "root",
+   "agent_id": null,
+   "source_t_s": 59.466,
+   "origin_shift_s": 59.466,
+   "arrival_s": 0.0,
+   "input_tokens": 83968,
+   "input_blocks": 1312,
+   "output_tokens": 3008,
+   "source_model": "claude-fable-5"
+  },
+  {
+   "client_index": 0,
+   "session": "00ca01c4aaeccee751ae6285beb54dea262f",
+   "json_path": "/requests/5/requests/0",
+   "actor": "subagent",
+   "agent_id": "subagent_001_bd16facd",
+   "source_t_s": 80.759,
+   "origin_shift_s": 59.466,
+   "arrival_s": 21.293,
+   "input_tokens": 34880,
+   "input_blocks": 545,
+   "output_tokens": 420,
+   "source_model": "claude-haiku-4-5-20251001"
+  },
+  {
+   "client_index": 0,
+   "session": "00ca01c4aaeccee751ae6285beb54dea262f",
+   "json_path": "/requests/5/requests/1",
+   "actor": "subagent",
+   "agent_id": "subagent_001_bd16facd",
+   "source_t_s": 84.523,
+   "origin_shift_s": 59.466,
+   "arrival_s": 25.057,
+   "input_tokens": 67008,
+   "input_blocks": 1047,
+   "output_tokens": 3304,
+   "source_model": "claude-haiku-4-5-20251001"
+  },
+  {
+   "client_index": 0,
+   "session": "00ca01c4aaeccee751ae6285beb54dea262f",
+   "json_path": "/requests/6/requests/0",
+   "actor": "subagent",
+   "agent_id": "subagent_002_77fc326d",
+   "source_t_s": 87.69,
+   "origin_shift_s": 59.466,
+   "arrival_s": 28.224,
+   "input_tokens": 34944,
+   "input_blocks": 546,
+   "output_tokens": 554,
+   "source_model": "claude-haiku-4-5-20251001"
+  },
+  {
+   "client_index": 0,
+   "session": "00ca01c4aaeccee751ae6285beb54dea262f",
+   "json_path": "/requests/6/requests/1",
+   "actor": "subagent",
+   "agent_id": "subagent_002_77fc326d",
+   "source_t_s": 91.729,
+   "origin_shift_s": 59.466,
+   "arrival_s": 32.263,
+   "input_tokens": 69184,
+   "input_blocks": 1081,
+   "output_tokens": 2584,
+   "source_model": "claude-haiku-4-5-20251001"
+  },
+  {
+   "client_index": 0,
+   "session": "00ca01c4aaeccee751ae6285beb54dea262f",
+   "json_path": "/requests/7/requests/0",
+   "actor": "subagent",
+   "agent_id": "subagent_003_f8e1a8f5",
+   "source_t_s": 94.038,
+   "origin_shift_s": 59.466,
+   "arrival_s": 34.572,
+   "input_tokens": 34880,
+   "input_blocks": 545,
+   "output_tokens": 544,
+   "source_model": "claude-haiku-4-5-20251001"
+  },
+  {
+   "client_index": 0,
+   "session": "00ca01c4aaeccee751ae6285beb54dea262f",
+   "json_path": "/requests/7/requests/1",
+   "actor": "subagent",
+   "agent_id": "subagent_003_f8e1a8f5",
+   "source_t_s": 97.932,
+   "origin_shift_s": 59.466,
+   "arrival_s": 38.466,
+   "input_tokens": 54976,
+   "input_blocks": 859,
+   "output_tokens": 3473,
+   "source_model": "claude-haiku-4-5-20251001"
+  }
+ ],
+ "sha256": "e232e42255e2bfaa9764d79093f1ea3ebed627e5dba4469e6d8a6845b3c65ab3",
+ "emitted_at": "2026-09-12",
+ "file": "cc_traces_clients_large_c1.jsonl"
+}

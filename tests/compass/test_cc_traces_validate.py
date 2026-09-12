@@ -11,7 +11,9 @@ The behaviour under test is the verdict, not the text of the message.
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import json
 import math
 import sys
@@ -1499,9 +1501,11 @@ def _cell_verdict(
     spread=0.01,
     *,
     tp=1,
+    clients=None,
     modelled_spread=None,
     metrics=("throughput_tok_s",),
     speedup=10.0,
+    repeats=validate.PROTOCOL_REPEATS,
 ):
     """A passed cell, for the ranking gate.
 
@@ -1527,47 +1531,60 @@ def _cell_verdict(
         "tolerance_pct": 10.0,
         "within_tolerance": True,
     }
-    return {
+    verdict = {
         "cell": name,
         "class": klass,
         "tp": tp,
         "passed": True,
+        # The repeats behind the verdict. The matrix checks this itself, so a
+        # fixture that left it out would be testing a cell nobody could have
+        # run rather than the one the protocol registers.
+        "repeats": repeats,
         "metrics": {metric: dict(block) for metric in metrics},
         "speedup": {"replay_ratio": speedup, "meets_gate": speedup >= 5.0},
     }
+    # The client count is part of a clients-matrix cell's identity. It is
+    # written only when the caller names one, so the fixtures that exist to
+    # show a verdict *without* a count being refused can still build one.
+    if clients is not None:
+        verdict["clients"] = clients
+    return verdict
 
 
 #: Every objective the matrix ranks, which is what a cell has to carry.
 ALL_METRICS = tuple(validate.OBJECTIVES)
 
 
-def _six(tmp_path, over=None):
-    """The six cells of the registered matrix, written out and passing.
+def _whole_matrix(tmp_path, over=None):
+    """Every cell of the registered matrix, written out and passing.
 
-    `over` is a mapping keyed by `(tp, class)` that replaces that cell's
-    verdict, so a test can break exactly one of the six and leave the rest a
+    Twenty-four of them: TP ∈ {1,2,4} × two classes × four client counts.
+    `over` is a mapping keyed by `(tp, class, clients)` that replaces that
+    cell's verdict, so a test can break exactly one cell and leave the rest a
     matrix.
     """
     over = over or {}
     dirs = []
     for tp in (1, 2, 4):
-        for klass in ("short", "long"):
-            name = f"tp{tp}_{klass}"
-            where = tmp_path / name
-            where.mkdir(parents=True, exist_ok=True)
-            blob = over.get(
-                (tp, klass),
-                _cell_verdict(
-                    name,
-                    klass,
-                    100.0 * tp,
-                    100.0 * tp,
-                    tp=tp,
-                    metrics=ALL_METRICS,
-                ),
-            )
-            (where / "cc_traces_cell.json").write_text(json.dumps(blob))
-            dirs.append(str(where))
+        for klass in validate.CLIENT_CLASSES:
+            for clients in validate.CLIENT_COUNTS:
+                name = f"tp{tp}_{klass}_c{clients}"
+                where = tmp_path / name
+                where.mkdir(parents=True, exist_ok=True)
+                blob = over.get(
+                    (tp, klass, clients),
+                    _cell_verdict(
+                        name,
+                        klass,
+                        100.0 * tp,
+                        100.0 * tp,
+                        tp=tp,
+                        clients=clients,
+                        metrics=ALL_METRICS,
+                    ),
+                )
+                (where / "cc_traces_cell.json").write_text(json.dumps(blob))
+                dirs.append(str(where))
     return dirs
 
 
@@ -1912,9 +1929,19 @@ class TestADiagnosticIsNotACellHoweverItIsNamed:
         assert "not acceptance" in capsys.readouterr().out
 
     def test_the_verdict_says_what_it_was_computed_for(self, cell):
+        """A one-repeat cell is graded and says what it is.
+
+        It used to say `acceptance`, because the purpose only ever recorded
+        whether a *deliberate* diagnostic had been asked for. Being short of
+        the registered repeats is the other way of not being the experiment,
+        and it is written in the same field --
+        `TestTheRegisteredRepeatsAreWhatAcceptanceIsGradedAgainst` is where
+        that rule lives.
+        """
         assert run(cell) == 0
         blob = json.loads((Path(cell) / "cc_traces_cell.json").read_text())
-        assert blob["purpose"] == "acceptance"
+        assert blob["purpose"] == "diagnostic"
+        assert blob["repeats"] == 1
 
     def _fail(self, cell_dir):
         assert run(cell_dir) == 1
@@ -2263,10 +2290,12 @@ class TestTheRegisteredWorkloadIsNotInTheCheckout:
 class TestTheMatrixIsAWholeMatrix:
     """A decision over part of the matrix is not the registered decision.
 
-    `CC_TRACES_PROTOCOL.md` §3 names six cells -- TP ∈ {1,2,4} × {short, long}
-    -- and §6's gates are about the ranking *across* them. One cell cannot
+    `CC_TRACES_PROTOCOL.md` §3 names twenty-four cells -- TP ∈ {1,2,4} × two
+    workload classes × four client counts -- and §6's gates are about the
+    ranking *across* the widths of one (class, client count). One cell cannot
     disagree with itself about which width is best, so a matrix assembled from
-    fewer than six has nothing to rank and must not report a pass.
+    fewer than all of them has groups with nothing to rank and must not report
+    a pass.
     """
 
     def test_a_single_cell_is_not_a_matrix(self, tmp_path, capsys):
@@ -2284,26 +2313,29 @@ class TestTheMatrixIsAWholeMatrix:
         assert validate.main(["matrix", str(where)]) == 1
         assert "PASS" not in capsys.readouterr().out
 
-    def test_the_six_registered_cells_pass(self, tmp_path, capsys):
-        assert validate.main(["matrix"] + _six(tmp_path)) == 0
+    def test_the_registered_cells_pass(self, tmp_path, capsys):
+        assert validate.main(["matrix"] + _whole_matrix(tmp_path)) == 0
         assert "MATRIX PASS" in capsys.readouterr().out
 
     def test_a_matrix_missing_one_cell_is_refused(self, tmp_path, capsys):
-        dirs = _six(tmp_path)
+        dirs = _whole_matrix(tmp_path)
         assert validate.main(["matrix"] + dirs[:-1]) == 1
         out = capsys.readouterr().out
-        assert "tp4" in out and "long" in out
+        # The refusal names the missing cell by all three of its coordinates,
+        # which is how the reader knows which one to go and run.
+        missing = (4, validate.CLIENT_CLASSES[-1], validate.CLIENT_COUNTS[-1])
+        assert validate._cell_name(missing) in out
 
     def test_a_repeated_cell_does_not_stand_in_for_a_missing_one(
         self, tmp_path, capsys
     ):
-        """Six directories, five configurations. The count is right and the
-        matrix is not."""
-        dirs = _six(tmp_path)
-        twice = tmp_path / "tp1_short_again"
+        """The right number of directories, one configuration short. The count
+        is right and the matrix is not."""
+        dirs = _whole_matrix(tmp_path)
+        twice = tmp_path / "tp1_clients_short_c1_again"
         twice.mkdir()
         (twice / "cc_traces_cell.json").write_text(
-            (tmp_path / "tp1_short" / "cc_traces_cell.json").read_text()
+            (tmp_path / "tp1_clients_short_c1" / "cc_traces_cell.json").read_text()
         )
         assert validate.main(["matrix"] + dirs + [str(twice)]) == 1
         assert "twice" in capsys.readouterr().out
@@ -2318,18 +2350,114 @@ class TestTheMatrixIsAWholeMatrix:
                 )
             )
         )
-        assert validate.main(["matrix"] + _six(tmp_path) + [str(where)]) == 1
+        assert validate.main(["matrix"] + _whole_matrix(tmp_path) + [str(where)]) == 1
         assert "tp=8" in capsys.readouterr().out
 
     def test_a_cell_missing_an_objective_is_refused_not_skipped(self, tmp_path, capsys):
         """The metric a cell does not carry is the one nobody ranked."""
         short = _cell_verdict(
-            "tp2_short", "short", 200.0, 200.0, tp=2, metrics=ALL_METRICS
+            "tp2_clients_short_c2",
+            "clients_short",
+            200.0,
+            200.0,
+            tp=2,
+            clients=2,
+            metrics=ALL_METRICS,
         )
         del short["metrics"]["ttft"]
-        dirs = _six(tmp_path, {(2, "short"): short})
+        dirs = _whole_matrix(tmp_path, {(2, "clients_short", 2): short})
         assert validate.main(["matrix"] + dirs) == 1
         assert "ttft" in capsys.readouterr().out
+
+
+class TestTheRankIsTakenInsideOneOfferedLoad:
+    """A width is ranked against the other widths on the same workload.
+
+    Two cells of the same class at different client counts hold different
+    numbers of requests and a different mixture of them, so a rank taken
+    across both would be ranking the workloads as well as the widths, and the
+    pooled number would read as the stronger claim. The ranking group is
+    therefore one `(class, client count)`: three cells, same requests, same
+    offered load. How a width behaves as the load grows is reported beside it
+    as measurements, and never as a rank.
+    """
+
+    def _diverging(self, tmp_path):
+        """One client count where the widest is not best, one where it is."""
+        narrow_wins = _cell_verdict(
+            "tp4_clients_short_c1",
+            "clients_short",
+            10.0,
+            10.0,
+            tp=4,
+            clients=1,
+            metrics=ALL_METRICS,
+        )
+        return _whole_matrix(tmp_path, {(4, "clients_short", 1): narrow_wins})
+
+    def test_there_is_one_ranking_group_per_class_and_client_count(self, tmp_path):
+        out = tmp_path / "verdict.json"
+        assert validate.main(["matrix"] + _whole_matrix(tmp_path)
+                             + ["--out", str(out)]) == 0
+        report = json.loads(out.read_text())
+        assert report["ranking_group"] == "(class, clients)"
+        assert set(report["by_group"]) == {
+            f"{klass} c{clients}"
+            for klass in validate.CLIENT_CLASSES
+            for clients in validate.CLIENT_COUNTS
+        }
+
+    def test_no_group_pools_two_client_counts(self, tmp_path):
+        """The absent section is the point: there is nowhere for a rank over
+        c1 and c8 together to be read from."""
+        out = tmp_path / "verdict.json"
+        validate.main(["matrix"] + _whole_matrix(tmp_path) + ["--out", str(out)])
+        report = json.loads(out.read_text())
+        assert "pooled" not in report and "by_class" not in report
+
+    def test_one_client_count_does_not_decide_another(self, tmp_path):
+        out = tmp_path / "verdict.json"
+        assert validate.main(["matrix"] + self._diverging(tmp_path)
+                             + ["--out", str(out)]) == 0
+        groups = json.loads(out.read_text())["by_group"]
+        one = groups["clients_short c1"]["throughput_tok_s"]
+        eight = groups["clients_short c8"]["throughput_tok_s"]
+        assert one["real_best"] == "tp2_clients_short_c1"
+        assert eight["real_best"] == "tp4_clients_short_c8"
+
+    def test_scaling_is_reported_as_measurements_not_as_a_rank(self, tmp_path):
+        out = tmp_path / "verdict.json"
+        validate.main(["matrix"] + _whole_matrix(tmp_path) + ["--out", str(out)])
+        scaling = json.loads(out.read_text())["scaling"]
+        assert set(scaling) == set(validate.CLIENT_CLASSES)
+        by_count = scaling["clients_short"]["throughput_tok_s"]
+        assert set(by_count) == {str(c) for c in validate.CLIENT_COUNTS}
+        for clients, cells in by_count.items():
+            assert len(cells) == 3, clients
+            for reading in cells.values():
+                # Both sides, so the reader can see the model track the load
+                # -- and nothing that decides anything.
+                assert set(reading) == {"real_centre", "modelled_centre"}
+
+    def test_a_verdict_with_no_client_count_is_not_a_cell_of_this_matrix(
+        self, tmp_path, capsys
+    ):
+        where = tmp_path / "tp1_clients_short"
+        where.mkdir()
+        (where / "cc_traces_cell.json").write_text(
+            json.dumps(
+                _cell_verdict(
+                    "tp1_clients_short",
+                    "clients_short",
+                    100.0,
+                    100.0,
+                    tp=1,
+                    metrics=ALL_METRICS,
+                )
+            )
+        )
+        assert validate.main(["matrix"] + _whole_matrix(tmp_path) + [str(where)]) == 1
+        assert "no client count" in capsys.readouterr().out
 
 
 class TestTheSpeedupGateIsPartOfTheVerdict:
@@ -2343,15 +2471,16 @@ class TestTheSpeedupGateIsPartOfTheVerdict:
 
     def _slow(self, tmp_path, ratio=2.0):
         slow = _cell_verdict(
-            "tp4_long",
-            "long",
+            "tp4_clients_large_c8",
+            "clients_large",
             400.0,
             400.0,
             tp=4,
+            clients=8,
             metrics=ALL_METRICS,
             speedup=ratio,
         )
-        return _six(tmp_path, {(4, "long"): slow})
+        return _whole_matrix(tmp_path, {(4, "clients_large", 8): slow})
 
     def test_an_accurate_matrix_that_replays_too_slowly_is_not_accepted(
         self, tmp_path, capsys
@@ -2367,22 +2496,28 @@ class TestTheSpeedupGateIsPartOfTheVerdict:
         # Valid, measured, and reported -- and not accepted. The distinction
         # is the point: a refused cell has no numbers to read, a failed gate
         # has numbers that say why it failed.
-        assert len(report["cells_used"]) == 6
+        assert len(report["cells_used"]) == len(validate.REGISTERED_CELLS)
         assert not report["refused"]
-        assert report["speedup"]["tp4_long"]["replay_ratio"] == 2.0
+        assert report["speedup"]["tp4_clients_large_c8"]["replay_ratio"] == 2.0
         assert report["gates"]["speedup"] is False
         assert report["accepted"] is False
 
     def test_a_cell_whose_gate_was_never_computed_is_not_accepted(self, tmp_path):
         unknown = _cell_verdict(
-            "tp1_short", "short", 100.0, 100.0, tp=1, metrics=ALL_METRICS
+            "tp1_clients_short_c1",
+            "clients_short",
+            100.0,
+            100.0,
+            tp=1,
+            clients=1,
+            metrics=ALL_METRICS,
         )
         unknown["speedup"] = {
             "replay_ratio": None,
             "meets_gate": None,
             "reason": "costs.json carries no execution terms",
         }
-        dirs = _six(tmp_path, {(1, "short"): unknown})
+        dirs = _whole_matrix(tmp_path, {(1, "clients_short", 1): unknown})
         assert validate.main(["matrix"] + dirs) == 1
 
 
@@ -2463,26 +2598,28 @@ class TestTiesAndSeparationsAreBothGated:
     def test_the_matrix_reads_it(self, tmp_path, capsys):
         """Separation is a gate in its own right.
 
-        The three short cells order the same way on both sides and are inside
-        tolerance, so ranking, tolerance and speedup all hold. What fails is
-        that the hardware's repeats overlap and the model's do not: the model
-        claims three distinct configurations where the machine shows one. A
-        matrix that did not read separation would accept this.
+        The three widths of one (class, client count) order the same way on
+        both sides and are inside tolerance, so ranking, tolerance and speedup
+        all hold. What fails is that the hardware's repeats overlap and the
+        model's do not: the model claims three distinct configurations where
+        the machine shows one. A matrix that did not read separation would
+        accept this.
         """
         short = {
-            (tp, "short"): _cell_verdict(
-                f"tp{tp}_short",
-                "short",
+            (tp, "clients_short", 1): _cell_verdict(
+                f"tp{tp}_clients_short_c1",
+                "clients_short",
                 centre,
                 centre,
                 0.05,
                 tp=tp,
+                clients=1,
                 modelled_spread=0.0001,
                 metrics=ALL_METRICS,
             )
             for tp, centre in ((1, 100.0), (2, 101.0), (4, 102.0))
         }
-        dirs = _six(tmp_path, short)
+        dirs = _whole_matrix(tmp_path, short)
         report = tmp_path / "matrix.json"
         assert validate.main(["matrix", "--out", str(report)] + dirs) == 1
         assert "MATRIX FAIL" in capsys.readouterr().out
@@ -2819,12 +2956,19 @@ class TestAnUndecidedToleranceIsNotAPass:
         assert block["error_pct"] is None
 
     def test_the_matrix_does_not_accept_an_ungraded_cell(self, tmp_path, capsys):
-        ungraded = _cell_verdict("tp4_long", "long", 400.0, 400.0, tp=4)
+        ungraded = _cell_verdict(
+            "tp4_clients_large_c8",
+            "clients_large",
+            400.0,
+            400.0,
+            tp=4,
+            clients=8,
+        )
         for name in ALL_METRICS:
             block = dict(ungraded["metrics"]["throughput_tok_s"])
             block["within_tolerance"] = None
             ungraded["metrics"][name] = block
-        dirs = _six(tmp_path, {(4, "long"): ungraded})
+        dirs = _whole_matrix(tmp_path, {(4, "clients_large", 8): ungraded})
         report = tmp_path / "matrix.json"
         assert validate.main(["matrix", "--out", str(report)] + dirs) == 1
         assert "MATRIX FAIL" in capsys.readouterr().out
@@ -3042,3 +3186,185 @@ class TestTheCostRecordIsBoundToWhatTheRunsMeasured:
         blob["executions"][1]["replay"] = None
         (Path(cell) / "run.modelled.json").write_text(json.dumps(blob))
         assert any("timed" in f for f in self._failures(cell))
+
+
+plan_mod = _load("cc_traces_plan")
+
+
+class TestTheRegisteredRepeatsAreWhatAcceptanceIsGradedAgainst:
+    """A caller cannot buy acceptance by asking for a shorter run.
+
+    `--repeats` was the number the cell was graded against, and the planner
+    passes its own `--repeats` straight into that command, so a 24-cell run at
+    one repeat a side came out labelled the same as the registered experiment.
+    The protocol's §3 count is three real and three modelled repeats; it is now
+    the floor for *acceptance* specifically. A shorter run stays a graded
+    diagnostic -- every property it can show, it still shows -- and it is the
+    purpose and the repeat count on its verdict that stop the matrix reading it
+    as a cell of the experiment.
+    """
+
+    def _planned(self, repeats):
+        """The validator command the public planner emits, for one cell."""
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            assert plan_mod.main(["--root", "/r", "--repeats", str(repeats)]) == 0
+        plan = json.loads(buffer.getvalue())
+        for step in plan["cells"][0]["steps"]:
+            if step["id"] == "validate":
+                return plan, list(step["command"])
+        raise AssertionError("the plan has no validate step")
+
+    def _three(self, cell_dir):
+        """The fixture cell, run three times a side and priced per repeat."""
+        for side in ("real", "modelled"):
+            base = json.loads((Path(cell_dir) / f"{side}.r1.json").read_text())
+            for index in (2, 3):
+                _write(Path(cell_dir) / f"{side}.r{index}.json", base)
+            _journal(cell_dir, side, 3, seconds=20.0)
+        _gpu_free(cell_dir)
+        costs = {
+            **{t: 10.0 for t in validate.MEASURED_COST_TERMS},
+            **{t: _supplied(10.0) for t in validate.SUPPLIED_COST_TERMS},
+            "cost_schema": validate.COSTS_SCHEMA,
+            "execution_clocks": {"real": "wall", "modelled": "wall"},
+            "repeats": {"real": 3, "modelled": 3},
+            "execution_by_repeat": {
+                side: {str(i): 20.0 for i in (1, 2, 3)}
+                for side in ("real", "modelled")
+            },
+            "startup_by_repeat": {
+                side: {str(i): 1.0 for i in (1, 2, 3)}
+                for side in ("real", "modelled")
+            },
+            "execution_real": 20.0,
+            "execution_modelled": 20.0,
+        }
+        (Path(cell_dir) / "costs.json").write_text(json.dumps(costs))
+        return cell_dir
+
+    def _as_argv(self, command, cell_dir, repeats):
+        """The planned command, re-aimed at the fixture cell.
+
+        The cell coordinates differ -- the fixture is the legacy `long` class
+        at TP=2 -- but the repeat count is the planner's own, which is the
+        thing under test.
+        """
+        assert command[:3] == [
+            "python",
+            "scripts/compass/cc_traces_validate.py",
+            "cell",
+        ]
+        assert command[command.index("--repeats") + 1] == str(repeats)
+        return [
+            "cell",
+            str(cell_dir),
+            "--class",
+            "long",
+            "--tp",
+            "2",
+            "--repeats",
+            command[command.index("--repeats") + 1],
+            "--calibration-registry",
+            str(Path(cell_dir) / "registry.json"),
+        ]
+
+    def test_the_planner_and_the_validator_mean_the_same_three(self):
+        assert plan_mod.REPEATS == validate.PROTOCOL_REPEATS == 3
+
+    def test_the_registered_plan_is_acceptance_and_its_cells_can_be(self, cell):
+        _, command = self._planned(validate.PROTOCOL_REPEATS)
+        assert validate.main(self._as_argv(command, self._three(cell), 3)) == 0
+        saved = verdict(cell)
+        assert saved["purpose"] == validate.ACCEPTANCE_PURPOSE
+        assert saved["accepted"] is True
+        assert saved["repeats"] == 3
+
+    def test_a_plan_at_one_repeat_says_it_is_a_diagnostic(self):
+        plan, _ = self._planned(1)
+        assert plan["purpose"] == plan_mod.DIAGNOSTIC
+        assert plan["repeats_registered"] == validate.PROTOCOL_REPEATS
+        assert "DIAGNOSTIC" in plan_mod.render(plan)
+
+    def test_the_default_plan_is_an_acceptance_plan(self):
+        plan, _ = self._planned(validate.PROTOCOL_REPEATS)
+        assert plan["purpose"] == plan_mod.ACCEPTANCE
+        assert "DIAGNOSTIC" not in plan_mod.render(plan)
+
+    def test_a_planned_one_repeat_cell_is_graded_but_not_accepted(self, cell):
+        """The defect, at the cell boundary: this used to be acceptance."""
+        _, command = self._planned(1)
+        assert validate.main(self._as_argv(command, cell, 1)) == 0
+        saved = verdict(cell)
+        assert saved["passed"] is True
+        assert saved["accepted"] is False
+        assert saved["purpose"] == validate.DIAGNOSTIC_PURPOSE
+        assert saved["repeats"] == 1
+        assert saved["repeats_registered"] == validate.PROTOCOL_REPEATS
+
+    def test_the_short_run_says_so_where_an_operator_reads_it(self, cell, capsys):
+        _, command = self._planned(1)
+        validate.main(self._as_argv(command, cell, 1))
+        assert "DIAGNOSTIC" in capsys.readouterr().out
+
+    def test_what_a_planned_short_run_writes_is_refused_by_the_matrix(
+        self, cell, tmp_path
+    ):
+        """The same boundary again, one cell later: the verdict a one-repeat
+        run produced cannot be counted into the matrix."""
+        _, command = self._planned(1)
+        validate.main(self._as_argv(command, cell, 1))
+        saved = verdict(cell)
+        short = _cell_verdict(
+            "tp4_clients_large_c8",
+            "clients_large",
+            400.0,
+            400.0,
+            tp=4,
+            clients=8,
+            metrics=ALL_METRICS,
+        )
+        # Exactly the two fields the short run wrote, on an otherwise perfect
+        # cell of the matrix.
+        short["purpose"] = saved["purpose"]
+        short["repeats"] = saved["repeats"]
+        dirs = _whole_matrix(tmp_path, {(4, "clients_large", 8): short})
+        assert validate.main(["matrix"] + dirs) == 1
+
+    def test_the_matrix_refuses_a_cell_short_of_the_registered_repeats(
+        self, tmp_path, capsys
+    ):
+        """Without the purpose, too: a hand-written verdict that claims
+        acceptance still has to say three repeats are under it."""
+        short = _cell_verdict(
+            "tp1_clients_short_c1",
+            "clients_short",
+            100.0,
+            100.0,
+            tp=1,
+            clients=1,
+            metrics=ALL_METRICS,
+            repeats=validate.PROTOCOL_REPEATS - 1,
+        )
+        dirs = _whole_matrix(tmp_path, {(1, "clients_short", 1): short})
+        assert validate.main(["matrix"] + dirs) == 1
+        assert "repeats" in capsys.readouterr().out
+
+    def test_a_verdict_that_does_not_say_its_repeats_is_not_a_cell(
+        self, tmp_path
+    ):
+        silent = _cell_verdict(
+            "tp2_clients_short_c2",
+            "clients_short",
+            200.0,
+            200.0,
+            tp=2,
+            clients=2,
+            metrics=ALL_METRICS,
+        )
+        del silent["repeats"]
+        dirs = _whole_matrix(tmp_path, {(2, "clients_short", 2): silent})
+        assert validate.main(["matrix"] + dirs) == 1
+
+    def test_the_whole_registered_matrix_still_passes(self, tmp_path):
+        assert validate.main(["matrix"] + _whole_matrix(tmp_path)) == 0

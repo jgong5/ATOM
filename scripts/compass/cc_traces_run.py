@@ -37,12 +37,13 @@ execution is the replay's own window through `compare.metrics` -- and the terms
 nothing here can measure (`capture`, `calibration`, `derivation`, `load`) are
 inputs to the merge, which refuses to write a `costs.json` without them.
 
-    python scripts/compass/cc_traces_run.py side --cell RESULTS/tp2_long \
-        --side real --tp 2 --class long
-    python scripts/compass/cc_traces_run.py side --cell RESULTS/tp2_long \
-        --side modelled --tp 2 --class long --replay-target target.json \
+    python scripts/compass/cc_traces_run.py side --cell RESULTS/tp2_clients_large_c4 \
+        --side real --tp 2 --class clients_large --clients 4
+    python scripts/compass/cc_traces_run.py side --cell RESULTS/tp2_clients_large_c4 \
+        --side modelled --tp 2 --class clients_large --clients 4 \
+        --replay-target target.json \
         --oracle transfer --oracle-option source=/path/to/tp1
-    python scripts/compass/cc_traces_run.py costs RESULTS/tp2_long \
+    python scripts/compass/cc_traces_run.py costs RESULTS/tp2_clients_large_c4 \
         --capture 412.0 --calibration 1980.0 --derivation 31.5 --load 96.0
 
 No result is claimed by this file. It runs commands and writes down what they
@@ -485,6 +486,7 @@ class SideRun:
                 "path": str(self.cell),
                 "tp": self.plan["tp"],
                 "class": self.plan["class"],
+                "clients": self.plan["clients"],
             },
             "side": self.side,
             "repeat": step["repeat"],
@@ -516,7 +518,9 @@ class SideRun:
 
     def _source(self, step) -> dict:
         """What this repeat was run *from*, with digests where there is a file."""
-        workload = ROOT / f"atom/compass/cc_traces_{self.plan['class']}.jsonl"
+        workload = ROOT / plan_module.workload(
+            self.plan["class"], self.plan["clients"]
+        )
         command = step["command"]
         target = None
         if "--compass-replay-target" in command:
@@ -1387,6 +1391,7 @@ class SideRun:
                     "host": self.host,
                     "tp": self.plan["tp"],
                     "class": self.plan["class"],
+                    "clients": self.plan["clients"],
                     "ok": not self.failures,
                     "executions": [self.executions[n] for n in sorted(self.executions)],
                     "refused": self.refused,
@@ -1515,6 +1520,7 @@ def _cell_plan(args) -> dict:
     built = plan_module.cell_steps(
         args.tp,
         args.klass,
+        args.clients,
         root=str(cell.parent),
         oracle=getattr(args, "oracle", None),
         options=getattr(args, "oracle_option", ()) or (),
@@ -1527,8 +1533,9 @@ def _cell_plan(args) -> dict:
     )
     if Path(built["cell"]).name != cell.name:
         raise SystemExit(
-            f"--cell {cell.name} is not tp{args.tp}_{args.klass}: the "
-            f"directory name is what the plan and the validator agree on"
+            f"--cell {cell.name} is not tp{args.tp}_{args.klass}_c"
+            f"{args.clients}: the directory name is what the plan and the "
+            f"validator agree on"
         )
     built["cell"] = str(cell)
     for step in built["steps"]:
@@ -1537,6 +1544,26 @@ def _cell_plan(args) -> dict:
                 part.replace(built["cell"], str(cell)) for part in step["command"]
             ]
     return built
+
+
+def purpose_of_run(asked_for: str, repeats: int) -> str:
+    """What a run of `repeats` repeats a side is actually for.
+
+    Asking for fewer repeats than `CC_TRACES_PROTOCOL.md` §3 registers is
+    asking for a diagnostic, whatever `--purpose` says. Deciding it here means
+    the stamp goes into every execution record and every artifact, so the
+    shortfall travels with the evidence rather than being inferable only from
+    how many files ended up in the directory.
+    """
+    if asked_for != ACCEPTANCE or repeats >= plan_module.REPEATS:
+        return asked_for
+    print(
+        f"--repeats {repeats} is fewer than the {plan_module.REPEATS} "
+        f"CC_TRACES_PROTOCOL.md section 3 registers: this run is stamped "
+        f"{DIAGNOSTIC} and cannot be graded as acceptance",
+        file=sys.stderr,
+    )
+    return DIAGNOSTIC
 
 
 def side(args) -> int:
@@ -1571,9 +1598,11 @@ def side(args) -> int:
             file=sys.stderr,
         )
         return 2
-    runner = SideRun(
-        _cell_plan(args), args.side, purpose=getattr(args, "purpose", ACCEPTANCE)
+    purpose = purpose_of_run(
+        getattr(args, "purpose", ACCEPTANCE),
+        getattr(args, "repeats", plan_module.REPEATS),
     )
+    runner = SideRun(_cell_plan(args), args.side, purpose=purpose)
     code = runner.run()
     for reason in runner.failures:
         print(reason, file=sys.stderr)
@@ -1942,7 +1971,16 @@ def main(argv=None) -> int:
     s.add_argument("--cell", required=True)
     s.add_argument("--side", required=True, choices=("real", "modelled"))
     s.add_argument("--tp", type=int, required=True)
-    s.add_argument("--class", dest="klass", required=True, choices=("short", "long"))
+    s.add_argument(
+        "--class", dest="klass", required=True, choices=plan_module.CLASSES
+    )
+    s.add_argument(
+        "--clients",
+        type=int,
+        required=True,
+        choices=plan_module.CLIENTS,
+        help="root sessions offered, which is this cell's registered workload",
+    )
     s.add_argument("--repeats", type=int, default=plan_module.REPEATS)
     s.add_argument(
         "--port",

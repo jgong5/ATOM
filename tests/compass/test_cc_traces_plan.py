@@ -59,10 +59,20 @@ def _role(cell, role, side=None):
 
 
 class TestTheMatrixItCovers:
-    def test_every_width_and_class_appears_once(self, plan):
-        seen = [(c["tp"], c["class"]) for c in plan["cells"]]
+    def test_every_width_and_class_and_client_count_appears_once(self, plan):
+        """A cell is (width, class, offered load), and the matrix is all of it.
+
+        The client count is a coordinate, not a variant of one: two cells that
+        agree on width and class and differ on offered load replay different
+        request sets, so dropping the count from the identity would let one of
+        them stand in for the other.
+        """
+        seen = [(c["tp"], c["class"], c["clients"]) for c in plan["cells"]]
         assert sorted(seen) == sorted(
-            (tp, klass) for tp in plan_mod.TPS for klass in plan_mod.CLASSES
+            (tp, klass, clients)
+            for tp in plan_mod.TPS
+            for klass in plan_mod.CLASSES
+            for clients in plan_mod.CLIENTS
         )
         assert len(seen) == len(set(seen))
 
@@ -246,7 +256,7 @@ class TestTheTwoSidesAreNotRunTheSameWay:
 
     def test_each_side_replays_the_registered_workload_for_its_class(self, plan):
         for cell in plan["cells"]:
-            expected = f"atom/compass/cc_traces_{cell['class']}.jsonl"
+            expected = plan_mod.workload(cell["class"], cell["clients"])
             replays = _role(cell, "replay")
             assert replays
             for step in replays:
@@ -366,7 +376,7 @@ class TestItSaysWhatItDoesNotProvide:
 class TestWhatItPrints:
     def test_the_shell_rendering_is_the_same_plan(self, tmp_path):
         text = _run(["--root", "/r", "--shell"])
-        assert "cc_traces_validate.py cell /r/tp4_long" in text
+        assert "cc_traces_validate.py cell /r/tp4_clients_large_c8" in text
         assert "[device_free]" in text and "[gpu]" in text
         assert "what this plan does not provide" in text
 
@@ -465,7 +475,8 @@ class TestTheTwoPortsAreChosenSeparately:
         with pytest.raises(SystemExit) as raised:
             plan_mod.cell_steps(
                 2,
-                "long",
+                "clients_large",
+                4,
                 root="/r",
                 oracle=None,
                 options=(),
@@ -556,7 +567,7 @@ class TestTheRegistryIsWhereTheConfigurationComesFrom:
                 seen += 1
                 assert (command[command.index("--compass-rank-aggregation") + 1]
                         == plan_mod.registry.RANK_AGGREGATION)
-        assert seen == 6 * got["repeats"]
+        assert seen == len(got["cells"]) * got["repeats"]
 
     def test_native_allocation_is_selected_at_every_width(self):
         # `carry_allocation=1` reuses the template's blocks and declares them
@@ -566,3 +577,47 @@ class TestTheRegistryIsWhereTheConfigurationComesFrom:
             options = plan_mod.registry.options(tp, "/a")
             assert "allocation=native" in options
             assert not any(o.startswith("carry_allocation=") for o in options)
+
+
+class TestAShorterRunIsPlannedAsADiagnostic:
+    """`--repeats` below §3's three does not build a cheaper acceptance run.
+
+    The planner hands its repeat count to the validator, so lowering it used to
+    lower the bar the cells were graded against and a one-repeat matrix came
+    out labelled acceptance. The count the validator accepts is now fixed at
+    the protocol's; what is left for the planner is to say plainly which of the
+    two kinds of run it has built.
+    """
+
+    def _plan(self, repeats):
+        return json.loads(_run(["--root", "/r", "--repeats", str(repeats)]))
+
+    def test_the_planner_does_not_keep_its_own_idea_of_three(self):
+        assert plan_mod.REPEATS == validate.PROTOCOL_REPEATS
+
+    def test_the_registered_count_builds_an_acceptance_plan(self, plan):
+        assert plan["repeats"] == plan_mod.REPEATS
+        assert plan["purpose"] == plan_mod.ACCEPTANCE
+
+    def test_fewer_repeats_builds_a_diagnostic_plan(self):
+        got = self._plan(1)
+        assert got["purpose"] == plan_mod.DIAGNOSTIC
+        assert got["repeats"] == 1
+        assert got["repeats_registered"] == plan_mod.REPEATS
+
+    def test_more_repeats_than_registered_is_still_acceptance(self):
+        assert self._plan(plan_mod.REPEATS + 1)["purpose"] == plan_mod.ACCEPTANCE
+
+    def test_a_diagnostic_plan_says_so_at_the_top_of_the_page(self):
+        text = plan_mod.render(self._plan(1))
+        assert "DIAGNOSTIC" in text.splitlines()[2]
+
+    def test_every_cell_of_a_short_plan_is_still_validated_publicly(self):
+        """The planned command is the public validator, with the count the
+        planner used. Whether that count can buy acceptance is the validator's
+        question, and `tests/compass/test_cc_traces_validate.py` asks it."""
+        got = self._plan(1)
+        for cell in got["cells"]:
+            command = _by_id(cell)["validate"]["command"]
+            assert command[1:3] == ["scripts/compass/cc_traces_validate.py", "cell"]
+            assert command[command.index("--repeats") + 1] == "1"

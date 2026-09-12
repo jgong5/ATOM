@@ -1,7 +1,19 @@
 {
  "protocol": "atom/compass/CC_TRACES_PROTOCOL.md",
- "sha256": "c0e9aaccf1308c10ad5e82552d5c5fb18bc4362c987d77e2260b20c78a075738",
- "registered_at": "2026-09-11T09:12:17Z",
- "revision": "3483e15c4f61f102b39868e70db7263acdfe59d1 (working tree dirty: 12 paths)",
- "superseded": null
+ "sha256": "1e90ce82f2c38ed7675502598f336db7605f13eb953dfd7e04b7cc30cabad98f",
+ "registered_at": "2026-09-12T16:20:00Z",
+ "revision": "45085f54073dfeba67969bd102dcbc6e4c220924 (working tree dirty: 1 path, this lock)",
+ "superseded": {
+  "protocol": "atom/compass/CC_TRACES_PROTOCOL.md",
+  "sha256": "85f85ca81b4784665228618e470fb2947b6239b356041cc6c42fbd5f497c3f8b",
+  "registered_at": "2026-09-12T14:51:25Z",
+  "revision": "2b0448b4002f7e43862e8ef2c059cb928b8a9fb9 (working tree dirty: 19 paths)",
+  "superseded": {
+   "protocol": "atom/compass/CC_TRACES_PROTOCOL.md",
+   "sha256": "c0e9aaccf1308c10ad5e82552d5c5fb18bc4362c987d77e2260b20c78a075738",
+   "registered_at": "2026-09-11T09:12:17Z",
+   "revision": "3483e15c4f61f102b39868e70db7263acdfe59d1 (working tree dirty: 12 paths)",
+   "superseded": null
+  }
+ }
 }
