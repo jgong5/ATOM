@@ -219,7 +219,10 @@ def test_the_width_reaches_its_own_files(tp):
     # `pricing_coverage`, `g4/card` and `xacq/training` as well as `g4/src1`,
     # and requiring one directory would mean either dropping those from the
     # registry or filing them under a name that is not where they live.
-    own = "g4/src1" if tp == 1 else f"serving/src_tp{tp}"
+    # At TP1 that directory is `g4/src2c`, the corrected decode-32 capture,
+    # and not `g4/src1`: the templates are what the step binds, and src1's
+    # body graph recorded an attention chain the deployment does not run.
+    own = "g4/src2c" if tp == 1 else f"serving/src_tp{tp}"
     for role in ("template", "head_template"):
         assert own in paths[role], (role, paths[role])
     # What must hold for every path is the thing the marker was standing in

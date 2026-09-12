@@ -119,6 +119,13 @@ INADMISSIBLE = {
 _TP1 = "{root}/g4/src1"
 _WIDE = "{root}/serving/src_tp{tp}"
 
+#: The corrected decode-32 capture, and the prices acquired against it.
+#: `g4/src1` keeps every byte it had -- it is the evidence for what the old
+#: binder refused and why -- and nothing here overwrites it: the seeds are
+#: new files under new names, and the repriced signatures are their own list.
+_SRC2C = "{root}/g4/src2c"
+_SRC2P = "{root}/g4/src2p"
+
 #: The rest of the source-width price tree. Two decode-32 pairs under `_TP1`
 #: were this file's whole TP=1 list; the run that was actually exercised
 #: staged the forty-odd files below and refused far less. They are named here
@@ -248,9 +255,30 @@ def _tp1_prices() -> tuple:
     def add(prices: str, graph: str = "") -> None:
         spec.append(f"{prices}:{graph}:unregistered")
 
-    # The two decode-32 pairs: the body and head templates' own prices.
-    add(f"{_TP1}/p27bdec32.tp1.r0.json", f"{_TP1}/b27dec32.tp1.r0.json")
-    add(f"{_TP1}/p27hdec32.tp1.r0.json", f"{_TP1}/h27dec32.tp1.r0.json")
+    # The two decode-32 pairs, against the corrected src2c graphs.
+    #
+    # The src1 records are unchanged and still on disk: what changed is which
+    # graph the step binds. `40ebae73` found that the CLI capture flags were
+    # written to `provenance.execution` and not to the BatchSpec actually
+    # traced, so the src1 body graph recorded a decode whose attention chain
+    # was not the deployed one. CC retraced it as src2c and repriced the 16
+    # MHA signatures that move with the corrected graph.
+    #
+    # So the body price list comes in two pieces, and the binding differs on
+    # purpose:
+    #
+    #   * the src1 list *unbound*. Its 2423 other signatures did not change,
+    #     and they match by signature. Binding it to the src2c graph would
+    #     claim it was measured against a graph it never saw.
+    #   * the 16 repriced signatures bound to the src2c body graph, which is
+    #     the graph they were measured against and the one the step binds.
+    #
+    # No key is substituted inside any old record. Where both pieces offer a
+    # signature the bound one is the specific match.
+    add(f"{_TP1}/p27bdec32.tp1.r0.json")
+    add(f"{_SRC2P}/prices/p27bdec32attn.tp1.r0.{_REP}.json",
+        f"{_SRC2C}/b27dec32.tp1.r0.json")
+    add(f"{_TP1}/p27hdec32.tp1.r0.json", f"{_SRC2C}/h27dec32.tp1.r0.json")
 
     # The 640- and 16384-token prefill cells.
     p640 = f"{_PC}/p640"
@@ -378,8 +406,12 @@ def per_width_options(tp: int) -> tuple:
             ("tp", "1"),
             ("replay_target", _CAPTURED_TARGET),
             ("price", ",".join(_tp1_prices())),
-            ("template", f"{_TP1}/b27dec32.tp1.r0.json"),
-            ("head_template", f"{_TP1}/h27dec32.tp1.r0.json"),
+            # src2c, not src1: the templates are what the step binds, and the
+            # src1 capture recorded a decode whose attention chain was not
+            # the deployed one. See `_tp1_prices` for what that changed and
+            # what it deliberately did not.
+            ("template", f"{_SRC2C}/b27dec32.tp1.r0.json"),
+            ("head_template", f"{_SRC2C}/h27dec32.tp1.r0.json"),
         )
     body = f"{_WIDE}/p27bdec32.json:{_WIDE}/b27dec32.json:unregistered"
     head = f"{_WIDE}/p27hdec32.json:{_WIDE}/h27dec32.json:unregistered"
