@@ -67,7 +67,13 @@ def _check_source(layout: TargetRecord, config) -> None:
             % (layout.source, captured, captured))
     want = str(getattr(config, "model", "") or "")
     got = str(layout.config.get("model", "") or "")
-    if want and got and want != got:
+    if not got:
+        raise ValueError(
+            "ATOMCompass: %s names no model, so there is nothing to check the "
+            "borrowed layout against. An unattributed record is not a source: "
+            "the state transfer layout being taken from it is a property of "
+            "the architecture that produced it." % layout.source)
+    if want and want != got:
         raise ValueError(
             "ATOMCompass: %s records %s and this derivation is for %s. The "
             "state transfer layout and capture shapes being borrowed are "
