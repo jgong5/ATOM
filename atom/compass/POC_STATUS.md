@@ -35,9 +35,23 @@ direction. What that changes:
   covered single-step checks (E7 at TP2, E8 at TP4) are **diagnostics**. They
   are retained in full as dated history and none of them may be cited as gate
   evidence. The rows below that still rest on them are marked accordingly.
-* `agent_scratch/cc_pilot.jsonl` — the first 20 requests of the corpus — is a
-  **development and regression workload**. The cost model was iterated against
-  it; §3 already says so about E1. It is never held out on workload.
+* `agent_scratch/cc_pilot.jsonl` (`bf4049f84be161df`) is a **development and
+  regression workload**. The cost model was iterated against it; §3 already says
+  so about E1. It is never held out on workload. Two facts about the file that
+  its one-line description used to hide:
+  * It holds **62 requests**, every one of session
+    `002001296e8a8c38ad9d7cc436d691afc602` (the file abbreviates it to
+    `002001296e8a`), which is excluded from both frozen cc-traces workloads
+    — disjointness is by session identity, not by sampling. E1 sent only its
+    **first 20**; the current development replays send all 62. "First 20" is
+    a description of an historical run, not of the file, and where it appears
+    below it means the run.
+  * Its arrival column is **file time, not raw corpus time**. 25 of the 61 gaps
+    were clipped to 30 s when the pilot was cut, compressing a raw source span of
+    88 934 s into a file span of 1 098.9 s. Replays pace to the file, so a
+    development run reproduces the clipped pacing and not the corpus's real idle
+    structure. Nothing in the final protocol or the two frozen workloads depends
+    on this file, and none of them is changed by saying it.
 * The held-out axis the PoC is asked for is **configuration**. Every held-out
   axis is named per prediction, and evaluated TP2/TP4 full-engine measurements
   stay out of calibration.
@@ -231,7 +245,8 @@ rather than a run.
 
 ### E1 — long-input serving, 27B, TP=4 (the cc-traces pilot; closed)
 
-* **Workload** `agent_scratch/cc_pilot.jsonl`, the first 20 requests of
+* **Workload** the first 20 rows of `agent_scratch/cc_pilot.jsonl`, a 62-row
+  single-session development file cut from
   `semianalysisai/cc-traces-weka-062126-256k`. Statistics of **those twenty**:
   input tokens min 640, median 84,800, max 119,360, sum 1,681,024; output
   tokens min 20, median 525, max 3,693; declared arrivals spanning 244.5 s,
