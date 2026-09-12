@@ -402,6 +402,32 @@ class LLMEngine:
             },
         }
 
+    def get_compass_arrival_barrier(self, timeout: float = 30.0) -> dict[str, Any]:
+        """Did any rank's arrival barrier give up waiting for the workload?
+
+        Any rank timing out invalidates the run: the barrier exists so that no
+        rank advances virtual time past an arrival still in flight, and one
+        that did is enough for the schedule to stop being the schedule the
+        workload describes.
+
+        So the states do not average. True beats unknown beats False: a single
+        rank reporting a timeout decides it, and otherwise a rank that could
+        not answer leaves the whole reading unknown rather than letting the
+        ranks that did answer speak for it.
+        """
+        responses = self.core_mgr.broadcast_utility_command_sync(
+            "get_compass_arrival_barrier", timeout=timeout
+        )
+        ranks = [resp.get("result", resp) for resp in responses]
+        states = [rank.get("timed_out") for rank in ranks]
+        if any(state is True for state in states):
+            timed_out: bool | None = True
+        elif not states or any(state is None for state in states):
+            timed_out = None
+        else:
+            timed_out = False
+        return {"timed_out": timed_out, "ranks": ranks}
+
     def get_cache_statistics(self, timeout: float = 30.0) -> dict[str, Any]:
         """Return aggregated prefix-cache statistics across DP ranks.
 

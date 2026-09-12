@@ -2412,6 +2412,12 @@ async def compass_requests(drain: bool = True):
 
     ``drain`` (default true) clears what it returns, so a benchmark reads each
     run exactly once and a long-lived server does not grow a row per request.
+
+    The arrival barrier is reported alongside them because it decides whether
+    these readings mean anything: if it gave up waiting, virtual time advanced
+    past an arrival still in flight and every latency after that point is
+    invalid. It rides on this response rather than its own endpoint so a client
+    cannot read the timings without also reading whether they are usable.
     """
     records = list(_compass_records.values())
     if drain:
@@ -2419,8 +2425,29 @@ async def compass_requests(drain: bool = True):
     return {
         "count": len(records),
         "clock": "virtual" if _compass_clock_is_virtual() else "wall",
+        "arrival_barrier": _compass_arrival_barrier(),
         "requests": records,
     }
+
+
+def _compass_arrival_barrier() -> dict:
+    """The engine core's own barrier state, or why it could not be read.
+
+    The scheduler lives in another process, so this is a round trip. It happens
+    once, at the end of a run, with the engine idle -- but a round trip can
+    still fail, and a failure here must not be reported as a run that was fine.
+    An unreadable barrier is ``timed_out: None``, which is neither a pass nor a
+    failure: the harness refuses on True and says "unknown" on None.
+    """
+    if engine is None:
+        return {"timed_out": None, "why": "the engine is not initialised"}
+    try:
+        return engine.get_compass_arrival_barrier(timeout=10.0)
+    except Exception as exc:
+        # Caught broadly on purpose: a barrier nobody could read is reported as
+        # unknown, and no failure of this reading may fail the run it describes.
+        logger.warning("Could not read the Compass arrival barrier", exc_info=True)
+        return {"timed_out": None, "why": f"{type(exc).__name__}: {exc}"}
 
 
 def _compass_clock_is_virtual() -> bool:

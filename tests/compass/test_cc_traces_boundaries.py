@@ -92,6 +92,10 @@ class Stub(BaseHTTPRequestHandler):
     #: The arrival protocol lives in those bodies and nowhere else, so this is
     #: what lets it be tested at the seam without an engine behind it.
     posted: ClassVar[list] = []
+    #: What the drain endpoint answers. `replay.py` reads the engine's barrier
+    #: state off this same response, so a test sets it here to stand for what
+    #: the engine observed.
+    requests_reply: ClassVar[dict] = {"count": 0, "requests": []}
 
     def do_POST(self):  # BaseHTTPRequestHandler names it this way
         length = int(self.headers.get("Content-Length") or 0)
@@ -99,7 +103,7 @@ class Stub(BaseHTTPRequestHandler):
         if self.path.startswith("/compass/requests"):
             # `replay.py` drains the engine's record store with a POST at the
             # end of a run. Recording it here would count it as a request.
-            body = json.dumps({"count": 0, "requests": []}).encode()
+            body = json.dumps(type(self).requests_reply).encode()
         else:
             type(self).posted.append(sent)
             body = json.dumps(
@@ -115,7 +119,7 @@ class Stub(BaseHTTPRequestHandler):
         if self.path.startswith("/compass/provenance"):
             body = json.dumps(type(self).provenance).encode()
         elif self.path.startswith("/compass/requests"):
-            body = json.dumps({"count": 0, "requests": []}).encode()
+            body = json.dumps(type(self).requests_reply).encode()
         else:
             self.send_response(404)
             self.end_headers()
@@ -135,6 +139,7 @@ def served():
     server = HTTPServer(("127.0.0.1", 0), Stub)
     Stub.provenance = {}
     Stub.posted = []
+    Stub.requests_reply = {"count": 0, "requests": []}
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
@@ -541,3 +546,156 @@ class TestTheArrivalBarrierIsOnlyArmedByTheSideThatCanFillIt:
         assert modelled and real
         assert "--pace" not in modelled[0]
         assert "--pace" in real[0]
+
+
+class TestABarrierThatActuallyTimedOutFailsTheRun:
+    """The state the engine really observed, carried to the harness.
+
+    `compare.py` has refused a manifest whose `arrival_barrier_timed_out` is
+    true for some time, but nothing ever wrote that key: the scheduler sets the
+    flag on itself in the EngineCore process and no endpoint exported it, so
+    the check could not fire. These check the producer end -- that
+    `/compass/requests` is read for it, that it reaches the manifest, and that
+    a run which timed out fails instead of reporting "0 failed".
+
+    Three states throughout. A barrier that could not be read is not a barrier
+    that held: unknown is reported and never silently promoted to either
+    answer.
+    """
+
+    def _trace(self, tmp_path, count=3):
+        path = tmp_path / "trace.jsonl"
+        path.write_text(
+            "".join(
+                json.dumps(
+                    {"arrival_s": i * 0.01, "input_tokens": 8, "output_tokens": 1}
+                )
+                + "\n"
+                for i in range(count)
+            )
+        )
+        return path
+
+    def _run(self, base, tmp_path, barrier):
+        """One unpaced run against a stub whose drain reports `barrier`."""
+        out = tmp_path / "out.json"
+        Stub.requests_reply = {"count": 0, "requests": [], **barrier}
+        code = replay_mod.main(
+            [
+                "--port",
+                base.rsplit(":", 1)[1],
+                "--model",
+                "m",
+                "--trace",
+                str(self._trace(tmp_path)),
+                "--out",
+                str(out),
+                "--timeout",
+                "20",
+            ]
+        )
+        return code, json.loads(out.read_text())["run"]
+
+    def test_a_barrier_that_held_is_a_passing_run(self, served, tmp_path):
+        base, _ = served
+        code, run = self._run(base, tmp_path, {"arrival_barrier": {"timed_out": False}})
+        assert code == 0
+        assert run["arrival_barrier_timed_out"] is False
+
+    def test_a_barrier_that_timed_out_fails_the_run(self, served, tmp_path):
+        base, _ = served
+        code, run = self._run(
+            base,
+            tmp_path,
+            {
+                "arrival_barrier": {
+                    "timed_out": True,
+                    "ranks": [{"detail": {"arrived": 11, "expected": 62}}],
+                }
+            },
+        )
+        assert code != 0, "a run whose barrier timed out must not exit 0"
+        assert run["arrival_barrier_timed_out"] is True
+
+    def test_the_failed_run_still_leaves_its_evidence(self, served, tmp_path):
+        """Failing by deleting the artifact would leave only a log line, which
+        is the situation this whole field exists to end."""
+        base, _ = served
+        code, run = self._run(base, tmp_path, {"arrival_barrier": {"timed_out": True}})
+        assert code != 0
+        assert run["arrival_barrier"] == {"timed_out": True}
+
+    def test_the_field_compare_refuses_on_is_the_field_replay_writes(
+        self, served, tmp_path
+    ):
+        """Named once. A manifest key nothing writes is how this check spent
+        its whole life so far being unable to fire."""
+        base, _ = served
+        _, run = self._run(base, tmp_path, {"arrival_barrier": {"timed_out": True}})
+        compare_source = (ROOT / "scripts/compass/compare.py").read_text()
+        assert 'm.get("arrival_barrier_timed_out")' in compare_source
+        assert "arrival_barrier_timed_out" in run
+
+    def test_an_unreadable_barrier_is_unknown_and_neither_answer(
+        self, served, tmp_path
+    ):
+        """A server too old to report one, or a round trip that failed. The
+        run is not refused -- nothing says it was bad -- but nothing may read
+        it as verified either."""
+        base, _ = served
+        code, run = self._run(base, tmp_path, {})
+        assert code == 0
+        assert run["arrival_barrier_timed_out"] is None
+
+    def test_an_unknown_barrier_is_not_truthy_to_the_check(self, served, tmp_path):
+        """`compare.py` refuses on truthiness, so unknown must not be a dict
+        or a non-empty string that happens to be true."""
+        base, _ = served
+        _, run = self._run(base, tmp_path, {"arrival_barrier": {"timed_out": None}})
+        assert not run["arrival_barrier_timed_out"]
+        assert run["arrival_barrier_timed_out"] is None
+
+
+class TestTheServerSideOfTheBarrierReading:
+    """The engine cannot be imported without a device, so its source is read.
+
+    Weaker than calling it, and named so nobody mistakes it for the stronger
+    check -- but it fails the day a name on either side of the round trip is
+    changed, which is the failure that leaves the harness reading a field
+    nobody writes.
+    """
+
+    COMMAND = "get_compass_arrival_barrier"
+
+    def test_the_endpoint_reports_the_barrier_next_to_the_timings(self):
+        source = (ROOT / "atom/entrypoints/openai/api_server.py").read_text()
+        start = source.index("async def compass_requests")
+        endpoint = source[start : source.index("\ndef _compass_clock_is_virtual", start)]
+        assert '"arrival_barrier"' in endpoint
+
+    def test_the_command_the_server_sends_is_one_the_engine_answers(self):
+        server = (ROOT / "atom/entrypoints/openai/api_server.py").read_text()
+        engine = (ROOT / "atom/model_engine/llm_engine.py").read_text()
+        utility = (ROOT / "atom/model_engine/engine_utility.py").read_text()
+        assert f"def {self.COMMAND}" in engine
+        assert f'"{self.COMMAND}"' in engine
+        assert f'"{self.COMMAND}": "_handle_{self.COMMAND}"' in utility
+        assert f"def _handle_{self.COMMAND}" in utility
+        assert f"{self.COMMAND}(" in server
+
+    def test_the_engine_reads_the_attribute_the_scheduler_sets(self):
+        """`arrival_barrier_timed_out` is set in `_arrival_barrier_unmet` and
+        read here; two spellings would export a permanent False."""
+        scheduler = (ROOT / "atom/model_engine/scheduler.py").read_text()
+        utility = (ROOT / "atom/model_engine/engine_utility.py").read_text()
+        assert "self.arrival_barrier_timed_out = {" in scheduler
+        assert "arrival_barrier_timed_out" in utility
+
+    def test_a_rank_that_cannot_answer_does_not_vote_for_a_good_run(self):
+        """True beats unknown beats False, so one silent rank cannot be
+        outvoted into a pass by the ranks that did answer."""
+        engine = (ROOT / "atom/model_engine/llm_engine.py").read_text()
+        start = engine.index(f"def {self.COMMAND}")
+        body = engine[start : engine.index("\n    def ", start + 10)]
+        assert "any(state is True" in body
+        assert "any(state is None" in body
