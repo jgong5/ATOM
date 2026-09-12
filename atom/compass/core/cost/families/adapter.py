@@ -61,7 +61,7 @@ import logging
 import re
 from typing import Optional
 
-from atom.compass.core.cost.families import attention
+from atom.compass.core.cost.families import attention, attention_scope
 from atom.compass.core.cost.families.features import (
     contract_for,
     grouping_key,
@@ -178,6 +178,30 @@ def _attention_scope(blob: dict, registration: Optional[str]) -> dict:
     if topology is not None:
         scope["topology"] = _hashable(topology)
     return scope
+
+
+def _resolved_declaration(blob: dict, price_path: str):
+    """What the measuring process itself resolved, read as a per-family scope.
+
+    New price records carry `resolved_scope`: the environment, the pools and
+    the per-layer backends the SAME process stood up, written down before it
+    priced anything. That is the strongest evidence a scope can have -- it is
+    not a later reading of a config, it is what ran -- so it is taken here in
+    preference to anything the request declares about the same file.
+
+    A record whose resolution cannot be read is not quietly treated as a
+    record without one. It keeps a scope key naming the failure, so it can
+    never pool with a record whose resolution WAS read, and a reader is told
+    which file to go and look at.
+    """
+    payload = (blob or {}).get("resolved_scope")
+    if not isinstance(payload, dict):
+        return None, None
+    try:
+        return attention_scope.read_resolved(
+            payload, where="%s:resolved_scope" % price_path), None
+    except ValueError as exc:
+        return None, str(exc)
 
 
 #: Key components that identify WHICH layer a call was, rather than what it
@@ -491,12 +515,25 @@ class ParametricPriceLibrary(PriceLibrary):
             self._source_ops.setdefault(price_path, {}).setdefault(sig, op)
         if not by_sig:
             return
-        scope = _attention_scope(blob, registration)
+        declared = _attention_scope(blob, registration)
+        resolved, unreadable = _resolved_declaration(blob, price_path)
+        if unreadable:
+            # Never silently pooled with a file whose resolution was read:
+            # this key differs from every readable one, so the two are
+            # different deployments until somebody fixes the record.
+            declared["resolved_scope_unreadable"] = unreadable
         for sig, record in (blob.get("prices") or {}).items():
             op = by_sig.get(sig)
             seconds = (record or {}).get("seconds")
             if op is None or seconds is None:
                 continue
+            # Per operator, because the file's resolution covers both
+            # families and the two are identified by different facts: the
+            # linear attention kernel never reads the paged KV cache, so a KV
+            # layout is not a fact about it.
+            scope = dict(declared)
+            if resolved is not None:
+                scope.update(resolved.for_op(op))
             self._attention_obs.append(
                 (op, float(seconds), price_path, scope,
                  _measurement_identity(record), _host_seconds(record)))
@@ -809,15 +846,16 @@ class ParametricPriceLibrary(PriceLibrary):
         matching a scoped fit, which is the refusal that keeps a law measured
         under one deployment from answering for another.
         """
-        scope = dict(self.request_attention_scope or {})
+        scope = self._declared_scope(op)
         if "measurement_treatment" not in scope:
-            treatment = self._sole_treatment()
+            treatment = self._treatment_for(op, scope)
             if treatment is not None:
-                # One treatment among every collected measurement, so pricing
-                # under it states a fact rather than choosing between laws.
-                # With several present and none declared, nothing is filled in
-                # and the scope comparison refuses by name -- which is the
-                # point: a warm-cache law is not a price for a cold request.
+                # One treatment across the domain this call belongs to, so
+                # pricing under it states a fact rather than choosing between
+                # laws. With several present and none declared, nothing is
+                # filled in and the scope comparison refuses by name -- which
+                # is the point: a warm-cache law is not a price for a cold
+                # request.
                 scope["measurement_treatment"] = treatment
         if registration is not None:
             scope.setdefault("registration", registration)
@@ -827,9 +865,71 @@ class ParametricPriceLibrary(PriceLibrary):
                              if isinstance(topology, dict) else tuple(topology))
         return scope or None
 
-    def _sole_treatment(self):
-        """The one treatment every collected measurement shares, or None."""
-        treatments = {obs[4] for obs in self._attention_obs}
+    def _declared_scope(self, op: dict) -> dict:
+        """What the asking deployment declares, for THIS call's family.
+
+        A declaration may be per family -- which is what reading a resolved
+        deployment produces, because the two families are identified by
+        different facts -- or one mapping meant for whichever family asks.
+        Both are accepted; a per-family declaration is selected by the
+        operator's own name rather than by anything the caller passes, so a
+        GDN call is never handed the unified family's KV facts.
+        """
+        declared = self.request_attention_scope
+        if declared is None:
+            return {}
+        if hasattr(declared, "for_op"):
+            return declared.for_op(op)
+        if not isinstance(declared, dict) or not declared:
+            return {}
+        labels = set(attention_scope.FAMILY_LABELS.values())
+        if set(declared) <= labels and all(
+                isinstance(value, dict) for value in declared.values()):
+            label = attention_scope.FAMILY_LABELS.get(op.get("name"))
+            return dict(declared.get(label) or {})
+        return dict(declared)
+
+    def _treatment_for(self, op: dict, scope):
+        """The treatment resolved WITHIN the domain this request asks about.
+
+        Not across the library. A mixed library holds both families, and they
+        are naturally measured under different treatments -- different region
+        rebuilds, different rotations, and under a collector that records
+        kernel ids for one run and not another. Asking whether the whole
+        library shares one treatment answers "no" for a perfectly ordinary
+        library and refuses every price in it.
+
+        The domain is this call's family, its regime and its static operand
+        geometry: the observations that could be points of the law this call
+        would be priced from, and no others. Ambiguity inside that domain is
+        still refused -- a cold-cache and a warm-cache measurement of the same
+        law are two laws, and picking one would be choosing which to charge.
+
+        The regime filter is dropped when this call's own regime cannot be
+        read, which happens when the scope is not yet complete enough to say.
+        Family and geometry still hold, so the answer is drawn from the same
+        operator on the same heads either way.
+        """
+        family = op.get("name")
+        geometry = attention.geometry_of(op)
+        asked = attention.regime_of(op, None, attention.scoped(op, scope))
+        wanted = None if isinstance(asked, attention.Refusal) else asked.name
+        treatments = set()
+        for obs_op, _s, _src, obs_scope, measurement, _host in \
+                self._attention_obs:
+            if obs_op.get("name") != family:
+                continue
+            if attention.geometry_of(obs_op) != geometry:
+                continue
+            if wanted is not None:
+                full = dict(obs_scope or {})
+                full["measurement_treatment"] = measurement
+                regime = attention.regime_of(
+                    obs_op, None, attention.scoped(obs_op, full))
+                if isinstance(regime, attention.Refusal) \
+                        or regime.name != wanted:
+                    continue
+            treatments.add(measurement)
         return treatments.pop() if len(treatments) == 1 else None
 
     def _layout_note(self, op: dict) -> str:

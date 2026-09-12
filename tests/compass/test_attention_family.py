@@ -957,6 +957,225 @@ class TestTheKVByteScaleIsStatedAtTheRightOrder:
         assert attention.MHA_LAYERS != 64
 
 
+def _resolved_record(*, gdn_layers=(0, 1), mha_layers=(3,), dtype="bf16",
+                     asked_dtype="bf16", envs=None, block=16, window=-1,
+                     state_slots=32, views=True):
+    """A stood-up deployment's record, in the schema the collector writes.
+
+    Values follow the real one: BF16 KV in a packed paged view, GDN state in
+    its own conv/recurrent pool, the dispatch environment as strings. The
+    keyword arguments exist so a test can withhold exactly one fact and see it
+    named rather than defaulted.
+    """
+    atom_envs = {"ATOM_ENABLE_GDN_DECODE_LOSSY_FAST": "False",
+                 "ATOM_USE_UNIFIED_ATTN": "False",
+                 "ATOM_FORCE_ATTN_TRITON": "False",
+                 "ATOM_V4_BACKEND": "legacy", "ATOM_V4_BACKEND_LAYERS": ""}
+    atom_envs.update(envs or {})
+    layers, kv_views = {}, {}
+    for number in gdn_layers:
+        layers["language_model.model.layers.%d.linear_attn" % number] = {
+            "attn_backend": "atom.model_ops.attentions.gdn_attn."
+                            "GDNAttentionBackend",
+            "class": "atom.model_ops.base_attention.LinearAttention",
+            "impl": "atom.model_ops.attention_gdn.GatedDeltaNet",
+            "impl_attrs": {"activation": "silu", "head_k_dim": 128,
+                           "head_v_dim": 128, "hidden_size": 5120,
+                           "key_dim": 2048, "layer_num": number,
+                           "num_k_heads": 16, "num_v_heads": 48,
+                           "value_dim": 6144}}
+        kv_views["holder0:layer_%d" % number] = _view([32, 3, 10240],
+                                                      [30720, 10240, 1],
+                                                      [32, 48, 128, 128],
+                                                      [786432, 16384, 128, 1])
+    for number in mha_layers:
+        layers["language_model.model.layers.%d.self_attn" % number] = {
+            "attn_backend": "atom.model_ops.attentions.aiter_attention."
+                            "AiterBackend",
+            "class": "atom.model_ops.paged_attention.Attention",
+            "impl": "atom.model_ops.attention_mha.PagedAttentionImpl",
+            "impl_attrs": {"head_dim": 256, "kv_cache_dtype": dtype,
+                           "layer_num": number, "num_heads": 24,
+                           "num_kv_heads": 4, "scale": 0.0625,
+                           "sliding_window": window}}
+        kv_views["holder0:layer_%d" % number] = _view(
+            [131072, 4, 32, 16, 8], [16384, 4096, 128, 8, 1],
+            [131072, 4, 2, 256, 8], [16384, 4096, 2048, 8, 1])
+    record = {
+        "atom_envs": atom_envs,
+        "caches_summary": {
+            "blocks": 131072, "kv_heads": 4, "state_slots": state_slots,
+            "pool_shapes": {"kv_cache": [[2, 16, 131072, block, 4, 256],
+                                         "torch.bfloat16"]}},
+        "config": {"kv_cache_block_size": block,
+                   "kv_cache_dtype": asked_dtype,
+                   "max_model_len": 262144},
+        "layers": layers,
+    }
+    if views:
+        record["kv_views"] = kv_views
+    return record
+
+
+def _view(k_shape, k_stride, v_shape, v_stride):
+    return {"entry_class": "KVCacheTensor",
+            "k": {"shape": k_shape, "stride": k_stride,
+                  "dtype": "torch.bfloat16", "element_size": 2,
+                  "is_contiguous": True, "data_ptr": "0x7ecf1e000000",
+                  "storage_offset": 0, "bytes": 1966080},
+            "v": {"shape": v_shape, "stride": v_stride,
+                  "dtype": "torch.bfloat16", "element_size": 2,
+                  "is_contiguous": True, "data_ptr": "0x7ece8de00000",
+                  "storage_offset": 34359738368, "bytes": 50331648}}
+
+
+class TestAResolvedDeploymentIsReadAsAScope:
+    """The judgement, written down once and checkable against the record.
+
+    A dump is not a scope, but refusing every dump is not the answer either:
+    the process that measured these prices wrote down what it stood up, and
+    reading that as the five facts the kernel turns on is exactly the reading
+    somebody has to make. It is made here, with each value carrying the path
+    it came from.
+    """
+
+    def _read(self, **kwargs):
+        from atom.compass.core.cost.families import attention_scope
+
+        return attention_scope.read_resolved(_resolved_record(**kwargs),
+                                             where="rec")
+
+    def test_both_families_get_their_own_scope(self):
+        declared = self._read()
+        assert set(declared.scopes) == {"unified", "gdn"}
+        assert declared.for_family("unified")["kv_cache_dtype"] == "bf16"
+        assert declared.for_family("unified")["sliding_window"] == -1
+        assert declared.for_family("gdn")["gdn_decode_lossy_fast"] is False
+        # The KV facts are not handed to the family that never reads the KV
+        # cache, and the state geometry is not handed to the one that has no
+        # state.
+        assert "kv_cache_layout" not in declared.for_family("gdn")
+        assert "gdn_state_geometry" not in declared.for_family("unified")
+
+    def test_every_declared_key_is_covered(self):
+        declared = self._read()
+        assert set(attention.UNIFIED_SCOPE) <= set(
+            declared.for_family("unified"))
+        assert set(attention.GDN_SCOPE) <= set(declared.for_family("gdn"))
+
+    def test_the_layout_is_the_view_not_the_pool(self):
+        """A pool allocation proves storage; the view proves the arrangement
+        the kernel indexes it through."""
+        layout = dict(self._read().for_family("unified"))["kv_cache_layout"]
+        fields = dict(dict(layout)["k"])
+        assert fields["shape"] == (131072, 4, 32, 16, 8)
+        assert fields["stride"] == (16384, 4096, 128, 8, 1)
+        assert fields["dtype"] == "torch.bfloat16"
+
+    def test_where_a_tensor_sits_is_not_part_of_its_layout(self):
+        """Otherwise two layers holding identical views would be two
+        deployments, and nothing would ever pool."""
+        one = self._read().for_family("unified")["kv_cache_layout"]
+        other = _resolved_record(mha_layers=(3, 7))
+        other["kv_views"]["holder0:layer_7"]["k"]["data_ptr"] = "0xdeadbeef"
+        other["kv_views"]["holder0:layer_7"]["k"]["storage_offset"] = 4096
+        from atom.compass.core.cost.families import attention_scope
+
+        assert attention_scope.read_resolved(
+            other, where="rec").for_family("unified")["kv_cache_layout"] == one
+
+    def test_the_backend_carries_the_environment_it_dispatches_on(self):
+        """`AiterBackend` does not say which branch ran. Two runs that differ
+        on the dispatch environment took different kernels through the same
+        backend class."""
+        mine = self._read().for_family("unified")["attention_backend"]
+        theirs = self._read(
+            envs={"ATOM_USE_UNIFIED_ATTN": "True"}
+        ).for_family("unified")["attention_backend"]
+        assert mine != theirs
+        assert dict(mine)["impl"].endswith("PagedAttentionImpl")
+
+    def test_requested_and_resolved_are_both_recorded_and_not_confused(self):
+        declared = self._read(asked_dtype="auto")
+        assert declared.for_family("unified")["kv_cache_dtype"] == "bf16"
+        statuses = {(f.key, f.status): f.value for f in declared.facts}
+        assert statuses[("kv_cache_dtype", "resolved")] == "bf16"
+        assert statuses[("kv_cache_dtype", "requested")] == "auto"
+
+    def test_a_config_that_contradicts_the_layers_is_refused(self):
+        with pytest.raises(ValueError, match="one of the two is wrong"):
+            self._read(asked_dtype="fp8")
+
+    def test_a_block_size_the_pool_does_not_carry_is_not_resolved(self):
+        """The config value is what was asked for. It becomes a resolved fact
+        only where the pool that was allocated carries it."""
+        from atom.compass.core.cost.families import attention_scope
+
+        record = _resolved_record()
+        record["config"]["kv_cache_block_size"] = 64
+        with pytest.raises(ValueError, match="kv_cache_block_size"):
+            attention_scope.read_resolved(record, where="rec")
+
+    def test_a_missing_fact_is_named_rather_than_defaulted(self):
+        with pytest.raises(ValueError, match="kv_views"):
+            self._read(views=False)
+
+    def test_a_short_view_table_still_proves_the_layout(self):
+        """The collector writes the holders it was given, not one entry per
+        bound module, and every layer of a family indexes the same pool. A
+        layout two holders show and none contradicts is resolved; requiring
+        all sixty-four would refuse every real record."""
+        from atom.compass.core.cost.families import attention_scope
+
+        record = _resolved_record(gdn_layers=(0, 1, 2), mha_layers=(3, 7))
+        del record["kv_views"]["holder0:layer_7"]
+        del record["kv_views"]["holder0:layer_2"]
+        declared = attention_scope.read_resolved(record, where="rec")
+        assert declared.for_family("unified")["kv_cache_layout"] == \
+            self._read().for_family("unified")["kv_cache_layout"]
+        # And it says which modules showed it, so a one-witness reading is
+        # not mistaken for a unanimous one.
+        source = [f.source for f in declared.facts
+                  if f.key == "kv_cache_layout"][0]
+        assert "layers.3.self_attn" in source
+        assert "layers.7.self_attn" not in source
+
+    def test_two_recorded_views_that_disagree_have_no_one_layout(self):
+        from atom.compass.core.cost.families import attention_scope
+
+        record = _resolved_record(mha_layers=(3, 7))
+        record["kv_views"]["holder0:layer_7"]["k"]["stride"] = [1, 2, 3, 4, 5]
+        with pytest.raises(ValueError, match="disagree on it"):
+            attention_scope.read_resolved(record, where="rec")
+
+    def test_a_family_no_recorded_view_covers_is_refused(self):
+        with pytest.raises(ValueError, match="for none of the"):
+            self._read(views=False)
+
+    def test_a_dispatch_environment_nobody_recorded_is_named(self):
+        from atom.compass.core.cost.families import attention_scope
+
+        record = _resolved_record()
+        del record["atom_envs"]["ATOM_V4_BACKEND"]
+        with pytest.raises(ValueError, match="ATOM_V4_BACKEND"):
+            attention_scope.read_resolved(record, where="rec")
+
+    def test_layers_that_disagree_have_no_one_value(self):
+        from atom.compass.core.cost.families import attention_scope
+
+        record = _resolved_record(mha_layers=(3, 7))
+        record["layers"]["language_model.model.layers.7.self_attn"][
+            "impl_attrs"]["sliding_window"] = 4096
+        with pytest.raises(ValueError, match="disagree on"):
+            attention_scope.read_resolved(record, where="rec")
+
+    def test_every_scope_member_says_where_it_came_from(self):
+        declared = self._read()
+        for fact in declared.facts:
+            assert fact.source.startswith("rec")
+            assert fact.status in ("resolved", "requested")
+
+
 class TestTheFactoryCarriesTheDeclaredDeployment:
     """The scope reaches the library through the factory, not through a test.
 
@@ -991,7 +1210,8 @@ class TestTheFactoryCarriesTheDeclaredDeployment:
         scope_path.write_text(json.dumps({"attention_scope": dict(SCOPE)}))
         library = _price_library(self._files(tmp_path), gap_ratio(True), None,
                                  str(scope_path))
-        assert library.request_attention_scope["kv_cache_dtype"] == "fp8"
+        assert library.request_attention_scope.for_family(
+            "unified")["kv_cache_dtype"] == "fp8"
 
         record, source = library.lookup(
             _unified([641], [641], is_prefill=True, has_cached=False))
@@ -1000,14 +1220,65 @@ class TestTheFactoryCarriesTheDeclaredDeployment:
         assert source.startswith("interpolated://")
         assert sorted(record["kernels"]) == ["k0", "k1"]
 
+    def test_the_scope_file_is_recorded_as_the_bytes_that_were_parsed(
+            self, tmp_path):
+        """Cost-critical input: which laws a run may price from depends on it,
+        so what it WAS is part of what the run was. Read once, digested at the
+        read, and recorded beside the prices -- not re-derived from the path
+        afterwards, which would describe bytes the run never used."""
+        import hashlib
+
+        from atom.compass.runtime.source_oracle import (_price_library,
+                                                        gap_ratio)
+
+        scope_path = tmp_path / "attn_scope.json"
+        scope_path.write_text(json.dumps({"attention_scope": dict(SCOPE)}))
+        raw = scope_path.read_bytes()
+        library = _price_library(self._files(tmp_path), gap_ratio(True), None,
+                                 str(scope_path))
+
+        rows = [row for row in library.loaded_inputs
+                if row.role == "oracle.attention_scope"]
+        assert len(rows) == 1
+        assert rows[0].sha256 == hashlib.sha256(raw).hexdigest()
+        assert rows[0].size == len(raw)
+        assert rows[0].requested == str(scope_path)
+
+        # Replaced after the load: the record still describes what was read.
+        scope_path.write_text(json.dumps({"attention_scope": {}}))
+        assert rows[0].sha256 == hashlib.sha256(raw).hexdigest()
+
+    def test_a_rank_is_served_its_own_scope_file(self, tmp_path):
+        """Every rank writes `name.tp0.json`, `name.tp1.json`; the option can
+        only name the stem. Which file this rank got is the thing worth
+        recording, and the record holds both ends of it."""
+        from atom.compass.runtime.source_oracle import (_price_library,
+                                                        gap_ratio)
+
+        stem = tmp_path / "attn_scope.json"
+        stem.write_text(json.dumps({"attention_scope": dict(SCOPE)}))
+        mine = tmp_path / "attn_scope.tp1.json"
+        mine.write_text(json.dumps(
+            {"attention_scope": dict(SCOPE, kv_cache_dtype="bf16")}))
+
+        library = _price_library(self._files(tmp_path), gap_ratio(True),
+                                 {"tp": 1}, str(stem))
+        row = [r for r in library.loaded_inputs
+               if r.role == "oracle.attention_scope"][0]
+        assert row.path == str(mine)
+        assert row.requested == str(stem)
+        assert row.rank_own is True
+        assert library.request_attention_scope.for_family(
+            "unified")["kv_cache_dtype"] == "bf16"
+
     def test_a_mapping_is_accepted_as_well_as_a_file(self, tmp_path):
         from atom.compass.runtime.source_oracle import (_price_library,
                                                         gap_ratio)
 
         library = _price_library(self._files(tmp_path), gap_ratio(True), None,
                                  dict(SCOPE))
-        assert library.request_attention_scope["attention_backend"] == \
-            "unified_attention"
+        assert library.request_attention_scope.for_family(
+            "unified")["attention_backend"] == "unified_attention"
 
     def test_a_scope_with_modelling_off_is_an_error_not_a_silent_drop(
             self, tmp_path):
@@ -1020,39 +1291,179 @@ class TestTheFactoryCarriesTheDeclaredDeployment:
         from atom.compass.runtime.source_oracle import (_price_library,
                                                         gap_ratio)
 
-        with pytest.raises(ValueError, match="neither a mapping nor a file"):
+        with pytest.raises(ValueError, match="not a file that exists"):
             _price_library(self._files(tmp_path), gap_ratio(True), None,
                            str(tmp_path / "nothing.json"))
 
-    def test_a_resolution_dump_is_not_a_scope(self, tmp_path):
-        """A file can record the whole environment and still not say which of
-        it the kernel turns on. Reading one as a scope is a judgement, and it
-        has to be written down as one."""
+    def test_a_file_that_is_neither_a_scope_nor_a_deployment_is_refused(
+            self, tmp_path):
+        """A scope has to be written down by whoever resolved it, or be
+        readable from a record of what was stood up. A file that is neither
+        cannot become one by being passed here."""
+        from atom.compass.runtime.source_oracle import _attention_request_scope
+
+        other = tmp_path / "other.json"
+        other.write_text(json.dumps({"model": "x", "tensor_parallel_size": 1}))
+        with pytest.raises(ValueError, match="none of the facts"):
+            _attention_request_scope(str(other))
+
+    def test_a_deployment_record_short_of_a_fact_is_refused_by_name(
+            self, tmp_path):
+        """Read, not rejected out of hand -- and refused with the missing fact
+        named, which is what somebody needs to close the gap."""
         from atom.compass.runtime.source_oracle import _attention_request_scope
 
         dump = tmp_path / "dump.json"
         dump.write_text(json.dumps({"atom_envs": {"ATOM_V4_BACKEND": "legacy"},
                                     "caches_summary": {"kv_heads": 4}}))
-        with pytest.raises(ValueError, match="resolution dump"):
+        with pytest.raises(ValueError, match="names no module of either"):
             _attention_request_scope(str(dump))
 
 
+class TestOneLibraryPricesBothFamilies:
+    """The ordinary case, and the one a mixed deployment actually is.
+
+    64 bound modules, 48 linear and 16 paged, measured in the same process
+    under treatments that differ naturally between them. A library that can
+    only answer when every observation in it shares one treatment cannot
+    answer for this model at all.
+    """
+
+    def _library(self, tmp_path):
+        from atom.compass.runtime.microbench import signature_of
+        from atom.compass.runtime.source_oracle import (_price_library,
+                                                        gap_ratio)
+
+        entries = []
+        for index, (op, seconds) in enumerate(_cold_designs()):
+            prices = {signature_of(op): {
+                "seconds": seconds, "kernels": {"k0": seconds},
+                # Two regions rebuilt for the paged family and one for the
+                # linear family: a real difference in what was measured, and
+                # the reason a library-wide treatment question has no answer.
+                "kv_regions": 2, "cache": "graph",
+                "occurrences": 1, "name": op["name"],
+                "signature": signature_of(op)}}
+            entries.append(_file(tmp_path, "u%d" % index, [op], prices))
+        for index, q in enumerate((96, 100, 300, 1000, 4680)):
+            op = _gdn([q], initial=[False])
+            seconds = 1e-9 * q
+            prices = {signature_of(op): {
+                "seconds": seconds, "kernels": {"gdn0": seconds},
+                "kv_regions": 1, "cache": "graph",
+                "occurrences": 1, "name": op["name"],
+                "signature": signature_of(op)}}
+            entries.append(_file(tmp_path, "g%d" % index, [op], prices,
+                                 scope=GDN_SCOPE))
+        return _price_library(entries, gap_ratio(True), None,
+                              {"unified": dict(SCOPE), "gdn": dict(GDN_SCOPE)})
+
+    def test_an_unseen_call_of_each_family_is_priced_from_one_body(
+            self, tmp_path):
+        library = self._library(tmp_path)
+
+        mha, mha_source = library.lookup(
+            _unified([641], [641], is_prefill=True, has_cached=False))
+        gdn, gdn_source = library.lookup(_gdn([256], initial=[False]))
+
+        assert mha is not None and gdn is not None
+        assert mha["interpolated"] is True and gdn["interpolated"] is True
+        assert mha_source.startswith("interpolated://")
+        assert gdn_source.startswith("interpolated://")
+        # Each priced from its own family's law, with its own evidenced
+        # launch composition -- not one family's kernels charged to the other.
+        assert sorted(mha["kernels"]) == ["k0"]
+        assert sorted(gdn["kernels"]) == ["gdn0"]
+
+    def test_the_treatment_is_resolved_inside_the_asking_family(self, tmp_path):
+        """The two families were measured under different region rebuilds,
+        which is ordinary. Asking whether the whole library shares one
+        treatment answers no, and would refuse both prices."""
+        library = self._library(tmp_path)
+        treatments = {obs[4] for obs in library._attention_obs}
+        assert len(treatments) > 1
+
+        asked = _gdn([256], initial=[False])
+        resolved = library._treatment_for(asked, dict(GDN_SCOPE))
+        assert resolved is not None
+        assert dict(resolved[1:])["kv_regions"] == 1
+
+    def test_a_second_treatment_inside_one_family_is_still_refused(
+            self, tmp_path):
+        """Ambiguity inside the domain is not resolved by picking one: a
+        cold-cache and a warm-cache measurement of the same law are two laws.
+        """
+        from atom.compass.runtime.microbench import signature_of
+
+        library = self._library(tmp_path)
+        op = _gdn([2048], initial=[False])
+        prices = {signature_of(op): {
+            "seconds": 2e-6, "kernels": {"gdn0": 2e-6},
+            "kv_regions": 9, "cache": "cold", "occurrences": 1,
+            "name": op["name"], "signature": signature_of(op)}}
+        price, graph = _file(tmp_path, "gx", [op], prices, scope=GDN_SCOPE)
+        library.add(price, graph)
+
+        assert library._treatment_for(_gdn([256], initial=[False]),
+                                      dict(GDN_SCOPE)) is None
+
+
+#: The scope Pricing resolved on the same stand-up path, and a price record
+#: from the CORRECTED acquisition, which carries its own resolution inline.
+#: Batch 1 is withdrawn from every calibrated input -- it was taken against a
+#: stale module -- so nothing here reads it.
 PRICING_SCOPE = ("/workspace/ATOM/agent_scratch/pricing_coverage/p_caseb"
                  "/ATTN_SCOPE.json")
+B2_PRICE = "/workspace/ATOM/agent_scratch/b2acq/training/PRICE_G5.rep2.json"
 
 
 @pytest.mark.skipif(not os.path.exists(PRICING_SCOPE),
                     reason="the resolved scope file is not here")
-def test_the_resolved_scope_file_is_still_a_dump_not_a_scope():
-    """Stated as a test so the gap is visible rather than assumed closed.
+def test_the_resolved_scope_file_becomes_a_usable_declaration():
+    """Against the real file, not a fixture shaped like one.
 
-    What was relayed resolves the deployment -- 48 GDN and 16 MHA layers, BF16,
-    heads 24/4, head_dim 256, block 16, window disabled -- but records it as an
-    environment dump under its own keys. Until the declared keys are written
-    into it (or a mapping standing behind that reading is passed), a run
-    pointed at this file is refused, and that refusal is the honest answer.
+    It records the deployment as an environment dump under its own keys, which
+    is not a scope; reading it as one is the judgement `attention_scope` makes,
+    and this is where that reading is checked against what Pricing actually
+    wrote: 48 linear and 16 paged modules, BF16, window disabled, block 16.
     """
     from atom.compass.runtime.source_oracle import _attention_request_scope
 
-    with pytest.raises(ValueError, match="resolution dump"):
-        _attention_request_scope(PRICING_SCOPE)
+    declared, loaded = _attention_request_scope(PRICING_SCOPE)
+    assert loaded.role == "oracle.attention_scope"
+    assert loaded.sha256 and loaded.size
+
+    unified = declared.for_family("unified")
+    assert set(attention.UNIFIED_SCOPE) <= set(unified)
+    assert unified["kv_cache_dtype"] == "bf16"
+    assert unified["sliding_window"] == -1
+    assert unified["kv_cache_block_size"] == 16
+    gdn = declared.for_family("gdn")
+    assert set(attention.GDN_SCOPE) <= set(gdn)
+    assert gdn["gdn_decode_lossy_fast"] is False
+    assert all(fact.source.startswith(loaded.path) for fact in declared.facts)
+
+
+@pytest.mark.skipif(not os.path.exists(B2_PRICE),
+                    reason="the corrected price record is not here")
+def test_a_price_record_carries_the_deployment_its_own_process_resolved():
+    """The strongest evidence a scope can have: not a later reading of a
+    config, but what the process that took these measurements stood up,
+    written down before it priced anything. The adapter takes it from the
+    record rather than requiring the request to declare it again.
+
+    Nothing here is fitted. What is checked is that the record proves its own
+    deployment: the seconds are not read at all.
+    """
+    from atom.compass.core.cost.families.adapter import _resolved_declaration
+
+    with open(B2_PRICE) as handle:
+        blob = json.load(handle)
+    declared, unreadable = _resolved_declaration(blob, B2_PRICE)
+    assert unreadable is None, unreadable
+    assert declared is not None
+    assert set(declared.scopes) == {"unified", "gdn"}
+    assert declared.for_family("unified")["kv_cache_dtype"] == "bf16"
+    assert declared.for_family("gdn")["gdn_decode_lossy_fast"] is False
+    assert declared.for_op({"name": GDN}) == declared.for_family("gdn")
+    assert declared.for_op({"name": UNIFIED}) == declared.for_family("unified")

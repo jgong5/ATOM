@@ -294,11 +294,31 @@ def test_a_pricing_time_refusal_is_returned_untouched():
 
 
 def test_attention_refuses_and_names_the_unmeasured_component():
+    """An empty library refuses, and the refusal has to be actionable.
+
+    What matters is not the wording but that a reader can tell this apart
+    from an ordinary unmeasured width: the family is named, the statement is
+    that nothing was measured rather than that this call is out of support,
+    and the reason a row count cannot stand in is given. Asserting the
+    sentence verbatim makes every rewording a failure and every loss of one
+    of those three a pass.
+    """
     library = ParametricPriceLibrary()
-    record, detail = library.lookup(attention(32, 1151, list(range(32))))
+    op = attention(32, 1151, list(range(32)))
+    record, detail = library.lookup(op)
     assert record is None
-    assert "ragged" in detail
-    assert "nobody has measured" in detail
+
+    lowered = detail.lower()
+    # It names the family this is, ...
+    assert op["name"].split("::")[-1].split("_with")[0] in lowered \
+        or "attention" in lowered
+    # ... says the absence is of evidence, not of support -- there is no law
+    # here to be outside of, ...
+    assert "measured" in lowered
+    assert "outside" not in lowered and "out of support" not in lowered
+    # ... and says why no row count stands in for one, which is the thing a
+    # reader would otherwise try next.
+    assert "batch" in lowered or "row" in lowered
 
 
 def test_attention_contract_marks_allocator_state_unmeasured():

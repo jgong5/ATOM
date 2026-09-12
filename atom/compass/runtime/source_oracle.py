@@ -225,9 +225,7 @@ def region_snapshot(name: str, model) -> dict:
     body = _json.dumps(snapshot, sort_keys=True, separators=(",", ":"))
     snapshot["sha256"] = hashlib.sha256(body.encode()).hexdigest()
     return snapshot
-
-
-def _attention_request_scope(value):
+def _attention_request_scope(value, coords=None):
     """The deployment the request is asking for a ragged attention price IN.
 
     A ragged attention law is identified by the deployment it was measured
@@ -235,65 +233,49 @@ def _attention_request_scope(value):
     dispatcher took, and for linear attention the state geometry. None of that
     is derivable from the operator, so a request that does not declare it is
     refused rather than answered by whichever law happens to be fitted. This
-    is where that declaration enters: a dict, or a path to the JSON file
+    is where that declaration enters: a mapping, or a path to the JSON file
     whoever resolved the deployment wrote.
 
-    Nothing is inferred here and nothing is defaulted. A missing file is an
-    error, because a run that asked to price attention under a named
-    deployment and silently got no deployment at all would read as an honest
-    refusal of the whole family.
+    The file is read through `loaded_input.load_json`, the same reader the
+    price lists go through, and for the same reasons: this scope decides which
+    laws a run is allowed to price from, so what it was is part of what the
+    run was. That reader resolves the rank's own file from the stem, digests
+    the exact bytes it parsed, and hands back a record of both -- which is
+    returned here so the composition can carry it beside the prices instead of
+    the manifest describing a deployment nobody can check.
+
+    Nothing is inferred and nothing is defaulted. A missing file is an error,
+    because a run that asked to price attention under a named deployment and
+    silently got no deployment at all would read as an honest refusal of the
+    whole family.
     """
+    from atom.compass.core.cost.families.attention_scope import declaration_of
+
     if not value:
-        return None
+        return None, None
     if isinstance(value, dict):
-        return dict(value)
-    import json as _json
-    import os as _os
+        return declaration_of(value, where="the attention_scope mapping"), None
+    requested = str(value).strip()
+    if not requested:
+        return None, None
+    from atom.compass.core.loaded_input import load_json
 
-    path = str(value).strip()
-    if not path:
-        return None
-    if not _os.path.exists(path):
+    try:
+        payload, loaded = load_json(requested, role="oracle.attention_scope",
+                                    coords=coords)
+    except FileNotFoundError as exc:
+        # Named with the resolution, not with the stem alone: at TP>1 the
+        # stem is what the option said and the resolved name is what this
+        # rank went looking for, and a reader who cannot see the second
+        # cannot tell a missing file from a rank suffix nobody wrote.
         raise ValueError(
-            "attention_scope names %r, which is neither a mapping nor a file "
-            "that exists. The resolved deployment has to come from something "
-            "that recorded it." % path)
-    with open(path) as handle:
-        loaded = _json.load(handle)
-    if isinstance(loaded, dict) and isinstance(loaded.get("attention_scope"),
-                                               dict):
-        loaded = loaded["attention_scope"]
-    if not isinstance(loaded, dict):
-        raise ValueError(
-            "attention_scope file %s holds %s, not a mapping of resolved "
-            "deployment facts" % (path, type(loaded).__name__))
-    return _declared_attention_scope(loaded, path)
+            "attention_scope names %r, which resolved to %s and is not a file "
+            "that exists. The deployment a price is asked for has to come "
+            "from something that recorded it." % (requested, exc.filename)
+        ) from exc
+    return declaration_of(payload, where=loaded.path), loaded
 
 
-def _declared_attention_scope(loaded: dict, path: str) -> dict:
-    """``loaded``, once it actually states the facts a law is identified by.
-
-    A resolution DUMP is not a scope. A file can record the whole environment
-    -- every env var, the pool summary, the registered layers -- and still not
-    say which of them the attention kernel turns on, and turning a dump into a
-    scope is a reading somebody has to make and stand behind. So this refuses
-    a file that names none of the declared keys, and names them in the
-    refusal, rather than passing a hundred unrelated facts down as a
-    deployment and having every law fail to match for reasons nobody can see.
-    """
-    from atom.compass.core.cost.families.attention import (GDN_SCOPE,
-                                                            UNIFIED_SCOPE)
-
-    declared = tuple(UNIFIED_SCOPE) + tuple(GDN_SCOPE)
-    if not any(key in loaded for key in declared):
-        raise ValueError(
-            "attention_scope file %s states none of the facts a ragged "
-            "attention law is identified by (%s). It looks like a resolution "
-            "dump: reading one as a scope is a judgement, and it has to be "
-            "written down as one -- either as an `attention_scope` block in "
-            "that file or as a mapping passed here."
-            % (path, ", ".join(declared)))
-    return dict(loaded)
 
 
 def _price_library(entries, gap_ratio, coords=None, attention_scope=None):
@@ -321,14 +303,24 @@ def _price_library(entries, gap_ratio, coords=None, attention_scope=None):
         library = (ParametricPriceLibrary()
                    if gap_ratio is _DEFAULT_GAP_RATIO
                    else ParametricPriceLibrary(max_gap_ratio=gap_ratio))
-    scope = _attention_request_scope(attention_scope)
-    if scope is not None:
+    declaration, loaded = _attention_request_scope(attention_scope, coords)
+    if declaration is not None:
         if gap_ratio is None:
             raise ValueError(
                 "attention_scope declares the deployment a MODELLED attention "
                 "price would be asked for, and modelling is off. Turn the "
                 "family provider on with interpolate, or drop the scope.")
-        library.request_attention_scope = scope
+        # The per-family declaration, not one flattened mapping: the families
+        # are identified by different facts, and a linear attention call
+        # refused over a KV layout it never reads would be refused for a
+        # reason that does not apply to it.
+        library.request_attention_scope = declaration
+        if loaded is not None:
+            # Recorded beside the prices in the same manifest. A run that
+            # answered from a law depended on these bytes as much as on the
+            # price list, and a manifest that omits them describes a
+            # deployment nobody can check afterwards.
+            library.loaded_inputs = library.loaded_inputs + (loaded,)
     extra = {"coords": coords} if coords else {}
     for entry in entries:
         if isinstance(entry, (tuple, list)):
