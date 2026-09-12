@@ -75,8 +75,15 @@ class TargetRecord:
         # that never look at this. `atom.compass.replay.bootstrap` is what
         # wants it, and it says so when it is absent.
         self.hardware: dict = dict(blob.get("hardware") or {})
+        #: Present only on a record `derive_target` built: the memory model's
+        #: lineage plus the fields it had to borrow. A replay reads it so that
+        #: a run against a derived record never describes its own budget as
+        #: captured -- no device produced those answers, and the record says
+        #: which artifacts did.
+        self.derivation: dict = dict(blob.get("derivation") or {})
 
     @classmethod
+
     def load(cls, path: str, *, coords=None) -> "TargetRecord":
         """Read a target, and keep the identity of the bytes that were read.
 
@@ -162,7 +169,7 @@ class ReplayModelRunner(CompassPredictMixin):
         #: members are frozen, because a consumer retains this as evidence.
         #: Kept on the runner rather than folded into the RPC reply: that wire
         #: form is the engine's and provenance is not part of it.
-        self.loaded_inputs: tuple = (
+        self.compass_runtime_inputs: tuple = (
             (self.target.loaded_input,) if self.target.loaded_input else ())
         #: The manifest of those inputs plus the deployment terms they were
         #: read for. Filled in by `get_num_blocks`.
@@ -281,7 +288,8 @@ class ReplayModelRunner(CompassPredictMixin):
         would otherwise serve is the one it was told not to use.
 
         Either way the artifacts that produced the answer are in
-        ``loaded_inputs``, digested where they were read, and the manifest of
+        ``compass_runtime_inputs``, digested where they were read, and the
+        manifest of
         them with the terms they were read for is in ``compass_loaded_inputs``.
         ``compass_budget_source`` says which of the two branches below actually
         served -- ``captured`` or ``source-derived`` -- because that is a fact
@@ -290,7 +298,7 @@ class ReplayModelRunner(CompassPredictMixin):
         from atom.compass.core.memory_blocks import (
             CAPTURED, SOURCE_DERIVED, budget_source, derived_block_info)
 
-        # The target is already in `loaded_inputs`: it was digested in
+        # The target is already in `compass_runtime_inputs`: it was digested in
         # `TargetRecord.load`, where it was parsed. Re-recording it here would
         # mean opening it again, and a second open attests to the file as it is
         # now rather than as it was used.
@@ -319,21 +327,31 @@ class ReplayModelRunner(CompassPredictMixin):
             # Published on the refusal path too: what a run that stopped had
             # already read is evidence about the run that stopped. Appended as
             # the reads happened, so a refusal keeps its partial record.
-            self.loaded_inputs = tuple(self.loaded_inputs) + tuple(read)
+            self.compass_runtime_inputs = (
+                tuple(self.compass_runtime_inputs) + tuple(read))
             context = self._capacity_context(path)
             self.compass_loaded_inputs = dict(
-                manifest(self.loaded_inputs), **context)
+                manifest(self.compass_runtime_inputs), **context)
             count = int(blocks.get("num_kvcache_blocks") or 0) if served else None
+            # A record `derive_target` wrote is not a capture, and a run
+            # replaying one may not call its budget captured: that number came
+            # out of the memory model when the record was made rather than off
+            # a card, and the record carries the lineage that says from what.
+            if path:
+                kind, provenance = SOURCE_DERIVED, (lineage or None)
+            elif self.target.derivation:
+                kind, provenance = SOURCE_DERIVED, dict(self.target.derivation)
+            else:
+                # A capture's lineage is the target it came from, already in
+                # the manifest under `runtime.replay_target`.
+                kind, provenance = CAPTURED, None
             self.compass_budget_source = budget_source(
-                SOURCE_DERIVED if path else CAPTURED,
-                inputs=self.loaded_inputs,
+                kind,
+                inputs=self.compass_runtime_inputs,
                 served=served,
                 num_kvcache_blocks=count,
                 deployment=context["deployment"],
-                # The capture's lineage is the target it came from, already in
-                # the manifest under `runtime.replay_target`; a derivation says
-                # more about itself and says it here.
-                lineage=(lineage or None) if path else None)
+                lineage=provenance)
         self.compass_loaded_inputs["num_kvcache_blocks"] = count
         return blocks
 
@@ -343,33 +361,15 @@ class ReplayModelRunner(CompassPredictMixin):
         The digests say which bytes were read; these say what they were read
         *for*. Both are needed to say a number was founded: the same profile
         sizes a different pool at another width, block size or utilization.
+
+        The terms are `memory_blocks.capacity_context`'s, so the device-backed
+        runner publishes the same shape for the same decision and a reader
+        comparing a modelled replay against a real run is comparing fields
+        that were built by one piece of code.
         """
-        config = self.config
-        return {
-            "modelled": bool(memory_model),
-            "memory_model": memory_model or None,
-            "deployment": {
-                # The mode as well as the flags: the pair is the thing a
-                # reader has been guessing from. A measure-mode run can serve a
-                # derived budget, so neither field alone says what was served.
-                "mode": str(getattr(self._compass_config, "mode", "")),
-                "model": str(getattr(config, "model", "")),
-                "tensor_parallel_size": int(
-                    getattr(config, "tensor_parallel_size", 1) or 1),
-                "pipeline_parallel_size": int(
-                    getattr(config, "pipeline_parallel_size", 1) or 1),
-                "max_model_len": int(getattr(config, "max_model_len", 0) or 0),
-                "max_num_seqs": int(getattr(config, "max_num_seqs", 0) or 0),
-                "max_num_batched_tokens": int(
-                    getattr(config, "max_num_batched_tokens", 0) or 0),
-                "gpu_memory_utilization": float(
-                    getattr(config, "gpu_memory_utilization", 0.0) or 0.0),
-                "kv_cache_block_size": int(
-                    getattr(config, "kv_cache_block_size", 0) or 0),
-                "kv_cache_dtype": str(getattr(config, "kv_cache_dtype", "auto")),
-                "enforce_eager": bool(getattr(config, "enforce_eager", False)),
-            },
-        }
+        from atom.compass.core.memory_blocks import capacity_context
+
+        return capacity_context(self.config, self._compass_config, memory_model)
 
     def allocate_kv_cache(self, num_kvcache_blocks) -> bool:
         """There is no cache to allocate; the accounting for it is real.

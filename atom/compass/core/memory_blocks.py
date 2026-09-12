@@ -42,7 +42,8 @@ from atom.compass.core.memory_model import UnfoundedPrediction, derived_readings
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["warmup_tokens", "derived_block_info", "PROFILE_ROLE",
+__all__ = ["warmup_tokens", "derived_block_info", "profile_reader",
+           "capacity_context", "derivation_lineage", "PROFILE_ROLE",
            "BUDGET_SCHEMA", "DEVICE_MEASURED", "CAPTURED", "RECORDED",
            "SOURCE_DERIVED", "budget_source"]
 
@@ -172,6 +173,111 @@ def _world_size(config) -> int:
     return max(1, int(getattr(config, "tensor_parallel_size", 1) or 1))
 
 
+def capacity_context(config, compass_config, memory_model: str = "") -> dict:
+    """The deployment terms a block count cannot be checked without.
+
+    The digests say which bytes were read; these say what they were read
+    *for*. Both are needed to say a number was founded: the same profile sizes
+    a different pool at another width, block size or utilization. One shape for
+    both runners, because the question a reader asks of either is the same.
+    """
+    return {
+        "modelled": bool(memory_model),
+        "memory_model": memory_model or None,
+        "deployment": {
+            # The mode as well as the flags: the pair is the thing a reader has
+            # been guessing from. A measure-mode run can serve a derived
+            # budget, so neither field alone says what was served.
+            "mode": str(getattr(compass_config, "mode", "")),
+            "model": str(getattr(config, "model", "")),
+            "tensor_parallel_size": int(
+                getattr(config, "tensor_parallel_size", 1) or 1),
+            "pipeline_parallel_size": int(
+                getattr(config, "pipeline_parallel_size", 1) or 1),
+            "max_model_len": int(getattr(config, "max_model_len", 0) or 0),
+            "max_num_seqs": int(getattr(config, "max_num_seqs", 0) or 0),
+            "max_num_batched_tokens": int(
+                getattr(config, "max_num_batched_tokens", 0) or 0),
+            "gpu_memory_utilization": float(
+                getattr(config, "gpu_memory_utilization", 0.0) or 0.0),
+            "kv_cache_block_size": int(
+                getattr(config, "kv_cache_block_size", 0) or 0),
+            "kv_cache_dtype": str(getattr(config, "kv_cache_dtype", "auto")),
+            "enforce_eager": bool(getattr(config, "enforce_eager", False)),
+        },
+    }
+
+
+def derivation_lineage(profile, calibration, *, path, world, activation,
+                       readings=None) -> dict:
+    """What a derived budget was derived *from*.
+
+    One shape for both sizing paths, so a modelled budget describes itself the
+    same way whether a card was present or not. A source-derived budget is not
+    disqualified for having read an artifact; what disqualifies it is being
+    unable to say which one, at what width, and on whose calibration.
+    """
+    profile = profile if isinstance(profile, Mapping) else {}
+    calibration = calibration if isinstance(calibration, Mapping) else {}
+    readings = readings if isinstance(readings, Mapping) else {}
+    return {
+        "kind": SOURCE_DERIVED,
+        "profile": path,
+        "world_size": int(world),
+        "compile_mode": profile.get("compile_mode"),
+        "total_source": profile.get("total_source") or profile.get("source"),
+        # Per term, in the calibration's own words: which run each number came
+        # off and what was composed onto it. This is what makes a derived
+        # budget auditable rather than merely undevice.
+        "calibration_provenance": dict(calibration.get("provenance") or {}),
+        "activation_bytes": int(activation),
+        # The derived terms themselves, so a record built from this budget
+        # cannot state a graph pool the budget was not computed with.
+        "peak_torch": int(readings.get("peak_torch") or 0),
+        "non_torch": int(readings.get("non_torch") or 0),
+        "cudagraph_overhead": int(readings.get("cudagraph_overhead") or 0),
+    }
+
+
+def profile_reader(collect: MutableSequence, *, coords=None):
+    """The readers a modelled budget loads its profile through.
+
+    Both sizing paths -- the GPU-free replay and the device-backed runner in
+    modelled mode -- read the same artifacts for the same reason, so they read
+    them the same way: one open, the digest of those bytes, `json.loads` of
+    those same bytes, appended to `collect` as it happens. A caller that only
+    needs the readings still leaves behind a record of what produced them.
+
+    Returns `(read, load_referenced, payloads)`. `read(requested, role)` takes
+    a role; `load_referenced(where)` is the one-argument loader
+    `derived_readings` calls for the files a profile names, and it nests their
+    roles under the profile -- a calibration is an input in its own right, and
+    a validator that saw only the profile could not tell that the numbers
+    behind it were read at all. `payloads` keeps the first payload per role for
+    a caller that wants what it said as well as that it was read.
+    """
+    payloads: dict = {}
+
+    def read(requested, role):
+        """One open, one digest, one parse -- the shared helper's contract."""
+        payload, record = load_json(requested, role=role, coords=coords)
+        collect.append(record)
+        payloads.setdefault(role, payload)
+        return payload
+
+    def load_referenced(where):
+        profile = payloads.get(PROFILE_ROLE) or {}
+        role = PROFILE_ROLE + ".referenced"
+        if isinstance(where, str) and isinstance(profile, Mapping):
+            for field in ("calibration", "model_config"):
+                if where == profile.get(field):
+                    role = "%s.%s" % (PROFILE_ROLE, field)
+                    break
+        return read(where, role)
+
+    return read, load_referenced, payloads
+
+
 def derived_block_info(
     path: str,
     config,
@@ -216,29 +322,7 @@ def derived_block_info(
     by the engine's arithmetic and carry the engine's error.
     """
     collect = collect if collect is not None else []
-    payloads: dict = {}
-
-    def read(requested, role):
-        """One open, one digest, one parse -- the shared helper's contract."""
-        payload, record = load_json(requested, role=role, coords=coords)
-        collect.append(record)
-        payloads.setdefault(role, payload)
-        return payload
-
-    def load_referenced(where):
-        """The loader `derived_readings` uses for the files a profile names.
-
-        Nested roles rather than one flattened `runtime.memory_model`: a
-        calibration is an input in its own right, and a validator that saw only
-        the profile could not tell that the numbers behind it were read at all.
-        """
-        role = PROFILE_ROLE + ".referenced"
-        if isinstance(where, str):
-            for field in ("calibration", "model_config"):
-                if where == profile.get(field):
-                    role = "%s.%s" % (PROFILE_ROLE, field)
-                    break
-        return read(where, role)
+    read, load_referenced, payloads = profile_reader(collect, coords=coords)
 
     if not (path or "").strip():
         _refuse("no memory profile was named")
@@ -346,19 +430,9 @@ def derived_block_info(
         activation / 2**30, warmup_tokens(config))
 
     if lineage is not None:
-        calibration = payloads.get(PROFILE_ROLE + ".calibration") or {}
-        lineage.update({
-            "kind": SOURCE_DERIVED,
-            "profile": path,
-            "world_size": world,
-            "compile_mode": profile.get("compile_mode"),
-            "total_source": profile.get("total_source") or profile.get("source"),
-            # Per term, in the calibration's own words: which run each number
-            # came off and what was composed onto it. This is what makes a
-            # derived budget auditable rather than merely undevice.
-            "calibration_provenance": dict(calibration.get("provenance") or {}),
-            "activation_bytes": int(activation),
-        })
+        lineage.update(derivation_lineage(
+            profile, payloads.get(PROFILE_ROLE + ".calibration"),
+            path=path, world=world, activation=activation, readings=readings))
 
     return {
         "num_kvcache_blocks": int(plan.paged_entries),

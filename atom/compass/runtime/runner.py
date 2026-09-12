@@ -49,6 +49,13 @@ class CompassModelRunner(CompassPredictMixin, ModelRunner):
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
+        #: The capacity artifacts, appended to where they are read rather than
+        #: frozen here: `get_num_blocks` opens the profile, and it runs later.
+        self._compass_runtime_inputs: list = []
+        #: Where the budget actually came from, once something has chosen it.
+        #: `None` is a real state -- a run nobody recorded a source for is not
+        #: a run that measured one -- and it is never inferred from the mode.
+        self.compass_budget_source: Optional[dict] = None
         self._init_compass_state()
 
 
@@ -784,9 +791,46 @@ class CompassModelRunner(CompassPredictMixin, ModelRunner):
 
         with self._recorded_readings(readings):
             result = super().get_num_blocks()
+        # The count belongs to the source `_recorded_readings` just chose: the
+        # substitution has happened by here and the arithmetic has run on it.
+        if isinstance(self.compass_budget_source, dict):
+            self.compass_budget_source["num_kvcache_blocks"] = int(
+                result.get("num_kvcache_blocks") or 0)
         self._write_memory(readings, result)
         self._write_replay_target(blocks=result)
         return result
+
+    @property
+    def compass_runtime_inputs(self) -> tuple:
+        """Every capacity artifact this runner has read, so far.
+
+        Appended to as the reads happen -- the profile is opened in
+        `get_num_blocks`, which runs long after `_init_compass_state`, so a set
+        frozen at init would record that this run read no capacity input and
+        publish that as a finding about the run when it is a fact about the
+        ordering.
+        """
+        return tuple(getattr(self, "_compass_runtime_inputs", ()))
+
+    def _publish_budget_source(self, kind: str, *, lineage=None) -> None:
+        """Say where the budget this run is about to serve came from.
+
+        At the branch that chose it. The options do not decide it: a profile is
+        honoured here in *measure* mode too, so a run with a real clock can be
+        sized analytically and nothing in the flags says so. The block count is
+        filled in by `get_num_blocks` once the arithmetic has run.
+        """
+        from atom.compass.core.memory_blocks import (
+            budget_source, capacity_context)
+
+        context = capacity_context(
+            self.config, self._compass_config,
+            (self._compass_config.memory_model or "").strip())
+        self.compass_budget_source = budget_source(
+            kind,
+            inputs=self.compass_runtime_inputs,
+            deployment=context["deployment"],
+            lineage=lineage)
 
     @contextlib.contextmanager
     def _recorded_readings(self, live: dict):
@@ -805,8 +849,14 @@ class CompassModelRunner(CompassPredictMixin, ModelRunner):
         """
         import torch
 
+        from atom.compass.core.memory_blocks import (
+            DEVICE_MEASURED, RECORDED, SOURCE_DERIVED)
+
         modelled = self._modelled_readings()
         if modelled is not None:
+            # No term here came off a card, whatever the mode says.
+            self._publish_budget_source(
+                SOURCE_DERIVED, lineage=getattr(self, "_modelled_lineage", None))
             was = self._substitute(modelled)
             try:
                 yield
@@ -819,6 +869,9 @@ class CompassModelRunner(CompassPredictMixin, ModelRunner):
         readings = source.readings_for(config) if source else None
         expected = self._expected_non_torch()
         if readings is None:
+            # The record could not answer for this configuration, so the card
+            # does -- and the run says so rather than being read as replayed.
+            self._publish_budget_source(DEVICE_MEASURED)
             if source is not None:
                 logger.warning("ATOMCompass WARNING: sizing from this device: "
                                "%s", source.refusal(config, expected))
@@ -833,11 +886,13 @@ class CompassModelRunner(CompassPredictMixin, ModelRunner):
                 "budget is partly the box's.", spread / 2**20)
         refusal = source.refusal(config, expected)
         if refusal:
+            self._publish_budget_source(DEVICE_MEASURED)
             logger.warning("ATOMCompass WARNING: sizing from this device: %s",
                            refusal)
             yield
             return
 
+        self._publish_budget_source(RECORDED)
         was = self._substitute({
             "total": readings.total, "free": readings.free,
             "peak_torch": readings.peak_torch, "non_torch": readings.non_torch,
@@ -931,16 +986,38 @@ class CompassModelRunner(CompassPredictMixin, ModelRunner):
         The judgement lives in `memory_model.derived_readings` so that it can
         be exercised without a device; this end owns only the file system.
         """
+        from atom.compass.core.memory_blocks import (
+            PROFILE_ROLE, derivation_lineage, profile_reader)
         from atom.compass.core.memory_model import derived_readings
 
-        def load(where: str):
-            with open(where, encoding="utf-8") as fh:
-                return json.load(fh)
+        # Through the shared reader, so a measured run's manifest is comparable
+        # with a replayed one: one open, the digest of those bytes, `json.loads`
+        # of those same bytes, appended as each read happens. Nothing is
+        # reopened afterwards to report on it. `coords=None` deliberately -- a
+        # profile is a per-*width* artifact, not a per-rank one.
+        collected = getattr(self, "_compass_runtime_inputs", None)
+        if collected is None:
+            collected = self._compass_runtime_inputs = []
+        read, load, payloads = profile_reader(collected)
 
         tokens = self._warmup_tokens()
+        profile = read(path, PROFILE_ROLE)
+        # Before the derivation, and passed into it: `derived_readings` refuses
+        # a profile written for another width, and it can only do that if it is
+        # told the width this deployment is actually about to run at. Computed
+        # afterwards, the guard never fires and the lineage below would claim
+        # TP=4 for a TP=2 profile's numbers.
+        world = 1
+        for size in self._topology().values():
+            world *= max(1, int(size))
         readings, activation = derived_readings(
-            load(path), warmup_tokens=tokens, load=load, source=path,
+            profile, warmup_tokens=tokens, load=load, source=path,
+            world_size=world,
             enforce_eager=bool(getattr(self.config, "enforce_eager", False)))
+        #: What this derivation was derived from, for the budget-source record.
+        self._modelled_lineage = derivation_lineage(
+            profile, payloads.get(PROFILE_ROLE + ".calibration"),
+            path=path, world=world, activation=activation, readings=readings)
         logger.info(
             "ATOMCompass: sizing from a modelled budget, not from any device "
             "(peak_torch %.2f GB, non_torch %.2f GB, activations %.2f GB over "
@@ -976,7 +1053,14 @@ class CompassModelRunner(CompassPredictMixin, ModelRunner):
             found = [q for p in paths.split(",") for q in
                      sorted(glob.glob(p.strip())) if q]
             try:
-                self._memory_source = RecordedMemory(found)
+                # Digested where they are parsed, into the same list the
+                # profile reads append to: a recorded budget is served out of
+                # these bytes, and `compass_budget_source` has to be able to
+                # name them.
+                collected = getattr(self, "_compass_runtime_inputs", None)
+                if collected is None:
+                    collected = self._compass_runtime_inputs = []
+                self._memory_source = RecordedMemory(found, collect=collected)
             except Exception as exc:  # noqa: BLE001 - never fail a run over it
                 logger.warning("ATOMCompass WARNING: could not read %s: %s",
                                paths, exc)
