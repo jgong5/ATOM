@@ -201,30 +201,32 @@ class ParametricPriceLibrary(PriceLibrary):
             # prices are of the padded width, not of the scheduled one.
             self.padded[price_path] = (rows, scheduled)
         self._rows[price_path] = rows
-        from atom.compass.runtime.microbench import cost_key_of
+        from atom.compass.runtime.microbench import cost_key_of, signature_of
 
         for op in graph.get("ops") or ():
-            # Keyed by the COST key, because `_build` looks these up with the
-            # keys of `PriceLibrary._prices`, which are cost keys. Keying by
-            # the raw signature here would miss on every operator carrying an
-            # allocator address, and the miss is silent: the curve would just
-            # be empty and the family would refuse widths it can price.
+            # `_ops` is an index -- "what structure does this key have".
+            # Keyed by the cost key so it still answers for a request whose
+            # allocator moved; keying it by the raw signature would miss on
+            # every operator carrying an address, silently, leaving the curve
+            # empty and the family refusing widths it can price.
             self._ops.setdefault(cost_key_of(op), op)
-            # Also per source. `_ops` is keyed by signature alone and keeps the
-            # first operator seen under it, which is fine for "what structure
-            # does this key have" and wrong for "what did THIS file price". A
-            # signature does not carry layout, so one file's dense rebuild and
-            # another's strided view share a key; pairing every scoped price
-            # with the first-seen operator puts both on the first layout's
-            # curve.
-            # First occurrence, matching the two readers that already choose:
-            # `microbench` keys its example operator with `example.setdefault`,
-            # and `PriceLibrary._ingest` captures the measured layout with
-            # `layouts.setdefault`. A graph holding a dense and a strided call
-            # under one signature is PRICED as the dense one, so labelling it
-            # strided here would disagree with the measurement.
+            # `_source_ops` is an association -- "what did THIS record price".
+            # Keyed by the RAW signature, because the cost key is many-to-one
+            # and the observations it collapses need not share a layout; the
+            # layout is exactly what this per-file map exists to keep straight.
+            # A cost-key join would hand a record whichever collapsed sibling
+            # the graph happened to list first, which is R5 again by another
+            # route. `_build` therefore joins on `record["signature"]`.
+            #
+            # First occurrence within one raw signature, matching the two
+            # readers that already choose: `microbench` keys its example
+            # operator with `example.setdefault`, and `PriceLibrary._ingest`
+            # captures the measured layout with `layouts.setdefault`. A graph
+            # holding a dense and a strided call under one raw signature is
+            # PRICED as the dense one, so labelling it strided here would
+            # disagree with the measurement.
             self._source_ops.setdefault(price_path, {}).setdefault(
-                cost_key_of(op), op)
+                signature_of(op), op)
         self._curves_built = False
 
     def _build(self) -> None:
@@ -244,10 +246,19 @@ class ParametricPriceLibrary(PriceLibrary):
         if self._curves_built:
             return
         self._observations.clear()
-        for sig, records in self._prices.items():
+        for _cost_key, records in self._prices.items():
             for record in records:
                 source = record.get("source")
-                op = (self._source_ops.get(source) or {}).get(sig)
+                # Joined on the record's OWN raw signature, not on the cost key
+                # it is filed under. The cost key collapses observations that
+                # may differ in layout, and this join is what decides which
+                # operator -- and therefore which layout -- a measurement is
+                # attributed to. A record from before this field existed has no
+                # signature and is left to exact-key use, as an unpaired one
+                # always was.
+                sig = record.get("signature")
+                op = (None if sig is None
+                      else (self._source_ops.get(source) or {}).get(sig))
                 if op is None:
                     # No graph from this file, so nothing says what this price
                     # is a price of. Exact-signature use only; `unbuildable`

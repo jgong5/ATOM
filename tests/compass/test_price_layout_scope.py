@@ -25,7 +25,7 @@ from atom.compass.core.cost.library import (
     UNREGISTERED,
     PriceLibrary,
 )
-from atom.compass.runtime.microbench import signature_of
+from atom.compass.runtime.microbench import cost_key_of, signature_of
 
 # -- operators -------------------------------------------------------------
 #
@@ -453,3 +453,168 @@ def test_a_duplicate_signature_in_one_graph_takes_the_first_occurrence(
     assert not recorded.get("layouts"), (
         "the second, strided call was taken as the representative for a price "
         "the collector measured on the first, dense one")
+
+
+# == (4) the cost key collapses observations; layout must not follow it =====
+#
+# `core/cost/identity` files two observations that differ only in allocator
+# addresses under one cost key, so one measurement answers for both. That is a
+# LOOKUP index. Layout is a per-record fact: the two collapsed observations may
+# have been recorded on differently arranged memory, and whichever the graph
+# happens to list first is not necessarily the one whose price is kept.
+#
+# Keying the ingest-time layout table by the cost key reintroduces the defect
+# this module exists for, one level down -- so these go through the same real
+# `add`/`lookup`, with the two failure modes the review named: a price file
+# whose order is the reverse of the graph's, and a first raw observation that
+# carries no price at all.
+
+MEASURED_SLOTS = [9102, 9118, 9134, 9150, 9166, 9182, 9198, 9214]
+SHIFTED_SLOTS = [1150, 2302, 3454, 4606, 5758, 6910, 8062, 9214]
+
+
+def attn(slots, *, layouts=()) -> dict:
+    """Decode attention. Same cost key at either allocation, and the two
+    differ in the one component the normalisation removes."""
+    op = {
+        "name": "aiter::unified_attention_with_output_base",
+        "input_shapes": [[8, 6144], [8, 1024]],
+        "dtypes": ["bfloat16", "bfloat16"],
+        "context": [["slot_mapping", list(slots)],
+                    ["context_lens", [1151] * 8],
+                    ["max_seqlen_k", 1151]],
+    }
+    if layouts:
+        op["layouts"] = layouts
+    return op
+
+
+ATTN_STRIDED = [[0, [6144, 4096, 49152, "buf0"]]]
+
+
+def _collapsed_file(tmp_path, tag, graph_ops, priced_ops, seconds):
+    """One file whose graph records `graph_ops` in that order and whose price
+    list records `priced_ops` in that order. Both raw signatures share a cost
+    key; the price list may name a subset, and in a different order."""
+    prices = {
+        "provenance": {"topology": TP1, MEASURED_KEY: REGISTERED},
+        "prices": {signature_of(op): {
+            "seconds": seconds, "kernels": {"k": seconds},
+            "occurrences": 1, "name": op["name"]} for op in priced_ops},
+    }
+    gpath = tmp_path / f"g_{tag}.json"
+    ppath = tmp_path / f"p_{tag}.json"
+    gpath.write_text(json.dumps({"ops": list(graph_ops)}))
+    ppath.write_text(json.dumps(prices))
+    library = PriceLibrary()
+    library.add(str(ppath), str(gpath))
+    return library
+
+
+def test_the_kept_price_carries_its_own_layout_not_the_graphs_first(tmp_path):
+    """Graph lists the dense call first; the price list names the strided one
+    first, so the strided record is the one kept for this scope.
+
+    Its layout has to be the strided one it was measured under. Taking the
+    graph's first entry instead stamps it dense, and a dense request is then
+    answered from a measurement of a strided read.
+    """
+    dense = attn(MEASURED_SLOTS)
+    strided = attn(SHIFTED_SLOTS, layouts=ATTN_STRIDED)
+    library = _collapsed_file(tmp_path, "rev", [dense, strided],
+                              [strided, dense], 3e-4)
+
+    record, detail = library.lookup(attn(SHIFTED_SLOTS, layouts=ATTN_STRIDED),
+                                    topology=TP1, registration=REGISTERED)
+    assert record is not None, detail
+    assert record["seconds"] == pytest.approx(3e-4)
+
+    refused, why = library.lookup(attn(MEASURED_SLOTS),
+                                  topology=TP1, registration=REGISTERED)
+    assert refused is None, (
+        "a dense request was paid from a price measured on a strided read, "
+        f"because the layout came from the graph's first entry: {why}")
+
+
+def test_an_unpriced_first_observation_does_not_lend_its_layout(tmp_path):
+    """The graph's first call has no price at all -- the collector refused it,
+    or it simply is not in the list. The record that does exist must still
+    carry the layout of the observation it was taken from."""
+    dense = attn(MEASURED_SLOTS)
+    strided = attn(SHIFTED_SLOTS, layouts=ATTN_STRIDED)
+    library = _collapsed_file(tmp_path, "gap", [dense, strided],
+                              [strided], 3e-4)
+
+    record, detail = library.lookup(attn(SHIFTED_SLOTS, layouts=ATTN_STRIDED),
+                                    topology=TP1, registration=REGISTERED)
+    assert record is not None, detail
+
+    refused, why = library.lookup(attn(MEASURED_SLOTS),
+                                  topology=TP1, registration=REGISTERED)
+    assert refused is None, (
+        "the only price in the file was measured strided, and a dense request "
+        f"was answered from it: {why}")
+
+
+def mrope(positions, *, layouts=()) -> dict:
+    """Rotary embedding over 8 decode rows. A rows family -- so the parametric
+    curve is actually built for it -- that carries `positions`, which is an
+    allocator-relative component the cost key normalises away. The two
+    allocations below therefore collapse onto one cost key while remaining
+    distinct observations."""
+    op = {
+        "name": "triton::_mrope_qk_kernel",
+        "input_shapes": [[8, 6144], [8, 1024]],
+        "dtypes": ["bfloat16", "bfloat16"],
+        "context": [["positions", list(positions)]],
+    }
+    if layouts:
+        op["layouts"] = layouts
+    return op
+
+
+MROPE_STRIDED = [[0, [6144, 4096, 49152, "buf0"]]]
+
+
+def test_the_parametric_join_uses_the_records_own_observation(tmp_path):
+    """`ParametricPriceLibrary` pairs each price with the operator it priced,
+    to read a feature map off it. Joining on the cost key hands it whichever
+    collapsed sibling the graph listed first -- the same defect as (3), and
+    the curve is then built on the wrong layout.
+
+    The graph lists the dense call first; the only price in the file was
+    measured on the strided one. A cost-key join returns the dense operator,
+    so the observation carries no layout and the strided curve never exists.
+    """
+    dense = mrope(MEASURED_SLOTS)
+    strided = mrope(SHIFTED_SLOTS, layouts=MROPE_STRIDED)
+    assert cost_key_of(dense) == cost_key_of(strided), "the premise"
+    assert signature_of(dense) != signature_of(strided), "the premise"
+
+    prices = {
+        "provenance": {"topology": TP1, MEASURED_KEY: REGISTERED,
+                       "execution": {"body_rows_traced": 8}},
+        "prices": {signature_of(strided): {
+            "seconds": 3e-4, "kernels": {"k": 3e-4},
+            "occurrences": 1, "name": strided["name"]}},
+    }
+    gpath = tmp_path / "g_join.json"
+    ppath = tmp_path / "p_join.json"
+    gpath.write_text(json.dumps(
+        {"ops": [dense, strided],
+         "provenance": {"execution": {"body_rows_traced": 8}}}))
+    ppath.write_text(json.dumps(prices))
+    library = ParametricPriceLibrary()
+    library.add(str(ppath), str(gpath))
+    library._build()
+
+    seen = 0
+    for observations in library._observations.values():
+        for op, *_ in observations:
+            seen += 1
+            assert op.get("layouts"), (
+                "a price measured on the strided call was attributed to the "
+                "dense one, because the join went through the cost key")
+    assert seen == 1, (
+        "the join produced no observation, so the layout assertion above "
+        f"never ran: {seen} observations")

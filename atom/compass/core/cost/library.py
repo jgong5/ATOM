@@ -531,10 +531,22 @@ class PriceLibrary:
         # then produced both errors at once -- the scope whose layout lost the
         # race had its own measurement refused, and the other scope's request
         # was answered from a price measured on a layout it does not have.
+        #
+        # Keyed by the RAW signature, not by the cost key. The cost key is a
+        # many-to-one map: two observations whose allocator addresses differ
+        # collapse onto one key, and nothing says they share a layout. Keying
+        # this table by the cost key reintroduces the same load-order bug one
+        # level down -- `setdefault` keeps whichever raw observation the graph
+        # listed first, while the record finally chosen may be a different raw
+        # one (a different order in the JSON, or the first raw record refused
+        # a price), so a price gets stamped with a layout it was not measured
+        # under. The cost key is a reusable lookup index. It is not an
+        # association, and anything per-record stays on the observation it
+        # belongs to.
         layouts = {}
         if graph is not None:
             for op in graph["ops"]:
-                layouts.setdefault(_cost_key_of(op), _layout_fingerprint(op))
+                layouts.setdefault(_signature_of(op), _layout_fingerprint(op))
         for sig, record in (blob.get("prices") or {}).items():
             # Reindex on the way in. The file names the signature it was
             # measured under; the library files it under the cost key, through
@@ -559,12 +571,16 @@ class PriceLibrary:
             # says which call was actually measured, and a lookup answered
             # under a shifted allocation is told apart by comparing the two.
             entry = dict(record, source=price_path, scope=scope, signature=sig)
-            if key in layouts:
+            if sig in layouts:
+                # Looked up by this record's own raw signature, so the layout
+                # stored is the one this measurement was taken under and not
+                # whichever collapsed sibling the graph happened to list first.
+                #
                 # Absent is not dense: a price loaded without its graph has
                 # nothing to say about layout, and must not be read as having
                 # said "dense". Only a recorded one is stored, and only a
                 # recorded one is checked.
-                entry["layout"] = layouts[key]
+                entry["layout"] = layouts[sig]
             kept.append(entry)
         for sig, why in (blob.get("unpriced") or {}).items():
             self._refusals.setdefault(cost_key(sig), why)
