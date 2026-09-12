@@ -47,7 +47,8 @@ once; a served run asking for the source composition wants the measured one.
 
 from typing import NamedTuple, Optional
 
-__all__ = ["source_cost_oracle", "build_source_oracle", "SourceComposition",
+__all__ = ["source_cost_oracle", "build_source_oracle", "build_source_group",
+           "SourceComposition", "SourceGroup", "RankGroupOracle",
            "price_specs", "template_shape", "seeded_graphs", "gap_ratio"]
 
 
@@ -377,12 +378,173 @@ class SourceComposition(NamedTuple):
     loaded_inputs: tuple = ()
 
 
+class RankGroupOracle:
+    """One composition per rank of the group, selected by the shape's rank.
+
+    `rank_aggregation="slowest"` prices a step on every logical rank and keeps
+    the maximum, because a deployment's step ends when its slowest rank ends
+    and the ranks are not interchangeable -- the TP4 head measurements run
+    13.510 / 16.158 / 13.459 / 13.452 ms. It did that by moving
+    ``StepShape.rank_coords`` and asking *one* oracle, whose price library had
+    been loaded once, at the executor's own coordinates. `LibraryCostOracle`
+    does not select prices by rank: it looks a signature up in the library it
+    holds. So every rank was priced from rank 0's tables and the outlier that
+    motivates the policy could not appear in the answer.
+
+    This holds one real oracle per rank, each built from that rank's own
+    resolved artifacts, and dispatches on the coordinate the shape carries.
+    The expensive part is not repeated: the model is traced once and every
+    rank's oracle shares those derivers.
+
+    Everything that is not `estimate` delegates to the representative rank, so
+    `describe`, coverage and the reporting surface behave as they did --
+    including `native_allocation`, and that one is worth being exact about.
+
+    The predict mixin does not *set* `native_allocation`; it reads the provider
+    off the oracle and calls `offer()` on the provider itself, once per step.
+    The provider is held inside each rank's `TemplateGraphs`, so a wrapper that
+    fanned out an assignment would be fanning out the wrong thing -- the
+    objects already inside the other ranks' template sources would never see
+    the batch, and every rank above the representative would refuse the step
+    for want of an allocation. So the ranks are built sharing *one* provider.
+    `NativeAllocation.allocation_for` already indexes by the shape's own
+    coordinates, so one object serves the whole group correctly, and one
+    `offer()` reaches all of it.
+    """
+
+    def __init__(self, by_rank: dict, representative: int = 0) -> None:
+        self._by_rank = dict(by_rank)
+        self._representative = representative
+        #: Which ranks `estimate` has been answered from. A set, not a log:
+        #: this is asked once by a report and would otherwise grow by one
+        #: entry per rank per step for the length of a run. What it
+        #: distinguishes is "every rank was asked" from "rank 0 was asked
+        #: four times", and that needs the ranks, not their order.
+        self.selected_ranks: set = set()
+
+    @property
+    def representative(self):
+        return self._by_rank[self._representative]
+
+    def oracle_for(self, rank: int):
+        """This rank's own oracle, or an error naming the rank that has none.
+
+        Fails closed. The shared-file fallback for a rank that wrote no
+        artifacts of its own already happened, during construction, in
+        `resolve_rank_path` -- that rank has a real composition built from the
+        shared tables. A rank with no composition at all is a rank outside the
+        group this oracle was built for, and answering it from another rank's
+        prices is precisely the substitution this class exists to stop.
+        """
+        rank = int(rank)
+        if rank not in self._by_rank:
+            raise LookupError(
+                f"this oracle was built for ranks {sorted(self._by_rank)} and "
+                f"was asked to price rank {rank}. A rank with no composition "
+                f"has no prices of its own, and another rank's are prices of "
+                f"different work.")
+        return self._by_rank[rank]
+
+    def estimate(self, shape):
+        rank = int((shape.rank_coords or {}).get("tp", self._representative))
+        oracle = self.oracle_for(rank)
+        self.selected_ranks.add(rank)
+        return oracle.estimate(shape)
+
+    def __getattr__(self, name):
+        # Reached only for names this class does not define, so `estimate`
+        # never lands here. Keeps `describe`, the coverage split, the
+        # allocation provider and anything else a report reads working
+        # unchanged, answered by the rank the composition represents.
+        return getattr(self.representative, name)
+
+
+class SourceGroup(NamedTuple):
+    """Every rank's composition, and the oracle that selects between them."""
+
+    oracle: object
+    #: rank index -> that rank's `SourceComposition`. Empty at TP1, where the
+    #: group is one rank and `oracle` is that rank's own oracle.
+    by_rank: dict
+    #: The union of what every rank loaded. Each `LoadedInput` carries the
+    #: coordinates of the rank that read it, so this stays per-rank detail
+    #: rather than becoming an undifferentiated set.
+    loaded_inputs: tuple = ()
+    #: What the derivation cost, counted once for the group rather than once
+    #: per rank: the model is traced once and the derivers are shared.
+    build_seconds: float = 0.0
+
+
+def build_source_group(*, tp: int = 1, rank_coords=None, head=False, **kwargs):
+    """The group's oracle: one real composition per rank, one derivation.
+
+    At TP1 this is exactly :func:`build_source_oracle` and returns that
+    composition's own oracle -- there is one rank, and wrapping it would add a
+    layer with nothing to select between.
+
+    Above TP1 every rank gets its own composition, so each resolves its own
+    price list and its own templates through `resolve_rank_path`. Only the
+    artifact reads are repeated; the model is traced once, by rank 0's build,
+    and every other rank is handed those derivers. That matters: a whole-model
+    build per rank would be four builds of a 27B model to read four small JSON
+    files, and the build cost would then be counted four times in a record
+    whose whole purpose is to be accountable.
+    """
+    width = int(tp or 1)
+    coords = _rank_coords(rank_coords)
+    representative = int(coords.get("tp", 0))
+    if width <= 1:
+        built = build_source_oracle(tp=width, rank_coords=rank_coords,
+                                    head=head, **kwargs)
+        return SourceGroup(built.oracle, {}, built.loaded_inputs,
+                           built.build_seconds)
+
+    first = build_source_oracle(tp=width, rank_coords={"tp": representative},
+                                head=head, **kwargs)
+    shared = (first.deriver, _head_deriver_of(first))
+    by_rank = {representative: first}
+    for rank in range(width):
+        if rank == representative:
+            continue
+        by_rank[rank] = build_source_oracle(
+            tp=width, rank_coords={"tp": rank}, head=head,
+            _shared_derivers=shared,
+            # One provider for the group, not one per rank. The runner offers
+            # this step's assignment by calling `offer()` on the object
+            # itself, and that object lives inside each rank's
+            # `TemplateGraphs` -- so ranks holding their own copies would
+            # never be offered anything and would refuse every step.
+            _shared_allocation=first.allocation, **kwargs)
+
+    loaded: list = []
+    for rank in sorted(by_rank):
+        loaded.extend(by_rank[rank].loaded_inputs)
+    oracle = RankGroupOracle({r: c.oracle for r, c in by_rank.items()},
+                             representative)
+    oracle.compass_loaded_inputs = tuple(loaded)
+    return SourceGroup(oracle, by_rank, tuple(loaded), first.build_seconds)
+
+
+def _head_deriver_of(composition):
+    """The head deriver a composition built, where it built one.
+
+    `SourceComposition` carries the body deriver by name and the head one only
+    inside `head_graphs`, which is where `TemplateGraphs` keeps it.
+    """
+    return getattr(composition.head_graphs, "_derive", None)
+
+
 def source_cost_oracle(*, rank_coords=None, **kwargs):
     """The frozen composition as a plain oracle, for `oracle_qualname`.
 
     This is the entry point a served run names. It takes exactly the arguments
     :func:`build_source_oracle` documents and returns only the oracle, because
     that is what `_build_oracle` expects to get back.
+
+    Above TP1 that oracle is the group's, not one rank's. A served run has one
+    executor standing in for the whole group, and `rank_aggregation="slowest"`
+    asks it to price every rank; it can only answer that honestly if every
+    rank's artifacts were actually loaded.
 
     ``rank_coords`` is named explicitly rather than swept into ``**kwargs``,
     and that is the whole reason it is in this signature: `_build_oracle`
@@ -392,7 +554,7 @@ def source_cost_oracle(*, rank_coords=None, **kwargs):
     a served run built the same composition and resolved the same artifacts --
     rank 0's, wherever a per-rank file existed.
     """
-    return build_source_oracle(rank_coords=rank_coords, **kwargs).oracle
+    return build_source_group(rank_coords=rank_coords, **kwargs).oracle
 
 
 def build_source_oracle(
@@ -418,6 +580,8 @@ def build_source_oracle(
     derive: bool = True,
     interpolate=None,
     rank_coords=None,
+    _shared_derivers=None,
+    _shared_allocation=None,
 ):
     """The frozen composition, from names and paths alone.
 
@@ -531,9 +695,27 @@ def build_source_oracle(
             "carry_allocation: the template's block assignment is reused for "
             "every cohort bound to it")
 
+    if _shared_allocation is not None:
+        # Another rank of this group built it. Deliberately the same object
+        # and not an equal one: the runner offers a step's assignment by
+        # calling `offer()` on the provider, and `allocation_for` indexes what
+        # was offered by the shape's own coordinates -- so one provider serves
+        # the whole group, and a per-rank copy would serve only the rank whose
+        # copy the runner happened to hold.
+        allocation = _shared_allocation
+
     body_deriver = head_deriver = None
     build_seconds = 0.0
-    if derive:
+    if _shared_derivers is not None:
+        # Another rank of this group already paid for the trace. `ModelTracer`
+        # builds one model per process and refuses a second, and a rank's
+        # graphs are produced from the shape's own coordinates rather than
+        # from a per-rank build, so sharing is what the derivation already
+        # assumed. `build_seconds` stays zero here: the cost was real once and
+        # a record that counted it per rank would report four builds of a
+        # model that was built once.
+        body_deriver, head_deriver = _shared_derivers
+    elif derive:
         import time
 
         from atom.compass.runtime.tracer import ModelTracer, ShapeDeriver
