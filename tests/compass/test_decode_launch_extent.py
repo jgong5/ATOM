@@ -41,10 +41,18 @@ DECLARED = {"block_size": 16, "max_model_len": MAX_MODEL_LEN,
 CONTEXT = 1151
 
 #: The gluon decode branch's declared scope. `compute_units` is the part's CU
-#: count -- 304 for MI300X -- and the launcher assumes two workgroups per CU,
-#: so the split count is min(8, ceil(608 / (sequences * num_kv_heads)))
+#: count and the launcher assumes two workgroups per CU, so the split count is
+#: min(8, ceil(2 * compute_units / (sequences * num_kv_heads)))
 #: (`attention_mha.py`:552, `pa_decode_gluon.py`:111-118). Both are here
 #: because the tile geometry follows from them and neither is in the key.
+#:
+#: 304 is MI300X, and it is deliberately NOT the part the decode campaign was
+#: measured on -- that is MI308X at 80 CUs, confirmed by rocminfo across all
+#: eight agents. A fixture that used the deployment's own number could not
+#: tell a declared value apart from a constant baked into the launcher, which
+#: is the thing these tests exist to pin down. Do not read 304 as a hardware
+#: fact about this deployment; the deployment's value lives in
+#: `measured_scope.json` and comes from the device properties dump.
 GLUON_SCOPE = {"attention_backend": "paged_gluon", "sliding_window": -1,
                "num_kv_heads": 4, "compute_units": 304}
 
