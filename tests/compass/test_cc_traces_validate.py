@@ -2476,6 +2476,33 @@ class TestEveryRepeatIsAccountedFor:
         assert got["replay_ratio"] == pytest.approx(4.0)
         assert got["meets_gate"] is False
 
+    def _twenty_each(self, **over):
+        return self._costs(
+            real_by_repeat={"1": 20.0, "2": 20.0, "3": 20.0},
+            modelled_by_repeat={"1": 20.0, "2": 20.0, "3": 20.0},
+            derivation=[],
+            **over,
+        )
+
+    def test_the_numerator_is_the_median_of_the_records(self):
+        """Twenty seconds a repeat on both sides, and no stated totals at all.
+        The records are the measurement, so the ratio is 1x."""
+        costs = self._twenty_each()
+        del costs["execution_real"], costs["execution_modelled"]
+        got = validate._speedup(costs, reuse_cells=1)
+        assert got["replay_ratio"] == pytest.approx(1.0)
+        assert got["meets_gate"] is False
+
+    def test_a_stale_total_beside_the_records_is_never_the_numerator(self):
+        """Three real repeats of twenty seconds, and a 120-second
+        `execution_real` left over from a longer run. That total read 6x. It
+        is not preferred and it is not quietly dropped either: which of the
+        two is from another run is not something this can decide."""
+        got = validate._speedup(self._twenty_each(real=120.0), reuse_cells=1)
+        assert got["replay_ratio"] is None
+        assert got["meets_gate"] is None
+        assert "execution_real" in got["reason"]
+
     def test_a_complete_record_still_passes(self):
         got = validate._speedup(self._costs(), reuse_cells=1)
         assert got["replay_ratio"] == pytest.approx(6.0)
@@ -2543,3 +2570,96 @@ class TestAnUndecidedToleranceIsNotAPass:
         assert validate.main(["matrix", "--out", str(report)] + dirs) == 1
         assert "MATRIX FAIL" in capsys.readouterr().out
         assert json.loads(report.read_text())["gates"]["tolerance"] is False
+
+
+class TestTheCostRecordIsBoundToTheRunsItPriced:
+    """A cost record is about particular executions, and has to name them.
+
+    `repeats` and `execution_by_repeat` were checked against each other and
+    against nothing else, so a record could be internally perfect and about a
+    different run of this cell: three saved repeats priced by a one-repeat
+    record, or a per-execution map beside an aggregate left over from an
+    earlier, longer run. Both read as a faster replay than the cell measured.
+    """
+
+    def _three(self, cell_dir, costs):
+        for side in ("real", "modelled"):
+            base = json.loads((Path(cell_dir) / f"{side}.r1.json").read_text())
+            for index in (2, 3):
+                _write(Path(cell_dir) / f"{side}.r{index}.json", base)
+            _journal(cell_dir, side, 3)
+        _gpu_free(cell_dir)
+        (Path(cell_dir) / "costs.json").write_text(json.dumps(costs))
+        return cell_dir
+
+    def _costs(self, *, coverage=(1, 2, 3), execution=20.0, aggregate=None):
+        blob = {
+            **{t: 10.0 for t in validate.MEASURED_COST_TERMS},
+            **{t: _supplied(10.0) for t in validate.SUPPLIED_COST_TERMS},
+            "cost_schema": validate.COSTS_SCHEMA,
+            "execution_clocks": {"real": "wall", "modelled": "wall"},
+        }
+        if coverage:
+            blob["repeats"] = {"real": len(coverage), "modelled": len(coverage)}
+            blob["execution_by_repeat"] = {
+                side: {str(i): execution for i in coverage}
+                for side in ("real", "modelled")
+            }
+            blob["startup_by_repeat"] = {
+                side: {str(i): 1.0 for i in coverage} for side in ("real", "modelled")
+            }
+            for side in ("real", "modelled"):
+                blob[f"execution_{side}"] = (
+                    aggregate if aggregate is not None else execution
+                )
+        return blob
+
+    def _run(self, cell_dir):
+        return validate.main(
+            [
+                "cell",
+                str(cell_dir),
+                "--class",
+                "long",
+                "--tp",
+                "2",
+                "--repeats",
+                "3",
+                "--calibration-registry",
+                str(Path(cell_dir) / "registry.json"),
+            ]
+        )
+
+    def _failures(self, cell_dir):
+        self._run(cell_dir)
+        return verdict(cell_dir)["failures"]
+
+    def test_a_matching_record_passes(self, cell):
+        assert self._run(self._three(cell, self._costs())) == 0
+
+    def test_three_runs_priced_by_a_one_repeat_record_are_refused(self, cell):
+        """The defect: the record is self-consistent and about one execution
+        of a cell that ran three."""
+        self._three(cell, self._costs(coverage=(1,)))
+        assert any("saved" in f for f in self._failures(cell))
+
+    def test_a_record_naming_repeats_the_cell_did_not_save_is_refused(self, cell):
+        self._three(cell, self._costs(coverage=(1, 2, 7)))
+        assert any("7" in f for f in self._failures(cell))
+
+    def test_an_aggregate_only_record_cannot_price_a_multi_repeat_cell(self, cell):
+        """Aggregate-only is the one-shot diagnostic shape and stays supported
+        there; it cannot stand in for the executions an acceptance cell ran."""
+        self._three(cell, self._costs(coverage=()))
+        assert any("per-execution" in f for f in self._failures(cell))
+
+    def test_a_stale_aggregate_beside_the_records_is_refused(self, cell):
+        """Twenty seconds a repeat, and a 120-second total left over from a
+        run that is not this one."""
+        self._three(cell, self._costs(execution=20.0, aggregate=120.0))
+        assert any("execution_real" in f for f in self._failures(cell))
+
+    def test_one_repeat_may_still_be_priced_in_aggregate(self, cell):
+        """The one-shot diagnostic route: one execution, one number, and no
+        per-execution record to match it against."""
+        assert run(cell) == 0

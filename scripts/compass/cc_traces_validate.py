@@ -33,6 +33,7 @@ import json
 import math
 import os
 import platform
+import re
 import sys
 from pathlib import Path
 
@@ -1394,10 +1395,8 @@ def cell(args) -> int:
             f"two understates the replay speedup by the repeat count. "
             f"Re-merge the cell rather than reinterpreting the old record"
         )
-    for side in ("real", "modelled"):
-        _, why = _repeat_coverage(costs, side)
-        if why:
-            failures.append(why)
+    _, timing_reasons = _timing(costs)
+    failures += timing_reasons
     missing = [t for t in MEASURED_COST_TERMS if not _finite(costs.get(t))]
     for term in SUPPLIED_COST_TERMS:
         value = costs.get(term)
@@ -1494,6 +1493,11 @@ def cell(args) -> int:
             f"modelled repeats, fewer than the {args.repeats} the "
             f"protocol registers"
         )
+
+    # The record has to be about these runs, not about a run of this cell that
+    # is no longer here.
+    for side, paths in (("real", real_paths), ("modelled", modelled_paths)):
+        failures += check_costs_cover_runs(costs, side, paths, args.repeats)
 
     failures += check_gpu_free(cell_dir, modelled_paths)
 
@@ -1864,6 +1868,104 @@ def _for_repeat(costs: dict, term: str, repeat: int, *windows: str) -> float:
     return total
 
 
+def _timing(costs: dict):
+    """What this cell's executions cost, read from the records of them.
+
+    The per-execution records are the measurement: one row per run, each with
+    its own duration. `execution_<side>` is a summary of those rows under the
+    registered quantile convention, and a summary cannot be more authoritative
+    than what it summarises -- a record carrying three twenty-second repeats
+    and a 120-second total is not a 120-second cell, it is a cell beside a
+    number from another run. So the term is derived from the rows wherever
+    there are rows, and a stated total that disagrees with them is reported as
+    the contradiction it is rather than quietly preferred.
+
+    A cell that ran once has no rows to summarise and states its seconds
+    directly. That is the one-shot diagnostic shape, and `cell` is what keeps
+    it out of multi-repeat acceptance.
+
+    Returns `({side: {"by_repeat": ..., "execution": ...}}, [reasons])`.
+    """
+    out, reasons = {}, []
+    for side in ("real", "modelled"):
+        coverage, why = _repeat_coverage(costs, side)
+        stated = costs.get(f"execution_{side}")
+        seconds = float(stated) if _finite(stated) else None
+        if why:
+            reasons.append(why)
+        elif coverage:
+            derived = _quantile(list(coverage.values()))
+            if seconds is not None and abs(seconds - derived) > 1e-6 * max(
+                1.0, derived
+            ):
+                reasons.append(
+                    f"costs.json reports execution_{side}={seconds:.3f}s while "
+                    f"its per-execution records say {derived:.3f}s: an "
+                    f"aggregate that is not the median of the repeats it was "
+                    f"taken over belongs to another run of this cell"
+                )
+            seconds = derived
+        out[side] = {"by_repeat": coverage, "execution": seconds}
+    return out, reasons
+
+
+def _saved_repeats(paths) -> set:
+    """The repeat numbers this cell actually saved a run artifact for."""
+    found = set()
+    for path in paths:
+        match = re.search(r"\.r(\d+)\.json$", path.name)
+        if not match:
+            return None
+        found.add(int(match.group(1)))
+    return found
+
+
+def check_costs_cover_runs(costs: dict, side: str, paths: list, required: int) -> list:
+    """The cost record has to be about the executions this cell saved.
+
+    `repeats` and `execution_by_repeat` agreeing with each other says the
+    record is self-consistent, not that it is this run's. A cell that saved
+    three runs and carries a one-repeat record is priced by an execution that
+    is not in front of us, and every per-repeat quantity read off it is a
+    quantity of something else.
+    """
+    coverage, why = _repeat_coverage(costs, side)
+    if why:
+        # Already reported once, by `_timing`. Saying it twice is not a
+        # second finding.
+        return []
+    if not coverage:
+        if required > 1:
+            return [
+                (
+                    f"costs.json prices the {side} side in aggregate only and "
+                    f"this cell ran {required} repeats: the gate divides one "
+                    f"repeat's seconds, so every run this cell saved needs a "
+                    f"per-execution record. Aggregate alone is the one-shot "
+                    f"diagnostic shape"
+                )
+            ]
+        return []
+    saved = _saved_repeats(paths)
+    if saved is None:
+        return [
+            (
+                f"the {side} run artifacts are not named per repeat, so the "
+                f"per-execution records in costs.json cannot be matched to "
+                f"the runs this cell saved"
+            )
+        ]
+    if set(coverage) != saved:
+        return [
+            (
+                f"costs.json prices {side} repeats {sorted(coverage)} while "
+                f"this cell saved runs for {sorted(saved)}: the record is "
+                f"about a different run of this cell"
+            )
+        ]
+    return []
+
+
 def _quantile(values: list) -> float:
     """The one quantile convention, applied to a list of per-repeat totals."""
     ordered = sorted(values)
@@ -1897,8 +1999,19 @@ def _speedup(costs: dict, reuse_cells: int) -> dict:
     acquisition. An amortised ratio is a different and weaker claim than the
     gate, so it is never what `meets_gate` reads.
     """
-    execution_real = costs.get("execution_real")
-    execution_modelled = costs.get("execution_modelled")
+    # One reading of what this cell's executions cost, shared with `cell`:
+    # the per-execution records where there are any, the stated aggregate only
+    # for a cell that ran once.
+    timing, reasons = _timing(costs)
+    if reasons:
+        return {
+            "replay_ratio": None,
+            "amortised_ratio": None,
+            "meets_gate": None,
+            "reason": reasons[0],
+        }
+    execution_real = timing["real"]["execution"]
+    execution_modelled = timing["modelled"]["execution"]
     if not (
         _finite(execution_real)
         and _finite(execution_modelled)
@@ -1931,24 +2044,14 @@ def _speedup(costs: dict, reuse_cells: int) -> dict:
     # Which repeats there are to divide by. A record that states more than one
     # repeat and does not say what each cost has nothing to match a journalled
     # term against, and the median it does carry is not one repeat's total.
-    coverage = {}
-    for side in ("modelled", "real"):
-        coverage[side], why = _repeat_coverage(costs, side)
-        if why:
-            return {
-                "replay_ratio": None,
-                "amortised_ratio": None,
-                "meets_gate": None,
-                "reason": why,
-            }
-    modelled_repeats = coverage["modelled"]
+    modelled_repeats = timing["modelled"]["by_repeat"]
     if modelled_repeats:
         # Every second of the term the gate divides by has to land on one of
         # the repeats this cell actually ran -- not on a repeat number the
         # record does not have, and not on no repeat at all.
         foreign = _foreign_repeats(costs, "derivation", set(modelled_repeats))
-        if coverage["real"]:
-            foreign += _foreign_repeats(costs, "load", set(coverage["real"]))
+        if timing["real"]["by_repeat"]:
+            foreign += _foreign_repeats(costs, "load", set(timing["real"]["by_repeat"]))
         if foreign:
             listed = ", ".join(f"repeat {r} ({s:.3f}s)" for r, s in sorted(foreign))
             return {
@@ -2005,7 +2108,7 @@ def _speedup(costs: dict, reuse_cells: int) -> dict:
                 for i in modelled_repeats
             ]
         )
-        real_repeats = coverage["real"]
+        real_repeats = timing["real"]["by_repeat"]
         real_startups = _by_repeat(costs, "startup_by_repeat", "real")
         real_total = (
             _quantile(
