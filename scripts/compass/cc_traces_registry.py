@@ -271,18 +271,39 @@ _B2_GDN = (
     ("G7", (1, 2, 3, 4)),
 )
 
-#: The cold-MHA companion of the V=16 campaign: `xacq` P4, four repeats,
-#: `realized_cache` `["graph"]`, 0 histories against 16384 queries, graph
-#: `b1_G4`. v2 excludes it from the cached fit and says why -- "P4 is the cold
-#: diagnostic bridge; it is not a cached training point and never enters this
-#: fit" -- which is exactly what makes it this deployment's cold observation.
+#: The cold-MHA input set: B2's own P1-P4, four designs at four repeats.
 #:
-#: B2's own cold MHA (P1-P4 under `b2acq`) is V=32. `kv_regions` is a treatment
-#: field and the declared deployment is the V=16 one, so B2's cold set is not
-#: this deployment's cold measurement; loading it beside this one would put two
-#: treatments in the cold domain, which is the ambiguity the composition
-#: refuses. It is archived below rather than dropped silently.
-_V16_COLD = (("P4", "{root}/b1graphs/b1_G4.reduced.json"),)
+#: This was `xacq` P4 alone, on the argument that the declared deployment is
+#: the V=16 one and B2's cold set is V=32. The argument is right about the
+#: treatment and wrong about the consequence. `unified.prefill.cold` is fitted
+#: over ("calls", "paired_work", "query_rows") -- three features -- and one
+#: design measured four times gives four rows identical in every one of them.
+#: The design matrix is singular, so no cold law was fitted at all, and cold
+#: calls fell through to the legacy p640/p16384 entries, which carry no
+#: `has_cached` and are refused as unscoped. A book with one cold point does
+#: not have a narrower cold law than a book with four; it has none.
+#:
+#: So the cold domain takes the set that can actually be fitted -- the same 16
+#: files `mixed_freeze/v1` fitted its cold law from -- and `xacq` P4 moves to
+#: the archive. The domain still holds exactly ONE treatment, which is what
+#: the original rule was protecting.
+#:
+#: The cost, stated rather than buried: the cold law is V=32 while the cached
+#: law is V=16, a mixed treatment across regimes. The two are separate laws
+#: and no fit ever sees both populations, so nothing is pooled -- but the
+#: qualification travels with this baseline and must not be dropped when its
+#: end-to-end numbers are quoted. The alternative on offer is not a cleaner
+#: cold law; it is no cold law.
+#:
+#: Pairings are from `mixed_freeze/v1/FROZEN.json`'s `inputs`, not inferred:
+#: `b1graphs` uses the batch-1 id scheme, so P2 -> `b1_G2` and P4 -> `b1_G4`
+#: while P1 and P3 keep their own names.
+_B2_COLD = (
+    ("P1", "{root}/b1graphs/b1_P1.reduced.json"),
+    ("P2", "{root}/b1graphs/b1_G2.reduced.json"),
+    ("P3", "{root}/b1graphs/b1_P3.reduced.json"),
+    ("P4", "{root}/b1graphs/b1_G4.reduced.json"),
+)
 
 _V16_DESIGNS = (
     ("K1", "{root}/b1graphs/b1_C1.reduced.json"),
@@ -311,9 +332,11 @@ ARCHIVED_CACHED_MHA = (
     ("{root}/b2acq/training/PRICE_K{1..5}.rep{1..4}.json",
      "unified.prefill.cached, kv_regions=32 -- the superseded B2 population, "
      "20 files, still frozen in mixed_freeze/v1"),
-    ("{root}/b2acq/training/PRICE_P{1..4}.rep{1..4}.json",
-     "unified.prefill.COLD, kv_regions=32 -- 16 files; archived for the same "
-     "treatment reason, not because the cold candidate changed"),
+    ("{root}/xacq/training/PRICE_P{1..4}.rep{1..4}.json",
+     "unified.prefill.COLD, kv_regions=16 -- the X P4 cold diagnostic, 4 "
+     "files of ONE design. Archived, not loaded: it cannot fit the "
+     "three-feature cold law by itself, and loading it beside the B2 cold "
+     "set would put two treatments in the cold domain"),
 )
 
 
@@ -473,9 +496,9 @@ def _tp1_prices() -> tuple:
     # the serving deployment's own attention observations, under the serving
     # scope, and the two ragged laws this book has to answer from were fitted
     # from these.
-    for design, graph in _V16_COLD:
+    for design, graph in _B2_COLD:
         for rep in _V16_REPEATS:
-            add(f"{_XACQ}/PRICE_{design}.rep{rep}.json", graph)
+            add(f"{_B2ACQ}/PRICE_{design}.rep{rep}.json", graph)
     for design, repeats in _B2_GDN:
         for rep in repeats:
             add(f"{_B2ACQ}/PRICE_{design}.rep{rep}.json",
