@@ -148,6 +148,29 @@ def _kv_blocks() -> int:
     return 0
 
 
+def shift_addresses(values, offset: int):
+    """Move real addresses into another KV region, leaving sentinels alone.
+
+    A padded batch does not carry an address in every position. A bucketed
+    decode rounds three real rows up to a bucket of four, and the fourth row's
+    ``slot_mapping`` entry is ``-1``: not a slot, a statement that there is no
+    slot. The kernel tests for the negative and skips the write.
+
+    Adding a region offset to that ``-1`` turns it into a perfectly valid
+    address -- and specifically into an address in the *previous* region, which
+    is the one region guaranteed to hold live data from the call before. The
+    padding row then stops being skipped and writes over another row's KV. The
+    benchmark reports a time for work that is not the work being priced, and a
+    correctness check on the output would not obviously fail, because the
+    damage lands in a region the current call does not read.
+
+    So the offset applies to addresses only. Negative entries are sentinels and
+    are carried through unchanged, which is also what makes variant 0 --
+    offset 0 -- exactly the recorded call.
+    """
+    return [v if v < 0 else v + offset for v in values]
+
+
 def _install_attention(recorded: dict[str, Any], variants: int) -> list:
     """One installer per distinct KV region the captured batch should touch.
 
@@ -205,7 +228,7 @@ def _install_attention(recorded: dict[str, Any], variants: int) -> list:
             used = len(flat) // max(shape[0], 1)
             if used:
                 table[:, :used] = torch.tensor(
-                    [x + v * stride for x in flat],
+                    shift_addresses(flat, v * stride),
                     dtype=torch.int32, device="cuda").reshape(shape[0], used)
 
         metadata = AttentionMetaData(
@@ -213,7 +236,8 @@ def _install_attention(recorded: dict[str, Any], variants: int) -> list:
             context_lens=tensor(recorded.get("context_lens"), torch.int32),
             slot_mapping=tensor(
                 None if slots is None
-                else [x + v * stride * block_size for x in slots], torch.int64),
+                else shift_addresses(slots, v * stride * block_size),
+                torch.int64),
             cu_seqlens_q=tensor(recorded.get("cu_seqlens_q"), torch.int32),
             cu_seqlens_k=tensor(recorded.get("cu_seqlens_k"), torch.int32),
             max_seqlen_q=int(recorded.get("max_seqlen_q", 0)),
