@@ -400,9 +400,6 @@ class PriceLibrary:
         #: not a record, for the reason in the class docstring.
         self._prices: dict[str, list] = {}
         self._refusals: dict[str, str] = {}
-        #: signature -> layout fingerprint of the operator it was measured from,
-        #: where the graph that was priced is available to say.
-        self._layouts: dict[str, str] = {}
         self.sources: list[str] = []
         self.partial: list[str] = []
         self.conflicts: dict[str, list[float]] = {}
@@ -460,6 +457,22 @@ class PriceLibrary:
             # anything assembled from it is partial until a full-graph run says
             # otherwise.
             self.partial.append(f"{price_path} (--only {provenance['only']})")
+        # The layouts this run's own graph recorded, read before the prices so
+        # each record can carry the one it was measured under.
+        #
+        # Keeping these in one signature-keyed table instead made the check
+        # load-order dependent: a signature holds several scoped records, and
+        # the first file read fixed the layout every later scope was validated
+        # against. Two files priced at different widths and different layouts
+        # then produced both errors at once -- the scope whose layout lost the
+        # race had its own measurement refused, and the other scope's request
+        # was answered from a price measured on a layout it does not have.
+        layouts = {}
+        if graph_path:
+            with open(graph_path, encoding="utf-8") as fh:
+                for op in json.load(fh)["ops"]:
+                    layouts.setdefault(_signature_of(op),
+                                       _layout_fingerprint(op))
         for sig, record in (blob.get("prices") or {}).items():
             kept = self._prices.setdefault(sig, [])
             same = [r for r in kept if _same_scope(r["scope"], scope)]
@@ -469,14 +482,16 @@ class PriceLibrary:
                 if was and abs(now - was) / was > 0.05:
                     self.conflicts.setdefault(sig, [was]).append(now)
                 continue
-            kept.append(dict(record, source=price_path, scope=scope))
+            entry = dict(record, source=price_path, scope=scope)
+            if sig in layouts:
+                # Absent is not dense: a price loaded without its graph has
+                # nothing to say about layout, and must not be read as having
+                # said "dense". Only a recorded one is stored, and only a
+                # recorded one is checked.
+                entry["layout"] = layouts[sig]
+            kept.append(entry)
         for sig, why in (blob.get("unpriced") or {}).items():
             self._refusals.setdefault(sig, why)
-        if graph_path:
-            with open(graph_path, encoding="utf-8") as fh:
-                for op in json.load(fh)["ops"]:
-                    self._layouts.setdefault(_signature_of(op),
-                                             _layout_fingerprint(op))
 
     def lookup(self, op: dict, topology=None, registration=None):
         """``(record, source)`` for one operator, or ``(None, reason)``.
@@ -502,14 +517,19 @@ class PriceLibrary:
                 return None, why
         else:
             record = candidates[0]
-        measured = self._layouts.get(sig)
+        # Against the layout of the record that was *selected*, which for a
+        # collective is chosen by width and path above. A price and the layout
+        # it was measured under are one measurement and travel together.
+        measured = record.get("layout")
         if measured is not None:
             mine = _layout_fingerprint(op)
             if mine != measured:
                 # Same key, different memory. The price is real and it is a
                 # price of something else.
-                return None, ("priced under a different operand layout "
-                              f"({measured or 'dense'} vs {mine or 'dense'})")
+                return None, (
+                    "priced under a different operand layout at "
+                    f"{_scope_note(record['scope'])} "
+                    f"({measured or 'dense'} vs {mine or 'dense'})")
         return record, record.get("source", "?")
 
     @staticmethod
@@ -607,8 +627,10 @@ class PriceLibrary:
                     if self.conflicts else "")
         scoped = sum(1 for recs in self._prices.values() if len(recs) > 1)
         multi = (f", {scoped} held in more than one scope" if scoped else "")
+        with_layout = sum(1 for recs in self._prices.values()
+                          if any("layout" in r for r in recs))
         return (f"PriceLibrary({len(self._prices)} signatures from "
-                f"{len(self.sources)} runs, {len(self._layouts)} with a "
+                f"{len(self.sources)} runs, {with_layout} with a "
                 f"recorded layout{multi}{partial}{conflict})")
 
 
