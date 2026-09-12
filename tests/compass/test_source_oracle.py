@@ -313,6 +313,18 @@ class TestTheContractWithTheServedPath:
             "interpolation_limit", "loaded_inputs")
 
 
+def _read_prices(oracle):
+    """The price files this oracle's library actually opened.
+
+    `library.sources` holds the paths as they were *asked for*, which since the
+    loader took over resolution is the stem the option carried -- the same
+    string at every rank. Which file a rank was served is in the record the
+    reader took as it parsed the bytes, and that is what these tests are about.
+    """
+    return [loaded.path for loaded in oracle.library.loaded_inputs
+            if loaded.role == "oracle.price"]
+
+
 def _rank_price_file(tmp_path, name, signature):
     """A library file whose one signature says which file it came from."""
     path = tmp_path / name
@@ -391,8 +403,8 @@ class TestTheRankTheServedPathActuallyBuildsWith:
         at_zero = _Runner(tp=2, rank=0)._build_oracle(config)
         at_one = _Runner(tp=2, rank=1)._build_oracle(config)
 
-        assert at_zero.library.sources == [shared]
-        assert at_one.library.sources == [str(tmp_path / "prices.tp1.json")]
+        assert _read_prices(at_zero) == [shared]
+        assert _read_prices(at_one) == [str(tmp_path / "prices.tp1.json")]
 
     def test_a_rank_with_no_file_of_its_own_reads_the_shared_one(self, tmp_path):
         """Which is correct in a symmetric group, and a different claim.
@@ -404,7 +416,7 @@ class TestTheRankTheServedPathActuallyBuildsWith:
         template = _template_file(tmp_path)
         oracle = _Runner(tp=2, rank=3)._build_oracle(
             _oracle_config(shared, template))
-        assert oracle.library.sources == [shared]
+        assert _read_prices(oracle) == [shared]
 
         built = build_source_oracle(price=shared, template=template, derive=0,
                                     require_complete=0,
@@ -449,7 +461,7 @@ class TestTheRankTheServedPathActuallyBuildsWith:
         _rank_price_file(tmp_path, "prices.tp0.json", "sig::decoy")
         oracle = _Runner(tp=1, rank=0)._build_oracle(
             _oracle_config(shared, _template_file(tmp_path)))
-        assert oracle.library.sources == [shared]
+        assert _read_prices(oracle) == [shared]
 
     def test_rank_zero_of_a_wide_group_is_also_unchanged(self, tmp_path):
         """The injection fires, resolves to rank 0's own name, and that is the
@@ -458,7 +470,7 @@ class TestTheRankTheServedPathActuallyBuildsWith:
         _rank_price_file(tmp_path, "prices.tp0.json", "sig::rank0")
         oracle = _Runner(tp=2, rank=0)._build_oracle(
             _oracle_config(shared, _template_file(tmp_path)))
-        assert oracle.library.sources == [str(tmp_path / "prices.tp0.json")]
+        assert _read_prices(oracle) == [str(tmp_path / "prices.tp0.json")]
 
     def test_an_explicit_option_is_not_overridden_by_the_runner(self, tmp_path):
         """`_build_oracle` only fills a rank the options did not already set."""
@@ -467,7 +479,7 @@ class TestTheRankTheServedPathActuallyBuildsWith:
         config = _oracle_config(shared, _template_file(tmp_path))
         config.oracle_options["rank_coords"] = "tp:1"
         oracle = _Runner(tp=2, rank=0)._build_oracle(config)
-        assert oracle.library.sources == [str(tmp_path / "prices.tp1.json")]
+        assert _read_prices(oracle) == [str(tmp_path / "prices.tp1.json")]
 
     def test_a_rank_one_shape_is_served_by_the_rank_zero_template(self, tmp_path):
         """End to end: the miss the rank injection would otherwise have caused.

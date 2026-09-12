@@ -312,18 +312,39 @@ class TestThePriceReaderSeam:
         built = build_source_oracle(template=_template_file(tmp_path), derive=0)
         assert not [i for i in built.loaded_inputs
                     if i.role.startswith("oracle.price")]
-
-
 class TestResolutionHappensOnce:
+    """Only the reader resolves, and it does so as it opens the file.
 
-    def test_the_factory_stops_resolving_once_the_library_does(self, monkeypatch):
-        """Which side resolves decides what the record says, so it is asked
-        rather than assumed -- and while the library still takes resolved
-        paths, this factory keeps resolving, because a TP>1 run that silently
-        stopped reading its own prices would be the worse defect."""
+    That is what lets one record hold both ends: the stem the option carried,
+    and the per-rank file this rank was served. A factory that resolved on the
+    way in would hand the library a suffixed path it had no way to recognise
+    as a rank's own, and every record would read `rank_own: false` under a
+    name nothing asked for.
+    """
+
+    def test_the_library_takes_the_rank_and_resolves_for_itself(self):
         from atom.compass.core.cost.library import PriceLibrary
-        from atom.compass.runtime.source_oracle import price_reader_resolves_ranks
 
+        assert "coords" in inspect.signature(PriceLibrary.add).parameters
+        assert "coords" in inspect.signature(PriceLibrary.load).parameters
 
-        expected = "coords" in inspect.signature(PriceLibrary.add).parameters
-        assert price_reader_resolves_ranks() is expected
+    def test_the_factory_hands_the_option_stem_through_unresolved(self, tmp_path):
+        from atom.compass.runtime.source_oracle import build_source_group
+
+        from .test_source_oracle import _price_file
+
+        # The group builds every rank, so rank 0 needs something to read too:
+        # the shared list, which is what it falls back to.
+        stem = _price_file(tmp_path, "prices.json")
+        _price_file(tmp_path, "prices.tp1.json")
+        built = build_source_group(price=stem, tp=2, derive=0,
+                                   require_complete=0, regions="none",
+                                   template=_template_file(tmp_path),
+                                   rank_coords={"tp": 1})
+
+        mine = [i for i in built.loaded_inputs
+                if i.role == "oracle.price" and i.rank_coords == (("tp", 1),)]
+        assert mine, built.loaded_inputs
+        assert mine[0].requested == stem
+        assert mine[0].path.endswith("prices.tp1.json")
+        assert mine[0].rank_own is True

@@ -217,15 +217,74 @@ class TestTheSelectorDoesNotStandInForTheChildren:
 
 class TestTheRecordNamesEveryRanksFiles:
 
+    def test_every_rank_retains_the_identity_of_its_price_file(self, tmp_path):
+        """The prices, through the real library reader.
+
+        Each rank resolves its own list and reports the digest of the bytes it
+        parsed, under the stem the option carried. Both ends: a record holding
+        only the resolved name could not say what was asked for, and one
+        holding only the stem could not say which rank answered.
+        """
+        import hashlib
+
+        group = _build_group(**_group(tmp_path))
+
+        prices = {i.path: i for i in group.loaded_inputs
+                  if i.role == "oracle.price"}
+        assert len(prices) == WIDTH, prices
+        for rank in range(WIDTH):
+            path = str(tmp_path / f"prices.tp{rank}.json")
+            assert path in prices, f"rank {rank}'s price list is unrecorded"
+            with open(path, "rb") as handle:
+                assert prices[path].sha256 == hashlib.sha256(
+                    handle.read()).hexdigest()
+            assert prices[path].rank_own is True
+            assert prices[path].requested == str(tmp_path / "prices.json")
+            assert prices[path].rank_coords == (("tp", rank),)
+
+    def test_a_price_graph_is_recorded_under_its_own_role(self, tmp_path):
+        """The second member of the price triple. It decides which operand
+        layout a price was measured against, so a record naming the list and
+        not the graph cannot say what the price was a price of."""
+        import hashlib
+
+        options = _group(tmp_path)
+        for rank in range(WIDTH):
+            _template(tmp_path, rank)
+        options["price"] = (f"{tmp_path / 'prices.json'}:"
+                            f"{tmp_path / 'graph.json'}")
+
+        group = _build_group(**options)
+
+        graphs = {i.path: i for i in group.loaded_inputs
+                  if i.role == "oracle.price_graph"}
+        assert len(graphs) == WIDTH, graphs
+        for rank in range(WIDTH):
+            path = str(tmp_path / f"graph.tp{rank}.json")
+            assert path in graphs
+            with open(path, "rb") as handle:
+                assert graphs[path].sha256 == hashlib.sha256(
+                    handle.read()).hexdigest()
+            assert graphs[path].rank_own is True
+
+    def test_replacing_a_ranks_price_file_afterwards_does_not_move_it(
+            self, tmp_path):
+        """The reopening defect, on the prices. A digest taken later describes
+        whatever is at the path later; this one was taken as the bytes were
+        parsed, so it goes on describing the list the oracle is holding."""
+        group = _build_group(**_group(tmp_path))
+        before = {i.path: i.sha256 for i in group.loaded_inputs
+                  if i.role == "oracle.price"}
+
+        _prices(tmp_path, 2, 0.999)
+
+        after = {i.path: i.sha256 for i in group.loaded_inputs
+                 if i.role == "oracle.price"}
+        assert after == before
+
     def test_every_rank_retains_the_identity_of_what_it_read(self, tmp_path):
         """Not only the executor's own rank. The manifest is the evidence for
         a group's prediction, so it has to hold the group's inputs.
-
-        Templates only, for now. Each rank does load its own price file -- the
-        cost assertions above are what prove it -- but `PriceLibrary` does not
-        yet report the identity of what it read, so there is nothing here to
-        assert it against. This grows an `oracle.price` arm per rank when that
-        reader lands; it is not a statement that prices are exempt.
         """
         import hashlib
 

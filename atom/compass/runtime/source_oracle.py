@@ -124,30 +124,6 @@ def gap_ratio(value, what: str = "interpolate"):
     return ratio
 
 
-def price_reader_resolves_ranks() -> bool:
-    """Whether `PriceLibrary` resolves this rank's price file for itself.
-
-    A transitional seam, and it is here rather than hidden in a ``try`` because
-    which side resolves decides what the record says. Resolution has to happen
-    exactly once, at the read, so that the record can hold both the stem the
-    option carried and the file this rank was actually served. While the
-    library still takes paths pre-resolved, this factory keeps resolving them
-    -- otherwise a TP>1 run would silently stop reading its own prices, which
-    is a worse outcome than a coarser record.
-
-    Delete this, and the branches it guards, once `PriceLibrary.add` takes
-    ``coords``.
-    """
-    import inspect
-
-    from atom.compass.core.cost.library import PriceLibrary
-
-    try:
-        return "coords" in inspect.signature(PriceLibrary.add).parameters
-    except (TypeError, ValueError):  # pragma: no cover - odd callables
-        return False
-
-
 def _price_library(entries, gap_ratio, coords=None):
     """The exact-signature library, or the family provider in front of it.
 
@@ -159,9 +135,9 @@ def _price_library(entries, gap_ratio, coords=None):
     Off by default. An interpolated price is a claim about a row count nobody
     ran, and a run that did not ask for one should not silently get one.
 
-    ``coords`` is offered only where the library resolves ranks itself; see
-    :func:`price_reader_resolves_ranks`. Both branches go through ``add``, so
-    there is one call site to add the argument to rather than two.
+    ``coords`` goes to the library unresolved, and the library resolves as it
+    reads. Both branches go through ``add``, so there is one call site
+    carrying it rather than two.
     """
     from atom.compass.core.cost.library import PriceLibrary
 
@@ -643,17 +619,14 @@ def build_source_oracle(
             "on.")
 
     requested_prices = _entries(price, "price")
-    # Resolve the rank's file exactly once, and as late as possible. Where the
-    # library reads for itself, it is handed the stems the option carried and
-    # resolves as it loads, so its record holds both the stem asked for and
-    # the file served. Until then this factory keeps resolving, because a TP>1
-    # run that silently stopped reading its own prices would be a worse defect
-    # than a coarser record. See `price_reader_resolves_ranks`.
-    library_resolves = price_reader_resolves_ranks()
-    price_entries = price_specs(requested_prices,
-                                None if library_resolves else coords)
-    library = _price_library(price_entries, gap_ratio(interpolate),
-                             coords if library_resolves else None)
+    # Unresolved on the way in, resolved once by the reader as it opens the
+    # file. That is what lets the record hold both ends of it: the stem the
+    # option carried, and the per-rank file this rank was actually served.
+    # Resolving here as well would hand the library a suffixed path it had no
+    # way to recognise as a rank's own, and every record would read
+    # `rank_own: false` under a name nothing asked for.
+    price_entries = price_specs(requested_prices)
+    library = _price_library(price_entries, gap_ratio(interpolate), coords)
     regions_model = region_model(regions)
     rank_artifacts = _rank_artifacts(
         coords, requested_prices, templates, head_templates)
