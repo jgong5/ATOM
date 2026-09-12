@@ -176,7 +176,14 @@ class TestTheRecordNamesEveryRanksFiles:
 
     def test_every_rank_retains_the_identity_of_what_it_read(self, tmp_path):
         """Not only the executor's own rank. The manifest is the evidence for
-        a group's prediction, so it has to hold the group's inputs."""
+        a group's prediction, so it has to hold the group's inputs.
+
+        Templates only, for now. Each rank does load its own price file -- the
+        cost assertions above are what prove it -- but `PriceLibrary` does not
+        yet report the identity of what it read, so there is nothing here to
+        assert it against. This grows an `oracle.price` arm per rank when that
+        reader lands; it is not a statement that prices are exempt.
+        """
         import hashlib
 
         options = _group(tmp_path)
@@ -216,17 +223,79 @@ class TestTheRecordNamesEveryRanksFiles:
 
 class TestTheGroupPaysForOneDerivation:
 
-    def test_the_ranks_share_one_composition_of_derivers(self, tmp_path):
-        """Four whole-model builds to read four small JSON files would be the
-        wrong trade, and would put a build cost in the record four times."""
+    def test_every_rank_gets_a_composition(self, tmp_path):
         group = _build_group(**_group(tmp_path))
 
         assert set(group.by_rank) == set(range(WIDTH))
-        assert group.build_seconds == 0.0, "derive is off here, so nothing was"
-        for rank, composition in group.by_rank.items():
-            if rank == 0:
-                continue
-            assert composition.build_seconds == 0.0
+
+    def test_the_model_is_traced_once_and_the_derivers_are_shared(
+            self, tmp_path, monkeypatch):
+        """With derivation actually on, which is the only setting where there
+        is a build to count.
+
+        `ModelTracer.build` is spied rather than run: it loads a model, and
+        the claim under test is about how many times it is called and which
+        deriver each rank view ends up holding. Four builds of a 27B model to
+        read four small JSON files would be the wrong trade, and would put the
+        build cost in the record four times.
+        """
+        from atom.compass.runtime import tracer as tracer_module
+
+        builds = []
+
+        class _Tracer:
+            pass
+
+        class _Deriver:
+            def __init__(self, tracer, region=None, **kwargs):
+                self.tracer = tracer
+                self.region = region
+
+        def _build(model_path, tp, device="meta", **kwargs):
+            builds.append((model_path, tp))
+            return _Tracer()
+
+        monkeypatch.setattr(tracer_module.ModelTracer, "build",
+                            staticmethod(_build))
+        monkeypatch.setattr(tracer_module, "ShapeDeriver", _Deriver)
+
+        options = dict(_group(tmp_path))
+        for rank in range(WIDTH):
+            _template(tmp_path, rank)
+        options.update(derive=1, head=True, model="/models/stub",
+                       block_size=16, max_model_len=4096,
+                       head_template=options["template"])
+        group = _build_group(**options)
+
+        assert len(builds) == 1, builds
+        body = {c.deriver for c in group.by_rank.values()}
+        assert len(body) == 1 and None not in body
+        heads = {c.head_graphs._derive for c in group.by_rank.values()}
+        assert len(heads) == 1 and None not in heads
+        assert next(iter(body)).region == "body"
+        assert next(iter(heads)).region == "head"
+
+    def test_the_build_cost_is_counted_once(self, tmp_path, monkeypatch):
+        """A record whose whole purpose is to be accountable must not report
+        one build four times."""
+        from atom.compass.runtime import tracer as tracer_module
+
+        class _Deriver:
+            def __init__(self, tracer, region=None, **kwargs):
+                self.region = region
+
+        monkeypatch.setattr(tracer_module.ModelTracer, "build",
+                            staticmethod(lambda *a, **k: object()))
+        monkeypatch.setattr(tracer_module, "ShapeDeriver", _Deriver)
+
+        options = dict(_group(tmp_path))
+        options.update(derive=1, model="/models/stub", block_size=16,
+                       max_model_len=4096)
+        group = _build_group(**options)
+
+        assert group.build_seconds == group.by_rank[0].build_seconds
+        for rank in range(1, WIDTH):
+            assert group.by_rank[rank].build_seconds == 0.0
 
 
 class TestTheServedSurfaceIsUnchanged:
