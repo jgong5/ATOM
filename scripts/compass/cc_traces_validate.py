@@ -1494,13 +1494,6 @@ def cell(args) -> int:
             f"protocol registers"
         )
 
-    # The record has to be about these runs, not about a run of this cell that
-    # is no longer here.
-    for side, paths in (("real", real_paths), ("modelled", modelled_paths)):
-        failures += check_costs_cover_runs(costs, side, paths, args.repeats)
-
-    failures += check_gpu_free(cell_dir, modelled_paths)
-
     journals, blobs = {}, {}
     for side, paths in (("real", real_paths), ("modelled", modelled_paths)):
         journal_path = cell_dir / f"run.{side}.json"
@@ -1508,6 +1501,17 @@ def cell(args) -> int:
             json.loads(journal_path.read_text()) if journal_path.exists() else None
         )
         blobs[side] = [json.loads(p.read_text()) for p in paths]
+
+    # The record has to be about these runs: the artifacts that are here, and
+    # the seconds the journal timed them at. Repeat numbers alone do not say
+    # which run of this cell a record came from -- every run of it has repeats
+    # 1..3 -- so the durations are what it is bound to.
+    for side, paths in (("real", real_paths), ("modelled", modelled_paths)):
+        failures += check_costs_cover_runs(
+            costs, side, paths, journals[side], args.repeats
+        )
+
+    failures += check_gpu_free(cell_dir, modelled_paths)
 
     # Before anything is measured: a diagnostic run exercises this same harness
     # and writes these same file names, so what separates it from a cell is
@@ -1920,20 +1924,74 @@ def _saved_repeats(paths) -> set:
     return found
 
 
-def check_costs_cover_runs(costs: dict, side: str, paths: list, required: int) -> list:
-    """The cost record has to be about the executions this cell saved.
+def _journal_timing(journal, side: str):
+    """What `run.<side>.json` says each of this side's executions cost.
+
+    The journal is where a duration is first written down: `SideRun` stamps
+    each repeat's replay with its own stopwatch as the client returns, before
+    anything is summarised. `costs.<side>.json` and the merged `costs.json`
+    are summaries of it, and a rerun rewrites the journal and this side's
+    costs while the merged record stays behind -- same cell, same repeats 1..3,
+    seconds from the run before this one.
+
+    Returns `({repeat: seconds}, [reasons])`. A journal that is absent or
+    empty is not reported here: `check_who_served` already refuses it, and one
+    finding said twice is not two findings.
+    """
+    if not isinstance(journal, dict) or not journal:
+        return {}, []
+    executions = journal.get("executions") or []
+    if not executions:
+        return {}, []
+    out = {}
+    for index, execution in enumerate(executions):
+        repeat = execution.get("repeat")
+        seconds = (execution.get("replay") or {}).get("seconds")
+        if not isinstance(repeat, int) or not _finite(seconds):
+            return {}, [
+                (
+                    f"{side}: run.{side}.json records an execution "
+                    f"(#{index + 1}) the replay never timed, so there is "
+                    f"nothing to bind this cell's price to. A repeat nobody "
+                    f"timed is not a repeat that cost what a summary says"
+                )
+            ]
+        if repeat in out:
+            return {}, [
+                (
+                    f"{side}: run.{side}.json records repeat {repeat} twice, "
+                    f"so one execution's duration stands for two"
+                )
+            ]
+        out[int(repeat)] = float(seconds)
+    return out, []
+
+
+def _disagrees(priced: float, measured: float) -> bool:
+    return abs(priced - measured) > 1e-6 * max(1.0, abs(measured))
+
+
+def check_costs_cover_runs(
+    costs: dict, side: str, paths: list, journal, required: int
+) -> list:
+    """The cost record has to be about the executions this cell ran.
 
     `repeats` and `execution_by_repeat` agreeing with each other says the
     record is self-consistent, not that it is this run's. A cell that saved
     three runs and carries a one-repeat record is priced by an execution that
-    is not in front of us, and every per-repeat quantity read off it is a
-    quantity of something else.
+    is not in front of us. Neither is a record whose repeat numbers match and
+    whose seconds do not: repeat numbers are 1..3 in every run of this cell,
+    so they identify nothing on their own. What identifies a run is what it
+    measured, and that is in the journal.
     """
     coverage, why = _repeat_coverage(costs, side)
     if why:
         # Already reported once, by `_timing`. Saying it twice is not a
         # second finding.
         return []
+    timed, problems = _journal_timing(journal, side)
+    if problems:
+        return problems
     if not coverage:
         if required > 1:
             return [
@@ -1945,6 +2003,18 @@ def check_costs_cover_runs(costs: dict, side: str, paths: list, required: int) -
                     f"diagnostic shape"
                 )
             ]
+        stated = costs.get(f"execution_{side}")
+        if len(timed) == 1 and _finite(stated):
+            measured = next(iter(timed.values()))
+            if _disagrees(float(stated), measured):
+                return [
+                    (
+                        f"costs.json prices the {side} side at "
+                        f"{float(stated):.3f}s while run.{side}.json records "
+                        f"its one execution taking {measured:.3f}s: the record "
+                        f"is left over from another run of this cell"
+                    )
+                ]
         return []
     saved = _saved_repeats(paths)
     if saved is None:
@@ -1961,6 +2031,30 @@ def check_costs_cover_runs(costs: dict, side: str, paths: list, required: int) -
                 f"costs.json prices {side} repeats {sorted(coverage)} while "
                 f"this cell saved runs for {sorted(saved)}: the record is "
                 f"about a different run of this cell"
+            )
+        ]
+    if not timed:
+        return []
+    if set(coverage) != set(timed):
+        return [
+            (
+                f"costs.json prices {side} repeats {sorted(coverage)} while "
+                f"run.{side}.json records executions {sorted(timed)}: the "
+                f"record is about a different run of this cell"
+            )
+        ]
+    off = [i for i in sorted(coverage) if _disagrees(coverage[i], timed[i])]
+    if off:
+        first = off[0]
+        return [
+            (
+                f"costs.json prices {side} repeat {first} at "
+                f"{coverage[first]:.3f}s while run.{side}.json records that "
+                f"execution taking {timed[first]:.3f}s"
+                + (f" (and {len(off) - 1} more)" if len(off) > 1 else "")
+                + ": the repeat numbers of a re-run cell are the same 1.."
+                f"{len(timed)} either way, so a merged record survives its own "
+                f"run. This one is the previous one"
             )
         ]
     return []

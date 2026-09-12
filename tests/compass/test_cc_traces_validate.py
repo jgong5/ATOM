@@ -129,13 +129,19 @@ def _server(
     return provenance
 
 
-def _journal(cell_dir, side, repeats, *, executions=None):
-    """The run journal `cc_traces_run.py` leaves beside the artifacts."""
+def _journal(cell_dir, side, repeats, *, executions=None, seconds=10.0):
+    """The run journal `cc_traces_run.py` leaves beside the artifacts.
+
+    Each execution carries its repeat number and the replay's own stopwatch,
+    the way `SideRun` writes them: those are what a cost record is bound to.
+    """
     if executions is None:
         executions = [
             {
                 "execution_id": f"cx-{side}{index}",
                 "purpose": "acceptance",
+                "repeat": index + 1,
+                "replay": {"seconds": seconds},
                 "server_process": {
                     "said": _identity(),
                     "observed": {
@@ -2582,12 +2588,12 @@ class TestTheCostRecordIsBoundToTheRunsItPriced:
     earlier, longer run. Both read as a faster replay than the cell measured.
     """
 
-    def _three(self, cell_dir, costs):
+    def _three(self, cell_dir, costs, seconds=20.0):
         for side in ("real", "modelled"):
             base = json.loads((Path(cell_dir) / f"{side}.r1.json").read_text())
             for index in (2, 3):
                 _write(Path(cell_dir) / f"{side}.r{index}.json", base)
-            _journal(cell_dir, side, 3)
+            _journal(cell_dir, side, 3, seconds=seconds)
         _gpu_free(cell_dir)
         (Path(cell_dir) / "costs.json").write_text(json.dumps(costs))
         return cell_dir
@@ -2663,3 +2669,123 @@ class TestTheCostRecordIsBoundToTheRunsItPriced:
         """The one-shot diagnostic route: one execution, one number, and no
         per-execution record to match it against."""
         assert run(cell) == 0
+
+
+class TestTheCostRecordIsBoundToWhatTheRunsMeasured:
+    """Matching repeat numbers is not matching executions.
+
+    A rerun of a cell writes `run.<side>.json` and `costs.<side>.json` again
+    and leaves the merged `costs.json` from the previous run in place until
+    someone merges again. Same cell, same three repeats, same numbers 1..3 --
+    so every identity check passes while the seconds belong to the run before
+    this one. The modelled side got ten times slower and the record still says
+    ten seconds a repeat: a 12x replay over a 1.2x measurement.
+
+    The journal is what the repeats were timed by. The cost record is a
+    summary of it, and a summary that disagrees with the measurement it
+    summarises is not this cell's price.
+    """
+
+    def _cell(self, cell_dir, *, real, modelled, priced_real, priced_modelled):
+        for side in ("real", "modelled"):
+            base = json.loads((Path(cell_dir) / f"{side}.r1.json").read_text())
+            for index in (2, 3):
+                _write(Path(cell_dir) / f"{side}.r{index}.json", base)
+        _journal(cell_dir, "real", 3, seconds=real)
+        _journal(cell_dir, "modelled", 3, seconds=modelled)
+        _gpu_free(cell_dir)
+        costs = {
+            **{t: 10.0 for t in validate.MEASURED_COST_TERMS},
+            **{t: _supplied(10.0) for t in validate.SUPPLIED_COST_TERMS},
+            "cost_schema": validate.COSTS_SCHEMA,
+            "execution_clocks": {"real": "wall", "modelled": "wall"},
+            "derivation": _supplied(0.0, within="execution_modelled"),
+            "repeats": {"real": 3, "modelled": 3},
+            "execution_by_repeat": {
+                "real": {str(i): priced_real for i in (1, 2, 3)},
+                "modelled": {str(i): priced_modelled for i in (1, 2, 3)},
+            },
+            "startup_by_repeat": {
+                side: {str(i): 1.0 for i in (1, 2, 3)} for side in ("real", "modelled")
+            },
+            "execution_real": priced_real,
+            "execution_modelled": priced_modelled,
+        }
+        (Path(cell_dir) / "costs.json").write_text(json.dumps(costs))
+        return cell_dir
+
+    def _failures(self, cell_dir):
+        validate.main(
+            [
+                "cell",
+                str(cell_dir),
+                "--class",
+                "long",
+                "--tp",
+                "2",
+                "--repeats",
+                "3",
+                "--calibration-registry",
+                str(Path(cell_dir) / "registry.json"),
+            ]
+        )
+        return verdict(cell_dir)["failures"]
+
+    def test_a_stale_merge_of_the_previous_run_is_refused(self, cell):
+        """The defect: this run replayed in 100s a repeat, the merged record
+        still carries the 10s of the run before it, and 120/10 reads 12x."""
+        self._cell(
+            cell,
+            real=120.0,
+            modelled=100.0,
+            priced_real=120.0,
+            priced_modelled=10.0,
+        )
+        failures = self._failures(cell)
+        assert any("100" in f and "10" in f for f in failures)
+
+    def test_a_record_of_what_the_journal_timed_passes(self, cell):
+        assert (
+            self._failures(
+                self._cell(
+                    cell,
+                    real=120.0,
+                    modelled=100.0,
+                    priced_real=120.0,
+                    priced_modelled=100.0,
+                )
+            )
+            == []
+        )
+
+    def test_a_one_shot_aggregate_is_bound_to_its_one_execution_too(self, cell):
+        """One repeat, one number, and the same stale-merge failure: the
+        journal timed ten seconds and the record prices a hundred."""
+        (Path(cell) / "costs.json").write_text(
+            json.dumps(
+                {
+                    **{t: 10.0 for t in validate.MEASURED_COST_TERMS},
+                    **{t: _supplied(10.0) for t in validate.SUPPLIED_COST_TERMS},
+                    "cost_schema": validate.COSTS_SCHEMA,
+                    "execution_clocks": {"real": "wall", "modelled": "wall"},
+                    "execution_real": 100.0,
+                }
+            )
+        )
+        run(cell)
+        assert any("100" in f for f in verdict(cell)["failures"])
+
+    def test_an_execution_the_journal_never_timed_cannot_be_priced(self, cell):
+        """A repeat with no replay duration is a repeat nobody measured; the
+        seconds beside it came from somewhere else."""
+        self._cell(
+            cell,
+            real=120.0,
+            modelled=100.0,
+            priced_real=120.0,
+            priced_modelled=100.0,
+        )
+        blob = json.loads((Path(cell) / "run.modelled.json").read_text())
+        blob["executions"][1]["replay"] = None
+        (Path(cell) / "run.modelled.json").write_text(json.dumps(blob))
+        assert any("timed" in f for f in self._failures(cell))
