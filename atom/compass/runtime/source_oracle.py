@@ -227,7 +227,76 @@ def region_snapshot(name: str, model) -> dict:
     return snapshot
 
 
-def _price_library(entries, gap_ratio, coords=None):
+def _attention_request_scope(value):
+    """The deployment the request is asking for a ragged attention price IN.
+
+    A ragged attention law is identified by the deployment it was measured
+    under -- KV dtype and layout, block size, sliding window, the backend the
+    dispatcher took, and for linear attention the state geometry. None of that
+    is derivable from the operator, so a request that does not declare it is
+    refused rather than answered by whichever law happens to be fitted. This
+    is where that declaration enters: a dict, or a path to the JSON file
+    whoever resolved the deployment wrote.
+
+    Nothing is inferred here and nothing is defaulted. A missing file is an
+    error, because a run that asked to price attention under a named
+    deployment and silently got no deployment at all would read as an honest
+    refusal of the whole family.
+    """
+    if not value:
+        return None
+    if isinstance(value, dict):
+        return dict(value)
+    import json as _json
+    import os as _os
+
+    path = str(value).strip()
+    if not path:
+        return None
+    if not _os.path.exists(path):
+        raise ValueError(
+            "attention_scope names %r, which is neither a mapping nor a file "
+            "that exists. The resolved deployment has to come from something "
+            "that recorded it." % path)
+    with open(path) as handle:
+        loaded = _json.load(handle)
+    if isinstance(loaded, dict) and isinstance(loaded.get("attention_scope"),
+                                               dict):
+        loaded = loaded["attention_scope"]
+    if not isinstance(loaded, dict):
+        raise ValueError(
+            "attention_scope file %s holds %s, not a mapping of resolved "
+            "deployment facts" % (path, type(loaded).__name__))
+    return _declared_attention_scope(loaded, path)
+
+
+def _declared_attention_scope(loaded: dict, path: str) -> dict:
+    """``loaded``, once it actually states the facts a law is identified by.
+
+    A resolution DUMP is not a scope. A file can record the whole environment
+    -- every env var, the pool summary, the registered layers -- and still not
+    say which of them the attention kernel turns on, and turning a dump into a
+    scope is a reading somebody has to make and stand behind. So this refuses
+    a file that names none of the declared keys, and names them in the
+    refusal, rather than passing a hundred unrelated facts down as a
+    deployment and having every law fail to match for reasons nobody can see.
+    """
+    from atom.compass.core.cost.families.attention import (GDN_SCOPE,
+                                                            UNIFIED_SCOPE)
+
+    declared = tuple(UNIFIED_SCOPE) + tuple(GDN_SCOPE)
+    if not any(key in loaded for key in declared):
+        raise ValueError(
+            "attention_scope file %s states none of the facts a ragged "
+            "attention law is identified by (%s). It looks like a resolution "
+            "dump: reading one as a scope is a judgement, and it has to be "
+            "written down as one -- either as an `attention_scope` block in "
+            "that file or as a mapping passed here."
+            % (path, ", ".join(declared)))
+    return dict(loaded)
+
+
+def _price_library(entries, gap_ratio, coords=None, attention_scope=None):
     """The exact-signature library, or the family provider in front of it.
 
     The provider is a subclass that overrides `lookup` alone, so everything
@@ -252,6 +321,14 @@ def _price_library(entries, gap_ratio, coords=None):
         library = (ParametricPriceLibrary()
                    if gap_ratio is _DEFAULT_GAP_RATIO
                    else ParametricPriceLibrary(max_gap_ratio=gap_ratio))
+    scope = _attention_request_scope(attention_scope)
+    if scope is not None:
+        if gap_ratio is None:
+            raise ValueError(
+                "attention_scope declares the deployment a MODELLED attention "
+                "price would be asked for, and modelling is off. Turn the "
+                "family provider on with interpolate, or drop the scope.")
+        library.request_attention_scope = scope
     extra = {"coords": coords} if coords else {}
     for entry in entries:
         if isinstance(entry, (tuple, list)):
@@ -658,6 +735,7 @@ def build_source_oracle(
     allocation: str = "",
     derive: bool = True,
     interpolate=None,
+    attention_scope=None,
     rank_coords=None,
     _shared_derivers=None,
     _shared_allocation=None,
@@ -729,7 +807,8 @@ def build_source_oracle(
     # way to recognise as a rank's own, and every record would read
     # `rank_own: false` under a name nothing asked for.
     price_entries = price_specs(requested_prices)
-    library = _price_library(price_entries, gap_ratio(interpolate), coords)
+    library = _price_library(price_entries, gap_ratio(interpolate), coords,
+                             attention_scope)
     regions_model = region_model(regions)
     # Immediately, off the object just selected -- not from the name again.
     regions_taken = region_snapshot(regions, regions_model)

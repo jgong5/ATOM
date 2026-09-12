@@ -58,8 +58,10 @@ regardless of which half of the seam it is running against.
 from __future__ import annotations
 
 import logging
+import re
 from typing import Optional
 
+from atom.compass.core.cost.families import attention
 from atom.compass.core.cost.families.features import (
     contract_for,
     grouping_key,
@@ -89,6 +91,211 @@ INTERPOLATED_SCHEME = INTERPOLATED_SOURCE_PREFIX
 
 #: The one refusal a family module is allowed to answer.
 _OPEN_QUESTION = "no entry for this signature"
+
+
+#: Where a RESOLVED attention scope may be written in a price artifact. Only
+#: sections whose values are facts about the process that ran: `config` is not
+#: among them, because a config states what was *asked for*. `kv_cache_dtype:
+#: "auto"` is a request the engine then resolves to something concrete, and a
+#: backend named in a config is a preference the dispatcher may not have taken.
+#: Reading either as a runtime fact is how a law gets attributed to a kernel
+#: that never ran.
+_ATTENTION_SCOPE_SECTIONS = ("attention_scope", "resolved_scope")
+
+#: The keys either attention family turns on. Read as a union: a unified
+#: observation simply will not carry `gdn_state_geometry`, and a GDN one will
+#: not carry `kv_cache_dtype`, and neither absence is filled in here.
+_ATTENTION_SCOPE_KEYS = tuple(sorted(set(attention.UNIFIED_SCOPE)
+                                     | set(attention.GDN_SCOPE)))
+
+#: Conditions of the measurement itself, as the collector writes them. Not
+#: kernel-selecting, and carried anyway: `attention._scope_of` requires
+#: agreement on every declared key, so two files that differ in how many
+#: repeats they averaged, whether the first call was included, whether the
+#: capture rotated its cache residency, or which of them a later collection
+#: superseded, refuse to pool rather than averaging measurements taken under
+#: different conditions. Dropping them here is what would make that refusal
+#: unreachable.
+_MEASUREMENT_CONDITIONS = (
+    "cache_state", "compile_mode", "cudagraph_mode", "dtype", "enforce_eager",
+    "first_call", "iters", "max_model_len", "model", "only", "quantization",
+    "repeats", "rotation", "superseded", "tensor_parallel_size", "timing",
+    "timing_method", "visited", "warmup",
+)
+
+#: Config fields worth carrying as conditions, under a name that cannot be
+#: mistaken for a resolved fact. Two files that asked for different things are
+#: not obviously one deployment, and `requested.` says plainly that this is the
+#: request and not what the engine did with it.
+_REQUESTED_CONDITIONS = ("attention_backend", "block_size", "kv_cache_dtype",
+                         "kv_cache_layout", "sliding_window")
+
+
+def _hashable(value):
+    """A declared value in a form two scopes can be compared by."""
+    if isinstance(value, dict):
+        return tuple(sorted((str(k), _hashable(v)) for k, v in value.items()))
+    if isinstance(value, list):
+        return tuple(_hashable(v) for v in value)
+    return value
+
+
+def _attention_scope(blob: dict, registration: Optional[str]) -> dict:
+    """What a price file DECLARES about the kernel and the conditions.
+
+    Nothing is inferred. A pool allocation proves storage, not the view a
+    backend takes over it, so no key here is derived from operand shapes:
+    every one comes from something the collector wrote down, in a section that
+    records what ran rather than what was requested.
+
+    Everything declared is carried, not only the kernel-selecting keys. The
+    scope is the identity a fit is filed under, and a condition left out here
+    is a difference two observations are allowed to disagree on silently.
+    """
+    provenance = blob.get("provenance") or {}
+    scope: dict = {}
+    for field in _ATTENTION_SCOPE_KEYS:
+        for section in _ATTENTION_SCOPE_SECTIONS:
+            where = provenance.get(section) or {}
+            if isinstance(where, dict) and field in where:
+                scope[field] = _hashable(where[field])
+                break
+        else:
+            if field in provenance:
+                scope[field] = _hashable(provenance[field])
+    for field in _MEASUREMENT_CONDITIONS:
+        if field in provenance:
+            scope[field] = _hashable(provenance[field])
+    config = provenance.get("config") or {}
+    if isinstance(config, dict):
+        for field in _REQUESTED_CONDITIONS:
+            if field in config:
+                scope["requested." + field] = _hashable(config[field])
+    declared_registration = provenance.get("registration", registration)
+    if declared_registration is not None:
+        scope["registration"] = declared_registration
+    topology = provenance.get("topology")
+    if topology is not None:
+        scope["topology"] = _hashable(topology)
+    return scope
+
+
+#: Key components that identify WHICH layer a call was, rather than what it
+#: cost. A layer name and the blocks and slots that layer's cache occupies
+#: differ across the copies of one step and are the only things that do; every
+#: other component stays in the identity, so anything else that differs makes
+#: two observations separate design points rather than replicates.
+_LAYER_IDENTITY = ("layer_name", "layer", "layer_idx", "block_tables",
+                   "slot_mapping", "kv_cache", "kv_cache_ptr")
+
+
+#: The TREATMENT a price record was taken under: the conditions imposed on the
+#: measurement, as opposed to what came out of it. Not provenance --
+#: `provenance.cache` states the cache mode that was requested, while
+#: `record["cache"]` is what that record was actually taken under, and only the
+#: second is a fact about the measurement. `kv_regions` and `arg_sets` say
+#: which regions were rebuilt and how many argument sets were rotated through:
+#: two records that differ in either are measurements of different residency,
+#: not repeats of one. The version qualifiers are here because a record taken
+#: by a different collector is not a repeat of one taken by this one.
+#:
+#: The treatment rides into the FIT scope, not only into the replicate key. A
+#: cold-cache point and a warm-cache point are not two points on one law, and
+#: separating them only at collapse time would let them rejoin as independent
+#: points of the same fit -- which is the same averaging, moved one step later.
+_TREATMENT_FIELDS = ("cache", "kv_regions", "arg_sets", "version",
+                     "collector_version", "schema_version")
+
+#: Measured OUTCOMES. Deliberately not part of any identity: `host_seconds` is
+#: a number that came out of the measurement and carries ordinary timing
+#: noise, so keying on it would make every repeat and every layer copy its own
+#: design point -- the exact inflation the replicate collapse exists to
+#: prevent. It is kept as a distribution, with its missingness, for a reader
+#: who needs to know whether a record was measuring the launch or the kernel.
+_OUTCOME_FIELDS = ("host_seconds",)
+
+
+def _measurement_identity(record: dict) -> tuple:
+    """The treatment this record was taken under, as a comparable key.
+
+    Part of both the design identity and the fitted law's scope, so two
+    records taken under different cache modes, different region rebuilds or
+    different collector versions are never collapsed into one design point's
+    median and never pooled into one law -- either of which would average a
+    cold measurement with a warm one and report the result as a repeat.
+    """
+    kernels = tuple(sorted((record.get("kernels") or {})))
+    return (kernels,) + tuple(
+        (field, _hashable(record[field])) for field in _TREATMENT_FIELDS
+        if field in record)
+
+
+def _host_seconds(record: dict):
+    """The record's host time, or None where it does not say."""
+    value = (record or {}).get("host_seconds")
+    try:
+        return None if value is None else float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def kernels_of(measurement: tuple) -> tuple:
+    """The kernel names a measurement identity carries."""
+    return measurement[0] if measurement else ()
+
+
+#: The layer index inside a bound module path, e.g. the `3` in
+#: `language_model.model.layers.3.self_attn`. A real graph records that path as
+#: a SCALAR under a positional key (`#5`), so a layer cannot be recognised by
+#: its key the way `layer_name` can -- and without this every one of the 64
+#: bound modules in a captured step reads as its own design point, which would
+#: report 64 independent measurements where one step was measured 64 times.
+_LAYER_INDEX = re.compile(r"(?<=\.layers\.)\d+(?=\.)")
+
+
+def _delayered(value):
+    """``value`` with any bound-module layer index blanked.
+
+    The module KIND survives: `self_attn` and `linear_attn` stay distinct, so
+    an MHA layer and a GDN layer are never collapsed into one another. Only
+    the index -- the thing that differs between replicates of one step and
+    nothing else -- is removed.
+    """
+    if isinstance(value, str):
+        return _LAYER_INDEX.sub("*", value) if ".layers." in value else value
+    if isinstance(value, (list, tuple)):
+        return [_delayered(item) for item in value]
+    return value
+
+
+def _design_identity(op: dict) -> tuple:
+    """Everything about this call except which layer it was.
+
+    Operand shapes, operand dtypes and the recorded operand views, because a
+    strided call and a dense one are different work on the same numbers. Every
+    context and scalar the key carries, because that is where the native
+    branches live -- `is_prefill`, `has_cached`, `state`, `replayssm`, the
+    speculative offsets, `num_actual_tokens`. The launch grid, because a
+    Triton launch over a different grid is a different amount of work.
+    """
+    context = tuple((k, repr(_delayered(v))) for k, v in
+                    (tuple(x) for x in op.get("context") or ())
+                    if k not in _LAYER_IDENTITY)
+    scalars = tuple((k, repr(_delayered(v))) for k, v in
+                    (tuple(x) for x in op.get("scalars") or ())
+                    if k not in _LAYER_IDENTITY)
+    grid = tuple((k, repr(v)) for k, v in
+                 (tuple(x) for x in op.get("launch") or ()) if k == "grid")
+    values = _hashable(op.get("int_values") or ())
+    # `_hashable`, not a shallow conversion: a recorded operand view is a
+    # nested list of strides, and a one-level tuple() leaves inner lists
+    # unhashable -- which on a real strided operator is a crash, not a
+    # subtlety.
+    return (op.get("name"),
+            _hashable(op.get("input_shapes") or ()),
+            tuple(op.get("dtypes") or ()),
+            _hashable(op.get("layouts") or ()),
+            context, scalars, grid, values)
 
 
 def _scope_key(scope) -> tuple:
@@ -162,6 +369,23 @@ class ParametricPriceLibrary(PriceLibrary):
         #: price file -> (executed rows, scheduled tokens) where a capture
         #: bucket makes the two differ, so the padding stays visible
         self.padded: dict[str, tuple[int, int]] = {}
+        #: Every ragged attention price as it was written, before the library
+        #: reindexes it: (op, seconds, source, scope). Collected here rather
+        #: than read back out of `self._prices` because `_ingest` files records
+        #: under the cost key and keeps one per scope -- which is right for an
+        #: exact lookup and wrong for a fit, where two captures of the same key
+        #: at different ragged structures are two design points and the second
+        #: would be dropped as a duplicate.
+        self._attention_obs: list = []
+        #: the fitted attention model, built once from those observations
+        self._attention_model = None
+        #: The asking deployment's own resolved attention scope -- its KV
+        #: dtype, layout, block size, window, resolved backend, GDN state
+        #: geometry. Set by whoever resolves it; left empty here, because
+        #: guessing it is how a law measured under one deployment ends up
+        #: answering for another. An empty request matches only an unscoped
+        #: fit, which under `strict` does not exist.
+        self.request_attention_scope: dict = {}
 
     # -- assembly -------------------------------------------------------
 
@@ -190,6 +414,15 @@ class ParametricPriceLibrary(PriceLibrary):
                 "no graph supplied, so its operators have no structure to "
                 "read a feature from; exact-signature use only")
             return
+        # Before the row-family eligibility check below, deliberately. A
+        # standalone attention primitive graph need contain no embedding and
+        # carry no `body_rows_traced` -- it is one operator measured on its
+        # own, not a body -- and `_traced_rows` refuses such a file. That
+        # refusal is correct for a row curve, which is a curve in the width the
+        # body ran at, and irrelevant to an attention fit, which reads its
+        # features off the operator's own ragged structure. Collecting after it
+        # would throw away exactly the primitive measurements this model needs.
+        self._collect_attention(price_path, _blob, graph, registration)
         reading = _traced_rows(graph)
         if isinstance(reading, tuple):
             self.unbuildable[price_path] = f"{graph_path}: {reading[1]}"
@@ -228,6 +461,138 @@ class ParametricPriceLibrary(PriceLibrary):
             self._source_ops.setdefault(price_path, {}).setdefault(
                 signature_of(op), op)
         self._curves_built = False
+
+    def _collect_attention(self, price_path: str, blob: dict, graph: dict,
+                           registration: Optional[str]) -> None:
+        """Keep every ragged attention price joined to its own graph operator.
+
+        The join is on the record's own RAW signature against the graph from
+        the same file, which is the association `_source_ops` exists to hold;
+        it is populated here too, so a file that `_traced_rows` later refuses
+        still keeps the link between what was priced and what it was a price
+        of. The record's kernels are kept with it: which kernels served a call
+        is evidence about what ran, and two records served by different kernels
+        are not replicates of one design point.
+
+        Nothing is deduplicated at this stage and nothing is filed under a cost
+        key. Two captures of one signature at different ragged structures are
+        two design points, and the library's own index -- keyed by cost key,
+        one record per scope -- would keep only the first of them.
+        """
+        from atom.compass.runtime.microbench import signature_of
+
+        families = (attention.UNIFIED, attention.GDN)
+        by_sig: dict = {}
+        for op in graph.get("ops") or ():
+            if op.get("name") not in families:
+                continue
+            sig = signature_of(op)
+            by_sig.setdefault(sig, op)
+            self._source_ops.setdefault(price_path, {}).setdefault(sig, op)
+        if not by_sig:
+            return
+        scope = _attention_scope(blob, registration)
+        for sig, record in (blob.get("prices") or {}).items():
+            op = by_sig.get(sig)
+            seconds = (record or {}).get("seconds")
+            if op is None or seconds is None:
+                continue
+            self._attention_obs.append(
+                (op, float(seconds), price_path, scope,
+                 _measurement_identity(record), _host_seconds(record)))
+        self._attention_model = None
+
+    def attention_design_points(self) -> list:
+        """The collected observations with layer replicates collapsed.
+
+        Every layer in one captured step shares that step's ragged structure,
+        so 16 or 48 of them are 16 or 48 measurements of one design point, not
+        16 or 48 points. Fitting them as points would inflate the residual
+        degrees of freedom by an order of magnitude and report a law as checked
+        when nothing independent ever checked it, so they are collapsed to
+        their median here and the replicate count and spread kept with it.
+
+        What decides that two observations are replicates is their FULL source
+        identity, not their ragged structure: the operand shapes and dtypes,
+        the recorded operand views, every context and scalar the key carries --
+        which includes the native state and speculative branches -- the launch
+        grid, the kernels that served them, and the declared scope. Two
+        observations that differ in any of those are measurements of different
+        work, and collapsing them to a median before the model ever sees them
+        would hide that difference inside a single number.
+        """
+        groups: dict = {}
+        for obs in self._attention_obs:
+            op, seconds, source, scope, measurement, _host = obs
+            key = (_design_identity(op), measurement,
+                   attention.scope_key(scope))
+            groups.setdefault(key, []).append(obs)
+        points = []
+        for members in groups.values():
+            members.sort(key=lambda m: m[1])
+            op, seconds, source, scope, measurement, _host = \
+                members[len(members) // 2]
+            # The treatment travels with the point into the fit, so a law is
+            # identified by the conditions its measurements were taken under
+            # as well as by the deployment. Without this a cold-cache point
+            # and a warm-cache point, correctly kept apart here, would rejoin
+            # as two independent points of one fit.
+            scope = dict(scope or {})
+            scope["measurement_treatment"] = measurement
+            note = source
+            if len(members) > 1:
+                low, high = members[0][1], members[-1][1]
+                sources = sorted({m[2] for m in members})
+                note = ("%s (%d replicates, spread %.1f%%%s)"
+                        % (source, len(members),
+                           (high - low) / seconds * 100 if seconds else 0.0,
+                           "" if len(sources) == 1
+                           else ", from %d files" % len(sources)))
+            note += self._host_note(members)
+            points.append((op, seconds, note, scope))
+        return points
+
+    @staticmethod
+    def _host_note(members) -> str:
+        """The host-time distribution behind a design point, and what is missing.
+
+        Diagnostic only: host time is an outcome, so it never decides whether
+        two measurements are the same design. A reader still needs it, because
+        a point whose host time dominates its device time was measuring the
+        launch rather than the kernel.
+        """
+        hosts = [m[5] for m in members]
+        known = [value for value in hosts if value is not None]
+        if not known:
+            return " (host time: not recorded on any of %d)" % len(hosts)
+        note = " (host time %.3g-%.3gs" % (min(known), max(known))
+        if len(known) != len(hosts):
+            note += ", absent on %d of %d" % (len(hosts) - len(known),
+                                              len(hosts))
+        return note + ")"
+
+    def attention_model(self, *, strict: bool = True):
+        """The fitted ragged attention model, built once from what was added.
+
+        ``strict`` is the acceptance setting: a fit whose observations do not
+        declare the scope keys its kernel turns on is refused rather than
+        assumed. It is a keyword here only so a diagnostic caller can ask for
+        the undeclared fits by name and get them stamped as such.
+        """
+        if self._attention_model is None or not strict:
+            model = attention.Model.from_priced(
+                self.attention_design_points(), strict=strict)
+            if not strict:
+                return model
+            self._attention_model = model
+        return self._attention_model
+
+    def attention_coverage(self) -> dict:
+        """What the ragged model can and cannot price, to be reported."""
+        coverage = dict(self.attention_model().coverage())
+        coverage["observations"] = len(self._attention_obs)
+        coverage["design_points"] = len(self.attention_design_points())
+        return coverage
 
     def _build(self) -> None:
         """Group every measured price by the operator *it* priced.
@@ -295,13 +660,8 @@ class ParametricPriceLibrary(PriceLibrary):
                           "declared family contract, so there is no statement "
                           "of what its price may depend on")
         if contract.kind != "rows":
-            missing = ", ".join(contract.unmeasured_nuisances)
-            return None, (
-                f"{original}; {contract.family} is parameterised by its ragged "
-                "(query, history) structure and no measurement varies that at "
-                "fixed " + (f"{missing}" if missing else "state") +
-                ", so a price here would be an assumption about components "
-                "nobody has measured")
+            return self._modelled(op, original, contract, topology,
+                                  registration)
 
         self._build()
         curve, verified_rows = self._curve_for(op, topology, registration)
@@ -328,6 +688,149 @@ class ParametricPriceLibrary(PriceLibrary):
         return (dict(_record(answer, curve, verified_rows),
                      **{INTERPOLATED_FLAG: True}),
                 f"{INTERPOLATED_SCHEME}{contract.family}/rows={verified_rows}")
+
+    def _modelled(self, op: dict, original: str, contract, topology=None,
+                  registration=None):
+        """A ragged family's price from its regime's law, or why there is none.
+
+        Reached only behind the open question -- an operator nobody priced --
+        so an exact measurement of this call, when one exists, has already been
+        returned by the base class and is never displaced by a law.
+
+        The result is marked `interpolated` and carries an `interpolated://`
+        source. It is a prediction: honest coverage counts it as covered and
+        never as measured, and that distinction is the reason this does not
+        return a bare number.
+
+        It also carries the launch composition the evidence behind that law
+        shows, because a record's kernel count is not decoration: `body` adds
+        ``max(1, len(record["kernels"]))`` launches per occurrence and the
+        oracle charges per-launch overhead on top of the seconds. An empty
+        kernels map would quietly count a multi-kernel attention wrapper as one
+        launch, so a price whose composition the evidence does not establish is
+        refused instead. The names are carried with no seconds attributed to
+        them: how a modelled total divides between kernels is not something
+        this knows, and splitting it evenly would be inventing the split.
+        """
+        if not self._attention_obs:
+            # Nothing was collected at all, which is a different statement
+            # from "this call is outside the law": there is no law. Said
+            # first, because a regime refusal here would describe the key
+            # when the answer is that nobody has measured this family.
+            return None, (f"{original}; this is a ragged attention family and "
+                          "nobody has measured it in this library. Its price "
+                          "depends on how the batch pairs queries with "
+                          "histories, so no row count stands in for one")
+        scope = self._request_scope(op, topology, registration)
+        model = self.attention_model()
+        answer = model.price(op, scope)
+        if isinstance(answer, attention.Refusal):
+            # The family is named in the refusal, not only the reason: a
+            # reader of "no entry for this signature" needs to know this is a
+            # ragged family whose price depends on the batch structure rather
+            # than on a row count, or the gap looks like an ordinary
+            # unmeasured width.
+            return None, (f"{original}; this is a ragged attention family, "
+                          f"and {answer.reason}")
+        scope = attention.scoped(op, scope)
+        regime = attention.regime_of(op, None, scope)
+        name = regime.name
+        fit, _why = model.fit_for(name, scope)
+        kernels, unevidenced = self._launch_composition(name, fit)
+        if unevidenced:
+            return None, (f"{original}; this is a ragged attention family, "
+                          f"and {unevidenced}")
+        return ({
+            "seconds": answer,
+            # Names, not an attribution. `None` rather than a share, so
+            # anything that reads a per-kernel number finds an absence instead
+            # of a plausible fabrication; the launch COUNT is what the evidence
+            # establishes and what `body` reads.
+            "kernels": {kernel: None for kernel in kernels},
+            "kernel_attribution": "unknown: modelled total, not measured per "
+                                  "kernel",
+            "occurrences": 1,
+            "name": contract.family,
+            INTERPOLATED_FLAG: True,
+            "interpolation": {
+                "family": contract.family,
+                "basis": "modelled",
+                "regime": name,
+                "detail": fit.describe(),
+                "measured_sources": sorted({
+                    source for _op, _s, source, _scope, _how, _host
+                    in self._attention_obs}),
+            },
+        }, f"{INTERPOLATED_SCHEME}{contract.family}/{name}")
+
+    def _launch_composition(self, regime_name: str, fit):
+        """The kernels every measurement behind this law was served by.
+
+        Returns ``(names, None)`` when they agree, and ``(None, reason)`` when
+        they do not or when none of them says. Disagreement is not resolved by
+        picking one: two records served by different kernel sets are evidence
+        that this regime does not launch a fixed composition, and a price that
+        assumed one would change the step's launch count on no evidence.
+        """
+        compositions = set()
+        wanted = attention.scope_key(fit.scope)
+        for op, _seconds, _source, obs_scope, measurement, _host in \
+                self._attention_obs:
+            obs_scope = dict(obs_scope or {})
+            obs_scope["measurement_treatment"] = measurement
+            obs_scope = attention.scoped(op, obs_scope)
+            regime = attention.regime_of(op, None, obs_scope)
+            if isinstance(regime, attention.Refusal) \
+                    or regime.name != regime_name:
+                continue
+            if attention.scope_key(obs_scope) != wanted:
+                continue
+            compositions.add(kernels_of(measurement))
+        compositions.discard(())
+        if not compositions:
+            return None, (
+                "no measurement behind the %s law records which kernels "
+                "served it, so how many launches this call is cannot be "
+                "stated; a price without that changes the step's launch count "
+                "silently" % regime_name)
+        if len(compositions) > 1:
+            shown = "; ".join(sorted(", ".join(c) for c in compositions))
+            return None, (
+                "the measurements behind the %s law were served by different "
+                "kernel sets (%s), so this regime has no established launch "
+                "composition to carry" % (regime_name, shown))
+        return sorted(compositions.pop()), None
+
+    def _request_scope(self, op: dict, topology, registration):
+        """The static scope the asking deployment declares, or None.
+
+        A request that declares nothing is not silently given a measured
+        scope: `attention.Model.price` treats an undeclared request as not
+        matching a scoped fit, which is the refusal that keeps a law measured
+        under one deployment from answering for another.
+        """
+        scope = dict(self.request_attention_scope or {})
+        if "measurement_treatment" not in scope:
+            treatment = self._sole_treatment()
+            if treatment is not None:
+                # One treatment among every collected measurement, so pricing
+                # under it states a fact rather than choosing between laws.
+                # With several present and none declared, nothing is filled in
+                # and the scope comparison refuses by name -- which is the
+                # point: a warm-cache law is not a price for a cold request.
+                scope["measurement_treatment"] = treatment
+        if registration is not None:
+            scope.setdefault("registration", registration)
+        if topology:
+            scope.setdefault("topology",
+                             tuple(sorted(topology.items()))
+                             if isinstance(topology, dict) else tuple(topology))
+        return scope or None
+
+    def _sole_treatment(self):
+        """The one treatment every collected measurement shares, or None."""
+        treatments = {obs[4] for obs in self._attention_obs}
+        return treatments.pop() if len(treatments) == 1 else None
 
     def _layout_note(self, op: dict) -> str:
         """Say so when operand layout is why nothing matched.
@@ -423,6 +926,10 @@ class ParametricPriceLibrary(PriceLibrary):
                 f"max gap ratio {self.max_gap_ratio}")
         if self.unbuildable:
             note += f"; {len(self.unbuildable)} file(s) exact-signature only"
+        if self._attention_obs:
+            note += ("; %d ragged attention observation(s) over %d design "
+                     "point(s)" % (len(self._attention_obs),
+                                   len(self.attention_design_points())))
         return base + note
 
 

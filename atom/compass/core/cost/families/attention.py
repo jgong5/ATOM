@@ -32,7 +32,10 @@ functions of the same structure rather than one function with a parameter.
 
   ``unified.prefill.cold``    new queries only, no cached prefix to read
   ``unified.prefill.cached``  queries over a prefix already in the KV cache
-  ``unified.decode``          one query row per sequence, history in cache
+  ``unified.decode.paged_gluon``   one query row per sequence, gluon paged
+                                   decode tiling each context separately
+  ``unified.decode.unified_attn``  the same batch through aiter unified
+                                   attention, which does not tile that way
   ``gdn.prefill``             chunked scan over fresh sequences
   ``gdn.decode``              conv update plus recurrence over fixed state
 
@@ -41,17 +44,28 @@ from its own regime's fit.
 
 Scope
 -----
-A per-layer wrapper is not one kernel. Which kernel runs depends on the KV
-cache dtype and layout, on `sliding_window`, and on the backend the deployment
-selected -- and none of those are recoverable from the operand dtypes, because
-a BF16 query says nothing about whether the cached KV it reads is FP8.
+A per-layer wrapper is not one kernel. `_dispatch_decode` alone turns on
+`sliding_window`, on `ATOM_USE_UNIFIED_ATTN` and `ATOM_FORCE_ATTN_TRITON`, on
+`kv_cache_block_size`, and on the flash-versus-shuffle layout -- and none of
+that is recoverable from the operand dtypes, because a BF16 query says nothing
+about whether the cached KV it reads is FP8.
 
-So :data:`REQUIRED_SCOPE` has to be declared by the observations themselves.
-Under `strict` -- the default, and what an acceptance run gets -- a fit whose
-observations do not declare them is refused rather than assumed. `strict=False`
-permits an undeclared fit for diagnostic use and stamps `scope_undeclared` on
-the result, so a number produced that way can never be mistaken for one that
-was scoped.
+The two families do not turn on the same facts, so they do not carry the same
+required scope. Unified attention reads the paged KV cache and its dtype,
+layout, window, block size and resolved backend all select the kernel. GDN
+reads no KV cache at all -- its state is the conv and recurrent pool the engine
+stood up -- so a KV dtype would be a scope key that means nothing here, and
+requiring it would refuse honest observations for a fact that does not apply.
+What does apply to GDN is the fixed-state geometry and whether the lossy fast
+decode path was enabled.
+
+A fit is therefore identified by its regime **and** its scope, never by regime
+alone, and a request is priced only from a fit whose scope its own declared
+scope matches key for key. Under `strict` -- the default, and what an
+acceptance run gets -- a fit whose observations do not declare the required
+keys is refused rather than assumed. `strict=False` permits an undeclared fit
+for diagnostic use and stamps `scope_undeclared` on the result, so a number
+produced that way can never be mistaken for one that was scoped.
 """
 
 from __future__ import annotations
@@ -59,9 +73,12 @@ from __future__ import annotations
 import math
 from typing import Optional
 
-__all__ = ["REQUIRED_SCOPE", "UNIFIED", "GDN", "Structure", "Regime",
+__all__ = ["REQUIRED_SCOPE", "UNIFIED_SCOPE", "GDN_SCOPE", "UNIFIED", "GDN",
+           "Structure", "Regime", "REGIMES", "DECODE_KERNELS",
+           "UNPROVEN_DECODE_KERNELS",
            "Refusal", "Fit", "Model", "structure_of", "regime_of",
-           "features_for", "fit_regime", "CHUNK_SIZE"]
+           "features_for", "fit_regime", "CHUNK_SIZE", "scope_key",
+           "geometry_of", "scoped", "TOKEN_AXIS"]
 
 UNIFIED = "aiter::unified_attention_with_output_base"
 GDN = "aiter::linear_attention_with_output_base"
@@ -72,17 +89,36 @@ GDN = "aiter::linear_attention_with_output_base"
 #: it.
 CHUNK_SIZE = 64
 
-#: Static deployment facts that decide *which kernel* an attention call takes.
-#: Two observations that disagree on any of these are measurements of
+#: Static deployment facts that decide which kernel a *unified attention* call
+#: takes. Two observations that disagree on any of these are measurements of
 #: different work, and one that declares none of them cannot be shown to be in
 #: any regime at all.
 #:
 #: `kv_cache_dtype` is resolvable today from the collector's own record of the
 #: pool it stood up. The rest are not: an allocation geometry proves the
-#: storage, not the view the backend takes over it, so layout, sliding window
-#: and backend selection still have to be declared by whoever resolves them.
-REQUIRED_SCOPE = ("kv_cache_dtype", "kv_cache_layout", "sliding_window",
-                  "attention_backend")
+#: storage, not the view the backend takes over it, so layout, sliding window,
+#: block size and backend selection still have to be declared by whoever
+#: resolves them. `kv_cache_block_size` is here because `_dispatch_decode`
+#: reads it directly -- at 256 under unified attention it takes the persistent
+#: ASM kernel and otherwise Triton.
+UNIFIED_SCOPE = ("kv_cache_dtype", "kv_cache_layout", "kv_cache_block_size",
+                 "sliding_window", "attention_backend")
+
+#: The static facts a *linear attention* call turns on. No KV cache appears
+#: here: GDN reads the conv and recurrent state pool, never the paged KV cache,
+#: so a KV dtype or layout is not a fact about this kernel and requiring one
+#: would refuse honest observations over something that does not apply.
+#:
+#: `gdn_decode_lossy_fast` is `ATOM_ENABLE_GDN_DECODE_LOSSY_FAST` as the
+#: measured process resolved it; the guarded branch in `attention_gdn.py` is a
+#: different kernel, not a faster setting of the same one.
+#: `gdn_state_geometry` is the conv width and head geometry the fixed state
+#: has, which sizes every decode step regardless of the batch.
+GDN_SCOPE = ("gdn_decode_lossy_fast", "gdn_state_geometry")
+
+#: Back-compatible name: the unified family's scope, which is what the module
+#: required when it modelled only that family.
+REQUIRED_SCOPE = UNIFIED_SCOPE
 
 #: Bytes of KV one history row costs, per MHA layer, at the measured
 #: deployment: heads 4 x head_dim 256 x 2 bytes (BF16) x K and V = 4 KiB.
@@ -125,11 +161,16 @@ class Structure:
     """
 
     __slots__ = ("queries", "histories", "is_prefill", "has_cached", "state",
-                 "bucket", "num_prefills", "num_decodes", "num_actual_tokens")
+                 "bucket", "num_prefills", "num_decodes", "num_actual_tokens",
+                 "num_spec_decodes", "num_spec_decode_tokens", "replayssm",
+                 "spec_masked", "has_initial_state", "executed_rows")
 
     def __init__(self, queries=(), histories=(), *, is_prefill=None,
                  has_cached=None, state=None, bucket=None,
-                 num_prefills=None, num_decodes=None, num_actual_tokens=None):
+                 num_prefills=None, num_decodes=None, num_actual_tokens=None,
+                 num_spec_decodes=None, num_spec_decode_tokens=None,
+                 replayssm=None, spec_masked=None, has_initial_state=None,
+                 executed_rows=None):
         self.queries = tuple(int(q) for q in queries)
         self.histories = tuple(int(h) for h in histories)
         self.is_prefill = is_prefill
@@ -139,6 +180,12 @@ class Structure:
         self.num_prefills = num_prefills
         self.num_decodes = num_decodes
         self.num_actual_tokens = num_actual_tokens
+        self.num_spec_decodes = num_spec_decodes
+        self.num_spec_decode_tokens = num_spec_decode_tokens
+        self.replayssm = replayssm
+        self.spec_masked = spec_masked
+        self.has_initial_state = has_initial_state
+        self.executed_rows = executed_rows
 
     @property
     def sequences(self) -> int:
@@ -169,45 +216,203 @@ class Structure:
         """Per-sequence ceil(q/CHUNK_SIZE), summed. Not ceil of the total."""
         return sum(-(-q // CHUNK_SIZE) for q in self.queries)
 
+    def contexts(self) -> tuple:
+        """Per request, what the decode kernel reads: history plus own query."""
+        if self.queries and len(self.queries) == len(self.histories):
+            return tuple(q + h for q, h in zip(self.queries, self.histories))
+        return self.histories
+
+    def context_tiles(self, partition: int) -> int:
+        """Partition tiles the paged decode kernel covers the context with.
+
+        Per sequence, again. The kernel tiles each sequence separately and
+        reduces across that sequence's tiles, so a batch of short contexts and
+        one long context do not cover the same number of tiles even where they
+        hold the same number of rows.
+        """
+        return sum(-(-c // partition) for c in self.contexts())
+
+    def continued(self) -> Optional[int]:
+        """Sequences whose scan resumes from a recurrent state already held.
+
+        `has_initial_state` is a per-sequence boolean mask the engine builds,
+        and it is a branch, not a detail: a fresh sequence starts its chunked
+        scan from a zero state, a continued one loads the state the pool holds
+        and carries it in. Returns None where no mask was recorded, so a caller
+        can refuse rather than read an absence as "all fresh".
+        """
+        mask = self.has_initial_state
+        if mask is None:
+            return None
+        if self.queries:
+            mask = list(mask)[:len(self.queries)]
+        return sum(1 for flag in mask if flag)
+
 
 def _context(op: dict) -> dict:
     return {k: v for k, v in (tuple(x) for x in op.get("context") or ())}
 
 
+def _serialized(value):
+    """Values out of one of `forward_ctx`'s captured tensors.
+
+    `_capture_linear_attention` writes each GDN tensor as ``[values,
+    dtype_name]``, because these are a mix of index tensors and boolean masks
+    and a mask rebuilt as int32 selects nothing. Read in that shape, so a
+    fixture serialized by the source collector parses without a second
+    convention. A bare list is accepted too -- the unified family's
+    `cu_seqlens_q` is written that way -- and anything else is None rather than
+    a guess.
+    """
+    if isinstance(value, (list, tuple)):
+        if (len(value) == 2 and isinstance(value[0], (list, tuple))
+                and isinstance(value[1], str)):
+            return list(value[0])
+        if all(isinstance(v, (int, bool)) for v in value):
+            return list(value)
+    return None
+
+
+def _starts_to_lengths(starts) -> tuple:
+    values = _serialized(starts)
+    if not values or len(values) < 2:
+        return ()
+    return tuple(int(values[i + 1]) - int(values[i])
+                 for i in range(len(values) - 1))
+
+
 def structure_of(op: dict) -> Optional[Structure]:
     """The ragged structure an operator records, or None if it records none."""
     ctx = _context(op)
-    cu = ctx.get("cu_seqlens_q")
-    context = ctx.get("context_lens")
-    queries: tuple = ()
-    if isinstance(cu, (list, tuple)) and len(cu) > 1:
-        queries = tuple(int(cu[i + 1]) - int(cu[i]) for i in range(len(cu) - 1))
+    queries = _starts_to_lengths(ctx.get("cu_seqlens_q"))
+    if not queries:
+        # GDN records its offsets under its own names. The non-spec tensor is
+        # the one that describes the sequences this model prices; the spec one
+        # belongs to a branch `regime_of` refuses.
+        queries = _starts_to_lengths(ctx.get("non_spec_query_start_loc"))
+    context = _serialized(ctx.get("context_lens"))
     histories: tuple = ()
-    if isinstance(context, (list, tuple)) and queries:
+    if context and queries:
         histories = tuple(int(c) - q for c, q in zip(context, queries))
-    elif isinstance(context, (list, tuple)):
+    elif context:
         histories = tuple(int(c) for c in context)
-    execution = ctx.get("capture_bucket")
     return Structure(
         queries, histories,
         is_prefill=ctx.get("is_prefill"),
         has_cached=ctx.get("has_cached"),
         state=ctx.get("state"),
-        bucket=execution,
+        bucket=ctx.get("capture_bucket"),
         num_prefills=ctx.get("num_prefills"),
         num_decodes=ctx.get("num_decodes"),
         num_actual_tokens=ctx.get("num_actual_tokens"),
+        num_spec_decodes=ctx.get("num_spec_decodes"),
+        num_spec_decode_tokens=ctx.get("num_spec_decode_tokens"),
+        replayssm=ctx.get("replayssm"),
+        spec_masked=(_serialized(ctx.get("spec_sequence_masks")) is not None
+                     or _serialized(ctx.get("spec_query_start_loc"))
+                     is not None),
+        has_initial_state=_serialized(ctx.get("has_initial_state")),
+        executed_rows=_output_rows(op),
     )
 
 
+#: `core_attn_out` is operand 3 of `linear_attention_with_output_base(mixed_qkv,
+#: b, a, core_attn_out, layer_name)`. Its row count is the width the call was
+#: given, which is not the width it computed over: the wrapper slices its
+#: operands to `num_actual_tokens` and then zeros `core_attn_out` from there to
+#: the end. Both numbers are recorded facts, and the difference between them is
+#: work.
+_GDN_OUTPUT_OPERAND = 3
+
+
+def _output_rows(op: dict):
+    """Rows the output tensor was allocated with, where the key records it."""
+    if op.get("name") != GDN:
+        return None
+    shapes = op.get("input_shapes") or ()
+    if len(shapes) <= _GDN_OUTPUT_OPERAND:
+        return None
+    shape = shapes[_GDN_OUTPUT_OPERAND]
+    if not isinstance(shape, (list, tuple)) or not shape:
+        return None
+    return int(shape[0])
+
+
+def _hashable(value):
+    """A recorded value in a form two records can be compared by.
+
+    Recursive, because the things being compared are not flat: a recorded
+    operand view is a nested list of strides, and a shallow conversion leaves
+    inner lists unhashable -- which on real strided operators is not a subtle
+    inaccuracy but a crash at the first grouping.
+    """
+    if isinstance(value, dict):
+        return tuple(sorted((str(k), _hashable(v)) for k, v in value.items()))
+    if isinstance(value, (list, tuple)):
+        return tuple(_hashable(v) for v in value)
+    return value
+
+
+#: The axis a ragged structure varies. Substituted for a recorded extent only
+#: where that extent equals a token count the key itself records, so it is the
+#: key that says an axis is the token axis and never a position convention.
+TOKEN_AXIS = "*tokens"
+
+
+def geometry_of(op: dict, structure: Optional["Structure"] = None) -> tuple:
+    """The static operand geometry of this call: everything but the tokens.
+
+    Heads, head dimension, conv width, state rank, the operand dtypes and the
+    recorded operand views. All of it selects the kernel and sets its cost per
+    row, so two calls that differ in any of it are not points on one law --
+    and a law fitted over 4 KV heads must not answer a request with 8.
+
+    The token extent is abstracted away, because varying it is precisely what
+    a ragged fit is a fit over. Only extents the key itself states are token
+    counts are abstracted; an axis that merely happens to equal one at this
+    batch size keeps its number, so nothing is generalised on a coincidence.
+    """
+    structure = structure_of(op) if structure is None else structure
+    counts = set()
+    if structure is not None:
+        for value in (structure.query_total, structure.num_actual_tokens,
+                      structure.executed_rows):
+            if isinstance(value, int) and value > 0:
+                counts.add(value)
+    shapes = []
+    for shape in op.get("input_shapes") or ():
+        if isinstance(shape, (list, tuple)) and shape and shape[0] in counts:
+            shapes.append((TOKEN_AXIS,) + tuple(shape[1:]))
+        else:
+            shapes.append(_hashable(shape))
+    return (tuple(shapes), tuple(op.get("dtypes") or ()),
+            _hashable(op.get("layouts") or ()))
+
+
+def scoped(op: dict, scope, structure: Optional["Structure"] = None) -> dict:
+    """``scope`` with this call's static operand geometry folded in.
+
+    Both a fit and a request go through here, so a law is identified by its
+    geometry as well as its regime and its deployment, and a request whose
+    geometry differs is refused by the same scope machinery that refuses a
+    different KV dtype -- rather than being priced by a law fitted on other
+    heads.
+    """
+    combined = dict(scope or {})
+    combined["operand_geometry"] = geometry_of(op, structure)
+    return combined
+
+
 class Regime:
-    """One native branch, with the features its cost is a function of."""
+    """One native branch: the features its cost depends on, and its scope."""
 
-    __slots__ = ("name", "features")
+    __slots__ = ("name", "features", "required_scope")
 
-    def __init__(self, name: str, features: tuple) -> None:
+    def __init__(self, name: str, features: tuple,
+                 required_scope: tuple = UNIFIED_SCOPE) -> None:
         self.name = name
         self.features = tuple(features)
+        self.required_scope = tuple(required_scope)
 
     def __eq__(self, other):
         return isinstance(other, Regime) and self.name == other.name
@@ -229,18 +434,93 @@ REGIMES = {
     "unified.prefill.cached": Regime("unified.prefill.cached",
                                      ("paired_work", "query_rows",
                                       "history_rows")),
-    "unified.decode": Regime("unified.decode",
-                             ("context_rows", "active", "bucket_pad")),
-    # No history term. The native conv update and recurrence consume a fixed
-    # state, so a GDN decode does not read the full history and a term for it
-    # would be a coefficient fitted to noise.
-    "gdn.decode": Regime("gdn.decode", ("active", "bucket_pad")),
-    "gdn.prefill": Regime("gdn.prefill", ("query_rows", "chunks", "sequences")),
+    # Decode is two regimes, not one, because `paged_attention_triton` is a
+    # fork: with `ATOM_USE_UNIFIED_ATTN` or the flash layout it calls aiter's
+    # `unified_attention` over the paged cache, and otherwise it runs the
+    # gluon paged decode, which partitions each sequence into
+    # `context_partition_size` tiles and reduces across them. Those are
+    # different kernels with different cost laws, and imposing either one's law
+    # on the other is the mistake this split exists to prevent. Which ran is a
+    # scope fact, so `regime_of` refuses a decode whose backend is undeclared.
+    #
+    # On the partitioned branch the tile count is the ragged term: a batch pays
+    # for a part-full tail tile per sequence, so two batches with the same
+    # summed context and different raggedness do not cost the same.
+    "unified.decode.paged_gluon": Regime(
+        "unified.decode.paged_gluon",
+        ("context_rows", "context_tiles", "active", "bucket_pad")),
+    # On the unified/flash branch there is no per-sequence partition to count.
+    # What the measurements show instead is that raggedness dominates: a
+    # 32-sequence mixed batch summing 394164 context rows costs ~3.70ms while a
+    # balanced 32x16384 batch summing 524288 costs ~0.998ms -- more rows, less
+    # than a third the time. No law in summed rows can produce that, so the
+    # ragged term here is the grid the longest sequence forces every sequence
+    # to be covered by, and `grid_pad_rows` is what that grid covers beyond the
+    # rows that exist. It is a candidate law and nothing more until a holdout
+    # at a structure it was not fitted on says otherwise.
+    "unified.decode.unified_attn": Regime(
+        "unified.decode.unified_attn",
+        ("context_rows", "grid_pad_rows", "active", "bucket_pad")),
+    # `tail_pad_rows`, not nothing. The wrapper does slice `mixed_qkv`, `b` and
+    # `a` to `num_actual_tokens` before the convolution, so the kernels do not
+    # run over an underfilled bucket's padding -- but `attention_gdn.py` then
+    # zeros `core_attn_out[num_actual_tokens:]` for replay safety, which is
+    # work over exactly those rows. Calling underfill free on the strength of
+    # the slice alone would drop that. Both numbers are recorded -- the sliced
+    # width in the metadata, the allocated width in the output operand's shape
+    # -- so the difference is carried as a term rather than assumed either way.
+    "gdn.decode": Regime("gdn.decode", ("calls", "active", "tail_pad_rows"),
+                         GDN_SCOPE),
+    # `continued_sequences`, because `has_initial_state` is a branch the
+    # native scan takes per sequence: a fresh one starts from a zero state, a
+    # continued one loads the recurrent state the pool holds and carries it
+    # into the first chunk. Every GDN prefill measured so far is all-fresh, so
+    # the column pins to zero and the fit states the subdomain it covers --
+    # which is what makes a mixed fresh/continued batch a named refusal here
+    # instead of a price with no evidence under it.
+    "gdn.prefill": Regime("gdn.prefill",
+                          ("query_rows", "chunks", "sequences",
+                           "continued_sequences", "tail_pad_rows"),
+                          GDN_SCOPE),
 }
 
+#: `context_partition_size` in the gluon paged decode path, and *only* there.
+#: The sliding-window case uses 128 and one partition, which is why the window
+#: is in the required scope and this is read through it rather than assumed.
+DECODE_PARTITION_SIZE = 256
+DECODE_PARTITION_SIZE_SLIDING = 128
 
-def regime_of(op: dict, structure: Optional[Structure] = None):
-    """Which native branch this call takes, or a `Refusal` naming the gap."""
+#: The resolved decode kernel, as whoever resolves the scope must name it, to
+#: the regime whose law it takes. Exact values, refused when unknown: a decode
+#: priced under the wrong branch's law is the failure this table prevents.
+DECODE_KERNELS = {
+    "unified_attention": "unified.decode.unified_attn",
+    "paged_gluon": "unified.decode.paged_gluon",
+}
+
+#: Decode kernels that exist and have no law here. They are listed rather than
+#: aliased onto one that does: `paged_attention_persistent_asm` and
+#: `paged_attention_asm` are separate implementations, and nothing measured so
+#: far shows either of them following the gluon path's tile law. Mapping them
+#: onto it would be a price with no evidence behind it, so they refuse by name
+#: until a source primitive measurement says which law they take.
+UNPROVEN_DECODE_KERNELS = ("paged_attention_persistent_asm",
+                           "paged_attention_asm", "paged_attention_triton")
+
+
+def _partition_size(scope) -> int:
+    window = (scope or {}).get("sliding_window")
+    if isinstance(window, int) and window > 0:
+        return DECODE_PARTITION_SIZE_SLIDING
+    return DECODE_PARTITION_SIZE
+
+
+def regime_of(op: dict, structure: Optional[Structure] = None, scope=None):
+    """Which native branch this call takes, or a `Refusal` naming the gap.
+
+    ``scope`` is the declared static scope. Decode needs it: which decode
+    kernel ran is not in the key, and the two do not share a cost law.
+    """
     name = op.get("name", "")
     structure = structure_of(op) if structure is None else structure
     if structure is None:
@@ -251,7 +531,27 @@ def regime_of(op: dict, structure: Optional[Structure] = None):
                 "the key does not say whether this is a prefill, and the "
                 "prefill and decode kernels are different work")
         if not structure.is_prefill:
-            return REGIMES["unified.decode"]
+            backend = (scope or {}).get("attention_backend")
+            if backend is None:
+                return Refusal(
+                    "which decode kernel ran is not declared. "
+                    "`paged_attention_triton` forks on ATOM_USE_UNIFIED_ATTN "
+                    "and the flash layout into aiter's unified_attention and "
+                    "the gluon paged decode, and those partition the context "
+                    "differently; one law imposed on the other is a wrong "
+                    "price, not an approximate one",
+                    missing=("attention_backend",))
+            regime = DECODE_KERNELS.get(str(backend))
+            if regime is None:
+                known = (" It is a kernel this knows of and has no law for; "
+                         "nothing measured shows it follows another's."
+                         if str(backend) in UNPROVEN_DECODE_KERNELS else "")
+                return Refusal(
+                    "%r is not a decode kernel this has a law for.%s Declare "
+                    "one of %s" % (backend, known,
+                                   ", ".join(sorted(DECODE_KERNELS))),
+                    missing=("attention_backend",))
+            return REGIMES[regime]
         if structure.has_cached is None:
             return Refusal(
                 "the key does not say whether a cached prefix was read, and "
@@ -261,6 +561,26 @@ def regime_of(op: dict, structure: Optional[Structure] = None):
     if name == GDN:
         prefills = structure.num_prefills
         decodes = structure.num_decodes
+        if structure.replayssm:
+            return Refusal(
+                "this call ran under ReplaySSM, where the state pool holds one "
+                "checkpoint per request and the per-draft states are "
+                "reconstructed on demand; that is a different kernel and this "
+                "models the plain one",
+                missing=("replayssm",))
+        if structure.spec_masked or int(structure.num_spec_decodes or 0) \
+                or int(structure.num_spec_decode_tokens or 0):
+            return Refusal(
+                "this call carries speculative sequences, which take the "
+                "multi-query conv update and a verify window rather than the "
+                "single-token path; no measurement here separates their share",
+                missing=("spec_sequence_masks",))
+        if structure.num_actual_tokens is None:
+            return Refusal(
+                "the key does not carry num_actual_tokens, and the wrapper "
+                "slices its operands to that before the convolution, so how "
+                "many rows the kernel ran over is unknown",
+                missing=("num_actual_tokens",))
         if prefills is None or decodes is None:
             return Refusal(
                 "the key does not carry the prefill/decode split, which is "
@@ -270,15 +590,74 @@ def regime_of(op: dict, structure: Optional[Structure] = None):
                 "this call mixes fresh prefill sequences with continued "
                 "decode ones; the two run different kernels in one call and "
                 "no measurement separates their share")
-        return REGIMES["gdn.prefill" if int(prefills) else "gdn.decode"]
+        if int(prefills):
+            if structure.has_initial_state is None:
+                return Refusal(
+                    "the key does not carry has_initial_state, and that mask "
+                    "is the branch the chunked scan takes per sequence: a "
+                    "fresh sequence starts from a zero state, a continued one "
+                    "loads the state the pool holds. Reading its absence as "
+                    "all-fresh would be assuming the branch",
+                    missing=("has_initial_state",))
+            return REGIMES["gdn.prefill"]
+        return REGIMES["gdn.decode"]
     return Refusal(f"{name} is not an attention family this models")
 
 
-def features_for(regime: Regime, structure: Structure):
-    """The feature vector for one call, or a `Refusal` for what it lacks."""
+def features_for(regime: Regime, structure: Structure, scope=None):
+    """The feature vector for one call, or a `Refusal` for what it lacks.
+
+    ``scope`` is the declared static scope the call ran under. It is read for
+    the one feature that needs it -- the decode partition width, which the
+    sliding-window case halves -- and never to fill in a structural fact.
+    """
+    partition = _partition_size(scope)
     values = []
     for feature in regime.features:
-        if feature == "paired_work":
+        if feature == "calls":
+            # A per-call cost: the launch, and the fixed conv and recurrent
+            # state a GDN step touches whatever the batch holds.
+            values.append(1.0)
+        elif feature == "context_tiles":
+            values.append(float(structure.context_tiles(partition)))
+        elif feature == "grid_pad_rows":
+            contexts = structure.contexts()
+            if not contexts:
+                return Refusal("the call records no per-sequence context, so "
+                               "how ragged the batch was is unknown")
+            values.append(float(max(contexts) * len(contexts)
+                                - sum(contexts)))
+        elif feature == "continued_sequences":
+            continued = structure.continued()
+            if continued is None:
+                return Refusal(
+                    "the call records no has_initial_state mask, so how many "
+                    "of its sequences resume a held recurrent state is "
+                    "unknown; that is a branch, not a zero",
+                    missing=("has_initial_state",))
+            values.append(float(continued))
+        elif feature == "tail_pad_rows":
+            if structure.executed_rows is None:
+                return Refusal(
+                    "the key does not record the width the output tensor was "
+                    "allocated with, so the padding tail the kernel zeroes "
+                    "cannot be counted; underfill is not shown to be free",
+                    missing=("output_rows",))
+            if structure.num_actual_tokens is None:
+                return Refusal(
+                    "the key does not record num_actual_tokens, so the sliced "
+                    "width the kernel ran over is unknown",
+                    missing=("num_actual_tokens",))
+            values.append(float(max(int(structure.executed_rows)
+                                    - int(structure.num_actual_tokens), 0)))
+        elif feature == "actual_rows":
+            if structure.num_actual_tokens is None:
+                return Refusal(
+                    "the call does not record num_actual_tokens, which is "
+                    "what the wrapper sliced its operands to",
+                    missing=("num_actual_tokens",))
+            values.append(float(structure.num_actual_tokens))
+        elif feature == "paired_work":
             if len(structure.queries) != len(structure.histories):
                 return Refusal("queries and histories are not paired per "
                                "request, so the attended pairs are unknown")
@@ -343,14 +722,28 @@ def _solve(matrix, rhs):
 
 
 class Fit:
-    """A regime's law, and everything a reader needs to distrust it."""
+    """A regime's law, and everything a reader needs to distrust it.
 
-    __slots__ = ("regime", "coefficients", "scales", "points", "residual_df",
-                 "relative_error", "domain", "scope", "scope_undeclared")
+    ``features`` are the terms this law actually carries. They can be fewer
+    than its regime's: a column that is zero in every measurement carries no
+    information about its own coefficient, and fitting it anyway makes the
+    whole design rank deficient and refuses a law that the evidence otherwise
+    supports. Those columns are ``pinned`` instead -- the fit is a fit of the
+    subdomain where they are zero, and :meth:`Model.price` refuses a structure
+    where any of them is not, rather than extrapolating a coefficient nobody
+    measured.
+    """
 
-    def __init__(self, regime, coefficients, scales, points, residual_df,
-                 relative_error, domain, scope, scope_undeclared=()):
+    __slots__ = ("regime", "features", "pinned", "coefficients", "scales",
+                 "points", "residual_df", "relative_error", "domain", "scope",
+                 "scope_undeclared")
+
+    def __init__(self, regime, features, pinned, coefficients, scales, points,
+                 residual_df, relative_error, domain, scope,
+                 scope_undeclared=()):
         self.regime = regime
+        self.features = tuple(features)
+        self.pinned = tuple(pinned)
         self.coefficients = tuple(coefficients)
         self.scales = tuple(scales)
         self.points = points
@@ -361,6 +754,7 @@ class Fit:
         self.scope_undeclared = tuple(scope_undeclared)
 
     def predict(self, values):
+        """``values`` in this fit's own feature order, pinned ones removed."""
         total = 0.0
         for value, coefficient, scale in zip(values, self.coefficients,
                                              self.scales):
@@ -370,10 +764,13 @@ class Fit:
     def describe(self) -> str:
         terms = ", ".join(
             "%s=%.4e" % (name, coefficient / scale if scale else 0.0)
-            for name, coefficient, scale in zip(self.regime.features,
+            for name, coefficient, scale in zip(self.features,
                                                 self.coefficients, self.scales))
         note = ("" if not self.scope_undeclared else
                 "; scope undeclared: " + ", ".join(self.scope_undeclared))
+        if self.pinned:
+            note += ("; measured only where %s is zero"
+                     % ", ".join(self.pinned))
         return ("%s from %d point(s), %d residual df, in-sample %.1f%% [%s]%s"
                 % (self.regime.name, self.points, self.residual_df,
                    self.relative_error * 100, terms, note))
@@ -406,7 +803,7 @@ def _distinct(values):
     return out
 
 
-def _scope_of(observations):
+def _scope_of(observations, required=UNIFIED_SCOPE):
     """The static scope these observations share, or a refusal to pool them.
 
     Agreement is required on **every** key any observation declares, not only
@@ -417,7 +814,7 @@ def _scope_of(observations):
     another does not is a disagreement too: the second has not said it matches,
     and reading its silence as agreement is the failure this is closed against.
     """
-    keys = set(REQUIRED_SCOPE)
+    keys = set(required)
     for obs in observations:
         keys.update(obs[3] or {})
     declared, undeclared = {}, []
@@ -429,7 +826,7 @@ def _scope_of(observations):
             continue
         if len(seen) > 1:
             shown = ", ".join(sorted(repr(s) for s in seen))
-            if field in REQUIRED_SCOPE:
+            if field in required:
                 return Refusal(
                     "these observations disagree on %s (%s); they are "
                     "measurements of different kernels and pooling them would "
@@ -440,7 +837,7 @@ def _scope_of(observations):
                 "training observation would average measurements of "
                 "different deployments" % (field, shown))
         declared[field] = seen[0]
-    return declared, tuple(f for f in undeclared if f in REQUIRED_SCOPE)
+    return declared, tuple(f for f in undeclared if f in required)
 
 
 def fit_regime(regime, observations, *, strict=True, min_residual_df=1):
@@ -455,7 +852,7 @@ def fit_regime(regime, observations, *, strict=True, min_residual_df=1):
     the design is rank deficient, which is what perfectly collinear features
     look like; or the fit wants a negative cost for some work.
     """
-    scope = _scope_of(observations)
+    scope = _scope_of(observations, regime.required_scope)
     if isinstance(scope, Refusal):
         return scope
     declared, undeclared = scope
@@ -466,26 +863,45 @@ def fit_regime(regime, observations, *, strict=True, min_residual_df=1):
             "that may differ" % ", ".join(undeclared),
             missing=undeclared)
 
-    rows, rhs, domain = [], [], []
-    for structure, seconds, _source, _scope in observations:
-        values = features_for(regime, structure)
+    full, rhs = [], []
+    for structure, seconds, _source, obs_scope in observations:
+        values = features_for(regime, structure, obs_scope)
         if isinstance(values, Refusal):
             return values
-        rows.append(values)
+        full.append(values)
         rhs.append(float(seconds))
-        domain.append(values)
-    wanted = len(regime.features) + min_residual_df
+
+    # A column that is zero at every measured point says nothing about its own
+    # coefficient, and carrying it makes the whole design rank deficient -- so
+    # a mandatory padding term would refuse every fit over a set of full-bucket
+    # captures, which is most of what exists. Pin it instead: the law is a law
+    # of the subdomain where it is zero, and `price` refuses a structure where
+    # it is not.
+    kept = [i for i in range(len(regime.features))
+            if any(row[i] for row in full)]
+    pinned = tuple(name for i, name in enumerate(regime.features)
+                   if i not in kept)
+    if not kept:
+        return Refusal(
+            "%s: every one of %s is zero at every measured point, so there is "
+            "no work here to attribute a cost to"
+            % (regime.name, ", ".join(regime.features)))
+    features = tuple(regime.features[i] for i in kept)
+    rows = [[row[i] for i in kept] for row in full]
+    domain = rows
+
+    wanted = len(features) + min_residual_df
     if len(rows) < wanted:
         return Refusal(
             "%s has %d independent point(s) and needs at least %d to fit %d "
             "term(s) with anything left over to check them against"
-            % (regime.name, len(rows), wanted, len(regime.features)))
+            % (regime.name, len(rows), wanted, len(features)))
 
     # Scale each column by its largest value: the features differ by many
     # orders of magnitude -- attended pairs against sequence counts -- and the
     # normal equations would otherwise be conditioned by the units.
     scales = [max((abs(row[i]) for row in rows), default=0.0) or 1.0
-              for i in range(len(regime.features))]
+              for i in range(len(features))]
     scaled = [[row[i] / scales[i] for i in range(len(row))] for row in rows]
     solved = _solve(scaled, rhs)
     if solved is None:
@@ -493,8 +909,8 @@ def fit_regime(regime, observations, *, strict=True, min_residual_df=1):
             "%s: the design is rank deficient -- two or more of %s do not "
             "vary independently across these points, so their coefficients "
             "cannot be told apart. Measure a point that separates them."
-            % (regime.name, ", ".join(regime.features)))
-    negative = [name for name, c in zip(regime.features, solved) if c < 0]
+            % (regime.name, ", ".join(features)))
+    negative = [name for name, c in zip(features, solved) if c < 0]
     if negative:
         return Refusal(
             "%s: the fit wants a negative cost for %s, which is not a cost. "
@@ -503,8 +919,49 @@ def fit_regime(regime, observations, *, strict=True, min_residual_df=1):
 
     predicted = [sum(c * v for c, v in zip(solved, row)) for row in scaled]
     errors = [abs(p - y) / y for p, y in zip(predicted, rhs) if y]
-    return Fit(regime, solved, scales, len(rows), len(rows) - len(solved),
-               max(errors) if errors else 0.0, domain, declared, undeclared)
+    return Fit(regime, features, pinned, solved, scales, len(rows),
+               len(rows) - len(solved), max(errors) if errors else 0.0,
+               domain, declared, undeclared)
+
+
+def scope_key(scope) -> tuple:
+    """A declared scope as a hashable key. Every key it carries, sorted."""
+    return tuple(sorted((str(k), repr(v)) for k, v in (scope or {}).items()))
+
+
+def _by_scope(observations) -> dict:
+    """Observations split by their own declared scope, in first-seen order."""
+    groups: dict = {}
+    for obs in observations:
+        groups.setdefault(scope_key(obs[3]), []).append(obs)
+    return groups
+
+
+def _label(regime_name: str, key: tuple) -> str:
+    if not key:
+        return f"{regime_name} @ undeclared scope"
+    return "%s @ %s" % (regime_name,
+                        ", ".join("%s=%s" % (k, v) for k, v in key))
+
+
+def _scope_matches(fit_scope, request_scope) -> Optional[str]:
+    """The first key on which a fit and a request differ, or None.
+
+    Every key either side declares has to agree. A request that is silent
+    where the fit is specific has not said it matches, and a fit that is silent
+    where the request is specific was not shown to have been measured there --
+    which is the known-against-undeclared pooling this refuses.
+    """
+    fit_scope = fit_scope or {}
+    request_scope = request_scope or {}
+    for field in sorted(set(fit_scope) | set(request_scope)):
+        mine = fit_scope.get(field, ABSENT)
+        theirs = request_scope.get(field, ABSENT)
+        if (mine is ABSENT) != (theirs is ABSENT):
+            return field
+        if mine is not ABSENT and mine != theirs:
+            return field
+    return None
 
 
 class Model:
@@ -519,39 +976,91 @@ class Model:
 
     @classmethod
     def from_observations(cls, grouped, *, strict=True, min_residual_df=1):
-        """``grouped`` maps a regime name to its observation list."""
+        """``grouped`` maps a regime name to its observation list.
+
+        Each regime's observations are split by their own declared scope before
+        anything is fitted, so a law is identified by regime **and** scope. Two
+        TP geometries, or a superseded collection beside a current one, become
+        two fits or two refusals -- never one law averaged over both.
+        """
         model = cls(strict=strict)
         for name, observations in grouped.items():
             regime = REGIMES.get(name)
             if regime is None:
                 model.refusals[name] = Refusal(f"{name} is not a known regime")
                 continue
-            outcome = fit_regime(regime, observations, strict=strict,
-                                 min_residual_df=min_residual_df)
-            if isinstance(outcome, Refusal):
-                model.refusals[name] = outcome
-            else:
-                model.fits[name] = outcome
+            for key, group in _by_scope(observations).items():
+                label = _label(name, key)
+                outcome = fit_regime(regime, group, strict=strict,
+                                     min_residual_df=min_residual_df)
+                if isinstance(outcome, Refusal):
+                    model.refusals[label] = outcome
+                else:
+                    model.fits[label] = outcome
         return model
 
-    def price(self, op: dict):
-        """Seconds for this call, or a `Refusal` naming what is missing."""
+    @classmethod
+    def from_priced(cls, observations, *, strict=True, min_residual_df=1):
+        """Build from ``(op, seconds, source, scope)`` measurements.
+
+        The adapter's entry point: it holds priced operators, not structures,
+        and which regime each one is in is a question about the operator and
+        its scope rather than something a caller should decide. Operators whose
+        regime cannot be established are recorded as refusals against their own
+        name, so they are reported rather than dropped.
+        """
+        grouped: dict = {}
+        model_refusals: dict = {}
+        for op, seconds, source, scope in observations:
+            structure = structure_of(op)
+            # Geometry folded in before anything is grouped: a law over 4 KV
+            # heads and a law over 8 are two laws, and grouping them by regime
+            # and deployment alone would fit one curve through both.
+            scope = scoped(op, scope, structure)
+            regime = regime_of(op, structure, scope)
+            if isinstance(regime, Refusal):
+                model_refusals.setdefault(op.get("name", "?"), regime)
+                continue
+            grouped.setdefault(regime.name, []).append(
+                (structure, seconds, source, scope))
+        model = cls.from_observations(grouped, strict=strict,
+                                      min_residual_df=min_residual_df)
+        for name, refusal in model_refusals.items():
+            model.refusals.setdefault(name, refusal)
+        return model
+
+    def price(self, op: dict, scope=None):
+        """Seconds for this call, or a `Refusal` naming what is missing.
+
+        ``scope`` is the requesting deployment's own declared scope. It selects
+        the fit: a law measured under one static scope does not answer for
+        another, and an undeclared request does not match a known fit.
+        """
         structure = structure_of(op)
         if structure is None:
             return Refusal("this operator records no ragged structure")
-        regime = regime_of(op, structure)
+        # The same fold as at fit time, so the geometry this call actually has
+        # is what selects the law rather than being ignored at prediction.
+        scope = scoped(op, scope, structure)
+        regime = regime_of(op, structure, scope)
         if isinstance(regime, Refusal):
             return regime
-        fit = self.fits.get(regime.name)
+        fit, why = self._fit_for(regime, scope)
         if fit is None:
-            known = self.refusals.get(regime.name)
-            return Refusal(
-                "%s has no fitted law: %s" % (
-                    regime.name,
-                    known.reason if known else "no measurement reached it"))
-        values = features_for(regime, structure)
+            return why
+        values = features_for(regime, structure, scope)
         if isinstance(values, Refusal):
             return values
+        index = {name: i for i, name in enumerate(regime.features)}
+        for name in fit.pinned:
+            if values[index[name]]:
+                return Refusal(
+                    "%s: this call has %g %s and every measurement behind this "
+                    "law had none, so what that work costs has not been "
+                    "measured. It is unsupported rather than free"
+                    % (regime.name, values[index[name]], name),
+                    missing=(name,))
+        values = [values[index[name]] for name in fit.features]
         outside = _outside_domain(fit, values)
         if outside:
             return Refusal(
@@ -564,6 +1073,73 @@ class Model:
                 "%s: the law returns %r for this structure, which is not a "
                 "duration" % (regime.name, seconds))
         return seconds
+
+
+
+    def fit_for(self, regime_name: str, scope=None, op: Optional[dict] = None):
+        """``(fit, None)`` for this regime and scope, or ``(None, Refusal)``.
+
+        ``op``, when given, folds that call's static operand geometry into the
+        scope exactly as `price` does. A caller that asks about a law for a
+        particular call has to ask under the same key the price is selected
+        by, or it is told the law is unidentifiable when the truth is that it
+        asked about a different deployment's heads.
+
+        Public because a caller that has to say more about a modelled price
+        than the number -- which measurements are behind it, what they were
+        served by -- needs the fit itself, and reaching into the private
+        selector to get it is how two callers end up selecting differently.
+        """
+        regime = REGIMES.get(regime_name)
+        if regime is None:
+            return None, Refusal("%s is not a known regime" % regime_name)
+        if op is not None:
+            scope = scoped(op, scope)
+        return self._fit_for(regime, scope)
+
+    def describe_fit(self, regime_name: str, scope=None) -> str:
+        """The law a price at this regime and scope came from, in words.
+
+        Attached to every modelled record, so a reader of a prediction can see
+        how many independent points are behind it, how far it misses them, and
+        which subdomain it was measured in -- without going back to the fit.
+        """
+        fit, why = self.fit_for(regime_name, scope)
+        if fit is None:
+            return why.reason
+        return fit.describe()
+
+    def _fit_for(self, regime, scope):
+        """The fit for this regime whose scope the request matches."""
+        candidates = [(label, fit) for label, fit in self.fits.items()
+                      if fit.regime.name == regime.name]
+        if not candidates:
+            known = [r for label, r in self.refusals.items()
+                     if label.split(" @ ")[0] == regime.name]
+            return None, Refusal(
+                "%s has no fitted law: %s" % (
+                    regime.name,
+                    known[0].reason if known
+                    else "no measurement reached it"))
+        matched = [(label, fit) for label, fit in candidates
+                   if _scope_matches(fit.scope, scope) is None]
+        if len(matched) == 1:
+            return matched[0][1], None
+        if not matched:
+            differs = {label: _scope_matches(fit.scope, scope)
+                       for label, fit in candidates}
+            return None, Refusal(
+                "%s is fitted, but not for this deployment: %s. A law "
+                "measured under one static scope is not a price under "
+                "another" % (regime.name,
+                             "; ".join("%s differs on %s" % (label, field)
+                                       for label, field in
+                                       sorted(differs.items()))))
+        return None, Refusal(
+            "%s has %d fits whose scope this request matches (%s); the "
+            "request does not say which deployment it is"
+            % (regime.name, len(matched),
+               ", ".join(sorted(label for label, _fit in matched))))
 
     def coverage(self) -> dict:
         """What is modelled and what is not, for a report to state plainly."""
@@ -578,7 +1154,7 @@ class Model:
 
 def _outside_domain(fit, values):
     """Which feature, if any, sits outside the measured hull, and its range."""
-    for index, name in enumerate(fit.regime.features):
+    for index, name in enumerate(fit.features):
         column = [row[index] for row in fit.domain]
         low, high = min(column), max(column)
         if values[index] < low or values[index] > high:
