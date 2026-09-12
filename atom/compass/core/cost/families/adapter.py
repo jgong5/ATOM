@@ -318,19 +318,34 @@ _OUTCOME_FIELDS = ("host_seconds",)
 #: conservative here, it is fatal: every row width lands in its own group, and
 #: within one row width `crit_waves` is exactly proportional to
 #: `max_cta_tiles`, so the makespan law is unidentifiable by construction and
-#: no amount of further measurement can separate its two bounds. The remaining
-#: integer arguments (the 256/128 partition size) track `sliding_window`, which
-#: is a required scope key, so the deployments they distinguish stay apart on
-#: their own. Type arguments are NOT canonicalised: a bfloat16 instantiation
-#: and an fp8 one are different work.
+#: no amount of further measurement can separate its two bounds. The other two
+#: integer arguments are head dimensions and are NOT canonicalised; neither are
+#: the type arguments, because a bfloat16 instantiation and an fp8 one are
+#: different work.
 _GEOMETRY_SPECIALIZED_KERNELS = ("pa_decode_ps_reduce_hip_kernel",)
 
-#: An integer template argument, in a C++ symbol's argument list.
-_TEMPLATE_INTEGER = re.compile(r"(?<=[<,]) ?\d+ ?(?=[,>])")
+#: The *last* integer template argument, and only that one.
+#:
+#: The resolved declaration (`csrc/cpp_itfs/pa/pa_ps.cuh`:183-190) is
+#: `<output_t, logits_t, sink_t, USE_SINKS, HEAD_SIZE, QUERY_GROUP_SIZE,
+#: CONTEXT_PARTITION_NUM>`: three integers, split count last. The campaign
+#: observed `<__hip_bfloat16, __hip_bfloat16, __hip_bfloat16, false, 256, 6,
+#: N>` for N in {2, 3, 5, 8} and no other instantiation.
+#:
+#: Only `CONTEXT_PARTITION_NUM` is pooled, because only it is a modelled
+#: launch feature -- it is the split count `Structure` already reads, and
+#: leaving it in the measurement identity is what makes the law
+#: unidentifiable. `HEAD_SIZE` (256) and `QUERY_GROUP_SIZE` (6) stay in the
+#: symbol: they are head dimensions, not launch features, and an earlier
+#: blanket `\d+` substitution erased them as well -- which would have let a
+#: differently-shaped head or query grouping pool silently into this law.
+#: Both were constant across every observed symbol, so narrowing changes no
+#: existing design point. It removes a way for a future one to be wrong.
+_TEMPLATE_SPLIT_COUNT = re.compile(r"(?<=,) ?\d+ ?(?=>)")
 
 
 def _canonical_kernel(name: str) -> str:
-    """A geometry-specialized kernel symbol, with that geometry taken out.
+    """A split-specialized kernel symbol, with the split count taken out.
 
     Returns the name unchanged for every kernel not named in
     `_GEOMETRY_SPECIALIZED_KERNELS`, which is all but one of them. Where it
@@ -340,7 +355,7 @@ def _canonical_kernel(name: str) -> str:
     """
     if not any(symbol in name for symbol in _GEOMETRY_SPECIALIZED_KERNELS):
         return name
-    return _TEMPLATE_INTEGER.sub(" *", name)
+    return _TEMPLATE_SPLIT_COUNT.sub(" *", name)
 
 
 def _measurement_identity(record: dict, policy: tuple = ("unevidenced",)) -> tuple:

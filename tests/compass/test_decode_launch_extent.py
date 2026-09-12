@@ -1118,7 +1118,26 @@ class TestTheSplitSpecializationIsNotATreatment:
         canonical = {adapter._canonical_kernel(reduce_kernel(splits))
                      for splits in (2, 3, 5, 8)}
         assert len(canonical) == 1
-        assert "256" not in canonical.pop().split(">")[0]
+        arguments = canonical.pop().split(">")[0]
+        assert arguments.split(",")[-1].strip() == "*"
+
+    def test_the_head_dimensions_stay(self):
+        """`<..., HEAD_SIZE, QUERY_GROUP_SIZE, CONTEXT_PARTITION_NUM>`, per
+        the resolved declaration in `csrc/cpp_itfs/pa/pa_ps.cuh`:183-190.
+        Only the last is a launch feature. The first two are head geometry,
+        and an earlier blanket integer substitution took them out too, which
+        would let a 128-wide head or a different query grouping pool into this
+        law without anyone being told."""
+        from atom.compass.core.cost.families import adapter
+
+        canonical = adapter._canonical_kernel(reduce_kernel(8))
+        assert "256" in canonical
+        assert ", 6," in canonical
+        assert adapter._canonical_kernel(
+            reduce_kernel(8).replace("false, 256,", "false, 128,")) \
+            != canonical
+        assert adapter._canonical_kernel(
+            reduce_kernel(8).replace(", 6,", ", 8,")) != canonical
 
     def test_a_kernel_nobody_declared_specialized_is_untouched(self):
         """Only the named symbol. Anything else keeps every argument it has,
