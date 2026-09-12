@@ -34,7 +34,17 @@ def _frozen(template):
     return json.dumps(template, sort_keys=True, default=str)
 
 
-def shape(queries, contexts, *, bucket=32, tp=1, rank=0, prefill=0):
+def shape(queries, contexts, *, bucket=None, tp=1, rank=0, prefill=0):
+    """A cohort. Eager by default, because most of what is below is a rule
+    about per-request metadata and a replay bucket is not part of it.
+
+    It used to default to 32 against batches of two and four, which declared a
+    padding no fixture here ever built and no rule then read -- the bucket
+    reached `template_key` and nothing else. Now that binding derives the
+    replay's tails, a declared bucket has to be one the template was built for:
+    the tests that are about padding pass one and build a template to match
+    (`attention_op(..., pad=)`), and the rest say what they always meant.
+    """
     return StepShape(
         num_scheduled_tokens=tuple(queries),
         context_lens=tuple(contexts),
@@ -43,13 +53,19 @@ def shape(queries, contexts, *, bucket=32, tp=1, rank=0, prefill=0):
         capture_bucket=bucket, compiled=None, produces_output=True)
 
 
-def attention_op(rows, *, extra=(), allocator=True):
-    """One operator carrying the context an attention call records."""
+def attention_op(rows, *, extra=(), allocator=True, pad=0):
+    """One operator carrying the context an attention call records.
+
+    ``pad`` is how many rows of the capture bucket this batch does not fill --
+    the template is then what a derivation at that bucket produces, tails and
+    all, rather than the active rows with a padded allocator bolted on.
+    """
     positions = []
     for q, c in rows:
         positions.extend(range(c - q, c))
+    positions += [0] * pad
     context = [
-        ["context_lens", [c for _, c in rows]],
+        ["context_lens", [c for _, c in rows] + [0] * pad],
         ["positions", positions * POSITION_ROWS],
         ["max_seqlen_k", max(c for _, c in rows)],
         ["max_seqlen_q", max(q for q, _ in rows)],
@@ -57,8 +73,8 @@ def attention_op(rows, *, extra=(), allocator=True):
         ["cu_seqlens_k", None],
     ]
     if allocator:
-        context.append(["slot_mapping", list(range(len(rows)))])
-        context.append(["block_tables", [[0]] * len(rows)])
+        context.append(["slot_mapping", list(range(len(rows) + pad))])
+        context.append(["block_tables", [[0]] * (len(rows) + pad)])
     context.extend(list(e) for e in extra)
     return {"name": "aiter::unified_attention_with_output_base",
             "input_shapes": "1,2", "dtypes": "bfloat16", "context": context}
@@ -419,16 +435,20 @@ def test_a_batch_with_no_state_slots_is_refused_not_defaulted():
                     source)
 
 
-def test_the_capture_s_padding_is_kept_and_counted():
-    """A capture at a wider rung records the buffer, not the active rows.
+def test_the_replayed_tail_is_derived_rather_than_carried():
+    """The padded tail is now the allocation's, not the capture's leftovers.
 
-    The active entries are the scheduler's; the tail is whatever the runner
-    left in the padded buffer, and it stays -- overwriting it would invent an
-    assignment for rows that are not running, and dropping it would resize a
-    buffer the graph's own shapes still describe.
+    It used to be carried: the native source answered for the two active rows,
+    the template's buffer was four wide, and the last two entries were whatever
+    the runner had left there -- kept, and counted under `allocation_padding`
+    so a reader could see they were not this step's. A source that derives the
+    replay's width answers all four, `-1` tail included
+    (aiter_attention.py:1106), so there is nothing left over to carry and the
+    count is empty. Same values, better provenance: the tail is a statement
+    about this step rather than a residue of some other one.
     """
     rows = [(1, 32), (1, 32)]
-    template = template_for(rows)
+    template = template_for(rows, pad=2)
     context = template["ops"][1]["context"]
     for entry in context:
         if entry[0] == "slot_mapping":
@@ -437,8 +457,24 @@ def test_the_capture_s_padding_is_kept_and_counted():
     bound = bind_cohort(template, shape([1, 1], [32, 32], bucket=4), source)
     slots = dict(map(tuple, bound["ops"][1]["context"]))["slot_mapping"]
     assert slots == [8 * 16 + 15, 4 * 16 + 15, -1, -1]
-    assert bound["provenance"]["binding"]["allocation_padding"] == {
-        "slot_mapping": 2}
+    assert bound["provenance"]["binding"]["allocation_padding"] == {}
+
+
+def test_a_source_that_answers_short_is_carried_and_counted():
+    """`_fit_allocation`'s other branch, kept under test now that the padded
+
+    decode no longer reaches it. A source that supplies fewer entries than the
+    template's buffer holds has not described those rows, and the template's
+    own values are the only thing there is -- carried, and counted, so nothing
+    downstream reads them as this step's assignment.
+    """
+    from atom.compass.runtime.templates import _fit_allocation
+
+    padding = {}
+    fitted = _fit_allocation("slot_mapping", [-1, -1, -1, -1], [143, 79],
+                             padding)
+    assert fitted == [143, 79, -1, -1]
+    assert padding == {"slot_mapping": 2}
 
 
 def test_a_mixed_prefill_decode_batch_is_refused_by_name():
@@ -491,30 +527,36 @@ def test_state_slots_are_placed_by_row_not_by_list_position():
     source = offered(native(), rows, [[7, 8], [3, 4], [1, 2]],
                      slots=(5, 9), state_rows=[1, 2])
     with pytest.raises(BindRefusal, match=r"rows \[0\] of 3 hold no state"):
-        bind_cohort(template_for(rows), shape([1] * 3, [32] * 3, bucket=4),
-                    source)
+        bind_cohort(template_for(rows, pad=1),
+                    shape([1] * 3, [32] * 3, bucket=4), source)
 
     source = offered(native(), rows, [[7, 8], [3, 4], [1, 2]],
                      slots=(9, 5, 2), state_rows=[2, 0, 1])
-    bound = bind_cohort(template_for(rows, extra=[
-        ["non_spec_state_indices_tensor", [[0, 0, 0], "int32"]]]),
+    bound = bind_cohort(template_for(rows, pad=1, extra=[
+        ["non_spec_state_indices_tensor", [[0, 0, 0, -1], "int32"]]]),
         shape([1] * 3, [32] * 3, bucket=4), source)
     context = dict(map(tuple, bound["ops"][1]["context"]))
-    assert context["non_spec_state_indices_tensor"] == [[5, 2, 9], "int32"]
+    assert context["non_spec_state_indices_tensor"] == [[5, 2, 9, -1], "int32"]
 
 
 def test_an_active_count_below_the_capture_bucket_pads_every_field():
     """Two running requests bound to a graph captured at four.
 
-    The template's buffers are four-wide, and they stay four-wide: the two
-    active entries are the scheduler's and the tail is the capture's, counted
-    per field so a reader can see how much of the bound metadata was not this
-    step's. Overwriting the tail would invent an assignment for rows that are
-    not running.
+    Every field is four wide and every tail is the one the engine writes into
+    that field -- `-1` for the slot map and for both state-index tensors, zero
+    for the context lengths, the last real offset repeated for the query
+    starts. They are not interchangeable: index `0` is request zero's state
+    entry, so padding the state tensors with it would have the idle rows read
+    and write a live sequence's recurrent state.
+
+    Nothing here is carried. The replay's width is derived on both sides now,
+    so `allocation_padding` -- which counts buffer entries the allocation did
+    not reach -- is empty, and the padding shows up under `replay_pad_rows`
+    instead, where it says what it is.
     """
     rows = [(1, 32), (1, 32)]
-    template = template_for(rows, extra=[
-        ["non_spec_state_indices_tensor", [[0, 0, 0, 0], "int32"]]])
+    template = template_for(rows, pad=2, extra=[
+        ["non_spec_state_indices_tensor", [[0, 0, -1, -1], "int32"]]])
     for entry in template["ops"][1]["context"]:
         if entry[0] == "slot_mapping":
             entry[1] = [-1, -1, -1, -1]
@@ -523,9 +565,12 @@ def test_an_active_count_below_the_capture_bucket_pads_every_field():
     bound = bind_cohort(template, shape([1, 1], [32, 32], bucket=4), source)
     context = dict(map(tuple, bound["ops"][1]["context"]))
     assert context["slot_mapping"] == [8 * 16 + 15, 4 * 16 + 15, -1, -1]
-    assert context["non_spec_state_indices_tensor"] == [[5, 9, 0, 0], "int32"]
-    assert bound["provenance"]["binding"]["allocation_padding"] == {
-        "slot_mapping": 2, "non_spec_state_indices_tensor": 2}
+    assert context["non_spec_state_indices_tensor"] == [[5, 9, -1, -1],
+                                                        "int32"]
+    assert context["context_lens"] == [32, 32, 0, 0]
+    binding = bound["provenance"]["binding"]
+    assert binding["allocation_padding"] == {}
+    assert (binding["replay_pad_rows"], binding["replay_pad_tokens"]) == (2, 2)
 
 
 # -- the linear-attention initial-state flags -------------------------------

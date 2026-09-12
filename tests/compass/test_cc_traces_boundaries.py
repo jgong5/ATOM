@@ -107,8 +107,19 @@ class Stub(BaseHTTPRequestHandler):
             body = json.dumps(type(self).requests_reply).encode()
         else:
             type(self).posted.append(sent)
+            # A completion shaped like the one a server really returns: the
+            # requested number of output tokens, counted in `usage`, and the
+            # finish reason that goes with having produced them. `replay.py`
+            # reads all three to decide whether the workload completed, and a
+            # stub that answered without them would make every run here look
+            # like one that came back short.
+            produced = int(sent.get("max_tokens") or 0)
             body = json.dumps(
-                {"choices": [{"text": "x"}], "usage": {"prompt_tokens": 0}}
+                {
+                    "choices": [{"text": "x " * produced,
+                                 "finish_reason": "length"}],
+                    "usage": {"prompt_tokens": 0, "completion_tokens": produced},
+                }
             ).encode()
         self.send_response(200)
         self.send_header("Content-Type", "application/json")

@@ -137,9 +137,15 @@ def executed_body_rows(shape: StepShape) -> int:
     computes ``num_tokens_pad = running_bs * max_q_len`` and the captured graph
     executes all of it, the real count being used only to slice the result
     afterwards (model_runner.py:3189-3192, 3841-3843). An eager step has no
-    bucket and runs the tokens it was given.
+    bucket and runs the tokens it was given -- and so does a prefill that
+    declares one, because `ForwardMode.decide` sends any batch holding a
+    prefill token down the eager path (forward_context.py:196-204). The same
+    expression as `BatchSpec.padded_rows`, prefill guard included: this is the
+    number `_check_body_rows` holds a derivation to, and a guard is only worth
+    having if both sides compute it the same way.
     """
-    if shape.capture_bucket is None:
+    if shape.capture_bucket is None or int(
+            getattr(shape, "num_prefill_tokens", 0) or 0):
         return shape.total_tokens
     return shape.capture_bucket * _max_q_len(shape)
 
@@ -218,6 +224,15 @@ class Coverage:
     #: attention" are different situations.
     refused: dict[str, int] = field(default_factory=dict)
     reasons: dict[str, str] = field(default_factory=dict)
+    #: One entry per refused *signature*, not per name. A name collapses every
+    #: shape an operator was called at, and a name is not something anyone can
+    #: measure or model: the counts above answer "how much is missing", this
+    #: answers "missing at what", which is the question a price acquisition or a
+    #: family model is actually given. Held as a tuple of plain dicts, and
+    #: deliberately without the operator's context entries -- those carry whole
+    #: block tables and slot maps, and a refusal record that large stops being
+    #: something a log line or a handoff can hold.
+    refused_signatures: tuple = ()
     #: Which price list answered, by operator count. A library assembled from
     #: more than one run is legitimate; one whose composition cannot be stated
     #: is not.
@@ -261,6 +276,12 @@ class Coverage:
             zero_work=self.zero_work + other.zero_work,
             refused=refused,
             reasons={**self.reasons, **other.reasons},
+            # Concatenated, not merged by key: body and head are two graphs,
+            # and the same signature refused in both is two refusals at two
+            # widths. Summing them would report one call site where there are
+            # two, which is the thing the per-name counts already do.
+            refused_signatures=(tuple(self.refused_signatures)
+                                + tuple(other.refused_signatures)),
             sources=sources,
         )
 
@@ -287,6 +308,8 @@ class Coverage:
             "seconds": self.seconds,
             "refused_operators": dict(self.refused),
             "refusal_reasons": dict(self.reasons),
+            "refused_signatures": [dict(entry)
+                                   for entry in self.refused_signatures],
             "sources": dict(self.sources),
         }
 
@@ -306,9 +329,17 @@ class Coverage:
             head = f"{head} ({', '.join(parts)})"
         if self.complete:
             return head
-        missing = ", ".join(f"{n}x {name}"
-                            for name, n in sorted(self.refused.items(),
-                                                  key=lambda kv: -kv[1])[:5])
+        ranked = sorted(self.refused.items(), key=lambda kv: -kv[1])
+        missing = ", ".join(f"{n}x {name}" for name, n in ranked[:5])
+        # What the five shown do not account for, stated rather than left for a
+        # reader to discover by adding them up. Run 4's batch 5 printed five
+        # names summing to 67 against an UNPRICED 68: the sixth name was real,
+        # and the line gave no sign it existed. A truncation that cannot be
+        # detected from the line it truncates is worse than a longer line.
+        rest = sum(n for _, n in ranked[5:])
+        if rest:
+            missing = (f"{missing}, and {rest} more in "
+                       f"{len(ranked) - 5} further names")
         return f"{head}; UNPRICED {self.operators - self.priced}: {missing}"
 
 
@@ -696,11 +727,39 @@ class PriceLibrary:
         refused: dict[str, int] = {}
         reasons: dict[str, str] = {}
         sources: dict[str, int] = {}
+        #: Refused calls gathered by cost key, in the order the graph lists
+        #: them, so the record a reader gets back is the step's own order and
+        #: not a dict's.
+        by_key: dict[str, dict] = {}
         for op in ops:
             record, detail = self.lookup(op, topology, registration)
             if record is None:
                 refused[op["name"]] = refused.get(op["name"], 0) + 1
                 reasons.setdefault(op["name"], detail)
+                key = _cost_key_of(op)
+                entry = by_key.get(key)
+                if entry is None:
+                    by_key[key] = {
+                        "name": op.get("name", ""),
+                        "cost_key": key,
+                        "signature": _signature_of(op),
+                        "input_shapes": op.get("input_shapes"),
+                        # The graph's own field name is `dtypes`, inputs only;
+                        # reading `input_dtypes` here would record None for
+                        # every refusal and look like a graph that lost them.
+                        "dtypes": op.get("dtypes"),
+                        "output_shapes": op.get("output_shapes"),
+                        "output_dtypes": op.get("output_dtypes"),
+                        # In the signature already, repeated as a field because
+                        # this is where a decode attention says max_qlen=1 and a
+                        # prefill says 16384 -- the same operator on the same
+                        # shapes at two unrelated amounts of work.
+                        "scalars": op.get("scalars"),
+                        "occurrences": 1,
+                        "reason": detail,
+                    }
+                else:
+                    entry["occurrences"] += 1
                 continue
             seconds = float(record["seconds"])
             total += seconds
@@ -720,7 +779,8 @@ class PriceLibrary:
         return (total,
                 Coverage(operators=len(ops), measured=measured, seconds=total,
                          interpolated=interpolated, zero_work=zero_work,
-                         refused=refused, reasons=reasons, sources=sources),
+                         refused=refused, reasons=reasons, sources=sources,
+                         refused_signatures=tuple(by_key.values())),
                 launches)
 
     def describe(self) -> str:
@@ -840,6 +900,68 @@ def _binding_key(graph):
         if entries:
             out.append((index, entries))
     return tuple(out)
+
+
+#: How many refusals one process will write before it stops writing. A refusal
+#: raises, so a served run normally produces exactly one -- but a caller that
+#: catches and continues would otherwise fill a disk with the same graph, and
+#: a diagnostic that can take a node down is not one anybody will leave on.
+_DUMPS_WRITTEN = 0
+_DUMP_LIMIT = 4
+
+
+def _dump_refusal(shape: StepShape, graph, head_graph, coverage) -> None:
+    """Write down the step that was refused, if anybody asked to see it.
+
+    Off unless ``COMPASS_REFUSAL_DUMP`` names a directory, so the served path
+    is byte-identical to before for every run that does not want this. What it
+    preserves is the evidence a refusal destroys today: `describe()` keeps five
+    names and a count, and the graph the names came from -- the actual derived
+    body, at the actual widths this step's own allocation bound into it -- is
+    dropped on the way out. Re-deriving it later from a log line is guesswork,
+    and a family cannot be modelled from a name.
+
+    Failures here are swallowed on purpose. This runs one line before a
+    ``ValueError`` that the caller is expecting; turning an unwritable
+    directory into a different exception would hide the refusal behind the
+    diagnostic meant to explain it.
+    """
+    global _DUMPS_WRITTEN
+
+    import os
+
+    target = os.environ.get("COMPASS_REFUSAL_DUMP", "")
+    if not target or _DUMPS_WRITTEN >= _DUMP_LIMIT:
+        return
+    try:
+        from dataclasses import asdict
+
+        _DUMPS_WRITTEN += 1
+        os.makedirs(target, exist_ok=True)
+        path = os.path.join(
+            target,
+            "refusal_b%d_t%d_%d.json" % (
+                shape.batch_size, shape.total_tokens, _DUMPS_WRITTEN))
+        payload = {
+            # The step as the oracle was given it -- lengths per request, not
+            # reduced, because which request is long is the whole question at
+            # a mixed batch.
+            "shape": asdict(shape),
+            "coverage": coverage.as_dict(),
+            # Both regions, whole. The refused operators are in here at their
+            # real shapes and dtypes, which is what a price acquisition or a
+            # family model is actually written against.
+            "body_graph": graph,
+            "head_graph": head_graph,
+        }
+        with open(path, "w") as handle:
+            json.dump(payload, handle, default=str)
+        logger.warning(
+            "ATOMCompass WARNING: refusal evidence written to %s", path)
+    except Exception as error:  # noqa: BLE001 - see docstring
+        logger.warning(
+            "ATOMCompass WARNING: could not write refusal evidence: %s",
+            error)
 
 
 def _price_key(shape: StepShape, graph, head_graph):
@@ -990,6 +1112,7 @@ class LibraryCostOracle:
             self.price_cache_hits += 1
         self.last_coverage = coverage
         if self.require_complete and not coverage.complete:
+            _dump_refusal(shape, graph, head_graph, coverage)
             raise ValueError("incomplete: " + coverage.describe())
         overhead = (launches + head_launches) * self.seconds_per_launch
         breakdown = {"<body>": body, "<overhead>": overhead}

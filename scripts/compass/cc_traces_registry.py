@@ -301,13 +301,21 @@ OPEN_REFUSALS = {
                   "declared as such",
         "first_met": False,
     },
+    # The padded tail below the capture bucket used to be listed here as a
+    # third permanent refusal. It is not one any more: `derive and bind an
+    # ordinary padded decode` (70306a99) traces the padded body and keeps the
+    # binding, and `pack M-RoPE decode positions at the width the graph reads`
+    # (6d01323b) lays the pad inside each M-RoPE section rather than once at
+    # the end, so a three-request step replaying a bucket of four is priced
+    # rather than named. What remains below are the two that are refusals on
+    # purpose.
     "unallocatable_steps": {
         "what": "a step nobody offers an allocation for is refused by name: "
-                "a mixed prefill/decode batch, a row with no state slot, and "
-                "the padded tail below the capture bucket",
+                "a mixed prefill/decode batch, and a row with no state slot",
         "cells": CELLS,
         "closes": "nothing, for cc-traces: with TBO off the scheduler emits "
-                  "no mixed batch, and the other two are refusals on purpose",
+                  "no mixed batch, and a row with no state slot is a refusal "
+                  "on purpose",
         "first_met": False,
     },
 }

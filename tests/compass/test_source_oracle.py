@@ -568,10 +568,18 @@ class TestAskingForFittedPrices:
         What it says about the file is how the two cases are told apart: given
         the graph it names that graph and what the graph itself lacks, and
         given no graph it says there was none.
+
+        The two are reported separately because they are not the same loss. A
+        file with no graph is exact-key-only and nothing can change that. A
+        file WITH a graph that states no width of its own -- no embedding and
+        no `body_rows_traced`, which is every head region -- is still read
+        operator by operator for the families that declare where their width
+        lives, so it lands in `no_file_width` rather than `unbuildable`.
         """
         graph = _template_file(tmp_path)
         library = self._built(tmp_path, interpolate="true").oracle.library
-        assert graph in "".join(library.unbuildable.values())
+        assert graph in "".join(library.no_file_width.values())
+        assert graph not in "".join(library.unbuildable.values())
         bare = build_source_oracle(
             price=_price_file(tmp_path), template=_template_file(tmp_path),
             derive=0, regions="source-27b-tp1-conc-v2",

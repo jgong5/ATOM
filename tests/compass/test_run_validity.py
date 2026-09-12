@@ -64,7 +64,33 @@ class _Stub:
                  ttft: float = 1.0, per_token: float = 0.1,
                  break_ordering: bool = False, git: bool = True,
                  oracle: str | None = None, virtual: bool = False,
-                 arrivals: str = "counter"):
+                 arrivals: str = "counter", abandon: int = 0,
+                 short: int = 0, stop_early: int = 0,
+                 overlong: int = 0, no_usage: bool = False):
+        #: How many of the requests this server abandons: it answers 503 and
+        #: never produces a completion, which is what a real engine that has
+        #: run out of room does and what the client saw on the TP1 run where
+        #: 59 of 62 timed out.
+        self.abandon = abandon
+        #: How many come back with fewer output tokens than were asked for,
+        #: still claiming `finish_reason="length"` -- a generation the engine
+        #: cut off rather than one the model ended.
+        self.short = short
+        #: How many stop on the model's own EOS one token short. The client
+        #: asks for `ignore_eos`, so this cannot happen to a request it sent;
+        #: it is here because a reply that claims it did happen still did not
+        #: replay the registered length, and must not be waved through on the
+        #: strength of its finish reason.
+        self.stop_early = stop_early
+        #: How many come back with *more* output tokens than were asked for.
+        #: A mismatch in the other direction, and just as much a different
+        #: workload from the registered one.
+        self.overlong = overlong
+        #: Answer without `usage.completion_tokens`, so nothing can be said
+        #: about what was produced.
+        self.no_usage = no_usage
+        #: Requests answered so far, which is how the counts above are spent.
+        self.served = 0
         self.calibration = calibration
         self.provenance = provenance
         self.git = git
@@ -84,21 +110,51 @@ class _Stub:
         self.ttft = ttft
         self.per_token = per_token
         self.break_ordering = break_ordering
+        #: Every completion body this server was sent, in arrival order, so a
+        #: test can ask what the client actually requested rather than what
+        #: it says it requests.
+        self.bodies: list[dict] = []
         self.records: list[dict] = []
         self._next_arrival = 0.0
         self._served_until = 0.0
         self._lock = threading.Lock()
 
-    def completion(self, body: dict) -> dict:
+    def completion(self, body: dict):
+        """The reply, or None for a request this server abandons.
+
+        Abandonment is answered as a 503 by the handler rather than by never
+        replying: a test that waited out a real timeout would take the
+        client's `--timeout` to run, and what is under test is what the client
+        does with a request that did not produce a completion, not how long it
+        waits for one.
+        """
+        with self._lock:
+            self.bodies.append(body)
         prompt_tokens = len(body["prompt"].split())
         n = int(body["max_tokens"])
         with self._lock:
+            self.served += 1
+            mine = self.served
+            if mine <= self.abandon:
+                return None
+            produced, reason = n, "length"
+            if mine <= self.abandon + self.short:
+                # Cut off: fewer tokens than asked for, and the engine still
+                # says it stopped because it reached the length.
+                produced, reason = max(0, n - 1), "length"
+            elif mine <= self.abandon + self.short + self.stop_early:
+                # Ended by the model rather than by the engine. Still short.
+                produced, reason = max(1, n - 1), "stop"
+            elif (mine <= self.abandon + self.short + self.stop_early
+                    + self.overlong):
+                # More than was asked for, reported as reaching the length.
+                produced, reason = n + 1, "length"
             arrive = {"epoch": 0.0, "serial": self._served_until}.get(
                 self.arrivals, self._next_arrival)
             self._next_arrival += 0.5
             rid = f"cmpl-{len(self.records)}"
             first = arrive + self.ttft
-            finish = first + self.per_token * max(0, n - 1)
+            finish = first + self.per_token * max(0, produced - 1)
             self._served_until = max(self._served_until, finish)
             if self.break_ordering and not self.records:
                 first, arrive = arrive, first  # first token before arrival
@@ -108,12 +164,14 @@ class _Stub:
                 "finish_time": finish,
                 "ttft": first - arrive, "latency": finish - arrive,
             })
+        usage = {"prompt_tokens": prompt_tokens,
+                 "total_tokens": prompt_tokens + produced}
+        if not self.no_usage:
+            usage["completion_tokens"] = produced
         return {"id": rid, "object": "text_completion", "model": body["model"],
-                "choices": [{"index": 0, "text": "x " * n,
-                             "finish_reason": "length"}],
-                "usage": {"prompt_tokens": prompt_tokens,
-                          "completion_tokens": n,
-                          "total_tokens": prompt_tokens + n}}
+                "choices": [{"index": 0, "text": "x " * produced,
+                             "finish_reason": reason}],
+                "usage": usage}
 
     def requests_blob(self) -> dict:
         kept = list(self.records[self.drop_records:] if self.drop_records
@@ -178,7 +236,11 @@ def _serve(stub: _Stub):
             if self.path.startswith("/compass/requests"):
                 self._json(stub.requests_blob())
             elif self.path.startswith("/v1/completions"):
-                self._json(stub.completion(body))
+                reply = stub.completion(body)
+                if reply is None:
+                    self._json({"detail": "engine overloaded"}, code=503)
+                else:
+                    self._json(reply)
             else:
                 self._json({"detail": "no"}, code=404)
 
@@ -207,6 +269,151 @@ def _run(stub: _Stub, trace: Path, out: Path, extra=()) -> int:
     finally:
         server.shutdown()
         server.server_close()
+
+
+class TestARunThatDidNotCompleteExitsNonZero:
+    """Reporting "0 failed" was the client's opinion of its own sending.
+
+    A TP1 development run answered 3 of 62 requests -- the other 59 timed out
+    -- and `replay.py` exited 0, wrote a manifest saying `failed: 0`, and the
+    artifact was read as a measurement. The client counted only the requests
+    whose *send* raised, and a request that was accepted and then abandoned
+    raised nothing on the way out.
+
+    These drive the real client against a socket that abandons, cuts short and
+    under-reports, and assert on the exit code an operator or the acceptance
+    harness actually reads.
+    """
+
+    def _manifest(self, out: Path) -> dict:
+        return json.loads(out.read_text())["run"]
+
+    def test_a_workload_that_completed_still_exits_zero(self, tmp_path, trace):
+        """The control. Everything below has to fail *against* this."""
+        out = tmp_path / "run.json"
+        assert _run(_Stub(), trace, out) == 0
+        manifest = self._manifest(out)
+        assert manifest["complete"] is True
+        assert (manifest["completed"], manifest["requests"]) == (3, 3)
+        assert (manifest["failed"], manifest["missing"],
+                manifest["truncated"]) == (0, 0, 0)
+        assert manifest["incomplete_reasons"] is None
+
+    def test_requests_the_engine_abandoned_fail_the_run(self, tmp_path, trace):
+        out = tmp_path / "run.json"
+        assert _run(_Stub(abandon=2), trace, out) == replay.INCOMPLETE_EXIT
+        manifest = self._manifest(out)
+        assert manifest["complete"] is False
+        assert manifest["failed"] == 2
+        assert manifest["completed"] == 1
+
+    def test_the_artifact_survives_the_failure(self, tmp_path, trace):
+        """Written first, then failed. Deleting it would leave only a log
+        line, and the file is what says which requests did not complete."""
+        out = tmp_path / "run.json"
+        assert _run(_Stub(abandon=3), trace, out) == replay.INCOMPLETE_EXIT
+        blob = json.loads(out.read_text())
+        assert len(blob["results"]) == 3
+        assert not any(r["ok"] for r in blob["results"])
+
+    def test_the_reasons_are_counted_rather_than_sampled(self, tmp_path, trace,
+                                                         capsys):
+        """Fifty-nine timeouts and fifty-eight timeouts plus one 400 are
+        different runs, and only the second is worth getting out of bed for.
+        The old client printed the first failure and nothing else."""
+        out = tmp_path / "run.json"
+        assert _run(_Stub(abandon=2), trace, out) == replay.INCOMPLETE_EXIT
+        reasons = self._manifest(out)["incomplete_reasons"]["failed"]
+        assert [r["requests"] for r in reasons] == [2]
+        assert "503" in reasons[0]["reason"]
+        assert "2 failed: " in capsys.readouterr().err
+
+    def test_a_completion_cut_short_is_not_a_completion(self, tmp_path, trace):
+        """Three of four tokens, and the engine still calling it "length".
+        The step sequence such a run performed is not the trace's, so the
+        artifact's metrics are over a workload nobody asked for."""
+        out = tmp_path / "run.json"
+        assert _run(_Stub(short=1), trace, out) == replay.INCOMPLETE_EXIT
+        manifest = self._manifest(out)
+        assert (manifest["truncated"], manifest["failed"]) == (1, 0)
+        assert manifest["completed"] == 2
+        reason = manifest["incomplete_reasons"]["truncated"][0]["reason"]
+        assert "produced 3 output tokens where 4 were registered" in reason
+
+    def test_a_sequence_the_model_ended_itself_is_still_short(self, tmp_path,
+                                                              trace):
+        """`finish_reason="stop"` names the cause, not a dispensation. The
+        client asks for `ignore_eos`, so a reply that stopped early did not
+        run the registered decode lengths however it reports itself, and a
+        comparison against it would be over a different workload."""
+        out = tmp_path / "run.json"
+        assert _run(_Stub(stop_early=3), trace, out) == replay.INCOMPLETE_EXIT
+        manifest = self._manifest(out)
+        assert (manifest["truncated"], manifest["completed"]) == (3, 0)
+        assert manifest["complete"] is False
+        assert "'stop'" in (
+            manifest["incomplete_reasons"]["truncated"][0]["reason"])
+
+    def test_a_reply_longer_than_asked_for_is_a_mismatch_too(self, tmp_path,
+                                                             trace):
+        """The other direction. An extra token is an extra decode step, so an
+        over-produced reply is no more the registered workload than a short
+        one -- and a `got >= want` check would have taken it."""
+        out = tmp_path / "run.json"
+        assert _run(_Stub(overlong=1), trace, out) == replay.INCOMPLETE_EXIT
+        manifest = self._manifest(out)
+        assert (manifest["truncated"], manifest["completed"]) == (1, 2)
+        reason = manifest["incomplete_reasons"]["truncated"][0]["reason"]
+        assert "produced 5 output tokens where 4 were registered" in reason
+
+    def test_fixed_length_generation_is_what_was_asked_for(self, tmp_path,
+                                                           trace):
+        """Enforcing the count is only honest if the client asked for it.
+        `CompletionRequest.ignore_eos` is what says "run the whole length"
+        (atom/entrypoints/openai/protocol.py:246 -> api_server.py:1697); this
+        client never sent it, so every request it made was free to stop early
+        and the count check below could be argued with."""
+        stub = _Stub()
+        out = tmp_path / "run.json"
+        assert _run(stub, trace, out) == 0
+        assert len(stub.bodies) == 3
+        assert all(b.get("ignore_eos") is True for b in stub.bodies)
+
+    def test_a_reply_that_counts_nothing_cannot_be_read_as_complete(
+            self, tmp_path, trace):
+        """`compare.py` already refuses a run whose replies carry no
+        `usage.completion_tokens`, so a client that accepted one would write
+        an artifact nothing downstream will take."""
+        out = tmp_path / "run.json"
+        assert _run(_Stub(no_usage=True), trace, out) == replay.INCOMPLETE_EXIT
+        manifest = self._manifest(out)
+        assert manifest["truncated"] == 3
+        assert "usage.completion_tokens" in (
+            manifest["incomplete_reasons"]["truncated"][0]["reason"])
+
+    def test_the_incomplete_exit_is_its_own_code(self):
+        """Not the refusal's, which the harness reads as "do not retry", and
+        not the barrier's: three boundaries, three codes, so a log line says
+        which one rejected the run."""
+        assert replay.INCOMPLETE_EXIT not in (0, 1, 3)
+
+    def test_the_shortfall_is_named_without_the_length_check(self, tmp_path,
+                                                             trace, capsys):
+        """`--check-lengths` is optional and the tally is not. Run without it,
+        as the acceptance plan's modelled side is, and the warning still says
+        how much of the workload ran."""
+        stub = _Stub(abandon=2)
+        server = _serve(stub)
+        out = tmp_path / "run.json"
+        try:
+            code = replay.main(["--port", str(server.server_address[1]),
+                                "--trace", str(trace), "--out", str(out)])
+        finally:
+            server.shutdown()
+            server.server_close()
+        assert code == replay.INCOMPLETE_EXIT
+        assert self._manifest(out)["complete"] is False
+        assert "1 of 3 requests completed" in capsys.readouterr().err
 
 
 class TestTheClientRecordsWhoServedIt:

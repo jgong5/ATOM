@@ -350,6 +350,78 @@ class TestWhatWasNotPricedIsSaidRatherThanZeroed:
             oracle.estimate(shape)
 
 
+    def test_the_summary_says_what_it_left_out(self, tmp_path):
+        """Five names and a total that do not agree is a silent truncation.
+
+        Run 4's batch 5 printed `UNPRICED 68` above five names summing to 67.
+        The sixth was real and the line gave no sign it existed, which sent a
+        reader to classify three operators as the whole remainder.
+        """
+        known = _op("aiter::gemm", [[16, 4096], [4096, 4096]])
+        unknown = [_op(f"aten::op{i}", [[16, 4096]]) for i in range(7)]
+        prices = _price_list(tmp_path, "p.json", [known], 1e-3)
+        lib = PriceLibrary.load([(prices, None)])
+        _s, coverage, _l = lib.body(_graph([known] + unknown))
+        line = coverage.describe()
+        assert "UNPRICED 7" in line
+        assert "and 2 more in 2 further names" in line
+
+    def test_a_refusal_keeps_the_call_not_only_the_name(self, tmp_path):
+        """A name is not something anyone can measure or model."""
+        known = _op("aiter::gemm", [[16, 4096], [4096, 4096]])
+        unknown = _op("aten::slice.Tensor", [[14592, 1792]])
+        prices = _price_list(tmp_path, "p.json", [known], 1e-3)
+        lib = PriceLibrary.load([(prices, None)])
+        _s, coverage, _l = lib.body(_graph([known, unknown, unknown]))
+        assert len(coverage.refused_signatures) == 1
+        entry = coverage.refused_signatures[0]
+        assert entry["name"] == "aten::slice.Tensor"
+        assert entry["input_shapes"] == [[14592, 1792]]
+        assert entry["dtypes"] == ["bfloat16"]
+        # Two calls of one signature are one thing to model, counted twice --
+        # not two things.
+        assert entry["occurrences"] == 2
+
+    def test_the_refused_step_is_written_down_when_asked(
+        self, tmp_path, monkeypatch):
+        """The graph a refusal names, kept rather than dropped on the way out."""
+        known = _op("aiter::gemm", [[16, 4096], [4096, 4096]])
+        unknown = _op("aten::index.Tensor", [[14592, 1792]])
+        prices = _price_list(tmp_path, "p.json", [known], 1e-3)
+        shape = StepShape(num_scheduled_tokens=(14592, 1792),
+                          context_lens=(49152, 0))
+        graphs = StaticGraphs({StaticGraphs.key(shape):
+                               _graph([known, unknown])})
+        oracle = LibraryCostOracle(PriceLibrary.load([(prices, None)]), graphs,
+                                   require_complete=True)
+        monkeypatch.setenv("COMPASS_REFUSAL_DUMP", str(tmp_path / "dumps"))
+        with pytest.raises(ValueError, match="incomplete"):
+            oracle.estimate(shape)
+        written = list((tmp_path / "dumps").glob("refusal_*.json"))
+        assert len(written) == 1
+        blob = json.loads(written[0].read_text())
+        assert blob["shape"]["num_scheduled_tokens"] == [14592, 1792]
+        assert [op["name"] for op in blob["body_graph"]["ops"]] == [
+            "aiter::gemm", "aten::index.Tensor"]
+        assert blob["coverage"]["refused_signatures"][0]["name"] == (
+            "aten::index.Tensor")
+
+    def test_nothing_is_written_when_nobody_asked(self, tmp_path, monkeypatch):
+        """A diagnostic that writes by default is a diagnostic that fills a
+        node's disk during acceptance."""
+        known = _op("aiter::gemm", [[16, 4096], [4096, 4096]])
+        unknown = _op("aten::index.Tensor", [[14592, 1792]])
+        prices = _price_list(tmp_path, "p.json", [known], 1e-3)
+        shape = StepShape(num_scheduled_tokens=(1,), context_lens=(16,))
+        graphs = StaticGraphs({StaticGraphs.key(shape):
+                               _graph([known, unknown])})
+        oracle = LibraryCostOracle(PriceLibrary.load([(prices, None)]), graphs,
+                                   require_complete=True)
+        monkeypatch.delenv("COMPASS_REFUSAL_DUMP", raising=False)
+        with pytest.raises(ValueError, match="incomplete"):
+            oracle.estimate(shape)
+        assert list(tmp_path.glob("**/refusal_*.json")) == []
+
 class TestALibraryKnowsWhatItIsMadeOf:
 
     def test_a_narrowed_run_marks_the_library_partial(self, tmp_path):

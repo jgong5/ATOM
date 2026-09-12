@@ -101,6 +101,62 @@ class TraceRequest:
     model: str = ""
 
 
+def head_rows_padded(args, spec) -> Optional[bool]:
+    """Does production project this step's *padded* rows through the LM head?
+
+    Not the same question as where the head runs, though the answer turns on
+    the same flag. A FULL capture at TP1 computes `compute_logits` inside the
+    graph over `outputs[:num_tokens]` with `num_tokens = bs * max_q_len` --
+    the bucket (model_runner.py:4293-4300) -- and the replay narrows the result
+    with `graph_logits[key][:num_tokens]` afterwards (:3238-3239), so the
+    projection really is the bucket's width. Every other path narrows first:
+    the runner hands `compute_logits` hidden states it has already sliced to
+    `scheduled_bs * max_q_len` (:3189, :3235, :3241), and the head is the
+    batch's width whatever the body's was.
+
+    So a padded decode has two extents in one step, and a head traced at the
+    body's is a wider projection than TP2 runs while one traced at the batch's
+    is a narrower projection than TP1 runs.
+
+    ``False`` whenever there is no bucket: an eager step pads nothing, at any
+    width. ``None`` only when a bucket is declared and ``--cudagraph-mode`` is
+    not -- the padding then turns on a deployment fact nobody supplied, and
+    either answer is wrong in the way that shows up as a plausible number.
+    """
+    bucket = getattr(spec, "capture_bucket", None)
+    if bucket is None:
+        bucket = getattr(args, "capture_bucket", None)
+    if bucket is None:
+        return False
+    kind = step_kind(args, spec)
+    mode = getattr(args, "cudagraph_mode", None)
+    if mode is None or kind is None:
+        return None
+    return kind == "decode" and mode == "full" and args.tp == 1
+
+
+def head_rows_for(args, spec) -> Optional[int]:
+    """How many rows this step hands ``compute_logits``; None without a spec.
+
+    Refuses rather than guesses when :func:`head_rows_padded` cannot answer.
+    This is the width the head region is *traced* at, so a guess does not
+    survive anywhere as an assumption a reader could meet -- it is simply a
+    head graph of the wrong shape, priced without complaint.
+    """
+    if spec is None:
+        return None
+    padded = head_rows_padded(args, spec)
+    if padded is None:
+        raise BuildRefusal(
+            "this step declares a capture bucket but no cudagraph mode, and "
+            "the LM head's width turns on which: a FULL replay at TP1 projects "
+            "the padded bucket inside the body graph and slices afterwards, "
+            "every other path slices the hidden states to the scheduled rows "
+            "and projects those. Declare the mode rather than tracing a head "
+            "at one of the two widths.")
+    return spec.padded_rows if padded else spec.num_tokens
+
+
 def head_placement(args, spec, notes) -> dict:
     """Whether production runs this step's LM head inside the replayed body.
 
@@ -148,13 +204,12 @@ def head_placement(args, spec, notes) -> dict:
                  "(piecewise branch), :3238-3241 (full-replay branch), :4104 "
                  "(logits_in_graph)"),
         "assumes": "two-batch overlap off",
-        # The head's rows are not the body's. A FULL capture projects the whole
-        # padded bucket, `compute_logits(outputs[:num_tokens])` with
-        # `num_tokens = bs * max_q_len` (:4297), and the replay slices
-        # `graph_logits[key][:num_tokens]` afterwards (:3239). Every eager head
-        # instead receives hidden states already cut to `scheduled_bs *
-        # max_q_len` (:3189, :3228-3230). This graph is the eager shape.
-        "rows_padded_to_capture_bucket": False,
+        # The head's rows are not the body's, and which of the two this graph
+        # holds is not a constant: see `head_rows_padded`. It was `False`
+        # unconditionally, which is right for every eager step and wrong for
+        # the one configuration that captures the head -- TP1, FULL, decode --
+        # where the projection is the bucket's width and the slice comes after.
+        "rows_padded_to_capture_bucket": head_rows_padded(args, spec),
         "rows_into_compute_logits": notes.get("hidden_rows"),
     }
 
@@ -248,6 +303,8 @@ def execution_record(args, spec, notes) -> dict:
     it is recorded as unknown rather than assumed equal to the real count.
     """
     bucket = getattr(args, "capture_bucket", None)
+    if spec is not None and spec.capture_bucket is not None:
+        bucket = spec.capture_bucket
     return {
         "step_kind": step_kind(args, spec),
         "cudagraph_mode": getattr(args, "cudagraph_mode", None),
@@ -255,8 +312,14 @@ def execution_record(args, spec, notes) -> dict:
         "body_rows_traced": notes.get("body_rows"),
         # Rows the step really has, before any padding.
         "rows_real": spec.num_tokens if spec is not None else args.tokens,
-        # Rows a replay would forward, when the step replays one.
-        "body_rows_executed": bucket,
+        # Rows a replay would forward, when the step replays one. Rows, not
+        # requests: `num_tokens_pad = running_bs * max_q_len`, which is the
+        # bucket only when each request computes one token. This used to
+        # report the bucket itself, so a speculative decode's executed height
+        # was understated by the factor `max_q_len` -- and matched the trace
+        # only because the trace was wrong in the same place.
+        "body_rows_executed": (spec.padded_rows if spec is not None
+                               else bucket),
         "capture_bucket": bucket,
         "head_rows_traced": notes.get("hidden_rows"),
         "regions_traced": REGION_INCLUDES[getattr(args, "region", "body")],
@@ -276,8 +339,26 @@ def init_env(tp: int) -> None:
     os.environ.setdefault("WORLD_SIZE", "1")
 
 
+def _head_input(hidden, head_rows: Optional[int]):
+    """The hidden states the runner would hand ``compute_logits``.
+
+    A narrowing only. ``head_rows`` above the body's height is a caller error
+    rather than something to pad up to: the head reads the body's output, and
+    rows the body never computed do not exist to project.
+    """
+    if head_rows is None:
+        return hidden
+    rows = int(hidden.shape[0])
+    if head_rows > rows:
+        raise BuildRefusal(
+            f"the LM head was asked for {head_rows} rows and the body "
+            f"produced {rows}; a head cannot project rows the body did not "
+            "compute")
+    return hidden if head_rows == rows else hidden[:head_rows]
+
+
 def trace_regions(model, input_ids, positions, topology=None, on_meta=False,
-                  spec=None, region="body"):
+                  spec=None, region="body", head_rows=None):
     """Run one forward under the tracers, returning the combined graph.
 
     ``region`` says what is recorded.
@@ -298,6 +379,14 @@ def trace_regions(model, input_ids, positions, topology=None, on_meta=False,
     already has one row per sequence. So this must be traced with the batch
     spec installed, exactly as attention is, or a 16384-token prefill would
     record a head 16384 rows wide against the 1 row production computes.
+
+    ``head_rows`` is the other half of that. How many of the body's rows reach
+    `compute_logits` is not how many the body ran, once a decode is padded: the
+    runner either projects the whole bucket inside the capture and slices the
+    logits (TP1, FULL) or slices the hidden states and projects the scheduled
+    rows (everything else) -- see :func:`head_rows_padded`. ``None`` keeps
+    every row, which is right for an unpadded step and is what a caller with no
+    spec gets.
 
     Still outside every region: sampling, input preparation, and the runner's
     own host work. Those are named in the graph's provenance rather than left
@@ -347,6 +436,7 @@ def trace_regions(model, input_ids, positions, topology=None, on_meta=False,
             with record_collectives(scratch.graph, tracer=scratch), \
                     TritonLaunchTracer(graph=scratch.graph), scratch:
                 hidden = model(input_ids, positions)
+            hidden = _head_input(hidden, head_rows)
             notes["hidden_rows"] = int(hidden.shape[0])
             t0 = time.perf_counter()
             with collectives, triton, ops:
@@ -354,7 +444,12 @@ def trace_regions(model, input_ids, positions, topology=None, on_meta=False,
         elif region == "both":
             t0 = time.perf_counter()
             with collectives, triton, ops:
-                model.compute_logits(model(input_ids, positions))
+                # The slice is inside the traced region because it is inside
+                # the captured one: `outputs[:num_tokens]` is an operator of
+                # the graph the runner captures (model_runner.py:4296-4300).
+                hidden = _head_input(model(input_ids, positions), head_rows)
+                notes["hidden_rows"] = int(hidden.shape[0])
+                model.compute_logits(hidden)
         else:
             t0 = time.perf_counter()
             with collectives, triton, ops:
@@ -598,13 +693,20 @@ class ModelTracer:
         # fp32 it is recorded as `...|1;4,5120;5120;4,5120|float32,bfloat16,
         # bfloat16,bfloat16`, against the capture's all-bfloat16, and every
         # fused qk-rmsnorm in the graph then misses its price by dtype alone.
+        # How many of the body's rows the head projects, decided here rather
+        # than in `trace_regions` because it is a question about the
+        # deployment -- the cudagraph mode and the width -- and those are on
+        # the request, not on the batch. Refuses when the request does not say.
+        head_rows = (head_rows_for(request, spec)
+                     if request.region in ("head", "both") else None)
+
         prev_dtype = torch.get_default_dtype()
         torch.set_default_dtype(self.config.torch_dtype)
         try:
             graph, trace_s, redirected, notes = trace_regions(
                 self.model, *inputs, topology={"tp": self.tp},
                 on_meta=self.device.type == "meta", spec=spec,
-                region=request.region)
+                region=request.region, head_rows=head_rows)
         finally:
             torch.set_default_dtype(prev_dtype)
 

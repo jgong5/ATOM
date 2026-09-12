@@ -65,6 +65,7 @@ from atom.compass.core.cost.families import attention, attention_scope
 from atom.compass.core.cost.families.features import (
     contract_for,
     grouping_key,
+    executed_rows,
     infer_rows,
 )
 from atom.compass.core.cost.families.support import (
@@ -502,8 +503,9 @@ class ParametricPriceLibrary(PriceLibrary):
         #: file gives a signature string; the structured operator is what a
         #: feature map can be read off, and only a graph supplies it.
         self._ops: dict[str, dict] = {}
-        #: price file -> the row count that run was measured at
-        self._rows: dict[str, int] = {}
+        #: price file -> the row count that run was measured at, or None when
+        #: the file states no width of its own and its operators must
+        self._rows: dict[str, Optional[int]] = {}
         #: price file -> {signature -> the operator THAT file's graph recorded}
         #: Needed beside `_ops` because a key does not carry layout: two
         #: files can price the same key on differently arranged memory, and
@@ -517,6 +519,18 @@ class ParametricPriceLibrary(PriceLibrary):
         #: price file -> (executed rows, scheduled tokens) where a capture
         #: bucket makes the two differ, so the padding stays visible
         self.padded: dict[str, tuple[int, int]] = {}
+        #: price file -> why it states no width of its own, when it does not.
+        #: Not the same as `unbuildable`: a head graph has no embedding and no
+        #: `body_rows_traced`, so it states no file width at all, and yet every
+        #: operator in it whose family declares `rows_from` still says what
+        #: width IT ran at. Those files are usable per operator and refused
+        #: only for the families that have no such reading.
+        #:
+        #: A graph whose two width statements CONTRADICT each other is not
+        #: here -- it stays in `unbuildable`. Silence about the width and a
+        #: contradiction about it are different facts, and only the first one
+        #: leaves the operators trustworthy.
+        self.no_file_width: dict[str, str] = {}
         #: Every ragged attention price as it was written, before the library
         #: reindexes it: (op, seconds, source, scope). Collected here rather
         #: than read back out of `self._prices` because `_ingest` files records
@@ -581,14 +595,35 @@ class ParametricPriceLibrary(PriceLibrary):
         self._collect_attention(price_path, _blob, graph, registration)
         reading = _traced_rows(graph)
         if isinstance(reading, tuple):
-            self.unbuildable[price_path] = f"{graph_path}: {reading[1]}"
-            return
-        rows = reading
-        scheduled = sum((graph.get("key") or {}).get("batch_signature") or ())
-        if scheduled and scheduled != rows:
-            # Legitimate under a capture bucket, and worth saying out loud: the
-            # prices are of the padded width, not of the scheduled one.
-            self.padded[price_path] = (rows, scheduled)
+            _, why, conflicting = reading
+            if conflicting:
+                # The graph states a width twice and the two disagree. That is
+                # not a missing reading, it is an untrustworthy one, and the
+                # per-operator readings come off the same graph: a body whose
+                # provenance and embedding contradict each other is not a
+                # source an interpolated price may be built from just because
+                # its GEMM happens to declare `rows_from`. Refused as a whole,
+                # exactly as it was before any operator could state a width.
+                self.unbuildable[price_path] = f"{graph_path}: {why}"
+                return
+            # No width for the file as a whole, and nothing contradicting it
+            # either. That used to end the file's usefulness, which is why
+            # every head price file was exact-key only: a head graph carries
+            # neither an embedding nor `body_rows_traced`, so it could never
+            # state one. It is only fatal for families that have no operand
+            # reading of their own; the operators that do are still
+            # measurements of a known width, and `_build` reads them one at a
+            # time below.
+            rows = None
+            self.no_file_width[price_path] = f"{graph_path}: {why}"
+        else:
+            rows = reading
+            scheduled = sum((graph.get("key") or {}).get("batch_signature")
+                            or ())
+            if scheduled and scheduled != rows:
+                # Legitimate under a capture bucket, and worth saying out loud:
+                # the prices are of the padded width, not of the scheduled one.
+                self.padded[price_path] = (rows, scheduled)
         self._rows[price_path] = rows
         from atom.compass.runtime.microbench import cost_key_of, signature_of
 
@@ -840,7 +875,23 @@ class ParametricPriceLibrary(PriceLibrary):
                 contract = contract_for(op.get("name", ""))
                 if contract is None or contract.kind != "rows":
                     continue
-                rows = self._rows.get(source)
+                # The width this observation is a measurement OF. Read off the
+                # operator first where its family declares where to look,
+                # because the two readings are not the same number in the head
+                # region: a head graph traced over 16384 hidden rows contains
+                # an LM-head GEMM that ran at the request count, because
+                # `compute_logits` selects each request's last token before
+                # multiplying. Filing that GEMM at 16384 rows would put a
+                # measurement of 2 rows of work on the 16384-row curve.
+                #
+                # For families with no declared reading the file's width is
+                # still the only statement available, and it is used unchanged
+                # -- this is a per-family refinement, not a new default. On the
+                # existing library the two agree wherever both exist: 40 of 40
+                # `gemm_a16w16` observations in run 5's price list.
+                rows = executed_rows(op)
+                if rows is None:
+                    rows = self._rows.get(source)
                 seconds = record.get("seconds")
                 if rows is None or seconds is None:
                     continue
@@ -867,6 +918,10 @@ class ParametricPriceLibrary(PriceLibrary):
             return None, (f"{original}; and {op.get('name', '?')} has no "
                           "declared family contract, so there is no statement "
                           "of what its price may depend on")
+        if contract.kind == "view":
+            # Not a curve: a family whose price is structurally absent when the
+            # recording proves it, and refused when the recording does not.
+            return self._view_price(op, original, contract)
         if contract.kind != "rows":
             return self._modelled(op, original, contract, topology,
                                   registration)
@@ -897,6 +952,58 @@ class ParametricPriceLibrary(PriceLibrary):
                      **{INTERPOLATED_FLAG: True}),
                 f"{INTERPOLATED_SCHEME}{contract.family}/rows={verified_rows}")
 
+    def _view_price(self, op: dict, original: str, contract):
+        """Zero seconds, but only where the recording proves nothing ran.
+
+        A slice that returns a view dispatches no kernel: the output is the
+        input's storage at an offset, and producing it is host bookkeeping.
+        That is not something to be measured and found small -- it is work that
+        does not exist -- so it is declared, and it is declared from evidence
+        the graph carries rather than from the operator's name.
+
+        `output_aliases` is that evidence. It records, per output, whether the
+        operator allocated it, decided as the trace ran by whether the output's
+        storage is one of the operator's own inputs. An index means it wrote
+        into a tensor that already existed; `None` means it allocated.
+
+        Three outcomes, and the two refusals matter as much as the price:
+
+        * no `output_aliases` at all -- a graph written before the field was
+          recorded. Empty means *not known*, which the field's own docstring is
+          careful to distinguish from *the same as the input*. Refused.
+        * an output the operator allocated -- then it copied rather than
+          viewed, and a copy of an arbitrary extent is real work that no
+          measurement here covers. Refused.
+        * every output an alias -- no kernel, and the price is zero.
+
+        Reported under `ZERO_WORK_FLAG`, which exists for exactly this: fully
+        accounted for, not a measurement, and never inferred from a zero time.
+        """
+        aliases = op.get("output_aliases")
+        if not aliases:
+            return None, (
+                f"{original}; {contract.family} is priced at zero only where "
+                "the recording shows it allocated nothing, and this graph "
+                "records no output_aliases -- which is not known, not the same "
+                "as not allocated")
+        if any(alias is None for alias in aliases):
+            return None, (
+                f"{original}; this {contract.family} allocated its output, so "
+                "it copied rather than viewed, and a copy is work no "
+                "measurement here covers")
+        return ({"seconds": 0.0,
+                 "kernels": {},
+                 "occurrences": 1,
+                 "name": contract.family,
+                 ZERO_WORK_FLAG: True,
+                 "structural": {
+                     "family": contract.family,
+                     "basis": "alias",
+                     "output_aliases": list(aliases),
+                     "detail": ("output aliases an operand's storage, so no "
+                                "kernel is dispatched"),
+                 }},
+                f"structural://{contract.family}/alias")
     def _modelled(self, op: dict, original: str, contract, topology=None,
                   registration=None):
         """A ragged family's price from its regime's law, or why there is none.
@@ -1257,6 +1364,9 @@ class ParametricPriceLibrary(PriceLibrary):
                 f"max gap ratio {self.max_gap_ratio}")
         if self.unbuildable:
             note += f"; {len(self.unbuildable)} file(s) exact-signature only"
+        if self.no_file_width:
+            note += (f"; {len(self.no_file_width)} file(s) state no width of "
+                     "their own and are read per operator")
         if self._attention_obs:
             note += ("; %d ragged attention observation(s) over %d design "
                      "point(s)" % (len(self._attention_obs),
@@ -1264,7 +1374,7 @@ class ParametricPriceLibrary(PriceLibrary):
         return base + note
 
 
-def _traced_rows(graph: dict) -> Optional[int] | tuple[None, str]:
+def _traced_rows(graph: dict) -> Optional[int] | tuple[None, str, bool]:
     """The width this graph's operators actually ran at.
 
     Three readings can be present and they are not the same number:
@@ -1285,8 +1395,13 @@ def _traced_rows(graph: dict) -> Optional[int] | tuple[None, str]:
         used as the width -- reading it as one is exactly the actual-for-padded
         substitution that has to stay visible -- but a difference is recorded.
 
-    A disagreement between the first two is a real conflict and refuses the
-    file rather than picking one.
+    A disagreement between the first two is a real conflict. It is returned
+    distinctly from an absent reading, because the two are not the same loss:
+    a graph that states no width can still hold operators that state their
+    own, while a graph whose two statements contradict each other is not a
+    trustworthy source for any of them.
+
+    Returns the width, or ``(None, why, conflicting)``.
     """
     declared = ((graph.get("provenance") or {})
                 .get("execution", {})
@@ -1306,12 +1421,13 @@ def _traced_rows(graph: dict) -> Optional[int] | tuple[None, str]:
         return None, (
             f"provenance says the body was traced over {declared} rows and its "
             f"own embedding runs {executed}; those are different widths and "
-            "choosing between them would be a guess")
+            "choosing between them would be a guess"), True
     rows = declared if declared is not None else executed
     if rows is None or rows <= 0:
         return None, (
             "the graph records neither provenance.execution.body_rows_traced "
-            "nor an embedding whose token operand states the executed width")
+            "nor an embedding whose token operand states the executed width"), False
+    return rows
     return rows
 
 

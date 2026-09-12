@@ -799,11 +799,32 @@ def _cold_designs():
 
 def test_a_standalone_attention_graph_is_collected_though_it_has_no_body(
         tmp_path):
-    """A primitive graph has no embedding and no `body_rows_traced`, so the
-    row-family check refuses it -- correctly, and irrelevantly. The attention
-    observations are taken before that refusal, not after it."""
+    """A primitive graph has no embedding and no `body_rows_traced`, so it
+    states no width of its own -- and the attention observations are taken
+    before that fact is consulted, not after it.
+
+    The premise assertion below changed at the merge of the head/native path
+    and is worth naming, because the change is real and not cosmetic. This
+    test was written when a file that stated no width went into
+    `unbuildable`, meaning exact-signature only. It now goes into
+    `no_file_width`, a separate bucket introduced so that silence about the
+    width and a CONTRADICTION about it stop being the same fact: a file that
+    says nothing still lets every operator whose family declares `rows_from`
+    say what width it ran at, while a file that contradicts itself does not.
+
+    So "the row curve cannot use these files" is no longer true as a blanket
+    statement, and asserting it via `unbuildable` would now assert something
+    false. What is still true, and is what this test actually needs, is that
+    these files state no width of their own -- and that attention is refused
+    by the row path regardless, because it is ragged and no row count stands
+    in for how a batch pairs queries with histories.
+    """
     library = _library(tmp_path, _cold_designs())
-    assert library.unbuildable  # the row curve cannot use these files
+    assert library.no_file_width  # these files state no width of their own
+    assert not library.unbuildable  # and none of them contradicts itself
+    # Four cold designs, not the three this fixture carried before the
+    # unified prefill law gained its `calls` term: four points is what
+    # identifies it.
     assert len(library._attention_obs) == 4 * 16
     assert len(library.attention_design_points()) == 4
 
