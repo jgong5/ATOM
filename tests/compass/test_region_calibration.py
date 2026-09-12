@@ -222,19 +222,15 @@ class TestADigestOverEveryCoefficient:
         assert digest(1.0e-4) != digest(1.05e-4)
 
 
-class TestTheValidatorRequiresADeclaration:
+class TestTheValidatorReadsTheSnapshot:
+    """The cases that need the snapshot helper to set up. The ones that do
+    not live in `test_region_declaration_required`, which is importable
+    against a tree without it and is therefore the regression."""
+
 
     def test_the_passing_cell_passes(self, cell):
         assert run(cell) == 0
 
-    def test_an_unregistered_preset_is_refused(self, cell):
-        """Every file input and every scalar is valid; only the regions are
-        undeclared."""
-        _registry(cell, sha256="9" * 64)
-
-        assert run(cell) == 1
-        assert any("the calibration registry does not declare" in f
-                   for f in _failures(cell))
 
     def test_a_changed_coefficient_stops_matching_the_declaration(self, cell):
         """The registry still declares the preset it was told about; the run
@@ -248,12 +244,6 @@ class TestTheValidatorRequiresADeclaration:
         assert any("either the preset is unregistered, or its numbers have "
                    "moved" in f for f in _failures(cell))
 
-    def test_a_run_that_records_no_preset_is_refused(self, cell):
-        _rank(cell, regions=base.KEEP)
-
-        assert run(cell) == 1
-        assert any("does not record which region preset" in f
-                   for f in _failures(cell))
 
     def test_a_preset_declared_as_something_else_is_refused(self, cell):
         _registry(cell, kind="source_calibration")
