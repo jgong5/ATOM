@@ -88,6 +88,28 @@ class Stub(BaseHTTPRequestHandler):
     """A server that answers the two endpoints `replay.py` reads."""
 
     provenance: ClassVar[dict] = {}
+    #: Every body `replay.py` posted, in the order this server received them.
+    #: The arrival protocol lives in those bodies and nowhere else, so this is
+    #: what lets it be tested at the seam without an engine behind it.
+    posted: ClassVar[list] = []
+
+    def do_POST(self):  # BaseHTTPRequestHandler names it this way
+        length = int(self.headers.get("Content-Length") or 0)
+        sent = json.loads(self.rfile.read(length) or b"{}")
+        if self.path.startswith("/compass/requests"):
+            # `replay.py` drains the engine's record store with a POST at the
+            # end of a run. Recording it here would count it as a request.
+            body = json.dumps({"count": 0, "requests": []}).encode()
+        else:
+            type(self).posted.append(sent)
+            body = json.dumps(
+                {"choices": [{"text": "x"}], "usage": {"prompt_tokens": 0}}
+            ).encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "application/json")
+        self.send_header("Content-Length", str(len(body)))
+        self.end_headers()
+        self.wfile.write(body)
 
     def do_GET(self):  # BaseHTTPRequestHandler names it this way
         if self.path.startswith("/compass/provenance"):
@@ -111,6 +133,8 @@ class Stub(BaseHTTPRequestHandler):
 @pytest.fixture
 def served():
     server = HTTPServer(("127.0.0.1", 0), Stub)
+    Stub.provenance = {}
+    Stub.posted = []
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
@@ -379,3 +403,141 @@ class TestWhoAnsweredIsSomethingTheServerReports:
         )
         assert done.returncode == 0, done.stderr
         assert done.stdout.strip() == "[]", done.stdout
+
+
+class TestTheArrivalBarrierIsOnlyArmedByTheSideThatCanFillIt:
+    """`compass_workload_size` is a promise the *declared* path keeps.
+
+    The scheduler holds the virtual clock until that many requests are waiting,
+    so that no arrival can turn up late and be stamped retroactively. An
+    unpaced client keeps the promise trivially: every request is posted as fast
+    as the socket allows, before any step is decided. A paced client cannot --
+    it delivers requests across the trace's own span on purpose, so the count
+    arms a barrier that submission will not fill within
+    `ARRIVAL_BARRIER_TIMEOUT_S`. The barrier then opens anyway and says so, and
+    every latency from that point on is invalid.
+
+    That is not hypothetical: a 62-request cc_pilot development run was sent
+    with `--pace` against a predictor, 11 had arrived when the 120s ran out,
+    and the first answered batch landed after the barrier had already given up.
+    These drive `replay.py::main` against a stub, so what is checked is the
+    bodies the program really posts rather than a description of them.
+    """
+
+    VIRTUAL: ClassVar[dict] = {
+        "compass": {"enabled": True, "mode": "predict", "virtual_clock": True}
+    }
+    WALL: ClassVar[dict] = {
+        "compass": {"enabled": True, "mode": "measure", "virtual_clock": False}
+    }
+
+    def _trace(self, tmp_path, count=3):
+        path = tmp_path / "trace.jsonl"
+        path.write_text(
+            "".join(
+                json.dumps(
+                    {"arrival_s": i * 0.01, "input_tokens": 8, "output_tokens": 1}
+                )
+                + "\n"
+                for i in range(count)
+            )
+        )
+        return path
+
+    def _run(self, base, tmp_path, *extra, count=3):
+        out = tmp_path / "out.json"
+        return (
+            replay_mod.main(
+                [
+                    "--port",
+                    base.rsplit(":", 1)[1],
+                    "--model",
+                    "m",
+                    "--trace",
+                    str(self._trace(tmp_path, count)),
+                    "--out",
+                    str(out),
+                    "--timeout",
+                    "20",
+                    *extra,
+                ]
+            ),
+            out,
+        )
+
+    def test_a_declared_run_still_arms_the_barrier_with_its_own_size(
+        self, served, tmp_path
+    ):
+        """The protocol the predictive side depends on, unchanged."""
+        base, stub = served
+        stub.provenance = self.VIRTUAL
+        code, _ = self._run(base, tmp_path, count=5)
+        assert code == 0
+        assert len(stub.posted) == 5
+        assert all(b["compass_workload_size"] == 5 for b in stub.posted)
+        assert sorted(b["compass_arrival"] for b in stub.posted) == [
+            0.0,
+            0.01,
+            0.02,
+            0.03,
+            0.04,
+        ]
+
+    def test_a_paced_run_declares_no_count_it_cannot_honour(self, served, tmp_path):
+        """Paced against a *real* clock is the supported combination, and it
+        must not leave a barrier armed behind it."""
+        base, stub = served
+        stub.provenance = self.WALL
+        code, _ = self._run(base, tmp_path, "--pace")
+        assert code == 0
+        assert len(stub.posted) == 3
+        assert not any("compass_workload_size" in b for b in stub.posted)
+        assert not any("compass_arrival" in b for b in stub.posted)
+
+    def test_pacing_a_predictor_is_refused_before_anything_is_sent(
+        self, served, tmp_path
+    ):
+        """The combination that produced the invalid run. Refused at the same
+        exit the harness already treats as a refusal, and refused early: a run
+        that has posted half a workload before noticing has already moved the
+        engine's clock."""
+        base, stub = served
+        stub.provenance = self.VIRTUAL
+        code, out = self._run(base, tmp_path, "--pace")
+        assert code == 3
+        assert stub.posted == []
+        assert not out.exists(), "a refused run must not leave a result behind"
+
+    def test_the_refusal_exit_is_the_one_the_harness_reads_as_a_failure(self):
+        run_mod = _load("cc_traces_run")
+        assert run_mod.REFUSAL_EXIT == 3
+
+    def test_a_server_that_says_nothing_is_not_treated_as_a_predictor(
+        self, served, tmp_path
+    ):
+        """`_clock_of` returns None for a server with no provenance endpoint,
+        and a real engine older than this protocol is exactly that. Refusing
+        it would make the real side of every pair unrunnable."""
+        base, stub = served
+        stub.provenance = {}
+        code, _ = self._run(base, tmp_path, "--pace")
+        assert code == 0
+
+    def test_the_declared_count_is_the_whole_workload(self, served, tmp_path):
+        """Not the number that happened to be posted by then. A barrier armed
+        with fewer than the workload opens early, which is the same invalid
+        run reached from the other side."""
+        base, stub = served
+        stub.provenance = self.VIRTUAL
+        code, _ = self._run(base, tmp_path, count=7)
+        assert code == 0
+        assert {b["compass_workload_size"] for b in stub.posted} == {7}
+
+    def test_the_plans_modelled_side_is_the_declared_one(self):
+        """The wiring, checked against the plan that emits it: this whole
+        failure came from a hand-typed command, not from the plan."""
+        modelled = [c for c in _commands("replay") if "modelled.r1.json" in " ".join(c)]
+        real = [c for c in _commands("replay") if "real.r1.json" in " ".join(c)]
+        assert modelled and real
+        assert "--pace" not in modelled[0]
+        assert "--pace" in real[0]
