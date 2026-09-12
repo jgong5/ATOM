@@ -128,23 +128,52 @@ def _capture_attention() -> tuple[tuple[str, Any], ...]:
     return tuple(recorded)
 
 
+#: A paged KV cache is block-major and five-dimensional:
+#: ``(blocks, kv_heads, block_size, head_dim, packing)``. A hybrid model's
+#: linear-attention state is not -- see :func:`_kv_blocks`.
+_PAGED_KV_RANK = 5
+
+
 def _kv_blocks() -> int:
-    """How many blocks the KV cache holds, or 0 if it is not reachable.
+    """How many blocks the PAGED KV cache holds, or 0 if it is not reachable.
 
     Read from the persistent KV context rather than the live forward one. The
     cache is installed once at startup and kept separately, which is exactly why
     a benchmark can reset the forward context and still find it -- and why
     reading it from the live context returns nothing right after that reset.
+
+    **Paged only.** A hybrid model's ``kv_cache_data`` holds two kinds of entry
+    under the same layer keys:
+
+        layer_0  k=(32, 3, 10240)             linear-attention state
+        layer_3  k=(147456, 4, 32, 16, 8)     paged KV
+
+    and the leading dimension means different things in the two: blocks in the
+    paged pool, **sequences** in the state. Returning the first entry found
+    returned 32 -- a state cache's sequence count -- for a pool of 147,456
+    blocks. `_install_attention` then computed ``blocks // stride`` as 0 and
+    collapsed the rotation to a single region at every requested count, with
+    nothing said. Every standalone price for this model was therefore timed
+    against one region however many were allocated, which is what the recorded
+    ``kv_regions: 1`` has been reporting all along.
+
+    So the rank is the discriminator, and the largest paged pool wins: there is
+    one per full-attention layer and they are the same size, but taking the max
+    is stable if that ever stops being true.
     """
     from atom.utils import forward_context as fc
 
     holders = [getattr(fc, "_forward_kv_cache_context", None),
                fc.get_forward_context()]
     for holder in holders:
+        blocks = 0
         for entry in (getattr(holder, "kv_cache_data", None) or {}).values():
             cache = getattr(entry, "k_cache", None)
-            if cache is not None and cache.dim() >= 1 and cache.shape[0] > 0:
-                return int(cache.shape[0])
+            if (cache is not None and cache.dim() >= _PAGED_KV_RANK
+                    and cache.shape[0] > 0):
+                blocks = max(blocks, int(cache.shape[0]))
+        if blocks:
+            return blocks
     return 0
 
 
@@ -214,11 +243,25 @@ def _install_attention(recorded: dict[str, Any], variants: int) -> list:
     # variants are disjoint. Bounded by what the cache actually holds -- asking
     # for regions past the end would index out of the allocation.
     stride = (max(flat) + 1) if flat else 0
+    requested = variants
     if stride and variants > 1:
         blocks = _kv_blocks()
         variants = max(1, min(variants, blocks // stride)) if blocks else 1
     else:
         variants = 1
+    if requested > 1 and variants < requested:
+        # Say it. A caller asked for N cold regions and is getting fewer, and
+        # the only previous evidence was a `kv_regions` count in the artifact
+        # that nobody was reading as a shortfall. A price measured over one
+        # region while the caller believed it was rotating over sixty-four is
+        # a warm price wearing a cold label.
+        logger.warning(
+            "ATOMCompass WARNING: %d KV regions requested, %d available -- "
+            "the pool "
+            "holds %d blocks and this operator's footprint is %d, so the "
+            "rotation is %s. Prices from this run are over %d region(s), not "
+            "%d.", requested, variants, _kv_blocks(), stride,
+            "disabled" if variants == 1 else "reduced", variants, requested)
 
     thunks = []
     for v in range(variants):
