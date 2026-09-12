@@ -59,10 +59,20 @@ def _role(cell, role, side=None):
 
 
 class TestTheMatrixItCovers:
-    def test_every_width_and_class_appears_once(self, plan):
-        seen = [(c["tp"], c["class"]) for c in plan["cells"]]
+    def test_every_width_and_class_and_client_count_appears_once(self, plan):
+        """A cell is (width, class, offered load), and the matrix is all of it.
+
+        The client count is a coordinate, not a variant of one: two cells that
+        agree on width and class and differ on offered load replay different
+        request sets, so dropping the count from the identity would let one of
+        them stand in for the other.
+        """
+        seen = [(c["tp"], c["class"], c["clients"]) for c in plan["cells"]]
         assert sorted(seen) == sorted(
-            (tp, klass) for tp in plan_mod.TPS for klass in plan_mod.CLASSES
+            (tp, klass, clients)
+            for tp in plan_mod.TPS
+            for klass in plan_mod.CLASSES
+            for clients in plan_mod.CLIENTS
         )
         assert len(seen) == len(set(seen))
 
@@ -246,7 +256,7 @@ class TestTheTwoSidesAreNotRunTheSameWay:
 
     def test_each_side_replays_the_registered_workload_for_its_class(self, plan):
         for cell in plan["cells"]:
-            expected = f"atom/compass/cc_traces_{cell['class']}.jsonl"
+            expected = plan_mod.workload(cell["class"], cell["clients"])
             replays = _role(cell, "replay")
             assert replays
             for step in replays:
@@ -366,7 +376,7 @@ class TestItSaysWhatItDoesNotProvide:
 class TestWhatItPrints:
     def test_the_shell_rendering_is_the_same_plan(self, tmp_path):
         text = _run(["--root", "/r", "--shell"])
-        assert "cc_traces_validate.py cell /r/tp4_long" in text
+        assert "cc_traces_validate.py cell /r/tp4_clients_large_c8" in text
         assert "[device_free]" in text and "[gpu]" in text
         assert "what this plan does not provide" in text
 
@@ -465,7 +475,8 @@ class TestTheTwoPortsAreChosenSeparately:
         with pytest.raises(SystemExit) as raised:
             plan_mod.cell_steps(
                 2,
-                "long",
+                "clients_large",
+                4,
                 root="/r",
                 oracle=None,
                 options=(),
@@ -556,7 +567,7 @@ class TestTheRegistryIsWhereTheConfigurationComesFrom:
                 seen += 1
                 assert (command[command.index("--compass-rank-aggregation") + 1]
                         == plan_mod.registry.RANK_AGGREGATION)
-        assert seen == 6 * got["repeats"]
+        assert seen == len(got["cells"]) * got["repeats"]
 
     def test_native_allocation_is_selected_at_every_width(self):
         # `carry_allocation=1` reuses the template's blocks and declares them

@@ -38,10 +38,25 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 PROTOCOL = ROOT / "atom" / "compass" / "CC_TRACES_PROTOCOL.md"
 LOCK = ROOT / "atom" / "compass" / "cc_traces_protocol.lock.json"
+#: The client counts the matrix offers as an independent workload axis.
+CLIENT_COUNTS = (1, 2, 4, 8)
+#: The two classes of the clients matrix: subagent bursts whose every prompt is
+#: at or below 4096 tokens, and bounded large-prompt bursts. There is one
+#: workload file per (class, client count), so the eight below are what the
+#: matrix actually replays.
+CLIENT_CLASSES = ("clients_short", "clients_large")
 #: The workloads the protocol registers. Their digests are written into the
 #: document, so the document's own digest covers them: an edited workload and an
 #: unedited protocol cannot both be current.
-WORKLOADS = ("cc_traces_long", "cc_traces_short")
+#:
+#: `cc_traces_long` and `cc_traces_short` stay registered. They are what the
+#: earlier accepted cells ran against, and removing them here would leave that
+#: evidence describing a workload this protocol no longer names.
+WORKLOADS = ("cc_traces_long", "cc_traces_short") + tuple(
+    f"cc_traces_{klass}_c{clients}"
+    for klass in CLIENT_CLASSES
+    for clients in CLIENT_COUNTS
+)
 
 
 def _mechanism():

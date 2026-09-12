@@ -309,17 +309,19 @@ class Clock:
         self.t += seconds
 
 
-def _a_workload_on_disk(tmp_path, monkeypatch, klass="long"):
+def _a_workload_on_disk(tmp_path, monkeypatch, klass="clients_large", clients=4):
     """Bytes where the runner looks for the workload, for the digest checks.
 
-    The runner digests whatever is at `ROOT/atom/compass/
-    cc_traces_<class>.jsonl` and refuses a replay whose trace digest differs.
+    The runner digests whatever is at the registered path for this cell's
+    (class, client count) and refuses a replay whose trace digest differs.
     Those registered files are reproduced from the corpus rather than
     committed, so a test about that plumbing supplies its own workload instead
-    of depending on a checkout having the acceptance inputs in it.
+    of depending on a checkout having the acceptance inputs in it. The path is
+    asked of the plan rather than spelled again here, so a rename cannot leave
+    the runner and the test writing to two different files.
     """
     root = tmp_path / "repo"
-    path = root / "atom" / "compass" / f"cc_traces_{klass}.jsonl"
+    path = root / plan_mod.workload(klass, clients)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps({
         "arrival_s": 0.0, "input_tokens": 640,
@@ -353,10 +355,11 @@ def _the_workload_is_on_disk(tmp_path, monkeypatch):
     _a_workload_on_disk(tmp_path, monkeypatch)
 
 
-def _plan(tmp_path, tp=2, klass="long"):
+def _plan(tmp_path, tp=2, klass="clients_large", clients=4):
     built = plan_mod.cell_steps(
         tp,
         klass,
+        clients,
         root=str(tmp_path),
         oracle="transfer",
         options=(),
@@ -643,7 +646,7 @@ class TestWhatAnsweredIsWhatWeThinkAnswered:
         runner = _runner(tmp_path, "modelled")
         runner.run()
         for n in (1, 2, 3):
-            assert (tmp_path / "tp2_long" / f"provenance.modelled.r{n}.json").exists()
+            assert (tmp_path / "tp2_clients_large_c4" / f"provenance.modelled.r{n}.json").exists()
 
     def test_a_server_in_the_other_side_s_mode_fails_the_repeat(self, tmp_path):
         """A modelled side served by a measuring engine is a real run wearing
@@ -752,7 +755,7 @@ class TestTheCostsItCanMeasure:
         (cell / "costs.modelled.json").write_text(json.dumps(modelled))
 
     def test_the_merge_needs_the_terms_nothing_here_measures(self, tmp_path, capsys):
-        cell = tmp_path / "tp2_long"
+        cell = tmp_path / "tp2_clients_large_c4"
         self._partials(cell)
         assert run_mod.main(["costs", str(cell)]) == 2
         assert not (cell / "costs.json").exists()
@@ -761,7 +764,7 @@ class TestTheCostsItCanMeasure:
             assert f"--{term}" in message
 
     def test_the_merge_needs_both_sides(self, tmp_path, capsys):
-        cell = tmp_path / "tp2_long"
+        cell = tmp_path / "tp2_clients_large_c4"
         cell.mkdir(parents=True)
         (cell / "costs.real.json").write_text(
             json.dumps({"startup_real": 1.0, "execution_real": 2.0})
@@ -782,7 +785,7 @@ class TestTheCostsItCanMeasure:
         assert "costs.modelled.json" in capsys.readouterr().err
 
     def test_a_complete_merge_carries_every_term_the_validator_reads(self, tmp_path):
-        cell = tmp_path / "tp2_long"
+        cell = tmp_path / "tp2_clients_large_c4"
         self._partials(cell)
         assert run_mod.main(self._argv(cell)) == 0
         costs = json.loads((cell / "costs.json").read_text())
@@ -812,7 +815,7 @@ class TestTheCostsItCanMeasure:
         """The split is measured on both sides: the journal stamps each
         derivation's wall interval and the side record stamps each window's,
         so which contains which is an intersection rather than a claim."""
-        cell = tmp_path / "tp2_long"
+        cell = tmp_path / "tp2_clients_large_c4"
         self._partials(
             cell,
             per_execution=[
@@ -849,7 +852,7 @@ class TestTheCostsItCanMeasure:
     ):
         """An interval means nothing without the windows it would fall inside,
         and inventing them is exactly the assertion this replaces."""
-        cell = tmp_path / "tp2_long"
+        cell = tmp_path / "tp2_clients_large_c4"
         self._partials(cell, per_execution=[{"repeat": 0}])
         journal = tmp_path / "derivations.jsonl"
         journal.write_text(json.dumps({"t0": 1.0, "t1": 2.0}) + "\n")
@@ -864,7 +867,7 @@ class TestTheCostsItCanMeasure:
         Without this, the measured split depends on the operator remembering a
         flag, and forgetting it silently falls back to a declared number.
         """
-        cell = tmp_path / "tp2_long"
+        cell = tmp_path / "tp2_clients_large_c4"
         self._partials(
             cell,
             per_execution=[
@@ -893,7 +896,7 @@ class TestTheCostsItCanMeasure:
         self, tmp_path, capsys
     ):
         """Discovery finding nothing must not read as 'derivation was free'."""
-        cell = tmp_path / "tp2_long"
+        cell = tmp_path / "tp2_clients_large_c4"
         self._partials(cell)
         full = self._argv(cell)
         drop = {"--derivation", "--derivation-source", "--derivation-within"}
@@ -915,7 +918,7 @@ class TestTheCostsItCanMeasure:
         """`load` has a container the protocol states, so it defaults. Nobody
         has measured whether the oracle build is inside `startup_modelled`, so
         `derivation` has no default and the operator has to say which it is."""
-        cell = tmp_path / "tp2_long"
+        cell = tmp_path / "tp2_clients_large_c4"
         self._partials(cell)
         argv = [a for a in self._argv(cell) if a not in ("--derivation-within", "none")]
         assert run_mod.main(argv) == 2
@@ -923,7 +926,7 @@ class TestTheCostsItCanMeasure:
         assert not (cell / "costs.json").exists()
 
     def test_a_supplied_second_with_no_artifact_is_not_merged(self, tmp_path, capsys):
-        cell = tmp_path / "tp2_long"
+        cell = tmp_path / "tp2_clients_large_c4"
         self._partials(cell)
         argv = [a for a in self._argv(cell) if a not in ("--load-source", "server.log")]
         assert run_mod.main(argv) == 2
@@ -933,7 +936,7 @@ class TestTheCostsItCanMeasure:
     def test_a_partial_from_the_old_schema_is_not_merged(self, tmp_path, capsys):
         """The old record called a virtual window `execution_modelled`, and
         nothing in it says so. It cannot be read as if it were the new one."""
-        cell = tmp_path / "tp2_long"
+        cell = tmp_path / "tp2_clients_large_c4"
         self._partials(cell)
         (cell / "costs.modelled.json").write_text(
             json.dumps({"startup_modelled": 9.0, "execution_modelled": 98.87})
@@ -945,7 +948,7 @@ class TestTheCostsItCanMeasure:
     def test_a_partial_whose_execution_is_not_wall_is_not_merged(
         self, tmp_path, capsys
     ):
-        cell = tmp_path / "tp2_long"
+        cell = tmp_path / "tp2_clients_large_c4"
         self._partials(cell, clocks={"startup": "wall", "execution": "virtual"})
         assert run_mod.main(self._argv(cell)) == 2
         assert "wall-clock" in capsys.readouterr().err
@@ -984,13 +987,15 @@ class TestTheSidesCannotBeRunWrong:
         argv = [
             "side",
             "--cell",
-            str(tmp_path / "tp2_long"),
+            str(tmp_path / "tp2_clients_large_c4"),
             "--side",
             "modelled",
             "--tp",
             "2",
             "--class",
-            "long",
+            "clients_large",
+            "--clients",
+            "4",
         ]
         assert run_mod.main(argv) == 2
         assert "--replay-target" in capsys.readouterr().err
@@ -999,13 +1004,15 @@ class TestTheSidesCannotBeRunWrong:
         argv = [
             "side",
             "--cell",
-            str(tmp_path / "tp2_long"),
+            str(tmp_path / "tp2_clients_large_c4"),
             "--side",
             "real",
             "--tp",
             "2",
             "--class",
-            "long",
+            "clients_large",
+            "--clients",
+            "4",
             "--replay-target",
             "/w/t.json",
         ]
@@ -1021,13 +1028,15 @@ class TestTheSidesCannotBeRunWrong:
         argv = [
             "side",
             "--cell",
-            str(tmp_path / "tp1_long"),
+            str(tmp_path / "tp1_clients_large_c4"),
             "--side",
             "modelled",
             "--tp",
             "1",
             "--class",
-            "long",
+            "clients_large",
+            "--clients",
+            "4",
             "--replay-target",
             "/w/t.json",
         ]
@@ -1038,13 +1047,15 @@ class TestTheSidesCannotBeRunWrong:
         argv = [
             "side",
             "--cell",
-            str(tmp_path / "tp2_long"),
+            str(tmp_path / "tp2_clients_large_c4"),
             "--side",
             "real",
             "--tp",
             "2",
             "--class",
-            "long",
+            "clients_large",
+            "--clients",
+            "4",
             "--memory-model",
             "/w/p.json",
         ]
@@ -1053,9 +1064,10 @@ class TestTheSidesCannotBeRunWrong:
 
     def test_the_profile_reaches_the_modelled_server(self, tmp_path):
         args = types.SimpleNamespace(
-            cell=str(tmp_path / "tp2_long"),
+            cell=str(tmp_path / "tp2_clients_large_c4"),
             tp=2,
-            klass="long",
+            klass="clients_large",
+            clients=4,
             oracle=None,
             oracle_option=[],
             port=8000,
@@ -1083,7 +1095,9 @@ class TestTheSidesCannotBeRunWrong:
             "--tp",
             "2",
             "--class",
-            "long",
+            "clients_large",
+            "--clients",
+            "4",
         ]
         with pytest.raises(SystemExit):
             run_mod.main(argv)
@@ -1195,7 +1209,7 @@ class TestEveryRepeatIsAnExecutionWithAName:
         runner.run()
         for execution in self._executions(runner):
             source, config = execution["source"], execution["config"]
-            assert source["workload"].endswith("cc_traces_long.jsonl")
+            assert source["workload"].endswith("cc_traces_clients_large_c4.jsonl")
             assert len(source["workload_sha256"]) == 64
             assert source["replay_target"] == "/w/target.json"
             assert source["oracle"] == "transfer"
@@ -1714,13 +1728,15 @@ class TestARunSaysWhatItWasFor:
                 [
                     "side",
                     "--cell",
-                    "/tmp/x/tp2_long",
+                    "/tmp/x/tp2_clients_large_c4",
                     "--side",
                     "modelled",
                     "--tp",
                     "2",
                     "--class",
-                    "long",
+                    "clients_large",
+                    "--clients",
+                    "4",
                     "--purpose",
                     "acceptance-ish",
                 ]
@@ -1845,7 +1861,7 @@ class TestDerivationIsAttributedToTheRepeatThatSpentIt:
     """
 
     def _cell(self, tmp_path, repeats=3):
-        cell = tmp_path / "tp2_long"
+        cell = tmp_path / "tp2_clients_large_c4"
         cell.mkdir(parents=True, exist_ok=True)
         wall = {"startup": run_mod.WALL_CLOCK, "execution": run_mod.WALL_CLOCK}
         base = 1000.0

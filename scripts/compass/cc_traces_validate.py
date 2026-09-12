@@ -55,9 +55,48 @@ compare = _load("compare")
 # --------------------------------------------------------------------------
 # what the protocol registers
 
+#: The clients matrix (`CC_TRACES_PROTOCOL.md` §1B): one registered workload
+#: file per (class, client count). A client is a root session, not a cap on
+#: in-flight requests.
+CLIENT_CLASSES = ("clients_large", "clients_short")
+CLIENT_COUNTS = (1, 2, 4, 8)
+
+#: `long` and `short` stay readable here. They are what the earlier six cells
+#: ran against, and a validator that could no longer name them could no longer
+#: re-check that preserved evidence.
+LEGACY_CLASSES = ("long", "short")
+
+
+def workload_name(klass: str, clients=None) -> str:
+    """The registered workload's name, from the coordinates that identify it.
+
+    A clients-matrix cell is (class, client count) and there is one file per
+    pair; a legacy cell is a class alone. Mixing the two -- a client count on
+    `long`, or a clients class without one -- names no registered file, so it
+    is a refusal rather than a silently different workload.
+    """
+    if klass in CLIENT_CLASSES:
+        if clients not in CLIENT_COUNTS:
+            raise SystemExit(
+                f"cc-traces: class {klass} is one of the clients matrix's, so "
+                f"it needs --clients from {CLIENT_COUNTS}; got {clients!r}. "
+                f"The client count is part of which workload was replayed, "
+                f"not a label on it."
+            )
+        return f"{klass}_c{clients}"
+    if clients is not None:
+        raise SystemExit(
+            f"cc-traces: class {klass} has no client axis -- it registers one "
+            f"workload file, and --clients {clients} would name a file that "
+            f"was never registered."
+        )
+    return klass
+
+
 WORKLOADS = {
-    "long": ROOT / "atom" / "compass" / "cc_traces_long.jsonl",
-    "short": ROOT / "atom" / "compass" / "cc_traces_short.jsonl",
+    name: ROOT / "atom" / "compass" / f"cc_traces_{name}.jsonl"
+    for name in LEGACY_CLASSES
+    + tuple(f"{k}_c{c}" for k in CLIENT_CLASSES for c in CLIENT_COUNTS)
 }
 
 #: The engine every cell is served by. Read back from the server's own
@@ -146,7 +185,7 @@ def workload_manifest(path: Path) -> Path:
     return path.with_name(path.name[: -len(".jsonl")] + ".manifest.json")
 
 
-def registered_workload(klass: str) -> Path:
+def registered_workload(klass: str, clients=None) -> Path:
     """The registered workload file, or a refusal that says how to get it.
 
     The `.jsonl` are not in the repository. They are a slice of a 568 MB
@@ -165,21 +204,30 @@ def registered_workload(klass: str) -> Path:
     is a caller supplying its own rows on purpose, and what a run actually read
     is separately digested into the run record.
     """
-    path = WORKLOADS[klass]
+    name = workload_name(klass, clients)
+    path = WORKLOADS[name]
+    generator = (
+        "cc_traces_clients_workload.py"
+        if klass in CLIENT_CLASSES
+        else "cc_traces_workload.py"
+    )
+    coordinates = f"--class {klass}" + (
+        f" --clients {clients}" if klass in CLIENT_CLASSES else ""
+    )
     manifest = workload_manifest(path)
     registered = (json.loads(manifest.read_text()) if manifest.exists()
                   else None)
     if not path.exists():
         if registered is None:
             raise SystemExit(
-                f"cc-traces: there is no {klass} workload at {path} and no "
+                f"cc-traces: there is no {name} workload at {path} and no "
                 f"manifest at {manifest} to say what it should be. Refusing "
                 "to guess one.")
         raise SystemExit(
-            f"cc-traces: the registered {klass} workload is not at {path}.\n"
+            f"cc-traces: the registered {name} workload is not at {path}.\n"
             "It is reproduced from the corpus, not committed:\n"
-            "  python scripts/compass/cc_traces_workload.py emit "
-            f"--class {klass} \\\n"
+            f"  python scripts/compass/{generator} emit "
+            f"{coordinates} \\\n"
             f"      --corpus <corpus>/{registered['corpus']['file']} \\\n"
             f"      --out {path} --manifest {manifest} \\\n"
             f"      --at {registered['emitted_at']}\n"
@@ -189,7 +237,7 @@ def registered_workload(klass: str) -> Path:
             f"result must hash to {registered['sha256'][:16]}...")
     if registered is not None and _digest(path) != registered["sha256"]:
         raise SystemExit(
-            f"cc-traces: {path} is not the registered {klass} workload (it "
+            f"cc-traces: {path} is not the registered {name} workload (it "
             f"hashes to {_digest(path)[:16]}..., the manifest registers "
             f"{registered['sha256'][:16]}...). Neither the manifest nor a "
             "locked workload is edited to make a run pass; re-emit from the "
@@ -197,9 +245,9 @@ def registered_workload(klass: str) -> Path:
     return path
 
 
-def registered_rows(klass: str) -> list[dict]:
+def registered_rows(klass: str, clients=None) -> list[dict]:
     rows = []
-    for line in registered_workload(klass).read_text().splitlines():
+    for line in registered_workload(klass, clients).read_text().splitlines():
         if line.strip():
             rows.append(json.loads(line))
     return rows
@@ -2244,8 +2292,10 @@ def cell(args) -> int:
         print(f"  FAIL: {cell_dir} is not a directory, so there is no cell here")
         return 1
     klass = getattr(args, "class")
-    rows = registered_rows(klass)
-    workload_sha = _digest(WORKLOADS[klass])
+    clients = getattr(args, "clients", None)
+    name = workload_name(klass, clients)
+    rows = registered_rows(klass, clients)
+    workload_sha = _digest(WORKLOADS[name])
     failures, notes = [], []
 
     stamp_path = cell_dir / "cc_traces_protocol.json"
@@ -2261,7 +2311,7 @@ def cell(args) -> int:
                 "the cell's protocol stamp does not match the "
                 "registration in force when it ran"
             )
-        stamped = (stamp.get("workloads") or {}).get(f"cc_traces_{klass}")
+        stamped = (stamp.get("workloads") or {}).get(f"cc_traces_{name}")
         if stamped and stamped != workload_sha:
             failures.append(
                 f"the cell ran against workload {stamped[:16]}, "
@@ -2480,7 +2530,11 @@ def cell(args) -> int:
     verdict = {
         "cell": str(cell_dir),
         "class": klass,
+        # Part of the cell's identity, not a label on it: the matrix ranks
+        # within one client count and refuses a duplicate (tp, class, clients).
+        "clients": clients,
         "tp": args.tp,
+        "workload": name,
         "workload_sha256": workload_sha,
         "purpose": ACCEPTANCE_PURPOSE,
         "repeats": len(reports),
@@ -2498,7 +2552,9 @@ def cell(args) -> int:
     for reason in notes:
         print(f"  note: {reason}")
     print(
-        f"{cell_dir.name}: class={klass} tp={args.tp} repeats={len(reports)} "
+        f"{cell_dir.name}: class={klass}"
+        + (f" clients={clients}" if clients is not None else "")
+        + f" tp={args.tp} repeats={len(reports)} "
         f"{'PASS' if verdict['passed'] else 'REFUSED'}"
     )
     return 0 if verdict["passed"] else 1
@@ -3354,28 +3410,49 @@ def _decide(cells: list[dict], metric: str, direction: str) -> dict:
     }
 
 
-#: The cells `CC_TRACES_PROTOCOL.md` §3 registers. The decision the protocol
-#: is for is which width to deploy at, per workload class, so the matrix is
-#: the unit of acceptance and a subset of it is not a smaller version of the
-#: same claim -- it is a different one.
-REGISTERED_CELLS = tuple((tp, klass) for tp in (1, 2, 4) for klass in sorted(WORKLOADS))
+#: The cells `CC_TRACES_PROTOCOL.md` §3 registers: twenty-four, each identified
+#: by all three of (tp, class, clients). The decision the protocol is for is
+#: which width to deploy at, per workload class *and* per offered load, so the
+#: matrix is the unit of acceptance and a subset of it is not a smaller version
+#: of the same claim -- it is a different one.
+REGISTERED_CELLS = tuple(
+    (tp, klass, clients)
+    for tp in (1, 2, 4)
+    for klass in CLIENT_CLASSES
+    for clients in CLIENT_COUNTS
+)
+
+
+def _cell_name(key) -> str:
+    tp, klass, clients = key
+    return f"tp{tp} {klass} c{clients}"
 
 
 def _cell_key(verdict: dict, where: str, refused: list):
     """This verdict's place in the registered matrix, or None with a reason."""
-    klass, tp = verdict.get("class"), verdict.get("tp")
+    klass, tp, clients = (
+        verdict.get("class"),
+        verdict.get("tp"),
+        verdict.get("clients"),
+    )
     try:
         tp = int(tp)
     except (TypeError, ValueError):
         tp = None
-    if (tp, klass) not in REGISTERED_CELLS:
+    try:
+        clients = int(clients)
+    except (TypeError, ValueError):
+        clients = None
+    if (tp, klass, clients) not in REGISTERED_CELLS:
         refused.append(
             f"{where}: this verdict is for tp={verdict.get('tp')!r} "
-            f"class={klass!r}, which is not one of the six cells the protocol "
-            f"registers ({', '.join(f'tp{t} {k}' for t, k in REGISTERED_CELLS)})"
+            f"class={klass!r} clients={verdict.get('clients')!r}, which is not "
+            f"one of the {len(REGISTERED_CELLS)} cells the protocol registers. "
+            f"A verdict with no client count is from before the clients "
+            f"matrix and is not a cell of it"
         )
         return None
-    return (tp, klass)
+    return (tp, klass, clients)
 
 
 def matrix(args) -> int:
@@ -3416,7 +3493,7 @@ def matrix(args) -> int:
         # count alone cannot tell the difference.
         if key in seen:
             refused.append(
-                f"{where}: tp{key[0]} {key[1]} is already contributed by "
+                f"{where}: {_cell_name(key)} is already contributed by "
                 f"{seen[key]}, so this cell would be counted twice"
             )
             continue
@@ -3433,18 +3510,23 @@ def matrix(args) -> int:
                 f"verdict, so this cell cannot be ranked on "
                 f"{'them' if len(absent) > 1 else 'it'}"
             )
-    for tp, klass in REGISTERED_CELLS:
-        if (tp, klass) not in seen:
+    for key in REGISTERED_CELLS:
+        if key not in seen:
             refused.append(
-                f"tp{tp} {klass}: no cell was contributed for it. A ranking "
+                f"{_cell_name(key)}: no cell was contributed for it. A ranking "
                 f"over part of the matrix is not the ranking the protocol "
                 f"registers"
             )
     report = {
         "cells_used": [c["cell"] for c in cells],
         "refused": refused,
-        "by_class": {},
-        "pooled": {},
+        # One ranking group per (class, clients). There is deliberately no
+        # pooled section: c1 and c8 hold different numbers and mixtures of
+        # requests, so a rank over both would be ranking workloads as well as
+        # widths, and the pooled number would read as the stronger claim.
+        "ranking_group": "(class, clients)",
+        "by_group": {},
+        "scaling": {},
     }
     if refused:
         for reason in refused:
@@ -3456,30 +3538,57 @@ def matrix(args) -> int:
         if args.out:
             Path(args.out).write_text(json.dumps(report, indent=1) + "\n")
         return 1
-    for klass in sorted({c["class"] for c in cells}):
-        group = [c for c in cells if c["class"] == klass]
-        report["by_class"][klass] = {
-            metric: _decide(group, metric, direction)
-            for metric, direction in OBJECTIVES.items()
+    # One group per (class, client count): the three widths, over the same
+    # replayed request identities at the same offered load. That is the only
+    # comparison in which the workload is held fixed and the width is what
+    # changed, so it is the only one a rank is about.
+    for klass in CLIENT_CLASSES:
+        for clients in CLIENT_COUNTS:
+            group = [
+                c
+                for c in cells
+                if c.get("class") == klass and c.get("clients") == clients
+            ]
+            report["by_group"][f"{klass} c{clients}"] = {
+                metric: _decide(group, metric, direction)
+                for metric, direction in OBJECTIVES.items()
+            }
+    # Scaling is reported, not ranked. Different client counts replay different
+    # numbers and mixtures of requests, so a number that crosses them describes
+    # two changes at once; the centres are written out so the reader can see
+    # how each width answers a larger offered load without the report calling
+    # one of them the winner across loads.
+    for klass in CLIENT_CLASSES:
+        report["scaling"][klass] = {
+            metric: {
+                str(clients): {
+                    c["cell"]: {
+                        "real_centre": c["metrics"][metric].get("real_centre"),
+                        "modelled_centre": c["metrics"][metric].get("modelled_centre"),
+                    }
+                    for c in cells
+                    if c.get("class") == klass
+                    and c.get("clients") == clients
+                    and metric in (c.get("metrics") or {})
+                }
+                for clients in CLIENT_COUNTS
+            }
+            for metric in OBJECTIVES
         }
-    report["pooled"] = {
-        metric: _decide(cells, metric, direction)
-        for metric, direction in OBJECTIVES.items()
-    }
     report["speedup"] = {c["cell"]: c.get("speedup") for c in cells}
-    for klass, block in report["by_class"].items():
+    for group_name, block in report["by_group"].items():
         for metric, result in block.items():
             print(
-                f"{klass:5s} {metric:18s} top1="
+                f"{group_name:22s} {metric:18s} top1="
                 f"{result.get('top1_agrees')} rho={result.get('spearman_rho')} "
                 f"regret={result.get('regret_pct')} "
                 f"separation={result.get('separation_faithful')}"
             )
             for reason in result.get("separation_failures") or ():
-                print(f"  SEPARATION: {klass} {metric}: {reason}")
+                print(f"  SEPARATION: {group_name} {metric}: {reason}")
             for cell_name in result.get("tolerance_undecided") or ():
                 print(
-                    f"  UNGRADED: {klass} {metric}: {cell_name} carries no "
+                    f"  UNGRADED: {group_name} {metric}: {cell_name} carries no "
                     f"within_tolerance reading, so it is not inside tolerance"
                 )
     # Validity and acceptance are different questions and the report answers
@@ -3487,7 +3596,7 @@ def matrix(args) -> int:
     # whether the measurements together are the result the protocol registers
     # is these gates, each reported by name so a failure says which claim
     # failed rather than only that one did.
-    results = [r for block in report["by_class"].values() for r in block.values()]
+    results = [r for block in report["by_group"].values() for r in block.values()]
     gates = {
         "ranking": all(
             r.get("top1_agrees") and r.get("rho_meets_gate") for r in results
@@ -3518,7 +3627,22 @@ def main(argv=None) -> int:
     sub = ap.add_subparsers(dest="cmd", required=True)
     c = sub.add_parser("cell")
     c.add_argument("dir")
-    c.add_argument("--class", required=True, choices=sorted(WORKLOADS))
+    # A cell is named by its coordinates, not by a workload file name: the two
+    # clients classes take a client count and the two legacy ones do not, and
+    # `workload_name` refuses either mixture rather than resolving it quietly.
+    c.add_argument(
+        "--class",
+        required=True,
+        choices=sorted(CLIENT_CLASSES + LEGACY_CLASSES),
+    )
+    c.add_argument(
+        "--clients",
+        type=int,
+        default=None,
+        choices=CLIENT_COUNTS,
+        help="the offered load, for a clients-matrix class; "
+        "omitted for the two legacy classes",
+    )
     c.add_argument("--tp", type=int, required=True)
     c.add_argument("--calibration-registry", default=None)
     c.add_argument("--repeats", type=int, default=3)

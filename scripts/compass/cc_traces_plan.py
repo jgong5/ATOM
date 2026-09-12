@@ -7,6 +7,12 @@ step produces and the ones the next step reads. It runs nothing itself --
 `cc_traces_run.py` executes this plan, and both read the same `cell_steps()`, so
 what is printed for review is what is run.
 
+The matrix is twenty-four cells: TP {1, 2, 4} x class {`clients_short`,
+`clients_large`} x clients {1, 2, 4, 8}. A cell is all three coordinates, and
+each one replays its own registered workload file (§1B). The earlier six-cell
+`short`/`long` matrix keeps its registration and its already-run cells; it is
+not re-planned here.
+
 Three places a step can run, and they are not interchangeable:
 
 * `gpu` -- the leased node, under the isolation audit. Only the real side.
@@ -56,7 +62,7 @@ def _load(name: str):
     return module
 
 
-#: The six cells' configuration as data. The plan used to take the modelled
+#: The cells' configuration as data. The plan used to take the modelled
 #: side's oracle and its dozen options as free text on the command line, which
 #: is the part of a matrix run most expensive to mistype and the part no test
 #: could reach. Naming `--artifact-root` resolves them from here instead.
@@ -110,7 +116,16 @@ def width_map(values, flag: str) -> dict:
 #: a prediction; they are here because the residual is reported, not because
 #: they test the bet.
 TPS = (1, 2, 4)
-CLASSES = ("short", "long")
+#: The clients matrix's two classes (`CC_TRACES_PROTOCOL.md` §1B). The earlier
+#: `short`/`long` classes keep their own registration and their already-run
+#: cells; they are not part of this matrix and are not re-planned here.
+CLASSES = ("clients_short", "clients_large")
+#: Offered load, as a count of root sessions. Not a cap on in-flight requests:
+#: every descendant is replayed at its own offset and contributes load, so the
+#: only concurrency bound in a cell is the server's own `max_num_seqs`.
+#: The pools are nested (c1 ⊂ c2 ⊂ c4 ⊂ c8), so a step up this axis adds roots
+#: without disturbing the requests already there.
+CLIENTS = (1, 2, 4, 8)
 
 #: Repeats per side, from the protocol's §3. Three on the modelled side too: a
 #: single simulated run is not a distribution.
@@ -276,7 +291,20 @@ def _serve(
     return cmd
 
 
-def _replay(klass: str, out: str, *, paced: bool, prepare: int, port: int):
+def workload(klass: str, clients: int, suffix: str = "jsonl") -> str:
+    """The registered file for one (class, client count).
+
+    One file per cell, not one file plus a client argument: the request set a
+    cell replayed has to be a digest the protocol registered, and a driver flag
+    that selects a subset at run time would leave the bytes the same for eight
+    different workloads.
+    """
+    return f"atom/compass/cc_traces_{klass}_c{clients}.{suffix}"
+
+
+def _replay(
+    klass: str, clients: int, out: str, *, paced: bool, prepare: int, port: int
+):
     cmd = [
         "python",
         "scripts/compass/replay.py",
@@ -285,7 +313,7 @@ def _replay(klass: str, out: str, *, paced: bool, prepare: int, port: int):
         "--model",
         MODEL,
         "--trace",
-        f"atom/compass/cc_traces_{klass}.jsonl",
+        workload(klass, clients),
         "--out",
         out,
         "--check-lengths",
@@ -311,6 +339,7 @@ def _lifecycle(
     *,
     tp: int,
     klass: str,
+    clients: int,
     cell: str,
     where: str,
     port: int,
@@ -373,6 +402,7 @@ def _lifecycle(
             ),
             "command": _replay(
                 klass,
+                clients,
                 f"{cell}/{side}.r{n}.json",
                 paced=not modelled,
                 prepare=0 if modelled else 3,
@@ -407,6 +437,7 @@ def _lifecycle(
 def cell_steps(
     tp: int,
     klass: str,
+    clients: int,
     *,
     root: str,
     oracle,
@@ -425,7 +456,18 @@ def cell_steps(
             f"{port}: they are two different sockets on one host and the "
             f"server cannot bind one of them"
         )
-    cell = f"{root.rstrip('/')}/tp{tp}_{klass}"
+    if klass not in CLASSES:
+        raise SystemExit(f"{klass!r} is not a registered class of this matrix")
+    if clients not in CLIENTS:
+        raise SystemExit(
+            f"clients={clients} is not one of the registered counts {CLIENTS}: "
+            f"there is no workload file for it, and inventing one here would "
+            f"be choosing the load after the matrix was registered"
+        )
+    # All three coordinates are in the name. A cell directory that carried only
+    # the width and the class would collide across client counts, and the
+    # second run would overwrite the first one's evidence.
+    cell = f"{root.rstrip('/')}/tp{tp}_{klass}_c{clients}"
     steps = [
         {
             "id": "stamp",
@@ -449,12 +491,12 @@ def cell_steps(
             "why": "the registered bytes, re-derived from the rule, before the lease is spent",
             "command": [
                 "python",
-                "scripts/compass/cc_traces_workload.py",
+                "scripts/compass/cc_traces_clients_workload.py",
                 "verify",
                 "--manifest",
-                f"atom/compass/cc_traces_{klass}.manifest.json",
+                workload(klass, clients, "manifest.json"),
                 "--workload",
-                f"atom/compass/cc_traces_{klass}.jsonl",
+                workload(klass, clients),
                 "--corpus",
                 corpus,
             ],
@@ -505,6 +547,7 @@ def cell_steps(
             n,
             tp=tp,
             klass=klass,
+            clients=clients,
             cell=cell,
             where="gpu",
             port=port,
@@ -548,6 +591,7 @@ def cell_steps(
             n,
             tp=tp,
             klass=klass,
+            clients=clients,
             cell=cell,
             where="device_free",
             port=port,
@@ -607,6 +651,8 @@ def cell_steps(
                 cell,
                 "--class",
                 klass,
+                "--clients",
+                str(clients),
                 "--tp",
                 str(tp),
                 "--repeats",
@@ -617,7 +663,14 @@ def cell_steps(
             "produces": ["cc_traces_cell.json"],
         },
     ]
-    return {"cell": cell, "tp": tp, "class": klass, "steps": steps}
+    return {
+        "cell": cell,
+        "tp": tp,
+        "class": klass,
+        "clients": clients,
+        "workload": workload(klass, clients),
+        "steps": steps,
+    }
 
 
 def build(args) -> dict:
@@ -630,6 +683,7 @@ def build(args) -> dict:
         cell_steps(
             tp,
             klass,
+            clients,
             root=args.root,
             oracle=args.oracle or _registry_oracle(args),
             options=args.oracle_option or _registry_options(args, tp),
@@ -642,6 +696,7 @@ def build(args) -> dict:
         )
         for tp in TPS
         for klass in CLASSES
+        for clients in CLIENTS
     ]
     return {
         "protocol": "atom/compass/CC_TRACES_PROTOCOL.md",
@@ -651,6 +706,13 @@ def build(args) -> dict:
         "repeats": args.repeats,
         "processes_per_side": args.repeats,
         "cells": cells,
+        "classes": list(CLASSES),
+        "client_counts": list(CLIENTS),
+        "ranking_groups": (
+            "one per (class, clients): TP1/TP2/TP4 over the same replayed "
+            "request set. Client counts are offered load and are never pooled "
+            "into a rank (CC_TRACES_PROTOCOL.md §6)"
+        ),
         "matrix": [
             "python",
             "scripts/compass/cc_traces_validate.py",
@@ -679,7 +741,10 @@ def render(plan: dict) -> str:
         "",
     ]
     for cell in plan["cells"]:
-        out.append(f"## {cell['cell']}  (TP={cell['tp']}, {cell['class']})")
+        out.append(
+            f"## {cell['cell']}  (TP={cell['tp']}, {cell['class']}, "
+            f"{cell['clients']} client(s))"
+        )
         for step in cell["steps"]:
             where = step["where"]
             if step.get("command"):
