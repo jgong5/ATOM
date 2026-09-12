@@ -596,6 +596,40 @@ def memory_model(tp: int, root) -> str:
     return _PROFILE.format(root=str(Path(root)), tp=tp)
 
 
+#: The bounded `gemm_a16w16` supplement: agent_scratch/gemm_supp_books, from
+#: acquire_gemm_supp.sh -> scripts/compass/primitives.py on cards 3,4,5,6,
+#: four ranks x four retained repeats, iters=50 warmup=20 cache=graph
+#: layers=attention -- the base book's own acquisition policy, against the
+#: base book's own graph family. The base books are unmodified.
+#:
+#: Off by default, and the reason is in the numbers rather than in caution.
+#: It was acquired to test one suspect entry:
+#: `gemm_a16w16|32,5120;3584,5120|bfloat16,bfloat16|#2=None` reads
+#: 189.749us/op at rank 1 in p27bdec32.tp1.json against ~20.6us/op at every
+#: other rank. That reading does not reproduce -- rank 1 remeasures at
+#: 25.464us/op, range 25.365..25.515 over four repeats.
+#:
+#: But the same run puts all five of its signatures ~23% above the base at
+#: ranks 1, 2 and 3 while matching it within 0.8% at rank 0, including
+#: signatures that were never anomalous. That offset tracks the card set --
+#: rank 0 was card 3, the base ran cards 0-3 -- not the shape and not the
+#: rank index. Layering these absolute values would trade one wrong entry for
+#: a uniform offset on four right ones: TP4 rank 1 falls 16227.2 -> 14874.7us,
+#: but ranks 2 and 3 rise 13533.2 -> 14898.3 and 13522.7 -> 14948.1us.
+#:
+#: So this is a measurement, not yet a correction. Turning it on is a
+#: reviewer's decision. The standing recommendation is to leave it off and
+#: re-measure on cards 0,1,2,3 once they are free, which makes the comparison
+#: card-for-card and settles the offset instead of importing it.
+INCLUDE_GEMM_SUPPLEMENT_V1 = False
+
+#: TP4 only: the supplement was measured at no other width. `gsr.json`
+#: resolves per rank through `resolve_rank_path`, and the graph is the one the
+#: prices were measured against, which is also the body graph this width
+#: already names.
+_GEMM_SUPPLEMENT_V1 = "{root}/gemm_supp_books/gsr.json:" + _WIDE + "/b27dec32.json"
+
+
 def per_width_options(tp: int) -> tuple:
     """The options this width adds to `SHARED_OPTIONS`, unresolved."""
     if tp == 1:
@@ -617,6 +651,12 @@ def per_width_options(tp: int) -> tuple:
     # so which one answers must not depend on load order.
     prices = (body, head, f"{_WIDE}/ar_capture.json",
               f"{_WIDE}/ar_plain.json", f"{_WIDE}/ag_prices.json")
+    if tp == 4 and INCLUDE_GEMM_SUPPLEMENT_V1:
+        # Ahead of the list: within one scope the first price wins, so a
+        # supplement that is loaded after the book it supplements answers
+        # nothing. It is a narrowed run and says so in its own provenance, so
+        # PriceLibrary marks the library PARTIAL when it is on.
+        prices = (_GEMM_SUPPLEMENT_V1,) + prices
     return (
         ("tp", str(tp)),
         ("replay_target", _DERIVED_TARGET),
