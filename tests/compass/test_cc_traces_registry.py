@@ -1,4 +1,4 @@
-"""The six cells' configuration, against the prose that explains it.
+"""The twenty-four cells' configuration, against the prose that explains it.
 
 `SOURCE_ONLY_SERVING.md` is where the option set was written down first, in
 shell, for a person to copy. `cc_traces_registry.py` is the same set as data,
@@ -13,7 +13,10 @@ so what is checked there is the key set and the properties that matter.
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
+import json
 import re
 from pathlib import Path
 
@@ -88,7 +91,7 @@ def test_all_rank_mode_is_selected_for_every_cell():
     # whoever types the server command.
     assert registry.RANK_AGGREGATION == "slowest"
     report = registry.check("/nowhere")
-    assert len(report["cells"]) == 6
+    assert len(report["cells"]) == 24
     assert {c["rank_aggregation"] for c in report["cells"]} == {"slowest"}
 
 
@@ -150,7 +153,7 @@ def test_the_profile_is_a_required_artifact_at_every_width():
         )
 
 
-def test_a_root_with_nothing_in_it_is_six_cells_of_absences(tmp_path):
+def test_a_root_with_nothing_in_it_is_every_cell_of_absences(tmp_path):
     report = registry.check(tmp_path)
     assert [c["cell"] for c in report["cells"]] == list(registry.CELLS)
     for cell in report["cells"]:
@@ -199,7 +202,9 @@ def test_the_measured_terms_name_the_step_that_measures_them():
 
 def test_the_report_reads_as_a_report(tmp_path):
     text = registry.render(registry.check(tmp_path))
-    assert "tp4-long -- NOT runnable" in text
+    assert "clients_large c8 -- NOT rankable" in text
+    assert "tp4_clients_large_c8" in text
+    assert "NOT runnable" in text
     assert "costs no step of this harness measures" in text
     assert "ABSENT" in text
 
@@ -278,8 +283,8 @@ def test_a_rank_reading_another_rank_s_file_is_named_not_counted_present(tmp_pat
     profile.parent.mkdir(parents=True, exist_ok=True)
     profile.write_text("{}")
 
-    cell = registry.check(tmp_path)["cells"][2]
-    assert cell["cell"] == "tp2-short"
+    cell = next(c for c in registry.check(tmp_path)["cells"]
+                if c["cell"] == "tp2_clients_short_c1")
     assert cell["absent_artifacts"] == []
     assert cell["runnable"]
     # Rank 0 has its own of the four per-rank artifacts. The three all-reduce
@@ -329,7 +334,7 @@ def test_a_group_of_one_has_nobody_to_be_confused_with(tmp_path):
         staged.write_text("{}")
 
     cell = registry.check(tmp_path)["cells"][0]
-    assert cell["cell"] == "tp1-short"
+    assert cell["cell"] == "tp1_clients_short_c1"
     assert cell["absent_artifacts"] == []
     assert cell["shared_artifacts"] == []
     assert cell["runnable"]
@@ -382,8 +387,13 @@ def test_the_refusal_met_first_is_named_as_such():
     # is still priced at 32 rows alone. A cell that met it first and was not
     # told would be a matrix launched on a refusal it hits on the first decode
     # step with 31 running requests, hours in.
-    assert registry.OPEN_REFUSALS["head_rows"]["cells"] == tuple(
-        c for c in registry.CELLS if not c.startswith("tp1-"))
+    assert registry.OPEN_REFUSALS["head_rows"]["cells"] == registry.cells_at(2, 4)
+    # Every cell of those two widths, at every offered load: the head is
+    # priced at 32 rows whatever the client count is, so a refusal charged to
+    # `tp2 c1` and not to `tp2 c8` would be a claim about the wrong axis.
+    assert len(registry.OPEN_REFUSALS["head_rows"]["cells"]) == 16
+    assert not any(c.startswith("tp1_")
+                   for c in registry.OPEN_REFUSALS["head_rows"]["cells"])
 
 
 def test_the_two_width_refusals_are_not_charged_to_tp1():
@@ -392,8 +402,8 @@ def test_the_two_width_refusals_are_not_charged_to_tp1():
     # make the one width that could run today look as blocked as the others.
     for key in ("derivation_is_rank0_s", "region_model_held_out"):
         cells = registry.OPEN_REFUSALS[key]["cells"]
-        assert "tp1-short" not in cells and "tp1-long" not in cells
-        assert set(cells) == {"tp2-short", "tp2-long", "tp4-short", "tp4-long"}
+        assert not any(c.startswith("tp1_") for c in cells)
+        assert set(cells) == set(registry.cells_at(2, 4))
 
 
 def test_each_refusal_says_what_would_close_it(tmp_path):
@@ -425,3 +435,181 @@ def test_all_three_widths_are_sized_from_the_frozen_r21_profiles():
         )
         assert "/capture_replay/profile/" not in registry.memory_model(tp, "/r")
     assert len({registry.memory_model(tp, "/r") for tp in registry.TPS}) == 3
+
+
+# -- the matrix this registry is of --------------------------------------
+
+
+def _plan_cells():
+    """The cells an ordinary default plan prints, with no flags but a root."""
+    plan = _load("cc_traces_plan")
+    buffer = io.StringIO()
+    with contextlib.redirect_stdout(buffer):
+        assert plan.main(["--root", "/r"]) == 0
+    return json.loads(buffer.getvalue())["cells"]
+
+
+class TestTheRegistryIsOfTheMatrixThatRuns:
+    """Twenty-four cells, named the same in all three modules.
+
+    The registry described six `tp{1,2,4}-{short,long}` cells while the plan
+    wrote twenty-four directories and the validator keyed twenty-four verdicts.
+    Nothing failed: a readiness report simply answered about a matrix nobody
+    was going to run, and eighteen cells had no readiness line at all.
+    """
+
+    def test_the_registry_names_twenty_four_cells(self):
+        assert len(registry.CELLS) == 24
+        assert len(set(registry.CELLS)) == 24
+        assert registry.CELLS == tuple(
+            registry.cell_id(tp, klass, clients)
+            for tp in registry.TPS
+            for klass in registry.CLASSES
+            for clients in registry.CLIENTS
+        )
+
+    def test_every_cell_carries_its_client_count(self):
+        report = registry.check("/nowhere")
+        assert len(report["cells"]) == 24
+        for cell in report["cells"]:
+            assert cell["clients"] in registry.CLIENTS
+            assert cell["cell"].endswith(f"_c{cell['clients']}")
+            assert cell["class"] in registry.CLASSES
+
+    def test_the_registry_and_the_plan_name_the_same_cells(self):
+        # The plan's directory basename *is* the registry's cell id. Two names
+        # for one cell is how a readiness line and an evidence directory stop
+        # being about the same thing.
+        planned = {Path(c["cell"]).name for c in _plan_cells()}
+        assert planned == set(registry.CELLS)
+
+    def test_the_registry_and_the_validator_register_the_same_cells(self):
+        validate = _load("cc_traces_validate")
+        keyed = {registry.cell_id(tp, klass, clients)
+                 for tp, klass, clients in validate.REGISTERED_CELLS}
+        assert keyed == set(registry.CELLS)
+
+    def test_no_cell_directory_can_overwrite_another_client_count(self):
+        # Each cell's evidence is written under its own directory, and the
+        # client count is in the name. Without it, `tp2_clients_short` would be
+        # four runs into one directory and the last one would own every file.
+        cells = _plan_cells()
+        assert len(cells) == 24
+        assert len({c["cell"] for c in cells}) == 24
+        for tp in registry.TPS:
+            for klass in registry.CLASSES:
+                same = [c["cell"] for c in cells
+                        if c["tp"] == tp and c["class"] == klass]
+                assert len(set(same)) == len(registry.CLIENTS) == len(same)
+        # Two steps of one cell may write one file -- the sampler's baseline
+        # and its window both append to that cell's `gpu.jsonl` -- so what is
+        # checked is that no *cell* can write a file another cell wrote.
+        produced = [
+            {f"{c['cell']}/{name}"
+             for step in c["steps"] for name in step["produces"]}
+            for c in cells
+        ]
+        flat = [path for cell in produced for path in cell]
+        assert len(flat) == len(set(flat))
+        assert all(paths for paths in produced)
+
+    def test_no_verdict_can_be_read_as_another_client_count(self):
+        validate = _load("cc_traces_validate")
+        refused = []
+        keys = {
+            validate._cell_key(
+                {"cell": registry.cell_id(2, "clients_short", clients),
+                 "tp": 2, "class": "clients_short", "clients": clients},
+                "where", refused)
+            for clients in registry.CLIENTS
+        }
+        assert refused == []
+        assert len(keys) == len(registry.CLIENTS)
+        # And one that carries no count is not quietly resolved to any of them.
+        assert validate._cell_key(
+            {"cell": "tp2-short", "tp": 2, "class": "short"},
+            "where", refused) is None
+        assert refused
+
+    def test_a_group_is_one_class_at_one_offered_load(self):
+        report = registry.check("/nowhere")
+        assert len(report["groups"]) == 8
+        for name, group in report["groups"].items():
+            assert group["widths"] == list(registry.TPS)
+            assert len(set(group["cells"])) == 3
+            # Nothing is rankable under a root with no artifacts in it, and the
+            # group says so rather than reporting a rank over what resolved.
+            assert group["rankable"] is False
+            assert group["not_runnable"] == group["cells"]
+            assert all(c["group"] == name for c in report["cells"]
+                       if c["cell"] in group["cells"])
+
+    def test_a_group_missing_one_width_is_not_a_partial_rank(self, tmp_path):
+        # Everything staged for TP1 and TP2 and nothing for TP4: eight groups
+        # each holding two runnable cells and one that is not, and no group
+        # rankable. Two thirds of a rank over three widths is not a rank.
+        for tp in (1, 2):
+            for path in registry.required_artifacts(tp, tmp_path).values():
+                Path(path).parent.mkdir(parents=True, exist_ok=True)
+                Path(path).write_text("{}")
+        report = registry.check(tmp_path)
+        assert not any(g["rankable"] for g in report["groups"].values())
+        for group in report["groups"].values():
+            assert len(group["not_runnable"]) == 1
+            assert group["not_runnable"][0].startswith("tp4_")
+
+    def test_a_refusal_is_charged_by_width_not_by_offered_load(self):
+        # The head is priced at 32 rows and nowhere else at TP>1 whatever the
+        # client count is. A refusal that named c1 and not c8 would be a claim
+        # about the axis that does not carry it.
+        for term in registry.OPEN_REFUSALS.values():
+            widths = {c.split("_")[0] for c in term["cells"]}
+            for width in widths:
+                charged = {c for c in term["cells"] if c.startswith(f"{width}_")}
+                assert charged == {c for c in registry.CELLS
+                                   if c.startswith(f"{width}_")}, term["what"]
+
+    def test_the_configuration_is_the_width_s_and_the_load_does_not_move_it(self):
+        # What the offered load changes is which requests arrive, not what
+        # prices them. If that ever stops being true it is a finding, and it
+        # should be one here rather than in a run.
+        report = registry.check("/nowhere")
+        for tp in registry.TPS:
+            same = [c for c in report["cells"] if c["tp"] == tp]
+            assert len(same) == 8
+            assert len({json.dumps(c["oracle_options"]) for c in same}) == 1
+            assert len({json.dumps(c["artifacts"]) for c in same}) == 1
+            assert len({json.dumps(c["absent_artifacts"]) for c in same}) == 1
+
+    def test_the_first_registration_is_archived_and_not_relabelled(self):
+        # The `short`/`long` classes selected different requests under a
+        # different rule. Renaming `tp2-short` into this matrix would put the
+        # clients matrix's name on measurements taken under the other one.
+        archived = registry.ARCHIVED_REGISTRATION
+        assert archived["cells"] == (
+            "tp1-short", "tp1-long", "tp2-short", "tp2-long",
+            "tp4-short", "tp4-long")
+        assert archived["classes"] == ("short", "long")
+        assert archived["why_archived"]
+        assert not set(archived["cells"]) & set(registry.CELLS)
+        assert "short" not in registry.CLASSES and "long" not in registry.CLASSES
+        report = registry.check("/nowhere")
+        assert report["archived_registration"]["cells"] == list(archived["cells"])
+        assert not any(c["cell"] in archived["cells"] for c in report["cells"])
+
+    def test_the_report_says_the_archived_registration_is_archived(self, tmp_path):
+        text = registry.render(registry.check(tmp_path))
+        assert "archived and not relabelled" in text
+        assert "tp2-short" in text
+        assert registry.ARCHIVED_REGISTRATION["why_archived"] in text
+
+    def test_the_report_is_readable_at_twenty_four_cells(self, tmp_path):
+        # The artifacts are the width's, so the report states them three times
+        # rather than twenty-four. A reader who cannot find the eight lines
+        # that differ under two hundred that cannot does not read it.
+        text = registry.render(registry.check(tmp_path))
+        assert text.count("  oracle            ") == len(registry.TPS)
+        for cell in registry.CELLS:
+            assert cell in text
+        for name in registry.check(tmp_path)["groups"]:
+            assert f"## {name} -- " in text

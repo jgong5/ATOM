@@ -1,4 +1,4 @@
-"""What each of the six cc-traces cells is configured with, in one place.
+"""What each of the twenty-four cc-traces cells is configured with, in one place.
 
 `cc_traces_plan.py` prints the commands a cell needs and `cc_traces_run.py`
 executes them, and both have so far taken the modelled side's oracle
@@ -40,8 +40,69 @@ from atom.compass.core.artifacts import resolve_rank_path
 
 #: The matrix, in the order a report should read.
 TPS = (1, 2, 4)
-CLASSES = ("short", "long")
-CELLS = tuple(f"tp{tp}-{klass}" for tp in TPS for klass in CLASSES)
+#: The clients matrix's two classes (`CC_TRACES_PROTOCOL.md` §1B).
+CLASSES = ("clients_short", "clients_large")
+#: Offered load, as a count of root sessions. A cell is a width *and* a class
+#: *and* an offered load: `cc_traces_plan.py` writes one directory per triple
+#: and `cc_traces_validate.py` keys one verdict per triple, so this module has
+#: to name the same twenty-four things they do or a readiness report would be
+#: about a matrix nobody runs.
+CLIENTS = (1, 2, 4, 8)
+
+
+def cell_id(tp: int, klass: str, clients: int) -> str:
+    """One cell's name, in the form the plan and the validator both use.
+
+    The same string the plan makes its directory out of and the validator's
+    verdict carries, so a readiness line and an evidence directory can be held
+    against each other by name. All three coordinates are in it: a name
+    carrying only the width and the class would be the same string for four
+    different offered loads, and whichever ran last would own the directory.
+    """
+    return f"tp{tp}_{klass}_c{clients}"
+
+
+CELLS = tuple(
+    cell_id(tp, klass, clients)
+    for tp in TPS
+    for klass in CLASSES
+    for clients in CLIENTS
+)
+
+
+def cells_at(*tps) -> tuple:
+    """Every cell of these widths, over all classes and all offered loads.
+
+    What a refusal is charged to is a property of the width -- the head is
+    priced at 32 rows and nowhere else at TP>1 whatever the offered load is --
+    so the refusals name widths and this expands them, rather than each one
+    carrying twenty-four strings that could disagree with each other.
+    """
+    return tuple(
+        cell_id(tp, klass, clients)
+        for tp in tps
+        for klass in CLASSES
+        for clients in CLIENTS
+    )
+
+
+#: The first cc-traces registration, kept as a registration rather than
+#: renamed into this one. Its `short`/`long` classes are different workloads
+#: selected by a different rule -- whole busy episodes with delegated agents in
+#: flight is what the clients classes added -- so relabelling `tp2-short` as
+#: `tp2_clients_short_c1` would put this matrix's name on measurements taken
+#: under the other one. Those six cells and their evidence stand; they are not
+#: re-planned here and nothing in `check` reports on them.
+ARCHIVED_REGISTRATION = {
+    "cells": tuple(f"tp{tp}-{klass}" for tp in TPS for klass in ("short", "long")),
+    "classes": ("short", "long"),
+    "why_archived": (
+        "superseded as the planned matrix by the clients registration of "
+        "CC_TRACES_PROTOCOL.md §1B, which replays whole busy episodes at a "
+        "declared offered load; the two rules select different requests, so "
+        "these cells are archived under their own names rather than relabelled"
+    ),
+}
 
 MODEL = "Qwen/Qwen3.8-27B"
 
@@ -532,7 +593,7 @@ OPEN_REFUSALS = {
         "what": "at TP>1 the head is priced at 32 rows and nowhere else; any "
                 "other running-request count is refused, and one measured "
                 "point fits nothing",
-        "cells": tuple(c for c in CELLS if not c.startswith("tp1-")),
+        "cells": cells_at(2, 4),
         "closes": "the source-width row ladder, re-measured or transferred at "
                   "each width, over the counts the workloads actually reach",
         "first_met": True,
@@ -548,7 +609,7 @@ OPEN_REFUSALS = {
     "derivation_is_rank0_s": {
         "what": "derivation produces rank 0's shard whatever rank asks, so "
                 "at TP>1 the other ranks are served the representative",
-        "cells": tuple(c for c in CELLS if not c.startswith("tp1-")),
+        "cells": cells_at(2, 4),
         "closes": "per-rank derivation, or a measured bound on the "
                   "rank-to-rank spread at each width",
         "first_met": False,
@@ -556,7 +617,7 @@ OPEN_REFUSALS = {
     "region_model_held_out": {
         "what": "the region model is held out at TP2 and TP4: it was fitted "
                 "at the source width and its transfer is what G4 tests",
-        "cells": tuple(c for c in CELLS if not c.startswith("tp1-")),
+        "cells": cells_at(2, 4),
         "closes": "the G4 held-out transfer result, or a width-local fit "
                   "declared as such",
         "first_met": False,
@@ -698,55 +759,110 @@ def verify(tp: int, root) -> dict:
     }
 
 
-def cell_config(tp: int, klass: str, root) -> dict:
-    """One cell, whole: what it is served with and what it still owes."""
+def cell_config(tp: int, klass: str, clients: int, root, resolved=None) -> dict:
+    """One cell, whole: what it is served with and what it still owes.
+
+    The configuration is the width's: the same oracle options, artifacts and
+    resolution answer for every class and every offered load, because what the
+    client count changes is which requests arrive, not what prices them. Saying
+    so here, by building one config per cell out of the width's own, is the
+    point -- a readiness report that resolved artifacts per *width* and then
+    printed six lines would be silent about eighteen cells that exist.
+    """
     return {
-        "cell": f"tp{tp}-{klass}",
+        "cell": cell_id(tp, klass, clients),
         "tp": tp,
         "class": klass,
+        "clients": clients,
         "oracle": ORACLE,
         "oracle_options": options(tp, root),
         "rank_aggregation": RANK_AGGREGATION,
         "allocation": "native",
         "artifacts": option_paths(tp, root),
-        "resolution": resolution(tp, root),
+        # `resolved` is this width's, handed in by `check` so that twenty-four
+        # cells do not stat the same hundred-odd files eight times each. It is
+        # the width's resolution either way, and the default keeps a single
+        # cell answerable on its own.
+        "resolution": resolution(tp, root) if resolved is None else resolved,
         "owed_costs": list(OWED_TERMS),
         "open_refusals": sorted(k for k, v in OPEN_REFUSALS.items()
-                                if f"tp{tp}-{klass}" in v["cells"]),
+                                if cell_id(tp, klass, clients) in v["cells"]),
     }
+
+
+def group_id(klass: str, clients: int) -> str:
+    """The ranking group a cell belongs to: one class at one offered load.
+
+    The same grouping `cc_traces_validate.py` ranks inside -- three widths over
+    the same replayed requests -- so readiness is reported in the unit the
+    decision is taken in. A group missing one width has no rank to report, and
+    that is worth knowing before a lease is bought rather than after two of the
+    three cells have run.
+    """
+    return f"{klass} c{clients}"
 
 
 def check(root) -> dict:
     """Resolve every cell and say what is missing, without running anything."""
     cells = []
+    # Resolved once per width and shared, not because it is faster -- though at
+    # four ranks and a hundred-odd price files it is -- but because it is the
+    # claim: the client count changes which requests arrive and nothing about
+    # what prices them, so two cells of one width that disagreed about their
+    # artifacts would be a bug in this module rather than a finding.
     for tp in TPS:
+        resolved = resolution(tp, root)
+        absent, shared = set(), set()
+        for rank, roles in resolved.items():
+            for role, found in roles.items():
+                if not found["exists"]:
+                    absent.add(f"{role}@tp{rank}")
+                elif not found["own"]:
+                    # Exists, and is not this rank's: one rank's file answering
+                    # for another is admissible and is a claim, so it is named
+                    # rather than counted as present.
+                    shared.add(f"{role}@tp{rank}")
+        bad = sorted(key for key in INADMISSIBLE
+                     if any(o.startswith(f"{key}=") for o in options(tp, root)))
         for klass in CLASSES:
-            config = cell_config(tp, klass, root)
-            absent, shared = set(), set()
-            for rank, roles in config["resolution"].items():
-                for role, found in roles.items():
-                    if not found["exists"]:
-                        absent.add(f"{role}@tp{rank}")
-                    elif not found["own"]:
-                        # Exists, and is not this rank's: one rank's file
-                        # answering for another is admissible and is a claim,
-                        # so it is named rather than counted as present.
-                        shared.add(f"{role}@tp{rank}")
-            bad = sorted(key for key in INADMISSIBLE
-                         if any(o.startswith(f"{key}=")
-                                for o in config["oracle_options"]))
-            config["absent_artifacts"] = sorted(absent)
-            config["shared_artifacts"] = sorted(shared)
-            config["inadmissible_options"] = bad
-            config["runnable"] = not absent and not bad
-            # Configured is not ready. A cell with every artifact resolved
-            # still refuses the steps below, and the difference between the
-            # two is the whole content of this report.
-            config["ready"] = config["runnable"] and not config["open_refusals"]
-            cells.append(config)
+            for clients in CLIENTS:
+                config = cell_config(tp, klass, clients, root,
+                                     resolved=resolved)
+                config["absent_artifacts"] = sorted(absent)
+                config["shared_artifacts"] = sorted(shared)
+                config["inadmissible_options"] = list(bad)
+                config["group"] = group_id(klass, clients)
+                config["runnable"] = not absent and not bad
+                # Configured is not ready. A cell with every artifact resolved
+                # still refuses the steps below, and the difference between the
+                # two is the whole content of this report.
+                config["ready"] = (config["runnable"]
+                                   and not config["open_refusals"])
+                cells.append(config)
+    groups = {}
+    for klass in CLASSES:
+        for clients in CLIENTS:
+            name = group_id(klass, clients)
+            members = [c for c in cells if c["group"] == name]
+            groups[name] = {
+                "cells": [c["cell"] for c in members],
+                "widths": [c["tp"] for c in members],
+                # A rank is taken over the three widths of one group. Two of
+                # three runnable is not a partial rank, it is no rank.
+                "rankable": (sorted(c["tp"] for c in members) == sorted(TPS)
+                             and all(c["runnable"] for c in members)),
+                "ready": all(c["ready"] for c in members),
+                "not_runnable": [c["cell"] for c in members
+                                 if not c["runnable"]],
+            }
     return {
         "root": str(Path(root)),
         "cells": cells,
+        "groups": groups,
+        "archived_registration": {
+            "cells": list(ARCHIVED_REGISTRATION["cells"]),
+            "why_archived": ARCHIVED_REGISTRATION["why_archived"],
+        },
         "owed_costs": {k: COST_TERMS[k] for k in OWED_TERMS},
         "means": (
             "the configuration each cell would be served with, what is "
@@ -761,13 +877,39 @@ def _resolved(cell, key: str) -> str:
     return cell["resolution"][int(rank)][role]["path"]
 
 
+def _state(cell: dict) -> str:
+    return ("ready" if cell["ready"] else
+            "configured, NOT ready" if cell["runnable"] else
+            "NOT runnable")
+
+
 def render(report: dict) -> str:
-    out = [f"# six cc-traces cells under {report['root']}", ""]
-    for cell in report["cells"]:
-        state = ("ready" if cell["ready"] else
-                 "configured, NOT ready" if cell["runnable"] else
-                 "NOT runnable")
-        out.append(f"## {cell['cell']} -- {state}")
+    out = [
+        f"# {len(report['cells'])} cc-traces cells under {report['root']}",
+        ("# a cell is (width, class, offered load); the rank is taken inside "
+         "one (class, offered load)"),
+        "",
+    ]
+    # By ranking group, because that is the unit the decision is taken in: a
+    # group whose three widths are not all runnable has no rank to report, and
+    # a reader scanning per width would not see that.
+    for name, group in report["groups"].items():
+        rank = "rankable" if group["rankable"] else "NOT rankable"
+        out.append(f"## {name} -- {rank}")
+        for cell in report["cells"]:
+            if cell["group"] == name:
+                out.append(f"  {cell['cell']:<32s} {_state(cell)}")
+        out.append("")
+    # The configuration itself once per width, not once per cell. It is the
+    # width's -- the offered load changes which requests arrive and nothing
+    # about what prices them -- and printing it twenty-four times would bury
+    # the eight lines that differ under two hundred that cannot.
+    out.append("## what each width is configured with, and what it refuses")
+    for tp in TPS:
+        cell = next(c for c in report["cells"] if c["tp"] == tp)
+        others = [c["cell"] for c in report["cells"] if c["tp"] == tp]
+        out.append(f"### tp{tp} -- the same for all {len(others)} cells of "
+                   f"this width")
         out.append(f"  oracle            {cell['oracle']}")
         out.append(f"  rank_aggregation  {cell['rank_aggregation']}")
         out.append(f"  allocation        {cell['allocation']}")
@@ -782,6 +924,12 @@ def render(report: dict) -> str:
             first = " (met first)" if term["first_met"] else ""
             out.append(f"  REFUSES{first}  {key}: {term['what']}")
             out.append(f"    closed by: {term['closes']}")
+        out.append("")
+    archived = report.get("archived_registration") or {}
+    if archived:
+        out.append("## the first registration, archived and not relabelled")
+        out.append(f"  {', '.join(archived['cells'])}")
+        out.append(f"  {archived['why_archived']}")
         out.append("")
     out.append("## costs no step of this harness measures")
     for name, term in report["owed_costs"].items():
