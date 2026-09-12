@@ -30,13 +30,16 @@ _identity = base._identity
 def _with_device_record(cell_dir, record, *, same_machine=False):
     """Replace what the predicting process said about itself.
 
-    ``same_machine`` puts the fixture server's host and boot onto the record.
-    A record produced here names this machine; the fixture server is a
-    fabricated `cell-host`, and the harness's own startup-versus-service check
-    is pinned to that. So the two are made to agree about the thing that is
-    not under test, by moving the side that is fabricated anyway -- the
-    record's device readings, which *are* under test, are left exactly as the
-    producer wrote them.
+    ``same_machine`` makes the fabricated parts of the cell agree with a
+    record the real producer wrote. Such a record names this process on this
+    machine; the fixture server is a fabricated `cell-host` and the fixture
+    journal probed a fabricated pid. So the host and boot are taken from the
+    fixture server onto the record, and the journal's harness observation is
+    moved onto the pid the record names.
+
+    Everything under test is left exactly as the producer wrote it: the device
+    nodes, the driver handles, the namespaces. What is adjusted is only the
+    identity of a machine and a process that no fixture could have known.
     """
     path = cell_dir / "modelled.r1.json"
     blob = json.loads(path.read_text())
@@ -50,8 +53,26 @@ def _with_device_record(cell_dir, record, *, same_machine=False):
                 process = record[reading]["process"]
                 process["host"] = served.get("host")
                 process["boot_id"] = served.get("boot_id")
+            _observe(cell_dir, record["launch"]["process"])
         ranks[0]["device_freedom"] = record
     _write(path, blob)
+
+
+def _observe(cell_dir, process):
+    """Point the fixture's harness observation at the process the record names.
+
+    The harness reads these out of `/proc` at run time; here they are written
+    down, so a record produced by a real process has to be met with an
+    observation of that process rather than of the fixture's invented one.
+    """
+    path = cell_dir / "run.modelled.json"
+    journal = json.loads(path.read_text())
+    for execution in journal.get("executions") or []:
+        for row in (execution.get("predictor_process") or {}).get("observed") or []:
+            row["said_pid"] = process["pid"]
+            row["start_ticks"] = process["start_ticks"]
+            row["ancestry"] = [process["pid"], row["launched_pid"]]
+    path.write_text(json.dumps(journal))
 
 
 def _failures(cell_dir):

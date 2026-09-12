@@ -736,33 +736,47 @@ RUNTIME_CAPACITY_ROLES = (
     "runtime.memory_in",
 )
 
-#: What the capacity selector may say it chose. The vocabulary is the
-#: selector's own, and only one of these is a measurement taken on the machine
-#: being reported.
-MEASURED_BUDGET_KINDS = ("device-measured",)
-BUDGET_KINDS = MEASURED_BUDGET_KINDS + (
+#: Which concrete input each budget kind has to have read. A kind is a claim
+#: about where a number came from, and the claim is only checkable against the
+#: file it came from: `captured` means a replay target was read, `source-derived`
+#: means a modelled profile was. A run that declares one and read the other has
+#: not described itself, whatever its record says.
+BUDGET_KIND_REQUIRES = {
+    "captured": ("runtime.replay_target",),
+    "source-derived": ("runtime.memory_model",),
+    "recorded": ("runtime.memory_in",),
+    # `device-measured` reads the device, not a file. It is required to have
+    # read nothing in particular and is held to `served` instead.
+    "device-measured": (),
+}
+
+#: What the capacity selector may say it chose. Its own vocabulary, and only
+#: one of these is a reading taken from the device the run was on.
+MEASURED_BUDGET_KIND = "device-measured"
+BUDGET_KINDS = (
+    MEASURED_BUDGET_KIND,
     "captured",
     "recorded",
     "source-derived",
 )
 
 
-def _budget_kind(record):
-    """The kind a budget-source record states, whatever shape it arrives in.
+def _budget_record(record):
+    """The selector's own record, or None if this run published none.
 
-    The selector publishes a record -- the kind, the hardware it refers to,
-    what it served, its lineage -- and that record is worth more than a bare
-    word, so it is carried whole and read here for the one field this has to
-    branch on. A plain string is accepted as the kind it names, because a
-    record that says only that is still saying it.
+    A dict and only a dict. The selector publishes the kind together with what
+    it refers to, whether it was served, and the lineage behind it, and those
+    are what make the kind checkable -- a bare word would name a category with
+    nothing behind it, which is the shape this replaces rather than a shorter
+    spelling of it.
     """
-    if record is None:
-        return None
-    if isinstance(record, str):
-        return record or None
-    if isinstance(record, dict):
-        return record.get("kind") or None
-    return None
+    return record if isinstance(record, dict) and record else None
+
+
+def _budget_kind(record):
+    """The kind a budget-source record states."""
+    held = _budget_record(record)
+    return (held or {}).get("kind") or None
 
 
 def _rank_records(modelled) -> list:
@@ -824,7 +838,123 @@ def check_capacity_inputs(modelled, label: str) -> list[str]:
                 f"{where} declares budget source {kind!r}, which is not one "
                 f"the protocol recognises ({', '.join(BUDGET_KINDS)})"
             )
+        else:
+            # The kind names where the number came from; this is whether the
+            # run read the thing it names. Any `runtime.*` row satisfying any
+            # kind would let a run declare `captured` on the strength of having
+            # opened a memory profile.
+            needed = BUDGET_KIND_REQUIRES.get(kind, ())
+            absent = [role for role in needed if role not in roles]
+            if absent:
+                bad.append(
+                    f"{where} declares a {kind!r} budget but read no "
+                    f"{', '.join(absent)}; the kind names a file and this run "
+                    f"did not open it"
+                )
     return bad
+
+
+def check_capacity_provenance(
+    modelled, registry: dict, tp: int, workload_sha: str, forbidden: dict
+) -> list[str]:
+    """Every capacity input, through the checks every calibration input gets.
+
+    This is the hole the presence check above does not close, and it is the
+    one that matters. `check_calibration` walks `oracle_option_sha256`, which
+    holds the files the *command line* named -- the price lists and the
+    templates. A memory profile and a replay target are not command-line
+    options of the oracle; they are read by the runtime, they reach the record
+    through the loaded-input manifest instead, and so nothing ever asked the
+    registry about them.
+
+    A run could therefore be sized from a profile measured on the target
+    engine, at the width being predicted, or from this cell's own measured
+    side, with every oracle input immaculate. The KV budget decides how many
+    requests fit, which decides the schedule, which is most of what the
+    numbers are -- so that is not a smaller leak than a priced operator, it is
+    a larger one.
+
+    So each actual runtime input is looked up by the digest the reader took as
+    it parsed the bytes, and held to the same declaration every other measured
+    input is held to: declared at all, of a recognised kind, not measured at
+    the width being predicted, not from the target engine, not produced from
+    the acceptance workload, not this cell's own artifact, and naming its own
+    sources and code.
+    """
+    by_sha = {
+        entry.get("sha256"): entry
+        for entry in (registry.get("artifacts") or [])
+        if isinstance(entry, dict)
+    }
+    bad = []
+    for index, rank in enumerate(_rank_records(modelled)):
+        for row in rank.get("inputs") or []:
+            if not isinstance(row, dict):
+                continue
+            role = row.get("role") or ""
+            if role.split(".")[0] != "runtime":
+                continue
+            tag = f"{label_of(index)} {role} {row.get('path')!r}"
+            sha = row.get("sha256")
+            if not _hexish(sha):
+                bad.append(
+                    f"{tag} carries no sha256, so it names a file rather than "
+                    f"a file's contents"
+                )
+                continue
+            if sha == workload_sha:
+                bad.append(
+                    f"{tag} is the acceptance workload itself, so what sized "
+                    f"this deployment came from the run being predicted"
+                )
+            for what, forbidden_sha in forbidden.items():
+                if forbidden_sha and sha == forbidden_sha:
+                    bad.append(
+                        f"{tag} is this cell's own {what}: the deployment was "
+                        f"sized from the measurement it is predicting"
+                    )
+            entry = by_sha.get(sha)
+            if entry is None:
+                bad.append(
+                    f"{tag}={sha[:16]} is not declared in the calibration "
+                    f"registry, so what sized this deployment cannot be "
+                    f"attributed to a measurement"
+                )
+                continue
+            kind = entry.get("kind")
+            if kind not in CALIBRATION_KINDS:
+                bad.append(
+                    f"{tag}={sha[:16]} is declared kind {kind!r}, which is "
+                    f"not one the protocol recognises"
+                )
+                continue
+            required = CALIBRATION_KINDS[kind]
+            at = entry.get("measured_at_tp")
+            if required is not None and at not in (None, required):
+                bad.append(
+                    f"{tag}={sha[:16]} is a {kind} measured at TP={at}, but "
+                    f"only TP={required} may be a source for it; at TP={tp} "
+                    f"this is the width being predicted"
+                )
+            if entry.get("from_target_engine"):
+                bad.append(
+                    f"{tag}={sha[:16]} declares it came from the target "
+                    f"engine: the deployment was sized by the engine whose "
+                    f"capacity is being predicted"
+                )
+            if entry.get("workload_sha256") == workload_sha:
+                bad.append(
+                    f"{tag}={sha[:16]} was produced from the acceptance "
+                    f"workload itself"
+                )
+            bad += check_artifact_provenance(
+                tag, entry, {}, workload_sha, forbidden
+            )
+    return bad
+
+
+def label_of(index: int) -> str:
+    return f"rank {index}"
 
 
 def check_reference_budget_is_measured(real, label: str) -> list[str]:
@@ -856,19 +986,33 @@ def check_reference_budget_is_measured(real, label: str) -> list[str]:
         ]
     bad = []
     for index, rank in enumerate(ranks):
-        kind = _budget_kind(rank.get("budget_source"))
+        held = _budget_record(rank.get("budget_source"))
+        kind = (held or {}).get("kind")
         if kind is None:
             bad.append(
                 f"{label}: rank {index} does not say which reading its KV "
                 f"budget was made from; the reference side has to have been "
                 f"sized by the device it ran on, and silence is not that"
             )
-        elif kind not in MEASURED_BUDGET_KINDS:
+            continue
+        if kind != MEASURED_BUDGET_KIND:
             bad.append(
                 f"{label}: rank {index} was sized from a {kind!r} budget, so "
                 f"the ground-truth side is itself a prediction and the "
                 f"comparison is between two models rather than between a "
                 f"model and a machine"
+            )
+            continue
+        # Both, because they are different claims. `kind` says where the
+        # reading came from; `served` says the engine actually ran on it. A
+        # device-measured budget that was computed and then not used is a
+        # measurement of the machine and not a description of this run, and
+        # the deployment the numbers came from would be some other budget's.
+        if held.get("served") is not True:
+            bad.append(
+                f"{label}: rank {index} declares a {kind!r} budget that it "
+                f"does not say it served (served={held.get('served')!r}), so "
+                f"what the reference engine actually ran on is unrecorded"
             )
     return bad
 
@@ -1817,6 +1961,100 @@ def check_who_served(journal, manifests: list, label: str) -> list[str]:
         problems += _who_answered(execution, where)
         if index < len(manifests):
             problems += _who_served(execution, manifests[index], where)
+            # Only the modelled side has a predictor to bind. A measured run
+            # serves from a device and has no GPU-free claim to make, so
+            # demanding a probe of one would refuse the ground-truth half of
+            # every comparison.
+            if label == "modelled":
+                problems += _who_predicted(execution, manifests[index], where)
+    return problems
+
+
+def _who_predicted(execution, manifest, where: str) -> list[str]:
+    """And that the process which predicted is the one the harness probed.
+
+    The harness reads the predictor's pid out of the worker's own device
+    reading and probes it here, from `/proc`, requiring it to be inside the
+    tree that repeat launched. It writes down what it saw. This reads that
+    down again, because a refusal that only ever happens live is a refusal
+    nobody can audit afterwards -- the artifacts outlive the process, and a
+    cell handed to this validator on its own would otherwise be free to ignore
+    a binding that failed or was never attempted.
+
+    Only the modelled side has a predictor. A measured run has no device
+    reading to bind, and demanding one would refuse the ground-truth half of
+    every comparison.
+    """
+    readings = [
+        rank.get("device_freedom")
+        for rank in (
+            ((manifest.get("server") or {}).get("compass") or {})
+            .get("loaded_inputs", {})
+            .get("ranks")
+            or []
+        )
+        if isinstance(rank, dict) and isinstance(rank.get("device_freedom"), dict)
+    ]
+    if not readings:
+        return []  # `check_predictor_device_freedom` decides that, per side
+    seen = execution.get("predictor_process")
+    if not isinstance(seen, dict) or not seen.get("observed"):
+        return [
+            (
+                f"{where}: the run records no independent probe of the process "
+                f"that predicted, so its device reading is only its own "
+                f"account of itself"
+            )
+        ]
+    if not seen.get("verified"):
+        return [
+            (
+                f"{where}: the harness probed the predicting process and did "
+                f"not verify it, and the cell was kept anyway"
+            )
+        ]
+    problems = []
+    observed = {
+        row.get("rank"): row for row in seen["observed"] if isinstance(row, dict)
+    }
+    if len(observed) != len(readings):
+        problems.append(
+            f"{where}: {len(observed)} predictor(s) were probed against "
+            f"{len(readings)} that reported a device reading"
+        )
+    for index, reading in enumerate(readings):
+        theirs = (reading.get("launch") or {}).get("process") or {}
+        ours = observed.get(index)
+        if ours is None:
+            problems.append(
+                f"{where}: predictor {index} reported a device reading that "
+                f"nothing probed"
+            )
+            continue
+        # The harness read these out of `/proc` itself; the worker read its
+        # own. Neither is written from the other, which is what makes the
+        # agreement worth anything.
+        if theirs.get("pid") != ours.get("said_pid"):
+            problems.append(
+                f"{where}: predictor {index} reports pid {theirs.get('pid')!r} "
+                f"and the probe was of pid {ours.get('said_pid')!r}"
+            )
+        if theirs.get("start_ticks") != ours.get("start_ticks"):
+            problems.append(
+                f"{where}: predictor {index} claims start tick "
+                f"{theirs.get('start_ticks')!r} and the probe read "
+                f"{ours.get('start_ticks')!r}, so the pid names a different "
+                f"process than the one that predicted"
+            )
+        launched = ours.get("launched_pid")
+        ancestry = ours.get("ancestry") or []
+        if launched is None or launched not in ancestry:
+            problems.append(
+                f"{where}: predictor {index} (pid {theirs.get('pid')!r}) is "
+                f"not in the process tree this repeat launched (pid "
+                f"{launched!r}); host and boot alone cannot tell it from "
+                f"another container on this machine"
+            )
     return problems
 
 
@@ -2023,6 +2261,12 @@ def cell(args) -> int:
             failures += [
                 f"repeat {index}: {reason}"
                 for reason in check_scalar_overheads(
+                    modelled, registry, args.tp, workload_sha, forbidden
+                )
+            ]
+            failures += [
+                f"repeat {index}: {reason}"
+                for reason in check_capacity_provenance(
                     modelled, registry, args.tp, workload_sha, forbidden
                 )
             ]

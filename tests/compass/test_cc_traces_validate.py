@@ -55,6 +55,31 @@ ROWS = [
 PRICES_SHA = "a" * 64
 SWEEP_SHA = "e" * 64
 CODE_SHA = "f" * 64
+#: The replay target the deployment was sized from. Its own digest, because
+#: what sized a deployment is declared and checked like any other measured
+#: input -- see `check_capacity_provenance`.
+TARGET_SHA = "b" * 64
+TARGET_CAPTURE_SHA = "c" * 64
+
+
+def capacity_artifact():
+    """The declaration of what sized the deployment.
+
+    Kept beside whatever a test is varying, because what sized the deployment
+    is checked like any other measured input and almost no test here is about
+    it. A test that *is* about it overrides this entry by name.
+    """
+    return {
+        "sha256": TARGET_SHA,
+        "kind": "derived_graph",
+        "measured_at_tp": 1,
+        "produced_by": "replay_target_out",
+        "workload_sha256": None,
+        "sources": [
+            {"path": "/m/target_capture.json", "sha256": TARGET_CAPTURE_SHA}
+        ],
+        "code": {"atom/compass/replay/runner.py": CODE_SHA},
+    }
 TABLE_SHA = "b" * 64
 WORKLOAD_ROW_KEYS = ("arrival_s", "input_tokens", "output_tokens")
 
@@ -164,24 +189,26 @@ def _server(
                                 "requested": "/x/target.json",
                                 "path": "/x/target.json",
                                 "rank_own": False,
-                                "sha256": "f" * 64,
+                                "sha256": TARGET_SHA,
                                 "size": 128,
                                 "rank_coords": {},
                             }
                         ],
                         "rolled_sha256": "0" * 64,
                         # The record the capacity selector publishes: the kind
-                        # it chose, and enough lineage to say what that kind
-                        # refers to. The real side is sized by the device it
-                        # ran on; the modelled side is sized from the capture
-                        # of one, which is the whole capability.
+                        # it chose, whether the engine ran on it, what it
+                        # refers to and the lineage behind it. The real side
+                        # is sized by the device it ran on; the modelled side
+                        # is sized from the capture of one, which is the whole
+                        # capability.
                         "budget_source": {
                             "kind": "device-measured"
                             if mode == "measure"
                             else "captured",
+                            "served": True,
                             "hardware_reference": "MI308X",
-                            "served": {"num_kvcache_blocks": 4096},
                             "lineage": ["/x/target.json"],
+                            "deployment": {"num_kvcache_blocks": 4096},
                         },
                         "device_freedom": _device_freedom(),
                     }
@@ -211,6 +238,24 @@ def _journal(cell_dir, side, repeats, *, executions=None):
                         "ancestry": [4242, 4240, 1],
                         "alive_at_provenance": True,
                     },
+                    "verified": True,
+                },
+                # What the harness read out of `/proc` about the process that
+                # predicted. Its own reading, not the worker's: the worker's
+                # account lives in the run manifest, and the two agreeing is
+                # the whole point of taking both.
+                "predictor_process": {
+                    "observed": [
+                        {
+                            "rank": 0,
+                            "said_pid": 4243,
+                            "launched_pid": 4240,
+                            "host": PROC_HOST,
+                            "boot_id": PROC_BOOT,
+                            "start_ticks": 132307571,
+                            "ancestry": [4243, 4242, 4240, 1],
+                        }
+                    ],
                     "verified": True,
                 },
             }
@@ -464,7 +509,24 @@ def cell(tmp_path, monkeypatch):
                             {"path": "/m/primitive_sweep.json", "sha256": SWEEP_SHA}
                         ],
                         "code": {"scripts/compass/primitives.py": CODE_SHA},
-                    }
+                    },
+                    # What sized the deployment. Declared like any other
+                    # measured input, because it is one: it decides how many
+                    # requests fit, which decides the schedule.
+                    {
+                        "sha256": TARGET_SHA,
+                        "kind": "derived_graph",
+                        "measured_at_tp": 1,
+                        "produced_by": "replay_target_out",
+                        "workload_sha256": None,
+                        "sources": [
+                            {
+                                "path": "/m/target_capture.json",
+                                "sha256": TARGET_CAPTURE_SHA,
+                            }
+                        ],
+                        "code": {"atom/compass/replay/runner.py": CODE_SHA},
+                    },
                 ]
             }
         )
@@ -796,6 +858,8 @@ class TestCalibrationLeakage:
             )
             entry.setdefault("code", {"scripts/compass/primitives.py": CODE_SHA})
             filled.append(entry)
+        if not any(e.get("sha256") == TARGET_SHA for e in filled):
+            filled.append(capacity_artifact())
         (cell / "registry.json").write_text(json.dumps({"artifacts": filled}))
 
     def test_a_standalone_primitive_at_this_width_is_allowed(self, cell):
@@ -1271,7 +1335,10 @@ class TestCalibrationProvenanceIsTransitive:
     """
 
     def _registry(self, cell, artifacts):
-        (cell / "registry.json").write_text(json.dumps({"artifacts": artifacts}))
+        held = list(artifacts)
+        if not any(e.get("sha256") == TARGET_SHA for e in held):
+            held.append(capacity_artifact())
+        (cell / "registry.json").write_text(json.dumps({"artifacts": held}))
 
     def _entry(self, **overrides):
         entry = {

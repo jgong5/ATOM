@@ -225,33 +225,46 @@ class CompassPredictMixin:
         return out
 
     def _observe_device_freedom(self, when: str) -> dict:
-        """This process's own reading, with what the runtime says recorded beside it.
+        """This process's own reading, with the runtime's account recorded beside it.
 
-        The runtime's view is read here rather than in
-        `atom.compass.core.device_freedom`, which is stdlib-only and has no
-        business importing a deep-learning runtime -- least of all to answer a
-        question whose answer it does not trust. It is recorded and excluded:
-        the replay bootstrap answers hardware queries from the captured target,
-        so a device count read in this interpreter describes the deployment
-        being modelled.
+        The runtime is *not asked*, and that is deliberate twice over.
+
+        It would not be evidence if it answered. The replay bootstrap supplies
+        hardware answers from the captured target so AITER can be imported with
+        no device present, so a count read in this interpreter describes the
+        deployment being modelled rather than the devices this process could
+        reach. The verdict rests on device nodes and this process's own file
+        descriptors instead.
+
+        And asking costs something real. `torch.cuda.is_available()` and
+        `device_count()` are CUDA calls, and a GPU-free replay must reach none
+        during construction -- `test_construction_reaches_no_cuda_call` pins
+        exactly that, and it caught this. Reading a number we had already
+        decided to ignore, at the cost of the property the whole gate is
+        about, is a bad trade in both directions.
+
+        So what is recorded is the bootstrap's own state, which is the thing
+        that explains *why* a runtime count would mislead, and a plain
+        statement that the runtime was not consulted.
         """
         from atom.compass.core import device_freedom
 
-        report = {}
-        try:
-            import torch
-
-            report["torch_version"] = getattr(torch, "__version__", None)
-            report["device_count"] = int(torch.cuda.device_count())
-            report["cuda_available"] = bool(torch.cuda.is_available())
-        except Exception as exc:  # torch absent or refusing: both are readings
-            report["error"] = f"{type(exc).__name__}: {exc}"
+        report = {
+            "consulted": False,
+            "why": (
+                "asking the runtime what it can see is a CUDA call, and a "
+                "GPU-free replay must reach none; its answer is supplied by "
+                "the replay bootstrap in any case and would describe the "
+                "captured deployment rather than this container"
+            ),
+        }
         try:
             from atom.compass.replay import bootstrap
 
             state = bootstrap.state()
             report["bootstrap_installed"] = bool(state.get("installed"))
             report["bootstrap_arch"] = state.get("arch")
+            report["bootstrap_source"] = state.get("source")
         except Exception as exc:  # noqa: BLE001 - provenance never fails a run
             report["bootstrap_error"] = f"{type(exc).__name__}: {exc}"
         return device_freedom.observe(when, runtime_report=report)

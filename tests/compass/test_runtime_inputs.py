@@ -27,6 +27,15 @@ TARGET_INPUT = LoadedInput(role="runtime.replay_target",
                            requested="target.json", path="target.json",
                            rank_own=False, sha256="c" * 64, size=33)
 
+#: The record the capacity selector publishes, as it publishes it.
+SOURCE_DERIVED = {
+    "kind": "source-derived",
+    "served": True,
+    "hardware_reference": "MI308X",
+    "lineage": ["profile.json"],
+    "deployment": {"num_kvcache_blocks": 4096},
+}
+
 
 class _Oracle:
     compass_loaded_inputs = (ORACLE_INPUT,)
@@ -120,22 +129,26 @@ class TestTheBudgetSource:
 
         assert runner.compass_input_manifest()["budget_source"] is None
 
-    def test_it_is_reported_as_the_selector_states_it(self):
+    def test_the_selectors_whole_record_is_carried(self):
+        """Not just the kind. What it refers to, whether the engine ran on it,
+        and the lineage behind it are what make the kind checkable, and this
+        layer passes them through rather than reducing them to a word."""
         runner = _runner()
-        runner.compass_budget_source = "analytical"
+        runner.compass_budget_source = dict(SOURCE_DERIVED)
 
-        assert runner.compass_input_manifest()["budget_source"] == "analytical"
+        assert runner.compass_input_manifest()["budget_source"] == SOURCE_DERIVED
 
     def test_it_is_not_inferred_from_the_cost_mode(self):
         """`mode="measure"` forces the wall clock and says nothing about
-        memory, so a measured run can be sized from an analytical profile.
+        memory, so a measured run can be sized from a modelled profile.
         Reading the mode here would report that run as measured."""
         runner = _runner()
         runner.__dict__["_compass_config_cache"] = CompassConfig(
             enabled=True, mode="measure", measure_out="/tmp/steps.jsonl")
-        runner.compass_budget_source = "analytical"
+        runner.compass_budget_source = dict(SOURCE_DERIVED)
 
-        assert runner.compass_input_manifest()["budget_source"] == "analytical"
+        seen = runner.compass_input_manifest()["budget_source"]
+        assert seen["kind"] == "source-derived"
 
 
 class TestTheSeamsAreThereForTheReaderToFill:
