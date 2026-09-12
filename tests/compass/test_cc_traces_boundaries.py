@@ -2,14 +2,15 @@
 
 Everything here is checked against the producer itself rather than against a
 stand-in: `replay.py`'s own argument parser, `replay.py`'s own clock rule, and
-the source of the server endpoint whose field names the harness reads. A mocked
-process will accept any flag you invent for it, which is exactly how a command
-plan stays plausible and wrong until the night it is run.
+the engine's own barrier state, read out through the engine's own handler. A
+mocked process will accept any flag you invent for it, which is exactly how a
+command plan stays plausible and wrong until the night it is run.
 
 `replay.py` imports nothing outside the standard library, so its real functions
-can be driven here against a local HTTP server. Nothing in this file starts an
-engine or touches a device; the server the engine would be is a stub, and what
-is being tested is the agreement at the seam, not the engine behind it.
+can be driven here against a local HTTP server, and the engine modules import
+without a device, so the barrier round trip is driven through the real ones.
+Nothing in this file starts an engine or touches a device: the serving side is
+a stub, and what is being tested is the agreement at the seam.
 """
 
 from __future__ import annotations
@@ -92,6 +93,10 @@ class Stub(BaseHTTPRequestHandler):
     #: The arrival protocol lives in those bodies and nowhere else, so this is
     #: what lets it be tested at the seam without an engine behind it.
     posted: ClassVar[list] = []
+    #: What the drain endpoint answers. `replay.py` reads the engine's barrier
+    #: state off this same response, so a test sets it here to stand for what
+    #: the engine observed.
+    requests_reply: ClassVar[dict] = {"count": 0, "requests": []}
 
     def do_POST(self):  # BaseHTTPRequestHandler names it this way
         length = int(self.headers.get("Content-Length") or 0)
@@ -99,7 +104,7 @@ class Stub(BaseHTTPRequestHandler):
         if self.path.startswith("/compass/requests"):
             # `replay.py` drains the engine's record store with a POST at the
             # end of a run. Recording it here would count it as a request.
-            body = json.dumps({"count": 0, "requests": []}).encode()
+            body = json.dumps(type(self).requests_reply).encode()
         else:
             type(self).posted.append(sent)
             body = json.dumps(
@@ -115,7 +120,7 @@ class Stub(BaseHTTPRequestHandler):
         if self.path.startswith("/compass/provenance"):
             body = json.dumps(type(self).provenance).encode()
         elif self.path.startswith("/compass/requests"):
-            body = json.dumps({"count": 0, "requests": []}).encode()
+            body = json.dumps(type(self).requests_reply).encode()
         else:
             self.send_response(404)
             self.end_headers()
@@ -135,6 +140,7 @@ def served():
     server = HTTPServer(("127.0.0.1", 0), Stub)
     Stub.provenance = {}
     Stub.posted = []
+    Stub.requests_reply = {"count": 0, "requests": []}
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
@@ -547,3 +553,335 @@ class TestTheArrivalBarrierIsOnlyArmedByTheSideThatCanFillIt:
         assert modelled and real
         assert "--pace" not in modelled[0]
         assert "--pace" in real[0]
+
+
+class TestABarrierThatActuallyTimedOutFailsTheRun:
+    """The state the engine really observed, carried to the harness.
+
+    `compare.py` has refused a manifest whose `arrival_barrier_timed_out` is
+    true for some time, but nothing ever wrote that key: the scheduler sets the
+    flag on itself in the EngineCore process and no endpoint exported it, so
+    the check could not fire. These check the producer end -- that
+    `/compass/requests` is read for it, that it reaches the manifest, and that
+    a run which timed out fails instead of reporting "0 failed".
+
+    Three states throughout. A barrier that could not be read is not a barrier
+    that held: unknown is reported and never silently promoted to either
+    answer.
+    """
+
+    def _trace(self, tmp_path, count=3):
+        path = tmp_path / "trace.jsonl"
+        path.write_text(
+            "".join(
+                json.dumps(
+                    {"arrival_s": i * 0.01, "input_tokens": 8, "output_tokens": 1}
+                )
+                + "\n"
+                for i in range(count)
+            )
+        )
+        return path
+
+    def _run(self, base, tmp_path, barrier):
+        """One unpaced run against a stub whose drain reports `barrier`."""
+        out = tmp_path / "out.json"
+        Stub.requests_reply = {"count": 0, "requests": [], **barrier}
+        code = replay_mod.main(
+            [
+                "--port",
+                base.rsplit(":", 1)[1],
+                "--model",
+                "m",
+                "--trace",
+                str(self._trace(tmp_path)),
+                "--out",
+                str(out),
+                "--timeout",
+                "20",
+            ]
+        )
+        return code, json.loads(out.read_text())["run"]
+
+    def test_a_barrier_that_held_is_a_passing_run(self, served, tmp_path):
+        base, _ = served
+        code, run = self._run(base, tmp_path, {"arrival_barrier": {"timed_out": False}})
+        assert code == 0
+        assert run["arrival_barrier_timed_out"] is False
+
+    def test_a_barrier_that_timed_out_fails_the_run(self, served, tmp_path):
+        base, _ = served
+        code, run = self._run(
+            base,
+            tmp_path,
+            {
+                "arrival_barrier": {
+                    "timed_out": True,
+                    "ranks": [{"detail": {"arrived": 11, "expected": 62}}],
+                }
+            },
+        )
+        assert code != 0, "a run whose barrier timed out must not exit 0"
+        assert run["arrival_barrier_timed_out"] is True
+
+    def test_the_failed_run_still_leaves_its_evidence(self, served, tmp_path):
+        """Failing by deleting the artifact would leave only a log line, which
+        is the situation this whole field exists to end."""
+        base, _ = served
+        code, run = self._run(base, tmp_path, {"arrival_barrier": {"timed_out": True}})
+        assert code != 0
+        assert run["arrival_barrier"] == {"timed_out": True}
+
+    def test_the_field_compare_refuses_on_is_the_field_replay_writes(
+        self, served, tmp_path
+    ):
+        """Named once. A manifest key nothing writes is how this check spent
+        its whole life so far being unable to fire."""
+        base, _ = served
+        _, run = self._run(base, tmp_path, {"arrival_barrier": {"timed_out": True}})
+        compare_source = (ROOT / "scripts/compass/compare.py").read_text()
+        assert 'm.get("arrival_barrier_timed_out")' in compare_source
+        assert "arrival_barrier_timed_out" in run
+
+    def test_an_unreadable_barrier_is_unknown_and_neither_answer(
+        self, served, tmp_path
+    ):
+        """A server too old to report one, or a round trip that failed. The
+        run is not refused -- nothing says it was bad -- but nothing may read
+        it as verified either."""
+        base, _ = served
+        code, run = self._run(base, tmp_path, {})
+        assert code == 0
+        assert run["arrival_barrier_timed_out"] is None
+
+    def test_an_unknown_barrier_is_not_truthy_to_the_check(self, served, tmp_path):
+        """`compare.py` refuses on truthiness, so unknown must not be a dict
+        or a non-empty string that happens to be true."""
+        base, _ = served
+        _, run = self._run(base, tmp_path, {"arrival_barrier": {"timed_out": None}})
+        assert not run["arrival_barrier_timed_out"]
+        assert run["arrival_barrier_timed_out"] is None
+
+
+class TestTheServerSideOfTheBarrierReading:
+    """The whole round trip, driven through the real code on both ends.
+
+    The scheduler's barrier is a piece of its own state and needs no device to
+    exercise, so nothing here is a stand-in for the producer: the state is put
+    there by `Scheduler._arrival_barrier_unmet` itself, read out by the real
+    `EngineUtilityHandler` through its real command table, aggregated by the
+    real `LLMEngine` method, and served by the real endpoint helper. A test
+    that handed a fake scheduler the attribute name the handler expects would
+    agree with the implementation by construction and would keep agreeing
+    after the scheduler stopped writing it.
+
+    An engine is still never started and no device is touched. What is
+    constructed is one `Scheduler.__new__` with the four fields the barrier
+    reads -- building a real one needs a model, a device and a KV cache, none
+    of which the barrier consults.
+    """
+
+    COMMAND = "get_compass_arrival_barrier"
+
+    @pytest.fixture
+    def virtual(self):
+        """A real virtual clock installed for the duration of a test.
+
+        `_arrival_barrier_unmet` decides whether there is anything to wait for
+        by asking the installed clock for an epoch, so the clock has to be the
+        real one: a wall clock opens the barrier immediately.
+        """
+        from atom.utils.clock import VirtualClock, get_clock, set_clock
+
+        previous = get_clock()
+        set_clock(VirtualClock(epoch=1_700_000_000.0))
+        yield
+        set_clock(previous)
+
+    @staticmethod
+    def _scheduler(arrived=0, declared=None, waited=0.0):
+        """A scheduler with `arrived` of `declared` requests waiting.
+
+        `waited` is how long submission has been going on, in real seconds,
+        which is what the barrier's timeout is measured against.
+        """
+        import time
+        from types import SimpleNamespace
+
+        from atom.model_engine.scheduler import Scheduler
+
+        scheduler = Scheduler.__new__(Scheduler)
+        scheduler._arrival_barrier_open = False
+        scheduler._arrival_barrier_since = time.monotonic() - waited if waited else None
+        scheduler.waiting = [
+            SimpleNamespace(compass_workload_size=declared) for _ in range(arrived)
+        ]
+        return scheduler
+
+    @classmethod
+    def _consulted(cls, **kwargs):
+        """A scheduler that has been through its barrier check once.
+
+        The state the handler reports only comes into existence when the real
+        method runs: a scheduler nobody consulted has no reading, which is
+        itself one of the cases below.
+        """
+        scheduler = cls._scheduler(**kwargs)
+        scheduler._arrival_barrier_unmet()
+        return scheduler
+
+    @classmethod
+    def _ask(cls, scheduler):
+        """What the utility handler answers for this scheduler.
+
+        Dispatched by command name through the real `_UTILITY_HANDLERS` table,
+        because the name is half of what can go wrong: a handler nobody can
+        reach answers nothing, and the caller reads that as unknown forever.
+        """
+        import queue
+
+        from atom.model_engine.engine_utility import EngineUtilityHandler
+
+        output = queue.Queue()
+        handler = EngineUtilityHandler(
+            runner_mgr=None, output_queue=output, scheduler=scheduler
+        )
+        handler._execute_utility_command(cls.COMMAND, {})
+        kind, payload = output.get_nowait()
+        assert kind == "UTILITY_RESPONSE"
+        assert payload["cmd"] == cls.COMMAND
+        return payload
+
+    @classmethod
+    def _aggregate(cls, responses):
+        """What the engine makes of one answer per rank."""
+        from types import SimpleNamespace
+
+        from atom.model_engine.llm_engine import LLMEngine
+
+        sent = {}
+
+        def broadcast(command, timeout=None):
+            sent["command"] = command
+            return responses
+
+        engine = SimpleNamespace(
+            core_mgr=SimpleNamespace(broadcast_utility_command_sync=broadcast)
+        )
+        reading = LLMEngine.get_compass_arrival_barrier(engine)
+        # The command the engine broadcasts has to be one the handler table
+        # answers, or every rank stays silent and every run reads unknown.
+        assert sent["command"] == cls.COMMAND
+        return reading
+
+    def test_a_barrier_that_actually_timed_out_reaches_the_caller(self, virtual):
+        """The failing case end to end: two of five arrived, submission ran
+        past the timeout, the scheduler gave up and ran anyway."""
+        from atom.model_engine.scheduler import Scheduler
+
+        scheduler = self._scheduler(
+            arrived=2, declared=5, waited=Scheduler.ARRIVAL_BARRIER_TIMEOUT_S + 1.0
+        )
+        assert scheduler._arrival_barrier_unmet() is False  # gave up, not met
+        assert scheduler._arrival_barrier_open is True
+
+        answer = self._ask(scheduler)["result"]
+        assert answer["timed_out"] is True
+        assert answer["detail"]["arrived"] == 2
+        assert answer["detail"]["expected"] == 5
+        assert answer["detail"]["timeout_s"] == Scheduler.ARRIVAL_BARRIER_TIMEOUT_S
+
+        reading = self._aggregate([self._ask(scheduler)])
+        assert reading["timed_out"] is True
+
+    def test_a_barrier_still_waiting_has_not_timed_out(self, virtual):
+        """Held, not failed. The engine is holding the virtual clock exactly
+        as intended, and a reading taken mid-wait must not say otherwise."""
+        scheduler = self._scheduler(arrived=2, declared=5)
+        assert scheduler._arrival_barrier_unmet() is True
+        assert self._ask(scheduler)["result"]["timed_out"] is False
+
+    def test_a_barrier_the_workload_filled_reports_false(self, virtual):
+        """The passing case: everything declared turned up, the barrier
+        opened on its own terms, and the run is verifiable."""
+        scheduler = self._scheduler(arrived=5, declared=5)
+        assert scheduler._arrival_barrier_unmet() is False
+        assert scheduler._arrival_barrier_open is True
+        assert self._aggregate([self._ask(scheduler)])["timed_out"] is False
+
+    def test_a_scheduler_that_never_reached_the_barrier_is_unknown(self):
+        """Never consulted, so there is nothing to report -- and unknown is
+        what that is. Reporting False here would claim a barrier held that was
+        never reached."""
+        answer = self._ask(self._scheduler())["result"]
+        assert answer["timed_out"] is None
+        assert answer["why"]
+        assert self._aggregate([answer])["timed_out"] is None
+
+    def test_a_rank_with_no_scheduler_is_unknown_rather_than_good(self):
+        answer = self._ask(None)["result"]
+        assert answer["timed_out"] is None
+        assert answer["why"]
+
+    def test_a_rank_that_cannot_answer_does_not_vote_for_a_good_run(self, virtual):
+        """True beats unknown beats False. One silent rank leaves the reading
+        unknown however many ranks answered, and one rank that timed out
+        decides it however many did not."""
+        good = self._ask(self._consulted(arrived=5, declared=5))
+        silent = self._ask(self._scheduler())
+        from atom.model_engine.scheduler import Scheduler
+
+        bad = self._ask(
+            self._consulted(
+                arrived=1,
+                declared=4,
+                waited=Scheduler.ARRIVAL_BARRIER_TIMEOUT_S + 1.0,
+            )
+        )
+        assert self._aggregate([good, good])["timed_out"] is False
+        assert self._aggregate([good, silent])["timed_out"] is None
+        assert self._aggregate([good, silent, bad])["timed_out"] is True
+        assert self._aggregate([])["timed_out"] is None
+
+    def test_the_ranks_that_answered_are_reported_alongside_the_verdict(self, virtual):
+        """The verdict is a summary; the run has to be able to show which rank
+        said what, or an unknown reading cannot be chased down."""
+        reading = self._aggregate(
+            [self._ask(self._consulted(arrived=5, declared=5)), self._ask(None)]
+        )
+        assert [rank["timed_out"] for rank in reading["ranks"]] == [False, None]
+
+    def test_the_endpoint_answers_with_the_engine_s_reading(self, monkeypatch):
+        """The server helper the harness drains through, against a stand-in
+        engine -- the one seam where a real object cannot be built here."""
+        from types import SimpleNamespace
+
+        import atom.entrypoints.openai.api_server as server
+        from atom.entrypoints.openai.api_server import _compass_arrival_barrier
+
+        reading = {"timed_out": False, "ranks": [{"timed_out": False}]}
+        monkeypatch.setattr(
+            server,
+            "engine",
+            SimpleNamespace(get_compass_arrival_barrier=lambda timeout: reading),
+        )
+        assert _compass_arrival_barrier() == reading
+
+    def test_an_endpoint_that_cannot_reach_the_engine_says_unknown(self, monkeypatch):
+        """A reading that failed must not fail the run it describes, and must
+        not pass it either."""
+        from types import SimpleNamespace
+
+        import atom.entrypoints.openai.api_server as server
+
+        def boom(timeout):
+            raise TimeoutError("no response from rank 0")
+
+        monkeypatch.setattr(server, "engine", None)
+        assert server._compass_arrival_barrier()["timed_out"] is None
+        monkeypatch.setattr(
+            server, "engine", SimpleNamespace(get_compass_arrival_barrier=boom)
+        )
+        unreadable = server._compass_arrival_barrier()
+        assert unreadable["timed_out"] is None
+        assert "no response from rank 0" in unreadable["why"]

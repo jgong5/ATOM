@@ -479,9 +479,19 @@ def main(argv=None) -> int:
     except Exception:  # noqa: BLE001 - an older or non-Compass server has none
         server = {}
 
+    # Whether the engine's arrival barrier gave up waiting, straight from the
+    # engine -- not inferred from the flags this client was given. A run can be
+    # invoked correctly and still time out, if submission was slow enough, and
+    # the client cannot see that from its own side: it reports "0 failed"
+    # either way. `compare.py` refuses a run whose manifest says True; an
+    # unknown barrier stays unknown and is reported rather than assumed.
+    barrier = (engine.get("arrival_barrier") or {}) if isinstance(engine, dict) else {}
+
     manifest = {
         "revision": _revision(),
         "client_revision": _revision(),
+        "arrival_barrier_timed_out": barrier.get("timed_out"),
+        "arrival_barrier": barrier or None,
         "server_revision": server.get("server_revision"),
         "server_code_sha256": server.get("server_code_sha256"),
         "model_revision": server.get("model_revision"),
@@ -509,6 +519,24 @@ def main(argv=None) -> int:
     print(f"sent {len(workload)} requests, {len(failed)} failed -> {args.out}")
     if failed:
         print("  first failure:", failed[0]["error"], file=sys.stderr)
+    if barrier.get("timed_out") is None:
+        # Said out loud rather than passed over. The run may be perfectly good;
+        # what is known is that nobody can tell from this artifact.
+        print(f"  NOTE: the arrival barrier could not be read "
+              f"({barrier.get('why') or 'no reading'}); this run's latencies "
+              f"are unverified, not verified",
+              file=sys.stderr)
+    if barrier.get("timed_out"):
+        # Written first and then failed: the artifact is the evidence of the
+        # failure, and deleting it would leave only a log line. Non-zero so a
+        # run that timed out cannot be read as a run that completed -- which is
+        # exactly what happened when this was only a warning in a server log.
+        detail = barrier.get("ranks") or barrier
+        print(f"ATOMCompass WARNING: the engine's arrival barrier timed out, "
+              f"so virtual time advanced past an arrival still in flight. "
+              f"Every latency in this run is invalid: {json.dumps(detail)}",
+              file=sys.stderr)
+        return 1
     return 0
 
 

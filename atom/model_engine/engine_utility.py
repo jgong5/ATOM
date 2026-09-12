@@ -45,6 +45,7 @@ class EngineUtilityHandler:
         "get_mtp_stats": "_handle_get_mtp_stats",
         "get_mtp_statistics": "_handle_get_mtp_statistics",
         "get_cache_statistics": "_handle_get_cache_statistics",
+        "get_compass_arrival_barrier": "_handle_get_compass_arrival_barrier",
         "abort_request": "_handle_abort_request",
     }
 
@@ -317,6 +318,52 @@ class EngineUtilityHandler:
             result |= self.scheduler.block_manager.checkpoint_funnel()
         self.output_queue.put_nowait(
             ("UTILITY_RESPONSE", {"cmd": "get_cache_statistics", "result": result})
+        )
+
+    # ------------------------------------------------------------------
+    # Compass arrival barrier
+    # ------------------------------------------------------------------
+
+    def _handle_get_compass_arrival_barrier(self, args: dict):
+        """Whether this rank's arrival barrier ever gave up waiting.
+
+        `Scheduler._arrival_barrier_unmet` holds virtual time until a declared
+        workload has fully arrived, and after `ARRIVAL_BARRIER_TIMEOUT_S` it
+        opens anyway and says so in the log. A warning in a server log is not a
+        result: a client reads "0 failed" and cannot tell that every latency
+        after that point is invalid. This is that state, on the channel a
+        client can actually read.
+
+        Answered on demand rather than pushed with the metrics snapshot. The
+        snapshot goes out every `METRICS_PUSH_INTERVAL_S` real seconds, and a
+        predictor can finish a whole workload inside one of those intervals --
+        so a run could time out and end without ever publishing it. A client
+        asks once, at the end, when the engine has nothing else to do.
+
+        Three states, deliberately: timed out, did not, and *not known*. A
+        process with no scheduler, or one whose barrier was never reached, has
+        not observed a good run -- it has observed nothing, and reporting that
+        as False would turn silence into evidence.
+        """
+        scheduler = self.scheduler
+        if scheduler is None:
+            result = {"timed_out": None, "why": "this rank has no scheduler"}
+        elif not hasattr(scheduler, "arrival_barrier_timed_out"):
+            # The attribute is created the first time the barrier is consulted,
+            # which a run that never scheduled anything has not done.
+            result = {"timed_out": None, "why": "the barrier was never reached"}
+        else:
+            timed_out = scheduler.arrival_barrier_timed_out
+            result = {
+                "timed_out": bool(timed_out),
+                "detail": timed_out,
+                "open": bool(getattr(scheduler, "_arrival_barrier_open", False)),
+            }
+        self.output_queue.put_nowait(
+            (
+                "UTILITY_RESPONSE",
+                {"cmd": "get_compass_arrival_barrier", "result": result},
+            )
         )
 
     def push_metrics(self) -> None:
