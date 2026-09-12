@@ -85,6 +85,49 @@ selected window belong in it — a wrapper event is not a request, but its
 children can be — and that audit can change both manifests. Nothing derived from
 these numbers is gate evidence, and no §1 row moves on them.
 
+**`cc_pilot.jsonl` is 62 requests, not 20, and its arrivals are clipped.**
+Audited 2026-09-12 against the corpus itself (`traces.jsonl`, sha256
+`e39cd2ff3eba21d4a3664be51da743ac3d2149a1933898cafc7bfeac8147eeef`, the digest
+both acceptance manifests record). The file at digest `bf4049f84be161df` holds
+**62** rows, and they are all 62 top-level servable requests of corpus session
+`002001296e8a8c38ad9d7cc436d691afc602` -- matched positionally on `in`, `out`,
+`api_time` and `ttft`, not on token counts alone, with that 12-character session
+prefix unique among the corpus's 393 sessions. That session is named in
+`development_sessions_excluded` and `sessions_rejected` in **both** acceptance
+manifests and appears in neither `sessions` list, so the development workload is
+disjoint from the frozen long and short workloads for all 62 requests, at
+whole-session granularity rather than request by request.
+
+Two numbers differ from the frozen long workload by more than scale:
+
+* **Volume.** All 62: 9 510 208 input / 83 702 output tokens. The first 20:
+  1 681 024 input, which is the "1.68M development slice" the long rule's
+  `volume_band` was sized against. Frozen long is 20 requests / 1 594 624 input
+  on raw source arrivals.
+* **Arrivals.** 25 of the 61 inter-arrival gaps -- exactly those above 30 s in
+  the source -- were clipped to 30.000 s when the file was written, collapsing a
+  source span of 88 934 s to 1 098.9 s (largest single clip 63 372.5 s -> 30 s).
+  The replay preserves the **file's** timestamps faithfully; the file does not
+  preserve the corpus's intervals. The frozen workloads declare the opposite
+  (`"raw source intervals, nothing clipped or compressed"`), so development and
+  acceptance runs do not share an arrival process. On the long rule's own
+  `max_window_span_s` of 900 s, the 62-request window would not be eligible.
+
+The digest does not say which slice a run consumed; the replay manifest's
+`requests` field does. Both exist in the record under the same digest:
+`poc/evidence/cc27_20260910/big_real.json` and
+`poc/matrix/tp1_long_gatea/real.json` replayed **20**;
+`memval/tp1ref/out/real.r1.json` and `diag_tp1_replay3.json` replayed **62**.
+The "first 20 requests" wording elsewhere in this file, in
+`CC_TRACES_PROTOCOL.md` and in `cc_traces_workload.py` is therefore a correct
+historical reference to the slice those earlier runs took, and the statistics
+recorded with it (min 640, median 84 800, max 119 360, sum 1 681 024) are the
+first-20 statistics. Over all 62 the range is 448 to 249 344 input tokens. None
+of this is a reason to alter the registered acceptance scope, and no earlier
+result is relabelled by it: the qualification is that a cc_pilot figure must
+carry its request count, and that no cc_pilot run -- at either count -- is
+acceptance evidence.
+
 Three properties of the corpus do not survive the current replay path, and they
 bound what any cc-traces cell can claim (`agent_scratch/cctraces.py`): prefix
 reuse is dropped — the trace's `hash_ids` carry 64-token block sharing, while
