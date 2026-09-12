@@ -68,12 +68,17 @@ SHARED_OPTIONS = (
     ("position_rows", "3"),
     ("cudagraph_mode", "full"),
     ("head", "1"),
-    # `prefill-cells`, not the older `conc-v2`: runs 5 and 6 -- the only two
-    # replays whose composition was actually exercised -- passed
-    # `source-27b-tp1-prefill-cells`, the source carrying the measured
-    # 1-sequence prefill cells. `conc-v2` has been this file's value since it
-    # was written and no run has selected it.
-    ("regions", "source-27b-tp1-prefill-cells"),
+    # `prefill-interp`, not `prefill-cells` and not the older `conc-v2`. Runs 5
+    # and 6 -- the only two replays whose composition was actually exercised --
+    # passed `source-27b-tp1-prefill-cells`, the source carrying the measured
+    # 1-sequence prefill cells, and run 7 died on it: an exact-match lookup of
+    # five cells cannot answer a final chunk, whose token count is
+    # `prompt mod chunk_budget` and so arbitrary. `prefill-interp` carries
+    # those five cells byte for byte and wins where keys collide; it adds
+    # unpaced source anchors and interpolates only between adjacent
+    # measurements of the same (sequences, produces_output) group, refusing
+    # outside their span. `conc-v2` has never been selected by any run.
+    ("regions", "source-27b-tp1-prefill-interp"),
     # Family-price mode, explicitly on. Without it `gap_ratio(None)` is None,
     # `_price_library` builds a plain `PriceLibrary` with no curves, and every
     # parametric family -- the head row ladder below above all -- is dead

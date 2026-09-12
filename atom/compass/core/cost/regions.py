@@ -322,6 +322,36 @@ class BucketedRunnerRegions:
     #: The same keys, for postprocess. Declared separately rather than paired
     #: so a source can carry one and not the other without a placeholder.
     postprocess_prefill_cells: tuple = ()
+    #: Additional measured points, same key shape as the cells above, that a
+    #: source offers as **interpolation anchors** rather than as published
+    #: cells.
+    #:
+    #: The distinction is provenance, not arithmetic. The cells are the stanzas
+    #: that have been reviewed and quoted elsewhere, and they are preserved
+    #: byte for byte -- where a cell and an anchor share a key the cell wins,
+    #: so adding anchors can never move a number that has already been
+    #: reported. The anchors are the rest of the same captures, admitted under
+    #: the same protocol, and they exist because a chunked prefill's final
+    #: chunk is an arbitrary remainder: run 7 died on `(1, 9216, True)` after
+    #: 104 priced steps, and no campaign will enumerate every tail.
+    #:
+    #: With anchors present a shape is answered by **linear interpolation in
+    #: token count, within one `(sequences, produces_output)` group, and only
+    #: inside that group's measured span**. Never across sequence counts:
+    #: preparation over two sequences totalling 15360 tokens is 3.9 ms against
+    #: 0.78 ms over one sequence of 15232, five times apart at the same token
+    #: count, so the sequence count is a separate model rather than an axis to
+    #: slide along. Never across `produces_output`: a middle chunk skips
+    #: postprocess entirely, so the two are different work.
+    #:
+    #: An interpolated value is an APPROXIMATION between two measurements. Its
+    #: band is not interpolated -- it is the union of the two bracketing
+    #: anchors' observed [min, max], so a quoted band is never tighter than the
+    #: evidence on either side of it. A group holding one anchor interpolates
+    #: nothing and answers that token count alone.
+    prepare_prefill_anchors: tuple = ()
+    #: The same, for postprocess.
+    postprocess_prefill_anchors: tuple = ()
     version: str = ""
     provenance: str = ""
 
@@ -330,6 +360,70 @@ class BucketedRunnerRegions:
 
     def _prefill_cells(self, which: tuple) -> dict:
         return {(int(s), int(t), bool(o)): m for (s, t, o), m in which}
+
+    def _prefill_table(self, cells: tuple, anchors: tuple) -> dict:
+        """The anchors, then the published cells written over them.
+
+        The order is the guarantee: a key that is both an anchor and a cell
+        keeps the cell's Measured exactly, so a source can gain anchors without
+        any already-reported number moving.
+        """
+        table = self._prefill_cells(anchors)
+        table.update(self._prefill_cells(cells))
+        return table
+
+    @staticmethod
+    def _prefill_span(table: dict, seqs: int, produces: bool) -> list:
+        """The token counts measured at this sequence count and output status."""
+        return sorted(t for (s, t, o) in table
+                      if s == seqs and o == produces)
+
+    def _interpolates(self) -> bool:
+        """Whether this source asked for interpolation at all.
+
+        A source that declares only cells keeps the exact-lookup behaviour it
+        was published with, to the number: `source-27b-tp1-prefill-cells` holds
+        640 and 15232 at one sequence, and the arrival of an interpolating
+        sibling must not quietly turn its 9216 refusal into an answer. Opting
+        in is declaring an anchor.
+        """
+        return bool(self.prepare_prefill_anchors
+                    or self.postprocess_prefill_anchors)
+
+    def _prefill_at(self, table: dict, key: tuple) -> Measured:
+        """This cell, exactly if measured, otherwise between its neighbours.
+
+        Callers reach here only after `refusal` has passed, so either the key
+        is present or this source interpolates and the key is inside its span.
+        """
+        if key in table:
+            return table[key]
+        if not self._interpolates():
+            raise KeyError(
+                f"prefill cell {key} is absent and this source declares no "
+                "interpolation anchors; `refusal` should have rejected it")
+        seqs, tokens, produces = key
+        span = self._prefill_span(table, seqs, produces)
+        lo = max(t for t in span if t <= tokens)
+        hi = min(t for t in span if t >= tokens)
+        left, right = table[(seqs, lo, produces)], table[(seqs, hi, produces)]
+        frac = (tokens - lo) / float(hi - lo)
+        return Measured(
+            seconds=left.seconds + frac * (right.seconds - left.seconds),
+            # The union, not an interpolated band. Both neighbours were
+            # measured and neither bounds the other, so the honest interval
+            # around a point between them is the one that contains both.
+            low=min(left.low, right.low),
+            high=max(left.high, right.high),
+            samples=left.samples + right.samples,
+            how=(f"INTERPOLATED linearly in token count between the measured "
+                 f"{lo} ({left.seconds:.6e} s) and {hi} "
+                 f"({right.seconds:.6e} s) at {seqs} sequence(s) "
+                 f"{'producing a token' if produces else 'producing none'}; "
+                 f"the band is the union of both anchors' observed ranges, "
+                 f"not a narrower interpolated one. Approximation between two "
+                 f"measurements, not a measurement"),
+        )
 
     @staticmethod
     def _produces_output(shape) -> bool:
@@ -354,11 +448,18 @@ class BucketedRunnerRegions:
         return (len(shape.num_scheduled_tokens), int(shape.total_tokens),
                 self._produces_output(shape))
 
-    def _prefill_term(self, shape, cells: tuple, scalar: Measured) -> Measured:
-        """The cell for this shape, or the scalar where a source has no cells."""
-        if not cells:
+    def _prefill_term(self, shape, cells: tuple, scalar: Measured,
+                      anchors: tuple = ()) -> Measured:
+        """The cell for this shape, or the scalar where a source has no cells.
+
+        With anchors the exact cell still wins; only a token count nobody
+        measured is interpolated, and `refusal` has already established that it
+        lies between two that were.
+        """
+        if not cells and not anchors:
             return scalar
-        return self._prefill_cells(cells)[self._prefill_key(shape)]
+        return self._prefill_at(self._prefill_table(cells, anchors),
+                                self._prefill_key(shape))
 
     def bucket_for(self, sequences: int):
         """The rung `ForwardMode.decide` would pick, or None above the ladder.
@@ -382,31 +483,61 @@ class BucketedRunnerRegions:
                     f"{list(self.topologies)}")
         seqs = len(shape.num_scheduled_tokens)
         if shape.num_prefill_tokens:
-            if self.prepare_prefill_cells:
-                # A lookup, not a domain. The cells are the shapes that were
-                # measured and nothing between them is claimed: preparation is
-                # not monotone in the batch, so an unmeasured cell is unknown
-                # rather than bracketed by its neighbours.
-                cells = self._prefill_cells(self.prepare_prefill_cells)
+            if self.prepare_prefill_cells or self.prepare_prefill_anchors:
+                # A lookup where there are only cells; a lookup with bounded
+                # interpolation where the source also supplies anchors.
+                # Preparation is not monotone in the batch, so what is claimed
+                # between two anchors is claimed only between *adjacent*
+                # measurements of the same sequence count and output status,
+                # and never outside their span.
+                cells = self._prefill_table(self.prepare_prefill_cells,
+                                            self.prepare_prefill_anchors)
                 key = self._prefill_key(shape)
-                if key not in cells:
+                span = self._prefill_span(cells, key[0], key[2])
+                produced = 'a token' if key[2] else 'no token'
+                if not self._interpolates():
+                    # Cells only: the published lookup, cell by cell. This is
+                    # the branch run 7 died in, and it must keep dying there.
+                    if key not in cells:
+                        return (f"prefill of {key[1]} tokens over {key[0]} "
+                                f"sequence(s), producing {produced}, was not "
+                                "measured; the measured token counts for that "
+                                f"group are {span}")
+                    post = self._prefill_cells(self.postprocess_prefill_cells)
+                    if key[2] and key not in post:
+                        return (f"prefill cell {key} has a preparation "
+                                "measurement and no postprocess one, and this "
+                                "step samples a token, so its postprocess is "
+                                "missing rather than zero")
+                    return None
+                if not span:
+                    groups = sorted({(s, o) for (s, _t, o) in cells})
+                    return (f"prefill over {key[0]} sequence(s) producing "
+                            f"{produced} was not measured at any token count; "
+                            f"the measured (sequences, produces_output) "
+                            f"groups are {groups}")
+                if not span[0] <= key[1] <= span[-1]:
                     return (f"prefill of {key[1]} tokens over {key[0]} "
-                            f"sequence(s), producing "
-                            f"{'a token' if key[2] else 'no token'}, was not "
-                            f"measured; the measured cells are "
-                            f"{sorted(cells)}")
+                            f"sequence(s), producing {produced}, is outside "
+                            f"the measured token span [{span[0]}, {span[-1]}] "
+                            f"for that group; the anchors there are {span}")
                 if key[2]:
                     # This step samples a token, so postprocess runs and must
                     # have been measured. Absent is a GAP here, not zero work:
                     # only an explicit `produces_output=False` licenses zero,
                     # and defaulting a sampling step to zero would silently
                     # drop a region the step really pays.
-                    post = self._prefill_cells(self.postprocess_prefill_cells)
-                    if key not in post:
+                    post = self._prefill_table(
+                        self.postprocess_prefill_cells,
+                        self.postprocess_prefill_anchors)
+                    post_span = self._prefill_span(post, key[0], key[2])
+                    if not post_span or not (post_span[0] <= key[1]
+                                             <= post_span[-1]):
                         return (f"prefill cell {key} has a preparation "
                                 "measurement and no postprocess one, and this "
                                 "step samples a token, so its postprocess is "
-                                "missing rather than zero")
+                                "missing rather than zero; the postprocess "
+                                f"anchors for that group are {post_span}")
                 return None
             if seqs not in self.prefill_sequences:
                 return (f"prefill over {seqs} sequences, measured only at "
@@ -460,18 +591,25 @@ class BucketedRunnerRegions:
         tp = int((dict(shape.topology) if shape.topology else {}).get("tp", 1))
         if prefill:
             prepare = self._prefill_term(shape, self.prepare_prefill_cells,
-                                         self.prepare_prefill)
-            if self.prepare_prefill_cells:
+                                         self.prepare_prefill,
+                                         self.prepare_prefill_anchors)
+            if self.prepare_prefill_cells or self.prepare_prefill_anchors:
                 # Only an explicit "produces no token" licenses zero here.
                 # `refusal` has already rejected a sampling cell whose
                 # postprocess was never measured, so reaching this branch with
-                # a missing key means the step genuinely samples nothing.
-                cells = self._prefill_cells(self.postprocess_prefill_cells)
-                postprocess = cells.get(
-                    self._prefill_key(shape),
-                    Measured.zero_work(
+                # no postprocess coverage means the step genuinely samples
+                # nothing.
+                cells = self._prefill_table(self.postprocess_prefill_cells,
+                                            self.postprocess_prefill_anchors)
+                key = self._prefill_key(shape)
+                covered = (key in cells if not self._interpolates()
+                           else bool(self._prefill_span(cells, key[0], key[2])))
+                if covered:
+                    postprocess = self._prefill_at(cells, key)
+                else:
+                    postprocess = Measured.zero_work(
                         "this chunk samples no token, so the runner skips "
-                        "postprocess entirely"))
+                        "postprocess entirely")
             else:
                 postprocess = self.postprocess_prefill
         else:
@@ -882,12 +1020,141 @@ SOURCE_27B_TP1_PREFILL_CELLS = BucketedRunnerRegions(
 )
 
 
+#: The same five cells, plus the rest of the same captures as anchors.
+#:
+#: Run 7 is why this exists. The replay priced 104 steps of the first-20
+#: cc_pilot slice -- 84 at (1 req, 16384), 18 at (2 reqs, 16384), one at
+#: (1 req, 640) -- and then died on request 19's final chunk, `(1, 9216,
+#: True)`, with `no measured region for this shape`. A chunked prefill's tail
+#: is `prompt mod chunk_budget`, an arbitrary remainder, so a five-cell lookup
+#: does not merely have a hole: it refuses the last step of nearly every long
+#: request, and the registered short workload (max 2560 tokens) matches no cell
+#: at all. No campaign fixes that by adding cells.
+#:
+#: **Nothing here was re-measured and no published number moved.** The five
+#: `prepare_prefill_cells` and four `postprocess_prefill_cells` above are
+#: carried over byte for byte and still win at their own keys. What is added is
+#: the rest of the TP1 source captures, extracted by
+#: `agent_scratch/stage/region_anchors.py` under three stated admissions:
+#:
+#: 1. **TP1 source captures only.** A TP>1 postprocess contains the sampled-id
+#:    broadcast this model prices separately, so pooling one would double count
+#:    it. No target-engine observation is read, and no final workload is read.
+#: 2. **Unpaced rows only.** Preparation is the remainder `seconds -
+#:    run_model - postprocess` and carries whatever device idle the host leaves
+#:    inside `forward`, so it moves with pacing -- ~3x at 1x640 between the
+#:    HTTP campaign and the bulk one. `devstep1` settles that this is a
+#:    per-row property rather than a campaign label: it alternates, one paced
+#:    row then one unpaced row, on the same 1x8192 shape, 2.790911e-3 against
+#:    1.124574e-3. The regime is therefore read from `gap_seconds` per row, cut
+#:    at 0.10 s, and the populations are nowhere near that line -- unpaced rows
+#:    run 0.0007..0.05 s and paced ones 0.17..3.2 s. The served replay enqueues
+#:    back to back, so unpaced is the regime it runs in.
+#: 3. **Cold first use excluded by position**, which is the prefill-region
+#:    method's own rule.
+#:
+#: That yields six one-sequence final-chunk anchors, not two: 640, 1024, 7680,
+#: 8192, 15232 and 15744. They are not monotone -- preparation climbs to
+#: 1.15 ms at 7680 and falls back to 0.78 ms at 15232 -- which is exactly why
+#: interpolation is restricted to *adjacent* anchors and never extrapolates.
+#:
+#: **What is still refused, deliberately.** Tails below 640 tokens: nothing in
+#: any TP1 source capture is shorter, so the registered short workload's own
+#: small final chunks have no evidence and must refuse until a campaign
+#: measures them. One sequence above 15744 producing a token. Two sequences
+#: below 2048. Three or more sequences at any token count -- those captures do
+#: exist (3x3072 through 16x16384, every one at 1024 tokens per sequence) but
+#: each is a single point that no trace shape will land on, so admitting them
+#: would widen what this model claims without covering anything asked of it.
+#:
+#: An interpolated answer is an approximation between two measurements and says
+#: so in its own `how`. For the shape that killed run 7 it is 1.049 ms, between
+#: the 8192 and 15232 anchors, against a step of several seconds -- about 0.03%
+#: of it. That is the honest size of this term and the reason a bounded
+#: interpolation is preferable to an indefinite acquisition.
+SOURCE_27B_TP1_PREFILL_INTERP = BucketedRunnerRegions(
+    postprocess_decode=SOURCE_27B_TP1_CONC_V2.postprocess_decode,
+    prepare_decode_cells=SOURCE_27B_TP1_CONC_V2.prepare_decode_cells,
+    postprocess_prefill=SOURCE_27B_TP1_CONC_V2.postprocess_prefill,
+    prepare_prefill=SOURCE_27B_TP1_CONC_V2.prepare_prefill,
+    # Unchanged, and authoritative wherever they apply.
+    prepare_prefill_cells=SOURCE_27B_TP1_PREFILL_CELLS.prepare_prefill_cells,
+    postprocess_prefill_cells=(
+        SOURCE_27B_TP1_PREFILL_CELLS.postprocess_prefill_cells),
+    prepare_prefill_anchors=(
+        ((1, 1024, True), Measured(
+            seconds=5.223719e-4, low=4.24425e-4, high=8.820927e-4, samples=7,
+            how="upper median [min,max] of the 7 unpaced 1x1024 final-chunk "
+                "rows of cap_conc2, calib2seq (all three cases) and "
+                "single640. POOLED across four captures, which is why the "
+                "range is 2.1x wide: these are the same cell measured by "
+                "different servers, and a band that cannot contain the other "
+                "instance is a band that will be wrong next start")),
+        ((1, 7680, True), Measured(
+            seconds=1.145359e-3, low=1.0484e-3, high=1.168497e-3, samples=3,
+            how="upper median [min,max] of the 3 unpaced 1x7680 rows of "
+                "devstep1, each the second of a paced/unpaced pair on the "
+                "same shape; the paced partners read 2.72-2.76e-3 and are "
+                "excluded as a different pacing regime, not discarded")),
+        ((1, 8192, True), Measured(
+            seconds=1.094724e-3, low=9.154264e-4, high=1.124574e-3, samples=3,
+            how="upper median [min,max] of the 3 unpaced 1x8192 rows of "
+                "devstep1; paced partners 2.79-2.84e-3, excluded by regime")),
+        ((1, 15744, True), Measured(
+            seconds=7.853395e-4, low=7.739877e-4, high=7.893327e-4, samples=3,
+            how="upper median [min,max] of the 3 unpaced 1x15744 rows of "
+                "devstep1. These three were already unpaced as measured, gaps "
+                "0.0023-0.0024 s, and have no paced partner")),
+        ((2, 2048, True), Measured(
+            seconds=6.163755e-4, low=5.538445e-4, high=7.502701e-4, samples=6,
+            how="upper median [min,max] of the 6 unpaced 2x1024 cohort "
+                "prefills of cap_conc and cap_conc3. The one paced 2x2048 row "
+                "reads 1.981141e-3 and is excluded by regime. This is the "
+                "only two-sequence evidence below 15360 and it is 6x smaller, "
+                "so the two-sequence group is steep and its interpolation "
+                "between 2048 and 15360 spans a wide gap on two anchors")),
+    ),
+    postprocess_prefill_anchors=(
+        ((1, 1024, True), Measured(
+            seconds=1.0156e-4, low=9.92e-5, high=1.0496e-4, samples=7,
+            how="span_seconds.postprocess of the same 7 unpaced rows")),
+        ((1, 7680, True), Measured(
+            seconds=1.0372e-4, low=1.022e-4, high=1.0492e-4, samples=3,
+            how="span_seconds.postprocess of the same 3 unpaced rows")),
+        ((1, 8192, True), Measured(
+            seconds=1.0028e-4, low=9.888e-5, high=1.0264e-4, samples=3,
+            how="span_seconds.postprocess of the same 3 unpaced rows")),
+        ((1, 15744, True), Measured(
+            seconds=1.0764e-4, low=1.0736e-4, high=1.0968e-4, samples=3,
+            how="span_seconds.postprocess of the same 3 unpaced rows")),
+        ((2, 2048, True), Measured(
+            seconds=1.0056e-4, low=9.972e-5, high=1.0152e-4, samples=6,
+            how="span_seconds.postprocess of the same 6 unpaced rows")),
+    ),
+    tp_broadcast=SOURCE_27B_TP1_CONC_V2.tp_broadcast,
+    decode_context=SOURCE_27B_TP1_CONC_V2.decode_context,
+    prefill_sequences=(1, 2),
+    prefill_tokens=(640, 16384),
+    topologies=(1,),
+    capture_sizes=SOURCE_27B_TP1_CONC_V2.capture_sizes,
+    version="prefill-interp-2026-09-12",
+    provenance="source-27b-tp1-prefill-cells unchanged, plus unpaced TP1 "
+               "prefill rows of pricing_coverage/single640, "
+               "pricing_coverage/calib2seq, pricing_coverage/devstep1, "
+               "g4/cap_conc and g4/cap_conc3 as interpolation anchors, "
+               "extracted by agent_scratch/stage/region_anchors.py. Decode, "
+               "broadcast and the context bound carried from "
+               "source-27b-tp1-conc-v2. TP1 only",
+)
+
+
 REGION_MODELS = {
     "source-27b-tp1": SOURCE_27B_TP1,
     "source-27b-tp1-conc": SOURCE_27B_TP1_CONC,
     "source-27b-tp1-conc-v2": SOURCE_27B_TP1_CONC_V2,
     "source-27b-tp1-prefill-1x640": SOURCE_27B_TP1_PREFILL_1X640,
     "source-27b-tp1-prefill-cells": SOURCE_27B_TP1_PREFILL_CELLS,
+    "source-27b-tp1-prefill-interp": SOURCE_27B_TP1_PREFILL_INTERP,
     "none": None,
 }
 

@@ -964,6 +964,47 @@ def _dump_refusal(shape: StepShape, graph, head_graph, coverage) -> None:
             error)
 
 
+def _dump_region_refusal(shape: StepShape, why: str) -> None:
+    """Write down a step refused by the region model, before the raise.
+
+    The sibling of `_dump_refusal`, for the refusal that happens too early to
+    have a graph. Same switch, same limit, same swallowing of its own failures
+    and for the same reason: this runs one line before a ``ValueError`` the
+    caller expects, so an unwritable directory must not replace the refusal
+    with a different exception.
+
+    What it preserves is the shape and the sentence. That is enough to direct
+    a fix -- run 7's record would have said `(1, 9216, True)`, one request,
+    110144 tokens already done, which names both the cell to measure and the
+    reason it will recur.
+    """
+    global _DUMPS_WRITTEN
+
+    import os
+
+    target = os.environ.get("COMPASS_REFUSAL_DUMP", "")
+    if not target or _DUMPS_WRITTEN >= _DUMP_LIMIT:
+        return
+    try:
+        from dataclasses import asdict
+
+        _DUMPS_WRITTEN += 1
+        os.makedirs(target, exist_ok=True)
+        path = os.path.join(
+            target,
+            "region_refusal_b%d_t%d_%d.json" % (
+                shape.batch_size, shape.total_tokens, _DUMPS_WRITTEN))
+        with open(path, "w") as handle:
+            json.dump({"refused_by": "region model", "why": why,
+                       "shape": asdict(shape)}, handle, default=str)
+        logger.warning(
+            "ATOMCompass WARNING: region refusal evidence written to %s", path)
+    except Exception as error:  # noqa: BLE001 - see docstring
+        logger.warning(
+            "ATOMCompass WARNING: could not write region refusal evidence: %s",
+            error)
+
+
 def _price_key(shape: StepShape, graph, head_graph):
     """What two steps must share for their priced body and head to be equal.
 
@@ -1075,6 +1116,16 @@ class LibraryCostOracle:
         if self.regions is not None:
             why = self.regions.refusal(shape)
             if why is not None:
+                # Recorded before it is raised. Run 7 refused `(1, 9216, True)`
+                # on its 105th step and the ValueError took the engine core
+                # with it: the log kept one sentence, and the step that
+                # provoked it -- its per-request scheduled tokens, its
+                # histories, which request was finishing -- survived only
+                # because the scheduler had logged the batch separately. A
+                # region gap is the one refusal that fires before any graph is
+                # derived, so `_dump_refusal` has nothing to write; this writes
+                # what there is instead of nothing.
+                _dump_region_refusal(shape, why)
                 raise ValueError(f"no measured region for this shape: {why}")
         graph = self.graphs.graph_for(shape)
         if graph is None:
