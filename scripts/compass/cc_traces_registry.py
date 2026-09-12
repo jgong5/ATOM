@@ -665,9 +665,25 @@ def per_width_options(tp: int) -> tuple:
     # so which one answers must not depend on load order.
     prices = (body, head, f"{_WIDE}/ar_capture.json",
               f"{_WIDE}/ar_plain.json", f"{_WIDE}/ag_prices.json")
-    # Ahead of the list: within one scope the first price wins. Neither family
-    # appears in the base books at either wide width, so this displaces no
-    # existing measured entry.
+    # Ahead of the list: within one scope the first price wins.
+    #
+    # This DOES displace one existing measured entry, and only one. At rank 0
+    # the old base book already carries a valid `masked_embedding` reading
+    # under the identical signature `#2=0;#3=62080`, so the new book takes
+    # precedence over it. The two agree: old 2.3069e-06 s, new 2.3536e-06 s
+    # with a declared range 2.2601e-06..2.4071e-06 s -- the old point lies
+    # inside the new bound, 2.0% apart. The new entry is `unstable: true` and
+    # carries that range as a qualification, which the old point reading did
+    # not; consume the bound, not the point.
+    #
+    # At ranks 1-3 nothing is displaced for a different reason: the old book
+    # repeated `#2=0` under every rank's name, so its entries never match those
+    # ranks' real windows (`#2=62080/124160/186240`) and were simply never
+    # answering. Both readings are kept -- no book is edited or removed here,
+    # so any future disagreement surfaces as a conflict rather than silently.
+    #
+    # `unified_attention_with_output_base` appears in no base book at either
+    # wide width, so that family displaces nothing at any rank.
     prices = (_WIDE_BOUNDED,) + prices
     if tp == 4 and INCLUDE_GEMM_SUPPLEMENT_V1:
         # Ahead of the list: within one scope the first price wins, so a
