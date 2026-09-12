@@ -849,6 +849,67 @@ class TestTheSidesCannotBeRunWrong:
         assert run_mod.main(argv) == 2
         assert "modelled side's input" in capsys.readouterr().err
 
+    def test_the_modelled_side_needs_the_profile_it_is_sized_from(
+        self, tmp_path, capsys
+    ):
+        # A target record carries block counts, so a run without the profile
+        # starts and serves -- sized from the captured numbers, publishing
+        # `captured`, and answering a question nobody asked.
+        argv = [
+            "side",
+            "--cell",
+            str(tmp_path / "tp1_long"),
+            "--side",
+            "modelled",
+            "--tp",
+            "1",
+            "--class",
+            "long",
+            "--replay-target",
+            "/w/t.json",
+        ]
+        assert run_mod.main(argv) == 2
+        assert "--memory-model" in capsys.readouterr().err
+
+    def test_the_real_side_refuses_a_profile(self, tmp_path, capsys):
+        argv = [
+            "side",
+            "--cell",
+            str(tmp_path / "tp2_long"),
+            "--side",
+            "real",
+            "--tp",
+            "2",
+            "--class",
+            "long",
+            "--memory-model",
+            "/w/p.json",
+        ]
+        assert run_mod.main(argv) == 2
+        assert "modelled side's input" in capsys.readouterr().err
+
+    def test_the_profile_reaches_the_modelled_server(self, tmp_path):
+        args = types.SimpleNamespace(
+            cell=str(tmp_path / "tp2_long"),
+            tp=2,
+            klass="long",
+            oracle=None,
+            oracle_option=[],
+            port=8000,
+            engine_port=8006,
+            repeats=3,
+            replay_target="/w/t.json",
+            memory_model="/w/p.json",
+            corpus=None,
+        )
+        built = run_mod._cell_plan(args)
+        serves = [s for s in built["steps"]
+                  if s["role"] == "serve" and s["side"] == "modelled"]
+        assert serves
+        for step in serves:
+            command = step["command"]
+            assert command[command.index("--compass-memory-model") + 1] == "/w/p.json"
+
     def test_the_cell_directory_has_to_be_the_one_the_validator_expects(self, tmp_path):
         argv = [
             "side",

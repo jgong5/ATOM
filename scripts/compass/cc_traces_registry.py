@@ -100,20 +100,25 @@ _WIDE = "{root}/serving/src_tp{tp}"
 #: captured width, and handing them to a wider scheduler lets it admit a
 #: workload the target cannot hold. So there is no one target for the matrix.
 #: TP=1 replays the captured source-width record, which is of the width it
-#: claims. TP=2 and TP=4 replay a record derived at that width from the
-#: memory model, beside the profile that derived it -- `memory_blocks`
-#: reports those as `source-derived` and the captured counts stay
-#: comparison-only.
+#: claims and is what the source oracle was built from. TP=2 and TP=4 replay
+#: a record derived at that width from the memory model. The pool every one
+#: of them is sized from is the analytical profile below, not the record.
 _CAPTURED_TARGET = "{root}/poc/g5_27b/target.json"
 _DERIVED_TARGET = "{root}/serving/src_tp{tp}/target.tp{tp}.json"
 
-#: The memory profile that width's target is derived from, and that the
-#: modelled server sizes its pool from. Named `profile.tp<N>.json` after
-#: MEMORY's own convention: a profile is a per-*width* artifact, never rank
-#: resolved, and the rank-suffix convention would collide with it head-on.
-#: MEMORY owns producing these and the derived targets above; this is where
-#: the acceptance matrix expects to find them.
-_PROFILE = "{root}/serving/src_tp{tp}/profile.tp{tp}.json"
+#: The memory profile every width sizes its pool from, including TP=1. The
+#: acceptance question is whether every non-KV term and the KV budget survive
+#: the move from measured to analytical, so a replay sized from a captured
+#: count is not evidence for it at any width -- TP=1 may *bootstrap* from the
+#: captured target (it is a record of its own width, and the source oracle is
+#: built from that capture), but the budget it actually replays under has to
+#: be the derived one. `memory_blocks` then reports `source-derived` for all
+#: three cells.
+#:
+#: These are MEMORY's own files at the path they already publish them to, not
+#: a delivery convention invented here: a profile is per *width*, never rank
+#: resolved.
+_PROFILE = "{root}/memval/capture_replay/profile/profile.tp{tp}.json"
 
 
 def replay_target(tp: int, root) -> str:
@@ -122,15 +127,14 @@ def replay_target(tp: int, root) -> str:
     return template.format(root=str(Path(root)), tp=tp)
 
 
-def memory_model(tp: int, root) -> str | None:
-    """The profile this width sizes from, or None where none is needed.
+def memory_model(tp: int, root) -> str:
+    """The profile this width sizes its pool from.
 
-    TP=1 has a record of its own width and is sized by it. A wider width has
-    no captured record, so the profile is not an option there but the thing
-    that makes the capacity attributable at all.
+    Every width, TP=1 included. Without it the replay takes the block and
+    state counts verbatim out of the target record and publishes the budget as
+    `captured`, which is the measured number the acceptance is supposed to be
+    testing the analytical one against.
     """
-    if tp == 1:
-        return None
     return _PROFILE.format(root=str(Path(root)), tp=tp)
 
 
@@ -190,13 +194,11 @@ def option_paths(tp: int, root) -> dict:
                     found[f"price[{n}].graph"] = parts[1]
         elif key in ("template", "head_template", "replay_target"):
             found[key] = value
-    profile = memory_model(tp, root)
-    if profile:
-        # Not an oracle option: the profile is a server flag, read by the
-        # replay runner and not by the price composition. It is required all
-        # the same -- at a wide width the pool has nothing else to be sized
-        # from -- so it is reported here with the files that are.
-        found["memory_model"] = profile
+    # Not an oracle option: the profile is a server flag, read by the replay
+    # runner and not by the price composition. It is required all the same --
+    # it is what the pool is sized from at every width -- so it is reported
+    # here with the files that are.
+    found["memory_model"] = memory_model(tp, root)
     return found
 
 

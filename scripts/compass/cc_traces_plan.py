@@ -228,10 +228,11 @@ def _serve(
             target or "$CC_TRACES_REPLAY_TARGET",
         ]
         if memory_model:
-            # What the pool is sized from at a width with no captured record
-            # of its own. The replay runner publishes the budget it used as
+            # What the pool is actually sized from, at every width including
+            # TP=1. The replay runner publishes the budget it used as
             # `source-derived` when this is given and `captured` when it is
-            # not, so the flag is also what makes the capacity attributable.
+            # not, and a cell sized from a captured count is not evidence
+            # about the analytical model the acceptance is testing.
             cmd += ["--compass-memory-model", memory_model]
     else:
         cmd = ["python", "-m", "atom.entrypoints.openai.api_server"]

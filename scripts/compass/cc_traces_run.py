@@ -1379,6 +1379,7 @@ def _cell_plan(args) -> dict:
         engine_port=args.engine_port,
         repeats=args.repeats,
         target=getattr(args, "replay_target", None),
+        memory_model=getattr(args, "memory_model", None),
         corpus=getattr(args, "corpus", None) or "$CC_TRACES_CORPUS",
     )
     if Path(built["cell"]).name != cell.name:
@@ -1408,6 +1409,22 @@ def side(args) -> int:
         print(
             "--replay-target is the modelled side's input; the real side "
             "serves the model itself",
+            file=sys.stderr,
+        )
+        return 2
+    if args.side == "modelled" and not args.memory_model:
+        print(
+            "the modelled side needs --memory-model: without it the pool is "
+            "sized from the counts the target record happens to carry and the "
+            "budget is published as captured, which is the measured number "
+            "this acceptance exists to test the analytical one against",
+            file=sys.stderr,
+        )
+        return 2
+    if args.side == "real" and args.memory_model:
+        print(
+            "--memory-model is the modelled side's input; the real side "
+            "measures the pool it actually allocated",
             file=sys.stderr,
         )
         return 2
@@ -1792,6 +1809,7 @@ def main(argv=None) -> int:
     s.add_argument("--oracle", default=None)
     s.add_argument("--oracle-option", action="append", default=[])
     s.add_argument("--replay-target", default=None)
+    s.add_argument("--memory-model", default=None)
     s.add_argument("--corpus", default=None)
     s.add_argument(
         "--purpose",

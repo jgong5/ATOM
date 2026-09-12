@@ -219,19 +219,13 @@ class TestTheTwoSidesAreNotRunTheSameWay:
         }
         assert len(set(seen.values())) == 3
 
-    def test_a_width_with_no_captured_record_sizes_from_its_profile(self):
+    def test_every_width_is_sized_from_the_analytical_profile(self):
         got = json.loads(_run(["--root", "/r", "--artifact-root", "/a"]))
         for cell in got["cells"]:
             for step in _role(cell, "serve", "modelled"):
                 command = step["command"]
-                if cell["tp"] == 1:
-                    # Sized by the record of its own width; a profile here
-                    # would report `source-derived` for a width that was
-                    # captured.
-                    assert "--compass-memory-model" not in command
-                    continue
                 assert command[command.index("--compass-memory-model") + 1] == (
-                    f"/a/serving/src_tp{cell['tp']}/profile.tp{cell['tp']}.json"
+                    f"/a/memval/capture_replay/profile/profile.tp{cell['tp']}.json"
                 )
 
     def test_the_real_side_is_never_handed_either(self):
