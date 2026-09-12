@@ -170,6 +170,11 @@ class ParametricPriceLibrary(PriceLibrary):
         #: operator in it whose family declares `rows_from` still says what
         #: width IT ran at. Those files are usable per operator and refused
         #: only for the families that have no such reading.
+        #:
+        #: A graph whose two width statements CONTRADICT each other is not
+        #: here -- it stays in `unbuildable`. Silence about the width and a
+        #: contradiction about it are different facts, and only the first one
+        #: leaves the operators trustworthy.
         self.no_file_width: dict[str, str] = {}
 
     # -- assembly -------------------------------------------------------
@@ -201,15 +206,27 @@ class ParametricPriceLibrary(PriceLibrary):
             return
         reading = _traced_rows(graph)
         if isinstance(reading, tuple):
-            # No width for the file as a whole. That used to end the file's
-            # usefulness, which is why every head price file was exact-key
-            # only: a head graph carries neither an embedding nor
-            # `body_rows_traced`, so it could never state one. It is only fatal
-            # for families that have no operand reading of their own; the
-            # operators that do are still measurements of a known width, and
-            # `_build` reads them one at a time below.
+            _, why, conflicting = reading
+            if conflicting:
+                # The graph states a width twice and the two disagree. That is
+                # not a missing reading, it is an untrustworthy one, and the
+                # per-operator readings come off the same graph: a body whose
+                # provenance and embedding contradict each other is not a
+                # source an interpolated price may be built from just because
+                # its GEMM happens to declare `rows_from`. Refused as a whole,
+                # exactly as it was before any operator could state a width.
+                self.unbuildable[price_path] = f"{graph_path}: {why}"
+                return
+            # No width for the file as a whole, and nothing contradicting it
+            # either. That used to end the file's usefulness, which is why
+            # every head price file was exact-key only: a head graph carries
+            # neither an embedding nor `body_rows_traced`, so it could never
+            # state one. It is only fatal for families that have no operand
+            # reading of their own; the operators that do are still
+            # measurements of a known width, and `_build` reads them one at a
+            # time below.
             rows = None
-            self.no_file_width[price_path] = f"{graph_path}: {reading[1]}"
+            self.no_file_width[price_path] = f"{graph_path}: {why}"
         else:
             rows = reading
             scheduled = sum((graph.get("key") or {}).get("batch_signature")
@@ -463,7 +480,7 @@ class ParametricPriceLibrary(PriceLibrary):
         return base + note
 
 
-def _traced_rows(graph: dict) -> Optional[int] | tuple[None, str]:
+def _traced_rows(graph: dict) -> Optional[int] | tuple[None, str, bool]:
     """The width this graph's operators actually ran at.
 
     Three readings can be present and they are not the same number:
@@ -484,8 +501,13 @@ def _traced_rows(graph: dict) -> Optional[int] | tuple[None, str]:
         used as the width -- reading it as one is exactly the actual-for-padded
         substitution that has to stay visible -- but a difference is recorded.
 
-    A disagreement between the first two is a real conflict and refuses the
-    file rather than picking one.
+    A disagreement between the first two is a real conflict. It is returned
+    distinctly from an absent reading, because the two are not the same loss:
+    a graph that states no width can still hold operators that state their
+    own, while a graph whose two statements contradict each other is not a
+    trustworthy source for any of them.
+
+    Returns the width, or ``(None, why, conflicting)``.
     """
     declared = ((graph.get("provenance") or {})
                 .get("execution", {})
@@ -505,12 +527,13 @@ def _traced_rows(graph: dict) -> Optional[int] | tuple[None, str]:
         return None, (
             f"provenance says the body was traced over {declared} rows and its "
             f"own embedding runs {executed}; those are different widths and "
-            "choosing between them would be a guess")
+            "choosing between them would be a guess"), True
     rows = declared if declared is not None else executed
     if rows is None or rows <= 0:
         return None, (
             "the graph records neither provenance.execution.body_rows_traced "
-            "nor an embedding whose token operand states the executed width")
+            "nor an embedding whose token operand states the executed width"), False
+    return rows
     return rows
 
 

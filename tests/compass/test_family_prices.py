@@ -680,3 +680,44 @@ def test_the_gather_still_scales_at_one_height(tmp_path):
     # ... and the same request against an unmeasured height is refused.
     record, why = library.lookup(_gather(3, 12288))
     assert record is None
+
+
+def test_a_graph_that_contradicts_itself_about_its_width_is_refused_whole(
+        tmp_path):
+    """Silence about the width and a contradiction about it differ.
+
+    A head graph states no width and its operators are still trustworthy --
+    that is what `no_file_width` is for. A body graph whose provenance says
+    640 rows while its own embedding runs 1024 states one twice and disagrees
+    with itself, and the operators whose family declares `rows_from` come off
+    that same graph. Reading them anyway would let a file that used to be
+    exact-key only start contributing points to a curve on the strength of
+    the one number nobody is disputing, which is not a stronger source than
+    it was before.
+    """
+    from atom.compass.runtime.microbench import signature_of
+
+    library = ParametricPriceLibrary(max_gap_ratio=2.0)
+    op = gemm(1024)
+    embed = {"name": "aten::embedding",
+             "input_shapes": [[151936, 5120], [1024]],
+             "dtypes": ["bfloat16", "int64"]}
+    graph = {"ops": [op, embed],
+             "provenance": {"execution": {"body_rows_traced": 640}}}
+    prices = {"prices": {signature_of(op): {
+        "seconds": 1e-3, "kernels": {"k": 1e-3},
+        "occurrences": 1, "name": op["name"]}}}
+    gpath = tmp_path / "conflict.graph.json"
+    ppath = tmp_path / "conflict.price.json"
+    gpath.write_text(json.dumps(graph))
+    ppath.write_text(json.dumps(prices))
+    library.add(str(ppath), str(gpath))
+
+    assert str(ppath) in library.unbuildable
+    assert str(ppath) not in library.no_file_width
+    assert "different widths" in library.unbuildable[str(ppath)]
+
+    # And it contributed nothing: no curve exists to answer another width,
+    # nor the width it was measured at by any route but the exact key.
+    record, why = library.lookup(gemm(512))
+    assert record is None
