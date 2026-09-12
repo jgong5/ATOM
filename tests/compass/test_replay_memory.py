@@ -46,7 +46,7 @@ from atom.compass.replay.derived_target import DERIVED_SCHEMA, derive_target
 from atom.compass.replay.runner import ReplayModelRunner, TargetRecord
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
-from atom.model_engine.state_runtime import StateRuntime
+from atom.model_engine.state_runtime import StateRuntime, StateTransfer
 
 ROOT = Path(__file__).resolve().parents[2]
 NATIVE_CONFIG = ROOT / "tests" / "compass" / "memory_records" / "qwen3_5_27b.config.json"
@@ -78,6 +78,13 @@ PARAMETERS = {1: 55562855904, 2: 27782542816, 4: 13892386272}
 BLOCKS = {1: 111969, 2: 266835, 4: 590328}
 
 CAPTURED_BLOCKS = 4096
+
+#: The 27B is GDN: its recurrent slot is handed to a successor by a one-token
+#: fork, and its chunk kernel cannot be read mid-step. The real wire form, not
+#: a default -- what is borrowed from the TP=1 record is this layout, so a
+#: fixture carrying `none` would not exercise the borrow at all.
+GDN_RUNTIME = StateRuntime(
+    transfer=StateTransfer.fork(1, readable_midstep=False))
 
 
 def _profile(tmp_path, width, *, total=TOTAL, calibration=None, **over):
@@ -121,7 +128,7 @@ def _target(tmp_path, width=1):
                    "pool_entries": {"paged": CAPTURED_BLOCKS,
                                     STATE_SLOT_CLASS: 32},
                    "pool_entries_per_req": {STATE_SLOT_CLASS: 1},
-                   "state_runtime": StateRuntime().to_wire()},
+                   "state_runtime": GDN_RUNTIME.to_wire()},
         "config": {"model": "Qwen/Qwen3.8-27B", "tensor_parallel_size": width,
                    "max_model_len": 262144, "max_num_seqs": 32,
                    "gpu_memory_utilization": 0.9},
@@ -286,7 +293,7 @@ class TestARefusalIsNeverAFallback:
             ReplayModelRunner(0, config)
         with pytest.raises(UnfoundedPrediction) as refusal:
             derived_block_info(config.compass_config.memory_model, config,
-                               state_runtime=StateRuntime().to_wire())
+                               state_runtime=GDN_RUNTIME.to_wire())
         assert "pipeline_parallel_size" in str(refusal.value)
         assert str(CAPTURED_BLOCKS) not in str(refusal.value)
 
@@ -386,7 +393,7 @@ class TestTheSeamIsCallableWithoutARunner:
         config = _config(tmp_path, profile=_profile(tmp_path, 1))
         direct = derived_block_info(
             config.compass_config.memory_model, config,
-            state_runtime=StateRuntime().to_wire())
+            state_runtime=GDN_RUNTIME.to_wire())
         assert direct == ReplayModelRunner(0, config).get_num_blocks()
 
     def test_a_target_with_no_state_runtime_says_what_is_missing(self, tmp_path):
@@ -627,7 +634,7 @@ class TestATargetForAWidthNoDeviceRan:
             # The TP=1 capture is in the room -- it supplied the layout -- and
             # not one of its capacity numbers survived into the record.
             assert CAPTURED_BLOCKS not in record["blocks"]["pool_entries"].values()
-            assert record["blocks"]["state_runtime"] == StateRuntime().to_wire()
+            assert record["blocks"]["state_runtime"] == GDN_RUNTIME.to_wire()
 
     def test_a_replay_against_it_plans_at_that_width(self, tmp_path):
         """The POC claim at TP=4: a scheduler, no card, no capture of TP=4.
@@ -700,5 +707,13 @@ class TestATargetForAWidthNoDeviceRan:
         layout = TargetRecord.load(_target(tmp_path, 1))
         layout.blocks["state_runtime"] = {"transfer": "teleport"}
         with pytest.raises(ValueError, match="wire contract"):
+            derive_target(_profile(tmp_path, 1), _config(tmp_path, width=2),
+                          layout=layout)
+
+    def test_a_source_that_names_no_model_is_refused(self, tmp_path):
+        """An unattributed record cannot be checked, so it is not a source."""
+        layout = TargetRecord.load(_target(tmp_path, 1))
+        layout.config.pop("model")
+        with pytest.raises(ValueError, match="names no model"):
             derive_target(_profile(tmp_path, 1), _config(tmp_path, width=2),
                           layout=layout)
