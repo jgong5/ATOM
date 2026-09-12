@@ -119,6 +119,11 @@ class BatchSpec:
     block_size: int
     max_model_len: int
     capture_bucket: Optional[int] = None
+    #: Which cudagraph mode the deployment declares -- "full", "piecewise", or
+    #: None when nobody said. Only a FULL capture replays attention, so this is
+    #: what decides whether this step runs the metadata the capture built or
+    #: metadata rebuilt from the batch: see :attr:`replays_captured_metadata`.
+    cudagraph_mode: Optional[str] = None
     num_spec_step: int = 0
     block_policy: str = "rounds"
     #: How long each request was at admission. Only the block allocation reads
@@ -251,6 +256,84 @@ class BatchSpec:
         """Does this step carry padding at all? Not the same as having a bucket:
         a batch that lands exactly on a captured size replays with none."""
         return self.padded_rows > self.num_tokens
+
+    @property
+    def replays_captured_metadata(self) -> Optional[bool]:
+        """Does this step run the attention metadata a *capture* built?
+
+        Two builders write the same field to different values.
+        ``prepare_decode`` takes ``max_seqlen_k = context_lens.max()`` --
+        the batch's own longest history (aiter_attention.py:1100, :1139) --
+        while ``build_for_cudagraph_capture`` pins it to the engine's
+        ``max_model_len`` (:1367, and :1331 for the unified builder). A FULL
+        capture replays the whole forward with the buffers the capture holds,
+        so a replayed step runs the captured value however short the batch
+        is. A PIECEWISE capture leaves attention eager -- ``capture_cudagraph``
+        logs "attention eager" and skips the whole-forward capture
+        (model_runner.py:4019-4031) -- so its metadata is rebuilt from the
+        batch every step even though the *rows* are still the bucket's.
+
+        ``False`` whenever there is no bucket, and for a prefill at any bucket,
+        for the reason :attr:`running_bs` gives. ``None`` only when a bucket is
+        declared and the mode is not: the answer turns on a deployment fact
+        nobody supplied, and both answers are wrong in the way that reads as a
+        plausible number. Same convention as
+        :func:`atom.compass.runtime.tracer.head_rows_padded`.
+        """
+        if self.capture_bucket is None or self.kind == "prefill":
+            return False
+        if self.cudagraph_mode is None:
+            return None
+        return self.cudagraph_mode.strip().lower() == "full"
+
+    @property
+    def launch_max_seqlen_k(self) -> int:
+        """``max_seqlen_k`` as this step's metadata actually carries it.
+
+        Not ``max(context_lens)`` unconditionally: that is the eager rule, and
+        applying it to a FULL replay records a graph the native run never had.
+        Nothing on the Gluon decode path *reads* the field (see
+        ``DECODE_CALIBRATION_SCOPE.md`` §1), so this is a matching defect
+        rather than a pricing one -- but ``max_seqlen_k`` is part of the
+        operator identity key (``core/cost/identity.py``:38), so a derived
+        graph carrying the eager value cannot match a captured one.
+
+        With a bucket and no declared mode the eager value is kept and
+        :attr:`launch_extent_scope` says ``"undeclared"``, so a consumer can
+        refuse the pair rather than discover the ambiguity in a price.
+        """
+        replays = self.replays_captured_metadata
+        if replays:
+            return self.max_model_len
+        return max(self.context_lens) if self.context_lens else 0
+
+    @property
+    def launch_extent_scope(self) -> str:
+        """Which of the two rules :attr:`launch_max_seqlen_k` used.
+
+        ``"captured"`` -- the capture's ``max_model_len``. ``"batch"`` -- the
+        batch's longest history, which is what an eager step and a PIECEWISE
+        replay both run. ``"undeclared"`` -- a bucket without a
+        ``--cudagraph-mode``; the batch value is recorded but is not evidence.
+        """
+        replays = self.replays_captured_metadata
+        if replays is None:
+            return "undeclared"
+        return "captured" if replays else "batch"
+
+    @property
+    def executed_rows(self) -> int:
+        """``batch_size`` as the decode kernel computes it from its operands.
+
+        ``pa_decode_gluon`` takes ``batch_size = query.shape[0] //
+        query_length`` and launches ``grid = (batch_size, num_kv_heads,
+        max_context_partition_num)`` (pa_decode_gluon.py:5342, :5356), so the
+        executed extent is a function of the operand shape and needs no
+        declared field of its own -- which is why the model derives it rather
+        than reading one. Recorded here so the derivation and the model compute
+        it the same way, as :attr:`padded_rows` is for the body.
+        """
+        return self.padded_rows // self.max_query_len
 
     @property
     def has_cached(self) -> bool:
@@ -433,7 +516,10 @@ class BatchSpec:
             recorded.append(("cu_seqlens_k", None))
         recorded += [
             ("max_seqlen_q", max(self.query_lens)),
-            ("max_seqlen_k", max(self.context_lens)),
+            # Not `max(self.context_lens)`: a FULL replay runs the extent the
+            # capture pinned, not the batch's. See
+            # :attr:`BatchSpec.launch_max_seqlen_k`.
+            ("max_seqlen_k", self.launch_max_seqlen_k),
             ("min_seqlen_q", 0),
             ("has_cached", self.has_cached),
             ("state", "prefill_prefix" if self.has_cached else "prefill_native"),

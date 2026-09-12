@@ -441,7 +441,8 @@ def _padding_of(shape: StepShape) -> tuple[int, int]:
             int(bucket) * max(queries) - sum(queries))
 
 
-def _bind(key, template_value, rows, pad_rows: int = 0, pad_tokens: int = 0):
+def _bind(key, template_value, rows, pad_rows: int = 0, pad_tokens: int = 0,
+          extent_scope: str = "batch"):
     """One context entry, recomputed for ``rows``, or :class:`BindRefusal`.
 
     Every formula here is a property of the batch that the runner also computes
@@ -486,9 +487,28 @@ def _bind(key, template_value, rows, pad_rows: int = 0, pad_tokens: int = 0):
                 "tokens; the section layout is not what this rule assumes")
         return per_token * (len(template_value) // tokens)
     if key == "max_seqlen_k":
-        # The real rows', not the padded ones'. A padded row's context is zero,
-        # and the runner's own `max_seqlen_q`/`max_seqlen_k` come off the
-        # scheduled batch (model_runner.py:3187).
+        # Two rules, and which one applies is the deployment's to say.
+        #
+        # Eager and PIECEWISE: the real rows', not the padded ones'. A padded
+        # row's context is zero, and the runner's own `max_seqlen_q` /
+        # `max_seqlen_k` come off the scheduled batch (model_runner.py:3187,
+        # aiter_attention.py:1100, :1139).
+        #
+        # FULL: the capture pinned the field to the engine's `max_model_len`
+        # (aiter_attention.py:1367, :1331) and the replay runs the buffer the
+        # capture holds, so the extent does not follow this cohort at all.
+        # Recomputing it from the contexts is the same failure `pad_rows`
+        # exists for one paragraph up: the derivation is right and the binding
+        # narrows it again, one cohort later.
+        if extent_scope == "captured":
+            return template_value
+        if extent_scope == "undeclared":
+            raise BindRefusal(
+                "this template replays a capture bucket but the deployment's "
+                "--cudagraph-mode was not declared, so whether max_seqlen_k "
+                "follows the batch or the capture's max_model_len is unknown; "
+                "both answers bind without complaint and one of them is a "
+                "graph the native run never had")
         return max(contexts) if contexts else 0
     if key == "max_seqlen_q":
         return max(queries) if queries else 0
@@ -642,13 +662,25 @@ def _fit_allocation(key, template_value, native_value, padding):
 
 
 def bind_cohort(template: dict, shape: StepShape,
-                allocation: Optional[AllocationSource] = None) -> dict:
+                allocation: Optional[AllocationSource] = None,
+                extent_scope: str = "batch") -> dict:
     """A copy of ``template`` whose per-request metadata describes ``shape``.
 
     ``allocation`` is required whenever the template carries allocator fields.
     Refuses rather than guesses, in both directions: an operator with a context
     field this module has no rule for raises, and so does a missing allocation.
+
+    ``extent_scope`` is which rule the attention launch extent follows --
+    ``"batch"``, ``"captured"`` or ``"undeclared"``, the three
+    :attr:`BatchSpec.launch_extent_scope` gives. It defaults to ``"batch"``,
+    which is every eager and PIECEWISE step, and a caller replaying a FULL
+    capture has to say so: a captured extent is a constant of the graph and
+    rebinding it to the cohort produces a graph the native run never had.
     """
+    if extent_scope not in ("batch", "captured", "undeclared"):
+        raise BindRefusal(
+            f"extent_scope {extent_scope!r} is not one of 'batch', "
+            "'captured', 'undeclared'")
     rows = _rows(shape)
     pad_rows, pad_tokens = _padding_of(shape)
     has_allocator = any(
@@ -692,7 +724,8 @@ def bind_cohort(template: dict, shape: StepShape,
                 else:
                     bound = value
             else:
-                bound = _bind(key, value, rows, pad_rows, pad_tokens)
+                bound = _bind(key, value, rows, pad_rows, pad_tokens,
+                              extent_scope)
             new.append([key, bound])
             changed = changed or bound != value
         rebound += bool(changed)

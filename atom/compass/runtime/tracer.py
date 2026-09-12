@@ -939,6 +939,11 @@ class ShapeDeriver:
             kind=kind, query_lens=queries, context_lens=contexts,
             block_size=self.block_size, max_model_len=self.max_model_len,
             capture_bucket=shape.capture_bucket,
+            # The deriver already holds the declared mode -- it puts it on
+            # every TraceRequest. The spec needs it too: only a FULL capture
+            # replays attention, and that is what decides whether the
+            # metadata's `max_seqlen_k` is the batch's or the capture's.
+            cudagraph_mode=self.cudagraph_mode,
             block_policy=self.block_policy,
             position_rows=self.position_rows,
             is_final_chunk=final,

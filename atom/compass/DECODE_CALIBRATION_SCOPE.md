@@ -15,43 +15,95 @@ is quoted in §2.1.
 
 ## 1. Which decode kernel the acceptance configuration dispatches
 
-Settled from the recorded graph rather than from reading the dispatch tree
-forwards. `agent_scratch/g4/s27decode4.tp1.r0.json`, one 27B decode step, whole
-operator census:
+**Retraction.** An earlier revision of this section read the kernel off the
+operator census of `agent_scratch/g4/s27decode4.tp1.r0.json` -- 16
+`aiter::unified_attention_with_output_base` calls for 16 full-attention layers
+-- and concluded that aiter's Triton `unified_attention` ran. That does not
+follow, and the census cannot support it.
 
-    256  aiter::gemm_a16w16
-    129  aiter::_fused_qk_rmsnorm_group_quant_kernel
-     64  aiter::silu_and_mul
-     48  aiter::linear_attention_with_output_base      <- 48 GDN layers
-     16  aiter::unified_attention_with_output_base     <- 16 full-attention layers
-     16  triton::_mrope_qk_kernel
+`aiter::unified_attention_with_output_base` is not a kernel. It is the generic
+per-layer graph-splitting boundary, registered at
+`atom/model_ops/base_attention.py:347` with `@mark_spliting_op(is_custom=True)`,
+and its whole body is
 
-So the full-attention decode kernel on this path is aiter's Triton
-`unified_attention`, not either ASM path. That pins the dispatch in
-`attention_mha.py:864 _dispatch_decode`: the call reached
-`paged_attention_triton` and took its `ATOM_USE_UNIFIED_ATTN or
-use_flash_layout` branch (`:515`). The two ASM branches are excluded --
-`use_pa_decode_bf16_asm()` (`:39`) additionally requires `get_gfx() ==
-"gfx1250"` and the deployment is gfx942 (`poc/g5_27b/target.json`), and the
-persistent branch requires `kv_cache_block_size == 256`.
+    self = atom_config.compilation_config.static_forward_context[layer_name]
+    return self.impl.forward(query=q, key=k, value=v, ...)
 
-`atom/compass/core/cost/families/attention.py` already names this correctly:
-`DECODE_KERNELS["unified_attention"] -> "unified.decode.unified_attn"`, with
-`paged_attention_asm`, `paged_attention_persistent_asm` and
-`paged_attention_triton` listed as `UNPROVEN_DECODE_KERNELS`. Nothing in this
-audit changes that table; the audit only establishes that the acceptance
-configuration lands on the branch that *does* have a law, which is the good case.
+Every `PagedAttentionImpl` call goes through it -- rope cache, KV insert,
+dispatch, kernel -- and Dynamo is told explicitly not to look inside
+(`base_attention.py:344-346`). So the name identifies the *layer wrapper*, and
+one census entry per full-attention layer is what that wrapper produces on
+every branch equally. No serialized operator record can name the callee,
+because the callee is not in the graph. Pricing's independent resolution --
+`AiterBackend` / `PagedAttentionImpl`, bf16 packed K/V,
+`ATOM_USE_UNIFIED_ATTN=False` -- is consistent with this and with nothing the
+census said.
 
-Two configuration inputs decide it and neither is in the plan's declared engine
-arguments. `scripts/compass/cc_traces_plan.py:143-151` passes only
+**What the predicate resolves to, traced forwards.** `attention_mha.py:864
+_dispatch_decode` reads four facts, in order:
+
+| fact | value here | source |
+| --- | --- | --- |
+| `self.sliding_window` | `-1` | no `sliding_window` key in the model config |
+| `envs.ATOM_USE_UNIFIED_ATTN` | `False` | `envs.py:342`, default `"0"`; not set by the plan |
+| `envs.ATOM_FORCE_ATTN_TRITON` | `False` | `envs.py:345`, default `"0"` |
+| `self.head_dim` | **256** | `config.json` `text_config.head_dim` |
+| `self.use_flash_layout` | `False` | `attention_mha.py:116`; assigned `False` at every write site in the tree and `True` at none |
+
+`use_triton_attn = ATOM_FORCE_ATTN_TRITON or sliding_window != -1 or head_dim
+!= 128` (`:228-233`) is therefore **True**, and for the third reason, not the
+first two: this is a 256-wide head. `_dispatch_decode` returns
+`self.paged_attention_triton` before it ever reaches
+`use_pa_decode_bf16_asm()`.
+
+Inside `paged_attention_triton` there is a second fork (`:515`). With
+`ATOM_USE_UNIFIED_ATTN` False and `use_flash_layout` False, the
+`unified_attention` call at `:523` is *not* taken. The else branch at `:545`
+runs, and it calls `run_pa_decode_gluon` (`:585`) ->
+`torch.ops.aiter.pa_decode_gluon` (`base_attention.py:104`).
+
+So the predicate resolves to the **Gluon paged decode**, and the earlier
+conclusion was wrong about which fork as well as about the evidence for it.
+
+**Status: predicate-resolved, callee not yet observed.** Every input above is
+read off a config file, an env default or a static assignment, which is enough
+to say what the branch must be and not enough to say what ran. ASM, unified and
+Gluon all stay UNPROVEN in
+`atom/compass/core/cost/families/attention.py`'s table until a run evidences
+one. The cheap way to evidence it, when a GPU run is next authorised: log
+`type(impl)`, `impl._dispatch_decode().__name__`, `impl.head_dim`,
+`impl.sliding_window`, `impl.use_flash_layout` and `envs.ATOM_USE_UNIFIED_ATTN`
+once per full-attention layer at bind time. That is an observation of the bound
+callee, and it costs one line in the startup path.
+
+Two consequences for the model, both already acted on and neither dependent on
+the branch being settled:
+
+* `DECODE_KERNELS` maps `paged_gluon -> unified.decode.paged_gluon`, which is
+  the regime whose features the acquisition in §5 would fill. The
+  `unified.decode.unified_attn` regime is not the acceptance path on this
+  reading and its `grid_pad_rows` law (§2.3) is not what the PoC needs first.
+* `max_seqlen_k` is **not read at all** on the Gluon branch. `:545-607` passes
+  `context_lens`, `block_tables`, `max_seqlen_q`, `max_context_partition_num`
+  and `context_partition_size`, and no maximum history. The FULL/eager
+  divergence in §2.2 is therefore a *graph-matching* defect -- `max_seqlen_k` is
+  in the operator identity key (`core/cost/identity.py:38`) -- and not a
+  mispriced kernel. It is fixed as such.
+
+Two configuration inputs are inherited silently rather than declared, and
+neither is in the plan's engine arguments.
+`scripts/compass/cc_traces_plan.py:143-151` passes only
 `--gpu-memory-utilization 0.90 --max-model-len 262144
 --no-enable_prefix_caching --max-num-seqs 32`. It does not pass `--block-size`
 and it does not pass `--cudagraph-mode`:
 
 * **`--block-size`.** `atom/config.py:1543` defaults `kv_cache_block_size = 16`.
-  At 256 the same deployment would dispatch `paged_attention_persistent_asm`
-  instead -- an `UNPROVEN_DECODE_KERNEL`, i.e. an unpriceable step, not a
-  slightly different price. At 256 or 1024 `aiter_attention.py:1135` and `:1371`
+  It does **not** move the decode dispatch here -- the `== 256` test is inside
+  the `ATOM_USE_UNIFIED_ATTN` arm, which is off, and `head_dim != 128` takes
+  the branch before it either way. (An earlier revision claimed 256 would
+  dispatch `paged_attention_persistent_asm`; that followed from the retracted
+  reading above and does not hold.) What it does move is the KV geometry and
+  the host work: at 256 or 1024 `aiter_attention.py:1135` and `:1371`
   additionally call `set_aiter_persistent_worker_buffers(bs)` on every decode
   step *and* at capture, building `work_indptr` / `work_info_set` /
   `reduce_indptr` / `reduce_final_map` / `reduce_partial_map` through
@@ -79,8 +131,41 @@ already recorded for the harness in `POC_STATUS.md`.
 Confirmed, and it is worth stating precisely because it is true for two
 different reasons on two different branches.
 
-On the branch this deployment takes, the extent is inside aiter's
-`unified_attention` and is driven by `max_seqlen_k`:
+**On the Gluon branch §1 resolves to, the extent is the row count and the split
+count, and neither is `max(contexts)`.** `pa_decode_gluon.py:5342` takes
+`batch_size = query.shape[0] // query_length` and `:5356` launches
+
+    grid = (batch_size, num_kv_heads, max_context_partition_num)
+
+with a second reduce launch at `:5580`, `grid = (batch_size, num_kv_heads, 1)`,
+whenever `max_context_partition_num > 1` (`:5393`, `one_shot`). Three things
+follow, and the first is the one the lead's warning names:
+
+* **`batch_size` is the padded bucket under a FULL replay, not the batch.** It
+  comes off the query operand, which the runner allocated at `running_bs *
+  max_q_len`. Thirty-one requests replaying a bucket of 32 launch 32 rows.
+* **`max_context_partition_num` is a function of that row count**, through
+  `get_recommended_splits(num_seqs, num_kv_heads)` (`attention_mha.py:552`,
+  `pa_decode_gluon.py:111`): `min(8, cdiv(num_sm * occupancy, num_seqs *
+  num_kv_heads))`, occupancy 2. With `num_kv_heads = 4` that is `min(8,
+  cdiv(2 * num_sm / 4, num_seqs))` -- a *step* function of the row count, so
+  the padded row does not merely add a row of work, it can change the split
+  count for every row. At 31 rows against 32 the two differ.
+* **`context_partition_size` is a constant 256** on this deployment
+  (`attention_mha.py:554`; the 128 case is sliding-window only), so the
+  per-sequence tile count is `ceil(context / 256)` and the family's existing
+  `context_tiles` term is the right shape for it.
+
+`num_sm` is a device property read at dispatch time
+(`torch.cuda.get_device_properties()`), so the split count is not derivable on
+a CPU host without declaring it. It is a static per-device fact, not a
+per-step one; the proposal in §5 treats it as a declared scope input in the
+same class as `topology`, and no step in this document depends on its value.
+
+On the unified/flash branch -- which this deployment does **not** take, and
+which is retained here because a `--block-size` or env change would reach it --
+the extent is inside aiter's `unified_attention` and is driven by
+`max_seqlen_k`:
 
 * `unified_attention.py:331` -- `use_2d_kernel(...)` returns true when
   `max_seqlen_k <= 512`. Below that threshold a single 2D kernel runs and there
@@ -408,3 +493,54 @@ Said plainly so that nothing here reads as broader than it is.
    `FULL` step. Blocked behind reading the `max_seqlen_k` in the two development
    measurements' own keys, which decides whether they remain usable evidence.
 4. Then the §5 acquisition, training first, holdouts frozen before measurement.
+
+
+## 7. What the launch-extent change implements
+
+Dependencies 1 and 3 of §6 are closed by the change this section documents.
+Dependency 2 remains a plan input and dependency 4 remains unstarted. No GPU
+measurement was taken, no law was fitted, and no frozen artifact was touched.
+
+**The extent is derived, not declared.** §2.1's refusal asked for
+`capture_bucket` in the operator context, and adding it there was the obvious
+fix and the wrong one: an operator's context is part of its identity key
+(`core/cost/identity.py`), so a new field reindexes every price already on disk.
+The rows are on the call instead, exactly as the kernel reads them --
+`_output_rows` now answers for the unified wrapper from `q.shape[0] //
+max_seqlen_q`, the expression at `pa_decode_gluon.py:5342`, and
+`Structure.active_sequences` counts the rows whose query length is non-zero.
+`bucket_pad` is their difference. A declared `capture_bucket`, where one is
+present, is used only to *contradict* the rows and never to supply them.
+
+Consequence for the family's contract, for Attention to confirm: `active`
+continues to mean every launched row, including the padded ones, which is what
+`len(queries)` has always returned on this path; the padding is carried
+separately by `bucket_pad`. Two tests in `test_attention_family.py` encoded the
+old contract and are rewritten -- one asserted a refusal that fired on every
+decode call this family can build, and one declared a bucket of 8 over two
+recorded rows, which is now the contradiction refusal.
+
+**`max_seqlen_k` follows the mode.** `BatchSpec` gains the declared
+`cudagraph_mode` -- `ShapeDeriver` already held it and put it on every
+`TraceRequest` -- and three properties: `replays_captured_metadata`,
+`launch_max_seqlen_k` and `launch_extent_scope`. A FULL decode replay records
+the capture's `max_model_len` (`aiter_attention.py:1367`), an eager or
+PIECEWISE step records the batch's longest history (`:1100`, `:1139`), and a
+bucket with no declared mode records the batch value under the scope
+`"undeclared"`, which says it is not evidence. Same convention as
+`tracer.head_rows_padded`: `None` rather than a plausible number.
+
+**The warm binder keeps it.** `bind_cohort` takes `extent_scope`, defaulting to
+`"batch"` -- every eager and PIECEWISE step -- and `_bind` returns a captured
+extent unchanged rather than recomputing it from the cohort. This is the same
+failure `pad_rows` exists for: a correctly derived graph coming back narrowed
+one cohort later. `"undeclared"` refuses.
+
+Validated in `tests/compass/test_decode_launch_extent.py` at 3 -> 4 and
+31 -> 32 under FULL, PIECEWISE and eager, on specs built by the real
+`ShapeDeriver`; through `_bind` and `bind_cohort` for the warm path; on
+serialized operator fixtures shaped as `forward_ctx` writes them, for the
+executed rows, the padded-row count and the bucket contradiction; and on GDN
+decode fixtures, which must not move -- the recurrence still prices `[calls,
+active, tail_pad_rows]` off its own output operand and `num_actual_tokens`, and
+still carries no full-history term.

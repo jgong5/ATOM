@@ -192,6 +192,22 @@ class Structure:
         return len(self.queries) or int(self.num_decodes or 0)
 
     @property
+    def active_sequences(self) -> Optional[int]:
+        """How many of the recorded rows carry a request.
+
+        A padded decode's offsets repeat the last real one, so a bucket of four
+        holding three requests records `cu_seqlens_q=[0,1,2,3,3]` -- four rows,
+        lengths `(1,1,1,0)`. `sequences` counts all four, because all four are
+        launched; this counts the three that have a query to compute.
+
+        `None` when the call records no offsets at all, which is the one case
+        where the two cannot be told apart.
+        """
+        if not self.queries:
+            return None
+        return sum(1 for q in self.queries if q > 0)
+
+    @property
     def query_total(self) -> int:
         return sum(self.queries) if self.queries else int(
             self.num_actual_tokens or 0)
@@ -325,17 +341,51 @@ def structure_of(op: dict) -> Optional[Structure]:
 _GDN_OUTPUT_OPERAND = 3
 
 
+#: `q` is operand 0 of `unified_attention_with_output_base(q, q_scale, k, v,
+#: positions, layer_name, use_mla, qkv)`, shaped `[rows, num_q_heads,
+#: head_dim]`. The Gluon decode kernel takes its launch extent straight off it
+#: -- `batch_size = query.shape[0] // query_length`, and `grid = (batch_size,
+#: num_kv_heads, max_context_partition_num)` (pa_decode_gluon.py:5342, :5356)
+#: -- so how many rows the kernel executed is a property of the operand, not a
+#: deployment field somebody has to declare.
+_UNIFIED_QUERY_OPERAND = 0
+
+
 def _output_rows(op: dict):
-    """Rows the output tensor was allocated with, where the key records it."""
-    if op.get("name") != GDN:
-        return None
+    """Rows the kernel was launched over, where the key records them.
+
+    For GDN, the width `core_attn_out` was allocated with. For the unified
+    wrapper, the query rows divided by the per-row query length -- the same
+    expression the kernel itself uses. Both are read off the recorded call;
+    neither needs `capture_bucket`, which no operator context carries.
+    """
+    name = op.get("name")
     shapes = op.get("input_shapes") or ()
-    if len(shapes) <= _GDN_OUTPUT_OPERAND:
-        return None
-    shape = shapes[_GDN_OUTPUT_OPERAND]
-    if not isinstance(shape, (list, tuple)) or not shape:
-        return None
-    return int(shape[0])
+    if name == GDN:
+        if len(shapes) <= _GDN_OUTPUT_OPERAND:
+            return None
+        shape = shapes[_GDN_OUTPUT_OPERAND]
+        if not isinstance(shape, (list, tuple)) or not shape:
+            return None
+        return int(shape[0])
+    if name == UNIFIED:
+        if len(shapes) <= _UNIFIED_QUERY_OPERAND:
+            return None
+        shape = shapes[_UNIFIED_QUERY_OPERAND]
+        if not isinstance(shape, (list, tuple)) or not shape:
+            return None
+        per_row = _context(op).get("max_seqlen_q")
+        try:
+            per_row = int(per_row)
+        except (TypeError, ValueError):
+            return None
+        if per_row <= 0 or int(shape[0]) % per_row:
+            # A row count that is not a whole number of query lengths is not
+            # this kernel's batch. Unknown beats a floor division that would
+            # come back as a plausible extent.
+            return None
+        return int(shape[0]) // per_row
+    return None
 
 
 def _hashable(value):
@@ -694,17 +744,32 @@ def features_for(regime: Regime, structure: Structure, scope=None):
         elif feature == "chunks":
             values.append(float(structure.chunks()))
         elif feature == "bucket_pad":
-            # Derived from the recorded bucket, never guessed. A call whose
-            # bucket nobody recorded has an unknown amount of padded work, and
-            # calling it zero would be inventing the answer.
-            if structure.bucket is None:
+            # Derived, never guessed -- but derived from the call's own rows
+            # rather than from a declared bucket. `capture_bucket` is a field
+            # of `StepShape` and `BatchSpec` that no operator context carries,
+            # so requiring it here refused every decode vector this family can
+            # otherwise build, including the ones already recorded.
+            #
+            # What the kernel launches is on the operands: the Gluon decode
+            # takes `batch_size = query.shape[0] // query_length` and the
+            # padded rows are the ones whose query length is zero. The recorded
+            # bucket is used only to contradict that, never to supply it.
+            rows = structure.executed_rows
+            if rows is None:
+                rows = structure.sequences
+            active = structure.active_sequences
+            if active is None:
                 return Refusal(
-                    "the replay bucket this call ran at was not recorded, so "
-                    "how many padded rows the kernel executed is unknown; "
-                    "that is a question for the padding owner, not a zero",
-                    missing=("capture_bucket",))
-            values.append(float(max(int(structure.bucket)
-                                    - structure.sequences, 0)))
+                    "the call records no per-request query offsets, so how "
+                    "many of its launched rows were padding is unknown; that "
+                    "is a question for the padding owner, not a zero",
+                    missing=("cu_seqlens_q",))
+            if structure.bucket is not None and int(structure.bucket) != rows:
+                return Refusal(
+                    f"the call was launched over {rows} rows but declares a "
+                    f"capture bucket of {structure.bucket}; one of the two "
+                    "does not describe this step")
+            values.append(float(max(int(rows) - int(active), 0)))
         else:  # pragma: no cover - guarded by REGIMES
             return Refusal(f"unknown feature {feature!r}")
     return values

@@ -257,20 +257,44 @@ class TestTheRegimesAreNativeBranches:
 
 class TestAbsentFactsAreNotZeros:
 
-    def test_an_unrecorded_bucket_refuses_rather_than_padding_zero(self):
+    def test_an_unpadded_call_pays_no_padding(self):
+        """Two rows, both carrying a request, is not a call with an unknown
+        amount of padding -- it is a call with none.
+
+        This asked for a refusal on the missing `capture_bucket` until the
+        field was looked for and found to be nowhere: it is on `StepShape` and
+        `BatchSpec`, and no operator context has ever carried it, so the
+        refusal fired on every decode call this family can build. The padded
+        rows are on the call instead -- the offsets repeat the last real one,
+        so a padded row's query length is zero.
+        """
         regime = attention.REGIMES["unified.decode.unified_attn"]
         structure = structure_of(_unified([1, 1], [50, 50], is_prefill=False,
                                           has_cached=False))
-        out = features_for(regime, structure, SCOPE)
-        assert isinstance(out, Refusal)
-        assert "capture_bucket" in out.missing
+        values = features_for(regime, structure, SCOPE)
+        assert not isinstance(values, Refusal), values
+        assert values[regime.features.index("bucket_pad")] == 0.0
 
-    def test_a_recorded_bucket_gives_the_padded_rows(self):
+    def test_the_padded_rows_are_the_ones_with_no_query(self):
+        regime = attention.REGIMES["unified.decode.unified_attn"]
+        # Six of eight rows padded: `cu_seqlens_q` repeats the last real
+        # offset, which is what makes a padded row an empty sequence.
+        structure = structure_of(_unified([1, 1, 0, 0, 0, 0, 0, 0],
+                                          [50, 50, 0, 0, 0, 0, 0, 0],
+                                          is_prefill=False, has_cached=False))
+        values = features_for(regime, structure, SCOPE)
+        assert not isinstance(values, Refusal), values
+        assert values[regime.features.index("bucket_pad")] == 6.0
+
+    def test_a_declared_bucket_that_contradicts_the_rows_refuses(self):
+        """A bucket of eight over two recorded rows is not a padded call: a
+        replay records the bucket's width in its own buffers. One of the two
+        facts is about a different step, and picking either is inventing."""
         regime = attention.REGIMES["unified.decode.unified_attn"]
         structure = structure_of(_unified([1, 1], [50, 50], is_prefill=False,
                                           has_cached=False, bucket=8))
-        values = features_for(regime, structure, SCOPE)
-        assert values[regime.features.index("bucket_pad")] == 6.0
+        out = features_for(regime, structure, SCOPE)
+        assert isinstance(out, Refusal)
 
     def test_an_unrecorded_output_width_refuses_rather_than_free_underfill(self):
         """The wrapper slices to num_actual_tokens, and then zeros the output
