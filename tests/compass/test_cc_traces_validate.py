@@ -62,6 +62,39 @@ TARGET_SHA = "b" * 64
 TARGET_CAPTURE_SHA = "c" * 64
 
 
+#: The preset the passing cell prices its regions from. A real built-in, so
+#: the snapshot in the record and the declaration in the registry are both
+#: taken from the same code a served run would select.
+CELL_REGIONS = "source-27b-tp1-conc-v2"
+
+
+def region_snapshot_of(name):
+    """The real snapshot of a built-in preset, as a run publishes it."""
+    from atom.compass.runtime.source_oracle import region_snapshot
+
+    from atom.compass.core.cost.regions import region_model
+
+    return region_snapshot(name, region_model(name))
+
+
+def region_artifact(name=CELL_REGIONS):
+    """Declare the preset a run selected, by the digest over its own values.
+
+    No `contents`: a region preset is code, snapshotted where it was selected,
+    and an entry claiming files for it would describe bytes that never
+    existed.
+    """
+    return {
+        "sha256": region_snapshot_of(name)["sha256"],
+        "kind": "region_model",
+        "measured_at_tp": 1,
+        "produced_by": "regions.py",
+        "workload_sha256": None,
+        "sources": [{"path": "/m/cap_subspan.json", "sha256": SWEEP_SHA}],
+        "code": {"atom/compass/core/cost/regions.py": CODE_SHA},
+    }
+
+
 def capacity_artifact():
     """The declaration of what sized the deployment.
 
@@ -94,7 +127,7 @@ CELL_FACTORY_OPTIONS = {
     "tp": 2,
     "require_complete": "true",
     "head": "true",
-    "regions": "source-27b-tp2",
+    "regions": CELL_REGIONS,
     "derive": "true",
     "model": "Qwen/Qwen3.8-27B",
     "block_size": 16,
@@ -214,6 +247,12 @@ def _server(
                             "lineage": ["/x/target.json"],
                             "deployment": {"num_kvcache_blocks": 4096},
                         },
+                        # The coefficients this run priced preparation and
+                        # postprocess from, snapshotted by value where they
+                        # were selected. From the real preset, so the record
+                        # and the declaration are both the code a served run
+                        # would have selected.
+                        "regions": region_snapshot_of(CELL_REGIONS),
                         "device_freedom": _device_freedom(),
                     }
                 ]
@@ -518,6 +557,7 @@ def cell(tmp_path, monkeypatch):
                     # measured input, because it is one: it decides how many
                     # requests fit, which decides the schedule.
                     capacity_artifact(),
+                    region_artifact(),
                 ]
             }
         )
@@ -851,6 +891,8 @@ class TestCalibrationLeakage:
             filled.append(entry)
         if not any(e.get("sha256") == TARGET_SHA for e in filled):
             filled.append(capacity_artifact())
+        if not any(e.get("kind") == "region_model" for e in filled):
+            filled.append(region_artifact())
         (cell / "registry.json").write_text(json.dumps({"artifacts": filled}))
 
     def test_a_standalone_primitive_at_this_width_is_allowed(self, cell):
@@ -1329,6 +1371,8 @@ class TestCalibrationProvenanceIsTransitive:
         held = list(artifacts)
         if not any(e.get("sha256") == TARGET_SHA for e in held):
             held.append(capacity_artifact())
+        if not any(e.get("kind") == "region_model" for e in held):
+            held.append(region_artifact())
         (cell / "registry.json").write_text(json.dumps({"artifacts": held}))
 
     def _entry(self, **overrides):

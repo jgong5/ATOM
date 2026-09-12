@@ -218,6 +218,13 @@ class CompassPredictMixin:
         # here rather than on a second RPC because it answers the same question
         # this one does -- what was this prediction actually made from -- and a
         # separate channel would be a second thing to keep in step.
+        # Kept out of `inputs`, which is files. A region preset is code the
+        # run selected, snapshotted by value where it was selected; filing it
+        # beside the files would invite a reader to look for bytes on disk
+        # that never existed.
+        snapshot = getattr(self._oracle, "compass_region_snapshot", None)
+        if snapshot is not None:
+            out["regions"] = dict(snapshot)
         out["device_freedom"] = {
             "launch": getattr(self, "_compass_device_launch", None),
             "readback": self._observe_device_freedom("readback"),

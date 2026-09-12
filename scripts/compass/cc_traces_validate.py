@@ -1027,6 +1027,98 @@ def check_reference_budget_is_measured(real, label: str) -> list[str]:
     return bad
 
 
+def check_region_calibration(
+    modelled, registry: dict, tp: int, workload_sha: str, forbidden: dict
+) -> list[str]:
+    """The region preset a run priced with, against a declaration of it.
+
+    A region model supplies preparation and postprocess -- everything in the
+    step that is not the body and not the head -- from measured coefficients,
+    and those go straight into every predicted duration. Nothing checked them.
+    They are not a file, so the calibration walk over `oracle_option_sha256`
+    never saw them; they are not a scalar option either, so
+    `check_scalar_overheads` did not; and `regions=source-27b-tp1` is a name,
+    which is not a measurement. The preset behind a name can be edited, and
+    two runs quoting the same name can have been priced from different numbers
+    with nothing in either record to show it.
+
+    So the run publishes the coefficients it selected, as values, and this
+    requires a `region_model` declaration carrying that exact digest. A
+    changed coefficient changes the digest, so it stops matching and there is
+    nothing to accept.
+
+    The declaration must **not** enumerate contents. A value snapshot is not a
+    file read, and an entry claiming files for it would be describing bytes
+    that never existed; `check_artifact_provenance` refuses that combination
+    already, which is why it is reused here rather than restated.
+
+    ``none`` is exempt by name: it selects no region model, contributes no
+    coefficients, and so has nothing to attribute. Whether an acceptance cell
+    may run that way is `check_source_factory`'s question and it already
+    answers no.
+    """
+    by_sha = {
+        entry.get("sha256"): entry
+        for entry in (registry.get("artifacts") or [])
+        if isinstance(entry, dict)
+    }
+    bad = []
+    for index, rank in enumerate(_rank_records(modelled)):
+        where = f"rank {index}"
+        snapshot = rank.get("regions")
+        if not isinstance(snapshot, dict) or not snapshot:
+            bad.append(
+                f"{where} does not record which region preset it priced "
+                f"preparation and postprocess from, so those terms are "
+                f"attributed to a name at best and to nothing at worst"
+            )
+            continue
+        if snapshot.get("parameters") is None:
+            continue  # `none`: no coefficients, nothing to attribute
+        sha = snapshot.get("sha256")
+        name = snapshot.get("requested")
+        if not _hexish(sha):
+            bad.append(
+                f"{where} records region preset {name!r} with no digest over "
+                f"its own values, so what it was priced from is a name again"
+            )
+            continue
+        tag = f"{where} regions={name!r}"
+        entry = by_sha.get(sha)
+        if entry is None:
+            bad.append(
+                f"{tag} selected coefficients whose digest {sha[:16]} the "
+                f"calibration registry does not declare: either the preset is "
+                f"unregistered, or its numbers have moved since it was"
+            )
+            continue
+        if entry.get("kind") != "region_model":
+            bad.append(
+                f"{tag}={sha[:16]} is declared kind {entry.get('kind')!r}; a "
+                f"region preset is a region_model"
+            )
+        at = entry.get("measured_at_tp")
+        if at not in (None, SOURCE_TP):
+            bad.append(
+                f"{tag}={sha[:16]} is declared measured at TP={at}, but only "
+                f"TP={SOURCE_TP} may be a source for a region model; at "
+                f"TP={tp} this is the width being predicted"
+            )
+        if entry.get("from_target_engine"):
+            bad.append(
+                f"{tag}={sha[:16]} declares it came from the target engine, "
+                f"so the regions were fitted on the engine being predicted"
+            )
+        if entry.get("workload_sha256") == workload_sha:
+            bad.append(
+                f"{tag}={sha[:16]} was produced from the acceptance workload "
+                f"itself"
+            )
+        # No observed files, deliberately: see the docstring.
+        bad += check_artifact_provenance(tag, entry, {}, workload_sha, forbidden)
+    return bad
+
+
 def check_predictor_device_freedom(modelled, label: str) -> list[str]:
     """That the process which predicted could not have reached a device.
 
@@ -2277,6 +2369,12 @@ def cell(args) -> int:
             failures += [
                 f"repeat {index}: {reason}"
                 for reason in check_capacity_provenance(
+                    modelled, registry, args.tp, workload_sha, forbidden
+                )
+            ]
+            failures += [
+                f"repeat {index}: {reason}"
+                for reason in check_region_calibration(
                     modelled, registry, args.tp, workload_sha, forbidden
                 )
             ]

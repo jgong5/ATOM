@@ -49,7 +49,8 @@ from typing import NamedTuple, Optional
 
 __all__ = ["source_cost_oracle", "build_source_oracle", "build_source_group",
            "SourceComposition", "SourceGroup", "RankGroupOracle",
-           "price_specs", "template_shape", "seeded_graphs", "gap_ratio"]
+           "price_specs", "template_shape", "seeded_graphs", "gap_ratio",
+           "region_snapshot", "region_values", "REGION_SNAPSHOT_SCHEMA"]
 
 
 def _entries(value, what: str):
@@ -122,6 +123,108 @@ def gap_ratio(value, what: str = "interpolate"):
         raise ValueError(f"{what}: {ratio} is narrower than adjacent measured "
                          "points, so nothing could ever be interpolated")
     return ratio
+
+
+#: The record :func:`region_snapshot` produces. Versioned for the same reason
+#: the budget record is: a validator reads it, and a field that quietly changes
+#: meaning is worse than one that is absent.
+REGION_SNAPSHOT_SCHEMA = "compass.regions.selected/1"
+
+
+def region_values(value):
+    """Every value a region preset holds, in a form JSON keeps whole.
+
+    Dataclasses become their fields and tuples become lists. A mapping whose
+    keys are not strings -- a ``(capture_bucket, padded) -> Measured`` table,
+    say -- becomes a sorted list of key/value pairs rather than being coerced:
+    `json.dumps` cannot write a tuple key, so it either raises or a careless
+    serialiser flattens it to a string, and both lose the coefficient. A
+    coefficient outside the digest is a number nobody is holding the run to.
+
+    Read off the object rather than from a list of fields kept here, so a
+    preset that grows a table -- a prefill cell map, a new region -- is
+    carried without this having to learn about it first.
+    """
+    import dataclasses
+    import json as _json
+
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        value = dataclasses.asdict(value)
+    if isinstance(value, dict):
+        if all(isinstance(key, str) for key in value):
+            return {key: region_values(item) for key, item in value.items()}
+        return {"__pairs__": sorted(
+            ([region_values(key), region_values(item)]
+             for key, item in value.items()),
+            key=lambda pair: _json.dumps(pair[0], sort_keys=True))}
+    if isinstance(value, (list, tuple)):
+        return [region_values(item) for item in value]
+    return value
+
+
+def region_snapshot(name: str, model) -> dict:
+    """The region preset a run selected, as a value rather than as a name.
+
+    ``model`` is the object the factory is holding -- the one it will price
+    with -- and not a name to look up again. Resolving the name a second time
+    at the end of construction would be the very pattern this work removes: a
+    record derived from an option rather than from the thing that was used, so
+    that a preset swapped in between would be priced from and not reported.
+    It is snapshotted where it is selected, for the same reason a file's
+    digest is taken where its bytes are parsed.
+
+    A region model supplies preparation and postprocess -- everything in the
+    step that is not the body and not the head -- from measured coefficients.
+    Those coefficients go straight into every predicted duration, and until
+    now the record said only which *name* was asked for. A name is not a
+    measurement: the preset behind it can be edited, and two runs quoting the
+    same name can have been priced from different numbers with nothing to show
+    it.
+
+    So the numbers are snapshotted where they are selected, and digested. This
+    is deliberately **not** a `LoadedInput` and must not be filed as one: no
+    file was read. The preset is built into the code, `sha256` here is over a
+    canonical serialisation of its own values, and a validator that treated it
+    as a file read would go looking for bytes on disk that never existed. The
+    distinction is why this has its own schema and its own key in the manifest
+    rather than joining `inputs`.
+
+    ``"none"`` snapshots as a selection of nothing. That is a real choice --
+    body plus head with no runner term -- and it contributes no coefficients,
+    so there is nothing to attribute and nothing is required of it. Whether it
+    is *allowed* in an acceptance cell is `check_source_factory`'s question,
+    and it already answers no.
+
+    Every name that selects this preset is recorded beside the one that was
+    asked for, so an alias cannot make two records of one preset look like
+    records of two.
+    """
+    import hashlib
+    import json as _json
+
+    from atom.compass.core.cost.regions import REGION_MODELS
+
+    # Aliases by identity against the object in hand, so two names for one
+    # preset cannot read as records of two.
+    aliases = sorted(key for key, value in REGION_MODELS.items()
+                     if value is model and value is not None)
+    snapshot = {
+        "schema": REGION_SNAPSHOT_SCHEMA,
+        "requested": str(name),
+        "aliases": aliases,
+        "version": str(getattr(model, "version", "") or ""),
+        "provenance": str(getattr(model, "provenance", "") or ""),
+        # Every field of the preset, coefficients and calibrated domain alike.
+        # The domain is part of what was selected: the same numbers over a
+        # wider domain is a different claim about where they hold.
+        # Read off the dataclass rather than listed here, so a preset that
+        # grows a field -- a prefill cell table, a new region -- is carried
+        # without this needing to know about it.
+        "parameters": None if model is None else region_values(model),
+    }
+    body = _json.dumps(snapshot, sort_keys=True, separators=(",", ":"))
+    snapshot["sha256"] = hashlib.sha256(body.encode()).hexdigest()
+    return snapshot
 
 
 def _price_library(entries, gap_ratio, coords=None):
@@ -628,6 +731,8 @@ def build_source_oracle(
     price_entries = price_specs(requested_prices)
     library = _price_library(price_entries, gap_ratio(interpolate), coords)
     regions_model = region_model(regions)
+    # Immediately, off the object just selected -- not from the name again.
+    regions_taken = region_snapshot(regions, regions_model)
     rank_artifacts = _rank_artifacts(
         coords, requested_prices, templates, head_templates)
 
@@ -759,6 +864,10 @@ def build_source_oracle(
     # A tuple, so what the worker later exposes cannot be edited by anything
     # that gets a reference to the oracle.
     oracle.compass_loaded_inputs = loaded_inputs
+    # Rides beside them and stays separate from them. The coefficients this
+    # run will price every step's preparation and postprocess from, as values,
+    # taken where they were selected -- not a file, and not filed as one.
+    oracle.compass_region_snapshot = regions_taken
     return SourceComposition(oracle, body_graphs, head_graphs, body_deriver,
                              build_seconds, allocation, coords, rank_artifacts,
                              getattr(library, "max_gap_ratio", None),
