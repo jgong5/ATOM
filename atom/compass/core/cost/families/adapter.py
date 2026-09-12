@@ -345,6 +345,10 @@ class ParametricPriceLibrary(PriceLibrary):
             return None, (f"{original}; and {op.get('name', '?')} has no "
                           "declared family contract, so there is no statement "
                           "of what its price may depend on")
+        if contract.kind == "view":
+            # Not a curve: a family whose price is structurally absent when the
+            # recording proves it, and refused when the recording does not.
+            return self._view_price(op, original, contract)
         if contract.kind != "rows":
             missing = ", ".join(contract.unmeasured_nuisances)
             return None, (
@@ -379,6 +383,59 @@ class ParametricPriceLibrary(PriceLibrary):
         return (dict(_record(answer, curve, verified_rows),
                      **{INTERPOLATED_FLAG: True}),
                 f"{INTERPOLATED_SCHEME}{contract.family}/rows={verified_rows}")
+
+    def _view_price(self, op: dict, original: str, contract):
+        """Zero seconds, but only where the recording proves nothing ran.
+
+        A slice that returns a view dispatches no kernel: the output is the
+        input's storage at an offset, and producing it is host bookkeeping.
+        That is not something to be measured and found small -- it is work that
+        does not exist -- so it is declared, and it is declared from evidence
+        the graph carries rather than from the operator's name.
+
+        `output_aliases` is that evidence. It records, per output, whether the
+        operator allocated it, decided as the trace ran by whether the output's
+        storage is one of the operator's own inputs. An index means it wrote
+        into a tensor that already existed; `None` means it allocated.
+
+        Three outcomes, and the two refusals matter as much as the price:
+
+        * no `output_aliases` at all -- a graph written before the field was
+          recorded. Empty means *not known*, which the field's own docstring is
+          careful to distinguish from *the same as the input*. Refused.
+        * an output the operator allocated -- then it copied rather than
+          viewed, and a copy of an arbitrary extent is real work that no
+          measurement here covers. Refused.
+        * every output an alias -- no kernel, and the price is zero.
+
+        Reported under `ZERO_WORK_FLAG`, which exists for exactly this: fully
+        accounted for, not a measurement, and never inferred from a zero time.
+        """
+        aliases = op.get("output_aliases")
+        if not aliases:
+            return None, (
+                f"{original}; {contract.family} is priced at zero only where "
+                "the recording shows it allocated nothing, and this graph "
+                "records no output_aliases -- which is not known, not the same "
+                "as not allocated")
+        if any(alias is None for alias in aliases):
+            return None, (
+                f"{original}; this {contract.family} allocated its output, so "
+                "it copied rather than viewed, and a copy is work no "
+                "measurement here covers")
+        return ({"seconds": 0.0,
+                 "kernels": {},
+                 "occurrences": 1,
+                 "name": contract.family,
+                 ZERO_WORK_FLAG: True,
+                 "structural": {
+                     "family": contract.family,
+                     "basis": "alias",
+                     "output_aliases": list(aliases),
+                     "detail": ("output aliases an operand's storage, so no "
+                                "kernel is dispatched"),
+                 }},
+                f"structural://{contract.family}/alias")
 
     def _layout_note(self, op: dict) -> str:
         """Say so when operand layout is why nothing matched.

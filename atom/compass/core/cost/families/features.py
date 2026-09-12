@@ -59,6 +59,7 @@ from atom.compass.core.cost.identity import normalized_context
 __all__ = [
     "FAMILY_CONTRACTS",
     "FamilyContract",
+    "ValueContract",
     "Nuisance",
     "aligns",
     "contract_for",
@@ -122,6 +123,12 @@ class FamilyContract:
     #: :func:`infer_rows` solve the second one along with the rows. See
     #: :func:`_values`, which is where the declaration takes effect.
     fixed_dims: tuple[tuple[int, int], ...] = ()
+    #: operand positions whose integer CONTENTS the price is declared
+    #: independent of, each with the validation that must hold before the
+    #: declaration applies. Empty for every family but the two head selectors.
+    #: See :class:`ValueContract`, and :func:`_abstracted_int_values`, which is
+    #: where a declaration takes effect.
+    values: tuple["ValueContract", ...] = ()
     #: why this family is parameterised the way it is
     rationale: str = ""
 
@@ -139,9 +146,137 @@ class FamilyContract:
         lines = [f"{self.family}: parameterised by {self.kind}"]
         if self.rationale:
             lines.append(f"    {self.rationale}")
+        for v in self.values:
+            lines.append(f"    values[{v.position}] {v.nuisance.describe()}")
         for n in self.nuisances:
             lines.append(f"    nuisance {n.describe()}")
         return "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class ValueContract:
+    """When an integer operand's CONTENTS may stand for their extent alone.
+
+    ``int_values`` is recorded because for a data-dependent kernel the shapes
+    do not say how much work is done: attention walks as much KV cache as
+    ``context_lens`` says, and a benchmark handed a zero-filled tensor of the
+    right shape priced one decode step's attention above the whole step. That
+    argument is real and it is why the values are in the key. It does not reach
+    every operator carrying an integer operand, and where it does not reach,
+    holding the literal vector costs every width: the head's gather carries the
+    selected row numbers, which differ at every width AND at every mix of
+    request lengths, so :func:`aligns` compares 4095 against 8191 and refuses
+    two measurements of the same operator.
+
+    A declaration here says, for one family at one operand position: the price
+    is a function of how many values there are, not of which values they are.
+    It is admissible only when :attr:`validate` confirms the operand really is
+    the thing the declaration describes -- an operand that fails validation
+    keeps its literal values and goes on refusing exactly as before, which is
+    the fail-closed direction. And it must carry a :attr:`nuisance` whose
+    measurement varies the values at a fixed width, on the same footing this
+    module demands of every other nuisance.
+
+    The values are never removed from the operator. This changes what the
+    comparison looks at, not what the recording holds: the raw vector, its
+    range and its layout association all stay on the ``OpSpec``, and a reader
+    or a later probe can still reach them.
+    """
+
+    #: operand position whose contents may be abstracted
+    position: int
+    #: name in :data:`_VALUE_VALIDATORS`: what must hold of the operand before
+    #: the abstraction applies
+    validate: str
+    #: the declaration that the price does not depend on the values, with the
+    #: measurement that varied them at a fixed width behind it
+    nuisance: Nuisance
+    #: why the abstraction is admissible for this family
+    rationale: str = ""
+
+
+_INT_DTYPES = ("int8", "int16", "int32", "int64",
+               "uint8", "uint16", "uint32", "uint64", "bool")
+
+
+def _dtype_at(op: dict, position: int) -> str:
+    dtypes = op.get("dtypes") or ()
+    return str(dtypes[position]) if position < len(dtypes) else ""
+
+
+def _vector_extent(op: dict, position: int) -> Optional[int]:
+    """The length of a one-dimensional operand, or ``None`` if it is not one."""
+    shapes = op.get("input_shapes") or ()
+    if position >= len(shapes):
+        return None
+    shape = shapes[position]
+    if not isinstance(shape, (list, tuple)) or len(shape) != 1:
+        return None
+    return int(shape[0])
+
+
+def _validates_int_elementwise(op: dict, position: int, values) -> bool:
+    """An integer vector whose kernel touches each element once.
+
+    What is checked is that the operand is what the declaration assumes: a
+    one-dimensional integer tensor, of the length the recording says, and that
+    the operator's declared width is that length. The claim being licensed is
+    narrow -- elementwise integer work at a fixed dtype and extent does the
+    same work whatever the integers are -- and it is not a claim that the
+    operator is cheap.
+    """
+    if _dtype_at(op, position) not in _INT_DTYPES:
+        return False
+    extent = _vector_extent(op, position)
+    if extent is None or extent != len(values) or extent <= 0:
+        return False
+    return executed_rows(op) == extent
+
+
+def _validates_row_selector(op: dict, position: int, values) -> bool:
+    """A gather index that selects distinct existing rows, once each.
+
+    Three things must hold before row numbers may stand for their count, and
+    each rules out a different way the price could depend on the values:
+
+    * every index inside the source height -- an out-of-bounds or negative
+      entry is not a row of this tensor, and a vector holding one is not the
+      access pattern this contract describes;
+    * no row selected twice -- the same count reading one row repeatedly is a
+      different amount of memory traffic from one reading distinct rows, and
+      the second is the only one measured;
+    * as many indices as the operand says, and as many as the operator's
+      declared width -- which is what ties the count to the rows rather than
+      leaving two independent extents.
+
+    Clustering is deliberately NOT checked. Whether the selected rows sit
+    together or spread across the tensor is a property the measurement varies
+    (see the selector probe behind the nuisance) rather than one this function
+    asserts away.
+    """
+    shapes = op.get("input_shapes") or ()
+    if position >= len(shapes) or not shapes or not shapes[0]:
+        return False
+    if _dtype_at(op, position) not in _INT_DTYPES:
+        return False
+    height = int(shapes[0][0])
+    extent = _vector_extent(op, position)
+    if extent is None or extent != len(values) or extent <= 0:
+        return False
+    numbers = [int(v) for v in values]
+    if any(v < 0 or v >= height for v in numbers):
+        return False
+    if len(set(numbers)) != len(numbers):
+        return False
+    return executed_rows(op) == extent
+
+
+#: The validations a :class:`ValueContract` may name. Keyed by name rather than
+#: holding the function itself so a contract stays a plain data literal.
+_VALUE_VALIDATORS = {
+    "int_elementwise": _validates_int_elementwise,
+    "row_selector": _validates_row_selector,
+}
 
 
 # The layer index appears in the attention families' scalars as the module path
@@ -234,6 +369,49 @@ FAMILY_CONTRACTS: dict[str, FamilyContract] = {
     for name in _ROW_FAMILIES
 }
 
+# The head selectors' VALUES, varied at a fixed width.
+#
+# Both metadata operators carry an integer vector whose contents change with
+# every batch: the subtraction's operand is the cumulative token offsets and
+# the gather's is the row numbers those offsets point at. Holding the literal
+# vectors in the comparison key is why both refused at every width -- not
+# because the family was unmeasured, but because no two measurements could ever
+# be recognised as the same operator.
+#
+# So the values were varied at a fixed width, which is the probe this module
+# demands before any component may be called a nuisance. Eight requests,
+# H=16384, five length distributions from equal-split to seven single-token
+# requests and one covering the rest (agent_scratch/headgrid/specs_native,
+# head_sel_m8_v1..v5), each priced three times under the ladder's own protocol.
+# The spread below is across those five value-sets at one width, so it is a
+# measured band rather than an assumed independence.
+_SELECTOR_SUB = Nuisance(
+    component="int_values[0]",
+    measured=True,
+    spread=0.0077,
+    evidence=("5 value-sets at M=8, headgrid/prices_native/head_sel_m8_v*, "
+              "1.956057e-06 to 1.971052e-06 s; the band is narrower than the "
+              "1.28% repeat spread of the widest single point, so nothing in "
+              "the measurement separates the value-sets from each other"),
+)
+# The gather's band is dominated by one value-set, v5 = [1]*7 + [16377], the
+# pathological one chosen to stress locality. Its own repeat spread is 51.66%
+# -- larger than the 18.64% band across all five -- which says that point is a
+# reading of the event-timing floor at ~4 us, not of a locality effect the
+# measurement can resolve. The larger number is recorded anyway: a nuisance
+# band that is bounded by resolution rather than by demonstrated independence
+# should be declared at its resolution, not narrowed by dropping the point
+# that made it wide. Excluding v5 would give 3.0% across v1..v4, and that
+# figure is deliberately NOT the one used here.
+_SELECTOR_INDEX = Nuisance(
+    component="int_values[1]",
+    measured=True,
+    spread=0.1864,
+    evidence=("5 value-sets at M=8, headgrid/prices_native/head_sel_m8_v*, "
+              "4.204401e-06 to 4.988156e-06 s; widest at v5=[1]*7+[16377], "
+              "whose own 51.66% repeat spread exceeds the band"),
+)
+
 # The two head metadata operators. Both ran in run 5's head graph, both were
 # refused with "has no declared family contract", and neither is free: the
 # gather is 4.3e-06 s and the subtraction 2.0e-06 s at M=2, measured on the
@@ -243,6 +421,18 @@ FAMILY_CONTRACTS["aten::sub.Tensor"] = FamilyContract(
     family="aten::sub.Tensor",
     kind="rows",
     rows_from=(0, 0),
+    values=(
+        ValueContract(
+            position=0,
+            validate="int_elementwise",
+            nuisance=_SELECTOR_SUB,
+            rationale=("the operand is the cumulative offset vector and the "
+                       "kernel subtracts a scalar from each entry once; at a "
+                       "fixed int32 dtype and extent that is the same work "
+                       "whatever the offsets are, and the measured band above "
+                       "is what the declaration costs"),
+        ),
+    ),
     rationale=("elementwise over the selected last-token indices; operand 0 is "
                "that index vector, so its length is the executed width"),
 )
@@ -265,18 +455,50 @@ FAMILY_CONTRACTS["aten::index.Tensor"] = FamilyContract(
     kind="rows",
     rows_from=(1, 0),
     fixed_dims=((0, 0),),
+    values=(
+        ValueContract(
+            position=1,
+            validate="row_selector",
+            nuisance=_SELECTOR_INDEX,
+            rationale=("the operand is the last-token row number of each "
+                       "request: validated in bounds, distinct, and as many as "
+                       "the width. Under those conditions the gather reads that "
+                       "many distinct rows of the source whatever their "
+                       "numbers, which the five value-sets confirm; a vector "
+                       "that fails any of the three keeps its literal values "
+                       "and is refused"),
+        ),
+    ),
     rationale=("gathers operand 1's rows out of operand 0; the selected count "
                "is the width and the source height is fixed, never scaled"),
 )
 
-# `aten::slice.Tensor` is deliberately absent. Its operand is the cumulative
-# sequence-offset vector, whose length is requests + 1: affine in the width,
-# not a multiple of it, so `aligns` cannot recognise two of its widths as the
-# same operator and a "rows" contract would be a false declaration. It was
-# measured at 9.3e-08 s, flat across the whole M ladder, so it is small -- but
-# small is not zero, and no operator-level "views are free" rule exists. It
-# stays refused until either a structural zero-work rule covers it or an affine
-# family kind exists to hold it.
+# `aten::slice.Tensor` is priced by its ALIAS, not by a row law. Its operand is
+# the cumulative sequence-offset vector, whose length is requests + 1: affine
+# in the width, not a multiple of it, so `aligns` cannot recognise two of its
+# widths as the same operator and a "rows" contract would be a false
+# declaration. That much was already established and is unchanged.
+#
+# What is new is that the family does not need one. The recording says the
+# operator allocated nothing -- `output_aliases` holds an index rather than
+# None, decided by whether the output's storage is one of the operator's own
+# inputs -- so it returned a view: the same storage at an offset, with no
+# kernel dispatched. A price of zero here is a structural fact about that
+# recording and not a small measurement rounded down, which is the distinction
+# `ZERO_WORK_FLAG` exists to keep. The standalone head grid corroborates it
+# without being the basis for it: 9.3e-08 s, four orders below the LM-head
+# GEMM in the same graph and at the timing floor.
+#
+# A slice whose recording shows an allocation is a copy, and is refused. A
+# graph too old to record `output_aliases` says nothing about which it was, and
+# nothing is not zero -- so that is refused too. See `_view_price`.
+FAMILY_CONTRACTS["aten::slice.Tensor"] = FamilyContract(
+    family="aten::slice.Tensor",
+    kind="view",
+    rationale=("priced at zero only on a recording that proves the output "
+               "aliases an operand's storage, so no kernel ran; a slice that "
+               "allocated is a copy and is refused"),
+)
 
 FAMILY_CONTRACTS["aiter::unified_attention_with_output_base"] = FamilyContract(
     family="aiter::unified_attention_with_output_base",
@@ -409,6 +631,38 @@ def _fixed_shapes(op: dict) -> Any:
     return out
 
 
+def _abstracted_int_values(op: dict) -> tuple:
+    """``int_values`` with declared-and-validated contents reduced to extent.
+
+    The operator is not modified: this is the comparison's view of it, built
+    fresh on each call, in the same spirit as :func:`_fixed_shapes`. A position
+    with no declaration, or one whose contents fail the declared validation,
+    is carried through with its values intact and so goes on matching nothing
+    but an identical vector.
+
+    A validated position becomes ``(position, count)``. The count is an integer
+    and it equals the operator's width, so the row-adjustment rule in
+    :func:`aligns` reaches it: n values at one width and 2n at twice the width
+    are recognised as one operator at two widths, which is the whole point, and
+    a count that did NOT move with the rows would still be refused.
+    """
+    raw = tuple((int(i), tuple(v)) for i, v in
+                (tuple(x) for x in op.get("int_values") or ()))
+    contract = contract_for(op.get("name", ""))
+    declared = {v.position: v for v in (contract.values if contract else ())}
+    if not declared:
+        return raw
+    out = []
+    for position, values in raw:
+        rule = declared.get(position)
+        validator = _VALUE_VALIDATORS.get(rule.validate) if rule else None
+        if validator is None or not validator(op, position, values):
+            out.append((position, values))
+            continue
+        out.append((position, len(values)))
+    return tuple(out)
+
+
 def _values(op: dict) -> list:
     """Every value in the operator's key, in a fixed order.
 
@@ -434,9 +688,7 @@ def _values(op: dict) -> list:
     # the library has already agreed are the same work, and a family law would
     # then refuse a width the key itself accepts.
     walk(normalized_context(op))
-    walk(tuple((i, tuple(v)) for i, v in
-               (tuple(x) for x in op.get("int_values") or ())))
-    walk(tuple((k, v) for k, v in (tuple(x) for x in op.get("scalars") or ())))
+    walk(_abstracted_int_values(op))
     for key, value in (tuple(x) for x in op.get("launch") or ()):
         if key == "grid":
             walk(tuple(value))

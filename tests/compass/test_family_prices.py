@@ -591,19 +591,36 @@ def test_a_graph_stating_no_width_of_its_own_is_still_read_per_operator(
     assert record["seconds"] == 2e-4
 
 
-def test_the_head_metadata_operators_have_contracts_and_the_slice_does_not():
-    """Three operators ran beside the head GEMM and they are not one case.
+def test_the_head_metadata_operators_have_contracts_and_the_slice_is_a_view():
+    """The three head metadata operators, and what each contract may claim.
 
-    The gather and the subtraction are row-linear in the number of requests
-    selected, and were measured at 4.3e-06 s and 2.0e-06 s at M=2 -- small,
-    and not zero. The slice is affine: its operand is the cumulative offset
-    vector, whose length is requests + 1, so no row count makes two of its
-    widths the same operator and a "rows" contract would be a false
-    declaration.
+    This test used to assert the slice had no contract at all. That was the
+    right answer while the only thing known about it was its shapes: the
+    slice is affine in requests, its operand is the cumulative offset vector
+    whose length is requests + 1, and no row count makes two of its widths
+    the same operator -- so a "rows" contract would have been a false
+    declaration, and it stays false today.
+
+    What changed is not the shape reasoning but the recording. The trace now
+    carries ``output_aliases``, and on the real head graph the slice's entry
+    is ``[-1]``: it allocated nothing and wrote into storage that existed
+    before the step. That is a structural fact about the recording, not an
+    inference from a small time, and it is the only basis on which the zero
+    is allowed. The sibling tests below hold the other two directions -- an
+    allocating slice is a copy and refuses, and a slice with no recorded
+    alias refuses rather than assuming one.
+
+    The sub and index contracts stay "rows". Both were refused in run 5,
+    both were measured at 2.0e-06 s and 4.3e-06 s at M=2, and neither is
+    zero.
     """
     assert contract_for("aten::sub.Tensor").kind == "rows"
     assert contract_for("aten::index.Tensor").kind == "rows"
-    assert contract_for("aten::slice.Tensor") is None
+    slice_contract = contract_for("aten::slice.Tensor")
+    assert slice_contract is not None
+    assert slice_contract.kind == "view"
+    assert slice_contract.rows_from is None
+    assert slice_contract.values == ()
 
 
 def test_the_gather_is_not_answered_across_the_height_it_gathers_from():
@@ -721,3 +738,146 @@ def test_a_graph_that_contradicts_itself_about_its_width_is_refused_whole(
     # nor the width it was measured at by any route but the exact key.
     record, why = library.lookup(gemm(512))
     assert record is None
+
+
+def _selector_gather(selected: int, height: int = 16384, rows=None) -> dict:
+    """The head's gather as it is really recorded: with its row numbers.
+
+    The default selectors are what a batch of equal-length requests produces --
+    the last row of each slice of the state -- so they are in bounds, distinct
+    and as many as the width.
+    """
+    if rows is None:
+        step = height // selected
+        rows = [(i + 1) * step - 1 for i in range(selected)]
+    return {"name": "aten::index.Tensor",
+            "input_shapes": [[height, 5120], [selected]],
+            "dtypes": ["bfloat16", "int32"],
+            "int_values": [[1, list(rows)]]}
+
+
+def _offsets(width: int, height: int = 16384) -> dict:
+    """The head's integer subtract, carrying the cumulative offsets."""
+    step = height // width
+    return {"name": "aten::sub.Tensor",
+            "input_shapes": [[width]],
+            "dtypes": ["int32"],
+            "scalars": [["#1", 1]],
+            "int_values": [[0, [(i + 1) * step for i in range(width)]]]}
+
+
+def test_the_gather_matches_two_widths_once_its_selectors_are_validated():
+    """Validated row numbers stand for their count, so two widths line up.
+
+    Without this the head's gather could never be priced at any width but the
+    one measured: the selectors differ at every width and at every mix of
+    request lengths, so the literal vectors made two recordings of the same
+    operator incomparable. The abstraction is the count, and the count is the
+    width -- which is exactly what `aligns` is built to recognise.
+    """
+    assert aligns(_selector_gather(4), 4, _selector_gather(2), 2)
+    assert infer_rows(_selector_gather(4), _selector_gather(2), 2) == 4
+
+    # And two different batches at the SAME width, whose requests were split
+    # differently, are the same operator rather than two.
+    assert aligns(_selector_gather(4, rows=[0, 1, 2, 16383]), 4,
+                  _selector_gather(4), 4)
+
+
+def test_a_gather_that_reads_one_row_twice_keeps_its_literal_selectors():
+    """Distinctness is a condition of the declaration, not a detail.
+
+    The same count reading one row four times is a different amount of memory
+    traffic from one reading four distinct rows, and only the second was
+    measured. A vector that repeats a row fails validation, keeps its values,
+    and is refused -- which is the fail-closed direction.
+    """
+    repeated = _selector_gather(4, rows=[4095, 4095, 4095, 4095])
+    assert not aligns(repeated, 4, _selector_gather(2), 2)
+    assert infer_rows(repeated, _selector_gather(2), 2) is None
+
+
+def test_a_gather_whose_selector_leaves_the_source_keeps_its_values():
+    """An index outside the source height is not a row of this tensor."""
+    outside = _selector_gather(4, rows=[0, 1, 2, 16384])
+    assert not aligns(outside, 4, _selector_gather(2), 2)
+    negative = _selector_gather(4, rows=[-1, 1, 2, 3])
+    assert not aligns(negative, 4, _selector_gather(2), 2)
+
+
+def test_a_selector_that_does_not_fill_its_operand_keeps_its_values():
+    """As many indices as the operand says, or the count means nothing."""
+    short = _selector_gather(4)
+    short["int_values"] = [[1, [4095, 8191, 12287]]]
+    assert not aligns(short, 4, _selector_gather(2), 2)
+
+
+def test_the_integer_subtract_matches_two_widths_of_unrelated_offsets():
+    """Elementwise integer work at a fixed dtype and extent is the same work.
+
+    The offsets themselves are unrelated between two batches -- they are
+    cumulative token counts -- so without the declaration the subtract refused
+    every width but its own, exactly as the gather did.
+    """
+    assert aligns(_offsets(4), 4, _offsets(2), 2)
+    assert infer_rows(_offsets(4), _offsets(2), 2) == 4
+    odd = {"name": "aten::sub.Tensor",
+           "input_shapes": [[4]],
+           "dtypes": ["int32"],
+           "scalars": [["#1", 1]],
+           "int_values": [[0, [7, 11, 13, 17]]]}
+    assert aligns(odd, 4, _offsets(2), 2)
+
+
+def test_a_slice_that_aliases_its_operand_is_priced_at_zero_structurally():
+    """A view dispatches no kernel, and the recording is what says so.
+
+    Not a measurement that came out small: `output_aliases` records, per
+    output, whether the operator allocated it, decided as the trace ran by
+    whether the output's storage is one of its own inputs. An index there
+    means it wrote into a tensor that already existed.
+    """
+    library = ParametricPriceLibrary(max_gap_ratio=2.0)
+    view = {"name": "aten::slice.Tensor",
+            "input_shapes": [[5]],
+            "output_shapes": [[4]],
+            "dtypes": ["int32"],
+            "scalars": [["#1", 0], ["#2", 1], ["#3", 9223372036854775807]],
+            "int_values": [[0, [0, 4096, 8192, 12288, 16384]]],
+            "output_aliases": [-1]}
+    record, source = library.lookup(view)
+    assert record is not None, source
+    assert record["seconds"] == 0.0
+    assert record["zero_work"] is True
+    assert record["structural"]["basis"] == "alias"
+    assert not record.get("interpolation")
+
+
+def test_a_slice_that_allocated_its_output_is_refused():
+    """Then it copied rather than viewed, and a copy is unmeasured work."""
+    library = ParametricPriceLibrary(max_gap_ratio=2.0)
+    copied = {"name": "aten::slice.Tensor",
+              "input_shapes": [[5]],
+              "output_shapes": [[4]],
+              "dtypes": ["int32"],
+              "output_aliases": [None]}
+    record, why = library.lookup(copied)
+    assert record is None
+    assert "copied rather than viewed" in why
+
+
+def test_a_slice_with_no_recorded_alias_is_refused_rather_than_assumed():
+    """Empty means not known, which is not the same as not allocated.
+
+    A graph written before `output_aliases` was recorded carries no statement
+    about what the slice did. Reading that silence as a view would turn every
+    such graph's slices into free work on no evidence.
+    """
+    library = ParametricPriceLibrary(max_gap_ratio=2.0)
+    silent = {"name": "aten::slice.Tensor",
+              "input_shapes": [[5]],
+              "output_shapes": [[4]],
+              "dtypes": ["int32"]}
+    record, why = library.lookup(silent)
+    assert record is None
+    assert "not known" in why
