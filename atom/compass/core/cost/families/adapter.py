@@ -207,7 +207,7 @@ class ParametricPriceLibrary(PriceLibrary):
         curve, verified_rows = self._curve_for(op)
         if curve is None:
             return None, (f"{original}; and no measured operator matches this "
-                          "one at any width")
+                          "one at any width" + self._layout_note(op))
         support = RowSupport(curve, max_gap_ratio=self.max_gap_ratio)
         answer = support.price(verified_rows)
         if isinstance(answer, Refusal):
@@ -222,6 +222,27 @@ class ParametricPriceLibrary(PriceLibrary):
         return (dict(_record(answer, curve, verified_rows),
                      **{INTERPOLATED_FLAG: True}),
                 f"{INTERPOLATED_SCHEME}{contract.family}/rows={verified_rows}")
+
+    def _layout_note(self, op: dict) -> str:
+        """Say so when operand layout is why nothing matched.
+
+        Without this the refusal reads "no measured operator matches this one
+        at any width", which is true and unhelpful: the family *was* measured,
+        at widths that bracket this one, on operands in a different memory
+        arrangement. Naming that is the difference between a gap somebody can
+        close and a gap somebody re-measures the wrong thing to close.
+        """
+        mine = _layout_note_for(op)
+        others = {_layout_note_for(measured)
+                  for key, obs in self._observations.items()
+                  if key[0] == op.get("name", "")
+                  for measured, *_ in obs}
+        others.discard(mine)
+        if not others:
+            return ""
+        return (f". This request's operands are {mine} while this family was "
+                f"measured on {', '.join(sorted(others))}, which is a "
+                "different operator rather than another width of this one")
 
     def _curve_for(self, op: dict):
         """The measured curve for this operator, and the width it sits at."""
@@ -334,6 +355,15 @@ def _record(answer, curve: MeasuredCurve, rows: int) -> dict:
             "measured_sources": sorted(set(answer.sources)),
         },
     }
+
+
+def _layout_note_for(op: dict) -> str:
+    """This operator's operand layout, named for a refusal message."""
+    positions = sorted(int(pos) for pos, _ in
+                       (tuple(x) for x in op.get("layouts") or ()))
+    if not positions:
+        return "a dense rebuild"
+    return f"a recorded view at operand {positions}"
 
 
 def coverage_split(library: PriceLibrary, graph_blob: dict,
