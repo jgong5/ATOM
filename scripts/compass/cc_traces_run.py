@@ -1493,15 +1493,39 @@ def _per_repeat(partial: dict, side: str, missing: list, where: str) -> dict:
                 f"repeat's share of anything)"
             )
             return {}
-        for name, key in (("execution", "execution_s"), ("startup", "startup_s")):
-            value = row.get(key)
-            if isinstance(value, (int, float)) and math.isfinite(value):
-                out[name][str(int(repeat))] = float(value)
-    if not out["execution"]:
-        if not many:
+        index = str(int(repeat))
+        if index in out["execution"] or index in out["startup"]:
+            # The row that arrives second replaces the first, so a side that
+            # names one repeat twice covers fewer repeats than it lists.
+            missing.append(
+                f"one per_execution row per repeat in {where} (repeat {index} "
+                f"is described twice, so another repeat is described not at "
+                f"all)"
+            )
             return {}
-        missing.append(f"execution_s on the per_execution rows of {where}")
-        return {}
+        value = row.get("execution_s")
+        if not isinstance(value, (int, float)) or not math.isfinite(value):
+            if not many:
+                return {}
+            missing.append(
+                f"execution_s on repeat {index} of {where} (a repeat nobody "
+                f"timed is not a repeat that cost nothing)"
+            )
+            return {}
+        out["execution"][index] = float(value)
+        startup = row.get("startup_s")
+        if isinstance(startup, (int, float)) and math.isfinite(startup):
+            out["startup"][index] = float(startup)
+    if many:
+        count = stated if isinstance(stated, int) else len(rows)
+        listed = sorted(int(i) for i in out["execution"])
+        if listed != list(range(1, count + 1)):
+            missing.append(
+                f"a per_execution row for each of the {count} repeats "
+                f"{where} reports (it describes {listed}); the ones it does "
+                f"not describe are not free"
+            )
+            return {}
     return out
 
 

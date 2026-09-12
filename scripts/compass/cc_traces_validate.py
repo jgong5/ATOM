@@ -1395,17 +1395,9 @@ def cell(args) -> int:
             f"Re-merge the cell rather than reinterpreting the old record"
         )
     for side in ("real", "modelled"):
-        stated = (costs.get("repeats") or {}).get(side)
-        if (
-            _finite(stated)
-            and int(stated) > 1
-            and not _by_repeat(costs, "execution_by_repeat", side)
-        ):
-            failures.append(
-                f"costs.json reports {int(stated)} {side} repeats but does not "
-                f"say what each one cost, so no per-repeat cost can be matched "
-                f"against its execution term"
-            )
+        _, why = _repeat_coverage(costs, side)
+        if why:
+            failures.append(why)
     missing = [t for t in MEASURED_COST_TERMS if not _finite(costs.get(t))]
     for term in SUPPLIED_COST_TERMS:
         value = costs.get(term)
@@ -1757,6 +1749,99 @@ def _by_repeat(costs: dict, key: str, side: str) -> dict:
     return out
 
 
+def _repeat_coverage(costs: dict, side: str):
+    """One side's per-repeat execution seconds, or a reason it cannot be used.
+
+    The map is not the authority on which repeats exist -- the record's own
+    `repeats` count is, and the map has to account for every one of them. A
+    side that ran three times and lists two has not said what the third cost,
+    and a median over the two that were written down is not the median the
+    cost term carries. So the keys must be repeat numbers, each named once,
+    each with a duration, and together exactly the repeats the side reports.
+    """
+    block = ((costs.get("execution_by_repeat") or {}).get(side)) or {}
+    stated = (costs.get("repeats") or {}).get(side)
+    count = int(stated) if _finite(stated) else None
+    if not isinstance(block, dict) or not block:
+        if count is not None and count > 1:
+            return {}, (
+                f"costs.json reports {count} {side} repeats but no "
+                f"execution_by_repeat.{side}: its execution term is a median "
+                f"over them and its supplied terms are totals across them, so "
+                f"the two cannot be put in one ratio. Re-merge the cell"
+            )
+        return {}, None
+    out = {}
+    for key, seconds in block.items():
+        try:
+            index = int(key)
+        except (TypeError, ValueError):
+            return {}, (
+                f"execution_by_repeat.{side} is keyed by {key!r}, which is not "
+                f"a repeat number, so its seconds belong to no repeat"
+            )
+        if index in out:
+            return {}, (
+                f"execution_by_repeat.{side} names repeat {index} twice, so "
+                f"one repeat's duration was replaced by another's and the "
+                f"side covers fewer repeats than it lists"
+            )
+        if not _finite(seconds):
+            return {}, (
+                f"execution_by_repeat.{side} records no duration for repeat "
+                f"{index} ({seconds!r}); a repeat nobody timed is not a repeat "
+                f"that cost nothing"
+            )
+        out[index] = float(seconds)
+    expected = set(range(1, (count if count is not None else len(out)) + 1))
+    if set(out) != expected:
+        return {}, (
+            f"execution_by_repeat.{side} covers repeats "
+            f"{sorted(out)}, not the {len(expected)} this record reports "
+            f"({sorted(expected)}): a denominator built from part of the "
+            f"repeats is not one repeat's share of the whole"
+        )
+    return out, None
+
+
+def _foreign_repeats(costs: dict, term: str, known: set) -> list:
+    """Nonzero parts of `term` charged to a repeat this record does not have.
+
+    A part naming repeat 4 of a three-repeat cell is matched to nothing: it is
+    not added to any repeat's denominator and it is not reported as belonging
+    to none, so it leaves the arithmetic silently and the replay reads faster
+    than it was measured to be.
+    """
+    out = []
+    for part in _parts(costs, term):
+        seconds = part.get("seconds")
+        if not _finite(seconds) or float(seconds) == 0.0:
+            continue
+        where = _repeat_of(part)
+        if where is None or where == EVERY_REPEAT or where in known:
+            continue
+        out.append((where, float(seconds)))
+    return out
+
+
+def _unplaced_repeats(costs: dict, term: str) -> float:
+    """Nonzero seconds of `term` that name no repeat, wherever they sit.
+
+    Once a cell says what each repeat cost, every second of a per-repeat term
+    has a repeat: the journal places it by interval, and a part the placement
+    missed is a part outside every window this cell measured. Its container
+    does not rescue it -- a part inside the execution window that belongs to
+    no repeat is a contradiction in the record, not a free second.
+    """
+    return sum(
+        float(part.get("seconds"))
+        for part in _parts(costs, term)
+        if _finite(part.get("seconds"))
+        and float(part.get("seconds")) != 0.0
+        and _repeat_of(part) is None
+    )
+
+
 def _for_repeat(costs: dict, term: str, repeat: int, *windows: str) -> float:
     """This repeat's share of `term`, minus whatever `windows` already hold.
 
@@ -1771,20 +1856,6 @@ def _for_repeat(costs: dict, term: str, repeat: int, *windows: str) -> float:
             continue
         where = _repeat_of(part)
         if where not in (repeat, EVERY_REPEAT):
-            continue
-        within = part.get("within")
-        if within and (not windows or within in windows):
-            continue
-        total += float(seconds)
-    return total
-
-
-def _unattributed(costs: dict, term: str, *windows: str) -> float:
-    """Seconds a total would add that belong to no repeat at all."""
-    total = 0.0
-    for part in _parts(costs, term):
-        seconds = part.get("seconds")
-        if not _finite(seconds) or _repeat_of(part) is not None:
             continue
         within = part.get("within")
         if within and (not windows or within in windows):
@@ -1860,32 +1931,48 @@ def _speedup(costs: dict, reuse_cells: int) -> dict:
     # Which repeats there are to divide by. A record that states more than one
     # repeat and does not say what each cost has nothing to match a journalled
     # term against, and the median it does carry is not one repeat's total.
-    modelled_repeats = _by_repeat(costs, "execution_by_repeat", "modelled")
-    stated = (costs.get("repeats") or {}).get("modelled")
-    if not modelled_repeats and _finite(stated) and int(stated) > 1:
-        return {
-            "replay_ratio": None,
-            "amortised_ratio": None,
-            "meets_gate": None,
-            "reason": (
-                f"costs.json reports {int(stated)} modelled repeats but no "
-                f"execution_by_repeat: its execution term is a median over "
-                f"them and its supplied terms are totals across them, so the "
-                f"two cannot be put in one ratio. Re-merge the cell"
-            ),
-        }
-    stray = _unattributed(costs, "derivation", "execution_modelled")
-    if modelled_repeats and stray > 0:
-        return {
-            "replay_ratio": None,
-            "amortised_ratio": None,
-            "meets_gate": None,
-            "reason": (
-                f"{stray:.3f}s of derivation belongs to no repeat and is not "
-                f"inside a measured window: it cannot be charged to one "
-                f"question without deciding how many questions it was for"
-            ),
-        }
+    coverage = {}
+    for side in ("modelled", "real"):
+        coverage[side], why = _repeat_coverage(costs, side)
+        if why:
+            return {
+                "replay_ratio": None,
+                "amortised_ratio": None,
+                "meets_gate": None,
+                "reason": why,
+            }
+    modelled_repeats = coverage["modelled"]
+    if modelled_repeats:
+        # Every second of the term the gate divides by has to land on one of
+        # the repeats this cell actually ran -- not on a repeat number the
+        # record does not have, and not on no repeat at all.
+        foreign = _foreign_repeats(costs, "derivation", set(modelled_repeats))
+        if coverage["real"]:
+            foreign += _foreign_repeats(costs, "load", set(coverage["real"]))
+        if foreign:
+            listed = ", ".join(f"repeat {r} ({s:.3f}s)" for r, s in sorted(foreign))
+            return {
+                "replay_ratio": None,
+                "amortised_ratio": None,
+                "meets_gate": None,
+                "reason": (
+                    f"costs.json charges {listed} to repeats this cell does "
+                    f"not have (it ran {sorted(modelled_repeats)}), so those "
+                    f"seconds are in no denominator and in no report"
+                ),
+            }
+        stray = _unplaced_repeats(costs, "derivation")
+        if stray > 0:
+            return {
+                "replay_ratio": None,
+                "amortised_ratio": None,
+                "meets_gate": None,
+                "reason": (
+                    f"{stray:.3f}s of derivation belongs to no repeat: it "
+                    f"cannot be charged to one question without deciding how "
+                    f"many questions it was for"
+                ),
+            }
     # Deriving this candidate's graphs is work the prediction needs, so the
     # gate's denominator has to include all of it -- and exactly once. A
     # structure first seen mid-schedule is derived inside the served window, so
@@ -1918,7 +2005,7 @@ def _speedup(costs: dict, reuse_cells: int) -> dict:
                 for i in modelled_repeats
             ]
         )
-        real_repeats = _by_repeat(costs, "execution_by_repeat", "real")
+        real_repeats = coverage["real"]
         real_startups = _by_repeat(costs, "startup_by_repeat", "real")
         real_total = (
             _quantile(
@@ -2152,9 +2239,15 @@ def _decide(cells: list[dict], metric: str, direction: str) -> dict:
         "rho_meets_gate": (rho is not None and rho >= RHO_MIN),
         "separation_failures": separation_failures,
         "separation_faithful": not separation_failures,
-        "within_tolerance": all(
-            m.get("within_tolerance") is not False for _, m in named
-        ),
+        # Three readings, one pass. `_across_repeats` writes None when the
+        # error could not be computed -- a zero real centre, or a metric with
+        # no registered tolerance -- and a cell nobody could grade is not a
+        # cell inside tolerance. The ungraded ones are named separately so a
+        # failure says which of the two it is.
+        "within_tolerance": all(m.get("within_tolerance") is True for _, m in named),
+        "tolerance_undecided": [
+            c["cell"] for c, m in named if m.get("within_tolerance") is None
+        ],
     }
 
 
@@ -2281,6 +2374,11 @@ def matrix(args) -> int:
             )
             for reason in result.get("separation_failures") or ():
                 print(f"  SEPARATION: {klass} {metric}: {reason}")
+            for cell_name in result.get("tolerance_undecided") or ():
+                print(
+                    f"  UNGRADED: {klass} {metric}: {cell_name} carries no "
+                    f"within_tolerance reading, so it is not inside tolerance"
+                )
     # Validity and acceptance are different questions and the report answers
     # both. Every cell above is a measurement this validator stands behind;
     # whether the measurements together are the result the protocol registers

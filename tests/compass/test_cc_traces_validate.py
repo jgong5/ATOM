@@ -2202,33 +2202,37 @@ class TestTiesAndSeparationsAreBothGated:
         assert any("spread" in r for r in out["separation_failures"])
 
     def test_the_matrix_reads_it(self, tmp_path, capsys):
-        """An invented separation inside one class fails the whole matrix."""
-        liar = _cell_verdict(
-            "tp4_short",
-            "short",
-            100.0,
-            400.0,
-            0.05,
-            tp=4,
-            modelled_spread=0.0001,
-            metrics=ALL_METRICS,
-        )
-        honest = {
+        """Separation is a gate in its own right.
+
+        The three short cells order the same way on both sides and are inside
+        tolerance, so ranking, tolerance and speedup all hold. What fails is
+        that the hardware's repeats overlap and the model's do not: the model
+        claims three distinct configurations where the machine shows one. A
+        matrix that did not read separation would accept this.
+        """
+        short = {
             (tp, "short"): _cell_verdict(
                 f"tp{tp}_short",
                 "short",
-                100.0 + tp * 0.1,
-                100.0,
+                centre,
+                centre,
                 0.05,
                 tp=tp,
                 modelled_spread=0.0001,
                 metrics=ALL_METRICS,
             )
-            for tp in (1, 2)
+            for tp, centre in ((1, 100.0), (2, 101.0), (4, 102.0))
         }
-        dirs = _six(tmp_path, {**honest, (4, "short"): liar})
-        assert validate.main(["matrix"] + dirs) == 1
+        dirs = _six(tmp_path, short)
+        report = tmp_path / "matrix.json"
+        assert validate.main(["matrix", "--out", str(report)] + dirs) == 1
         assert "MATRIX FAIL" in capsys.readouterr().out
+        gates = json.loads(report.read_text())["gates"]
+        assert gates["separation"] is False
+        assert gates["ranking"] is True
+        assert gates["tolerance"] is True
+        assert gates["speedup"] is True
+        assert gates["decided"] is True
 
 
 class TestTheGateDividesLikeForLike:
@@ -2327,3 +2331,215 @@ class TestTheGateDividesLikeForLike:
         ]
         got = validate._speedup(costs, reuse_cells=1)
         assert got["replay_ratio"] == pytest.approx(6.0)
+
+
+def _median_of(by_repeat: dict) -> float:
+    """The registered quantile over a per-repeat map, as the merge takes it."""
+    values = sorted(v for v in by_repeat.values() if isinstance(v, (int, float)))
+    return values[min(len(values) - 1, int(0.5 * len(values)))]
+
+
+class TestEveryRepeatIsAccountedFor:
+    """A per-repeat denominator is only per-repeat if the repeats are all there.
+
+    Reading the gate off `execution_by_repeat` made the map the authority on
+    which repeats exist, and nothing checked the map against what the record
+    says it ran. A side that reports three repeats and lists two, that lists
+    one twice under two spellings, or that lists one with no duration, still
+    produced a ratio -- over the repeats that happened to be written down.
+    And a derivation charged to a repeat outside the map was neither added to
+    a repeat nor reported as belonging to none: it was silently dropped, which
+    reads as a faster replay than was measured.
+    """
+
+    def _costs(
+        self,
+        *,
+        repeats=3,
+        modelled_by_repeat=None,
+        real_by_repeat=None,
+        derivation=None,
+        real=120.0,
+    ):
+        both = {str(i): 10.0 for i in range(1, repeats + 1)}
+        if derivation is None:
+            derivation = [
+                {
+                    "seconds": 10.0,
+                    "source": "derivations.jsonl",
+                    "within": "startup_modelled",
+                    "repeat": i,
+                }
+                for i in range(1, repeats + 1)
+            ]
+        modelled = both if modelled_by_repeat is None else modelled_by_repeat
+        return {
+            "capture": _supplied(0.0),
+            "calibration": _supplied(0.0),
+            "derivation": derivation,
+            "load": _supplied(0.0),
+            "startup_real": 0.0,
+            "startup_modelled": 0.0,
+            "execution_real": real,
+            "execution_modelled": _median_of(modelled),
+            "execution_clocks": {"real": "wall", "modelled": "wall"},
+            "repeats": {"real": repeats, "modelled": repeats},
+            "execution_by_repeat": {
+                "real": (
+                    {str(i): real for i in range(1, repeats + 1)}
+                    if real_by_repeat is None
+                    else real_by_repeat
+                ),
+                "modelled": modelled,
+            },
+            "startup_by_repeat": {
+                "real": {str(i): 0.0 for i in range(1, repeats + 1)},
+                "modelled": {str(i): 0.0 for i in range(1, repeats + 1)},
+            },
+        }
+
+    def test_a_derivation_charged_to_a_repeat_that_does_not_exist_is_refused(self):
+        """Three repeats, and 100 s of derivation booked to a fourth. It is
+        not in the map, so it was added to nothing and the ratio read 12x."""
+        costs = self._costs(
+            derivation=[
+                {
+                    "seconds": 100.0,
+                    "source": "derivations.jsonl",
+                    "within": None,
+                    "repeat": 4,
+                }
+            ]
+        )
+        got = validate._speedup(costs, reuse_cells=1)
+        assert got["meets_gate"] is None
+        assert got["replay_ratio"] is None
+        assert "repeat 4" in got["reason"]
+
+    def test_a_derivation_belonging_to_no_repeat_is_refused_wherever_it_sits(self):
+        costs = self._costs(
+            derivation=[
+                {
+                    "seconds": 100.0,
+                    "source": "derivations.jsonl",
+                    "within": "execution_modelled",
+                }
+            ]
+        )
+        got = validate._speedup(costs, reuse_cells=1)
+        assert got["meets_gate"] is None
+        assert "repeat" in got["reason"]
+
+    def test_a_side_that_does_not_list_every_repeat_is_refused(self):
+        costs = self._costs(modelled_by_repeat={"1": 10.0, "2": 10.0})
+        got = validate._speedup(costs, reuse_cells=1)
+        assert got["meets_gate"] is None
+        assert "3" in got["reason"]
+
+    def test_a_repeat_listed_twice_under_two_spellings_is_refused(self):
+        """`1` and `01` are one repeat written twice, and the second silently
+        replaced the first -- a three-repeat record covering two."""
+        costs = self._costs(modelled_by_repeat={"1": 10.0, "01": 30.0, "2": 10.0})
+        got = validate._speedup(costs, reuse_cells=1)
+        assert got["meets_gate"] is None
+        assert "twice" in got["reason"]
+
+    def test_a_repeat_with_no_duration_is_refused(self):
+        costs = self._costs(
+            modelled_by_repeat={"1": 10.0, "2": None, "3": 10.0},
+        )
+        got = validate._speedup(costs, reuse_cells=1)
+        assert got["meets_gate"] is None
+        assert "2" in got["reason"]
+
+    def test_a_repeat_named_by_something_that_is_not_a_number_is_refused(self):
+        costs = self._costs(modelled_by_repeat={"1": 10.0, "two": 10.0, "3": 10.0})
+        got = validate._speedup(costs, reuse_cells=1)
+        assert got["meets_gate"] is None
+
+    def test_the_real_side_must_cover_its_repeats_too(self):
+        costs = self._costs(real_by_repeat={"1": 120.0})
+        got = validate._speedup(costs, reuse_cells=1)
+        assert got["meets_gate"] is None
+        assert "real" in got["reason"]
+
+    def test_repeats_of_different_lengths_take_the_registered_median(self):
+        """Ten, twenty and thirty seconds of replay, each deriving for ten.
+        One question costs 20, 30 or 40 s; the registered convention takes the
+        middle one, so 120 s of real serving is 4x and not an average of
+        ratios."""
+        costs = self._costs(
+            modelled_by_repeat={"1": 10.0, "2": 20.0, "3": 30.0},
+        )
+        got = validate._speedup(costs, reuse_cells=1)
+        assert got["predict_once_s"] == pytest.approx(30.0)
+        assert got["replay_ratio"] == pytest.approx(4.0)
+        assert got["meets_gate"] is False
+
+    def test_a_complete_record_still_passes(self):
+        got = validate._speedup(self._costs(), reuse_cells=1)
+        assert got["replay_ratio"] == pytest.approx(6.0)
+        assert got["meets_gate"] is True
+
+
+class TestAnUndecidedToleranceIsNotAPass:
+    """`within_tolerance` has three readings and only one of them is a pass.
+
+    `_across_repeats` writes `None` when the real centre is zero or the metric
+    carries no registered tolerance -- an error it could not compute. Reading
+    `is not False` turned that into a pass, so a cell nobody could grade
+    counted as a cell inside tolerance.
+    """
+
+    def _pair(self, value, drop=False):
+        cells = [
+            _cell_verdict(f"tp{tp}", "long", 100.0 * tp, 100.0 * tp, tp=tp)
+            for tp in (1, 2)
+        ]
+        block = cells[0]["metrics"]["throughput_tok_s"]
+        if drop:
+            del block["within_tolerance"]
+        else:
+            block["within_tolerance"] = value
+        return cells
+
+    def test_an_ungraded_cell_is_not_within_tolerance(self):
+        out = validate._decide(self._pair(None), "throughput_tok_s", "max")
+        assert out["within_tolerance"] is False
+        assert out["tolerance_undecided"] == ["tp1"]
+
+    def test_a_cell_with_no_reading_at_all_is_not_within_tolerance(self):
+        out = validate._decide(self._pair(None, drop=True), "throughput_tok_s", "max")
+        assert out["within_tolerance"] is False
+        assert out["tolerance_undecided"] == ["tp1"]
+
+    def test_a_graded_failure_stays_a_failure_and_is_not_undecided(self):
+        out = validate._decide(self._pair(False), "throughput_tok_s", "max")
+        assert out["within_tolerance"] is False
+        assert out["tolerance_undecided"] == []
+
+    def test_a_graded_pass_passes(self):
+        out = validate._decide(self._pair(True), "throughput_tok_s", "max")
+        assert out["within_tolerance"] is True
+        assert out["tolerance_undecided"] == []
+
+    def test_a_zero_real_centre_is_where_the_ungraded_reading_comes_from(self):
+        reports = [
+            {"metrics": {"throughput_tok_s": {"real": 0.0, "modelled": 5.0}}},
+            {"metrics": {"throughput_tok_s": {"real": 0.0, "modelled": 6.0}}},
+        ]
+        block = validate._across_repeats(reports)["throughput_tok_s"]
+        assert block["within_tolerance"] is None
+        assert block["error_pct"] is None
+
+    def test_the_matrix_does_not_accept_an_ungraded_cell(self, tmp_path, capsys):
+        ungraded = _cell_verdict("tp4_long", "long", 400.0, 400.0, tp=4)
+        for name in ALL_METRICS:
+            block = dict(ungraded["metrics"]["throughput_tok_s"])
+            block["within_tolerance"] = None
+            ungraded["metrics"][name] = block
+        dirs = _six(tmp_path, {(4, "long"): ungraded})
+        report = tmp_path / "matrix.json"
+        assert validate.main(["matrix", "--out", str(report)] + dirs) == 1
+        assert "MATRIX FAIL" in capsys.readouterr().out
+        assert json.loads(report.read_text())["gates"]["tolerance"] is False

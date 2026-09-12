@@ -1701,6 +1701,40 @@ class TestDerivationIsAttributedToTheRepeatThatSpentIt:
             (None, None, 3.0)
         ]
 
+    def _mangle(self, cell, rows):
+        blob = json.loads((cell / "costs.modelled.json").read_text())
+        blob["per_execution"] = rows
+        (cell / "costs.modelled.json").write_text(json.dumps(blob))
+
+    def test_a_repeat_listed_twice_is_not_merged(self, tmp_path, capsys):
+        """Two rows for repeat 2 and none for repeat 3 is a three-repeat side
+        covering two, and the second row silently replaced the first."""
+        cell = self._cell(tmp_path)
+        rows = json.loads((cell / "costs.modelled.json").read_text())["per_execution"]
+        rows[2]["repeat"] = 2
+        self._mangle(cell, rows)
+        assert run_mod.main(self._argv(cell, self._journal(tmp_path, cell))) == 2
+        assert "twice" in capsys.readouterr().err
+        assert not (cell / "costs.json").exists()
+
+    def test_a_repeat_with_no_duration_is_not_merged(self, tmp_path, capsys):
+        cell = self._cell(tmp_path)
+        rows = json.loads((cell / "costs.modelled.json").read_text())["per_execution"]
+        rows[1]["execution_s"] = None
+        self._mangle(cell, rows)
+        assert run_mod.main(self._argv(cell, self._journal(tmp_path, cell))) == 2
+        assert "execution_s" in capsys.readouterr().err
+        assert not (cell / "costs.json").exists()
+
+    def test_a_side_short_of_a_repeat_is_not_merged(self, tmp_path, capsys):
+        """It says three and describes two; the missing one is not zero."""
+        cell = self._cell(tmp_path)
+        rows = json.loads((cell / "costs.modelled.json").read_text())["per_execution"]
+        self._mangle(cell, rows[:2])
+        assert run_mod.main(self._argv(cell, self._journal(tmp_path, cell))) == 2
+        assert "3" in capsys.readouterr().err
+        assert not (cell / "costs.json").exists()
+
     def test_a_side_that_kept_no_per_repeat_record_is_not_merged(
         self, tmp_path, capsys
     ):
