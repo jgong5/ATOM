@@ -225,9 +225,60 @@ def region_snapshot(name: str, model) -> dict:
     body = _json.dumps(snapshot, sort_keys=True, separators=(",", ":"))
     snapshot["sha256"] = hashlib.sha256(body.encode()).hexdigest()
     return snapshot
+def _attention_request_scope(value, coords=None):
+    """The deployment the request is asking for a ragged attention price IN.
+
+    A ragged attention law is identified by the deployment it was measured
+    under -- KV dtype and layout, block size, sliding window, the backend the
+    dispatcher took, and for linear attention the state geometry. None of that
+    is derivable from the operator, so a request that does not declare it is
+    refused rather than answered by whichever law happens to be fitted. This
+    is where that declaration enters: a mapping, or a path to the JSON file
+    whoever resolved the deployment wrote.
+
+    The file is read through `loaded_input.load_json`, the same reader the
+    price lists go through, and for the same reasons: this scope decides which
+    laws a run is allowed to price from, so what it was is part of what the
+    run was. That reader resolves the rank's own file from the stem, digests
+    the exact bytes it parsed, and hands back a record of both -- which is
+    returned here so the composition can carry it beside the prices instead of
+    the manifest describing a deployment nobody can check.
+
+    Nothing is inferred and nothing is defaulted. A missing file is an error,
+    because a run that asked to price attention under a named deployment and
+    silently got no deployment at all would read as an honest refusal of the
+    whole family.
+    """
+    from atom.compass.core.cost.families.attention_scope import declaration_of
+
+    if not value:
+        return None, None
+    if isinstance(value, dict):
+        return declaration_of(value, where="the attention_scope mapping"), None
+    requested = str(value).strip()
+    if not requested:
+        return None, None
+    from atom.compass.core.loaded_input import load_json
+
+    try:
+        payload, loaded = load_json(requested, role="oracle.attention_scope",
+                                    coords=coords)
+    except FileNotFoundError as exc:
+        # Named with the resolution, not with the stem alone: at TP>1 the
+        # stem is what the option said and the resolved name is what this
+        # rank went looking for, and a reader who cannot see the second
+        # cannot tell a missing file from a rank suffix nobody wrote.
+        raise ValueError(
+            "attention_scope names %r, which resolved to %s and is not a file "
+            "that exists. The deployment a price is asked for has to come "
+            "from something that recorded it." % (requested, exc.filename)
+        ) from exc
+    return declaration_of(payload, where=loaded.path), loaded
 
 
-def _price_library(entries, gap_ratio, coords=None):
+
+
+def _price_library(entries, gap_ratio, coords=None, attention_scope=None):
     """The exact-signature library, or the family provider in front of it.
 
     The provider is a subclass that overrides `lookup` alone, so everything
@@ -252,6 +303,24 @@ def _price_library(entries, gap_ratio, coords=None):
         library = (ParametricPriceLibrary()
                    if gap_ratio is _DEFAULT_GAP_RATIO
                    else ParametricPriceLibrary(max_gap_ratio=gap_ratio))
+    declaration, loaded = _attention_request_scope(attention_scope, coords)
+    if declaration is not None:
+        if gap_ratio is None:
+            raise ValueError(
+                "attention_scope declares the deployment a MODELLED attention "
+                "price would be asked for, and modelling is off. Turn the "
+                "family provider on with interpolate, or drop the scope.")
+        # The per-family declaration, not one flattened mapping: the families
+        # are identified by different facts, and a linear attention call
+        # refused over a KV layout it never reads would be refused for a
+        # reason that does not apply to it.
+        library.request_attention_scope = declaration
+        if loaded is not None:
+            # Recorded beside the prices in the same manifest. A run that
+            # answered from a law depended on these bytes as much as on the
+            # price list, and a manifest that omits them describes a
+            # deployment nobody can check afterwards.
+            library.loaded_inputs = library.loaded_inputs + (loaded,)
     extra = {"coords": coords} if coords else {}
     for entry in entries:
         if isinstance(entry, (tuple, list)):
@@ -658,6 +727,7 @@ def build_source_oracle(
     allocation: str = "",
     derive: bool = True,
     interpolate=None,
+    attention_scope=None,
     rank_coords=None,
     _shared_derivers=None,
     _shared_allocation=None,
@@ -729,7 +799,8 @@ def build_source_oracle(
     # way to recognise as a rank's own, and every record would read
     # `rank_own: false` under a name nothing asked for.
     price_entries = price_specs(requested_prices)
-    library = _price_library(price_entries, gap_ratio(interpolate), coords)
+    library = _price_library(price_entries, gap_ratio(interpolate), coords,
+                             attention_scope)
     regions_model = region_model(regions)
     # Immediately, off the object just selected -- not from the name again.
     regions_taken = region_snapshot(regions, regions_model)
@@ -837,6 +908,14 @@ def build_source_oracle(
                                  collect=seeded_inputs)
                    if head else None)
     _report_rank_binding(coords, body_graphs, head_graphs, derive)
+    # What a launch costs in THIS composition, told to the library that has to
+    # decide whether a missing launch composition matters. The oracle charges
+    # `launches * seconds_per_launch`, so where that rate is zero a price whose
+    # kernel composition nobody recorded costs exactly what a price with one
+    # would; where it is nonzero the count is a cost and the absence is a
+    # refusal. Published rather than inferred: the library reads the configured
+    # rate and never chooses it.
+    library.launch_charge_seconds = float(seconds_per_launch)
     oracle = LibraryCostOracle(
         library, body_graphs,
         seconds_per_launch=float(seconds_per_launch),
