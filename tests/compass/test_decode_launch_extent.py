@@ -24,6 +24,8 @@ field that no operator context carries.
 asked the same question a second time.
 """
 
+import argparse
+
 import pytest
 
 from atom.compass.core.cost.base import StepShape
@@ -754,3 +756,97 @@ class TestAnActiveSeedHasToQualifyForFULL:
         bound = graphs.graph_for(s)
         assert bound is not None and not graphs.refusals
         assert dict(bound["ops"][0]["context"])["max_seqlen_k"] == CONTEXT
+
+
+class TestTheDeclaredModeReachesTheInstalledBatch:
+    """The two deployment inputs arrive on the command line and are read off
+    the batch. `graph_diff.py trace` installs the spec for the trace and
+    records the request in the provenance, so a spec silent on both was traced
+    under the eager rule while its provenance said ``full`` -- which is
+    exactly the pair of facts `_check_traced_as_captured` refuses, and exactly
+    how the active TP1 seeds were produced.
+    """
+
+    @staticmethod
+    def _module():
+        import importlib.util
+        import sys
+        from pathlib import Path
+
+        path = (Path(__file__).resolve().parents[2] / "scripts" / "compass"
+                / "graph_diff.py")
+        spec = importlib.util.spec_from_file_location("compass_graph_diff",
+                                                      path)
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = module
+        spec.loader.exec_module(module)
+        return module
+
+    @staticmethod
+    def _args(mode=None, bucket=None):
+        return argparse.Namespace(cudagraph_mode=mode, capture_bucket=bucket)
+
+    @staticmethod
+    def _spec(mode=None, bucket=None):
+        return BatchSpec(kind="decode", query_lens=(1,) * 4,
+                         context_lens=(CONTEXT,) * 4, capture_bucket=bucket,
+                         cudagraph_mode=mode, **DECLARED)
+
+    def test_a_flag_lands_on_a_silent_spec(self):
+        """The defect itself: before this the flag reached the provenance and
+        the spec kept the eager rule, so the recorded extent was the batch's
+        longest context under a FULL label."""
+        module = self._module()
+        spec = self._spec()
+        assert spec.launch_max_seqlen_k == CONTEXT
+        reconciled, why = module.reconcile_declared(
+            spec, self._args(mode="full", bucket=4))
+        assert why is None
+        assert reconciled.cudagraph_mode == "full"
+        assert reconciled.capture_bucket == 4
+        assert reconciled.launch_max_seqlen_k == MAX_MODEL_LEN
+
+    def test_a_spec_that_declares_them_is_left_alone(self):
+        module = self._module()
+        reconciled, why = module.reconcile_declared(
+            self._spec(mode="full", bucket=4), self._args(mode="full",
+                                                          bucket=4))
+        assert why is None
+        assert reconciled.launch_max_seqlen_k == MAX_MODEL_LEN
+
+    def test_a_silent_flag_takes_the_spec_s_value_onto_the_request(self):
+        """Or the provenance records null for something the batch declared."""
+        module = self._module()
+        args = self._args()
+        reconciled, why = module.reconcile_declared(
+            self._spec(mode="full", bucket=4), args)
+        assert why is None
+        assert args.cudagraph_mode == "full" and args.capture_bucket == 4
+        assert reconciled.launch_max_seqlen_k == MAX_MODEL_LEN
+
+    @pytest.mark.parametrize("flag,spec_kwargs,args_kwargs", [
+        ("cudagraph-mode", {"mode": "piecewise"}, {"mode": "full"}),
+        ("capture-bucket", {"bucket": 8}, {"bucket": 4}),
+    ])
+    def test_a_contradiction_is_refused_rather_than_resolved(
+            self, flag, spec_kwargs, args_kwargs):
+        """Neither one wins. The trace would install the spec and the
+        provenance would record the flag, and a reader cannot tell which
+        produced the extent."""
+        module = self._module()
+        _, why = module.reconcile_declared(self._spec(**spec_kwargs),
+                                           self._args(**args_kwargs))
+        assert why is not None and flag in why
+
+    def test_the_reconciled_spec_is_the_one_the_active_seeds_needed(self):
+        """The regenerated TP1 seeds, in miniature: 32 decode rows at the
+        bucket they replay, declared FULL, priced at the engine's extent."""
+        module = self._module()
+        spec = BatchSpec(kind="decode", query_lens=(1,) * 32,
+                         context_lens=(CONTEXT,) * 32, **DECLARED)
+        reconciled, why = module.reconcile_declared(
+            spec, self._args(mode="full", bucket=32))
+        assert why is None
+        assert dict(reconciled.attention_context())["max_seqlen_k"] == \
+            MAX_MODEL_LEN
+        assert reconciled.launch_extent_scope == "captured"

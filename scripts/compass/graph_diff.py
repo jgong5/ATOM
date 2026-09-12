@@ -43,6 +43,50 @@ from atom.compass.runtime.tracer import (TRACE_TOKENS_DEFAULT, ModelTracer,
                                          TraceRequest)
 
 
+def reconcile_declared(spec, args):
+    """Put the declared deployment inputs on the batch, or say why not.
+
+    ``--cudagraph-mode`` and ``--capture-bucket`` reach the provenance through
+    the `TraceRequest`, and the *installed* batch through the spec. Nothing
+    used to carry them across, so a spec silent on both was traced under the
+    eager rule -- `max_seqlen_k` = the batch's longest context -- while the
+    provenance beside it recorded `cudagraph_mode: full` from the command
+    line. That is the seed a FULL bind now refuses: the label and the extent
+    disagree, and under FULL the extent is kept verbatim rather than
+    recomputed.
+
+    So reconcile here, where both are in hand. A spec that declares them wins
+    nothing and loses nothing -- it must simply agree with the flags -- and a
+    spec that is silent takes the declaration, which is the only way a flag
+    reaches `BatchSpec.launch_max_seqlen_k` at all. A flag left off takes the
+    spec's value onto the request, so the provenance does not record `null`
+    for something the batch declared.
+
+    Returns ``(spec, None)`` or ``(spec, message)``; the message is a
+    contradiction the caller should refuse on rather than resolve.
+    """
+    from atom.compass.runtime.batch_spec import BatchSpec
+
+    overrides = {}
+    for flag, cast in (("cudagraph_mode", str), ("capture_bucket", int)):
+        declared = getattr(args, flag, None)
+        on_spec = getattr(spec, flag)
+        if declared is None:
+            setattr(args, flag, on_spec)
+            continue
+        if on_spec is not None and cast(on_spec) != cast(declared):
+            return spec, (
+                f"--{flag.replace('_', '-')} {declared!r} contradicts the "
+                f"batch spec, which declares {on_spec!r}; the trace installs "
+                "the spec and the provenance records the flag, so the two "
+                "would disagree in the artifact")
+        if on_spec is None:
+            overrides[flag] = declared
+    if overrides:
+        spec = BatchSpec.from_dict({**spec.to_dict(), **overrides})
+    return spec, None
+
+
 def _trace_cmd(args) -> int:
     # Read before anything else. A misspelled field or an impossible batch
     # should say so now, not after a 27B model has been built on meta.
@@ -57,6 +101,10 @@ def _trace_cmd(args) -> int:
                       f"which computes {spec.num_tokens}", file=sys.stderr)
                 return 2
             args.tokens = spec.num_tokens
+        spec, why = reconcile_declared(spec, args)
+        if why is not None:
+            print(why, file=sys.stderr)
+            return 2
     tracer = ModelTracer.build(args.model, args.tp, args.device,
                                replay_target=getattr(args, "replay_target",
                                                      None))
