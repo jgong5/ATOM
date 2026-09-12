@@ -131,6 +131,13 @@ CLIENTS = (1, 2, 4, 8)
 #: single simulated run is not a distribution.
 REPEATS = 3
 
+#: What a plan is for. `--repeats` below the registered count does not build a
+#: cheaper acceptance run; it builds a diagnostic, and the plan is labelled
+#: that way so nothing downstream has to infer it from the file count. The
+#: words are `cc_traces_run.py`'s, so the label survives into the artifacts.
+ACCEPTANCE = "acceptance"
+DIAGNOSTIC = "diagnostic"
+
 MODEL = "Qwen/Qwen3.8-27B"
 
 #: The HTTP listener: what the health check polls and the replay client dials.
@@ -705,6 +712,12 @@ def build(args) -> dict:
         "engine_args": list(ENGINE_ARGS),
         "repeats": args.repeats,
         "processes_per_side": args.repeats,
+        # What the plan as built can be: a run of fewer than the registered
+        # repeats is a legitimate thing to want, but it is a diagnostic, and
+        # the plan says so here rather than letting the shortfall be
+        # discovered at the verdict.
+        "purpose": ACCEPTANCE if args.repeats >= REPEATS else DIAGNOSTIC,
+        "repeats_registered": REPEATS,
         "cells": cells,
         "classes": list(CLASSES),
         "client_counts": list(CLIENTS),
@@ -740,6 +753,15 @@ def render(plan: dict) -> str:
         ),
         "",
     ]
+    if plan.get("purpose") == DIAGNOSTIC:
+        out += [
+            (
+                f"# DIAGNOSTIC: {plan['repeats']} repeats a side is fewer than "
+                f"the {plan.get('repeats_registered', REPEATS)} section 3 "
+                f"registers, so no cell of this plan can pass acceptance"
+            ),
+            "",
+        ]
     for cell in plan["cells"]:
         out.append(
             f"## {cell['cell']}  (TP={cell['tp']}, {cell['class']}, "

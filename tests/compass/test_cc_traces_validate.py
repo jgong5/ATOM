@@ -11,7 +11,9 @@ The behaviour under test is the verdict, not the text of the message.
 
 from __future__ import annotations
 
+import contextlib
 import importlib.util
+import io
 import json
 import math
 import sys
@@ -1503,6 +1505,7 @@ def _cell_verdict(
     modelled_spread=None,
     metrics=("throughput_tok_s",),
     speedup=10.0,
+    repeats=validate.PROTOCOL_REPEATS,
 ):
     """A passed cell, for the ranking gate.
 
@@ -1533,6 +1536,10 @@ def _cell_verdict(
         "class": klass,
         "tp": tp,
         "passed": True,
+        # The repeats behind the verdict. The matrix checks this itself, so a
+        # fixture that left it out would be testing a cell nobody could have
+        # run rather than the one the protocol registers.
+        "repeats": repeats,
         "metrics": {metric: dict(block) for metric in metrics},
         "speedup": {"replay_ratio": speedup, "meets_gate": speedup >= 5.0},
     }
@@ -1922,9 +1929,19 @@ class TestADiagnosticIsNotACellHoweverItIsNamed:
         assert "not acceptance" in capsys.readouterr().out
 
     def test_the_verdict_says_what_it_was_computed_for(self, cell):
+        """A one-repeat cell is graded and says what it is.
+
+        It used to say `acceptance`, because the purpose only ever recorded
+        whether a *deliberate* diagnostic had been asked for. Being short of
+        the registered repeats is the other way of not being the experiment,
+        and it is written in the same field --
+        `TestTheRegisteredRepeatsAreWhatAcceptanceIsGradedAgainst` is where
+        that rule lives.
+        """
         assert run(cell) == 0
         blob = json.loads((Path(cell) / "cc_traces_cell.json").read_text())
-        assert blob["purpose"] == "acceptance"
+        assert blob["purpose"] == "diagnostic"
+        assert blob["repeats"] == 1
 
     def _fail(self, cell_dir):
         assert run(cell_dir) == 1
@@ -3169,3 +3186,185 @@ class TestTheCostRecordIsBoundToWhatTheRunsMeasured:
         blob["executions"][1]["replay"] = None
         (Path(cell) / "run.modelled.json").write_text(json.dumps(blob))
         assert any("timed" in f for f in self._failures(cell))
+
+
+plan_mod = _load("cc_traces_plan")
+
+
+class TestTheRegisteredRepeatsAreWhatAcceptanceIsGradedAgainst:
+    """A caller cannot buy acceptance by asking for a shorter run.
+
+    `--repeats` was the number the cell was graded against, and the planner
+    passes its own `--repeats` straight into that command, so a 24-cell run at
+    one repeat a side came out labelled the same as the registered experiment.
+    The protocol's §3 count is three real and three modelled repeats; it is now
+    the floor for *acceptance* specifically. A shorter run stays a graded
+    diagnostic -- every property it can show, it still shows -- and it is the
+    purpose and the repeat count on its verdict that stop the matrix reading it
+    as a cell of the experiment.
+    """
+
+    def _planned(self, repeats):
+        """The validator command the public planner emits, for one cell."""
+        buffer = io.StringIO()
+        with contextlib.redirect_stdout(buffer):
+            assert plan_mod.main(["--root", "/r", "--repeats", str(repeats)]) == 0
+        plan = json.loads(buffer.getvalue())
+        for step in plan["cells"][0]["steps"]:
+            if step["id"] == "validate":
+                return plan, list(step["command"])
+        raise AssertionError("the plan has no validate step")
+
+    def _three(self, cell_dir):
+        """The fixture cell, run three times a side and priced per repeat."""
+        for side in ("real", "modelled"):
+            base = json.loads((Path(cell_dir) / f"{side}.r1.json").read_text())
+            for index in (2, 3):
+                _write(Path(cell_dir) / f"{side}.r{index}.json", base)
+            _journal(cell_dir, side, 3, seconds=20.0)
+        _gpu_free(cell_dir)
+        costs = {
+            **{t: 10.0 for t in validate.MEASURED_COST_TERMS},
+            **{t: _supplied(10.0) for t in validate.SUPPLIED_COST_TERMS},
+            "cost_schema": validate.COSTS_SCHEMA,
+            "execution_clocks": {"real": "wall", "modelled": "wall"},
+            "repeats": {"real": 3, "modelled": 3},
+            "execution_by_repeat": {
+                side: {str(i): 20.0 for i in (1, 2, 3)}
+                for side in ("real", "modelled")
+            },
+            "startup_by_repeat": {
+                side: {str(i): 1.0 for i in (1, 2, 3)}
+                for side in ("real", "modelled")
+            },
+            "execution_real": 20.0,
+            "execution_modelled": 20.0,
+        }
+        (Path(cell_dir) / "costs.json").write_text(json.dumps(costs))
+        return cell_dir
+
+    def _as_argv(self, command, cell_dir, repeats):
+        """The planned command, re-aimed at the fixture cell.
+
+        The cell coordinates differ -- the fixture is the legacy `long` class
+        at TP=2 -- but the repeat count is the planner's own, which is the
+        thing under test.
+        """
+        assert command[:3] == [
+            "python",
+            "scripts/compass/cc_traces_validate.py",
+            "cell",
+        ]
+        assert command[command.index("--repeats") + 1] == str(repeats)
+        return [
+            "cell",
+            str(cell_dir),
+            "--class",
+            "long",
+            "--tp",
+            "2",
+            "--repeats",
+            command[command.index("--repeats") + 1],
+            "--calibration-registry",
+            str(Path(cell_dir) / "registry.json"),
+        ]
+
+    def test_the_planner_and_the_validator_mean_the_same_three(self):
+        assert plan_mod.REPEATS == validate.PROTOCOL_REPEATS == 3
+
+    def test_the_registered_plan_is_acceptance_and_its_cells_can_be(self, cell):
+        _, command = self._planned(validate.PROTOCOL_REPEATS)
+        assert validate.main(self._as_argv(command, self._three(cell), 3)) == 0
+        saved = verdict(cell)
+        assert saved["purpose"] == validate.ACCEPTANCE_PURPOSE
+        assert saved["accepted"] is True
+        assert saved["repeats"] == 3
+
+    def test_a_plan_at_one_repeat_says_it_is_a_diagnostic(self):
+        plan, _ = self._planned(1)
+        assert plan["purpose"] == plan_mod.DIAGNOSTIC
+        assert plan["repeats_registered"] == validate.PROTOCOL_REPEATS
+        assert "DIAGNOSTIC" in plan_mod.render(plan)
+
+    def test_the_default_plan_is_an_acceptance_plan(self):
+        plan, _ = self._planned(validate.PROTOCOL_REPEATS)
+        assert plan["purpose"] == plan_mod.ACCEPTANCE
+        assert "DIAGNOSTIC" not in plan_mod.render(plan)
+
+    def test_a_planned_one_repeat_cell_is_graded_but_not_accepted(self, cell):
+        """The defect, at the cell boundary: this used to be acceptance."""
+        _, command = self._planned(1)
+        assert validate.main(self._as_argv(command, cell, 1)) == 0
+        saved = verdict(cell)
+        assert saved["passed"] is True
+        assert saved["accepted"] is False
+        assert saved["purpose"] == validate.DIAGNOSTIC_PURPOSE
+        assert saved["repeats"] == 1
+        assert saved["repeats_registered"] == validate.PROTOCOL_REPEATS
+
+    def test_the_short_run_says_so_where_an_operator_reads_it(self, cell, capsys):
+        _, command = self._planned(1)
+        validate.main(self._as_argv(command, cell, 1))
+        assert "DIAGNOSTIC" in capsys.readouterr().out
+
+    def test_what_a_planned_short_run_writes_is_refused_by_the_matrix(
+        self, cell, tmp_path
+    ):
+        """The same boundary again, one cell later: the verdict a one-repeat
+        run produced cannot be counted into the matrix."""
+        _, command = self._planned(1)
+        validate.main(self._as_argv(command, cell, 1))
+        saved = verdict(cell)
+        short = _cell_verdict(
+            "tp4_clients_large_c8",
+            "clients_large",
+            400.0,
+            400.0,
+            tp=4,
+            clients=8,
+            metrics=ALL_METRICS,
+        )
+        # Exactly the two fields the short run wrote, on an otherwise perfect
+        # cell of the matrix.
+        short["purpose"] = saved["purpose"]
+        short["repeats"] = saved["repeats"]
+        dirs = _whole_matrix(tmp_path, {(4, "clients_large", 8): short})
+        assert validate.main(["matrix"] + dirs) == 1
+
+    def test_the_matrix_refuses_a_cell_short_of_the_registered_repeats(
+        self, tmp_path, capsys
+    ):
+        """Without the purpose, too: a hand-written verdict that claims
+        acceptance still has to say three repeats are under it."""
+        short = _cell_verdict(
+            "tp1_clients_short_c1",
+            "clients_short",
+            100.0,
+            100.0,
+            tp=1,
+            clients=1,
+            metrics=ALL_METRICS,
+            repeats=validate.PROTOCOL_REPEATS - 1,
+        )
+        dirs = _whole_matrix(tmp_path, {(1, "clients_short", 1): short})
+        assert validate.main(["matrix"] + dirs) == 1
+        assert "repeats" in capsys.readouterr().out
+
+    def test_a_verdict_that_does_not_say_its_repeats_is_not_a_cell(
+        self, tmp_path
+    ):
+        silent = _cell_verdict(
+            "tp2_clients_short_c2",
+            "clients_short",
+            200.0,
+            200.0,
+            tp=2,
+            clients=2,
+            metrics=ALL_METRICS,
+        )
+        del silent["repeats"]
+        dirs = _whole_matrix(tmp_path, {(2, "clients_short", 2): silent})
+        assert validate.main(["matrix"] + dirs) == 1
+
+    def test_the_whole_registered_matrix_still_passes(self, tmp_path):
+        assert validate.main(["matrix"] + _whole_matrix(tmp_path)) == 0

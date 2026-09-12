@@ -1546,6 +1546,26 @@ def _cell_plan(args) -> dict:
     return built
 
 
+def purpose_of_run(asked_for: str, repeats: int) -> str:
+    """What a run of `repeats` repeats a side is actually for.
+
+    Asking for fewer repeats than `CC_TRACES_PROTOCOL.md` §3 registers is
+    asking for a diagnostic, whatever `--purpose` says. Deciding it here means
+    the stamp goes into every execution record and every artifact, so the
+    shortfall travels with the evidence rather than being inferable only from
+    how many files ended up in the directory.
+    """
+    if asked_for != ACCEPTANCE or repeats >= plan_module.REPEATS:
+        return asked_for
+    print(
+        f"--repeats {repeats} is fewer than the {plan_module.REPEATS} "
+        f"CC_TRACES_PROTOCOL.md section 3 registers: this run is stamped "
+        f"{DIAGNOSTIC} and cannot be graded as acceptance",
+        file=sys.stderr,
+    )
+    return DIAGNOSTIC
+
+
 def side(args) -> int:
     if args.side == "modelled" and not args.replay_target:
         print(
@@ -1578,9 +1598,11 @@ def side(args) -> int:
             file=sys.stderr,
         )
         return 2
-    runner = SideRun(
-        _cell_plan(args), args.side, purpose=getattr(args, "purpose", ACCEPTANCE)
+    purpose = purpose_of_run(
+        getattr(args, "purpose", ACCEPTANCE),
+        getattr(args, "repeats", plan_module.REPEATS),
     )
+    runner = SideRun(_cell_plan(args), args.side, purpose=purpose)
     code = runner.run()
     for reason in runner.failures:
         print(reason, file=sys.stderr)

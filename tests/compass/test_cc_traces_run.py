@@ -1722,6 +1722,16 @@ class TestARunSaysWhatItWasFor:
             assert "purpose" not in execution["id_inputs"]
             assert run_mod.verify_execution_id(execution) is True
 
+    def test_a_run_shorter_than_the_registered_repeats_is_a_diagnostic(self):
+        """`--purpose acceptance --repeats 1` is a contradiction, and the
+        repeats are the half of it that was measured. The stamp is decided
+        before the first server starts, so it reaches every record."""
+        registered = run_mod.plan_module.REPEATS
+        assert run_mod.purpose_of_run("acceptance", registered) == "acceptance"
+        assert run_mod.purpose_of_run("acceptance", registered + 1) == "acceptance"
+        assert run_mod.purpose_of_run("acceptance", registered - 1) == "diagnostic"
+        assert run_mod.purpose_of_run("diagnostic", registered) == "diagnostic"
+
     def test_the_cli_offers_only_the_two_purposes(self):
         with pytest.raises(SystemExit):
             run_mod.main(

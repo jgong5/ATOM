@@ -577,3 +577,47 @@ class TestTheRegistryIsWhereTheConfigurationComesFrom:
             options = plan_mod.registry.options(tp, "/a")
             assert "allocation=native" in options
             assert not any(o.startswith("carry_allocation=") for o in options)
+
+
+class TestAShorterRunIsPlannedAsADiagnostic:
+    """`--repeats` below §3's three does not build a cheaper acceptance run.
+
+    The planner hands its repeat count to the validator, so lowering it used to
+    lower the bar the cells were graded against and a one-repeat matrix came
+    out labelled acceptance. The count the validator accepts is now fixed at
+    the protocol's; what is left for the planner is to say plainly which of the
+    two kinds of run it has built.
+    """
+
+    def _plan(self, repeats):
+        return json.loads(_run(["--root", "/r", "--repeats", str(repeats)]))
+
+    def test_the_planner_does_not_keep_its_own_idea_of_three(self):
+        assert plan_mod.REPEATS == validate.PROTOCOL_REPEATS
+
+    def test_the_registered_count_builds_an_acceptance_plan(self, plan):
+        assert plan["repeats"] == plan_mod.REPEATS
+        assert plan["purpose"] == plan_mod.ACCEPTANCE
+
+    def test_fewer_repeats_builds_a_diagnostic_plan(self):
+        got = self._plan(1)
+        assert got["purpose"] == plan_mod.DIAGNOSTIC
+        assert got["repeats"] == 1
+        assert got["repeats_registered"] == plan_mod.REPEATS
+
+    def test_more_repeats_than_registered_is_still_acceptance(self):
+        assert self._plan(plan_mod.REPEATS + 1)["purpose"] == plan_mod.ACCEPTANCE
+
+    def test_a_diagnostic_plan_says_so_at_the_top_of_the_page(self):
+        text = plan_mod.render(self._plan(1))
+        assert "DIAGNOSTIC" in text.splitlines()[2]
+
+    def test_every_cell_of_a_short_plan_is_still_validated_publicly(self):
+        """The planned command is the public validator, with the count the
+        planner used. Whether that count can buy acceptance is the validator's
+        question, and `tests/compass/test_cc_traces_validate.py` asks it."""
+        got = self._plan(1)
+        for cell in got["cells"]:
+            command = _by_id(cell)["validate"]["command"]
+            assert command[1:3] == ["scripts/compass/cc_traces_validate.py", "cell"]
+            assert command[command.index("--repeats") + 1] == "1"

@@ -1938,6 +1938,19 @@ DIAGNOSTIC_MARKER = "DIAGNOSTIC.json"
 #: it was computed under rather than being retroactively refused.
 ACCEPTANCE_PURPOSE = "acceptance"
 
+#: What a verdict says when the evidence under it is real but short of the
+#: registered experiment. It is the same word `cc_traces_run.py` stamps a
+#: deliberate diagnostic with, so one rule at the matrix boundary covers both.
+DIAGNOSTIC_PURPOSE = "diagnostic"
+
+#: Repeats per side that `CC_TRACES_PROTOCOL.md` §3 registers, and the floor
+#: acceptance is graded against. It is fixed here rather than taken from the
+#: caller: `--repeats` says how many repeats a run was *asked* for, and a
+#: caller lowering it lowers what was measured, not what the protocol accepts.
+#: A shorter run stays a legitimate diagnostic -- it just cannot be graded as
+#: the experiment.
+PROTOCOL_REPEATS = 3
+
 
 def _purpose_of(blob) -> str:
     """The purpose of a stored verdict, with silence meaning acceptance."""
@@ -2422,12 +2435,21 @@ def cell(args) -> int:
             f"{len(real_paths)} real and {len(modelled_paths)} "
             f"modelled runs in {cell_dir}"
         )
+    # A cell has to show the repeats it was asked for. That much is the
+    # caller's number, so asking for one and getting one is a complete
+    # diagnostic rather than an error.
+    found = min(len(real_paths), len(modelled_paths))
     if len(real_paths) < args.repeats or len(modelled_paths) < args.repeats:
         failures.append(
             f"{len(real_paths)} real and {len(modelled_paths)} "
             f"modelled repeats, fewer than the {args.repeats} the "
             f"protocol registers"
         )
+    # Acceptance is a different question, and the protocol's number answers it.
+    # A caller may lower `--repeats` and get a graded diagnostic; it cannot
+    # lower what the matrix accepts, so a short cell is stamped for what it is
+    # and the stamp is what the matrix reads.
+    short_run = found < PROTOCOL_REPEATS or args.repeats < PROTOCOL_REPEATS
 
     journals, blobs = {}, {}
     for side, paths in (("real", real_paths), ("modelled", modelled_paths)):
@@ -2536,13 +2558,24 @@ def cell(args) -> int:
         "tp": args.tp,
         "workload": name,
         "workload_sha256": workload_sha,
-        "purpose": ACCEPTANCE_PURPOSE,
+        # A cell short of the registered repeats is written down as what it
+        # is. The properties below are still graded -- a one-repeat run is a
+        # useful diagnostic -- but the purpose is what the matrix reads, and a
+        # diagnostic is refused there exactly like a deliberate one.
+        "purpose": DIAGNOSTIC_PURPOSE if short_run else ACCEPTANCE_PURPOSE,
         "repeats": len(reports),
+        "repeats_asked_for": args.repeats,
+        "repeats_registered": PROTOCOL_REPEATS,
         "costs": costs,
         "isolation": isolation.get("verdict"),
         "failures": failures,
         "notes": notes,
         "passed": not failures and bool(reports),
+        # What passed means here: every property this cell was graded on held.
+        # Whether the cell is *acceptance* is that plus the registered repeats,
+        # and the two are separate fields because a short run can be entirely
+        # sound and still not be the experiment.
+        "accepted": not failures and bool(reports) and not short_run,
         "metrics": _across_repeats(reports),
         "speedup": _speedup(costs, args.reuse_cells),
     }
@@ -2555,7 +2588,16 @@ def cell(args) -> int:
         f"{cell_dir.name}: class={klass}"
         + (f" clients={clients}" if clients is not None else "")
         + f" tp={args.tp} repeats={len(reports)} "
-        f"{'PASS' if verdict['passed'] else 'REFUSED'}"
+        + (
+            "REFUSED"
+            if not verdict["passed"]
+            else "PASS"
+            if verdict["accepted"]
+            else (
+                f"PASS (DIAGNOSTIC: fewer than the {PROTOCOL_REPEATS} "
+                f"registered repeats, so not acceptance)"
+            )
+        )
     )
     return 0 if verdict["passed"] else 1
 
@@ -3479,6 +3521,18 @@ def matrix(args) -> int:
                 f"{_purpose_of(verdict)!r}, not acceptance"
             )
             continue
+        # The matrix checks the repeat count itself rather than trusting that
+        # whoever ran `cell` used the registered one. A verdict that does not
+        # say how many repeats are under it cannot be read as saying three.
+        repeats = verdict.get("repeats")
+        if not isinstance(repeats, int) or repeats < PROTOCOL_REPEATS:
+            refused.append(
+                f"{where}: {repeats!r} repeats a side, not the "
+                f"{PROTOCOL_REPEATS} CC_TRACES_PROTOCOL.md section 3 "
+                f"registers; a shorter run is a diagnostic, not a cell of "
+                f"this matrix"
+            )
+            continue
         if not verdict.get("passed"):
             refused.append(
                 f"{where}: the cell did not pass "
@@ -3645,7 +3699,17 @@ def main(argv=None) -> int:
     )
     c.add_argument("--tp", type=int, required=True)
     c.add_argument("--calibration-registry", default=None)
-    c.add_argument("--repeats", type=int, default=3)
+    c.add_argument(
+        "--repeats",
+        type=int,
+        default=PROTOCOL_REPEATS,
+        help=(
+            f"how many repeats a side this cell is expected to show. The "
+            f"registered {PROTOCOL_REPEATS} are a floor: a larger number is "
+            f"required of the cell, a smaller one is not honoured and the "
+            f"verdict is written as a diagnostic"
+        ),
+    )
     c.add_argument(
         "--reuse-cells",
         type=int,

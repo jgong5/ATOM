@@ -343,6 +343,15 @@ against one simulated one, and one simulated run is not a distribution. A
 modelled side that is deterministic will show it by producing three identical
 results, which is a finding and costs a few CPU minutes to establish.
 
+Three is what **acceptance** is graded against, and it is not a caller's
+number. `--repeats` below three still builds and runs — a one-repeat pass over
+the matrix is a useful thing to want — but the plan says it is a diagnostic,
+`cc_traces_run.py` stamps every execution record and artifact `diagnostic`
+whatever `--purpose` was asked for, the cell verdict is written for
+`diagnostic`, and `cc_traces_validate.py matrix` refuses any cell that does not
+carry three repeats. A short run is evidence about the harness, never a cell of
+the matrix.
+
 Cells are run one at a time on an otherwise idle node, with the isolation audit
 of `scripts/compass/isolation.py` over the whole window.
 
