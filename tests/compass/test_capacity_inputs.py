@@ -28,11 +28,16 @@ verdict = base.verdict
 validate = base.validate
 _write = base._write
 
-#: A modelled side's published budget: the count it served and the terms it
-#: was derived with, as the passing cell states them. The terms are what
-#: section 6's memory gate compares; without them every test here that leaves
-#: the modelled budget otherwise well-formed would fail on the missing lineage
-#: rather than on the one property it varies.
+#: A modelled side's published budget, sized from a capture rather than from a
+#: profile: the count it served and the terms it was derived with. The terms
+#: are what section 6's memory gate compares; without them every test here
+#: that leaves the modelled budget otherwise well-formed would fail on the
+#: missing lineage rather than on the one property it varies.
+#:
+#: Not what the passing cell publishes. That one is sized from a real profile
+#: and carries the manifest of the files its prediction was read out of, which
+#: is what the per-component half of that gate holds it to; a test that needs
+#: the cell's own budget takes it from the artifact with `base.budget_of`.
 CAPTURED = {"kind": "captured", "served": True,
             "hardware_reference": "MI308X",
             "num_kvcache_blocks": base.MODELLED_KV_BLOCKS,
@@ -101,18 +106,21 @@ class TestThePredictorMustSayWhatSizedIt:
         number came from, and `captured` means a replay target was read -- a
         run that opened a memory profile instead has not described itself,
         whatever its record says."""
-        _rank(cell, "modelled", inputs=[_input("runtime.memory_model")])
+        _rank(cell, "modelled", budget_source=CAPTURED,
+              inputs=[_input("runtime.memory_model")])
 
         assert run(cell) == 1
         assert any("the kind names a file and this run did not open it" in f
                    for f in _failures(cell))
 
     def test_a_source_derived_budget_must_have_read_a_profile(self, cell):
+        """The cell's own budget -- it is a source-derived one -- with the
+        rows it reports reading cut down to the one role this is about."""
         _rank(cell, "modelled",
-              budget_source=dict(CAPTURED, kind="source-derived"),
+              budget_source=dict(base.budget_of(cell), kind="source-derived"),
               inputs=[_input("runtime.memory_model", sha=base.TARGET_SHA)])
 
-        assert run(cell) == 0
+        assert run(cell) == 0, _failures(cell)
 
     def test_a_nested_runtime_role_is_a_capacity_input(self, cell):
         """Roles are a namespace, not an enum: a profile that names further
@@ -120,10 +128,11 @@ class TestThePredictorMustSayWhatSizedIt:
         still go through the registry."""
         _rank(cell, "modelled",
               inputs=[_input("runtime.replay_target", sha=base.TARGET_SHA),
+                      _input("runtime.memory_model", sha=base.TARGET_SHA),
                       _input("runtime.memory_model.collective",
                              sha=base.TARGET_SHA)])
 
-        assert run(cell) == 0
+        assert run(cell) == 0, _failures(cell)
 
     def test_a_run_that_names_no_budget_source_is_refused(self, cell):
         _rank(cell, "modelled", budget_source=None)
@@ -144,10 +153,10 @@ class TestThePredictorMustSayWhatSizedIt:
         sized without a device; this is a guard on an acceptance role, not a
         ban on analytical capacity."""
         _rank(cell, "modelled",
-              budget_source=dict(CAPTURED, kind="source-derived"),
+              budget_source=dict(base.budget_of(cell), kind="source-derived"),
               inputs=[_input("runtime.memory_model")])
 
-        assert run(cell) == 0
+        assert run(cell) == 0, _failures(cell)
 
 
 class TestACapacityInputLeaksLikeAPricedOne:
@@ -279,7 +288,11 @@ class TestTheDeclarationMustEnumerateTheFileThatWasRead:
         path.write_text(json.dumps(blob))
 
     def _use(self, cell_dir, loaded):
-        _rank(cell_dir, "modelled", inputs=[loaded.as_dict()])
+        # Beside the rows that say what the budget was derived from, which
+        # this is not varying: a source-derived budget that reported reading
+        # no profile would fail for that instead.
+        _rank(cell_dir, "modelled",
+              inputs=[loaded.as_dict(), *base.memory_rows_of(cell_dir)])
 
     def test_a_registry_that_enumerates_the_file_read_is_accepted(self, cell):
         """The case that was refused. Everything here is real: the bytes on

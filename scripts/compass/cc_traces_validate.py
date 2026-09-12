@@ -1179,13 +1179,15 @@ def check_component_terms(record: dict, rank, where: str):
     what that run published. An uncompared term fails exactly as a breached one
     does: a term nobody looked at is not a term that passed.
 
-    Returns `(failures, rows, not_compared)`. The third is a stated reason
-    rather than a silence: a budget that was not derived from a profile carries
-    no per-term prediction, and holding a captured count against the capture it
-    came from is an identity, not a test. `cc_traces_plan.py` passes
-    `--compass-memory-model` on every modelled width, so a cell that lands
-    there is one whose modelled side was not the plan's, and the verdict says
-    so where a reader will find it.
+    Returns `(failures, rows, not_compared)`. The third is the stated reason a
+    comparison could not be made, kept so the verdict names it rather than
+    going quiet -- but it is a failure as well, not an excuse. A budget that
+    states no per-term prediction (a captured one, or one publishing no
+    attested input manifest) cannot satisfy this gate, and an acceptance cell
+    that passed after skipping it would be reporting eight unchecked terms as
+    checked. `cc_traces_plan.py` passing `--compass-memory-model` on every
+    modelled width is not evidence that a submitted result was produced that
+    way; the record is.
     """
     try:
         memory = _load("validate_memory")
@@ -1204,19 +1206,23 @@ def check_component_terms(record: dict, rank, where: str):
 
     kind = budget.get("kind")
     if kind != "source-derived":
-        return [], [], (
+        reason = (
             f"{where}: the modelled budget is {kind!r}, so it states no "
-            f"per-term prediction and the eight component terms were not "
-            f"compared. Only a source-derived budget carries one"
+            f"per-term prediction and the eight component terms cannot be "
+            f"compared. Only a source-derived budget carries one, and a cell "
+            f"whose modelled side published anything else has not been "
+            f"through this gate"
         )
+        return [reason], [], reason
 
     if not ((budget.get("inputs") or {}).get("inputs")):
-        return [], [], (
+        reason = (
             f"{where}: the modelled budget publishes no attested input "
-            f"manifest, so its prediction can only be re-derived from files "
-            f"the run never said it read. The eight component terms were not "
+            f"manifest, so its prediction could only be re-derived from files "
+            f"the run never said it read. The eight component terms cannot be "
             f"compared -- what a run does not attest cannot be held against it"
         )
+        return [reason], [], reason
 
     config = record.get("config") or {}
     world = _world_of(config)
@@ -1394,7 +1400,9 @@ def check_memory_terms(real, modelled, cell_dir: Path, repeat: int, label: str):
         # measured counterpart. The rank index is carried onto every row so a
         # disagreement can be attributed to the rank that had it.
         # A budget that states no per-term prediction is recorded as such --
-        # a named reason in the verdict, not an absence a reader has to notice.
+        # a named reason in the verdict, not an absence a reader has to notice
+        # -- and it fails: the terms it could not compare are eight terms this
+        # cell has no evidence about, which is not a pass.
         component_bad, component_rows, skipped = check_component_terms(
             record, rank, where
         )
