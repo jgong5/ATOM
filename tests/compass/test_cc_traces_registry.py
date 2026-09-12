@@ -109,7 +109,7 @@ def test_the_required_artifacts_are_read_out_of_the_options():
     assert artifacts["head_template"] == "/r/serving/src_tp2/h27dec32.json"
     assert artifacts["replay_target"] == "/r/serving/src_tp2/target.tp2.json"
     assert artifacts["memory_model"] == (
-        "/r/memval/capture_replay/profile/profile.tp2.json"
+        "/r/memval/capture_replay/profile_r21/profile.tp2.json"
     )
     # Five price specs at a wide width; the two with a graph beside them
     # contribute both files.
@@ -136,7 +136,7 @@ def test_every_width_is_sized_by_the_analytical_profile_of_its_width():
     # is already known.
     for tp in registry.TPS:
         assert registry.memory_model(tp, "/r") == (
-            f"/r/memval/capture_replay/profile/profile.tp{tp}.json"
+            f"/r/memval/capture_replay/profile_r21/profile.tp{tp}.json"
         )
 
 
@@ -373,3 +373,20 @@ def test_each_refusal_says_what_would_close_it(tmp_path):
     text = registry.render(registry.check(tmp_path))
     assert "REFUSES (met first)  head_rows" in text
     assert "closed by: a head price sweep" in text
+
+
+def test_all_three_widths_are_sized_from_the_frozen_r21_profiles():
+    # The routing test for the profile set, not for the per-width suffix. Two
+    # directories exist: `profile/`, which past diagnostics cite by path and
+    # which therefore stays on disk, and `profile_r21/`, which carries
+    # `capture_history` and the calibration files MEMORY's 8ef965dc gate
+    # reads. Only the second is the frozen plan's input, and a default that
+    # silently reverts to the first would size all six cells from the retired
+    # set while every other artifact stayed current -- an absence nothing else
+    # in the readiness report would show, because both paths resolve.
+    for tp in registry.TPS:
+        assert registry.memory_model(tp, "/r") == (
+            f"/r/memval/capture_replay/profile_r21/profile.tp{tp}.json"
+        )
+        assert "/capture_replay/profile/" not in registry.memory_model(tp, "/r")
+    assert len({registry.memory_model(tp, "/r") for tp in registry.TPS}) == 3

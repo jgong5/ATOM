@@ -118,7 +118,13 @@ _DERIVED_TARGET = "{root}/serving/src_tp{tp}/target.tp{tp}.json"
 #: These are MEMORY's own files at the path they already publish them to, not
 #: a delivery convention invented here: a profile is per *width*, never rank
 #: resolved.
-_PROFILE = "{root}/memval/capture_replay/profile/profile.tp{tp}.json"
+#:
+#: `profile_r21` rather than the older `profile/`: the r21 set carries
+#: `capture_history`, so a profile records what was captured beside the terms
+#: it derives, and its calibration files are the ones MEMORY's 8ef965dc gate
+#: reads. The older directory is left in place -- past diagnostics cite it by
+#: path and must keep resolving -- but nothing in the frozen plan selects it.
+_PROFILE = "{root}/memval/capture_replay/profile_r21/profile.tp{tp}.json"
 
 
 def replay_target(tp: int, root) -> str:
