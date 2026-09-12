@@ -35,6 +35,18 @@ What each row compares:
     python scripts/compass/validate_memory.py compass_ops/mem_*.json \
         [--graph compass_ops/g.prefill.json] [--checkpoint DIR] \
         [--model-config DIR/config.json] [--log run.log]
+
+Acceptance runs it once more, with the gate:
+
+    python scripts/compass/validate_memory.py memory_out.json \
+        --budget-source budget_source.json --model-config DIR/config.json \
+        --max-num-batched-tokens N --gate
+
+`--budget-source` is the record the run published when it chose its budget;
+the profile is taken out of its input manifest, so the derived column is the
+prediction that actually sized the run rather than one re-derived afterwards.
+`--gate` then requires every non-KV term within 10% and the block count within
+5%, and fails on a term nothing compared as readily as on one that disagreed.
 """
 from __future__ import annotations
 
@@ -52,11 +64,13 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
 from atom.compass.core.kv_geometry import (  # noqa: E402
     InsufficientPoolBudget, blocks_from_readings, gdn_state_bytes,
     layer_types_disagree, paged_block_bytes, text_config)
+from atom.compass.core.loaded_input import load_json  # noqa: E402
 from atom.compass.core.memory import MemoryReadings  # noqa: E402
+from atom.compass.core.memory_blocks import PROFILE_ROLE  # noqa: E402
 from atom.compass.core.memory_calibration import for_model  # noqa: E402
 from atom.compass.core.memory_model import (  # noqa: E402
     DEFAULT_PERSISTENT, UnfoundedPrediction, activation_curve,
-    capture_pinned_bytes, graph_pool_bytes,
+    capture_pinned_bytes, derived_readings, graph_pool_bytes,
     load_residue_bytes, measured_graph_pool_bytes, non_torch_bytes,
     peak_activation_bytes, liveness_is_recorded, liveness_instrumentation,
     traced_shape, weight_bytes, LIVENESS_INSTRUMENTATION)
@@ -183,7 +197,7 @@ KV_DTYPE_BYTES = {"bf16": 2, "fp16": 2, "float16": 2, "bfloat16": 2,
 
 
 def kv_rows(config: dict, readings: dict, tp: int, world: int, blob: dict,
-            model_config: str) -> None:
+            model_config: str, predicted: dict = None) -> None:
     """The block count, derived from the model's own geometry.
 
     The last term, and the one every other term exists to serve: a
@@ -192,6 +206,14 @@ def kv_rows(config: dict, readings: dict, tp: int, world: int, blob: dict,
     layer split and the head geometry, `plan_pools` is ATOM's own, and the five
     readings come from the record. So when this disagrees with a run, the
     disagreement is in the readings and nowhere else.
+
+    `predicted` is the five readings the *model* states. Given one, the plan is
+    made from those instead, and the row stops being an arithmetic check and
+    becomes the question acceptance is actually asking: how far off is the
+    capacity this configuration would have been given. Run off the recorded
+    readings the row reads +0.00% on every record by construction -- the
+    engine planned from exactly those numbers -- so a 5% gate over it would
+    pass without testing anything.
 
     Silent without `--model-config`, because guessing the checkpoint from the
     record's model name would be a download.
@@ -213,13 +235,14 @@ def kv_rows(config: dict, readings: dict, tp: int, world: int, blob: dict,
     block_size = int(config.get("block_size") or 0)
     kv_bytes = KV_DTYPE_BYTES.get(str(config.get("kv_cache_dtype")), 2)
     recorded_blocks = ((blob.get("blocks") or {}).get("num_kvcache_blocks"))
+    plan_from = predicted or readings
     try:
         plan = blocks_from_readings(
             native, MemoryReadings(
-                total=int(readings["total"]), free=int(readings["free"]),
-                peak_torch=int(readings["peak_torch"]),
-                non_torch=int(readings["non_torch"]),
-                cudagraph_overhead=int(readings["cudagraph_overhead"])),
+                total=int(plan_from["total"]), free=int(plan_from["free"]),
+                peak_torch=int(plan_from["peak_torch"]),
+                non_torch=int(plan_from["non_torch"]),
+                cudagraph_overhead=int(plan_from["cudagraph_overhead"])),
             utilization=float(config.get("gpu_memory_utilization") or 0),
             max_num_seqs=int(config.get("max_num_seqs") or 0),
             tensor_parallel=tp, block_size=block_size,
@@ -240,10 +263,18 @@ def kv_rows(config: dict, readings: dict, tp: int, world: int, blob: dict,
     state_bytes = gdn_state_bytes(native, tensor_parallel=tp)
     if recorded_blocks:
         error = (plan.paged_entries - recorded_blocks) / recorded_blocks * 100
+        # Only a plan made from the model's own readings is evidence about the
+        # model. The arithmetic-only row is left uncovered rather than counted,
+        # so a gate run without a profile fails loudly instead of passing on an
+        # identity.
+        if predicted:
+            note_term("kv blocks", error)
         print("  %-14s %8d %8d  %+5.2f%% %7s  %s"
               % ("kv blocks", plan.paged_entries, recorded_blocks, error, "",
-                 "derived from config.json; %d B a block, %.1f MiB a request "
-                 "of state" % (block_bytes, state_bytes / (1 << 20))))
+                 "%s readings; %d B a block, %.1f MiB a request of state"
+                 % ("the profile's" if predicted else
+                    "the record's own (arithmetic only)",
+                    block_bytes, state_bytes / (1 << 20))))
     else:
         print("  %-14s %8d %8s  %6s %7s  %s"
               % ("kv blocks", plan.paged_entries, "-", "-", "",
@@ -291,6 +322,136 @@ def _cal_note(calib, cal_map: dict, config: dict, sha: str, producer,
     return note
 
 
+def profile_from_budget_source(path: str) -> tuple:
+    """The profile the run was sized from, as the run itself published it.
+
+    Both runners publish `compass.memory.budget_source/1` at the branch that
+    *chose* the budget, and its `inputs` manifest carries the digest of the
+    bytes the runner parsed, taken at the read. Taking the profile from there
+    rather than from this script's own command line is the whole difference
+    between "the file the run used" and "a file with a similar name that
+    exists now" -- and the second is not evidence about the run.
+
+    Returns ``(path, sha256)``.
+    """
+    with open(path, encoding="utf-8") as fh:
+        blob = json.load(fh)
+    rows = [r for r in ((blob.get("inputs") or {}).get("inputs") or ())
+            if r.get("role") == PROFILE_ROLE]
+    if not rows:
+        raise SystemExit(
+            "%s is a %r budget and names no %s input, so this run was not "
+            "sized from a profile and there is no prediction to compare its "
+            "readings against." % (path, blob.get("kind"), PROFILE_ROLE))
+    if len(rows) > 1:
+        raise SystemExit("%s names %d memory profiles; a rank reads one"
+                         % (path, len(rows)))
+    return str(rows[0].get("path") or ""), str(rows[0].get("sha256") or "")
+
+
+def predicted_terms(path: str, expect_sha: str, config: dict, tokens: int,
+                    world: int) -> dict:
+    """Every non-KV term the predictor states, at this record's width.
+
+    The derived column for `weights`, `model buffers` and `activations` is the
+    profile's own -- the same numbers `derived_readings` hands the runner --
+    so what the gate compares is the prediction that actually sized the run,
+    not a re-derivation that might differ from it.
+
+    `world_size` is passed so the profile's own cross-width guard fires: a
+    TP=2 profile read against a TP=4 record is refused rather than quietly
+    sized at two and reported as four.
+    """
+    profile, loaded = load_json(path, role=PROFILE_ROLE)
+    if expect_sha and loaded.sha256 != expect_sha:
+        raise SystemExit(
+            "%s is not the profile the run read: the run's manifest says "
+            "%s, these bytes are %s. The file moved under the comparison."
+            % (path, expect_sha[:12], loaded.sha256[:12]))
+    # A profile for another model priced against this record's readings is not
+    # a failing comparison, it is a comparison of two unrelated runs -- the
+    # 27B's parameters against the 0.6B's allocator read at +4560%. The gate
+    # would report it as a model error, which is the one thing it must never
+    # do, so it is refused here instead.
+    stated = str((profile.get("provenance") or {}).get("model") or "")
+    recorded = str(config.get("model") or "")
+    if stated and recorded and stated != recorded:
+        raise SystemExit(
+            "%s is the profile for %s and this record is %s. Every term would "
+            "compare two different models." % (path, stated, recorded))
+
+    load = lambda p: json.load(open(p, encoding="utf-8"))  # noqa: E731
+    readings, activation = derived_readings(
+        profile, warmup_tokens=tokens, load=load, world_size=world,
+        source=path,
+        enforce_eager=bool(config.get("enforce_eager")))
+    return {
+        "path": loaded.path,
+        "sha256": loaded.sha256,
+        "parameters": int(profile.get("parameters") or 0),
+        "buffers": int(profile.get("buffers") or 0),
+        "activation": int(activation),
+        "readings": readings,
+        "calibration": load(str(profile["calibration"])),
+    }
+
+
+#: What the comparison has to come out at. KV is the tighter one because it
+#: *is* the capacity: every other term exists to size it, so their errors
+#: reach a scheduler only through this one, and only after competing with each
+#: other for the same budget.
+KV_TOLERANCE = 5.0
+TERM_TOLERANCE = 10.0
+
+#: Every term the comparison has to have actually compared. A term that
+#: printed no error is not a term that passed -- it is one nobody looked at,
+#: and a sum of terms validated only in total is the shape of error this
+#: project has already been caught by twice. So absence fails exactly as a
+#: breach does.
+#:
+#: `pool estimate` and `capture pinned` are deliberately not here. The first is
+#: an identity (both sides are the engine's own estimator) and the second is a
+#: mechanism check on the pinned half of a term `graph pool` already gates.
+REQUIRED_TERMS = ("weights", "model buffers", "load residue", "persistent",
+                  "activations", "non-torch", "graph pool", "kv blocks")
+
+#: term -> error percent, or None where the row could not compare. Filled by
+#: `row` and `kv_rows` as they print, reset per record, read by `gate`.
+SEEN: dict = {}
+
+
+def note_term(name: str, error) -> None:
+    """Remember a term's error for the gate, keeping the worst seen.
+
+    Worst rather than last: `activations` prints twice on a record that
+    carries a traced graph, and a gate that took the second would let the
+    first disagreement through.
+    """
+    if name not in SEEN or SEEN[name] is None:
+        SEEN[name] = error
+    elif error is not None and abs(error) > abs(SEEN[name]):
+        SEEN[name] = error
+
+
+def gate(label: str) -> bool:
+    """Whether this record's comparison passes, term by term."""
+    print("\n  gate  --  every non-KV term within %.0f%%, KV within %.0f%%"
+          % (TERM_TOLERANCE, KV_TOLERANCE))
+    ok = True
+    for name in REQUIRED_TERMS:
+        limit = KV_TOLERANCE if name == "kv blocks" else TERM_TOLERANCE
+        error = SEEN.get(name)
+        if error is None:
+            shown, verdict, ok = "       -", "UNCOVERED", False
+        else:
+            within = abs(error) <= limit
+            shown, verdict = "%+7.2f%%" % error, "pass" if within else "FAIL"
+            ok = ok and within
+        print("  %-14s %9s  <= %4.1f%%   %s" % (name, shown, limit, verdict))
+    print("  %s  %s" % ("GATE PASS" if ok else "GATE FAIL", label))
+    return ok
+
+
 def row(name: str, derived, recorded, note: str = "", budget: int = 0) -> None:
     """One term, its own error, and what that error is worth.
 
@@ -302,7 +463,9 @@ def row(name: str, derived, recorded, note: str = "", budget: int = 0) -> None:
         return "       -" if value is None else "%7.3fG" % (value / GB)
     if derived is None or recorded is None or not recorded:
         error, share = "     -", "      -"
+        note_term(name, None)
     else:
+        note_term(name, (derived - recorded) / recorded * 100)
         error = "%+5.1f%%" % ((derived - recorded) / recorded * 100)
         share = ("%+6.2f%%" % ((derived - recorded) / budget * 100)
                  if budget else "      -")
@@ -428,7 +591,30 @@ def main() -> int:
     ap.add_argument("--calibrate",
                     help="write the collective constants measured from these "
                          "records to this path, for memory_model to read")
+    ap.add_argument("--budget-source",
+                    help="the run's saved compass.memory.budget_source/1. The "
+                         "profile is taken from its input manifest, so the "
+                         "derived column is the prediction that actually "
+                         "sized the run")
+    ap.add_argument("--profile",
+                    help="the memory profile, where no budget source was "
+                         "saved. Names the file but cannot attest the run "
+                         "read it; prefer --budget-source")
+    ap.add_argument("--gate", action="store_true",
+                    help="exit non-zero unless every non-KV term is within "
+                         "%.0f%% and the block count within %.0f%%, on every "
+                         "record. An uncompared term fails."
+                         % (TERM_TOLERANCE, KV_TOLERANCE))
     args = ap.parse_args()
+
+    profile_path, profile_sha = args.profile, ""
+    if args.budget_source:
+        attested, profile_sha = profile_from_budget_source(args.budget_source)
+        if args.profile and os.path.abspath(args.profile) != os.path.abspath(attested):
+            raise SystemExit(
+                "--profile is %s but the run's budget source says it read %s. "
+                "The run decides which it was." % (args.profile, attested))
+        profile_path = attested
 
     paths = [q for p in args.records for q in sorted(glob.glob(p))] or args.records
     graph = json.load(open(args.graph)) if args.graph else None
@@ -447,7 +633,9 @@ def main() -> int:
 
     print("  %-14s %8s %8s  %6s %7s  %s"
           % ("term", "derived", "recorded", "error", "of bgt", "note"))
+    passed = True
     for name, config, readings, tp, blob, sha in non_torch_seen:
+        SEEN.clear()
         print("\n%s  --  %s tp=%d max_model_len=%s"
               % (name, config.get("model"), tp, config.get("max_model_len")))
 
@@ -467,6 +655,21 @@ def main() -> int:
         calib = for_model(config.get("model")) if args.source_calibration else None
         cal_map = calib.mapping(world) if calib else None
 
+        # The prediction that sized this run, where the run said which one it
+        # was. Its calibration then supplies the width-dependent terms too, so
+        # every derived figure below comes from one profile rather than from a
+        # profile and a separately chosen table.
+        predicted = None
+        if profile_path:
+            predicted = predicted_terms(
+                profile_path, profile_sha, config,
+                warmup_tokens(config, args.max_num_batched_tokens
+                              or int(config.get("max_num_batched_tokens") or 0)),
+                world)
+            calib, cal_map = None, predicted["calibration"]
+            print("  predicted by    %s  %s"
+                  % (predicted["sha256"][:12], predicted["path"]))
+
         # The producer block if the record carries one. None today: the writer
         # does not emit it, which is why every row reads "run unidentified".
         cal_note = partial(_cal_note, calib, cal_map, config, sha,
@@ -474,6 +677,16 @@ def main() -> int:
 
         checkpoint = args.checkpoint
         derived_weights = weight_bytes(checkpoint, tp) if checkpoint else None
+        weights_note = "" if parameters else "record predates the split"
+        # The profile states both, so where there is one it is the derived
+        # side of both rows: the profile's `parameters` are what the run was
+        # sized with, and a checkpoint re-read would be a second derivation
+        # answering a question the run did not ask.
+        derived_buffers = None
+        if predicted is not None:
+            derived_weights = predicted["parameters"]
+            derived_buffers = predicted["buffers"]
+            weights_note = "the profile's own parameters, sharded at TP=%d" % tp
         # Against the model's own parameters, which is what the term claims to
         # be -- not against the allocator after loading, which is that plus
         # whatever the loader still holds, and not against the buffers either,
@@ -482,10 +695,11 @@ def main() -> int:
         weights_seen = (parameters - buffers
                         if parameters is not None and buffers is not None
                         else parameters)
-        row("weights", derived_weights, weights_seen,
-            "" if parameters else "record predates the split", sizing_budget)
-        row("model buffers", None, buffers,
-            "not modelled; built at init, absent from the checkpoint", sizing_budget)
+        row("weights", derived_weights, weights_seen, weights_note, sizing_budget)
+        row("model buffers", derived_buffers, buffers,
+            "the profile's own buffers" if derived_buffers is not None else
+            "not modelled; built at init, absent from the checkpoint",
+            sizing_budget)
 
         residue = (allocated - parameters
                    if allocated is not None and parameters is not None else None)
@@ -535,7 +749,12 @@ def main() -> int:
         traced_peak = ((graph or {}).get("provenance") or {}).get(
             "activation_peak_bytes")
         if traced_peak:
-            row("activations", derived_act, int(traced_peak),
+            # Named apart from the gated term where a profile is in play: the
+            # walk against its own traced step and the profile's term at the
+            # warmup shape are two different claims, and the gate is about the
+            # one the run was sized by.
+            row("activations (walk)" if predicted is not None else "activations",
+                derived_act, int(traced_peak),
                 "vs the traced step's own peak (%d tokens)" % graph_tokens(graph))
 
         # Fallback, and a weaker one: the warmup prefill's peak. Only a check
@@ -589,6 +808,13 @@ def main() -> int:
                          % (calib.terms["activations"].value, kind))
                 if blob.get("run") is None and kind == "residual":
                     note += " (run unidentified)"
+        if predicted is not None:
+            # The profile's own term, at this record's warmup shape -- the
+            # figure that went into `peak_torch` and sized the run, rather than
+            # a walk re-scaled here.
+            scaled = predicted["activation"]
+            note = ("the profile's term at the warmup shape (%d tokens), vs "
+                    "the warmup peak" % warmup_tokens(config, budget))
         row("activations", scaled, warmup_act, note)
 
         # `non_torch` is device-wide used memory minus this process's reserve,
@@ -601,9 +827,11 @@ def main() -> int:
         # `non_torch_bytes` drops `MODEL_HEADROOM` whenever it is given one,
         # which is right where the calibrated run already contains the headroom
         # and wrong everywhere else: an uncalibrated width would lose the term.
-        nt_cal = (cal_map if cal_map and world in (cal_map.get("non_torch") or {})
-                  else None)
-        row("non-torch", non_torch_bytes(world, nt_cal), readings.get("non_torch"),
+        widths = {int(w) for w in (cal_map or {}).get("non_torch") or {}}
+        nt_cal = cal_map if world in widths else None
+        derived_nt = (predicted["readings"]["non_torch"] if predicted is not None
+                      else non_torch_bytes(world, nt_cal))
+        row("non-torch", derived_nt, readings.get("non_torch"),
             cal_note("non_torch",
                      "device-wide reading; a neighbour is charged here"),
             sizing_budget)
@@ -677,7 +905,11 @@ def main() -> int:
                         % ("plus" if world == 1 else "without"),
                         sizing_budget)
 
-        kv_rows(config, readings, tp, world, blob, args.model_config)
+        kv_rows(config, readings, tp, world, blob, args.model_config,
+                predicted["readings"] if predicted is not None else None)
+
+        if args.gate:
+            passed = gate(name) and passed
 
     if args.calibrate:
         write_calibration(non_torch_seen, args.calibrate)
@@ -700,6 +932,13 @@ def main() -> int:
                      "-" if parameters is None else "%.3fG" % (parameters / GB),
                      "-" if residue is None else "%.3fG" % (residue / GB),
                      (readings.get("non_torch") or 0) / GB))
+
+    if args.gate:
+        if not non_torch_seen:
+            print("\nGATE FAIL  no record carried readings, so nothing was "
+                  "compared")
+            return 1
+        return 0 if passed else 1
     return 0
 
 

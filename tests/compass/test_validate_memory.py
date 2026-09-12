@@ -214,3 +214,108 @@ def test_an_unlabelled_graph_is_matched_on_tokens_and_admits_it():
     bare = {"key": {"batch_signature": [16384]}}
     assert "tokens are all there is to match" in script.warmup_mismatch(
         bare, config, 16384)
+
+
+class TestTheGateAcceptanceRunsOn:
+    """What `--gate` has to refuse.
+
+    The comparison prints per-term errors and, until now, always exited 0. A
+    report nobody can fail is a report, not a gate, and the thing acceptance
+    needs is the second one: every non-KV term within 10%, the block count
+    within 5%, and a term nothing compared treated as a failure rather than as
+    a blank.
+    """
+
+    def test_every_term_inside_its_threshold_passes(self):
+        script = _script()
+        script.SEEN.update({name: 1.0 for name in script.REQUIRED_TERMS})
+        assert script.gate("record") is True
+
+    def test_a_term_nothing_compared_is_a_failure_not_a_blank(self):
+        """The shape of error this project has been caught by twice.
+
+        A missing row and a passing row look identical in a total. Here the
+        uncompared term fails on its own.
+        """
+        script = _script()
+        script.SEEN.update({name: 1.0 for name in script.REQUIRED_TERMS})
+        del script.SEEN["non-torch"]
+        assert script.gate("record") is False
+
+    def test_the_block_count_is_held_to_the_tighter_threshold(self):
+        """7% is a passing term and a failing capacity."""
+        script = _script()
+        script.SEEN.update({name: 7.0 for name in script.REQUIRED_TERMS
+                            if name != "kv blocks"})
+        script.SEEN["kv blocks"] = 7.0
+        assert script.gate("record") is False
+        script.SEEN["kv blocks"] = 4.0
+        assert script.gate("record") is True
+
+    def test_the_worst_of_two_rows_for_a_term_is_the_one_gated(self):
+        """`activations` prints twice where a graph was traced."""
+        script = _script()
+        script.note_term("activations", 2.0)
+        script.note_term("activations", -30.0)
+        assert script.SEEN["activations"] == -30.0
+
+    def test_a_block_count_planned_from_the_record_is_not_coverage(self):
+        """Run off the recorded readings the row is an identity.
+
+        The engine planned from exactly those five numbers, so the derivation
+        reproduces its count and the row reads +0.00% on every record ever
+        written. Counting that as the KV term would pass the 5% gate without
+        testing the model at all, so it is left uncovered instead.
+        """
+        script = _script()
+        blob = _record("27b.tp1.memory.json")
+        script.kv_rows(blob["config"], blob["readings"], 1, 1, blob,
+                       str(RECORDS / "qwen3_5_27b.config.json"))
+        assert "kv blocks" not in script.SEEN
+
+    def test_a_profile_for_another_model_is_refused(self, tmp_path):
+        """Not a failing comparison -- two unrelated runs.
+
+        The 27B's parameters against the 0.6B's allocator read is +4560%, and
+        a gate that reported that as a model error would be reporting on a
+        comparison nobody made.
+        """
+        script = _script()
+        profile = tmp_path / "profile.json"
+        profile.write_text(json.dumps(
+            {"provenance": {"model": "Qwen/Qwen3.8-27B"}}))
+        with pytest.raises(SystemExit) as raised:
+            script.predicted_terms(str(profile), "", {"model": "Qwen/Qwen3-0.6B"},
+                                   16384, 1)
+        assert "two different models" in str(raised.value)
+
+    def test_the_profile_compared_is_the_one_the_run_read(self, tmp_path):
+        """Taken out of what the run published, not off this script's
+        command line: the second is a claim about a path made later."""
+        script = _script()
+        source = tmp_path / "budget_source.json"
+        source.write_text(json.dumps({
+            "kind": "source-derived",
+            "inputs": {"inputs": [
+                {"role": "runtime.replay_target", "path": "/t.json",
+                 "sha256": "aa"},
+                {"role": script.PROFILE_ROLE, "path": "/p.json",
+                 "sha256": "bb"}]}}))
+        assert script.profile_from_budget_source(str(source)) == ("/p.json", "bb")
+
+    def test_a_budget_no_profile_sized_has_nothing_to_compare(self, tmp_path):
+        script = _script()
+        source = tmp_path / "budget_source.json"
+        source.write_text(json.dumps(
+            {"kind": "device-measured", "inputs": {"inputs": []}}))
+        with pytest.raises(SystemExit) as raised:
+            script.profile_from_budget_source(str(source))
+        assert "not sized from a profile" in str(raised.value)
+
+    def test_a_profile_that_moved_under_the_comparison_is_refused(self, tmp_path):
+        script = _script()
+        profile = tmp_path / "profile.json"
+        profile.write_text(json.dumps({"provenance": {}}))
+        with pytest.raises(SystemExit) as raised:
+            script.predicted_terms(str(profile), "0" * 64, {}, 16384, 1)
+        assert "not the profile the run read" in str(raised.value)
