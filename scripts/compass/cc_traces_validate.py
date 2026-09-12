@@ -319,6 +319,25 @@ def check_side_roles(real, modelled) -> list[str]:
             "offset from the engine's epoch, so preparation lands "
             "inside every measured request's TTFT"
         )
+    # The modelled side has to be *known* not to have timed out. `compare.py`
+    # refuses a True reading, which leaves unknown passing -- and unknown is
+    # what a run gets when the engine could not be asked, or when the artifact
+    # predates the field. Reported as a pass, that is the same claim as "the
+    # barrier held", from evidence that says nothing. For a predictor it is the
+    # whole question: every latency it produces depends on virtual time never
+    # having advanced past an arrival still in flight, and only the engine can
+    # say. So acceptance requires the engine's own False here. A real server
+    # runs on a wall clock and has no barrier to wait on, so an unread barrier
+    # there stays not applicable.
+    if mm.get("arrival_barrier_timed_out") is None:
+        why = (mm.get("arrival_barrier") or {}).get("why") or (
+            "the manifest carries no reading"
+        )
+        bad.append(
+            f"the modelled side's arrival barrier was never read ({why}): "
+            f"an unread barrier is not a barrier that held, so this run's "
+            f"latencies are unverified rather than verified"
+        )
     for label, run, mode, clock in (
         ("real", real, "measure", "wall"),
         ("modelled", modelled, "predict", "virtual"),

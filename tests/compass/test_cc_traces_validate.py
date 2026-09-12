@@ -232,6 +232,16 @@ def _side(
         "server_revision": "abc123",
         "server_code_sha256": "c" * 64,
         "model_revision": "rev1",
+        # What the engine answered when the run was drained. A predictor
+        # answers False -- its barrier was reached and held. A wall-clock
+        # server has no barrier to reach, and answers nothing, which is why
+        # the passing fixture leaves the real side unread.
+        "arrival_barrier_timed_out": None if paced else False,
+        "arrival_barrier": (
+            {"timed_out": None, "why": "the barrier was never reached"}
+            if paced
+            else {"timed_out": False, "ranks": [{"timed_out": False}]}
+        ),
         "server": _server(
             tp,
             mode=mode,
@@ -545,6 +555,63 @@ class TestClocksAndArrivals:
         path = cell / "modelled.r1.json"
         blob = json.loads(path.read_text())
         blob["run"]["arrival_barrier_timed_out"] = True
+        _write(path, blob)
+        assert run(cell) == 1
+
+    def test_an_unread_barrier_on_the_modelled_side_is_refused(self, cell):
+        """Unknown is not a pass. The engine answered neither way, so nothing
+        says virtual time stayed behind the last arrival -- which is the only
+        thing that makes these latencies mean anything."""
+        path = cell / "modelled.r1.json"
+        blob = json.loads(path.read_text())
+        blob["run"]["arrival_barrier_timed_out"] = None
+        blob["run"]["arrival_barrier"] = {
+            "timed_out": None,
+            "why": "TimeoutError: no response from rank 0",
+        }
+        _write(path, blob)
+        assert run(cell) == 1
+
+    def test_a_modelled_run_that_never_recorded_a_barrier_is_refused(self, cell):
+        """An artifact written before the field existed reads as unknown, not
+        as a pass: it is exactly the run this check was added for."""
+        path = cell / "modelled.r1.json"
+        blob = json.loads(path.read_text())
+        blob["run"].pop("arrival_barrier_timed_out")
+        blob["run"].pop("arrival_barrier")
+        _write(path, blob)
+        assert run(cell) == 1
+
+    def test_the_refusal_says_why_the_barrier_could_not_be_read(self, cell, capsys):
+        path = cell / "modelled.r1.json"
+        blob = json.loads(path.read_text())
+        blob["run"]["arrival_barrier"] = {
+            "timed_out": None,
+            "why": "the engine is not initialised",
+        }
+        blob["run"]["arrival_barrier_timed_out"] = None
+        _write(path, blob)
+        assert run(cell) == 1
+        assert "the engine is not initialised" in capsys.readouterr().out
+
+    def test_an_unread_barrier_on_the_real_side_is_allowed(self, cell):
+        """A wall-clock server never waits for a declared workload, so it has
+        no barrier state to report and its absence is not a defect."""
+        path = cell / "real.r1.json"
+        blob = json.loads(path.read_text())
+        blob["run"].pop("arrival_barrier_timed_out")
+        blob["run"].pop("arrival_barrier")
+        _write(path, blob)
+        assert run(cell) == 0
+
+    def test_a_barrier_that_held_is_what_lets_the_cell_pass(self, cell):
+        """The passing fixture passes *because* the reading is False, not
+        because nobody looked: flipping it to unknown refuses the same cell."""
+        assert run(cell) == 0
+        path = cell / "modelled.r1.json"
+        blob = json.loads(path.read_text())
+        assert blob["run"]["arrival_barrier_timed_out"] is False
+        blob["run"]["arrival_barrier_timed_out"] = None
         _write(path, blob)
         assert run(cell) == 1
 
