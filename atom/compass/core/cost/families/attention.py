@@ -429,10 +429,16 @@ class Regime:
 #: every query is a multiple of CHUNK_SIZE, which is true of every GDN prefill
 #: measured so far.
 REGIMES = {
+    # `calls` first, for the same reason it leads `gdn.prefill`: the wrapper
+    # launches once per batch and that launch is not free. P1 is the training
+    # point that says so -- 2080 paired positions over 64 query rows, as close
+    # to no work as a measured call gets, and it still costs 28.41us. A law
+    # with only proportional terms charges P1 essentially nothing and has to
+    # absorb that floor into the slopes of the points that do work.
     "unified.prefill.cold": Regime("unified.prefill.cold",
-                                   ("paired_work", "query_rows")),
+                                   ("calls", "paired_work", "query_rows")),
     "unified.prefill.cached": Regime("unified.prefill.cached",
-                                     ("paired_work", "query_rows",
+                                     ("calls", "paired_work", "query_rows",
                                       "history_rows")),
     # Decode is two regimes, not one, because `paged_attention_triton` is a
     # fork: with `ATOM_USE_UNIFIED_ATTN` or the flash layout it calls aiter's

@@ -424,6 +424,43 @@ def _scope_note(key: tuple) -> str:
             f"{registration or 'an undeclared path'}")
 
 
+def _topology_key(topology):
+    """A declared topology as the hashable value a scope carries."""
+    return (tuple(sorted(topology.items())) if isinstance(topology, dict)
+            else tuple(topology))
+
+
+def _shown_to_match(obs_scope, requested) -> bool:
+    """Whether an observation was SHOWN to be under the requested scope.
+
+    Only the keys the request declares are judged, and the observation has to
+    declare every one of them with the same value. Silence on a requested key
+    is not a match: an entry that never said which backend, KV dtype or state
+    it was measured under was not shown to be this deployment, so it does not
+    get a say in which treatment this deployment is priced under.
+
+    The observation's own extra keys are deliberately not judged here. At this
+    point the request is still the raw declaration -- registration and
+    topology are added after -- so demanding agreement in that direction would
+    reject every well-scoped observation for keys the request has not been
+    given yet. `attention.Model._fit_for` compares both directions once the
+    request is complete, and that remains the check that decides the price.
+
+    Both sides are normalised through `_hashable` before they are compared.
+    An observation's scope was made hashable when it was read and a caller's
+    declaration need not have been, so a state geometry declared as a list
+    would otherwise differ from the identical tuple that was measured -- a
+    mismatch invented by the reader, not by the deployments.
+    """
+    obs_scope = obs_scope or {}
+    for field, value in (requested or {}).items():
+        if field not in obs_scope:
+            return False
+        if _hashable(obs_scope[field]) != _hashable(value):
+            return False
+    return True
+
+
 #: The scope key for an operator whose cost does not depend on the group. Not
 #: `None`, so it cannot be confused with "scope not recorded".
 _LOCAL = ("local",)
@@ -1136,9 +1173,7 @@ class ParametricPriceLibrary(PriceLibrary):
         if registration is not None:
             scope.setdefault("registration", registration)
         if topology:
-            scope.setdefault("topology",
-                             tuple(sorted(topology.items()))
-                             if isinstance(topology, dict) else tuple(topology))
+            scope.setdefault("topology", _topology_key(topology))
         return scope or None
 
     def _declared_scope(self, op: dict) -> dict:
@@ -1185,17 +1220,44 @@ class ParametricPriceLibrary(PriceLibrary):
         read, which happens when the scope is not yet complete enough to say.
         Family and geometry still hold, so the answer is drawn from the same
         operator on the same heads either way.
+
+        Family, regime and geometry are not the whole domain, and taking them
+        for it is how an ordinary mixed library goes wrong. A real one holds
+        the entries a registry already had beside the new family records, and
+        a legacy attention entry may declare no static scope at all. Filtered
+        only by family and geometry it is still a candidate here, so its
+        treatment joins the set, the set has two members, and a request whose
+        own scope matches exactly one deployment is told the treatment is
+        ambiguous -- a valid modelled fallback lost to an entry that was never
+        shown to be the same deployment. So the requested static scope filters
+        too: see `_shown_to_match`. Those legacy entries keep answering
+        exactly, by signature, through the path above this one; what they lose
+        is the vote on a fallback that is not theirs.
+
+        What is deliberately NOT done is to break a remaining tie by asking
+        which candidate happens to have a fitted law. It is tempting -- an
+        unfittable domain cannot answer anyway -- but the candidates left at
+        that point are treatments that this request's own declared scope
+        matches, and choosing among them by fittability charges the request
+        under a treatment it never named because the alternative had too few
+        points to check it. Two treatments inside the asked deployment are two
+        laws, and which one a call was under is a fact about the call. So the
+        ambiguity stands and the refusal names it.
         """
         family = op.get("name")
         geometry = attention.geometry_of(op)
         asked = attention.regime_of(op, None, attention.scoped(op, scope))
         wanted = None if isinstance(asked, attention.Refusal) else asked.name
+        requested = dict(scope or {})
+        requested.pop("measurement_treatment", None)
         treatments = set()
         for obs_op, _s, _src, obs_scope, measurement, _host, _q in \
                 self._attention_obs:
             if obs_op.get("name") != family:
                 continue
             if attention.geometry_of(obs_op) != geometry:
+                continue
+            if not _shown_to_match(obs_scope, requested):
                 continue
             if wanted is not None:
                 full = dict(obs_scope or {})

@@ -353,13 +353,14 @@ class TestAFitRefusesWhatItCannotIdentify:
         assert "wanted a negative cost" in described
 
     def test_a_law_no_better_than_a_flat_charge_is_refused(self):
-        """The same falling seconds at three points: too few and too scattered
+        """The same falling seconds at four points: too few and too scattered
         for the design to determine the sign, so the nonnegative fit returns
         something. It explains nothing, and saying so is the gate -- not the
         sign of a coefficient."""
         regime = attention.REGIMES["unified.prefill.cold"]
         out = fit_regime(regime, self._points(
-            [(64, 0, 1e-3), (128, 0, 5e-4), (256, 0, 1e-4)]))
+            [(64, 0, 1e-3), (128, 0, 5e-4), (256, 0, 1e-4),
+             (512, 0, 5e-5)]))
         assert isinstance(out, Refusal)
         assert "the same number" in out.reason
 
@@ -444,7 +445,7 @@ class TestAFitRefusesWhatItCannotIdentify:
         regime = attention.REGIMES["unified.prefill.cold"]
         k = 2.25e-10
         fit = fit_regime(regime, self._points(
-            [(q, 0, k * (q * (q + 1) // 2)) for q in (64, 128, 256)],
+            [(q, 0, k * (q * (q + 1) // 2)) for q in (64, 128, 256, 512)],
             scope=None), strict=False)
         assert not isinstance(fit, Refusal)
         assert set(fit.scope_undeclared) == set(REQUIRED_SCOPE)
@@ -474,10 +475,13 @@ class TestAFitRefusesWhatItCannotIdentify:
 class TestPricingAnUnseenStructure:
 
     def _model(self, strict=True):
-        """A cold-prefill law over three points, on a known coefficient."""
+        """A cold-prefill law over four points, on a known coefficient. Four
+        because the regime charges a per-call term as well as its two
+        proportional ones; the truth is exactly proportional, so that term
+        fits to nothing here."""
         k = 2.25e-10
         points = []
-        for q in (64, 4672, 16384):
+        for q in (64, 640, 4672, 16384):
             op = _unified([q], [q], is_prefill=True, has_cached=False)
             points.append((op, k * structure_of(op).paired_work(), "src",
                            dict(SCOPE)))
@@ -581,7 +585,8 @@ class TestPricingAnUnseenStructure:
         for queries, contexts in (([2, 2], [130, 130]),
                                   ([8, 8], [136, 136]),
                                   ([2, 2], [514, 514]),
-                                  ([16, 4], [272, 1028])):
+                                  ([16, 4], [272, 1028]),
+                                  ([4, 12], [68, 900])):
             op = _unified(queries, contexts, is_prefill=True,
                           has_cached=True)
             points.append((op, k * structure_of(op).paired_work(), "src",
@@ -608,7 +613,7 @@ class TestObservationsPoolOnlyWhenEverythingDeclaredAgrees:
     def _points(self, extra):
         k = 2.25e-10
         points = []
-        for q, more in zip((64, 128, 256), extra):
+        for q, more in zip((64, 128, 256, 512), extra):
             structure = structure_of(_unified([q], [q], is_prefill=True,
                                               has_cached=False))
             scope = dict(SCOPE)
@@ -620,7 +625,7 @@ class TestObservationsPoolOnlyWhenEverythingDeclaredAgrees:
     def test_one_declared_condition_throughout_pools(self):
         regime = attention.REGIMES["unified.prefill.cold"]
         fit = fit_regime(regime,
-                         self._points([{"tensor_parallel_size": 1}] * 3))
+                         self._points([{"tensor_parallel_size": 1}] * 4))
         assert not isinstance(fit, Refusal)
         assert fit.scope["tensor_parallel_size"] == 1
 
@@ -656,14 +661,14 @@ class TestObservationsPoolOnlyWhenEverythingDeclaredAgrees:
 
     def test_a_declared_none_is_a_statement_not_an_absence(self):
         regime = attention.REGIMES["unified.prefill.cold"]
-        fit = fit_regime(regime, self._points([{}] * 3))
+        fit = fit_regime(regime, self._points([{}] * 4))
         assert not isinstance(fit, Refusal)
         assert fit.scope_undeclared == ()
         assert fit.scope["sliding_window"] is None
 
     def test_a_list_valued_condition_compares_by_value(self):
         regime = attention.REGIMES["unified.prefill.cold"]
-        fit = fit_regime(regime, self._points([{"pool": [2, 16, 131072]}] * 3))
+        fit = fit_regime(regime, self._points([{"pool": [2, 16, 131072]}] * 4))
         assert not isinstance(fit, Refusal)
         out = fit_regime(regime, self._points(
             [{"pool": [2, 16, 131072]}, {"pool": [2, 16, 65536]},
@@ -780,9 +785,13 @@ def _gdn_designs():
 
 
 def _cold_designs():
+    # Four widths, because `unified.prefill.cold` charges a per-call term as
+    # well as its two proportional ones, and a fit keeps a degree of freedom
+    # to check itself with. The truth here is still exactly proportional, so
+    # the per-call term fits to nothing and the law reads as it always did.
     k = 2.25e-10
     designs = []
-    for q in (64, 4672, 16384):
+    for q in (64, 640, 4672, 16384):
         op = _unified([q], [q], is_prefill=True, has_cached=False)
         designs.append((op, k * structure_of(op).paired_work()))
     return designs
@@ -813,14 +822,16 @@ def test_a_standalone_attention_graph_is_collected_though_it_has_no_body(
     library = _library(tmp_path, _cold_designs())
     assert library.no_file_width  # these files state no width of their own
     assert not library.unbuildable  # and none of them contradicts itself
-    assert len(library._attention_obs) == 3 * 16
-    assert len(library.attention_design_points()) == 3
+    assert len(library._attention_obs) == 4 * 16
+    assert len(library.attention_design_points()) == 4
+
+
 def test_layer_copies_collapse_to_one_design_point_each(tmp_path):
     """16 layers of one step are 16 measurements of one point. Counting them
     as points would report a law as checked that nothing checked."""
     library = _library(tmp_path, _cold_designs(), layers=48)
     points = library.attention_design_points()
-    assert len(points) == 3
+    assert len(points) == 4
     assert all("47 replicates" in note or "replicates" in note
                for _op, _s, note, _scope in points)
 
@@ -908,7 +919,7 @@ def test_two_kernel_sets_are_two_treatments_even_where_launches_are_free(
     allowance for an unrecorded composition does not touch that: what it
     passes is silence, and this is evidence."""
     library = _library(tmp_path, _cold_designs(),
-                       kernels_per_design=[("k0",), ("k0", "k1"), ("k0",)])
+                       kernels_per_design=[("k0",), ("k0", "k1"), ("k0",), ("k0",)])
     library.launch_charge_seconds = 0.0
     treatments = {scope["measurement_treatment"] for _op, _s, _note, scope
                   in library.attention_design_points()}
@@ -958,8 +969,8 @@ class TestTheRotationIsAPolicyNotAScope:
         """Three sizes measured by one collector rotated over three different
         counts. That is one policy applied three times, so they pool."""
         library = _library(tmp_path, _cold_designs(), policy=POLICY_A,
-                           arg_sets=[64, 12, 2])
-        assert len(library.attention_design_points()) == 3
+                           arg_sets=[64, 12, 2, 64])
+        assert len(library.attention_design_points()) == 4
         assert self._treatments(library) == 1
         record, _source = self._ask(library)
         assert record is not None
@@ -968,8 +979,8 @@ class TestTheRotationIsAPolicyNotAScope:
         """A different microbench is a different byte budget and a different
         clamp. Those numbers were not taken the same way."""
         library = _library(tmp_path, _cold_designs(),
-                           policy=[POLICY_A, POLICY_B, POLICY_A],
-                           arg_sets=[64, 64, 64])
+                           policy=[POLICY_A, POLICY_B, POLICY_A, POLICY_A],
+                           arg_sets=[64, 64, 64, 64])
         assert self._treatments(library) == 2
         record, _detail = self._ask(library)
         assert record is None
@@ -977,7 +988,7 @@ class TestTheRotationIsAPolicyNotAScope:
     def test_an_unrecorded_policy_pools_with_nothing_that_has_one(
             self, tmp_path):
         library = _library(tmp_path, _cold_designs(),
-                           policy=[POLICY_A, None, POLICY_A])
+                           policy=[POLICY_A, None, POLICY_A, POLICY_A])
         assert self._treatments(library) == 2
         record, _detail = self._ask(library)
         assert record is None
@@ -986,13 +997,13 @@ class TestTheRotationIsAPolicyNotAScope:
             self, tmp_path):
         """Out of the identity, not out of the record: a reader still sees how
         cold each point's operands were held."""
-        library = _library(tmp_path, _cold_designs(), arg_sets=[64, 12, 2])
+        library = _library(tmp_path, _cold_designs(), arg_sets=[64, 12, 2, 64])
         notes = " ".join(note for _op, _s, note, _scope
                          in library.attention_design_points())
         assert "arg_sets 64" in notes and "arg_sets 2" in notes
 
     def test_the_policy_is_reported_in_coverage(self, tmp_path):
-        library = _library(tmp_path, _cold_designs(), arg_sets=[64, 12, 2])
+        library = _library(tmp_path, _cold_designs(), arg_sets=[64, 12, 2, 64])
         library.launch_charge_seconds = 0.0
         coverage = library.attention_coverage()
         assert coverage["acquisition_policies"] == [
@@ -1016,14 +1027,14 @@ class TestAcquisitionMetadataIsNotADeployment:
     def test_files_that_differ_only_in_iteration_count_still_pool(
             self, tmp_path):
         library = _library(tmp_path, _cold_designs(),
-                           acquisition={"iters": [50, 20, 50]})
+                           acquisition={"iters": [50, 20, 50, 50]})
         record, _detail = self._ask(library)
         assert record is not None
 
     def test_files_that_differ_only_in_the_family_filter_still_pool(
             self, tmp_path):
         library = _library(tmp_path, _cold_designs(),
-                           acquisition={"only": ["gdn", "attention", "gdn"]})
+                           acquisition={"only": ["gdn", "attention", "gdn", "gdn"]})
         record, _detail = self._ask(library)
         assert record is not None
 
@@ -1039,7 +1050,7 @@ class TestAcquisitionMetadataIsNotADeployment:
         """The relaxation is confined to acquisition metadata: a difference in
         what was actually deployed is still a difference."""
         library = _library(tmp_path, _cold_designs(),
-                           acquisition={"model": ["m1", "m2", "m1"]})
+                           acquisition={"model": ["m1", "m2", "m1", "m1"]})
         scopes = {attention.scope_key(scope) for _op, _s, _note, scope
                   in library.attention_design_points()}
         assert len(scopes) == 2  # m1 and m2 are two deployments, not one law
@@ -1753,6 +1764,198 @@ class TestOneLibraryPricesBothFamilies:
 
         assert library._treatment_for(_gdn([256], initial=[False]),
                                       dict(GDN_SCOPE)) is None
+
+
+class TestALegacyEntryDoesNotDecideANewFallback:
+    """The mixed library a registry actually has, not the new records alone.
+
+    A real run loads what the registry already held beside the new family
+    records, and an older attention entry may declare no static scope at all.
+    It is the same family at the same geometry, so family and geometry do not
+    separate it, and the treatment it was measured under is its own. Left in
+    the candidate set it makes the treatment ambiguous, and a request whose
+    own scope matches exactly one deployment is refused a price that one
+    fitted deployment was ready to give.
+
+    What that entry keeps is what it always had: its own signature, answered
+    exactly.
+    """
+
+    def _unscoped(self, tmp_path, name, ops, prices):
+        """A price file that declares no deployment, as older ones do."""
+        gpath = tmp_path / f"g{name}.json"
+        ppath = tmp_path / f"p{name}.json"
+        gpath.write_text(json.dumps({"ops": ops, "provenance": {}}))
+        ppath.write_text(json.dumps({"prices": prices, "provenance": {}}))
+        return str(ppath), str(gpath)
+
+    def _library(self, tmp_path):
+        from atom.compass.runtime.microbench import signature_of
+        from atom.compass.runtime.source_oracle import (_price_library,
+                                                        gap_ratio)
+
+        entries = []
+        for index, (op, seconds) in enumerate(_gdn_designs()):
+            prices = {signature_of(op): {
+                "seconds": seconds, "kernels": {"gdn0": seconds},
+                "kv_regions": 1, "cache": "graph", "occurrences": 1,
+                "name": op["name"], "signature": signature_of(op)}}
+            entries.append(_file(tmp_path, "g%d" % index, [op], prices,
+                                 scope=GDN_SCOPE))
+        library = _price_library(entries, gap_ratio(True), None,
+                                 {"gdn": dict(GDN_SCOPE)})
+        # The legacy entry: same family, same geometry, a treatment of its
+        # own, and nothing said about the deployment it was taken in.
+        self.legacy = _gdn([777], initial=[False])
+        sig = signature_of(self.legacy)
+        library.add(*self._unscoped(
+            tmp_path, "legacy", [self.legacy],
+            {sig: {"seconds": 9.9e-6, "kernels": {"old": 9.9e-6},
+                   "kv_regions": 7, "cache": "cold", "occurrences": 1,
+                   "name": self.legacy["name"], "signature": sig}}))
+        return library
+
+    def test_the_unscoped_entry_does_not_make_the_treatment_ambiguous(
+            self, tmp_path):
+        library = self._library(tmp_path)
+        treatments = {obs[4] for obs in library._attention_obs}
+        assert len(treatments) > 1
+
+        resolved = library._treatment_for(_gdn([256], initial=[False]),
+                                          dict(GDN_SCOPE))
+        assert resolved is not None
+        # The scoped measurements' treatment, not the legacy entry's.
+        assert dict(resolved[1:])["kv_regions"] == 1
+
+    def test_the_new_fallback_still_answers_from_the_law(self, tmp_path):
+        """From the ragged law, which the provenance has to name.
+
+        "Something answered" is not the claim. The row curve behind this
+        family answers too, under the same ``interpolated://`` prefix, so a
+        test that only checks the prefix passes whether or not the modelled
+        price survived. What the treatment filter protects is the law, so the
+        regime is what is asserted.
+        """
+        library = self._library(tmp_path)
+        record, detail = library.lookup(_gdn([256], initial=[False]))
+        assert record is not None, detail
+        assert record["interpolated"] is True
+        assert detail == "interpolated://%s/gdn.prefill" % GDN
+
+    def test_the_legacy_entry_still_answers_exactly(self, tmp_path):
+        """Nothing is taken away from it. It is refused a vote on a fallback
+        that is not its deployment's; its own price is still its own."""
+        library = self._library(tmp_path)
+        record, detail = library.lookup(self.legacy)
+        assert record is not None, detail
+        assert record["seconds"] == 9.9e-6
+        assert not record.get("interpolated")
+
+    def test_a_scoped_disagreement_is_still_refused(self, tmp_path):
+        """The filter is about what was SHOWN, not about preferring the new
+        records. An entry that declares this deployment and disagrees about
+        the conditions is a second deployment, and that ambiguity stands."""
+        from atom.compass.runtime.microbench import signature_of
+
+        library = self._library(tmp_path)
+        op = _gdn([2048], initial=[False])
+        sig = signature_of(op)
+        library.add(*_file(tmp_path, "same", [op],
+                           {sig: {"seconds": 2e-6, "kernels": {"gdn0": 2e-6},
+                                  "kv_regions": 9, "cache": "cold",
+                                  "occurrences": 1, "name": op["name"],
+                                  "signature": sig}},
+                           scope=GDN_SCOPE))
+        assert library._treatment_for(_gdn([256], initial=[False]),
+                                      dict(GDN_SCOPE)) is None
+
+
+#: A GDN deployment that is not the one under test: a superseded collection
+#: taken on a different recurrent state geometry. Same family, same operand
+#: geometry, its own treatment -- and enough points behind it to fit a law of
+#: its own, which is what makes it the case an eligibility check cannot
+#: rescue.
+OTHER_GDN_SCOPE = {"gdn_decode_lossy_fast": False,
+                   "gdn_state_geometry": [1, 3, 8192, 128]}
+
+
+class TestASupersededCollectionDoesNotBlockTheAskedDeployment:
+    """The poisoning case with both deployments fitted.
+
+    An unscoped entry can never form a law, so a check that only asks which
+    candidate has one would already keep it out of the way. A superseded
+    collection is different: it declares a deployment, it has enough points,
+    and it fits. Filtered only by family, regime and geometry it is a second
+    treatment in the candidate set; with none declared, nothing is filled in
+    and the request is refused for want of a treatment -- while the law it
+    asked for sits there fitted, under the scope it declared.
+
+    So the requested static scope decides membership, and the answer comes
+    from the deployment the request named.
+    """
+
+    def _library(self, tmp_path, *, asked=GDN_SCOPE):
+        """Two collections of the same designs, always both present.
+
+        Which one the request declares is the only thing ``asked`` changes:
+        the library is the same either way, so a test that gets the other
+        collection's answer got it by selection and not by a different build.
+        The superseded collection is twice as slow, so its law and its answer
+        are distinguishable from the asked one's by the number as well as by
+        the kernels.
+        """
+        from atom.compass.runtime.microbench import signature_of
+        from atom.compass.runtime.source_oracle import (_price_library,
+                                                        gap_ratio)
+
+        entries = []
+        for label, scope, kernel, regions, factor in (
+                ("a", GDN_SCOPE, "gdn0", 1, 1.0),
+                ("b", OTHER_GDN_SCOPE, "old", 7, 2.0)):
+            for index, (op, seconds) in enumerate(_gdn_designs()):
+                seconds *= factor
+                prices = {signature_of(op): {
+                    "seconds": seconds, "kernels": {kernel: seconds},
+                    "kv_regions": regions, "cache": "graph", "occurrences": 1,
+                    "name": op["name"], "signature": signature_of(op)}}
+                entries.append(_file(tmp_path, "%s%d" % (label, index), [op],
+                                     prices, scope=scope))
+        return _price_library(entries, gap_ratio(True), None,
+                              {"gdn": dict(asked)})
+
+    def test_both_deployments_fit(self, tmp_path):
+        """The precondition. Without it the next test would pass for the
+        wrong reason -- one law and one candidate, nothing to choose."""
+        library = self._library(tmp_path)
+        model = library.attention_model()
+        fitted = [label for label in model.fits if "gdn.prefill" in label]
+        assert len(fitted) == 2, (model.fits, model.refusals)
+        assert len({obs[4] for obs in library._attention_obs}) == 2
+
+    def test_the_asked_deployment_is_priced_from_its_own_law(self, tmp_path):
+        library = self._library(tmp_path)
+
+        record, detail = library.lookup(_gdn([256], initial=[False]))
+        assert record is not None, detail
+        assert detail == "interpolated://%s/gdn.prefill" % GDN
+        # From the asked deployment's measurements, not the superseded ones.
+        assert sorted(record["kernels"]) == ["gdn0"]
+
+    def test_asking_for_the_superseded_deployment_answers_from_it(
+            self, tmp_path):
+        """The rule is not "prefer the newer records". Whichever deployment
+        the request declares is the one it is answered from -- and the answer
+        is that collection's own number, at its own scale."""
+        op = _gdn([256], initial=[False])
+        mine, _d = self._library(tmp_path).lookup(op)
+        theirs, detail = self._library(
+            tmp_path, asked=OTHER_GDN_SCOPE).lookup(op)
+
+        assert theirs is not None, detail
+        assert detail == "interpolated://%s/gdn.prefill" % GDN
+        assert sorted(theirs["kernels"]) == ["old"]
+        assert theirs["seconds"] == pytest.approx(2 * mine["seconds"],
+                                                  rel=1e-9)
 
 
 #: The scope Pricing resolved on the same stand-up path, and a price record
