@@ -372,6 +372,22 @@ def _rows(shape: StepShape):
                  for q, c in zip(shape.num_scheduled_tokens, shape.context_lens))
 
 
+def _reads_cache(shape: StepShape) -> bool:
+    """Whether this batch is a prefill that reads KV it did not compute.
+
+    `BatchSpec.has_cached`, computed from the shape: prefill, and some row
+    whose context is longer than its query. It is in the template key and not
+    in the bound fields because it is not a value a cohort can be given. The
+    backend records three fields on the cached branch that it does not record
+    otherwise -- `total_kv`, `seq_starts`, `num_cached_tokens` -- and binding
+    rewrites values, it does not grow a context entry a trace never held. It
+    also selects the attention kernel, so the two are not the same graph.
+    """
+    return bool(shape.num_prefill_tokens) and any(
+        int(c) > int(q) for q, c in zip(shape.num_scheduled_tokens,
+                                        shape.context_lens))
+
+
 def template_key(shape: StepShape):
     """What makes two cohorts share a template.
 
@@ -388,7 +404,7 @@ def template_key(shape: StepShape):
     coords = tuple(sorted((str(k), int(v))
                           for k, v in (shape.rank_coords or {}).items()))
     return (queries, int(shape.num_prefill_tokens), groups, coords,
-            shape.capture_bucket, shape.compiled)
+            shape.capture_bucket, shape.compiled, _reads_cache(shape))
 
 
 def _cu_seqlens(queries):
@@ -434,11 +450,21 @@ def _bind(key, template_value, rows):
     if key == "cu_seqlens_q":
         return _cu_seqlens(queries)
     if key == "cu_seqlens_k":
-        # Recorded as null on the decode path; a template that carries one is a
-        # structure this function has not been shown.
+        # Cumulative key lengths, prefill only. The keys are the whole context,
+        # cached prefix included: `prepare_prefill` accumulates
+        # `seqlen_k = context_lens[i]`
+        # (atom/model_ops/attentions/backends.py:449), and
+        # `BatchSpec.attention_context` records that same sum. Decode leaves it
+        # None and so does binding -- it does not invent an empty tensor.
         if template_value is None:
             return None
-        raise BindRefusal("cu_seqlens_k is set in the template")
+        if len(template_value) != len(rows) + 1:
+            raise BindRefusal(
+                f"cu_seqlens_k has {len(template_value)} entries and this "
+                f"batch has {len(rows)} requests; it is one offset per prefill "
+                "row after a leading zero, and a batch whose prefill rows are "
+                "not all of it is a structure this function has not been shown")
+        return _cu_seqlens(contexts)
     if key == "non_spec_query_start_loc":
         # The linear-attention layers take the same cumulative query offsets
         # over the non-speculative requests, recorded as a ``[values, dtype]``
@@ -451,6 +477,50 @@ def _bind(key, template_value, rows):
                               "batch; speculative decoding changes the "
                               "structure, not the cohort")
         return [_cu_seqlens(queries), dtype]
+    if key == "has_initial_state":
+        # Which prefill rows continue a sequence whose convolution state is
+        # already in the pool. Cohort, not structure: `template_key` drops the
+        # context lengths, so one template serves a first chunk, a continuation
+        # and a batch of both at once, and those differ row by row -- a row
+        # with an incoming state reads it and a row without does not.
+        #
+        # The formula is the recording rule's, `batch_spec.py::gdn_context`:
+        # per prefill row, `num_cached_tokens > 0`, which is context minus
+        # query. Decode records None, as the backend does, so a template
+        # carrying None binds to None rather than to an empty tensor.
+        if template_value is None:
+            return None
+        values, dtype = template_value
+        if len(values) != len(rows):
+            raise BindRefusal(
+                f"has_initial_state has {len(values)} entries and this batch "
+                f"has {len(rows)} requests; the field is recorded over the "
+                "prefill rows, and a batch whose prefill rows are not all of "
+                "it is a structure this function has not been shown")
+        return [[1 if c - q > 0 else 0 for q, c in rows], dtype]
+    if key in ("total_kv", "seq_starts", "num_cached_tokens"):
+        # The cached-prefix branch of `BatchSpec.attention_context`, which
+        # `template_key` now separates, so a template carrying these is bound
+        # only to a cohort that also reads a cached prefix. Each is the
+        # recording rule verbatim: the total keys attention walks, the start of
+        # each request's cached prefix, and how many tokens of it were already
+        # there -- `cached_lens`, which is context minus query.
+        cached = [c - q for q, c in rows]
+        if key == "total_kv":
+            return sum(contexts)
+        if key == "num_cached_tokens":
+            return cached
+        starts, run = [], 0
+        for n in cached:
+            starts.append(run)
+            run += n
+        if len(template_value) != len(rows):
+            raise BindRefusal(
+                f"seq_starts has {len(template_value)} entries and this batch "
+                f"has {len(rows)} requests; it is one start per prefill row, "
+                "and a batch whose prefill rows are not all of it is a "
+                "structure this function has not been shown")
+        return starts
     if key in CARRIED_CONSTANTS:
         return template_value
     if key in ("num_prefills", "num_prefill_tokens", "num_decodes",

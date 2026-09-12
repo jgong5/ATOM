@@ -513,3 +513,253 @@ def test_an_active_count_below_the_capture_bucket_pads_every_field():
     assert context["non_spec_state_indices_tensor"] == [[5, 9, 0, 0], "int32"]
     assert bound["provenance"]["binding"]["allocation_padding"] == {
         "slot_mapping": 2, "non_spec_state_indices_tensor": 2}
+
+
+# -- the linear-attention initial-state flags -------------------------------
+
+def gdn_op(rows, *, value="auto", allocator=False):
+    """One operator carrying the context a DeltaNet prefill records.
+
+    `value` is what the template holds for `has_initial_state`; "auto" records
+    the rule's own answer for `rows`, which is what a trace would contain.
+    """
+    starts, total = [0], 0
+    for q, _ in rows:
+        total += q
+        starts.append(total)
+    if value == "auto":
+        value = [[1 if c - q > 0 else 0 for q, c in rows], "bool"]
+    context = [
+        ["num_prefills", len(rows)],
+        ["num_prefill_tokens", sum(q for q, _ in rows)],
+        ["num_decodes", 0],
+        ["num_decode_tokens", 0],
+        ["non_spec_query_start_loc", [starts, "int32"]],
+        ["has_initial_state", value],
+    ]
+    if allocator:
+        context.append(["non_spec_state_indices_tensor",
+                        [list(range(len(rows))), "int32"]])
+    return {"name": "atom::fused_recurrent_gated_delta_rule",
+            "input_shapes": "1,2", "dtypes": "bfloat16", "context": context}
+
+
+def gdn_template(rows, **kw):
+    return {"ops": [gdn_op(rows, **kw)], "provenance": {"region": "body"}}
+
+
+def _flags(bound):
+    return dict(map(tuple, bound["ops"][0]["context"]))["has_initial_state"]
+
+
+def test_a_first_prefill_chunk_has_no_incoming_state():
+    """The run's real first step: one 640-token prompt, nothing cached."""
+    bound = bind_cohort(gdn_template([(15360, 15360)]),
+                        shape([640], [640], bucket=None, prefill=640),
+                        carried())
+    assert _flags(bound) == [[0], "bool"]
+
+
+def test_a_continuation_chunk_reads_the_state_it_left():
+    """Chunk 1 of a 63744-token prompt: 15744 computed, 16384 scheduled."""
+    bound = bind_cohort(gdn_template([(16384, 16384)]),
+                        shape([16384], [32128], bucket=None, prefill=16384),
+                        carried())
+    assert _flags(bound) == [[1], "bool"]
+
+
+def test_mixed_per_request_history_is_flagged_row_by_row():
+    """One template, four rows, and only the two with a history read one."""
+    rows = [(4096, 4096)] * 4
+    bound = bind_cohort(
+        gdn_template(rows),
+        shape([4096] * 4, [4096, 20480, 4096, 65536], bucket=None,
+              prefill=16384),
+        carried())
+    assert _flags(bound) == [[0, 1, 0, 1], "bool"]
+
+
+def test_the_flags_follow_the_cohort_not_the_template():
+    """A template recorded on continuations, bound to first chunks."""
+    bound = bind_cohort(gdn_template([(4096, 20480), (4096, 20480)]),
+                        shape([4096, 4096], [4096, 4096], bucket=None,
+                              prefill=8192),
+                        carried())
+    assert _flags(bound) == [[0, 0], "bool"]
+
+
+def test_has_initial_state_binding_does_not_mutate_the_template():
+    template = gdn_template([(4096, 20480), (4096, 20480)])
+    before = [list(map(list, op["context"])) for op in template["ops"]]
+    bind_cohort(template, shape([4096, 4096], [4096, 4096], bucket=None,
+                                prefill=8192), carried())
+    after = [list(map(list, op["context"])) for op in template["ops"]]
+    assert after == before
+
+
+def test_a_decode_template_keeps_the_field_unset():
+    """The backend leaves it None on decode; binding does not invent a tensor."""
+    bound = bind_cohort(gdn_template([(1, 1151)] * 4, value=None),
+                        shape([1] * 4, [4096] * 4), carried())
+    assert _flags(bound) is None
+
+
+def test_flags_for_a_different_number_of_rows_are_refused():
+    """Recorded over the prefill rows: a batch that is not all prefill rows
+    is a structure this rule has not been shown, and it says so."""
+    template = {"ops": [{"name": "atom::fused_recurrent_gated_delta_rule",
+                         "input_shapes": "1", "dtypes": "bfloat16",
+                         "context": [["has_initial_state", [[0, 0], "bool"]]]}],
+                "provenance": {"region": "body"}}
+    with pytest.raises(BindRefusal, match="has_initial_state has 2 entries"):
+        bind_cohort(template, shape([4096] * 3, [4096] * 3, bucket=None,
+                                    prefill=12288), carried())
+
+
+# -- the prefill key offsets ------------------------------------------------
+
+def prefill_attention_op(rows):
+    """The context a prefill attention call records, cu_seqlens_k included."""
+    op = attention_op(rows, allocator=False)
+    context = [e for e in op["context"] if e[0] != "cu_seqlens_k"]
+    cu_k, total = [0], 0
+    for _, c in rows:
+        total += c
+        cu_k.append(total)
+    cu_q, run = [0], 0
+    for q, _ in rows:
+        run += q
+        cu_q.append(run)
+    context.append(["cu_seqlens_q", cu_q])
+    context.append(["cu_seqlens_k", cu_k])
+    op["context"] = context
+    return op
+
+
+def _ctx(bound, i=0):
+    return dict(map(tuple, bound["ops"][i]["context"]))
+
+
+def test_cu_seqlens_k_is_the_cohorts_cumulative_context():
+    """Whole context per row, cached prefix included: what the keys are."""
+    template = {"ops": [prefill_attention_op([(4096, 4096)] * 2)],
+                "provenance": {"region": "body"}}
+    bound = bind_cohort(template,
+                        shape([4096, 4096], [4096, 20480], bucket=None,
+                              prefill=8192), carried())
+    assert _ctx(bound)["cu_seqlens_k"] == [0, 4096, 24576]
+    # The query offsets stay the scheduled tokens, which is the difference.
+    assert _ctx(bound)["cu_seqlens_q"] == [0, 4096, 8192]
+
+
+def test_the_run_s_first_step_binds_its_key_offsets():
+    """640 tokens, nothing cached: keys and queries coincide."""
+    template = {"ops": [prefill_attention_op([(15360, 15360)])],
+                "provenance": {"region": "body"}}
+    bound = bind_cohort(template,
+                        shape([640], [640], bucket=None, prefill=640),
+                        carried())
+    assert _ctx(bound)["cu_seqlens_k"] == [0, 640]
+    assert _ctx(bound)["cu_seqlens_q"] == [0, 640]
+
+
+def test_a_decode_template_leaves_the_key_offsets_unset():
+    bound = bind_cohort(template_for([(1, 1151)] * 4),
+                        shape([1] * 4, [4096] * 4), carried())
+    assert _ctx(bound, 1)["cu_seqlens_k"] is None
+
+
+def test_key_offsets_for_a_different_number_of_rows_are_refused():
+    template = {"ops": [{"name": "aiter::unified_attention_with_output_base",
+                         "input_shapes": "1", "dtypes": "bfloat16",
+                         "context": [["cu_seqlens_k", [0, 4096, 8192]]]}],
+                "provenance": {"region": "body"}}
+    with pytest.raises(BindRefusal, match="cu_seqlens_k has 3 entries"):
+        bind_cohort(template, shape([4096] * 3, [4096] * 3, bucket=None,
+                                    prefill=12288), carried())
+
+
+# -- the cached-prefix branch -----------------------------------------------
+
+def cached_prefill_op(rows):
+    """A prefill that reads a cached prefix, with the three extra fields."""
+    op = prefill_attention_op(rows)
+    cached = [c - q for q, c in rows]
+    starts, run = [], 0
+    for n in cached:
+        starts.append(run)
+        run += n
+    op["context"].extend([
+        ["has_cached", True],
+        ["state", "prefill_prefix"],
+        ["total_kv", sum(c for _, c in rows)],
+        ["seq_starts", starts],
+        ["num_cached_tokens", cached],
+    ])
+    return op
+
+
+def test_a_cached_prefill_does_not_share_a_first_chunks_template():
+    """Not a cohort difference: the backend records three fields on one branch
+    and not the other, and binding rewrites values rather than growing them."""
+    first = shape([16384], [16384], bucket=None, prefill=16384)
+    later = shape([16384], [32128], bucket=None, prefill=16384)
+    assert template_key(first) != template_key(later)
+
+
+def test_decode_is_not_a_cached_prefill():
+    """Every decode row has a longer context than query, and none of them is
+    a prefill reading a prefix; `BatchSpec.has_cached` says so too."""
+    assert template_key(shape([1] * 4, [1151] * 4)) == template_key(
+        shape([1] * 4, [65536] * 4))
+
+
+def test_the_cached_fields_are_the_cohorts_own():
+    """Chunk 2 of two 63744-token prompts, at different offsets."""
+    template = {"ops": [cached_prefill_op([(8192, 24576), (8192, 24576)])],
+                "provenance": {"region": "body"}}
+    bound = bind_cohort(template,
+                        shape([8192, 8192], [24576, 40960], bucket=None,
+                              prefill=16384), carried())
+    ctx = _ctx(bound)
+    assert ctx["num_cached_tokens"] == [16384, 32768]
+    assert ctx["seq_starts"] == [0, 16384]
+    assert ctx["total_kv"] == 65536
+    assert ctx["cu_seqlens_k"] == [0, 24576, 65536]
+    assert ctx["cu_seqlens_q"] == [0, 8192, 16384]
+    # The branch itself is carried: the key already separated it.
+    assert ctx["has_cached"] is True
+    assert ctx["state"] == "prefill_prefix"
+
+
+def test_a_ragged_cached_cohort_binds_row_by_row():
+    rows = [(4096, 8192)] * 3
+    template = {"ops": [cached_prefill_op(rows)],
+                "provenance": {"region": "body"}}
+    bound = bind_cohort(template,
+                        shape([4096] * 3, [4096 + 128, 8192, 65536],
+                              bucket=None, prefill=12288), carried())
+    ctx = _ctx(bound)
+    assert ctx["num_cached_tokens"] == [128, 4096, 61440]
+    assert ctx["seq_starts"] == [0, 128, 4224]
+    assert ctx["total_kv"] == 4224 + 8192 + 65536
+
+
+def test_cached_prefill_binding_does_not_mutate_the_template():
+    template = {"ops": [cached_prefill_op([(8192, 24576), (8192, 24576)])],
+                "provenance": {"region": "body"}}
+    before = [list(map(list, op["context"])) for op in template["ops"]]
+    bind_cohort(template, shape([8192, 8192], [24576, 40960], bucket=None,
+                                prefill=16384), carried())
+    assert [list(map(list, op["context"]))
+            for op in template["ops"]] == before
+
+
+def test_seq_starts_for_a_different_number_of_rows_are_refused():
+    template = {"ops": [{"name": "aiter::unified_attention_with_output_base",
+                         "input_shapes": "1", "dtypes": "bfloat16",
+                         "context": [["seq_starts", [0, 16384]]]}],
+                "provenance": {"region": "body"}}
+    with pytest.raises(BindRefusal, match="seq_starts has 2 entries"):
+        bind_cohort(template, shape([4096] * 3, [8192] * 3, bucket=None,
+                                    prefill=12288), carried())
