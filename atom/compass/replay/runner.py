@@ -21,20 +21,32 @@ is ATOM's own code operating on those numbers.
 
 from __future__ import annotations
 
-import hashlib
 import logging
 
-import json
-import os
 from typing import Optional
 
+from atom.compass.core.loaded_input import load_json, manifest
 from atom.compass.runtime.predict import CompassPredictMixin
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["ReplayModelRunner", "TargetRecord"]
+__all__ = ["ReplayModelRunner", "TargetRecord", "TARGET_ROLE"]
 
 TARGET_VERSION = 1
+
+#: What a replay target is to a run that loads it *here*: the thing that
+#: decides the deployment's actual capacity. The source factory reads a target
+#: too, for AITER's architecture query, and records it as
+#: `oracle.replay_target`. They are different files read by different code for
+#: different purposes, and neither can stand in for the other.
+TARGET_ROLE = "runtime.replay_target"
+
+
+def _no_target(path) -> str:
+    return (f"ATOMCompass: no replay target at {path!r}. A GPU-free replay "
+            f"needs the startup answers a device would have given -- capture "
+            f"them with --compass-replay-target-out on a run of this "
+            f"configuration, or model them.")
 
 
 class TargetRecord:
@@ -45,15 +57,13 @@ class TargetRecord:
     anything that would let this become a second implementation of sizing.
     """
 
-    def __init__(self, blob: dict, source: str, *, sha256: Optional[str] = None,
-                 nbytes: Optional[int] = None) -> None:
+    def __init__(self, blob: dict, source: str, loaded=None) -> None:
         self.source = source
-        #: Digested by `load` from the bytes it parsed, and never recomputed by
-        #: re-opening the path. `replay_target` is outside the hashed oracle
-        #: options and it names a *file*: the name is not the input, and a
-        #: digest taken at report time attests to whatever is on disk then.
-        self.sha256 = sha256
-        self.bytes = nbytes
+        #: The `LoadedInput` for the bytes `load` parsed, or None for a record
+        #: built by hand. `replay_target` is outside the hashed oracle options
+        #: and it names a *file*: the name is not the input, and a digest taken
+        #: at report time attests to whatever is on disk then.
+        self.loaded_input = loaded
         self.version = int(blob.get("version") or 0)
         self.blocks: dict = dict(blob.get("blocks") or {})
         self.config: dict = dict(blob.get("config") or {})
@@ -67,19 +77,21 @@ class TargetRecord:
         self.hardware: dict = dict(blob.get("hardware") or {})
 
     @classmethod
-    def load(cls, path: str) -> "TargetRecord":
-        if not path or not os.path.exists(path):
-            raise FileNotFoundError(
-                f"ATOMCompass: no replay target at {path!r}. A GPU-free replay "
-                f"needs the startup answers a device would have given -- "
-                f"capture them with --compass-replay-target-out on a run of "
-                f"this configuration, or model them."
-            )
-        with open(path, "rb") as fh:
-            raw = fh.read()
-        blob = json.loads(raw.decode("utf-8"))
-        record = cls(blob, path, sha256=hashlib.sha256(raw).hexdigest(),
-                     nbytes=len(raw))
+    def load(cls, path: str, *, coords=None) -> "TargetRecord":
+        """Read a target, and keep the identity of the bytes that were read.
+
+        One open through the shared loader: the digest is of the same `bytes`
+        the parse ran on, so replacing the file afterwards changes neither.
+        There is no existence check before it either -- a stat and then a read
+        are two looks at the file system, and the second is the one that counts.
+        """
+        if not path:
+            raise FileNotFoundError(_no_target(path))
+        try:
+            blob, loaded = load_json(path, role=TARGET_ROLE, coords=coords)
+        except FileNotFoundError:
+            raise FileNotFoundError(_no_target(path)) from None
+        record = cls(blob, loaded.path, loaded)
         if record.version != TARGET_VERSION:
             raise ValueError(
                 f"ATOMCompass: {path} is a version {record.version} replay "
@@ -144,11 +156,23 @@ class ReplayModelRunner(CompassPredictMixin):
             )
         self.target = TargetRecord.load(getattr(compass, "replay_target", ""))
         self._check_parallel_contract(config)
-        #: Filled in by `get_num_blocks`: the sealed record of the files that
-        #: actually produced the capacity this run plans from. Kept on the
-        #: runner rather than folded into the RPC reply, because the wire form
-        #: is the engine's and provenance is not part of it.
+        #: Every artifact this runner loaded, as the shared
+        #: `atom.compass.core.loaded_input` records them: the target now, and
+        #: whatever `get_num_blocks` reads to size the pool. A tuple, and its
+        #: members are frozen, because a consumer retains this as evidence.
+        #: Kept on the runner rather than folded into the RPC reply: that wire
+        #: form is the engine's and provenance is not part of it.
+        self.loaded_inputs: tuple = (
+            (self.target.loaded_input,) if self.target.loaded_input else ())
+        #: The manifest of those inputs plus the deployment terms they were
+        #: read for. Filled in by `get_num_blocks`.
         self.compass_loaded_inputs: Optional[dict] = None
+        #: Where the budget this run actually served came from -- decided at
+        #: the branch in `get_num_blocks` that chose it, not inferred from the
+        #: flags afterwards. Never `device-measured` here: this runner has no
+        #: device, and that is the one kind final acceptance's hardware side
+        #: may treat as evidence about the card.
+        self.compass_budget_source: Optional[dict] = None
         differences = self.target.disagreements(config)
         if differences:
             logger.warning(
@@ -256,20 +280,23 @@ class ReplayModelRunner(CompassPredictMixin):
         asked to be modelled and cannot be has to stop, because the number it
         would otherwise serve is the one it was told not to use.
 
-        Either way the files that produced the answer are recorded in
-        ``compass_loaded_inputs``, digested where they were read.
+        Either way the artifacts that produced the answer are in
+        ``loaded_inputs``, digested where they were read, and the manifest of
+        them with the terms they were read for is in ``compass_loaded_inputs``.
+        ``compass_budget_source`` says which of the two branches below actually
+        served -- ``captured`` or ``source-derived`` -- because that is a fact
+        about the run and not about what the flags asked for.
         """
         from atom.compass.core.memory_blocks import (
-            LoadedInputs, derived_block_info)
+            CAPTURED, SOURCE_DERIVED, budget_source, derived_block_info)
 
-        inputs = LoadedInputs()
-        # Not a read of our own: the target was digested when it was parsed, in
-        # `TargetRecord.load`, and re-opening it here would attest to the file
-        # as it is now rather than as it was used.
-        inputs.note("replay_target", path=self.target.source,
-                    abspath=os.path.abspath(self.target.source),
-                    sha256=self.target.sha256, bytes=self.target.bytes)
-
+        # The target is already in `loaded_inputs`: it was digested in
+        # `TargetRecord.load`, where it was parsed. Re-recording it here would
+        # mean opening it again, and a second open attests to the file as it is
+        # now rather than as it was used.
+        read: list = []
+        lineage: dict = {}
+        served = False
         path = (getattr(self._compass_config, "memory_model", "") or "").strip()
         try:
             if not path:
@@ -279,15 +306,35 @@ class ReplayModelRunner(CompassPredictMixin):
                     path, self.config,
                     state_runtime=self.target.blocks.get("state_runtime"),
                     captured=self.target.blocks,
-                    inputs=inputs)
+                    # No rank coordinates on purpose. A memory profile is a
+                    # per-*width* artifact -- `profile.tp2.json` is the one for
+                    # a TP=2 deployment, not the one for rank 2 -- and the
+                    # rank-suffix convention would collide with that naming
+                    # head-on. The option names the file it means.
+                    coords=None,
+                    collect=read,
+                    lineage=lineage)
+            served = True
         finally:
-            # Published on the refusal path too. What a run that stopped had
-            # already read is evidence about the run that stopped.
-            inputs.seal()
-            self.compass_loaded_inputs = inputs.manifest(
-                **self._capacity_context(path))
-        self.compass_loaded_inputs["num_kvcache_blocks"] = int(
-            blocks.get("num_kvcache_blocks") or 0)
+            # Published on the refusal path too: what a run that stopped had
+            # already read is evidence about the run that stopped. Appended as
+            # the reads happened, so a refusal keeps its partial record.
+            self.loaded_inputs = tuple(self.loaded_inputs) + tuple(read)
+            context = self._capacity_context(path)
+            self.compass_loaded_inputs = dict(
+                manifest(self.loaded_inputs), **context)
+            count = int(blocks.get("num_kvcache_blocks") or 0) if served else None
+            self.compass_budget_source = budget_source(
+                SOURCE_DERIVED if path else CAPTURED,
+                inputs=self.loaded_inputs,
+                served=served,
+                num_kvcache_blocks=count,
+                deployment=context["deployment"],
+                # The capture's lineage is the target it came from, already in
+                # the manifest under `runtime.replay_target`; a derivation says
+                # more about itself and says it here.
+                lineage=(lineage or None) if path else None)
+        self.compass_loaded_inputs["num_kvcache_blocks"] = count
         return blocks
 
     def _capacity_context(self, memory_model: str) -> dict:
@@ -302,6 +349,10 @@ class ReplayModelRunner(CompassPredictMixin):
             "modelled": bool(memory_model),
             "memory_model": memory_model or None,
             "deployment": {
+                # The mode as well as the flags: the pair is the thing a
+                # reader has been guessing from. A measure-mode run can serve a
+                # derived budget, so neither field alone says what was served.
+                "mode": str(getattr(self._compass_config, "mode", "")),
                 "model": str(getattr(config, "model", "")),
                 "tensor_parallel_size": int(
                     getattr(config, "tensor_parallel_size", 1) or 1),
