@@ -588,6 +588,143 @@ def check_artifact_provenance(role, entry, observed_files, workload_sha, forbidd
     return bad
 
 
+#: Timing scalars a run carries as numbers rather than as files, and where
+#: each is read from in the server's own provenance.
+#:
+#: These are measurements. `seconds_per_launch` is a per-launch overhead fitted
+#: from timed steps; `admission_seconds` is the measured time a request takes
+#: to reach the point of being schedulable, which `CompassConfig` documents as
+#: a property of the machine and the process layout that has to be measured per
+#: deployment. Both go straight into a predicted duration.
+#:
+#: And both sat outside every check there was. Calibration is validated by
+#: digest and a number has no digest, so a scalar fitted to the target engine
+#: at the width being predicted -- the residual between a prediction and the
+#: run it is predicting, which is the one thing that must never be fitted --
+#: reached a verdict with nothing in the record even naming it.
+SCALAR_OVERHEADS = {
+    "seconds_per_launch": ("oracle_options", "seconds_per_launch"),
+    "admission_seconds": ("compass", "admission_seconds"),
+}
+
+
+def _scalar_value(compass: dict, where: tuple):
+    """What the server reports for one scalar, or None if it reports none."""
+    holder, name = where
+    found = compass if holder == "compass" else (compass.get(holder) or {})
+    if not isinstance(found, dict) or name not in found:
+        return None
+    return found[name]
+
+
+def check_scalar_overheads(
+    modelled, registry: dict, tp: int, workload_sha: str, forbidden: dict
+) -> list[str]:
+    """Every nonzero timing scalar, against a declaration that states its value.
+
+    Zero is exempt, explicitly and by name. It is the documented default of
+    both of these and it means "this run claims no such term": there is no
+    measurement to attribute, and demanding a declaration for the absence of a
+    term would refuse every run that never used one.
+
+    A nonzero value is a number somebody measured, so it is held to what every
+    other measured input is held to. It must appear in the registry as an
+    `overhead_constant` carrying that exact value -- not a range and not a
+    rounding, because a constant that has to be matched approximately is a
+    constant nobody can check -- and that declaration is then read like any
+    other: sources and code named, not from the target engine, not measured at
+    the width being predicted, not produced from the acceptance workload or
+    from this cell's own measured side.
+
+    That last group is the point. A scalar fitted to the target engine is a
+    residual, and a residual added to a prediction makes the prediction agree
+    with the run it is predicting by construction.
+    """
+    bad = []
+    compass = (modelled.manifest.get("server") or {}).get("compass") or {}
+    declared = [
+        entry
+        for entry in (registry.get("artifacts") or [])
+        if isinstance(entry, dict) and entry.get("kind") == "overhead_constant"
+    ]
+    for name, where in sorted(SCALAR_OVERHEADS.items()):
+        raw = _scalar_value(compass, where)
+        if raw is None:
+            continue
+        try:
+            value = float(raw)
+        except (TypeError, ValueError):
+            bad.append(
+                f"{name}={raw!r} is not a number, so what the predictor added "
+                f"is unknown"
+            )
+            continue
+        if not _finite(value):
+            bad.append(f"{name}={raw!r} is not finite")
+            continue
+        if value == 0.0:
+            # Exempt, and explicitly not "unchecked": a zero term contributes
+            # nothing to the prediction, so there is no measurement behind it
+            # to attribute.
+            continue
+        # Both, and neither on its own. The value alone does not bind: an
+        # anonymous constant that happens to carry the same number is a
+        # measurement of something else in different units, and letting it
+        # answer here would attribute a per-launch overhead to whatever was
+        # nearest. The name alone does not bind either -- that is the
+        # declaration agreeing with itself. There are no completed acceptance
+        # cells to grandfather, so there is no anonymous form to accept.
+        named = [
+            entry
+            for entry in declared
+            if entry.get("option") == name
+            and _finite(entry.get("value"))
+            and float(entry["value"]) == value
+        ]
+        if not named:
+            said = sorted(
+                f"{entry.get('option')!r}={entry.get('value')!r}"
+                for entry in declared
+            )
+            bad.append(
+                f"the modelled server ran with {name}={value!r} and the "
+                f"calibration registry declares no overhead_constant naming "
+                f"that option at that value (it declares {said or 'none'}): a "
+                f"number that goes straight into the predicted duration is "
+                f"attributed to nothing, and a digest check cannot see it "
+                f"because a number has no digest"
+            )
+            continue
+        entry = named[0]
+        tag = f"{name}={value!r}"
+        at = entry.get("measured_at_tp")
+        if at not in (None, SOURCE_TP):
+            bad.append(
+                f"{tag} is declared measured at TP={at}, but an overhead "
+                f"constant may only be a source at TP={SOURCE_TP}; at TP={tp} "
+                f"this is the width being predicted"
+            )
+        if entry.get("from_target_engine"):
+            bad.append(
+                f"{tag} declares it came from the target engine: a scalar "
+                f"fitted there is the residual between the prediction and the "
+                f"run it is predicting"
+            )
+        if entry.get("workload_sha256") == workload_sha:
+            bad.append(
+                f"{tag} was produced from the acceptance workload itself, so "
+                f"the predictor was fitted to the run it is predicting"
+            )
+        for what, forbidden_sha in forbidden.items():
+            if forbidden_sha and entry.get("sha256") == forbidden_sha:
+                bad.append(
+                    f"{tag} is this cell's own {what}: the predictor was "
+                    f"fitted to the measurement it is predicting"
+                )
+        bad += check_artifact_provenance(tag, entry, {}, workload_sha, forbidden)
+    return bad
+
+
 def check_calibration(
     modelled, registry: dict, tp: int, workload_sha: str, forbidden: dict
 ) -> list[str]:
@@ -1590,6 +1727,12 @@ def cell(args) -> int:
             failures += [
                 f"repeat {index}: {reason}"
                 for reason in check_calibration(
+                    modelled, registry, args.tp, workload_sha, forbidden
+                )
+            ]
+            failures += [
+                f"repeat {index}: {reason}"
+                for reason in check_scalar_overheads(
                     modelled, registry, args.tp, workload_sha, forbidden
                 )
             ]
