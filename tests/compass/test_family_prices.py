@@ -488,3 +488,136 @@ def test_a_switched_bracket_is_counted_refused_and_not_interpolated(tmp_path):
     reason = coverage.reasons["aiter::gemm_a16w16"]
     assert "same kernel" in reason
     assert "MT64x16x256" in reason and "MT128x32x128" in reason
+
+
+# -- the width an observation is filed at -------------------------------------
+#
+# A price file states one width for the whole file. In the body that is also
+# the width every operator in it ran at. In the head it is not: the graph is
+# traced over the hidden state handed to `compute_logits`, and the LM-head
+# GEMM runs after that state has been narrowed to one row per request.
+
+
+def head_gemm(rows: int) -> dict:
+    """The LM-head GEMM as run 5 executed it: (M, 5120) x (vocab, 5120)."""
+    return {
+        "name": "aiter::gemm_a16w16",
+        "input_shapes": [[rows, 5120], [248320, 5120]],
+        "dtypes": ["bfloat16", "bfloat16"],
+        "scalars": [["#2", "None"]],
+    }
+
+
+def _head_file(library, tmp_path, rows: int, seconds: float, traced=None):
+    """One head price file: a GEMM at `rows`, in a graph traced at `traced`."""
+    from atom.compass.runtime.microbench import signature_of
+
+    op = head_gemm(rows)
+    graph = {"ops": [op]}
+    if traced is not None:
+        graph["provenance"] = {"execution": {"body_rows_traced": traced}}
+    prices = {"prices": {signature_of(op): {
+        "seconds": seconds, "kernels": {"k": seconds},
+        "occurrences": 1, "name": op["name"]}}}
+    gpath = tmp_path / f"hg{rows}.json"
+    ppath = tmp_path / f"hp{rows}.json"
+    gpath.write_text(json.dumps(graph))
+    ppath.write_text(json.dumps(prices))
+    library.add(str(ppath), str(gpath))
+    return str(gpath)
+
+
+def test_a_declared_family_reads_its_width_off_its_own_operator():
+    from atom.compass.core.cost.families.features import executed_rows
+
+    assert executed_rows(head_gemm(2)) == 2
+    assert executed_rows(gemm(640)) == 640
+
+
+def test_a_family_with_no_declared_reading_says_so_rather_than_guessing():
+    from atom.compass.core.cost.families.features import executed_rows
+
+    # `aten::view` carries no operand that says which dimension the batch is,
+    # which is why the reading is declared per family instead of assumed to be
+    # operand 0 dimension 0 everywhere.
+    assert executed_rows({"name": "aten::view",
+                          "input_shapes": [[32, 17408]]}) is None
+
+
+def test_the_head_gemm_is_filed_at_the_rows_it_ran_not_the_rows_traced(
+        tmp_path):
+    """The whole point: 2 rows of work must not join the 16384-row curve.
+
+    Both files below are traced over the full hidden height, because that is
+    what a head graph is traced over. Their GEMMs ran at 1 and 2 rows.
+    """
+    library = ParametricPriceLibrary(max_gap_ratio=2.0)
+    _head_file(library, tmp_path, 1, 1e-4, traced=16384)
+    _head_file(library, tmp_path, 2, 2e-4, traced=16384)
+    _head_file(library, tmp_path, 4, 4e-4, traced=16384)
+
+    # Asked at a width no file holds, so the answer can only come from the
+    # curve, and the curve names the widths it was built from. Those are the
+    # widths the GEMMs ran at, not the height the graphs were traced over.
+    record, source = library.lookup(head_gemm(3))
+    assert record is not None, source
+    assert record["interpolation"]["measured_rows"] == [1, 2, 4]
+    assert record["interpolation"]["rows"] == 3
+
+    # And the width the files state is outside that range entirely, so it is
+    # refused rather than answered from these three.
+    record, why = library.lookup(head_gemm(16384))
+    assert record is None
+    assert "outside the measured range" in why
+
+
+def test_a_graph_stating_no_width_of_its_own_is_still_read_per_operator(
+        tmp_path):
+    """A head graph has no embedding and no `body_rows_traced`.
+
+    Before the width was read off the operator this ended the file's
+    usefulness, which is why every head price file in run 5 was
+    exact-signature only and the M=2 step refused with "no entry for this
+    signature".
+    """
+    library = ParametricPriceLibrary(max_gap_ratio=2.0)
+    graph = _head_file(library, tmp_path, 1, 1e-4)
+    _head_file(library, tmp_path, 2, 2e-4)
+
+    assert graph in "".join(library.no_file_width.values())
+    assert graph not in "".join(library.unbuildable.values())
+    record, source = library.lookup(head_gemm(2))
+    assert record is not None, source
+    assert record["seconds"] == 2e-4
+
+
+def test_the_head_metadata_operators_have_contracts_and_the_slice_does_not():
+    """Three operators ran beside the head GEMM and they are not one case.
+
+    The gather and the subtraction are row-linear in the number of requests
+    selected, and were measured at 4.3e-06 s and 2.0e-06 s at M=2 -- small,
+    and not zero. The slice is affine: its operand is the cumulative offset
+    vector, whose length is requests + 1, so no row count makes two of its
+    widths the same operator and a "rows" contract would be a false
+    declaration.
+    """
+    assert contract_for("aten::sub.Tensor").kind == "rows"
+    assert contract_for("aten::index.Tensor").kind == "rows"
+    assert contract_for("aten::slice.Tensor") is None
+
+
+def test_the_gather_is_not_answered_across_the_height_it_gathers_from():
+    """`aten::index` has a second dimension and it is not collapsed.
+
+    The selected count is the width; the height selected FROM stays part of
+    the key. A measurement that gathered 2 rows out of 640 does not answer a
+    request that gathers 2 out of 16384 -- that would be a claim about the
+    source height nobody has measured at a fixed width.
+    """
+    def gather(selected: int, height: int) -> dict:
+        return {"name": "aten::index.Tensor",
+                "input_shapes": [[height, 5120], [selected]],
+                "dtypes": ["bfloat16", "int32"]}
+
+    assert infer_rows(gather(2, 16384), gather(1, 16384), 1) == 2
+    assert infer_rows(gather(2, 16384), gather(2, 640), 2) is None

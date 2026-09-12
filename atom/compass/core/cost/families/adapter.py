@@ -63,6 +63,7 @@ from typing import Optional
 from atom.compass.core.cost.families.features import (
     contract_for,
     grouping_key,
+    executed_rows,
     infer_rows,
 )
 from atom.compass.core.cost.families.support import (
@@ -147,8 +148,9 @@ class ParametricPriceLibrary(PriceLibrary):
         #: file gives a signature string; the structured operator is what a
         #: feature map can be read off, and only a graph supplies it.
         self._ops: dict[str, dict] = {}
-        #: price file -> the row count that run was measured at
-        self._rows: dict[str, int] = {}
+        #: price file -> the row count that run was measured at, or None when
+        #: the file states no width of its own and its operators must
+        self._rows: dict[str, Optional[int]] = {}
         #: price file -> {signature -> the operator THAT file's graph recorded}
         #: Needed beside `_ops` because a key does not carry layout: two
         #: files can price the same key on differently arranged memory, and
@@ -162,6 +164,13 @@ class ParametricPriceLibrary(PriceLibrary):
         #: price file -> (executed rows, scheduled tokens) where a capture
         #: bucket makes the two differ, so the padding stays visible
         self.padded: dict[str, tuple[int, int]] = {}
+        #: price file -> why it states no width of its own, when it does not.
+        #: Not the same as `unbuildable`: a head graph has no embedding and no
+        #: `body_rows_traced`, so it states no file width at all, and yet every
+        #: operator in it whose family declares `rows_from` still says what
+        #: width IT ran at. Those files are usable per operator and refused
+        #: only for the families that have no such reading.
+        self.no_file_width: dict[str, str] = {}
 
     # -- assembly -------------------------------------------------------
 
@@ -192,14 +201,23 @@ class ParametricPriceLibrary(PriceLibrary):
             return
         reading = _traced_rows(graph)
         if isinstance(reading, tuple):
-            self.unbuildable[price_path] = f"{graph_path}: {reading[1]}"
-            return
-        rows = reading
-        scheduled = sum((graph.get("key") or {}).get("batch_signature") or ())
-        if scheduled and scheduled != rows:
-            # Legitimate under a capture bucket, and worth saying out loud: the
-            # prices are of the padded width, not of the scheduled one.
-            self.padded[price_path] = (rows, scheduled)
+            # No width for the file as a whole. That used to end the file's
+            # usefulness, which is why every head price file was exact-key
+            # only: a head graph carries neither an embedding nor
+            # `body_rows_traced`, so it could never state one. It is only fatal
+            # for families that have no operand reading of their own; the
+            # operators that do are still measurements of a known width, and
+            # `_build` reads them one at a time below.
+            rows = None
+            self.no_file_width[price_path] = f"{graph_path}: {reading[1]}"
+        else:
+            rows = reading
+            scheduled = sum((graph.get("key") or {}).get("batch_signature")
+                            or ())
+            if scheduled and scheduled != rows:
+                # Legitimate under a capture bucket, and worth saying out loud:
+                # the prices are of the padded width, not of the scheduled one.
+                self.padded[price_path] = (rows, scheduled)
         self._rows[price_path] = rows
         from atom.compass.runtime.microbench import cost_key_of, signature_of
 
@@ -267,7 +285,23 @@ class ParametricPriceLibrary(PriceLibrary):
                 contract = contract_for(op.get("name", ""))
                 if contract is None or contract.kind != "rows":
                     continue
-                rows = self._rows.get(source)
+                # The width this observation is a measurement OF. Read off the
+                # operator first where its family declares where to look,
+                # because the two readings are not the same number in the head
+                # region: a head graph traced over 16384 hidden rows contains
+                # an LM-head GEMM that ran at the request count, because
+                # `compute_logits` selects each request's last token before
+                # multiplying. Filing that GEMM at 16384 rows would put a
+                # measurement of 2 rows of work on the 16384-row curve.
+                #
+                # For families with no declared reading the file's width is
+                # still the only statement available, and it is used unchanged
+                # -- this is a per-family refinement, not a new default. On the
+                # existing library the two agree wherever both exist: 40 of 40
+                # `gemm_a16w16` observations in run 5's price list.
+                rows = executed_rows(op)
+                if rows is None:
+                    rows = self._rows.get(source)
                 seconds = record.get("seconds")
                 if rows is None or seconds is None:
                     continue
@@ -423,6 +457,9 @@ class ParametricPriceLibrary(PriceLibrary):
                 f"max gap ratio {self.max_gap_ratio}")
         if self.unbuildable:
             note += f"; {len(self.unbuildable)} file(s) exact-signature only"
+        if self.no_file_width:
+            note += (f"; {len(self.no_file_width)} file(s) state no width of "
+                     "their own and are read per operator")
         return base + note
 
 

@@ -63,6 +63,7 @@ __all__ = [
     "aligns",
     "contract_for",
     "grouping_key",
+    "executed_rows",
     "row_features",
 ]
 
@@ -107,6 +108,11 @@ class FamilyContract:
     kind: str
     #: components the price is declared independent of
     nuisances: tuple[Nuisance, ...] = ()
+    #: where this family's executed width is read off its own operator, as
+    #: ``(operand position, dimension)``. ``None`` leaves the width to the file
+    #: the measurement came from, which is what every family did before the
+    #: head region needed otherwise. See :func:`executed_rows`.
+    rows_from: Optional[tuple[int, int]] = None
     #: why this family is parameterised the way it is
     rationale: str = ""
 
@@ -199,15 +205,63 @@ _ROW_FAMILIES = (
     "aten::view",
 )
 
+#: Where each row family's executed width is read off its own operator. Absent
+#: means "the file's width", which is what every family used before the head
+#: region showed the two can differ. Each entry here is a checked reading, not
+#: a convention -- see :func:`executed_rows` for the counts.
+_ROWS_FROM: dict[str, tuple[int, int]] = {
+    "aiter::gemm_a16w16": (0, 0),
+    "aten::embedding": (1, 0),
+}
+
 FAMILY_CONTRACTS: dict[str, FamilyContract] = {
     name: FamilyContract(
         family=name,
         kind="rows",
+        rows_from=_ROWS_FROM.get(name),
         rationale=("key carries shapes, dtypes and architectural scalars only; "
                    "token rows is the sole component that moves between steps"),
     )
     for name in _ROW_FAMILIES
 }
+
+# The two head metadata operators. Both ran in run 5's head graph, both were
+# refused with "has no declared family contract", and neither is free: the
+# gather is 4.3e-06 s and the subtraction 2.0e-06 s at M=2, measured on the
+# standalone head grid. Declaring them is what lets a head step be priced
+# without treating a gather as zero.
+FAMILY_CONTRACTS["aten::sub.Tensor"] = FamilyContract(
+    family="aten::sub.Tensor",
+    kind="rows",
+    rows_from=(0, 0),
+    rationale=("elementwise over the selected last-token indices; operand 0 is "
+               "that index vector, so its length is the executed width"),
+)
+
+# The gather that selects the last token of each request out of the hidden
+# state. Its width is the number selected -- operand 1's length -- while the
+# height it selects FROM is operand 0 dimension 0 and is a second independent
+# dimension. That height stays an exact-match component of the grouping key,
+# so this contract makes no claim across it: a request gathering 2 rows out of
+# 16384 is not answered from a measurement that gathered 2 out of 640. The
+# standalone grid measured both heights so the claim can be checked later
+# rather than assumed now.
+FAMILY_CONTRACTS["aten::index.Tensor"] = FamilyContract(
+    family="aten::index.Tensor",
+    kind="rows",
+    rows_from=(1, 0),
+    rationale=("gathers operand 1's rows out of operand 0; the selected count "
+               "is the width and the source height stays exact-match"),
+)
+
+# `aten::slice.Tensor` is deliberately absent. Its operand is the cumulative
+# sequence-offset vector, whose length is requests + 1: affine in the width,
+# not a multiple of it, so `aligns` cannot recognise two of its widths as the
+# same operator and a "rows" contract would be a false declaration. It was
+# measured at 9.3e-08 s, flat across the whole M ladder, so it is small -- but
+# small is not zero, and no operator-level "views are free" rule exists. It
+# stays refused until either a structural zero-work rule covers it or an affine
+# family kind exists to hold it.
 
 FAMILY_CONTRACTS["aiter::unified_attention_with_output_base"] = FamilyContract(
     family="aiter::unified_attention_with_output_base",
@@ -228,6 +282,64 @@ FAMILY_CONTRACTS["aiter::linear_attention_with_output_base"] = FamilyContract(
                "the query start offsets; the prefill/decode split is part of "
                "the feature, not a nuisance"),
 )
+
+
+
+
+def executed_rows(op: dict) -> Optional[int]:
+    """The width THIS operator ran at, read off the operator itself.
+
+    A file-level width answers "how many rows did the step this measurement
+    came from schedule". For most families that is also the width every
+    operator in the file ran at, and reading it once per file is both cheaper
+    and the only reading available -- an ``aten::view`` carries no operand that
+    says which of its dimensions the batch is.
+
+    The head region is where the two readings part company. A head graph is
+    traced over the hidden state handed to ``compute_logits`` -- 16384 rows at
+    the 16384-token prefill -- but ``compute_logits`` first selects the last
+    token of each request, so the LM-head GEMM runs at the *request* count.
+    Run 5 executed ``[2,5120] x [248320,5120]``: M=2 inside a file whose
+    traced width is 16384. Pricing that GEMM as a 16384-row measurement is not
+    an approximation, it is a measurement of different work.
+
+    So the reading is declared per family rather than inferred, and only where
+    the operand position carrying the width is known:
+
+    * ``aiter::gemm_a16w16`` -- operand 0, dimension 0 is M. Checked against
+      every existing measurement: on the 40 ``gemm_a16w16`` observations in the
+      run-5 price list this reading reproduces the file width 40 times and
+      disagrees 0 times, so declaring it changes no price already taken.
+    * ``aten::embedding`` -- operand 1, dimension 0 is the token index, which
+      is the same tensor ``_traced_rows`` reads the file width from. Declaring
+      it is a restatement, not a new claim.
+    * ``aten::sub.Tensor`` and ``aten::index.Tensor`` -- the two head metadata
+      operators whose width is the request count. Neither had a contract at
+      all, so both refused with "no declared family contract" however the
+      library was built.
+
+    Every other family keeps ``rows_from=None`` deliberately. The same check
+    that licenses the GEMM refuses a blanket rule: reading operand 0 dimension
+    0 on ``aten::embedding`` hits the weight table (0 of 8 agree), on
+    ``aten::min`` 0 of 8, on ``aten::empty.memory_format`` 0 of 9, on
+    ``aten::reshape`` 8 of 16. A global "rows are operand 0 dimension 0" would
+    silently refile two thirds of the existing library.
+
+    ``None`` when the family declares no reading, or when the operator does not
+    carry the declared position.
+    """
+    contract = contract_for(op.get("name", ""))
+    if contract is None or contract.rows_from is None:
+        return None
+    position, dimension = contract.rows_from
+    shapes = op.get("input_shapes") or ()
+    if position >= len(shapes):
+        return None
+    shape = shapes[position]
+    if dimension >= len(shape):
+        return None
+    rows = int(shape[dimension])
+    return rows if rows > 0 else None
 
 
 def contract_for(family: str) -> Optional[FamilyContract]:
