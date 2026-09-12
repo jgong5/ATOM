@@ -7,15 +7,21 @@ saved inside a larger artifact. So the question this answers is whether the
 object we already save is the object that parser already accepts -- and if it
 is, no writer and no second schema is needed, only a selector.
 
-Nothing here is projected or reshaped. The record comes from the real replay
-runner, travels through the real endpoint, is written by the real
-`SideRun._check_provenance`, is read back off disk, and the budget object is
-handed to the parser **unchanged**. A local projection of the object would
-prove only that this test can build one.
+The record comes from the real replay runner, travels through the real
+endpoint, is written by the real `SideRun._check_provenance`, is read back off
+disk, and the budget object is handed to the parser **unchanged**.
 
-The parser is the pinned 99e3943a copy, staged read-only under agent_scratch.
-No MEMORY code is edited, and the copy is not on the import path of anything
-else.
+Writing that object out to its own file is a projection -- it is a new local
+file. What it is not is a new *schema*: the bytes are the record as saved,
+under `compass.memory.budget_source/1`, with no field added, renamed or
+computed. Building the object here instead would prove only that this test can
+build one, which is why it is extracted rather than constructed.
+
+The parser is `scripts/compass/validate_memory.py` from this tree, so that
+after integration this exercises the gate that actually runs and notices
+producer/consumer drift. `ATOMCOMPASS_MEMVAL_PARSER` points it at another copy
+for the pinned cross-branch check -- that override is this task's, not a
+supported knob. Either way no MEMORY code is edited.
 """
 
 import importlib.util
@@ -32,22 +38,39 @@ from . import test_replay_memory as mem
 
 validate = base.validate
 
-#: The pinned parser, staged beside this worktree rather than vendored.
-PARSER = (Path(__file__).resolve().parents[2] / "agent_scratch"
-          / "memval_bridge" / "validate_memory_99e3943a.py")
+#: This tree's own memory validator. The default on purpose: a bridge test
+#: pinned to a copy under `agent_scratch` would pass for ever without ever
+#: reading the gate that runs, and producer/consumer drift is exactly what it
+#: exists to catch.
+PARSER = (Path(__file__).resolve().parents[2] / "scripts" / "compass"
+          / "validate_memory.py")
+
+#: Point this at another checkout's `validate_memory.py` to run the same
+#: bridge against it -- the pinned cross-branch check this task needed. Not a
+#: supported setting; it exists so a cross-branch verification does not have
+#: to be done by editing the test.
+PARSER_ENV = "ATOMCOMPASS_MEMVAL_PARSER"
 
 
 @pytest.fixture(scope="module")
 def memval():
-    if not PARSER.exists():
-        pytest.skip(f"{PARSER} is not staged here")
-    spec = importlib.util.spec_from_file_location("memval_99e3943a", PARSER)
+    """The parser, imported for real.
+
+    The only skip is the one case that is a fact about the checkout rather
+    than about the code: a `validate_memory.py` predating
+    `profile_from_budget_source` has nothing for this to test. An import error
+    in a parser that *is* there is a failure -- swallowing it would turn a
+    broken gate into a green run.
+    """
+    where = Path(os.environ.get(PARSER_ENV) or PARSER)
+    if not where.exists():
+        pytest.skip(f"{where} is not present in this checkout")
+    spec = importlib.util.spec_from_file_location("memval_under_test", where)
     module = importlib.util.module_from_spec(spec)
     sys.modules[spec.name] = module
-    try:
-        spec.loader.exec_module(module)
-    except Exception as exc:  # noqa: BLE001 - environment-dependent
-        pytest.skip(f"the pinned validator does not import here: {exc}")
+    spec.loader.exec_module(module)
+    if not hasattr(module, "profile_from_budget_source"):
+        pytest.skip(f"{where} predates profile_from_budget_source")
     return module
 
 
