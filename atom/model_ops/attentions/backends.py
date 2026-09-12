@@ -426,11 +426,32 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
         batch: ScheduledBatch,
         context_lens: np.ndarray,
         max_seqlen_q: int,
+        bs: int,
     ) -> torch.Tensor | None:
+        """Pack the decode step's M-RoPE positions at the width they are read.
+
+        `bs` is the padded row count -- `running_bs` under cudagraph, the
+        scheduled count when eager -- and not the scheduled one, because the
+        buffer is read at a stride rather than as a contiguous prefix.
+        `_mrope_positions_view(n)` strides the flat buffer by `n`
+        (model_runner.py:1454-1457), and the capture took that view at
+        `running_bs * max_seqlen_q` (:4194, :4230), which is the layout a
+        replay reads (:3233) and the piecewise path rebuilds (:3205).
+        Packing three sections of the *scheduled* width leaves section one
+        starting where the graph expects section zero to end: at three rows
+        into a bucket of four the graph reads each section rotated by one,
+        so every section but the first carries another section's positions.
+
+        The 1-D tensors do not have this problem -- a short write leaves a
+        stale tail but never moves a real value -- which is why it survived
+        here. `input_ids` already pads to the captured bucket for the same
+        reason (model_runner.py:583-600).
+        """
         if not getattr(self.model_runner, "use_mrope", False):
             return None
 
-        total_tokens = batch.total_tokens_num_decode
+        scheduled_tokens = batch.total_tokens_num_decode
+        total_tokens = max(scheduled_tokens, bs * max_seqlen_q)
         positions = self._mrope_cpu_view(total_tokens)
         offset = 0
         for req_id, context_len in zip(batch.req_ids, context_lens):
@@ -443,6 +464,12 @@ class CommonAttentionBuilder(AttentionMetadataBuilder[T], Generic[T]):
                 base = np.arange(start + int(delta), stop + int(delta), dtype=np.int64)
             positions[:, offset : offset + max_seqlen_q] = base[None, :]
             offset += max_seqlen_q
+        # Zero, a legal position, in every section's tail. Attention never
+        # walks these rows -- cu_seqlens_q repeats its last offset so they are
+        # empty sequences -- but the rotary embedding and the MoE path do read
+        # them, and whatever the previous step left there is not a position.
+        if total_tokens > offset:
+            positions[:, offset:total_tokens] = 0
 
         return self._copy_mrope_to_gpu(total_tokens)
 

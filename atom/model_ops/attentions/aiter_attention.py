@@ -1172,7 +1172,7 @@ class AiterAttentionMetadataBuilder(CommonAttentionBuilder):
                 max_query_len=int(max_seqlen_q),
             )
         mrope_positions = self._build_mrope_decode_positions(
-            batch, context_lens, max_seqlen_q
+            batch, context_lens, max_seqlen_q, bs
         )
         if mrope_positions is not None:
             positions = mrope_positions
