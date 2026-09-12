@@ -794,7 +794,8 @@ def build_source_oracle(
     is reported at build time rather than as a hundred identical misses later.
     """
     from atom.compass.core.cost.library import LibraryCostOracle
-    from atom.compass.core.cost.regions import region_model
+    from atom.compass.core.cost.regions import (region_model,
+                                                wide_tp_precondition)
     from atom.compass.runtime.templates import (CarriedAllocation,
                                                  NativeAllocation)
 
@@ -823,6 +824,16 @@ def build_source_oracle(
     library = _price_library(price_entries, gap_ratio(interpolate), coords,
                              attention_scope)
     regions_model = region_model(regions)
+    # A preset declared above TP1 carries an argument about which of the
+    # runner's preparation branches this deployment takes, and one of those
+    # branches is selected by the block size rather than by the step. The
+    # shape a region model is later handed does not carry a block size, so
+    # this is the only place the pairing can be checked -- and a preset used
+    # outside the configuration its transfer was argued for is a wrong number,
+    # not a missing one.
+    why = wide_tp_precondition(regions_model, tp, block_size)
+    if why is not None:
+        raise ValueError(why)
     # Immediately, off the object just selected -- not from the name again.
     regions_taken = region_snapshot(regions, regions_model)
     rank_artifacts = _rank_artifacts(

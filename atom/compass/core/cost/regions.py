@@ -1252,6 +1252,103 @@ SOURCE_27B_TP1_PREFILL_INTERP = BucketedRunnerRegions(
 #: Below 1536 tokens and above 16384 the pooled group refuses, as it should:
 #: 16384 is the token budget, so no step exceeds it, and nothing multi-sequence
 #: shorter than 1536 was measured.
+#:
+#: THE DECLARED WIDTHS, 2026-09-13. This profile shipped saying `topologies=(1,)`
+#: while carrying its decode, broadcast and scalar prefill terms from
+#: `SOURCE_27B_TP1_CONC_V2`, which says `(1, 2, 4)` -- and says it over prefill
+#: terms measured at TP1 too, carried in turn from `SOURCE_27B_TP1`. So the
+#: narrowing was not a stronger claim about where these seconds hold; it was
+#: the prefill-era descendants dropping their parents' declaration while
+#: inheriting their numbers. The cost of that was real: the TP2 and TP4 cells
+#: of the client matrix had to pass `regions=none`, which does not widen a
+#: prediction, it drops preparation and postprocess out of it and leaves body
+#: plus head. The declaration is now carried from the parent like every other
+#: transferred field, and `version` moves with it so a run stamped against the
+#: old declaration is not confusable with one stamped against this.
+#:
+#: **No coefficient changed.** Every cell, anchor, band and sample count below
+#: is what it was; at TP1 this profile answers exactly what `prefill-seqs-
+#: 2026-09-12` answered. What changed is which widths it will answer for, and
+#: `region_snapshot` digests the domain along with the numbers, so the change
+#: is visible in the digest rather than silent.
+#:
+#: WHY THE TRANSFER HOLDS HERE. Not a claim that runner regions are
+#: width-insensitive in general. A claim that on THIS engine at THIS
+#: configuration, the code `prepare_model` and `postprocess` execute is the
+#: same code over the same shapes at every width, plus one collective that was
+#: measured separately. Read off the source, not fitted:
+#:
+#: 1. **The runner has exactly two TP-conditional statements outside the
+#:    model.** `get_tp_group()` appears in the forward path at
+#:    model_runner.py:3309-3312, the broadcast of the sampled ids, and at
+#:    :3323-3324, a second broadcast taken only when a request asked for
+#:    logprobs. There is no third, and `prepare_model` contains none.
+#:
+#: 2. **Postprocess sees full-width logits at every TP.** `ParallelLMHead`
+#:    shards the vocabulary and all-gathers it back inside `compute_logits`
+#:    (embed_head.py:255-257), and the shard divides exactly --
+#:    `assert num_embeddings % self.tp_size == 0` (embed_head.py:150) with
+#:    `num_embeddings = config.vocab_size`, unpadded (qwen3_5.py:522). The
+#:    sampler's `[sequences, vocab]` input is therefore identically shaped at
+#:    TP1, TP2 and TP4. The all-gather itself is inside `run_model`, so it is
+#:    the head's cost and not a region's; `LibraryCostOracle.estimate` merges
+#:    head coverage into the step's, so an unpriced all-gather makes the step
+#:    incomplete rather than silently free.
+#:
+#: 3. **Preparation is sized by the batch and by configuration constants.**
+#:    `prepare_sample` writes `[bs]` rows (model_runner.py:2726-2772);
+#:    `block_table_cols` is `max_num_blocks_per_seq // block_ratio`, from
+#:    `max_model_len` and `block_size` (backends.py:341); `pack_rows` writes
+#:    one row per sequence. None of them carries a width.
+#:
+#: 4. **The builder's one per-rank head count does no per-step work here.**
+#:    `CommonAttentionBuilder.num_attention_heads` is `heads // world_size`
+#:    (backends.py:346) and gates eagle's mid-step path; this deployment has
+#:    no drafter.
+#:
+#: 5. **The one genuinely width-sized preparation term is off this
+#:    configuration's path.** See `KV_HEAD_SIZED_PREPARE_BLOCK_SIZES`:
+#:    `block_size=16` never calls it, and `wide_tp_precondition` refuses a
+#:    build that pairs this profile with a block size that would. That is the
+#:    one material width-sensitive term found in preparation, and it is
+#:    excluded by configuration rather than by argument.
+#:
+#: 6. **The cross-rank collectives in preparation are DP's, not TP's.**
+#:    `_preprocess` gates its packed all_gather on `data_parallel_size`,
+#:    `enable_tbo` and `prefill_context_parallel_size`
+#:    (model_runner.py:2140-2180), all 1 here.
+#:
+#: WHAT IS ADDED AT TP>1: `tp_broadcast`, the collective of point 1, carried
+#: from `SOURCE_27B_TP1` where it was measured by
+#: `agent_scratch/g4/bcast_probe.py` as a standalone primitive on the real two-
+#: and four-rank groups (26.5-29.0 us, flat across 1-32 sequences, both
+#: dtypes, both widths). `_parts` charges it only when the step samples a
+#: token, so a middle chunk of a chunked prefill is not billed a collective it
+#: never runs. Nothing else is scaled by the width; no number here is fitted
+#: to any TP2 or TP4 engine observation.
+#:
+#: DECLARED LIMITATIONS, none of them closed by this change:
+#:
+#: * **Inter-rank skew is not modelled.** Preparation here is
+#:   `seconds - run_model - postprocess` from a TP1 capture, where there was
+#:   no peer to wait for. At TP>1 a rank reaching the body's first collective
+#:   early waits there, and that wait lands inside `run_model` -- the body's
+#:   span, not a region's. This profile neither models nor claims it;
+#:   `rank_aggregation="slowest"` is what the step-level answer leans on.
+#: * **Process control is outside this span entirely.** At TP>1 the engine
+#:   core dispatches a step through `rpc_broadcast_mq.enqueue`
+#:   (async_proc.py:429) and the writer waits until `read_count == n_reader`,
+#:   `n_reader` being the width (aiter `shm_broadcast.acquire_write`). That is
+#:   host-side and outside `ModelRunner.forward`, so it is neither included
+#:   here nor double-counted -- it is an unmeasured term of the served step,
+#:   reported as such rather than folded into a region. Measuring it is a
+#:   standalone primitive campaign, to be coordinated rather than assumed.
+#: * **Logprobs are out of scope.** The second broadcast of point 1 fires when
+#:   any request asks for logprobs. The captures requested none and neither
+#:   does the acceptance protocol, so nothing here measures it.
+#: * **Every bound above still binds at every width**: `waiting=0` steps,
+#:   decode histories 1025..1152 tokens, the pooled 3..32-sequence prefill
+#:   group on the token axis, captured replays only.
 SOURCE_27B_TP1_PREFILL_SEQS = BucketedRunnerRegions(
     postprocess_decode=SOURCE_27B_TP1_CONC_V2.postprocess_decode,
     prepare_decode_cells=SOURCE_27B_TP1_CONC_V2.prepare_decode_cells,
@@ -1344,9 +1441,13 @@ SOURCE_27B_TP1_PREFILL_SEQS = BucketedRunnerRegions(
     decode_context=SOURCE_27B_TP1_CONC_V2.decode_context,
     prefill_sequences=(1, 2),
     prefill_tokens=(640, 16384),
-    topologies=(1,),
+    # Carried from the parent, like the decode cells and the broadcast above.
+    # See "THE DECLARED WIDTHS" in the note: the numbers under this are the
+    # same numbers, and what licenses them at 2 and 4 is a source-code
+    # argument plus the separately measured broadcast, not a fit.
+    topologies=SOURCE_27B_TP1_CONC_V2.topologies,
     capture_sizes=SOURCE_27B_TP1_CONC_V2.capture_sizes,
-    version="prefill-seqs-2026-09-12",
+    version="prefill-seqs-2026-09-13",
     provenance="source-27b-tp1-prefill-interp unchanged, plus the retained "
                "rows of pricing_coverage/regiongaps and "
                "pricing_coverage/regionseqs as one pooled 3..32-sequence "
@@ -1356,8 +1457,74 @@ SOURCE_27B_TP1_PREFILL_SEQS = BucketedRunnerRegions(
                "agent_scratch/stage/multiseq_anchors.py. g4/cap_conc rows "
                "above four sequences are excluded as a separate cached "
                "population, not pooled. Steps scheduled with waiting=0 only. "
-               "TP1 only",
+               "Every coefficient measured at TP1; declared for tp 1, 2 and 4 "
+               "as SOURCE_27B_TP1 and source-27b-tp1-conc-v2 already are, on "
+               "the source-code argument in the note above (the runner's only "
+               "TP-conditional statements outside the model are "
+               "model_runner.py:3309-3312 and :3323-3324; compute_logits "
+               "all-gathers the vocabulary shards back to config.vocab_size "
+               "before postprocess sees them, embed_head.py:150 and :255-257; "
+               "preparation is sized by the batch and by max_model_len / "
+               "block_size, backends.py:341; the kv-head-sized metadata build "
+               "is block_size 256/1024 only, aiter_attention.py:1133 and "
+               ":1370, and this deployment runs 16) plus tp_broadcast, a "
+               "standalone bcast_probe.py primitive on the real 2- and 4-rank "
+               "groups. NOT COVERED: inter-rank skew (lands in the body's "
+               "span), engine-core process control (outside "
+               "ModelRunner.forward), logprobs broadcasts. No full-engine or "
+               "serving measurement at TP2 or TP4 contributed any number here",
 )
+
+
+#: Block sizes whose per-step attention metadata build is sized by the rank's
+#: own KV head count, and therefore is NOT width-invariant.
+#:
+#: `AiterAttentionMetadataBuilder` calls `set_aiter_persistent_worker_buffers`
+#: only `if self.block_size in (256, 1024)` (aiter_attention.py:1133 on the
+#: served path, :1370 on the capture path), and that function passes
+#: `num_key_value_heads // get_tp_group().world_size` to
+#: `aiter.get_pa_metadata_v1` (aiter_attention.py:354-396). Its output tables
+#: -- `work_meta_data`, `work_info_set`, the reduce maps -- are sized by that
+#: per-rank head count, so on those block sizes preparation carries a term
+#: that shrinks as TP grows, and a TP1 measurement of it is a measurement of
+#: different work.
+#:
+#: At `block_size=16`, which is what the cc-traces deployment runs, the branch
+#: is not taken and the question does not arise. That is a
+#: configuration-conditional exemption rather than a general result, so it is
+#: named here and checked at build time by `wide_tp_precondition`.
+KV_HEAD_SIZED_PREPARE_BLOCK_SIZES = (256, 1024)
+
+
+def wide_tp_precondition(model, tp: int, block_size: int) -> Optional[str]:
+    """Why this preset must not be used at this width and block size, or None.
+
+    A widened preset's transfer argument rests on a branch that
+    `block_size=16` does not take. A deployment that moved the block size to
+    256 or 1024 would take it, and preparation would then carry a term sized
+    by the rank's own KV head count -- so the TP1 numbers would be
+    measurements of different work, quietly.
+
+    Checked at build time because that is where both facts are known: a shape
+    does not carry the block size, so `refusal` cannot see it. Fails closed,
+    and only for a preset that actually claims a width above one.
+    """
+    if model is None or int(tp or 1) <= 1:
+        return None
+    if len(getattr(model, "topologies", (1,))) <= 1:
+        return None
+    if int(block_size or 0) not in KV_HEAD_SIZED_PREPARE_BLOCK_SIZES:
+        return None
+    return (
+        f"region preset {getattr(model, 'version', '')!r} is declared for tp "
+        f"{list(model.topologies)}, and that declaration rests on the "
+        f"per-step attention metadata build being width-invariant. At "
+        f"block_size={int(block_size)} it is not: "
+        f"set_aiter_persistent_worker_buffers runs for block sizes "
+        f"{list(KV_HEAD_SIZED_PREPARE_BLOCK_SIZES)} and sizes its tables by "
+        f"num_key_value_heads // tp, so preparation measured at TP1 is a "
+        f"measurement of different work. Measure that configuration, or run "
+        f"this width with regions=none.")
 
 
 REGION_MODELS = {
