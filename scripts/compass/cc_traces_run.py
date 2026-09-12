@@ -1108,6 +1108,27 @@ class SideRun:
                     "it was prepared, which lands inside every declared "
                     "arrival's TTFT"
                 )
+        # Whether the workload finished, read from the tally rather than from
+        # the exit code above. An exit code is one bit and it is the client's
+        # opinion of itself; a repeat that answered 3 of 62 requests and
+        # returned zero is the reason this is a separate question. The counts
+        # are `replay.py`'s, written into the artifact it leaves behind.
+        if manifest.get("complete") is not True:
+            counts = {
+                name: int(manifest.get(name) or 0)
+                for name in ("failed", "missing", "truncated")
+            }
+            if manifest.get("complete") is None and not any(counts.values()):
+                bad.append(
+                    "it carries no completeness tally, so whether the replay "
+                    "finished its workload cannot be read from the artifact"
+                )
+            else:
+                bad.append(
+                    "the replay did not complete its workload ("
+                    + ", ".join(f"{n} {name}" for name, n in counts.items() if n)
+                    + f"): {json.dumps(manifest.get('incomplete_reasons'))}"
+                )
         # The frozen corpus, checked by its bytes rather than by its path:
         # the replay records the digest of the trace it actually read.
         # Fail-closed on either side being absent. Written as `want and got

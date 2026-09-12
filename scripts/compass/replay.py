@@ -84,6 +84,88 @@ def _workload(args) -> list[dict]:
 MAX_IN_FLIGHT = 1024
 
 
+#: `main` exits with this when the workload did not complete -- a request that
+#: failed, never returned an outcome, or came back short. Its own code rather
+#: than the refusal's 3 or the arrival barrier's 1, so a log line says which
+#: boundary rejected the run without anyone having to read the artifact.
+INCOMPLETE_EXIT = 4
+
+
+def _completion_shortfall(response, want: int):
+    """Why this reply is not the completion that was asked for, or None.
+
+    Returned rather than raised: the *count* of these is the result. A run
+    that produced three completions out of sixty-two is not a slow run, it is
+    a different workload, and the artifact has to say so.
+
+    `usage.completion_tokens` is the server's own count and the only one worth
+    reading. `compare.py` already refuses a run whose replies do not carry it,
+    so a client that accepts one has written an artifact nothing downstream
+    will take. A reply that produced fewer tokens than were asked for is short
+    unless the model ended the sequence itself: `finish_reason == "stop"` is
+    the engine saying the generation is over, and no client can ask for more
+    than that. Anything else -- an abort, a "length" that is not the length
+    requested, or no reason at all -- is a request the engine gave up on.
+    """
+    if not isinstance(response, dict):
+        return "the server's reply was not an object"
+    choices = response.get("choices")
+    if not choices:
+        return "the reply carried no choices"
+    got = (response.get("usage") or {}).get("completion_tokens")
+    if not isinstance(got, int) or isinstance(got, bool):
+        return "the reply carried no usage.completion_tokens"
+    if got >= want:
+        return None
+    reason = (choices[0] or {}).get("finish_reason")
+    if reason == "stop":
+        return None
+    return (f"produced {got} of {want} output tokens and finished as "
+            f"{reason!r}")
+
+
+def _incomplete(results: list[dict], workload: list[dict]) -> dict:
+    """Every request the run did not complete, grouped by why it did not.
+
+    Three questions kept separate because they have different causes and
+    different fixes: a request whose answer never came (`failed`), a declared
+    request with no outcome recorded at all (`missing` -- the result list is
+    not the workload, and a client that reports on the rows it holds says
+    nothing about the ones it does not), and an answer that came back short
+    (`truncated`). The three are disjoint by construction, so the counts add.
+    """
+    seen = {r.get("index") for r in results}
+    failed = [{"index": r.get("index"), "why": r.get("error") or "no reason given"}
+              for r in results if not r.get("ok")]
+    missing = [{"index": i, "why": "no outcome was recorded for this request"}
+               for i in range(len(workload)) if i not in seen]
+    truncated = []
+    for r in results:
+        if not r.get("ok"):
+            continue
+        why = _completion_shortfall(
+            r.get("response"), int(workload[r["index"]]["output_tokens"]))
+        if why:
+            truncated.append({"index": r["index"], "why": why})
+    return {"failed": failed, "missing": missing, "truncated": truncated}
+
+
+def _reasons(rows: list[dict]) -> list[dict]:
+    """The distinct reasons, and how many requests each accounts for.
+
+    "59 failed" names a number; "59 failed: TimeoutError: timed out" names a
+    cause, and the two are a different amount of work to act on. Counted
+    rather than sampled, because one failure standing for fifty-nine is only
+    honest when all fifty-nine are the same one.
+    """
+    counts: dict[str, int] = {}
+    for row in rows:
+        why = str(row.get("why"))[:200]
+        counts[why] = counts.get(why, 0) + 1
+    return [{"reason": why, "requests": n}
+            for why, n in sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))]
+
+
 def _digest(path):
     """SHA-256 of a file, or None when there is no file to name."""
     if not path:
@@ -423,7 +505,13 @@ def main(argv=None) -> int:
     with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
         results = list(pool.map(one, enumerate(workload)))
 
-    failed = [r for r in results if not r["ok"]]
+    # What the run produced, against what it was asked to produce. This client
+    # counted only the requests whose *send* raised and reported "0 failed"
+    # for everything else, so a development run that answered 3 of 62 and
+    # timed out on the rest exited zero and was read as a measurement. The
+    # tally is written into the artifact and decides the exit code below.
+    incomplete = _incomplete(results, workload)
+    failed = incomplete["failed"]
 
     # What the server says it received, against what was asked for. The builder
     # is exact by construction under a tokenizer giving one token per word in
@@ -506,6 +594,16 @@ def main(argv=None) -> int:
         "trace_sha256": _digest(args.trace),
         "model": model,
         "failed": len(failed),
+        "missing": len(incomplete["missing"]),
+        "truncated": len(incomplete["truncated"]),
+        # Named for what it is, so a reader does not have to add three
+        # numbers up and hope they are disjoint.
+        "completed": len(workload) - sum(len(v) for v in incomplete.values()),
+        "complete": not any(incomplete.values()),
+        # The reasons, counted. `compare.py` reads `failed`; a person reads
+        # this, and a person is who decides whether to rerun.
+        "incomplete_reasons": ({k: _reasons(v) for k, v in incomplete.items() if v}
+                               or None),
         "prompt_lengths": length_check,
         "prepare": ({k: v for k, v in prepare.items() if k != "records"}
                     if prepare else None),
@@ -516,9 +614,17 @@ def main(argv=None) -> int:
     with open(args.out, "w", encoding="utf-8") as fh:
         json.dump({"run": manifest, "workload": workload, "results": results,
                    "engine": engine}, fh, indent=1)
-    print(f"sent {len(workload)} requests, {len(failed)} failed -> {args.out}")
-    if failed:
-        print("  first failure:", failed[0]["error"], file=sys.stderr)
+    completed = len(workload) - sum(len(v) for v in incomplete.values())
+    print(f"sent {len(workload)} requests, {completed} completed, "
+          f"{len(failed)} failed, {len(incomplete['missing'])} missing, "
+          f"{len(incomplete['truncated'])} short -> {args.out}")
+    for kind, rows in incomplete.items():
+        # Every reason with its own count, not the first one standing in for
+        # the rest: fifty-nine timeouts and fifty-eight timeouts plus one 400
+        # are different runs, and the second is the one worth reading.
+        for entry in _reasons(rows):
+            print(f"  {entry['requests']} {kind}: {entry['reason']}",
+                  file=sys.stderr)
     if barrier.get("timed_out") is None:
         # Said out loud rather than passed over. The run may be perfectly good;
         # what is known is that nobody can tell from this artifact.
@@ -537,6 +643,24 @@ def main(argv=None) -> int:
               f"Every latency in this run is invalid: {json.dumps(detail)}",
               file=sys.stderr)
         return 1
+    if not manifest["complete"]:
+        # After the artifact is written, for the same reason the barrier check
+        # is: the file is the evidence, and a run that exits non-zero without
+        # leaving one cannot be diagnosed.
+        #
+        # A replay is an expected-success run. Whether a *configuration* is
+        # feasible is not asked here and never was -- the engine answers that
+        # at startup by refusing to size a pool it cannot page with
+        # (`InsufficientPoolBudget`, atom/compass/replay/runner.py), and a
+        # server that refused never reaches a client. So there is no mode in
+        # which these counts are the expected outcome, and nothing to exempt.
+        print(f"ATOMCompass WARNING: {completed} of {len(workload)} requests "
+              f"completed. The engine did not run the workload this artifact "
+              f"describes, so its metrics are over a different one and its "
+              f"step sequence is not the trace's: "
+              f"{json.dumps(manifest['incomplete_reasons'])}",
+              file=sys.stderr)
+        return INCOMPLETE_EXIT
     return 0
 
 

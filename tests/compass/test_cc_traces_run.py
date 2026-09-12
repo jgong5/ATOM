@@ -265,6 +265,16 @@ class FakeProcesses:
             "paced": side == "real",
             "trace": str(trace),
             "trace_sha256": (run_mod.file_digest(full) or {}).get("sha256"),
+            # What `replay.py` writes when every request completed. Carried
+            # here because the harness reads the tally rather than the exit
+            # code, and a fixture that omits it would stand for an artifact
+            # no run of this client produces.
+            "failed": 0,
+            "missing": 0,
+            "truncated": 0,
+            "completed": 0,
+            "complete": True,
+            "incomplete_reasons": None,
             "requests": 0,
             "server": fake_provenance(
                 "measure" if side == "real" else "predict", code=self.served
@@ -491,6 +501,60 @@ class TestTheRealSideIsWatchedAndPrepared:
         runner = _runner(tmp_path, "real", processes=procs)
         assert runner.run() == 1
         assert any("not paced" in f for f in runner.failures)
+
+    def test_an_incomplete_replay_fails_the_repeat(self, tmp_path):
+        """The exit code is one bit and it is the client's own opinion. A
+        repeat whose replay answered a fraction of the workload and returned
+        zero would otherwise be accepted, which is how a TP1 development run
+        that served 3 of 62 requests reached a result file."""
+        procs = FakeProcesses(cell=tmp_path)
+        original = procs._write_artifact
+
+        def short(command):
+            original(command)
+            out = Path(command[command.index("--out") + 1])
+            blob = json.loads(out.read_text())
+            blob["run"].update(
+                {
+                    "complete": False,
+                    "failed": 59,
+                    "completed": 3,
+                    "requests": 62,
+                    "incomplete_reasons": {
+                        "failed": [
+                            {"reason": "TimeoutError: timed out", "requests": 59}
+                        ]
+                    },
+                }
+            )
+            out.write_text(json.dumps(blob))
+
+        procs._write_artifact = short
+        runner = _runner(tmp_path, "real", processes=procs)
+        assert runner.run() == 1
+        assert any("did not complete its workload" in f for f in runner.failures)
+        assert any("TimeoutError" in f for f in runner.failures)
+
+    def test_an_artifact_with_no_tally_fails_the_repeat(self, tmp_path):
+        """Unknown is not complete. An artifact from a client too old to count
+        says nothing about whether its workload finished, and reading it as a
+        result is the assumption this whole check exists to refuse."""
+        procs = FakeProcesses(cell=tmp_path)
+        original = procs._write_artifact
+
+        def untallied(command):
+            original(command)
+            out = Path(command[command.index("--out") + 1])
+            blob = json.loads(out.read_text())
+            for name in ("complete", "completed", "failed", "missing",
+                         "truncated", "incomplete_reasons"):
+                blob["run"].pop(name, None)
+            out.write_text(json.dumps(blob))
+
+        procs._write_artifact = untallied
+        runner = _runner(tmp_path, "real", processes=procs)
+        assert runner.run() == 1
+        assert any("no completeness tally" in f for f in runner.failures)
 
     def test_a_prepared_modelled_artifact_fails_the_repeat(self, tmp_path):
         procs = FakeProcesses(cell=tmp_path)
