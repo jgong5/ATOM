@@ -42,7 +42,8 @@ from atom.compass.core.memory_blocks import (
 )
 from atom.compass.core.memory_model import UnfoundedPrediction
 from atom.compass.core.memory_topology import compose_calibration
-from atom.compass.replay.runner import ReplayModelRunner
+from atom.compass.replay.derived_target import DERIVED_SCHEMA, derive_target
+from atom.compass.replay.runner import ReplayModelRunner, TargetRecord
 from atom.model_engine.block_manager import BlockManager
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.state_runtime import StateRuntime
@@ -105,7 +106,15 @@ def _profile(tmp_path, width, *, total=TOTAL, calibration=None, **over):
     return str(path)
 
 
-def _target(tmp_path):
+def _target(tmp_path, width=1):
+    """A record of the startup answers, at the width it claims.
+
+    A replay refuses a record captured at another width -- the block count
+    would be handed to a scheduler the deployment cannot hold -- so a fixture
+    for a TP=2 or TP=4 replay has to say TP=2 or TP=4. What a *real* wider
+    record is derived from rather than captured is `derive_target`'s business,
+    and `TestATargetForAWidthNoDeviceRan` is about that.
+    """
     blob = {
         "version": 1,
         "blocks": {"num_kvcache_blocks": CAPTURED_BLOCKS,
@@ -113,21 +122,21 @@ def _target(tmp_path):
                                     STATE_SLOT_CLASS: 32},
                    "pool_entries_per_req": {STATE_SLOT_CLASS: 1},
                    "state_runtime": StateRuntime().to_wire()},
-        "config": {"model": "Qwen/Qwen3.8-27B", "tensor_parallel_size": 1,
+        "config": {"model": "Qwen/Qwen3.8-27B", "tensor_parallel_size": width,
                    "max_model_len": 262144, "max_num_seqs": 32,
                    "gpu_memory_utilization": 0.9},
         "graph": {"capture_seconds": 12.5, "capture_sizes": [1, 8, 32],
                   "pool_bytes": 1 << 30},
     }
-    path = tmp_path / "target.json"
+    path = tmp_path / ("target.tp%d.json" % width)
     path.write_text(json.dumps(blob))
     return str(path)
 
 
-def _config(tmp_path, *, profile="", width=1, **over):
+def _config(tmp_path, *, profile="", width=1, target=None, **over):
     """The deployment being replayed -- the registered acceptance cell."""
     compass = CompassConfig(enabled=True, mode="predict",
-                            replay_target=_target(tmp_path),
+                            replay_target=target or _target(tmp_path, width),
                             memory_model=profile or None)
     config = types.SimpleNamespace(
         compass_config=compass, model="Qwen/Qwen3.8-27B",
@@ -262,9 +271,24 @@ class TestARefusalIsNeverAFallback:
         assert "TP=4" in message
 
     def test_a_pipeline_parallel_deployment(self, tmp_path):
-        message = self._refused(tmp_path, pipeline_parallel_size=2,
-                                profile=_profile(tmp_path, 1))
-        assert "pipeline_parallel_size" in message
+        """Refused twice over, and the memory side owns the second one.
+
+        The replay's parallelism contract stops a pipelined deployment before
+        a profile is ever opened -- one executor cannot be several stages. The
+        sizing refusal is a separate claim about a separate mistake: the engine
+        reduces the per-stage block counts with a collective and a profile
+        describes one stage, so even a caller who has no runner may not size
+        one stage and publish it as the pool.
+        """
+        config = _config(tmp_path, pipeline_parallel_size=2,
+                         profile=_profile(tmp_path, 1))
+        with pytest.raises(ValueError, match="pipeline stages"):
+            ReplayModelRunner(0, config)
+        with pytest.raises(UnfoundedPrediction) as refusal:
+            derived_block_info(config.compass_config.memory_model, config,
+                               state_runtime=StateRuntime().to_wire())
+        assert "pipeline_parallel_size" in str(refusal.value)
+        assert str(CAPTURED_BLOCKS) not in str(refusal.value)
 
     def test_a_checkpoint_this_geometry_does_not_describe(self, tmp_path):
         native = json.loads(NATIVE_CONFIG.read_text())
@@ -388,7 +412,7 @@ class TestTheFilesThatProducedTheNumberAreRecorded:
     def _inputs(self, tmp_path, **over):
         runner = ReplayModelRunner(0, _config(tmp_path, **over))
         runner.get_num_blocks()
-        return runner.loaded_inputs
+        return runner.compass_runtime_inputs
 
     def _by_role(self, inputs):
         return {record.role: record for record in inputs}
@@ -440,7 +464,7 @@ class TestTheFilesThatProducedTheNumberAreRecorded:
     def test_a_replay_with_no_profile_still_names_its_target(self, tmp_path):
         runner = ReplayModelRunner(0, _config(tmp_path))
         runner.get_num_blocks()
-        assert [r.role for r in runner.loaded_inputs] == [
+        assert [r.role for r in runner.compass_runtime_inputs] == [
             "runtime.replay_target"]
         assert runner.compass_loaded_inputs["modelled"] is False
         assert runner.compass_loaded_inputs["num_kvcache_blocks"] == (
@@ -453,7 +477,7 @@ class TestTheFilesThatProducedTheNumberAreRecorded:
         raw = Path(target).read_bytes()
         assert runner.target.loaded_input.sha256 == hashlib.sha256(
             raw).hexdigest()
-        assert runner.loaded_inputs == (runner.target.loaded_input,)
+        assert runner.compass_runtime_inputs == (runner.target.loaded_input,)
 
     def test_a_refusal_still_says_what_had_been_read(self, tmp_path):
         runner = ReplayModelRunner(0, _config(
@@ -463,7 +487,7 @@ class TestTheFilesThatProducedTheNumberAreRecorded:
         # The profile and the checkpoint geometry were read before the width
         # was checked, so they are evidence about the run that stopped; the
         # calibration never was.
-        assert set(self._by_role(runner.loaded_inputs)) == {
+        assert set(self._by_role(runner.compass_runtime_inputs)) == {
             "runtime.replay_target",
             "runtime.memory_model",
             "runtime.memory_model.model_config",
@@ -482,8 +506,8 @@ class TestTheFilesThatProducedTheNumberAreRecorded:
                                               profile=_profile(tmp_path, 1)))
         runner.get_num_blocks()
         published = runner.compass_loaded_inputs
-        assert published["rolled_sha256"] == roll(runner.loaded_inputs)
-        assert published["inputs"] == manifest(runner.loaded_inputs)["inputs"]
+        assert published["rolled_sha256"] == roll(runner.compass_runtime_inputs)
+        assert published["inputs"] == manifest(runner.compass_runtime_inputs)["inputs"]
 
     def test_the_terms_the_bytes_were_read_for_travel_with_them(self, tmp_path):
         """Same profile, another width: a digest alone does not found a count."""
@@ -566,3 +590,115 @@ class TestTheRunSaysWhereItsBudgetActuallyCameFrom:
         assert record["served"] is False
         assert "num_kvcache_blocks" not in record
         assert "lineage" not in record
+
+
+class TestATargetForAWidthNoDeviceRan:
+    """The record a wider GPU-free deployment is replayed against.
+
+    A replay refuses startup answers captured at another width, so predicting
+    TP=2 or TP=4 without a card is not a matter of pointing the TP=1 record at
+    a wider config -- there has to be a record *at* that width, and no device
+    has ever run one. `derive_target` builds it from the memory model: the
+    capacity is derived at the width it claims, and the handful of fields the
+    model does not describe are borrowed from the TP=1 source record and named.
+
+    The lineage that matters: nothing here reads a target-engine capture of the
+    width being derived. The borrow is from TP=1, which is the calibration's
+    own source configuration.
+    """
+
+    def _derived(self, tmp_path, width):
+        layout = TargetRecord.load(_target(tmp_path, 1))
+        config = _config(tmp_path, width=width)
+        read: list = []
+        record = derive_target(
+            _profile(tmp_path / str(width), width), config,
+            layout=layout, collect=read)
+        path = tmp_path / ("derived.tp%d.json" % width)
+        path.write_text(json.dumps(record))
+        return record, str(path), read
+
+    def test_the_derived_record_is_the_modelled_capacity(self, tmp_path):
+        for width in (2, 4):
+            (tmp_path / str(width)).mkdir(parents=True, exist_ok=True)
+            record, _, _ = self._derived(tmp_path, width)
+            assert record["blocks"]["num_kvcache_blocks"] == BLOCKS[width]
+            assert record["config"]["tensor_parallel_size"] == width
+            # The TP=1 capture is in the room -- it supplied the layout -- and
+            # not one of its capacity numbers survived into the record.
+            assert CAPTURED_BLOCKS not in record["blocks"]["pool_entries"].values()
+            assert record["blocks"]["state_runtime"] == StateRuntime().to_wire()
+
+    def test_a_replay_against_it_plans_at_that_width(self, tmp_path):
+        """The POC claim at TP=4: a scheduler, no card, no capture of TP=4.
+
+        No `--compass-memory-model` on this run at all. The capacity came from
+        the model when the record was derived, and what is being checked is
+        that a replay of a logical TP=4 deployment accepts it and hands the
+        block manager the modelled pool.
+        """
+        (tmp_path / "4").mkdir(parents=True, exist_ok=True)
+        _, path, _ = self._derived(tmp_path, 4)
+        runner = ReplayModelRunner(0, _config(tmp_path, width=4, target=path))
+        assert runner.logical_tp == 4
+        assert runner.physical_executors == 1
+        blocks = runner.get_num_blocks()
+        assert _planner(blocks).kv.num_free == BLOCKS[4]
+        assert runner.compass_budget_source["kind"] == SOURCE_DERIVED
+        assert runner.compass_budget_source["hardware_reference"] is False
+
+    def test_the_record_says_what_it_did_not_derive(self, tmp_path):
+        """A borrowed field a reader cannot find is the failure mode here."""
+        (tmp_path / "2").mkdir(parents=True, exist_ok=True)
+        record, _, _ = self._derived(tmp_path, 2)
+        derivation = record["derivation"]
+        assert derivation["schema"] == DERIVED_SCHEMA
+        assert set(derivation["borrowed"]) == {
+            "from", "state_runtime", "capture_sizes", "hardware"}
+        assert derivation["borrowed"]["from"].endswith("target.tp1.json")
+        assert derivation["lineage"]["world_size"] == 2
+        assert derivation["lineage"]["kind"] == SOURCE_DERIVED
+        # No capture time is claimed for graphs no device ever captured.
+        assert record["graph"]["capture_seconds"] == 0.0
+        assert record["graph"]["pool_bytes"] == (
+            derivation["lineage"]["cudagraph_overhead"])
+
+    def test_every_file_behind_the_record_is_digested(self, tmp_path):
+        (tmp_path / "2").mkdir(parents=True, exist_ok=True)
+        _, _, read = self._derived(tmp_path, 2)
+        roles = {row.role for row in read}
+        assert "runtime.memory_model" in roles
+        assert "runtime.memory_model.calibration" in roles
+        assert all(row.role.startswith("runtime.") for row in read)
+        assert manifest(read)["rolled_sha256"] == roll(read)
+
+    def test_a_source_record_with_no_layout_is_refused(self, tmp_path):
+        """The one borrowed field nothing can stand in for."""
+        layout = TargetRecord.load(_target(tmp_path, 1))
+        layout.blocks.pop("state_runtime")
+        with pytest.raises(ValueError, match="state transfer layout"):
+            derive_target(_profile(tmp_path, 1), _config(tmp_path),
+                          layout=layout)
+
+    def test_a_target_engine_capture_is_not_a_source(self, tmp_path):
+        """The laundering path: derive from a TP=4 capture and it comes back
+        stamped source-derived at TP=4, past the width check that would have
+        refused it. Only the calibration's own width may be borrowed from."""
+        layout = TargetRecord.load(_target(tmp_path, 4))
+        with pytest.raises(ValueError, match="only a TP1 source record"):
+            derive_target(_profile(tmp_path, 1), _config(tmp_path, width=4),
+                          layout=layout)
+
+    def test_a_record_of_another_model_is_not_a_source(self, tmp_path):
+        layout = TargetRecord.load(_target(tmp_path, 1))
+        layout.config["model"] = "Qwen/Qwen3-0.6B"
+        with pytest.raises(ValueError, match="Qwen/Qwen3-0.6B"):
+            derive_target(_profile(tmp_path, 1), _config(tmp_path, width=2),
+                          layout=layout)
+
+    def test_a_layout_the_engine_cannot_read_back_is_refused(self, tmp_path):
+        layout = TargetRecord.load(_target(tmp_path, 1))
+        layout.blocks["state_runtime"] = {"transfer": "teleport"}
+        with pytest.raises(ValueError, match="wire contract"):
+            derive_target(_profile(tmp_path, 1), _config(tmp_path, width=2),
+                          layout=layout)
