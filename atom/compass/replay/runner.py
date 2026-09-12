@@ -21,6 +21,7 @@ is ATOM's own code operating on those numbers.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 
 import json
@@ -44,8 +45,15 @@ class TargetRecord:
     anything that would let this become a second implementation of sizing.
     """
 
-    def __init__(self, blob: dict, source: str) -> None:
+    def __init__(self, blob: dict, source: str, *, sha256: Optional[str] = None,
+                 nbytes: Optional[int] = None) -> None:
         self.source = source
+        #: Digested by `load` from the bytes it parsed, and never recomputed by
+        #: re-opening the path. `replay_target` is outside the hashed oracle
+        #: options and it names a *file*: the name is not the input, and a
+        #: digest taken at report time attests to whatever is on disk then.
+        self.sha256 = sha256
+        self.bytes = nbytes
         self.version = int(blob.get("version") or 0)
         self.blocks: dict = dict(blob.get("blocks") or {})
         self.config: dict = dict(blob.get("config") or {})
@@ -67,9 +75,11 @@ class TargetRecord:
                 f"capture them with --compass-replay-target-out on a run of "
                 f"this configuration, or model them."
             )
-        with open(path, encoding="utf-8") as fh:
-            blob = json.load(fh)
-        record = cls(blob, path)
+        with open(path, "rb") as fh:
+            raw = fh.read()
+        blob = json.loads(raw.decode("utf-8"))
+        record = cls(blob, path, sha256=hashlib.sha256(raw).hexdigest(),
+                     nbytes=len(raw))
         if record.version != TARGET_VERSION:
             raise ValueError(
                 f"ATOMCompass: {path} is a version {record.version} replay "
@@ -134,6 +144,11 @@ class ReplayModelRunner(CompassPredictMixin):
             )
         self.target = TargetRecord.load(getattr(compass, "replay_target", ""))
         self._check_parallel_contract(config)
+        #: Filled in by `get_num_blocks`: the sealed record of the files that
+        #: actually produced the capacity this run plans from. Kept on the
+        #: runner rather than folded into the RPC reply, because the wire form
+        #: is the engine's and provenance is not part of it.
+        self.compass_loaded_inputs: Optional[dict] = None
         differences = self.target.disagreements(config)
         if differences:
             logger.warning(
@@ -240,17 +255,70 @@ class ReplayModelRunner(CompassPredictMixin):
         No path leads from a refusal back to ``self.target.blocks``. A run that
         asked to be modelled and cannot be has to stop, because the number it
         would otherwise serve is the one it was told not to use.
+
+        Either way the files that produced the answer are recorded in
+        ``compass_loaded_inputs``, digested where they were read.
         """
+        from atom.compass.core.memory_blocks import (
+            LoadedInputs, derived_block_info)
+
+        inputs = LoadedInputs()
+        # Not a read of our own: the target was digested when it was parsed, in
+        # `TargetRecord.load`, and re-opening it here would attest to the file
+        # as it is now rather than as it was used.
+        inputs.note("replay_target", path=self.target.source,
+                    abspath=os.path.abspath(self.target.source),
+                    sha256=self.target.sha256, bytes=self.target.bytes)
+
         path = (getattr(self._compass_config, "memory_model", "") or "").strip()
-        if not path:
-            return dict(self.target.blocks)
+        try:
+            if not path:
+                blocks = dict(self.target.blocks)
+            else:
+                blocks = derived_block_info(
+                    path, self.config,
+                    state_runtime=self.target.blocks.get("state_runtime"),
+                    captured=self.target.blocks,
+                    inputs=inputs)
+        finally:
+            # Published on the refusal path too. What a run that stopped had
+            # already read is evidence about the run that stopped.
+            inputs.seal()
+            self.compass_loaded_inputs = inputs.manifest(
+                **self._capacity_context(path))
+        self.compass_loaded_inputs["num_kvcache_blocks"] = int(
+            blocks.get("num_kvcache_blocks") or 0)
+        return blocks
 
-        from atom.compass.core.memory_blocks import derived_block_info
+    def _capacity_context(self, memory_model: str) -> dict:
+        """The deployment terms a block count cannot be checked without.
 
-        return derived_block_info(
-            path, self.config,
-            state_runtime=self.target.blocks.get("state_runtime"),
-            captured=self.target.blocks)
+        The digests say which bytes were read; these say what they were read
+        *for*. Both are needed to say a number was founded: the same profile
+        sizes a different pool at another width, block size or utilization.
+        """
+        config = self.config
+        return {
+            "modelled": bool(memory_model),
+            "memory_model": memory_model or None,
+            "deployment": {
+                "model": str(getattr(config, "model", "")),
+                "tensor_parallel_size": int(
+                    getattr(config, "tensor_parallel_size", 1) or 1),
+                "pipeline_parallel_size": int(
+                    getattr(config, "pipeline_parallel_size", 1) or 1),
+                "max_model_len": int(getattr(config, "max_model_len", 0) or 0),
+                "max_num_seqs": int(getattr(config, "max_num_seqs", 0) or 0),
+                "max_num_batched_tokens": int(
+                    getattr(config, "max_num_batched_tokens", 0) or 0),
+                "gpu_memory_utilization": float(
+                    getattr(config, "gpu_memory_utilization", 0.0) or 0.0),
+                "kv_cache_block_size": int(
+                    getattr(config, "kv_cache_block_size", 0) or 0),
+                "kv_cache_dtype": str(getattr(config, "kv_cache_dtype", "auto")),
+                "enforce_eager": bool(getattr(config, "enforce_eager", False)),
+            },
+        }
 
     def allocate_kv_cache(self, num_kvcache_blocks) -> bool:
         """There is no cache to allocate; the accounting for it is real.
