@@ -460,6 +460,33 @@ def _tp1_prices() -> tuple:
     add(f"{_sw}/p27_head_9216.tp1.r0.{_REP}.json",
         f"{_sw}/graphs/b27_tp1_r0_pref_head_9216.json")
 
+    # The dispatch-band anchors in (9216, 16384].
+    #
+    # Same defect as the 9216 rung and the same fix, applied to the whole
+    # interval instead of one row. `agent_scratch/stage/DISPATCH_BANDS.md`
+    # probed the Tensile dispatch on the 64-token row grid for each of the
+    # five body GEMM geometries, and the tile is NOT monotone in M: the two
+    # widest geometries cycle through six bands between 8256 and 16384. So a
+    # crossover point is the wrong model and a finer mesh is the wrong fix;
+    # what is needed is a measured pair bracketing each band, and consecutive
+    # anchors that straddle a boundary are adjacent on the 64 grid, so no
+    # schedulable row falls strictly between them.
+    #
+    # These rungs are DERIVED, not synthesised, under the same protocol as the
+    # ladder they extend: cold spec, `graph_diff.py trace` on meta, `--layers
+    # attention`, `--iters 50`, three repeats, fresh process per rung, on the
+    # `p640/snapshot4` source root. Each priced 107 signatures over 2439/2439
+    # operators, so unlike the 9216 rung these are not partial.
+    #
+    # Listed as they land. The acquisition is still running; a row is added
+    # here only once all three repeats have returned rc=0, because a rung
+    # priced once is a reading and not a rung. 14400 and 15360 are the pair
+    # that brackets 14592, which is the row the two-request prefix refused.
+    _anc = f"{_PC}/dispatch_anchors"
+    for row in (14400, 15360):
+        add(f"{_anc}/p27_body_{row}.tp1.r0.{_REP}.json",
+            f"{_anc}/graphs/b27_tp1_r0_pref_body_{row}.json")
+
     # The long-context cells and the mixed step.
     for stem in ("ctx_b32_c4096", "ctx_b32_c16384", "mix_b32"):
         add(f"{_PC}/long/p27_{stem}.tp1.r0.{_REP}.json",
