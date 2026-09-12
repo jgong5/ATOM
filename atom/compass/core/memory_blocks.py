@@ -27,11 +27,8 @@ refuses would put the two kinds of number back in the same channel.
 
 from __future__ import annotations
 
-import hashlib
-import json
 import logging
-import os
-from typing import Any, Callable, Mapping, Optional
+from typing import Any, Mapping, MutableSequence, Optional
 
 from atom.compass.core.kv_geometry import (
     GDN_HYBRID_MODEL_TYPES,
@@ -39,17 +36,38 @@ from atom.compass.core.kv_geometry import (
     layer_types_disagree,
     text_config,
 )
+from atom.compass.core.loaded_input import load_json
 from atom.compass.core.memory import MemoryReadings
 from atom.compass.core.memory_model import UnfoundedPrediction, derived_readings
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["warmup_tokens", "derived_block_info", "load_json", "LoadedInputs"]
+__all__ = ["warmup_tokens", "derived_block_info", "PROFILE_ROLE",
+           "BUDGET_SCHEMA", "DEVICE_MEASURED", "CAPTURED", "RECORDED",
+           "SOURCE_DERIVED", "budget_source"]
 
-#: The manifest `LoadedInputs.manifest()` produces. Versioned because a
-#: validator will read it and a field that quietly changes meaning is worse
-#: than one that is absent.
-LOADED_INPUTS_SCHEMA = "compass.memory.loaded_inputs/1"
+#: The record `budget_source` produces. Versioned: a validator reads it to
+#: decide whether a run is a hardware reference, and a field that quietly
+#: changes meaning is worse than one that is absent.
+BUDGET_SCHEMA = "compass.memory.budget_source/1"
+
+#: Where the block count a run actually served came from. Decided at the
+#: branch that produced it, never inferred from the flags afterwards: a
+#: profile is honoured by the device-backed runner in *measure* mode too, so a
+#: run whose mode and clock look like a measurement can still have been sized
+#: analytically. That is a legitimate diagnostic; what is not legitimate is it
+#: being unreadable from the outside.
+DEVICE_MEASURED = "device-measured"   # the card was asked, on this run
+CAPTURED = "captured"                 # replayed from a target a device wrote
+RECORDED = "recorded"                 # replayed from a memory record (memory_in)
+SOURCE_DERIVED = "source-derived"     # computed from a profile; no device
+
+#: What a memory profile is to a run: an input that decides the deployment's
+#: *actual capacity*, not one that constructs the cost oracle. The files the
+#: profile itself names are nested under it -- `runtime.memory_model.
+#: calibration`, `runtime.memory_model.model_config` -- so a validator can see
+#: that a calibration was read without it being flattened into its parent.
+PROFILE_ROLE = "runtime.memory_model"
 
 #: What a `kv_cache_dtype` costs per element. Mirrors the table
 #: `scripts/compass/validate_memory.py` reads records with; both exist because
@@ -60,97 +78,53 @@ KV_DTYPE_BYTES = {
 }
 
 
-def load_json(path: str):
-    """Read a path and parse it. The file-system half, kept injectable."""
-    with open(path, encoding="utf-8") as fh:
-        return json.load(fh)
 
 
-class LoadedInputs:
-    """Every file a sizing actually read, digested at the moment it was read.
+def budget_source(
+    kind: str,
+    *,
+    inputs=(),
+    served: bool = True,
+    num_kvcache_blocks: Optional[int] = None,
+    deployment: Optional[Mapping[str, Any]] = None,
+    lineage: Optional[Mapping[str, Any]] = None,
+    coords: Optional[Mapping[str, int]] = None,
+) -> dict:
+    """What the budget this run served actually came from.
 
-    The run's own flags are hashed, but `replay_target` and `memory_model` name
-    *files* and the names are not the inputs -- the bytes are. A path can be
-    rewritten between the run and the report, can be a symlink, can be named by
-    one option and read through another. So this digests what the reader
-    consumed, in the order it consumed it, and never re-opens anything: a
-    manifest built by re-reading at report time attests to whatever is on disk
-    then, which is exactly the claim it appears to rule out.
+    Published at the branch that chose it -- `get_num_blocks` -- and not
+    reconstructed later from the options, because the options do not decide it:
+    `--compass-memory-model` is honoured by the device-backed runner in every
+    mode, so a measure-mode run with a real clock can serve an analytically
+    derived capacity, and nothing in the request says so.
 
-    A file read twice is recorded twice, in order, rather than deduplicated:
-    two reads of one path are two events, and a validator that saw one entry
-    could not tell that the bytes were the same both times.
+    `hardware_reference` is the field a validator wants and it is true for one
+    kind only: a budget this run took off the card. A captured, recorded or
+    derived budget may be entirely legitimate -- a GPU-free replay sized from a
+    source-derived profile is the point of the exercise -- but it is not
+    evidence about *this* run's hardware, and final acceptance's real-hardware
+    side is the only place that distinction has to be enforced.
 
-    One instance covers one sizing. It seals when that sizing finishes, so a
-    later read cannot append to a manifest that has already been published.
-    The record survives a refusal on purpose -- what was read before a run
-    stopped is evidence about the run that stopped.
+    `lineage` is how a derivation says what it was derived *from*. A
+    source-derived budget is not disqualified for having read an artifact;
+    what disqualifies it is being unable to say which one and at what width.
     """
+    from atom.compass.core.loaded_input import manifest as _manifest
 
-    def __init__(self, load: Optional[Callable[[str], Any]] = None) -> None:
-        #: A caller-supplied reader (tests, and callers with their own file
-        #: system). Its bytes are not ours to digest, and that is recorded
-        #: rather than papered over with a second read of our own.
-        self._load = load
-        self._reads: list = []
-        self._sealed = False
-
-    def read(self, where: str, role: str = "referenced"):
-        if self._sealed:
-            raise RuntimeError(
-                "ATOMCompass: this loaded-input manifest is sealed. It "
-                "describes one sizing, and a read after that sizing belongs "
-                "to a different one.")
-        entry = {"role": role, "path": str(where), "order": len(self._reads)}
-        try:
-            entry["abspath"] = os.path.abspath(str(where))
-        except (OSError, ValueError):                            # noqa: BLE001
-            entry["abspath"] = None
-        if self._load is not None:
-            value = self._load(where)
-            entry["sha256"] = None
-            entry["bytes"] = None
-            entry["note"] = ("read through a caller-supplied loader; the "
-                             "bytes were never in this process")
-        else:
-            with open(where, "rb") as fh:
-                raw = fh.read()
-            value = json.loads(raw.decode("utf-8"))
-            entry["sha256"] = hashlib.sha256(raw).hexdigest()
-            entry["bytes"] = len(raw)
-        self._reads.append(entry)
-        return value
-
-    def note(self, role: str, **fields) -> None:
-        """Record an input that was not a file -- carried inline, or absent."""
-        if self._sealed:
-            raise RuntimeError("ATOMCompass: this manifest is sealed")
-        entry = {"role": role, "path": None, "abspath": None,
-                 "sha256": None, "bytes": None, "order": len(self._reads)}
-        entry.update(fields)
-        self._reads.append(entry)
-
-    def seal(self) -> None:
-        self._sealed = True
-
-    @property
-    def sealed(self) -> bool:
-        return self._sealed
-
-    def digest_of(self, role: str) -> Optional[str]:
-        for entry in self._reads:
-            if entry["role"] == role:
-                return entry["sha256"]
-        return None
-
-    def manifest(self, **context) -> dict:
-        """The record, copied out. Callers cannot edit what is kept here."""
-        return {
-            "schema": LOADED_INPUTS_SCHEMA,
-            "sealed": self._sealed,
-            "reads": [dict(entry) for entry in self._reads],
-            **context,
-        }
+    record = {
+        "schema": BUDGET_SCHEMA,
+        "kind": kind,
+        "hardware_reference": kind == DEVICE_MEASURED,
+        "served": bool(served),
+        "inputs": _manifest(inputs, coords=coords),
+    }
+    if num_kvcache_blocks is not None:
+        record["num_kvcache_blocks"] = int(num_kvcache_blocks)
+    if deployment is not None:
+        record["deployment"] = dict(deployment)
+    if lineage is not None:
+        record["lineage"] = dict(lineage)
+    return record
 
 
 def warmup_tokens(config) -> int:
@@ -204,8 +178,9 @@ def derived_block_info(
     *,
     state_runtime: Optional[Mapping[str, Any]] = None,
     captured: Optional[Mapping[str, Any]] = None,
-    load: Optional[Callable[[str], Any]] = None,
-    inputs: Optional["LoadedInputs"] = None,
+    coords: Optional[Mapping[str, int]] = None,
+    collect: Optional[MutableSequence] = None,
+    lineage: Optional[dict] = None,
 ) -> dict:
     """`get_num_blocks`' reply, derived from a profile instead of measured.
 
@@ -217,49 +192,59 @@ def derived_block_info(
     `captured` is used only to say when the derived pool has a different shape
     than the recorded one.
 
-    `inputs` is a `LoadedInputs` the caller keeps. Every file this reads --
-    the profile, the calibration and the model config it names -- is digested
-    here, as it is read, and the collector is sealed before this returns. The
-    caller then owns an immutable record of the bytes that produced the number,
-    which is not the same thing as the paths the flags named.
+    `collect` is a list the caller keeps. Every file this reads -- the profile
+    and the calibration and model config it names -- is appended to it as a
+    `LoadedInput`: the digest of the exact bytes that were parsed, taken at the
+    read. Nothing is reopened afterwards, so what the caller retains is what
+    this process loaded and not what is at those paths later. The list is
+    appended to as the reads happen, so a refusal leaves behind what had been
+    read before the run stopped, which is evidence about the run that stopped.
+
+    `coords` is passed through to the loader's rank resolution unchanged; the
+    caller decides whether these artifacts are per-rank (see the note at the
+    runner's call site -- they are not).
+
+    `lineage` is a dict this fills in on success with what the derivation was
+    derived *from*: the width it is for, how the profile was compiled, and the
+    calibration's own per-term provenance strings. A source-derived budget is
+    a legitimate answer -- it is the whole point of a GPU-free replay -- but
+    only if it can say this much about itself.
 
     Raises `UnfoundedPrediction` when the profile cannot answer, and lets
     ATOM's own `InsufficientPoolBudget` through when the budget leaves nothing
     to page with -- a configuration Compass calls infeasible has to be refused
     by the engine's arithmetic and carry the engine's error.
     """
-    inputs = inputs if inputs is not None else LoadedInputs(load)
-    try:
-        return _derive(path, config, state_runtime=state_runtime,
-                       captured=captured, load=load, inputs=inputs)
-    finally:
-        # Sealed on the way out of either exit. A refusal keeps what it had
-        # already read -- that is evidence about the run that stopped -- but
-        # nothing may be appended to it afterwards.
-        inputs.seal()
+    collect = collect if collect is not None else []
+    payloads: dict = {}
 
-
-def _derive(path, config, *, state_runtime, captured, load, inputs) -> dict:
-    """`derived_block_info` without the sealing. See it for the contract."""
-    # Everything downstream -- including `derived_readings`, which opens the
-    # calibration itself -- reads through the collector, so nothing can be
-    # loaded without being digested.
-    read = inputs.read
+    def read(requested, role):
+        """One open, one digest, one parse -- the shared helper's contract."""
+        payload, record = load_json(requested, role=role, coords=coords)
+        collect.append(record)
+        payloads.setdefault(role, payload)
+        return payload
 
     def load_referenced(where):
-        role = "referenced"
+        """The loader `derived_readings` uses for the files a profile names.
+
+        Nested roles rather than one flattened `runtime.memory_model`: a
+        calibration is an input in its own right, and a validator that saw only
+        the profile could not tell that the numbers behind it were read at all.
+        """
+        role = PROFILE_ROLE + ".referenced"
         if isinstance(where, str):
-            if where == profile.get("calibration"):
-                role = "calibration"
-            elif where == profile.get("model_config"):
-                role = "model_config"
+            for field in ("calibration", "model_config"):
+                if where == profile.get(field):
+                    role = "%s.%s" % (PROFILE_ROLE, field)
+                    break
         return read(where, role)
 
     if not (path or "").strip():
         _refuse("no memory profile was named")
 
     try:
-        profile = read(path, "profile")
+        profile = read(path, PROFILE_ROLE)
     except FileNotFoundError:
         _refuse("no memory profile at %r" % path)
     except (OSError, ValueError) as exc:
@@ -278,11 +263,11 @@ def _derive(path, config, *, state_runtime, captured, load, inputs) -> dict:
         _refuse("the memory profile at %r names no `model_config`, so the KV "
                 "geometry has no checkpoint to read" % path)
     try:
-        if isinstance(native_path, Mapping):
-            native = native_path
-            inputs.note("model_config", note="carried inline in the profile")
-        else:
-            native = read(native_path, "model_config")
+        # A profile may carry the checkpoint geometry inline. Then there is no
+        # file to digest and nothing to record separately: those bytes are the
+        # profile's own, already covered by its digest.
+        native = (native_path if isinstance(native_path, Mapping)
+                  else read(native_path, PROFILE_ROLE + ".model_config"))
     except (OSError, ValueError) as exc:
         _refuse("the model config the profile names (%r) could not be read (%s)"
                 % (native_path, exc))
@@ -359,6 +344,21 @@ def _derive(path, config, *, state_runtime, captured, load, inputs) -> dict:
         "%d warmup tokens)", plan.paged_entries, path, world,
         readings["peak_torch"] / 2**30, readings["non_torch"] / 2**30,
         activation / 2**30, warmup_tokens(config))
+
+    if lineage is not None:
+        calibration = payloads.get(PROFILE_ROLE + ".calibration") or {}
+        lineage.update({
+            "kind": SOURCE_DERIVED,
+            "profile": path,
+            "world_size": world,
+            "compile_mode": profile.get("compile_mode"),
+            "total_source": profile.get("total_source") or profile.get("source"),
+            # Per term, in the calibration's own words: which run each number
+            # came off and what was composed onto it. This is what makes a
+            # derived budget auditable rather than merely undevice.
+            "calibration_provenance": dict(calibration.get("provenance") or {}),
+            "activation_bytes": int(activation),
+        })
 
     return {
         "num_kvcache_blocks": int(plan.paged_entries),
