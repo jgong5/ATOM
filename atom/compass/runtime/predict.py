@@ -525,6 +525,15 @@ class CompassPredictMixin:
             "topology": dict(shape.topology),
             "rank_coords": dict(shape.rank_coords),
             "capture_bucket": shape.capture_bucket,
+            # How the step ran, and whether it sampled -- taken from the shape
+            # the runner was handed rather than left to be reconstructed later.
+            # Neither is recoverable from this row's lengths: whether a chunk is
+            # a request's last is the scheduler's to know, and after a
+            # preemption and re-prefill a request's last occurrence in the table
+            # is not its last chunk. Analysis that guessed the predicate would
+            # charge an LM head to steps that never ran one.
+            "compiled": shape.compiled,
+            "produces_output": shape.produces_output,
             # Wall seconds between the previous forward returning and this one
             # starting: the engine's own work, which a simulated run does not
             # advance its clock for. None on the first step of a process, where

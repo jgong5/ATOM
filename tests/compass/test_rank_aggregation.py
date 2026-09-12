@@ -65,9 +65,9 @@ def _runner(policy, oracle):
     return stub
 
 
-def _shape(tp):
+def _shape(tp, **over):
     return StepShape(num_scheduled_tokens=(1, 1), context_lens=(128, 130),
-                     topology={"tp": tp}, rank_coords={"tp": 0})
+                     topology={"tp": tp}, rank_coords={"tp": 0}, **over)
 
 
 def test_rank0_prices_one_rank_and_says_so():
@@ -197,3 +197,31 @@ def test_the_recorded_row_carries_the_aggregation(tmp_path):
     assert row["seconds"] == pytest.approx(0.016158)
     assert row["rank_aggregation"]["slowest_rank"] == 1
     assert row["rank_aggregation"]["policy"] == "slowest"
+
+
+@pytest.mark.parametrize("compiled,produces", [(True, False), (False, True),
+                                               (None, True)])
+def test_the_recorded_row_states_how_the_step_ran_and_whether_it_sampled(
+        tmp_path, compiled, produces):
+    """Both come off the shape the runner was handed, not off the lengths.
+
+    Whether a chunk is a request's last is the scheduler's to know, and after a
+    preemption and re-prefill a request's last occurrence in the table is not
+    its last chunk -- so a reader reconstructing the predicate from context
+    lengths or last occurrence gets it wrong exactly where the schedule got
+    interesting. Recorded, there is nothing to reconstruct.
+    """
+    import json
+
+    oracle = _PerRankOracle({0: 0.004})
+    runner = _runner("rank0", oracle)
+    runner._compass_config.measure_out = str(tmp_path / "steps.jsonl")
+    runner._measure_fh = None
+    runner._topology = lambda: {"tp": 1}
+    runner._rank_coords = lambda: {"tp": 0}
+    shape = _shape(1, compiled=compiled, produces_output=produces)
+    runner._record_measurement(shape, 0.004, None)
+    runner._measure_fh.close()
+    row = json.loads((tmp_path / "steps.jsonl").read_text().splitlines()[0])
+    assert row["compiled"] is compiled
+    assert row["produces_output"] is produces
