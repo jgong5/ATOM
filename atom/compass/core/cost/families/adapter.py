@@ -163,6 +163,14 @@ def _attention_scope(blob: dict, registration: Optional[str]) -> dict:
     Everything declared is carried, not only the kernel-selecting keys. The
     scope is the identity a fit is filed under, and a condition left out here
     is a difference two observations are allowed to disagree on silently.
+
+    With one exception, and it is the collective registration regime -- see
+    `ParametricPriceLibrary._request_scope`. An attention kernel is not a
+    collective, the exact path consults the regime for collectives alone, and
+    a request always carries the asking graph's regime while a primitive
+    capture rarely declares one. Carried here it would be a key that only one
+    side ever states, which is a guaranteed refusal dressed as a scope
+    difference. `registration` is still accepted so callers keep one signature.
     """
     provenance = blob.get("provenance") or {}
     scope: dict = {}
@@ -183,9 +191,6 @@ def _attention_scope(blob: dict, registration: Optional[str]) -> dict:
         for field in _REQUESTED_CONDITIONS:
             if field in config:
                 scope["requested." + field] = _hashable(config[field])
-    declared_registration = provenance.get("registration", registration)
-    if declared_registration is not None:
-        scope["registration"] = declared_registration
     topology = provenance.get("topology")
     if topology is not None:
         scope["topology"] = _hashable(topology)
@@ -1158,6 +1163,25 @@ class ParametricPriceLibrary(PriceLibrary):
         scope: `attention.Model.price` treats an undeclared request as not
         matching a scoped fit, which is the refusal that keeps a law measured
         under one deployment from answering for another.
+
+        The collective registration regime is NOT part of it, and `registration`
+        is taken only to keep the signature the caller already has. `_scope_of`
+        states the rule for the row curve and it holds here for the same
+        reason: only a collective's cost depends on the group it runs in, and
+        `PriceLibrary.lookup` consults registration in `_collective` alone. An
+        attention kernel is not a collective, so how the collectives elsewhere
+        in the graph were registered cannot select it. `PriceLibrary.body`
+        hands the graph's registration to *every* lookup, so scoping ragged
+        attention on it refuses a request that the exact-signature path would
+        have answered without ever looking at the key -- two paths disagreeing
+        about the same operator, which is the bug rather than the scoping.
+
+        This is not hypothetical. Priced against the real TP1 registry plus the
+        75 attention pairs, run 5's body graph declares `unregistered` and not
+        one of the 75 price files declares a regime at all, so every one of its
+        64 attention calls was refused with "differs on registration" while
+        agreeing on backend, KV layout, state geometry, treatment and operand
+        geometry -- the whole of what actually selects the kernel.
         """
         scope = self._declared_scope(op)
         if "measurement_treatment" not in scope:
@@ -1170,8 +1194,6 @@ class ParametricPriceLibrary(PriceLibrary):
                 # is the point: a warm-cache law is not a price for a cold
                 # request.
                 scope["measurement_treatment"] = treatment
-        if registration is not None:
-            scope.setdefault("registration", registration)
         if topology:
             scope.setdefault("topology", _topology_key(topology))
         return scope or None

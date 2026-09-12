@@ -822,6 +822,9 @@ def test_a_standalone_attention_graph_is_collected_though_it_has_no_body(
     library = _library(tmp_path, _cold_designs())
     assert library.no_file_width  # these files state no width of their own
     assert not library.unbuildable  # and none of them contradicts itself
+    # Four cold designs, not the three this fixture carried before the
+    # unified prefill law gained its `calls` term: four points is what
+    # identifies it.
     assert len(library._attention_obs) == 4 * 16
     assert len(library.attention_design_points()) == 4
 
@@ -1868,6 +1871,65 @@ class TestALegacyEntryDoesNotDecideANewFallback:
                            scope=GDN_SCOPE))
         assert library._treatment_for(_gdn([256], initial=[False]),
                                       dict(GDN_SCOPE)) is None
+
+
+class TestTheCollectiveRegistrationRegimeIsNotAnAttentionScope:
+    """How the collectives were registered cannot select an attention kernel.
+
+    `PriceLibrary.body` hands the asking graph's regime to every lookup, and
+    `PriceLibrary.lookup` consults it for collectives alone. A primitive
+    attention capture, meanwhile, declares no regime -- not one of the 75 B2
+    pairs does. Scope the family on registration and the request states a key
+    the measurements never state, so a law that agrees on backend, KV layout,
+    state geometry, treatment and operand geometry is refused anyway, while
+    the exact-signature path for the same operator answers without ever
+    looking at the key. `_scope_of` already states this rule for the row
+    curve; this is the same rule for the ragged one.
+
+    Found on run 5's real body graph, which declares `unregistered`: all 64
+    attention calls were refused for "differs on registration" and for nothing
+    else.
+    """
+
+    def _library(self, tmp_path):
+        from atom.compass.runtime.microbench import signature_of
+        from atom.compass.runtime.source_oracle import (_price_library,
+                                                        gap_ratio)
+
+        entries = []
+        for index, (op, seconds) in enumerate(_gdn_designs()):
+            prices = {signature_of(op): {
+                "seconds": seconds, "kernels": {"gdn0": seconds},
+                "kv_regions": 1, "cache": "graph", "occurrences": 1,
+                "name": op["name"], "signature": signature_of(op)}}
+            entries.append(_file(tmp_path, "g%d" % index, [op], prices,
+                                 scope=GDN_SCOPE))
+        return _price_library(entries, gap_ratio(True), None,
+                              {"gdn": dict(GDN_SCOPE)})
+
+    def test_a_graph_that_declares_a_regime_is_still_priced(self, tmp_path):
+        """The run-5 case: the asking graph says `unregistered`, the
+        measurements say nothing, and the kernel is the same kernel."""
+        library = self._library(tmp_path)
+        record, detail = library.lookup(_gdn([256], initial=[False]), None,
+                                        "unregistered")
+        assert record is not None, detail
+        assert detail == "interpolated://%s/gdn.prefill" % GDN
+
+    def test_the_regime_is_not_in_the_request_scope(self, tmp_path):
+        library = self._library(tmp_path)
+        scope = library._request_scope(_gdn([256], initial=[False]), None,
+                                       "registered")
+        assert "registration" not in scope
+
+    def test_two_regimes_get_the_same_price(self, tmp_path):
+        """Not merely that both are answered: the same number. A regime that
+        moved the price would mean it selects something, and it does not."""
+        library = self._library(tmp_path)
+        op = _gdn([256], initial=[False])
+        unregistered, _u = library.lookup(op, None, "unregistered")
+        registered, _r = library.lookup(op, None, "registered")
+        assert registered["seconds"] == unregistered["seconds"]
 
 
 #: A GDN deployment that is not the one under test: a superseded collection
