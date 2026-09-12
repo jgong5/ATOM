@@ -105,6 +105,32 @@ def _scope_note(key: tuple) -> str:
             f"{registration or 'an undeclared path'}")
 
 
+#: The scope key for an operator whose cost does not depend on the group. Not
+#: `None`, so it cannot be confused with "scope not recorded".
+_LOCAL = ("local",)
+
+
+def _scope_of(op: dict, scope) -> tuple:
+    """The scope a measurement of this operator is valid in.
+
+    Only a collective's cost depends on the group it runs in, and
+    ``PriceLibrary.lookup`` scopes exact prices for collectives alone. A GEMM
+    is a GEMM: the same shapes on the same layout cost the same whether the
+    deployment around it is TP1 or TP2, and whether the collectives elsewhere
+    in that graph take the registered path or not. The body hands the graph's
+    registration to *every* lookup, so scoping local families on it would
+    refuse an in-support interpolation of a GEMM measured in an unregistered
+    price list purely because the graph asking has registered collectives --
+    while the exact-width lookup of that same GEMM succeeds. Two paths
+    disagreeing about the same operator is the bug, not the scoping.
+
+    So local families share one scope and collectives keep theirs.
+    """
+    from atom.compass.runtime.microbench import _is_collective_op
+
+    return _scope_key(scope) if _is_collective_op(op) else _LOCAL
+
+
 class ParametricPriceLibrary(PriceLibrary):
     """Exact prices first; a measured curve in rows behind the open question.
 
@@ -186,7 +212,14 @@ class ParametricPriceLibrary(PriceLibrary):
             # another's strided view share a key; pairing every scoped price
             # with the first-seen operator puts both on the first layout's
             # curve.
-            self._source_ops.setdefault(price_path, {})[signature_of(op)] = op
+            # First occurrence, matching the two readers that already choose:
+            # `microbench` keys its example operator with `example.setdefault`,
+            # and `PriceLibrary._ingest` captures the measured layout with
+            # `layouts.setdefault`. A graph holding a dense and a strided call
+            # under one signature is PRICED as the dense one, so labelling it
+            # strided here would disagree with the measurement.
+            self._source_ops.setdefault(price_path, {}).setdefault(
+                signature_of(op), op)
         self._curves_built = False
 
     def _build(self) -> None:
@@ -222,7 +255,7 @@ class ParametricPriceLibrary(PriceLibrary):
                 seconds = record.get("seconds")
                 if rows is None or seconds is None:
                     continue
-                key = (grouping_key(op), _scope_key(record.get("scope")))
+                key = (grouping_key(op), _scope_of(op, record.get("scope")))
                 self._observations.setdefault(key, []).append(
                     (op, rows, float(seconds), source or "?",
                      tuple(record.get("kernels") or ())))
@@ -315,6 +348,10 @@ class ParametricPriceLibrary(PriceLibrary):
                    if key[0] == structural}
         if not present:
             return [], None
+        if present.keys() == {_LOCAL}:
+            # A local family: one scope by construction, and the request's
+            # topology and registration say nothing about its cost.
+            return [present[_LOCAL]], None
         if topology is None and registration is None:
             if len(present) == 1:
                 return list(present.values()), None
