@@ -24,9 +24,21 @@ What each row compares:
   `+0.0%` at every width because both sides are `0.2 x (peak_torch -
   current_torch)` computed from the same record. Worth keeping as a drift check
   on the mirror, worth nothing as evidence about the pool.
-* **graph pool** -- the term itself: what capture is predicted to reserve,
-  against what capture did reserve. That measurement has been in every record
-  since the terms were split and nothing was reading it.
+* **reservation** -- the engine's *policy*, predicted rather than restated:
+  `0.2 x` the modelled peak activations, against the overhead the run actually
+  reserved. This is the number that leaves the KV budget, so it is the pool
+  quantity the block count is exposed to, and it is gated as its own term.
+* **graph pool** -- what capture actually costs, which is a different question
+  from what the engine sets aside for it. The derived side is the source-only
+  prediction published in the profile's own calibration -- the TP=1 capture
+  request stream transformed to this width and replayed through the allocator
+  (`memory_capture.capture_stream` -> `capture_reserved_parts`) -- against the
+  reserved delta in the record. **Not** `measured_graph_pool_bytes`: that is a
+  superseded width-constant (104 MiB flat above TP=1, its own docstring says
+  so), no predictor in the tree calls it, and gating against it charged the
+  model 26.8% at TP=4 for a formula the run never used. Where the profile
+  publishes no capture prediction the row does not compare, and under `--gate`
+  an uncompared term fails.
 * **kv blocks** -- the block count, derived from the checkpoint's own
   `config.json` and sized by ATOM's own `plan_pools`. The only row here with no
   fitted constant anywhere in it, which is what makes a disagreement
@@ -57,6 +69,7 @@ import json
 import os
 import re
 import sys
+from collections.abc import Mapping
 from functools import partial
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", ".."))
@@ -71,7 +84,7 @@ from atom.compass.core.memory_calibration import for_model  # noqa: E402
 from atom.compass.core.memory_model import (  # noqa: E402
     DEFAULT_PERSISTENT, UnfoundedPrediction, activation_curve,
     capture_pinned_bytes, derived_readings, graph_pool_bytes,
-    load_residue_bytes, measured_graph_pool_bytes, non_torch_bytes,
+    load_residue_bytes, non_torch_bytes,
     peak_activation_bytes, liveness_is_recorded, liveness_instrumentation,
     traced_shape, weight_bytes, LIVENESS_INSTRUMENTATION)
 
@@ -189,6 +202,41 @@ def recorded_pool(blob: dict) -> tuple:
             tuple(int(s) for s in (pool.get("capture_sizes") or ())))
 
 
+def published_capture(cal_map, world: int):
+    """The source-derived capture prediction the profile carries, at `world`.
+
+    The prediction is a replay of the TP=1 capture request stream, transformed
+    to this width and run through the allocator's own segment rules
+    (`memory_capture.capture_stream` -> `memory_model.capture_reserved_parts`).
+    It needs the recorded TP=1 allocation history, which is a probe artifact
+    and not something a validator can hold, so it is computed once where that
+    history lives and published per width in the calibration the profile names.
+    That makes it input-bound: the run digested the calibration when it loaded
+    the profile, so what is compared here is a number the run itself was
+    carrying, not one this script chose.
+
+    Returns ``(bytes, provenance)`` or ``(None, reason)``. Answering from a
+    neighbouring width is exactly the carry-forward failure the topology module
+    refuses, so an unpublished width returns nothing rather than the closest
+    one.
+    """
+    table = (cal_map or {}).get("capture_reserved")
+    if not isinstance(table, Mapping):
+        return None, ("the profile's calibration publishes no source-derived "
+                      "capture prediction")
+    keyed = {}
+    for key, value in table.items():
+        try:
+            keyed[int(key)] = value
+        except (TypeError, ValueError):
+            continue
+    entry = keyed.get(int(world))
+    if not isinstance(entry, Mapping) or not entry.get("total"):
+        return None, ("the profile's calibration publishes no capture "
+                      "prediction at TP=%d" % world)
+    return int(entry["total"]), str(entry.get("provenance") or "")
+
+
 #: How many bytes an element of the KV cache takes, by the name the record
 #: keeps. Enough to price a block; a quantized cache also carries a scale,
 #: which `paged_block_bytes` adds in fp32 regardless.
@@ -197,7 +245,7 @@ KV_DTYPE_BYTES = {"bf16": 2, "fp16": 2, "float16": 2, "bfloat16": 2,
 
 
 def kv_rows(config: dict, readings: dict, tp: int, world: int, blob: dict,
-            model_config: str, predicted: dict = None) -> None:
+            model_config: str, predicted: dict = None, served=None) -> None:
     """The block count, derived from the model's own geometry.
 
     The last term, and the one every other term exists to serve: a
@@ -214,6 +262,12 @@ def kv_rows(config: dict, readings: dict, tp: int, world: int, blob: dict,
     readings the row reads +0.00% on every record by construction -- the
     engine planned from exactly those numbers -- so a 5% gate over it would
     pass without testing anything.
+
+    `served` is the count the run itself published in its budget source. Where
+    both it and the record state a count they have to be the same number: the
+    record is written by the process that was handed the budget, so a
+    disagreement means the record belongs to a different run than the manifest
+    and neither can be trusted to describe the other.
 
     Silent without `--model-config`, because guessing the checkpoint from the
     record's model name would be a download.
@@ -235,6 +289,12 @@ def kv_rows(config: dict, readings: dict, tp: int, world: int, blob: dict,
     block_size = int(config.get("block_size") or 0)
     kv_bytes = KV_DTYPE_BYTES.get(str(config.get("kv_cache_dtype")), 2)
     recorded_blocks = ((blob.get("blocks") or {}).get("num_kvcache_blocks"))
+    if served is not None:
+        if recorded_blocks and int(served) != int(recorded_blocks):
+            PROBLEMS.append(
+                "the run published %d KV blocks and this record states %d"
+                % (int(served), int(recorded_blocks)))
+        recorded_blocks = recorded_blocks or int(served)
     plan_from = predicted or readings
     try:
         plan = blocks_from_readings(
@@ -322,8 +382,8 @@ def _cal_note(calib, cal_map: dict, config: dict, sha: str, producer,
     return note
 
 
-def profile_from_budget_source(path: str) -> tuple:
-    """The profile the run was sized from, as the run itself published it.
+def profile_from_budget_source(path: str) -> dict:
+    """Everything the run attested about the budget it chose.
 
     Both runners publish `compass.memory.budget_source/1` at the branch that
     *chose* the budget, and its `inputs` manifest carries the digest of the
@@ -332,24 +392,99 @@ def profile_from_budget_source(path: str) -> tuple:
     between "the file the run used" and "a file with a similar name that
     exists now" -- and the second is not evidence about the run.
 
-    Returns ``(path, sha256)``.
+    The manifest is kept **whole**. An earlier cut pulled out the profile row
+    and dropped the rest, which meant the profile's digest was checked and the
+    calibration and model config it names -- where every collective constant
+    and the whole KV geometry live -- were re-opened unverified. A nested file
+    can be edited without touching the profile's bytes, so an outer digest that
+    still matches proves nothing about what `derived_readings` will read.
+
+    Returns the profile's path and digest, a path -> digest map covering every
+    attested input, and the run's own stored prediction (`lineage`) and served
+    block count, so the comparison can be held to what the run published rather
+    than only to what it recorded.
     """
     with open(path, encoding="utf-8") as fh:
         blob = json.load(fh)
-    rows = [r for r in ((blob.get("inputs") or {}).get("inputs") or ())
-            if r.get("role") == PROFILE_ROLE]
-    if not rows:
+    rows = list((blob.get("inputs") or {}).get("inputs") or ())
+    profiles = [r for r in rows if r.get("role") == PROFILE_ROLE]
+    if not profiles:
         raise SystemExit(
             "%s is a %r budget and names no %s input, so this run was not "
             "sized from a profile and there is no prediction to compare its "
             "readings against." % (path, blob.get("kind"), PROFILE_ROLE))
-    if len(rows) > 1:
+    if len(profiles) > 1:
         raise SystemExit("%s names %d memory profiles; a rank reads one"
-                         % (path, len(rows)))
-    return str(rows[0].get("path") or ""), str(rows[0].get("sha256") or "")
+                         % (path, len(profiles)))
+    attested: dict = {}
+    for row in rows:
+        where, digest = str(row.get("path") or ""), str(row.get("sha256") or "")
+        if not where or not digest:
+            continue
+        key = os.path.abspath(where)
+        if attested.get(key, digest) != digest:
+            # The same path read twice with different bytes is not something to
+            # pick a winner from: one of the two reads is being compared here
+            # and there is no way to tell which.
+            raise SystemExit(
+                "%s attests %s at two different digests, %s and %s"
+                % (path, where, attested[key][:12], digest[:12]))
+        attested[key] = digest
+    return {
+        "budget_source": path,
+        "profile": str(profiles[0].get("path") or ""),
+        "profile_sha256": str(profiles[0].get("sha256") or ""),
+        "attested": attested,
+        "lineage": blob.get("lineage") or {},
+        "num_kvcache_blocks": blob.get("num_kvcache_blocks"),
+        "kind": blob.get("kind"),
+    }
 
 
-def predicted_terms(path: str, expect_sha: str, config: dict, tokens: int,
+def attesting_loader(attested, source: str):
+    """A `load` for `derived_readings` that reads each input once, verified.
+
+    `derived_readings` opens whatever the profile names -- its calibration and
+    its model config -- and those are inputs to the prediction exactly as the
+    profile is. This reads each one time, digests the same bytes it parses, and
+    refuses any file the run's manifest does not attest or whose bytes have
+    moved since it did. Caching is not an optimisation here: the calibration
+    was being opened twice, so the two reads could disagree and the second
+    would silently win.
+    """
+    cache: dict = {}
+
+    def load(where):
+        key = os.path.abspath(str(where))
+        if key in cache:
+            return cache[key]
+        if attested is None:
+            # No budget source was saved, so there is nothing to attest
+            # against. The caller has already said so; this reads plainly
+            # rather than inventing an expectation.
+            with open(str(where), encoding="utf-8") as fh:
+                cache[key] = json.load(fh)
+            return cache[key]
+        expect = attested.get(key)
+        if expect is None:
+            raise SystemExit(
+                "the prediction reads %s, which %s does not attest. An input "
+                "the run never published cannot be compared against the run."
+                % (where, source))
+        blob, loaded = load_json(str(where), role="validate.nested_input")
+        if loaded.sha256 != expect:
+            raise SystemExit(
+                "%s has moved under the comparison: the run read %s, these "
+                "bytes are %s. The profile's own digest still matching says "
+                "nothing about the files it names."
+                % (where, expect[:12], loaded.sha256[:12]))
+        cache[key] = blob
+        return blob
+
+    return load
+
+
+def predicted_terms(attest: dict, config: dict, tokens: int,
                     world: int) -> dict:
     """Every non-KV term the predictor states, at this record's width.
 
@@ -358,10 +493,17 @@ def predicted_terms(path: str, expect_sha: str, config: dict, tokens: int,
     so what the gate compares is the prediction that actually sized the run,
     not a re-derivation that might differ from it.
 
+    Every file the derivation touches is verified against the run's manifest,
+    not just the profile, and each is read once. Where the run also published
+    its own readings (`lineage`), re-deriving them has to reproduce them: a
+    disagreement means this is not the prediction that sized the run, whatever
+    the digests say, and that is refused rather than reported as model error.
+
     `world_size` is passed so the profile's own cross-width guard fires: a
     TP=2 profile read against a TP=4 record is refused rather than quietly
     sized at two and reported as four.
     """
+    path, expect_sha = attest["profile"], attest["profile_sha256"]
     profile, loaded = load_json(path, role=PROFILE_ROLE)
     if expect_sha and loaded.sha256 != expect_sha:
         raise SystemExit(
@@ -380,11 +522,42 @@ def predicted_terms(path: str, expect_sha: str, config: dict, tokens: int,
             "%s is the profile for %s and this record is %s. Every term would "
             "compare two different models." % (path, stated, recorded))
 
-    load = lambda p: json.load(open(p, encoding="utf-8"))  # noqa: E731
+    load = attesting_loader(attest.get("attested"),
+                            attest.get("budget_source") or "the manifest")
     readings, activation = derived_readings(
         profile, warmup_tokens=tokens, load=load, world_size=world,
         source=path,
         enforce_eager=bool(config.get("enforce_eager")))
+
+    # The run stored what it derived. Re-deriving it here has to land on the
+    # same numbers, or this is some other prediction wearing the right digests
+    # -- a different code revision, a different warmup shape -- and comparing
+    # it to the record would charge the model for a gap it never produced.
+    lineage = attest.get("lineage") or {}
+    stated_world = lineage.get("world_size")
+    if stated_world is not None and int(stated_world) != int(world):
+        raise SystemExit(
+            "the run published its budget at TP=%s and this record is TP=%d"
+            % (stated_world, world))
+    if lineage.get("profile") and os.path.abspath(str(lineage["profile"])) \
+            != os.path.abspath(path):
+        raise SystemExit(
+            "the run's lineage says it modelled from %s and its manifest says "
+            "it read %s" % (lineage["profile"], path))
+    for term, got in (("peak_torch", readings.get("peak_torch")),
+                      ("non_torch", readings.get("non_torch")),
+                      ("cudagraph_overhead",
+                       readings.get("cudagraph_overhead")),
+                      ("activation_bytes", activation)):
+        want = lineage.get(term)
+        if want is None or got is None:
+            continue
+        if int(want) != int(got):
+            raise SystemExit(
+                "re-deriving the run's own prediction gives %s = %d and the "
+                "run published %d. Same inputs, different answer: this is not "
+                "the prediction that sized the run." % (term, int(got),
+                                                        int(want)))
     return {
         "path": loaded.path,
         "sha256": loaded.sha256,
@@ -392,6 +565,9 @@ def predicted_terms(path: str, expect_sha: str, config: dict, tokens: int,
         "buffers": int(profile.get("buffers") or 0),
         "activation": int(activation),
         "readings": readings,
+        # Already read and verified by the loader above; taking it from the
+        # cache is what keeps one file from being parsed twice into two
+        # possibly different mappings.
         "calibration": load(str(profile["calibration"])),
     }
 
@@ -412,12 +588,28 @@ TERM_TOLERANCE = 10.0
 #: `pool estimate` and `capture pinned` are deliberately not here. The first is
 #: an identity (both sides are the engine's own estimator) and the second is a
 #: mechanism check on the pinned half of a term `graph pool` already gates.
+#:
+#: The pool is two terms, not one, because the engine asks two questions about
+#: it. `reservation` is policy -- `0.2 x` the modelled peak activations, which
+#: is what actually leaves the KV budget -- and `graph pool` is cost, what
+#: capture goes on to reserve. They differ by 4-19x and neither substitutes
+#: for the other: gating only the first would leave the capture prediction
+#: unchecked, and gating only the second would leave the number the scheduler
+#: is exposed to unchecked.
 REQUIRED_TERMS = ("weights", "model buffers", "load residue", "persistent",
-                  "activations", "non-torch", "graph pool", "kv blocks")
+                  "activations", "non-torch", "reservation", "graph pool",
+                  "kv blocks")
 
 #: term -> error percent, or None where the row could not compare. Filled by
 #: `row` and `kv_rows` as they print, reset per record, read by `gate`.
 SEEN: dict = {}
+
+#: Reasons this comparison is not complete, as opposed to not within tolerance.
+#: A record that was asked for and could not be compared is the failure mode
+#: with no row to show for it: the terms that did print all pass and the run
+#: whose numbers are missing is the one nobody looked at. Rank 1 going quiet
+#: while rank 0 reads clean is exactly that shape, so it fails here.
+PROBLEMS: list = []
 
 
 def note_term(name: str, error) -> None:
@@ -437,7 +629,9 @@ def gate(label: str) -> bool:
     """Whether this record's comparison passes, term by term."""
     print("\n  gate  --  every non-KV term within %.0f%%, KV within %.0f%%"
           % (TERM_TOLERANCE, KV_TOLERANCE))
-    ok = True
+    ok = not PROBLEMS
+    for problem in PROBLEMS:
+        print("  %-14s %9s             %s" % ("completeness", "-", problem))
     for name in REQUIRED_TERMS:
         limit = KV_TOLERANCE if name == "kv blocks" else TERM_TOLERANCE
         error = SEEN.get(name)
@@ -607,16 +801,37 @@ def main() -> int:
                          % (TERM_TOLERANCE, KV_TOLERANCE))
     args = ap.parse_args()
 
-    profile_path, profile_sha = args.profile, ""
+    attest = None
     if args.budget_source:
-        attested, profile_sha = profile_from_budget_source(args.budget_source)
-        if args.profile and os.path.abspath(args.profile) != os.path.abspath(attested):
+        attest = profile_from_budget_source(args.budget_source)
+        if args.profile and (os.path.abspath(args.profile)
+                             != os.path.abspath(attest["profile"])):
             raise SystemExit(
                 "--profile is %s but the run's budget source says it read %s. "
-                "The run decides which it was." % (args.profile, attested))
-        profile_path = attested
+                "The run decides which it was."
+                % (args.profile, attest["profile"]))
+    elif args.profile:
+        # Named but not attested: nothing says the run read these bytes, and
+        # the rows will say so.
+        attest = {"budget_source": "", "profile": args.profile,
+                  "profile_sha256": "", "attested": None, "lineage": {},
+                  "num_kvcache_blocks": None, "kind": None}
+    profile_path = attest["profile"] if attest else None
 
-    paths = [q for p in args.records for q in sorted(glob.glob(p))] or args.records
+    # A pattern that matched nothing is a record that was asked for and is not
+    # here. Falling back to the literal pattern turned that into a file-not-
+    # found much later, or -- when other patterns did match -- into a clean
+    # report over whatever happened to exist.
+    paths = []
+    for pattern in args.records:
+        found = sorted(glob.glob(pattern))
+        if not found:
+            if os.path.exists(pattern):
+                found = [pattern]
+            else:
+                PROBLEMS.append("%s was asked for and matched no file" % pattern)
+                continue
+        paths.extend(found)
     graph = json.load(open(args.graph)) if args.graph else None
     pool_seen = measured_pool(args.log) if args.log else 0
 
@@ -626,6 +841,10 @@ def main() -> int:
             blob = json.load(fh)
         readings, config = blob.get("readings") or {}, blob.get("config") or {}
         if not readings:
+            # A record that exists and states nothing is not a record that
+            # agrees. Skipping it let a clean rank 0 carry a silent rank 1.
+            PROBLEMS.append("%s carries no readings, so nothing in it was "
+                            "compared" % os.path.basename(path))
             continue
         tp = int((config.get("topology") or {}).get("tp", 1) or 1)
         non_torch_seen.append(
@@ -662,7 +881,7 @@ def main() -> int:
         predicted = None
         if profile_path:
             predicted = predicted_terms(
-                profile_path, profile_sha, config,
+                attest, config,
                 warmup_tokens(config, args.max_num_batched_tokens
                               or int(config.get("max_num_batched_tokens") or 0)),
                 world)
@@ -851,16 +1070,31 @@ def main() -> int:
             if identity else "the mirror has drifted from the engine's "
                              "estimator", sizing_budget)
 
-        # The term itself: what capture reserved, against what capture was
-        # predicted to reserve. `graph_pool.reserved` is in the record; a
-        # `--log` is only needed for a record written before it was.
+        # The same estimator run forward instead of restated: 0.2 x the
+        # *modelled* peak activations, against what the run reserved. This is
+        # the pool number the KV budget is exposed to, so it is gated even
+        # though it is policy rather than cost -- an engine that sets aside the
+        # wrong amount misprices the cache whether or not capture then fits.
+        if predicted is not None:
+            row("reservation", predicted["readings"].get("cudagraph_overhead"),
+                estimate, "the engine's reservation policy at the modelled "
+                          "activation peak", sizing_budget)
+
+        # The cost, which is a different question. The derived side is the
+        # source-only capture replay published in the profile's calibration --
+        # never `measured_graph_pool_bytes`, whose width constant no predictor
+        # uses. `graph_pool.reserved` is in the record; a `--log` is only
+        # needed for a record written before it was.
         reserved, allocated, capture_sizes = recorded_pool(blob)
         seen = reserved or pool_seen
         if seen:
-            row("graph pool", measured_graph_pool_bytes(capture_sizes, world),
-                seen,
-                "vs the %d MiB capture actually reserved over %d buckets"
-                % (seen / (1 << 20), len(capture_sizes)), sizing_budget)
+            capture_pred, capture_note = published_capture(cal_map, world)
+            row("graph pool", capture_pred, seen,
+                ("vs the %d MiB capture actually reserved over %d buckets; %s"
+                 % (seen / (1 << 20), len(capture_sizes),
+                    capture_note or "source-derived capture replay"))
+                if capture_pred is not None else capture_note,
+                sizing_budget)
             if estimate:
                 # Which way the estimator is wrong is not fixed. It is 0.2x the
                 # peak activations, so it scales with the model while the pool
@@ -906,7 +1140,8 @@ def main() -> int:
                         sizing_budget)
 
         kv_rows(config, readings, tp, world, blob, args.model_config,
-                predicted["readings"] if predicted is not None else None)
+                predicted["readings"] if predicted is not None else None,
+                served=(attest or {}).get("num_kvcache_blocks"))
 
         if args.gate:
             passed = gate(name) and passed
@@ -937,7 +1172,15 @@ def main() -> int:
         if not non_torch_seen:
             print("\nGATE FAIL  no record carried readings, so nothing was "
                   "compared")
+            for problem in PROBLEMS:
+                print("  %s" % problem)
             return 1
+        if PROBLEMS:
+            # Already shown per record; restated here because a completeness
+            # failure is the one that leaves no failing row behind it.
+            print("\nincomplete: %d requested record(s) were not compared"
+                  % len(PROBLEMS))
+            passed = False
         return 0 if passed else 1
     return 0
 

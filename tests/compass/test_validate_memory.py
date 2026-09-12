@@ -13,6 +13,7 @@ reserved, which every record has carried since the terms were split.
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 from pathlib import Path
@@ -37,6 +38,64 @@ def _script():
 def _record(name: str) -> dict:
     with open(RECORDS / name, encoding="utf-8") as fh:
         return json.load(fh)
+
+
+def _attest(profile, **extra) -> dict:
+    """What a run would have published about a profile it read.
+
+    `attested` is None here, which is the unattested case -- named on the
+    command line, not taken out of a manifest -- so these stay about the term
+    under test rather than about the digest checks.
+    """
+    attest = {"budget_source": "", "profile": str(profile),
+              "profile_sha256": "", "attested": None, "lineage": {},
+              "num_kvcache_blocks": None, "kind": None}
+    attest.update(extra)
+    return attest
+
+
+def _servable_profile(tmp_path, width: int = 1):
+    """A profile complete enough that `derived_readings` will answer.
+
+    Not a stub: `derived_readings` fails closed on every missing term, so
+    anything short of a real profile refuses before the checks under test are
+    reached. The numbers are the 27B's, at the shape the emitter writes.
+    """
+    calibration = tmp_path / ("calibration.tp%d.json" % width)
+    calibration.write_text(json.dumps({
+        "persistent": 252339712,
+        "non_torch": {str(width): 1157627904},
+        "load_residue": {str(width): 14924832},
+        "provenance": {
+            "persistent": "S27: 27B full engine, the source config",
+            "non_torch": "S27: 27B full engine, the source config",
+            "load_residue": "S27: 27B full engine, the source config",
+        },
+    }))
+    profile = tmp_path / ("profile.tp%d.json" % width)
+    profile.write_text(json.dumps({
+        "total": 206141652992,
+        "world_size": width,
+        "parameters": 55000000000 // width,
+        "buffers": 33554432,
+        "model_config": str(RECORDS / "qwen3_5_27b.config.json"),
+        "compile_mode": "inductor",
+        "calibration": str(calibration),
+        "provenance": {"model": "Qwen/Qwen3.8-27B"},
+    }))
+    return profile, calibration
+
+
+def _digests(*paths) -> dict:
+    """What a run's manifest would say about the files a derivation reads.
+
+    The model config is in here too: it is an input to the activation term
+    exactly as the calibration is, and the loader refuses anything the
+    manifest does not name.
+    """
+    every = list(paths) + [RECORDS / "qwen3_5_27b.config.json"]
+    return {str(path): hashlib.sha256(Path(path).read_bytes()).hexdigest()
+            for path in every}
 
 
 def test_the_pool_measurement_is_read_off_the_record():
@@ -285,8 +344,8 @@ class TestTheGateAcceptanceRunsOn:
         profile.write_text(json.dumps(
             {"provenance": {"model": "Qwen/Qwen3.8-27B"}}))
         with pytest.raises(SystemExit) as raised:
-            script.predicted_terms(str(profile), "", {"model": "Qwen/Qwen3-0.6B"},
-                                   16384, 1)
+            script.predicted_terms(_attest(profile),
+                                   {"model": "Qwen/Qwen3-0.6B"}, 16384, 1)
         assert "two different models" in str(raised.value)
 
     def test_the_profile_compared_is_the_one_the_run_read(self, tmp_path):
@@ -301,7 +360,8 @@ class TestTheGateAcceptanceRunsOn:
                  "sha256": "aa"},
                 {"role": script.PROFILE_ROLE, "path": "/p.json",
                  "sha256": "bb"}]}}))
-        assert script.profile_from_budget_source(str(source)) == ("/p.json", "bb")
+        attest = script.profile_from_budget_source(str(source))
+        assert (attest["profile"], attest["profile_sha256"]) == ("/p.json", "bb")
 
     def test_a_budget_no_profile_sized_has_nothing_to_compare(self, tmp_path):
         script = _script()
@@ -317,5 +377,212 @@ class TestTheGateAcceptanceRunsOn:
         profile = tmp_path / "profile.json"
         profile.write_text(json.dumps({"provenance": {}}))
         with pytest.raises(SystemExit) as raised:
-            script.predicted_terms(str(profile), "0" * 64, {}, 16384, 1)
+            script.predicted_terms(_attest(profile, profile_sha256="0" * 64),
+                                   {}, 16384, 1)
         assert "not the profile the run read" in str(raised.value)
+
+    def test_every_attested_input_is_kept_not_just_the_profile(self, tmp_path):
+        """The calibration is where every collective constant lives.
+
+        Pulling out the profile row and dropping the rest left the one file
+        whose digest was checked as the one file that carries no numbers.
+        """
+        script = _script()
+        source = tmp_path / "budget_source.json"
+        source.write_text(json.dumps({
+            "kind": "source-derived",
+            "inputs": {"inputs": [
+                {"role": script.PROFILE_ROLE, "path": "/p.json",
+                 "sha256": "bb"},
+                {"role": "runtime.memory_model.calibration", "path": "/c.json",
+                 "sha256": "cc"},
+                {"role": "runtime.memory_model.model_config", "path": "/m.json",
+                 "sha256": "dd"}]}}))
+        attest = script.profile_from_budget_source(str(source))
+        assert attest["attested"] == {"/p.json": "bb", "/c.json": "cc",
+                                      "/m.json": "dd"}
+
+    def test_one_path_attested_at_two_digests_is_refused(self, tmp_path):
+        """One of the two reads is the one being compared, and there is no
+        way to tell which."""
+        script = _script()
+        source = tmp_path / "budget_source.json"
+        source.write_text(json.dumps({
+            "kind": "source-derived",
+            "inputs": {"inputs": [
+                {"role": script.PROFILE_ROLE, "path": "/p.json",
+                 "sha256": "bb"},
+                {"role": "runtime.memory_model.model_config", "path": "/m.json",
+                 "sha256": "dd"},
+                {"role": "runtime.memory_model.model_config", "path": "/m.json",
+                 "sha256": "ee"}]}}))
+        with pytest.raises(SystemExit) as raised:
+            script.profile_from_budget_source(str(source))
+        assert "two different digests" in str(raised.value)
+
+    def test_a_nested_input_that_moved_is_refused_though_the_outer_did_not(
+            self, tmp_path):
+        """The failure an outer digest cannot see.
+
+        A calibration can be rewritten without touching a byte of the profile
+        that names it, so a profile digest that still matches says nothing
+        about the numbers the derivation is about to read.
+        """
+        script = _script()
+        calibration = tmp_path / "calibration.json"
+        calibration.write_text(json.dumps({"persistent": 1}))
+        load = script.attesting_loader({str(calibration): "0" * 64}, "budget")
+        with pytest.raises(SystemExit) as raised:
+            load(str(calibration))
+        assert "moved under the comparison" in str(raised.value)
+
+    def test_an_input_the_run_never_published_is_refused(self, tmp_path):
+        script = _script()
+        other = tmp_path / "elsewhere.json"
+        other.write_text(json.dumps({}))
+        load = script.attesting_loader({}, "budget_source.json")
+        with pytest.raises(SystemExit) as raised:
+            load(str(other))
+        assert "does not attest" in str(raised.value)
+
+    def test_an_attested_input_is_read_once(self, tmp_path):
+        """Two reads of one file can disagree, and the second would win.
+
+        `derived_readings` opens the calibration and the returned mapping was
+        opened again separately, so the prediction and the row notes could be
+        describing different bytes.
+        """
+        script = _script()
+        path = tmp_path / "calibration.json"
+        path.write_text(json.dumps({"persistent": 1}))
+        digest = hashlib.sha256(path.read_bytes()).hexdigest()
+        load = script.attesting_loader({str(path): digest}, "budget")
+        first = load(str(path))
+        path.write_text(json.dumps({"persistent": 2}))
+        assert load(str(path)) is first
+
+    def test_a_prediction_that_no_longer_reproduces_the_run_is_refused(
+            self, tmp_path):
+        """Same digests, different answer.
+
+        The run stored what it derived. If re-deriving it here lands somewhere
+        else -- a different revision of the model, a different warmup shape --
+        then this is not the prediction that sized the run, and charging the
+        record for the gap would be charging it for the wrong thing.
+        """
+        script = _script()
+        profile, _ = _servable_profile(tmp_path, 1)
+        config = {"model": "Qwen/Qwen3.8-27B"}
+        predicted = script.predicted_terms(_attest(profile), config, 16384, 1)
+        published = int(predicted["readings"]["non_torch"])
+        with pytest.raises(SystemExit) as raised:
+            script.predicted_terms(
+                _attest(profile, lineage={"non_torch": published + 1}),
+                config, 16384, 1)
+        assert "not the prediction that sized the run" in str(raised.value)
+
+    def test_a_record_at_another_width_than_the_run_published_is_refused(
+            self, tmp_path):
+        script = _script()
+        profile, _ = _servable_profile(tmp_path, 1)
+        with pytest.raises(SystemExit) as raised:
+            script.predicted_terms(
+                _attest(profile, lineage={"world_size": 2}),
+                {"model": "Qwen/Qwen3.8-27B"}, 16384, 1)
+        assert "TP=2" in str(raised.value)
+
+    def test_the_calibration_priced_is_the_one_the_derivation_read(
+            self, tmp_path):
+        """One read, one mapping.
+
+        The row notes quote the calibration and the prediction consumes it. If
+        those are two separate `open`s, a file rewritten between them makes
+        the notes describe numbers the prediction never saw.
+        """
+        script = _script()
+        profile, calibration = _servable_profile(tmp_path, 1)
+        attested = _digests(profile, calibration)
+        predicted = script.predicted_terms(
+            _attest(profile, attested=attested,
+                    profile_sha256=attested[str(profile)]),
+            {"model": "Qwen/Qwen3.8-27B"}, 16384, 1)
+        assert predicted["calibration"]["persistent"] == 252339712
+
+    def test_a_calibration_that_moved_is_refused_with_the_profile_intact(
+            self, tmp_path):
+        """The failure the outer digest cannot see, through the real path."""
+        script = _script()
+        profile, calibration = _servable_profile(tmp_path, 1)
+        attested = dict(_digests(profile, calibration),
+                        **{str(calibration): "0" * 64})
+        with pytest.raises(SystemExit) as raised:
+            script.predicted_terms(
+                _attest(profile, attested=attested,
+                        profile_sha256=attested[str(profile)]),
+                {"model": "Qwen/Qwen3.8-27B"}, 16384, 1)
+        assert "moved under the comparison" in str(raised.value)
+
+    def test_the_gate_holds_the_reservation_and_the_capture_apart(self):
+        """Two questions about the pool, neither standing in for the other.
+
+        `reservation` is `0.2 x` the modelled activations -- the policy that
+        actually leaves the KV budget -- and `graph pool` is what capture goes
+        on to cost. They differ by 3x on this model, so a gate that covered
+        only one of them would report a validated pool either way.
+        """
+        script = _script()
+        assert "reservation" in script.REQUIRED_TERMS
+        assert "graph pool" in script.REQUIRED_TERMS
+
+    def test_the_capture_term_comes_from_the_profile_not_a_constant(self):
+        """The 104 MiB width constant is superseded and no predictor calls it.
+
+        Gating against it charged the model +26.8% at TP=4 for a formula the
+        run never used. The derived side is the source-derived capture replay
+        the profile's own calibration publishes.
+        """
+        script = _script()
+        published, note = script.published_capture(
+            {"capture_reserved": {"4": {"total": 85983232,
+                                        "provenance": "replayed"}}}, 4)
+        assert (published, note) == (85983232, "replayed")
+
+    def test_an_unpublished_width_is_not_answered_from_a_neighbour(self):
+        """The carry-forward failure the topology module refuses, again."""
+        script = _script()
+        published, why = script.published_capture(
+            {"capture_reserved": {"2": {"total": 106954752}}}, 4)
+        assert published is None
+        assert "TP=4" in why
+
+    def test_a_profile_publishing_no_capture_prediction_leaves_it_uncovered(self):
+        script = _script()
+        published, why = script.published_capture({"persistent": 1}, 2)
+        assert published is None
+        assert "no source-derived capture prediction" in why
+
+    def test_a_record_with_no_readings_fails_rather_than_being_skipped(self):
+        """Rank 0 clean and rank 1 silent used to read as a pass.
+
+        Every term that printed was inside tolerance; the run whose numbers
+        were missing is the one nobody looked at.
+        """
+        script = _script()
+        script.SEEN.update({name: 1.0 for name in script.REQUIRED_TERMS})
+        script.PROBLEMS.append("tp4.memory.tp1.json carries no readings")
+        assert script.gate("tp4.memory.tp0.json") is False
+
+    def test_a_requested_record_that_is_not_there_fails_completeness(self):
+        script = _script()
+        script.SEEN.update({name: 1.0 for name in script.REQUIRED_TERMS})
+        script.PROBLEMS.append("mem_*.tp1.json was asked for and matched no file")
+        assert script.gate("record") is False
+
+    def test_a_served_count_the_record_disagrees_with_is_a_problem(self):
+        """The record is written by the process that was handed the budget."""
+        script = _script()
+        blob = _record("27b.tp1.memory.json")
+        served = int(blob["blocks"]["num_kvcache_blocks"]) + 1
+        script.kv_rows(blob["config"], blob["readings"], 1, 1, blob,
+                       str(RECORDS / "qwen3_5_27b.config.json"), served=served)
+        assert any("published" in problem for problem in script.PROBLEMS)
