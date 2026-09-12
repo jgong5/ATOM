@@ -494,6 +494,25 @@ class LLMEngine:
             timed_out = False
         return {"timed_out": timed_out, "ranks": ranks}
 
+    def get_compass_inputs(self, timeout: float = 30.0) -> dict[str, Any]:
+        """What each engine core's predictor loaded, recorded as it read it.
+
+        Deliberately not aggregated. Ranks legitimately load different files --
+        that is what the per-rank artifact convention is for -- so one merged
+        answer would be a claim no rank made. Each record carries the
+        coordinates of the rank that produced it, and they are reported as the
+        list they are.
+
+        The identity of what a prediction was fitted to has to come from the
+        process that did the fitting. An API server digesting the paths an
+        option names is reading a different file, possibly on a different
+        filesystem, certainly at a different time.
+        """
+        responses = self.core_mgr.broadcast_utility_command_sync(
+            "get_compass_inputs", timeout=timeout
+        )
+        return {"ranks": [resp.get("result", resp) for resp in responses]}
+
     def get_cache_statistics(self, timeout: float = 30.0) -> dict[str, Any]:
         """Return aggregated prefix-cache statistics across DP ranks.
 

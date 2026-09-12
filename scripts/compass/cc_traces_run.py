@@ -922,7 +922,95 @@ class SideRun:
                 f"answered"
             )
         execution["server_process"]["verified"] = True
+        self._check_predictor_process(step, said, execution, proc)
         return True
+
+    def _check_predictor_process(self, step, said, execution, proc) -> bool:
+        """And that the process which *predicted* is one this repeat launched.
+
+        The server answering the port is not the process that produced the
+        prediction: the runner lives in a worker, and the worker is the one
+        that opened the tables and could or could not have reached a device.
+        Its own reading of itself travels back in the provenance; this probes
+        the pid that reading names, from here, exactly as the check above
+        probes the server's.
+
+        Host and boot equality is not enough on its own, and that is the gap
+        this closes. Two containers on one machine share a host and a boot, so
+        a worker in a GPU container and a probe in a CPU container agree on
+        both -- as does a worker left over from an earlier repeat. Ancestry
+        does not: being inside the tree this repeat started is a claim neither
+        of those can make.
+
+        Recorded as well as checked, so the offline validator reads our
+        observations beside the worker's own account, neither written from the
+        other.
+        """
+        compass = said.get("compass") or {}
+        ranks = ((compass.get("loaded_inputs") or {}).get("ranks")) or []
+        readings = [
+            rank.get("device_freedom")
+            for rank in ranks
+            if isinstance(rank, dict) and isinstance(rank.get("device_freedom"), dict)
+        ]
+        if not readings:
+            # Not refused here. A measured side has no predictor at all, and a
+            # modelled side missing one is refused by the offline validator,
+            # which knows which side it is reading. This records that we saw
+            # none rather than quietly recording nothing.
+            execution["predictor_process"] = {"observed": [], "verified": False}
+            return True
+
+        observed, ok = [], True
+        for index, reading in enumerate(readings):
+            theirs = (reading.get("launch") or {}).get("process") or {}
+            pid = theirs.get("pid")
+            seen = {
+                "rank": index,
+                "said_pid": pid,
+                "launched_pid": proc.pid,
+                "host": self.host,
+                "boot_id": self.probe.boot_id(),
+                "start_ticks": self.probe.start_ticks(pid) if pid else None,
+                "ancestry": self._ancestry(pid, proc.pid) if pid else [],
+            }
+            observed.append(seen)
+            if not pid:
+                self.failures.append(
+                    f"{step['id']}: the predictor's device reading names no "
+                    f"pid, so nothing here can be probed to confirm which "
+                    f"process produced the prediction"
+                )
+                ok = False
+                continue
+            if seen["start_ticks"] is None:
+                self.failures.append(
+                    f"{step['id']}: the predictor claims pid {pid} but no such "
+                    f"process exists here, so its reading describes a process "
+                    f"this machine is not running"
+                )
+                ok = False
+                continue
+            if theirs.get("start_ticks") != seen["start_ticks"]:
+                self.failures.append(
+                    f"{step['id']}: predictor pid {pid} started at tick "
+                    f"{theirs.get('start_ticks')!r} by its own account and at "
+                    f"{seen['start_ticks']!r} by ours, so the pid has been "
+                    f"reused and the reading is another process's"
+                )
+                ok = False
+                continue
+            if proc.pid not in seen["ancestry"]:
+                self.failures.append(
+                    f"{step['id']}: predictor pid {pid} is not the server this "
+                    f"repeat launched (pid {proc.pid}) nor a descendant of it, "
+                    f"so its device reading describes another process -- which "
+                    f"host and boot alone cannot tell from ours, since another "
+                    f"container on this machine shares both"
+                )
+                ok = False
+        execution["predictor_process"] = {"observed": observed, "verified": ok}
+        return ok
 
     def _replay(self, step) -> bool:
         """This repeat's replay, against the server this repeat started."""

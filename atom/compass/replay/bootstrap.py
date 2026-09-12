@@ -46,6 +46,7 @@ a GPU. Those two requirements are separate and are reported separately.
 
 from __future__ import annotations
 
+import hashlib
 import importlib.util
 import json
 import logging
@@ -61,7 +62,23 @@ __all__ = ["install", "install_from_target", "state", "ArchUnavailable"]
 _STATE: dict = {"installed": False, "arch": None, "gpu_archs": None,
                 "redundant_installs": 0,
                 "source": None, "reason": None, "calls": 0,
-                "chip_info_hook": False, "chip_info_calls": 0}
+                "chip_info_hook": False, "chip_info_calls": 0,
+                #: Every captured target this *process* read, in the order it
+                #: read them, each labelled with what it was read for. Written
+                #: in `install_from_target`, which is the only place these
+                #: files are opened: a reader asked later to digest the path
+                #: would describe whatever is there then.
+                #:
+                #: A list and not one record, because one process legitimately
+                #: reads two different targets. `replay_server` reads the
+                #: deployment's own, to bootstrap the interpreter, and
+                #: `ModelTracer.build` then reads whatever the factory's
+                #: `replay_target` option names, to answer the derivation's
+                #: architecture query. Those are separate reads of separately
+                #: named files, and a single slot lost one of them --
+                #: whichever ran second, or, across the adoption in `install`,
+                #: whichever ran first.
+                "inputs": []}
 
 
 class ArchUnavailable(RuntimeError):
@@ -70,7 +87,36 @@ class ArchUnavailable(RuntimeError):
 
 def state() -> dict:
     """What the bootstrap did, for a run to report rather than assert."""
-    return dict(_STATE)
+    out = dict(_STATE)
+    # Copied, not shared: a caller that held the live list would see later
+    # reads appear in a record it had already taken.
+    out["inputs"] = [dict(row) for row in (_STATE.get("inputs") or ())]
+    return out
+
+
+def _record_input(record: dict) -> None:
+    """Keep one read, unless this exact read is already kept.
+
+    Identity is ``(role, path, sha256)``. The same file read twice for the
+    same purpose is one input; the same file read for two purposes is two,
+    because what a run did with it is part of what it is.
+    """
+    held = _STATE.setdefault("inputs", [])
+    key = (record["role"], record["path"], record["sha256"])
+    if any((r["role"], r["path"], r["sha256"]) == key for r in held):
+        return
+    held.append(record)
+
+
+def _merge_inputs(first, second) -> list:
+    """Both modules' reads, in order, without duplicating a shared one."""
+    merged: list = []
+    for row in list(first or ()) + list(second or ()):
+        key = (row["role"], row["path"], row["sha256"])
+        if any((r["role"], r["path"], r["sha256"]) == key for r in merged):
+            continue
+        merged.append(dict(row))
+    return merged
 
 
 def _live_arch() -> Optional[str]:
@@ -205,7 +251,15 @@ def install(arch: str, *, source: str = "unknown") -> dict:
             found = _process_state()
             if found is not None:
                 adopted, where = found
+                # This module object may already hold a read of its own: the
+                # caller that is installing right now opened a target before
+                # calling in. A plain `update` would replace that with the
+                # adopted module's list and lose it, which is the opposite of
+                # what adoption is for -- the two lists are two halves of what
+                # the *process* read.
+                mine = _STATE.get("inputs")
                 _STATE.update(adopted)
+                _STATE["inputs"] = _merge_inputs(adopted.get("inputs"), mine)
                 _STATE["adopted_from"] = where
         # Already answered, with the architecture being asked for: the
         # derivation path's second call is redundant rather than wrong.
@@ -296,20 +350,50 @@ def install(arch: str, *, source: str = "unknown") -> dict:
     return state()
 
 
-def install_from_target(path: str) -> dict:
+def install_from_target(path: str, *,
+                        role: str = "bootstrap.replay_target") -> dict:
     """Read the architecture out of a captured replay target and install it.
 
     Deliberately reads the file by hand rather than through
     :class:`~atom.compass.replay.runner.TargetRecord`. This has to run before
     ``atom`` is imported at all, so it takes no import it does not need; the
     record's own validation happens later, when the runner loads it properly.
+
+    ``role`` says what this read was *for*, and the default is the one the
+    process bootstrap does: `replay_server` reading the deployment's own
+    target so the interpreter can answer an architecture query. The source
+    factory passes ``oracle.replay_target`` instead, because the file its
+    ``replay_target=`` option names is a separate file read for a separate
+    purpose -- and neither of the two can stand in for the other in a record
+    of what the run was configured from.
     """
     if not path or not os.path.exists(path):
         raise FileNotFoundError(
             f"ATOMCompass: no replay target at {path!r}, so there is no "
             f"architecture to replay as.")
-    with open(path, encoding="utf-8") as fh:
-        blob = json.load(fh)
+    # Read once, digested from the same bytes. This is the only place the
+    # derivation side opens the target, so it is the only place its identity
+    # can be taken from the bytes that were actually used; a reader asked
+    # later to digest this path would describe whatever is there then.
+    #
+    # Done inline rather than through `atom.compass.core.loaded_input`,
+    # because `_sitedir/sitecustomize.py` loads this file *by path* precisely
+    # so that a spawned child need not import `atom` -- see `_process_state`.
+    # The record is shaped as `LoadedInput.as_dict()` and
+    # `LoadedInput.from_dict` reads it back; the duplication is one dict
+    # literal, and it is what keeps this module stdlib-only.
+    with open(path, "rb") as fh:
+        raw = fh.read()
+    blob = json.loads(raw.decode("utf-8"))
+    _record_input({
+        "role": role,
+        "requested": path,
+        "path": path,
+        "rank_own": False,
+        "sha256": hashlib.sha256(raw).hexdigest(),
+        "size": len(raw),
+        "rank_coords": {},
+    })
     hardware = (blob.get("hardware") or {})
     arch = hardware.get("arch")
     if not arch:

@@ -47,8 +47,10 @@ once; a served run asking for the source composition wants the measured one.
 
 from typing import NamedTuple, Optional
 
-__all__ = ["source_cost_oracle", "build_source_oracle", "SourceComposition",
-           "price_specs", "template_shape", "seeded_graphs", "gap_ratio"]
+__all__ = ["source_cost_oracle", "build_source_oracle", "build_source_group",
+           "SourceComposition", "SourceGroup", "RankGroupOracle",
+           "price_specs", "template_shape", "seeded_graphs", "gap_ratio",
+           "region_snapshot", "region_values", "REGION_SNAPSHOT_SCHEMA"]
 
 
 def _entries(value, what: str):
@@ -123,7 +125,109 @@ def gap_ratio(value, what: str = "interpolate"):
     return ratio
 
 
-def _price_library(entries, gap_ratio):
+#: The record :func:`region_snapshot` produces. Versioned for the same reason
+#: the budget record is: a validator reads it, and a field that quietly changes
+#: meaning is worse than one that is absent.
+REGION_SNAPSHOT_SCHEMA = "compass.regions.selected/1"
+
+
+def region_values(value):
+    """Every value a region preset holds, in a form JSON keeps whole.
+
+    Dataclasses become their fields and tuples become lists. A mapping whose
+    keys are not strings -- a ``(capture_bucket, padded) -> Measured`` table,
+    say -- becomes a sorted list of key/value pairs rather than being coerced:
+    `json.dumps` cannot write a tuple key, so it either raises or a careless
+    serialiser flattens it to a string, and both lose the coefficient. A
+    coefficient outside the digest is a number nobody is holding the run to.
+
+    Read off the object rather than from a list of fields kept here, so a
+    preset that grows a table -- a prefill cell map, a new region -- is
+    carried without this having to learn about it first.
+    """
+    import dataclasses
+    import json as _json
+
+    if dataclasses.is_dataclass(value) and not isinstance(value, type):
+        value = dataclasses.asdict(value)
+    if isinstance(value, dict):
+        if all(isinstance(key, str) for key in value):
+            return {key: region_values(item) for key, item in value.items()}
+        return {"__pairs__": sorted(
+            ([region_values(key), region_values(item)]
+             for key, item in value.items()),
+            key=lambda pair: _json.dumps(pair[0], sort_keys=True))}
+    if isinstance(value, (list, tuple)):
+        return [region_values(item) for item in value]
+    return value
+
+
+def region_snapshot(name: str, model) -> dict:
+    """The region preset a run selected, as a value rather than as a name.
+
+    ``model`` is the object the factory is holding -- the one it will price
+    with -- and not a name to look up again. Resolving the name a second time
+    at the end of construction would be the very pattern this work removes: a
+    record derived from an option rather than from the thing that was used, so
+    that a preset swapped in between would be priced from and not reported.
+    It is snapshotted where it is selected, for the same reason a file's
+    digest is taken where its bytes are parsed.
+
+    A region model supplies preparation and postprocess -- everything in the
+    step that is not the body and not the head -- from measured coefficients.
+    Those coefficients go straight into every predicted duration, and until
+    now the record said only which *name* was asked for. A name is not a
+    measurement: the preset behind it can be edited, and two runs quoting the
+    same name can have been priced from different numbers with nothing to show
+    it.
+
+    So the numbers are snapshotted where they are selected, and digested. This
+    is deliberately **not** a `LoadedInput` and must not be filed as one: no
+    file was read. The preset is built into the code, `sha256` here is over a
+    canonical serialisation of its own values, and a validator that treated it
+    as a file read would go looking for bytes on disk that never existed. The
+    distinction is why this has its own schema and its own key in the manifest
+    rather than joining `inputs`.
+
+    ``"none"`` snapshots as a selection of nothing. That is a real choice --
+    body plus head with no runner term -- and it contributes no coefficients,
+    so there is nothing to attribute and nothing is required of it. Whether it
+    is *allowed* in an acceptance cell is `check_source_factory`'s question,
+    and it already answers no.
+
+    Every name that selects this preset is recorded beside the one that was
+    asked for, so an alias cannot make two records of one preset look like
+    records of two.
+    """
+    import hashlib
+    import json as _json
+
+    from atom.compass.core.cost.regions import REGION_MODELS
+
+    # Aliases by identity against the object in hand, so two names for one
+    # preset cannot read as records of two.
+    aliases = sorted(key for key, value in REGION_MODELS.items()
+                     if value is model and value is not None)
+    snapshot = {
+        "schema": REGION_SNAPSHOT_SCHEMA,
+        "requested": str(name),
+        "aliases": aliases,
+        "version": str(getattr(model, "version", "") or ""),
+        "provenance": str(getattr(model, "provenance", "") or ""),
+        # Every field of the preset, coefficients and calibrated domain alike.
+        # The domain is part of what was selected: the same numbers over a
+        # wider domain is a different claim about where they hold.
+        # Read off the dataclass rather than listed here, so a preset that
+        # grows a field -- a prefill cell table, a new region -- is carried
+        # without this needing to know about it.
+        "parameters": None if model is None else region_values(model),
+    }
+    body = _json.dumps(snapshot, sort_keys=True, separators=(",", ":"))
+    snapshot["sha256"] = hashlib.sha256(body.encode()).hexdigest()
+    return snapshot
+
+
+def _price_library(entries, gap_ratio, coords=None):
     """The exact-signature library, or the family provider in front of it.
 
     The provider is a subclass that overrides `lookup` alone, so everything
@@ -133,23 +237,28 @@ def _price_library(entries, gap_ratio):
 
     Off by default. An interpolated price is a claim about a row count nobody
     ran, and a run that did not ask for one should not silently get one.
+
+    ``coords`` goes to the library unresolved, and the library resolves as it
+    reads. Both branches go through ``add``, so there is one call site
+    carrying it rather than two.
     """
     from atom.compass.core.cost.library import PriceLibrary
 
     if gap_ratio is None:
-        return PriceLibrary.load(entries)
+        library = PriceLibrary()
+    else:
+        from atom.compass.core.cost.families import ParametricPriceLibrary
 
-    from atom.compass.core.cost.families import ParametricPriceLibrary
-
-    library = (ParametricPriceLibrary()
-               if gap_ratio is _DEFAULT_GAP_RATIO
-               else ParametricPriceLibrary(max_gap_ratio=gap_ratio))
+        library = (ParametricPriceLibrary()
+                   if gap_ratio is _DEFAULT_GAP_RATIO
+                   else ParametricPriceLibrary(max_gap_ratio=gap_ratio))
+    extra = {"coords": coords} if coords else {}
     for entry in entries:
         if isinstance(entry, (tuple, list)):
             library.add(entry[0], entry[1] if len(entry) > 1 else None,
-                        entry[2] if len(entry) > 2 else None)
+                        entry[2] if len(entry) > 2 else None, **extra)
         else:
-            library.add(entry, None, None)
+            library.add(entry, None, None, **extra)
     return library
 
 
@@ -271,7 +380,8 @@ def template_shape(graph: dict):
     )
 
 
-def seeded_graphs(paths, derive, allocation, coords=None):
+def seeded_graphs(paths, derive, allocation, coords=None, *,
+                  role="oracle.template", collect=None):
     """A `TemplateGraphs` holding the graphs already on disk, keyed by spec.
 
     ``coords`` resolves each path to this rank's file where one was written,
@@ -281,18 +391,21 @@ def seeded_graphs(paths, derive, allocation, coords=None):
     reading it would erase the difference between a graph derived for this rank
     and one borrowed from the representative. `TemplateGraphs` serves the
     borrow deliberately, on a miss, and counts it as a representative hit.
-    """
-    import json
 
-    from atom.compass.core.artifacts import resolve_rank_path
+    ``collect``, where given, is a list each template's `LoadedInput` is
+    appended to under ``role``. The identity is taken here because here is
+    where the bytes are parsed: a caller that digested these paths afterwards
+    would describe whatever is at them *then*, and would be digesting the stem
+    the option carried rather than the per-rank file that was served.
+    """
+    from atom.compass.core.loaded_input import load_json
     from atom.compass.runtime.templates import TemplateGraphs, template_key
 
     graphs = {}
-    for path in paths:
-        if coords:
-            path = resolve_rank_path(path, coords)[0]
-        with open(path, encoding="utf-8") as fh:
-            graph = json.load(fh)
+    for requested in paths:
+        graph, loaded = load_json(requested, role=role, coords=coords)
+        if collect is not None:
+            collect.append(loaded)
         graphs[template_key(template_shape(graph))] = graph
     return TemplateGraphs(graphs, derive=derive, allocation=allocation)
 
@@ -332,6 +445,172 @@ class SourceComposition(NamedTuple):
     #: number, and the number is the part a reader has to be able to check.
     #: ``None`` means no price could be fitted at all.
     interpolation_limit: float | None = None
+    #: Every artifact this composition actually loaded, as the reader that
+    #: parsed it described it -- a `LoadedInput` per file, carrying the digest
+    #: of the bytes that were parsed and which rank's file they came from.
+    #:
+    #: Distinct from `rank_artifacts`, which answers "was this rank's own file
+    #: there?" from the paths alone and can be computed without opening
+    #: anything. This answers "what did this rank load?", which no later
+    #: reader can reconstruct: the option is a DSL over stems, and the files
+    #: it names can change after the load.
+    loaded_inputs: tuple = ()
+
+
+class RankGroupOracle:
+    """One composition per rank of the group, selected by the shape's rank.
+
+    `rank_aggregation="slowest"` prices a step on every logical rank and keeps
+    the maximum, because a deployment's step ends when its slowest rank ends
+    and the ranks are not interchangeable -- the TP4 head measurements run
+    13.510 / 16.158 / 13.459 / 13.452 ms. It did that by moving
+    ``StepShape.rank_coords`` and asking *one* oracle, whose price library had
+    been loaded once, at the executor's own coordinates. `LibraryCostOracle`
+    does not select prices by rank: it looks a signature up in the library it
+    holds. So every rank was priced from rank 0's tables and the outlier that
+    motivates the policy could not appear in the answer.
+
+    This holds one real oracle per rank, each built from that rank's own
+    resolved artifacts, and dispatches on the coordinate the shape carries.
+    The expensive part is not repeated: the model is traced once and every
+    rank's oracle shares those derivers.
+
+    Everything that is not `estimate` delegates to the representative rank, so
+    `describe`, coverage and the reporting surface behave as they did --
+    including `native_allocation`, and that one is worth being exact about.
+
+    The predict mixin does not *set* `native_allocation`; it reads the provider
+    off the oracle and calls `offer()` on the provider itself, once per step.
+    The provider is held inside each rank's `TemplateGraphs`, so a wrapper that
+    fanned out an assignment would be fanning out the wrong thing -- the
+    objects already inside the other ranks' template sources would never see
+    the batch, and every rank above the representative would refuse the step
+    for want of an allocation. So the ranks are built sharing *one* provider.
+    `NativeAllocation.allocation_for` already indexes by the shape's own
+    coordinates, so one object serves the whole group correctly, and one
+    `offer()` reaches all of it.
+    """
+
+    def __init__(self, by_rank: dict, representative: int = 0) -> None:
+        self._by_rank = dict(by_rank)
+        self._representative = representative
+        #: Which ranks `estimate` has been answered from. A set, not a log:
+        #: this is asked once by a report and would otherwise grow by one
+        #: entry per rank per step for the length of a run. What it
+        #: distinguishes is "every rank was asked" from "rank 0 was asked
+        #: four times", and that needs the ranks, not their order.
+        self.selected_ranks: set = set()
+
+    @property
+    def representative(self):
+        return self._by_rank[self._representative]
+
+    def oracle_for(self, rank: int):
+        """This rank's own oracle, or an error naming the rank that has none.
+
+        Fails closed. The shared-file fallback for a rank that wrote no
+        artifacts of its own already happened, during construction, in
+        `resolve_rank_path` -- that rank has a real composition built from the
+        shared tables. A rank with no composition at all is a rank outside the
+        group this oracle was built for, and answering it from another rank's
+        prices is precisely the substitution this class exists to stop.
+        """
+        rank = int(rank)
+        if rank not in self._by_rank:
+            raise LookupError(
+                f"this oracle was built for ranks {sorted(self._by_rank)} and "
+                f"was asked to price rank {rank}. A rank with no composition "
+                f"has no prices of its own, and another rank's are prices of "
+                f"different work.")
+        return self._by_rank[rank]
+
+    def estimate(self, shape):
+        rank = int((shape.rank_coords or {}).get("tp", self._representative))
+        oracle = self.oracle_for(rank)
+        self.selected_ranks.add(rank)
+        return oracle.estimate(shape)
+
+    def __getattr__(self, name):
+        # Reached only for names this class does not define, so `estimate`
+        # never lands here. Keeps `describe`, the coverage split, the
+        # allocation provider and anything else a report reads working
+        # unchanged, answered by the rank the composition represents.
+        return getattr(self.representative, name)
+
+
+class SourceGroup(NamedTuple):
+    """Every rank's composition, and the oracle that selects between them."""
+
+    oracle: object
+    #: rank index -> that rank's `SourceComposition`. Empty at TP1, where the
+    #: group is one rank and `oracle` is that rank's own oracle.
+    by_rank: dict
+    #: The union of what every rank loaded. Each `LoadedInput` carries the
+    #: coordinates of the rank that read it, so this stays per-rank detail
+    #: rather than becoming an undifferentiated set.
+    loaded_inputs: tuple = ()
+    #: What the derivation cost, counted once for the group rather than once
+    #: per rank: the model is traced once and the derivers are shared.
+    build_seconds: float = 0.0
+
+
+def build_source_group(*, tp: int = 1, rank_coords=None, head=False, **kwargs):
+    """The group's oracle: one real composition per rank, one derivation.
+
+    At TP1 this is exactly :func:`build_source_oracle` and returns that
+    composition's own oracle -- there is one rank, and wrapping it would add a
+    layer with nothing to select between.
+
+    Above TP1 every rank gets its own composition, so each resolves its own
+    price list and its own templates through `resolve_rank_path`. Only the
+    artifact reads are repeated; the model is traced once, by rank 0's build,
+    and every other rank is handed those derivers. That matters: a whole-model
+    build per rank would be four builds of a 27B model to read four small JSON
+    files, and the build cost would then be counted four times in a record
+    whose whole purpose is to be accountable.
+    """
+    width = int(tp or 1)
+    coords = _rank_coords(rank_coords)
+    representative = int(coords.get("tp", 0))
+    if width <= 1:
+        built = build_source_oracle(tp=width, rank_coords=rank_coords,
+                                    head=head, **kwargs)
+        return SourceGroup(built.oracle, {}, built.loaded_inputs,
+                           built.build_seconds)
+
+    first = build_source_oracle(tp=width, rank_coords={"tp": representative},
+                                head=head, **kwargs)
+    shared = (first.deriver, _head_deriver_of(first))
+    by_rank = {representative: first}
+    for rank in range(width):
+        if rank == representative:
+            continue
+        by_rank[rank] = build_source_oracle(
+            tp=width, rank_coords={"tp": rank}, head=head,
+            _shared_derivers=shared,
+            # One provider for the group, not one per rank. The runner offers
+            # this step's assignment by calling `offer()` on the object
+            # itself, and that object lives inside each rank's
+            # `TemplateGraphs` -- so ranks holding their own copies would
+            # never be offered anything and would refuse every step.
+            _shared_allocation=first.allocation, **kwargs)
+
+    loaded: list = []
+    for rank in sorted(by_rank):
+        loaded.extend(by_rank[rank].loaded_inputs)
+    oracle = RankGroupOracle({r: c.oracle for r, c in by_rank.items()},
+                             representative)
+    oracle.compass_loaded_inputs = tuple(loaded)
+    return SourceGroup(oracle, by_rank, tuple(loaded), first.build_seconds)
+
+
+def _head_deriver_of(composition):
+    """The head deriver a composition built, where it built one.
+
+    `SourceComposition` carries the body deriver by name and the head one only
+    inside `head_graphs`, which is where `TemplateGraphs` keeps it.
+    """
+    return getattr(composition.head_graphs, "_derive", None)
 
 
 def source_cost_oracle(*, rank_coords=None, **kwargs):
@@ -341,6 +620,11 @@ def source_cost_oracle(*, rank_coords=None, **kwargs):
     :func:`build_source_oracle` documents and returns only the oracle, because
     that is what `_build_oracle` expects to get back.
 
+    Above TP1 that oracle is the group's, not one rank's. A served run has one
+    executor standing in for the whole group, and `rank_aggregation="slowest"`
+    asks it to price every rank; it can only answer that honestly if every
+    rank's artifacts were actually loaded.
+
     ``rank_coords`` is named explicitly rather than swept into ``**kwargs``,
     and that is the whole reason it is in this signature: `_build_oracle`
     offers the rank only to an oracle that names it, by
@@ -349,7 +633,7 @@ def source_cost_oracle(*, rank_coords=None, **kwargs):
     a served run built the same composition and resolved the same artifacts --
     rank 0's, wherever a per-rank file existed.
     """
-    return build_source_oracle(rank_coords=rank_coords, **kwargs).oracle
+    return build_source_group(rank_coords=rank_coords, **kwargs).oracle
 
 
 def build_source_oracle(
@@ -375,6 +659,8 @@ def build_source_oracle(
     derive: bool = True,
     interpolate=None,
     rank_coords=None,
+    _shared_derivers=None,
+    _shared_allocation=None,
 ):
     """The frozen composition, from names and paths alone.
 
@@ -435,11 +721,20 @@ def build_source_oracle(
             "refused for want of a graph. Seed a template or turn derivation "
             "on.")
 
-    price_entries = price_specs(_entries(price, "price"), coords)
-    library = _price_library(price_entries, gap_ratio(interpolate))
+    requested_prices = _entries(price, "price")
+    # Unresolved on the way in, resolved once by the reader as it opens the
+    # file. That is what lets the record hold both ends of it: the stem the
+    # option carried, and the per-rank file this rank was actually served.
+    # Resolving here as well would hand the library a suffixed path it had no
+    # way to recognise as a rank's own, and every record would read
+    # `rank_own: false` under a name nothing asked for.
+    price_entries = price_specs(requested_prices)
+    library = _price_library(price_entries, gap_ratio(interpolate), coords)
     regions_model = region_model(regions)
+    # Immediately, off the object just selected -- not from the name again.
+    regions_taken = region_snapshot(regions, regions_model)
     rank_artifacts = _rank_artifacts(
-        coords, _entries(price, "price"), templates, head_templates)
+        coords, requested_prices, templates, head_templates)
 
     allocation_choice = str(allocation or "").strip().lower()
     if allocation_choice and carry_allocation:
@@ -478,9 +773,27 @@ def build_source_oracle(
             "carry_allocation: the template's block assignment is reused for "
             "every cohort bound to it")
 
+    if _shared_allocation is not None:
+        # Another rank of this group built it. Deliberately the same object
+        # and not an equal one: the runner offers a step's assignment by
+        # calling `offer()` on the provider, and `allocation_for` indexes what
+        # was offered by the shape's own coordinates -- so one provider serves
+        # the whole group, and a per-rank copy would serve only the rank whose
+        # copy the runner happened to hold.
+        allocation = _shared_allocation
+
     body_deriver = head_deriver = None
     build_seconds = 0.0
-    if derive:
+    if _shared_derivers is not None:
+        # Another rank of this group already paid for the trace. `ModelTracer`
+        # builds one model per process and refuses a second, and a rank's
+        # graphs are produced from the shape's own coordinates rather than
+        # from a per-rank build, so sharing is what the derivation already
+        # assumed. `build_seconds` stays zero here: the cost was real once and
+        # a record that counted it per rank would report four builds of a
+        # model that was built once.
+        body_deriver, head_deriver = _shared_derivers
+    elif derive:
         import time
 
         from atom.compass.runtime.tracer import ModelTracer, ShapeDeriver
@@ -515,9 +828,13 @@ def build_source_oracle(
         if head:
             head_deriver = ShapeDeriver(tracer, region="head", **common)
 
-    body_graphs = seeded_graphs(templates, body_deriver, allocation, coords)
+    seeded_inputs: list = []
+    body_graphs = seeded_graphs(templates, body_deriver, allocation, coords,
+                                role="oracle.template",
+                                collect=seeded_inputs)
     head_graphs = (seeded_graphs(head_templates, head_deriver, allocation,
-                                 coords)
+                                 coords, role="oracle.head_template",
+                                 collect=seeded_inputs)
                    if head else None)
     _report_rank_binding(coords, body_graphs, head_graphs, derive)
     oracle = LibraryCostOracle(
@@ -535,9 +852,59 @@ def build_source_oracle(
     # the attribute absent knows the oracle is not taking allocations.
     if allocation is not None and getattr(allocation, "measured", False):
         oracle.native_allocation = allocation
+    loaded_inputs = _loaded_inputs(library, seeded_inputs, derive)
+    # Attached to the oracle, and not only returned in the composition, for
+    # the same reason `native_allocation` is: `source_cost_oracle` is what a
+    # served run names, and it hands back the oracle alone. Everything else
+    # here would be discarded before `CompassPredictMixin` ever saw it -- so a
+    # record that lived only in the composition would describe the diagnostic
+    # path and never the served one, which is the path that has to be
+    # attributable.
+    #
+    # A tuple, so what the worker later exposes cannot be edited by anything
+    # that gets a reference to the oracle.
+    oracle.compass_loaded_inputs = loaded_inputs
+    # Rides beside them and stays separate from them. The coefficients this
+    # run will price every step's preparation and postprocess from, as values,
+    # taken where they were selected -- not a file, and not filed as one.
+    oracle.compass_region_snapshot = regions_taken
     return SourceComposition(oracle, body_graphs, head_graphs, body_deriver,
                              build_seconds, allocation, coords, rank_artifacts,
-                             getattr(library, "max_gap_ratio", None))
+                             getattr(library, "max_gap_ratio", None),
+                             loaded_inputs)
+
+
+def _loaded_inputs(library, seeded, derive) -> tuple:
+    """Every artifact this composition loaded, as its reader described it.
+
+    Collected from the readers rather than re-derived from the options, which
+    is the whole point: the option is a DSL over stems and the files it names
+    can change after the load, so only the reader can say what was read.
+
+    Three sources, because there are three readers:
+
+    * the price library, which reports its own reads once it takes identities.
+      Until then it reports none, and a price is absent from this record
+      rather than misdescribed in it -- an absent input reads as "unrecorded"
+      downstream, where a guessed one would read as evidence.
+    * the seeded templates, collected as `seeded_graphs` parses them.
+    * the replay target the derivation read to answer its architecture query,
+      taken from `bootstrap.state()` rather than reopened. Filtered to the
+      oracle role: the same process may also have read the deployment's own
+      target to bootstrap itself, and that is a different input belonging to
+      the runtime side of the record.
+    """
+    from atom.compass.core.loaded_input import LoadedInput
+
+    found = list(getattr(library, "loaded_inputs", ()) or ())
+    found.extend(seeded)
+    if derive:
+        from atom.compass.replay import bootstrap
+
+        for row in bootstrap.state().get("inputs") or ():
+            if row.get("role") == "oracle.replay_target":
+                found.append(LoadedInput.from_dict(row))
+    return tuple(found)
 
 
 def _rank_artifacts(coords, prices, templates, head_templates) -> dict:

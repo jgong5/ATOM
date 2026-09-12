@@ -55,6 +55,68 @@ ROWS = [
 PRICES_SHA = "a" * 64
 SWEEP_SHA = "e" * 64
 CODE_SHA = "f" * 64
+#: The replay target the deployment was sized from. Its own digest, because
+#: what sized a deployment is declared and checked like any other measured
+#: input -- see `check_capacity_provenance`.
+TARGET_SHA = "b" * 64
+TARGET_CAPTURE_SHA = "c" * 64
+
+
+#: The preset the passing cell prices its regions from. A real built-in, so
+#: the snapshot in the record and the declaration in the registry are both
+#: taken from the same code a served run would select.
+CELL_REGIONS = "source-27b-tp1-conc-v2"
+
+
+def region_snapshot_of(name):
+    """The real snapshot of a built-in preset, as a run publishes it."""
+    from atom.compass.runtime.source_oracle import region_snapshot
+
+    from atom.compass.core.cost.regions import region_model
+
+    return region_snapshot(name, region_model(name))
+
+
+def region_artifact(name=CELL_REGIONS):
+    """Declare the preset a run selected, by the digest over its own values.
+
+    No `contents`: a region preset is code, snapshotted where it was selected,
+    and an entry claiming files for it would describe bytes that never
+    existed.
+    """
+    return {
+        "sha256": region_snapshot_of(name)["sha256"],
+        "kind": "region_model",
+        "measured_at_tp": 1,
+        "produced_by": "regions.py",
+        "workload_sha256": None,
+        "sources": [{"path": "/m/cap_subspan.json", "sha256": SWEEP_SHA}],
+        "code": {"atom/compass/core/cost/regions.py": CODE_SHA},
+    }
+
+
+def capacity_artifact():
+    """The declaration of what sized the deployment.
+
+    Kept beside whatever a test is varying, because what sized the deployment
+    is checked like any other measured input and almost no test here is about
+    it. A test that *is* about it overrides this entry by name.
+    """
+    return {
+        "sha256": TARGET_SHA,
+        "kind": "derived_graph",
+        "measured_at_tp": 1,
+        "produced_by": "replay_target_out",
+        "workload_sha256": None,
+        # Enumerated, like every other artifact the server reads. The file is
+        # named by its basename, which is what the validator compares against
+        # what the rank reports having opened.
+        "contents": {"target.json": TARGET_SHA},
+        "sources": [
+            {"path": "/m/target_capture.json", "sha256": TARGET_CAPTURE_SHA}
+        ],
+        "code": {"atom/compass/replay/runner.py": CODE_SHA},
+    }
 TABLE_SHA = "b" * 64
 WORKLOAD_ROW_KEYS = ("arrival_s", "input_tokens", "output_tokens")
 
@@ -65,7 +127,7 @@ CELL_FACTORY_OPTIONS = {
     "tp": 2,
     "require_complete": "true",
     "head": "true",
-    "regions": "source-27b-tp2",
+    "regions": CELL_REGIONS,
     "derive": "true",
     "model": "Qwen/Qwen3.8-27B",
     "block_size": 16,
@@ -89,6 +151,34 @@ def _identity(pid=4242, *, ppid=4240, ticks=132307571, host=PROC_HOST, boot=PROC
         "start_ticks": ticks,
         "ticks_per_second": 100,
     }
+
+
+def _device_reading(when, *, nodes=None, handles=(), process=None):
+    """One reading as the predictor's own process takes it about itself."""
+    return {
+        "when": when,
+        "process": process or _identity(pid=4243, ppid=4242),
+        "namespaces": {"mnt": "mnt:[4026532281]", "pid": "pid:[4026532282]",
+                       "net": "net:[4026531840]", "user": "user:[4026531837]",
+                       "cgroup": "cgroup:[4026531835]"},
+        "device_cgroup": ["0::/"],
+        "device_nodes": nodes or {n: False for n in validate.DEVICE_NODES},
+        "own_driver_handles": list(handles),
+        "device_free": not any((nodes or {}).values()) and not handles,
+        # Recorded and not counted. A replay interpreter answers hardware
+        # queries from the captured target, so this describes the deployment
+        # being modelled. The fixture carries a nonzero count on purpose, to
+        # pin that it decides nothing.
+        "reported_by_runtime": {"device_count": 4, "cuda_available": True,
+                                "bootstrap_installed": True},
+        "runtime_note": "recorded, not counted",
+    }
+
+
+def _device_freedom(**over):
+    """Both readings, from one process, as the manifest carries them."""
+    return {"launch": _device_reading("launch", **over),
+            "readback": _device_reading("readback", **over)}
 
 
 def _server(
@@ -122,6 +212,51 @@ def _server(
             "oracle_option_files": files or {},
             "virtual_clock": virtual,
             "admission_seconds": 0.0,
+            # What the ranks recorded as they read, and what the predicting
+            # process observed about itself. Only the modelled side is held to
+            # the device reading; the real side carries one because the same
+            # runner produces both records.
+            "loaded_inputs": {
+                "ranks": [
+                    {
+                        "rank_coords": {},
+                        "inputs": [
+                            {
+                                "role": "runtime.replay_target",
+                                "requested": "/x/target.json",
+                                "path": "/x/target.json",
+                                "rank_own": False,
+                                "sha256": TARGET_SHA,
+                                "size": 128,
+                                "rank_coords": {},
+                            }
+                        ],
+                        "rolled_sha256": "0" * 64,
+                        # The record the capacity selector publishes: the kind
+                        # it chose, whether the engine ran on it, what it
+                        # refers to and the lineage behind it. The real side
+                        # is sized by the device it ran on; the modelled side
+                        # is sized from the capture of one, which is the whole
+                        # capability.
+                        "budget_source": {
+                            "kind": "device-measured"
+                            if mode == "measure"
+                            else "captured",
+                            "served": True,
+                            "hardware_reference": "MI308X",
+                            "lineage": ["/x/target.json"],
+                            "deployment": {"num_kvcache_blocks": 4096},
+                        },
+                        # The coefficients this run priced preparation and
+                        # postprocess from, snapshotted by value where they
+                        # were selected. From the real preset, so the record
+                        # and the declaration are both the code a served run
+                        # would have selected.
+                        "regions": region_snapshot_of(CELL_REGIONS),
+                        "device_freedom": _device_freedom(),
+                    }
+                ]
+            },
         },
     }
     if served is not None:
@@ -152,6 +287,24 @@ def _journal(cell_dir, side, repeats, *, executions=None, seconds=10.0):
                         "ancestry": [4242, 4240, 1],
                         "alive_at_provenance": True,
                     },
+                    "verified": True,
+                },
+                # What the harness read out of `/proc` about the process that
+                # predicted. Its own reading, not the worker's: the worker's
+                # account lives in the run manifest, and the two agreeing is
+                # the whole point of taking both.
+                "predictor_process": {
+                    "observed": [
+                        {
+                            "rank": 0,
+                            "said_pid": 4243,
+                            "launched_pid": 4240,
+                            "host": PROC_HOST,
+                            "boot_id": PROC_BOOT,
+                            "start_ticks": 132307571,
+                            "ancestry": [4243, 4242, 4240, 1],
+                        }
+                    ],
                     "verified": True,
                 },
             }
@@ -405,7 +558,12 @@ def cell(tmp_path, monkeypatch):
                             {"path": "/m/primitive_sweep.json", "sha256": SWEEP_SHA}
                         ],
                         "code": {"scripts/compass/primitives.py": CODE_SHA},
-                    }
+                    },
+                    # What sized the deployment. Declared like any other
+                    # measured input, because it is one: it decides how many
+                    # requests fit, which decides the schedule.
+                    capacity_artifact(),
+                    region_artifact(),
                 ]
             }
         )
@@ -737,6 +895,10 @@ class TestCalibrationLeakage:
             )
             entry.setdefault("code", {"scripts/compass/primitives.py": CODE_SHA})
             filled.append(entry)
+        if not any(e.get("sha256") == TARGET_SHA for e in filled):
+            filled.append(capacity_artifact())
+        if not any(e.get("kind") == "region_model" for e in filled):
+            filled.append(region_artifact())
         (cell / "registry.json").write_text(json.dumps({"artifacts": filled}))
 
     def test_a_standalone_primitive_at_this_width_is_allowed(self, cell):
@@ -1212,7 +1374,12 @@ class TestCalibrationProvenanceIsTransitive:
     """
 
     def _registry(self, cell, artifacts):
-        (cell / "registry.json").write_text(json.dumps({"artifacts": artifacts}))
+        held = list(artifacts)
+        if not any(e.get("sha256") == TARGET_SHA for e in held):
+            held.append(capacity_artifact())
+        if not any(e.get("kind") == "region_model" for e in held):
+            held.append(region_artifact())
+        (cell / "registry.json").write_text(json.dumps({"artifacts": held}))
 
     def _entry(self, **overrides):
         entry = {

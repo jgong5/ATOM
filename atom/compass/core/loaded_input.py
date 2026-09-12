@@ -101,6 +101,26 @@ class LoadedInput:
             "rank_coords": {name: index for name, index in self.rank_coords},
         }
 
+    @classmethod
+    def from_dict(cls, row: Mapping) -> LoadedInput:
+        """Read back a record a reader could not build directly.
+
+        `atom.compass.replay.bootstrap` is the case this exists for: it is
+        loaded by path by a child interpreter that must not import `atom`, so
+        it records its read as a plain dict of exactly these fields. Reading it
+        back here keeps the digest the one taken at that read rather than
+        re-deriving anything.
+        """
+        return cls(
+            role=row["role"],
+            requested=row["requested"],
+            path=row["path"],
+            rank_own=bool(row.get("rank_own")),
+            sha256=row["sha256"],
+            size=int(row.get("size") or 0),
+            rank_coords=_coord_pairs(row.get("rank_coords")),
+        )
+
 
 def _coord_pairs(coords: Mapping[str, int] | None) -> tuple:
     return tuple(

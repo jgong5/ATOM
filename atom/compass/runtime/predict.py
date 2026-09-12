@@ -58,6 +58,38 @@ class CompassPredictMixin:
         added here is added to both, which is the point.
         """
         self._oracle: CostOracle = self._build_oracle(self._compass_config)
+        # Frozen here, at the end of the build that did the reading, and never
+        # recomputed. The alternative -- letting a reader digest the option's
+        # paths when it is asked -- is what this replaces: the option is a DSL
+        # over per-rank stems, so it does not name the files that were opened,
+        # and by the time anyone asks the bytes may have changed.
+        #
+        # The *oracle's* inputs only. The capacity side is not read yet: a
+        # memory profile or a replay target is opened in `get_num_blocks`,
+        # which runs after this, so freezing a whole manifest here would
+        # freeze an empty capacity record and publish it as the finding that
+        # there was none. Those are collected at readback instead -- see
+        # `compass_input_manifest`.
+        self._compass_oracle_inputs = tuple(
+            getattr(self._oracle, "compass_loaded_inputs", ()) or ())
+        #: What the capacity path read, appended by the reader that read it.
+        #: Left alone here rather than initialised to a frozen empty tuple,
+        #: for the reason above. `runtime.*` roles, distinct from the
+        #: `oracle.*` ones above.
+        if not hasattr(self, "compass_runtime_inputs"):
+            self.compass_runtime_inputs: tuple = ()
+        #: Which reading the KV budget was actually made from, as the code
+        #: that selected it says: "measured", "analytical", "recorded" or
+        #: "replay-target". None until that selection has run, which is a
+        #: real state and is reported as one -- a run whose capacity source
+        #: is unknown is not a run whose capacity was measured.
+        if not hasattr(self, "compass_budget_source"):
+            self.compass_budget_source = None
+        # Taken here, by the process that is about to predict, before it has
+        # served anything. The readback is taken when the record is asked for,
+        # so a device that appeared in between is a difference between the two
+        # rather than something neither reading covers.
+        self._compass_device_launch = self._observe_device_freedom("launch")
         self._graph = OpGraph()
         self._traced_steps = 0
         self._prefill_index = 0
@@ -147,6 +179,102 @@ class CompassPredictMixin:
         ):
             options["rank_coords"] = self._rank_coords()
         return oracle_cls(**options)
+
+    def compass_input_manifest(self) -> dict:
+        """Everything this rank loaded, as the readers that parsed it said.
+
+        Named as a plain method because that is how the worker RPC reaches a
+        runner: `runner_mgr.call_func` does `getattr(runner, name)`. It reads
+        retained records and opens nothing, so it is safe to answer at any
+        point in a run.
+
+        Assembled here rather than frozen whole at init, and the difference
+        matters. The oracle's inputs *are* frozen at init, because that is
+        when the oracle read them. The capacity inputs are not read by then:
+        a memory profile or a replay target is opened in `get_num_blocks`,
+        which runs later, so a manifest frozen in `_init_compass_state` would
+        have recorded "this run read no capacity input" and published that as
+        a finding rather than as a race. Assembling at readback collects both,
+        and still reopens nothing -- every record here was taken by the reader
+        that parsed the bytes.
+
+        A reader that reads nothing contributes nothing, and that is a state
+        rather than a failure: the declared stub a measured run uses has no
+        tables, and demanding a record from it would refuse the ground-truth
+        side of every comparison.
+        """
+        from atom.compass.core.loaded_input import manifest
+
+        runtime = tuple(getattr(self, "compass_runtime_inputs", ()) or ())
+        out = manifest(tuple(self._compass_oracle_inputs) + runtime,
+                       coords=self._rank_coords())
+        # Which reading the budget was actually made from, beside the files it
+        # was made from. Not inferred from the cost mode: `mode="measure"`
+        # forces the wall clock and says nothing about memory, so a measured
+        # run can be sized from an analytical profile with nothing in the
+        # record to show it. Reported as the selector states it, or None.
+        out["budget_source"] = getattr(self, "compass_budget_source", None)
+        # Both readings, from the process that produced the prediction. Carried
+        # here rather than on a second RPC because it answers the same question
+        # this one does -- what was this prediction actually made from -- and a
+        # separate channel would be a second thing to keep in step.
+        # Kept out of `inputs`, which is files. A region preset is code the
+        # run selected, snapshotted by value where it was selected; filing it
+        # beside the files would invite a reader to look for bytes on disk
+        # that never existed.
+        snapshot = getattr(self._oracle, "compass_region_snapshot", None)
+        if snapshot is not None:
+            out["regions"] = dict(snapshot)
+        out["device_freedom"] = {
+            "launch": getattr(self, "_compass_device_launch", None),
+            "readback": self._observe_device_freedom("readback"),
+        }
+        return out
+
+    def _observe_device_freedom(self, when: str) -> dict:
+        """This process's own reading, with the runtime's account recorded beside it.
+
+        The runtime is *not asked*, and that is deliberate twice over.
+
+        It would not be evidence if it answered. The replay bootstrap supplies
+        hardware answers from the captured target so AITER can be imported with
+        no device present, so a count read in this interpreter describes the
+        deployment being modelled rather than the devices this process could
+        reach. The verdict rests on device nodes and this process's own file
+        descriptors instead.
+
+        And asking costs something real. `torch.cuda.is_available()` and
+        `device_count()` are CUDA calls, and a GPU-free replay must reach none
+        during construction -- `test_construction_reaches_no_cuda_call` pins
+        exactly that, and it caught this. Reading a number we had already
+        decided to ignore, at the cost of the property the whole gate is
+        about, is a bad trade in both directions.
+
+        So what is recorded is the bootstrap's own state, which is the thing
+        that explains *why* a runtime count would mislead, and a plain
+        statement that the runtime was not consulted.
+        """
+        from atom.compass.core import device_freedom
+
+        report = {
+            "consulted": False,
+            "why": (
+                "asking the runtime what it can see is a CUDA call, and a "
+                "GPU-free replay must reach none; its answer is supplied by "
+                "the replay bootstrap in any case and would describe the "
+                "captured deployment rather than this container"
+            ),
+        }
+        try:
+            from atom.compass.replay import bootstrap
+
+            state = bootstrap.state()
+            report["bootstrap_installed"] = bool(state.get("installed"))
+            report["bootstrap_arch"] = state.get("arch")
+            report["bootstrap_source"] = state.get("source")
+        except Exception as exc:  # noqa: BLE001 - provenance never fails a run
+            report["bootstrap_error"] = f"{type(exc).__name__}: {exc}"
+        return device_freedom.observe(when, runtime_report=report)
 
     def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
         """Predict the step, or trace it, depending on the configured mode."""
