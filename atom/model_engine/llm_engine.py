@@ -3,7 +3,6 @@
 
 import itertools
 import logging
-import time
 from collections import Counter
 from dataclasses import fields
 from typing import Any
@@ -93,6 +92,16 @@ def _install_compass_clock(config):
     return clock, set_clock(clock)
 
 
+#: Clocks whose owning engine has closed, by id. A strong reference, so an id
+#: cannot be reused by a later object and make a retired clock look live; the
+#: dict is bounded by the number of Compass engines this process closes.
+_retired_clocks: dict = {}
+
+
+def _clock_is_retired(clock) -> bool:
+    return clock is not None and id(clock) in _retired_clocks
+
+
 class LLMEngine:
 
     def __init__(self, model, tokenizer=None, **kwargs):
@@ -102,6 +111,9 @@ class LLMEngine:
         data_parallel_master_port = kwargs.get("data_parallel_master_port", None)
         config = Config(model, **config_kwargs)
         self.config = config
+        # Installed at the END of __init__, not here: nothing in construction
+        # reads the clock, and a constructor that raises after installing one
+        # would leave the process on a frozen clock with no engine to close.
         # Installed at the END of __init__, not here: nothing in construction
         # reads the clock, and a constructor that raises after installing one
         # would leave the process on a frozen clock with no engine to close.
@@ -232,13 +244,33 @@ class LLMEngine:
         Only if it is still ours: something later in the process may have
         installed its own, and stamping over that would be the same bug in the
         other direction.
+
+        Supported lifetime for several Compass engines in one process is
+        nesting -- the engine closed first is the one opened last. Closing them
+        out of order is the one case where the clock an engine saved is a clock
+        that has since been closed, and reinstalling that would put the process
+        back on a dead engine's frozen time. Here the process goes to wall time
+        instead, with a warning, because no live owner remains to speak for
+        virtual time.
         """
         if self._compass_clock is None:
             return
-        from atom.utils.clock import get_clock, set_clock
+        from atom.utils.clock import get_clock, reset_clock, set_clock
 
+        _retired_clocks[id(self._compass_clock)] = self._compass_clock
         if get_clock() is self._compass_clock:
-            set_clock(self._clock_before_compass)
+            previous = self._clock_before_compass
+            if _clock_is_retired(previous):
+                logger.warning(
+                    "Compass engines closed out of order: the clock this engine "
+                    "replaced belongs to an engine that has already closed. "
+                    "Restoring wall time rather than a closed engine's virtual "
+                    "time; close overlapping Compass engines in reverse order "
+                    "of construction to keep the clock they each saved."
+                )
+                reset_clock()
+            else:
+                set_clock(previous)
         self._compass_clock = None
         self._clock_before_compass = None
 
