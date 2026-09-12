@@ -9,6 +9,8 @@ five cohorts compared field by field against independently derived ground truth
 model.
 """
 
+import json
+
 import pytest
 
 from atom.compass.core.cost.base import StepShape
@@ -19,6 +21,17 @@ from atom.compass.runtime.templates import (ALLOCATOR_FIELDS, BindRefusal,
 #: Three M-RoPE sections, as the 27B lays positions out. Kept as a name because
 #: a bare 3 in a slice length is the kind of constant that goes unexplained.
 POSITION_ROWS = 3
+
+
+def _frozen(template):
+    """A snapshot that a nested mutation cannot slip past.
+
+    The obvious `[list(map(list, op["context"])) for op in ...]` copies only the
+    outer two levels, so a binder that rewrote a value list in place -- which is
+    exactly the mistake worth catching -- would compare equal to itself. JSON is
+    the whole structure, and every value a template holds is JSON already.
+    """
+    return json.dumps(template, sort_keys=True, default=str)
 
 
 def shape(queries, contexts, *, bucket=32, tp=1, rank=0, prefill=0):
@@ -102,9 +115,9 @@ def test_binding_leaves_operators_without_context_untouched():
 
 def test_binding_does_not_mutate_the_template():
     template = template_for([(1, 1151)] * 4)
-    before = dict(map(tuple, template["ops"][1]["context"]))
+    before = _frozen(template)
     bind_cohort(template, shape([1] * 4, [4096] * 4), carried())
-    assert dict(map(tuple, template["ops"][1]["context"])) == before
+    assert _frozen(template) == before
 
 
 def test_min_seqlen_q_is_carried_not_recomputed():
@@ -590,11 +603,10 @@ def test_the_flags_follow_the_cohort_not_the_template():
 
 def test_has_initial_state_binding_does_not_mutate_the_template():
     template = gdn_template([(4096, 20480), (4096, 20480)])
-    before = [list(map(list, op["context"])) for op in template["ops"]]
+    before = _frozen(template)
     bind_cohort(template, shape([4096, 4096], [4096, 4096], bucket=None,
                                 prefill=8192), carried())
-    after = [list(map(list, op["context"])) for op in template["ops"]]
-    assert after == before
+    assert _frozen(template) == before
 
 
 def test_a_decode_template_keeps_the_field_unset():
@@ -748,11 +760,10 @@ def test_a_ragged_cached_cohort_binds_row_by_row():
 def test_cached_prefill_binding_does_not_mutate_the_template():
     template = {"ops": [cached_prefill_op([(8192, 24576), (8192, 24576)])],
                 "provenance": {"region": "body"}}
-    before = [list(map(list, op["context"])) for op in template["ops"]]
+    before = _frozen(template)
     bind_cohort(template, shape([8192, 8192], [24576, 40960], bucket=None,
                                 prefill=16384), carried())
-    assert [list(map(list, op["context"]))
-            for op in template["ops"]] == before
+    assert _frozen(template) == before
 
 
 def test_seq_starts_for_a_different_number_of_rows_are_refused():

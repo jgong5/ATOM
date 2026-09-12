@@ -68,7 +68,7 @@ def _stamp_arrival(arrival_time: float | None) -> float:
     return epoch + float(arrival_time)
 
 
-def _install_compass_clock(config) -> None:
+def _install_compass_clock(config):
     """Put this process on the same virtual clock as the engine core.
 
     Arrival is stamped here while first-token is stamped in the engine core, and
@@ -76,13 +76,21 @@ def _install_compass_clock(config) -> None:
     and share an origin. This clock does not advance — in a simulated run the
     engine core owns progress — so an offline batch submitted together arrives
     together, at the start of virtual time.
+
+    Returns ``(installed, previous)``: the clock this call put in place and the
+    one it replaced, or ``(None, None)`` when Compass is off. The engine holds
+    both so it can hand the process back to the clock it found. A virtual clock
+    left installed after the engine closes freezes every later arrival in the
+    process, which for an ordinary engine in the same process is a wrong TTFT
+    rather than a missing one.
     """
     compass = getattr(config, "compass_config", None)
     if compass is None or not compass.enabled or not compass.virtual_clock:
-        return
+        return None, None
     from atom.utils.clock import VirtualClock, set_clock
 
-    set_clock(VirtualClock(epoch=compass.epoch))
+    clock = VirtualClock(epoch=compass.epoch)
+    return clock, set_clock(clock)
 
 
 class LLMEngine:
@@ -94,7 +102,11 @@ class LLMEngine:
         data_parallel_master_port = kwargs.get("data_parallel_master_port", None)
         config = Config(model, **config_kwargs)
         self.config = config
-        _install_compass_clock(self.config)
+        # Installed at the END of __init__, not here: nothing in construction
+        # reads the clock, and a constructor that raises after installing one
+        # would leave the process on a frozen clock with no engine to close.
+        self._compass_clock = None
+        self._clock_before_compass = None
         self.tokenizer = tokenizer or _load_tokenizer(
             config.model, config.trust_remote_code
         )
@@ -210,11 +222,33 @@ class LLMEngine:
         logger.info(
             f"LLMEngine init with {self.data_parallel_size} data parallel ranks"
         )
+        self._compass_clock, self._clock_before_compass = _install_compass_clock(
+            self.config
+        )
+
+    def _restore_clock(self) -> None:
+        """Hand the process back to the clock this engine found.
+
+        Only if it is still ours: something later in the process may have
+        installed its own, and stamping over that would be the same bug in the
+        other direction.
+        """
+        if self._compass_clock is None:
+            return
+        from atom.utils.clock import get_clock, set_clock
+
+        if get_clock() is self._compass_clock:
+            set_clock(self._clock_before_compass)
+        self._compass_clock = None
+        self._clock_before_compass = None
 
     def close(self):
         """Shut down engine and release all GPU resources."""
-        if hasattr(self, "core_mgr"):
-            self.core_mgr.close()
+        try:
+            if hasattr(self, "core_mgr"):
+                self.core_mgr.close()
+        finally:
+            self._restore_clock()
 
     def add_request(
         self,

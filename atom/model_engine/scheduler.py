@@ -2874,10 +2874,12 @@ class Scheduler:
                     seq.num_tokens,
                     len(seq.block_table),
                 )
-            _first_now = (seq.num_completion_tokens >= 1
-                          and seq.first_token_time == 0.0)
-            if _first_now:
-                seq.first_token_time = get_clock().time()
+            # TTFT is not stamped here. At this point `num_completion_tokens`
+            # still counts rejected speculative tokens and anything past
+            # max_tokens, so a request capped at zero output would be given a
+            # first-token time for a token it never returns. The stamp is below,
+            # from the finalized retained length, and that site is reached by
+            # every sequence this loop walks.
             if _lc.enabled:
                 # One row per sequence postprocess actually walked. A sequence
                 # missing from these rows was skipped -- `idx is None` -- and
@@ -2886,7 +2888,7 @@ class Scheduler:
                          appended=int(num_new_token),
                          completion_tokens=int(seq.num_completion_tokens),
                          partial_prefill=bool(seq.is_partial_prefill),
-                         first_token_published=bool(_first_now),
+                         first_token_published=bool(seq.first_token_time),
                          first_token_time=float(seq.first_token_time))
 
             num_tokens = seq.num_tokens - num_placeholder_width - num_rejected
