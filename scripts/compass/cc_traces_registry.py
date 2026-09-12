@@ -169,6 +169,27 @@ SHARED_OPTIONS = (
     # and pointers that follow -- and `kv_regions` is a treatment field, so
     # they are two deployments and the V=16 law is fitted for this one.
     ("attention_scope", "{root}/xacq/SCOPE.json"),
+    # The dispatch probe, as evidence rather than as a planning note. It says
+    # which Tensile kernel the source serves each row count with on the
+    # 64-token grid over 8192..16384, and the fitted GEMM family reads it to
+    # refuse an interpolant that crosses a switch its two bracketing
+    # measurements cannot see.
+    #
+    # That refusal is not redundant with the endpoint test the family already
+    # applies. This source RE-ENTERS a tile at higher row counts:
+    # `MT256x192x64_MI32x32x1` serves 8256..9216, again 11328..12288, and
+    # again 14400..15360. So the measured 9216 and the measured 14400 name the
+    # same kernel with four other tiles between them, and without this the new
+    # 14400 anchor would silently authorise the whole 9216..14400 gap it was
+    # never measured to cover.
+    #
+    # All three shards, because a switch that straddles a shard boundary is
+    # witnessed by none of them alone and the starts are recomputed over the
+    # union of their rows.
+    ("dispatch_bands",
+     "aiter::gemm_a16w16={root}/dispatch_bands/bands.json,"
+     "aiter::gemm_a16w16={root}/dispatch_bands/lower_8192_9280/bands.json,"
+     "aiter::gemm_a16w16={root}/dispatch_bands/smoke_16320_16384/bands.json"),
 )
 
 #: Options no acceptance cell may carry, with why. Checked rather than trusted:
@@ -751,6 +772,15 @@ def option_paths(tp: int, root) -> dict:
                 found[f"price[{n}].prices"] = parts[0]
                 if len(parts) > 1 and parts[1]:
                     found[f"price[{n}].graph"] = parts[1]
+        elif key == "dispatch_bands":
+            # Each entry is FAMILY=PATH, and the shards are not
+            # interchangeable: a kernel switch that straddles a shard
+            # boundary is witnessed by none of them alone, so every shard
+            # is required and a missing one is a missing constraint, not a
+            # smaller one.
+            for n, entry in enumerate(value.split(",")):
+                _, _, path = entry.partition("=")
+                found[f"dispatch_bands[{n}]"] = path
         elif key in ("template", "head_template", "replay_target"):
             found[key] = value
     # Not an oracle option: the profile is a server flag, read by the replay

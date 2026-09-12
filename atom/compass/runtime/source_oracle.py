@@ -291,8 +291,51 @@ def _attention_request_scope(value, coords=None, what="attention_scope"):
 
 
 
+
+def _load_dispatch_bands(library, value, coords=None):
+    """Register dispatch-probe evidence on a family price library.
+
+    ``value`` is one or more ``FAMILY=PATH`` entries. The family is declared
+    rather than guessed because a probe file records the GEOMETRY it
+    dispatched -- a weight shape and two dtypes -- and not the operator name
+    the price library knows it by; a probe attached to the wrong family would
+    refuse brackets that are fine and, worse, leave the real ones open.
+
+    Read through `loaded_input.load_json`, the same reader the price lists go
+    through, so what the run priced against is digested and recorded: band
+    evidence decides which interpolants a run was ALLOWED, and a manifest that
+    omits it describes a different set of rules from the one that ran.
+
+    No timing in a probe file is read. The probe is a dispatch reading, and
+    `dispatch_bands.load_band_map` takes only the rows and the kernel names.
+    """
+    if not value:
+        return
+    from atom.compass.core.loaded_input import load_json
+
+    for entry in _entries(value, "dispatch_bands"):
+        family, sep, path = entry.partition("=")
+        if not sep or not family.strip() or not path.strip():
+            raise ValueError(
+                f"dispatch_bands {entry!r}: expected FAMILY=PATH, as in "
+                "aiter::gemm_a16w16=/.../dispatch_bands/bands.json. The "
+                "family is declared because a probe file names a geometry, "
+                "not an operator.")
+        try:
+            _payload, loaded = load_json(path.strip(),
+                                         role="oracle.dispatch_bands",
+                                         coords=coords)
+        except FileNotFoundError as exc:
+            raise ValueError(
+                "dispatch_bands names %r, which resolved to %s and is not a "
+                "file that exists. Band evidence is what allows an "
+                "interpolant across a wide bracket; a missing probe must not "
+                "read as a clean one." % (path.strip(), exc.filename)) from exc
+        library.add_dispatch_bands([loaded.path], family.strip())
+        library.loaded_inputs = library.loaded_inputs + (loaded,)
+
 def _price_library(entries, gap_ratio, coords=None, attention_scope=None,
-                   measured_attention_scope=None):
+                   measured_attention_scope=None, dispatch_bands=None):
     """The exact-signature library, or the family provider in front of it.
 
     The provider is a subclass that overrides `lookup` alone, so everything
@@ -358,6 +401,13 @@ def _price_library(entries, gap_ratio, coords=None, attention_scope=None,
         library.declared_attention_scope = measured
         if measured_loaded is not None:
             library.loaded_inputs = library.loaded_inputs + (measured_loaded,)
+    if dispatch_bands:
+        if gap_ratio is None:
+            raise ValueError(
+                "dispatch_bands constrains which interpolants a fitted family "
+                "may give, and modelling is off, so nothing would read it. "
+                "Turn the family provider on with interpolate, or drop it.")
+        _load_dispatch_bands(library, dispatch_bands, coords)
     extra = {"coords": coords} if coords else {}
     for entry in entries:
         if isinstance(entry, (tuple, list)):
@@ -774,6 +824,7 @@ def build_source_oracle(
     interpolate=None,
     attention_scope=None,
     measured_attention_scope=None,
+    dispatch_bands=None,
     rank_coords=None,
     _shared_derivers=None,
     _shared_allocation=None,
@@ -825,6 +876,14 @@ def build_source_oracle(
     no scope down. Both are a mapping or a path to the JSON whoever resolved
     the deployment wrote, both go through the same reader, and both are
     carried into the manifest as loaded inputs. See `_price_library`.
+
+    ``dispatch_bands`` is ``FAMILY=PATH`` evidence from a dispatch probe: which
+    kernel the source serves each row count with, over the span the probe
+    covered. A fitted family uses it to refuse an interpolant that crosses a
+    switch its two bracketing measurements cannot see -- on this source one
+    tile name occupies several disjoint bands, so agreeing endpoints do not
+    make one curve. Optional, and its absence is silence: without it the
+    endpoint test stands alone, exactly as before.
     """
     from atom.compass.core.cost.library import LibraryCostOracle
     from atom.compass.core.cost.regions import (region_model,
@@ -855,7 +914,8 @@ def build_source_oracle(
     # `rank_own: false` under a name nothing asked for.
     price_entries = price_specs(requested_prices)
     library = _price_library(price_entries, gap_ratio(interpolate), coords,
-                             attention_scope, measured_attention_scope)
+                             attention_scope, measured_attention_scope,
+                             dispatch_bands)
     regions_model = region_model(regions)
     # A preset declared above TP1 carries an argument about which of the
     # runner's preparation branches this deployment takes, and one of those

@@ -24,6 +24,16 @@ exactly the declared 2.0 -- crossed the switch and missed the measured 20- and
 kernels the price is refused, and where at least one names none the price says
 the identity went unchecked rather than implying it was confirmed.
 
+Nor do the two endpoints settle it. This source re-enters a tile at higher row
+counts, so one kernel name occupies several disjoint bands: the dispatch probe
+in ``agent_scratch/stage/DISPATCH_BANDS.md`` found ``MT256x192x64_MI32x32x1``
+serving 8256..9216, again 11328..12288, and again 14400..15360. Two
+measurements at 9216 and 14400 therefore agree on the name and still sit on
+different curves, with four other tiles between them. Where that probe reached
+a geometry its band starts are carried on the curve and asked directly, so a
+bracket containing a switch is refused whatever its ends are called. Where it
+did not reach, it says nothing and the endpoint test stands alone.
+
 Every answer carries where it came from. An interpolated price names both
 bracketing measurements and their files; an exact one names its own. The
 uncertainty is assembled from what the measurements show -- the spread across
@@ -36,6 +46,8 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass, field
 from typing import Optional
+
+from .dispatch_bands import BandEvidence
 
 __all__ = ["MeasuredCurve", "MeasuredPoint", "Refusal", "RowSupport"]
 
@@ -90,6 +102,10 @@ class MeasuredCurve:
     points: dict[int, MeasuredPoint] = field(default_factory=dict)
     #: spread contributed by nuisances this family collapsed, as a fraction
     nuisance_spread: float = 0.0
+    #: what the dispatch probe saw BETWEEN the measured points, where it
+    #: reached this geometry. `None` means no probe covered it, which is
+    #: silence and not a clean bill: the endpoint test then stands alone.
+    bands: Optional[BandEvidence] = None
 
     def add(self, rows: int, seconds: float, source: str,
             kernels: tuple[str, ...] = ()) -> None:
@@ -146,8 +162,20 @@ class RowSupport:
                     if _switches(self.curve.points[a], self.curve.points[b])]
         switch_note = (f", kernel switches inside a bracket: "
                        f"{'; '.join(switches)}" if switches else "")
+        band = self.curve.bands
+        band_note = ""
+        if band is not None:
+            crossed = [f"{a}->{b}" for a, b in zip(rows, rows[1:])
+                       if band.crossings(a, b)]
+            band_note = (f", dispatch probe covers {band.low}..{band.high} "
+                         f"(step {band.step}) with {len(band.starts)} band "
+                         "start(s)")
+            if crossed:
+                band_note += (f"; probed switches inside a bracket: "
+                              f"{'; '.join(crossed)}")
         return (f"{self.curve.family}: measured at {rows}"
-                f", max gap ratio {self.max_gap_ratio}{note}{switch_note}")
+                f", max gap ratio {self.max_gap_ratio}{note}{switch_note}"
+                f"{band_note}")
 
     def price(self, rows: int) -> Price | Refusal:
         curve = self.curve
@@ -200,6 +228,30 @@ class RowSupport:
                 "interpolant between two points is a claim about one curve, "
                 "and a kernel switch inside the bracket says there are two of "
                 "them; the ladder needs a point on this side of the switch",
+                component="kernel_switch")
+
+        # The endpoints agreeing is not the whole question. The dispatch probe
+        # found this source re-enters a tile at higher row counts, so a name
+        # can appear in DISJOINT bands: `MT256x192x64_MI32x32x1` serves
+        # 8256..9216 and again 14400..15360, with four other tiles between
+        # them. 9216 and 14400 would pass the test above and still be two
+        # curves. Where the probe covered the bracket it is asked directly.
+        crossings = curve.bands.crossings(lo, hi) if curve.bands else ()
+        if crossings:
+            band = curve.bands
+            covered = ("" if band.covers(lo, hi) else
+                       f"; the probe covers {band.low}..{band.high}, so rows "
+                       "outside that span are unexamined and this refusal "
+                       "rests only on what it did see")
+            return Refusal(
+                f"{rows} rows falls between {lo} and {hi}, and the dispatch "
+                f"probe changes kernel inside that bracket at "
+                f"{', '.join(str(b) for b in crossings)} rows (each located to "
+                f"within {band.step} rows below the row named). The two "
+                "bracketing measurements may well name the same kernel -- the "
+                "same tile is dispatched again at higher row counts -- but a "
+                "name repeating across disjoint bands is not one curve, and an "
+                "interpolant across a switch is not a reading" + covered,
                 component="kernel_switch")
 
         seconds = _log_interpolate(rows, lo, left.value, hi, right.value)

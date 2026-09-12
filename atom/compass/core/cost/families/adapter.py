@@ -62,6 +62,12 @@ import re
 from typing import Optional
 
 from atom.compass.core.cost.families import attention, attention_scope
+from atom.compass.core.cost.families.dispatch_bands import (
+    BandMap,
+    geometry_key,
+    load_band_map,
+    static_shapes,
+)
 from atom.compass.core.cost.families.features import (
     contract_for,
     grouping_key,
@@ -593,6 +599,10 @@ class ParametricPriceLibrary(PriceLibrary):
         #: contradiction about it are different facts, and only the first one
         #: leaves the operators trustworthy.
         self.no_file_width: dict[str, str] = {}
+        #: Dispatch-band evidence, keyed by geometry, for the families a probe
+        #: reached. Empty unless `add_dispatch_bands` was called: no probe is
+        #: silence, and silence must not read as a clean bracket.
+        self._bands = BandMap()
         #: Every ragged attention price as it was written, before the library
         #: reindexes it: (op, seconds, source, scope). Collected here rather
         #: than read back out of `self._prices` because `_ingest` files records
@@ -1525,6 +1535,31 @@ class ParametricPriceLibrary(PriceLibrary):
                     "(have: "
                     + "; ".join(sorted(_scope_note(k) for k in present)) + ")")
 
+
+    def add_dispatch_bands(self, paths, family: str) -> int:
+        """Register a dispatch probe's band map for one family.
+
+        The probe is source evidence, not a planning note: it is what tells
+        `RowSupport` that a bracket whose ends name the same tile still has
+        other tiles inside it. `family` is declared by the caller because a
+        probe file records the geometry it dispatched, not the operator name
+        this library knows it by.
+
+        No timing in a probe file is read. Returns the number of geometries
+        the evidence now covers.
+        """
+        added = load_band_map(paths, family)
+        for key in added.keys():
+            self._bands.add(key, added.get(key))
+        # A curve caches nothing about bands, but it is built from
+        # `_observations`, so the same invalidation the observations use keeps
+        # the two in step.
+        self._curves_built = False
+        return len(self._bands)
+
+    def dispatch_bands(self) -> str:
+        """What band evidence this library holds, for a report or a refusal."""
+        return self._bands.describe()
     def _curve_for(self, op: dict, topology=None, registration=None):
         """The measured curve for this operator, and the width it sits at."""
         groups, _why = self._groups_for(op, topology, registration)
@@ -1551,6 +1586,13 @@ class ParametricPriceLibrary(PriceLibrary):
             family=op.get("name", ""),
             nuisance_spread=contract.nuisance_spread if contract else 0.0,
         )
+        # The probe, where it reached this geometry. Matched on the operand
+        # shapes that do NOT carry the row count -- for a projection, its
+        # weight -- because that is what the dispatch keys on, and two
+        # projections of different widths share every coarser key.
+        curve.bands = self._bands.get(
+            geometry_key(op.get("name", ""), op.get("dtypes") or (),
+                         static_shapes(op, rows_here)))
         for rows, seconds, source, kernels in matched:
             curve.add(rows, seconds, source, kernels)
         return curve, rows_here

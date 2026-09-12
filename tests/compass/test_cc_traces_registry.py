@@ -303,6 +303,15 @@ def test_a_rank_reading_another_rank_s_file_is_named_not_counted_present(tmp_pat
     bounded.mkdir(parents=True)
     for name in ("wb.json", "wbg.json"):
         (bounded / name).write_text("{}")
+    # The dispatch probe's band shards. They are not a price -- no timing in
+    # them is read -- but they are what stops an interpolant from crossing a
+    # kernel switch, so a run without them is a run with a constraint missing.
+    for rel in ("dispatch_bands/bands.json",
+                "dispatch_bands/lower_8192_9280/bands.json",
+                "dispatch_bands/smoke_16320_16384/bands.json"):
+        shard = tmp_path / rel
+        shard.parent.mkdir(parents=True, exist_ok=True)
+        shard.write_text('{"readings": []}')
     # The target derived at this width, and the profile it is sized from --
     # which lives with MEMORY's other profiles, not under the width's
     # directory.
