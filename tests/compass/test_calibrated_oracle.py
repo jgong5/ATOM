@@ -1,0 +1,715 @@
+"""Fitting a cost model to steps that were actually timed.
+
+The failure mode these guard against is not a bad fit — it is a confident one.
+Every bug this oracle has had returned a precise number that was wrong, and
+none of them raised.
+"""
+
+import json
+
+import pytest
+
+from atom.compass.core.cost.base import StepShape
+from atom.compass.core.cost.calibrated import (
+    CalibratedCostOracle, _least_squares, _prefill_features, _truthy)
+
+
+def write_table(path, rows):
+    with open(path, "w", encoding="utf-8") as fh:
+        for tokens, context, seconds, prefill in rows:
+            fh.write(json.dumps({
+                "seconds": seconds,
+                "num_scheduled_tokens": [tokens],
+                "context_lens": [context],
+                "num_prefill_tokens": tokens if prefill else 0,
+            }) + "\n")
+    return str(path)
+
+
+def decode(batch=1, context=128):
+    return StepShape(
+        num_scheduled_tokens=tuple([1] * batch),
+        context_lens=tuple([context] * batch),
+        num_prefill_tokens=0,
+    )
+
+
+def prefill(tokens):
+    return StepShape(
+        num_scheduled_tokens=(tokens,), context_lens=(0,),
+        num_prefill_tokens=tokens,
+    )
+
+
+class TestOutlierRejection:
+    """Triton autotunes per shape, not once per process.
+
+    So a calibration sweep built from deliberately varied shapes pays a one-off
+    benchmarking cost on many of its own samples. In the real table one prefill
+    row sat at 0.13 s where its neighbour at a larger size took 0.036 s.
+    """
+
+    @staticmethod
+    def _linear(n, slope=1e-5, intercept=0.005):
+        return [[1.0, float(i), float(i * i)] for i in n], [
+            intercept + slope * i for i in n
+        ]
+
+    def test_a_clean_fit_drops_nothing(self):
+        rows, targets = self._linear(range(100, 1100, 100))
+        coeffs, dropped = _least_squares(rows, targets)
+        assert coeffs is not None
+        assert dropped == 0
+
+    def test_one_contaminated_sample_is_dropped(self):
+        sizes = list(range(100, 1600, 100))
+        rows, targets = self._linear(sizes)
+        targets[3] *= 30.0                      # an autotuning launch
+        coeffs, dropped = _least_squares(rows, targets)
+        assert dropped >= 1
+        # And the fit now describes the clean points rather than splitting the
+        # difference with the contaminated one.
+        predicted = sum(c * f for c, f in zip(coeffs, rows[3]))
+        assert predicted == pytest.approx(self._linear([sizes[3]])[1][0], rel=0.2)
+
+    def test_a_fit_too_small_to_survive_dropping_keeps_everything(self):
+        """With barely enough points, discarding one leaves nothing to fit.
+
+        Better a fit influenced by an outlier than coefficients derived from an
+        underdetermined system, which look like a model and predict nothing.
+        """
+        rows, targets = self._linear([100, 200, 300])
+        coeffs, dropped = _least_squares(rows, targets)
+        assert coeffs is not None and dropped == 0
+
+    def test_fewer_samples_than_coefficients_is_refused(self):
+        rows, targets = self._linear([100, 200])
+        coeffs, dropped = _least_squares(rows, targets)
+        assert coeffs is None and dropped == 0
+
+
+class TestOracle:
+    def test_decode_cost_grows_with_context(self, tmp_path):
+        """Decode is bandwidth-bound in the KV history it reads."""
+        rows = [(1, ctx, 0.001 + ctx * 1e-6, False) for ctx in range(64, 2048, 64)]
+        oracle = CalibratedCostOracle(write_table(tmp_path / "t.jsonl", rows))
+        assert oracle.estimate(decode(context=1024)).seconds > \
+            oracle.estimate(decode(context=128)).seconds
+
+    def test_prefill_cost_grows_with_tokens(self, tmp_path):
+        rows = [(n, 0, 0.005 + n * 1e-5, True) for n in range(128, 4096, 128)]
+        oracle = CalibratedCostOracle(write_table(tmp_path / "t.jsonl", rows))
+        assert oracle.estimate(prefill(2048)).seconds > \
+            oracle.estimate(prefill(256)).seconds
+
+    def test_a_kind_never_measured_is_refused_not_invented(self, tmp_path):
+        """Returning the mean of no samples is zero.
+
+        That is what made TTFT come back as 0 ms against a real 7.6 s: a
+        confident, precise, entirely fictional answer.
+        """
+        rows = [(1, ctx, 0.001, False) for ctx in range(64, 1024, 64)]
+        oracle = CalibratedCostOracle(write_table(tmp_path / "t.jsonl", rows))
+        with pytest.raises(ValueError, match="no prefill measurements"):
+            oracle.estimate(prefill(512))
+
+    def test_a_prediction_is_never_negative(self, tmp_path):
+        """A fit extrapolates, and a negative duration runs the clock backwards."""
+        rows = [(n, 0, 0.005 + n * 1e-5, True) for n in range(1024, 8192, 512)]
+        oracle = CalibratedCostOracle(write_table(tmp_path / "t.jsonl", rows))
+        assert oracle.estimate(prefill(1)).seconds > 0.0
+
+    def test_an_empty_table_is_refused(self, tmp_path):
+        with pytest.raises(ValueError, match="no usable measurements"):
+            CalibratedCostOracle(write_table(tmp_path / "t.jsonl", []))
+
+    def test_describe_reports_dropped_samples(self, tmp_path):
+        """A fit that discarded evidence must not describe itself like one that
+        kept it."""
+        rows = [(n, 0, 0.005 + n * 1e-5, True) for n in range(128, 4096, 128)]
+        rows[5] = (rows[5][0], 0, 5.0, True)
+        oracle = CalibratedCostOracle(write_table(tmp_path / "t.jsonl", rows))
+        assert "dropped" in oracle.describe()
+
+
+class TestPrefillAttentionIsPerRequest:
+    """A step prefilling two requests must not charge one against the other.
+
+    `tokens * history` on the batch totals cross-multiplies them. On a real 27B
+    step -- 1856 new tokens on a 67968 context, batched with 14528 new tokens on
+    a 14528 context -- that charges 16384 * 66112 where only 1856 * 66112 is
+    attended, 8.8 times too much. Fourteen such steps in one serving run came out
+    +27.28% against -4.01% for the single-request ones, and the two nearly
+    cancelled in the total.
+    """
+
+    @staticmethod
+    def _shape(pairs, decodes=()):
+        """pairs: (new_tokens, context) per prefilling request."""
+        sched = [n for n, _ in pairs] + [1] * len(decodes)
+        ctxs = [c for _, c in pairs] + list(decodes)
+        return StepShape(
+            num_scheduled_tokens=tuple(sched), context_lens=tuple(ctxs),
+            num_prefill_tokens=sum(n for n, _ in pairs),
+        )
+
+    def test_one_request_is_unchanged(self):
+        """The old features were right for a batch of one, and a sweep is mostly
+        batches of one -- which is why this survived so long."""
+        f = _prefill_features(self._shape([(16384, 65536)]))
+        assert f == [1.0, 16384.0, 16384.0 ** 2, 16384.0 * (65536.0 - 16384.0)]
+
+    def test_two_requests_are_not_cross_multiplied(self):
+        f = _prefill_features(self._shape([(1856, 67968), (14528, 14528)]))
+        # 14528 is a first chunk: its context is its own tokens, so no history.
+        assert f[3] == pytest.approx(1856.0 * (67968.0 - 1856.0))
+        collapsed = 16384.0 * ((67968.0 + 14528.0) - 16384.0)
+        assert f[3] < collapsed / 8
+
+    def test_a_decode_riding_along_is_not_charged_here(self):
+        """Its attention is what the decode model is for."""
+        alone = _prefill_features(self._shape([(16384, 65536)]))
+        with_decode = _prefill_features(
+            self._shape([(16384, 65536)], decodes=(120000,)))
+        assert alone == with_decode
+
+    def test_within_chunk_attention_is_also_per_request(self):
+        """Two 1000-token chunks are not one 2000-token chunk: attention within
+        a chunk is quadratic, so the sum of squares is not the square of sums."""
+        f = _prefill_features(self._shape([(1000, 1000), (1000, 1000)]))
+        assert f[2] == pytest.approx(2 * 1000.0 ** 2)
+        assert f[2] < (2000.0 ** 2)
+
+
+class TestLeadingWarmupIsReportedNotCharged:
+    """The sweep's own first steps are autotuning, and they do not transfer.
+
+    A calibration sweep pays for Triton's per-shape autotuning on its first
+    forwards: 47.5 s, 19.5 s and 6.1 s at 8, 32 and 96 tokens on the 27B, where
+    the same shapes later cost 0.11 s. The fit rejects all three, correctly.
+
+    A serving run pays a first-step cost too -- 6.87 s, steady to 1.3% over four
+    repeats -- and it is tempting to predict the second from the first. It was
+    tried: charging the sweep's 72.8 s to the run's leading steps priced its
+    first step at 47.56 s against 6.87 s measured and moved prefill from +0.10%
+    to +31.03%. They are different programs; a server spends most of the
+    process-level warmth in startup, before its first measured step.
+
+    So the number is measured and said out loud, and never charged. These pin
+    that down, because "report it" is one edit away from "use it".
+    """
+
+    @staticmethod
+    def _with_warmup(tmp_path):
+        rows = [(n, 0, 0.005 + n * 1e-5, True) for n in range(128, 4096, 128)]
+        # Three leading steps costing far more than their shape says, then the
+        # ordinary sweep. The same shapes appear later, so nothing but position
+        # distinguishes them.
+        warm = [(128, 0, 4.0, True), (256, 0, 1.5, True), (384, 0, 0.4, True)]
+        return write_table(tmp_path / "t.jsonl", warm + rows)
+
+    def test_it_is_found_and_reported(self, tmp_path):
+        oracle = CalibratedCostOracle(self._with_warmup(tmp_path))
+        assert len(oracle._warmup) == 3
+        assert "leading warmup in table=3 steps" in oracle.describe()
+        assert "not charged" in oracle.describe()
+
+    def test_it_is_not_charged_to_any_prediction(self, tmp_path):
+        """The whole point. Detection must not become pricing."""
+        table = self._with_warmup(tmp_path)
+        on = CalibratedCostOracle(table)
+        off = CalibratedCostOracle(table, warmup="off")
+        # Including the first estimate the oracle ever makes, which is where a
+        # replayed warmup would land.
+        for shape in (prefill(128), prefill(128), prefill(2048)):
+            assert on.estimate(shape).seconds == pytest.approx(
+                off.estimate(shape).seconds)
+
+    def test_an_ordinary_sweep_reports_none(self, tmp_path):
+        """Absence has to be distinguishable from presence, or the report is
+        decoration."""
+        rows = [(n, 0, 0.005 + n * 1e-5, True) for n in range(128, 4096, 128)]
+        oracle = CalibratedCostOracle(write_table(tmp_path / "t.jsonl", rows))
+        assert oracle._warmup == []
+        assert "leading warmup" not in oracle.describe()
+
+    def test_it_stops_at_the_first_ordinary_step(self, tmp_path):
+        """A later autotuning stall is contamination, not warmth: it happens at
+        whatever shape the sweep had reached, and a run will not meet it there."""
+        rows = [(n, 0, 0.005 + n * 1e-5, True) for n in range(128, 4096, 128)]
+        rows[10] = (rows[10][0], 0, 9.0, True)
+        oracle = CalibratedCostOracle(write_table(
+            tmp_path / "t.jsonl", [(128, 0, 4.0, True)] + rows))
+        assert len(oracle._warmup) == 1
+
+    def test_a_measured_constant_is_charged_once_and_only_to_prefill(
+            self, tmp_path):
+        """The other half of the bargain, and the same one
+        --compass-admission-seconds makes: a number the table cannot hold, taken
+        from a real run of the same deployment and reused. 6.68 s on the 27B at
+        tp=4, steady to 1.3% over four repeats.
+
+        Charged to the first prefill step because that is where a real run pays
+        it, and never again, because warmth is paid once.
+        """
+        rows = [(n, 0, 0.005 + n * 1e-5, True) for n in range(128, 4096, 128)]
+        rows += [(1, ctx, 0.001 + ctx * 1e-6, False) for ctx in range(64, 2048, 64)]
+        table = write_table(tmp_path / "t.jsonl", rows)
+        plain = CalibratedCostOracle(table)
+        warm = CalibratedCostOracle(table, warmup_seconds=6.68)
+
+        base = plain.estimate(prefill(1024)).seconds
+        assert warm.estimate(prefill(1024)).seconds == pytest.approx(base + 6.68)
+        # Once. The second prefill step is a cold machine no longer.
+        assert warm.estimate(prefill(1024)).seconds == pytest.approx(base)
+        assert "measured first-step warmup=6.68s" in warm.describe()
+
+    def test_a_decode_first_does_not_consume_it(self, tmp_path):
+        """A run whose first step is a decode has not paid the prefill warmth
+        yet, and must not be told it has."""
+        rows = [(n, 0, 0.005 + n * 1e-5, True) for n in range(128, 4096, 128)]
+        rows += [(1, ctx, 0.001 + ctx * 1e-6, False) for ctx in range(64, 2048, 64)]
+        table = write_table(tmp_path / "t.jsonl", rows)
+        plain = CalibratedCostOracle(table)
+        warm = CalibratedCostOracle(table, warmup_seconds=6.68)
+        assert warm.estimate(decode(context=512)).seconds == pytest.approx(
+            plain.estimate(decode(context=512)).seconds)
+        assert warm.estimate(prefill(1024)).seconds == pytest.approx(
+            plain.estimate(prefill(1024)).seconds + 6.68)
+
+    def test_it_defaults_to_the_behaviour_before_it_existed(self, tmp_path):
+        rows = [(n, 0, 0.005 + n * 1e-5, True) for n in range(128, 4096, 128)]
+        oracle = CalibratedCostOracle(write_table(tmp_path / "t.jsonl", rows))
+        assert oracle._warmup_seconds == 0.0
+        assert "measured first-step warmup" not in oracle.describe()
+
+    @pytest.mark.parametrize("value,expected", [
+        ("off", False), ("0", False), ("false", False), ("no", False),
+        ("on", True), ("1", True), (True, True), (False, False),
+    ])
+    def test_the_option_survives_being_a_string(self, value, expected):
+        """Oracle options arrive from a command line, so "off" must mean off and
+        not merely be a non-empty string."""
+        assert _truthy(value) is expected
+
+
+class TestExtrapolationIsAnnounced:
+    """A fitted model answers anything, including what it has no evidence for.
+
+    This caused the same error twice in two dimensions: a prefill model fitted
+    to 1753-16370 tokens asked about 520, and a decode model fitted to batch
+    sizes 1-4 asked about 8. Neither said anything; both were simply wrong.
+    """
+
+    @staticmethod
+    def _decode_table(tmp_path, batches):
+        rows = []
+        for b in batches:
+            for ctx in range(64, 1024, 64):
+                rows.append((b, ctx, 0.003 + b * 1e-4 + ctx * 1e-7, False))
+        path = tmp_path / "t.jsonl"
+        with open(path, "w", encoding="utf-8") as fh:
+            for b, ctx, seconds, _ in rows:
+                fh.write(json.dumps({
+                    "seconds": seconds,
+                    "num_scheduled_tokens": [1] * b,
+                    "context_lens": [ctx // b] * b,
+                    "num_prefill_tokens": 0,
+                }) + "\n")
+        return str(path)
+
+    def test_inside_the_calibrated_range_is_silent(self, tmp_path, caplog):
+        oracle = CalibratedCostOracle(self._decode_table(tmp_path, [1, 2, 4, 8]))
+        caplog.clear()
+        oracle.estimate(decode(batch=4, context=100))
+        assert not [r for r in caplog.records if "extrapolation" in r.message]
+
+    def test_outside_it_warns(self, tmp_path, caplog):
+        import logging
+
+        oracle = CalibratedCostOracle(self._decode_table(tmp_path, [1, 2, 4]))
+        with caplog.at_level(logging.WARNING):
+            oracle.estimate(decode(batch=64, context=100))
+        assert any("extrapolation" in r.message for r in caplog.records)
+
+    def test_repetition_adds_no_further_warnings(self, tmp_path, caplog):
+        """A serving run asks this thousands of times.
+
+        More than one feature can be out of range at once -- here both the batch
+        size and the total context are -- so the invariant is not "one warning"
+        but "no more after the first time each is seen".
+        """
+        import logging
+
+        oracle = CalibratedCostOracle(self._decode_table(tmp_path, [1, 2, 4]))
+        with caplog.at_level(logging.WARNING):
+            oracle.estimate(decode(batch=64, context=100))
+            first = len([r for r in caplog.records if "extrapolation" in r.message])
+            for _ in range(50):
+                oracle.estimate(decode(batch=64, context=100))
+            after = len([r for r in caplog.records if "extrapolation" in r.message])
+        assert first >= 1
+        assert after == first
+
+
+class TestEventDraining:
+    """Timed steps are written once the device has finished them, not before.
+
+    Draining by `query()` rather than `synchronize()` is the whole point: a
+    host-side sync on every step destroyed the host/device overlap a serving
+    loop runs on, making the measured run 33% slower than the same run
+    unmeasured (4.33 ms per output token against 3.26 ms). The table then
+    described a machine that only existed while being measured.
+    """
+
+    class FakeEvent:
+        def __init__(self, ready=True, ms=1.0):
+            self._ready, self._ms = ready, ms
+
+        def query(self):
+            return self._ready
+
+        def elapsed_time(self, other):
+            return other._ms
+
+    @staticmethod
+    def _runner():
+        import collections
+
+        from atom.compass.config import CompassConfig
+        from atom.compass.runtime.runner import CompassModelRunner
+
+        stub = CompassModelRunner.__new__(CompassModelRunner)
+        stub.__dict__["_compass_config_cache"] = CompassConfig(
+            enabled=True, mode="measure", measure_out="t.jsonl",
+        )
+        stub._pending = collections.deque()
+        stub._measured_steps = 0
+        stub._measured_by_kind = {}
+        stub._written = []
+        stub._record_measurement = (
+            lambda shape, seconds, gap=None, req_ids=None, started_at=None,
+            decision=None, spans=None: stub._written.append(
+                (shape, seconds, gap, spans)
+            )
+        )
+        return stub
+
+    def _step(self, ready=True, ms=2.0, spans=None):
+        """One entry as `_forward_measured` appends it.
+
+        The last slot holds the inner event pairs -- the regions of the forward
+        timed separately inside the outer pair. None where a step recorded none.
+        """
+        return (decode(), self.FakeEvent(), self.FakeEvent(ready=ready, ms=ms),
+                None, None, None, None, spans)
+
+    def test_an_unfinished_step_is_not_written_yet(self):
+        stub = self._runner()
+        stub._pending.append(self._step(ready=False))
+        stub._drain_pending()
+        assert stub._written == []
+        assert len(stub._pending) == 1
+
+    def test_finished_steps_are_written_in_order(self):
+        stub = self._runner()
+        for ms in (2.0, 4.0, 8.0):
+            stub._pending.append(self._step(ms=ms))
+        stub._drain_pending()
+        assert [s for _, s, _g, _sp in stub._written] == [0.002, 0.004, 0.008]
+        assert not stub._pending
+
+    def test_draining_stops_at_the_first_unfinished_step(self):
+        """Order matters: a later step must not be written before an earlier
+        one, or the table's rows stop corresponding to the run's sequence."""
+        stub = self._runner()
+        stub._pending.append(self._step(ms=2.0))
+        stub._pending.append(self._step(ready=False))
+        stub._pending.append(self._step(ms=8.0))
+        stub._drain_pending()
+        assert [s for _, s, _g, _sp in stub._written] == [0.002]
+        assert len(stub._pending) == 2
+
+    def test_inner_spans_are_resolved_alongside_the_outer_one(self):
+        """The sub-spans exist so the modelled region can be told apart from the
+        rest of the forward. Draining must convert them the same way, and to
+        seconds, or a row reports a body in milliseconds next to a step in
+        seconds."""
+        stub = self._runner()
+        pair = (self.FakeEvent(), self.FakeEvent(ms=6.0))
+        stub._pending.append(self._step(ms=10.0, spans={"run_model": pair}))
+        stub._drain_pending()
+        (_shape, seconds, _gap, spans), = stub._written
+        assert seconds == 0.010
+        assert spans == {"run_model": 0.006}
+
+    def test_a_step_without_inner_spans_still_drains(self):
+        """Capture predates the inner pairs, or the region was never entered."""
+        stub = self._runner()
+        stub._pending.append(self._step(ms=4.0, spans=None))
+        stub._drain_pending()
+        assert stub._written[0][3] == {}
+
+    def test_warmup_is_counted_per_kind(self):
+        """Prefill happens a handful of times in a whole run, so a warmup
+        counted in total steps discards every prefill sample there is."""
+        from atom.compass.config import CompassConfig
+
+        stub = self._runner()
+        stub.__dict__["_compass_config_cache"] = CompassConfig(
+            enabled=True, mode="measure", measure_out="t.jsonl",
+            measure_warmup_steps=1,
+        )
+        stub._count_and_record(prefill(128), 0.5)     # first prefill: dropped
+        stub._count_and_record(decode(), 0.001)       # first decode: dropped
+        stub._count_and_record(prefill(256), 0.05)    # kept
+        stub._count_and_record(decode(), 0.002)       # kept
+        assert [s for _, s, _g, _sp in stub._written] == [0.05, 0.002]
+
+
+class TestTheSubSpanWindowIsOnlyOpenForAMeasuredStep:
+    """`run_model` is called by more than measured forwards.
+
+    Graph capture and dummy runs go through it too, and an event recorded while
+    a capture is active is recorded *into the graph* -- so it would then be
+    replayed on every subsequent step, timing nothing and corrupting the graph
+    it sits in. The window is therefore opened by `_forward_measured` alone, and
+    `_timed_span` passes straight through whenever it is shut.
+    """
+
+    @staticmethod
+    def _stub():
+        from atom.compass.runtime.runner import CompassModelRunner
+
+        return CompassModelRunner.__new__(CompassModelRunner)
+
+    def test_a_shut_window_records_nothing(self):
+        stub = self._stub()
+        assert not hasattr(stub, "_subspans")
+        assert stub._timed_span("run_model", lambda: "out") == "out"
+
+    def test_an_explicitly_shut_window_records_nothing(self):
+        stub = self._stub()
+        stub._subspans = None
+        assert stub._timed_span("run_model", lambda: "out") == "out"
+        assert stub._subspans is None
+
+    def test_an_open_window_collects_the_region(self):
+        stub = self._stub()
+        stub._subspans = {}
+        assert stub._timed_span("run_model", lambda: "out") == "out"
+        assert list(stub._subspans) == ["run_model"]
+        began, ended = stub._subspans["run_model"]
+        assert began is not ended
+
+    def test_a_raising_region_does_not_leave_the_window_open(self):
+        """A forward that raises must still shut it, or the next graph capture
+        runs with the window open -- which is the failure this class exists to
+        prevent, arriving by a different route."""
+        stub = self._stub()
+        stub._subspans = {}
+
+        def boom():
+            raise RuntimeError("kernel")
+
+        with pytest.raises(RuntimeError):
+            stub._timed_span("run_model", boom)
+        # `_timed_span` itself leaves the window alone; `_forward_measured`'s
+        # `finally` is what shuts it. What must hold here is that the failure
+        # did not record a half-pair that a later drain would read as timing.
+        assert "run_model" not in stub._subspans
+
+
+class TestEmpiricalOracle:
+    """Answering from nearby measurements instead of a fitted form.
+
+    Its diagnostic value came first: asked about the shape the calibrated oracle
+    was getting wrong, it returned 3.84 ms where the fit returned 3.83 ms. Two
+    methods with opposite failure modes agreeing meant the fit was faithful to
+    its data and the data was wrong — which is what led to F9.
+    """
+
+    @staticmethod
+    def _oracle(tmp_path, rows):
+        from atom.compass.core.cost.interpolated import InterpolatedCostOracle
+
+        path = tmp_path / "t.jsonl"
+        with open(path, "w", encoding="utf-8") as fh:
+            for batch, ctx, seconds in rows:
+                fh.write(json.dumps({
+                    "seconds": seconds,
+                    "num_scheduled_tokens": [1] * batch,
+                    "context_lens": [ctx // batch] * batch,
+                    "num_prefill_tokens": 0,
+                }) + "\n")
+        return InterpolatedCostOracle(str(path), neighbours=3)
+
+    def test_an_exact_match_answers_exactly(self, tmp_path):
+        rows = [(4, ctx, 0.001 + ctx * 1e-6) for ctx in range(400, 2000, 400)]
+        oracle = self._oracle(tmp_path, rows)
+        got = oracle.estimate(decode(batch=4, context=200)).seconds  # ctx total 800
+        assert got == pytest.approx(0.001 + 800 * 1e-6, rel=1e-6)
+
+    def test_it_interpolates_between_neighbours(self, tmp_path):
+        rows = [(4, ctx, ctx * 1e-6) for ctx in range(400, 4000, 400)]
+        oracle = self._oracle(tmp_path, rows)
+        got = oracle.estimate(decode(batch=4, context=250)).seconds  # total 1000
+        assert 0.0008 < got < 0.0012
+
+    def test_a_kind_never_measured_is_refused(self, tmp_path):
+        oracle = self._oracle(tmp_path, [(4, c, 0.001) for c in range(400, 2000, 400)])
+        with pytest.raises(ValueError, match="no prefill measurements"):
+            oracle.estimate(prefill(512))
+
+    def test_far_outside_the_data_it_warns(self, tmp_path, caplog):
+        """Nearest-neighbour degrades to "the closest edge" rather than
+        diverging, which is gentler than extrapolating a line but still an
+        answer given without evidence."""
+        import logging
+
+        oracle = self._oracle(tmp_path, [(4, c, 0.001) for c in range(400, 2000, 400)])
+        with caplog.at_level(logging.WARNING):
+            oracle.estimate(decode(batch=4, context=100000))
+        assert any("outside the measured range" in r.message for r in caplog.records)
+
+    def test_features_are_standardised_before_distances_are_taken(self, tmp_path):
+        """Context runs to thousands and batch size to single digits.
+
+        Unstandardised, every neighbour would be chosen by context alone and
+        batch size would carry no weight at all.
+        """
+        rows = [(1, 1000, 0.010), (8, 1000, 0.020)]
+        rows += [(1, 1200, 0.010), (8, 1200, 0.020)]
+        oracle = self._oracle(tmp_path, rows)
+        near_one = oracle.estimate(decode(batch=1, context=1100)).seconds
+        near_eight = oracle.estimate(decode(batch=8, context=137)).seconds
+        assert near_one < near_eight
+
+
+def test_every_compass_warning_is_greppable():
+    """Warnings must announce themselves in the message, not rely on the level.
+
+    ATOM logs as "[atom.compass.x 00:00:00] ..." and never names the level, so
+    anything scanning captured output for warnings has to match on the text.
+    `compass/validate.py` does exactly that; a warning added without the prefix
+    would be silently invisible in the one workflow that runs all the phases.
+    """
+    import ast
+    import pathlib
+
+    root = pathlib.Path(__file__).resolve().parents[2] / "atom" / "compass"
+    offenders = []
+    for path in root.rglob("*.py"):
+        tree = ast.parse(path.read_text())
+        for node in ast.walk(tree):
+            if not isinstance(node, ast.Call):
+                continue
+            func = node.func
+            if not (isinstance(func, ast.Attribute) and func.attr == "warning"):
+                continue
+            if not node.args or not isinstance(node.args[0], ast.Constant):
+                continue
+            message = node.args[0].value
+            if isinstance(message, str) and not message.startswith(
+                "ATOMCompass WARNING:"
+            ):
+                offenders.append(f"{path.name}:{node.lineno} {message[:50]!r}")
+
+    assert not offenders, (
+        "these logger.warning calls will not be surfaced by validate.py:\n  "
+        + "\n  ".join(offenders)
+    )
+
+
+class TestWarningsReachTheUser:
+    """`validate.py` captures each phase, so warnings must be extracted from it.
+
+    Capturing is right — an engine start-up is thousands of lines and none of
+    them are the point — but it swallowed the warnings too, and those *are* the
+    point. The extrapolation warning exists so a bad number announces itself
+    rather than being read off the table as fact; swallowed, it was inert in the
+    one workflow that runs all four phases.
+    """
+
+    @staticmethod
+    def _validate_module():
+        import importlib.util
+        import pathlib
+
+        path = (pathlib.Path(__file__).resolve().parents[2]
+                / "scripts" / "compass" / "validate.py")
+        spec = importlib.util.spec_from_file_location("compass_validate", path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def test_a_warning_on_stderr_is_surfaced(self, capsys):
+        module = self._validate_module()
+        line = "[atom.compass.core.cost.calibrated 00:00:00] " + module.MARKER \
+            + " costing a decode step outside the calibrated range"
+        module._run(["python", "-c", f"import sys; sys.stderr.write({line!r})"])
+        assert "outside the calibrated range" in capsys.readouterr().out
+
+    def test_ordinary_output_is_not_surfaced(self, capsys):
+        """Only warnings, or the signal drowns in engine start-up noise."""
+        module = self._validate_module()
+        module._run(["python", "-c",
+                     "print('ATOMCompass active: mode=predict oracle=X')"])
+        assert capsys.readouterr().out == ""
+
+    def test_the_same_warning_is_printed_once(self, capsys):
+        """A serving run emits per-step; the phase log holds many copies."""
+        module = self._validate_module()
+        line = module.MARKER + " costing a decode step outside the range"
+        module._run(["python", "-c",
+                     f"print({line!r}); print({line!r}); print({line!r})"])
+        assert capsys.readouterr().out.count("costing a decode step") == 1
+
+
+class TestTheTableSaysWhoseStepItWas:
+    """A step table that cannot name the requests it served runs out of evidence.
+
+    On cc-traces the simulated run matched the real one on step counts, device
+    seconds, occupancy and when requests finished, and still reported TTFT at
+    twice the truth. Every aggregate agreed, so the next question -- which
+    request was being served when -- had nothing to answer it with.
+    """
+
+    def _runner(self, path):
+        from atom.compass.config import CompassConfig
+        from atom.compass.runtime.runner import CompassModelRunner
+
+        stub = CompassModelRunner.__new__(CompassModelRunner)
+        stub.__dict__["_compass_config_cache"] = CompassConfig(
+            enabled=True, mode="measure", measure_out=str(path),
+        )
+        stub._measure_fh = None
+        # Single rank: the writer asks the topology whether to add a rank
+        # suffix to the path, and that is the only thing it needs the engine
+        # config for.
+        stub._topology = lambda: {}
+        return stub
+
+    def _row(self, tmp_path, **kwargs):
+        import json
+
+        path = tmp_path / "steps.jsonl"
+        stub = self._runner(path)
+        stub._record_measurement(decode(), 0.002, None, **kwargs)
+        stub._measure_fh.flush()
+        return json.loads(path.read_text().splitlines()[0])
+
+    def test_the_ids_are_written(self, tmp_path):
+        row = self._row(tmp_path, req_ids=["a", "b"])
+        assert row["req_ids"] == ["a", "b"]
+
+    def test_they_are_strings_whatever_the_engine_uses(self, tmp_path):
+        """Request ids are ints in some paths and strings in others, and a
+        table read by a different process should not have to know which."""
+        row = self._row(tmp_path, req_ids=[7, 8])
+        assert row["req_ids"] == ["7", "8"]
+
+    def test_a_step_with_no_ids_records_none(self, tmp_path):
+        """Not an empty list: absent and empty mean different things, and only
+        one of them is a step that served nothing."""
+        assert self._row(tmp_path)["req_ids"] is None

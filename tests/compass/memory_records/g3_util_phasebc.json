@@ -1,0 +1,290 @@
+{
+  "version": 1,
+  "what": "Phase B asks whether the 0.33 rung's non_torch was a property of the utilization or of what ran just before it; phase C repeats the source configuration three times on an exclusively-held device.",
+  "device": "MI308X gfx942, hjbog-srdc-18, HIP_VISIBLE_DEVICES=0, exclusive lease",
+  "model": "Qwen/Qwen3.8-27B",
+  "config": {
+    "tensor_parallel": 1,
+    "max_model_len": 262144,
+    "max_num_seqs": 32,
+    "block_size": 16,
+    "enable_prefix_caching": false,
+    "num_prompts": 2,
+    "max_tokens": 8,
+    "prompt_tokens": 256
+  },
+  "phase_b": {
+    "window_utc": [
+      "2026-09-11T08:41:49Z",
+      "2026-09-11T08:52:28Z"
+    ],
+    "design": "2x2: each utilization run once from a settled device and once straight after a failed start-up.",
+    "runs": {
+      "settled_u0.33": {
+        "blocks": 1583,
+        "readings": {
+          "total": 206141652992,
+          "free": 149866676224,
+          "peak_torch": 57971260416,
+          "weights_torch": 54761936384,
+          "parameter_bytes": 54747011552,
+          "buffer_bytes": 33554432,
+          "buffer_breakdown": [
+            {
+              "name": "rotary_emb.cos_cache",
+              "count": 1,
+              "bytes": 16777216,
+              "shape": [
+                262144,
+                1,
+                1,
+                32
+              ],
+              "dtype": null
+            },
+            {
+              "name": "rotary_emb.sin_cache",
+              "count": 1,
+              "bytes": 16777216,
+              "shape": [
+                262144,
+                1,
+                1,
+                32
+              ],
+              "dtype": null
+            }
+          ],
+          "current_torch": 55014276096,
+          "non_torch": 1157627904,
+          "cudagraph_overhead": 591396864
+        },
+        "sha256": "2df81daae7d449cae18be93f03eb39eeba6e99b7fb766c6285273f52d42d87aa"
+      },
+      "settled_u0.40": {
+        "blocks": 15238,
+        "readings": {
+          "total": 206141652992,
+          "free": 149866676224,
+          "peak_torch": 57971260416,
+          "weights_torch": 54761936384,
+          "parameter_bytes": 54747011552,
+          "buffer_bytes": 33554432,
+          "buffer_breakdown": [
+            {
+              "name": "rotary_emb.cos_cache",
+              "count": 1,
+              "bytes": 16777216,
+              "shape": [
+                262144,
+                1,
+                1,
+                32
+              ],
+              "dtype": null
+            },
+            {
+              "name": "rotary_emb.sin_cache",
+              "count": 1,
+              "bytes": 16777216,
+              "shape": [
+                262144,
+                1,
+                1,
+                32
+              ],
+              "dtype": null
+            }
+          ],
+          "current_torch": 55014276096,
+          "non_torch": 1157627904,
+          "cudagraph_overhead": 591396864
+        },
+        "sha256": "a794ef6e3d709f5a63185a447c40edfff540874e29554e1fa96d1990e1357c05"
+      },
+      "afterfail_u0.40": {
+        "blocks": 15238,
+        "readings": {
+          "total": 206141652992,
+          "free": 149866676224,
+          "peak_torch": 57971260416,
+          "weights_torch": 54761936384,
+          "parameter_bytes": 54747011552,
+          "buffer_bytes": 33554432,
+          "buffer_breakdown": [
+            {
+              "name": "rotary_emb.cos_cache",
+              "count": 1,
+              "bytes": 16777216,
+              "shape": [
+                262144,
+                1,
+                1,
+                32
+              ],
+              "dtype": null
+            },
+            {
+              "name": "rotary_emb.sin_cache",
+              "count": 1,
+              "bytes": 16777216,
+              "shape": [
+                262144,
+                1,
+                1,
+                32
+              ],
+              "dtype": null
+            }
+          ],
+          "current_torch": 55014276096,
+          "non_torch": 1157627904,
+          "cudagraph_overhead": 591396864
+        },
+        "sha256": "a794ef6e3d709f5a63185a447c40edfff540874e29554e1fa96d1990e1357c05"
+      }
+    },
+    "afterfail_pre": {
+      "utilization": 0.32,
+      "exit": 1,
+      "error": "InsufficientPoolBudget: state pool needs 2510290944B of 2122210714B -> RuntimeError, byte-identical to phase A"
+    },
+    "finding": "The teardown hypothesis is refuted: a settled 0.33 reads 1157627904 B, the same as 0.40 and 0.41, and a 0.40 run started straight after a failure reads it too. The phase A 0.33 excursion of 1677721600 B did not reproduce."
+  },
+  "phase_c": {
+    "window_utc": [
+      "2026-09-11T08:53:49Z",
+      "2026-09-11T09:03:38Z"
+    ],
+    "utilization": 0.9,
+    "design": "Three repeats of the declared source configuration, with rocm-smi KFD ownership sampled every ~35 s throughout (27b.tp1.exclusive.ownership.txt).",
+    "runs": {
+      "src1": {
+        "blocks": 112772,
+        "readings": {
+          "total": 206141652992,
+          "free": 149866676224,
+          "peak_torch": 57971260416,
+          "weights_torch": 54761936384,
+          "parameter_bytes": 54747011552,
+          "buffer_bytes": 33554432,
+          "buffer_breakdown": [
+            {
+              "name": "rotary_emb.cos_cache",
+              "count": 1,
+              "bytes": 16777216,
+              "shape": [
+                262144,
+                1,
+                1,
+                32
+              ],
+              "dtype": null
+            },
+            {
+              "name": "rotary_emb.sin_cache",
+              "count": 1,
+              "bytes": 16777216,
+              "shape": [
+                262144,
+                1,
+                1,
+                32
+              ],
+              "dtype": null
+            }
+          ],
+          "current_torch": 55014276096,
+          "non_torch": 1157627904,
+          "cudagraph_overhead": 591396864
+        },
+        "sha256": "4ff602796143df38166131f12ed4c1b728cc051fbb9c78be3bfd4540f417258e"
+      },
+      "src2": {
+        "blocks": 112772,
+        "readings": {
+          "total": 206141652992,
+          "free": 149866676224,
+          "peak_torch": 57971260416,
+          "weights_torch": 54761936384,
+          "parameter_bytes": 54747011552,
+          "buffer_bytes": 33554432,
+          "buffer_breakdown": [
+            {
+              "name": "rotary_emb.cos_cache",
+              "count": 1,
+              "bytes": 16777216,
+              "shape": [
+                262144,
+                1,
+                1,
+                32
+              ],
+              "dtype": null
+            },
+            {
+              "name": "rotary_emb.sin_cache",
+              "count": 1,
+              "bytes": 16777216,
+              "shape": [
+                262144,
+                1,
+                1,
+                32
+              ],
+              "dtype": null
+            }
+          ],
+          "current_torch": 55014276096,
+          "non_torch": 1157627904,
+          "cudagraph_overhead": 591396864
+        },
+        "sha256": "4ff602796143df38166131f12ed4c1b728cc051fbb9c78be3bfd4540f417258e"
+      },
+      "src3": {
+        "blocks": 112772,
+        "readings": {
+          "total": 206141652992,
+          "free": 149866676224,
+          "peak_torch": 57971260416,
+          "weights_torch": 54761936384,
+          "parameter_bytes": 54747011552,
+          "buffer_bytes": 33554432,
+          "buffer_breakdown": [
+            {
+              "name": "rotary_emb.cos_cache",
+              "count": 1,
+              "bytes": 16777216,
+              "shape": [
+                262144,
+                1,
+                1,
+                32
+              ],
+              "dtype": null
+            },
+            {
+              "name": "rotary_emb.sin_cache",
+              "count": 1,
+              "bytes": 16777216,
+              "shape": [
+                262144,
+                1,
+                1,
+                32
+              ],
+              "dtype": null
+            }
+          ],
+          "current_torch": 55014276096,
+          "non_torch": 1157627904,
+          "cudagraph_overhead": 591396864
+        },
+        "sha256": "4ff602796143df38166131f12ed4c1b728cc051fbb9c78be3bfd4540f417258e"
+      }
+    },
+    "finding": "All three records are byte-identical, sha256 4ff602796143df38166131f12ed4c1b728cc051fbb9c78be3bfd4540f417258e. Runs 2 and 3 started with 21.5 GB and 170 GB of residual occupancy on the box from this agent's own previous engine, and still read the same non_torch. The historical TP=1 source record reads 1191182336 B, 32 MiB higher; that difference is why the historical record is not the calibration source.",
+    "ownership": "No foreign process was attributed VRAM in any sample. One long-lived foreign KFD attachment (pid 1685833) was present throughout at 0 B, and the device's idle floor was 297689088 B in every sample."
+  },
+  "ownership_log_sha256": "0e77067c88a0a3b45276e663fa83b36ae69ff26a06d21a58176c9346f0eb9637"
+}

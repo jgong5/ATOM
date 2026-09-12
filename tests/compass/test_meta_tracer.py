@@ -1,0 +1,365 @@
+"""What the dispatch tracer records about where tensors come from and go.
+
+Shapes alone do not make a graph walkable for liveness: two tensors of the same
+shape are the same entry. What makes it walkable is `inputs_from` and
+`output_aliases`, and both are keyed on storage identity -- so these tests are
+about that key, on the device derivation actually runs on.
+
+Meta is that device, and a meta tensor has no address: `data_ptr()` is 0 for
+every storage ever made, and it does not raise. The trace that came of keying
+on the address alone was not missing anything a reader could notice; it was
+wrong in a way that reads as a very tidy graph, every input produced by the
+operator immediately before it and every output an alias. The CPU trace of the
+same function is the control: the two should agree about provenance, because
+provenance is a property of the function, not of where its tensors live.
+"""
+
+import pytest
+
+torch = pytest.importorskip("torch")
+
+from atom.compass.core.graph import OpSpec  # noqa: E402
+from atom.compass.runtime.meta import (  # noqa: E402
+    MetaOpTracer,
+    _collective_stand_in,
+    _storage_of,
+    fresh_like,
+    fresh_shape,
+)
+
+
+def _tensor(device):
+    return torch.zeros(4, 4, device=device)
+
+
+@torch.library.custom_op("compass_test::fill_", mutates_args={"out"})
+def _fill(out: torch.Tensor, x: torch.Tensor) -> None:
+    """An operator that writes into a destination and returns nothing.
+
+    The shape of an aiter out-kernel in three lines: what it produced is the
+    buffer it was handed, a dispatch tracer sees that only in the arguments,
+    and the destination is the first of them.
+    """
+    out.copy_(x)
+
+
+@pytest.mark.parametrize("device", ["cpu", "meta"])
+def test_two_storages_are_two_keys_and_a_view_is_one(device):
+    a, b = _tensor(device), _tensor(device)
+    assert _storage_of(a) is not None
+    assert _storage_of(a) != _storage_of(b)
+    # A reshape allocates nothing. Counting it as its own storage would invent
+    # activation memory that never existed, which is the reason the key is a
+    # storage and not a tensor.
+    assert _storage_of(a.view(2, 8)) == _storage_of(a)
+
+
+def _trace(device):
+    """A function with one of each provenance, traced on `device`.
+
+    It has a residual and a second weight on purpose. A straight chain cannot
+    tell a correct producer map from a collapsed one: where every operator
+    reads only what the one before it wrote, "the operator before" is the right
+    answer by accident. What separates them is a read of something older -- the
+    residual -- and a read of something this step never produced at all -- the
+    second weight, reached after the first operator has run.
+    """
+    tracer = MetaOpTracer()
+    w1 = torch.ones(4, 4, device=device)     # a weight: from before the step
+    w2 = torch.ones(4, 4, device=device)     # a second one, read later
+    x = torch.zeros(4, 4, device=device)     # the step's input: likewise
+    with tracer:
+        h = torch.mm(x, w1)                  # fresh allocation, from nothing
+        y = torch.relu(h)                    # fresh allocation, from mm
+        z = torch.mm(y, w2)                  # reads a weight, not an activation
+        out = z + h                          # the residual: reads h again
+        out.add_(1.0)                        # in place: aliases its input
+    return tracer, [op.name for op in tracer.graph.ops]
+
+
+@pytest.mark.parametrize("device", ["cpu", "meta"])
+def test_provenance_is_recorded_operator_by_operator(device):
+    tracer, names = _trace(device)
+    assert names == ["aten::mm", "aten::relu", "aten::mm",
+                     "aten::add.Tensor", "aten::add_.Tensor"]
+    ops = tracer.graph.ops
+
+    # The weight and the step input were not produced by this step.
+    assert ops[0].inputs_from == (-1, -1)
+    # relu reads what mm wrote, and nothing else.
+    assert ops[1].inputs_from == (0,)
+    # The second mm reads relu's output and a weight. Under one collapsed key
+    # the weight reads as relu's output too, and a weight counted as an
+    # activation is activation memory that is freed when it is not.
+    assert ops[2].inputs_from == (1, -1)
+    # The residual reaches back past the operator before it.
+    assert ops[3].inputs_from == (2, 0)
+    assert ops[4].inputs_from == (3,)
+
+    # Four fresh allocations and one write into an existing buffer. Reading
+    # these wrongly is the difference between a live set that holds four
+    # tensors and one that holds none.
+    assert [op.output_aliases for op in ops] == [
+        (None,), (None,), (None,), (None,), (3,)]
+
+
+def test_meta_records_the_same_provenance_as_cpu():
+    """The control, stated as one comparison rather than two sets of numbers.
+
+    Before `_storage_of` had a key for a tensor with no address, this is the
+    assertion that failed: on meta every `inputs_from` was the operator before
+    and every `output_aliases` was an alias, because every storage was one
+    storage.
+    """
+    on_cpu, cpu_names = _trace("cpu")
+    on_meta, meta_names = _trace("meta")
+    assert meta_names == cpu_names
+    assert ([op.inputs_from for op in on_meta.graph.ops]
+            == [op.inputs_from for op in on_cpu.graph.ops])
+    assert ([op.output_aliases for op in on_meta.graph.ops]
+            == [op.output_aliases for op in on_cpu.graph.ops])
+
+
+@pytest.mark.parametrize("device", ["cpu", "meta"])
+def test_a_destination_the_trace_never_saw_is_recorded_as_this_step_s(device):
+    """The out-variant recovery, which needs `_seen` to be a real set.
+
+    An operator that returns no tensor writes into the destination it was
+    handed. Where that buffer was allocated inside a wrapper the tracer cannot
+    see into, it is real memory belonging to this step and nothing else in the
+    graph says so. With every storage collapsed to one key, `_seen` saturates
+    on the first tensor and this never fires again.
+    """
+    tracer = MetaOpTracer()
+    x = torch.ones(4, 4, device=device)
+    # Allocated where the tracer cannot see it, which is the case the recovery
+    # is for: `torch.empty` inside a wrapper that is itself a custom operator
+    # never reaches a dispatch tracer.
+    out = torch.empty(4, 4, device=device)
+    with tracer:
+        torch.ops.compass_test.fill_(out, x)
+    named = [op.name for op in tracer.graph.ops]
+    assert named == ["compass_test::fill_"]
+    op = tracer.graph.ops[0]
+    # The operator returned nothing, so the destination is what it produced.
+    assert op.output_shapes == ((4, 4),)
+    assert op.output_aliases == (None,)
+
+
+@pytest.mark.parametrize("device", ["cpu", "meta"])
+def test_a_destination_the_trace_has_seen_belongs_to_whoever_wrote_it(device):
+    """The other half: seeing it twice must not count it twice."""
+    tracer = MetaOpTracer()
+    x = torch.ones(4, 4, device=device)
+    with tracer:
+        out = torch.zeros(4, 4, device=device)
+        torch.ops.compass_test.fill_(out, x)
+    named = [op.name for op in tracer.graph.ops]
+    assert named[-1] == "compass_test::fill_"
+    # `zeros` allocated it and is recorded as having done so; the fill claims
+    # no output of its own, because claiming one would double the buffer.
+    assert tracer.graph.ops[-1].output_shapes == ()
+
+
+@pytest.mark.parametrize("device", ["cpu", "meta"])
+def test_deaths_are_stamped_onto_the_operator_whose_output_died(device):
+    """The tracer watched every tensor go; nothing wrote it down.
+
+    Only the capture path stamped, and every template on disk came down the
+    derivation path, so every derived graph reached the memory walk with no
+    `dies_at` -- where the walk falls back to a last-read rule and returns a
+    number either way.
+    """
+    tracer = MetaOpTracer()
+    w = torch.ones(4, 4, device=device)
+    x = torch.zeros(4, 4, device=device)
+    with tracer:
+        h = torch.mm(x, w)
+        y = torch.relu(h)
+        del h                    # dies while relu is the operator in progress
+        z = torch.mm(y, w)
+        del y                    # dies while the second mm is
+    assert tracer.deaths, "the finalizers did not fire"
+    assert tracer.stamp_deaths() == 2
+    ops = tracer.graph.ops
+    assert ops[0].dies_at == (1,)
+    assert ops[1].dies_at == (2,)
+    # `z` is still held, so its producer carries no death and the walk holds
+    # it to the end of the step -- which is what it did.
+    assert not ops[2].dies_at
+    del z
+
+
+def test_a_synthesized_operator_is_given_the_producer_map_s_answer():
+    """What `record_collectives` needs, and added straight to a graph loses.
+
+    A collective under simulated tensor parallelism never dispatches, so its
+    operator is synthesized. Appended to the graph alone it reads nothing --
+    its input looks unread by anything in the step -- and produces nothing the
+    map knows about, so the next operator is recorded as reading the tensor the
+    collective was handed instead of the one it returned.
+    """
+    tracer = MetaOpTracer()
+    x = torch.zeros(4, 4, device="meta")
+    w = torch.ones(4, 4, device="meta")
+    with tracer:
+        h = torch.mm(x, w)
+        out = torch.empty(4, 4, device="meta")
+        tracer.note_operator(
+            OpSpec(name="aiter::all_reduce_", input_shapes=((4, 4),),
+                   output_shapes=((4, 4),), dtypes=("bfloat16",),
+                   group="tp", output_aliases=(None,)),
+            inputs=(h,), outputs=(out,))
+        torch.relu(out)
+    names = [op.name for op in tracer.graph.ops]
+    index = names.index("aiter::all_reduce_")
+    collective = tracer.graph.ops[index]
+    assert collective.inputs_from == (0,)          # the gemm, not nothing
+    assert collective.output_aliases == (None,)    # out of place, verified
+    assert names[-1] == "aten::relu"
+    assert tracer.graph.ops[-1].inputs_from == (index,)
+
+
+@pytest.mark.parametrize("device", ["cpu", "meta"])
+def test_a_reused_key_is_not_credited_to_the_tensor_that_died(device):
+    """`_died` forgets the key, so the next tensor at it is a new tensor."""
+    tracer = MetaOpTracer()
+    tracer._producers[("storage", 7)] = 3
+    tracer._seen.add(("storage", 7))
+    tracer._died(3, 0, ("storage", 7))
+    assert ("storage", 7) not in tracer._producers
+    assert ("storage", 7) not in tracer._seen
+    # A key held by somebody else is left alone.
+    tracer._producers[("storage", 9)] = 5
+    tracer._died(3, 0, ("storage", 9))
+    assert tracer._producers[("storage", 9)] == 5
+
+
+class TestTheCollectiveStandIn:
+    """A collective that cannot run still has to produce a tensor of its own.
+
+    Every live path through ATOM's all-reduce allocates its output --
+    `GroupCoordinator.all_reduce` makes it out of place because a PyTorch
+    custom op cannot both mutate and return, and each implementation under it
+    opens with `empty_like`, `zeros_like` or `clone`. Only `world_size == 1`
+    returns the input, and that is the branch derivation stands in *for*.
+
+    Handing the input back was wrong in both directions at once: the collective
+    got no tensor to watch, so no death was recorded for it, and the input's own
+    death at the call site vanished behind the shared storage. `linear.py` does
+    `y = tensor_model_parallel_all_reduce(y)`, which releases the row-parallel
+    matmul's output there; aliased, that buffer reads as immortal.
+    """
+
+    def test_the_stand_in_is_a_new_storage(self):
+        x = torch.zeros(4, 4, device="meta")
+        out = _collective_stand_in("aiter::all_reduce_", [x])
+        assert out is not x
+        assert _storage_of(out) != _storage_of(x)
+        assert out.shape == x.shape and out.dtype == x.dtype
+
+    def test_allocating_it_records_no_operator(self):
+        """Otherwise a derived graph gains an `empty_like` a capture has not."""
+        tracer = MetaOpTracer()
+        x = torch.zeros(4, 4, device="meta")
+        with tracer:
+            fresh_like(x)
+            fresh_shape((8, 4), x)
+        assert [op.name for op in tracer.graph.ops] == []
+
+    def test_a_shape_changing_collective_is_still_refused(self):
+        """The fresh output is not licence to guess an all-gather's shape."""
+        x = torch.zeros(4, 4, device="meta")
+        assert _collective_stand_in("aiter::all_gather_unreg", [x]) is None
+        assert _collective_stand_in("aiter::reduce_scatter", [x]) is None
+
+    def test_the_tracer_sees_the_stand_in_as_the_collective_s_product(self):
+        """Which is the whole point: it is watched, and its death is recorded."""
+        tracer = MetaOpTracer()
+        x = torch.zeros(4, 4, device="meta")
+        w = torch.ones(4, 4, device="meta")
+        with tracer:
+            h = torch.mm(x, w)
+            out = _collective_stand_in("aiter::all_reduce_", [h])
+            tracer.note_operator(
+                OpSpec(name="aiter::all_reduce_", input_shapes=((4, 4),),
+                       output_shapes=((4, 4),), dtypes=("bfloat16",),
+                       group="tp", output_aliases=(None,)),
+                inputs=(h,), outputs=(out,))
+            index = len(tracer.graph.ops) - 1
+            del h                      # what `y = all_reduce(y)` does
+            torch.relu(out)
+        assert tracer.graph.ops[-1].inputs_from == (index,)
+        # The gemm's output died at the collective, not at the end of the step.
+        assert tracer.deaths.get((0, 0)) == index
+
+
+class TestTheOutputDtypeIsRecordedNotInferred:
+    """The one dtype a graph could not previously state.
+
+    A reader that needs an output's dtype had one place to get it: the first
+    input's. That is right for the elementwise and matmul operators holding
+    most of the memory, and wrong for exactly the operator that converts --
+    which is also the first operator of the step. `aiter::masked_embedding`
+    takes int32 token ids and returns bfloat16 activations, so the assumption
+    sizes a 16384x5120 output at 4 bytes an element instead of 2.
+    """
+
+    @pytest.mark.parametrize("device", ["cpu", "meta"])
+    def test_a_converting_operator_reports_its_own_dtype(self, device):
+        tracer = MetaOpTracer()
+        ids = torch.zeros(8, dtype=torch.int32, device=device)
+        table = torch.zeros(16, 4, dtype=torch.bfloat16, device=device)
+        with tracer:
+            torch.embedding(table, ids.to(torch.int64))
+        cast, emb = tracer.graph.ops[0], tracer.graph.ops[-1]
+        # The cast, where input0's dtype is plainly the wrong answer.
+        assert cast.dtypes[0] == "int32"
+        assert cast.output_dtypes == ("int64",)
+        # The lookup: ids in, activations out, at the table's dtype and not
+        # at whichever argument happens to come first.
+        assert emb.name == "aten::embedding"
+        assert emb.output_dtypes == ("bfloat16",)
+
+    @pytest.mark.parametrize("device", ["cpu", "meta"])
+    def test_it_stays_positional_with_the_shapes(self, device):
+        tracer, _ = _trace(device)
+        for op in tracer.graph.ops:
+            assert len(op.output_dtypes) == len(op.output_shapes)
+            assert len(op.output_dtypes) == len(op.output_aliases)
+
+    @pytest.mark.parametrize("device", ["cpu", "meta"])
+    def test_a_recovered_destination_is_dtyped_as_an_output(self, device):
+        """The out-variant path assigns `outs` after the dtypes would be read.
+
+        Computing them any earlier gives this operator an empty tuple beside a
+        one-element `output_shapes`, which is the positional mismatch the test
+        above would then catch somewhere else entirely.
+        """
+        tracer = MetaOpTracer()
+        x = torch.ones(4, 4, device=device)
+        out = torch.empty(4, 4, device=device)
+        with tracer:
+            torch.ops.compass_test.fill_(out, x)
+        op = tracer.graph.ops[0]
+        assert op.output_shapes == ((4, 4),)
+        assert op.output_dtypes == ("float32",)
+
+    def test_it_survives_a_round_trip_and_an_old_graph_does_not_invent_one(self):
+        from atom.compass.core.graph import OpGraph
+
+        graph = OpGraph()
+        graph.add(OpSpec(name="aiter::masked_embedding",
+                         output_shapes=((16384, 5120),),
+                         dtypes=("int32",), output_dtypes=("bfloat16",)))
+        data = graph.to_dict()
+        assert data["version"] == 3
+        assert OpGraph.from_dict(data).ops[0].output_dtypes == ("bfloat16",)
+
+        # A graph written before the field existed. Empty, not back-filled
+        # from `dtypes` -- a reconstructed value would be indistinguishable
+        # from a recorded one, and it is the reconstruction that was wrong.
+        old = dict(data, version=2)
+        old["ops"] = [{k: v for k, v in op.items() if k != "output_dtypes"}
+                      for op in old["ops"]]
+        assert OpGraph.from_dict(old).ops[0].output_dtypes == ()

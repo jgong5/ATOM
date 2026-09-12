@@ -3,7 +3,6 @@
 
 import itertools
 import logging
-import time
 from collections import Counter
 from dataclasses import fields
 from typing import Any
@@ -16,6 +15,7 @@ from atom.model_engine.multimodal import get_mrope_input_positions
 from atom.model_engine.sequence import Sequence
 from atom.sampling_params import SamplingParams
 from atom.utils import envs
+from atom.utils.clock import get_clock
 
 logger = logging.getLogger("atom")
 
@@ -33,6 +33,75 @@ def _load_tokenizer(model: str, trust_remote_code: bool = False):
     return tokenizer
 
 
+
+def _stamp_arrival(arrival_time: float | None) -> float:
+    """When a request should be treated as having arrived.
+
+    ``arrival_time`` is an offset into the run, not a timestamp, and it only
+    means anything on a clock that knows where the run began -- a virtual one.
+    Against a real server there is no start-of-run to offset from, so a declared
+    arrival is ignored and "now" is used, which is the right answer there.
+
+    The offset is from the epoch, and it is the *client's* job to place a
+    workload that does not start there. This process's virtual clock is frozen
+    at the epoch by design (see `_install_compass_clock`): only the engine core
+    advances time, so "now" here cannot be the run's progress. That is why a
+    predictor is never warmed by executing a warmup: there is no compilation to
+    warm physically, and an executed preparation would simply sit inside every
+    later request's window without moving the origin those arrivals are declared
+    against. A prediction run starts empty, at the epoch, standing for the
+    already-warm target -- see the refusal in `scripts/compass/replay.py`.
+    """
+    clock = get_clock()
+    if arrival_time is None:
+        return clock.time()
+    epoch = getattr(clock, "epoch", None)
+    if epoch is None:
+        logger.warning(
+            "ATOMCompass WARNING: ignoring a declared arrival of %.3fs -- this "
+            "engine is on a real clock, which has no start-of-run to offset "
+            "from. Arrivals are only declarable against a simulated run.",
+            arrival_time,
+        )
+        return clock.time()
+    return epoch + float(arrival_time)
+
+
+def _install_compass_clock(config):
+    """Put this process on the same virtual clock as the engine core.
+
+    Arrival is stamped here while first-token is stamped in the engine core, and
+    TTFT subtracts one from the other. They must therefore read the same clock
+    and share an origin. This clock does not advance — in a simulated run the
+    engine core owns progress — so an offline batch submitted together arrives
+    together, at the start of virtual time.
+
+    Returns ``(installed, previous)``: the clock this call put in place and the
+    one it replaced, or ``(None, None)`` when Compass is off. The engine holds
+    both so it can hand the process back to the clock it found. A virtual clock
+    left installed after the engine closes freezes every later arrival in the
+    process, which for an ordinary engine in the same process is a wrong TTFT
+    rather than a missing one.
+    """
+    compass = getattr(config, "compass_config", None)
+    if compass is None or not compass.enabled or not compass.virtual_clock:
+        return None, None
+    from atom.utils.clock import VirtualClock, set_clock
+
+    clock = VirtualClock(epoch=compass.epoch)
+    return clock, set_clock(clock)
+
+
+#: Clocks whose owning engine has closed, by id. A strong reference, so an id
+#: cannot be reused by a later object and make a retired clock look live; the
+#: dict is bounded by the number of Compass engines this process closes.
+_retired_clocks: dict = {}
+
+
+def _clock_is_retired(clock) -> bool:
+    return clock is not None and id(clock) in _retired_clocks
+
+
 class LLMEngine:
 
     def __init__(self, model, tokenizer=None, **kwargs):
@@ -42,6 +111,14 @@ class LLMEngine:
         data_parallel_master_port = kwargs.get("data_parallel_master_port", None)
         config = Config(model, **config_kwargs)
         self.config = config
+        # Installed at the END of __init__, not here: nothing in construction
+        # reads the clock, and a constructor that raises after installing one
+        # would leave the process on a frozen clock with no engine to close.
+        # Installed at the END of __init__, not here: nothing in construction
+        # reads the clock, and a constructor that raises after installing one
+        # would leave the process on a frozen clock with no engine to close.
+        self._compass_clock = None
+        self._clock_before_compass = None
         self.tokenizer = tokenizer or _load_tokenizer(
             config.model, config.trust_remote_code
         )
@@ -157,11 +234,53 @@ class LLMEngine:
         logger.info(
             f"LLMEngine init with {self.data_parallel_size} data parallel ranks"
         )
+        self._compass_clock, self._clock_before_compass = _install_compass_clock(
+            self.config
+        )
+
+    def _restore_clock(self) -> None:
+        """Hand the process back to the clock this engine found.
+
+        Only if it is still ours: something later in the process may have
+        installed its own, and stamping over that would be the same bug in the
+        other direction.
+
+        Supported lifetime for several Compass engines in one process is
+        nesting -- the engine closed first is the one opened last. Closing them
+        out of order is the one case where the clock an engine saved is a clock
+        that has since been closed, and reinstalling that would put the process
+        back on a dead engine's frozen time. Here the process goes to wall time
+        instead, with a warning, because no live owner remains to speak for
+        virtual time.
+        """
+        if self._compass_clock is None:
+            return
+        from atom.utils.clock import get_clock, reset_clock, set_clock
+
+        _retired_clocks[id(self._compass_clock)] = self._compass_clock
+        if get_clock() is self._compass_clock:
+            previous = self._clock_before_compass
+            if _clock_is_retired(previous):
+                logger.warning(
+                    "Compass engines closed out of order: the clock this engine "
+                    "replaced belongs to an engine that has already closed. "
+                    "Restoring wall time rather than a closed engine's virtual "
+                    "time; close overlapping Compass engines in reverse order "
+                    "of construction to keep the clock they each saved."
+                )
+                reset_clock()
+            else:
+                set_clock(previous)
+        self._compass_clock = None
+        self._clock_before_compass = None
 
     def close(self):
         """Shut down engine and release all GPU resources."""
-        if hasattr(self, "core_mgr"):
-            self.core_mgr.close()
+        try:
+            if hasattr(self, "core_mgr"):
+                self.core_mgr.close()
+        finally:
+            self._restore_clock()
 
     def add_request(
         self,
@@ -348,6 +467,51 @@ class LLMEngine:
                 for k, v in sorted(distribution.items())
             },
         }
+
+    def get_compass_arrival_barrier(self, timeout: float = 30.0) -> dict[str, Any]:
+        """Did any rank's arrival barrier give up waiting for the workload?
+
+        Any rank timing out invalidates the run: the barrier exists so that no
+        rank advances virtual time past an arrival still in flight, and one
+        that did is enough for the schedule to stop being the schedule the
+        workload describes.
+
+        So the states do not average. True beats unknown beats False: a single
+        rank reporting a timeout decides it, and otherwise a rank that could
+        not answer leaves the whole reading unknown rather than letting the
+        ranks that did answer speak for it.
+        """
+        responses = self.core_mgr.broadcast_utility_command_sync(
+            "get_compass_arrival_barrier", timeout=timeout
+        )
+        ranks = [resp.get("result", resp) for resp in responses]
+        states = [rank.get("timed_out") for rank in ranks]
+        if any(state is True for state in states):
+            timed_out: bool | None = True
+        elif not states or any(state is None for state in states):
+            timed_out = None
+        else:
+            timed_out = False
+        return {"timed_out": timed_out, "ranks": ranks}
+
+    def get_compass_inputs(self, timeout: float = 30.0) -> dict[str, Any]:
+        """What each engine core's predictor loaded, recorded as it read it.
+
+        Deliberately not aggregated. Ranks legitimately load different files --
+        that is what the per-rank artifact convention is for -- so one merged
+        answer would be a claim no rank made. Each record carries the
+        coordinates of the rank that produced it, and they are reported as the
+        list they are.
+
+        The identity of what a prediction was fitted to has to come from the
+        process that did the fitting. An API server digesting the paths an
+        option names is reading a different file, possibly on a different
+        filesystem, certainly at a different time.
+        """
+        responses = self.core_mgr.broadcast_utility_command_sync(
+            "get_compass_inputs", timeout=timeout
+        )
+        return {"ranks": [resp.get("result", resp) for resp in responses]}
 
     def get_cache_statistics(self, timeout: float = 30.0) -> dict[str, Any]:
         """Return aggregated prefix-cache statistics across DP ranks.
@@ -628,6 +792,8 @@ class InputOutputProcessor:
         data_parallel_rank: int | None = None,
         dp_session_id: str | None = None,
         dp_parent_session_id: str | None = None,
+        arrival_time: float | None = None,
+        workload_size: int | None = None,
     ):
         """responsible for:
         1) Tokenize
@@ -652,6 +818,8 @@ class InputOutputProcessor:
             data_parallel_rank=data_parallel_rank,
             dp_session_id=dp_session_id,
             dp_parent_session_id=dp_parent_session_id,
+            arrival_time=arrival_time,
+            workload_size=workload_size,
         )
         return seqs[0]
 
@@ -667,6 +835,8 @@ class InputOutputProcessor:
         data_parallel_rank: int | None = None,
         dp_session_id: str | None = None,
         dp_parent_session_id: str | None = None,
+        arrival_time: float | None = None,
+        workload_size: int | None = None,
     ) -> list[Sequence]:
         """Tokenize once and materialize ``sampling_params.n`` Sequences.
 
@@ -742,7 +912,8 @@ class InputOutputProcessor:
                 dp_session_id=dp_session_id,
                 dp_parent_session_id=dp_parent_session_id,
             )
-            seq.arrive_time = time.time()
+            seq.arrive_time = _stamp_arrival(arrival_time)
+            seq.compass_workload_size = workload_size
             self.requests[seq.id] = seq
             if seq.external_request_id is not None:
                 self._external_to_internal[seq.external_request_id] = seq.id
@@ -774,7 +945,9 @@ class InputOutputProcessor:
             if external_request_id is not None:
                 self._external_to_internal.pop(external_request_id, None)
             output_str = self.tokenizer.decode(req.completion_token_ids)
-            req.leave_time = time.time()
+            # Prefer the engine core's own stamp: it owns time, and under a
+            # simulated run this process's clock is deliberately frozen.
+            req.leave_time = getattr(req, "finish_time", 0.0) or get_clock().time()
 
             # Calculate TTFT (Time To First Token) and TPOT (Time Per Output Token)
             ttft = 0.0

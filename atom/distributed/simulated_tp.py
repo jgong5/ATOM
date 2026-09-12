@@ -115,9 +115,76 @@ def _reject_unsupported(config: "Config", logical: int, physical: int) -> None:
         _reject("does not support disaggregated prefill / KV transfer")
 
 
-def _patch_group(group, logical: int, physical: int) -> None:
-    """Report `logical` ranks; keep collectives on the `physical` ones."""
+#: Attributes `_patch_group` overwrites, so `restore_group` can put the group
+#: back exactly. `world_size` and `rank_in_group` are plain ints on the
+#: coordinator; the four collectives are bound methods.
+_PATCHED_ATTRS = ("all_gather", "gather", "reduce_scatter_tensor",
+                  "reduce_scatter", "all_reduce", "world_size",
+                  "rank_in_group")
+
+
+def restore_group(group) -> None:
+    """Undo one `_patch_group`, leaving the group as it was built.
+
+    Needed because a process that derives more than one rank has to re-patch,
+    and patching a patched group would close the wrappers over the lie: the
+    second patch would read `world_size` as the first patch's `logical` and
+    `rank_in_group` as the first patch's simulated rank. A no-op on a group
+    that was never patched.
+    """
+    saved = group.__dict__.pop("_simulated_tp_saved", None)
+    if saved is None:
+        return
+    for name, value in saved.items():
+        if value is _ABSENT:
+            group.__dict__.pop(name, None)
+        else:
+            group.__dict__[name] = value
+    group.__dict__.pop("simulated_tp_physical_world_size", None)
+    group.__dict__.pop("simulated_tp_logical_rank", None)
+
+
+class _Absent:
+    def __repr__(self) -> str:
+        return "<absent>"
+
+
+#: The attribute was not in the instance `__dict__` before patching (it came
+#: from the class, or did not exist); restoring means deleting, not writing a
+#: `None` the class would then shadow.
+_ABSENT = _Absent()
+
+
+def _patch_group(group, logical: int, physical: int,
+                 logical_rank: int | None = None) -> None:
+    """Report `logical` ranks; keep collectives on the `physical` ones.
+
+    `logical_rank` makes the group report a rank it does not physically have,
+    which is how a one-process derivation builds rank 1 of a TP4 deployment
+    rather than rank 0 four times. Only meaningful when `physical == 1`: with
+    real peers, `rank_in_group` is this process's identity inside a real
+    collective and lying about it would address the wrong peer.
+    """
+    if logical_rank is None:
+        logical_rank = group.rank_in_group
+    elif physical != 1:
+        raise ValueError(
+            f"cannot simulate logical rank {logical_rank} over {physical} "
+            "physical ranks: with peers present, rank_in_group is this "
+            "process's address in a real collective.")
+    elif not 0 <= logical_rank < logical:
+        raise ValueError(
+            f"logical rank {logical_rank} is outside a TP{logical} group.")
+
+    restore_group(group)
+    group.__dict__["_simulated_tp_saved"] = {
+        name: group.__dict__.get(name, _ABSENT) for name in _PATCHED_ATTRS
+    }
+
     device_group = group.device_group
+    # The real address, for deciding membership; `logical_rank` is which shard
+    # of the model this rank owns. They are the same number except under
+    # single-process derivation.
     rank_in_group = group.rank_in_group
 
     def _all_gather(
@@ -135,8 +202,9 @@ def _patch_group(group, logical: int, physical: int) -> None:
             (logical * rows,) + rest, dtype=input_.dtype, device=input_.device
         )
         if physical == 1:
-            # Nothing to talk to; the one shard that exists is this rank's.
-            flat[:rows].copy_(input_)
+            # Nothing to talk to; the one shard that exists is this rank's, and
+            # it belongs at this rank's own position in the gathered result.
+            flat[logical_rank * rows:(logical_rank + 1) * rows].copy_(input_)
         else:
             torch.distributed.all_gather_into_tensor(
                 flat[: physical * rows], input_, group=device_group
@@ -163,6 +231,10 @@ def _patch_group(group, logical: int, physical: int) -> None:
         if not is_dst:
             return None
         absent = [torch.zeros_like(input_) for _ in range(logical - physical)]
+        if physical == 1 and logical_rank:
+            # Our shard sits at `logical_rank`, not at the front.
+            absent.insert(logical_rank, gather_list.pop())
+            gather_list = []
         return torch.cat(gather_list + absent, dim=dim)
 
     def _reduce_scatter_tensor(
@@ -177,7 +249,8 @@ def _patch_group(group, logical: int, physical: int) -> None:
         )
         reduced = group.all_reduce(input_)
         shard = reduced.shape[dim] // logical
-        return reduced.narrow(dim, rank_in_group * shard, shard).contiguous()
+        # The slice this rank owns is its *logical* one.
+        return reduced.narrow(dim, logical_rank * shard, shard).contiguous()
 
     def _reduce_scatter(input_: torch.Tensor, dim: int = 0) -> torch.Tensor:
         return _reduce_scatter_tensor(input_, dim=dim)
@@ -195,4 +268,6 @@ def _patch_group(group, logical: int, physical: int) -> None:
         group.all_reduce = lambda input_, *a, **kw: input_
     # Last: the wrappers close over the real sizes.
     group.simulated_tp_physical_world_size = physical
+    group.simulated_tp_logical_rank = logical_rank
     group.world_size = logical
+    group.rank_in_group = logical_rank

@@ -29,6 +29,7 @@ if TYPE_CHECKING:
     # Annotation only. Importing AITER here would put a GPU kernel build behind
     # `import atom.config`, which is what `atom.quant_spec` defers on purpose.
     from aiter import QuantType
+from atom.compass.config import CompassConfig
 
 logger = logging.getLogger("atom")
 
@@ -1593,6 +1594,15 @@ class Config:
     # from all2all backend/mode: Mega owns dispatch, both GEMMs, and combine.
     moe_backend: str = "standard"
     runner_qualname: str = "atom.model_engine.model_runner.ModelRunner"
+    # Which pool the EngineCore drives its runners through. A dial for the
+    # same reason `runner_qualname` is one: the transport is not the policy, and
+    # a run that replaces the forward pass may also want to replace the process
+    # boundary around it.
+    runner_manager_qualname: str = "atom.model_engine.async_proc.AsyncIOProcManager"
+    # ATOMCompass: when enabled, the runner predicts the forward pass instead of
+    # performing it. Inert unless a Compass runner is also selected via
+    # runner_qualname.
+    compass_config: CompassConfig = field(default_factory=CompassConfig)
     # EPLB master switch + sub-config
     eplb_enable: bool = False
     eplb_config: EPLBConfig = field(default_factory=EPLBConfig)
@@ -1642,13 +1652,39 @@ class Config:
         without it, an oversized `-tp` keeps raising in ModelRunner instead of
         silently running smaller. A property, not a field: `enable_dp_attention`
         rewrites `tensor_parallel_size` after Config is built.
+
+        A GPU-free ATOMCompass replay is the second case, and it separates the
+        two numbers further than `--fake-eplb` does: one executor, whatever the
+        logical width, because the forward is priced rather than run. See
+        `atom/compass/replay/local_proc.py`.
         """
         tp = self.tensor_parallel_size
+        if self._compass_replay_active:
+            # Not `min(tp, ...)`: exactly one, and not conditioned on how many
+            # devices are visible, because a replay uses none of them. The
+            # logical width stays `tensor_parallel_size` and keeps governing
+            # every shard, group and pool computation; what collapses is only
+            # who executes.
+            return 1
         if not self.fake_eplb:
             return tp
         # Does not create a CUDA context, so it is safe in the parent process.
         visible = torch.cuda.device_count()
         return visible if 0 < visible < tp else tp
+
+    @property
+    def _compass_replay_active(self) -> bool:
+        """Is this the GPU-free replay, as opposed to any other Compass mode?
+
+        The same test `__post_init__` selects the replay runner and pool with,
+        kept in one place so the three cannot drift apart -- a run with the
+        replay pool and a physical world size above one refuses at startup, and
+        a run with the physical world size collapsed but a device-backed pool
+        would spawn workers for ranks whose runner no longer exists.
+        """
+        compass = getattr(self, "compass_config", None)
+        return bool(compass is not None and compass.enabled
+                    and compass.replay_target)
 
     @property
     def capture_sizes(self) -> list[int]:
@@ -1733,6 +1769,30 @@ class Config:
         ):
             self.runner_qualname = (
                 "atom.model_engine.model_runner.RapidServeModelRunner"
+            )
+
+        # ATOMCompass simulates the forward pass, which needs its own runner in
+        # every worker. Select it unless the user explicitly overrode
+        # runner_qualname, matching the RapidServe handling above.
+        if (
+            self.compass_config.enabled
+            and self.runner_qualname == "atom.model_engine.model_runner.ModelRunner"
+        ):
+            self.runner_qualname = "atom.compass.runtime.runner.CompassModelRunner"
+
+        # ...and a GPU-free replay swaps the *pool* as well as the runner. The
+        # runner alone is not enough: AsyncIOProcManager spawns a worker process
+        # per rank and that process is where the device is acquired, so a replay
+        # that only changed the runner would still fork a worker to hold a
+        # device it never uses.
+        if (
+            self.compass_config.enabled
+            and self.compass_config.replay_target
+            and self.runner_qualname == "atom.compass.runtime.runner.CompassModelRunner"
+        ):
+            self.runner_qualname = "atom.compass.replay.runner.ReplayModelRunner"
+            self.runner_manager_qualname = (
+                "atom.compass.replay.local_proc.LocalProcManager"
             )
 
         assert 1 <= self.tensor_parallel_size <= 8

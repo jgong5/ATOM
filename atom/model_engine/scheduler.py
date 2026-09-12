@@ -21,6 +21,7 @@ import logging
 import struct
 import threading
 import time
+import time as _time  # real seconds, for the arrival barrier's timeout
 from collections import deque
 from collections.abc import Callable, Iterable
 
@@ -42,6 +43,8 @@ from atom.model_engine.state_runtime import (
     StateRuntime,
 )
 from atom.utils import envs
+from atom.compass.runtime.lifecycle import trace as _compass_lifecycle
+from atom.utils.clock import get_clock
 
 logger = logging.getLogger("atom")
 
@@ -629,11 +632,18 @@ class ScheduledBatch:
         # whose committed slot was never claimed carries the -1 sentinel in a
         # one-element list, which is truthy, and letting it through would shift
         # every list positionally aligned with this one.
-        state_seqs = [
-            seq
-            for seq in seqs.values()
-            if seq.has_per_req_cache and seq.state_slot >= 0
-        ]
+        state_rows: list[int] = []
+        state_seqs = []
+        for _row, seq in enumerate(seqs.values()):
+            if seq.has_per_req_cache and seq.state_slot >= 0:
+                state_rows.append(_row)
+                state_seqs.append(seq)
+        # Batch row of each entry in the state lists below. Those lists are a
+        # *filtered* view of the batch, so their index is not the batch index;
+        # a consumer that reads them positionally misassigns every slot in a
+        # batch that mixes state-bearing requests with requests that hold no
+        # per-request cache.
+        self.state_rows = state_rows
         self.state_slots = [seq.state_slots for seq in state_seqs]
         # Column 0 broken out, because it is what every non-speculative backend
         # wants and rebuilding it per step in each of them would cost the same
@@ -838,6 +848,17 @@ class ScheduledBatch:
         return any(self.is_final_chunk)
 
 
+def is_pure_middle_chunk(batch) -> bool:
+    """Did this batch sample nothing at all?
+
+    Such a step returns early from the runner with no tokens and no deferral,
+    so it never takes a turn in the deferred-output buffer. Anything that
+    reproduces the output contract has to agree with the runner about this, so
+    both ask here.
+    """
+    return batch is not None and not batch.produces_output()
+
+
 class ScheduledBatchOutput:
     """Token-level results from a single forward pass.
 
@@ -860,9 +881,15 @@ class ScheduledBatchOutput:
         is_prev_prefill=False,
         logprobs=None,
         dspark_ell: np.ndarray | None = None,
+        compass_step_seconds: float | None = None,
     ):
         self.req_ids = req_ids
         self.token_ids = token_ids
+        # Set only by a simulated runner: how long this step was predicted to
+        # take. The scheduling process advances its clock by this rather than
+        # waiting, because the runner executes in a different process and has
+        # no clock of its own. None during a normal run.
+        self.compass_step_seconds = compass_step_seconds
         self.draft_token_ids = draft_token_ids
         self.num_rejected = num_rejected
         self.num_bonus = num_bonus
@@ -922,6 +949,10 @@ class Scheduler:
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
         self.config = config
+        # See _arrival_barrier_unmet: latched open once a declared workload has
+        # fully arrived, so a draining queue cannot re-close it.
+        self._arrival_barrier_open = False
+        self._arrival_barrier_since: float | None = None
 
         # Admit-rejected seqs (those `_unschedulable_reason` flags). Drained
         # by `take_rejected` each EngineCore step; routed through the same
@@ -1170,6 +1201,157 @@ class Scheduler:
                 break  # all partials summed; skip the rest of the decode tail
         return total
 
+    #: How long to wait, in real seconds, for a declared workload to finish
+    #: arriving before giving up on the barrier and running anyway. A client
+    #: that dies mid-submission must not hang the engine forever.
+    ARRIVAL_BARRIER_TIMEOUT_S = 120.0
+
+    def _arrival_barrier_unmet(self) -> bool:
+        """Is the engine still waiting to be told about every arrival?
+
+        Advancing virtual time is only safe when no earlier event can still turn
+        up. A client submitting over HTTP submits concurrently, so requests reach
+        the engine out of declared order: if the first one received is declared
+        for 0.9s, an idle engine jumps there, and a request declared for 0.0
+        arriving a moment later is retroactively late. That cost the first 13
+        requests of a 64-request run, which shared two first-token instants where
+        the real run had 64 distinct ones.
+
+        For a *closed* workload the fix is cheap: the client says how many
+        requests are coming, and the engine runs nothing until it has them all.
+        After that every arrival time is known, so every jump is safe. The wait
+        is bounded by how long submission takes -- a one-off startup cost, not a
+        per-step sleep, which is what makes real-time pacing unacceptable here.
+
+        Open-ended serving gets no help from this: there is no count to wait for,
+        and a simulator cannot know whether another request is about to arrive.
+        That case needs the schedule handed over up front.
+
+        Latched once open: a workload that has fully arrived cannot un-arrive,
+        and re-checking after requests start finishing would compare a shrinking
+        queue against the original total and stall the run.
+        """
+        if self._arrival_barrier_open:
+            return False
+        if not hasattr(self, "arrival_barrier_timed_out"):
+            self.arrival_barrier_timed_out = None
+        if getattr(get_clock(), "epoch", None) is None:
+            self._arrival_barrier_open = True  # real clock: nothing to wait for
+            return False
+
+        expected = None
+        for seq in self.waiting:
+            declared = getattr(seq, "compass_workload_size", None)
+            if declared:
+                expected = int(declared)
+                break
+        if not expected:
+            return False  # nobody declared a workload; nothing to hold for
+
+        if len(self.waiting) >= expected:
+            self._arrival_barrier_open = True
+            logger.info(
+                "ATOMCompass: all %d declared requests have arrived; "
+                "the virtual clock may now advance safely",
+                expected,
+            )
+            return False
+
+        # Real seconds deliberately: this measures the harness submitting, not
+        # the workload being simulated, and the virtual clock is frozen anyway.
+        if self._arrival_barrier_since is None:
+            self._arrival_barrier_since = _time.monotonic()
+        elif (_time.monotonic() - self._arrival_barrier_since
+              > self.ARRIVAL_BARRIER_TIMEOUT_S):
+            self._arrival_barrier_open = True
+            # Recorded, not only logged. A warning in a server log is not a
+            # result: the run that this fired on was read as an accuracy
+            # measurement for a day, because the client reported "0 failed"
+            # and nothing downstream could see that the arrival protocol had
+            # not completed.
+            self.arrival_barrier_timed_out = {
+                "arrived": len(self.waiting),
+                "expected": int(expected),
+                "timeout_s": float(self.ARRIVAL_BARRIER_TIMEOUT_S),
+            }
+            logger.warning(
+                "ATOMCompass WARNING: only %d of %d declared requests arrived "
+                "within %.0fs; running anyway. Virtual time may now advance "
+                "past an arrival still in flight, which makes that request "
+                "retroactively late -- treat this run's latencies as invalid.",
+                len(self.waiting), expected, self.ARRIVAL_BARRIER_TIMEOUT_S,
+            )
+        return not self._arrival_barrier_open
+
+    @property
+    def _admission_seconds(self) -> float:
+        """How long a request takes to become schedulable, simulated.
+
+        Measured at 8-18 ms on this deployment and unmodelled until now, which
+        was the entire TTFT error: a simulated run advances its clock by
+        predicted forward durations, so the two process hops between
+        ``preprocess`` and a worker cost nothing. Zero unless configured, and
+        configured only from a measurement.
+        """
+        compass = getattr(self.config, "compass_config", None)
+        return float(getattr(compass, "admission_seconds", 0.0) or 0.0)
+
+    def _schedulable_at(self, seq) -> float:
+        """The earliest simulated instant this request may be scheduled.
+
+        Its declared arrival plus the time the engine really takes to get it in
+        hand. Modelled as a delay on the request rather than as time consumed by
+        the engine, because it is per-request and concurrent: two requests
+        arriving together each wait once, not twice.
+        """
+        return seq.arrive_time + self._admission_seconds
+
+    def _declared_arrival_pending(self, seq) -> bool:
+        """Is this request not yet schedulable -- either not arrived, or arrived
+        and still being admitted?
+
+        Only ever true on a virtual clock. A simulated engine advances time by
+        the steps it predicts, not with the wall clock a client sends on, so a
+        workload declares when each request should be treated as arriving. The
+        engine has to honour that or the declaration only changes what TTFT is
+        measured *from* while the work still happens immediately -- which
+        produced 62 of 64 requests finishing before they arrived.
+
+        A real clock has no start-of-run, so nothing declares against it and
+        this costs one attribute read per waiting seq per tick.
+        """
+        clock = get_clock()
+        if getattr(clock, "epoch", None) is None:
+            return False
+        return self._schedulable_at(seq) > clock.time()
+
+    def _advance_to_next_arrival(self) -> None:
+        """Jump the virtual clock forward when there is nothing else to do.
+
+        The discrete-event step. With no runnable work and every waiting request
+        declared for later, real time would spin and virtual time would never
+        move -- so the next thing that can possibly happen is the next arrival,
+        and time goes straight there. Skipping the idle gap is the whole reason
+        a simulation is faster than the thing it simulates.
+
+        Deliberately narrow: it fires only when nothing is running and nothing
+        is admittable, so it can never skip past work that was ready.
+        """
+        clock = get_clock()
+        advance = getattr(clock, "advance", None)
+        if advance is None or getattr(clock, "epoch", None) is None:
+            return
+        if self.running or not self.waiting:
+            return
+        if self._arrival_barrier_unmet():
+            return  # an earlier arrival may still be in flight
+        now = clock.time()
+        pending = [self._schedulable_at(seq) for seq in self.waiting
+                   if self._schedulable_at(seq) > now]
+        if len(pending) != len(self.waiting):
+            return  # something has already arrived; let it run
+        advance(min(pending) - now)
+
     def _oldest_waiting_prefill_age_ms(self) -> float:
         """Age in ms (since arrival) of the oldest ADMITTABLE waiting prefill,
         or 0.0 if none.
@@ -1191,7 +1373,7 @@ class Scheduler:
                 oldest_arrive = seq.arrive_time
         if oldest_arrive is None:
             return 0.0
-        return max(0.0, (time.time() - oldest_arrive) * 1000.0)
+        return max(0.0, (get_clock().time() - oldest_arrive) * 1000.0)
 
     def publish_kv_events(self) -> None:
         """Drain BlockManager's event log and publish as one EventBatch. Called
@@ -1388,6 +1570,47 @@ class Scheduler:
         self._rejected = []
         return out
 
+    def _decision_record(self, kind: str, batched_tokens: int) -> dict:
+        """What the scheduler could see when it chose this step.
+
+        A step table records what ran. It cannot say why, and every comparison
+        between a real run and a simulated one has eventually needed that:
+        the two run the same steps at the same prices, in a different order,
+        and the order is a consequence of decisions whose inputs nothing keeps.
+
+        Cheap on purpose -- a handful of integers per step, and a 27B run has
+        about 4500 steps -- so it can stay on rather than being a debugging
+        mode somebody has to think to enable.
+        """
+        waiting = list(self.waiting)
+        outstanding = 0
+        for seq in waiting:
+            try:
+                if seq.num_prompt_tokens > seq.num_cached_tokens:
+                    outstanding += 1
+            except AttributeError:
+                outstanding += 1
+        held = 0
+        for seq in waiting:
+            try:
+                if self._declared_arrival_pending(seq):
+                    held += 1
+            except Exception:  # noqa: BLE001 - diagnostics never break a run
+                pass
+        return {
+            "kind": kind,
+            "tick": self._schedule_tick,
+            # Everything the prefill-first rule weighs: it decodes only when no
+            # prefill is ready, so what was waiting with prefill left to do is
+            # the reason a decode step did or did not happen.
+            "waiting": len(waiting),
+            "waiting_prefill_outstanding": outstanding,
+            "waiting_held_for_arrival": held,
+            "running": len(self.running),
+            "batched_tokens": int(batched_tokens),
+            "token_budget": int(getattr(self.config, "max_num_batched_tokens", 0) or 0),
+        }
+
     def schedule(self) -> tuple[ScheduledBatch, dict[int, Sequence]]:
         """Select the next batch of sequences for a forward pass.
 
@@ -1395,6 +1618,9 @@ class Scheduler:
         decoding already-running sequences.
         """
         self._schedule_tick += 1
+        # Nothing runnable and every arrival still in the future: move virtual
+        # time to the next one rather than spinning. No-op off a virtual clock.
+        self._advance_to_next_arrival()
         # Sources borrowed by the previous batch: its forward has been issued,
         # so they can go back on the free list.
         self.block_manager.complete_previous_state_batch()
@@ -1437,6 +1663,12 @@ class Scheduler:
         if not self.running and not self.waiting:
             return None
 
+        # Hold the whole run until a declared workload has finished arriving.
+        # Placed after should_allow_prefill above, which must execute every tick
+        # on every rank for cross-DP lockstep.
+        if self._arrival_barrier_unmet():
+            return None
+
         # ---- Phase 1: resume partial prefills from running ----
         # Gated by `delayer_allows` so cross-DP alignment still holds when one
         # rank is mid-chunked-prefill: a delayer veto skips both Phase 1 and
@@ -1471,7 +1703,7 @@ class Scheduler:
         # ---- Phase 2: new requests from waiting ----
         while (
             delayer_allows
-            and (self.delay_factor <= 0 or self._passed_delay(time.time()))
+            and (self.delay_factor <= 0 or self._passed_delay(get_clock().time()))
             and self.waiting
             and num_seqs_prefill < self.max_num_seqs
             and num_batched_tokens < self.max_num_batched_tokens
@@ -1488,6 +1720,13 @@ class Scheduler:
                 self._reject_aborted_waiting(seq)
                 continue
 
+            # Declared to arrive later: put it back and look again next tick.
+            # Not `_unschedulable_reason`, which finishes a sequence -- this one
+            # is fine, it is simply not here yet.
+            if self._declared_arrival_pending(seq):
+                skipped_waiting_requests.append(seq)
+                continue
+
             # Drop seqs the static-capacity check at submit-time flagged as
             # permanently unschedulable (oversized prompt, exhausted pool,
             # etc.). They've already been warned; mark FINISHED + record the
@@ -1500,6 +1739,7 @@ class Scheduler:
             unschedulable = self._unschedulable_reason(seq)
             if unschedulable is not None:
                 seq.status = SequenceStatus.FINISHED
+                seq.finish_time = get_clock().time()
                 seq.leave_reason = f"unschedulable: {unschedulable}"
                 self._rejected.append(seq)
                 continue
@@ -1712,6 +1952,8 @@ class Scheduler:
                     seq, start, start + int(num_scheduled_tokens[i])
                 )
 
+            _decision = self._decision_record(
+                "prefill", total_tokens_num_prefill)
             prefill_batch = ScheduledBatch(
                 seqs=scheduled_seqs,
                 num_scheduled_tokens=num_scheduled_tokens,
@@ -1734,6 +1976,12 @@ class Scheduler:
                     scheduled_seqs, num_scheduled_tokens, is_final_chunk
                 )
 
+            # Carried on the batch, the way the step's start time is, because
+            # the runner writes the table and the scheduler owns the reason.
+            try:
+                prefill_batch.compass_decision = _decision
+            except AttributeError:
+                pass
             return (prefill_batch, scheduled_seqs)
 
         # --- Decode scheduling ---
@@ -1839,6 +2087,8 @@ class Scheduler:
         if self.kv_connector is not None:
             connector_meta_output = self.kv_connector.build_connector_meta()
 
+        _decision = self._decision_record(
+            "decode", total_tokens_num_decode)
         decode_batch = ScheduledBatch(
             seqs=scheduled_seqs,
             num_scheduled_tokens=num_scheduled_tokens,
@@ -1859,6 +2109,10 @@ class Scheduler:
                 else None
             ),
         )
+        try:
+            decode_batch.compass_decision = _decision
+        except AttributeError:
+            pass
         self._consume_state_forks(scheduled_seqs)
         return (decode_batch, scheduled_seqs)
 
@@ -1918,6 +2172,7 @@ class Scheduler:
     def _reject_aborted_waiting(self, seq: Sequence) -> None:
         has_inflight_load = bool(getattr(seq, "_counted_as_inflight_load", False))
         seq.status = SequenceStatus.FINISHED
+        seq.finish_time = get_clock().time()
         seq.leave_reason = "aborted"
         self._rejected.append(seq)
         if not has_inflight_load or not self._connector_flag("is_offload"):
@@ -2436,6 +2691,29 @@ class Scheduler:
         draft_token_ids = fwd_output.draft_token_ids
         is_deferred_out = fwd_output.is_deferred_out
         token_logprobs = fwd_output.logprobs  # Optional[dict[int, float]]
+        # Off unless ATOM_COMPASS_LIFECYCLE names a file; see
+        # atom/compass/runtime/lifecycle.py for why a step table cannot answer
+        # the question this answers.
+        _lc = _compass_lifecycle()
+        if _lc.enabled:
+            _lc.emit(
+                "step_output",
+                # What the runner said this step produced, before postprocess
+                # decides which of it to act on.
+                returned=[str(r) for r in (fwd_output.req_ids or [])],
+                deferred=bool(is_deferred_out),
+                token_rows=len(prev_token_ids) if prev_token_ids is not None else 0,
+                # What was actually scheduled, and whether it was a step that
+                # samples anything at all.
+                scheduled=([str(r) for r in batch.req_ids]
+                           if batch is not None else None),
+                produces_output=(bool(batch.produces_output())
+                                 if batch is not None else None),
+                final_chunk=(list(batch.is_final_chunk)
+                             if batch is not None
+                             and batch.is_final_chunk is not None else None),
+                running=[str(seq.id) for seq in self.running],
+            )
         # update token_ids with the actual sampled token ids
 
         finished_seqs = []
@@ -2590,6 +2868,23 @@ class Scheduler:
                     seq.num_tokens,
                     len(seq.block_table),
                 )
+            # TTFT is not stamped here. At this point `num_completion_tokens`
+            # still counts rejected speculative tokens and anything past
+            # max_tokens, so a request capped at zero output would be given a
+            # first-token time for a token it never returns. The stamp is below,
+            # from the finalized retained length, and that site is reached by
+            # every sequence this loop walks.
+            if _lc.enabled:
+                # One row per sequence postprocess actually walked. A sequence
+                # missing from these rows was skipped -- `idx is None` -- and
+                # that absence is half the answer.
+                _lc.emit("seq_update", seq=str(seq.id), idx=int(idx),
+                         appended=int(num_new_token),
+                         completion_tokens=int(seq.num_completion_tokens),
+                         partial_prefill=bool(seq.is_partial_prefill),
+                         first_token_published=bool(seq.first_token_time),
+                         first_token_time=float(seq.first_token_time))
+
             num_tokens = seq.num_tokens - num_placeholder_width - num_rejected
             leave_reason = None
             # Client disconnected -> finish now via the normal stop path (frees
@@ -2685,7 +2980,20 @@ class Scheduler:
             # speculative tokens and cap/stop overflow have been removed. A
             # terminal response with no completion tokens must keep TTFT zero.
             if num_tokens - seq.num_prompt_tokens >= 1 and seq.first_token_time == 0.0:
-                seq.first_token_time = time.time()
+                # get_clock(), not time.time(): the other two stamp sites go
+                # through the clock, and mixing them makes TTFT a wall-clock
+                # instant minus a virtual one, which is not a duration.
+                seq.first_token_time = get_clock().time()
+                if _lc.enabled:
+                    # Reached only when the stamp above in this same loop did
+                    # not fire, so a sequence appearing here published its
+                    # first token from the *cropped* retained length rather
+                    # than from `num_completion_tokens`. Which of the two sites
+                    # stamps a request is exactly what a duration cannot show.
+                    _lc.emit("first_token_from_retained", seq=str(seq.id),
+                             retained=int(num_tokens - seq.num_prompt_tokens),
+                             completion_tokens=int(seq.num_completion_tokens),
+                             first_token_time=float(seq.first_token_time))
 
             # Hash generated blocks. Deferred output: all tokens forwarded;
             # undeferred: last token not yet forwarded, so exclude it.
@@ -2701,6 +3009,21 @@ class Scheduler:
             # A terminal event is required even when truncation leaves no
             # tokens (for example max_tokens <= 0). Async consumers wait for
             # this finished RequestOutput and would otherwise block forever.
+            if leave_reason is not None and seq.finish_time == 0.0:
+                # Stamped before the stream output is built rather than after,
+                # so the finishing output can carry it. The assignment further
+                # down is now conditional and leaves this value alone.
+                seq.finish_time = get_clock().time()
+                if _lc.enabled:
+                    # The other end of the interval TPOT divides. Recorded with
+                    # the first-token stamp beside it so the two can be checked
+                    # for being on the same clock rather than assumed to be.
+                    _lc.emit("finish", seq=str(seq.id), reason=str(leave_reason),
+                             first_token_time=float(seq.first_token_time),
+                             finish_time=float(seq.finish_time),
+                             completion_tokens=int(seq.num_completion_tokens),
+                             retained=int(num_tokens - seq.num_prompt_tokens))
+
             if stream_output_queue is not None and (
                 new_tokens or leave_reason is not None
             ):
@@ -2720,6 +3043,9 @@ class Scheduler:
                         seq, "kv_transfer_params_output", None
                     ),
                     num_cached_tokens=getattr(seq, "prefix_cache_hit_tokens", 0),
+                    arrive_time=seq.arrive_time,
+                    first_token_time=seq.first_token_time,
+                    finish_time=seq.finish_time,
                 )
 
                 if request_output.kv_transfer_params_output is not None:
@@ -2738,6 +3064,8 @@ class Scheduler:
                 seq.num_tokens = num_tokens
                 seq.leave_reason = leave_reason
                 seq.status = SequenceStatus.FINISHED
+                if seq.finish_time == 0.0:
+                    seq.finish_time = get_clock().time()
                 self.total_finished_requests += 1
                 self.total_prompt_tokens += int(seq.num_prompt_tokens)
                 self.total_generation_tokens += max(
@@ -3361,7 +3689,7 @@ class DecodeScheduler(Scheduler):
         if seq is not None:
             seq.num_cached_tokens = num_tokens_computed
             seq.append_token(sampled_token_id)
-            seq.first_token_time = time.time()
+            seq.first_token_time = get_clock().time()
             self.prefill_done.append(seq)
 
     def schedule(self):

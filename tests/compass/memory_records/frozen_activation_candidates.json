@@ -1,0 +1,352 @@
+{
+ "schema": "compass.activation.candidate/1",
+ "frozen_before_any_comparison_with": [
+  "the TP=2 and TP=4 measured activation peaks (class X27, evaluation-only)"
+ ],
+ "warmup_shape": {
+  "requests": 1,
+  "query_tokens": 16384,
+  "history_tokens": 0,
+  "why": "ATOM's own warmup batch; see model_engine/model_runner.py::warmup_model"
+ },
+ "region": "model body; the LM head is excluded and the warmup's dummy run keeps one row per sequence, so the head is ~1 MiB and not the peak",
+ "terms": {
+  "visible": {
+   "how": "device-free derivation of ATOM's own code at each width, walked over recorded tensor lifetime",
+   "tp_mechanism": "per tensor, from its own shape: a buffer whose trailing dimension is the hidden size is the residual stream and is replicated; the column-parallel projections are already narrower in the derived graph at that width",
+   "bytes": {
+    "1": 2717908992,
+    "2": 1862270976,
+    "4": 1434451968
+   }
+  },
+  "opaque_gdn_workspaces": {
+   "how": "allocation code and config geometry, atom/compass/core/memory_activation.py",
+   "tp_mechanism": "every gated-delta-rule workspace is head-indexed, so all of them shard; the residual stream and the normed hidden state do not",
+   "why_zero_here": "the peak falls in the MLP, where no linear attention is running. The GDN region's own derived peak is lower at every width (2684878848 / 1510211584 / 922877952 B at tp=1/2/4), so it does not set the high-water mark and contributes nothing at the peak.",
+   "bytes": {
+    "1": 0,
+    "2": 0,
+    "4": 0
+   }
+  },
+  "unexplained_residue": {
+   "how": "source TP=1 full-engine calibration (S27) minus the visible peak derived at TP=1",
+   "bytes_at_tp1": 239075328,
+   "tp_mechanism": "UNKNOWN. Carried replicated -- the same bytes at every width -- because that is the conservative direction: it over-states the peak, which under-sizes the KV budget rather than over-sizing it. If it turns out to shard, the alternative bound is 119537664 B at tp=2 and 59768832 B at tp=4.",
+   "bytes": {
+    "1": 239075328,
+    "2": 239075328,
+    "4": 239075328
+   }
+  }
+ },
+ "candidate_bytes": {
+  "1": 2956984320,
+  "2": 2101346304,
+  "4": 1673527296
+ },
+ "scope": "the warmup prefill shape above, Qwen/Qwen3.8-27B on MI308X. Nothing here is fitted to a TP=2 or TP=4 observation.",
+ "widths": {
+  "1": {
+   "graph": "agent_scratch/memval/lifetime/out/warmup_tp1.ident.json",
+   "tensor_parallel": 1,
+   "operators": 2999,
+   "peak_operator": 71,
+   "peak_operator_name": "aiter::gemm_a16w16",
+   "walk_bytes": 2717908992,
+   "embedding_dtype_correction": 0,
+   "visible_peak_bytes": 2717908992,
+   "live_at_peak": [
+    {
+     "operator": 68,
+     "name": "aiter::gemm_a16w16",
+     "shape": [
+      16384,
+      34816
+     ],
+     "dtype": "bfloat16",
+     "bytes": 1140850688,
+     "shards": true
+    },
+    {
+     "operator": 69,
+     "name": "aten::empty.memory_format",
+     "shape": [
+      16384,
+      17408
+     ],
+     "dtype": "bfloat16",
+     "bytes": 570425344,
+     "shards": true
+    },
+    {
+     "operator": 0,
+     "name": "aten::embedding",
+     "shape": [
+      16384,
+      5120
+     ],
+     "dtype": "bfloat16",
+     "bytes": 167772160,
+     "shards": false
+    },
+    {
+     "operator": 25,
+     "name": "aten::empty_like",
+     "shape": [
+      16384,
+      5120
+     ],
+     "dtype": "bfloat16",
+     "bytes": 167772160,
+     "shards": false
+    },
+    {
+     "operator": 34,
+     "name": "aiter::gemm_a16w16",
+     "shape": [
+      16384,
+      5120
+     ],
+     "dtype": "bfloat16",
+     "bytes": 167772160,
+     "shards": false
+    },
+    {
+     "operator": 60,
+     "name": "aten::empty_like",
+     "shape": [
+      16384,
+      5120
+     ],
+     "dtype": "bfloat16",
+     "bytes": 167772160,
+     "shards": false
+    },
+    {
+     "operator": 62,
+     "name": "aten::empty_like",
+     "shape": [
+      16384,
+      5120
+     ],
+     "dtype": "bfloat16",
+     "bytes": 167772160,
+     "shards": false
+    },
+    {
+     "operator": 71,
+     "name": "aiter::gemm_a16w16",
+     "shape": [
+      16384,
+      5120
+     ],
+     "dtype": "bfloat16",
+     "bytes": 167772160,
+     "shards": false
+    }
+   ]
+  },
+  "2": {
+   "graph": "agent_scratch/memval/lifetime/out/warmup_tp2.ident.json",
+   "tensor_parallel": 2,
+   "operators": 3128,
+   "peak_operator": 75,
+   "peak_operator_name": "aiter::gemm_a16w16",
+   "walk_bytes": 2030043136,
+   "embedding_dtype_correction": 167772160,
+   "visible_peak_bytes": 1862270976,
+   "live_at_peak": [
+    {
+     "operator": 72,
+     "name": "aiter::gemm_a16w16",
+     "shape": [
+      16384,
+      17408
+     ],
+     "dtype": "bfloat16",
+     "bytes": 570425344,
+     "shards": true
+    },
+    {
+     "operator": 0,
+     "name": "aiter::masked_embedding",
+     "shape": [
+      16384,
+      5120
+     ],
+     "dtype": "bfloat16",
+     "bytes": 167772160,
+     "shards": false
+    },
+    {
+     "operator": 73,
+     "name": "aten::empty.memory_format",
+     "shape": [
+      16384,
+      8704
+     ],
+     "dtype": "bfloat16",
+     "bytes": 285212672,
+     "shards": true
+    },
+    {
+     "operator": 27,
+     "name": "aten::empty_like",
+     "shape": [
+      16384,
+      5120
+     ],
+     "dtype": "bfloat16",
+     "bytes": 167772160,
+     "shards": false
+    },
+    {
+     "operator": 36,
+     "name": "aiter::gemm_a16w16",
+     "shape": [
+      16384,
+      5120
+     ],
+     "dtype": "bfloat16",
+     "bytes": 167772160,
+     "shards": false
+    },
+    {
+     "operator": 64,
+     "name": "aten::empty_like",
+     "shape": [
+      16384,
+      5120
+     ],
+     "dtype": "bfloat16",
+     "bytes": 167772160,
+     "shards": false
+    },
+    {
+     "operator": 66,
+     "name": "aten::empty_like",
+     "shape": [
+      16384,
+      5120
+     ],
+     "dtype": "bfloat16",
+     "bytes": 167772160,
+     "shards": false
+    },
+    {
+     "operator": 75,
+     "name": "aiter::gemm_a16w16",
+     "shape": [
+      16384,
+      5120
+     ],
+     "dtype": "bfloat16",
+     "bytes": 167772160,
+     "shards": false
+    }
+   ]
+  },
+  "4": {
+   "graph": "agent_scratch/memval/lifetime/out/warmup_tp4.ident.json",
+   "tensor_parallel": 4,
+   "operators": 3128,
+   "peak_operator": 75,
+   "peak_operator_name": "aiter::gemm_a16w16",
+   "walk_bytes": 1602224128,
+   "embedding_dtype_correction": 167772160,
+   "visible_peak_bytes": 1434451968,
+   "live_at_peak": [
+    {
+     "operator": 0,
+     "name": "aiter::masked_embedding",
+     "shape": [
+      16384,
+      5120
+     ],
+     "dtype": "bfloat16",
+     "bytes": 167772160,
+     "shards": false
+    },
+    {
+     "operator": 72,
+     "name": "aiter::gemm_a16w16",
+     "shape": [
+      16384,
+      8704
+     ],
+     "dtype": "bfloat16",
+     "bytes": 285212672,
+     "shards": true
+    },
+    {
+     "operator": 27,
+     "name": "aten::empty_like",
+     "shape": [
+      16384,
+      5120
+     ],
+     "dtype": "bfloat16",
+     "bytes": 167772160,
+     "shards": false
+    },
+    {
+     "operator": 36,
+     "name": "aiter::gemm_a16w16",
+     "shape": [
+      16384,
+      5120
+     ],
+     "dtype": "bfloat16",
+     "bytes": 167772160,
+     "shards": false
+    },
+    {
+     "operator": 64,
+     "name": "aten::empty_like",
+     "shape": [
+      16384,
+      5120
+     ],
+     "dtype": "bfloat16",
+     "bytes": 167772160,
+     "shards": false
+    },
+    {
+     "operator": 66,
+     "name": "aten::empty_like",
+     "shape": [
+      16384,
+      5120
+     ],
+     "dtype": "bfloat16",
+     "bytes": 167772160,
+     "shards": false
+    },
+    {
+     "operator": 75,
+     "name": "aiter::gemm_a16w16",
+     "shape": [
+      16384,
+      5120
+     ],
+     "dtype": "bfloat16",
+     "bytes": 167772160,
+     "shards": false
+    },
+    {
+     "operator": 73,
+     "name": "aten::empty.memory_format",
+     "shape": [
+      16384,
+      4352
+     ],
+     "dtype": "bfloat16",
+     "bytes": 142606336,
+     "shards": true
+    }
+   ]
+  }
+ }
+}

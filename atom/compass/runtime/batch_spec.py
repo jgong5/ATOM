@@ -1,0 +1,840 @@
+"""The batch a derivation is deriving, stated rather than inferred.
+
+A derived graph is a graph of *some* forward, and until now the trace said which
+one only by a token count. Four tokens through the model body is not four decode
+requests at context 66 -- the Q/K/V shapes agree, and nothing else does. Decode
+reads 66 tokens of KV per sequence and prefill reads none; a chunked prefill
+reads a gathered prefix; the kernels differ, the traffic differs by two orders of
+magnitude, and the operator signature that prices them is the same. So the batch
+is an input to derivation, written down, and the metadata attention reads is
+computed from it.
+
+Computed, not copied. The values here are the ones
+``aiter_attention.prepare_decode`` and ``CommonAttentionBuilder.prepare_prefill``
+compute from a ``ScheduledBatch``, reproduced from the same quantities a
+scheduler would have: per-request query and context lengths, the block size, the
+capture bucket. Nothing is read off a meta tensor -- there is nothing in one to
+read -- and nothing is borrowed from a capture of another configuration. What
+cannot be derived is declared: the block allocation is a policy, named in the
+spec and reproducible, because which block ids a request holds is the block
+manager's history and not a property of the batch.
+
+The recipe is validated by replaying it against a real capture:
+``tests/compass/test_batch_spec.py`` rebuilds every field the tracer recorded
+from the shape provenance that capture also wrote, and compares.
+"""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass, field, fields
+from typing import Any, Optional
+
+__all__ = ["BatchSpec", "allocate_blocks", "PAD_SLOT_ID",
+           "replays_captured_extent", "extent_scope_of"]
+
+#: What a padded row points at, which is nothing. The engine's own constant,
+#: repeated here rather than imported because this module deliberately has no
+#: import-time dependency on torch and every definition of it reaches for one:
+#: ``gdn_attn.py:1523``, ``causal_conv1d.py:15``, ``replayssm.py:54``, and the
+#: literal ``-1`` ``aiter_attention.prepare_decode`` writes into the tail of
+#: ``slot_mapping`` (aiter_attention.py:1106). Kept as one name because the
+#: alternative -- padding an index with ``0`` -- is not a smaller error but a
+#: different one: zero is request zero's slot, and a padded row carrying it
+#: reads and writes a live sequence's state and pages.
+PAD_SLOT_ID = -1
+
+
+def replays_captured_extent(capture_bucket, is_prefill: bool,
+                            cudagraph_mode) -> Optional[bool]:
+    """Does a step with these three facts run the metadata a *capture* built?
+
+    The rule itself, apart from the dataclass that usually carries it, because
+    two paths have to answer it identically: `BatchSpec`, which knows the
+    requests, and `TemplateGraphs`, which binds a warm template to a
+    `StepShape` and has only the same three facts. A second copy of the rule
+    would be a second chance to get it wrong, and the way it would fail --
+    derivation and warm reuse disagreeing about one graph -- is the defect
+    this rule exists to stop.
+
+    Two builders write ``max_seqlen_k`` to different values.
+    ``prepare_decode`` takes ``context_lens.max()``, the batch's own longest
+    history (aiter_attention.py:1100, :1139); ``build_for_cudagraph_capture``
+    pins it to the engine's ``max_model_len`` (:1367, and :1331 for the
+    unified builder). A FULL capture replays the whole forward from the
+    buffers the capture holds, so a replayed step runs the captured value
+    however short its batch is. A PIECEWISE capture leaves attention eager --
+    ``capture_cudagraph`` logs "attention eager" and skips the whole-forward
+    capture (model_runner.py:4019-4031) -- so its metadata is rebuilt every
+    step even though the *rows* are still the bucket's.
+
+    ``False`` whenever there is no bucket, and for a prefill at any bucket.
+    ``None`` only when a bucket is declared and the mode is not: the answer
+    turns on a deployment fact nobody supplied, and both answers are wrong in
+    the way that reads as a plausible number.
+    """
+    if capture_bucket is None or is_prefill:
+        return False
+    if cudagraph_mode is None:
+        return None
+    return str(cudagraph_mode).strip().lower() == "full"
+
+
+def extent_scope_of(capture_bucket, is_prefill: bool, cudagraph_mode) -> str:
+    """Which rule the attention launch extent follows, as a name.
+
+    ``"captured"`` -- the capture's ``max_model_len``. ``"batch"`` -- the
+    batch's longest history, which is what an eager step and a PIECEWISE
+    replay both run. ``"undeclared"`` -- a bucket without a
+    ``--cudagraph-mode``, which binders refuse rather than resolve.
+    """
+    replays = replays_captured_extent(capture_bucket, is_prefill,
+                                      cudagraph_mode)
+    if replays is None:
+        return "undeclared"
+    return "captured" if replays else "batch"
+
+
+def allocate_blocks(prompt_lens, context_lens, block_size: int,
+                    policy: str = "rounds") -> list[list[int]]:
+    """Which KV blocks each request holds, under a named policy.
+
+    Block identity is not a property of the batch. It is what the block manager
+    happened to hand out, and two runs of the same workload can differ. It still
+    reaches cost -- through which pages the attention kernel walks and how they
+    sit in cache -- so it cannot simply be invented per request as 0..n.
+
+    ``rounds`` is the policy a first-come scheduler produces and the one the 27B
+    capture shows: every request's prompt blocks are allocated in request order,
+    then one growth block per request per round, again in request order. The
+    captured 4x66 decode holds exactly
+    ``[[0,1,2,3,16],[4,5,6,7,17],[8,9,10,11,18],[12,13,14,15,19]]`` -- four
+    prompt blocks each from a 64-token prompt, then a fifth for the tokens past
+    64, in a second round.
+
+    ``packed`` is the degenerate alternative: every request's blocks contiguous.
+    It is offered because a long single-sequence batch has no rounds to speak of
+    and packing is then both true and simpler, not because it is interchangeable.
+    """
+    prompt_lens = list(prompt_lens)
+    context_lens = list(context_lens)
+    if len(prompt_lens) != len(context_lens):
+        raise ValueError("one prompt length per request")
+    need = [max(1, -(-c // block_size)) for c in context_lens]
+    have = [max(0, -(-p // block_size)) for p in prompt_lens]
+    if any(h > n for h, n in zip(have, need)):
+        raise ValueError("a prompt cannot occupy more blocks than the context")
+
+    tables: list[list[int]] = [[] for _ in need]
+    nxt = 0
+    if policy == "packed":
+        for i, n in enumerate(need):
+            tables[i] = list(range(nxt, nxt + n))
+            nxt += n
+        return tables
+    if policy != "rounds":
+        raise ValueError(f"unknown block allocation policy {policy!r}")
+    # Round zero: the prompts, in request order.
+    for i, n in enumerate(have):
+        tables[i] = list(range(nxt, nxt + n))
+        nxt += n
+    # Then one growth block per request per round, until every request has what
+    # its context needs. A request that finished growing is skipped, which is
+    # what leaves the ids of a longer request non-contiguous.
+    while any(len(t) < n for t, n in zip(tables, need)):
+        for i, n in enumerate(need):
+            if len(tables[i]) < n:
+                tables[i].append(nxt)
+                nxt += 1
+    return tables
+
+
+@dataclass(frozen=True)
+class BatchSpec:
+    """One forward, as a scheduler would have described it.
+
+    ``query_lens`` is how many tokens of each request this step computes and
+    ``context_lens`` how many the KV cache holds for it *including* those -- the
+    two names ATOM's own batch uses. A decode step is ``query_lens=[1,...]``; a
+    native prefill is ``query_lens == context_lens``; a chunked prefill is
+    neither, and sets ``has_cached``.
+
+    ``capture_bucket`` is the padded batch size a CUDA-graph replay would run,
+    or None for eager. It is recorded because it changes the size of every
+    metadata buffer and therefore the work, not because the model reads it.
+    """
+
+    kind: str                      # "decode" | "prefill"
+    query_lens: tuple[int, ...]
+    context_lens: tuple[int, ...]
+    block_size: int
+    max_model_len: int
+    capture_bucket: Optional[int] = None
+    #: Which cudagraph mode the deployment declares -- "full", "piecewise", or
+    #: None when nobody said. Only a FULL capture replays attention, so this is
+    #: what decides whether this step runs the metadata the capture built or
+    #: metadata rebuilt from the batch: see :attr:`replays_captured_metadata`.
+    cudagraph_mode: Optional[str] = None
+    num_spec_step: int = 0
+    block_policy: str = "rounds"
+    #: How long each request was at admission. Only the block allocation reads
+    #: it, and only to know where the first growth round starts.
+    prompt_lens: Optional[tuple[int, ...]] = None
+    #: Explicit block tables, when the batch is being replayed from a capture
+    #: that recorded them rather than described by a policy.
+    block_tables: Optional[tuple[tuple[int, ...], ...]] = None
+    #: MRoPE models lay positions out as [3, N]. Recorded because the tracer
+    #: reads the flattened tensor and its length is otherwise unexplainable.
+    position_rows: int = 1
+    #: Per request, is this step computing the last chunk of its prompt?
+    #:
+    #: Not derivable from the lengths. A chunk covering tokens 98305..114688 of
+    #: a 119360-token prompt and one covering 98305..114688 of a 114688-token
+    #: prompt have identical query and context lengths, and only the second is
+    #: final. The scheduler knows; a spec that does not say leaves it None, and
+    #: anything that needs the answer must then refuse rather than assume.
+    #:
+    #: What reads it: the LM head. A batch where no request is on its final
+    #: chunk samples nothing, and the runner skips `compute_logits` outright,
+    #: so on a long chunked prefill most chunks pay no head at all.
+    is_final_chunk: Optional[tuple[bool, ...]] = None
+    notes: dict = field(default_factory=dict)
+
+    # -- reading one off disk ------------------------------------------------
+
+    @classmethod
+    def from_dict(cls, raw: dict) -> "BatchSpec":
+        """Build from JSON, strictly.
+
+        JSON has lists where this has tuples, and no way to say "frozen". It
+        also has no way to say "you misspelled a field", which is why an
+        unknown key is an error rather than a default quietly winning: a spec
+        with ``prompt_len`` instead of ``prompt_lens`` would otherwise derive a
+        different batch than the one written down, and say nothing.
+        """
+        known = {f.name for f in fields(cls)}
+        unknown = set(raw) - known
+        if unknown:
+            raise ValueError(
+                f"unknown batch spec field(s) {sorted(unknown)}; "
+                f"known fields are {sorted(known)}")
+        kw = dict(raw)
+        for name in ("query_lens", "context_lens", "prompt_lens"):
+            if kw.get(name) is not None:
+                kw[name] = tuple(int(v) for v in kw[name])
+        if kw.get("is_final_chunk") is not None:
+            kw["is_final_chunk"] = tuple(bool(v) for v in kw["is_final_chunk"])
+        if kw.get("block_tables") is not None:
+            kw["block_tables"] = tuple(tuple(int(b) for b in row)
+                                       for row in kw["block_tables"])
+        spec = cls(**kw)
+        spec.validate()
+        return spec
+
+    @classmethod
+    def load(cls, path: str) -> "BatchSpec":
+        with open(path) as fh:
+            return cls.from_dict(json.load(fh))
+
+    def to_dict(self) -> dict:
+        """The spec as JSON, with the derived block table made explicit.
+
+        What goes in a graph's provenance is what was actually derived, so the
+        table is written out even when a policy produced it: the policy is
+        reproducible, but only if its output is there to check against.
+        """
+        out = {f.name: getattr(self, f.name) for f in fields(self)}
+        out["block_tables"] = self.tables()
+        return {k: (list(v) if isinstance(v, tuple) else v)
+                for k, v in out.items() if v is not None and v != {}}
+
+    # -- derived quantities, all of them pure -------------------------------
+
+    @property
+    def batch_size(self) -> int:
+        return len(self.query_lens)
+
+    @property
+    def num_tokens(self) -> int:
+        return sum(self.query_lens)
+
+    @property
+    def max_query_len(self) -> int:
+        """``max_seqlen_q``: how many tokens a padded row has to hold."""
+        return max(self.query_lens)
+
+    @property
+    def running_bs(self) -> int:
+        """How many rows wide this step's per-request buffers are.
+
+        ``ForwardMode.decide`` rounds a decode up to the smallest captured size
+        that fits (forward_context.py:238-244) and
+        ``attn_tensors_are_padded`` is exactly ``use_cudagraph`` (:247), so a
+        spec that names a bucket describes a replayed step and every
+        per-request buffer -- context lengths, block table rows, state indices,
+        the query start offsets -- is the bucket wide, not the batch.
+
+        An eager step pads nothing and the two numbers are the same, and so is
+        a prefill at any bucket: `ForwardMode.decide` sends every batch holding
+        a prefill token down the eager path (forward_context.py:196-204), so a
+        bucket on a prefill spec describes a capture this step does not replay.
+        """
+        if self.capture_bucket is None or self.kind == "prefill":
+            return self.batch_size
+        return self.capture_bucket
+
+    @property
+    def padded_rows(self) -> int:
+        """``num_tokens_pad``: how many rows the model body actually forwards.
+
+        ``running_bs * max_q_len`` (model_runner.py:3189-3192), which is what
+        the captured graph runs -- the real count slices the result afterwards
+        and changes no work. The same expression as
+        :func:`atom.compass.core.cost.library.executed_body_rows`, deliberately:
+        one is what a derivation traces and the other is what the oracle
+        charges, and a guard between them is only worth having if both sides
+        compute the number the same way.
+
+        A prefill runs eagerly whatever bucket is declared, for the reason
+        :attr:`running_bs` gives.
+        """
+        if self.capture_bucket is None or self.kind == "prefill":
+            return self.num_tokens
+        return self.capture_bucket * self.max_query_len
+
+    @property
+    def is_padded(self) -> bool:
+        """Does this step carry padding at all? Not the same as having a bucket:
+        a batch that lands exactly on a captured size replays with none."""
+        return self.padded_rows > self.num_tokens
+
+    @property
+    def replays_captured_metadata(self) -> Optional[bool]:
+        """Does this step run the attention metadata a *capture* built?
+
+        This spec's three facts put through :func:`replays_captured_extent`,
+        which is where the rule and its evidence live. Kept as a property
+        because a spec knows its own ``kind``; shared as a function because
+        `TemplateGraphs` must answer the same question about a `StepShape`
+        and must not answer it differently.
+
+        ``False`` whenever there is no bucket, and for a prefill at any bucket,
+        for the reason :attr:`running_bs` gives. ``None`` only when a bucket is
+        declared and the mode is not -- the same convention as
+        :func:`atom.compass.runtime.tracer.head_rows_padded`.
+        """
+        return replays_captured_extent(self.capture_bucket,
+                                       self.kind == "prefill",
+                                       self.cudagraph_mode)
+
+    @property
+    def launch_max_seqlen_k(self) -> int:
+        """``max_seqlen_k`` as this step's metadata actually carries it.
+
+        Not ``max(context_lens)`` unconditionally: that is the eager rule, and
+        applying it to a FULL replay records a graph the native run never had.
+        Nothing on the Gluon decode path *reads* the field (see
+        ``DECODE_CALIBRATION_SCOPE.md`` §1), so this is a matching defect
+        rather than a pricing one -- but ``max_seqlen_k`` is part of the
+        operator identity key (``core/cost/identity.py``:38), so a derived
+        graph carrying the eager value cannot match a captured one.
+
+        With a bucket and no declared mode the eager value is kept and
+        :attr:`launch_extent_scope` says ``"undeclared"``, so a consumer can
+        refuse the pair rather than discover the ambiguity in a price.
+        """
+        replays = self.replays_captured_metadata
+        if replays:
+            return self.max_model_len
+        return max(self.context_lens) if self.context_lens else 0
+
+    @property
+    def launch_extent_scope(self) -> str:
+        """Which of the two rules :attr:`launch_max_seqlen_k` used.
+
+        The name :func:`extent_scope_of` gives for this spec's three facts,
+        and the value `TemplateGraphs` passes to :func:`bind_cohort` for the
+        same step. ``"captured"`` -- the capture's ``max_model_len``.
+        ``"batch"`` -- the batch's longest history, which is what an eager
+        step and a PIECEWISE replay both run. ``"undeclared"`` -- a bucket
+        without a ``--cudagraph-mode``; the batch value is recorded but is
+        not evidence.
+        """
+        return extent_scope_of(self.capture_bucket, self.kind == "prefill",
+                               self.cudagraph_mode)
+
+    @property
+    def executed_rows(self) -> int:
+        """``batch_size`` as the decode kernel computes it from its operands.
+
+        ``pa_decode_gluon`` takes ``batch_size = query.shape[0] //
+        query_length`` and launches ``grid = (batch_size, num_kv_heads,
+        max_context_partition_num)`` (pa_decode_gluon.py:5342, :5356), so the
+        executed extent is a function of the operand shape and needs no
+        declared field of its own -- which is why the model derives it rather
+        than reading one. Recorded here so the derivation and the model compute
+        it the same way, as :attr:`padded_rows` is for the body.
+        """
+        return self.padded_rows // self.max_query_len
+
+    @property
+    def has_cached(self) -> bool:
+        """A prefill that reads KV it did not compute this step: chunked."""
+        return (self.kind == "prefill"
+                and any(c > q for q, c in zip(self.query_lens,
+                                              self.context_lens)))
+
+    @property
+    def cached_lens(self) -> tuple[int, ...]:
+        """How many tokens of each request the KV cache already held.
+
+        Not the prompt. A request admitted with 64 tokens that has generated one
+        has a 64-token prompt and 65 cached tokens, and the two are read by
+        different things: chunked prefill's `num_cached_tokens` means this one,
+        the block allocation below means the other.
+        """
+        return tuple(c - q for q, c in zip(self.query_lens, self.context_lens))
+
+    @property
+    def admitted_lens(self) -> tuple[int, ...]:
+        """How long each request was when the scheduler admitted it.
+
+        The block manager allocates a prompt's blocks in one go and then grows
+        one block at a time, so where the first growth round falls is a fact
+        about the prompt and is not recoverable from the context. Defaulted to
+        the cached length, which is right for a native prefill and for any
+        request that has not grown past its prompt.
+        """
+        return self.prompt_lens or self.cached_lens
+
+    def produces_output(self) -> Optional[bool]:
+        """Does this step sample a token, and so run the LM head?
+
+        The same rule the scheduler applies (`produces_output` in
+        `atom/model_engine/scheduler.py`), against a spec instead of a batch: a
+        decode always samples; a prefill samples only if some request is on its
+        final chunk. ``None`` means the spec did not say -- not "no", and not
+        "yes". A caller that needs the answer refuses on None; it is exactly
+        the case where guessing costs a whole LM head per chunk in one
+        direction or the other.
+        """
+        if self.kind == "decode":
+            return True
+        if self.is_final_chunk is None:
+            return None
+        return any(bool(x) for x in self.is_final_chunk)
+
+    def tables(self) -> list[list[int]]:
+        if self.block_tables is not None:
+            return [list(t) for t in self.block_tables]
+        return allocate_blocks(self.admitted_lens, self.context_lens,
+                               self.block_size, self.block_policy)
+
+    def validate(self) -> None:
+        """Everything that can be checked without a device, checked.
+
+        The failure this prevents is a spec that prices happily and describes a
+        step no engine could run: a context longer than the model's, a query
+        longer than its context, a block table too narrow for the tokens it must
+        address. Each of those produces a plausible number.
+        """
+        if self.kind not in ("decode", "prefill"):
+            raise ValueError(f"kind must be decode or prefill, not {self.kind!r}")
+        if not self.query_lens:
+            raise ValueError("a batch has at least one request")
+        if len(self.query_lens) != len(self.context_lens):
+            raise ValueError("one context length per request")
+        if (self.is_final_chunk is not None
+                and len(self.is_final_chunk) != len(self.query_lens)):
+            raise ValueError("one final-chunk flag per request")
+        if self.block_size <= 0:
+            raise ValueError("block size must be positive")
+        for i, (q, c) in enumerate(zip(self.query_lens, self.context_lens)):
+            if q <= 0:
+                raise ValueError(f"request {i} computes no token")
+            if q > c:
+                raise ValueError(
+                    f"request {i} computes {q} tokens into a context of {c}")
+            if c > self.max_model_len:
+                raise ValueError(
+                    f"request {i} context {c} exceeds max_model_len "
+                    f"{self.max_model_len}")
+        if self.kind == "decode" and set(self.query_lens) != {
+                self.num_spec_step + 1}:
+            raise ValueError(
+                "a decode step computes num_spec_step+1 tokens per request; "
+                f"got {sorted(set(self.query_lens))}")
+        width = self.max_model_len // self.block_size
+        for i, table in enumerate(self.tables()):
+            need = -(-self.context_lens[i] // self.block_size)
+            if len(table) < need:
+                raise ValueError(
+                    f"request {i} needs {need} blocks for {self.context_lens[i]}"
+                    f" tokens and its table holds {len(table)}")
+            if len(table) > width:
+                raise ValueError(
+                    f"request {i} holds {len(table)} blocks and a table row is "
+                    f"{width} wide at max_model_len {self.max_model_len}")
+        if self.capture_bucket is not None and self.capture_bucket < self.batch_size:
+            raise ValueError(
+                f"capture bucket {self.capture_bucket} is narrower than the "
+                f"batch of {self.batch_size}")
+
+    # -- the metadata the tracer records ------------------------------------
+
+    def attention_context(self) -> tuple[tuple[str, Any], ...]:
+        """What ``forward_ctx._capture_attention`` would record for this batch.
+
+        Field for field, in the order that function writes them, computed the
+        way the backend computes them:
+
+        * ``slot_mapping`` -- decode takes the last block and the count of
+          tokens in it (`aiter_attention.prepare_decode`, the ``max_seqlen_q==1``
+          branch); prefill walks every block from the cached prefix to the end
+          (`CommonAttentionBuilder.prepare_prefill`).
+        * ``cu_seqlens_k`` -- prefill only. Decode leaves it unset and the
+          recorded value is None.
+        * ``state`` -- ``prefill_prefix`` under a cached prefix, else
+          ``prefill_native``. Decode does not set it and inherits the same
+          default, which is why a decode capture reads ``prefill_native``.
+        * ``positions`` -- the last ``query_lens[i]`` positions of each request,
+          tiled over ``position_rows`` for MRoPE.
+
+        A replayed step's buffers are the capture bucket wide and the tail is
+        not left to chance; each field has its own padding value and they are
+        not interchangeable. See :data:`PAD_SLOT_ID` and
+        :attr:`BatchSpec.running_bs`.
+        """
+        self.validate()
+        tables = self.tables()
+        block = self.block_size
+        bs = self.running_bs
+        pad_bs = bs - self.batch_size
+        cu_q = [0]
+        for q in self.query_lens:
+            cu_q.append(cu_q[-1] + q)
+        # `cu_seqlens_q[scheduled_bs+1:bs+1] = cu_seqlens_q[scheduled_bs]`
+        # (model_runner.py:2649-2652): the padded rows repeat the last real
+        # offset, which makes each of them an empty sequence for attention --
+        # three requests in a bucket of four is [0, 1, 2, 3, 3], not [.., 4].
+        cu_q += [cu_q[-1]] * pad_bs
+
+        slots: list[int] = []
+        for i, (q, c) in enumerate(zip(self.query_lens, self.context_lens)):
+            for pos in range(c - q, c):
+                slots.append(tables[i][pos // block] * block + pos % block)
+        # `slot_mapping[:bs * max_seqlen_q] = -1` before the real rows are
+        # written over the head of it (aiter_attention.py:1106-1111). The tail
+        # must not name a slot: a real one would have the padded rows write KV
+        # over some other request's page.
+        slots += [PAD_SLOT_ID] * (self.padded_rows - len(slots))
+
+        positions: list[int] = []
+        for q, c in zip(self.query_lens, self.context_lens):
+            positions.extend(range(c - q, c))
+        # Zero, the same legal position the runner writes into the tail of its
+        # own buffer before a replay (model_runner.py:3199-3203). Padded first
+        # and tiled second: MRoPE's buffer is [3, num_tokens_pad], so each of
+        # the three rows carries the padding rather than the padding landing
+        # once at the end of a flattened one.
+        positions += [0] * (self.padded_rows - len(positions))
+        positions = positions * self.position_rows
+
+        recorded: list[tuple[str, Any]] = [
+            # `context_lens[scheduled_bs:bs] = 0` (aiter_attention.py:1115):
+            # a padded row holds no history, so the kernel walks no pages for
+            # it. Not the real context repeated, which would read a request's
+            # KV a second time and charge for it.
+            ("context_lens", list(self.context_lens) + [0] * pad_bs),
+            ("slot_mapping", slots),
+            ("cu_seqlens_q", cu_q),
+        ]
+        if self.kind == "prefill":
+            cu_k = [0]
+            for c in self.context_lens:
+                cu_k.append(cu_k[-1] + c)
+            recorded.append(("cu_seqlens_k", cu_k))
+        else:
+            recorded.append(("cu_seqlens_k", None))
+        recorded += [
+            ("max_seqlen_q", max(self.query_lens)),
+            # Not `max(self.context_lens)`: a FULL replay runs the extent the
+            # capture pinned, not the batch's. See
+            # :attr:`BatchSpec.launch_max_seqlen_k`.
+            ("max_seqlen_k", self.launch_max_seqlen_k),
+            ("min_seqlen_q", 0),
+            ("has_cached", self.has_cached),
+            ("state", "prefill_prefix" if self.has_cached else "prefill_native"),
+            ("is_prefill", self.kind == "prefill"),
+            ("positions", positions),
+        ]
+        if self.has_cached:
+            recorded += [
+                ("total_kv", sum(self.context_lens)),
+                ("seq_starts", list(_prefix_starts(self.cached_lens))),
+                ("num_cached_tokens", list(self.cached_lens)),
+            ]
+
+        width = self.max_model_len // self.block_size
+        used = min(width, max(1, -(-max(self.context_lens) // self.block_size)))
+        flat: list[int] = []
+        for table in tables:
+            row = list(table[:used])
+            row += [0] * (used - len(row))
+            flat.extend(row)
+        # `block_tables` is copied to the device `bs` rows deep
+        # (aiter_attention.py:1129), so a replay's table is the bucket's
+        # height. The padded rows are zeros and are never read: their context
+        # length is zero, so the kernel walks none of their blocks.
+        flat += [0] * (used * pad_bs)
+        recorded += [
+            ("block_tables_shape", [bs, width]),
+            ("block_tables", flat),
+        ]
+        return tuple(recorded)
+
+    def gdn_context(self, state_slots=None) -> tuple[tuple[str, Any], ...]:
+        """What ``_capture_linear_attention`` would record for this batch.
+
+        DeltaNet counts prefills and decodes separately and indexes a
+        per-request recurrent state pool rather than a paged KV cache, so its
+        metadata is start offsets and state indices, not block tables. The
+        recurrent and convolution state itself is not here for the same reason
+        it is not in a capture: it lives in ``kv_cache_data``, which the engine
+        installs at start-up and which is already real wherever pricing runs.
+
+        ``state_slots`` is which per-request state entry each request occupies;
+        the default is the batch order, which is what a fresh pool hands out.
+
+        **The padding here is the capture's, not the attention backend's, and
+        only a FULL capture applies it.** The two modes build this metadata
+        differently and a padded decode is where they diverge:
+
+        * FULL. ``_build_gdn_capture_metadata(bs)`` bakes
+          ``num_decodes = num_decode_tokens = num_actual_tokens = bs`` into the
+          graph and slices the buffers to the bucket (gdn_attn.py:1264-1281).
+          The replay refills them around those constants: the state index tails
+          become :data:`PAD_SLOT_ID` and the query offsets repeat the last real
+          one (:1189-1235). Three requests in a bucket of four therefore record
+          offsets ``[0, 1, 2, 3, 3]`` and indices ``[0, 1, 2, -1]`` against
+          counts of four. Index ``0`` would be a real state entry -- request
+          zero's -- and padding with it makes the padded lane read and write a
+          live sequence's recurrent state. Because ``num_actual_tokens`` is the
+          bucket's, the wrapper's ``core_attn_out[num_actual_tokens:]`` zeroing
+          covers nothing: under FULL there is no tail branch to charge.
+        * PIECEWISE, and eager. Attention is not captured
+          (model_runner.py:4019-4031) and this metadata is rebuilt from the
+          batch every step: the counts are the active ones, the offset view is
+          ``A + 1`` long and the index tensors are ``A`` long. The *output* is
+          still allocated at the bucket's width, so here the tail zeroing is
+          real -- but that width is the operand's, not this metadata's.
+
+        With a bucket and no declared mode there is no answer, and both
+        available ones are a padded decode's whole difference, so this raises
+        rather than picking the shape that happens to be in the code.
+        """
+        self.validate()
+        n = self.batch_size
+        slots = list(state_slots if state_slots is not None else range(n))
+        if len(slots) != n:
+            raise ValueError("one state slot per request")
+        starts = [0]
+        for q in self.query_lens:
+            starts.append(starts[-1] + q)
+
+        prefill = self.kind == "prefill"
+        # Prefill is always eager (`ForwardMode.decide`, forward_context.py:
+        # 196-204), so only a decode has a bucket to pad to -- and only a FULL
+        # capture pads this metadata to it.
+        replays = self.replays_captured_metadata
+        if replays is None:
+            raise ValueError(
+                f"this decode replays a capture bucket of {self.capture_bucket} "
+                "but the deployment's cudagraph_mode was not declared. A FULL "
+                "capture records the bucket's counts with a PAD-filled state "
+                "tail; a PIECEWISE one records the active counts. The two "
+                "differ by exactly the padding, so there is no shape to write "
+                "that is right under both.")
+        bs = self.running_bs if replays else self.batch_size
+        pad_bs = bs - self.batch_size
+        starts += [starts[-1]] * pad_bs
+        slots = slots + [PAD_SLOT_ID] * pad_bs
+        # Under FULL these are the bucket's, because the capture baked them in
+        # and the replay runs the captured kernel whatever the refilled buffers
+        # say; the offsets and indices above are what keep the padded lanes off
+        # real state. Under PIECEWISE they are the batch's, rebuilt per step.
+        rows = self.padded_rows if replays else self.num_tokens
+        recorded: list[tuple[str, Any]] = [
+            ("num_prefills", n if prefill else 0),
+            ("num_prefill_tokens", self.num_tokens if prefill else 0),
+            ("num_decodes", 0 if prefill else bs),
+            ("num_decode_tokens", 0 if prefill else rows),
+            ("num_spec_decodes", 0),
+            ("num_spec_decode_tokens", 0),
+            ("num_actual_tokens", self.num_tokens if prefill else rows),
+            ("replayssm", False),
+            ("non_spec_query_start_loc", [starts, "int32"]),
+            ("non_spec_state_indices_tensor", [slots, "int32"]),
+            ("non_spec_state_indices_in_tensor", [slots, "int32"]),
+        ]
+        # Which prefills continue a sequence whose convolution state is already
+        # in the pool. The conv takes it as a pointer, not a flag: absent, the
+        # kernel does not take a cheaper branch, it fails to compile --
+        # "'NoneType' object has no attribute 'type'" at the
+        # `tl.load(has_initial_states_ptr + idx_seq)` -- and all 48 DeltaNet
+        # layers of a long prefill go unpriced.
+        #
+        # The rule is the backend's own, where the metadata is built: per
+        # prefill row, `num_cached_tokens > 0`, and an all-False tensor rather
+        # than None where nothing is cached. `cached_lens` is that quantity, so
+        # a first chunk, a continuation and a mixed batch of both differ row by
+        # row -- which is also the difference in work, since a row with an
+        # incoming state reads it and a row without does not. Decode leaves the
+        # field None, as the backend does.
+        if prefill:
+            recorded.append(
+                ("has_initial_state",
+                 [[1 if c > 0 else 0 for c in self.cached_lens], "bool"]))
+        return tuple(recorded)
+
+
+def _prefix_starts(lengths):
+    total = 0
+    for n in lengths:
+        yield total
+        total += n
+
+
+
+def install(spec: "BatchSpec", device: str = "cpu"):
+    """Put the batch's metadata on the forward context, for a derivation.
+
+    Derivation traces a bare ``model(input_ids, positions)`` with no engine
+    around it, so nothing installs a forward context and attention records none
+    -- which is why 64 attention operators per step arrived at the price list
+    marked "reads a forward context and the graph recorded none". This installs
+    one, built from the spec.
+
+    The tensors are real and live on ``device``, not on meta. That is the point:
+    a meta tensor holds no values, so a context made of them would record
+    nothing, and the recorder would be reading its own emptiness back. The
+    metadata is small -- a few hundred integers -- and computing it on the host
+    costs nothing next to the model it describes.
+
+    It goes through ATOM's own ``AttentionMetaData`` and ``Context``, so a field
+    this recipe does not set takes the engine's default rather than one invented
+    here, and ``forward_ctx.capture`` reads it back exactly as it reads a live
+    step's.
+    """
+    import contextlib
+
+    import torch
+
+    from atom.config import get_current_atom_config
+    from atom.model_ops.attentions.gdn_attn import GDNAttentionMetadata
+    from atom.utils.forward_context import (
+        AttentionMetaData, AttnState, Context, set_forward_context)
+
+    fields = dict(spec.attention_context())
+    gdn_fields = dict(spec.gdn_context())
+
+    def tensor(values, dtype):
+        if values is None:
+            return None
+        return torch.tensor(values, dtype=dtype, device=device)
+
+    shape = fields["block_tables_shape"]
+    table = torch.zeros(tuple(shape), dtype=torch.int32, device=device)
+    used = len(fields["block_tables"]) // max(shape[0], 1)
+    if used:
+        table[:, :used] = torch.tensor(
+            fields["block_tables"], dtype=torch.int32,
+            device=device).reshape(shape[0], used)
+
+    metadata = AttentionMetaData(
+        block_tables=table,
+        context_lens=tensor(fields["context_lens"], torch.int32),
+        slot_mapping=tensor(fields["slot_mapping"], torch.int64),
+        cu_seqlens_q=tensor(fields["cu_seqlens_q"], torch.int32),
+        cu_seqlens_k=tensor(fields["cu_seqlens_k"], torch.int32),
+        max_seqlen_q=fields["max_seqlen_q"],
+        max_seqlen_k=fields["max_seqlen_k"],
+        min_seqlen_q=fields["min_seqlen_q"],
+        has_cached=fields["has_cached"],
+        state=AttnState(fields["state"]),
+        total_kv=fields.get("total_kv"),
+        seq_starts=tensor(fields.get("seq_starts"), torch.int32),
+        num_cached_tokens=tensor(fields.get("num_cached_tokens"), torch.int32),
+    )
+
+    gdn = GDNAttentionMetadata(**{
+        name: (value if not isinstance(value, list)
+               else tensor(value[0], getattr(torch, value[1])))
+        for name, value in gdn_fields.items() if name != "replayssm"})
+    # The convolution reads three more fields off the same object, and they are
+    # a pure function of the query start offsets -- recomputed with the engine's
+    # own helper rather than recorded, exactly as the pricing installer does.
+    from atom.model_ops.attentions.gdn_attn import compute_causal_conv1d_metadata
+
+    (gdn.nums_dict, gdn.batch_ptr,
+     gdn.token_chunk_offset_ptr) = compute_causal_conv1d_metadata(
+        gdn.non_spec_query_start_loc)
+    metadata.gdn_metadata = gdn
+
+    context = Context(
+        positions=tensor(fields["positions"], torch.int64),
+        is_prefill=fields["is_prefill"],
+    )
+
+    @contextlib.contextmanager
+    def installed():
+        set_forward_context(attn_metadata=metadata,
+                            atom_config=get_current_atom_config(),
+                            context=context)
+        try:
+            yield metadata
+        finally:
+            from atom.utils.forward_context import reset_forward_context
+
+            reset_forward_context()
+
+    return installed()
+
+
+def model_inputs(spec: "BatchSpec", device="meta"):
+    """The token and position tensors the runner would hand the model.
+
+    ``derived_inputs`` produced ``arange(tokens)`` -- one sequence starting at
+    position zero -- which is a prefill of ``tokens`` tokens and nothing else.
+    A decode batch's positions are the last token of each request, and the two
+    graphs differ from the first RoPE onward. Dtypes as ``derived_inputs``
+    documents them: ``int32`` ids, ``int64`` positions.
+
+    Under MRoPE the runner hands the model a ``[3, N]`` view of its position
+    buffer, not the flat one (`model_runner._mrope_positions_view`), and each
+    of the three rows holds the same values for text-only requests. The shape
+    reaches the graph -- RoPE indexes it -- so it is reproduced here rather
+    than left flat.
+
+    The height is ``padded_rows``, not ``num_tokens``. A replay forwards
+    ``self.model(input_ids[:num_tokens_pad], positions)`` over the whole bucket
+    and slices the result to the scheduled rows afterwards
+    (model_runner.py:3189-3192, 3234); handing the model the scheduled rows
+    instead traces the *eager* body, whose dense operators are narrower by the
+    padding. Three requests replaying a bucket of four is a four-row forward.
+    The ids are zeros, which is the runner's own pad -- a legal vocab id, so
+    the embedding gather stays in bounds (model_runner.py:583-600) -- and the
+    positions' tail is zero for the same reason (:3199-3203).
+    """
+    import torch
+
+    rows = spec.padded_rows
+    positions = []
+    for q, c in zip(spec.query_lens, spec.context_lens):
+        positions.extend(range(c - q, c))
+    positions += [0] * (rows - len(positions))
+    pos = torch.tensor(positions * spec.position_rows, dtype=torch.int64,
+                       device=device)
+    if spec.position_rows > 1:
+        pos = pos.view(spec.position_rows, rows)
+    return (torch.zeros(rows, dtype=torch.int32, device=device), pos)

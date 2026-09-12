@@ -23,6 +23,7 @@ import time
 import urllib.request
 import uuid
 from asyncio import AbstractEventLoop
+from collections import OrderedDict
 from collections.abc import AsyncGenerator
 from contextlib import asynccontextmanager
 from typing import TYPE_CHECKING, Any
@@ -133,6 +134,54 @@ DEFAULT_PORT = 8000
 
 engine = None
 tokenizer: AutoTokenizer | None = None
+
+# Per-request timings as the *engine* saw them, keyed by request id.
+#
+# Under Compass the engine core runs on a virtual clock and the forward is
+# predicted rather than performed, so this process -- which only watches tokens
+# arrive on a socket -- is timing the simulator, not the system being simulated.
+# An HTTP benchmark divides every metric by its own wall-clock duration and so
+# reports how fast the simulation ran. The engine's own readings are the only
+# place the simulated latency exists, and nothing in the serving path used to
+# look at them: `postprocess` computes them offline and the server never calls
+# it. These are served by GET /compass/requests.
+#
+# Bounded, and dropped oldest-first: a long-running server must not accumulate a
+# row per request forever. A benchmark drains it at the end of a run.
+_compass_records: "OrderedDict[str, dict]" = OrderedDict()
+COMPASS_MAX_RECORDS = 100_000
+
+
+def _record_engine_timings(request_id: str, out: "RequestOutput") -> None:
+    """Keep what the engine believed about one finished request.
+
+    Zero means unstamped, and a request that produced no token has no
+    time-to-first-token -- reporting 0.0 for it would pull a mean down with a
+    number that is not a measurement. Such a request is recorded with ttft None.
+    """
+    arrive = getattr(out, "arrive_time", 0.0) or 0.0
+    first = getattr(out, "first_token_time", 0.0) or 0.0
+    finish = getattr(out, "finish_time", 0.0) or 0.0
+    if not arrive or not finish:
+        return
+    if len(_compass_records) >= COMPASS_MAX_RECORDS:
+        _compass_records.popitem(last=False)
+    _compass_records[request_id] = {
+        "request_id": request_id,
+        # The engine's own id for the sequence, next to the client's id for the
+        # request. Two id spaces meet here and nowhere else a reader can see:
+        # the step table records sequence ids, these records are keyed by
+        # completion ids, and without both on one row a per-step table cannot be
+        # joined to a per-request one. Queue wait -- arrival to first step, which
+        # is where the cc-traces TTFT error turned out to live -- needs exactly
+        # that join.
+        "seq_id": str(getattr(out, "request_id", "")) or None,
+        "arrive_time": arrive,
+        "first_token_time": first or None,
+        "finish_time": finish,
+        "ttft": (first - arrive) if first else None,
+        "latency": finish - arrive,
+    }
 # The tool-call format this model emits, resolved once at startup from its
 # chat template. `None` means none was recognised and tool calls, if any, are
 # delivered as plain text -- said out loud at startup, never discovered here.
@@ -786,6 +835,8 @@ def _send_stream_chunk_direct(
     state: Any,
 ) -> None:
     """Buffer a single-request chunk for this engine step."""
+    if request_output.finished:
+        _record_engine_timings(request_id, request_output)
     assert _stream_batch_dispatcher is not None
     _stream_batch_dispatcher.enqueue(
         loop=loop,
@@ -837,6 +888,8 @@ async def generate_async(
     data_parallel_rank: int | None = None,
     dp_session_id: str | None = None,
     dp_parent_session_id: str | None = None,
+    arrival_time: float | None = None,
+    workload_size: int | None = None,
 ) -> AsyncGenerator[dict[str, Any], None]:
     """Generate text asynchronously for non-streaming requests."""
     token_queue: asyncio.Queue = asyncio.Queue()
@@ -865,6 +918,8 @@ async def generate_async(
         _ct = getattr(request_output, "num_cached_tokens", 0)
         if _ct:
             num_cached_tokens_seen = _ct
+        if request_output.finished:
+            _record_engine_timings(request_id, request_output)
         now = time.time()
         loop.call_soon_threadsafe(
             token_queue.put_nowait,
@@ -885,6 +940,8 @@ async def generate_async(
             data_parallel_rank=data_parallel_rank,
             dp_session_id=dp_session_id,
             dp_parent_session_id=dp_parent_session_id,
+            arrival_time=arrival_time,
+            workload_size=workload_size,
         )
 
     seq = await loop.run_in_executor(None, do_preprocess)
@@ -1214,6 +1271,8 @@ async def setup_streaming_request(
     data_parallel_rank: int | None = None,
     dp_session_id: str | None = None,
     dp_parent_session_id: str | None = None,
+    arrival_time: float | None = None,
+    workload_size: int | None = None,
 ) -> tuple[int, StreamOutputCollector, int]:
     """Set up a streaming request with the engine.
 
@@ -1249,6 +1308,8 @@ async def setup_streaming_request(
             data_parallel_rank=data_parallel_rank,
             dp_session_id=dp_session_id,
             dp_parent_session_id=dp_parent_session_id,
+            arrival_time=arrival_time,
+            workload_size=workload_size,
         )
         _seq_id_to_request_id[seq.id] = request_id
         return seq
@@ -1909,6 +1970,8 @@ async def completions(request: CompletionRequest, raw_request: Request):
                         sampling_params,
                         request_id,
                         kv_transfer_params=request.kv_transfer_params,
+                        arrival_time=request.compass_arrival,
+                        workload_size=request.compass_workload_size,
                         **dp_routing,
                     )
                 )
@@ -1949,6 +2012,8 @@ async def completions(request: CompletionRequest, raw_request: Request):
                     sampling_params,
                     request_id,
                     kv_transfer_params=request.kv_transfer_params,
+                    arrival_time=request.compass_arrival,
+                    workload_size=request.compass_workload_size,
                     **dp_routing,
                 ),
                 raw_request,
@@ -2331,6 +2396,406 @@ async def list_models():
 async def health():
     """Health check endpoint."""
     return {"status": "ok"}
+
+
+@app.get("/compass/requests")
+async def compass_requests(drain: bool = True):
+    """Per-request timings as the engine measured them, on the engine's clock.
+
+    Exists because a client cannot time a simulated run. Under Compass the
+    engine core advances a virtual clock by each predicted step and never
+    performs the forward, so a benchmark timing the socket reports how fast the
+    simulator ran -- roughly 3x faster than the system it stands for, on the
+    workload this was built against. These readings come from the engine and are
+    therefore in simulated time when the run is simulated, and in wall time when
+    it is not, which makes the two directly comparable.
+
+    ``drain`` (default true) clears what it returns, so a benchmark reads each
+    run exactly once and a long-lived server does not grow a row per request.
+
+    The arrival barrier is reported alongside them because it decides whether
+    these readings mean anything: if it gave up waiting, virtual time advanced
+    past an arrival still in flight and every latency after that point is
+    invalid. It rides on this response rather than its own endpoint so a client
+    cannot read the timings without also reading whether they are usable.
+    """
+    records = list(_compass_records.values())
+    if drain:
+        _compass_records.clear()
+    return {
+        "count": len(records),
+        "clock": "virtual" if _compass_clock_is_virtual() else "wall",
+        "arrival_barrier": _compass_arrival_barrier(),
+        "requests": records,
+    }
+
+
+def _compass_arrival_barrier() -> dict:
+    """The engine core's own barrier state, or why it could not be read.
+
+    The scheduler lives in another process, so this is a round trip. It happens
+    once, at the end of a run, with the engine idle -- but a round trip can
+    still fail, and a failure here must not be reported as a run that was fine.
+    An unreadable barrier is ``timed_out: None``, which is neither a pass nor a
+    failure: the harness refuses on True and says "unknown" on None.
+    """
+    if engine is None:
+        return {"timed_out": None, "why": "the engine is not initialised"}
+    try:
+        return engine.get_compass_arrival_barrier(timeout=10.0)
+    except Exception as exc:
+        # Caught broadly on purpose: a barrier nobody could read is reported as
+        # unknown, and no failure of this reading may fail the run it describes.
+        logger.warning("Could not read the Compass arrival barrier", exc_info=True)
+        return {"timed_out": None, "why": f"{type(exc).__name__}: {exc}"}
+
+
+def _compass_loaded_inputs() -> dict:
+    """Each rank's record of what it loaded, or why there is none.
+
+    A round trip, for the same reason the barrier is: the runner that opened
+    the files is in another process, and this one cannot answer for it. It
+    happens once, when provenance is asked for.
+
+    An unreadable record is reported as a reason and never as an empty one. A
+    rank that loaded nothing and a rank that could not be asked are different
+    states, and only the first is a claim the run is making about itself.
+    """
+    if engine is None:
+        return {"ranks": [], "why": "the engine is not initialised"}
+    try:
+        return engine.get_compass_inputs(timeout=10.0)
+    except Exception as exc:  # provenance never fails the run it describes
+        logger.warning("Could not read the Compass loaded inputs",
+                       exc_info=True)
+        return {"ranks": [], "why": f"{type(exc).__name__}: {exc}"}
+
+
+def _compass_clock_is_virtual() -> bool:
+    """Whether this process reports simulated time.
+
+    The engine core is a different process and owns the clock that stamps these
+    readings; this one only knows whether Compass was switched on. Reported so a
+    consumer is never left guessing which clock a number came from.
+    """
+    config = getattr(engine, "config", None)
+    compass = getattr(config, "compass_config", None)
+    return bool(compass and compass.enabled and compass.virtual_clock
+                and compass.mode == "predict")
+
+
+def _sha256_of(path) -> "str | None":
+    """Digest of a file this *server* read, or None if it read no such file."""
+    import hashlib
+    if not path:
+        return None
+    try:
+        with open(path, "rb") as fh:
+            digest = hashlib.sha256()
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                digest.update(chunk)
+        return digest.hexdigest()
+    except OSError:
+        return None
+
+
+def _server_revision() -> "str | None":
+    """The code this server is running, if its tree is a checkout."""
+    import subprocess
+    try:
+        here = os.path.dirname(os.path.abspath(__file__))
+        out = subprocess.run(["git", "-C", here, "rev-parse", "HEAD"],
+                             capture_output=True, text=True, timeout=10)
+        return out.stdout.strip() or None
+    except Exception:  # noqa: BLE001 - provenance is best effort
+        return None
+
+
+def _artifact_digests(path: str) -> dict:
+    """Every file this option stands for, guessed from its name alone.
+
+    The fallback, and only the fallback. It is used for an option no loader
+    reported reading, which means nobody can say what the option stood for and
+    the best available answer is what is on this filesystem now.
+
+    It cannot be the primary answer, because it guesses wrong in two ways that
+    matter. An option's value is frequently not one filename:
+    ``prices.json:graph.json:unregistered`` is a triple and ``a.json,b.json``
+    is a list, and asking `os.path.isfile` about either finds nothing -- so a
+    run that loaded two real tables reported no digest and was refused as
+    uncalibrated. And even where it finds files, it finds whatever is there
+    *now*, which after a re-run of the producer is not what was loaded.
+
+    What replaced it is `_loaded_option_files`: the record the ranks took as
+    they parsed the bytes.
+    """
+    import glob as _glob
+
+    stem, ext = os.path.splitext(path)
+    found = {}
+    for candidate in [path] + sorted(_glob.glob(f"{stem}.*{ext}")):
+        if candidate in found or not os.path.isfile(candidate):
+            continue
+        digest = _sha256_of(candidate)
+        if digest:
+            found[os.path.basename(candidate)] = digest
+    return found
+
+
+#: Which oracle option each loaded-input role is a member of. A role says what
+#: an artifact *is* to the run; an option key says which flag named it, and one
+#: flag names several files -- `price=list.json:graph.json:regime` is one
+#: option and two inputs. The mapping is here, at the reporting edge, because
+#: it is a fact about the command line rather than about the reader.
+_ROLE_OPTIONS = {
+    "oracle.price": "price",
+    "oracle.price_graph": "price",
+    "oracle.template": "template",
+    "oracle.head_template": "head_template",
+    "oracle.replay_target": "replay_target",
+}
+
+
+def _loaded_option_files(ranks: list) -> dict:
+    """Per option key, the files the ranks actually read, by name and digest.
+
+    Keyed by basename to match what `_artifact_digests` produced, so every
+    existing consumer keeps working. Ranks are merged rather than reported
+    separately here because the per-rank detail is published whole, beside
+    this, under `compass.loaded_inputs`: two ranks that read different files
+    both appear, and a reader that wants to know which rank read which looks
+    there rather than at this summary.
+    """
+    found: dict = {}
+    for record in ranks or ():
+        for row in (record or {}).get("inputs") or ():
+            key = _ROLE_OPTIONS.get(row.get("role"))
+            if not key or not row.get("sha256"):
+                continue
+            found.setdefault(key, {})[
+                os.path.basename(row.get("path") or "")] = row["sha256"]
+    return found
+
+
+def _digest_of_set(found: dict) -> str:
+    """One digest over several files, so ranks cannot differ unnoticed."""
+    import hashlib
+
+    rolled = hashlib.sha256()
+    for name in sorted(found):
+        rolled.update(f"{name}:{found[name]}\n".encode())
+    return rolled.hexdigest()
+
+
+_CODE_DIGEST = None
+
+
+def _server_code_digest() -> "str | None":
+    """A digest of the Python this server imported.
+
+    A git revision is not available everywhere the engine runs: the GPU nodes
+    hold an rsync copy of the tree, not a checkout, so `rev-parse` fails there
+    and every run served from one was unattributable. A revision would not have
+    been the whole answer anyway -- it names a commit, and a working tree with
+    uncommitted edits reports the commit it was edited from.
+
+    So this hashes the source itself. Two runs agreeing here ran the same code,
+    checkout or not, committed or not.
+    """
+    global _CODE_DIGEST
+    if _CODE_DIGEST is not None:
+        return _CODE_DIGEST or None
+    import hashlib
+    try:
+        root = os.path.dirname(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))))  # .../atom
+        digest = hashlib.sha256()
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = sorted(d for d in dirnames if d != "__pycache__")
+            for name in sorted(filenames):
+                if not name.endswith(".py"):
+                    continue
+                path = os.path.join(dirpath, name)
+                digest.update(os.path.relpath(path, root).encode())
+                with open(path, "rb") as fh:
+                    digest.update(fh.read())
+        _CODE_DIGEST = digest.hexdigest()
+    except Exception:  # noqa: BLE001 - provenance is best effort
+        _CODE_DIGEST = ""
+    return _CODE_DIGEST or None
+
+
+def _model_identity(path) -> "str | None":
+    """What checkpoint this is, by content rather than by name.
+
+    A served model name is whatever was typed on the command line. Under the
+    HuggingFace cache the resolved snapshot directory is named for the commit,
+    which is the identity when it is there; otherwise the config plus the sizes
+    of the weight shards distinguishes one checkpoint from another.
+    """
+    import hashlib
+    try:
+        name = str(path or "")
+        if not os.path.isdir(name):
+            # A repo id, not a directory. It was already downloaded to serve
+            # this request, so the cache can resolve it without the network.
+            from huggingface_hub import snapshot_download
+
+            name = snapshot_download(name, local_files_only=True)
+        path = os.path.abspath(name)
+        parts = path.split(os.sep)
+        if "snapshots" in parts:
+            return "hf:" + parts[parts.index("snapshots") + 1]
+        if not os.path.isdir(path):
+            return None
+        digest = hashlib.sha256()
+        for name in sorted(os.listdir(path)):
+            full = os.path.join(path, name)
+            if name == "config.json":
+                with open(full, "rb") as fh:
+                    digest.update(fh.read())
+            elif name.endswith((".safetensors", ".bin")):
+                digest.update(f"{name}:{os.path.getsize(full)}".encode())
+        return "tree:" + digest.hexdigest()[:32]
+    except Exception:  # noqa: BLE001 - provenance is best effort
+        return None
+
+
+def _server_process_identity() -> dict:
+    """Which process is answering -- not which code it was built from.
+
+    `server_code_sha256` establishes that the bytes on disk match. It cannot
+    establish that a reply came from the process the caller started: a server
+    left over from an earlier run, holding this port and built from the same
+    tree, produces an identical digest and an identical configuration. On
+    every other field of this endpoint a stale process and a fresh one are
+    indistinguishable.
+
+    The reading itself lives in `atom.compass.core.process_identity`, which is
+    stdlib-only and imports nothing from ATOM, so a caller can load it and
+    check these numbers against `/proc` without starting an engine. Nothing
+    here is meant to be taken on trust.
+    """
+    try:
+        from atom.compass.core import process_identity
+
+        return process_identity.identity()
+    except Exception:  # noqa: BLE001 - provenance is best effort
+        return {}
+
+
+@app.get("/compass/provenance")
+async def compass_provenance():
+    """What this server is, so a result can be attributed to something.
+
+    A replay client used to stamp results with *its own* git revision, which
+    identifies the machine that sent the requests and not the one that served
+    them -- and against a remote server those are different trees. Nothing in a
+    saved run said which build, which model or which calibration table produced
+    it, so two runs that disagreed could not be told apart from two runs of
+    different things.
+
+    Everything here is read on the server side. The calibration digest in
+    particular is the hash of the file *this process opened*: a client naming
+    the same path is naming a path on another filesystem.
+    """
+    config = getattr(engine, "config", None)
+    compass = getattr(config, "compass_config", None)
+    options = dict(getattr(compass, "oracle_options", None) or {}) if compass else {}
+
+    # Oracle options name files. Digest each one the server can actually read,
+    # so "the same calibration" is a claim about bytes rather than about a path.
+    #
+    # The path an option names is often not a file. Every rank writes its own
+    # calibration -- `steps.tp0.jsonl`, `steps.tp1.jsonl` -- and the option
+    # carries the shared stem that `resolve_rank_path` expands per rank. Asking
+    # whether the stem exists says no at every width above one, which left the
+    # runs that had a calibration looking like the runs that had none.
+    #
+    # So the digests come from the ranks: each records, as it parses an
+    # artifact, the digest of the bytes it parsed and which file it resolved
+    # to. The server publishes that rather than re-deriving anything. Where a
+    # rank reported nothing for an option -- an option no loader reads -- the
+    # name-based guess above is used and the record says so, because a reader
+    # has to be able to tell a digest of what ran from a digest of what is on
+    # the disk now.
+    loaded = _compass_loaded_inputs()
+    from_ranks = _loaded_option_files(loaded.get("ranks") or [])
+
+    option_digests = {}
+    option_files = {}
+    option_source = {}
+    for key, value in options.items():
+        if not isinstance(value, str) or not value:
+            continue
+        found = from_ranks.get(key)
+        source = "loaded"
+        if not found:
+            found, source = _artifact_digests(value), "path"
+        if not found:
+            continue
+        option_files[key] = found
+        option_source[key] = source
+        option_digests[key] = (list(found.values())[0] if len(found) == 1
+                               else _digest_of_set(found))
+
+    def pick(*names):
+        for holder in (config, getattr(config, "model_config", None),
+                       getattr(config, "parallel_config", None)):
+            for name in names:
+                if holder is not None and hasattr(holder, name):
+                    value = getattr(holder, name)
+                    if value is not None:
+                        return value
+        return None
+
+    return {
+        "server_revision": _server_revision(),
+        "server_code_sha256": _server_code_digest(),
+        "model": model_name,
+        "model_path": pick("model", "model_path", "served_model_name"),
+        "model_revision": (pick("revision", "model_revision")
+                           or _model_identity(pick("model", "model_path"))),
+        "tensor_parallel_size": pick("tensor_parallel_size", "tp_size"),
+        "pipeline_parallel_size": pick("pipeline_parallel_size", "pp_size"),
+        "max_model_len": pick("max_model_len"),
+        "enable_prefix_caching": pick("enable_prefix_caching"),
+        "gpu_memory_utilization": pick("gpu_memory_utilization"),
+        "max_num_seqs": pick("max_num_seqs"),
+        "compass": None if not compass else {
+            "enabled": compass.enabled,
+            "mode": compass.mode,
+            "oracle": compass.oracle_qualname,
+            "oracle_options": options,
+            "oracle_option_sha256": option_digests,
+            "oracle_option_files": option_files,
+            # Whether each digest is of bytes a rank reported parsing
+            # ("loaded") or of whatever the server found at that name when
+            # asked ("path"). The two are not the same evidence and a reader
+            # must not have to guess which it is holding.
+            "oracle_option_digest_source": option_source,
+            # The per-rank record, whole. `oracle_option_sha256` is a summary
+            # over the ranks; this says which rank read which file, whether it
+            # was that rank's own or the shared one, and under what role --
+            # none of which survives being folded into one digest per option.
+            "loaded_inputs": loaded,
+            "virtual_clock": compass.virtual_clock,
+            "admission_seconds": compass.admission_seconds,
+            # Which rank's step the modelled side is reporting. A plan that
+            # asks for `slowest` and gets a server still on `rank0` is priced
+            # from one rank of the group, which no step row would contradict --
+            # so the choice is served, not only passed.
+            "rank_aggregation": getattr(compass, "rank_aggregation", "rank0"),
+        },
+        # Which process is replying. Everything above describes a build and a
+        # configuration, all of which a stale server on this port reproduces
+        # exactly; only this says who served the request.
+        "server_process": _server_process_identity(),
+        "calibration_sha256": option_digests.get("table"),
+        "visible_devices": os.environ.get("HIP_VISIBLE_DEVICES")
+        or os.environ.get("CUDA_VISIBLE_DEVICES"),
+        "torch_version": getattr(__import__("torch"), "__version__", None),
+    }
 
 
 @app.api_route("/metrics", methods=["GET", "HEAD"], include_in_schema=False)
