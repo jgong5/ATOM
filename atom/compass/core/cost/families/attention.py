@@ -334,6 +334,50 @@ class Structure:
                 total += -(-high // partition) - low // partition
         return total
 
+    def max_cta_tiles(self, partition: int, splits: int,
+                      window: Optional[int] = None) -> int:
+        """The longest single CTA's partition-iteration count, in iterations.
+
+        Same grid and the same rounding as :meth:`split_tiles` -- this is that
+        method's per-CTA decomposition taken at its maximum instead of its sum,
+        and the two are checked against each other: the per-CTA counts sum
+        exactly to ``split_tiles`` at every point measured so far.
+
+        Why the maximum is a separate fact from the sum: the launch is a grid
+        of ``(sequences, kv_heads, splits)`` CTAs that run concurrently, so the
+        step ends when the *last* one ends. Two batches can iterate the same
+        total number of partitions with very different longest walks, and they
+        do not cost the same. Measured, at eight splits and 256-wide
+        partitions: contexts ``(4080,) * 8`` and a geometric ragged batch
+        summing the same 32640 rows both give 160 summed tiles, and price
+        79.34us and 218.67us -- 2.76x apart. Their longest CTAs are 4 and 14
+        iterations. In the shipped basis those two batches were the *same
+        vector*, so no coefficient over it could tell them apart.
+
+        Per KV head, like ``split_tiles``: the head axis repeats this work
+        rather than lengthening any one CTA, so it belongs to the launch width
+        (see the ``crit_waves`` feature) and not to this count.
+        """
+        splits = max(1, int(splits))
+        longest = 0
+        for context in self.contexts():
+            context = int(context)
+            if context <= 0:
+                continue
+            if window is not None and window > 0:
+                start = max(0, (context - window) // partition)
+                longest = max(longest,
+                              max(0, -(-context // partition) - start))
+                continue
+            page = -(-context // splits)
+            for index in range(splits):
+                low = page * index
+                if low >= context:
+                    break
+                high = min(context, low + page)
+                longest = max(longest, -(-high // partition) - low // partition)
+        return longest
+
     def continued(self) -> Optional[int]:
         """Sequences whose scan resumes from a recurrent state already held.
 
@@ -557,16 +601,35 @@ def scoped(op: dict, scope, structure: Optional["Structure"] = None) -> dict:
     return combined
 
 
+#: How a regime's features combine into a duration.
+#:
+#: ``"linear"`` -- a nonnegative weighted sum, which is every regime here
+#: except one. ``"makespan"`` -- ``c0 * calls + max(c_lat * <second feature>,
+#: c_bw * <third feature>)``: two lower bounds on how long a concurrent launch
+#: can take, of which the larger is binding. Only a regime whose *measurements*
+#: show both bounds should carry it; the form costs a closed-form solve and a
+#: reader's trust, and neither is worth spending where a sum fits.
+LINEAR, MAKESPAN = "linear", "makespan"
+
+
 class Regime:
     """One native branch: the features its cost depends on, and its scope."""
 
-    __slots__ = ("name", "features", "required_scope")
+    __slots__ = ("name", "features", "required_scope", "law")
 
     def __init__(self, name: str, features: tuple,
-                 required_scope: tuple = UNIFIED_SCOPE) -> None:
+                 required_scope: tuple = UNIFIED_SCOPE,
+                 law: str = LINEAR) -> None:
         self.name = name
         self.features = tuple(features)
         self.required_scope = tuple(required_scope)
+        if law not in (LINEAR, MAKESPAN):
+            raise ValueError("unknown law %r" % (law,))
+        if law == MAKESPAN and len(features) != 3:
+            raise ValueError(
+                "a makespan law is (calls, latency term, bandwidth term) and "
+                "takes exactly three features, not %d" % len(features))
+        self.law = law
 
     def __eq__(self, other):
         return isinstance(other, Regime) and self.name == other.name
@@ -615,10 +678,61 @@ REGIMES = {
     # 25 and 32 tile iterations. The feature was renamed rather than
     # redefined -- a law fitted against the summed count is a law about a
     # different quantity, and should not be silently reinterpreted.
+    #
+    # That basis -- (context_rows, split_tiles, active, bucket_pad) -- is kept
+    # in the tests and in the record, because it failed in a way worth not
+    # repeating. Summed work *collides*: two matched-total batches priced 2.76x
+    # and 3.17x apart are byte-identical vectors under it.
+    #
+    #     r08geom / x08c04080  (32640, 160,  8, 0) both   218.67 vs  79.34 us
+    #     r16geom / x16c04080  (65280, 288, 16, 0) both   497.26 vs 156.72 us
+    #
+    # No coefficient can separate a pair it cannot see, so the fit splits the
+    # difference and misses the ragged member by 61-66%. More points under that
+    # basis would have bought nothing; what was missing was a feature.
+    #
+    # The launch is a concurrent grid of (sequences, kv_heads, splits) CTAs, so
+    # the call ends when the *last* CTA ends, and two bounds on that makespan
+    # are what the measurements show:
+    #
+    #   `max_cta_tiles` -- the longest CTA's own partition-iteration count, in
+    #     iterations. Nothing finishes before the longest serial walk does,
+    #     whatever else the machine is doing. Same rounding as `split_tiles`,
+    #     of which it is the per-CTA maximum rather than the sum.
+    #
+    #   `crit_waves` -- that walk multiplied by how many launch waves the grid
+    #     occupies: `max_cta_tiles * ctas / (compute_units * DECODE_OCCUPANCY)`
+    #     where `ctas = launched_rows * num_kv_heads * splits`. Dimensionless
+    #     (iterations x waves). Once the grid fills the machine, the CTAs share
+    #     bandwidth and issue slots, and the work queues behind itself.
+    #
+    # The law charges the larger: `calls + max(c_lat * max_cta_tiles, c_bw *
+    # crit_waves)`. The crossover is not a tuned knee -- it falls out of the
+    # fitted coefficients as `waves = c_lat / c_bw`, and at the twelve training
+    # points that is 0.465, near the half-occupancy the hardware constants
+    # imply. Below it the longest CTA dominates; above it bandwidth does.
+    #
+    # Padding is charged, not dropped: `launched_rows` inside `crit_waves` is
+    # the *launched* width, padded rows included, so an 8-of-16 bucket costs
+    # what its 16-row launch costs. That is measured on both sides -- a padded
+    # training point (8 active in bucket 16) and a padded frozen holdout point
+    # (4 in bucket 16) -- rather than assumed, which is why `bucket_pad` is no
+    # longer carried as a separate pinned term.
+    #
+    # Evidence, in full, including what it does not cover: grid 2 (12 points)
+    # trains; grids 3/3e (11 points) were a holdout for the linear candidate
+    # and, for this form, a second use; grid 3v (5 points) is this form's own
+    # frozen validation -- predictions digested before pricing -- at 12.8% max
+    # and 7.7% median error against 50.4% and 52.6% max for the linear and
+    # shipped bases. That 12.8% is a reported limitation: the residuals tilt
+    # +2.3..+8.6% on the latency side and -12.8% on the single bandwidth-bound
+    # point, so `c_lat` is slightly rich and `c_bw` slightly lean. It is not a
+    # 10% primitive pass and is not claimed as one; the accuracy gates that
+    # decide anything are end-to-end.
     "unified.decode.paged_gluon": Regime(
         "unified.decode.paged_gluon",
-        ("context_rows", "split_tiles", "active", "bucket_pad"),
-        PAGED_GLUON_SCOPE),
+        ("calls", "max_cta_tiles", "crit_waves"),
+        PAGED_GLUON_SCOPE, law=MAKESPAN),
     # On the unified/flash branch there is no per-sequence partition to count.
     # What the measurements show instead is that raggedness dominates: a
     # 32-sequence mixed batch summing 394164 context rows costs ~3.70ms while a
@@ -880,6 +994,56 @@ def features_for(regime: Regime, structure: Structure, scope=None):
             values.append(float(structure.split_tiles(
                 partition, splits,
                 window if isinstance(window, int) and window > 0 else None)))
+        elif feature in ("max_cta_tiles", "crit_waves"):
+            if not structure.contexts():
+                return Refusal(
+                    "the call records no per-sequence context, so the "
+                    "partition walk its longest CTA runs cannot be counted")
+            splits = _decode_splits(scope, structure.sequences)
+            if isinstance(splits, Refusal):
+                return splits
+            window = (scope or {}).get("sliding_window")
+            longest = structure.max_cta_tiles(
+                partition, splits,
+                window if isinstance(window, int) and window > 0 else None)
+            if feature == "max_cta_tiles":
+                # Unit: partition iterations of the single longest CTA.
+                values.append(float(longest))
+                continue
+            # Unit: iterations x waves, dimensionless. `waves` is how many
+            # times the launched grid covers the machine's concurrent CTA
+            # slots -- `compute_units * DECODE_OCCUPANCY`, the same occupancy
+            # assumption `get_occupancy` makes (pa_decode_gluon.py:107-108)
+            # and the same one already inside `_decode_splits`. Both factors
+            # are read from the declared scope; neither is assumed, which is
+            # why `compute_units` is in PAGED_GLUON_SCOPE and a scope without
+            # it refuses above rather than defaulting to a part.
+            rows = structure.executed_rows
+            if rows is None:
+                rows = structure.sequences
+            if structure.bucket is not None and int(structure.bucket) != rows:
+                # The same contradiction `bucket_pad` used to catch, kept
+                # because this term needs the launched width just as much: a
+                # call cannot have been launched over both counts, and picking
+                # the convenient one prices a step nobody ran.
+                return Refusal(
+                    f"the call was launched over {rows} rows but declares a "
+                    f"capture bucket of {structure.bucket}; one of the two "
+                    "does not describe this step")
+            heads = int((scope or {}).get("num_kv_heads") or 0)
+            units = int((scope or {}).get("compute_units") or 0)
+            if not heads or not units:
+                return Refusal(
+                    "the launch occupies compute_units * %d CTA slots and "
+                    "num_kv_heads is one of its grid axes; this scope "
+                    "declares neither, so how much of the machine this call "
+                    "fills is unknown" % DECODE_OCCUPANCY,
+                    missing=tuple(n for n, v in (("num_kv_heads", heads),
+                                                 ("compute_units", units))
+                                  if not v))
+            ctas = int(rows) * heads * int(splits)
+            values.append(float(longest) * ctas
+                          / float(units * DECODE_OCCUPANCY))
         elif feature == "grid_pad_rows":
             contexts = structure.contexts()
             if not contexts:
@@ -1079,6 +1243,67 @@ def _solve_nonnegative(matrix, rhs):
     return best[1], best[2]
 
 
+#: Search bounds and refinement schedule for :func:`_solve_makespan`, as
+#: multiples of a scale the data sets. Declared rather than tuned per fit: the
+#: search is deterministic, so the same points always give the same law.
+MAKESPAN_STEPS = 20
+MAKESPAN_REFINEMENTS = 2
+
+
+def _solve_makespan(rows, rhs):
+    """Fit ``c0 * a + max(c_lat * b, c_bw * c)``, or ``None``.
+
+    The form is not linear in its coefficients -- which of the two bounds is
+    binding depends on the coefficients themselves -- so there is no normal
+    equation to solve. This is a deterministic coarse-to-fine grid search:
+    ``MAKESPAN_STEPS`` divisions per axis over a box the data sets, then
+    ``MAKESPAN_REFINEMENTS`` passes at a tenth the width around the best cell.
+    No random restarts, no tolerance to tune, same answer every time.
+
+    The objective is *relative* squared error, not absolute. These durations
+    span more than an order of magnitude (29-508us at the training points) and
+    the model is consumed as a ratio between candidate placements, so an
+    absolute objective would fit the three slowest points and ignore the rest.
+    Nonnegativity is enforced by the search box, which starts at zero.
+    """
+    if not rows or len(rows) != len(rhs) or any(y <= 0 for y in rhs):
+        return None
+    # A scale per axis from the data: the largest per-unit cost any single
+    # point could justify if that axis paid for the whole duration.
+    tops = []
+    for index in range(3):
+        column = [row[index] for row in rows]
+        best = max((y / v for v, y in zip(column, rhs) if v > 0), default=0.0)
+        if best <= 0:
+            return None
+        tops.append(best)
+
+    def cost(params):
+        total = 0.0
+        for row, y in zip(rows, rhs):
+            base, latency, bandwidth = (p * v for p, v in zip(params, row))
+            total += ((base + max(latency, bandwidth) - y) / y) ** 2
+        return total
+
+    lows = [0.0, 0.0, 0.0]
+    highs = list(tops)
+    best_params, best_cost = None, None
+    for _pass in range(MAKESPAN_REFINEMENTS + 1):
+        widths = [(h - l) / MAKESPAN_STEPS for l, h in zip(lows, highs)]
+        for i in range(MAKESPAN_STEPS + 1):
+            for j in range(MAKESPAN_STEPS + 1):
+                for k in range(MAKESPAN_STEPS + 1):
+                    params = (lows[0] + widths[0] * i,
+                              lows[1] + widths[1] * j,
+                              lows[2] + widths[2] * k)
+                    value = cost(params)
+                    if best_cost is None or value < best_cost:
+                        best_params, best_cost = params, value
+        lows = [max(0.0, p - w) for p, w in zip(best_params, widths)]
+        highs = [p + w for p, w in zip(best_params, widths)]
+    return best_params
+
+
 class Fit:
     """A regime's law, and everything a reader needs to distrust it.
 
@@ -1118,6 +1343,16 @@ class Fit:
 
     def predict(self, values):
         """``values`` in this fit's own feature order, pinned ones removed."""
+        if self.regime.law == MAKESPAN:
+            # (calls, latency term, bandwidth term), in that declared order.
+            # Scales are 1.0 here: the search that fitted these coefficients
+            # weighted each point by its own duration, so the columns did not
+            # need rescaling to be conditioned, and carrying a scale would
+            # make the printed coefficients mean something other than
+            # microseconds per iteration.
+            base, latency, bandwidth = (
+                c * v for c, v in zip(self.coefficients, values))
+            return base + max(latency, bandwidth)
         total = 0.0
         for value, coefficient, scale in zip(values, self.coefficients,
                                              self.scales):
@@ -1125,6 +1360,16 @@ class Fit:
         return total
 
     def describe(self) -> str:
+        if self.regime.law == MAKESPAN:
+            c0, c_lat, c_bw = self.coefficients
+            return ("%s from %d point(s), %d residual df, in-sample %.1f%% "
+                    "[%s + max(%.4e * %s, %.4e * %s); crossover where the "
+                    "second exceeds the first, at %s / %s = %.3f]"
+                    % (self.regime.name, self.points, self.residual_df,
+                       self.relative_error * 100, "%.4e" % c0, c_lat,
+                       self.features[1], c_bw, self.features[2],
+                       self.features[1], self.features[2],
+                       (c_lat / c_bw) if c_bw else float("inf")))
         terms = ", ".join(
             "%s=%.4e" % (name, coefficient / scale if scale else 0.0)
             for name, coefficient, scale in zip(self.features,
@@ -1266,6 +1511,46 @@ def fit_regime(regime, observations, *, strict=True, min_residual_df=1):
             "%s has %d independent point(s) and needs at least %d to fit %d "
             "term(s) with anything left over to check them against"
             % (regime.name, len(rows), wanted, len(features)))
+
+    if regime.law == MAKESPAN:
+        if pinned:
+            return Refusal(
+                "%s: %s is zero at every measured point, and this law's two "
+                "bounds are only separable where both of them move. A "
+                "makespan fitted with a bound held at zero is a linear law "
+                "wearing its name" % (regime.name, ", ".join(pinned)))
+        ratios = _distinct([round(row[2] / row[1], 9) for row in rows
+                            if row[1] and row[2]])
+        if len(ratios) < 2:
+            return Refusal(
+                "%s: %s and %s are proportional across every one of these "
+                "points, so which of the two bounds is binding never changes "
+                "and their coefficients cannot be told apart. These are all "
+                "one launch width; measure another."
+                % (regime.name, features[1], features[2]))
+        solved = _solve_makespan(rows, rhs)
+        if solved is None:
+            return Refusal(
+                "%s: no nonnegative makespan law fits these points -- either "
+                "a duration is not positive or a term is zero everywhere"
+                % regime.name)
+        scales = [1.0] * len(features)
+        predicted = [solved[0] * row[0] + max(solved[1] * row[1],
+                                              solved[2] * row[2])
+                     for row in rows]
+        # The same dull rival the linear path has to beat: charging every
+        # point the mean. Stated as a comparison, not a tolerance.
+        mean = sum(rhs) / len(rhs)
+        total = sum((y - mean) ** 2 for y in rhs)
+        residual = sum((p - y) ** 2 for p, y in zip(predicted, rhs))
+        if total > 0.0 and residual >= total:
+            return Refusal(
+                "%s: the makespan law fits these points no better than "
+                "charging every one of them the same number" % regime.name)
+        errors = [abs(p - y) / y for p, y in zip(predicted, rhs) if y]
+        return Fit(regime, features, pinned, solved, scales, len(rows),
+                   len(rows) - len(solved), max(errors) if errors else 0.0,
+                   domain, declared, undeclared, ())
 
     # Scale each column by its largest value: the features differ by many
     # orders of magnitude -- attended pairs against sequence counts -- and the

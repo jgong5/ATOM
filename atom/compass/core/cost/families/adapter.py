@@ -103,11 +103,18 @@ _OPEN_QUESTION = "no entry for this signature"
 #: that never ran.
 _ATTENTION_SCOPE_SECTIONS = ("attention_scope", "resolved_scope")
 
-#: The keys either attention family turns on. Read as a union: a unified
-#: observation simply will not carry `gdn_state_geometry`, and a GDN one will
-#: not carry `kv_cache_dtype`, and neither absence is filled in here.
-_ATTENTION_SCOPE_KEYS = tuple(sorted(set(attention.UNIFIED_SCOPE)
-                                     | set(attention.GDN_SCOPE)))
+#: Every key some attention regime is identified by. Read as a union: a
+#: unified observation simply will not carry `gdn_state_geometry`, and a GDN
+#: one will not carry `kv_cache_dtype`, and neither absence is filled in here.
+#: Taken from the regimes themselves rather than from the two family scopes,
+#: because a regime may be identified by more than its family is -- the paged
+#: decode law turns on `num_kv_heads` and `compute_units` as well, and a key
+#: missing from this tuple is a fact the adapter drops on the floor, leaving
+#: the law that needs it permanently refused for want of it.
+_ATTENTION_SCOPE_KEYS = tuple(sorted(
+    set(attention.UNIFIED_SCOPE) | set(attention.GDN_SCOPE)
+    | {key for regime in attention.REGIMES.values()
+       for key in regime.required_scope}))
 
 #: Conditions of the measurement itself, as the collector writes them. Not
 #: kernel-selecting, and carried anyway: `attention._scope_of` requires
@@ -306,6 +313,55 @@ def _acquisition_policy(blob: dict) -> tuple:
 #: who needs to know whether a record was measuring the launch or the kernel.
 _OUTCOME_FIELDS = ("host_seconds",)
 
+#: Kernel symbols whose integer template arguments are a FUNCTION of the launch
+#: geometry a law already models, not a condition the measurement was taken
+#: under. The paged decode reduce kernel is instantiated per split count, and
+#: the split count is decided by the launch itself --
+#: `min(DECODE_MAX_SPLITS, ceil(compute_units * DECODE_OCCUPANCY /
+#: (rows * num_kv_heads)))` -- so a batch width and a specialization are the
+#: same fact stated twice. Keeping the specialization in the identity is not
+#: conservative here, it is fatal: every row width lands in its own group, and
+#: within one row width `crit_waves` is exactly proportional to
+#: `max_cta_tiles`, so the makespan law is unidentifiable by construction and
+#: no amount of further measurement can separate its two bounds. The other two
+#: integer arguments are head dimensions and are NOT canonicalised; neither are
+#: the type arguments, because a bfloat16 instantiation and an fp8 one are
+#: different work.
+_GEOMETRY_SPECIALIZED_KERNELS = ("pa_decode_ps_reduce_hip_kernel",)
+
+#: The *last* integer template argument, and only that one.
+#:
+#: The resolved declaration (`csrc/cpp_itfs/pa/pa_ps.cuh`:183-190) is
+#: `<output_t, logits_t, sink_t, USE_SINKS, HEAD_SIZE, QUERY_GROUP_SIZE,
+#: CONTEXT_PARTITION_NUM>`: three integers, split count last. The campaign
+#: observed `<__hip_bfloat16, __hip_bfloat16, __hip_bfloat16, false, 256, 6,
+#: N>` for N in {2, 3, 5, 8} and no other instantiation.
+#:
+#: Only `CONTEXT_PARTITION_NUM` is pooled, because only it is a modelled
+#: launch feature -- it is the split count `Structure` already reads, and
+#: leaving it in the measurement identity is what makes the law
+#: unidentifiable. `HEAD_SIZE` (256) and `QUERY_GROUP_SIZE` (6) stay in the
+#: symbol: they are head dimensions, not launch features, and an earlier
+#: blanket `\d+` substitution erased them as well -- which would have let a
+#: differently-shaped head or query grouping pool silently into this law.
+#: Both were constant across every observed symbol, so narrowing changes no
+#: existing design point. It removes a way for a future one to be wrong.
+_TEMPLATE_SPLIT_COUNT = re.compile(r"(?<=,) ?\d+ ?(?=>)")
+
+
+def _canonical_kernel(name: str) -> str:
+    """A split-specialized kernel symbol, with the split count taken out.
+
+    Returns the name unchanged for every kernel not named in
+    `_GEOMETRY_SPECIALIZED_KERNELS`, which is all but one of them. Where it
+    does substitute, the substitution is recorded and reported, because
+    pooling two symbols that the compiler kept apart is a modelling claim and
+    a reader is entitled to see it made.
+    """
+    if not any(symbol in name for symbol in _GEOMETRY_SPECIALIZED_KERNELS):
+        return name
+    return _TEMPLATE_SPLIT_COUNT.sub(" *", name)
+
 
 def _measurement_identity(record: dict, policy: tuple = ("unevidenced",)) -> tuple:
     """The treatment this record was taken under, as a comparable key.
@@ -316,7 +372,8 @@ def _measurement_identity(record: dict, policy: tuple = ("unevidenced",)) -> tup
     median and never pooled into one law -- either of which would average a
     cold measurement with a warm one and report the result as a repeat.
     """
-    kernels = tuple(sorted((record.get("kernels") or {})))
+    kernels = tuple(sorted(_canonical_kernel(name)
+                           for name in (record.get("kernels") or {})))
     return (kernels, ("acquisition_policy", policy)) + tuple(
         (field, _hashable(record[field]))
         for field in _TREATMENT_FIELDS if field in record)
@@ -544,6 +601,11 @@ class ParametricPriceLibrary(PriceLibrary):
         #: at different ragged structures are two design points and the second
         #: would be dropped as a duplicate.
         self._attention_obs: list = []
+        #: canonical kernel symbol -> the specializations pooled under it.
+        #: Empty unless `_canonical_kernel` actually substituted something.
+        #: Reported by `attention_coverage`, because pooling two symbols the
+        #: compiler kept apart is a modelling claim, not bookkeeping.
+        self._pooled_kernels: dict = {}
         #: What a launch costs where this library is being priced, published by
         #: whoever builds the cost oracle -- see `source_oracle`. `None` means
         #: nobody said, which is not the same as zero and is never read as it.
@@ -561,6 +623,21 @@ class ParametricPriceLibrary(PriceLibrary):
         #: answering for another. An empty request matches only an unscoped
         #: fit, which under `strict` does not exist.
         self.request_attention_scope: dict = {}
+        #: The deployment a price file that is SILENT about its own was
+        #: measured under, declared by whoever resolved it -- an
+        #: `attention_scope.Declaration`, carrying the facts behind every
+        #: member it names. `None` means nobody declared one, which is not the
+        #: same as an empty declaration: a silent file then stays silent and
+        #: its observations are refused for want of a backend, which is the
+        #: honest outcome rather than a loss.
+        #:
+        #: It may only fill a silence. A key the file states is the measuring
+        #: process speaking about its own run, and a caller disagreeing with
+        #: it is a contradiction to be fixed, not a preference to be applied.
+        #: That is the rule `add` already keeps for `registration` -- "a
+        #: caller may name the scope a file leaves unstated, not overrule the
+        #: one it states" -- and this is the same rule for the same reason.
+        self.declared_attention_scope = None
 
     # -- assembly -------------------------------------------------------
 
@@ -711,11 +788,56 @@ class ParametricPriceLibrary(PriceLibrary):
             scope = dict(declared)
             if resolved is not None:
                 scope.update(resolved.for_op(op))
+            scope = self._with_declared_scope(scope, op, price_path)
+            for name in (record or {}).get("kernels") or {}:
+                canonical = _canonical_kernel(name)
+                if canonical != name:
+                    self._pooled_kernels.setdefault(
+                        canonical, set()).add(name)
             self._attention_obs.append(
                 (op, float(seconds), price_path, scope,
                  _measurement_identity(record, policy), _host_seconds(record),
                  _qualification(record)))
         self._attention_model = None
+
+    def _with_declared_scope(self, scope: dict, op: dict,
+                             price_path: str) -> dict:
+        """The file's own scope, with a caller's declaration filling silences.
+
+        Only silences. Where the file and the declaration both state a key and
+        disagree, this raises: one of them is wrong about what ran, and which
+        one is not something this can decide. Answering from either would file
+        the measurement under a deployment it may not have been taken in, and
+        a wrong scope answers where an absent one refuses.
+
+        The keys it may fill are the two families' own scope keys and nothing
+        else. A declaration is a reading of which kernel-selecting facts held;
+        it is not a place to write measurement conditions the collector did
+        not record, and letting it reach `_MEASUREMENT_CONDITIONS` would make
+        a caller able to claim two files were captured alike.
+        """
+        declaration = self.declared_attention_scope
+        if declaration is None:
+            return scope
+        offered = declaration.for_op(op)
+        if not offered:
+            return scope
+        filled = dict(scope)
+        for key in _ATTENTION_SCOPE_KEYS:
+            if key not in offered:
+                continue
+            value = _hashable(offered[key])
+            if key in filled:
+                if filled[key] != value:
+                    raise ValueError(
+                        "%s was measured with %s=%r recorded in the file, and "
+                        "the declared measured scope says %r. A caller may "
+                        "name a fact the file leaves unstated, not overrule "
+                        "one it states: fix whichever is wrong about what ran."
+                        % (price_path, key, filled[key], value))
+                continue
+            filled[key] = value
+        return filled
 
     def attention_design_points(self) -> list:
         """The collected observations with layer replicates collapsed.
@@ -840,6 +962,19 @@ class ParametricPriceLibrary(PriceLibrary):
             path: dict(entry["context"])
             for path, entry in sorted(self._attention_acquisition.items())}
         coverage["launch_charge_seconds"] = self.launch_charge_seconds
+        # Whether any of this was filed under a scope the FILES stated or one
+        # a caller declared for them. A law fitted over declared facts is
+        # exactly as good as the declaration, and a reader cannot weigh it
+        # without being told the declaration was there.
+        coverage["declared_measured_scope"] = (
+            None if self.declared_attention_scope is None
+            else self.declared_attention_scope.as_dict())
+        # Which compiler specializations were pooled into one treatment, and
+        # what they were. Empty for every library that priced nothing
+        # geometry-specialized, which is most of them.
+        coverage["pooled_kernel_specializations"] = {
+            canonical: sorted(names)
+            for canonical, names in sorted(self._pooled_kernels.items())}
         return coverage
 
     def _build(self) -> None:
