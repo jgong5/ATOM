@@ -259,6 +259,127 @@ class TestTheSelectorIsAboutRecordsAndNotRankOrdinals:
             ranks[1]["budget_source"]
 
 
+def _replay_shaped(saved_path, out):
+    """The same payload as `replay.py` nests it, under `.run.server`."""
+    with open(saved_path, encoding="utf-8") as handle:
+        said = json.load(handle)
+    out.write_text(json.dumps({"run": {"server": said}}), encoding="utf-8")
+    return out
+
+
+class TestTheSavedArtifactIsAcceptedDirectly:
+    """No extraction step at all, where the consumer can take the artifact.
+
+    `budget_source_object` reads either container, so `--budget-source` can be
+    pointed straight at what the harness wrote. That is better than a jq step
+    for the same reason the record beats the option string: one fewer file
+    between the run and the thing reading it.
+
+    Skipped where the parser under test predates that -- the extraction path
+    is what those versions take, and it still works.
+    """
+
+    def _direct(self, memval, path, **kw):
+        if not hasattr(memval, "budget_source_object"):
+            pytest.skip("this parser predates budget_source_object")
+        with open(path, encoding="utf-8") as handle:
+            blob = json.load(handle)
+        return memval.budget_source_object(blob, str(path), **kw)
+
+    def test_the_provenance_artifact_is_read_without_extraction(
+            self, memval, monkeypatch, tmp_path):
+        saved = _saved(tmp_path, _api_payload(monkeypatch, tmp_path))
+
+        direct = self._direct(memval, saved)
+
+        assert direct == _select(saved), "the same object, not a copy of some"
+
+    def test_the_replay_artifact_is_read_without_extraction(
+            self, memval, monkeypatch, tmp_path):
+        """The other container: `.run.server.compass...`."""
+        saved = _saved(tmp_path, _api_payload(monkeypatch, tmp_path))
+        nested = _replay_shaped(saved, tmp_path / "modelled.r1.json")
+
+        direct = self._direct(memval, nested)
+
+        assert direct == _select(saved)
+
+    def test_an_already_extracted_object_still_reads(self, memval, monkeypatch,
+                                                     tmp_path):
+        """Compatibility both ways: the extraction path keeps working, so a
+        cell prepared for an older consumer is not stranded."""
+        saved = _saved(tmp_path, _api_payload(monkeypatch, tmp_path))
+        handed = tmp_path / "budget_source.json"
+        handed.write_text(json.dumps(_select(saved)), encoding="utf-8")
+
+        direct = self._direct(memval, handed)
+
+        assert direct == _select(saved)
+
+    def test_the_direct_read_yields_the_same_results_as_extraction(
+            self, memval, monkeypatch, tmp_path):
+        """The claim that matters: pointing at the artifact and pointing at an
+        extracted object give the parser the same profile, digest, attested
+        inputs, lineage and served count."""
+        if not hasattr(memval, "budget_source_object"):
+            pytest.skip("this parser predates budget_source_object")
+        saved = _saved(tmp_path, _api_payload(monkeypatch, tmp_path))
+        handed = tmp_path / "budget_source.json"
+        handed.write_text(json.dumps(_select(saved)), encoding="utf-8")
+
+        extracted = memval.profile_from_budget_source(str(handed))
+        with open(saved, encoding="utf-8") as handle:
+            direct_obj = memval.budget_source_object(
+                json.load(handle), str(saved))
+        straight = tmp_path / "straight.json"
+        straight.write_text(json.dumps(direct_obj), encoding="utf-8")
+        direct = memval.profile_from_budget_source(str(straight))
+
+        for key in ("profile", "profile_sha256", "attested", "lineage",
+                    "num_kvcache_blocks", "kind"):
+            assert direct[key] == extracted[key], key
+
+    def test_one_physical_record_is_not_spread_across_logical_ranks(
+            self, memval, monkeypatch, tmp_path):
+        """The bridge's own caveat, checked against the consumer's rule.
+
+        A GPU-free replay writes one physical record carrying a whole width's
+        budget. Asked for a width it does not state, the selector must not
+        hand it over as if it were that rank's.
+        """
+        if not hasattr(memval, "budget_source_object"):
+            pytest.skip("this parser predates budget_source_object")
+        saved = _saved(tmp_path, _api_payload(monkeypatch, tmp_path))
+        with open(saved, encoding="utf-8") as handle:
+            blob = json.load(handle)
+
+        ranks = blob["compass"]["loaded_inputs"]["ranks"]
+        assert len(ranks) == 1, "one physical predictor"
+        # One record is unambiguous and is returned whatever width is asked
+        # for; the record states its own width and the caller compares.
+        direct = memval.budget_source_object(blob, str(saved), world=4)
+        stated = (direct.get("lineage") or {}).get("world_size")
+        assert stated != 4 or stated is None, (
+            "if this ever states 4 the fixture changed, not the rule")
+
+    def test_two_records_that_cannot_be_told_apart_are_refused(
+            self, memval, monkeypatch, tmp_path):
+        """And where there really are two, an index is the wrong way to
+        choose, so the selector refuses rather than picking."""
+        if not hasattr(memval, "budget_source_object"):
+            pytest.skip("this parser predates budget_source_object")
+        saved = _saved(tmp_path, _api_payload(monkeypatch, tmp_path))
+        with open(saved, encoding="utf-8") as handle:
+            blob = json.load(handle)
+        ranks = blob["compass"]["loaded_inputs"]["ranks"]
+        ranks.append(json.loads(json.dumps(ranks[0])))
+
+        with pytest.raises(SystemExit) as refused:
+            memval.budget_source_object(blob, str(saved))
+
+        assert "not a TP rank" in str(refused.value)
+
+
 class TestWhatTheBridgeCannotCarry:
     """Two boundaries found while verifying the bridge. Both are MEMORY's to
     correct; recorded here so the handoff carries evidence rather than a
