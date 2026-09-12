@@ -677,10 +677,11 @@ class TestTheCostsItCanMeasure:
         validate = _load("cc_traces_validate")
         for term in validate.MEASURED_COST_TERMS:
             assert isinstance(costs[term], float)
-        # A supplied second carries where it was read from and what contains
-        # it, so a total can tell it from a measured one and not double it.
+        # A supplied second carries where it was read from, what contains it
+        # and which repeat spent it, so a total can tell it from a measured
+        # one, not double it, and keep it beside one repeat of execution.
         for term in validate.SUPPLIED_COST_TERMS:
-            assert set(costs[term]) == {"seconds", "source", "within"}
+            assert set(costs[term]) == {"seconds", "source", "within", "repeat"}
             assert costs[term]["source"]
         assert costs["load"]["within"] == "startup_real"
         assert costs["capture"]["within"] is None
@@ -1578,3 +1579,157 @@ class TestBothPortsAreCheckedBeforeAnythingIsLaunched:
         ports = runner._ports(step, lambda flag: run_mod._after(step["command"], flag))
         assert set(ports) == {"http_dial"}
         assert ports["http_dial"]["port"] == 8000
+
+
+class TestDerivationIsAttributedToTheRepeatThatSpentIt:
+    """A journal covers the whole cell; the cost terms are per repeat.
+
+    `execution_modelled` is the median of the cell's repeats -- what one
+    replay cost. So every second placed beside it has to be one repeat's
+    worth too, or the ratio built from the two is wrong by the repeat count.
+    The journal already carries each derivation's own interval and the side
+    record already carries each repeat's windows, so the attribution is an
+    intersection, not an allocation.
+    """
+
+    def _cell(self, tmp_path, repeats=3):
+        cell = tmp_path / "tp2_long"
+        cell.mkdir(parents=True, exist_ok=True)
+        wall = {"startup": run_mod.WALL_CLOCK, "execution": run_mod.WALL_CLOCK}
+        base = 1000.0
+        rows = []
+        for index in range(1, repeats + 1):
+            start = base + (index - 1) * 1000.0
+            rows.append(
+                {
+                    "repeat": index,
+                    "execution_s": 10.0,
+                    "startup_s": 20.0,
+                    "startup_window": [start, start + 20.0],
+                    "execution_window": [start + 20.0, start + 30.0],
+                }
+            )
+        (cell / "costs.modelled.json").write_text(
+            json.dumps(
+                {
+                    "cost_schema": run_mod.COSTS_SCHEMA,
+                    "clocks": dict(wall, served_window="virtual"),
+                    "repeats": repeats,
+                    "startup_modelled": 20.0,
+                    "execution_modelled": 10.0,
+                    "served_window_modelled": 300.0,
+                    "per_execution": rows,
+                }
+            )
+        )
+        (cell / "costs.real.json").write_text(
+            json.dumps(
+                {
+                    "cost_schema": run_mod.COSTS_SCHEMA,
+                    "clocks": dict(wall, served_window="wall"),
+                    "repeats": repeats,
+                    "startup_real": 100.0,
+                    "execution_real": 120.0,
+                    "served_window_real": 119.0,
+                    "per_execution": [
+                        {
+                            "repeat": index,
+                            "execution_s": 120.0,
+                            "startup_s": 100.0,
+                            "startup_window": [0.0, 100.0],
+                            "execution_window": [100.0, 220.0],
+                        }
+                        for index in range(1, repeats + 1)
+                    ],
+                }
+            )
+        )
+        return cell
+
+    def _journal(self, tmp_path, cell, repeats=3):
+        """One 10-second derivation inside each repeat's startup window."""
+        path = tmp_path / "derivations.jsonl"
+        lines = []
+        for index in range(1, repeats + 1):
+            start = 1000.0 + (index - 1) * 1000.0 + 5.0
+            lines.append(json.dumps({"t0": start, "t1": start + 10.0}))
+        path.write_text("\n".join(lines) + "\n")
+        return path
+
+    def test_each_derivation_is_charged_to_its_own_repeat(self, tmp_path):
+        """The defect: three repeats' derivations were merged into one 30 s
+        part, which then sat beside a 10 s median execution."""
+        cell = self._cell(tmp_path)
+        journal = self._journal(tmp_path, cell)
+        assert run_mod.main(self._argv(cell, journal)) == 0
+        parts = json.loads((cell / "costs.json").read_text())["derivation"]
+        by_repeat = {p.get("repeat"): p["seconds"] for p in parts}
+        assert by_repeat == {1: 10.0, 2: 10.0, 3: 10.0}
+        assert {p["within"] for p in parts} == {"startup_modelled"}
+
+    def test_the_merged_record_says_what_each_repeat_cost(self, tmp_path):
+        cell = self._cell(tmp_path)
+        assert run_mod.main(self._argv(cell, self._journal(tmp_path, cell))) == 0
+        costs = json.loads((cell / "costs.json").read_text())
+        assert costs["repeats"] == {"real": 3, "modelled": 3}
+        assert costs["execution_by_repeat"]["modelled"] == {
+            "1": 10.0,
+            "2": 10.0,
+            "3": 10.0,
+        }
+        assert costs["startup_by_repeat"]["modelled"]["2"] == 20.0
+
+    def test_the_gate_built_from_it_is_per_repeat(self, tmp_path):
+        """End to end: 120 s of real serving against one repeat's 10 s replay
+        plus that repeat's own 10 s of derivation is 6×, not 3×."""
+        cell = self._cell(tmp_path)
+        assert run_mod.main(self._argv(cell, self._journal(tmp_path, cell))) == 0
+        validate = _load("cc_traces_validate")
+        got = validate._speedup(
+            json.loads((cell / "costs.json").read_text()), reuse_cells=1
+        )
+        assert got["replay_ratio"] == pytest.approx(6.0)
+
+    def test_a_derivation_in_no_repeats_window_carries_no_repeat(self, tmp_path):
+        cell = self._cell(tmp_path)
+        path = tmp_path / "derivations.jsonl"
+        path.write_text(json.dumps({"t0": 900.0, "t1": 903.0}) + "\n")
+        assert run_mod.main(self._argv(cell, path)) == 0
+        parts = json.loads((cell / "costs.json").read_text())["derivation"]
+        parts = parts if isinstance(parts, list) else [parts]
+        assert [(p["within"], p.get("repeat"), p["seconds"]) for p in parts] == [
+            (None, None, 3.0)
+        ]
+
+    def test_a_side_that_kept_no_per_repeat_record_is_not_merged(
+        self, tmp_path, capsys
+    ):
+        """Three repeats and one number is a median; there is nothing to
+        match a per-repeat cost against."""
+        cell = self._cell(tmp_path)
+        blob = json.loads((cell / "costs.modelled.json").read_text())
+        del blob["per_execution"]
+        (cell / "costs.modelled.json").write_text(json.dumps(blob))
+        assert run_mod.main(self._argv(cell, self._journal(tmp_path, cell))) == 2
+        assert "per_execution" in capsys.readouterr().err
+        assert not (cell / "costs.json").exists()
+
+    def _argv(self, cell, journal):
+        return [
+            "costs",
+            str(cell),
+            "--capture",
+            "0",
+            "--capture-source",
+            "capture/manifest.json",
+            "--calibration",
+            "0",
+            "--calibration-source",
+            "registry/calibration.json",
+            "--derivation-journal",
+            str(journal),
+            "--load",
+            "0",
+            "--load-source",
+            "server.log",
+        ]

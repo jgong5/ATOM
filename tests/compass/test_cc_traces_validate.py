@@ -1318,25 +1318,84 @@ class TestCalibrationProvenanceIsTransitive:
         _write(path, blob)
 
 
-def _cell_verdict(name, klass, real, modelled, spread=0.01):
-    """A passed cell carrying one metric, for the ranking gate."""
+def _cell_verdict(
+    name,
+    klass,
+    real,
+    modelled,
+    spread=0.01,
+    *,
+    tp=1,
+    modelled_spread=None,
+    metrics=("throughput_tok_s",),
+    speedup=10.0,
+):
+    """A passed cell, for the ranking gate.
+
+    Both sides carry a range, not just a centre. The real one is what says
+    whether the hardware separated two configurations; the modelled one is what
+    says whether the model claims a separation of its own, and the protocol's
+    §6 fidelity rule is a comparison of the two. A fixture that carried only
+    the real spread could not express an invented separation at all.
+    """
+    if modelled_spread is None:
+        modelled_spread = spread
+    block = {
+        "real": [real],
+        "modelled": [modelled],
+        "real_centre": real,
+        "modelled_centre": modelled,
+        "real_range": [real * (1 - spread), real * (1 + spread)],
+        "modelled_range": [
+            modelled * (1 - modelled_spread),
+            modelled * (1 + modelled_spread),
+        ],
+        "error_pct": 0.0,
+        "tolerance_pct": 10.0,
+        "within_tolerance": True,
+    }
     return {
         "cell": name,
         "class": klass,
+        "tp": tp,
         "passed": True,
-        "metrics": {
-            "throughput_tok_s": {
-                "real": [real],
-                "modelled": [modelled],
-                "real_centre": real,
-                "modelled_centre": modelled,
-                "real_range": [real * (1 - spread), real * (1 + spread)],
-                "error_pct": 0.0,
-                "tolerance_pct": 10.0,
-                "within_tolerance": True,
-            }
-        },
+        "metrics": {metric: dict(block) for metric in metrics},
+        "speedup": {"replay_ratio": speedup, "meets_gate": speedup >= 5.0},
     }
+
+
+#: Every objective the matrix ranks, which is what a cell has to carry.
+ALL_METRICS = tuple(validate.OBJECTIVES)
+
+
+def _six(tmp_path, over=None):
+    """The six cells of the registered matrix, written out and passing.
+
+    `over` is a mapping keyed by `(tp, class)` that replaces that cell's
+    verdict, so a test can break exactly one of the six and leave the rest a
+    matrix.
+    """
+    over = over or {}
+    dirs = []
+    for tp in (1, 2, 4):
+        for klass in ("short", "long"):
+            name = f"tp{tp}_{klass}"
+            where = tmp_path / name
+            where.mkdir(parents=True, exist_ok=True)
+            blob = over.get(
+                (tp, klass),
+                _cell_verdict(
+                    name,
+                    klass,
+                    100.0 * tp,
+                    100.0 * tp,
+                    tp=tp,
+                    metrics=ALL_METRICS,
+                ),
+            )
+            (where / "cc_traces_cell.json").write_text(json.dumps(blob))
+            dirs.append(str(where))
+    return dirs
 
 
 class TestTheRankingGate:
@@ -1642,11 +1701,18 @@ class TestADiagnosticIsNotACellHoweverItIsNamed:
         assert any("does not say what the run was for" in r for r in self._fail(cell))
 
     def test_a_stored_verdict_with_no_purpose_keeps_its_history(self, cell, capsys):
-        """The exception: verdicts predate the field and are not re-graded."""
+        """The exception: verdicts predate the field and are not re-graded.
+
+        One cell is not a matrix, so this cannot assert acceptance -- what it
+        asserts is that nothing is said about purpose. A missing field is not
+        a diagnostic marker.
+        """
         blob = {"cell": str(cell), "class": "long", "tp": 2, "passed": True}
         (Path(cell) / "cc_traces_cell.json").write_text(json.dumps(blob))
-        assert validate.main(["matrix", str(cell)]) == 0
-        capsys.readouterr()
+        validate.main(["matrix", str(cell)])
+        out = capsys.readouterr().out
+        assert "not acceptance" not in out
+        assert "DIAGNOSTIC.json is present" not in out
 
     def test_a_passing_verdict_beside_a_marker_is_refused_by_the_matrix(
         self, cell, capsys
@@ -1933,3 +1999,331 @@ class TestTheSourceFactoryWasGivenAWholeModel:
         assert any(
             "left regions" in r for r in self._reasons({**GOOD_FACTORY, "regions": ""})
         )
+
+
+class TestTheMatrixIsAWholeMatrix:
+    """A decision over part of the matrix is not the registered decision.
+
+    `CC_TRACES_PROTOCOL.md` §3 names six cells -- TP ∈ {1,2,4} × {short, long}
+    -- and §6's gates are about the ranking *across* them. One cell cannot
+    disagree with itself about which width is best, so a matrix assembled from
+    fewer than six has nothing to rank and must not report a pass.
+    """
+
+    def test_a_single_cell_is_not_a_matrix(self, tmp_path, capsys):
+        """The defect: every per-metric result was skipped for having fewer
+        than two comparable cells, and `all()` over nothing is True."""
+        where = tmp_path / "tp1_long"
+        where.mkdir()
+        (where / "cc_traces_cell.json").write_text(
+            json.dumps(
+                _cell_verdict(
+                    "tp1_long", "long", 100.0, 100.0, tp=1, metrics=ALL_METRICS
+                )
+            )
+        )
+        assert validate.main(["matrix", str(where)]) == 1
+        assert "PASS" not in capsys.readouterr().out
+
+    def test_the_six_registered_cells_pass(self, tmp_path, capsys):
+        assert validate.main(["matrix"] + _six(tmp_path)) == 0
+        assert "MATRIX PASS" in capsys.readouterr().out
+
+    def test_a_matrix_missing_one_cell_is_refused(self, tmp_path, capsys):
+        dirs = _six(tmp_path)
+        assert validate.main(["matrix"] + dirs[:-1]) == 1
+        out = capsys.readouterr().out
+        assert "tp4" in out and "long" in out
+
+    def test_a_repeated_cell_does_not_stand_in_for_a_missing_one(
+        self, tmp_path, capsys
+    ):
+        """Six directories, five configurations. The count is right and the
+        matrix is not."""
+        dirs = _six(tmp_path)
+        twice = tmp_path / "tp1_short_again"
+        twice.mkdir()
+        (twice / "cc_traces_cell.json").write_text(
+            (tmp_path / "tp1_short" / "cc_traces_cell.json").read_text()
+        )
+        assert validate.main(["matrix"] + dirs + [str(twice)]) == 1
+        assert "twice" in capsys.readouterr().out
+
+    def test_a_cell_outside_the_registered_matrix_is_refused(self, tmp_path, capsys):
+        where = tmp_path / "tp8_long"
+        where.mkdir()
+        (where / "cc_traces_cell.json").write_text(
+            json.dumps(
+                _cell_verdict(
+                    "tp8_long", "long", 100.0, 100.0, tp=8, metrics=ALL_METRICS
+                )
+            )
+        )
+        assert validate.main(["matrix"] + _six(tmp_path) + [str(where)]) == 1
+        assert "tp=8" in capsys.readouterr().out
+
+    def test_a_cell_missing_an_objective_is_refused_not_skipped(self, tmp_path, capsys):
+        """The metric a cell does not carry is the one nobody ranked."""
+        short = _cell_verdict(
+            "tp2_short", "short", 200.0, 200.0, tp=2, metrics=ALL_METRICS
+        )
+        del short["metrics"]["ttft"]
+        dirs = _six(tmp_path, {(2, "short"): short})
+        assert validate.main(["matrix"] + dirs) == 1
+        assert "ttft" in capsys.readouterr().out
+
+
+class TestTheSpeedupGateIsPartOfTheVerdict:
+    """§6 registers the ≥5× replay speedup as a gate, not as a footnote.
+
+    An accurate model is not the claim being accepted. The claim is an
+    accurate model that answers faster than the hardware does, and a matrix
+    that ranks perfectly at 2× has measured something valid and failed the
+    acceptance it was run for.
+    """
+
+    def _slow(self, tmp_path, ratio=2.0):
+        slow = _cell_verdict(
+            "tp4_long",
+            "long",
+            400.0,
+            400.0,
+            tp=4,
+            metrics=ALL_METRICS,
+            speedup=ratio,
+        )
+        return _six(tmp_path, {(4, "long"): slow})
+
+    def test_an_accurate_matrix_that_replays_too_slowly_is_not_accepted(
+        self, tmp_path, capsys
+    ):
+        assert validate.main(["matrix"] + self._slow(tmp_path)) == 1
+        out = capsys.readouterr().out
+        assert "MATRIX FAIL" in out
+
+    def test_the_failing_measurement_is_still_reported(self, tmp_path):
+        out = tmp_path / "verdict.json"
+        validate.main(["matrix"] + self._slow(tmp_path) + ["--out", str(out)])
+        report = json.loads(out.read_text())
+        # Valid, measured, and reported -- and not accepted. The distinction
+        # is the point: a refused cell has no numbers to read, a failed gate
+        # has numbers that say why it failed.
+        assert len(report["cells_used"]) == 6
+        assert not report["refused"]
+        assert report["speedup"]["tp4_long"]["replay_ratio"] == 2.0
+        assert report["gates"]["speedup"] is False
+        assert report["accepted"] is False
+
+    def test_a_cell_whose_gate_was_never_computed_is_not_accepted(self, tmp_path):
+        unknown = _cell_verdict(
+            "tp1_short", "short", 100.0, 100.0, tp=1, metrics=ALL_METRICS
+        )
+        unknown["speedup"] = {
+            "replay_ratio": None,
+            "meets_gate": None,
+            "reason": "costs.json carries no execution terms",
+        }
+        dirs = _six(tmp_path, {(1, "short"): unknown})
+        assert validate.main(["matrix"] + dirs) == 1
+
+
+class TestTiesAndSeparationsAreBothGated:
+    """§6: a model that invents a separation the hardware does not show fails,
+    and so does one that flattens a separation the hardware does show.
+
+    Both sides are read as spreads. Two cells are separated on a side when
+    that side's repeats do not overlap, and tied when they do -- the same rule
+    for the model as for the hardware, because the question is whether the
+    model claims a difference the hardware has, not whether its centres happen
+    to sort the same way.
+    """
+
+    def _pair(self, real_spread, modelled_spread, modelled=(100.0, 101.0)):
+        return [
+            _cell_verdict(
+                "tp1_long",
+                "long",
+                100.0,
+                modelled[0],
+                real_spread,
+                tp=1,
+                modelled_spread=modelled_spread,
+            ),
+            _cell_verdict(
+                "tp2_long",
+                "long",
+                101.0,
+                modelled[1],
+                real_spread,
+                tp=2,
+                modelled_spread=modelled_spread,
+            ),
+        ]
+
+    def test_an_invented_separation_fails(self):
+        """The hardware's repeats overlap; the model's do not. The model is
+        claiming a difference nothing measured."""
+        cells = self._pair(real_spread=0.05, modelled_spread=0.0001)
+        out = validate._decide(cells, "throughput_tok_s", "max")
+        assert out["separation_faithful"] is False
+        assert any("invent" in r for r in out["separation_failures"])
+
+    def test_a_flattened_separation_fails(self):
+        """The hardware separates them; the model's spread swallows it."""
+        cells = self._pair(real_spread=0.0001, modelled_spread=0.05)
+        out = validate._decide(cells, "throughput_tok_s", "max")
+        assert out["separation_faithful"] is False
+        assert any("flatten" in r for r in out["separation_failures"])
+
+    def test_agreeing_about_a_tie_is_faithful(self):
+        out = validate._decide(
+            self._pair(real_spread=0.05, modelled_spread=0.05),
+            "throughput_tok_s",
+            "max",
+        )
+        assert out["separation_faithful"] is True
+        assert out["separation_failures"] == []
+
+    def test_agreeing_about_a_separation_is_faithful(self):
+        out = validate._decide(
+            self._pair(real_spread=0.0001, modelled_spread=0.0001),
+            "throughput_tok_s",
+            "max",
+        )
+        assert out["separation_faithful"] is True
+
+    def test_a_verdict_with_no_modelled_spread_cannot_be_judged(self):
+        cells = self._pair(0.01, 0.01)
+        for cell in cells:
+            del cell["metrics"]["throughput_tok_s"]["modelled_range"]
+            cell["metrics"]["throughput_tok_s"]["modelled"] = []
+        out = validate._decide(cells, "throughput_tok_s", "max")
+        assert out["separation_faithful"] is False
+        assert any("spread" in r for r in out["separation_failures"])
+
+    def test_the_matrix_reads_it(self, tmp_path, capsys):
+        """An invented separation inside one class fails the whole matrix."""
+        liar = _cell_verdict(
+            "tp4_short",
+            "short",
+            100.0,
+            400.0,
+            0.05,
+            tp=4,
+            modelled_spread=0.0001,
+            metrics=ALL_METRICS,
+        )
+        honest = {
+            (tp, "short"): _cell_verdict(
+                f"tp{tp}_short",
+                "short",
+                100.0 + tp * 0.1,
+                100.0,
+                0.05,
+                tp=tp,
+                modelled_spread=0.0001,
+                metrics=ALL_METRICS,
+            )
+            for tp in (1, 2)
+        }
+        dirs = _six(tmp_path, {**honest, (4, "short"): liar})
+        assert validate.main(["matrix"] + dirs) == 1
+        assert "MATRIX FAIL" in capsys.readouterr().out
+
+
+class TestTheGateDividesLikeForLike:
+    """Execution is one repeat's seconds; derivation must be too.
+
+    `execution_modelled` is the median over the cell's repeats -- what one
+    replay cost. A derivation journal covers every repeat, so summing it and
+    adding it to a single repeat's execution divides a per-repeat numerator by
+    an all-repeats denominator, and the ratio is wrong by the repeat count.
+    """
+
+    def _costs(
+        self,
+        repeats=3,
+        execution=10.0,
+        derivation=10.0,
+        real=120.0,
+        within="startup_modelled",
+        attribute=True,
+    ):
+        parts = []
+        for index in range(1, repeats + 1):
+            part = {
+                "seconds": derivation,
+                "source": "derivations.jsonl",
+                "within": within,
+            }
+            if attribute:
+                part["repeat"] = index
+            parts.append(part)
+        return {
+            "capture": _supplied(0.0),
+            "calibration": _supplied(0.0),
+            "derivation": parts,
+            "load": _supplied(0.0),
+            "startup_real": 0.0,
+            "startup_modelled": 0.0,
+            "execution_real": real,
+            "execution_modelled": execution,
+            "execution_clocks": {"real": "wall", "modelled": "wall"},
+            "repeats": {"real": repeats, "modelled": repeats},
+            "execution_by_repeat": {
+                "real": {str(i): real for i in range(1, repeats + 1)},
+                "modelled": {str(i): execution for i in range(1, repeats + 1)},
+            },
+            "startup_by_repeat": {
+                "real": {str(i): 0.0 for i in range(1, repeats + 1)},
+                "modelled": {str(i): 0.0 for i in range(1, repeats + 1)},
+            },
+        }
+
+    def test_one_repeats_execution_is_divided_by_one_repeats_derivation(self):
+        """Three repeats, each 10 s of replay and 10 s of derivation, against
+        120 s of real serving. One question costs 20 s, so the gate is 6×."""
+        got = validate._speedup(self._costs(), reuse_cells=1)
+        assert got["replay_ratio"] == pytest.approx(6.0)
+        assert got["meets_gate"] is True
+        # The whole term is still reported; only the denominator is per-repeat.
+        assert got["derivation_included_s"] == pytest.approx(30.0)
+        assert got["derivation_per_repeat_s"] == pytest.approx(10.0)
+
+    def test_derivation_inside_the_replay_window_is_still_counted_once(self):
+        """Containment does not change: seconds the execution window already
+        holds are not added to it again, per repeat as before."""
+        got = validate._speedup(self._costs(within="execution_modelled"), reuse_cells=1)
+        assert got["replay_ratio"] == pytest.approx(12.0)
+        assert got["derivation_added_to_gate_s"] == pytest.approx(0.0)
+        assert got["derivation_inside_execution_s"] == pytest.approx(30.0)
+
+    def test_seconds_belonging_to_no_repeat_are_refused(self):
+        """A journal row outside every measured window has no repeat to be
+        divided by, and guessing one is what this replaces."""
+        got = validate._speedup(self._costs(attribute=False), reuse_cells=1)
+        assert got["meets_gate"] is None
+        assert "repeat" in got["reason"]
+
+    def test_a_multi_repeat_record_with_no_attribution_at_all_is_refused(self):
+        costs = self._costs()
+        del costs["execution_by_repeat"]
+        got = validate._speedup(costs, reuse_cells=1)
+        assert got["meets_gate"] is None
+        assert "repeat" in got["reason"]
+
+    def test_a_cost_that_happens_once_per_repeat_may_say_so(self):
+        """A supplied term nobody journalled can still be placed: `each` says
+        these seconds are spent in every repeat, which is a claim the record
+        carries rather than an allocation the reader invents."""
+        costs = self._costs(attribute=False)
+        costs["derivation"] = [
+            {
+                "seconds": 10.0,
+                "source": "startup.json",
+                "within": "startup_modelled",
+                "repeat": "each",
+            }
+        ]
+        got = validate._speedup(costs, reuse_cells=1)
+        assert got["replay_ratio"] == pytest.approx(6.0)

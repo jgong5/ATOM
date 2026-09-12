@@ -110,8 +110,18 @@ SUPPLIED_COST_TERMS = ("capture", "calibration", "derivation", "load")
 #: The record shape whose supplied terms were bare numbers. Refused rather
 #: than upgraded: it never stated containment, so there is nothing to read.
 COSTS_SCHEMA_V2 = "compass.costs/2"
+#: The record shape whose supplied terms carried no repeat. Its execution
+#: terms are medians over the cell's repeats and its journalled terms are sums
+#: over all of them, so a ratio of the two is wrong by the repeat count and
+#: nothing in the record says by how much. Refused rather than upgraded.
+COSTS_SCHEMA_V3 = "compass.costs/3"
 #: What `cc_traces_run.py costs` writes now.
-COSTS_SCHEMA = "compass.costs/3"
+COSTS_SCHEMA = "compass.costs/4"
+
+#: What a supplied part writes in its `repeat` field when the cost is spent
+#: once in every repeat rather than in one of them. It is a claim the record
+#: makes, not an allocation a reader performs over a total.
+EVERY_REPEAT = "each"
 
 TOLERANCE_PCT = {"throughput_tok_s": 10.0, "tpot": 10.0, "ttft": 15.0}
 RHO_MIN = 0.90
@@ -1374,6 +1384,28 @@ def cell(args) -> int:
 
     costs_path = cell_dir / "costs.json"
     costs = json.loads(costs_path.read_text()) if costs_path.exists() else {}
+    said = costs.get("cost_schema")
+    if costs and said != COSTS_SCHEMA:
+        failures.append(
+            f"costs.json is a {said!r} record, not {COSTS_SCHEMA!r}: its "
+            f"execution terms are medians over this cell's repeats while its "
+            f"journalled terms are totals across all of them, and nothing in "
+            f"it says which repeat any second was spent in. A ratio of the "
+            f"two understates the replay speedup by the repeat count. "
+            f"Re-merge the cell rather than reinterpreting the old record"
+        )
+    for side in ("real", "modelled"):
+        stated = (costs.get("repeats") or {}).get(side)
+        if (
+            _finite(stated)
+            and int(stated) > 1
+            and not _by_repeat(costs, "execution_by_repeat", side)
+        ):
+            failures.append(
+                f"costs.json reports {int(stated)} {side} repeats but does not "
+                f"say what each one cost, so no per-repeat cost can be matched "
+                f"against its execution term"
+            )
     missing = [t for t in MEASURED_COST_TERMS if not _finite(costs.get(t))]
     for term in SUPPLIED_COST_TERMS:
         value = costs.get(term)
@@ -1596,6 +1628,11 @@ def _across_repeats(reports: list[dict]) -> dict:
             "real_centre": centre_r,
             "modelled_centre": centre_m,
             "real_range": [min(real), max(real)],
+            # The model's own spread, on the same footing as the hardware's.
+            # A separation is a claim either side can make, and §6 gates both
+            # directions of disagreement about one, so the modelled repeats
+            # have to be readable as a range and not only as a centre.
+            "modelled_range": [min(modelled), max(modelled)],
             "error_pct": (
                 ((centre_m - centre_r) / centre_r * 100.0) if centre_r else None
             ),
@@ -1686,6 +1723,82 @@ def _uncontained(costs: dict, term: str) -> float:
     return _outside(costs, term)
 
 
+def _repeat_of(part) -> object:
+    """Which repeat a supplied part's seconds were spent in.
+
+    `EVERY_REPEAT` is a part that happens once per repeat -- a cost the record
+    states rather than one a reader allocates. `None` is a part nobody placed,
+    and a part nobody placed cannot be matched to a per-repeat denominator.
+    """
+    value = part.get("repeat")
+    if value == EVERY_REPEAT:
+        return EVERY_REPEAT
+    if isinstance(value, bool) or not isinstance(value, (int, str)):
+        return None
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _by_repeat(costs: dict, key: str, side: str) -> dict:
+    """`{repeat: seconds}` for one side's measured window, or `{}`."""
+    block = ((costs.get(key) or {}).get(side)) or {}
+    if not isinstance(block, dict):
+        return {}
+    out = {}
+    for repeat, seconds in block.items():
+        try:
+            index = int(repeat)
+        except (TypeError, ValueError):
+            continue
+        if _finite(seconds):
+            out[index] = float(seconds)
+    return out
+
+
+def _for_repeat(costs: dict, term: str, repeat: int, *windows: str) -> float:
+    """This repeat's share of `term`, minus whatever `windows` already hold.
+
+    A part belongs to this repeat when it says so, or when it says it happens
+    in every repeat. Parts belonging to another repeat are another repeat's
+    cost and are not divided into this one.
+    """
+    total = 0.0
+    for part in _parts(costs, term):
+        seconds = part.get("seconds")
+        if not _finite(seconds):
+            continue
+        where = _repeat_of(part)
+        if where not in (repeat, EVERY_REPEAT):
+            continue
+        within = part.get("within")
+        if within and (not windows or within in windows):
+            continue
+        total += float(seconds)
+    return total
+
+
+def _unattributed(costs: dict, term: str, *windows: str) -> float:
+    """Seconds a total would add that belong to no repeat at all."""
+    total = 0.0
+    for part in _parts(costs, term):
+        seconds = part.get("seconds")
+        if not _finite(seconds) or _repeat_of(part) is not None:
+            continue
+        within = part.get("within")
+        if within and (not windows or within in windows):
+            continue
+        total += float(seconds)
+    return total
+
+
+def _quantile(values: list) -> float:
+    """The one quantile convention, applied to a list of per-repeat totals."""
+    ordered = sorted(values)
+    return ordered[min(len(ordered) - 1, int(0.5 * len(ordered)))]
+
+
 def _speedup(costs: dict, reuse_cells: int) -> dict:
     """The gate ratio, and every cost the gate does not include.
 
@@ -1695,6 +1808,16 @@ def _speedup(costs: dict, reuse_cells: int) -> dict:
     denominator because deriving this candidate's graph is work the prediction
     needs and a per-candidate cost; `capture` and `calibration` are not, because
     they happen once and the gate is about what asking one more question costs.
+
+    **Both halves of the ratio are one repeat's seconds.** `execution_*` is the
+    median over the cell's repeats -- what one replay cost -- so a derivation
+    journal covering three repeats cannot be added to it whole. Doing that
+    divided a per-repeat numerator by an all-repeats denominator and understated
+    the ratio by the repeat count: three repeats of a ten-second replay each
+    deriving for ten seconds, against two minutes of real serving, read 3x where
+    asking one question costs twenty seconds and the answer is 6x. So the
+    denominator is built per repeat and reduced under the same quantile
+    convention as the terms it is built from.
 
     Everything the gate excludes is reported beside it rather than folded in:
     the acquisition seconds, the startup-inclusive ratio for a reader who wants
@@ -1734,6 +1857,35 @@ def _speedup(costs: dict, reuse_cells: int) -> dict:
                 "two is not a speedup"
             ),
         }
+    # Which repeats there are to divide by. A record that states more than one
+    # repeat and does not say what each cost has nothing to match a journalled
+    # term against, and the median it does carry is not one repeat's total.
+    modelled_repeats = _by_repeat(costs, "execution_by_repeat", "modelled")
+    stated = (costs.get("repeats") or {}).get("modelled")
+    if not modelled_repeats and _finite(stated) and int(stated) > 1:
+        return {
+            "replay_ratio": None,
+            "amortised_ratio": None,
+            "meets_gate": None,
+            "reason": (
+                f"costs.json reports {int(stated)} modelled repeats but no "
+                f"execution_by_repeat: its execution term is a median over "
+                f"them and its supplied terms are totals across them, so the "
+                f"two cannot be put in one ratio. Re-merge the cell"
+            ),
+        }
+    stray = _unattributed(costs, "derivation", "execution_modelled")
+    if modelled_repeats and stray > 0:
+        return {
+            "replay_ratio": None,
+            "amortised_ratio": None,
+            "meets_gate": None,
+            "reason": (
+                f"{stray:.3f}s of derivation belongs to no repeat and is not "
+                f"inside a measured window: it cannot be charged to one "
+                f"question without deciding how many questions it was for"
+            ),
+        }
     # Deriving this candidate's graphs is work the prediction needs, so the
     # gate's denominator has to include all of it -- and exactly once. A
     # structure first seen mid-schedule is derived inside the served window, so
@@ -1746,34 +1898,73 @@ def _speedup(costs: dict, reuse_cells: int) -> dict:
     derivation_added = _outside(costs, "derivation", "execution_modelled")
     derivation_in_execution = derivation - derivation_added
     acquisition = sum(_supplied_seconds(costs, t) for t in ("capture", "calibration"))
-    predict_once = execution_modelled + derivation_added
-    replay_ratio = execution_real / predict_once if predict_once > 0 else None
-
     startup_real = float(costs.get("startup_real") or 0.0)
     startup_modelled = float(costs.get("startup_modelled") or 0.0)
-    # A supplied term that happens inside a measured window is already in that
-    # window's seconds. `load` is inside `startup_real` by the protocol's own
-    # definition (§5, "weight load and graph capture inside that startup"), so
-    # adding it here charged the real side twice; the same holds for any term
-    # that declares a container.
-    real_total = execution_real + startup_real + _uncontained(costs, "load")
-    modelled_total = (
-        execution_modelled + _uncontained(costs, "derivation") + startup_modelled
-    )
+    if modelled_repeats:
+        added_per_repeat = {
+            index: _for_repeat(costs, "derivation", index, "execution_modelled")
+            for index in modelled_repeats
+        }
+        predict_once = _quantile(
+            [modelled_repeats[i] + added_per_repeat[i] for i in modelled_repeats]
+        )
+        derivation_added_reported = _quantile(list(added_per_repeat.values()))
+        startups = _by_repeat(costs, "startup_by_repeat", "modelled")
+        modelled_total = _quantile(
+            [
+                modelled_repeats[i]
+                + startups.get(i, startup_modelled)
+                + _for_repeat(costs, "derivation", i)
+                for i in modelled_repeats
+            ]
+        )
+        real_repeats = _by_repeat(costs, "execution_by_repeat", "real")
+        real_startups = _by_repeat(costs, "startup_by_repeat", "real")
+        real_total = (
+            _quantile(
+                [
+                    real_repeats[i]
+                    + real_startups.get(i, startup_real)
+                    + _for_repeat(costs, "load", i)
+                    for i in real_repeats
+                ]
+            )
+            if real_repeats
+            else execution_real + startup_real + _uncontained(costs, "load")
+        )
+    else:
+        predict_once = execution_modelled + derivation_added
+        derivation_added_reported = derivation_added
+        # A supplied term that happens inside a measured window is already in
+        # that window's seconds. `load` is inside `startup_real` by the
+        # protocol's own definition (§5, "weight load and graph capture inside
+        # that startup"), so adding it here charged the real side twice; the
+        # same holds for any term that declares a container.
+        real_total = execution_real + startup_real + _uncontained(costs, "load")
+        modelled_total = (
+            execution_modelled + _uncontained(costs, "derivation") + startup_modelled
+        )
+    replay_ratio = execution_real / predict_once if predict_once > 0 else None
     per_cell = acquisition / max(1, reuse_cells)
     amortised_total = modelled_total + per_cell
     saved_per_cell = real_total - modelled_total
     return {
         "gate": (
             f"execution_real / (execution_modelled + the derivation that "
-            f"window does not already contain) >= {SPEEDUP_MIN}"
+            f"window does not already contain), both one repeat's seconds, "
+            f">= {SPEEDUP_MIN}"
         ),
         "replay_ratio": replay_ratio,
+        "repeats": sorted(modelled_repeats) or None,
         "derivation_included_s": derivation,
         # The same seconds, split by who already counted them, so a reader can
         # check that the denominator holds every derivation exactly once.
         "derivation_added_to_gate_s": derivation_added,
         "derivation_inside_execution_s": derivation_in_execution,
+        # What one question's derivation cost, which is what the gate divides
+        # by -- the whole term above is every question this cell asked.
+        "derivation_per_repeat_s": derivation_added_reported,
+        "predict_once_s": predict_once,
         "acquisition_s": acquisition,
         "acquisition_terms": {
             "capture": _supplied_seconds(costs, "capture"),
@@ -1836,6 +2027,78 @@ def spearman(a: list[float], b: list[float]):
 OBJECTIVES = {"throughput_tok_s": "max", "ttft": "min", "tpot": "min"}
 
 
+def _spread(block: dict, side: str):
+    """One side's range on a metric, from the range or from the repeats.
+
+    Returns None when the verdict carries neither, which is not the same as a
+    zero-width range: a side whose spread was never recorded cannot be said to
+    have separated two configurations or to have tied them.
+    """
+    stated = block.get(f"{side}_range")
+    if (
+        isinstance(stated, (list, tuple))
+        and len(stated) == 2
+        and all(_finite(v) for v in stated)
+    ):
+        return (float(min(stated)), float(max(stated)))
+    repeats = [v for v in (block.get(side) or []) if _finite(v)]
+    if repeats:
+        return (float(min(repeats)), float(max(repeats)))
+    return None
+
+
+def _overlap(left, right) -> bool:
+    return left[0] <= right[1] and right[0] <= left[1]
+
+
+def _fidelity(named: list) -> list:
+    """Where the model disagrees with the hardware about a tie, pair by pair.
+
+    `CC_TRACES_PROTOCOL.md` §6: two configurations are tied on a metric when
+    the repeats overlap on it, and a model that *invents* a separation the
+    hardware does not show fails, as does one that *flattens* a separation the
+    hardware does show. Both are read the same way on both sides -- overlap of
+    the measured spreads -- because the question is whether the model claims a
+    difference the hardware has, not whether its centres happen to sort the
+    same way. Top-1 agreement does not cover this: a model can pick the same
+    winner while claiming a gap between two configurations that are the same
+    machine within its own noise.
+    """
+    reasons = []
+    for i in range(len(named)):
+        for j in range(i + 1, len(named)):
+            (left, lm), (right, rm) = named[i], named[j]
+            pair = f"{left['cell']} vs {right['cell']}"
+            spreads = {
+                side: (_spread(lm, side), _spread(rm, side))
+                for side in ("real", "modelled")
+            }
+            missing = [
+                side for side, (a, b) in spreads.items() if a is None or b is None
+            ]
+            if missing:
+                reasons.append(
+                    f"{pair}: no {', '.join(missing)} spread is recorded, so "
+                    f"whether these two configurations differ is unmeasured"
+                )
+                continue
+            real_tied = _overlap(*spreads["real"])
+            modelled_tied = _overlap(*spreads["modelled"])
+            if real_tied and not modelled_tied:
+                reasons.append(
+                    f"{pair}: the model invents a separation the hardware does "
+                    f"not show -- the real repeats overlap and the modelled "
+                    f"ones do not"
+                )
+            elif modelled_tied and not real_tied:
+                reasons.append(
+                    f"{pair}: the model flattens a separation the hardware does "
+                    f"show -- the real repeats are apart and the modelled ones "
+                    f"overlap"
+                )
+    return reasons
+
+
 def _decide(cells: list[dict], metric: str, direction: str) -> dict:
     """Top-1 agreement, ties as the hardware shows them, and regret.
 
@@ -1876,6 +2139,7 @@ def _decide(cells: list[dict], metric: str, direction: str) -> dict:
     rho = spearman(
         [m["real_centre"] for _, m in named], [m["modelled_centre"] for _, m in named]
     )
+    separation_failures = _fidelity(named)
     return {
         "comparable_cells": len(named),
         "real_best": best[0]["cell"],
@@ -1886,14 +2150,41 @@ def _decide(cells: list[dict], metric: str, direction: str) -> dict:
         "regret_pct": regret,
         "spearman_rho": rho,
         "rho_meets_gate": (rho is not None and rho >= RHO_MIN),
+        "separation_failures": separation_failures,
+        "separation_faithful": not separation_failures,
         "within_tolerance": all(
             m.get("within_tolerance") is not False for _, m in named
         ),
     }
 
 
+#: The cells `CC_TRACES_PROTOCOL.md` §3 registers. The decision the protocol
+#: is for is which width to deploy at, per workload class, so the matrix is
+#: the unit of acceptance and a subset of it is not a smaller version of the
+#: same claim -- it is a different one.
+REGISTERED_CELLS = tuple((tp, klass) for tp in (1, 2, 4) for klass in sorted(WORKLOADS))
+
+
+def _cell_key(verdict: dict, where: str, refused: list):
+    """This verdict's place in the registered matrix, or None with a reason."""
+    klass, tp = verdict.get("class"), verdict.get("tp")
+    try:
+        tp = int(tp)
+    except (TypeError, ValueError):
+        tp = None
+    if (tp, klass) not in REGISTERED_CELLS:
+        refused.append(
+            f"{where}: this verdict is for tp={verdict.get('tp')!r} "
+            f"class={klass!r}, which is not one of the six cells the protocol "
+            f"registers ({', '.join(f'tp{t} {k}' for t, k in REGISTERED_CELLS)})"
+        )
+        return None
+    return (tp, klass)
+
+
 def matrix(args) -> int:
     cells, refused = [], []
+    seen = {}
     for where in args.dirs:
         path = Path(where) / "cc_traces_cell.json"
         if not path.exists():
@@ -1915,12 +2206,44 @@ def matrix(args) -> int:
                 f"{_purpose_of(verdict)!r}, not acceptance"
             )
             continue
-        (cells if verdict.get("passed") else refused).append(
-            verdict
-            if verdict.get("passed")
-            else f"{where}: the cell did not pass "
-            f"({len(verdict.get('failures') or [])} failures)"
-        )
+        if not verdict.get("passed"):
+            refused.append(
+                f"{where}: the cell did not pass "
+                f"({len(verdict.get('failures') or [])} failures)"
+            )
+            continue
+        key = _cell_key(verdict, where, refused)
+        if key is None:
+            continue
+        # Two directories for one configuration is not two measurements of the
+        # matrix; it is one cell counted twice while another is absent, and the
+        # count alone cannot tell the difference.
+        if key in seen:
+            refused.append(
+                f"{where}: tp{key[0]} {key[1]} is already contributed by "
+                f"{seen[key]}, so this cell would be counted twice"
+            )
+            continue
+        seen[key] = where
+        cells.append(verdict)
+    # Every objective, for every cell. A cell that carries no `ttft` is a cell
+    # nobody ranked on `ttft`, and skipping the comparison reports a gate that
+    # was never evaluated as one that passed.
+    for verdict in cells:
+        absent = [m for m in OBJECTIVES if m not in (verdict.get("metrics") or {})]
+        if absent:
+            refused.append(
+                f"{verdict['cell']}: no {', '.join(sorted(absent))} in the "
+                f"verdict, so this cell cannot be ranked on "
+                f"{'them' if len(absent) > 1 else 'it'}"
+            )
+    for tp, klass in REGISTERED_CELLS:
+        if (tp, klass) not in seen:
+            refused.append(
+                f"tp{tp} {klass}: no cell was contributed for it. A ranking "
+                f"over part of the matrix is not the ranking the protocol "
+                f"registers"
+            )
     report = {
         "cells_used": [c["cell"] for c in cells],
         "refused": refused,
@@ -1953,18 +2276,40 @@ def matrix(args) -> int:
             print(
                 f"{klass:5s} {metric:18s} top1="
                 f"{result.get('top1_agrees')} rho={result.get('spearman_rho')} "
-                f"regret={result.get('regret_pct')}"
+                f"regret={result.get('regret_pct')} "
+                f"separation={result.get('separation_faithful')}"
             )
+            for reason in result.get("separation_failures") or ():
+                print(f"  SEPARATION: {klass} {metric}: {reason}")
+    # Validity and acceptance are different questions and the report answers
+    # both. Every cell above is a measurement this validator stands behind;
+    # whether the measurements together are the result the protocol registers
+    # is these gates, each reported by name so a failure says which claim
+    # failed rather than only that one did.
+    results = [r for block in report["by_class"].values() for r in block.values()]
+    gates = {
+        "ranking": all(
+            r.get("top1_agrees") and r.get("rho_meets_gate") for r in results
+        ),
+        "separation": all(r.get("separation_faithful") for r in results),
+        "tolerance": all(r.get("within_tolerance") for r in results),
+        # §6 registers the replay speedup as a gate. A model that ranks
+        # perfectly and answers no faster than the hardware has measured
+        # something valid and is not the thing being accepted.
+        "speedup": all(
+            ((c.get("speedup") or {}).get("meets_gate") is True) for c in cells
+        ),
+        "decided": all(not r.get("reason") for r in results),
+    }
+    report["gates"] = gates
+    report["accepted"] = all(gates.values())
+    for name, held in gates.items():
+        if not held:
+            print(f"  GATE FAILED: {name}")
     if args.out:
         Path(args.out).write_text(json.dumps(report, indent=1) + "\n")
-    passed = all(
-        r.get("top1_agrees") and r.get("rho_meets_gate") and r.get("within_tolerance")
-        for block in report["by_class"].values()
-        for r in block.values()
-        if r.get("comparable_cells", 0) >= 2
-    )
-    print("MATRIX " + ("PASS" if passed else "FAIL"))
-    return 0 if passed else 1
+    print("MATRIX " + ("PASS" if report["accepted"] else "FAIL"))
+    return 0 if report["accepted"] else 1
 
 
 def main(argv=None) -> int:
