@@ -415,17 +415,53 @@ def _cu_seqlens(queries):
     return out
 
 
-def _bind(key, template_value, rows):
+def _padding_of(shape: StepShape) -> tuple[int, int]:
+    """``(pad_rows, pad_tokens)``: how much of this step's buffers is padding.
+
+    A replayed decode runs ``running_bs`` rows and ``running_bs * max_q_len``
+    tokens while the batch has fewer of each, so every per-request and
+    per-token buffer the kernels read has a tail. Both numbers are zero without
+    a bucket, zero again for a batch that lands exactly on one, and zero for a
+    prefill at any bucket -- `ForwardMode.decide` sends a batch holding a
+    prefill token down the eager path (forward_context.py:196-204), so nothing
+    is replayed and nothing is padded.
+
+    ``template_key`` carries the bucket and the query-length vector, so a
+    template and any cohort bound to it agree on these two numbers by
+    construction: the padding is structure, and a cohort that changed it would
+    key its own template.
+    """
+    bucket = shape.capture_bucket
+    queries = [int(q) for q in shape.num_scheduled_tokens]
+    if bucket is None or int(getattr(shape, "num_prefill_tokens", 0) or 0):
+        return 0, 0
+    if not queries:
+        return 0, 0
+    return (int(bucket) - len(queries),
+            int(bucket) * max(queries) - sum(queries))
+
+
+def _bind(key, template_value, rows, pad_rows: int = 0, pad_tokens: int = 0):
     """One context entry, recomputed for ``rows``, or :class:`BindRefusal`.
 
     Every formula here is a property of the batch that the runner also computes
     from the batch. None reads the template's value except to keep a constant
     the cohort cannot change, or to learn a section count.
+
+    ``pad_rows`` and ``pad_tokens`` are the replay's padding, and each field
+    that has a tail gets its own -- the same tails
+    ``BatchSpec.attention_context`` derives, since both are reproducing what
+    the runner writes into the buffers a captured graph reads. Recomputing
+    these at the batch's width instead is how a padded template comes back
+    unpadded from a warm hit: the derivation is right and the binding narrows
+    it again, one cohort later.
     """
     queries = [q for q, _ in rows]
     contexts = [c for _, c in rows]
     if key == "context_lens":
-        return contexts
+        # Zero for a padded row: it holds no history to walk
+        # (aiter_attention.py:1115).
+        return contexts + [0] * pad_rows
     if key == "positions":
         # A request's next position is the last index of its history; a
         # multi-token query runs to the end of its chunk. The tensor is M-RoPE,
@@ -434,9 +470,15 @@ def _bind(key, template_value, rows):
         # from the template's own length rather than a constant, because the
         # template and the cohort share a query-length vector by construction
         # and so share the token count.
+        #
+        # Padded before the sections are counted, not after: the buffer is
+        # [position_rows, num_tokens_pad], so the pad is inside each section.
+        # Counting sections against the unpadded length would read a 3-request
+        # decode in a bucket of 4 as four sections of three.
         per_token = []
         for q, c in rows:
             per_token.extend(range(c - q, c))
+        per_token += [0] * pad_tokens
         tokens = len(per_token)
         if not tokens or len(template_value) % tokens:
             raise BindRefusal(
@@ -444,11 +486,19 @@ def _bind(key, template_value, rows):
                 "tokens; the section layout is not what this rule assumes")
         return per_token * (len(template_value) // tokens)
     if key == "max_seqlen_k":
+        # The real rows', not the padded ones'. A padded row's context is zero,
+        # and the runner's own `max_seqlen_q`/`max_seqlen_k` come off the
+        # scheduled batch (model_runner.py:3187).
         return max(contexts) if contexts else 0
     if key == "max_seqlen_q":
         return max(queries) if queries else 0
     if key == "cu_seqlens_q":
-        return _cu_seqlens(queries)
+        # The padded rows repeat the last real offset, which is what makes each
+        # of them an empty sequence for attention rather than a fifth request
+        # (model_runner.py:2649-2652): three in a bucket of four is
+        # [0, 1, 2, 3, 3].
+        out = _cu_seqlens(queries)
+        return out + [out[-1]] * pad_rows
     if key == "cu_seqlens_k":
         # Cumulative key lengths, prefill only. The keys are the whole context,
         # cached prefix included: `prepare_prefill` accumulates
@@ -471,12 +521,17 @@ def _bind(key, template_value, rows):
         # pair. Speculative decoding is off in this deployment, so every
         # request is non-spec; a template whose non-spec count differs from its
         # batch is a structure this function has not been shown.
+        #
+        # Padded the same way, and for the same reason: `gdn_attn.py:1231-1233`
+        # fills the tail of the buffer with the last real offset, and the
+        # captured graph reads `[: bs + 1]` of it (:1276).
         values, dtype = template_value
-        if len(values) != len(queries) + 1:
+        if len(values) != len(queries) + 1 + pad_rows:
             raise BindRefusal("non_spec_query_start_loc is not over the whole "
                               "batch; speculative decoding changes the "
                               "structure, not the cohort")
-        return [_cu_seqlens(queries), dtype]
+        out = _cu_seqlens(queries)
+        return [out + [out[-1]] * pad_rows, dtype]
     if key == "has_initial_state":
         # Which prefill rows continue a sequence whose convolution state is
         # already in the pool. Cohort, not structure: `template_key` drops the
@@ -595,6 +650,7 @@ def bind_cohort(template: dict, shape: StepShape,
     field this module has no rule for raises, and so does a missing allocation.
     """
     rows = _rows(shape)
+    pad_rows, pad_tokens = _padding_of(shape)
     has_allocator = any(
         tuple(entry)[0] in ALLOCATOR_FIELDS
         for op in template["ops"] for entry in (op.get("context") or ()))
@@ -636,7 +692,7 @@ def bind_cohort(template: dict, shape: StepShape,
                 else:
                     bound = value
             else:
-                bound = _bind(key, value, rows)
+                bound = _bind(key, value, rows, pad_rows, pad_tokens)
             new.append([key, bound])
             changed = changed or bound != value
         rebound += bool(changed)
@@ -659,6 +715,12 @@ def bind_cohort(template: dict, shape: StepShape,
         # how much: those entries are the capture's pad, not this
         # step's assignment, and a reader has to be able to tell.
         "allocation_padding": dict(padding),
+        # The replay's padding, which is a different thing from the line above.
+        # That one is buffer entries the allocation did not reach and the
+        # template's own values were kept for; these are rows the captured
+        # graph really forwards, derived rather than carried.
+        "replay_pad_rows": pad_rows,
+        "replay_pad_tokens": pad_tokens,
         "carried_constants": {k: why for k, why in CARRIED_CONSTANTS.items()},
     }
     bound_graph["provenance"] = provenance

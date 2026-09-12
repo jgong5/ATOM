@@ -137,9 +137,15 @@ def executed_body_rows(shape: StepShape) -> int:
     computes ``num_tokens_pad = running_bs * max_q_len`` and the captured graph
     executes all of it, the real count being used only to slice the result
     afterwards (model_runner.py:3189-3192, 3841-3843). An eager step has no
-    bucket and runs the tokens it was given.
+    bucket and runs the tokens it was given -- and so does a prefill that
+    declares one, because `ForwardMode.decide` sends any batch holding a
+    prefill token down the eager path (forward_context.py:196-204). The same
+    expression as `BatchSpec.padded_rows`, prefill guard included: this is the
+    number `_check_body_rows` holds a derivation to, and a guard is only worth
+    having if both sides compute it the same way.
     """
-    if shape.capture_bucket is None:
+    if shape.capture_bucket is None or int(
+            getattr(shape, "num_prefill_tokens", 0) or 0):
         return shape.total_tokens
     return shape.capture_bucket * _max_q_len(shape)
 

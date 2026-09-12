@@ -30,7 +30,18 @@ import json
 from dataclasses import dataclass, field, fields
 from typing import Any, Optional
 
-__all__ = ["BatchSpec", "allocate_blocks"]
+__all__ = ["BatchSpec", "allocate_blocks", "PAD_SLOT_ID"]
+
+#: What a padded row points at, which is nothing. The engine's own constant,
+#: repeated here rather than imported because this module deliberately has no
+#: import-time dependency on torch and every definition of it reaches for one:
+#: ``gdn_attn.py:1523``, ``causal_conv1d.py:15``, ``replayssm.py:54``, and the
+#: literal ``-1`` ``aiter_attention.prepare_decode`` writes into the tail of
+#: ``slot_mapping`` (aiter_attention.py:1106). Kept as one name because the
+#: alternative -- padding an index with ``0`` -- is not a smaller error but a
+#: different one: zero is request zero's slot, and a padded row carrying it
+#: reads and writes a live sequence's state and pages.
+PAD_SLOT_ID = -1
 
 
 def allocate_blocks(prompt_lens, context_lens, block_size: int,
@@ -192,6 +203,56 @@ class BatchSpec:
         return sum(self.query_lens)
 
     @property
+    def max_query_len(self) -> int:
+        """``max_seqlen_q``: how many tokens a padded row has to hold."""
+        return max(self.query_lens)
+
+    @property
+    def running_bs(self) -> int:
+        """How many rows wide this step's per-request buffers are.
+
+        ``ForwardMode.decide`` rounds a decode up to the smallest captured size
+        that fits (forward_context.py:238-244) and
+        ``attn_tensors_are_padded`` is exactly ``use_cudagraph`` (:247), so a
+        spec that names a bucket describes a replayed step and every
+        per-request buffer -- context lengths, block table rows, state indices,
+        the query start offsets -- is the bucket wide, not the batch.
+
+        An eager step pads nothing and the two numbers are the same, and so is
+        a prefill at any bucket: `ForwardMode.decide` sends every batch holding
+        a prefill token down the eager path (forward_context.py:196-204), so a
+        bucket on a prefill spec describes a capture this step does not replay.
+        """
+        if self.capture_bucket is None or self.kind == "prefill":
+            return self.batch_size
+        return self.capture_bucket
+
+    @property
+    def padded_rows(self) -> int:
+        """``num_tokens_pad``: how many rows the model body actually forwards.
+
+        ``running_bs * max_q_len`` (model_runner.py:3189-3192), which is what
+        the captured graph runs -- the real count slices the result afterwards
+        and changes no work. The same expression as
+        :func:`atom.compass.core.cost.library.executed_body_rows`, deliberately:
+        one is what a derivation traces and the other is what the oracle
+        charges, and a guard between them is only worth having if both sides
+        compute the number the same way.
+
+        A prefill runs eagerly whatever bucket is declared, for the reason
+        :attr:`running_bs` gives.
+        """
+        if self.capture_bucket is None or self.kind == "prefill":
+            return self.num_tokens
+        return self.capture_bucket * self.max_query_len
+
+    @property
+    def is_padded(self) -> bool:
+        """Does this step carry padding at all? Not the same as having a bucket:
+        a batch that lands exactly on a captured size replays with none."""
+        return self.padded_rows > self.num_tokens
+
+    @property
     def has_cached(self) -> bool:
         """A prefill that reads KV it did not compute this step: chunked."""
         return (self.kind == "prefill"
@@ -313,26 +374,53 @@ class BatchSpec:
           default, which is why a decode capture reads ``prefill_native``.
         * ``positions`` -- the last ``query_lens[i]`` positions of each request,
           tiled over ``position_rows`` for MRoPE.
+
+        A replayed step's buffers are the capture bucket wide and the tail is
+        not left to chance; each field has its own padding value and they are
+        not interchangeable. See :data:`PAD_SLOT_ID` and
+        :attr:`BatchSpec.running_bs`.
         """
         self.validate()
         tables = self.tables()
         block = self.block_size
+        bs = self.running_bs
+        pad_bs = bs - self.batch_size
         cu_q = [0]
         for q in self.query_lens:
             cu_q.append(cu_q[-1] + q)
+        # `cu_seqlens_q[scheduled_bs+1:bs+1] = cu_seqlens_q[scheduled_bs]`
+        # (model_runner.py:2649-2652): the padded rows repeat the last real
+        # offset, which makes each of them an empty sequence for attention --
+        # three requests in a bucket of four is [0, 1, 2, 3, 3], not [.., 4].
+        cu_q += [cu_q[-1]] * pad_bs
 
         slots: list[int] = []
         for i, (q, c) in enumerate(zip(self.query_lens, self.context_lens)):
             for pos in range(c - q, c):
                 slots.append(tables[i][pos // block] * block + pos % block)
+        # `slot_mapping[:bs * max_seqlen_q] = -1` before the real rows are
+        # written over the head of it (aiter_attention.py:1106-1111). The tail
+        # must not name a slot: a real one would have the padded rows write KV
+        # over some other request's page.
+        slots += [PAD_SLOT_ID] * (self.padded_rows - len(slots))
 
         positions: list[int] = []
         for q, c in zip(self.query_lens, self.context_lens):
             positions.extend(range(c - q, c))
+        # Zero, the same legal position the runner writes into the tail of its
+        # own buffer before a replay (model_runner.py:3199-3203). Padded first
+        # and tiled second: MRoPE's buffer is [3, num_tokens_pad], so each of
+        # the three rows carries the padding rather than the padding landing
+        # once at the end of a flattened one.
+        positions += [0] * (self.padded_rows - len(positions))
         positions = positions * self.position_rows
 
         recorded: list[tuple[str, Any]] = [
-            ("context_lens", list(self.context_lens)),
+            # `context_lens[scheduled_bs:bs] = 0` (aiter_attention.py:1115):
+            # a padded row holds no history, so the kernel walks no pages for
+            # it. Not the real context repeated, which would read a request's
+            # KV a second time and charge for it.
+            ("context_lens", list(self.context_lens) + [0] * pad_bs),
             ("slot_mapping", slots),
             ("cu_seqlens_q", cu_q),
         ]
@@ -366,8 +454,13 @@ class BatchSpec:
             row = list(table[:used])
             row += [0] * (used - len(row))
             flat.extend(row)
+        # `block_tables` is copied to the device `bs` rows deep
+        # (aiter_attention.py:1129), so a replay's table is the bucket's
+        # height. The padded rows are zeros and are never read: their context
+        # length is zero, so the kernel walks none of their blocks.
+        flat += [0] * (used * pad_bs)
         recorded += [
-            ("block_tables_shape", [self.batch_size, width]),
+            ("block_tables_shape", [bs, width]),
             ("block_tables", flat),
         ]
         return tuple(recorded)
@@ -384,6 +477,14 @@ class BatchSpec:
 
         ``state_slots`` is which per-request state entry each request occupies;
         the default is the batch order, which is what a fresh pool hands out.
+
+        A replayed decode is the bucket's width here too, and the padding is
+        not the attention backend's. Both state index tensors pad with
+        :data:`PAD_SLOT_ID` and the query start offsets repeat the last real
+        one (gdn_attn.py:1224-1235), against a graph captured at the bucket's
+        counts (:1264-1281). Index ``0`` would be a real state entry -- request
+        zero's -- and padding with it makes the padded rows read and write a
+        live sequence's recurrent state.
         """
         self.validate()
         n = self.batch_size
@@ -395,14 +496,26 @@ class BatchSpec:
             starts.append(starts[-1] + q)
 
         prefill = self.kind == "prefill"
+        # Prefill is always eager (`ForwardMode.decide`, forward_context.py:
+        # 196-204), so only a decode has a bucket to pad to.
+        bs = self.batch_size if prefill else self.running_bs
+        pad_bs = bs - self.batch_size
+        starts += [starts[-1]] * pad_bs
+        slots = slots + [PAD_SLOT_ID] * pad_bs
         recorded: list[tuple[str, Any]] = [
             ("num_prefills", n if prefill else 0),
             ("num_prefill_tokens", self.num_tokens if prefill else 0),
-            ("num_decodes", 0 if prefill else n),
-            ("num_decode_tokens", 0 if prefill else self.num_tokens),
+            # The counts a capture bakes into the graph are the bucket's
+            # (`_build_gdn_capture_metadata(bs)`, gdn_attn.py:1264-1281), and a
+            # replay runs the captured kernel whatever the refilled buffers
+            # say. So the work is the bucket's; only the offsets and indices
+            # above keep the padded rows from touching real state.
+            ("num_decodes", 0 if prefill else bs),
+            ("num_decode_tokens", 0 if prefill else self.padded_rows),
             ("num_spec_decodes", 0),
             ("num_spec_decode_tokens", 0),
-            ("num_actual_tokens", self.num_tokens),
+            ("num_actual_tokens", self.num_tokens if prefill
+             else self.padded_rows),
             ("replayssm", False),
             ("non_spec_query_start_loc", [starts, "int32"]),
             ("non_spec_state_indices_tensor", [slots, "int32"]),
@@ -546,15 +659,26 @@ def model_inputs(spec: "BatchSpec", device="meta"):
     of the three rows holds the same values for text-only requests. The shape
     reaches the graph -- RoPE indexes it -- so it is reproduced here rather
     than left flat.
+
+    The height is ``padded_rows``, not ``num_tokens``. A replay forwards
+    ``self.model(input_ids[:num_tokens_pad], positions)`` over the whole bucket
+    and slices the result to the scheduled rows afterwards
+    (model_runner.py:3189-3192, 3234); handing the model the scheduled rows
+    instead traces the *eager* body, whose dense operators are narrower by the
+    padding. Three requests replaying a bucket of four is a four-row forward.
+    The ids are zeros, which is the runner's own pad -- a legal vocab id, so
+    the embedding gather stays in bounds (model_runner.py:583-600) -- and the
+    positions' tail is zero for the same reason (:3199-3203).
     """
     import torch
 
+    rows = spec.padded_rows
     positions = []
     for q, c in zip(spec.query_lens, spec.context_lens):
         positions.extend(range(c - q, c))
+    positions += [0] * (rows - len(positions))
     pos = torch.tensor(positions * spec.position_rows, dtype=torch.int64,
                        device=device)
     if spec.position_rows > 1:
-        pos = pos.view(spec.position_rows, spec.num_tokens)
-    return (torch.zeros(spec.num_tokens, dtype=torch.int32, device=device),
-            pos)
+        pos = pos.view(spec.position_rows, rows)
+    return (torch.zeros(rows, dtype=torch.int32, device=device), pos)
