@@ -342,14 +342,24 @@ class TestBindingKeepsThePadding:
                               ("non_spec_query_start_loc",
                                "non_spec_state_indices_tensor",
                                "num_decodes")]}
-        return {"ops": [op, linear], "provenance": {"region": "body"}}
+        return {"ops": [op, linear],
+                # The spec these two were derived from, mode included. Under
+                # the captured rule the binder keeps the template's own extent,
+                # so it qualifies the seed against this before it does.
+                "provenance": {"region": "body",
+                               "batch_spec": spec_of(n, context,
+                                                     bucket=bucket).to_dict()}}
 
     @pytest.mark.parametrize("n,bucket", [(3, 4), (31, 32)])
     def test_a_bound_cohort_keeps_the_bucket_s_width(self, n, bucket):
         template = self._template(n, 66, bucket)
         # Same structure, different histories: what binding is for.
         cohort = shape(n, 4096, bucket=bucket)
-        bound = bind_cohort(template, cohort, CarriedAllocation("structural"))
+        # The template is a FULL derivation -- `spec_of` declares it -- so it
+        # binds under the rule it was written for. Under the batch rule its
+        # padded GDN offsets are one row per request and this refuses.
+        bound = bind_cohort(template, cohort, CarriedAllocation("structural"),
+                            extent_scope="captured")
         ctx = {k: v for k, v in bound["ops"][0]["context"]}
         gdn = {k: v for k, v in bound["ops"][1]["context"]}
 

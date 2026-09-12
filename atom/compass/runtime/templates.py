@@ -561,16 +561,34 @@ def _bind(key, template_value, rows, pad_rows: int = 0, pad_tokens: int = 0,
         # request is non-spec; a template whose non-spec count differs from its
         # batch is a structure this function has not been shown.
         #
-        # Padded the same way, and for the same reason: `gdn_attn.py:1231-1233`
-        # fills the tail of the buffer with the last real offset, and the
-        # captured graph reads `[: bs + 1]` of it (:1276).
+        # Unlike `cu_seqlens_q`, this one is padded only under FULL. That is
+        # not a choice made here: `_build_gdn_capture_metadata` bakes the
+        # bucket's counts into the graph and the replay refills the tail of the
+        # buffer with the last real offset (gdn_attn.py:1189-1235, :1264-1281),
+        # while PIECEWISE leaves this metadata eager and rebuilds it from the
+        # active batch every step -- `A + 1` offsets, no tail
+        # (model_runner.py:4019-4031). `BatchSpec.gdn_context` derives it under
+        # exactly that split, so binding it under the other one refuses a
+        # correctly derived PIECEWISE template. ``extent_scope`` is the same
+        # declared mode, resolved once in `batch_spec.extent_scope_of`.
         values, dtype = template_value
-        if len(values) != len(queries) + 1 + pad_rows:
-            raise BindRefusal("non_spec_query_start_loc is not over the whole "
-                              "batch; speculative decoding changes the "
-                              "structure, not the cohort")
+        if extent_scope == "undeclared":
+            raise BindRefusal(
+                "this template replays a capture bucket but the deployment's "
+                "--cudagraph-mode was not declared, so whether "
+                "non_spec_query_start_loc carries the bucket's padded offsets "
+                "or the active batch's is unknown; the two differ by exactly "
+                "the padding and both bind without complaint")
+        pad = pad_rows if extent_scope == "captured" else 0
+        if len(values) != len(queries) + 1 + pad:
+            raise BindRefusal(
+                f"non_spec_query_start_loc has {len(values)} offsets and this "
+                f"batch has {len(queries)} requests with {pad} padded rows "
+                f"under the {extent_scope!r} rule; it is one offset per row "
+                "of the whole batch after a leading zero. Speculative decoding "
+                "changes the structure, not the cohort")
         out = _cu_seqlens(queries)
-        return [out + [out[-1]] * pad_rows, dtype]
+        return [out + [out[-1]] * pad, dtype]
     if key == "has_initial_state":
         # Which prefill rows continue a sequence whose convolution state is
         # already in the pool. Cohort, not structure: `template_key` drops the
@@ -692,15 +710,34 @@ def _check_traced_as_captured(template: dict) -> None:
     history as a captured extent -- a wrong number with a right-looking
     provenance, which is worse than a refusal.
 
-    Only refuses when the template *says*: a graph whose provenance records no
-    mode is not evidence either way, and refusing it would reject every
-    template derived before the field existed. What it records is
-    `BatchSpec.to_dict`, which writes every declared field it holds.
+    The declared mode is necessary and not sufficient. A seed can say ``full``
+    and still carry the extent the *eager* rule produced, because that is
+    exactly what every graph derived before this rule was fixed does. So the
+    seed is also checked against itself: its provenance records the whole
+    `BatchSpec`, `BatchSpec.launch_max_seqlen_k` is the one rule that says what
+    the extent should be under the mode that spec declares, and a recorded
+    value that disagrees with it is a stale derivation whatever its label
+    reads. Refusing is the only safe answer -- under ``"captured"`` this value
+    is kept verbatim, so a wrong one is preserved rather than corrected, and
+    `max_seqlen_k` is part of the operator identity key.
     """
     spec = ((template.get("provenance") or {}).get("batch_spec") or {})
     traced = spec.get("cudagraph_mode")
     if traced is None:
-        return
+        # A seed written before the derivation recorded its mode. Silence is
+        # not a FULL trace: the extent this binder is about to keep verbatim
+        # is exactly the field the eager rule got wrong, so an unqualified
+        # seed carrying an eager `max_seqlen_k` would be preserved as a
+        # captured one. Re-derive it under the mode being priced -- the
+        # derivation path stamps `provenance.batch_spec.cudagraph_mode` -- or
+        # bind under PIECEWISE/eager, where the value is recomputed anyway.
+        raise BindRefusal(
+            "this template's provenance does not say which cudagraph_mode it "
+            "was derived under, and it is being bound for a FULL replay, "
+            "which keeps the template's own max_seqlen_k rather than "
+            "recomputing it. An unqualified seed is not evidence of a FULL "
+            "trace. Re-derive it through the source derivation path, which "
+            "records the mode.")
     if str(traced).strip().lower() != "full":
         raise BindRefusal(
             f"this template was traced under cudagraph_mode {traced!r} and is "
@@ -708,6 +745,28 @@ def _check_traced_as_captured(template: dict) -> None:
             "max_seqlen_k. That value is the traced run's longest history, "
             "not this deployment's max_model_len. Derive the template under "
             "the mode being priced.")
+    from atom.compass.runtime.batch_spec import BatchSpec
+
+    try:
+        expected = BatchSpec.from_dict(spec).launch_max_seqlen_k
+    except Exception as exc:
+        raise BindRefusal(
+            "this template's provenance carries a batch_spec that will not "
+            f"rebuild ({exc}), so the extent it records cannot be checked "
+            "against the mode it declares") from exc
+    for op in template.get("ops") or ():
+        for entry in op.get("context") or ():
+            key, value = tuple(entry)
+            if key != "max_seqlen_k" or value == expected:
+                continue
+            raise BindRefusal(
+                f"{op.get('name')} records max_seqlen_k {value} and the "
+                f"batch_spec in its own provenance -- cudagraph_mode "
+                f"{traced!r}, max_model_len {spec.get('max_model_len')}, "
+                f"capture_bucket {spec.get('capture_bucket')} -- makes it "
+                f"{expected}. The seed is labelled FULL and carries the eager "
+                "rule's value, which this bind would keep verbatim. "
+                "Re-derive it through the source derivation path.")
 
 
 def bind_cohort(template: dict, shape: StepShape,
@@ -900,7 +959,18 @@ class TemplateGraphs:
             from atom.compass.runtime import derivation_log
 
             began = derivation_log.now()
-            template = self._derive(shape)
+            try:
+                template = self._derive(shape)
+            except (BindRefusal, ValueError) as exc:
+                # `BatchSpec.gdn_context` raises where a bucketed decode has no
+                # declared mode: the FULL and PIECEWISE shapes differ by
+                # exactly the padding and neither is right under both. That is
+                # the same answer as a bind refusal and belongs in the same
+                # place -- a served step asks this cache a question and gets
+                # None with a reason, rather than an exception out of the
+                # provider for one operator family and a refusal for another.
+                self.refusals[key] = str(exc)
+                return None
             ended = derivation_log.now()
             self.derivation_seconds += ended - began
             if template is None:

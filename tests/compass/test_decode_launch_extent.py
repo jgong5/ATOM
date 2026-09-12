@@ -161,9 +161,11 @@ class TestTheWarmBinderKeepsIt:
         assert dict(bound["ops"][0]["context"])["max_seqlen_k"] == 4096
 
     def test_bind_cohort_keeps_a_captured_extent(self):
+        spec = spec_of(2, bucket=4, mode="full", context=4096)
         template = {"ops": [{"name": A.UNIFIED,
                              "context": [["max_seqlen_k", MAX_MODEL_LEN],
-                                         ["max_seqlen_q", 1]]}]}
+                                         ["max_seqlen_q", 1]]}],
+                    "provenance": {"batch_spec": spec.to_dict()}}
         bound = bind_cohort(template, shape(2, context=4096, bucket=4),
                             extent_scope="captured")
         assert (dict(bound["ops"][0]["context"])["max_seqlen_k"]
@@ -380,13 +382,15 @@ class TestTheRecurrentTailIsUnchanged:
 
     The convolution skips ``PAD_SLOT_ID`` lanes and the recurrence skips
     zero-length ones, so the state work follows the *active* lanes. The gating
-    and the output copy run over the allocated width, so that work follows the
-    *bucket*. Under PIECEWISE the kernel additionally zeroes the rows between
-    the two. A single `active` term made 3-of-4 and 4-of-4 the same point.
+    and the output copy run over ``num_actual_tokens`` -- `attention_gdn.py`
+    slices ``a`` and ``b`` to it and copies ``output[:num_actual_tokens]`` --
+    which is the bucket under FULL and the active rows under PIECEWISE. The
+    rest of the allocation is only zeroed, and that is the third term. A
+    single `active` term made 3-of-4 and 4-of-4 the same point.
     """
 
     @pytest.mark.parametrize("rows,active", [(4, 3), (32, 31), (4, 4)])
-    def test_a_full_replay_prices_active_lanes_against_bucket_rows(
+    def test_a_full_replay_prices_active_lanes_against_processed_rows(
             self, rows, active):
         op = gdn_op(rows, active)
         st = A.structure_of(op)
@@ -410,22 +414,43 @@ class TestTheRecurrentTailIsUnchanged:
 
         assert vec(3) == [1.0, 3.0, 4.0, 0.0]
         assert vec(4) == [1.0, 4.0, 4.0, 0.0]
+        # Both process the bucket under FULL; only the lane count separates
+        # them, which is the point of the second term.
         assert vec(3) != vec(4)
 
     def test_piecewise_records_the_active_counts_and_a_real_zeroed_tail(self):
         """Same batch, same bucket, different mode -- and it must key apart.
 
-        PIECEWISE runs the same three lanes but allocates four rows and zeroes
-        the fourth. `tail_pad_rows` is what says so.
+        PIECEWISE runs the same three lanes, gates and copies three rows, and
+        zeroes the fourth. `tail_pad_rows` is what says so -- and the processed
+        term is three, not four, or a PIECEWISE step would be priced above a
+        FULL one that gates strictly more rows.
         """
         op = gdn_op(4, 3, mode="piecewise")
         st = A.structure_of(op)
         assert st.executed_rows == 4 and st.num_actual_tokens == 3
         vec = A.features_for(A.regime_of(op, st, {}), st, {})
-        assert vec == [1.0, 3.0, 4.0, 1.0]
+        assert vec == [1.0, 3.0, 3.0, 1.0]
         full = gdn_op(4, 3)
         stf = A.structure_of(full)
-        assert vec != A.features_for(A.regime_of(full, stf, {}), stf, {})
+        full_vec = A.features_for(A.regime_of(full, stf, {}), stf, {})
+        assert vec != full_vec
+        # The ordering the allocated width got backwards: FULL processes four
+        # rows here and PIECEWISE three, so the processed term must not tie.
+        processed = A.REGIMES["gdn.decode"].features.index("actual_rows")
+        assert vec[processed] < full_vec[processed]
+
+    def test_the_allocated_width_is_still_recoverable(self):
+        """Splitting the width did not lose it: gated plus zeroed is the
+        allocation, under either mode."""
+        regime = A.REGIMES["gdn.decode"]
+        processed = regime.features.index("actual_rows")
+        tail = regime.features.index("tail_pad_rows")
+        for mode in ("full", "piecewise"):
+            op = gdn_op(4, 3, mode=mode)
+            st = A.structure_of(op)
+            vec = A.features_for(regime, st, {})
+            assert vec[processed] + vec[tail] == float(st.executed_rows)
 
     def test_a_padded_lane_is_skipped_rather_than_counted(self):
         """`gdn_attn.py`:1224-1226. The tail indexes no state, so it is not a
@@ -461,13 +486,30 @@ class TestTheProviderPathCarriesTheMode:
     """
 
     def _template_from(self, spec):
-        """A one-op template carrying exactly what a derivation would write."""
+        """The two operators a decode derivation writes, not just the MHA one.
+
+        The GDN operator is here because its metadata is padded under a
+        different rule from attention's: `non_spec_query_start_loc` is
+        `A + 1 + pad` under FULL and `A + 1` under PIECEWISE. A template
+        carrying only `aiter::unified_attention_with_output_base` exercises the
+        extent rule and says nothing about that one, and a bind that required
+        the padded length in both modes refused every correctly derived
+        PIECEWISE decode on the cold return.
+        """
         ctx = dict(spec.attention_context())
+        gdn = dict(spec.gdn_context())
         return {"ops": [{"name": A.UNIFIED,
                          "input_shapes": [[spec.padded_rows, 24, 256]],
                          "context": [[k, ctx[k]] for k in
                                      ("context_lens", "cu_seqlens_q",
-                                      "max_seqlen_q", "max_seqlen_k")]}],
+                                      "max_seqlen_q", "max_seqlen_k")]},
+                        {"name": A.GDN,
+                         "input_shapes": [[spec.padded_rows, 10240]],
+                         "context": [[k, gdn[k]] for k in
+                                     ("num_decodes", "num_decode_tokens",
+                                      "num_actual_tokens",
+                                      "non_spec_query_start_loc",
+                                      "non_spec_state_indices_tensor")]}],
                 # What `ModelTracer.provenance` writes: the spec the graph
                 # was derived from, mode included.
                 "provenance": {"region": "body",
@@ -539,10 +581,40 @@ class TestTheProviderPathCarriesTheMode:
         s = shape(n, bucket=bucket)
         assert graphs.graph_for(s) is None
         key = template_key(s)
-        assert "cudagraph-mode" in graphs.refusals[key]
+        # Now that the template carries a GDN operator the refusal comes from
+        # the derivation rather than the bind -- `gdn_context` has no shape to
+        # write for a bucketed decode whose mode is undeclared, and neither
+        # candidate is right under both. Either way the provider answers None
+        # with a recorded reason; what it must not do is raise past the caller
+        # for one operator family and refuse for another.
+        assert "was not declared" in graphs.refusals[key]
         # And it refuses on the warm path too, not only the cold one.
         graphs.derivations = 0
         assert graphs.graph_for(s) is None
+
+    @pytest.mark.parametrize("n,bucket", [(3, 4), (31, 32)])
+    def test_the_attention_only_refusal_is_still_the_binds(self, n, bucket):
+        """With no GDN operator in the template there is nothing for the
+        derivation to refuse, and the bind is what names the undeclared mode.
+        Both stages have to answer the same way."""
+        from atom.compass.runtime.templates import TemplateGraphs
+
+        def derive(_shape):
+            spec = spec_of(n, bucket=bucket, mode="piecewise")
+            ctx = dict(spec.attention_context())
+            return {"ops": [{"name": A.UNIFIED,
+                             "context": [[k, ctx[k]] for k in
+                                         ("context_lens", "cu_seqlens_q",
+                                          "max_seqlen_q", "max_seqlen_k")]}],
+                    "provenance": {"batch_spec": spec.to_dict()}}
+
+        graphs = TemplateGraphs(None, derive=derive,
+                                allocation=CarriedAllocation("structural"),
+                                cudagraph_mode=None)
+        s = shape(n, bucket=bucket)
+        assert graphs.graph_for(s) is None
+        assert "--cudagraph-mode was not declared" in \
+            graphs.refusals[template_key(s)]
 
     def test_a_template_traced_under_another_mode_is_refused(self):
         """A seeded template was traced by some other run, and the key it is
@@ -591,3 +663,94 @@ class TestTheFactoryHandsTheModeToTheCache:
 
         params = inspect.signature(build_source_oracle).parameters
         assert "cudagraph_mode" in params
+
+
+class TestAnActiveSeedHasToQualifyForFULL:
+    """A seed is served verbatim under FULL. Its label is not enough.
+
+    ``agent_scratch/g4/src1/b27dec32.tp1.r0.json``, the template the registered
+    TP1 composition passes as ``--compass-oracle-option template=``, records
+    ``cudagraph_mode: "full"``, ``capture_bucket: 32``, ``max_model_len:
+    262144`` -- and ``max_seqlen_k: 1151``, the longest history of the 32
+    requests it holds. It was derived before the extent rule was fixed, so it
+    carries the eager value under a FULL label. Checking the label alone lets
+    that through, and under ``"captured"`` the binder keeps it: a wrong
+    ``max_seqlen_k`` in the operator identity key, with correct-looking
+    provenance over it.
+
+    The check is the seed against itself. Its provenance holds the whole
+    `BatchSpec`, and `BatchSpec.launch_max_seqlen_k` is the one rule that says
+    what that spec's extent is. Nothing is relabelled here -- a seed that
+    disagrees with its own declaration is refused, and the remedy is to
+    re-derive it.
+    """
+
+    #: The active seed's shape, as recorded: a full bucket, so no padding is
+    #: involved and the extent is the only thing in question.
+    ACTIVE_N = 32
+    ACTIVE_BUCKET = 32
+
+    def _seeded(self, *, mode, extent=None, drop_mode=False):
+        spec = spec_of(self.ACTIVE_N, bucket=self.ACTIVE_BUCKET,
+                       mode=mode, context=CONTEXT)
+        ctx = dict(spec.attention_context())
+        if extent is not None:
+            ctx["max_seqlen_k"] = extent
+        declared = spec.to_dict()
+        if drop_mode:
+            declared.pop("cudagraph_mode", None)
+        return {"ops": [{"name": A.UNIFIED,
+                         "input_shapes": [[spec.padded_rows, 24, 256]],
+                         "context": [[k, ctx[k]] for k in
+                                     ("context_lens", "cu_seqlens_q",
+                                      "max_seqlen_q", "max_seqlen_k")]}],
+                "provenance": {"region": "body", "batch_spec": declared}}
+
+    def _graphs(self, mode, template):
+        from atom.compass.runtime.templates import TemplateGraphs
+
+        s = shape(self.ACTIVE_N, CONTEXT,
+                  bucket=self.ACTIVE_BUCKET)
+        graphs = TemplateGraphs({template_key(s): template}, derive=None,
+                                allocation=CarriedAllocation("structural"),
+                                cudagraph_mode=mode)
+        return graphs, s
+
+    def test_the_active_seeds_recorded_extent_is_the_eager_one(self):
+        """What the file holds, restated as the derivation would produce it
+        under the old rule: the batch's longest history, not max_model_len."""
+        spec = spec_of(32, bucket=32, mode="piecewise")
+        assert dict(spec.attention_context())["max_seqlen_k"] == CONTEXT
+        assert spec.max_model_len == MAX_MODEL_LEN
+
+    def test_a_full_labelled_seed_carrying_the_eager_extent_is_refused(self):
+        graphs, s = self._graphs(
+            "full", self._seeded(mode="full", extent=CONTEXT))
+        assert graphs.graph_for(s) is None
+        reason = graphs.refusals[template_key(s)]
+        assert "Re-derive it" in reason and str(CONTEXT) in reason
+
+    def test_a_seed_with_no_declared_mode_is_refused_not_assumed(self):
+        graphs, s = self._graphs(
+            "full", self._seeded(mode="full", drop_mode=True))
+        assert graphs.graph_for(s) is None
+        assert "does not say which cudagraph_mode" in \
+            graphs.refusals[template_key(s)]
+
+    def test_a_seed_derived_under_the_fixed_rule_is_served(self):
+        """The remedy, asserted rather than assumed: re-derived through the
+        source derivation path, the same seed binds."""
+        graphs, s = self._graphs("full", self._seeded(mode="full"))
+        bound = graphs.graph_for(s)
+        assert bound is not None and not graphs.refusals
+        assert dict(bound["ops"][0]["context"])["max_seqlen_k"] == MAX_MODEL_LEN
+
+    def test_an_unqualified_seed_still_serves_a_piecewise_deployment(self):
+        """The refusal is scoped to where the value is kept verbatim. Under
+        PIECEWISE the extent is recomputed from the cohort, so an old seed is
+        not evidence of anything the bind relies on."""
+        graphs, s = self._graphs(
+            "piecewise", self._seeded(mode="piecewise", drop_mode=True))
+        bound = graphs.graph_for(s)
+        assert bound is not None and not graphs.refusals
+        assert dict(bound["ops"][0]["context"])["max_seqlen_k"] == CONTEXT

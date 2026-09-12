@@ -78,7 +78,7 @@ def _gdn_full(bucket, active, *, seconds=None):
 
 
 #: Six FULL captures. Four full buckets and two partly-filled ones: without
-#: the latter ``state_lanes`` and ``bucket_rows`` are the same column at every
+#: the latter ``state_lanes`` and ``actual_rows`` are the same column at every
 #: point and the design is rank deficient, which is a real constraint on the
 #: decode acquisition and not a fixture detail.
 _GDN_FULL_POINTS = ((8, 8, 7.4e-6), (16, 16, 9.8e-6), (32, 32, 14.6e-6),
@@ -350,7 +350,7 @@ class TestAbsentFactsAreNotZeros:
         values = features_for(regime, structure, GDN_SCOPE)
         assert not isinstance(values, Refusal), values
         assert values[regime.features.index("state_lanes")] == 5.0
-        assert values[regime.features.index("bucket_rows")] == 8.0
+        assert values[regime.features.index("actual_rows")] == 5.0
         assert values[regime.features.index("tail_pad_rows")] == 3.0
 
     def test_grid_pad_rows_is_what_the_longest_sequence_forces(self):
@@ -532,7 +532,7 @@ class TestAFitRefusesWhatItCannotIdentify:
     def test_full_buckets_alone_cannot_separate_lanes_from_rows(self):
         """The acquisition constraint, stated as a test.
 
-        With only fully-occupied buckets, `state_lanes` and `bucket_rows` are
+        With only fully-occupied buckets, `state_lanes` and `actual_rows` are
         the same column, and no measurement of that set says which of the two
         the time is proportional to. The fit refuses and names the remedy
         rather than splitting the coefficient arbitrarily.

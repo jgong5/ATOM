@@ -624,19 +624,27 @@ REGIMES = {
     # at the same launch. A single `active` term read off the offsets counted
     # all four for both and made them the same vector.
     #
-    # `bucket_rows` -- the allocated width, off the output operand. The gating
-    # and the output copy run it whatever the state lanes do, which is why the
-    # two are separate terms rather than one.
+    # `actual_rows` -- the rows the gating and the output copy actually
+    # process, which is `num_actual_tokens` and not the allocated width. The
+    # two are the same number under FULL, where the capture pinned
+    # `num_actual_tokens` to `bs`; under PIECEWISE they are not.
+    # `attention_gdn.py` slices `a` and `b` to `num_actual_tokens` and copies
+    # `output[:num_actual_tokens]`, so a PIECEWISE step at bucket four with
+    # three active rows gates three rows, not four. Charging the allocated
+    # width there would order a PIECEWISE step above a FULL one that does
+    # strictly more work.
     #
     # `tail_pad_rows` -- the rows `attention_gdn.py` zeros above
-    # `num_actual_tokens` for replay safety. Under FULL this is *zero*: the
-    # capture pinned `num_actual_tokens` to `bs`, so there is no tail to zero
-    # and charging one would be inventing work. Under PIECEWISE the counts are
-    # the batch's while the allocation is still the bucket's, so the branch is
-    # real and the term is what tells the two modes apart at the same
-    # `(state_lanes, bucket_rows)`.
+    # `num_actual_tokens` for replay safety, which is the rest of the
+    # allocation. Under FULL this is *zero*: the capture pinned
+    # `num_actual_tokens` to `bs`, so there is no tail to zero and charging one
+    # would be inventing work. Under PIECEWISE the counts are the batch's while
+    # the allocation is still the bucket's, so the branch is real and the term
+    # is what tells the two modes apart. The allocated width is still
+    # recoverable as `actual_rows + tail_pad_rows`; it is split because the
+    # zeroing and the gating are different work at different rates.
     "gdn.decode": Regime("gdn.decode",
-                         ("calls", "state_lanes", "bucket_rows",
+                         ("calls", "state_lanes", "actual_rows",
                           "tail_pad_rows"),
                          GDN_SCOPE),
     # `continued_sequences`, because `has_initial_state` is a branch the
@@ -891,14 +899,6 @@ def features_for(regime: Regime, structure: Structure, scope=None):
                     "carry a query; the state index tensor and the query "
                     "offsets describe different steps")
             values.append(float(lanes))
-        elif feature == "bucket_rows":
-            if structure.executed_rows is None:
-                return Refusal(
-                    "the key does not record the width the output tensor was "
-                    "allocated with, and that is what the gating and the "
-                    "output copy run over",
-                    missing=("output_rows",))
-            values.append(float(structure.executed_rows))
         elif feature == "tail_pad_rows":
             if structure.executed_rows is None:
                 return Refusal(
