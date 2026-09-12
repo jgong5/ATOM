@@ -46,6 +46,7 @@ class EngineUtilityHandler:
         "get_mtp_statistics": "_handle_get_mtp_statistics",
         "get_cache_statistics": "_handle_get_cache_statistics",
         "get_compass_arrival_barrier": "_handle_get_compass_arrival_barrier",
+        "get_compass_inputs": "_handle_get_compass_inputs",
         "abort_request": "_handle_abort_request",
     }
 
@@ -364,6 +365,40 @@ class EngineUtilityHandler:
                 "UTILITY_RESPONSE",
                 {"cmd": "get_compass_arrival_barrier", "result": result},
             )
+        )
+
+    # ------------------------------------------------------------------
+    # Compass loaded inputs
+    # ------------------------------------------------------------------
+
+    def _handle_get_compass_inputs(self, args: dict):
+        """What the predictor actually loaded, read off the runner that loaded it.
+
+        This crosses a process boundary for a reason. The runner opens the
+        price lists, the templates and the replay target; the API server does
+        not, and its filesystem need not even be the same one. Every previous
+        answer to "what was this fitted to?" was the API server digesting the
+        paths an option named, which is a different reading of a different
+        file at a different time.
+
+        A runner with no Compass state does not implement the method, and that
+        is reported as unread rather than as an empty record: nothing loaded
+        and nothing asked are different states, and only one of them is a
+        run's own claim about itself.
+        """
+        try:
+            result = self.runner_mgr.call_func("compass_input_manifest",
+                                               wait_out=True)
+        except Exception as exc:  # provenance never fails the run it describes
+            logger.warning(
+                "%s: could not read the Compass input manifest", self.label,
+                exc_info=True)
+            result = {"why": f"{type(exc).__name__}: {exc}"}
+        if not isinstance(result, dict):
+            result = {"why": "this runner records no loaded inputs"}
+        self.output_queue.put_nowait(
+            ("UTILITY_RESPONSE", {"cmd": "get_compass_inputs",
+                                  "result": result})
         )
 
     def push_metrics(self) -> None:

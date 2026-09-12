@@ -2450,6 +2450,27 @@ def _compass_arrival_barrier() -> dict:
         return {"timed_out": None, "why": f"{type(exc).__name__}: {exc}"}
 
 
+def _compass_loaded_inputs() -> dict:
+    """Each rank's record of what it loaded, or why there is none.
+
+    A round trip, for the same reason the barrier is: the runner that opened
+    the files is in another process, and this one cannot answer for it. It
+    happens once, when provenance is asked for.
+
+    An unreadable record is reported as a reason and never as an empty one. A
+    rank that loaded nothing and a rank that could not be asked are different
+    states, and only the first is a claim the run is making about itself.
+    """
+    if engine is None:
+        return {"ranks": [], "why": "the engine is not initialised"}
+    try:
+        return engine.get_compass_inputs(timeout=10.0)
+    except Exception as exc:  # provenance never fails the run it describes
+        logger.warning("Could not read the Compass loaded inputs",
+                       exc_info=True)
+        return {"ranks": [], "why": f"{type(exc).__name__}: {exc}"}
+
+
 def _compass_clock_is_virtual() -> bool:
     """Whether this process reports simulated time.
 
@@ -2491,7 +2512,23 @@ def _server_revision() -> "str | None":
 
 
 def _artifact_digests(path: str) -> dict:
-    """Every file this option actually stands for, by name, with its digest."""
+    """Every file this option stands for, guessed from its name alone.
+
+    The fallback, and only the fallback. It is used for an option no loader
+    reported reading, which means nobody can say what the option stood for and
+    the best available answer is what is on this filesystem now.
+
+    It cannot be the primary answer, because it guesses wrong in two ways that
+    matter. An option's value is frequently not one filename:
+    ``prices.json:graph.json:unregistered`` is a triple and ``a.json,b.json``
+    is a list, and asking `os.path.isfile` about either finds nothing -- so a
+    run that loaded two real tables reported no digest and was refused as
+    uncalibrated. And even where it finds files, it finds whatever is there
+    *now*, which after a re-run of the producer is not what was loaded.
+
+    What replaced it is `_loaded_option_files`: the record the ranks took as
+    they parsed the bytes.
+    """
     import glob as _glob
 
     stem, ext = os.path.splitext(path)
@@ -2502,6 +2539,41 @@ def _artifact_digests(path: str) -> dict:
         digest = _sha256_of(candidate)
         if digest:
             found[os.path.basename(candidate)] = digest
+    return found
+
+
+#: Which oracle option each loaded-input role is a member of. A role says what
+#: an artifact *is* to the run; an option key says which flag named it, and one
+#: flag names several files -- `price=list.json:graph.json:regime` is one
+#: option and two inputs. The mapping is here, at the reporting edge, because
+#: it is a fact about the command line rather than about the reader.
+_ROLE_OPTIONS = {
+    "oracle.price": "price",
+    "oracle.price_graph": "price",
+    "oracle.template": "template",
+    "oracle.head_template": "head_template",
+    "oracle.replay_target": "replay_target",
+}
+
+
+def _loaded_option_files(ranks: list) -> dict:
+    """Per option key, the files the ranks actually read, by name and digest.
+
+    Keyed by basename to match what `_artifact_digests` produced, so every
+    existing consumer keeps working. Ranks are merged rather than reported
+    separately here because the per-rank detail is published whole, beside
+    this, under `compass.loaded_inputs`: two ranks that read different files
+    both appear, and a reader that wants to know which rank read which looks
+    there rather than at this summary.
+    """
+    found: dict = {}
+    for record in ranks or ():
+        for row in (record or {}).get("inputs") or ():
+            key = _ROLE_OPTIONS.get(row.get("role"))
+            if not key or not row.get("sha256"):
+                continue
+            found.setdefault(key, {})[
+                os.path.basename(row.get("path") or "")] = row["sha256"]
     return found
 
 
@@ -2639,15 +2711,31 @@ async def compass_provenance():
     # carries the shared stem that `resolve_rank_path` expands per rank. Asking
     # whether the stem exists says no at every width above one, which left the
     # runs that had a calibration looking like the runs that had none.
+    #
+    # So the digests come from the ranks: each records, as it parses an
+    # artifact, the digest of the bytes it parsed and which file it resolved
+    # to. The server publishes that rather than re-deriving anything. Where a
+    # rank reported nothing for an option -- an option no loader reads -- the
+    # name-based guess above is used and the record says so, because a reader
+    # has to be able to tell a digest of what ran from a digest of what is on
+    # the disk now.
+    loaded = _compass_loaded_inputs()
+    from_ranks = _loaded_option_files(loaded.get("ranks") or [])
+
     option_digests = {}
     option_files = {}
+    option_source = {}
     for key, value in options.items():
         if not isinstance(value, str) or not value:
             continue
-        found = _artifact_digests(value)
+        found = from_ranks.get(key)
+        source = "loaded"
+        if not found:
+            found, source = _artifact_digests(value), "path"
         if not found:
             continue
         option_files[key] = found
+        option_source[key] = source
         option_digests[key] = (list(found.values())[0] if len(found) == 1
                                else _digest_of_set(found))
 
@@ -2681,6 +2769,16 @@ async def compass_provenance():
             "oracle_options": options,
             "oracle_option_sha256": option_digests,
             "oracle_option_files": option_files,
+            # Whether each digest is of bytes a rank reported parsing
+            # ("loaded") or of whatever the server found at that name when
+            # asked ("path"). The two are not the same evidence and a reader
+            # must not have to guess which it is holding.
+            "oracle_option_digest_source": option_source,
+            # The per-rank record, whole. `oracle_option_sha256` is a summary
+            # over the ranks; this says which rank read which file, whether it
+            # was that rank's own or the shared one, and under what role --
+            # none of which survives being folded into one digest per option.
+            "loaded_inputs": loaded,
             "virtual_clock": compass.virtual_clock,
             "admission_seconds": compass.admission_seconds,
             # Which rank's step the modelled side is reporting. A plan that

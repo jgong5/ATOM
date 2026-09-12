@@ -58,6 +58,12 @@ class CompassPredictMixin:
         added here is added to both, which is the point.
         """
         self._oracle: CostOracle = self._build_oracle(self._compass_config)
+        # Frozen here, at the end of the build that did the reading, and never
+        # recomputed. The alternative -- letting a reader digest the option's
+        # paths when it is asked -- is what this replaces: the option is a DSL
+        # over per-rank stems, so it does not name the files that were opened,
+        # and by the time anyone asks the bytes may have changed.
+        self._compass_inputs = self._freeze_compass_inputs()
         self._graph = OpGraph()
         self._traced_steps = 0
         self._prefill_index = 0
@@ -147,6 +153,34 @@ class CompassPredictMixin:
         ):
             options["rank_coords"] = self._rank_coords()
         return oracle_cls(**options)
+
+    def _freeze_compass_inputs(self) -> dict:
+        """Everything this rank loaded, as the readers that parsed it said.
+
+        Collected off the oracle, which is the only thing `_build_oracle`
+        hands back -- `source_cost_oracle` returns the oracle alone, so a
+        record that lived anywhere else would never reach a served run.
+
+        An oracle that reads nothing reports nothing, and that is a state and
+        not a failure: the declared stub a measured run uses has no tables, and
+        demanding a record from it would refuse the ground-truth side of every
+        comparison.
+        """
+        from atom.compass.core.loaded_input import manifest
+
+        loaded = getattr(self._oracle, "compass_loaded_inputs", ()) or ()
+        return manifest(loaded, coords=self._rank_coords())
+
+    def compass_input_manifest(self) -> dict:
+        """The frozen record, for the engine's utility RPC to hand out.
+
+        Named as a plain method because that is how the worker RPC reaches a
+        runner: `runner_mgr.call_func` does `getattr(runner, name)`. It reads
+        state and touches nothing, so it is safe to answer at any point in a
+        run -- and it answers the same thing at every point, which is the
+        property that makes it evidence.
+        """
+        return dict(self._compass_inputs)
 
     def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
         """Predict the step, or trace it, depending on the configured mode."""
