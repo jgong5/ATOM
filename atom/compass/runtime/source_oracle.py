@@ -908,6 +908,14 @@ def build_source_oracle(
                                  collect=seeded_inputs)
                    if head else None)
     _report_rank_binding(coords, body_graphs, head_graphs, derive)
+    # What a launch costs in THIS composition, told to the library that has to
+    # decide whether a missing launch composition matters. The oracle charges
+    # `launches * seconds_per_launch`, so where that rate is zero a price whose
+    # kernel composition nobody recorded costs exactly what a price with one
+    # would; where it is nonzero the count is a cost and the absence is a
+    # refusal. Published rather than inferred: the library reads the configured
+    # rate and never chooses it.
+    library.launch_charge_seconds = float(seconds_per_launch)
     oracle = LibraryCostOracle(
         library, body_graphs,
         seconds_per_launch=float(seconds_per_launch),

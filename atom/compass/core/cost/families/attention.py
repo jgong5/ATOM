@@ -478,8 +478,21 @@ REGIMES = {
     # the column pins to zero and the fit states the subdomain it covers --
     # which is what makes a mixed fresh/continued batch a named refusal here
     # instead of a price with no evidence under it.
+    # `calls` because the wrapper runs once per batch whatever the batch
+    # holds, and the measurements say that term is not zero. Two priced GDN
+    # prefills settle it on their own: 96 query rows in 2 chunks over 1
+    # sequence costs 156.07us, and 224 rows in 4 chunks over 2 sequences --
+    # more of every structural term, on the same graph, the same operand
+    # rotation and the same region count -- costs 201.46us. A law with no
+    # intercept and no negative coefficients has to charge the second at least
+    # twice the first, so it cannot come within 21% of both; the per-call term
+    # is what the evidence requires, not what makes a number fit. It is the
+    # same term `gdn.decode` already carries, for the same reason: the launch
+    # and the fixed conv and recurrent state a step touches regardless of its
+    # rows. Identified from training designs; nothing here is fitted to a
+    # holdout.
     "gdn.prefill": Regime("gdn.prefill",
-                          ("query_rows", "chunks", "sequences",
+                          ("calls", "query_rows", "chunks", "sequences",
                            "continued_sequences", "tail_pad_rows"),
                           GDN_SCOPE),
 }
@@ -721,6 +734,69 @@ def _solve(matrix, rhs):
     return [aug[i][n] / aug[i][i] for i in range(n)]
 
 
+#: Active sets are enumerated, so the work is exponential in the column count.
+#: Every regime here has at most six terms; the cap is a guard against a
+#: regime that grows one day, not a limit anything currently meets.
+_MAX_ENUMERATED_COLUMNS = 12
+
+
+def _solve_nonnegative(matrix, rhs):
+    """Least squares subject to every coefficient being at least zero.
+
+    A cost is not negative, so the constraint is not a preference -- it is the
+    only region of the parameter space that means anything. The unconstrained
+    solution leaving it is what a near-collinear design looks like: with two
+    columns that move together, the residual is flat along their difference
+    and the split between them is decided by noise, which routinely puts one
+    of them below zero. Refusing there throws away a law the evidence does
+    support over the region that is meaningful.
+
+    Solved by enumerating the active sets. The optimum of a nonnegative least
+    squares problem is the unconstrained solution of SOME subset of columns
+    with the rest held at zero, so with a handful of columns every subset can
+    be tried and the best feasible one taken. That is the global optimum by
+    construction, and it satisfies the KKT conditions because it is.
+
+    Enumeration rather than a greedy descent, because the greedy version is
+    wrong in exactly the case this exists for. Dropping the most negative
+    column and refitting never reconsiders a column it dropped, and a column
+    that is negative alongside its correlated partner can be positive once
+    that partner is the one held at zero. On ``A = [[6,2,1],[4,8,1],[5,7,1],
+    [5,3,1]]`` with ``y = [7,5,4,8]`` the free solution is ``(-2,-1,21)``;
+    dropping greedily gives ``(0,0,6)`` at SSE 10, while ``(1,0,1)`` is
+    feasible at SSE 8. Returns ``(coefficients, bounded)`` where ``bounded``
+    are the column indices held at zero, or ``None`` when no subset of the
+    columns is solvable.
+
+    A column bounded at zero is NOT a column shown to be free. It is a column
+    this design cannot separate from the ones it moves with, and the caller
+    has to say so -- see `Fit.bounded`.
+    """
+    width = len(matrix[0])
+    if width > _MAX_ENUMERATED_COLUMNS:  # pragma: no cover - no such regime
+        return None
+    best = None
+    for mask in range(1, 1 << width):
+        free = [i for i in range(width) if mask & (1 << i)]
+        if len(free) > len(matrix):
+            continue
+        sub = [[row[i] for i in free] for row in matrix]
+        solved = _solve(sub, rhs)
+        if solved is None or any(c < 0.0 for c in solved):
+            continue
+        predicted = [sum(c * v for c, v in zip(solved, row)) for row in sub]
+        sse = sum((p - y) ** 2 for p, y in zip(predicted, rhs))
+        if best is None or sse < best[0]:
+            out = [0.0] * width
+            for k, i in enumerate(free):
+                out[i] = solved[k]
+            best = (sse, out, tuple(i for i in range(width)
+                                    if not mask & (1 << i)))
+    if best is None:
+        return None
+    return best[1], best[2]
+
+
 class Fit:
     """A regime's law, and everything a reader needs to distrust it.
 
@@ -736,11 +812,11 @@ class Fit:
 
     __slots__ = ("regime", "features", "pinned", "coefficients", "scales",
                  "points", "residual_df", "relative_error", "domain", "scope",
-                 "scope_undeclared")
+                 "scope_undeclared", "bounded")
 
     def __init__(self, regime, features, pinned, coefficients, scales, points,
                  residual_df, relative_error, domain, scope,
-                 scope_undeclared=()):
+                 scope_undeclared=(), bounded=()):
         self.regime = regime
         self.features = tuple(features)
         self.pinned = tuple(pinned)
@@ -752,6 +828,11 @@ class Fit:
         self.domain = domain
         self.scope = scope
         self.scope_undeclared = tuple(scope_undeclared)
+        #: Terms the nonnegativity constraint holds at zero. Carried and
+        #: reported, never silently dropped: a zero here is not evidence that
+        #: the work is free, it is this design's inability to separate that
+        #: term from the ones it moves with.
+        self.bounded = tuple(bounded)
 
     def predict(self, values):
         """``values`` in this fit's own feature order, pinned ones removed."""
@@ -771,6 +852,13 @@ class Fit:
         if self.pinned:
             note += ("; measured only where %s is zero"
                      % ", ".join(self.pinned))
+        if self.bounded:
+            note += ("; %s held at zero by the nonnegativity bound, which is "
+                     "active there -- the free solve wanted a negative cost "
+                     "for them, either because this design cannot separate "
+                     "them from the terms they move with or because a term "
+                     "is missing. The law charges nothing for them and does "
+                     "not claim they are free" % ", ".join(self.bounded))
         return ("%s from %d point(s), %d residual df, in-sample %.1f%% [%s]%s"
                 % (self.regime.name, self.points, self.residual_df,
                    self.relative_error * 100, terms, note))
@@ -910,18 +998,58 @@ def fit_regime(regime, observations, *, strict=True, min_residual_df=1):
             "vary independently across these points, so their coefficients "
             "cannot be told apart. Measure a point that separates them."
             % (regime.name, ", ".join(features)))
-    negative = [name for name, c in zip(features, solved) if c < 0]
-    if negative:
-        return Refusal(
-            "%s: the fit wants a negative cost for %s, which is not a cost. "
-            "Either a term is missing or these points are not one regime."
-            % (regime.name, ", ".join(negative)))
+    bounded = ()
+    if any(c < 0 for c in solved):
+        # A cost is not negative, so an unconstrained solution outside that
+        # region is not a law. It is a hint -- usually of a near-collinear
+        # design, where noise decides the split between columns that move
+        # together, sometimes of physics this regime's features are missing.
+        # Either way the answer is the constrained optimum and an honest
+        # statement of which terms its constraint holds at zero. Whether that
+        # predictor is usable is decided by what it costs in error, below and
+        # in cross-validation, not by the sign of the free solve.
+        constrained = _solve_nonnegative(scaled, rhs)
+        if constrained is None:
+            return Refusal(
+                "%s: the fit wants a negative cost for %s, and the design "
+                "left after holding it at zero is rank deficient, so there is "
+                "no nonnegative law these points identify. Measure a point "
+                "that separates them."
+                % (regime.name,
+                   ", ".join(name for name, c in zip(features, solved)
+                             if c < 0)))
+        solved, at_zero = constrained
+        bounded = tuple(features[i] for i in at_zero)
+        if not any(solved):
+            return Refusal(
+                "%s: every term goes to zero under nonnegativity, so these "
+                "points identify no cost at all" % regime.name)
 
     predicted = [sum(c * v for c, v in zip(solved, row)) for row in scaled]
+
+    # A law has to beat the dullest rival there is: charging every point the
+    # same number. If it does not, it has found no structure -- the seconds
+    # move, and not with the work -- and whatever came out of the solve is a
+    # shape fitted to scatter. Stated as a comparison rather than as a
+    # tolerance so there is no threshold to tune: the mean is a competitor,
+    # not a number somebody chose.
+    mean = sum(rhs) / len(rhs)
+    total = sum((y - mean) ** 2 for y in rhs)
+    residual = sum((p - y) ** 2 for p, y in zip(predicted, rhs))
+    if total > 0.0 and residual >= total:
+        return Refusal(
+            "%s: the law fits these points no better than charging every one "
+            "of them the same number, so nothing here says the cost follows "
+            "the work. Either a term is missing or these points are not one "
+            "regime." % regime.name)
+
     errors = [abs(p - y) / y for p, y in zip(predicted, rhs) if y]
+    # Residual df counts every fitted term, including the ones the constraint
+    # holds at zero. Counting only the free ones would report more degrees of
+    # freedom on a design that identified less, which is backwards.
     return Fit(regime, features, pinned, solved, scales, len(rows),
                len(rows) - len(solved), max(errors) if errors else 0.0,
-               domain, declared, undeclared)
+               domain, declared, undeclared, bounded)
 
 
 def scope_key(scope) -> tuple:

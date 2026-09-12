@@ -118,10 +118,21 @@ _ATTENTION_SCOPE_KEYS = tuple(sorted(set(attention.UNIFIED_SCOPE)
 #: unreachable.
 _MEASUREMENT_CONDITIONS = (
     "cache_state", "compile_mode", "cudagraph_mode", "dtype", "enforce_eager",
-    "first_call", "iters", "max_model_len", "model", "only", "quantization",
+    "first_call", "max_model_len", "model", "quantization",
     "repeats", "rotation", "superseded", "tensor_parallel_size", "timing",
     "timing_method", "visited", "warmup",
 )
+
+#: Acquisition metadata: true of how a batch was collected, and not a property
+#: an inference request could have or fail to have. `iters` is how many times
+#: the harness replayed a capture to get a stable number, and `only` is the
+#: family filter the operator was selected by. A served step does not choose an
+#: iteration count, so requiring a request to state one before a law applies
+#: would make every law unmatchable for a reason nobody could act on. They are
+#: kept as qualification -- a reader still sees how many iterations stood
+#: behind a number -- and taken out of scope EQUALITY, which is about which
+#: deployment a price is a price for.
+_ACQUISITION_CONTEXT = ("iters", "only")
 
 #: Config fields worth carrying as conditions, under a name that cannot be
 #: mistaken for a resolved fact. Two files that asked for different things are
@@ -217,18 +228,69 @@ _LAYER_IDENTITY = ("layer_name", "layer", "layer_idx", "block_tables",
 #: measurement, as opposed to what came out of it. Not provenance --
 #: `provenance.cache` states the cache mode that was requested, while
 #: `record["cache"]` is what that record was actually taken under, and only the
-#: second is a fact about the measurement. `kv_regions` and `arg_sets` say
-#: which regions were rebuilt and how many argument sets were rotated through:
-#: two records that differ in either are measurements of different residency,
-#: not repeats of one. The version qualifiers are here because a record taken
-#: by a different collector is not a repeat of one taken by this one.
+#: second is a fact about the measurement. `kv_regions` says which regions were
+#: rebuilt, and the argument rotation says how cold the operands were kept: two
+#: records that differ in either are measurements of different residency, not
+#: repeats of one. The version qualifiers are here because a record taken by a
+#: different collector is not a repeat of one taken by this one.
+#:
+#: The operand rotation enters as the POLICY that produced it, not as the count
+#: it produced. `arg_sets` is `max(2, min(64, COLD_WORKING_SET_BYTES //
+#: per_set))` -- see `microbench._build_arg_sets` -- so it is a shape-derived
+#: output of one residency policy, a function of the design point rather than a
+#: knob anybody set. Keying on it makes the treatment vary with the very thing
+#: being fitted: every size gets its own singleton law and nothing is left to
+#: fit. What distinguishes two genuinely different measurement policies is the
+#: code that decided the residency, and the collector records exactly that --
+#: see `_acquisition_policy`. So records taken under one policy pool, records
+#: taken under a different one do not, and the realized count is kept as
+#: qualification on the point instead of as its scope.
 #:
 #: The treatment rides into the FIT scope, not only into the replicate key. A
 #: cold-cache point and a warm-cache point are not two points on one law, and
 #: separating them only at collapse time would let them rejoin as independent
 #: points of the same fit -- which is the same averaging, moved one step later.
-_TREATMENT_FIELDS = ("cache", "kv_regions", "arg_sets", "version",
+_TREATMENT_FIELDS = ("cache", "kv_regions", "version",
                      "collector_version", "schema_version")
+
+#: Shape-derived outputs of the acquisition policy. Kept with the point as
+#: evidence -- a reader still sees how many operand sets a record actually
+#: rotated over, and so how large its footprint was -- and kept OUT of the
+#: identity, because a value the design point determines cannot also be a
+#: condition the design point is compared under.
+_QUALIFICATION_FIELDS = ("arg_sets",)
+
+#: The module whose code decides the residency policy: the byte budget, the
+#: clamp, and the rotation `arg_sets` is the output of. Its content hash is
+#: what separates two measurement policies from one policy applied to two
+#: shapes.
+_POLICY_MODULE = "atom.compass.runtime.microbench"
+
+
+def _acquisition_policy(blob: dict) -> tuple:
+    """The measurement policy a price file was taken under, from its own record.
+
+    The collector writes the identity of every module it imported, by path and
+    content hash, before it measures anything. The hash of the module that
+    builds the operand rotation IS the policy: the same hash is the same byte
+    budget and the same clamp, and a different hash is a different policy whose
+    numbers were not taken the same way.
+
+    A file that does not record it gets ``("unevidenced",)``, which equals no
+    recorded policy and pools with nothing that has one. That is a refusal to
+    assume, not a default: an unrecorded policy might be this one or might not,
+    and the difference is the whole question.
+    """
+    modules = (((blob.get("provenance") or {}).get("collector") or {})
+               .get("source_identity") or {}).get("modules") or {}
+    entry = modules.get(_POLICY_MODULE) if isinstance(modules, dict) else None
+    if isinstance(entry, dict):
+        digest = entry.get("sha256")
+    else:
+        digest = entry if isinstance(entry, str) else None
+    if not digest:
+        return ("unevidenced",)
+    return (_POLICY_MODULE, str(digest))
 
 #: Measured OUTCOMES. Deliberately not part of any identity: `host_seconds` is
 #: a number that came out of the measurement and carries ordinary timing
@@ -239,7 +301,7 @@ _TREATMENT_FIELDS = ("cache", "kv_regions", "arg_sets", "version",
 _OUTCOME_FIELDS = ("host_seconds",)
 
 
-def _measurement_identity(record: dict) -> tuple:
+def _measurement_identity(record: dict, policy: tuple = ("unevidenced",)) -> tuple:
     """The treatment this record was taken under, as a comparable key.
 
     Part of both the design identity and the fitted law's scope, so two
@@ -249,9 +311,34 @@ def _measurement_identity(record: dict) -> tuple:
     cold measurement with a warm one and report the result as a repeat.
     """
     kernels = tuple(sorted((record.get("kernels") or {})))
-    return (kernels,) + tuple(
-        (field, _hashable(record[field])) for field in _TREATMENT_FIELDS
-        if field in record)
+    return (kernels, ("acquisition_policy", policy)) + tuple(
+        (field, _hashable(record[field]))
+        for field in _TREATMENT_FIELDS if field in record)
+
+
+def _qualification(record: dict) -> tuple:
+    """The shape-derived facts kept with a record but out of its identity."""
+    return tuple((field, _hashable(record[field]))
+                 for field in _QUALIFICATION_FIELDS if field in record)
+
+
+def _acquisition_context(blob: dict) -> tuple:
+    """How a batch was collected, as qualification rather than as scope.
+
+    `iters` is how many times the harness replayed a capture, `only` the
+    family filter the operator was selected by -- see `_ACQUISITION_CONTEXT`.
+    Both are true of the acquisition and neither is a property a served
+    request could have, so they are recorded and reported and never compared.
+    """
+    provenance = blob.get("provenance") or {}
+    config = provenance.get("config") or {}
+    found = []
+    for field in _ACQUISITION_CONTEXT:
+        for where in (provenance, config if isinstance(config, dict) else {}):
+            if field in where:
+                found.append((field, _hashable(where[field])))
+                break
+    return tuple(found)
 
 
 def _host_seconds(record: dict):
@@ -401,6 +488,14 @@ class ParametricPriceLibrary(PriceLibrary):
         #: at different ragged structures are two design points and the second
         #: would be dropped as a duplicate.
         self._attention_obs: list = []
+        #: What a launch costs where this library is being priced, published by
+        #: whoever builds the cost oracle -- see `source_oracle`. `None` means
+        #: nobody said, which is not the same as zero and is never read as it.
+        self.launch_charge_seconds = None
+        #: Per price file, how it was acquired: the policy its numbers were
+        #: taken under and the acquisition metadata that qualifies them
+        #: without identifying a deployment. Reported, never compared.
+        self._attention_acquisition: dict = {}
         #: the fitted attention model, built once from those observations
         self._attention_model = None
         #: The asking deployment's own resolved attention scope -- its KV
@@ -516,6 +611,11 @@ class ParametricPriceLibrary(PriceLibrary):
         if not by_sig:
             return
         declared = _attention_scope(blob, registration)
+        policy = _acquisition_policy(blob)
+        self._attention_acquisition[price_path] = {
+            "policy": policy,
+            "context": _acquisition_context(blob),
+        }
         resolved, unreadable = _resolved_declaration(blob, price_path)
         if unreadable:
             # Never silently pooled with a file whose resolution was read:
@@ -536,7 +636,8 @@ class ParametricPriceLibrary(PriceLibrary):
                 scope.update(resolved.for_op(op))
             self._attention_obs.append(
                 (op, float(seconds), price_path, scope,
-                 _measurement_identity(record), _host_seconds(record)))
+                 _measurement_identity(record, policy), _host_seconds(record),
+                 _qualification(record)))
         self._attention_model = None
 
     def attention_design_points(self) -> list:
@@ -560,14 +661,14 @@ class ParametricPriceLibrary(PriceLibrary):
         """
         groups: dict = {}
         for obs in self._attention_obs:
-            op, seconds, source, scope, measurement, _host = obs
+            op, seconds, source, scope, measurement, _host, _qual = obs
             key = (_design_identity(op), measurement,
                    attention.scope_key(scope))
             groups.setdefault(key, []).append(obs)
         points = []
         for members in groups.values():
             members.sort(key=lambda m: m[1])
-            op, seconds, source, scope, measurement, _host = \
+            op, seconds, source, scope, measurement, _host, _qual = \
                 members[len(members) // 2]
             # The treatment travels with the point into the fit, so a law is
             # identified by the conditions its measurements were taken under
@@ -585,9 +686,30 @@ class ParametricPriceLibrary(PriceLibrary):
                            (high - low) / seconds * 100 if seconds else 0.0,
                            "" if len(sources) == 1
                            else ", from %d files" % len(sources)))
-            note += self._host_note(members)
+            note += self._host_note(members) + self._qualification_note(members)
             points.append((op, seconds, note, scope))
         return points
+
+    @staticmethod
+    def _qualification_note(members) -> str:
+        """The shape-derived facts behind a point, kept where a reader sees them.
+
+        The operand rotation a record realized is evidence about how cold its
+        operands were held, and it is a function of this point's own footprint.
+        It qualifies the number; it does not identify the law -- see
+        `_QUALIFICATION_FIELDS` -- so it is written here rather than into the
+        scope.
+        """
+        seen: dict = {}
+        for member in members:
+            for field, value in member[6] or ():
+                seen.setdefault(field, set()).add(value)
+        if not seen:
+            return ""
+        return " (" + ", ".join(
+            "%s %s" % (field, "/".join(str(v) for v in sorted(
+                values, key=str)))
+            for field, values in sorted(seen.items())) + ")"
 
     @staticmethod
     def _host_note(members) -> str:
@@ -629,6 +751,18 @@ class ParametricPriceLibrary(PriceLibrary):
         coverage = dict(self.attention_model().coverage())
         coverage["observations"] = len(self._attention_obs)
         coverage["design_points"] = len(self.attention_design_points())
+        # How the numbers were acquired, reported beside what they cover. A
+        # reader deciding whether to trust a modelled price needs to see that
+        # two policies are present, or that one file recorded none -- neither
+        # of which is visible from the laws, because the first is why two laws
+        # exist and the second is why one does not.
+        coverage["acquisition_policies"] = sorted(
+            {tuple(entry["policy"])
+             for entry in self._attention_acquisition.values()})
+        coverage["acquisition_context"] = {
+            path: dict(entry["context"])
+            for path, entry in sorted(self._attention_acquisition.items())}
+        coverage["launch_charge_seconds"] = self.launch_charge_seconds
         return coverage
 
     def _build(self) -> None:
@@ -773,7 +907,33 @@ class ParametricPriceLibrary(PriceLibrary):
         regime = attention.regime_of(op, None, scope)
         name = regime.name
         fit, _why = model.fit_for(name, scope)
-        kernels, unevidenced = self._launch_composition(name, fit)
+        kernels, unevidenced, state = self._launch_composition(name, fit)
+        attribution = "unknown: modelled total, not measured per kernel"
+        if state == "unrecorded":
+            # An unrecorded composition matters exactly as much as a launch
+            # costs. `PriceLibrary.body` charges `launches *
+            # seconds_per_launch`, so where that rate is zero the composition
+            # buys nothing: no launch charge is inferred from it, and refusing
+            # would be withholding a price over a number that could not have
+            # changed it. Where the rate is nonzero -- or is not stated at all
+            # -- the count IS a cost, and no count is invented to get past
+            # this. The charge is read as configured; it is never set to zero
+            # here.
+            charge = getattr(self, "launch_charge_seconds", None)
+            if isinstance(charge, (int, float)) \
+                    and not isinstance(charge, bool) and float(charge) == 0.0:
+                kernels, unevidenced = (), None
+                attribution = (
+                    "unknown and uncharged: no measurement behind this law "
+                    "records which kernels served it, and this library "
+                    "charges nothing per launch, so no launch count is "
+                    "inferred from the absence")
+            else:
+                unevidenced = (
+                    "%s -- and this library charges %s per launch, so the "
+                    "count it would need is a cost, not a label"
+                    % (unevidenced, "an unstated amount" if charge is None
+                       else "%.3gs" % float(charge)))
         if unevidenced:
             return None, (f"{original}; this is a ragged attention family, "
                           f"and {unevidenced}")
@@ -784,8 +944,7 @@ class ParametricPriceLibrary(PriceLibrary):
             # of a plausible fabrication; the launch COUNT is what the evidence
             # establishes and what `body` reads.
             "kernels": {kernel: None for kernel in kernels},
-            "kernel_attribution": "unknown: modelled total, not measured per "
-                                  "kernel",
+            "kernel_attribution": attribution,
             "occurrences": 1,
             "name": contract.family,
             INTERPOLATED_FLAG: True,
@@ -795,7 +954,7 @@ class ParametricPriceLibrary(PriceLibrary):
                 "regime": name,
                 "detail": fit.describe(),
                 "measured_sources": sorted({
-                    source for _op, _s, source, _scope, _how, _host
+                    source for _op, _s, source, _scope, _how, _host, _q
                     in self._attention_obs}),
             },
         }, f"{INTERPOLATED_SCHEME}{contract.family}/{name}")
@@ -803,15 +962,26 @@ class ParametricPriceLibrary(PriceLibrary):
     def _launch_composition(self, regime_name: str, fit):
         """The kernels every measurement behind this law was served by.
 
-        Returns ``(names, None)`` when they agree, and ``(None, reason)`` when
-        they do not or when none of them says. Disagreement is not resolved by
-        picking one: two records served by different kernel sets are evidence
-        that this regime does not launch a fixed composition, and a price that
-        assumed one would change the step's launch count on no evidence.
+        Returns ``(names, reason, state)``. The state separates the two ways
+        this can come up empty, because they are different facts and only one
+        of them is ever survivable. ``"disagree"`` means two records behind one
+        law were served by different kernel sets: that is positive evidence
+        that the regime has no fixed composition, and picking one would invent
+        a launch count. ``"unrecorded"`` means nobody wrote the composition
+        down -- the collector was run without kernel-id collection -- which
+        says nothing about what ran and leaves the decision to what a launch
+        actually costs. The caller resolves that; this only reports it.
+
+        In practice `"unrecorded"` is the state that arrives here: the kernels
+        a record was served by are part of its measurement identity, so two
+        records served differently are separated into two laws before either
+        is fitted. The disagreement branch is the backstop for a scope that
+        stops carrying the composition, and it is kept because the cost of
+        being wrong about it is a silently altered launch count.
         """
         compositions = set()
         wanted = attention.scope_key(fit.scope)
-        for op, _seconds, _source, obs_scope, measurement, _host in \
+        for op, _seconds, _source, obs_scope, measurement, _host, _q in \
                 self._attention_obs:
             obs_scope = dict(obs_scope or {})
             obs_scope["measurement_treatment"] = measurement
@@ -828,15 +998,14 @@ class ParametricPriceLibrary(PriceLibrary):
             return None, (
                 "no measurement behind the %s law records which kernels "
                 "served it, so how many launches this call is cannot be "
-                "stated; a price without that changes the step's launch count "
-                "silently" % regime_name)
+                "stated" % regime_name), "unrecorded"
         if len(compositions) > 1:
             shown = "; ".join(sorted(", ".join(c) for c in compositions))
             return None, (
                 "the measurements behind the %s law were served by different "
                 "kernel sets (%s), so this regime has no established launch "
-                "composition to carry" % (regime_name, shown))
-        return sorted(compositions.pop()), None
+                "composition to carry" % (regime_name, shown)), "disagree"
+        return sorted(compositions.pop()), None, "known"
 
     def _request_scope(self, op: dict, topology, registration):
         """The static scope the asking deployment declares, or None.
@@ -915,7 +1084,7 @@ class ParametricPriceLibrary(PriceLibrary):
         asked = attention.regime_of(op, None, attention.scoped(op, scope))
         wanted = None if isinstance(asked, attention.Refusal) else asked.name
         treatments = set()
-        for obs_op, _s, _src, obs_scope, measurement, _host in \
+        for obs_op, _s, _src, obs_scope, measurement, _host, _q in \
                 self._attention_obs:
             if obs_op.get("name") != family:
                 continue

@@ -318,18 +318,113 @@ class TestAFitRefusesWhatItCannotIdentify:
         says to measure a point that separates them."""
         regime = attention.REGIMES["gdn.prefill"]
         points = []
-        for q, seconds in ((64, 1e-4), (128, 2e-4), (256, 4e-4), (512, 8e-4)):
+        # Every width a multiple of CHUNK_SIZE, so `chunks` is exactly
+        # `query_rows / 64`, and every batch one sequence, so `sequences` is
+        # exactly `calls`. Enough of them to clear the point count: the
+        # refusal under test is that the design cannot separate the terms, not
+        # that it is short of rows.
+        for q, seconds in ((64, 1e-4), (128, 2e-4), (256, 4e-4), (512, 8e-4),
+                           (1024, 1.6e-3), (2048, 3.2e-3), (4096, 6.4e-3)):
             structure = structure_of(_gdn([q], initial=[False]))
             points.append((structure, seconds, "src", dict(GDN_SCOPE)))
         out = fit_regime(regime, points)
         assert isinstance(out, Refusal)
         assert "rank deficient" in out.reason and "separates them" in out.reason
 
-    def test_a_negative_coefficient_is_refused_as_not_a_cost(self):
+    def test_a_negative_free_coefficient_bounds_the_term_and_says_so(self):
+        """One term grows the cost and another reduces it. A cost cannot be
+        negative, so the constrained law charges zero for the second and
+        reports that the bound is active there. The sign of the free solve is
+        not itself a verdict -- whether this law is usable is decided by its
+        error -- but which terms the bound holds at zero is published. This is
+        the shape the measured GDN prefill has: at equal query rows, spreading
+        them over more sequences measures faster."""
+        regime = attention.REGIMES["unified.prefill.cold"]
+        points = [(q, 0, 1.0e-9 * (q * (q + 1) // 2) - 1.0e-8 * q)
+                  for q in (64, 128, 256, 512, 1024, 2048)]
+        fit = fit_regime(regime, self._points(points))
+        assert not isinstance(fit, Refusal), getattr(fit, "reason", "")
+        assert "query_rows" in fit.bounded
+        assert fit.coefficients[fit.features.index("query_rows")] == 0.0
+        described = fit.describe()
+        assert "query_rows" in described and "held at zero" in described
+        # The free solve wanting a negative is the reason the bound is
+        # active, and the report says that rather than guessing at a cause.
+        assert "wanted a negative cost" in described
+
+    def test_a_law_no_better_than_a_flat_charge_is_refused(self):
+        """The same falling seconds at three points: too few and too scattered
+        for the design to determine the sign, so the nonnegative fit returns
+        something. It explains nothing, and saying so is the gate -- not the
+        sign of a coefficient."""
         regime = attention.REGIMES["unified.prefill.cold"]
         out = fit_regime(regime, self._points(
             [(64, 0, 1e-3), (128, 0, 5e-4), (256, 0, 1e-4)]))
-        assert isinstance(out, Refusal) and "not a cost" in out.reason
+        assert isinstance(out, Refusal)
+        assert "the same number" in out.reason
+
+    def test_an_undetermined_negative_is_bounded_rather_than_refused(self):
+        """Two columns that move together leave the split between them open,
+        and the noise puts one side of it below zero. The law inside the
+        region a cost can live in is the honest one -- and it says which term
+        it is holding at zero."""
+        # Two columns that move together, and a right-hand side whose free
+        # solution puts the second below zero. Solved directly, so what is
+        # under test is the constraint and not the noise of some fixture.
+        matrix = [[1.0, 1.02], [2.0, 2.01], [3.0, 3.03], [4.0, 3.98],
+                  [5.0, 5.01], [6.0, 6.02]]
+        rhs = [1.0, 2.05, 2.9, 4.1, 4.95, 6.0]
+        free = attention._solve(matrix, rhs)
+        assert min(free) < 0  # the design does not determine the split
+        solved, at_zero = attention._solve_nonnegative(matrix, rhs)
+        assert all(c >= 0 for c in solved)
+        assert at_zero and all(solved[i] == 0.0 for i in at_zero)
+        # What the free column carries is the work both columns describe, not
+        # half of it: the total charged at each point still tracks the data.
+        for row, y in zip(matrix, rhs):
+            assert abs(sum(c * v for c, v in zip(solved, row)) - y) < 0.2
+
+    def test_the_constrained_solve_finds_the_feasible_optimum(self):
+        """A greedy drop-the-negative-column solver is not NNLS: it never
+        reconsiders a column it dropped, and a column that is negative next to
+        its correlated partner can be positive once the partner is held at
+        zero. This design is the counterexample -- greedy removal returns
+        (0, 0, 6) at SSE 10, and (1, 0, 1) is feasible at SSE 8."""
+        matrix = [[6.0, 2.0, 1.0], [4.0, 8.0, 1.0],
+                  [5.0, 7.0, 1.0], [5.0, 3.0, 1.0]]
+        rhs = [7.0, 5.0, 4.0, 8.0]
+        free = attention._solve(matrix, rhs)
+        assert [round(c, 6) for c in free] == [-2.0, -1.0, 21.0]
+
+        solved, at_zero = attention._solve_nonnegative(matrix, rhs)
+        assert all(c >= 0.0 for c in solved)
+        sse = sum((sum(c * v for c, v in zip(solved, row)) - y) ** 2
+                  for row, y in zip(matrix, rhs))
+        assert sse < 10.0 - 1e-9  # strictly better than the greedy answer
+        assert sse == pytest.approx(8.0, abs=1e-9)
+        assert [round(c, 6) for c in solved] == [1.0, 0.0, 1.0]
+        assert at_zero == (1,)
+
+        # KKT: the residual must not be correlated with a free column, and a
+        # held column's gradient must point out of the feasible region.
+        residual = [y - sum(c * v for c, v in zip(solved, row))
+                    for row, y in zip(matrix, rhs)]
+        for index in range(len(matrix[0])):
+            gradient = -sum(row[index] * r for row, r in zip(matrix, residual))
+            if index in at_zero:
+                assert gradient >= -1e-9
+            else:
+                assert abs(gradient) < 1e-9
+
+    def test_a_bounded_term_is_named_where_a_reader_of_the_price_sees_it(self):
+        """A zero coefficient and a term held at zero are different claims."""
+        regime = attention.REGIMES["gdn.prefill"]
+        fit = attention.Fit(regime, ("query_rows", "chunks"), (),
+                            (1.0, 0.0), (1.0, 1.0), 6, 4, 0.01,
+                            [[1.0, 1.0]], dict(GDN_SCOPE), (), ("chunks",))
+        described = fit.describe()
+        assert "held at zero by the nonnegativity bound" in described
+        assert "does not claim they are free" in described
 
     def test_undeclared_scope_is_refused_under_strict(self):
         regime = attention.REGIMES["unified.prefill.cold"]
@@ -456,14 +551,8 @@ class TestPricingAnUnseenStructure:
     def test_a_continued_gdn_prefill_is_unsupported_on_all_fresh_evidence(self):
         """Current GDN sources are all-fresh single sequences. A batch that
         resumes a held state is a named gap, not a price."""
-        k = 1e-9
-        points = []
-        # Not all multiples of CHUNK_SIZE: if they were, `chunks` would be
-        # exactly `query_rows / 64` and the law would be rank deficient by
-        # construction rather than by anything about the evidence.
-        for q in (96, 100, 300, 1000, 4680):
-            op = _gdn([q], initial=[False])
-            points.append((op, k * q, "src", dict(GDN_SCOPE)))
+        points = [(op, seconds, "src", dict(GDN_SCOPE))
+                  for op, seconds in _gdn_designs()]
         model = Model.from_priced(points)
         asked = _gdn([256], initial=[True])
         # Asked with the op, so the question carries the same operand geometry
@@ -597,36 +686,97 @@ def _layer_copy(op, layer):
     return copy
 
 
+#: A stand-in for the content hash of `atom.compass.runtime.microbench`, which
+#: is what the collector records and what the adapter reads as the policy.
+POLICY_A = "a" * 64
+POLICY_B = "b" * 64
+
+
 def _library(tmp_path, designs, *, scope=None, kernels=("k0", "k1"),
-             layers=16, graph_extra=None, name="p"):
+             layers=16, graph_extra=None, name="p", policy=POLICY_A,
+             arg_sets=None, kernels_per_design=None, acquisition=None):
     """A library holding one attention price per design, replicated by layer.
 
     The price files are synthetic, so this establishes what the adapter does
     with artifacts -- not that any real artifact declares a resolved scope.
+
+    `policy` is the module hash the collector records; `arg_sets` is the
+    rotation that policy produced at each design's footprint, which is a
+    number per design rather than a setting. `acquisition` is the metadata a
+    run carries about itself, such as the iteration count.
     """
     from atom.compass.runtime.microbench import signature_of
 
     library = ParametricPriceLibrary()
     for index, (op, seconds) in enumerate(designs):
         ops, prices = [], {}
+        served = (kernels_per_design[index] if kernels_per_design is not None
+                  else kernels)
         for layer in range(layers):
             copy = _layer_copy(op, layer)
             ops.append(copy)
-            prices[signature_of(copy)] = {
-                "seconds": seconds, "kernels": {k: seconds / len(kernels)
-                                                for k in kernels},
+            record = {
+                "seconds": seconds, "kernels": {k: seconds / len(served)
+                                                for k in served},
                 "occurrences": 1, "name": op["name"],
                 "signature": signature_of(copy),
             }
+            if arg_sets is not None:
+                record["arg_sets"] = (arg_sets[index]
+                                      if isinstance(arg_sets, (list, tuple))
+                                      else arg_sets)
+            prices[signature_of(copy)] = record
         graph = {"ops": ops, "provenance": dict(graph_extra or {})}
-        blob = {"prices": prices,
-                "provenance": {"attention_scope": dict(scope or SCOPE)}}
+        provenance = {"attention_scope": dict(scope or SCOPE)}
+        if policy is not None:
+            digest = (policy[index] if isinstance(policy, (list, tuple))
+                      else policy)
+            provenance["collector"] = {"source_identity": {"modules": {
+                "atom.compass.runtime.microbench": {
+                    "file": "/snap/atom/compass/runtime/microbench.py",
+                    "sha256": digest}}}}
+        for key, value in (acquisition or {}).items():
+            provenance[key] = (value[index]
+                               if isinstance(value, (list, tuple))
+                               else value)
+        blob = {"prices": prices, "provenance": provenance}
         gpath = tmp_path / f"g{name}{index}.json"
         ppath = tmp_path / f"{name}{index}.json"
         gpath.write_text(json.dumps(graph))
         ppath.write_text(json.dumps(blob))
         library.add(str(ppath), str(gpath))
     return library
+
+
+def _gdn_designs():
+    """GDN prefill designs that can identify the regime's terms.
+
+    Three things have to vary independently or the law is unidentifiable by
+    construction: the query rows, the chunk count (so widths that are not all
+    multiples of CHUNK_SIZE), and the sequence count (so batches that are not
+    all single-sequence, which would make `sequences` a copy of `calls`).
+
+    The synthetic truth charges every term the regime carries, at a positive
+    rate. A truth that left one out would make its coefficient whatever the
+    collinearity between the columns happened to produce -- a small negative
+    number, refused for the right reason by the wrong fixture -- and a truth
+    with no per-call term would assert the opposite of what the measured
+    family shows.
+    """
+    rates = {"calls": 4.0e-8, "query_rows": 1.0e-9, "chunks": 3.0e-9,
+             "sequences": 7.0e-9, "continued_sequences": 0.0,
+             "tail_pad_rows": 0.0}
+    regime = attention.REGIMES["gdn.prefill"]
+    designs = []
+    for queries in ([96], [100], [300], [1000], [4680],
+                    [128, 96], [64, 64, 96], [512, 300]):
+        op = _gdn(queries, initial=[False] * len(queries))
+        values = attention.features_for(regime, structure_of(op))
+        assert not isinstance(values, Refusal), values
+        seconds = sum(rates[name] * value
+                      for name, value in zip(regime.features, values))
+        designs.append((op, seconds))
+    return designs
 
 
 def _cold_designs():
@@ -690,12 +840,195 @@ def test_a_modelled_price_carries_the_evidenced_launch_composition(tmp_path):
 
 
 def test_a_price_whose_launch_composition_is_unevidenced_is_refused(tmp_path):
+    """A library that charges per launch needs the count. Nothing records it
+    here, so the charge cannot be stated and no count is invented for it."""
     library = _library(tmp_path, _cold_designs(), kernels=())
+    library.launch_charge_seconds = 95.8e-6
     library.request_attention_scope = dict(SCOPE)
     record, detail = library.lookup(
         _unified([641], [641], is_prefill=True, has_cached=False))
     assert record is None
     assert "launch" in detail
+    # The refusal says which of the two absences this is: nobody wrote the
+    # composition down, and the charge is what makes that matter.
+    assert "records which kernels" in detail and "9.58e-05s" in detail
+
+
+def test_an_unrecorded_composition_passes_where_a_launch_costs_nothing(
+        tmp_path):
+    """The real collector can be run without kernel-id collection, and the
+    source factory charges nothing per launch. Refusing there would withhold a
+    price over a number that could not have changed it -- so it is allowed,
+    and says in the record that the composition is unknown and uncharged."""
+    library = _library(tmp_path, _cold_designs(), kernels=())
+    # As `build_source_oracle` publishes it: the source factory charges
+    # nothing per launch, and says so rather than leaving it unstated.
+    library.launch_charge_seconds = 0.0
+    library.request_attention_scope = dict(SCOPE)
+    record, source = library.lookup(
+        _unified([641], [641], is_prefill=True, has_cached=False))
+    assert record is not None and source.startswith("interpolated://")
+    assert record["kernels"] == {}
+    assert "unknown and uncharged" in record["kernel_attribution"]
+
+
+def test_a_nonzero_launch_charge_is_never_zeroed_to_let_a_price_through(
+        tmp_path):
+    """The allowance is conditional on the charge the library is configured
+    with, and reading it is all that happens: the charge is not touched."""
+    library = _library(tmp_path, _cold_designs(), kernels=())
+    library.launch_charge_seconds = 95.8e-6
+    library.request_attention_scope = dict(SCOPE)
+    library.lookup(_unified([641], [641], is_prefill=True, has_cached=False))
+    assert library.launch_charge_seconds == 95.8e-6
+
+
+def test_two_kernel_sets_are_two_treatments_even_where_launches_are_free(
+        tmp_path):
+    """Not the same absence as an unrecorded composition, and not reached the
+    same way. The kernels a record was served by are part of its measurement
+    identity, so records served by different kernels are separated before any
+    law exists -- they never arrive at one fit to disagree inside it. The
+    allowance for an unrecorded composition does not touch that: what it
+    passes is silence, and this is evidence."""
+    library = _library(tmp_path, _cold_designs(),
+                       kernels_per_design=[("k0",), ("k0", "k1"), ("k0",)])
+    library.launch_charge_seconds = 0.0
+    treatments = {scope["measurement_treatment"] for _op, _s, _note, scope
+                  in library.attention_design_points()}
+    assert len(treatments) == 2
+    library.request_attention_scope = dict(SCOPE)
+    record, _detail = library.lookup(
+        _unified([641], [641], is_prefill=True, has_cached=False))
+    assert record is None
+
+
+class TestTheRotationIsAPolicyNotAScope:
+    """`arg_sets` is what one residency policy produced at a given footprint.
+
+    It is `max(2, min(64, COLD_WORKING_SET_BYTES // per_set))`, so it falls
+    out of the operand size. Treating it as part of the treatment makes the
+    treatment a function of the design point: every size becomes its own law
+    with one point in it, and nothing is ever fitted.
+    """
+
+    def _ask(self, library):
+        library.request_attention_scope = dict(SCOPE)
+        return library.lookup(
+            _unified([641], [641], is_prefill=True, has_cached=False))
+
+    @staticmethod
+    def _treatments(library) -> int:
+        """How many distinct treatments the collected points fall into.
+
+        The direct observation of pooling: a refusal further downstream says
+        the law is short of points, which is a consequence rather than the
+        fact under test.
+        """
+        return len({scope["measurement_treatment"]
+                    for _op, _s, _note, scope
+                    in library.attention_design_points()})
+
+    def test_the_clamp_this_reads_is_the_clamp_the_collector_applies(self):
+        """Pinned against the source, so a change there is caught here."""
+        import inspect
+
+        from atom.compass.runtime import microbench
+        body = inspect.getsource(microbench._build_arg_sets)
+        assert "max(2, min(64," in body.replace(" ", "").replace(
+            "max(2,min(64,", "max(2, min(64,")
+
+    def test_one_policy_at_three_footprints_is_one_law(self, tmp_path):
+        """Three sizes measured by one collector rotated over three different
+        counts. That is one policy applied three times, so they pool."""
+        library = _library(tmp_path, _cold_designs(), policy=POLICY_A,
+                           arg_sets=[64, 12, 2])
+        assert len(library.attention_design_points()) == 3
+        assert self._treatments(library) == 1
+        record, _source = self._ask(library)
+        assert record is not None
+
+    def test_two_policies_do_not_pool(self, tmp_path):
+        """A different microbench is a different byte budget and a different
+        clamp. Those numbers were not taken the same way."""
+        library = _library(tmp_path, _cold_designs(),
+                           policy=[POLICY_A, POLICY_B, POLICY_A],
+                           arg_sets=[64, 64, 64])
+        assert self._treatments(library) == 2
+        record, _detail = self._ask(library)
+        assert record is None
+
+    def test_an_unrecorded_policy_pools_with_nothing_that_has_one(
+            self, tmp_path):
+        library = _library(tmp_path, _cold_designs(),
+                           policy=[POLICY_A, None, POLICY_A])
+        assert self._treatments(library) == 2
+        record, _detail = self._ask(library)
+        assert record is None
+
+    def test_the_realized_rotation_is_kept_as_evidence_on_the_point(
+            self, tmp_path):
+        """Out of the identity, not out of the record: a reader still sees how
+        cold each point's operands were held."""
+        library = _library(tmp_path, _cold_designs(), arg_sets=[64, 12, 2])
+        notes = " ".join(note for _op, _s, note, _scope
+                         in library.attention_design_points())
+        assert "arg_sets 64" in notes and "arg_sets 2" in notes
+
+    def test_the_policy_is_reported_in_coverage(self, tmp_path):
+        library = _library(tmp_path, _cold_designs(), arg_sets=[64, 12, 2])
+        library.launch_charge_seconds = 0.0
+        coverage = library.attention_coverage()
+        assert coverage["acquisition_policies"] == [
+            ("atom.compass.runtime.microbench", POLICY_A)]
+        assert coverage["launch_charge_seconds"] == 0.0
+
+
+class TestAcquisitionMetadataIsNotADeployment:
+    """`iters` and `only` are true of the collection, not of a request.
+
+    A served step does not choose an iteration count or a family filter, so
+    requiring a request to state one before a law applies would make every law
+    unmatchable for a reason nobody could act on.
+    """
+
+    def _ask(self, library):
+        library.request_attention_scope = dict(SCOPE)
+        return library.lookup(
+            _unified([641], [641], is_prefill=True, has_cached=False))
+
+    def test_files_that_differ_only_in_iteration_count_still_pool(
+            self, tmp_path):
+        library = _library(tmp_path, _cold_designs(),
+                           acquisition={"iters": [50, 20, 50]})
+        record, _detail = self._ask(library)
+        assert record is not None
+
+    def test_files_that_differ_only_in_the_family_filter_still_pool(
+            self, tmp_path):
+        library = _library(tmp_path, _cold_designs(),
+                           acquisition={"only": ["gdn", "attention", "gdn"]})
+        record, _detail = self._ask(library)
+        assert record is not None
+
+    def test_it_is_kept_and_reported_rather_than_dropped(self, tmp_path):
+        library = _library(tmp_path, _cold_designs(),
+                           acquisition={"iters": 50, "only": "attention"})
+        context = library.attention_coverage()["acquisition_context"]
+        assert context
+        assert all(entry == {"iters": 50, "only": "attention"}
+                   for entry in context.values())
+
+    def test_a_real_deployment_difference_still_refuses(self, tmp_path):
+        """The relaxation is confined to acquisition metadata: a difference in
+        what was actually deployed is still a difference."""
+        library = _library(tmp_path, _cold_designs(),
+                           acquisition={"model": ["m1", "m2", "m1"]})
+        scopes = {attention.scope_key(scope) for _op, _s, _note, scope
+                  in library.attention_design_points()}
+        assert len(scopes) == 2  # m1 and m2 are two deployments, not one law
+        record, _detail = self._ask(library)
+        assert record is None
 
 
 def test_an_exact_measurement_is_never_displaced_by_a_law(tmp_path):
@@ -1345,9 +1678,7 @@ class TestOneLibraryPricesBothFamilies:
                 "occurrences": 1, "name": op["name"],
                 "signature": signature_of(op)}}
             entries.append(_file(tmp_path, "u%d" % index, [op], prices))
-        for index, q in enumerate((96, 100, 300, 1000, 4680)):
-            op = _gdn([q], initial=[False])
-            seconds = 1e-9 * q
+        for index, (op, seconds) in enumerate(_gdn_designs()):
             prices = {signature_of(op): {
                 "seconds": seconds, "kernels": {"gdn0": seconds},
                 "kv_regions": 1, "cache": "graph",
