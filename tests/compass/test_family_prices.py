@@ -1039,3 +1039,100 @@ def test_two_operators_with_one_scalar_name_and_two_values_do_not_match():
     # widths -- the guard separates configurations, not widths.
     wide = dict(launched(4, 1e-06, 5120), input_shapes=[[32, 5120]])
     assert aligns(wide, 32, a, 16)
+
+
+def _priced(library, op, seconds, rows_traced, tmp_path, tag):
+    """File one measurement of `op` at `seconds` into `library`."""
+    from atom.compass.runtime.microbench import signature_of
+
+    graph = {"ops": [op],
+             "provenance": {"execution": {"body_rows_traced": rows_traced}}}
+    prices = {"prices": {signature_of(op): {
+        "seconds": seconds, "kernels": {"k": seconds},
+        "occurrences": 1, "name": op["name"]}}}
+    gpath = tmp_path / f"{tag}g.json"
+    ppath = tmp_path / f"{tag}p.json"
+    gpath.write_text(json.dumps(graph))
+    ppath.write_text(json.dumps(prices))
+    library.add(str(ppath), str(gpath))
+
+
+def test_a_declared_value_band_reaches_the_price_it_was_declared_for():
+    """The band a `ValueContract` promises is the band the price reports.
+
+    A family declares independence in two places: `nuisances` for components
+    that are not operands, and `values[i].nuisance` for the cost of letting a
+    declared integer payload stand for its extent. The two head selectors
+    declare their WHOLE uncertainty through `values` and leave `nuisances`
+    empty, so an aggregate that reads only `nuisances` reports 0.0 for exactly
+    the two families that have a measured band -- the contract promises 0.77%
+    and 18.64%, and the price answers as though the selectors had never been
+    varied.
+
+    The numbers are unchanged by this: a nuisance band is not a correction to
+    the mean, it is the spread around it.
+    """
+    sub = contract_for("aten::sub.Tensor")
+    gather = contract_for("aten::index.Tensor")
+
+    # Declared through `values`, and `nuisances` is empty -- which is the
+    # whole reason the aggregate had to be widened rather than the contracts
+    # rewritten.
+    assert sub.nuisances == ()
+    assert gather.nuisances == ()
+    assert [v.nuisance.spread for v in sub.values] == [0.0077]
+    assert [v.nuisance.spread for v in gather.values] == [0.1864]
+
+    assert sub.nuisance_spread == 0.0077
+    assert gather.nuisance_spread == 0.1864
+
+    # A measured value nuisance is not an unmeasured one: widening the
+    # aggregate must not start refusing the families it now reaches.
+    assert sub.unmeasured_nuisances == ()
+    assert gather.unmeasured_nuisances == ()
+
+    # And a family that declares no value contract is untouched.
+    assert contract_for("aiter::gemm_a16w16").nuisance_spread == 0.0
+
+
+def test_an_alternate_valid_selector_is_answered_with_the_declared_band(
+        tmp_path):
+    """Same M, different valid row numbers: same price, declared uncertainty.
+
+    This is the case the declaration exists to serve and the case that proves
+    it cost something. The library measured one selector at width 4. The
+    request carries a different, equally valid one -- in bounds, distinct, four
+    of them -- so the abstraction is what lets it match at all. The mean is the
+    measured mean, unchanged. What must come back with it is 18.64%: the band
+    across the five value-sets that were actually varied at a fixed M. A price
+    that answers 0.0 here is claiming the selectors were held constant, and
+    they were not.
+    """
+    library = ParametricPriceLibrary(max_gap_ratio=2.0)
+    _priced(library, _selector_gather(2), 2e-06, 16384, tmp_path, "g2")
+    _priced(library, _selector_gather(4), 4e-06, 16384, tmp_path, "g4")
+
+    # A selector the library never saw: the last row of four unequal slices.
+    alternate = _selector_gather(4, rows=[7, 512, 9000, 16383])
+    assert alternate["int_values"] != _selector_gather(4)["int_values"]
+
+    record, source = library.lookup(alternate)
+    assert record is not None, source
+    assert record["seconds"] == pytest.approx(4e-06)
+    assert record["interpolation"]["uncertainty"] == pytest.approx(0.1864)
+
+    # The subtract carries its own, narrower band by the same route.
+    subs = ParametricPriceLibrary(max_gap_ratio=2.0)
+    _priced(subs, _offsets(2), 2e-06, 16384, tmp_path, "s2")
+    _priced(subs, _offsets(4), 4e-06, 16384, tmp_path, "s4")
+    other = dict(_offsets(4), int_values=[[0, [3, 11, 5000, 16384]]])
+    record, source = subs.lookup(other)
+    assert record is not None, source
+    assert record["seconds"] == pytest.approx(4e-06)
+    assert record["interpolation"]["uncertainty"] == pytest.approx(0.0077)
+
+    # An interpolated width carries the band too, combined in quadrature with
+    # the gap term rather than replacing it -- so it is at least as wide.
+    record, source = library.lookup(_selector_gather(3, rows=[5, 900, 16383]))
+    assert record is not None, source
+    assert record["interpolation"]["uncertainty"] > 0.1864

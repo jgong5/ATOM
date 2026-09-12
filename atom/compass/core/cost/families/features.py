@@ -133,13 +133,35 @@ class FamilyContract:
     rationale: str = ""
 
     @property
+    def all_nuisances(self) -> tuple[Nuisance, ...]:
+        """Every declared nuisance, wherever it was declared.
+
+        A family declares independence in two places. `nuisances` holds the
+        components that are not operands at all -- the layer index, the slot
+        mapping -- and `values[i].nuisance` holds the band that abstracting a
+        declared integer payload costs. Both are the same kind of claim and
+        both have to reach the same two consumers, or a band gets promised in
+        a contract and then dropped on the way to the price: the two head
+        selectors declare their whole uncertainty through `values`, and
+        `nuisances` is empty for them, so reading only `nuisances` returned a
+        spread of 0.0 for the two families that have one.
+        """
+        return self.nuisances + tuple(v.nuisance for v in self.values)
+
+    @property
     def unmeasured_nuisances(self) -> tuple[str, ...]:
-        return tuple(n.component for n in self.nuisances if not n.measured)
+        return tuple(n.component for n in self.all_nuisances if not n.measured)
 
     @property
     def nuisance_spread(self) -> float:
-        """The band collapsing this family's measured nuisances costs."""
-        spreads = [n.spread or 0.0 for n in self.nuisances if n.measured]
+        """The band collapsing this family's measured nuisances costs.
+
+        The widest, not the sum: these are alternative readings of the same
+        price, not independent error terms to accumulate. It is combined in
+        quadrature with the measurement spread downstream, which is where the
+        independence assumption belongs.
+        """
+        spreads = [n.spread or 0.0 for n in self.all_nuisances if n.measured]
         return max(spreads) if spreads else 0.0
 
     def describe(self) -> str:
