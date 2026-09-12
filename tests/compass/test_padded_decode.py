@@ -50,8 +50,12 @@ def shape(n, context=1151, *, bucket=None, tp=1, rank=0):
         capture_bucket=bucket, compiled=None, produces_output=True)
 
 
-def spec_of(n, context=1151, *, bucket=None, **kw):
-    return ShapeDeriver(None, **{**DECLARED, **kw}).spec_for(
+def spec_of(n, context=1151, *, bucket=None, cudagraph_mode="full", **kw):
+    """A derived spec. FULL by default: a bucketed decode has no metadata
+    shape that is right under both capture modes, so the mode is declared
+    here rather than left for `gdn_context` to refuse."""
+    return ShapeDeriver(None, cudagraph_mode=cudagraph_mode,
+                        **{**DECLARED, **kw}).spec_for(
         shape(n, context, bucket=bucket))
 
 
@@ -112,9 +116,19 @@ class TestWhatThePaddedRowsCarry:
         real = [tables[i][65 // block] * block + 65 % block for i in range(3)]
         assert ctx["slot_mapping"][:3] == real
         assert ctx["slot_mapping"][3:] == [PAD_SLOT_ID]
-        # The real rows', not the padded ones': max_seqlen comes off the
-        # scheduled batch (model_runner.py:3187).
-        assert ctx["max_seqlen_k"] == 66 and ctx["max_seqlen_q"] == 1
+        # `max_seqlen_q` is the scheduled batch's, one token per decode row.
+        assert ctx["max_seqlen_q"] == 1
+        # `max_seqlen_k` is not. This bucket is replayed from a FULL capture,
+        # and `aiter_attention.py:1367` froze the declared `max_model_len`
+        # into that graph's metadata; the replay does not rewrite it.
+        assert ctx["max_seqlen_k"] == 262144
+        # Under PIECEWISE the same batch runs attention eagerly
+        # (`model_runner.py:4019-4031`), so `prepare_decode` recomputes it from
+        # the live histories (`aiter_attention.py:1100`) and the real rows'
+        # longest is what the kernel sees.
+        eager = dict(spec_of(3, context=66, bucket=4,
+                             cudagraph_mode="piecewise").attention_context())
+        assert eager["max_seqlen_k"] == 66
         assert ctx["block_tables_shape"][0] == 4
 
     def test_the_state_index_tail_is_pad_slot_id_and_never_zero(self):

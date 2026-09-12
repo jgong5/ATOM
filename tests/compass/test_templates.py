@@ -360,6 +360,9 @@ def native(**kw):
 
     kw.setdefault("block_size", 16)
     kw.setdefault("max_model_len", 262144)
+    # Declared FULL by default: the bucketed fixtures below are replays of a
+    # FULL capture, and an undeclared mode is refused rather than guessed.
+    kw.setdefault("cudagraph_mode", "full")
     return NativeAllocation(**kw)
 
 

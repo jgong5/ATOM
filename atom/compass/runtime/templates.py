@@ -57,6 +57,7 @@ from __future__ import annotations
 from typing import Optional, Protocol
 
 from atom.compass.core.cost.base import StepShape
+from atom.compass.runtime.batch_spec import extent_scope_of
 
 __all__ = ["BindRefusal", "AllocationSource", "CarriedAllocation",
            "NativeAllocation", "NativeStepAllocation",
@@ -222,13 +223,18 @@ class NativeAllocation:
 
     def __init__(self, *, block_size: int, max_model_len: int,
                  position_rows: int = 1, num_spec_step: int = 0,
-                 needs_state: bool = True) -> None:
+                 needs_state: bool = True, cudagraph_mode=None) -> None:
         self.block_size = int(block_size)
         self.max_model_len = int(max_model_len)
         self.position_rows = int(position_rows)
         self.num_spec_step = int(num_spec_step)
-        #: Whether a record without state slots is a refusal. True for this
-        #: deployment, whose GDN layers index a state pool every step.
+        #: The deployment's declared capture mode. Held here for the same
+        #: reason `TemplateGraphs` holds it: the state tail this class encodes
+        #: is mode-specific. A FULL replay writes the bucket's counts with a
+        #: PAD-filled state tail; a PIECEWISE one writes the active counts.
+        #: Left ``None``, a bucketed decode is refused rather than encoded
+        #: under whichever rule happened to be the default.
+        self.cudagraph_mode = cudagraph_mode
         self.needs_state = bool(needs_state)
         self._record = None
         self.offered = 0
@@ -304,6 +310,10 @@ class NativeAllocation:
             num_spec_step=self.num_spec_step,
             block_tables=record.block_tables,
             position_rows=self.position_rows,
+            # The declared mode, so the state tail this class supplies is the
+            # one the engine writes: `gdn_context` refuses a bucketed decode
+            # without it rather than pick a rule.
+            cudagraph_mode=self.cudagraph_mode,
         )
         try:
             attention = dict(spec.attention_context())
@@ -338,7 +348,15 @@ class NativeAllocation:
                     "gaps with row numbers is the fresh-pool assumption under "
                     "another name.")
             ordered = [by_row[i] for i in range(len(rows))]
-            gdn = dict(spec.gdn_context(state_slots=ordered))
+            try:
+                gdn = dict(spec.gdn_context(state_slots=ordered))
+            except ValueError as exc:
+                # An undeclared capture mode, most often. A refusal here is
+                # this module's own vocabulary; a bare ValueError out of a
+                # binding reads as a bug rather than as a missing declaration.
+                raise BindRefusal(
+                    f"the state tail cannot be encoded for this step: "
+                    f"{exc}") from exc
             supplied["non_spec_state_indices_tensor"] = gdn[
                 "non_spec_state_indices_tensor"]
             supplied["non_spec_state_indices_in_tensor"] = gdn[
@@ -358,6 +376,7 @@ class NativeAllocation:
         held = ("none offered" if record is None
                 else f"{len(record.rows)} requests from {record.source}")
         return (f"NativeAllocation(block_size={self.block_size}, "
+                f"cudagraph_mode={self.cudagraph_mode}, "
                 f"state={'required' if self.needs_state else 'optional'}; "
                 f"{held}; offered {self.offered}, answered {self.answered})")
 
@@ -661,6 +680,36 @@ def _fit_allocation(key, template_value, native_value, padding):
         "does not fit the buffer the capture recorded")
 
 
+def _check_traced_as_captured(template: dict) -> None:
+    """Refuse a template that was not itself traced as a FULL capture.
+
+    Under ``"captured"`` the binder keeps the template's ``max_seqlen_k``
+    rather than recomputing it, so the value is only right if the template was
+    derived under the mode being replayed. A template read off disk was traced
+    by some other run: `seeded_graphs` keys it by structure, and structure does
+    not include the mode. So a PIECEWISE-traced graph served to a FULL
+    deployment would be kept verbatim and would carry that run's longest
+    history as a captured extent -- a wrong number with a right-looking
+    provenance, which is worse than a refusal.
+
+    Only refuses when the template *says*: a graph whose provenance records no
+    mode is not evidence either way, and refusing it would reject every
+    template derived before the field existed. What it records is
+    `BatchSpec.to_dict`, which writes every declared field it holds.
+    """
+    spec = ((template.get("provenance") or {}).get("batch_spec") or {})
+    traced = spec.get("cudagraph_mode")
+    if traced is None:
+        return
+    if str(traced).strip().lower() != "full":
+        raise BindRefusal(
+            f"this template was traced under cudagraph_mode {traced!r} and is "
+            "being bound for a FULL replay, which keeps the template's own "
+            "max_seqlen_k. That value is the traced run's longest history, "
+            "not this deployment's max_model_len. Derive the template under "
+            "the mode being priced.")
+
+
 def bind_cohort(template: dict, shape: StepShape,
                 allocation: Optional[AllocationSource] = None,
                 extent_scope: str = "batch") -> dict:
@@ -681,6 +730,8 @@ def bind_cohort(template: dict, shape: StepShape,
         raise BindRefusal(
             f"extent_scope {extent_scope!r} is not one of 'batch', "
             "'captured', 'undeclared'")
+    if extent_scope == "captured":
+        _check_traced_as_captured(template)
     rows = _rows(shape)
     pad_rows, pad_tokens = _padding_of(shape)
     has_allocator = any(
@@ -789,14 +840,25 @@ class TemplateGraphs:
     from "rank 3 was priced from rank 3's graph" and a report has to be able to
     tell them apart. A template keyed at the asking rank always wins; the
     fallback only fires on a miss.
+
+    ``cudagraph_mode`` is the deployment's declared mode, and it is held here
+    rather than read off the shape because it is a property of the deployment
+    and not of a step: `StepShape` says which bucket ran, never which mode
+    captured it. Every bind goes through :func:`extent_scope_of` with it, so a
+    warm reuse and the derivation that filled the cache resolve one step's
+    launch extent the same way. Left ``None``, a bucketed step binds to
+    ``"undeclared"`` and is refused -- which is the intended answer, not a
+    gap: the deriver takes the same mode, and a composition that declares it
+    to one and not the other would bind FULL graphs against the batch rule.
     """
 
     def __init__(self, templates=None, derive=None, allocation=None,
-                 representative_rank: int = 0) -> None:
+                 representative_rank: int = 0, cudagraph_mode=None) -> None:
         self._templates = dict(templates or {})
         self._derive = derive
         self._allocation = allocation
         self._representative = int(representative_rank)
+        self._cudagraph_mode = cudagraph_mode
         self.hits = 0
         self.binds = 0
         self.derivations = 0
@@ -849,8 +911,16 @@ class TemplateGraphs:
             self._templates[key] = template
         else:
             self.hits += 1
+        # The same scope on the cold return and every warm one after it. A
+        # derivation builds its graph from a `BatchSpec` that already knows
+        # the mode, so binding that graph back under the default batch rule
+        # would overwrite a captured `max_seqlen_k` the moment it was
+        # produced -- and then again on every hit.
+        scope = extent_scope_of(shape.capture_bucket,
+                                shape.num_prefill_tokens > 0,
+                                self._cudagraph_mode)
         try:
-            bound = bind_cohort(template, shape, self._allocation)
+            bound = bind_cohort(template, shape, self._allocation, scope)
         except BindRefusal as exc:
             self.refusals[key] = str(exc)
             return None
@@ -863,7 +933,10 @@ class TemplateGraphs:
         stood_in = (f", {self.representative_hits} of them from rank "
                     f"{self._representative}'s graph"
                     if self.representative_hits else "")
+        mode = (f"cudagraph_mode {self._cudagraph_mode}"
+                if self._cudagraph_mode else "no cudagraph_mode declared")
         return (f"TemplateGraphs({len(self._templates)} templates, "
                 f"{self.hits} hits{stood_in}, {self.derivations} derivations "
                 f"in {self.derivation_seconds:.3f}s, "
-                f"{self.binds} binds, {len(self.refusals)} refused; {where})")
+                f"{self.binds} binds, {len(self.refusals)} refused; "
+                f"{mode}; {where})")

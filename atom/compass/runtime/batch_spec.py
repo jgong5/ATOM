@@ -30,7 +30,8 @@ import json
 from dataclasses import dataclass, field, fields
 from typing import Any, Optional
 
-__all__ = ["BatchSpec", "allocate_blocks", "PAD_SLOT_ID"]
+__all__ = ["BatchSpec", "allocate_blocks", "PAD_SLOT_ID",
+           "replays_captured_extent", "extent_scope_of"]
 
 #: What a padded row points at, which is nothing. The engine's own constant,
 #: repeated here rather than imported because this module deliberately has no
@@ -42,6 +43,56 @@ __all__ = ["BatchSpec", "allocate_blocks", "PAD_SLOT_ID"]
 #: different one: zero is request zero's slot, and a padded row carrying it
 #: reads and writes a live sequence's state and pages.
 PAD_SLOT_ID = -1
+
+
+def replays_captured_extent(capture_bucket, is_prefill: bool,
+                            cudagraph_mode) -> Optional[bool]:
+    """Does a step with these three facts run the metadata a *capture* built?
+
+    The rule itself, apart from the dataclass that usually carries it, because
+    two paths have to answer it identically: `BatchSpec`, which knows the
+    requests, and `TemplateGraphs`, which binds a warm template to a
+    `StepShape` and has only the same three facts. A second copy of the rule
+    would be a second chance to get it wrong, and the way it would fail --
+    derivation and warm reuse disagreeing about one graph -- is the defect
+    this rule exists to stop.
+
+    Two builders write ``max_seqlen_k`` to different values.
+    ``prepare_decode`` takes ``context_lens.max()``, the batch's own longest
+    history (aiter_attention.py:1100, :1139); ``build_for_cudagraph_capture``
+    pins it to the engine's ``max_model_len`` (:1367, and :1331 for the
+    unified builder). A FULL capture replays the whole forward from the
+    buffers the capture holds, so a replayed step runs the captured value
+    however short its batch is. A PIECEWISE capture leaves attention eager --
+    ``capture_cudagraph`` logs "attention eager" and skips the whole-forward
+    capture (model_runner.py:4019-4031) -- so its metadata is rebuilt every
+    step even though the *rows* are still the bucket's.
+
+    ``False`` whenever there is no bucket, and for a prefill at any bucket.
+    ``None`` only when a bucket is declared and the mode is not: the answer
+    turns on a deployment fact nobody supplied, and both answers are wrong in
+    the way that reads as a plausible number.
+    """
+    if capture_bucket is None or is_prefill:
+        return False
+    if cudagraph_mode is None:
+        return None
+    return str(cudagraph_mode).strip().lower() == "full"
+
+
+def extent_scope_of(capture_bucket, is_prefill: bool, cudagraph_mode) -> str:
+    """Which rule the attention launch extent follows, as a name.
+
+    ``"captured"`` -- the capture's ``max_model_len``. ``"batch"`` -- the
+    batch's longest history, which is what an eager step and a PIECEWISE
+    replay both run. ``"undeclared"`` -- a bucket without a
+    ``--cudagraph-mode``, which binders refuse rather than resolve.
+    """
+    replays = replays_captured_extent(capture_bucket, is_prefill,
+                                      cudagraph_mode)
+    if replays is None:
+        return "undeclared"
+    return "captured" if replays else "batch"
 
 
 def allocate_blocks(prompt_lens, context_lens, block_size: int,
@@ -261,30 +312,20 @@ class BatchSpec:
     def replays_captured_metadata(self) -> Optional[bool]:
         """Does this step run the attention metadata a *capture* built?
 
-        Two builders write the same field to different values.
-        ``prepare_decode`` takes ``max_seqlen_k = context_lens.max()`` --
-        the batch's own longest history (aiter_attention.py:1100, :1139) --
-        while ``build_for_cudagraph_capture`` pins it to the engine's
-        ``max_model_len`` (:1367, and :1331 for the unified builder). A FULL
-        capture replays the whole forward with the buffers the capture holds,
-        so a replayed step runs the captured value however short the batch
-        is. A PIECEWISE capture leaves attention eager -- ``capture_cudagraph``
-        logs "attention eager" and skips the whole-forward capture
-        (model_runner.py:4019-4031) -- so its metadata is rebuilt from the
-        batch every step even though the *rows* are still the bucket's.
+        This spec's three facts put through :func:`replays_captured_extent`,
+        which is where the rule and its evidence live. Kept as a property
+        because a spec knows its own ``kind``; shared as a function because
+        `TemplateGraphs` must answer the same question about a `StepShape`
+        and must not answer it differently.
 
         ``False`` whenever there is no bucket, and for a prefill at any bucket,
         for the reason :attr:`running_bs` gives. ``None`` only when a bucket is
-        declared and the mode is not: the answer turns on a deployment fact
-        nobody supplied, and both answers are wrong in the way that reads as a
-        plausible number. Same convention as
+        declared and the mode is not -- the same convention as
         :func:`atom.compass.runtime.tracer.head_rows_padded`.
         """
-        if self.capture_bucket is None or self.kind == "prefill":
-            return False
-        if self.cudagraph_mode is None:
-            return None
-        return self.cudagraph_mode.strip().lower() == "full"
+        return replays_captured_extent(self.capture_bucket,
+                                       self.kind == "prefill",
+                                       self.cudagraph_mode)
 
     @property
     def launch_max_seqlen_k(self) -> int:
@@ -311,15 +352,16 @@ class BatchSpec:
     def launch_extent_scope(self) -> str:
         """Which of the two rules :attr:`launch_max_seqlen_k` used.
 
-        ``"captured"`` -- the capture's ``max_model_len``. ``"batch"`` -- the
-        batch's longest history, which is what an eager step and a PIECEWISE
-        replay both run. ``"undeclared"`` -- a bucket without a
-        ``--cudagraph-mode``; the batch value is recorded but is not evidence.
+        The name :func:`extent_scope_of` gives for this spec's three facts,
+        and the value `TemplateGraphs` passes to :func:`bind_cohort` for the
+        same step. ``"captured"`` -- the capture's ``max_model_len``.
+        ``"batch"`` -- the batch's longest history, which is what an eager
+        step and a PIECEWISE replay both run. ``"undeclared"`` -- a bucket
+        without a ``--cudagraph-mode``; the batch value is recorded but is
+        not evidence.
         """
-        replays = self.replays_captured_metadata
-        if replays is None:
-            return "undeclared"
-        return "captured" if replays else "batch"
+        return extent_scope_of(self.capture_bucket, self.kind == "prefill",
+                               self.cudagraph_mode)
 
     @property
     def executed_rows(self) -> int:
@@ -564,13 +606,32 @@ class BatchSpec:
         ``state_slots`` is which per-request state entry each request occupies;
         the default is the batch order, which is what a fresh pool hands out.
 
-        A replayed decode is the bucket's width here too, and the padding is
-        not the attention backend's. Both state index tensors pad with
-        :data:`PAD_SLOT_ID` and the query start offsets repeat the last real
-        one (gdn_attn.py:1224-1235), against a graph captured at the bucket's
-        counts (:1264-1281). Index ``0`` would be a real state entry -- request
-        zero's -- and padding with it makes the padded rows read and write a
-        live sequence's recurrent state.
+        **The padding here is the capture's, not the attention backend's, and
+        only a FULL capture applies it.** The two modes build this metadata
+        differently and a padded decode is where they diverge:
+
+        * FULL. ``_build_gdn_capture_metadata(bs)`` bakes
+          ``num_decodes = num_decode_tokens = num_actual_tokens = bs`` into the
+          graph and slices the buffers to the bucket (gdn_attn.py:1264-1281).
+          The replay refills them around those constants: the state index tails
+          become :data:`PAD_SLOT_ID` and the query offsets repeat the last real
+          one (:1189-1235). Three requests in a bucket of four therefore record
+          offsets ``[0, 1, 2, 3, 3]`` and indices ``[0, 1, 2, -1]`` against
+          counts of four. Index ``0`` would be a real state entry -- request
+          zero's -- and padding with it makes the padded lane read and write a
+          live sequence's recurrent state. Because ``num_actual_tokens`` is the
+          bucket's, the wrapper's ``core_attn_out[num_actual_tokens:]`` zeroing
+          covers nothing: under FULL there is no tail branch to charge.
+        * PIECEWISE, and eager. Attention is not captured
+          (model_runner.py:4019-4031) and this metadata is rebuilt from the
+          batch every step: the counts are the active ones, the offset view is
+          ``A + 1`` long and the index tensors are ``A`` long. The *output* is
+          still allocated at the bucket's width, so here the tail zeroing is
+          real -- but that width is the operand's, not this metadata's.
+
+        With a bucket and no declared mode there is no answer, and both
+        available ones are a padded decode's whole difference, so this raises
+        rather than picking the shape that happens to be in the code.
         """
         self.validate()
         n = self.batch_size
@@ -583,25 +644,34 @@ class BatchSpec:
 
         prefill = self.kind == "prefill"
         # Prefill is always eager (`ForwardMode.decide`, forward_context.py:
-        # 196-204), so only a decode has a bucket to pad to.
-        bs = self.batch_size if prefill else self.running_bs
+        # 196-204), so only a decode has a bucket to pad to -- and only a FULL
+        # capture pads this metadata to it.
+        replays = self.replays_captured_metadata
+        if replays is None:
+            raise ValueError(
+                f"this decode replays a capture bucket of {self.capture_bucket} "
+                "but the deployment's cudagraph_mode was not declared. A FULL "
+                "capture records the bucket's counts with a PAD-filled state "
+                "tail; a PIECEWISE one records the active counts. The two "
+                "differ by exactly the padding, so there is no shape to write "
+                "that is right under both.")
+        bs = self.running_bs if replays else self.batch_size
         pad_bs = bs - self.batch_size
         starts += [starts[-1]] * pad_bs
         slots = slots + [PAD_SLOT_ID] * pad_bs
+        # Under FULL these are the bucket's, because the capture baked them in
+        # and the replay runs the captured kernel whatever the refilled buffers
+        # say; the offsets and indices above are what keep the padded lanes off
+        # real state. Under PIECEWISE they are the batch's, rebuilt per step.
+        rows = self.padded_rows if replays else self.num_tokens
         recorded: list[tuple[str, Any]] = [
             ("num_prefills", n if prefill else 0),
             ("num_prefill_tokens", self.num_tokens if prefill else 0),
-            # The counts a capture bakes into the graph are the bucket's
-            # (`_build_gdn_capture_metadata(bs)`, gdn_attn.py:1264-1281), and a
-            # replay runs the captured kernel whatever the refilled buffers
-            # say. So the work is the bucket's; only the offsets and indices
-            # above keep the padded rows from touching real state.
             ("num_decodes", 0 if prefill else bs),
-            ("num_decode_tokens", 0 if prefill else self.padded_rows),
+            ("num_decode_tokens", 0 if prefill else rows),
             ("num_spec_decodes", 0),
             ("num_spec_decode_tokens", 0),
-            ("num_actual_tokens", self.num_tokens if prefill
-             else self.padded_rows),
+            ("num_actual_tokens", self.num_tokens if prefill else rows),
             ("replayssm", False),
             ("non_spec_query_start_loc", [starts, "int32"]),
             ("non_spec_state_indices_tensor", [slots, "int32"]),

@@ -89,6 +89,15 @@ GDN = "aiter::linear_attention_with_output_base"
 #: it.
 CHUNK_SIZE = 64
 
+#: What a padded state lane holds, which is no lane. ``gdn_attn.py``:1189-1225
+#: fills ``non_spec_state_indices_tensor[num_decodes:]`` with it at replay,
+#: and the convolution skips those entries rather than touching slot 0's
+#: checkpoint. Repeated here rather than imported from
+#: `atom.compass.runtime.batch_spec`, which defines the same constant for the
+#: same reason: this module reads recorded keys and must not depend on the
+#: runtime that produces them.
+PAD_SLOT_ID = -1
+
 #: Static deployment facts that decide which kernel a *unified attention* call
 #: takes. Two observations that disagree on any of these are measurements of
 #: different work, and one that declares none of them cannot be shown to be in
@@ -103,6 +112,18 @@ CHUNK_SIZE = 64
 #: ASM kernel and otherwise Triton.
 UNIFIED_SCOPE = ("kv_cache_dtype", "kv_cache_layout", "kv_cache_block_size",
                  "sliding_window", "attention_backend")
+
+#: What the gluon paged decode branch needs on top of the unified facts.
+#:
+#: Its split count is not a constant and not a property of the batch alone:
+#: `attention_mha.py`:552 asks `get_recommended_splits(num_seqs,
+#: num_kv_heads)`, which is
+#: ``min(8, ceil(compute_units * 2 / (num_seqs * num_kv_heads)))``
+#: (`pa_decode_gluon.py`:111-118). The sequence count is in the key; the head
+#: count and the device's CU count are not, so they are declared. Two
+#: measurements taken on parts with different CU counts are measurements of
+#: different grids, which is the other reason this belongs in the scope.
+PAGED_GLUON_SCOPE = UNIFIED_SCOPE + ("num_kv_heads", "compute_units")
 
 #: The static facts a *linear attention* call turns on. No KV cache appears
 #: here: GDN reads the conv and recurrent state pool, never the paged KV cache,
@@ -163,14 +184,15 @@ class Structure:
     __slots__ = ("queries", "histories", "is_prefill", "has_cached", "state",
                  "bucket", "num_prefills", "num_decodes", "num_actual_tokens",
                  "num_spec_decodes", "num_spec_decode_tokens", "replayssm",
-                 "spec_masked", "has_initial_state", "executed_rows")
+                 "spec_masked", "has_initial_state", "executed_rows",
+                 "state_indices")
 
     def __init__(self, queries=(), histories=(), *, is_prefill=None,
                  has_cached=None, state=None, bucket=None,
                  num_prefills=None, num_decodes=None, num_actual_tokens=None,
                  num_spec_decodes=None, num_spec_decode_tokens=None,
                  replayssm=None, spec_masked=None, has_initial_state=None,
-                 executed_rows=None):
+                 executed_rows=None, state_indices=None):
         self.queries = tuple(int(q) for q in queries)
         self.histories = tuple(int(h) for h in histories)
         self.is_prefill = is_prefill
@@ -186,6 +208,8 @@ class Structure:
         self.spec_masked = spec_masked
         self.has_initial_state = has_initial_state
         self.executed_rows = executed_rows
+        self.state_indices = (None if state_indices is None
+                              else tuple(int(s) for s in state_indices))
 
     @property
     def sequences(self) -> int:
@@ -206,6 +230,30 @@ class Structure:
         if not self.queries:
             return None
         return sum(1 for q in self.queries if q > 0)
+
+    @property
+    def state_lanes(self) -> Optional[int]:
+        """How many recurrent-state lanes this GDN call actually works on.
+
+        Not the launched lane count. A FULL capture bakes ``num_decodes = bs``
+        into the graph and the replay refills the buffers around it: the state
+        index tail is filled with ``PAD_SLOT_ID`` and the query offsets repeat
+        the last real one (gdn_attn.py:1224-1235, :1264-1281). The convolution
+        skips a PAD index and the recurrence skips a zero-length lane, so the
+        state work is the *unpadded* count while the gating and the output copy
+        still run the bucket's width. Counting the launched lanes for both --
+        which ``sequences`` does, because for attention they are the same
+        number -- makes three-of-four and four-of-four the same vector.
+
+        Read off the state index tensor, which is where the padding is
+        explicit. The offsets give the same count and are used to contradict
+        it, never to supply it: if the two disagree the metadata does not
+        describe one step, and :func:`features_for` refuses rather than
+        picking the more convenient one. ``None`` when neither is recorded.
+        """
+        if self.state_indices is None:
+            return self.active_sequences
+        return sum(1 for s in self.state_indices if s != PAD_SLOT_ID)
 
     @property
     def query_total(self) -> int:
@@ -238,15 +286,53 @@ class Structure:
             return tuple(q + h for q, h in zip(self.queries, self.histories))
         return self.histories
 
-    def context_tiles(self, partition: int) -> int:
-        """Partition tiles the paged decode kernel covers the context with.
+    def split_tiles(self, partition: int, splits: int,
+                    window: Optional[int] = None) -> int:
+        """Partition tiles the gluon paged decode kernel actually iterates.
 
-        Per sequence, again. The kernel tiles each sequence separately and
-        reduces across that sequence's tiles, so a batch of short contexts and
-        one long context do not cover the same number of tiles even where they
-        hold the same number of rows.
+        Not ``sum(ceil(C / partition))``. `run_pa_decode_gluon` launches a grid
+        of ``(sequences, kv_heads, splits)`` and each split program covers one
+        contiguous *page* of its own sequence
+        (`pa_decode_gluon.py`:1481-1491)::
+
+            page  = ceil(C / splits)
+            start = (page * j) // partition
+            end   = ceil(min(C, page * (j + 1)) / partition)
+
+        Each split rounds to whole partitions separately, so a page boundary
+        falling inside a partition makes both neighbouring splits load that
+        partition. The summed form misses it exactly where it matters: at eight
+        splits, contexts ``(2048, 2305)`` and ``(2176, 2177)`` both sum to 18
+        partitions, and the kernel runs 25 and 32 tile iterations per KV head.
+
+        ``window`` is the deployment's sliding window where it sets one. That
+        branch (:1453-1478) tiles only the window and hands each split a whole
+        number of partitions, so nothing there is covered twice -- and the
+        caller pins the split count to one for it anyway
+        (`attention_mha.py`:554-556).
+
+        Per KV head: the head is the grid's second axis and every head repeats
+        this work, so the head count belongs to the law's coefficient rather
+        than to the count.
         """
-        return sum(-(-c // partition) for c in self.contexts())
+        splits = max(1, int(splits))
+        total = 0
+        for context in self.contexts():
+            context = int(context)
+            if context <= 0:
+                continue
+            if window is not None and window > 0:
+                start = max(0, (context - window) // partition)
+                total += max(0, -(-context // partition) - start)
+                continue
+            page = -(-context // splits)
+            for index in range(splits):
+                low = page * index
+                if low >= context:
+                    break
+                high = min(context, low + page)
+                total += -(-high // partition) - low // partition
+        return total
 
     def continued(self) -> Optional[int]:
         """Sequences whose scan resumes from a recurrent state already held.
@@ -329,6 +415,7 @@ def structure_of(op: dict) -> Optional[Structure]:
                      is not None),
         has_initial_state=_serialized(ctx.get("has_initial_state")),
         executed_rows=_output_rows(op),
+        state_indices=_serialized(ctx.get("non_spec_state_indices_tensor")),
     )
 
 
@@ -502,9 +589,19 @@ REGIMES = {
     # On the partitioned branch the tile count is the ragged term: a batch pays
     # for a part-full tail tile per sequence, so two batches with the same
     # summed context and different raggedness do not cost the same.
+    #
+    # `split_tiles`, not a summed `ceil(C / 256)`. The launcher splits each
+    # sequence into `splits` contiguous pages and each page rounds to whole
+    # partitions on its own (pa_decode_gluon.py:1481-1491), so the boundaries
+    # are paid for. The two names are not the same number: at eight splits,
+    # contexts (2048, 2305) and (2176, 2177) both sum to 18 partitions and run
+    # 25 and 32 tile iterations. The feature was renamed rather than
+    # redefined -- a law fitted against the summed count is a law about a
+    # different quantity, and should not be silently reinterpreted.
     "unified.decode.paged_gluon": Regime(
         "unified.decode.paged_gluon",
-        ("context_rows", "context_tiles", "active", "bucket_pad")),
+        ("context_rows", "split_tiles", "active", "bucket_pad"),
+        PAGED_GLUON_SCOPE),
     # On the unified/flash branch there is no per-sequence partition to count.
     # What the measurements show instead is that raggedness dominates: a
     # 32-sequence mixed batch summing 394164 context rows costs ~3.70ms while a
@@ -517,15 +614,30 @@ REGIMES = {
     "unified.decode.unified_attn": Regime(
         "unified.decode.unified_attn",
         ("context_rows", "grid_pad_rows", "active", "bucket_pad")),
-    # `tail_pad_rows`, not nothing. The wrapper does slice `mixed_qkv`, `b` and
-    # `a` to `num_actual_tokens` before the convolution, so the kernels do not
-    # run over an underfilled bucket's padding -- but `attention_gdn.py` then
-    # zeros `core_attn_out[num_actual_tokens:]` for replay safety, which is
-    # work over exactly those rows. Calling underfill free on the strength of
-    # the slice alone would drop that. Both numbers are recorded -- the sliced
-    # width in the metadata, the allocated width in the output operand's shape
-    # -- so the difference is carried as a term rather than assumed either way.
-    "gdn.decode": Regime("gdn.decode", ("calls", "active", "tail_pad_rows"),
+    # Three widths, and a padded decode makes them three different numbers.
+    #
+    # `state_lanes` -- the lanes that do recurrent work. A FULL capture bakes
+    # `num_decodes = bs` into the graph, and the replay refills the state index
+    # tail with PAD and repeats the last query offset (gdn_attn.py:1224-1235,
+    # :1264-1281). The convolution skips a PAD index and the recurrence skips a
+    # zero-length lane, so three-of-four does less state work than four-of-four
+    # at the same launch. A single `active` term read off the offsets counted
+    # all four for both and made them the same vector.
+    #
+    # `bucket_rows` -- the allocated width, off the output operand. The gating
+    # and the output copy run it whatever the state lanes do, which is why the
+    # two are separate terms rather than one.
+    #
+    # `tail_pad_rows` -- the rows `attention_gdn.py` zeros above
+    # `num_actual_tokens` for replay safety. Under FULL this is *zero*: the
+    # capture pinned `num_actual_tokens` to `bs`, so there is no tail to zero
+    # and charging one would be inventing work. Under PIECEWISE the counts are
+    # the batch's while the allocation is still the bucket's, so the branch is
+    # real and the term is what tells the two modes apart at the same
+    # `(state_lanes, bucket_rows)`.
+    "gdn.decode": Regime("gdn.decode",
+                         ("calls", "state_lanes", "bucket_rows",
+                          "tail_pad_rows"),
                          GDN_SCOPE),
     # `continued_sequences`, because `has_initial_state` is a branch the
     # native scan takes per sequence: a fresh one starts from a zero state, a
@@ -582,6 +694,50 @@ def _partition_size(scope) -> int:
     if isinstance(window, int) and window > 0:
         return DECODE_PARTITION_SIZE_SLIDING
     return DECODE_PARTITION_SIZE
+
+
+#: `get_recommended_splits` caps the split count here (pa_decode_gluon.py:118)
+#: and assumes two workgroups per CU (`get_occupancy`, :107-108).
+DECODE_MAX_SPLITS = 8
+DECODE_OCCUPANCY = 2
+
+
+def _decode_splits(scope, sequences):
+    """How many context splits the launcher asks for, or a `Refusal`.
+
+    `attention_mha.py`:552 computes it per call:
+    ``min(8, ceil(compute_units * occupancy / (num_seqs * num_kv_heads)))``.
+    It is not fixed across a batch-size sweep -- a batch of 8 and a batch of
+    64 on the same part take different split counts and so different tile
+    geometry -- which is why it is derived here rather than declared whole.
+
+    The sliding-window branch is pinned to one split by the caller
+    (`attention_mha.py`:554-556), and that is a source fact rather than an
+    arithmetic one, so it is returned before anything else is read.
+    """
+    window = (scope or {}).get("sliding_window")
+    if isinstance(window, int) and window > 0:
+        return 1
+    heads = (scope or {}).get("num_kv_heads")
+    units = (scope or {}).get("compute_units")
+    missing = tuple(name for name, value in (("num_kv_heads", heads),
+                                             ("compute_units", units))
+                    if not value)
+    if missing:
+        return Refusal(
+            "the gluon decode grid's split count is "
+            "min(8, ceil(compute_units * 2 / (sequences * num_kv_heads))), and "
+            "this scope declares neither %s. The tile geometry follows from "
+            "it, so a tile count without it is not this kernel's work"
+            % " nor ".join(missing),
+            missing=missing)
+    if not sequences:
+        return Refusal(
+            "the call records no sequence count, and the split count the "
+            "launcher asks for is computed from it")
+    lanes = int(sequences) * int(heads)
+    splits = -(-int(units) * DECODE_OCCUPANCY // lanes)
+    return max(1, min(DECODE_MAX_SPLITS, splits))
 
 
 def regime_of(op: dict, structure: Optional[Structure] = None, scope=None):
@@ -687,8 +843,18 @@ def features_for(regime: Regime, structure: Structure, scope=None):
             # A per-call cost: the launch, and the fixed conv and recurrent
             # state a GDN step touches whatever the batch holds.
             values.append(1.0)
-        elif feature == "context_tiles":
-            values.append(float(structure.context_tiles(partition)))
+        elif feature == "split_tiles":
+            if not structure.contexts():
+                return Refusal(
+                    "the call records no per-sequence context, so the tiles "
+                    "its splits cover cannot be counted")
+            splits = _decode_splits(scope, structure.sequences)
+            if isinstance(splits, Refusal):
+                return splits
+            window = (scope or {}).get("sliding_window")
+            values.append(float(structure.split_tiles(
+                partition, splits,
+                window if isinstance(window, int) and window > 0 else None)))
         elif feature == "grid_pad_rows":
             contexts = structure.contexts()
             if not contexts:
@@ -705,6 +871,34 @@ def features_for(regime: Regime, structure: Structure, scope=None):
                     "unknown; that is a branch, not a zero",
                     missing=("has_initial_state",))
             values.append(float(continued))
+        elif feature == "state_lanes":
+            lanes = structure.state_lanes
+            if lanes is None:
+                return Refusal(
+                    "the call records neither a state index tensor nor query "
+                    "offsets, so how many lanes carry a live recurrent state "
+                    "is unknown; a padded lane is skipped, not cheap",
+                    missing=("non_spec_state_indices_tensor",))
+            # The offsets say the same thing, and where both are recorded they
+            # have to agree: they are two views of one padding decision
+            # (gdn_attn.py:1224-1235 writes them together). A disagreement
+            # means the key does not describe one step.
+            by_offset = structure.active_sequences
+            if (structure.state_indices is not None and by_offset is not None
+                    and by_offset != lanes):
+                return Refusal(
+                    f"{lanes} state lanes are unpadded but {by_offset} rows "
+                    "carry a query; the state index tensor and the query "
+                    "offsets describe different steps")
+            values.append(float(lanes))
+        elif feature == "bucket_rows":
+            if structure.executed_rows is None:
+                return Refusal(
+                    "the key does not record the width the output tensor was "
+                    "allocated with, and that is what the gating and the "
+                    "output copy run over",
+                    missing=("output_rows",))
+            values.append(float(structure.executed_rows))
         elif feature == "tail_pad_rows":
             if structure.executed_rows is None:
                 return Refusal(
