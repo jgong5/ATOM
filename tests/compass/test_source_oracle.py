@@ -550,6 +550,24 @@ class TestAskingForFittedPrices:
         assert self._built(tmp_path,
                            interpolate=1.5).oracle.library.max_gap_ratio == 1.5
 
+    def test_the_number_one_means_on_in_either_spelling(self, tmp_path):
+        """`interpolate=1` is how a command line says yes, and it arrives int.
+
+        `arg_utils` converts every numeric option value before the oracle sees
+        it, so the string `"1"` branch never fires for the spelling the
+        registry actually uses. Read as a ratio instead, 1.0 is a bound no two
+        distinct row counts can meet -- run 8 asked for interpolation this way
+        and refused 2118 operators for a gap "wider than the declared max gap
+        ratio 1.0".
+        """
+        from atom.compass.core.cost.families import ParametricPriceLibrary
+
+        default = ParametricPriceLibrary().max_gap_ratio
+        assert default > 1.0
+        for spelling in (1, 1.0, "1"):
+            library = self._built(tmp_path, interpolate=spelling).oracle.library
+            assert library.max_gap_ratio == default
+
     def test_a_ratio_under_one_is_refused_rather_than_clamped(self, tmp_path):
         with pytest.raises(ValueError) as exc:
             self._built(tmp_path, interpolate=0.5)

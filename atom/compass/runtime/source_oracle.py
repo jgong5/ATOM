@@ -100,8 +100,9 @@ def gap_ratio(value, what: str = "interpolate"):
     asserting: the widest ratio between two adjacent measured row counts their
     evidence supports interpolating across. ``true`` is accepted as the
     family default so a command line can turn it on without also choosing a
-    number, and a ratio below 1 is refused rather than clamped -- it would name
-    a gap narrower than no gap at all.
+    number, ``1`` means that default in either spelling, and a ratio below 1 is
+    refused rather than clamped -- it would name a gap narrower than no gap at
+    all.
     """
     if value in (None, "", False, 0):
         return None
@@ -119,6 +120,18 @@ def gap_ratio(value, what: str = "interpolate"):
         raise ValueError(
             f"{what}: expected a max gap ratio, true, or off, "
             f"got {value!r}") from None
+    if ratio == 1.0:
+        # The same token as `"1"` above, and it has to mean the same thing.
+        # A command line writes `interpolate=1`; `arg_utils` converts every
+        # numeric option value to an int before the oracle sees it, so the
+        # string branch never fires for the one spelling people actually use.
+        # Run 8 asked for interpolation that way, was handed an explicit bound
+        # of 1.0, and refused 2118 operators with "wider than the declared max
+        # gap ratio 1.0" -- a bound no two distinct row counts can meet, since
+        # `hi / lo` exceeds 1 whenever `hi != lo`. Collapsing it loses nothing
+        # distinct: a ratio of exactly 1.0 names no gap at all, which is what
+        # `off` already says.
+        return _DEFAULT_GAP_RATIO
     if ratio < 1.0:
         raise ValueError(f"{what}: {ratio} is narrower than adjacent measured "
                          "points, so nothing could ever be interpolated")
