@@ -395,6 +395,18 @@ class BucketedRunnerRegions:
                             f"{'a token' if key[2] else 'no token'}, was not "
                             f"measured; the measured cells are "
                             f"{sorted(cells)}")
+                if key[2]:
+                    # This step samples a token, so postprocess runs and must
+                    # have been measured. Absent is a GAP here, not zero work:
+                    # only an explicit `produces_output=False` licenses zero,
+                    # and defaulting a sampling step to zero would silently
+                    # drop a region the step really pays.
+                    post = self._prefill_cells(self.postprocess_prefill_cells)
+                    if key not in post:
+                        return (f"prefill cell {key} has a preparation "
+                                "measurement and no postprocess one, and this "
+                                "step samples a token, so its postprocess is "
+                                "missing rather than zero")
                 return None
             if seqs not in self.prefill_sequences:
                 return (f"prefill over {seqs} sequences, measured only at "
@@ -449,11 +461,11 @@ class BucketedRunnerRegions:
         if prefill:
             prepare = self._prefill_term(shape, self.prepare_prefill_cells,
                                          self.prepare_prefill)
-            if self.postprocess_prefill_cells or self.prepare_prefill_cells:
-                # A middle chunk samples nothing, so it pays no postprocess at
-                # all. Absent from the postprocess cells means zero work here,
-                # not a missing measurement: the key already records that this
-                # step produces no token.
+            if self.prepare_prefill_cells:
+                # Only an explicit "produces no token" licenses zero here.
+                # `refusal` has already rejected a sampling cell whose
+                # postprocess was never measured, so reaching this branch with
+                # a missing key means the step genuinely samples nothing.
                 cells = self._prefill_cells(self.postprocess_prefill_cells)
                 postprocess = cells.get(
                     self._prefill_key(shape),
@@ -466,7 +478,13 @@ class BucketedRunnerRegions:
             prepare = self._decode_prepare(shape)
             postprocess = self.postprocess_decode
         parts = [("<postprocess>", postprocess), ("<prepare>", prepare)]
-        if tp > 1:
+        # The broadcast is of the SAMPLED TOKEN
+        # (`get_tp_group().broadcast(sampled_tokens, src=0)`), so a step that
+        # samples nothing does not run it. A middle chunk of a long prompt is
+        # exactly that, and charging it a broadcast would bill a collective
+        # that never happened. Decode always samples.
+        samples = (self._produces_output(shape) if prefill else True)
+        if tp > 1 and samples:
             parts.append(("<tp-broadcast>", self.tp_broadcast))
         return parts
 
@@ -781,21 +799,21 @@ SOURCE_27B_TP1_PREFILL_1X640 = BucketedRunnerRegions(
 #: Every cell below is three retained repeats of one shape from one campaign.
 #: Nothing here is fitted and nothing between the cells is claimed.
 #:
-#: Deliberately absent, and why:
+#: Where two cohorts share a key they are POOLED, not chosen between. The
+#: ragged 2x16384 case and the two-full-prompt one differ by 1.4%; the 1x16384
+#: middle chunks differ by 73.6% across the two histories they were measured
+#: at. Both pooled ranges are under 0.008% of their step, and acceptance is
+#: end-to-end throughput, TPOT and TTFT -- so a relative spread on a term worth
+#: a thousandth of the step is not grounds for an indefinite per-history table,
+#: and silently preferring one cohort would be worse than carrying both. Every
+#: pooled cell names the histories and shapes it spans and its range covers
+#: them all. The pooled value is an APPROXIMATION generalising over the pooled
+#: cohorts, and low/high are the observed six-sample range -- neither is a
+#: bound on anything unmeasured.
 #:
-#: * **2 sequences x 16384 from the ragged `observed` case** ([640, 15744]).
-#:   It has the same `(sequences, tokens)` key as the `even` case and a
-#:   different value -- 3.9315e-3 against 3.8754e-3 -- because one is two full
-#:   prompts and the other is a full prompt beside a chunk of a 63744-token
-#:   one. The key does not separate them, so the full-prompt cell is the one
-#:   carried and the ragged one is left out rather than silently preferred.
-#: * **1 sequence x 16384 middle chunks.** Three retained repeats each exist in
-#:   the same capture, but at two different histories -- 1.1406e-3 s at context
-#:   32128 and 7.9199e-4 s at 48512, a 44% difference under one key. Preparation
-#:   has a term that grows with history, so these need context in the key
-#:   before either can be carried. Measured, retained, not yet expressible.
-#: * **1 sequence x 1024.** Three rows, but they are the campaign's preparation
-#:   and flush bursts rather than a measured cell, and their spread is 53%.
+#: Deliberately absent: **1 sequence x 1024**. Excluded on ROLE, not on spread
+#: -- those three rows are the campaign.s own preparation and flush bursts
+#: rather than a measured cell.
 SOURCE_27B_TP1_PREFILL_CELLS = BucketedRunnerRegions(
     postprocess_decode=SOURCE_27B_TP1_CONC_V2.postprocess_decode,
     prepare_decode_cells=SOURCE_27B_TP1_CONC_V2.prepare_decode_cells,
@@ -818,9 +836,22 @@ SOURCE_27B_TP1_PREFILL_CELLS = BucketedRunnerRegions(
             how="calib2seq lower, two full 7680-token prompts co-scheduled; "
                 "upper median [min,max]")),
         ((2, 16384, True), Measured(
-            seconds=3.875352e-3, low=3.84098e-3, high=3.94232e-3, samples=3,
-            how="calib2seq even, two full 8192-token prompts co-scheduled; "
-                "upper median [min,max]")),
+            seconds=3.931546e-3, low=3.819904e-3, high=4.209002e-3, samples=6,
+            how="calib2seq even and observed POOLED: two full 8192-token "
+                "prompts, and a full 640-token prompt beside a 15744-token "
+                "chunk. Same key, 1.4% apart, and the pooled range is 3.891e-4 "
+                "s on a 5.3310 s step -- 0.0073%. Pooled rather than choosing "
+                "one, so no cohort is silently preferred; upper median "
+                "[min,max] over all six rows")),
+        ((1, 16384, False), Measured(
+            seconds=1.086426e-3, low=7.377930e-4, high=1.280762e-3, samples=6,
+            how="the middle chunks of the 63744-token prompt, POOLED over the "
+                "two histories they were measured at, 32128 and 48512 cached. "
+                "73.6% apart relative and 5.430e-4 s on a 7.0196 s step, "
+                "0.0077% of it: acceptance is end-to-end throughput, TPOT and "
+                "TTFT, so a relative spread on a term worth a thousandth of "
+                "the step is not grounds for a per-history table. Both "
+                "histories are named and the range spans both")),
     ),
     postprocess_prefill_cells=(
         ((1, 640, True), Measured(
