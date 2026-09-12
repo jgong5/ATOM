@@ -196,6 +196,7 @@ class FakeProcesses:
     def start(self, command, *, log, cwd=None, env=None):
         self._pid += 1
         proc = FakeProc(self._pid, command)
+        proc.env = env
         self.started.append(proc)
         return proc
 
@@ -763,6 +764,57 @@ class TestTheCostsItCanMeasure:
         assert run_mod.main(argv) == 2
         assert "startup_window" in capsys.readouterr().err
         assert not (cell / "costs.json").exists()
+
+    def test_a_journal_the_run_wrote_into_the_cell_needs_no_flag(self, tmp_path):
+        """The modelled server writes its journal here, so the merge finds it.
+
+        Without this, the measured split depends on the operator remembering a
+        flag, and forgetting it silently falls back to a declared number.
+        """
+        cell = tmp_path / "tp2_long"
+        self._partials(
+            cell,
+            per_execution=[
+                {
+                    "repeat": 0,
+                    "startup_window": [1000.0, 1040.0],
+                    "execution_window": [1050.0, 1100.0],
+                }
+            ],
+        )
+        # The runtime's own naming: one file per server process.
+        (cell / "derivation.modelled.r0.4001.jsonl").write_text(
+            json.dumps({"t0": 1005.0, "t1": 1035.0}) + "\n"
+        )
+        (cell / "derivation.modelled.r1.4002.jsonl").write_text(
+            json.dumps({"t0": 1060.0, "t1": 1080.0}) + "\n"
+        )
+        argv = [a for a in self._argv(cell) if a not in ("--derivation-within", "none")]
+        assert run_mod.main(argv) == 0
+        parts = json.loads((cell / "costs.json").read_text())["derivation"]
+        by_window = {p["within"]: p["seconds"] for p in parts}
+        assert by_window["startup_modelled"] == pytest.approx(30.0)
+        assert by_window["execution_modelled"] == pytest.approx(20.0)
+
+    def test_no_journal_in_the_cell_is_still_a_refusal_not_a_zero(
+        self, tmp_path, capsys
+    ):
+        """Discovery finding nothing must not read as 'derivation was free'."""
+        cell = tmp_path / "tp2_long"
+        self._partials(cell)
+        full = self._argv(cell)
+        drop = {"--derivation", "--derivation-source", "--derivation-within"}
+        argv, skip = [], 0
+        for item in full:
+            if skip:
+                skip = 0
+                continue
+            if item in drop:
+                skip = 1
+                continue
+            argv.append(item)
+        assert run_mod.main(argv) == 2
+        assert "--derivation" in capsys.readouterr().err
 
     def test_a_derivation_with_no_stated_container_is_not_merged(
         self, tmp_path, capsys

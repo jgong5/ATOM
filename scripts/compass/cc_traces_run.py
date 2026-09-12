@@ -55,6 +55,7 @@ import argparse
 import importlib.util
 import json
 import math
+import os
 import socket
 import subprocess
 import sys
@@ -640,6 +641,23 @@ class SideRun:
             )
         return None
 
+    def _serve_env(self, step):
+        """The server's environment, or None to inherit this one unchanged.
+
+        Only the modelled side gets `ATOM_COMPASS_DERIVATION_LOG`. Derivation
+        is work the predicting server does, so a real-side journal could only
+        be empty, and an empty file is indistinguishable from a run where the
+        variable was never set. The runtime suffixes the path with the pid, so
+        repeats and the engine core land in separate files under one cell and
+        `costs` picks all of them up.
+        """
+        if self.side != "modelled":
+            return None
+        env = dict(os.environ)
+        env["ATOM_COMPASS_DERIVATION_LOG"] = str(
+            self.cell / f"derivation.{self.side}.r{step['repeat']}.jsonl")
+        return env
+
     def _serve(self, step) -> bool:
         """Start this repeat's server, wait for health, read what it is."""
         # Only another server: the sampler is meant to outlive every repeat,
@@ -663,7 +681,8 @@ class SideRun:
             self._record(step, ok=False, reason=conflict)
             return False
         started = self.now()
-        proc = self.processes.start(step["command"], log=self._log(step))
+        proc = self.processes.start(
+            step["command"], log=self._log(step), env=self._serve_env(step))
         execution = self._mint(step, proc, self.wall())
         self.running[step["id"]] = {
             "proc": proc,
@@ -1540,7 +1559,14 @@ def costs(args) -> int:
                 missing.append(f"{term} in {path.name}")
             else:
                 merged[term] = float(value)
-    measured = _derivation_from_journal(cell, args.derivation_journal, missing)
+    journals = list(args.derivation_journal or [])
+    if not journals:
+        # The modelled `serve` step writes its journal into this cell, so a run
+        # made by this harness needs no flag. Discovery only: if there is none,
+        # `measured` stays None and the --derivation refusal below still fires.
+        journals = sorted(
+            str(path) for path in cell.glob("derivation.modelled.*.jsonl"))
+    measured = _derivation_from_journal(cell, journals, missing)
     for term in SUPPLIED_TERMS:
         if term == "derivation" and measured is not None:
             # Measured beats declared: the journal carries each derivation's
