@@ -1202,3 +1202,121 @@ class TestThePoolIsReplayedFromRequestsNotFromWhatSurvived:
         with pytest.raises(UnfoundedPrediction):
             capture_reserved_parts(46_137_344,
                                    pool_stream=[("alloc", "a", 300_000)])
+
+
+class TestAProfileHasToBeAboutTheRunThatLoadsIt:
+    """Two ways a founded profile can still describe a different deployment.
+
+    Both were silent. The width one matters most: every width-dependent term is
+    keyed off the profile's own `world_size`, and `_at_width` answers a width
+    it has no entry for from the widest one below it -- so a TP=2 profile
+    handed to a TP=4 run produced a complete, confident, wrongly-sized budget
+    with nothing in the readings to show which width it was for.
+    """
+
+    @staticmethod
+    def _with_config(profile=None):
+        base, load = _founded(profile)
+        def loader(path):
+            if path == "config.json":
+                return {"text_config": QWEN3_27B}
+            return load(path)
+        return base, loader
+
+    def test_a_profile_for_another_width_is_refused_not_stretched(self):
+        profile, load = self._with_config(
+            {"model_config": "config.json", "compile_mode": "inductor",
+             "graph": None, "world_size": 2})
+        with pytest.raises(UnfoundedPrediction) as refusal:
+            derived_readings(profile, warmup_tokens=16_384, load=load,
+                             world_size=4)
+        assert "TP=2" in str(refusal.value) and "TP=4" in str(refusal.value)
+
+    def test_the_matching_width_passes_through(self):
+        profile, load = self._with_config(
+            {"model_config": "config.json", "compile_mode": "inductor",
+             "graph": None, "world_size": 4})
+        _, activation = derived_readings(profile, warmup_tokens=16_384,
+                                         load=load, world_size=4)
+        assert activation == 1_116_471_296
+
+    def test_a_caller_that_does_not_know_the_width_is_not_forced_to_guess(self):
+        """Omitting it is how a device-free caller says it has no deployment."""
+        profile, load = self._with_config(
+            {"model_config": "config.json", "compile_mode": "inductor",
+             "graph": None, "world_size": 4})
+        readings, _ = derived_readings(profile, warmup_tokens=16_384, load=load)
+        assert readings["peak_torch"] > 0
+
+    def test_an_inductor_profile_is_refused_for_an_eager_run(self):
+        """`enforce_eager` zeroes the graph pool and moves the instant.
+
+        Left unchecked the two halves of one prediction describe two programs:
+        a compiled activation peak beside an eager graph-pool term.
+        """
+        profile, load = self._with_config(
+            {"model_config": "config.json", "compile_mode": "inductor",
+             "graph": None, "world_size": 4})
+        with pytest.raises(UnfoundedPrediction, match="enforce_eager"):
+            derived_readings(profile, warmup_tokens=16_384, load=load,
+                             enforce_eager=True)
+
+    def test_an_eager_profile_is_what_an_eager_run_wants(self):
+        profile, load = self._with_config(
+            {"model_config": "config.json", "compile_mode": "eager",
+             "graph": None, "world_size": 4})
+        readings, _ = derived_readings(profile, warmup_tokens=16_384,
+                                       load=load, enforce_eager=True)
+        assert readings["cudagraph_overhead"] == 0
+
+
+class TestACalibrationIsOnlyValidInItsOwnEnvironment:
+    """The pools move between two terms and neither number looks wrong.
+
+    Under expandable segments or a raw collective input pool, 2 GiB per rank
+    crosses from `load_residue` into `non_torch`. A prediction built on the
+    other environment is still complete, still provenanced and still exactly as
+    confident, which is why the environment is checked rather than documented.
+    Opt-in by data: a calibration that states no conditions is untouched.
+    """
+
+    @staticmethod
+    def _with_conditions(monkeypatch, conditions, env):
+        base, load = _founded(calibration={"conditions": conditions})
+        for key, value in env.items():
+            if value is None:
+                monkeypatch.delenv(key, raising=False)
+            else:
+                monkeypatch.setenv(key, value)
+        return base, load
+
+    def test_the_measured_environment_passes(self, monkeypatch):
+        profile, load = self._with_conditions(
+            monkeypatch, {"PYTORCH_HIP_ALLOC_CONF": None},
+            {"PYTORCH_HIP_ALLOC_CONF": None})
+        readings, _ = derived_readings(profile, warmup_tokens=200, load=load)
+        assert readings["peak_torch"] > 0
+
+    def test_a_different_allocator_environment_is_refused(self, monkeypatch):
+        profile, load = self._with_conditions(
+            monkeypatch, {"PYTORCH_HIP_ALLOC_CONF": None},
+            {"PYTORCH_HIP_ALLOC_CONF": "expandable_segments:True"})
+        with pytest.raises(UnfoundedPrediction) as refusal:
+            derived_readings(profile, warmup_tokens=200, load=load)
+        assert "PYTORCH_HIP_ALLOC_CONF" in str(refusal.value)
+        assert "2 GiB per rank" in str(refusal.value)
+
+    def test_a_calibration_that_states_nothing_is_unaffected(self, monkeypatch):
+        monkeypatch.setenv("PYTORCH_HIP_ALLOC_CONF", "expandable_segments:True")
+        profile, load = _founded()
+        readings, _ = derived_readings(profile, warmup_tokens=200, load=load)
+        assert readings["peak_torch"] > 0
+
+    def test_the_conditions_are_read_from_the_composed_block_too(self, monkeypatch):
+        """`compose_calibration` nests them under `topology_delta`."""
+        monkeypatch.setenv("AITER_CUSTOM_AR_RAW_INPUT_POOL", "1")
+        profile, load = _founded(calibration={
+            "topology_delta": {"conditions": {"AITER_CUSTOM_AR_RAW_INPUT_POOL": None}}})
+        with pytest.raises(UnfoundedPrediction,
+                           match="AITER_CUSTOM_AR_RAW_INPUT_POOL"):
+            derived_readings(profile, warmup_tokens=200, load=load)
