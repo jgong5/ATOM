@@ -225,7 +225,7 @@ def region_snapshot(name: str, model) -> dict:
     body = _json.dumps(snapshot, sort_keys=True, separators=(",", ":"))
     snapshot["sha256"] = hashlib.sha256(body.encode()).hexdigest()
     return snapshot
-def _attention_request_scope(value, coords=None):
+def _attention_request_scope(value, coords=None, what="attention_scope"):
     """The deployment the request is asking for a ragged attention price IN.
 
     A ragged attention law is identified by the deployment it was measured
@@ -254,14 +254,14 @@ def _attention_request_scope(value, coords=None):
     if not value:
         return None, None
     if isinstance(value, dict):
-        return declaration_of(value, where="the attention_scope mapping"), None
+        return declaration_of(value, where="the %s mapping" % what), None
     requested = str(value).strip()
     if not requested:
         return None, None
     from atom.compass.core.loaded_input import load_json
 
     try:
-        payload, loaded = load_json(requested, role="oracle.attention_scope",
+        payload, loaded = load_json(requested, role="oracle." + what,
                                     coords=coords)
     except FileNotFoundError as exc:
         # Named with the resolution, not with the stem alone: at TP>1 the
@@ -269,16 +269,17 @@ def _attention_request_scope(value, coords=None):
         # rank went looking for, and a reader who cannot see the second
         # cannot tell a missing file from a rank suffix nobody wrote.
         raise ValueError(
-            "attention_scope names %r, which resolved to %s and is not a file "
+            "%s names %r, which resolved to %s and is not a file "
             "that exists. The deployment a price is asked for has to come "
-            "from something that recorded it." % (requested, exc.filename)
+            "from something that recorded it." % (what, requested, exc.filename)
         ) from exc
     return declaration_of(payload, where=loaded.path), loaded
 
 
 
 
-def _price_library(entries, gap_ratio, coords=None, attention_scope=None):
+def _price_library(entries, gap_ratio, coords=None, attention_scope=None,
+                   measured_attention_scope=None):
     """The exact-signature library, or the family provider in front of it.
 
     The provider is a subclass that overrides `lookup` alone, so everything
@@ -292,6 +293,18 @@ def _price_library(entries, gap_ratio, coords=None, attention_scope=None):
     ``coords`` goes to the library unresolved, and the library resolves as it
     reads. Both branches go through ``add``, so there is one call site
     carrying it rather than two.
+
+    ``measured_attention_scope`` is the other end of the same question:
+    ``attention_scope`` says what deployment a price is being ASKED for, and
+    this says what deployment a price list that does not record one was TAKEN
+    in. A primitive price file written by `scripts/compass/primitives.py`
+    records the pools it allocated and the kernel its dispatch probe saw, but
+    in sections the family adapter does not read as a scope, so without this
+    every ragged observation in it is refused for want of a declared backend
+    and the family fits over nothing at all. It fills silences only -- a file
+    that states a fact and a declaration that contradicts it raise -- and the
+    declaration is carried into the manifest as a loaded input, because a law
+    fitted under declared facts is worth exactly what the declaration is.
     """
     from atom.compass.core.cost.library import PriceLibrary
 
@@ -321,6 +334,17 @@ def _price_library(entries, gap_ratio, coords=None, attention_scope=None):
             # price list, and a manifest that omits them describes a
             # deployment nobody can check afterwards.
             library.loaded_inputs = library.loaded_inputs + (loaded,)
+    measured, measured_loaded = _attention_request_scope(
+        measured_attention_scope, coords, what="measured_attention_scope")
+    if measured is not None:
+        if gap_ratio is None:
+            raise ValueError(
+                "measured_attention_scope declares the deployment these price "
+                "lists were MEASURED under, which only a fitted family reads. "
+                "Turn the family provider on with interpolate, or drop it.")
+        library.declared_attention_scope = measured
+        if measured_loaded is not None:
+            library.loaded_inputs = library.loaded_inputs + (measured_loaded,)
     extra = {"coords": coords} if coords else {}
     for entry in entries:
         if isinstance(entry, (tuple, list)):
@@ -736,6 +760,7 @@ def build_source_oracle(
     derive: bool = True,
     interpolate=None,
     attention_scope=None,
+    measured_attention_scope=None,
     rank_coords=None,
     _shared_derivers=None,
     _shared_allocation=None,
@@ -779,6 +804,14 @@ def build_source_oracle(
     So at TP>1 a shape from rank 1 does not match a template derived at rank 0.
     It falls through to derivation, or -- with ``derive=0`` -- is refused. That
     is reported at build time rather than as a hundred identical misses later.
+
+    ``attention_scope`` and ``measured_attention_scope`` are the two ends of
+    the ragged-attention deployment question, and neither is defaulted: the
+    first is the deployment this run is ASKING for a price in, the second the
+    deployment the price lists were TAKEN in, for lists whose collector wrote
+    no scope down. Both are a mapping or a path to the JSON whoever resolved
+    the deployment wrote, both go through the same reader, and both are
+    carried into the manifest as loaded inputs. See `_price_library`.
     """
     from atom.compass.core.cost.library import LibraryCostOracle
     from atom.compass.core.cost.regions import region_model
@@ -808,7 +841,7 @@ def build_source_oracle(
     # `rank_own: false` under a name nothing asked for.
     price_entries = price_specs(requested_prices)
     library = _price_library(price_entries, gap_ratio(interpolate), coords,
-                             attention_scope)
+                             attention_scope, measured_attention_scope)
     regions_model = region_model(regions)
     # Immediately, off the object just selected -- not from the name again.
     regions_taken = region_snapshot(regions, regions_model)

@@ -219,18 +219,34 @@ class TestTheModelReadsTheExecutedExtent:
                          for k, v in (tuple(e) for e in op["context"])]
         assert A.structure_of(op).executed_rows is None
 
-    @pytest.mark.parametrize("rows,active,pad", [(4, 3, 1), (32, 31, 1),
-                                                 (4, 4, 0), (32, 32, 0)])
-    def test_the_padded_rows_are_priced_as_a_term(self, rows, active, pad):
-        op = unified_op(rows, active)
-        st = A.structure_of(op)
+    @pytest.mark.parametrize("rows,active", [(4, 3), (32, 31), (4, 4),
+                                             (32, 32)])
+    def test_a_padded_launch_is_charged_at_its_launched_width(self, rows,
+                                                             active):
+        """Padding is still charged -- through the launch, not beside it.
+
+        The gluon decode regime no longer carries `bucket_pad`. It does not
+        need to: `crit_waves` counts the CTAs the grid actually launches, and
+        a padded row launches its CTAs like any other. So an 8-of-16 bucket
+        occupies a 16-row launch and is charged for one, which is what the
+        padded training point (8 active in bucket 16) and the padded frozen
+        holdout point (4 in bucket 16) measured.
+
+        What a padded row does *not* do is lengthen anyone's walk: its context
+        is zero, so it adds nothing to `max_cta_tiles`.
+        """
+        st = A.structure_of(unified_op(rows, active))
         scope = dict(GLUON_SCOPE)
-        regime = A.regime_of(op, st, scope)
+        regime = A.regime_of(unified_op(rows, active), st, scope)
         assert not isinstance(regime, A.Refusal), regime
         vec = A.features_for(regime, st, scope)
         assert not isinstance(vec, A.Refusal), vec
-        assert vec[regime.features.index("bucket_pad")] == float(pad)
-        assert vec[regime.features.index("active")] == float(rows)
+        splits = A._decode_splits(scope, st.sequences)
+        ctas = rows * scope["num_kv_heads"] * splits
+        longest = vec[regime.features.index("max_cta_tiles")]
+        assert vec[regime.features.index("crit_waves")] == pytest.approx(
+            longest * ctas
+            / float(scope["compute_units"] * A.DECODE_OCCUPANCY))
 
     def test_a_declared_bucket_that_contradicts_the_rows_refuses(self):
         op = unified_op(4, 3, bucket=8)
@@ -241,13 +257,27 @@ class TestTheModelReadsTheExecutedExtent:
         assert isinstance(vec, A.Refusal)
 
     def test_a_call_with_no_offsets_still_refuses(self):
+        """Still a refusal, and the reason moved rather than weakened.
+
+        It used to be `bucket_pad`: the offsets were the only record of which
+        rows were padding, and reading their absence as "no padding" was the
+        failure it closed. The gluon decode law no longer separates launched
+        rows from active ones -- it charges the launch -- so that particular
+        reason is gone. The refusal is not: the split count the launcher asks
+        for is computed from the sequence count, the offsets are where that
+        count is, and a grid whose split axis is unknown is not a tile
+        geometry. The other decode regime refuses on its own grounds.
+        """
         op = unified_op(4, 3)
         op["context"] = [e for e in op["context"]
                          if e[0] != "cu_seqlens_q"]
         st = A.structure_of(op)
         scope = dict(GLUON_SCOPE)
-        vec = A.features_for(A.regime_of(op, st, scope), st, scope)
-        assert isinstance(vec, A.Refusal)
+        out = A.features_for(A.regime_of(op, st, scope), st, scope)
+        assert isinstance(out, A.Refusal)
+        assert "split count" in out.reason
+        flash = A.REGIMES["unified.decode.unified_attn"]
+        assert isinstance(A.features_for(flash, st, {}), A.Refusal)
 
 
 def gluon_op(contexts):
@@ -276,13 +306,18 @@ class TestTheGluonSplitGeometry:
     """
 
     def _tiles(self, contexts):
+        """The summed tile count, taken off `Structure` rather than the regime.
+
+        `split_tiles` is no longer one of the gluon decode regime's features --
+        the summed form collides, see `TestTheLongestCTAIsItsOwnFact` -- but it
+        is still the arithmetic the launcher does, and it is still the quantity
+        `max_cta_tiles` decomposes, so its rounding stays tested here.
+        """
         op = gluon_op(contexts)
         st = A.structure_of(op)
-        regime = A.regime_of(op, st, GLUON_SCOPE)
-        assert not isinstance(regime, A.Refusal), regime
-        vec = A.features_for(regime, st, GLUON_SCOPE)
-        assert not isinstance(vec, A.Refusal), vec
-        return vec[regime.features.index("split_tiles")]
+        splits = A._decode_splits(GLUON_SCOPE, st.sequences)
+        assert not isinstance(splits, A.Refusal), splits
+        return st.split_tiles(A.DECODE_PARTITION_SIZE, splits)
 
     def test_the_split_count_is_the_launchers_own(self):
         # 304 CUs at two workgroups each, over two sequences of four KV heads:
@@ -327,6 +362,201 @@ class TestTheGluonSplitGeometry:
         regime = A.REGIMES["unified.decode.paged_gluon"]
         assert "num_kv_heads" in regime.required_scope
         assert "compute_units" in regime.required_scope
+
+
+class TestTheLongestCTAIsItsOwnFact:
+    """The summed basis collided, and these are the measured pairs it tied.
+
+    Priced on node18 GPU2 at rotation 8 under snapshot 40ebae73, source tree
+    `g4/src2p/tree`. Both pairs carry the same context rows, the same summed
+    split tiles, the same launched rows and the same padding, and price 2.76x
+    and 3.17x apart:
+
+        r08geom / x08c04080   218.67 vs  79.34 us
+        r16geom / x16c04080   497.26 vs 156.72 us
+
+    `x08c04080` is eight uniform 4080-token rows; `r08geom` is the geometric
+    ragged batch that sums to the same 32640. The sixteen-row pair is the same
+    construction doubled.
+    """
+
+    RAGGED_8 = (128, 256, 512, 1024, 2048, 4096, 8192, 16384)
+    UNIFORM_8 = (4080,) * 8
+
+    def _vector(self, contexts):
+        op = gluon_op(list(contexts))
+        st = A.structure_of(op)
+        scope = dict(GLUON_SCOPE, compute_units=80)  # the measured part
+        regime = A.regime_of(op, st, scope)
+        assert not isinstance(regime, A.Refusal), regime
+        vec = A.features_for(regime, st, scope)
+        assert not isinstance(vec, A.Refusal), vec
+        return regime, scope, st, vec
+
+    def test_the_old_basis_gave_the_measured_pair_one_vector(self):
+        old = A.Regime("old.summed", ("context_rows", "split_tiles", "active",
+                                      "bucket_pad"), A.PAGED_GLUON_SCOPE)
+        vectors = []
+        for contexts in (self.RAGGED_8, self.UNIFORM_8):
+            op = gluon_op(list(contexts))
+            st = A.structure_of(op)
+            scope = dict(GLUON_SCOPE, compute_units=80)
+            vec = A.features_for(old, st, scope)
+            assert not isinstance(vec, A.Refusal), vec
+            vectors.append(vec)
+        assert vectors[0] == vectors[1]
+        assert vectors[0][:2] == [32640.0, 160.0]
+
+    def test_the_new_basis_separates_them(self):
+        longest = []
+        for contexts in (self.RAGGED_8, self.UNIFORM_8):
+            regime, _scope, _st, vec = self._vector(contexts)
+            longest.append(vec[regime.features.index("max_cta_tiles")])
+        assert longest == [14.0, 4.0]
+
+    def test_the_per_cta_counts_sum_to_the_summed_feature(self):
+        """The new term is a decomposition of the old one, not a new estimate
+        of it: the same rounding, taken at its maximum instead of its sum."""
+        for contexts in (self.RAGGED_8, self.UNIFORM_8, (2048, 2305),
+                         (131072, 1024), (176128,)):
+            st = A.structure_of(gluon_op(list(contexts)))
+            scope = dict(GLUON_SCOPE, compute_units=80)
+            splits = A._decode_splits(scope, st.sequences)
+            per_cta = []
+            for context in st.contexts():
+                page = -(-int(context) // splits)
+                for index in range(splits):
+                    low = page * index
+                    if low >= context:
+                        break
+                    high = min(int(context), low + page)
+                    per_cta.append(-(-high // A.DECODE_PARTITION_SIZE)
+                                   - low // A.DECODE_PARTITION_SIZE)
+            assert sum(per_cta) == st.split_tiles(A.DECODE_PARTITION_SIZE,
+                                                 splits)
+            assert max(per_cta) == st.max_cta_tiles(A.DECODE_PARTITION_SIZE,
+                                                    splits)
+
+    def test_crit_waves_is_the_walk_times_the_machine_it_fills(self):
+        regime, scope, st, vec = self._vector(self.RAGGED_8)
+        splits = A._decode_splits(scope, st.sequences)
+        ctas = st.executed_rows * scope["num_kv_heads"] * splits
+        slots = scope["compute_units"] * A.DECODE_OCCUPANCY
+        assert vec[regime.features.index("crit_waves")] == pytest.approx(
+            14.0 * ctas / float(slots))
+        assert vec[regime.features.index("calls")] == 1.0
+
+
+class TestTheMakespanLawIsFittedAndBounded:
+    """The law is `c0 + max(c_lat * max_cta_tiles, c_bw * crit_waves)`.
+
+    Not a sum: the launch is concurrent, so the call ends when its last CTA
+    ends, and the two terms are two bounds on that. Which one binds is decided
+    by the fitted coefficients -- the crossover is `c_lat / c_bw` waves -- and
+    not by a threshold anybody chose.
+    """
+
+    #: The measured part: MI308X, 80 CUs, 4 KV heads, bfloat16 NHD, block 16.
+    SCOPE = dict(GLUON_SCOPE, compute_units=80, kv_cache_dtype="bfloat16",
+                 kv_cache_layout="NHD", kv_cache_block_size=16)
+
+    #: Seven of the twelve measured grid-2 training points, in microseconds.
+    #: Source-oracle prices on node18 GPU2 at KV rotation 8 under snapshot
+    #: 40ebae73; medians over three repeats. Widths deliberately mixed -- at a
+    #: single launch width the two bounds are proportional and the fit refuses.
+    POINTS = [((256,) * 8, 29.1777), ((4096,) * 8, 79.9579),
+              ((4080,) * 8, 79.3375), ((16384,) * 8, 236.4947),
+              ((128, 256, 512, 1024, 2048, 4096, 8192, 16384), 218.6679),
+              ((32768,) * 2, 138.7911), ((8192,) * 32, 508.1840)]
+
+    def _observation(self, contexts, microseconds):
+        """One training observation, scoped the way `price` scopes a request.
+
+        `scoped` folds the call's static operand geometry into the scope, and
+        a fit whose scope was not folded the same way is a law `price` will
+        not select -- so the fixture folds it here rather than passing the
+        bare declared scope.
+        """
+        op = gluon_op(list(contexts))
+        structure = A.structure_of(op)
+        scope = A.scoped(op, dict(self.SCOPE), structure)
+        return (structure, microseconds * 1e-6, "test", scope)
+
+    def _fit(self):
+        regime = A.REGIMES["unified.decode.paged_gluon"]
+        return regime, A.fit_regime(regime, [self._observation(c, us)
+                                             for c, us in self.POINTS])
+
+    def _vector(self, regime, contexts):
+        structure, _us, _src, scope = self._observation(contexts, 1.0)
+        values = A.features_for(regime, structure, scope)
+        assert not isinstance(values, A.Refusal), values
+        return values
+
+    def test_it_fits_and_recovers_both_bounds(self):
+        regime, fit = self._fit()
+        assert not isinstance(fit, A.Refusal), fit
+        assert fit.regime.law == A.MAKESPAN
+        assert fit.features == ("calls", "max_cta_tiles", "crit_waves")
+        assert all(c > 0 for c in fit.coefficients)
+        # The crossover is the ratio of the two slopes, and it lands where
+        # the launch is around half occupancy -- not at a chosen threshold.
+        crossover = fit.coefficients[1] / fit.coefficients[2]
+        assert 0.2 < crossover < 1.0
+        # A law over seven points, judged against its own residuals.
+        assert fit.relative_error < 0.20
+        # The collided pair is no longer one price.
+        ragged = fit.predict(self._vector(
+            regime, (128, 256, 512, 1024, 2048, 4096, 8192, 16384)))
+        uniform = fit.predict(self._vector(regime, (4080,) * 8))
+        assert ragged > 2 * uniform
+
+    def test_one_launch_width_alone_cannot_identify_the_two_bounds(self):
+        """At a fixed width `crit_waves` is `max_cta_tiles` times a constant,
+        so which bound binds never changes and the split between them is
+        arbitrary. That is a refusal, not a law with wide error bars."""
+        regime = A.REGIMES["unified.decode.paged_gluon"]
+        same_width = [((256,) * 8, 29.1777), ((4096,) * 8, 79.9579),
+                      ((16384,) * 8, 236.4947), ((8192,) * 8, 134.4206)]
+        out = A.fit_regime(regime, [self._observation(c, us)
+                                    for c, us in same_width])
+        assert isinstance(out, A.Refusal)
+        assert "proportional" in out.reason
+
+    def test_the_description_names_the_crossover(self):
+        _regime, fit = self._fit()
+        assert not isinstance(fit, A.Refusal), fit
+        text = fit.describe()
+        assert "max(" in text and "crossover" in text
+        assert "max_cta_tiles" in text and "crit_waves" in text
+
+    def test_a_regime_declared_makespan_needs_exactly_three_terms(self):
+        with pytest.raises(ValueError):
+            A.Regime("bad", ("calls", "max_cta_tiles"), law=A.MAKESPAN)
+        with pytest.raises(ValueError):
+            A.Regime("bad", ("calls",), law="guesswork")
+
+    def test_a_price_outside_the_measured_walk_refuses(self):
+        """The law is a fit over what was measured. A walk far longer than
+        any behind it is unsupported, not extrapolated -- which is what keeps
+        a long-context request from being answered by a short-context law."""
+        regime, fit = self._fit()
+        assert not isinstance(fit, A.Refusal), fit
+        model = A.Model()
+        model.fits[A._label(regime.name, A.scope_key(fit.scope))] = fit
+        out = model.price(gluon_op([262144] * 8), dict(self.SCOPE))
+        assert isinstance(out, A.Refusal)
+        assert "outside the measured range" in out.reason
+
+    def test_a_structure_inside_the_hull_prices(self):
+        regime, fit = self._fit()
+        assert not isinstance(fit, A.Refusal), fit
+        model = A.Model()
+        model.fits[A._label(regime.name, A.scope_key(fit.scope))] = fit
+        out = model.price(gluon_op([8192] * 8), dict(self.SCOPE))
+        assert not isinstance(out, A.Refusal), out
+        # 134.42us measured at this point; the law is within a quarter of it.
+        assert abs(out * 1e6 - 134.4206) / 134.4206 < 0.25
 
 
 def gdn_op(rows, active, *, context=CONTEXT, mode="full"):
@@ -850,3 +1080,152 @@ class TestTheDeclaredModeReachesTheInstalledBatch:
         assert dict(reconciled.attention_context())["max_seqlen_k"] == \
             MAX_MODEL_LEN
         assert reconciled.launch_extent_scope == "captured"
+
+
+#: The reduce kernel the paged decode launches, as the compiler names it: one
+#: instantiation per split count. Abbreviated in the argument list only --
+#: `_canonical_kernel` reads the TEMPLATE list, which is verbatim.
+def reduce_kernel(splits):
+    return ("void aiter::pa_decode_ps_reduce_hip_kernel<__hip_bfloat16, "
+            "__hip_bfloat16, __hip_bfloat16, false, 256, 6, %d>"
+            "(__hip_bfloat16*, float const*, int)" % splits)
+
+
+class TestTheSplitSpecializationIsNotATreatment:
+    """Four instantiations of one kernel are one kernel.
+
+    The launcher picks the split count from the launch geometry --
+    `min(8, ceil(compute_units * 2 / (rows * num_kv_heads)))` -- and the
+    compiler emits a reduce kernel per split count. Kept in the measurement
+    identity, that specialization files every row width under its own law, and
+    inside one row width `crit_waves` is exactly proportional to
+    `max_cta_tiles`: the makespan law is then unidentifiable by construction
+    and no further measurement can fix it. So the integer template arguments
+    come out, and what they were is reported rather than dropped.
+    """
+
+    def test_the_split_count_comes_out_of_the_symbol(self):
+        from atom.compass.core.cost.families import adapter
+
+        canonical = {adapter._canonical_kernel(reduce_kernel(splits))
+                     for splits in (2, 3, 5, 8)}
+        assert len(canonical) == 1
+        assert "256" not in canonical.pop().split(">")[0]
+
+    def test_a_kernel_nobody_declared_specialized_is_untouched(self):
+        """Only the named symbol. Anything else keeps every argument it has,
+        including the integers -- a cache dtype enum is not a launch width."""
+        from atom.compass.core.cost.families import adapter
+
+        other = ("void aiter::reshape_and_cache_kernel<std::bfloat16_t, "
+                 "(vllm::Fp8KVCacheDataType)0, true>(int, int, 256)")
+        assert adapter._canonical_kernel(other) == other
+
+    def test_the_type_arguments_stay(self):
+        """A bfloat16 instantiation and an fp8 one are different work, and
+        pooling them would be the mistake this is preventing elsewhere."""
+        from atom.compass.core.cost.families import adapter
+
+        canonical = adapter._canonical_kernel(reduce_kernel(8))
+        assert "__hip_bfloat16" in canonical
+        assert adapter._canonical_kernel(
+            reduce_kernel(8).replace("__hip_bfloat16", "__hip_fp8")) \
+            != canonical
+
+
+class TestADeclarationFillsASilenceOnly:
+    """A price file that does not record its deployment, and a caller who does.
+
+    `scripts/compass/primitives.py` records the pools it stood up and the
+    kernel its dispatch probe saw, in provenance sections the adapter does not
+    read as a scope. Without a declaration every ragged decode observation in
+    such a file is refused for want of a declared backend and the family fits
+    over nothing. With one, the silences are filled -- and only the silences.
+    """
+
+    DECLARED = {"unified": dict(GLUON_SCOPE, kv_cache_dtype="bfloat16",
+                                kv_cache_layout="NHD", kv_cache_block_size=16)}
+
+    def _library(self, declared=None):
+        from atom.compass.core.cost.families import ParametricPriceLibrary
+        from atom.compass.core.cost.families.attention_scope import \
+            declaration_of
+
+        library = ParametricPriceLibrary()
+        if declared is not None:
+            library.declared_attention_scope = declaration_of(
+                declared, where="the test declaration")
+        return library
+
+    def test_a_silence_is_filled(self):
+        library = self._library(self.DECLARED)
+        filled = library._with_declared_scope({}, gluon_op([256]), "p.json")
+        assert filled["attention_backend"] == "paged_gluon"
+        assert filled["num_kv_heads"] == 4
+        # The two facts the paged decode law is identified by beyond its
+        # family's own scope. Dropping either leaves the law refused for want
+        # of a fact the declaration stated.
+        assert filled["compute_units"] == 304
+
+    def test_a_stated_fact_is_not_overruled(self):
+        library = self._library(dict(self.DECLARED))
+        with pytest.raises(ValueError) as raised:
+            library._with_declared_scope(
+                {"attention_backend": "aiter_mha"}, gluon_op([256]), "p.json")
+        assert "not overrule" in str(raised.value)
+
+    def test_agreement_is_not_an_error(self):
+        library = self._library(self.DECLARED)
+        filled = library._with_declared_scope(
+            {"attention_backend": "paged_gluon"}, gluon_op([256]), "p.json")
+        assert filled["attention_backend"] == "paged_gluon"
+
+    def test_no_declaration_changes_nothing(self):
+        library = self._library()
+        assert library._with_declared_scope({}, gluon_op([256]), "p.json") == {}
+
+    def test_the_declaration_is_reported(self):
+        """A law fitted over declared facts is worth exactly what the
+        declaration is, so coverage says there was one."""
+        library = self._library(self.DECLARED)
+        coverage = library.attention_coverage()
+        scopes = coverage["declared_measured_scope"]["scopes"]
+        assert scopes["unified"]["attention_backend"] == "paged_gluon"
+        assert self._library().attention_coverage()[
+            "declared_measured_scope"] is None
+
+
+class TestTheOracleCarriesBothEndsOfTheDeployment:
+    """`attention_scope` is what a price is ASKED for, `measured_attention_
+    scope` what a silent price list was TAKEN in. Different questions, one
+    shape, and neither is read as the other."""
+
+    DECLARED = {"unified": dict(GLUON_SCOPE, kv_cache_dtype="bfloat16",
+                                kv_cache_layout="NHD", kv_cache_block_size=16)}
+
+    def test_a_measured_scope_reaches_the_library(self):
+        from atom.compass.runtime.source_oracle import (_DEFAULT_GAP_RATIO,
+                                                        _price_library)
+
+        library = _price_library([], _DEFAULT_GAP_RATIO,
+                                 measured_attention_scope=self.DECLARED)
+        assert library.declared_attention_scope is not None
+        assert not library.request_attention_scope
+
+    def test_a_measured_scope_without_modelling_is_refused(self):
+        """Only a fitted family reads it. Accepting it with modelling off
+        would take a declaration that changes nothing and report success."""
+        from atom.compass.runtime.source_oracle import _price_library
+
+        with pytest.raises(ValueError) as raised:
+            _price_library([], None, measured_attention_scope=self.DECLARED)
+        assert "Turn the family provider on" in str(raised.value)
+
+    def test_the_two_ends_are_independent(self):
+        from atom.compass.runtime.source_oracle import (_DEFAULT_GAP_RATIO,
+                                                        _price_library)
+
+        library = _price_library([], _DEFAULT_GAP_RATIO,
+                                 attention_scope=self.DECLARED)
+        assert library.request_attention_scope is not None
+        assert library.declared_attention_scope is None
