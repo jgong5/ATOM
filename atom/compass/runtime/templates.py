@@ -635,6 +635,9 @@ class TemplateGraphs:
         self.hits = 0
         self.binds = 0
         self.derivations = 0
+        #: Wall seconds spent in the deriver, including the misses that ended
+        #: in a refusal -- a refused derivation still cost the time it took.
+        self.derivation_seconds = 0.0
         self.representative_hits = 0
         self.refusals = {}
 
@@ -660,10 +663,23 @@ class TemplateGraphs:
             if self._derive is None:
                 self.refusals[key] = "no template and no deriver"
                 return None
+            # Timed, not only counted. Whether these seconds are already
+            # inside the served window depends on *when* the miss happened,
+            # and nothing in this process knows when the harness decided
+            # startup ended -- so the interval is recorded on the wall clock,
+            # the one cc_traces_run.py stamps its own windows on, and the cost
+            # record places it by intersection instead of asserting a phase.
+            # Off unless ATOM_COMPASS_DERIVATION_LOG names a file.
+            from atom.compass.runtime import derivation_log
+
+            began = derivation_log.now()
             template = self._derive(shape)
+            ended = derivation_log.now()
+            self.derivation_seconds += ended - began
             if template is None:
                 self.refusals[key] = "deriver produced nothing"
                 return None
+            derivation_log.record(began, ended, key=str(key), on_demand=True)
             self.derivations += 1
             self._templates[key] = template
         else:
@@ -683,5 +699,6 @@ class TemplateGraphs:
                     f"{self._representative}'s graph"
                     if self.representative_hits else "")
         return (f"TemplateGraphs({len(self._templates)} templates, "
-                f"{self.hits} hits{stood_in}, {self.derivations} derivations, "
+                f"{self.hits} hits{stood_in}, {self.derivations} derivations "
+                f"in {self.derivation_seconds:.3f}s, "
                 f"{self.binds} binds, {len(self.refusals)} refused; {where})")

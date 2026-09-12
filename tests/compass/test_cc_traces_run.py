@@ -691,23 +691,18 @@ class TestTheCostsItCanMeasure:
     def test_a_complete_merge_carries_every_term_the_validator_reads(self, tmp_path):
         cell = tmp_path / "tp2_long"
         self._partials(cell)
-        argv = [
-            "costs",
-            str(cell),
-            "--capture",
-            "412",
-            "--calibration",
-            "1980",
-            "--derivation",
-            "31.5",
-            "--load",
-            "96",
-        ]
-        assert run_mod.main(argv) == 0
+        assert run_mod.main(self._argv(cell)) == 0
         costs = json.loads((cell / "costs.json").read_text())
         validate = _load("cc_traces_validate")
-        for term in validate.COST_TERMS:
+        for term in validate.MEASURED_COST_TERMS:
             assert isinstance(costs[term], float)
+        # A supplied second carries where it was read from and what contains
+        # it, so a total can tell it from a measured one and not double it.
+        for term in validate.SUPPLIED_COST_TERMS:
+            assert set(costs[term]) == {"seconds", "source", "within"}
+            assert costs[term]["source"]
+        assert costs["load"]["within"] == "startup_real"
+        assert costs["capture"]["within"] is None
         assert costs["supplied"] == list(run_mod.SUPPLIED_TERMS)
         # The gate reads this to check it is dividing wall seconds by wall
         # seconds, and the served windows travel beside it, not inside it.
@@ -718,6 +713,77 @@ class TestTheCostsItCanMeasure:
         assert costs["cost_schema"] == run_mod.COSTS_SCHEMA
         assert costs["served_window_modelled"] == 300.0
         assert costs["execution_modelled"] == 30.0
+
+    def test_a_journal_places_each_derivation_by_its_own_interval(self, tmp_path):
+        """The split is measured on both sides: the journal stamps each
+        derivation's wall interval and the side record stamps each window's,
+        so which contains which is an intersection rather than a claim."""
+        cell = tmp_path / "tp2_long"
+        self._partials(
+            cell,
+            per_execution=[
+                {
+                    "repeat": 0,
+                    "startup_window": [1000.0, 1040.0],
+                    "execution_window": [1050.0, 1100.0],
+                }
+            ],
+        )
+        journal = tmp_path / "derivations.jsonl"
+        journal.write_text(
+            # One while the server came up, one mid-schedule, one in neither.
+            json.dumps({"t0": 1005.0, "t1": 1035.0})
+            + "\n"
+            + json.dumps({"t0": 1060.0, "t1": 1080.0})
+            + "\n"
+            + json.dumps({"t0": 1041.0, "t1": 1044.0})
+            + "\n"
+        )
+        argv = [a for a in self._argv(cell) if a not in ("--derivation-within", "none")]
+        argv += ["--derivation-journal", str(journal)]
+        assert run_mod.main(argv) == 0
+        parts = json.loads((cell / "costs.json").read_text())["derivation"]
+        by_window = {p["within"]: p["seconds"] for p in parts}
+        assert by_window["startup_modelled"] == pytest.approx(30.0)
+        assert by_window["execution_modelled"] == pytest.approx(20.0)
+        assert by_window[None] == pytest.approx(3.0)
+        # The manual --derivation number was not read; the journal decided.
+        assert sum(by_window.values()) == pytest.approx(53.0)
+
+    def test_a_journal_without_the_windows_it_needs_is_not_guessed_at(
+        self, tmp_path, capsys
+    ):
+        """An interval means nothing without the windows it would fall inside,
+        and inventing them is exactly the assertion this replaces."""
+        cell = tmp_path / "tp2_long"
+        self._partials(cell, per_execution=[{"repeat": 0}])
+        journal = tmp_path / "derivations.jsonl"
+        journal.write_text(json.dumps({"t0": 1.0, "t1": 2.0}) + "\n")
+        argv = self._argv(cell) + ["--derivation-journal", str(journal)]
+        assert run_mod.main(argv) == 2
+        assert "startup_window" in capsys.readouterr().err
+        assert not (cell / "costs.json").exists()
+
+    def test_a_derivation_with_no_stated_container_is_not_merged(
+        self, tmp_path, capsys
+    ):
+        """`load` has a container the protocol states, so it defaults. Nobody
+        has measured whether the oracle build is inside `startup_modelled`, so
+        `derivation` has no default and the operator has to say which it is."""
+        cell = tmp_path / "tp2_long"
+        self._partials(cell)
+        argv = [a for a in self._argv(cell) if a not in ("--derivation-within", "none")]
+        assert run_mod.main(argv) == 2
+        assert "--derivation-within" in capsys.readouterr().err
+        assert not (cell / "costs.json").exists()
+
+    def test_a_supplied_second_with_no_artifact_is_not_merged(self, tmp_path, capsys):
+        cell = tmp_path / "tp2_long"
+        self._partials(cell)
+        argv = [a for a in self._argv(cell) if a not in ("--load-source", "server.log")]
+        assert run_mod.main(argv) == 2
+        assert "--load-source" in capsys.readouterr().err
+        assert not (cell / "costs.json").exists()
 
     def test_a_partial_from_the_old_schema_is_not_merged(self, tmp_path, capsys):
         """The old record called a virtual window `execution_modelled`, and
@@ -746,12 +812,25 @@ class TestTheCostsItCanMeasure:
             str(cell),
             "--capture",
             "412",
+            "--capture-source",
+            "capture/manifest.json",
             "--calibration",
             "1980",
+            "--calibration-source",
+            "registry/calibration.json",
             "--derivation",
             "31.5",
+            "--derivation-source",
+            "startup.json",
+            # Nobody has measured whether the oracle build is inside the
+            # modelled startup, so this run says it is not and the record
+            # carries that claim.
+            "--derivation-within",
+            "none",
             "--load",
             "96",
+            "--load-source",
+            "server.log",
         ]
 
 

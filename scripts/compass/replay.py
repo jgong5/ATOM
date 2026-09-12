@@ -313,6 +313,19 @@ def main(argv=None) -> int:
               file=sys.stderr)
         return 2
 
+    if args.pace and _clock_of(base, args.timeout) == "virtual":
+        print("ATOMCompass WARNING: refusing to pace a predictor. --pace "
+              "delivers each request when its arrival really comes round, on "
+              "the wall clock; this server advances a virtual clock by "
+              "predicted step costs, so the two race and the simulated run "
+              "performs a different set of steps from the run it stands for. "
+              "That is the failure declared arrivals exist to prevent. The "
+              "predictive side is the unpaced one: every declared arrival is "
+              "posted up front and honoured on the engine's own clock, so no "
+              "arrival is clipped and none waits on the socket. Pace the real "
+              "engine; declare arrivals to the predictor.", file=sys.stderr)
+        return 3
+
     if args.prepare and _clock_of(base, args.timeout) == "virtual":
         print("ATOMCompass WARNING: refusing to warm a predictor. A declared "
               "arrival is an offset from the engine's epoch, and the process "
@@ -357,7 +370,6 @@ def main(argv=None) -> int:
             "prompt": _prompt(row["input_tokens"], i),
             "max_tokens": row["output_tokens"],
             "temperature": 0.0,
-            "compass_workload_size": len(workload),
         }
         if not args.pace:
             # Declared rather than delivered: against a simulated engine the
@@ -365,6 +377,17 @@ def main(argv=None) -> int:
             # and the engine honours it. Ignored by a server on a real clock,
             # which is why --pace exists for that side.
             body["compass_arrival"] = at
+            # The count travels with the declaration and only with it. The
+            # barrier holds the virtual clock until `compass_workload_size`
+            # requests are waiting, which a declared workload satisfies as fast
+            # as the socket allows. A paced client delivers them across the
+            # trace's own span instead, so declaring the count under --pace
+            # arms a barrier that submission cannot fill: it waits out
+            # `ARRIVAL_BARRIER_TIMEOUT_S`, opens anyway, and every latency from
+            # that point is invalid. Seen on a 62-request cc_pilot run where 11
+            # had arrived when the 120s ran out, and the first batch landed
+            # after the barrier had already given up.
+            body["compass_workload_size"] = len(workload)
         try:
             return {"index": i, "ok": True, "response": _send(base + "/v1/completions",
                                                               body, args.timeout)}

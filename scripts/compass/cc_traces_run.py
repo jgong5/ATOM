@@ -196,13 +196,45 @@ MEASURED_TERMS = (
 )
 SUPPLIED_TERMS = ("capture", "calibration", "derivation", "load")
 
+#: Which measured window each supplied term happens *inside*, when it does.
+#: `CC_TRACES_PROTOCOL.md` §5 defines `load` as "weight load and graph capture
+#: inside that startup", so it is a component of `startup_real`, and adding it
+#: beside that startup charges it twice. `capture` and `calibration` are paid
+#: before any server of this cell starts, so nothing contains them.
+#: `derivation` is the one the protocol does not settle, and the one that does
+#: not have a single answer. Oracle construction happens in `predict.py`'s
+#: `_init_compass_state`, before the server answers `/health`, so that part is
+#: inside `startup_modelled`. But the source oracle derives a structure the
+#: first time the schedule shows it -- `TemplateGraphs.graph_for` calls its
+#: deriver on a miss (`templates.py:663`) -- and a miss has no phase: a shape
+#: first seen mid-schedule is derived inside the served window, so those
+#: seconds are inside `execution_modelled` and are already in the gate's
+#: denominator. One run's derivation straddles both. It has no default; the
+#: operator says, per part, or `--derivation-journal` measures it.
+CONTAINED_BY_DEFAULT = {
+    "capture": "none",
+    "calibration": "none",
+    "derivation": None,
+    "load": "startup_real",
+}
+
+#: What `--<term>-within` accepts: the windows this cell actually measures,
+#: plus "none". "none" is how a term says it overlaps no measured window,
+#: which is a claim; leaving it unstated is not.
+CONTAINERS = ("none",) + MEASURED_TERMS
+
 #: The cost record's schema. Version 2 names the clock every duration was
 #: taken on, because version 1 wrote the modelled side's *virtual* served
 #: window into `execution_modelled` -- a number that says how long the
 #: prediction thinks the workload takes, not what producing it cost. A reader
 #: that cannot tell the two apart cannot compute a speedup, so a record
 #: without this schema is refused rather than reinterpreted.
-COSTS_SCHEMA = "compass.costs/2"
+#: Version 3 makes each supplied term an object carrying the artifact it was
+#: read from and the measured window that contains it, because version 2's
+#: bare floats let `load` be added beside the `startup_real` that already
+#: included it. A version 2 record cannot be reinterpreted as a version 3 one
+#: -- its containment was never stated -- so it is refused, not upgraded.
+COSTS_SCHEMA = "compass.costs/3"
 
 #: The clock a duration a human would time with a stopwatch is taken on. The
 #: only one a runtime cost may be measured on.
@@ -1252,15 +1284,29 @@ class SideRun:
             served_windows.append(served)
             # Each second attributed to the execution that spent it, so a
             # reader can tell a source residual from an independent repeat.
+            held = self.executions.get(entry["repeat"]) or {}
+            process = held.get("process", {})
             per_execution.append(
                 {
                     "execution_id": entry.get("execution_id"),
                     "repeat": entry["repeat"],
                     "execution_s": wall,
                     "served_window_s": served,
-                    "startup_s": (self.executions.get(entry["repeat"]) or {})
-                    .get("process", {})
-                    .get("startup_s"),
+                    "startup_s": process.get("startup_s"),
+                    # The absolute wall interval each measured window occupied,
+                    # so a duration recorded elsewhere on the same clock can be
+                    # placed inside one by intersection rather than by someone
+                    # declaring which phase it belonged to. `startup_modelled`
+                    # is launch to the first /health answer; `execution_*` is
+                    # the replay client's own window.
+                    "startup_window": [
+                        process.get("launched_at"),
+                        process.get("healthy_at"),
+                    ],
+                    "execution_window": [
+                        (held.get("replay") or {}).get("started_at"),
+                        (held.get("replay") or {}).get("ended_at"),
+                    ],
                 }
             )
         payload = {
@@ -1368,6 +1414,94 @@ def side(args) -> int:
     return code
 
 
+def _windows(cell: Path) -> dict:
+    """The modelled side's measured wall intervals, by window name.
+
+    Read off `costs.modelled.json`'s `per_execution`, which `_write_costs`
+    stamps with each window's absolute start and end. Only the modelled side
+    is read: derivation is work the predicting server does, so a real-side
+    window cannot contain any of it.
+    """
+    path = cell / "costs.modelled.json"
+    if not path.exists():
+        return {}
+    found = {"startup_modelled": [], "execution_modelled": []}
+    for row in json.loads(path.read_text()).get("per_execution") or []:
+        for name, key in (
+            ("startup_modelled", "startup_window"),
+            ("execution_modelled", "execution_window"),
+        ):
+            span = row.get(key) or []
+            if len(span) == 2 and all(isinstance(t, (int, float)) for t in span):
+                found[name].append((float(span[0]), float(span[1])))
+    return {name: spans for name, spans in found.items() if spans}
+
+
+def _overlap(span, windows) -> float:
+    """Seconds of `span` that fall inside any of `windows`."""
+    start, end = span
+    return sum(max(0.0, min(end, stop) - max(start, begin)) for begin, stop in windows)
+
+
+def _derivation_from_journal(cell: Path, paths, missing: list):
+    """Derivation split by where it actually happened, or None if unmeasured.
+
+    Each journal row is one derivation with its own wall interval, written by
+    `atom.compass.runtime.derivation_log` as the deriver runs. The windows come
+    from this cell's own side record, on the same clock, so the split is an
+    intersection of two measured intervals and nobody has to declare a phase.
+    A row that lands in no window is reported as contained by nothing, which is
+    the honest reading of an interval outside every window this cell measured.
+    """
+    if not paths:
+        return None
+    windows = _windows(cell)
+    if not windows:
+        missing.append(
+            "startup_window/execution_window in costs.modelled.json (the "
+            "journal's intervals cannot be placed without the windows they "
+            "would fall inside; re-run the modelled side with this harness)"
+        )
+        return None
+    by_container = {name: 0.0 for name in windows}
+    by_container[None] = 0.0
+    rows = 0
+    for path in paths:
+        for line in Path(path).read_text().splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            start, end = row.get("t0"), row.get("t1")
+            if not all(isinstance(t, (int, float)) for t in (start, end)):
+                missing.append(f"t0/t1 on every row of {path}")
+                return None
+            rows += 1
+            placed = 0.0
+            for name, spans in windows.items():
+                inside = _overlap((float(start), float(end)), spans)
+                by_container[name] += inside
+                placed += inside
+            by_container[None] += max(0.0, (float(end) - float(start)) - placed)
+    origin = ", ".join(str(p) for p in paths)
+    parts = [
+        {
+            "seconds": seconds,
+            "source": f"{origin} ({rows} derivations, placed by interval)",
+            "within": name,
+        }
+        for name, seconds in by_container.items()
+        if seconds > 0.0
+    ]
+    if not parts:
+        # A run that derived nothing derived nothing. Recording the zero with
+        # its origin is different from leaving the term unstated.
+        parts = [
+            {"seconds": 0.0, "source": f"{origin} (no derivations)", "within": None}
+        ]
+    return parts[0] if len(parts) == 1 else parts
+
+
 def costs(args) -> int:
     """Merge both sides' measured seconds with the four supplied terms."""
     cell = Path(args.cell)
@@ -1406,14 +1540,63 @@ def costs(args) -> int:
                 missing.append(f"{term} in {path.name}")
             else:
                 merged[term] = float(value)
+    measured = _derivation_from_journal(cell, args.derivation_journal, missing)
     for term in SUPPLIED_TERMS:
-        value = getattr(args, term)
-        if value is None or not math.isfinite(value):
+        if term == "derivation" and measured is not None:
+            # Measured beats declared: the journal carries each derivation's
+            # own wall interval and the side record carries the windows, so
+            # containment is an intersection rather than an assertion.
+            merged[term] = measured
+            continue
+        values = getattr(args, term) or []
+        sources = getattr(args, f"{term}_source") or []
+        withins = getattr(args, f"{term}_within") or []
+        if not values:
             missing.append(
-                f"--{term} (nothing in this cell measures it; it is an input)"
+                f"--{term} (nothing in this cell measures it; it is an input. "
+                f"If it was never recorded, say so -- it is not zero)"
             )
-        else:
-            merged[term] = float(value)
+            continue
+        if len(sources) != len(values) or len(withins) not in (0, len(values)):
+            missing.append(
+                f"one --{term}-source and one --{term}-within per --{term} "
+                f"(got {len(values)} values, {len(sources)} sources, "
+                f"{len(withins)} containers; a part whose origin or container "
+                f"belongs to a different part says nothing about this one)"
+            )
+            continue
+        parts = []
+        for index, value in enumerate(values):
+            source = sources[index]
+            within = (withins[index] if withins else None) or CONTAINED_BY_DEFAULT[term]
+            if value is None or not math.isfinite(value):
+                missing.append(f"--{term} (a finite number of seconds)")
+                continue
+            if not source:
+                # A number with no origin reads exactly like a measured one.
+                missing.append(
+                    f"--{term}-source (which artifact this duration was read "
+                    f"from; a supplied second without one cannot be told from "
+                    f"a measured one)"
+                )
+                continue
+            if within is None:
+                missing.append(
+                    f"--{term}-within (whether this duration happens inside a "
+                    f"measured window. Unstated is not the same as 'none', "
+                    f"and a term whose containment is unknown cannot be "
+                    f"summed)"
+                )
+                continue
+            parts.append(
+                {
+                    "seconds": float(value),
+                    "source": str(source),
+                    "within": None if within == "none" else within,
+                }
+            )
+        if len(parts) == len(values):
+            merged[term] = parts[0] if len(parts) == 1 else parts
     if missing:
         print(
             "costs.json not written, because it would be missing: "
@@ -1427,12 +1610,25 @@ def costs(args) -> int:
         "this cell's own repeats, on the wall clock, the rest supplied at "
         "merge time. served_window_* is what the engine reports having "
         "served -- virtual on a predicting server -- and is carried for "
-        "comparison, never as a cost"
+        "comparison, never as a cost. Each supplied term names the artifact "
+        "it was read from and the measured window it happens inside; a term "
+        "with a container is already counted in that window and a total must "
+        "not add it again"
     )
     merged["supplied"] = list(SUPPLIED_TERMS)
     merged["measured"] = list(MEASURED_TERMS)
     (cell / "costs.json").write_text(json.dumps(merged, indent=1) + "\n")
     print("costs.json: " + ", ".join(f"{t}={merged[t]:.3f}" for t in MEASURED_TERMS))
+    for term in SUPPLIED_TERMS:
+        parts = merged[term] if isinstance(merged[term], list) else [merged[term]]
+        print(
+            f"  {term}: "
+            + " + ".join(
+                f"{p['seconds']:.3f}"
+                + (f" (inside {p['within']})" if p["within"] else " (inside nothing)")
+                for p in parts
+            )
+        )
     return 0
 
 
@@ -1477,7 +1673,47 @@ def main(argv=None) -> int:
     c = sub.add_parser("costs", help="merge the cell's cost terms")
     c.add_argument("cell")
     for term in SUPPLIED_TERMS:
-        c.add_argument(f"--{term}", type=float, default=None)
+        # Repeatable, because one term can be several durations with different
+        # containers -- derivation happens both while the server comes up and,
+        # on a first-seen structure, in the middle of serving. Each --<term>
+        # takes one --<term>-source and one --<term>-within, in order.
+        c.add_argument(
+            f"--{term}",
+            type=float,
+            action="append",
+            default=None,
+            help="seconds; repeat for a term that happens in more than one place",
+        )
+        c.add_argument(
+            f"--{term}-source",
+            action="append",
+            default=None,
+            help="the artifact this duration was read from",
+        )
+        c.add_argument(
+            f"--{term}-within",
+            choices=CONTAINERS,
+            action="append",
+            default=None,
+            help=(
+                "the measured window this duration happens inside, so a "
+                "total does not charge it twice; default "
+                f"{CONTAINED_BY_DEFAULT[term] or 'none -- must be stated'}"
+            ),
+        )
+    c.add_argument(
+        "--derivation-journal",
+        action="append",
+        default=None,
+        metavar="PATH",
+        help=(
+            "a derivation journal written by "
+            "atom.compass.runtime.derivation_log: one row per derivation with "
+            "its own wall interval. When given, derivation is split by "
+            "intersecting those intervals with this cell's measured windows "
+            "and the --derivation flags are not read"
+        ),
+    )
     c.set_defaults(func=costs)
 
     args = ap.parse_args(argv)
