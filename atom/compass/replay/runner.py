@@ -222,14 +222,35 @@ class ReplayModelRunner(CompassPredictMixin):
     # -- the startup RPCs, answered from the record ---------------------------
 
     def get_num_blocks(self) -> dict:
-        """What the device said, not what a device says.
+        """What the device said -- unless this run asked what a model says.
 
-        Returned verbatim, including the state-runtime wire form: the engine
-        rebuilds its own `StateRuntime` from it and the block manager plans from
-        `pool_entries`, so passing the recorded reply through is what keeps the
-        replay running ATOM's arithmetic rather than a copy of it.
+        Without ``--compass-memory-model`` the recorded reply is returned
+        verbatim, including the state-runtime wire form: the engine rebuilds
+        its own ``StateRuntime`` from it and the block manager plans from
+        ``pool_entries``, so passing it through is what keeps the replay
+        running ATOM's arithmetic rather than a copy of it.
+
+        With a profile the pool is *sized* here instead. The two flags already
+        composed on the command line and the reply was still the capture: a
+        scheduler sized by a measurement of the configuration the profile was
+        meant to replace, read as a forecast of the one being replayed. Only
+        the device-backed runner consumed a profile, and a GPU-free replay is
+        the run that has no device.
+
+        No path leads from a refusal back to ``self.target.blocks``. A run that
+        asked to be modelled and cannot be has to stop, because the number it
+        would otherwise serve is the one it was told not to use.
         """
-        return dict(self.target.blocks)
+        path = (getattr(self._compass_config, "memory_model", "") or "").strip()
+        if not path:
+            return dict(self.target.blocks)
+
+        from atom.compass.core.memory_blocks import derived_block_info
+
+        return derived_block_info(
+            path, self.config,
+            state_runtime=self.target.blocks.get("state_runtime"),
+            captured=self.target.blocks)
 
     def allocate_kv_cache(self, num_kvcache_blocks) -> bool:
         """There is no cache to allocate; the accounting for it is real.
