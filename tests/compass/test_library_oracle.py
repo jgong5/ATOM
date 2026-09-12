@@ -973,14 +973,24 @@ class TestPricingTheSameShapeTwiceCostsOnce:
             with pytest.raises(KeyError):
                 oracle.estimate(want)
 
-    def test_a_new_allocation_for_the_same_shape_is_priced_again(self, tmp_path):
+    def test_a_new_allocation_for_the_same_shape_is_bound_and_priced_again(
+            self, tmp_path):
         """The shape is not the whole price key: the native binder writes this
-        step's own allocation into the graph, and `signature_of` reads it.
+        step's own allocation into the graph, and the bind runs every step.
 
-        Measured on the 27B decode-32 graph: a second valid allocation for the
-        same shape moves 64 of 2439 signatures and takes the step from 32.667ms
-        over 2424 priced operators to 28.360ms over 2376. Answering the second
-        from the first is a wrong number carrying a complete-coverage claim.
+        What that allocation *costs*, though, is the same. Measured on the 27B
+        decode-32 graph before the cost key existed: a second valid allocation
+        for the same shape moved 64 of 2439 signatures and took the step from
+        32.667ms over 2424 priced operators to 28.360ms over 2376. That 4.3ms
+        was never a timing difference -- it is 48 operators dropping out of
+        coverage because their `slot_mapping` had moved, and the answer still
+        arriving as a number. So the old refusal was right about the claim and
+        wrong about the cause; `atom.compass.core.cost.identity` fixes the
+        cause, and the second allocation is priced from the first measurement
+        at complete coverage.
+
+        The cache still misses, because its key is the bound signature: the
+        bind, and every per-step refusal that depends on it, is re-decided.
         """
         shape = StepShape(num_scheduled_tokens=(1,), context_lens=(16,))
         first = _op("aiter::attn", [[1, 4096]],
@@ -992,10 +1002,34 @@ class TestPricingTheSameShapeTwiceCostsOnce:
             PriceLibrary.load([(prices, None)]),
             _Rebinds([_graph([first]), _graph([second])]),
             require_complete=True)
+        one = oracle.estimate(shape)
+        two = oracle.estimate(shape)
+        assert two.seconds == pytest.approx(one.seconds)
+        assert not oracle.last_coverage.refused
+        assert (oracle.price_cache_misses, oracle.price_cache_hits) == (2, 0)
+
+    def test_an_allocation_that_changes_the_work_is_still_refused(
+            self, tmp_path):
+        """The other direction, and the one the normalisation must not break.
+
+        A padded row carries `slot_mapping=-1`, meaning "no slot". A batch of
+        two with one real row is not a batch of two, so it is different work,
+        it does not share a cost key, and `require_complete` refuses it rather
+        than answering from the measurement of the full batch.
+        """
+        shape = StepShape(num_scheduled_tokens=(1,), context_lens=(16,))
+        full = _op("aiter::attn", [[2, 4096]],
+                   context=[["slot_mapping", [0, 16]]])
+        padded = _op("aiter::attn", [[2, 4096]],
+                     context=[["slot_mapping", [512, -1]]])
+        prices = _price_list(tmp_path, "p.json", [full], 1e-3)
+        oracle = LibraryCostOracle(
+            PriceLibrary.load([(prices, None)]),
+            _Rebinds([_graph([full]), _graph([padded])]),
+            require_complete=True)
         oracle.estimate(shape)
         with pytest.raises(ValueError, match="incomplete"):
             oracle.estimate(shape)
-        assert (oracle.price_cache_misses, oracle.price_cache_hits) == (2, 0)
 
     def test_an_unusable_head_is_still_refused_on_the_second_ask(self, tmp_path):
         """Whether this step may be given a head is decided every step: the

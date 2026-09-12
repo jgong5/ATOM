@@ -41,7 +41,7 @@ from atom.compass.runtime.triton_trace import GENERATED
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["price_graph", "signature_of"]
+__all__ = ["price_graph", "signature_of", "cost_key_of"]
 
 
 def signature_of(op: dict) -> str:
@@ -82,6 +82,20 @@ def signature_of(op: dict) -> str:
         if key == "grid":
             sig += "|grid=" + ",".join(str(x) for x in value)
     return sig
+
+
+
+def cost_key_of(op: dict) -> str:
+    """What a price for this operator is a price *of*.
+
+    `signature_of` says which call this was; this says which measurements
+    answer for it. The difference is the absolute addresses the allocator
+    handed the batch -- see `atom.compass.core.cost.identity`, which owns the
+    rule and is applied to stored price keys and fresh signatures alike.
+    """
+    from atom.compass.core.cost.identity import cost_key
+
+    return cost_key(signature_of(op))
 
 
 def _resolve(name: str):

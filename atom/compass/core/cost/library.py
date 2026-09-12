@@ -45,6 +45,7 @@ from dataclasses import dataclass, field
 from typing import Optional, Protocol
 
 from atom.compass.core.cost.base import StepCost, StepShape
+from atom.compass.core.cost.identity import cost_key
 from atom.compass.core.loaded_input import load_json
 
 logger = logging.getLogger(__name__)
@@ -67,6 +68,19 @@ def _signature_of(op: dict) -> str:
     from atom.compass.runtime.microbench import signature_of
 
     return signature_of(op)
+
+
+def _cost_key_of(op: dict) -> str:
+    """The key a price is filed and found under.
+
+    `_signature_of` identifies the call; this identifies the work. They differ
+    only in the allocator's absolute addresses, and the rule lives in
+    `atom.compass.core.cost.identity` so that the key a file was written with
+    and the key a lookup computes cannot drift apart.
+    """
+    from atom.compass.runtime.microbench import cost_key_of
+
+    return cost_key_of(op)
 
 
 def _layout_fingerprint(op: dict) -> str:
@@ -396,11 +410,24 @@ class PriceLibrary:
     """
 
     def __init__(self) -> None:
-        #: signature -> the records priced under it, each with the scope it was
+        #: cost key -> the records priced under it, each with the scope it was
         #: measured in: ``{"topology": ..., "registration": ...}``. A list and
         #: not a record, for the reason in the class docstring.
+        #:
+        #: The key is the *cost* key, not the signature: prices on disk were
+        #: written under the signature they were measured with, and are
+        #: reindexed through the same normalisation a lookup goes through, so
+        #: an artifact does not have to be recollected to be found. Each record
+        #: keeps its own ``signature``, which is the observation identity and
+        #: is never rewritten.
         self._prices: dict[str, list] = {}
         self._refusals: dict[str, str] = {}
+        #: cost key -> how many lookups this library answered from a record
+        #: measured under a different allocation. Not an error and not a
+        #: separate kind of price -- the same measurement, found through the
+        #: normalised key -- but it is the thing this normalisation buys, so it
+        #: is counted rather than assumed.
+        self.address_shifted: dict[str, int] = {}
         #: Every artifact this library parsed, in the order it parsed them,
         #: each carrying the digest of the exact bytes that were parsed. Empty
         #: on a library assembled by hand, which is an honest statement that
@@ -507,27 +534,40 @@ class PriceLibrary:
         layouts = {}
         if graph is not None:
             for op in graph["ops"]:
-                layouts.setdefault(_signature_of(op),
-                                   _layout_fingerprint(op))
+                layouts.setdefault(_cost_key_of(op), _layout_fingerprint(op))
         for sig, record in (blob.get("prices") or {}).items():
-            kept = self._prices.setdefault(sig, [])
+            # Reindex on the way in. The file names the signature it was
+            # measured under; the library files it under the cost key, through
+            # the same normalisation a lookup goes through. Nothing on disk is
+            # rewritten and nothing is remeasured -- an artifact collected
+            # before this rule existed is found by it.
+            key = cost_key(sig)
+            kept = self._prices.setdefault(key, [])
             same = [r for r in kept if _same_scope(r["scope"], scope)]
             if same:
                 was = float(same[0]["seconds"])
                 now = float(record["seconds"])
                 if was and abs(now - was) / was > 0.05:
-                    self.conflicts.setdefault(sig, [was]).append(now)
+                    # Two measurements the cost key says are of the same work,
+                    # disagreeing. Recorded rather than averaged or quietly
+                    # kept: if the normalisation has collapsed something that
+                    # is not a nuisance, this is the line that says so.
+                    self.conflicts.setdefault(key, [was]).append(now)
                 continue
-            entry = dict(record, source=price_path, scope=scope)
-            if sig in layouts:
+            # ``signature`` is the observation identity, kept verbatim. The
+            # cost key says which measurements answer for an operator; this
+            # says which call was actually measured, and a lookup answered
+            # under a shifted allocation is told apart by comparing the two.
+            entry = dict(record, source=price_path, scope=scope, signature=sig)
+            if key in layouts:
                 # Absent is not dense: a price loaded without its graph has
                 # nothing to say about layout, and must not be read as having
                 # said "dense". Only a recorded one is stored, and only a
                 # recorded one is checked.
-                entry["layout"] = layouts[sig]
+                entry["layout"] = layouts[key]
             kept.append(entry)
         for sig, why in (blob.get("unpriced") or {}).items():
-            self._refusals.setdefault(sig, why)
+            self._refusals.setdefault(cost_key(sig), why)
         return blob, graph
 
     def lookup(self, op: dict, topology=None, registration=None):
@@ -542,10 +582,10 @@ class PriceLibrary:
         """
         from atom.compass.runtime.microbench import _is_collective_op
 
-        sig = _signature_of(op)
-        candidates = self._prices.get(sig) or []
+        key = _cost_key_of(op)
+        candidates = self._prices.get(key) or []
         if not candidates:
-            refusal = self._refusals.get(sig)
+            refusal = self._refusals.get(key)
             return None, (f"refused when priced: {refusal}" if refusal
                           else "no entry for this signature")
         if _is_collective_op(op):
@@ -554,6 +594,15 @@ class PriceLibrary:
                 return None, why
         else:
             record = candidates[0]
+        # The measurement answers for this operator, and it was taken under a
+        # different allocation. That is the whole point of the cost key, and it
+        # is still worth counting: a coverage report that cannot separate
+        # "priced exactly as measured" from "priced through the normalisation"
+        # cannot be audited if the normalisation later turns out to be wrong.
+        measured_signature = record.get("signature")
+        if (measured_signature is not None
+                and measured_signature != _signature_of(op)):
+            self.address_shifted[key] = self.address_shifted.get(key, 0) + 1
         # Against the layout of the record that was *selected*, which for a
         # collective is chosen by width and path above. A price and the layout
         # it was measured under are one measurement and travel together.
@@ -666,9 +715,12 @@ class PriceLibrary:
         multi = (f", {scoped} held in more than one scope" if scoped else "")
         with_layout = sum(1 for recs in self._prices.values()
                           if any("layout" in r for r in recs))
-        return (f"PriceLibrary({len(self._prices)} signatures from "
+        shifted = sum(self.address_shifted.values())
+        moved = (f", {shifted} lookups answered under a shifted allocation"
+                 if shifted else "")
+        return (f"PriceLibrary({len(self._prices)} cost keys from "
                 f"{len(self.sources)} runs, {with_layout} with a "
-                f"recorded layout{multi}{partial}{conflict})")
+                f"recorded layout{multi}{moved}{partial}{conflict})")
 
 
 class GraphSource(Protocol):

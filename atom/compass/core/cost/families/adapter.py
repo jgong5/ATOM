@@ -150,7 +150,7 @@ class ParametricPriceLibrary(PriceLibrary):
         #: price file -> the row count that run was measured at
         self._rows: dict[str, int] = {}
         #: price file -> {signature -> the operator THAT file's graph recorded}
-        #: Needed beside `_ops` because a signature does not carry layout: two
+        #: Needed beside `_ops` because a key does not carry layout: two
         #: files can price the same key on differently arranged memory, and
         #: only the per-file map says which price is which.
         self._source_ops: dict[str, dict] = {}
@@ -201,10 +201,15 @@ class ParametricPriceLibrary(PriceLibrary):
             # prices are of the padded width, not of the scheduled one.
             self.padded[price_path] = (rows, scheduled)
         self._rows[price_path] = rows
-        from atom.compass.runtime.microbench import signature_of
+        from atom.compass.runtime.microbench import cost_key_of
 
         for op in graph.get("ops") or ():
-            self._ops.setdefault(signature_of(op), op)
+            # Keyed by the COST key, because `_build` looks these up with the
+            # keys of `PriceLibrary._prices`, which are cost keys. Keying by
+            # the raw signature here would miss on every operator carrying an
+            # allocator address, and the miss is silent: the curve would just
+            # be empty and the family would refuse widths it can price.
+            self._ops.setdefault(cost_key_of(op), op)
             # Also per source. `_ops` is keyed by signature alone and keeps the
             # first operator seen under it, which is fine for "what structure
             # does this key have" and wrong for "what did THIS file price". A
@@ -219,7 +224,7 @@ class ParametricPriceLibrary(PriceLibrary):
             # under one signature is PRICED as the dense one, so labelling it
             # strided here would disagree with the measurement.
             self._source_ops.setdefault(price_path, {}).setdefault(
-                signature_of(op), op)
+                cost_key_of(op), op)
         self._curves_built = False
 
     def _build(self) -> None:

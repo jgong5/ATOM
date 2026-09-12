@@ -318,7 +318,7 @@ class PricedGraphCostOracle:
                 graph under parallelism.
         """
         from atom.compass.core.artifacts import resolve_rank_path
-        from atom.compass.runtime.microbench import signature_of
+        from atom.compass.core.cost.identity import cost_key
 
         self.prices_path, _ = resolve_rank_path(prices, rank_coords)
         self.graph_path, _ = resolve_rank_path(graph, rank_coords)
@@ -345,7 +345,13 @@ class PricedGraphCostOracle:
 
         with open(self.prices_path, encoding="utf-8") as fh:
             price_blob = json.load(fh)
-        price_list = price_blob["prices"]
+        # Reindexed onto the cost key, the same function a lookup applies to
+        # the operator it is pricing. Old files were written under the raw
+        # signature and would otherwise stop matching the moment the lookup
+        # side normalises; this is the reindex, done in memory, so no retained
+        # artifact is rewritten or recollected.
+        price_list = {cost_key(k): v
+                      for k, v in (price_blob["prices"] or {}).items()}
         # The width these prices were measured at. None means the list cannot
         # certify one, which is read as "refuse" rather than "any width" -- see
         # the collective guard in `_cost`.
@@ -407,6 +413,7 @@ class PricedGraphCostOracle:
 
     def _cost(self, graph_blob: dict, price_list: dict, path: str) -> "_Costed":
         """What one graph costs, and the shape it is a graph of."""
+        from atom.compass.core.cost.identity import cost_key
         from atom.compass.runtime.microbench import (
             _is_collective_op, signature_of)
 
@@ -439,7 +446,7 @@ class PricedGraphCostOracle:
                 self.unpriced += 1
                 self.untransferable_collectives += 1
                 continue
-            entry = price_list.get(signature_of(op))
+            entry = price_list.get(cost_key(signature_of(op)))
             if entry is None:
                 self.unpriced += 1
                 continue

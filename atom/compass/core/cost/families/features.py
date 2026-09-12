@@ -54,6 +54,8 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Optional
 
+from atom.compass.core.cost.identity import normalized_context
+
 __all__ = [
     "FAMILY_CONTRACTS",
     "FamilyContract",
@@ -77,12 +79,21 @@ class Nuisance:
     spread: Optional[float] = None
     #: where that reading comes from, so a reader can check it
     evidence: str = ""
+    #: whether the cost key normalises this component away. Independent of
+    #: ``measured``: a normalised component is one the key no longer
+    #: distinguishes, which is a decision about identity; a measured one is a
+    #: component whose spread somebody has read off a measurement. Recording
+    #: both is what keeps "we collapsed this" from reading as "we measured it".
+    normalized: bool = False
 
     def describe(self) -> str:
         if not self.measured:
+            how = ("normalised out of the cost key on a structural argument, "
+                   "spread not yet measured" if self.normalized else
+                   "so operators differing in it are refused rather than "
+                   "priced")
             return (f"{self.component}: unmeasured -- no measurement varies it "
-                    "at a fixed feature point, so operators differing in it "
-                    "are refused rather than priced")
+                    f"at a fixed feature point, {how}")
         band = f" (spread {self.spread:.1%})" if self.spread is not None else ""
         return f"{self.component}: measured independent{band}, {self.evidence}"
 
@@ -140,9 +151,23 @@ _LAYER_LINEAR = Nuisance(
 )
 
 # Physical allocator and position state. Nothing under g4/ varies either of
-# these at a fixed (rows, history) point, so nothing licenses ignoring them.
-_SLOT_MAPPING = Nuisance(component="slot_mapping", measured=False)
-_POSITIONS = Nuisance(component="positions", measured=False)
+# these at a fixed (rows, history) point, so nothing still licenses calling the
+# price independent of them *on the evidence*.
+#
+# They are nevertheless normalised out of the cost key, by
+# `atom.compass.core.cost.identity`, on a structural argument rather than a
+# measured one: these fields say where the allocator put this batch, and the
+# kernel does one write per row wherever the row lands. The count of rows and
+# the count of void (-1, padded) entries are kept, because those are work.
+#
+# `normalized` records that separately from `measured`, so the distinction
+# survives: this is a declared equivalence awaiting the probe that would make
+# it a measured band, not a measurement. The probe is a fixed (rows, history)
+# point priced twice under two allocations; until it runs, the spread is
+# unknown and is reported as unknown.
+_SLOT_MAPPING = Nuisance(component="slot_mapping", measured=False,
+                         normalized=True)
+_POSITIONS = Nuisance(component="positions", measured=False, normalized=True)
 _BLOCK_TABLES = Nuisance(component="block_tables_shape", measured=False)
 
 
@@ -253,7 +278,12 @@ def _values(op: dict) -> list:
 
     walk(op.get("input_shapes") or ())
     walk(tuple(op.get("dtypes") or ()))
-    walk(tuple((k, v) for k, v in (tuple(x) for x in op.get("context") or ())))
+    # Addresses summarised to (count, void count) first, on the same rule the
+    # cost key uses. The parametric path has to reach the cost key's verdict:
+    # if it compared raw `slot_mapping` values it would separate two operators
+    # the library has already agreed are the same work, and a family law would
+    # then refuse a width the key itself accepts.
+    walk(normalized_context(op))
     walk(tuple((i, tuple(v)) for i, v in
                (tuple(x) for x in op.get("int_values") or ())))
     walk(tuple((k, v) for k, v in (tuple(x) for x in op.get("scalars") or ())))
