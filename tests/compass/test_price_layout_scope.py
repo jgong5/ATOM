@@ -26,7 +26,6 @@ from atom.compass.core.cost.library import (
 )
 from atom.compass.runtime.microbench import signature_of
 
-
 # -- operators -------------------------------------------------------------
 #
 # `layouts` as `meta._layouts_of` records them: (position, (stride, offset,
@@ -201,7 +200,7 @@ def test_a_strided_request_does_not_interpolate_dense_measurements(tmp_path):
     exact, why_exact = library.lookup(strided_gemm(32))
     assert exact is None, "the exact-width strided request should refuse"
 
-    record, detail = library.lookup(strided_gemm(48))
+    record, _detail = library.lookup(strided_gemm(48))
     assert record is None, (
         f"interpolated a strided 48-row request from dense measurements "
         f"({record}) while refusing the exact 32-row one: {why_exact}")
@@ -246,7 +245,7 @@ def test_a_layout_that_does_not_scale_with_the_rows_is_a_different_operator(
     """
     library = _rows_library(tmp_path, {32: (strided_gemm(32), 1e-4),
                                        64: (strided_gemm(64), 2e-4)})
-    record, detail = library.lookup(strided_gemm(48, offset=8192))
+    record, _detail = library.lookup(strided_gemm(48, offset=8192))
     assert record is None, f"answered a moved view with {record}"
 
 
