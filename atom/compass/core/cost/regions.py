@@ -77,6 +77,16 @@ class Measured:
     samples: int
     how: str
 
+    @classmethod
+    def zero_work(cls, why: str) -> "Measured":
+        """A region the engine is known not to run for this shape.
+
+        Not a measurement that came out small, and not a gap: a declaration
+        that the work does not happen. A middle chunk of a long prompt samples
+        no token, so the runner skips postprocess entirely.
+        """
+        return cls(seconds=0.0, low=0.0, high=0.0, samples=0, how=why)
+
     def describe(self) -> str:
         return (f"{self.seconds * 1e3:.4f} ms "
                 f"[{self.low * 1e3:.4f}, {self.high * 1e3:.4f}] "
@@ -279,6 +289,8 @@ class BucketedRunnerRegions:
     prepare_decode_cells: tuple
     #: Prefill and the broadcast are unchanged measurements, carried from the
     #: profile below rather than re-declared, so one capture backs one number.
+    #: The scalars are what a source uses when it has no prefill cells; where
+    #: it has them they are the fallback for nothing, and the cells decide.
     postprocess_prefill: Measured
     prepare_prefill: Measured
     tp_broadcast: Measured
@@ -290,11 +302,63 @@ class BucketedRunnerRegions:
     #: The engine's capture ladder, for callers resolving a rung themselves.
     #: Not used to fill in a shape's missing bucket -- see `refusal`.
     capture_sizes: tuple = ()
+    #: ``(sequences, total_tokens) -> Measured``, the prefill analogue of
+    #: `prepare_decode_cells`. Empty means this source has none and the scalar
+    #: above is used with the `prefill_sequences`/`prefill_tokens` domain, which
+    #: is every source written before these existed.
+    #:
+    #: They exist for the same reason the decode cells do: the term is not a
+    #: function of one number and is not monotone in the batch. Preparation over
+    #: one sequence of 640 tokens is 0.39 ms; over two sequences of a full
+    #: prompt each it is 3.9 ms; over fifteen and sixteen it is 1.19 ms again.
+    #: A single published scalar cannot represent a tenfold difference between
+    #: measured cells, and a range widened to span them would claim every token
+    #: count in between on the strength of a term measured at neither end.
+    #:
+    #: A populated source is therefore a **lookup, not a domain**: a shape is
+    #: priced when its exact cell was measured and refused otherwise. The
+    #: intermediate cells are not unknown-but-probably-fine, they are unknown.
+    prepare_prefill_cells: tuple = ()
+    #: The same keys, for postprocess. Declared separately rather than paired
+    #: so a source can carry one and not the other without a placeholder.
+    postprocess_prefill_cells: tuple = ()
     version: str = ""
     provenance: str = ""
 
     def _cells(self) -> dict:
         return {(int(b), bool(p)): m for (b, p), m in self.prepare_decode_cells}
+
+    def _prefill_cells(self, which: tuple) -> dict:
+        return {(int(s), int(t), bool(o)): m for (s, t, o), m in which}
+
+    @staticmethod
+    def _produces_output(shape) -> bool:
+        """Whether this prefill step samples a token.
+
+        A middle chunk of a long prompt does not: the runner skips postprocess
+        for it entirely, so its postprocess is *zero work* and not a small
+        measurement. Averaging a middle chunk with a final one would put a
+        term on a step that never ran it, which is why this is part of the key
+        rather than a footnote -- the same role `padded` plays for decode.
+        """
+        produces = getattr(shape, "produces_output", None)
+        if produces is not None:
+            return bool(produces)
+        # Older shapes do not carry it. A prefill whose scheduled tokens finish
+        # every sequence's prompt is a final chunk.
+        ctx = tuple(shape.context_lens or ())
+        sched = tuple(shape.num_scheduled_tokens or ())
+        return bool(ctx) and len(ctx) == len(sched)
+
+    def _prefill_key(self, shape) -> tuple:
+        return (len(shape.num_scheduled_tokens), int(shape.total_tokens),
+                self._produces_output(shape))
+
+    def _prefill_term(self, shape, cells: tuple, scalar: Measured) -> Measured:
+        """The cell for this shape, or the scalar where a source has no cells."""
+        if not cells:
+            return scalar
+        return self._prefill_cells(cells)[self._prefill_key(shape)]
 
     def bucket_for(self, sequences: int):
         """The rung `ForwardMode.decide` would pick, or None above the ladder.
@@ -318,6 +382,20 @@ class BucketedRunnerRegions:
                     f"{list(self.topologies)}")
         seqs = len(shape.num_scheduled_tokens)
         if shape.num_prefill_tokens:
+            if self.prepare_prefill_cells:
+                # A lookup, not a domain. The cells are the shapes that were
+                # measured and nothing between them is claimed: preparation is
+                # not monotone in the batch, so an unmeasured cell is unknown
+                # rather than bracketed by its neighbours.
+                cells = self._prefill_cells(self.prepare_prefill_cells)
+                key = self._prefill_key(shape)
+                if key not in cells:
+                    return (f"prefill of {key[1]} tokens over {key[0]} "
+                            f"sequence(s), producing "
+                            f"{'a token' if key[2] else 'no token'}, was not "
+                            f"measured; the measured cells are "
+                            f"{sorted(cells)}")
+                return None
             if seqs not in self.prefill_sequences:
                 return (f"prefill over {seqs} sequences, measured only at "
                         f"{list(self.prefill_sequences)}")
@@ -368,10 +446,26 @@ class BucketedRunnerRegions:
             raise ValueError(f"no measured region for this shape: {why}")
         prefill = bool(shape.num_prefill_tokens)
         tp = int((dict(shape.topology) if shape.topology else {}).get("tp", 1))
-        parts = [("<postprocess>", self.postprocess_prefill if prefill
-                  else self.postprocess_decode),
-                 ("<prepare>", self.prepare_prefill if prefill
-                  else self._decode_prepare(shape))]
+        if prefill:
+            prepare = self._prefill_term(shape, self.prepare_prefill_cells,
+                                         self.prepare_prefill)
+            if self.postprocess_prefill_cells or self.prepare_prefill_cells:
+                # A middle chunk samples nothing, so it pays no postprocess at
+                # all. Absent from the postprocess cells means zero work here,
+                # not a missing measurement: the key already records that this
+                # step produces no token.
+                cells = self._prefill_cells(self.postprocess_prefill_cells)
+                postprocess = cells.get(
+                    self._prefill_key(shape),
+                    Measured.zero_work(
+                        "this chunk samples no token, so the runner skips "
+                        "postprocess entirely"))
+            else:
+                postprocess = self.postprocess_prefill
+        else:
+            prepare = self._decode_prepare(shape)
+            postprocess = self.postprocess_decode
+        parts = [("<postprocess>", postprocess), ("<prepare>", prepare)]
         if tp > 1:
             parts.append(("<tp-broadcast>", self.tp_broadcast))
         return parts
@@ -676,11 +770,93 @@ SOURCE_27B_TP1_PREFILL_1X640 = BucketedRunnerRegions(
 )
 
 
+#: The prefill cells that have actually been measured, as a lookup.
+#:
+#: Keyed `(sequences, total_tokens, produces_output)`, the prefill analogue of
+#: `prepare_decode_cells`. The third field is not decoration: a middle chunk of
+#: a long prompt samples no token, so the runner skips postprocess for it
+#: entirely, and pairing a middle chunk with a final chunk's postprocess would
+#: charge a step for work it never did.
+#:
+#: Every cell below is three retained repeats of one shape from one campaign.
+#: Nothing here is fitted and nothing between the cells is claimed.
+#:
+#: Deliberately absent, and why:
+#:
+#: * **2 sequences x 16384 from the ragged `observed` case** ([640, 15744]).
+#:   It has the same `(sequences, tokens)` key as the `even` case and a
+#:   different value -- 3.9315e-3 against 3.8754e-3 -- because one is two full
+#:   prompts and the other is a full prompt beside a chunk of a 63744-token
+#:   one. The key does not separate them, so the full-prompt cell is the one
+#:   carried and the ragged one is left out rather than silently preferred.
+#: * **1 sequence x 16384 middle chunks.** Three retained repeats each exist in
+#:   the same capture, but at two different histories -- 1.1406e-3 s at context
+#:   32128 and 7.9199e-4 s at 48512, a 44% difference under one key. Preparation
+#:   has a term that grows with history, so these need context in the key
+#:   before either can be carried. Measured, retained, not yet expressible.
+#: * **1 sequence x 1024.** Three rows, but they are the campaign's preparation
+#:   and flush bursts rather than a measured cell, and their spread is 53%.
+SOURCE_27B_TP1_PREFILL_CELLS = BucketedRunnerRegions(
+    postprocess_decode=SOURCE_27B_TP1_CONC_V2.postprocess_decode,
+    prepare_decode_cells=SOURCE_27B_TP1_CONC_V2.prepare_decode_cells,
+    # Unused while the cells below are populated; kept so the dataclass is
+    # complete and a reader sees which scalar was superseded.
+    postprocess_prefill=SOURCE_27B_TP1_CONC_V2.postprocess_prefill,
+    prepare_prefill=SOURCE_27B_TP1_CONC_V2.prepare_prefill,
+    prepare_prefill_cells=(
+        ((1, 640, True), Measured(
+            seconds=3.916815e-4, low=3.85378e-4, high=3.92064e-4, samples=3,
+            how="upper median [min,max] of seconds - run_model - postprocess, "
+                "pricing_coverage/single640, bulk-enqueued with a "
+                "matching-shape warmup discarded by position")),
+        ((1, 15232, True), Measured(
+            seconds=7.823394e-4, low=7.60528e-4, high=8.30608e-4, samples=3,
+            how="the tail chunk that finishes the 63744-token prompt, one per "
+                "burst of calib2seq observed; upper median [min,max]")),
+        ((2, 15360, True), Measured(
+            seconds=3.860857e-3, low=3.82871e-3, high=4.03999e-3, samples=3,
+            how="calib2seq lower, two full 7680-token prompts co-scheduled; "
+                "upper median [min,max]")),
+        ((2, 16384, True), Measured(
+            seconds=3.875352e-3, low=3.84098e-3, high=3.94232e-3, samples=3,
+            how="calib2seq even, two full 8192-token prompts co-scheduled; "
+                "upper median [min,max]")),
+    ),
+    postprocess_prefill_cells=(
+        ((1, 640, True), Measured(
+            seconds=1.0052e-4, low=9.956e-5, high=1.0092e-4, samples=3,
+            how="span_seconds.postprocess, pricing_coverage/single640")),
+        ((1, 15232, True), Measured(
+            seconds=9.908e-5, low=9.852e-5, high=1.0080e-4, samples=3,
+            how="span_seconds.postprocess, calib2seq observed tail chunk")),
+        ((2, 15360, True), Measured(
+            seconds=1.590810e-4, low=1.56721e-4, high=1.62161e-4, samples=3,
+            how="span_seconds.postprocess, calib2seq lower")),
+        ((2, 16384, True), Measured(
+            seconds=1.100000e-4, low=1.09441e-4, high=1.13121e-4, samples=3,
+            how="span_seconds.postprocess, calib2seq even")),
+    ),
+    tp_broadcast=SOURCE_27B_TP1_CONC_V2.tp_broadcast,
+    decode_context=SOURCE_27B_TP1_CONC_V2.decode_context,
+    # Unused while cells are populated; `refusal` consults the cells instead.
+    prefill_sequences=(1, 2),
+    prefill_tokens=(640, 16384),
+    topologies=(1,),
+    capture_sizes=SOURCE_27B_TP1_CONC_V2.capture_sizes,
+    version="prefill-cells-2026-09-12",
+    provenance="pricing_coverage/single640 and pricing_coverage/calib2seq, "
+               "three retained repeats per cell. Decode, broadcast and the "
+               "context bound carried from source-27b-tp1-conc-v2. TP1 only: "
+               "nothing here is fitted to a TP2 or TP4 engine",
+)
+
+
 REGION_MODELS = {
     "source-27b-tp1": SOURCE_27B_TP1,
     "source-27b-tp1-conc": SOURCE_27B_TP1_CONC,
     "source-27b-tp1-conc-v2": SOURCE_27B_TP1_CONC_V2,
     "source-27b-tp1-prefill-1x640": SOURCE_27B_TP1_PREFILL_1X640,
+    "source-27b-tp1-prefill-cells": SOURCE_27B_TP1_PREFILL_CELLS,
     "none": None,
 }
 
