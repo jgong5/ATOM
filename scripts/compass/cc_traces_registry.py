@@ -629,6 +629,20 @@ INCLUDE_GEMM_SUPPLEMENT_V1 = False
 #: already names.
 _GEMM_SUPPLEMENT_V1 = "{root}/gemm_supp_books/gsr.json:" + _WIDE + "/b27dec32.json"
 
+#: The reviewed TP2/TP4 supplementary books: `unified_attention_with_output_base`
+#: and `masked_embedding`, measured at every rank of both widths against that
+#: rank's own graph (`acquire_wide_bounded.sh` -> `primitives.py`, 3 repeats,
+#: source assertion rc=0, `INDEX.json.problems` empty). Without them the
+#: ordinary factory refuses both families at TP2 and TP4; with them it refuses
+#: neither. Nothing is removed -- every prior book stays loaded, so a
+#: disagreement would surface as a conflict rather than be silently overwritten.
+#: `wb.json`/`wbg.json` resolve per rank through `resolve_rank_path`, and the
+#: `unregistered` scope matches the body and head entries below.
+#:
+#: This layer carries no GEMM prices and settles no GEMM question.
+_WIDE_BOUNDED = ("{root}/wide_bounded_registry/tp{tp}/wb.json:"
+                 "{root}/wide_bounded_registry/tp{tp}/wbg.json:unregistered")
+
 
 def per_width_options(tp: int) -> tuple:
     """The options this width adds to `SHARED_OPTIONS`, unresolved."""
@@ -651,6 +665,10 @@ def per_width_options(tp: int) -> tuple:
     # so which one answers must not depend on load order.
     prices = (body, head, f"{_WIDE}/ar_capture.json",
               f"{_WIDE}/ar_plain.json", f"{_WIDE}/ag_prices.json")
+    # Ahead of the list: within one scope the first price wins. Neither family
+    # appears in the base books at either wide width, so this displaces no
+    # existing measured entry.
+    prices = (_WIDE_BOUNDED,) + prices
     if tp == 4 and INCLUDE_GEMM_SUPPLEMENT_V1:
         # Ahead of the list: within one scope the first price wins, so a
         # supplement that is loaded after the book it supplements answers

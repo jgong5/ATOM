@@ -114,10 +114,18 @@ def test_the_required_artifacts_are_read_out_of_the_options():
     assert artifacts["memory_model"] == (
         "/r/memval/capture_replay/profile_r22/profile.tp2.json"
     )
-    # Five price specs at a wide width; the two with a graph beside them
-    # contribute both files.
-    assert artifacts["price[0].graph"].endswith("b27dec32.json")
-    assert "price[2].graph" not in artifacts
+    # Some price specs at a wide width carry a graph beside them and some do
+    # not, and which is which is the claim -- NOT the index each one happens
+    # to sit at. Indices move whenever a book is layered onto the list (the
+    # wide-bounded MHA/embedding books prepend one), so they are looked up by
+    # the file they name.
+    graphs = {k: v for k, v in artifacts.items() if k.endswith(".graph")}
+    assert any(v.endswith("b27dec32.json") for v in graphs.values())
+    # The all-reduce and gather lists are prices with no graph beside them.
+    prices = {k: v for k, v in artifacts.items() if k.endswith(".prices")}
+    for name in ("ar_capture.json", "ar_plain.json", "ag_prices.json"):
+        role = next(k for k, v in prices.items() if v.endswith(name))
+        assert role[: -len(".prices")] + ".graph" not in artifacts
 
 
 def test_each_width_replays_a_target_of_its_own_width():
@@ -289,6 +297,12 @@ def test_a_rank_reading_another_rank_s_file_is_named_not_counted_present(tmp_pat
         (wide / f"{stem}.tp0.json").write_text("{}")
     for name in ("ar_capture", "ar_plain", "ag_prices"):
         (wide / f"{name}.json").write_text("{}")
+    # The wide-bounded MHA/embedding books are measured per width and written
+    # unsuffixed, like the collectives; they live outside the width directory.
+    bounded = tmp_path / "wide_bounded_registry" / "tp2"
+    bounded.mkdir(parents=True)
+    for name in ("wb.json", "wbg.json"):
+        (bounded / name).write_text("{}")
     # The target derived at this width, and the profile it is sized from --
     # which lives with MEMORY's other profiles, not under the width's
     # directory.
@@ -305,8 +319,14 @@ def test_a_rank_reading_another_rank_s_file_is_named_not_counted_present(tmp_pat
     # and gather lists are shared on purpose and are written unsuffixed, so
     # they are "not this rank's" even at rank 0; the per-rank four are what
     # separate the two ranks here.
-    per_rank = ("template", "head_template", "price[0]", "price[1]")
-    assert not any(key.startswith(per_rank) and key.endswith("@tp0")
+    # Found by the file each role names, not by the index it sits at: layering
+    # a measured book onto the price list shifts every later index.
+    per_rank_stems = ("b27dec32", "h27dec32", "p27bdec32", "p27hdec32")
+    arts = registry.required_artifacts(2, tmp_path)
+    per_rank = {role.split(".")[0] for role, path in arts.items()
+                if Path(path).name.startswith(per_rank_stems)}
+    assert not any(key.split("@")[0].split(".")[0] in per_rank
+                   and key.endswith("@tp0")
                    for key in cell["shared_artifacts"])
     assert "template@tp1" in cell["shared_artifacts"]
     assert "head_template@tp1" in cell["shared_artifacts"]
@@ -363,8 +383,14 @@ def test_a_collective_s_price_list_is_the_group_s_not_a_rank_s(tmp_path):
     # twelve claims at TP4 against files that are correct, and bury the one
     # per-rank fallback that is a claim.
     found = registry.resolution(4, tmp_path)
+    arts = registry.required_artifacts(4, tmp_path)
+    collectives = sorted(
+        role for role, path in arts.items()
+        if Path(path).name in ("ar_capture.json", "ar_plain.json",
+                               "ag_prices.json"))
+    assert len(collectives) == 3
     for rank in range(4):
-        for role in ("price[2].prices", "price[3].prices", "price[4].prices"):
+        for role in collectives:
             assert found[rank][role]["own"] is True
             assert f".tp{rank}.json" not in found[rank][role]["path"]
         # The body and head templates stay per-rank, which is the point.
