@@ -63,7 +63,28 @@ class CompassPredictMixin:
         # paths when it is asked -- is what this replaces: the option is a DSL
         # over per-rank stems, so it does not name the files that were opened,
         # and by the time anyone asks the bytes may have changed.
-        self._compass_inputs = self._freeze_compass_inputs()
+        #
+        # The *oracle's* inputs only. The capacity side is not read yet: a
+        # memory profile or a replay target is opened in `get_num_blocks`,
+        # which runs after this, so freezing a whole manifest here would
+        # freeze an empty capacity record and publish it as the finding that
+        # there was none. Those are collected at readback instead -- see
+        # `compass_input_manifest`.
+        self._compass_oracle_inputs = tuple(
+            getattr(self._oracle, "compass_loaded_inputs", ()) or ())
+        #: What the capacity path read, appended by the reader that read it.
+        #: Left alone here rather than initialised to a frozen empty tuple,
+        #: for the reason above. `runtime.*` roles, distinct from the
+        #: `oracle.*` ones above.
+        if not hasattr(self, "compass_runtime_inputs"):
+            self.compass_runtime_inputs: tuple = ()
+        #: Which reading the KV budget was actually made from, as the code
+        #: that selected it says: "measured", "analytical", "recorded" or
+        #: "replay-target". None until that selection has run, which is a
+        #: real state and is reported as one -- a run whose capacity source
+        #: is unknown is not a run whose capacity was measured.
+        if not hasattr(self, "compass_budget_source"):
+            self.compass_budget_source = None
         self._graph = OpGraph()
         self._traced_steps = 0
         self._prefill_index = 0
@@ -154,33 +175,41 @@ class CompassPredictMixin:
             options["rank_coords"] = self._rank_coords()
         return oracle_cls(**options)
 
-    def _freeze_compass_inputs(self) -> dict:
-        """Everything this rank loaded, as the readers that parsed it said.
-
-        Collected off the oracle, which is the only thing `_build_oracle`
-        hands back -- `source_cost_oracle` returns the oracle alone, so a
-        record that lived anywhere else would never reach a served run.
-
-        An oracle that reads nothing reports nothing, and that is a state and
-        not a failure: the declared stub a measured run uses has no tables, and
-        demanding a record from it would refuse the ground-truth side of every
-        comparison.
-        """
-        from atom.compass.core.loaded_input import manifest
-
-        loaded = getattr(self._oracle, "compass_loaded_inputs", ()) or ()
-        return manifest(loaded, coords=self._rank_coords())
-
     def compass_input_manifest(self) -> dict:
-        """The frozen record, for the engine's utility RPC to hand out.
+        """Everything this rank loaded, as the readers that parsed it said.
 
         Named as a plain method because that is how the worker RPC reaches a
         runner: `runner_mgr.call_func` does `getattr(runner, name)`. It reads
-        state and touches nothing, so it is safe to answer at any point in a
-        run -- and it answers the same thing at every point, which is the
-        property that makes it evidence.
+        retained records and opens nothing, so it is safe to answer at any
+        point in a run.
+
+        Assembled here rather than frozen whole at init, and the difference
+        matters. The oracle's inputs *are* frozen at init, because that is
+        when the oracle read them. The capacity inputs are not read by then:
+        a memory profile or a replay target is opened in `get_num_blocks`,
+        which runs later, so a manifest frozen in `_init_compass_state` would
+        have recorded "this run read no capacity input" and published that as
+        a finding rather than as a race. Assembling at readback collects both,
+        and still reopens nothing -- every record here was taken by the reader
+        that parsed the bytes.
+
+        A reader that reads nothing contributes nothing, and that is a state
+        rather than a failure: the declared stub a measured run uses has no
+        tables, and demanding a record from it would refuse the ground-truth
+        side of every comparison.
         """
-        return dict(self._compass_inputs)
+        from atom.compass.core.loaded_input import manifest
+
+        runtime = tuple(getattr(self, "compass_runtime_inputs", ()) or ())
+        out = manifest(tuple(self._compass_oracle_inputs) + runtime,
+                       coords=self._rank_coords())
+        # Which reading the budget was actually made from, beside the files it
+        # was made from. Not inferred from the cost mode: `mode="measure"`
+        # forces the wall clock and says nothing about memory, so a measured
+        # run can be sized from an analytical profile with nothing in the
+        # record to show it. Reported as the selector states it, or None.
+        out["budget_source"] = getattr(self, "compass_budget_source", None)
+        return out
 
     def forward(self, batch: ScheduledBatch) -> ScheduledBatchOutput:
         """Predict the step, or trace it, depending on the configured mode."""
