@@ -27,8 +27,10 @@ refuses would put the two kinds of number back in the same channel.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
+import os
 from typing import Any, Callable, Mapping, Optional
 
 from atom.compass.core.kv_geometry import (
@@ -42,7 +44,12 @@ from atom.compass.core.memory_model import UnfoundedPrediction, derived_readings
 
 logger = logging.getLogger(__name__)
 
-__all__ = ["warmup_tokens", "derived_block_info", "load_json"]
+__all__ = ["warmup_tokens", "derived_block_info", "load_json", "LoadedInputs"]
+
+#: The manifest `LoadedInputs.manifest()` produces. Versioned because a
+#: validator will read it and a field that quietly changes meaning is worse
+#: than one that is absent.
+LOADED_INPUTS_SCHEMA = "compass.memory.loaded_inputs/1"
 
 #: What a `kv_cache_dtype` costs per element. Mirrors the table
 #: `scripts/compass/validate_memory.py` reads records with; both exist because
@@ -57,6 +64,93 @@ def load_json(path: str):
     """Read a path and parse it. The file-system half, kept injectable."""
     with open(path, encoding="utf-8") as fh:
         return json.load(fh)
+
+
+class LoadedInputs:
+    """Every file a sizing actually read, digested at the moment it was read.
+
+    The run's own flags are hashed, but `replay_target` and `memory_model` name
+    *files* and the names are not the inputs -- the bytes are. A path can be
+    rewritten between the run and the report, can be a symlink, can be named by
+    one option and read through another. So this digests what the reader
+    consumed, in the order it consumed it, and never re-opens anything: a
+    manifest built by re-reading at report time attests to whatever is on disk
+    then, which is exactly the claim it appears to rule out.
+
+    A file read twice is recorded twice, in order, rather than deduplicated:
+    two reads of one path are two events, and a validator that saw one entry
+    could not tell that the bytes were the same both times.
+
+    One instance covers one sizing. It seals when that sizing finishes, so a
+    later read cannot append to a manifest that has already been published.
+    The record survives a refusal on purpose -- what was read before a run
+    stopped is evidence about the run that stopped.
+    """
+
+    def __init__(self, load: Optional[Callable[[str], Any]] = None) -> None:
+        #: A caller-supplied reader (tests, and callers with their own file
+        #: system). Its bytes are not ours to digest, and that is recorded
+        #: rather than papered over with a second read of our own.
+        self._load = load
+        self._reads: list = []
+        self._sealed = False
+
+    def read(self, where: str, role: str = "referenced"):
+        if self._sealed:
+            raise RuntimeError(
+                "ATOMCompass: this loaded-input manifest is sealed. It "
+                "describes one sizing, and a read after that sizing belongs "
+                "to a different one.")
+        entry = {"role": role, "path": str(where), "order": len(self._reads)}
+        try:
+            entry["abspath"] = os.path.abspath(str(where))
+        except (OSError, ValueError):                            # noqa: BLE001
+            entry["abspath"] = None
+        if self._load is not None:
+            value = self._load(where)
+            entry["sha256"] = None
+            entry["bytes"] = None
+            entry["note"] = ("read through a caller-supplied loader; the "
+                             "bytes were never in this process")
+        else:
+            with open(where, "rb") as fh:
+                raw = fh.read()
+            value = json.loads(raw.decode("utf-8"))
+            entry["sha256"] = hashlib.sha256(raw).hexdigest()
+            entry["bytes"] = len(raw)
+        self._reads.append(entry)
+        return value
+
+    def note(self, role: str, **fields) -> None:
+        """Record an input that was not a file -- carried inline, or absent."""
+        if self._sealed:
+            raise RuntimeError("ATOMCompass: this manifest is sealed")
+        entry = {"role": role, "path": None, "abspath": None,
+                 "sha256": None, "bytes": None, "order": len(self._reads)}
+        entry.update(fields)
+        self._reads.append(entry)
+
+    def seal(self) -> None:
+        self._sealed = True
+
+    @property
+    def sealed(self) -> bool:
+        return self._sealed
+
+    def digest_of(self, role: str) -> Optional[str]:
+        for entry in self._reads:
+            if entry["role"] == role:
+                return entry["sha256"]
+        return None
+
+    def manifest(self, **context) -> dict:
+        """The record, copied out. Callers cannot edit what is kept here."""
+        return {
+            "schema": LOADED_INPUTS_SCHEMA,
+            "sealed": self._sealed,
+            "reads": [dict(entry) for entry in self._reads],
+            **context,
+        }
 
 
 def warmup_tokens(config) -> int:
@@ -111,6 +205,7 @@ def derived_block_info(
     state_runtime: Optional[Mapping[str, Any]] = None,
     captured: Optional[Mapping[str, Any]] = None,
     load: Optional[Callable[[str], Any]] = None,
+    inputs: Optional["LoadedInputs"] = None,
 ) -> dict:
     """`get_num_blocks`' reply, derived from a profile instead of measured.
 
@@ -122,17 +217,49 @@ def derived_block_info(
     `captured` is used only to say when the derived pool has a different shape
     than the recorded one.
 
+    `inputs` is a `LoadedInputs` the caller keeps. Every file this reads --
+    the profile, the calibration and the model config it names -- is digested
+    here, as it is read, and the collector is sealed before this returns. The
+    caller then owns an immutable record of the bytes that produced the number,
+    which is not the same thing as the paths the flags named.
+
     Raises `UnfoundedPrediction` when the profile cannot answer, and lets
     ATOM's own `InsufficientPoolBudget` through when the budget leaves nothing
     to page with -- a configuration Compass calls infeasible has to be refused
     by the engine's arithmetic and carry the engine's error.
     """
-    load = load or load_json
+    inputs = inputs if inputs is not None else LoadedInputs(load)
+    try:
+        return _derive(path, config, state_runtime=state_runtime,
+                       captured=captured, load=load, inputs=inputs)
+    finally:
+        # Sealed on the way out of either exit. A refusal keeps what it had
+        # already read -- that is evidence about the run that stopped -- but
+        # nothing may be appended to it afterwards.
+        inputs.seal()
+
+
+def _derive(path, config, *, state_runtime, captured, load, inputs) -> dict:
+    """`derived_block_info` without the sealing. See it for the contract."""
+    # Everything downstream -- including `derived_readings`, which opens the
+    # calibration itself -- reads through the collector, so nothing can be
+    # loaded without being digested.
+    read = inputs.read
+
+    def load_referenced(where):
+        role = "referenced"
+        if isinstance(where, str):
+            if where == profile.get("calibration"):
+                role = "calibration"
+            elif where == profile.get("model_config"):
+                role = "model_config"
+        return read(where, role)
+
     if not (path or "").strip():
         _refuse("no memory profile was named")
 
     try:
-        profile = load(path)
+        profile = read(path, "profile")
     except FileNotFoundError:
         _refuse("no memory profile at %r" % path)
     except (OSError, ValueError) as exc:
@@ -151,7 +278,11 @@ def derived_block_info(
         _refuse("the memory profile at %r names no `model_config`, so the KV "
                 "geometry has no checkpoint to read" % path)
     try:
-        native = native_path if isinstance(native_path, Mapping) else load(native_path)
+        if isinstance(native_path, Mapping):
+            native = native_path
+            inputs.note("model_config", note="carried inline in the profile")
+        else:
+            native = read(native_path, "model_config")
     except (OSError, ValueError) as exc:
         _refuse("the model config the profile names (%r) could not be read (%s)"
                 % (native_path, exc))
@@ -169,7 +300,7 @@ def derived_block_info(
     readings, activation = derived_readings(
         profile,
         warmup_tokens=warmup_tokens(config),
-        load=load,
+        load=load_referenced,
         enforce_eager=bool(getattr(config, "enforce_eager", False)),
         world_size=world,
         source=path,

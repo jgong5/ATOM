@@ -21,6 +21,7 @@ their lineage -- which is the property the widths were wanted for.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import types
@@ -30,7 +31,13 @@ import pytest
 
 from atom.compass.config import CompassConfig
 from atom.compass.core.kv_geometry import InsufficientPoolBudget
-from atom.compass.core.memory_blocks import derived_block_info, warmup_tokens
+from atom.compass.core.memory_blocks import (
+    LOADED_INPUTS_SCHEMA,
+    LoadedInputs,
+    derived_block_info,
+    load_json,
+    warmup_tokens,
+)
 from atom.compass.core.memory_model import UnfoundedPrediction
 from atom.compass.core.memory_topology import compose_calibration
 from atom.compass.replay.runner import ReplayModelRunner
@@ -361,3 +368,126 @@ class TestTheSeamIsCallableWithoutARunner:
         with pytest.raises(UnfoundedPrediction, match="state_runtime"):
             derived_block_info(config.compass_config.memory_model, config,
                                state_runtime=None)
+
+
+class TestTheFilesThatProducedTheNumberAreRecorded:
+    """A path is not an input. The bytes read at that path are.
+
+    `replay_target` and `memory_model` name files and sit outside the hashed
+    oracle options, so a run's recorded options can be identical to another's
+    and the capacity different. What is digested here is what the loaders
+    consumed, where they consumed it -- not a re-read at report time, which
+    would attest to whatever is on disk then and is exactly the claim such a
+    manifest appears to rule out.
+    """
+
+    def _manifest(self, tmp_path, **over):
+        runner = ReplayModelRunner(0, _config(tmp_path, **over))
+        runner.get_num_blocks()
+        return runner.compass_loaded_inputs
+
+    def _by_role(self, manifest):
+        return {entry["role"]: entry for entry in manifest["reads"]}
+
+    def test_every_file_the_sizing_read_is_in_it(self, tmp_path):
+        reads = self._by_role(self._manifest(
+            tmp_path, profile=_profile(tmp_path, 1)))
+        assert set(reads) == {"replay_target", "profile", "model_config",
+                              "calibration"}
+
+    def test_the_digests_are_the_bytes_on_disk(self, tmp_path):
+        profile = _profile(tmp_path, 1)
+        reads = self._by_role(self._manifest(tmp_path, profile=profile))
+        for entry in reads.values():
+            raw = Path(entry["path"]).read_bytes()
+            assert entry["sha256"] == hashlib.sha256(raw).hexdigest()
+            assert entry["bytes"] == len(raw)
+
+    def test_rewriting_a_file_afterwards_does_not_move_the_record(self, tmp_path):
+        """The property a report-time hash cannot have."""
+        profile = _profile(tmp_path, 1)
+        manifest = self._manifest(tmp_path, profile=profile)
+        before = self._by_role(manifest)["profile"]["sha256"]
+        Path(profile).write_text(json.dumps({"total": 1}))
+        assert self._by_role(manifest)["profile"]["sha256"] == before
+        assert before != hashlib.sha256(Path(profile).read_bytes()).hexdigest()
+
+    def test_the_record_is_sealed_when_the_sizing_ends(self, tmp_path):
+        runner = ReplayModelRunner(0, _config(tmp_path,
+                                              profile=_profile(tmp_path, 1)))
+        runner.get_num_blocks()
+        assert runner.compass_loaded_inputs["sealed"] is True
+        assert runner.compass_loaded_inputs["schema"] == LOADED_INPUTS_SCHEMA
+
+    def test_a_sealed_collector_takes_no_further_reads(self, tmp_path):
+        inputs = LoadedInputs()
+        profile = _profile(tmp_path, 1)
+        derived_block_info(profile, _config(tmp_path, profile=profile),
+                           state_runtime=StateRuntime().to_wire(),
+                           inputs=inputs)
+        assert inputs.sealed
+        with pytest.raises(RuntimeError, match="sealed"):
+            inputs.read(profile, "profile")
+
+    def test_a_replay_with_no_profile_still_names_its_target(self, tmp_path):
+        manifest = self._manifest(tmp_path)
+        reads = self._by_role(manifest)
+        assert set(reads) == {"replay_target"}
+        assert manifest["modelled"] is False
+        assert manifest["num_kvcache_blocks"] == CAPTURED_BLOCKS
+
+    def test_the_target_digest_is_taken_where_it_is_parsed(self, tmp_path):
+        config = _config(tmp_path)
+        target = config.compass_config.replay_target
+        runner = ReplayModelRunner(0, config)
+        raw = Path(target).read_bytes()
+        assert runner.target.sha256 == hashlib.sha256(raw).hexdigest()
+        runner.get_num_blocks()
+        entry = self._by_role(runner.compass_loaded_inputs)["replay_target"]
+        assert entry["sha256"] == runner.target.sha256
+
+    def test_a_refusal_still_says_what_had_been_read(self, tmp_path):
+        runner = ReplayModelRunner(0, _config(
+            tmp_path, profile=_profile(tmp_path, 2), width=1))
+        with pytest.raises(UnfoundedPrediction):
+            runner.get_num_blocks()
+        reads = self._by_role(runner.compass_loaded_inputs)
+        assert runner.compass_loaded_inputs["sealed"] is True
+        # The profile and the checkpoint geometry were read before the width
+        # was checked, so they are evidence about the run that stopped; the
+        # calibration never was.
+        assert set(reads) == {"replay_target", "profile", "model_config"}
+        assert "num_kvcache_blocks" not in runner.compass_loaded_inputs
+
+    def test_the_terms_the_bytes_were_read_for_travel_with_them(self, tmp_path):
+        """Same profile, another width: a digest alone does not found a count."""
+        manifest = self._manifest(tmp_path, profile=_profile(tmp_path, 4),
+                                  width=4)
+        assert manifest["modelled"] is True
+        assert manifest["num_kvcache_blocks"] == BLOCKS[4]
+        deployment = manifest["deployment"]
+        assert deployment["tensor_parallel_size"] == 4
+        assert deployment["gpu_memory_utilization"] == 0.9
+        assert deployment["kv_cache_block_size"] == 16
+        assert deployment["max_num_batched_tokens"] == 16384
+        assert deployment["enforce_eager"] is False
+
+    def test_a_caller_supplied_loader_says_the_bytes_were_never_ours(self, tmp_path):
+        """No second read of our own to paper over what we did not consume."""
+        profile = _profile(tmp_path, 1)
+        inputs = LoadedInputs(load=load_json)
+        derived_block_info(profile, _config(tmp_path, profile=profile),
+                           state_runtime=StateRuntime().to_wire(),
+                           inputs=inputs)
+        entry = self._by_role(inputs.manifest())["profile"]
+        assert entry["sha256"] is None
+        assert "never in this process" in entry["note"]
+
+    def test_a_file_read_twice_is_recorded_twice(self, tmp_path):
+        """The activation walk opens the checkpoint again; both reads count."""
+        manifest = self._manifest(tmp_path, profile=_profile(tmp_path, 1))
+        native = [e for e in manifest["reads"] if e["role"] == "model_config"]
+        assert len(native) == 2
+        assert native[0]["sha256"] == native[1]["sha256"]
+        assert [e["order"] for e in manifest["reads"]] == list(
+            range(len(manifest["reads"])))
