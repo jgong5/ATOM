@@ -1093,11 +1093,13 @@ def check_reference_budget_is_measured(real, label: str) -> list[str]:
 MEMORY_TERM_TOLERANCE = 0.10
 KV_BLOCK_TOLERANCE = 0.05
 
-#: The terms both sides state, by the names both sides use. `total` and `free`
-#: are here and not only the three that move: `total` says which card the
-#: profile describes, and `free` is where the weight term and the loader
-#: residue land, so a weight error that happens not to move the pool is visible
-#: in exactly one of these five and nowhere else.
+#: The aggregates both sides state, by the names both sides use. These are not
+#: the gate on their own -- `peak_torch` is weights plus persistent plus peak
+#: activations, and two of those wrong in opposite directions read here as one
+#: term slightly wrong, which is why `GATED_COMPONENT_TERMS` exists. They are
+#: kept because they say something the components do not: `total` says which
+#: card the profile describes, and `free` is the capacity the pool was actually
+#: cut from.
 GATED_MEMORY_TERMS = (
     "total",
     "free",
@@ -1109,6 +1111,23 @@ GATED_MEMORY_TERMS = (
 #: What the real side writes its readings as. Checked rather than assumed, for
 #: the reason every other schema here is.
 MEMORY_RECORD_VERSION = 1
+
+#: The non-KV terms `POC_STATUS.md` G3a actually tracks, in the names
+#: `validate_memory.py` gives them. Gating the aggregates alone would let two
+#: component errors in opposite directions read as one term slightly wrong --
+#: the shape of mistake that file records this project having been caught by
+#: twice -- so each of these carries its own 10%, and the aggregates above are
+#: kept beside them as capacity diagnostics rather than as the gate.
+GATED_COMPONENT_TERMS = (
+    "weights",
+    "model buffers",
+    "load residue",
+    "persistent",
+    "activations",
+    "non-torch",
+    "reservation",
+    "graph pool",
+)
 
 
 def _memory_records(cell_dir: Path, repeat: int) -> list:
@@ -1135,6 +1154,127 @@ def _relative(modelled, real):
     return abs(float(modelled) - float(real)) / abs(float(real))
 
 
+def _world_of(config: dict) -> int:
+    """How many ranks the record says its deployment had."""
+    world = 1
+    for size in (config.get("topology") or {"tp": 1}).values():
+        world *= max(1, int(size or 1))
+    return world
+
+
+def check_component_terms(record: dict, rank, where: str):
+    """Each non-KV term of the budget against its own measured counterpart.
+
+    The aggregates (`peak_torch` and the rest) are a sum of these, and a sum
+    checked only in total is the failure `validate_memory.py`'s own docstring
+    opens with: weights over and activations under by the same bytes reads as a
+    peak that agrees. So the eight terms `POC_STATUS.md` G3a tracks are
+    compared here individually, each at 10%.
+
+    Neither side's arithmetic is restated. The recorded column is
+    `validate_memory.recorded_terms` -- one definition of where the weights
+    stop and the residue starts -- and the derived column is
+    `derived_terms` over the prediction re-derived from the profile the
+    modelled run attested, which is refused outright if it does not reproduce
+    what that run published. An uncompared term fails exactly as a breached one
+    does: a term nobody looked at is not a term that passed.
+
+    Returns `(failures, rows, not_compared)`. The third is a stated reason
+    rather than a silence: a budget that was not derived from a profile carries
+    no per-term prediction, and holding a captured count against the capture it
+    came from is an identity, not a test. `cc_traces_plan.py` passes
+    `--compass-memory-model` on every modelled width, so a cell that lands
+    there is one whose modelled side was not the plan's, and the verdict says
+    so where a reader will find it.
+    """
+    try:
+        memory = _load("validate_memory")
+    except Exception as exc:  # noqa: BLE001 - an unloadable gate is a failure
+        return [(
+            f"{where}: validate_memory.py would not load ({exc}), so the "
+            f"per-term half of section 6's memory gate did not run"
+        )], [], None
+
+    budget = _budget_record((rank or {}).get("budget_source"))
+    if not budget:
+        return [(
+            f"{where}: the modelled run published no budget source, so there "
+            f"is no profile to derive its per-term prediction from"
+        )], [], None
+
+    kind = budget.get("kind")
+    if kind != "source-derived":
+        return [], [], (
+            f"{where}: the modelled budget is {kind!r}, so it states no "
+            f"per-term prediction and the eight component terms were not "
+            f"compared. Only a source-derived budget carries one"
+        )
+
+    if not ((budget.get("inputs") or {}).get("inputs")):
+        return [], [], (
+            f"{where}: the modelled budget publishes no attested input "
+            f"manifest, so its prediction can only be re-derived from files "
+            f"the run never said it read. The eight component terms were not "
+            f"compared -- what a run does not attest cannot be held against it"
+        )
+
+    config = record.get("config") or {}
+    world = _world_of(config)
+    try:
+        attest = memory.attest_from_budget(budget, f"{where}: modelled budget")
+        predicted = memory.predicted_terms(
+            attest,
+            config,
+            memory.warmup_tokens(
+                config, int(config.get("max_num_batched_tokens") or 0)
+            ),
+            world,
+        )
+    except SystemExit as exc:
+        # `validate_memory` refuses by exiting -- a profile for another model, a
+        # digest that moved, a re-derivation that does not reproduce what the
+        # run published. Every one of those is a reason this comparison cannot
+        # be made, not a reason to skip it.
+        return [f"{where}: the modelled prediction was refused -- {exc}"], [], None
+    except Exception as exc:  # noqa: BLE001
+        return [(
+            f"{where}: the modelled prediction could not be re-derived from "
+            f"the profile the run attested ({exc})"
+        )], [], None
+
+    derived = memory.derived_terms(predicted, world)
+    recorded = memory.recorded_terms(record.get("readings") or {}, record)
+
+    bad, rows = [], []
+    for term in GATED_COMPONENT_TERMS:
+        got, want = derived.get(term), recorded.get(term)
+        if want is None or got is None:
+            side = "real record" if want is None else "modelled prediction"
+            bad.append(
+                f"{where}: {term} is not stated by the {side}, so the term was "
+                f"not compared. An uncovered term fails here"
+            )
+            continue
+        error = _relative(got, want)
+        rows.append(
+            {
+                "term": term,
+                "real": int(want),
+                "modelled": int(got),
+                "relative_error": error,
+                "tolerance": MEMORY_TERM_TOLERANCE,
+            }
+        )
+        if error is None or error > MEMORY_TERM_TOLERANCE:
+            bad.append(
+                f"{where}: {term} modelled {got} against a measured {want} "
+                f"({'unbounded' if error == float('inf') else f'{error:.1%}'}, "
+                f"over the {MEMORY_TERM_TOLERANCE:.0%} this protocol gates "
+                f"non-KV terms at)"
+            )
+    return bad, rows, None
+
+
 def check_memory_terms(real, modelled, cell_dir: Path, repeat: int, label: str):
     """The gate protocol section 6 declares and nothing implemented.
 
@@ -1151,6 +1291,10 @@ def check_memory_terms(real, modelled, cell_dir: Path, repeat: int, label: str):
     are added to the cell's `forbidden` set so a modelled run that read one is
     refused. The comparison is a verdict on the model, not an input to it.
 
+    Three comparisons, not one: the aggregates both sides publish, the eight
+    non-KV component terms those aggregates are a sum of (`POC_STATUS.md` G3a),
+    each at its own 10%, and the block count at 5%.
+
     Returns `(failures, measured)` -- the second is the per-term arithmetic,
     kept in the verdict whether it passed or failed, because a gate that
     records only its own boolean cannot be re-read later.
@@ -1166,7 +1310,12 @@ def check_memory_terms(real, modelled, cell_dir: Path, repeat: int, label: str):
 
     modelled_ranks = _rank_records(modelled)
     real_ranks = _rank_records(real)
-    bad, measured = [], {"terms": [], "blocks": []}
+    bad, measured = [], {
+        "terms": [],
+        "components": [],
+        "components_not_compared": [],
+        "blocks": [],
+    }
 
     for index, path in enumerate(records):
         where = f"{label}: rank {index}"
@@ -1240,6 +1389,22 @@ def check_memory_terms(real, modelled, cell_dir: Path, repeat: int, label: str):
                     f", over the {MEMORY_TERM_TOLERANCE:.0%} this protocol gates "
                     f"non-KV terms at)"
                 )
+
+        # ...and the terms those aggregates are a sum of, each against its own
+        # measured counterpart. The rank index is carried onto every row so a
+        # disagreement can be attributed to the rank that had it.
+        # A budget that states no per-term prediction is recorded as such --
+        # a named reason in the verdict, not an absence a reader has to notice.
+        component_bad, component_rows, skipped = check_component_terms(
+            record, rank, where
+        )
+        bad += component_bad
+        for entry in component_rows:
+            measured["components"].append(dict(entry, rank=index))
+        if skipped:
+            measured["components_not_compared"].append(
+                {"rank": index, "reason": skipped}
+            )
 
         # The block count, tighter, and taken from each side's own statement of
         # what it served rather than recomputed here. The real record carries

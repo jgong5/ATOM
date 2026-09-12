@@ -3571,3 +3571,312 @@ class TestEveryMemoryTermIsGatedAgainstTheCard:
         )
         _write(cell / "modelled.r1.json", blob)
         assert run(cell) == 1
+
+
+#: The model config the derived activation term is read from. A real one --
+#: the derivation opens it and refuses a config it cannot size the model from.
+MODEL_CONFIG = Path(__file__).parent / "memory_records" / "qwen3_5_27b.config.json"
+
+#: The config a real memory record carries, in the shape `_write_memory`
+#: writes it. `max_model_len` and `max_num_batched_tokens` are here because
+#: they set the warmup prefill the `peak_torch` reading belongs to, and the
+#: activation term cannot be derived without them.
+COMPONENT_CONFIG = {
+    "model": "Qwen/Qwen3.8-27B",
+    "gpu_memory_utilization": 0.90,
+    "max_num_seqs": 32,
+    "max_model_len": 262144,
+    "max_num_batched_tokens": 16384,
+    "kv_cache_dtype": "auto",
+    "block_size": 16,
+    "topology": {"tp": 2},
+    "rank_coords": {},
+}
+
+
+def _component_profile(tmp_path, width=2, *, capture=True):
+    """A profile and calibration complete enough to derive all eight terms.
+
+    The same shape `test_validate_memory.py` uses, plus `capture_reserved`:
+    the graph-pool term is the source-only capture replay the calibration
+    publishes per width, and a calibration without it states no prediction for
+    that term at all -- which is its own case below.
+    """
+    calibration = tmp_path / f"calibration.tp{width}.json"
+    body = {
+        "persistent": 252_339_712,
+        "non_torch": {str(width): 1_157_627_904},
+        "load_residue": {str(width): 14_924_832},
+        "provenance": {
+            "persistent": "S27: 27B full engine, the source config",
+            "non_torch": "S27: 27B full engine, the source config",
+            "load_residue": "S27: 27B full engine, the source config",
+        },
+    }
+    if capture:
+        body["capture_reserved"] = {
+            str(width): {
+                "total": 127_926_272,
+                "provenance": "S27: TP1 capture stream, transformed",
+            }
+        }
+    calibration.write_text(json.dumps(body))
+    profile = tmp_path / f"profile.tp{width}.json"
+    profile.write_text(json.dumps({
+        "total": 206_141_652_992,
+        "world_size": width,
+        "parameters": 55_000_000_000 // width,
+        "buffers": 33_554_432,
+        "model_config": str(MODEL_CONFIG),
+        "compile_mode": "inductor",
+        "calibration": str(calibration),
+        "provenance": {"model": "Qwen/Qwen3.8-27B"},
+    }))
+    return profile, calibration
+
+
+def _derived_budget(profile, calibration, *, width=2, **over):
+    """The budget a run sized from that profile publishes.
+
+    Every file the derivation opens is in the manifest with the digest of the
+    bytes on disk: the profile, the calibration it names and the model config
+    it names. The loader refuses anything the manifest does not attest, which
+    is what makes this the run's own inputs rather than files with the right
+    names.
+    """
+    rows = []
+    for role, path in (
+        ("runtime.memory_model", profile),
+        ("runtime.memory_model.calibration", calibration),
+        ("runtime.memory_model.model_config", MODEL_CONFIG),
+    ):
+        rows.append({
+            "role": role,
+            "requested": str(path),
+            "path": str(path),
+            "rank_own": False,
+            "sha256": validate._digest(path),
+            "size": Path(path).stat().st_size,
+            "rank_coords": {},
+        })
+    budget = {
+        "kind": "source-derived",
+        "served": True,
+        "hardware_reference": "MI308X",
+        "num_kvcache_blocks": MODELLED_KV_BLOCKS,
+        "inputs": {"inputs": rows},
+        "lineage": {"profile": str(profile), "world_size": width},
+        "deployment": {"num_kvcache_blocks": 4096},
+    }
+    budget.update(over)
+    return budget
+
+
+def _terms_of(budget, config, width=2):
+    """The eight derived terms, by the same route the gate takes."""
+    memory = validate._load("validate_memory")
+    attest = memory.attest_from_budget(budget, "the test's budget")
+    predicted = memory.predicted_terms(
+        attest, config,
+        memory.warmup_tokens(
+            config, int(config.get("max_num_batched_tokens") or 0)),
+        width,
+    )
+    return memory.derived_terms(predicted, width)
+
+
+def _readings_for(derived, *, error=1.02, measured=None, **over):
+    """A record whose measured terms sit `error` below the derived ones.
+
+    Built from the terms outward rather than from a table of readings, so the
+    record says exactly what the comparison is about: each measured term is
+    the prediction divided by `error`, and the readings are whatever sums to
+    them under `recorded_terms`' own splits.
+
+    `measured` states a term the card reported that the profile does not
+    predict -- the record is written by a machine either way, and a term the
+    prediction is silent about still has a measurement behind it.
+    """
+    part = {term: int(value / error) for term, value in derived.items()
+            if value is not None}
+    part.update(measured or {})
+    buffers = part["model buffers"]
+    parameters = part["weights"] + buffers
+    allocated = parameters + part["load residue"]
+    current = allocated + part["persistent"]
+    record = {
+        "version": 1,
+        "readings": {
+            "total": 201_310_699_520,
+            "free": 187_904_819_200,
+            "parameter_bytes": parameters,
+            "buffer_bytes": buffers,
+            "weights_torch": allocated,
+            "current_torch": current,
+            "peak_torch": current + part["activations"],
+            "non_torch": part["non-torch"],
+            "cudagraph_overhead": part["reservation"],
+        },
+        "graph_pool": {"reserved": part["graph pool"], "allocated": 0,
+                       "capture_sizes": []},
+        "blocks": {"num_kvcache_blocks": KV_BLOCKS, "pool_entries": 1,
+                   "pool_entries_per_req": 1},
+        "config": dict(COMPONENT_CONFIG),
+    }
+    record.update(over)
+    return record
+
+
+class TestTheComponentTermsAreGatedIndividually:
+    """The eight non-KV terms `POC_STATUS.md` G3a tracks, each at 10%.
+
+    The aggregates are a sum, and a sum checked only in total is the failure
+    this project has been caught by twice: weights over and load residue under
+    by the same bytes leaves `peak_torch` exactly right and two terms wrong.
+    So each term is compared against its own measured counterpart, by
+    `validate_memory.py`'s own splits rather than a second copy of them.
+    """
+
+    def _compare(self, tmp_path, *, record=None, budget=None, width=2,
+                 capture=True):
+        if budget is None:
+            # Only when the caller has not built one: rewriting the profile
+            # under a budget whose digests were taken over the old bytes would
+            # test the digest check rather than the term the test is about.
+            profile, calibration = _component_profile(tmp_path, width,
+                                                      capture=capture)
+            budget = _derived_budget(profile, calibration, width=width)
+        if record is None:
+            record = _readings_for(_terms_of(budget, COMPONENT_CONFIG, width))
+        return validate.check_component_terms(
+            record, {"budget_source": budget}, "tp2_long r1 rank0")
+
+    def test_every_term_is_compared_and_two_percent_passes(self, tmp_path):
+        bad, rows, skipped = self._compare(tmp_path)
+        assert bad == []
+        assert skipped is None
+        assert {row["term"] for row in rows} == set(
+            validate.GATED_COMPONENT_TERMS)
+        assert all(row["relative_error"] <= validate.MEMORY_TERM_TOLERANCE
+                   for row in rows)
+        # Both sides kept, not just the verdict: a gate that records only its
+        # own boolean cannot be re-read once the run is over.
+        assert all(row["real"] and row["modelled"] for row in rows)
+
+    def test_two_errors_that_cancel_in_the_aggregate_are_refused(
+        self, tmp_path
+    ):
+        """The whole reason this gate exists beside the aggregate one.
+
+        Moving bytes from the load residue into the parameters leaves
+        `peak_torch` -- weights plus residue plus persistent plus activations
+        -- byte for byte where it was, so every aggregate still agrees. Two
+        component terms are wrong.
+        """
+        profile, calibration = _component_profile(tmp_path)
+        budget = _derived_budget(profile, calibration)
+        record = _readings_for(_terms_of(budget, COMPONENT_CONFIG))
+        before = dict(record["readings"])
+        record["readings"]["parameter_bytes"] += 8 * 2 ** 30
+        assert record["readings"]["peak_torch"] == before["peak_torch"]
+        bad, _rows, _ = self._compare(tmp_path, record=record, budget=budget)
+        assert any("weights modelled" in f for f in bad)
+        assert any("load residue modelled" in f for f in bad)
+
+    def test_one_term_outside_ten_percent_is_refused(self, tmp_path):
+        profile, calibration = _component_profile(tmp_path)
+        budget = _derived_budget(profile, calibration)
+        record = _readings_for(_terms_of(budget, COMPONENT_CONFIG))
+        record["readings"]["non_torch"] = int(
+            record["readings"]["non_torch"] * 0.8)
+        bad, _rows, _ = self._compare(tmp_path, record=record, budget=budget)
+        assert len(bad) == 1
+        assert "non-torch modelled" in bad[0]
+        assert "10%" in bad[0]
+
+    def test_a_term_the_record_never_measured_fails_as_uncovered(
+        self, tmp_path
+    ):
+        """A term nobody looked at is not a term that passed."""
+        profile, calibration = _component_profile(tmp_path)
+        budget = _derived_budget(profile, calibration)
+        record = _readings_for(_terms_of(budget, COMPONENT_CONFIG))
+        record.pop("graph_pool")
+        bad, rows, _ = self._compare(tmp_path, record=record, budget=budget)
+        assert any("graph pool is not stated by the real record" in f
+                   for f in bad)
+        assert "graph pool" not in {row["term"] for row in rows}
+
+    def test_a_term_the_profile_never_predicts_fails_as_uncovered(
+        self, tmp_path
+    ):
+        """An unpublished capture width is not answered from a neighbour."""
+        profile, calibration = _component_profile(tmp_path, capture=False)
+        budget = _derived_budget(profile, calibration)
+        record = _readings_for(_terms_of(budget, COMPONENT_CONFIG),
+                               measured={"graph pool": 127_926_272})
+        bad, _rows, _ = self._compare(tmp_path, record=record, budget=budget)
+        assert any("graph pool is not stated by the modelled prediction" in f
+                   for f in bad)
+
+    def test_a_profile_for_another_model_is_refused_not_reported(
+        self, tmp_path
+    ):
+        """Two unrelated runs compared is not a failing model."""
+        profile, calibration = _component_profile(tmp_path)
+        budget = _derived_budget(profile, calibration)
+        record = _readings_for(_terms_of(budget, COMPONENT_CONFIG))
+        blob = json.loads(profile.read_text())
+        blob["provenance"]["model"] = "Qwen/Qwen3.8-0.6B"
+        profile.write_text(json.dumps(blob))
+        budget = _derived_budget(profile, calibration)
+        bad, rows, _ = self._compare(tmp_path, record=record, budget=budget)
+        assert rows == []
+        assert any("was refused" in f for f in bad)
+
+    def test_a_file_that_moved_under_the_comparison_is_refused(self, tmp_path):
+        """The profile's own digest still matching says nothing about the
+        files it names."""
+        profile, calibration = _component_profile(tmp_path)
+        budget = _derived_budget(profile, calibration)
+        record = _readings_for(_terms_of(budget, COMPONENT_CONFIG))
+        blob = json.loads(calibration.read_text())
+        blob["persistent"] = 1
+        calibration.write_text(json.dumps(blob))
+        bad, rows, _ = self._compare(tmp_path, record=record, budget=budget)
+        assert rows == []
+        assert any("was refused" in f for f in bad)
+
+    def test_a_budget_that_states_no_prediction_is_named_not_skipped(
+        self, tmp_path
+    ):
+        """A captured budget carries a count, not a per-term derivation.
+
+        Holding it against the capture it came from is an identity. That is a
+        reason to say so in the verdict, not a reason for the gate to fall
+        silent -- so the terms are not compared and the record says which
+        budget it was.
+        """
+        profile, calibration = _component_profile(tmp_path)
+        budget = _derived_budget(profile, calibration, kind="captured")
+        bad, rows, skipped = self._compare(tmp_path, budget=budget)
+        assert (bad, rows) == ([], [])
+        assert "'captured'" in skipped and "not" in skipped
+
+    def test_a_run_that_published_no_budget_at_all_fails(self, tmp_path):
+        profile, calibration = _component_profile(tmp_path)
+        record = _readings_for(
+            _terms_of(_derived_budget(profile, calibration), COMPONENT_CONFIG))
+        bad, rows, skipped = validate.check_component_terms(
+            record, {}, "tp2_long r1 rank0")
+        assert (rows, skipped) == ([], None)
+        assert any("no budget source" in f for f in bad)
+
+    def test_the_cell_verdict_names_a_budget_it_could_not_compare(self, cell):
+        """End to end: the standard cell's modelled budget is a captured one,
+        so the verdict carries a named reason rather than an absence."""
+        assert run(cell) == 0
+        measured = verdict(cell)["memory"][0]
+        assert measured["components"] == []
+        assert len(measured["components_not_compared"]) == 1
+        assert "captured" in measured["components_not_compared"][0]["reason"]

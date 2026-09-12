@@ -237,6 +237,74 @@ def published_capture(cal_map, world: int):
     return int(entry["total"]), str(entry.get("provenance") or "")
 
 
+def recorded_terms(readings: dict, blob: dict, pool_seen: int = 0) -> dict:
+    """The measured side of every non-KV term, split the way this file says.
+
+    Named and shared rather than left inline, because the cc-traces acceptance
+    gate reads the same record and has to split it the same way: two copies of
+    `current_torch - weights_torch` are two chances for one of them to become
+    something else.
+
+    `None` where the record does not carry both readings a term is the
+    difference of. Not zero: an absent term is one nobody measured, which
+    fails as an uncovered term, and a zero would read as agreement.
+    """
+    allocated = readings.get("weights_torch")
+    parameters = readings.get("parameter_bytes")
+    buffers = readings.get("buffer_bytes")
+    current = readings.get("current_torch")
+    peak = readings.get("peak_torch")
+    reserved, _allocated, _sizes = recorded_pool(blob)
+
+    def minus(left, right):
+        return left - right if left is not None and right is not None else None
+
+    return {
+        # The model's own parameters, which is what the term claims to be --
+        # not the allocator after loading, which is that plus the residue, and
+        # not the buffers, which the checkpoint does not contain.
+        "weights": (parameters - buffers
+                    if parameters is not None and buffers is not None
+                    else parameters),
+        "model buffers": buffers,
+        "load residue": minus(allocated, parameters),
+        # The engine's forward buffers and nothing else: the residue above is
+        # already resident, and counting it twice would make this a sum.
+        "persistent": minus(current, allocated),
+        "activations": (max(peak - current, 0)
+                        if current is not None and peak is not None else None),
+        "non-torch": readings.get("non_torch"),
+        "reservation": readings.get("cudagraph_overhead"),
+        # The reserved delta, not the allocated one: a captured graph pins its
+        # intermediates, so the segments the allocator created are the cost.
+        "graph pool": (reserved or pool_seen) or None,
+    }
+
+
+def derived_terms(predicted: dict, world: int) -> dict:
+    """The predicted side of the same terms, every one from one profile.
+
+    The profile the run attested, its calibration, and nothing chosen here --
+    so what a gate compares is the prediction that sized the run.
+    """
+    cal_map = predicted.get("calibration") or {}
+    readings = predicted.get("readings") or {}
+    return {
+        "weights": predicted.get("parameters"),
+        "model buffers": predicted.get("buffers"),
+        "load residue": load_residue_bytes(world, cal_map),
+        "persistent": int(cal_map.get("persistent") or DEFAULT_PERSISTENT),
+        "activations": predicted.get("activation"),
+        "non-torch": readings.get("non_torch"),
+        # Policy, not cost: `0.2 x` the modelled activation peak, which is what
+        # actually leaves the KV budget.
+        "reservation": readings.get("cudagraph_overhead"),
+        # Cost, not policy: the source-only capture replay the profile's
+        # calibration publishes at this width.
+        "graph pool": published_capture(cal_map, world)[0],
+    }
+
+
 #: How many bytes an element of the KV cache takes, by the name the record
 #: keeps. Enough to price a block; a quantized cache also carries a scale,
 #: which `paged_block_bytes` adds in fp32 regardless.
@@ -516,7 +584,18 @@ def profile_from_budget_source(path: str, world=None, coords=None) -> dict:
     """
     with open(path, encoding="utf-8") as fh:
         saved = json.load(fh)
-    blob = budget_source_object(saved, path, world=world, coords=coords)
+    return attest_from_budget(
+        budget_source_object(saved, path, world=world, coords=coords), path)
+
+
+def attest_from_budget(blob, path: str) -> dict:
+    """The same thing, from a budget object a caller already selected.
+
+    The cc-traces gate holds one rank's published budget in its hand and knows
+    which rank it is, so it selects by identity rather than by the width-and-
+    coordinates matching `budget_source_object` has to fall back on when all it
+    has is the file.
+    """
     rows = list((blob.get("inputs") or {}).get("inputs") or ())
     profiles = [r for r in rows if r.get("role") == PROFILE_ROLE]
     if not profiles:
@@ -984,10 +1063,10 @@ def main() -> int:
         print("\n%s  --  %s tp=%d max_model_len=%s"
               % (name, config.get("model"), tp, config.get("max_model_len")))
 
-        allocated = readings.get("weights_torch")
+        # Only for the note below: every term's own split is `recorded_terms`'
+        # to make, and re-reading the readings here is how a second definition
+        # of a boundary gets started.
         parameters = readings.get("parameter_bytes")
-        current = readings.get("current_torch")
-        peak = readings.get("peak_torch")
 
         # What the terms are competing for: the fraction of the card the
         # engine may spend. An error only matters as a share of this.
@@ -1020,6 +1099,12 @@ def main() -> int:
         cal_note = partial(_cal_note, calib, cal_map, config, sha,
                            blob.get("run"))
 
+        # Both sides of the non-KV comparison, by the shared definitions. The
+        # rows below print them; the cc-traces acceptance gate reads the same
+        # two functions, so neither can drift from the other.
+        recorded = recorded_terms(readings, blob, pool_seen)
+        derived = derived_terms(predicted, world) if predicted is not None else {}
+
         checkpoint = args.checkpoint
         derived_weights = weight_bytes(checkpoint, tp) if checkpoint else None
         weights_note = "" if parameters else "record predates the split"
@@ -1029,34 +1114,23 @@ def main() -> int:
         # answering a question the run did not ask.
         derived_buffers = None
         if predicted is not None:
-            derived_weights = predicted["parameters"]
-            derived_buffers = predicted["buffers"]
+            derived_weights = derived["weights"]
+            derived_buffers = derived["model buffers"]
             weights_note = "the profile's own parameters, sharded at TP=%d" % tp
-        # Against the model's own parameters, which is what the term claims to
-        # be -- not against the allocator after loading, which is that plus
-        # whatever the loader still holds, and not against the buffers either,
-        # which the checkpoint does not contain.
-        buffers = readings.get("buffer_bytes")
-        weights_seen = (parameters - buffers
-                        if parameters is not None and buffers is not None
-                        else parameters)
-        row("weights", derived_weights, weights_seen, weights_note, sizing_budget)
+        buffers = recorded["model buffers"]
+        row("weights", derived_weights, recorded["weights"], weights_note,
+            sizing_budget)
         row("model buffers", derived_buffers, buffers,
             "the profile's own buffers" if derived_buffers is not None else
             "not modelled; built at init, absent from the checkpoint",
             sizing_budget)
 
-        residue = (allocated - parameters
-                   if allocated is not None and parameters is not None else None)
+        residue = recorded["load residue"]
         row("load residue", load_residue_bytes(world, cal_map), residue,
             cal_note("load_residue", "collective pools held through the "
                      "allocator"), sizing_budget)
 
-        # The engine's own forward buffers, and nothing else: the residue above
-        # is already resident and counting it twice would make this row a sum
-        # of two terms rather than a term.
-        persistent = (current - allocated
-                      if current is not None and allocated is not None else None)
+        persistent = recorded["persistent"]
         row("persistent", int((cal_map or {}).get("persistent") or DEFAULT_PERSISTENT),
             persistent,
             cal_note("persistent", "engine forward buffers; flat in width"),
@@ -1106,8 +1180,8 @@ def main() -> int:
         # at all when the warmup and the trace ran the same number of tokens.
         budget = (args.max_num_batched_tokens
                   or int(config.get("max_num_batched_tokens") or 0))
-        if current is not None and peak is not None:  # noqa: SIM108
-            warmup_act, note = max(peak - current, 0), "vs the warmup peak"  # noqa: E501
+        if recorded["activations"] is not None:  # noqa: SIM108
+            warmup_act, note = recorded["activations"], "vs the warmup peak"
         else:
             # `_estimate_cudagraph_overhead` is 0.2 x peak activations under
             # manual capture, so a record predating the split still says what
@@ -1174,9 +1248,9 @@ def main() -> int:
         # and wrong everywhere else: an uncalibrated width would lose the term.
         widths = {int(w) for w in (cal_map or {}).get("non_torch") or {}}
         nt_cal = cal_map if world in widths else None
-        derived_nt = (predicted["readings"]["non_torch"] if predicted is not None
+        derived_nt = (derived["non-torch"] if predicted is not None
                       else non_torch_bytes(world, nt_cal))
-        row("non-torch", derived_nt, readings.get("non_torch"),
+        row("non-torch", derived_nt, recorded["non-torch"],
             cal_note("non_torch",
                      "device-wide reading; a neighbour is charged here"),
             sizing_budget)
@@ -1189,7 +1263,7 @@ def main() -> int:
         # the mirror would show here first -- and it is now labelled as one
         # rather than read as a validated term.
         derived_pool = graph_pool_bytes(warmup_act) if warmup_act else None
-        estimate = readings.get("cudagraph_overhead")
+        estimate = recorded["reservation"]
         identity = (derived_pool is not None and derived_pool == estimate)
         row("pool estimate", derived_pool, estimate,
             "identity: both sides are the engine's own estimator"
@@ -1202,7 +1276,7 @@ def main() -> int:
         # though it is policy rather than cost -- an engine that sets aside the
         # wrong amount misprices the cache whether or not capture then fits.
         if predicted is not None:
-            row("reservation", predicted["readings"].get("cudagraph_overhead"),
+            row("reservation", derived["reservation"],
                 estimate, "the engine's reservation policy at the modelled "
                           "activation peak", sizing_budget)
 
@@ -1211,8 +1285,8 @@ def main() -> int:
         # never `measured_graph_pool_bytes`, whose width constant no predictor
         # uses. `graph_pool.reserved` is in the record; a `--log` is only
         # needed for a record written before it was.
-        reserved, allocated, capture_sizes = recorded_pool(blob)
-        seen = reserved or pool_seen
+        _reserved, allocated, capture_sizes = recorded_pool(blob)
+        seen = recorded["graph pool"]
         if seen:
             capture_pred, capture_note = published_capture(cal_map, world)
             row("graph pool", capture_pred, seen,
