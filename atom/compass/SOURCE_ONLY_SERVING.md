@@ -39,10 +39,11 @@ Every width shares these:
     --compass-oracle-option position_rows=3
     --compass-oracle-option cudagraph_mode=full
     --compass-oracle-option head=1
-    --compass-oracle-option regions=source-27b-tp1-conc-v2
+    --compass-oracle-option regions=source-27b-tp1-prefill-interp
     --compass-oracle-option require_complete=1
     --compass-oracle-option allocation=native
     --compass-oracle-option derive=1
+    --compass-oracle-option interpolate=1
 
 and adds its own prices and templates. At TP1 (`$SRC1` is `g4/src1`):
 
@@ -50,6 +51,28 @@ and adds its own prices and templates. At TP1 (`$SRC1` is `g4/src1`):
     --compass-oracle-option price=$SRC1/p27bdec32.tp1.r0.json:$SRC1/b27dec32.tp1.r0.json:unregistered,$SRC1/p27hdec32.tp1.r0.json:$SRC1/h27dec32.tp1.r0.json:unregistered
     --compass-oracle-option template=$SRC1/b27dec32.tp1.r0.json
     --compass-oracle-option head_template=$SRC1/h27dec32.tp1.r0.json
+
+
+`interpolate=1` turns the family price provider on at the density the provider
+itself declares -- it is the word `true`, not a ratio. A number there is read
+as a ratio and means something else: the widest ratio between two adjacent
+measured row counts the evidence supports interpolating across. `1` used to be
+taken literally as that ratio, which no two distinct row counts can meet, and
+run 8 refused 2118 of 2443 operators for it.
+
+`regions=source-27b-tp1-prefill-interp` is the successor to
+`source-27b-tp1-conc-v2`. It carries the measured one-sequence prefill cells
+byte for byte and interpolates only between adjacent measurements of the same
+`(sequences, produces_output)` group, refusing outside their span -- run 7
+died because an exact-cell lookup cannot answer a final chunk, whose token
+count is `prompt mod chunk_budget` and so arbitrary.
+
+The TP1 `price=` line above is the two decode-32 seed pairs, which is where
+this set started. The list the registry passes today is longer: it adds the
+prefill cells, the long-context and mixed steps, the one-sequence row ladder
+and the cached-MHA calibration inputs. `cc_traces_registry.py` is the
+authority for its contents; reproducing all of it here would be a third copy
+to drift.
 
 At TP2 and TP4 (`$D` is the staged directory below):
 

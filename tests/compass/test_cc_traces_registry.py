@@ -214,11 +214,22 @@ def test_the_width_reaches_its_own_files(tp):
     options = registry.options(tp, "/r")
     assert f"tp={tp}" in options
     paths = registry.required_artifacts(tp, "/r")
-    marker = "g4/src1" if tp == 1 else f"serving/src_tp{tp}"
-    # The target and the profile are not under the width's own directory:
-    # one is the captured record or a derived one, the other is MEMORY's.
-    assert all(marker in p for role, p in paths.items()
-               if role not in ("replay_target", "memory_model"))
+    # The templates are the width's own seeded pair, and they stay under its
+    # own directory. The rest of the price list does not: TP1's book draws on
+    # `pricing_coverage`, `g4/card` and `xacq/training` as well as `g4/src1`,
+    # and requiring one directory would mean either dropping those from the
+    # registry or filing them under a name that is not where they live.
+    own = "g4/src1" if tp == 1 else f"serving/src_tp{tp}"
+    for role in ("template", "head_template"):
+        assert own in paths[role], (role, paths[role])
+    # What must hold for every path is the thing the marker was standing in
+    # for: no width reads another width's files. That is the failure worth
+    # catching -- a TP2 cell priced from TP4's measurements would run, and
+    # report a number about a deployment nobody configured.
+    foreign = [f"serving/src_tp{other}" for other in registry.TPS if other != tp]
+    foreign += [f".tp{other}." for other in registry.TPS if other != tp]
+    for role, path in paths.items():
+        assert not any(mark in path for mark in foreign), (role, path)
 
 
 # -- what a rank actually opens ------------------------------------------
@@ -302,17 +313,17 @@ def test_a_group_of_one_has_nobody_to_be_confused_with(tmp_path):
     # coordinates a rank would append. Resolving them again asks for
     # `...tp1.r0.tp0.json`, misses, falls back, and reports six lines of
     # "not this rank's" about a width with one rank.
-    src = tmp_path / "g4" / "src1"
-    src.mkdir(parents=True)
-    for stem in ("b27dec32", "h27dec32", "p27bdec32", "p27hdec32"):
-        (src / f"{stem}.tp1.r0.json").write_text("{}")
-    (tmp_path / "poc" / "g5_27b").mkdir(parents=True)
-    (tmp_path / "poc" / "g5_27b" / "target.json").write_text("{}")
-    # TP=1 bootstraps its Config from the captured record and still replays
-    # under the analytical profile.
-    profile = Path(registry.memory_model(1, tmp_path))
-    profile.parent.mkdir(parents=True, exist_ok=True)
-    profile.write_text("{}")
+    # Staged from the registry's own list rather than a handful of names
+    # written out here. The four seed files were the whole of TP1's book when
+    # this was written; the book has since grown the prefill cells, the row
+    # ladder and the cached-MHA inputs, and a fixture that lists files by hand
+    # would report them absent and hide the resolution claim this is about.
+    # The profile is included: TP=1 bootstraps its Config from the captured
+    # record and still replays under the analytical profile.
+    for path in registry.required_artifacts(1, tmp_path).values():
+        staged = Path(path)
+        staged.parent.mkdir(parents=True, exist_ok=True)
+        staged.write_text("{}")
 
     cell = registry.check(tmp_path)["cells"][0]
     assert cell["cell"] == "tp1-short"
@@ -345,15 +356,31 @@ def test_every_artifact_resolving_does_not_make_a_cell_ready(tmp_path):
     # The failure this exists to stop: a matrix launched because the registry
     # said "runnable", meeting the head's 32-row refusal on the first decode
     # step with 31 running requests, hours in.
+    # `head_rows` is no longer every cell's: the source-width row ladder
+    # measures 1..32 at TP1, which is every count `max_num_seqs=32` reaches,
+    # so it closed there and stands at TP2/TP4. What must hold for all six is
+    # the original claim -- resolving every artifact is not readiness -- and
+    # each cell must name the refusals the registry charges it, no fewer.
+    wide = set(registry.OPEN_REFUSALS["head_rows"]["cells"])
+    assert wide and wide < set(registry.CELLS)
     for cell in registry.check(tmp_path)["cells"]:
         assert not cell["ready"]
-        assert "head_rows" in cell["open_refusals"]
+        owed = {k for k, v in registry.OPEN_REFUSALS.items()
+                if cell["cell"] in v["cells"]}
+        assert owed <= set(cell["open_refusals"]), cell["cell"]
+        assert owed
+        assert ("head_rows" in cell["open_refusals"]) is (cell["cell"] in wide)
 
 
 def test_the_refusal_met_first_is_named_as_such():
     first = [k for k, v in registry.OPEN_REFUSALS.items() if v["first_met"]]
     assert first == ["head_rows"]
-    assert registry.OPEN_REFUSALS["head_rows"]["cells"] == registry.CELLS
+    # Charged at TP2 and TP4 and nowhere else, because that is where the head
+    # is still priced at 32 rows alone. A cell that met it first and was not
+    # told would be a matrix launched on a refusal it hits on the first decode
+    # step with 31 running requests, hours in.
+    assert registry.OPEN_REFUSALS["head_rows"]["cells"] == tuple(
+        c for c in registry.CELLS if not c.startswith("tp1-"))
 
 
 def test_the_two_width_refusals_are_not_charged_to_tp1():
@@ -372,7 +399,12 @@ def test_each_refusal_says_what_would_close_it(tmp_path):
         assert set(term["cells"]) <= set(registry.CELLS), key
     text = registry.render(registry.check(tmp_path))
     assert "REFUSES (met first)  head_rows" in text
-    assert "closed by: a head price sweep" in text
+    # Against the registry's own wording, not a copy of it typed here: the
+    # copy is what went stale when the ladder replaced the head price sweep,
+    # and a report that prints a closing condition nobody is working on is
+    # worse than one that prints none. Every refusal, not just the first.
+    for key, term in registry.OPEN_REFUSALS.items():
+        assert f"closed by: {term['closes']}" in text, key
 
 
 def test_all_three_widths_are_sized_from_the_frozen_r21_profiles():
