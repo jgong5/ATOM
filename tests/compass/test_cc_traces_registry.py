@@ -107,11 +107,44 @@ def test_the_required_artifacts_are_read_out_of_the_options():
     artifacts = registry.required_artifacts(2, "/r")
     assert artifacts["template"] == "/r/serving/src_tp2/b27dec32.json"
     assert artifacts["head_template"] == "/r/serving/src_tp2/h27dec32.json"
-    assert artifacts["replay_target"] == "/r/poc/g5_27b/target.json"
+    assert artifacts["replay_target"] == "/r/serving/src_tp2/target.tp2.json"
+    assert artifacts["memory_model"] == "/r/serving/src_tp2/profile.tp2.json"
     # Five price specs at a wide width; the two with a graph beside them
     # contribute both files.
     assert artifacts["price[0].graph"].endswith("b27dec32.json")
     assert "price[2].graph" not in artifacts
+
+
+def test_each_width_replays_a_target_of_its_own_width():
+    # The replay runner takes the block and state capacities straight out of
+    # the target record and refuses one whose tensor_parallel_size is not the
+    # width being replayed. Handing the captured TP=1 record to TP=2 and TP=4
+    # -- which is what one --replay-target for the whole matrix does -- is
+    # therefore not a mistake the run survives to report.
+    assert registry.replay_target(1, "/r") == "/r/poc/g5_27b/target.json"
+    assert registry.replay_target(2, "/r") == "/r/serving/src_tp2/target.tp2.json"
+    assert registry.replay_target(4, "/r") == "/r/serving/src_tp4/target.tp4.json"
+    assert len({registry.replay_target(tp, "/r") for tp in registry.TPS}) == 3
+
+
+def test_only_the_widths_without_a_captured_record_are_sized_by_a_profile():
+    # TP=1 has a record of its own width and is sized by it; a wider width has
+    # nothing else to be sized from, so the profile is what makes its capacity
+    # attributable rather than assumed.
+    assert registry.memory_model(1, "/r") is None
+    assert registry.memory_model(2, "/r") == "/r/serving/src_tp2/profile.tp2.json"
+    assert registry.memory_model(4, "/r") == "/r/serving/src_tp4/profile.tp4.json"
+
+
+def test_a_width_that_needs_a_profile_reports_it_as_required():
+    # Read out of the same place the plan reads it, so a profile that is not
+    # staged is an absence in the readiness report rather than a server that
+    # starts and sizes itself from the wrong width.
+    assert "memory_model" not in registry.required_artifacts(1, "/r")
+    for tp in (2, 4):
+        assert registry.required_artifacts(tp, "/r")["memory_model"] == (
+            f"/r/serving/src_tp{tp}/profile.tp{tp}.json"
+        )
 
 
 def test_a_root_with_nothing_in_it_is_six_cells_of_absences(tmp_path):
@@ -218,8 +251,11 @@ def test_a_rank_reading_another_rank_s_file_is_named_not_counted_present(tmp_pat
         (wide / f"{stem}.tp0.json").write_text("{}")
     for name in ("ar_capture", "ar_plain", "ag_prices"):
         (wide / f"{name}.json").write_text("{}")
-    (tmp_path / "poc" / "g5_27b").mkdir(parents=True)
-    (tmp_path / "poc" / "g5_27b" / "target.json").write_text("{}")
+    # The width's own two, not the captured record: a wide width replays a
+    # target derived at that width and sizes its pool from the profile it was
+    # derived from.
+    (wide / "target.tp2.json").write_text("{}")
+    (wide / "profile.tp2.json").write_text("{}")
 
     cell = registry.check(tmp_path)["cells"][2]
     assert cell["cell"] == "tp2-short"
@@ -242,14 +278,16 @@ def test_the_report_says_which_rank_is_missing_which_file(tmp_path):
     assert "b27dec32.tp3.json" in text
 
 
-def test_the_captured_target_is_not_a_per_rank_artifact(tmp_path):
-    # One captured target builds the Config and every rank of the group builds
-    # the same one, so asking rank 3 for `target.tp3.json` would invent a file
-    # nothing produces.
+def test_the_target_and_the_profile_are_not_per_rank_artifacts(tmp_path):
+    # They are per *width*: one record builds the Config and one profile sizes
+    # the pool, and every rank of the group gets the same pair. Asking rank 3
+    # for `target.tp4.tp3.json` would invent a file nothing produces.
     found = registry.resolution(4, tmp_path)
     for rank in range(4):
-        assert found[rank]["replay_target"]["path"].endswith("g5_27b/target.json")
+        assert found[rank]["replay_target"]["path"].endswith("target.tp4.json")
         assert found[rank]["replay_target"]["own"] is True
+        assert found[rank]["memory_model"]["path"].endswith("profile.tp4.json")
+        assert found[rank]["memory_model"]["own"] is True
 
 
 def test_a_group_of_one_has_nobody_to_be_confused_with(tmp_path):

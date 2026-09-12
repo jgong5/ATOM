@@ -186,14 +186,60 @@ class TestTheTwoSidesAreNotRunTheSameWay:
                 assert "atom.entrypoints.openai.api_server" in step["command"]
                 assert "--compass-replay-target" not in step["command"]
 
-    def test_a_replay_target_reaches_every_modelled_repeat(self):
-        got = json.loads(_run(["--root", "/r", "--replay-target", "/w/t.json"]))
+    def test_each_width_is_served_its_own_target(self):
+        got = json.loads(_run(["--root", "/r", "--replay-target", "1=/w/t1.json",
+                               "--replay-target", "2=/w/t2.json",
+                               "--replay-target", "4=/w/t4.json"]))
         for cell in got["cells"]:
             for step in _role(cell, "serve", "modelled"):
                 command = step["command"]
                 assert command[command.index("--compass-replay-target") + 1] == (
-                    "/w/t.json"
+                    f"/w/t{cell['tp']}.json"
                 )
+
+    def test_one_target_cannot_be_handed_to_the_whole_matrix(self):
+        # The replay runner refuses a target whose width is not the one being
+        # replayed, so a bare path is two cells that cannot run -- and it read
+        # like a plan that was configured.
+        with pytest.raises(SystemExit) as raised:
+            _run(["--root", "/r", "--replay-target", "/w/t.json"])
+        assert "TP=PATH" in str(raised.value)
+
+    def test_the_registry_resolves_a_target_of_the_right_width(self):
+        got = json.loads(_run(["--root", "/r", "--artifact-root", "/a"]))
+        seen = {}
+        for cell in got["cells"]:
+            for step in _role(cell, "serve", "modelled"):
+                command = step["command"]
+                seen[cell["tp"]] = command[
+                    command.index("--compass-replay-target") + 1
+                ]
+        assert seen == {
+            tp: plan_mod.registry.replay_target(tp, "/a") for tp in plan_mod.TPS
+        }
+        assert len(set(seen.values())) == 3
+
+    def test_a_width_with_no_captured_record_sizes_from_its_profile(self):
+        got = json.loads(_run(["--root", "/r", "--artifact-root", "/a"]))
+        for cell in got["cells"]:
+            for step in _role(cell, "serve", "modelled"):
+                command = step["command"]
+                if cell["tp"] == 1:
+                    # Sized by the record of its own width; a profile here
+                    # would report `source-derived` for a width that was
+                    # captured.
+                    assert "--compass-memory-model" not in command
+                    continue
+                assert command[command.index("--compass-memory-model") + 1] == (
+                    f"/a/serving/src_tp{cell['tp']}/profile.tp{cell['tp']}.json"
+                )
+
+    def test_the_real_side_is_never_handed_either(self):
+        got = json.loads(_run(["--root", "/r", "--artifact-root", "/a"]))
+        for cell in got["cells"]:
+            for step in _role(cell, "serve", "real"):
+                assert "--compass-memory-model" not in step["command"]
+                assert "--compass-replay-target" not in step["command"]
 
     def test_both_sides_carry_the_registered_engine_configuration(self, plan):
         for cell in plan["cells"]:
@@ -302,7 +348,8 @@ class TestItSaysWhatItDoesNotProvide:
 
     def test_the_gaps_are_carried_in_the_plan_itself(self, plan):
         assert plan["gaps"]
-        assert any("replay target" in gap for gap in plan["gaps"])
+        assert any("target record of its own width" in gap for gap in plan["gaps"])
+        assert any("memory profile" in gap for gap in plan["gaps"])
         assert any("oracle" in gap for gap in plan["gaps"])
         assert any("capture, calibration, derivation" in gap for gap in plan["gaps"])
 

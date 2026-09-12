@@ -72,6 +72,40 @@ def _registry_options(args, tp: int) -> list:
     return registry.options(tp, root) if root else []
 
 
+def _registry_target(args, tp: int):
+    root = getattr(args, "artifact_root", None)
+    return registry.replay_target(tp, root) if root else None
+
+
+def _registry_profile(args, tp: int):
+    root = getattr(args, "artifact_root", None)
+    return registry.memory_model(tp, root) if root else None
+
+
+def width_map(values, flag: str) -> dict:
+    """`TP=PATH` pairs read into a dict keyed by width.
+
+    A bare path is refused. Neither of these files is shared across the
+    matrix: a target record is of the width it was captured or derived at --
+    the replay runner takes the block and state capacities straight out of it
+    and refuses a width it was not made for -- and a memory profile is of the
+    width it was taken at. One path here would therefore name the wrong file
+    for two of the three widths, which is exactly the mistake this plan
+    exists to stop someone making by hand.
+    """
+    out = {}
+    for value in values or ():
+        width, sep, path = value.partition("=")
+        if not sep or not path or not width.isdigit():
+            raise SystemExit(
+                f"{flag} takes TP=PATH, not {value!r}: the three widths do "
+                f"not share one file, so a bare path would be handed to all "
+                f"of them"
+            )
+        out[int(width)] = path
+    return out
+
+
 #: The matrix. TP=1 is the source width and its cells are a fit statistic, not
 #: a prediction; they are here because the residual is reported, not because
 #: they test the bet.
@@ -148,9 +182,10 @@ GAPS = (
         "validated against the oracle's constructor"
     ),
     (
-        "the modelled side needs a replay target to build a Config without a "
-        "device; it is an input here, produced by the source-width capture, "
-        "and no step in this plan creates one"
+        "the modelled side needs a target record of its own width to build a "
+        "Config without a device, and at TP=2 and TP=4 a memory profile to "
+        "size the pool from; both are inputs here, derived by the memory "
+        "model, and no step in this plan creates either"
     ),
     (
         "warmup_seconds is not in the server's /compass/provenance, so 'the "
@@ -176,13 +211,14 @@ def _serve(
     engine_port: int,
     cell: str,
     target,
+    memory_model=None,
 ):
     """The server command for one side of one cell.
 
     The modelled side goes through `replay_server.py` rather than the module
     entry point: AITER asks the driver for the chip at import, which on a
     machine with no device fails before any flag could be parsed, so the
-    captured target has to answer that question first.
+    target record has to answer that question first.
     """
     if modelled:
         cmd = [
@@ -191,6 +227,12 @@ def _serve(
             "--compass-replay-target",
             target or "$CC_TRACES_REPLAY_TARGET",
         ]
+        if memory_model:
+            # What the pool is sized from at a width with no captured record
+            # of its own. The replay runner publishes the budget it used as
+            # `source-derived` when this is given and `captured` when it is
+            # not, so the flag is also what makes the capacity attributable.
+            cmd += ["--compass-memory-model", memory_model]
     else:
         cmd = ["python", "-m", "atom.entrypoints.openai.api_server"]
     cmd += [
@@ -275,6 +317,7 @@ def _lifecycle(
     oracle,
     options,
     target,
+    memory_model=None,
 ):
     """One repeat: its own server, its replay, and the end of that process."""
     modelled = side == "modelled"
@@ -300,6 +343,7 @@ def _lifecycle(
                 engine_port=engine_port,
                 cell=cell,
                 target=target,
+                memory_model=memory_model,
             ),
             "background": True,
             "health": f"http://127.0.0.1:{port}/health",
@@ -370,6 +414,7 @@ def cell_steps(
     repeats: int,
     engine_port: int = ENGINE_PORT,
     target=None,
+    memory_model=None,
     corpus: str = "$CC_TRACES_CORPUS",
 ):
     """Every step of one cell, in the order it has to happen."""
@@ -466,6 +511,7 @@ def cell_steps(
             oracle=None,
             options=(),
             target=None,
+            memory_model=None,
         )
     steps += [
         {
@@ -508,6 +554,7 @@ def cell_steps(
             oracle=oracle,
             options=options,
             target=target,
+            memory_model=memory_model,
         )
     steps += [
         {
@@ -573,6 +620,11 @@ def cell_steps(
 
 
 def build(args) -> dict:
+    # Resolved per width, not once: what is handed over on the command line
+    # overrides the registry, and neither can cover a width it was not named
+    # for.
+    targets = width_map(getattr(args, "replay_target", None), "--replay-target")
+    profiles = width_map(getattr(args, "memory_model", None), "--memory-model")
     cells = [
         cell_steps(
             tp,
@@ -583,7 +635,8 @@ def build(args) -> dict:
             port=args.port,
             engine_port=args.engine_port,
             repeats=args.repeats,
-            target=getattr(args, "replay_target", None),
+            target=targets.get(tp) or _registry_target(args, tp),
+            memory_model=profiles.get(tp) or _registry_profile(args, tp),
             corpus=getattr(args, "corpus", None) or "$CC_TRACES_CORPUS",
         )
         for tp in TPS
@@ -663,8 +716,20 @@ def main(argv=None) -> int:
     )
     ap.add_argument(
         "--replay-target",
-        default=None,
-        help="the captured target the modelled server builds its Config from",
+        action="append",
+        default=[],
+        metavar="TP=PATH",
+        help=("the target record the modelled server of that width builds "
+              "its Config from; repeatable, one per width, overrides the "
+              "registry"),
+    )
+    ap.add_argument(
+        "--memory-model",
+        action="append",
+        default=[],
+        metavar="TP=PATH",
+        help=("the memory profile that width sizes its pool from; "
+              "repeatable, one per width, overrides the registry"),
     )
     ap.add_argument(
         "--corpus", default=None, help="the cc-traces corpus to verify against"
