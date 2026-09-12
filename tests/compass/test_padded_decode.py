@@ -50,8 +50,12 @@ def shape(n, context=1151, *, bucket=None, tp=1, rank=0):
         capture_bucket=bucket, compiled=None, produces_output=True)
 
 
-def spec_of(n, context=1151, *, bucket=None, **kw):
-    return ShapeDeriver(None, **{**DECLARED, **kw}).spec_for(
+def spec_of(n, context=1151, *, bucket=None, cudagraph_mode="full", **kw):
+    """A derived spec. FULL by default: a bucketed decode has no metadata
+    shape that is right under both capture modes, so the mode is declared
+    here rather than left for `gdn_context` to refuse."""
+    return ShapeDeriver(None, cudagraph_mode=cudagraph_mode,
+                        **{**DECLARED, **kw}).spec_for(
         shape(n, context, bucket=bucket))
 
 
@@ -112,9 +116,19 @@ class TestWhatThePaddedRowsCarry:
         real = [tables[i][65 // block] * block + 65 % block for i in range(3)]
         assert ctx["slot_mapping"][:3] == real
         assert ctx["slot_mapping"][3:] == [PAD_SLOT_ID]
-        # The real rows', not the padded ones': max_seqlen comes off the
-        # scheduled batch (model_runner.py:3187).
-        assert ctx["max_seqlen_k"] == 66 and ctx["max_seqlen_q"] == 1
+        # `max_seqlen_q` is the scheduled batch's, one token per decode row.
+        assert ctx["max_seqlen_q"] == 1
+        # `max_seqlen_k` is not. This bucket is replayed from a FULL capture,
+        # and `aiter_attention.py:1367` froze the declared `max_model_len`
+        # into that graph's metadata; the replay does not rewrite it.
+        assert ctx["max_seqlen_k"] == 262144
+        # Under PIECEWISE the same batch runs attention eagerly
+        # (`model_runner.py:4019-4031`), so `prepare_decode` recomputes it from
+        # the live histories (`aiter_attention.py:1100`) and the real rows'
+        # longest is what the kernel sees.
+        eager = dict(spec_of(3, context=66, bucket=4,
+                             cudagraph_mode="piecewise").attention_context())
+        assert eager["max_seqlen_k"] == 66
         assert ctx["block_tables_shape"][0] == 4
 
     def test_the_state_index_tail_is_pad_slot_id_and_never_zero(self):
@@ -328,14 +342,24 @@ class TestBindingKeepsThePadding:
                               ("non_spec_query_start_loc",
                                "non_spec_state_indices_tensor",
                                "num_decodes")]}
-        return {"ops": [op, linear], "provenance": {"region": "body"}}
+        return {"ops": [op, linear],
+                # The spec these two were derived from, mode included. Under
+                # the captured rule the binder keeps the template's own extent,
+                # so it qualifies the seed against this before it does.
+                "provenance": {"region": "body",
+                               "batch_spec": spec_of(n, context,
+                                                     bucket=bucket).to_dict()}}
 
     @pytest.mark.parametrize("n,bucket", [(3, 4), (31, 32)])
     def test_a_bound_cohort_keeps_the_bucket_s_width(self, n, bucket):
         template = self._template(n, 66, bucket)
         # Same structure, different histories: what binding is for.
         cohort = shape(n, 4096, bucket=bucket)
-        bound = bind_cohort(template, cohort, CarriedAllocation("structural"))
+        # The template is a FULL derivation -- `spec_of` declares it -- so it
+        # binds under the rule it was written for. Under the batch rule its
+        # padded GDN offsets are one row per request and this refuses.
+        bound = bind_cohort(template, cohort, CarriedAllocation("structural"),
+                            extent_scope="captured")
         ctx = {k: v for k, v in bound["ops"][0]["context"]}
         gdn = {k: v for k, v in bound["ops"][1]["context"]}
 

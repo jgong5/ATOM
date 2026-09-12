@@ -58,6 +58,33 @@ def _unified(queries, contexts, *, is_prefill, has_cached, bucket=None):
     return _op(**ctx)
 
 
+def _gdn_full(bucket, active, *, seconds=None):
+    """A GDN decode call as a FULL replay records it (`gdn_attn.py`:1264-1281).
+
+    All three counts are the bucket's; the query offsets repeat the last real
+    one and the state-index tail is ``PAD_SLOT_ID``. So ``tail_pad_rows`` is
+    zero here by construction -- under FULL there is no tail to zero -- while
+    the live lane count and the launched width are separately recorded.
+    """
+    op = _op(GDN,
+             shapes=[[bucket, 4], [bucket, 4], [bucket, 4], [bucket, 4, 128]],
+             num_prefills=0, num_decodes=bucket, num_decode_tokens=bucket,
+             num_actual_tokens=bucket,
+             non_spec_query_start_loc=(list(range(active + 1))
+                                       + [active] * (bucket - active)),
+             non_spec_state_indices_tensor=(list(range(active))
+                                            + [-1] * (bucket - active)))
+    return op if seconds is None else (op, seconds)
+
+
+#: Six FULL captures. Four full buckets and two partly-filled ones: without
+#: the latter ``state_lanes`` and ``actual_rows`` are the same column at every
+#: point and the design is rank deficient, which is a real constraint on the
+#: decode acquisition and not a fixture detail.
+_GDN_FULL_POINTS = ((8, 8, 7.4e-6), (16, 16, 9.8e-6), (32, 32, 14.6e-6),
+                    (64, 64, 24.2e-6), (16, 9, 8.4e-6), (64, 40, 19.4e-6))
+
+
 def _gdn(queries=(), *, decodes=0, tokens=None, allocated=None,
          initial=None, serialized=True, **extra):
     """A linear-attention call as `forward_ctx` serializes one.
@@ -257,37 +284,73 @@ class TestTheRegimesAreNativeBranches:
 
 class TestAbsentFactsAreNotZeros:
 
-    def test_an_unrecorded_bucket_refuses_rather_than_padding_zero(self):
+    def test_an_unpadded_call_pays_no_padding(self):
+        """Two rows, both carrying a request, is not a call with an unknown
+        amount of padding -- it is a call with none.
+
+        This asked for a refusal on the missing `capture_bucket` until the
+        field was looked for and found to be nowhere: it is on `StepShape` and
+        `BatchSpec`, and no operator context has ever carried it, so the
+        refusal fired on every decode call this family can build. The padded
+        rows are on the call instead -- the offsets repeat the last real one,
+        so a padded row's query length is zero.
+        """
         regime = attention.REGIMES["unified.decode.unified_attn"]
         structure = structure_of(_unified([1, 1], [50, 50], is_prefill=False,
                                           has_cached=False))
-        out = features_for(regime, structure, SCOPE)
-        assert isinstance(out, Refusal)
-        assert "capture_bucket" in out.missing
+        values = features_for(regime, structure, SCOPE)
+        assert not isinstance(values, Refusal), values
+        assert values[regime.features.index("bucket_pad")] == 0.0
 
-    def test_a_recorded_bucket_gives_the_padded_rows(self):
+    def test_the_padded_rows_are_the_ones_with_no_query(self):
+        regime = attention.REGIMES["unified.decode.unified_attn"]
+        # Six of eight rows padded: `cu_seqlens_q` repeats the last real
+        # offset, which is what makes a padded row an empty sequence.
+        structure = structure_of(_unified([1, 1, 0, 0, 0, 0, 0, 0],
+                                          [50, 50, 0, 0, 0, 0, 0, 0],
+                                          is_prefill=False, has_cached=False))
+        values = features_for(regime, structure, SCOPE)
+        assert not isinstance(values, Refusal), values
+        assert values[regime.features.index("bucket_pad")] == 6.0
+
+    def test_a_declared_bucket_that_contradicts_the_rows_refuses(self):
+        """A bucket of eight over two recorded rows is not a padded call: a
+        replay records the bucket's width in its own buffers. One of the two
+        facts is about a different step, and picking either is inventing."""
         regime = attention.REGIMES["unified.decode.unified_attn"]
         structure = structure_of(_unified([1, 1], [50, 50], is_prefill=False,
                                           has_cached=False, bucket=8))
-        values = features_for(regime, structure, SCOPE)
-        assert values[regime.features.index("bucket_pad")] == 6.0
+        out = features_for(regime, structure, SCOPE)
+        assert isinstance(out, Refusal)
 
     def test_an_unrecorded_output_width_refuses_rather_than_free_underfill(self):
-        """The wrapper slices to num_actual_tokens, and then zeros the output
-        rows past it. That tail is work, and it cannot be counted without the
-        allocated width."""
+        """Under PIECEWISE the wrapper slices to num_actual_tokens and zeros
+        the output rows past it. That tail is work, and it cannot be counted
+        without the allocated width.
+
+        The lanes are recorded here so the refusal is about the width alone:
+        without a state tensor the call would refuse a step earlier, for not
+        saying how many lanes are live.
+        """
         regime = attention.REGIMES["gdn.decode"]
         structure = Structure(num_prefills=0, num_decodes=4,
-                              num_actual_tokens=4)
+                              num_actual_tokens=4,
+                              state_indices=(0, 1, 2, 3))
         out = features_for(regime, structure, GDN_SCOPE)
         assert isinstance(out, Refusal) and "output_rows" in out.missing
 
     def test_the_zeroed_tail_is_counted_when_both_widths_are_recorded(self):
+        """A PIECEWISE call: five active lanes, counts at five, and an output
+        tensor still allocated at the bucket's eight rows."""
         regime = attention.REGIMES["gdn.decode"]
         structure = structure_of(
             _op(GDN, shapes=[[8, 4], [8, 4], [8, 4], [8, 4, 128]],
-                num_prefills=0, num_decodes=5, num_actual_tokens=5))
+                num_prefills=0, num_decodes=5, num_actual_tokens=5,
+                non_spec_state_indices_tensor=[0, 1, 2, 3, 4]))
         values = features_for(regime, structure, GDN_SCOPE)
+        assert not isinstance(values, Refusal), values
+        assert values[regime.features.index("state_lanes")] == 5.0
+        assert values[regime.features.index("actual_rows")] == 5.0
         assert values[regime.features.index("tail_pad_rows")] == 3.0
 
     def test_grid_pad_rows_is_what_the_longest_sequence_forces(self):
@@ -452,24 +515,36 @@ class TestAFitRefusesWhatItCannotIdentify:
         assert "scope undeclared" in fit.describe()
 
     def test_a_column_zero_everywhere_is_pinned_not_fitted(self):
-        """Every GDN decode measured so far ran a full bucket, so the padding
-        term is zero at every point. Requiring it would make every fit rank
-        deficient; pinning it states the subdomain the law covers."""
+        """Every GDN decode captured FULL has no zeroed tail at all -- the
+        frozen `num_actual_tokens` is the whole allocated width -- so the
+        padding term is zero at every point. Requiring it would make every
+        such fit rank deficient; pinning it states the subdomain the law
+        covers."""
         regime = attention.REGIMES["gdn.decode"]
-        points = []
-        for decodes, seconds in ((8, 1e-5), (16, 1.2e-5), (32, 1.6e-5),
-                                 (64, 2.4e-5)):
-            structure = structure_of(
-                _op(GDN,
-                    shapes=[[decodes, 4], [decodes, 4], [decodes, 4],
-                            [decodes, 4, 128]],
-                    num_prefills=0, num_decodes=decodes,
-                    num_actual_tokens=decodes))
-            points.append((structure, seconds, "src", dict(GDN_SCOPE)))
+        points = [(structure_of(_gdn_full(bucket, active)), seconds, "src",
+                   dict(GDN_SCOPE))
+                  for bucket, active, seconds in _GDN_FULL_POINTS]
         fit = fit_regime(regime, points)
-        assert not isinstance(fit, Refusal)
+        assert not isinstance(fit, Refusal), fit
         assert "tail_pad_rows" in fit.pinned
         assert "measured only where tail_pad_rows is zero" in fit.describe()
+
+    def test_full_buckets_alone_cannot_separate_lanes_from_rows(self):
+        """The acquisition constraint, stated as a test.
+
+        With only fully-occupied buckets, `state_lanes` and `actual_rows` are
+        the same column, and no measurement of that set says which of the two
+        the time is proportional to. The fit refuses and names the remedy
+        rather than splitting the coefficient arbitrarily.
+        """
+        regime = attention.REGIMES["gdn.decode"]
+        points = [(structure_of(_gdn_full(n, n)), seconds, "src",
+                   dict(GDN_SCOPE))
+                  for n, seconds in ((8, 7.4e-6), (16, 9.8e-6),
+                                     (32, 14.6e-6), (64, 24.2e-6))]
+        out = fit_regime(regime, points)
+        assert isinstance(out, Refusal)
+        assert "rank deficient" in out.reason
 
 
 class TestPricingAnUnseenStructure:
@@ -528,25 +603,23 @@ class TestPricingAnUnseenStructure:
         assert "unified.decode.unified_attn" in out.reason
 
     def test_a_pinned_column_refuses_rather_than_pricing_it_free(self):
-        """The law was measured where the padding tail was always zero. A call
-        that has one is unsupported, not free."""
-        points = []
-        for decodes, seconds in ((8, 1e-5), (16, 1.2e-5), (32, 1.6e-5),
-                                 (64, 2.4e-5)):
-            op = _op(GDN,
-                     shapes=[[decodes, 4], [decodes, 4], [decodes, 4],
-                             [decodes, 4, 128]],
-                     num_prefills=0, num_decodes=decodes,
-                     num_actual_tokens=decodes)
-            points.append((op, seconds, "src", dict(GDN_SCOPE)))
+        """The law was measured on FULL replays, where the padding tail is
+        always zero. A PIECEWISE call has one, and it is unsupported, not
+        free."""
+        points = [(_gdn_full(bucket, active), seconds, "src", dict(GDN_SCOPE))
+                  for bucket, active, seconds in _GDN_FULL_POINTS]
         # `from_priced`, the adapter's own path: it folds each call's static
         # operand geometry into the scope, so the allocated width travels with
         # the law rather than being rediscovered at prediction.
         model = Model.from_priced(points)
+        # PIECEWISE: twenty live lanes, counts at twenty, output still
+        # allocated at the bucket's thirty-two rows.
         underfilled = _op(GDN,
                           shapes=[[32, 4], [32, 4], [32, 4], [32, 4, 128]],
                           num_prefills=0, num_decodes=20,
-                          num_actual_tokens=20)
+                          num_decode_tokens=20, num_actual_tokens=20,
+                          non_spec_query_start_loc=list(range(21)),
+                          non_spec_state_indices_tensor=list(range(20)))
         out = model.price(underfilled, GDN_SCOPE)
         assert isinstance(out, Refusal)
         assert "unsupported rather than free" in out.reason

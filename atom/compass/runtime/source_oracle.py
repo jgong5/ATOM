@@ -450,7 +450,7 @@ def template_shape(graph: dict):
 
 
 def seeded_graphs(paths, derive, allocation, coords=None, *,
-                  role="oracle.template", collect=None):
+                  role="oracle.template", collect=None, cudagraph_mode=None):
     """A `TemplateGraphs` holding the graphs already on disk, keyed by spec.
 
     ``coords`` resolves each path to this rank's file where one was written,
@@ -466,6 +466,13 @@ def seeded_graphs(paths, derive, allocation, coords=None, *,
     where the bytes are parsed: a caller that digested these paths afterwards
     would describe whatever is at them *then*, and would be digesting the stem
     the option carried rather than the per-rank file that was served.
+
+    ``cudagraph_mode`` is the deployment's declared mode and goes to the cache,
+    not to the templates: it is the same value the deriver is built with, and
+    handing it to only one of the two would let a warm bind resolve a FULL
+    step's launch extent differently from the derivation that produced its
+    graph. A template read off disk says nothing about it -- the mode belongs
+    to the run being priced, not to the run that traced the graph.
     """
     from atom.compass.core.loaded_input import load_json
     from atom.compass.runtime.templates import TemplateGraphs, template_key
@@ -476,7 +483,8 @@ def seeded_graphs(paths, derive, allocation, coords=None, *,
         if collect is not None:
             collect.append(loaded)
         graphs[template_key(template_shape(graph))] = graph
-    return TemplateGraphs(graphs, derive=derive, allocation=allocation)
+    return TemplateGraphs(graphs, derive=derive, allocation=allocation,
+                          cudagraph_mode=cudagraph_mode)
 
 
 class SourceComposition(NamedTuple):
@@ -828,7 +836,10 @@ def build_source_oracle(
                 "max_model_len")
         allocation = NativeAllocation(
             block_size=int(block_size), max_model_len=int(max_model_len),
-            position_rows=int(position_rows))
+            position_rows=int(position_rows),
+            # Same declared mode the derivers and the template cache get: the
+            # state tail this source supplies is mode-specific.
+            cudagraph_mode=cudagraph_mode)
     elif allocation_choice not in ("", "carry", "none"):
         raise ValueError(
             f"allocation must be native, carry or none, not "
@@ -900,12 +911,17 @@ def build_source_oracle(
             head_deriver = ShapeDeriver(tracer, region="head", **common)
 
     seeded_inputs: list = []
+    # The same declared mode the derivers were built with just above, so a
+    # warm bind and the derivation behind it resolve one step's launch extent
+    # identically -- see `TemplateGraphs`.
     body_graphs = seeded_graphs(templates, body_deriver, allocation, coords,
                                 role="oracle.template",
-                                collect=seeded_inputs)
+                                collect=seeded_inputs,
+                                cudagraph_mode=cudagraph_mode)
     head_graphs = (seeded_graphs(head_templates, head_deriver, allocation,
                                  coords, role="oracle.head_template",
-                                 collect=seeded_inputs)
+                                 collect=seeded_inputs,
+                                 cudagraph_mode=cudagraph_mode)
                    if head else None)
     _report_rank_binding(coords, body_graphs, head_graphs, derive)
     # What a launch costs in THIS composition, told to the library that has to
