@@ -107,11 +107,47 @@ def test_the_required_artifacts_are_read_out_of_the_options():
     artifacts = registry.required_artifacts(2, "/r")
     assert artifacts["template"] == "/r/serving/src_tp2/b27dec32.json"
     assert artifacts["head_template"] == "/r/serving/src_tp2/h27dec32.json"
-    assert artifacts["replay_target"] == "/r/poc/g5_27b/target.json"
+    assert artifacts["replay_target"] == "/r/serving/src_tp2/target.tp2.json"
+    assert artifacts["memory_model"] == (
+        "/r/memval/capture_replay/profile/profile.tp2.json"
+    )
     # Five price specs at a wide width; the two with a graph beside them
     # contribute both files.
     assert artifacts["price[0].graph"].endswith("b27dec32.json")
     assert "price[2].graph" not in artifacts
+
+
+def test_each_width_replays_a_target_of_its_own_width():
+    # The replay runner takes the block and state capacities straight out of
+    # the target record and refuses one whose tensor_parallel_size is not the
+    # width being replayed. Handing the captured TP=1 record to TP=2 and TP=4
+    # -- which is what one --replay-target for the whole matrix does -- is
+    # therefore not a mistake the run survives to report.
+    assert registry.replay_target(1, "/r") == "/r/poc/g5_27b/target.json"
+    assert registry.replay_target(2, "/r") == "/r/serving/src_tp2/target.tp2.json"
+    assert registry.replay_target(4, "/r") == "/r/serving/src_tp4/target.tp4.json"
+    assert len({registry.replay_target(tp, "/r") for tp in registry.TPS}) == 3
+
+
+def test_every_width_is_sized_by_the_analytical_profile_of_its_width():
+    # TP=1 included. The acceptance asks whether the analytical memory model
+    # holds across the three widths; a TP=1 replay sized from the captured
+    # count answers a different question, and it is the question whose answer
+    # is already known.
+    for tp in registry.TPS:
+        assert registry.memory_model(tp, "/r") == (
+            f"/r/memval/capture_replay/profile/profile.tp{tp}.json"
+        )
+
+
+def test_the_profile_is_a_required_artifact_at_every_width():
+    # Read out of the same place the plan reads it, so a profile that is not
+    # staged is an absence in the readiness report rather than a server that
+    # starts and quietly sizes itself from a captured count.
+    for tp in registry.TPS:
+        assert registry.required_artifacts(tp, "/r")["memory_model"] == (
+            registry.memory_model(tp, "/r")
+        )
 
 
 def test_a_root_with_nothing_in_it_is_six_cells_of_absences(tmp_path):
@@ -179,8 +215,10 @@ def test_the_width_reaches_its_own_files(tp):
     assert f"tp={tp}" in options
     paths = registry.required_artifacts(tp, "/r")
     marker = "g4/src1" if tp == 1 else f"serving/src_tp{tp}"
+    # The target and the profile are not under the width's own directory:
+    # one is the captured record or a derived one, the other is MEMORY's.
     assert all(marker in p for role, p in paths.items()
-               if role != "replay_target")
+               if role not in ("replay_target", "memory_model"))
 
 
 # -- what a rank actually opens ------------------------------------------
@@ -218,8 +256,13 @@ def test_a_rank_reading_another_rank_s_file_is_named_not_counted_present(tmp_pat
         (wide / f"{stem}.tp0.json").write_text("{}")
     for name in ("ar_capture", "ar_plain", "ag_prices"):
         (wide / f"{name}.json").write_text("{}")
-    (tmp_path / "poc" / "g5_27b").mkdir(parents=True)
-    (tmp_path / "poc" / "g5_27b" / "target.json").write_text("{}")
+    # The target derived at this width, and the profile it is sized from --
+    # which lives with MEMORY's other profiles, not under the width's
+    # directory.
+    (wide / "target.tp2.json").write_text("{}")
+    profile = Path(registry.memory_model(2, tmp_path))
+    profile.parent.mkdir(parents=True, exist_ok=True)
+    profile.write_text("{}")
 
     cell = registry.check(tmp_path)["cells"][2]
     assert cell["cell"] == "tp2-short"
@@ -242,14 +285,16 @@ def test_the_report_says_which_rank_is_missing_which_file(tmp_path):
     assert "b27dec32.tp3.json" in text
 
 
-def test_the_captured_target_is_not_a_per_rank_artifact(tmp_path):
-    # One captured target builds the Config and every rank of the group builds
-    # the same one, so asking rank 3 for `target.tp3.json` would invent a file
-    # nothing produces.
+def test_the_target_and_the_profile_are_not_per_rank_artifacts(tmp_path):
+    # They are per *width*: one record builds the Config and one profile sizes
+    # the pool, and every rank of the group gets the same pair. Asking rank 3
+    # for `target.tp4.tp3.json` would invent a file nothing produces.
     found = registry.resolution(4, tmp_path)
     for rank in range(4):
-        assert found[rank]["replay_target"]["path"].endswith("g5_27b/target.json")
+        assert found[rank]["replay_target"]["path"].endswith("target.tp4.json")
         assert found[rank]["replay_target"]["own"] is True
+        assert found[rank]["memory_model"]["path"].endswith("profile.tp4.json")
+        assert found[rank]["memory_model"]["own"] is True
 
 
 def test_a_group_of_one_has_nobody_to_be_confused_with(tmp_path):
@@ -263,6 +308,11 @@ def test_a_group_of_one_has_nobody_to_be_confused_with(tmp_path):
         (src / f"{stem}.tp1.r0.json").write_text("{}")
     (tmp_path / "poc" / "g5_27b").mkdir(parents=True)
     (tmp_path / "poc" / "g5_27b" / "target.json").write_text("{}")
+    # TP=1 bootstraps its Config from the captured record and still replays
+    # under the analytical profile.
+    profile = Path(registry.memory_model(1, tmp_path))
+    profile.parent.mkdir(parents=True, exist_ok=True)
+    profile.write_text("{}")
 
     cell = registry.check(tmp_path)["cells"][0]
     assert cell["cell"] == "tp1-short"

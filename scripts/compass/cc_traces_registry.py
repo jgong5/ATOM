@@ -62,7 +62,6 @@ RANK_AGGREGATION = "slowest"
 SHARED_OPTIONS = (
     ("model", MODEL),
     ("device", "meta"),
-    ("replay_target", "{root}/poc/g5_27b/target.json"),
     ("block_size", "16"),
     ("max_model_len", "262144"),
     ("position_rows", "3"),
@@ -93,6 +92,52 @@ _TP1 = "{root}/g4/src1"
 _WIDE = "{root}/serving/src_tp{tp}"
 
 
+#: The record a modelled server builds its `Config` from, per width.
+#:
+#: `ReplayModelRunner._check_parallel_contract` refuses a target whose own
+#: `tensor_parallel_size` is not the width being replayed, and it refuses
+#: rather than warns: the block count and pool entries were sized at the
+#: captured width, and handing them to a wider scheduler lets it admit a
+#: workload the target cannot hold. So there is no one target for the matrix.
+#: TP=1 replays the captured source-width record, which is of the width it
+#: claims and is what the source oracle was built from. TP=2 and TP=4 replay
+#: a record derived at that width from the memory model. The pool every one
+#: of them is sized from is the analytical profile below, not the record.
+_CAPTURED_TARGET = "{root}/poc/g5_27b/target.json"
+_DERIVED_TARGET = "{root}/serving/src_tp{tp}/target.tp{tp}.json"
+
+#: The memory profile every width sizes its pool from, including TP=1. The
+#: acceptance question is whether every non-KV term and the KV budget survive
+#: the move from measured to analytical, so a replay sized from a captured
+#: count is not evidence for it at any width -- TP=1 may *bootstrap* from the
+#: captured target (it is a record of its own width, and the source oracle is
+#: built from that capture), but the budget it actually replays under has to
+#: be the derived one. `memory_blocks` then reports `source-derived` for all
+#: three cells.
+#:
+#: These are MEMORY's own files at the path they already publish them to, not
+#: a delivery convention invented here: a profile is per *width*, never rank
+#: resolved.
+_PROFILE = "{root}/memval/capture_replay/profile/profile.tp{tp}.json"
+
+
+def replay_target(tp: int, root) -> str:
+    """The target this width replays against, resolved against `root`."""
+    template = _CAPTURED_TARGET if tp == 1 else _DERIVED_TARGET
+    return template.format(root=str(Path(root)), tp=tp)
+
+
+def memory_model(tp: int, root) -> str:
+    """The profile this width sizes its pool from.
+
+    Every width, TP=1 included. Without it the replay takes the block and
+    state counts verbatim out of the target record and publishes the budget as
+    `captured`, which is the measured number the acceptance is supposed to be
+    testing the analytical one against.
+    """
+    return _PROFILE.format(root=str(Path(root)), tp=tp)
+
+
 def per_width_options(tp: int) -> tuple:
     """The options this width adds to `SHARED_OPTIONS`, unresolved."""
     if tp == 1:
@@ -102,6 +147,7 @@ def per_width_options(tp: int) -> tuple:
                 f":{_TP1}/h27dec32.tp1.r0.json:unregistered")
         return (
             ("tp", "1"),
+            ("replay_target", _CAPTURED_TARGET),
             ("price", f"{body},{head}"),
             ("template", f"{_TP1}/b27dec32.tp1.r0.json"),
             ("head_template", f"{_TP1}/h27dec32.tp1.r0.json"),
@@ -115,6 +161,7 @@ def per_width_options(tp: int) -> tuple:
               f"{_WIDE}/ar_plain.json", f"{_WIDE}/ag_prices.json")
     return (
         ("tp", str(tp)),
+        ("replay_target", _DERIVED_TARGET),
         ("price", ",".join(prices)),
         ("template", f"{_WIDE}/b27dec32.json"),
         ("head_template", f"{_WIDE}/h27dec32.json"),
@@ -147,6 +194,11 @@ def option_paths(tp: int, root) -> dict:
                     found[f"price[{n}].graph"] = parts[1]
         elif key in ("template", "head_template", "replay_target"):
             found[key] = value
+    # Not an oracle option: the profile is a server flag, read by the replay
+    # runner and not by the price composition. It is required all the same --
+    # it is what the pool is sized from at every width -- so it is reported
+    # here with the files that are.
+    found["memory_model"] = memory_model(tp, root)
     return found
 
 
@@ -156,15 +208,16 @@ required_artifacts = option_paths
 
 
 #: Roles whose single file answers for the whole group rather than for a rank.
-#: One captured target builds the same Config everywhere, and a collective's
-#: price list is a measurement of the group, not of a member: nothing writes
-#: `ar_capture.tp2.json`, so asking for one and then reporting the unsuffixed
-#: file as a fallback would file a claim against a file that is correct.
+#: A target and a profile are per *width* and build the same Config on every
+#: rank of it, and a collective's price list is a measurement of the group,
+#: not of a member: nothing writes `ar_capture.tp2.json`, so asking for one
+#: and then reporting the unsuffixed file as a fallback would file a claim
+#: against a file that is correct.
 _GROUP_STEMS = ("ar_capture.json", "ar_plain.json", "ag_prices.json")
 
 
 def _group_level(role: str, path: str) -> bool:
-    return role == "replay_target" or path.endswith(_GROUP_STEMS)
+    return role in ("replay_target", "memory_model") or path.endswith(_GROUP_STEMS)
 
 
 def resolution(tp: int, root) -> dict:
