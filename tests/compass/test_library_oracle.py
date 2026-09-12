@@ -867,3 +867,91 @@ class TestAFittedPriceIsNotAMeasurement:
         assert split["complete"] is False
         assert split["complete_measured"] is False
         assert "triton::norm" in split["refused_operators"]
+
+
+class TestPricingTheSameShapeTwiceCostsOnce:
+    """The replay's own CPU budget, which is an acceptance gate, not a polish.
+
+    Measured on the 27B decode-32 shape: 41.7ms to estimate one step against a
+    32.7ms modelled GPU step, ~39ms of it summing prices over ~2440 operators.
+    A serving replay asks the same handful of bucketed shapes thousands of
+    times. The arithmetic is reused; the bind is not, so nothing a per-step
+    refusal would have caught stops being checked.
+    """
+
+    OP = _op("aiter::gemm", [[16, 4096], [4096, 4096]])
+
+    def _oracle(self, tmp_path, shape, **kwargs):
+        prices = _price_list(tmp_path, "p.json", [self.OP], 1e-3)
+        graphs = StaticGraphs({StaticGraphs.key(shape): _graph([self.OP])})
+        return LibraryCostOracle(PriceLibrary.load([(prices, None)]), graphs,
+                                 **kwargs)
+
+    def test_the_second_estimate_is_the_first_answer(self, tmp_path):
+        shape = StepShape(num_scheduled_tokens=(1,), context_lens=(16,))
+        oracle = self._oracle(tmp_path, shape)
+        first = oracle.estimate(shape)
+        second = oracle.estimate(shape)
+        assert second.seconds == pytest.approx(first.seconds)
+        assert dict(second.breakdown) == pytest.approx(dict(first.breakdown))
+        assert (oracle.price_cache_misses, oracle.price_cache_hits) == (1, 1)
+
+    def test_a_permuted_batch_reuses_the_price_it_already_paid(self, tmp_path):
+        """Same key as the graph cache, for the same reason: whole rows move
+        together, so the derived graph -- and therefore its price -- is the
+        same one."""
+        one = StepShape(num_scheduled_tokens=(1, 4), context_lens=(16, 4096))
+        other = StepShape(num_scheduled_tokens=(4, 1), context_lens=(4096, 16))
+        oracle = self._oracle(tmp_path, one)
+        assert oracle.estimate(one).seconds == pytest.approx(
+            oracle.estimate(other).seconds)
+        assert oracle.price_cache_hits == 1
+
+    def test_sampling_and_not_sampling_are_not_the_same_price(self, tmp_path):
+        """`produces_output` decides whether the head runs at all, and the body
+        graph is identical either way -- so it has to be in the price key even
+        though the graph key does without it."""
+        samples = StepShape(num_scheduled_tokens=(1,), context_lens=(16,),
+                            produces_output=True)
+        silent = StepShape(num_scheduled_tokens=(1,), context_lens=(16,),
+                           produces_output=False)
+        head = _graph([_op("aiter::gemm", [[1, 4096], [4096, 151936]])])
+        prices = _price_list(tmp_path, "p.json",
+                             [self.OP, head["ops"][0]], 1e-3)
+        key = StaticGraphs.key(samples)
+        oracle = LibraryCostOracle(
+            PriceLibrary.load([(prices, None)]),
+            StaticGraphs({key: _graph([self.OP], head_in_graph=False)}),
+            head_graphs=StaticGraphs({key: head}))
+        with_head = oracle.estimate(samples)
+        without = oracle.estimate(silent)
+        assert oracle.price_cache_misses == 2
+        assert oracle.price_cache_hits == 0
+        assert without.seconds < with_head.seconds
+
+    def test_a_cached_price_still_refuses_an_incomplete_step(self, tmp_path):
+        """The refusal is not a property of the lookup that got cached: it is
+        re-decided from the cached coverage every step, so a `require_complete`
+        run cannot be talked into an answer by asking twice."""
+        unpriced = _op("triton::norm", [[16, 4096]])
+        prices = _price_list(tmp_path, "p.json", [self.OP], 1e-3)
+        shape = StepShape(num_scheduled_tokens=(1,), context_lens=(16,))
+        graphs = StaticGraphs(
+            {StaticGraphs.key(shape): _graph([self.OP, unpriced])})
+        oracle = LibraryCostOracle(PriceLibrary.load([(prices, None)]), graphs,
+                                   require_complete=True)
+        for _ in range(2):
+            with pytest.raises(ValueError, match="incomplete"):
+                oracle.estimate(shape)
+        assert oracle.last_coverage.refused
+
+    def test_a_missing_graph_is_still_refused_on_the_second_ask(self, tmp_path):
+        """The bind runs every step. A shape whose graph is gone is refused
+        even after a sibling shape has populated the price cache."""
+        have = StepShape(num_scheduled_tokens=(1,), context_lens=(16,))
+        want = StepShape(num_scheduled_tokens=(1, 1), context_lens=(16, 16))
+        oracle = self._oracle(tmp_path, have)
+        oracle.estimate(have)
+        for _ in range(2):
+            with pytest.raises(KeyError):
+                oracle.estimate(want)

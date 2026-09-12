@@ -671,6 +671,21 @@ class StaticGraphs:
         return f"StaticGraphs({len(self._graphs)} shapes)"
 
 
+def _price_key(shape: StepShape):
+    """What two steps must share for their priced body and head to be equal.
+
+    `StaticGraphs.key` already says what two steps must share for their derived
+    *graph* to be equal, and a price is keyed on operator names, tensor shapes
+    and dtypes -- never on tensor values -- so equal graphs price equally. Two
+    steps with the same rows and different block numbers are the same price.
+
+    `produces_output` is the one thing added: it decides whether the LM head
+    runs at all, so it changes the priced step even where the body graph is
+    identical.
+    """
+    return StaticGraphs.key(shape) + (bool(shape.produces_output),)
+
+
 class LibraryCostOracle:
     """A step's cost from its derived graph and the library, plus coverage.
 
@@ -737,6 +752,21 @@ class LibraryCostOracle:
                 "the region model alone.")
         self.regions = regions
         self.last_coverage: Optional[Coverage] = None
+        #: Priced body and head per shape, because summing a price over every
+        #: operator is where a replayed step's CPU time actually goes: measured
+        #: on the 27B decode-32 shape, 39ms of a 41.7ms estimate against a
+        #: 32.7ms modelled GPU step, over ~2440 operators. A serving replay asks
+        #: the same few bucketed shapes thousands of times, and pricing them
+        #: again each time is the whole gap to the GPU-free speedup gate.
+        #:
+        #: The bind is *not* cached: every step still derives or binds its own
+        #: graph, so every refusal -- a stale allocation, a shape outside the
+        #: template's rows, a rank mismatch -- still fires per step. What is
+        #: reused is only the arithmetic over an identical graph.
+        self._priced: dict = {}
+        self.price_cache_limit = 4096
+        self.price_cache_hits = 0
+        self.price_cache_misses = 0
 
     def estimate(self, shape: StepShape) -> StepCost:
         # Whether a shape is inside the region model's calibrated domain
@@ -759,14 +789,24 @@ class LibraryCostOracle:
                 f"{shape.total_tokens} tokens: derive one rather than "
                 "answering from a neighbouring shape")
         self._check_body_rows(graph, shape)
-        body, coverage, launches = self.library.body(
-            graph, self.body_registration)
-        head, head_coverage, head_launches = self._head_for(graph, shape)
-        if head_coverage is not None:
-            # One step, one coverage record: a head whose all-gather is unpriced
-            # has to make the *step* incomplete, not sit in a second record that
-            # `require_complete` never reads.
-            coverage = coverage.merged(head_coverage)
+        key = _price_key(shape)
+        priced = self._priced.get(key)
+        if priced is None:
+            body, coverage, launches = self.library.body(
+                graph, self.body_registration)
+            head, head_coverage, head_launches = self._head_for(graph, shape)
+            if head_coverage is not None:
+                # One step, one coverage record: a head whose all-gather is
+                # unpriced has to make the *step* incomplete, not sit in a
+                # second record that `require_complete` never reads.
+                coverage = coverage.merged(head_coverage)
+            self.price_cache_misses += 1
+            if len(self._priced) < self.price_cache_limit:
+                self._priced[key] = (body, coverage, launches, head,
+                                     head_coverage, head_launches)
+        else:
+            body, coverage, launches, head, head_coverage, head_launches = priced
+            self.price_cache_hits += 1
         self.last_coverage = coverage
         if self.require_complete and not coverage.complete:
             raise ValueError("incomplete: " + coverage.describe())
