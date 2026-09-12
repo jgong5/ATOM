@@ -22,6 +22,7 @@ from atom.compass.core.cost.families import ParametricPriceLibrary, coverage_spl
 from atom.compass.core.cost.library import (
     MEASURED_KEY,
     REGISTERED,
+    UNREGISTERED,
     PriceLibrary,
 )
 from atom.compass.runtime.microbench import signature_of
@@ -91,6 +92,7 @@ def _write(tmp_path, tag, op, seconds, *, topology=None, registration=None,
 
 # == (1) scoped selection vs signature-wide layout ==========================
 
+TP1 = {"tp": 1}
 TP2 = {"tp": 2}
 TP4 = {"tp": 4}
 
@@ -325,49 +327,129 @@ def test_the_strided_measurements_keep_their_own_support(tmp_path, order):
     assert 5e-4 <= record["seconds"] <= 10e-4, record["seconds"]
 
 
-def test_a_scope_with_no_measurement_of_its_own_is_refused_not_borrowed(
-        tmp_path):
-    """TP2 holds only dense prices, so a TP2 strided request has no support."""
+def test_a_local_operator_is_reusable_across_scopes(tmp_path):
+    """TP2 measured dense, TP4 measured strided, and both are just matmuls.
+
+    A GEMM's cost is a property of its shapes and its operand layout, not of
+    the deployment around it, so the strided curve answers a strided request
+    whichever group width asks. The separation that matters here is layout,
+    and it still holds: this is answered from the strided measurements, not
+    from the dense ones five times cheaper.
+    """
     library = _mixed_library(tmp_path)
     record, detail = library.lookup(strided_gemm(48), topology=TP2,
                                     registration=REGISTERED)
-    assert record is None, f"answered from another scope's curve: {record}"
+    assert record is not None, detail
+    assert 5e-4 <= record["seconds"] <= 10e-4, (
+        "answered from the dense curve rather than the strided one")
 
 
-def test_an_unnamed_scope_is_answered_while_only_one_offers_this_operator(
-        tmp_path):
-    """Dense exists at TP2 only, so there is nothing to choose between.
-
-    Scope separation must not turn into refusing everything that did not name
-    a scope: most callers never do, and a family measured in one scope has one
-    answer.
-    """
+def test_a_local_operator_needs_no_scope_named_at_all(tmp_path):
+    """Most callers never name one, and a matmul does not need them to."""
     library = _mixed_library(tmp_path)
     record, detail = library.lookup(gemm(48))
     assert record is not None, detail
     assert 1e-4 <= record["seconds"] <= 2e-4
 
 
-def test_the_same_operator_in_two_scopes_refuses_an_unnamed_request(tmp_path):
-    """Naming no scope while several offer it is the silent spend, not a default.
+# == (4) a local operator's cost does not depend on the group ==============
+#
+# `PriceLibrary.lookup` scopes exact prices for COLLECTIVES only, and the body
+# hands the graph's registration to every lookup. Scoping local families the
+# same way made the two paths disagree about one operator: the exact-width GEMM
+# was answered from an unregistered price list, while the in-support
+# interpolation of that same GEMM was refused for the same list being
+# unregistered.
 
-    Here both scopes hold the *dense* gemm, so structure alone cannot decide
-    and picking one would spend a price measured at another group width --
-    exactly what the base class refuses to do for a collective.
+def _local(tmp_path, tag, rows, seconds, topology, registration):
+    return _write(tmp_path, tag, gemm(rows), seconds, topology=topology,
+                  registration=registration, rows=rows)
+
+
+def test_a_gemm_interpolates_across_registration_regimes(tmp_path):
+    """A GEMM does not care which path the collectives elsewhere took."""
+    library = ParametricPriceLibrary(max_gap_ratio=2.0)
+    library.add(*_local(tmp_path, "u32", 32, 1e-4, TP1, UNREGISTERED))
+    library.add(*_local(tmp_path, "u64", 64, 2e-4, TP1, UNREGISTERED))
+
+    exact, why = library.lookup(gemm(32), topology=TP1,
+                                registration=REGISTERED)
+    assert exact is not None, why
+
+    between, detail = library.lookup(gemm(48), topology=TP1,
+                                     registration=REGISTERED)
+    assert between is not None, (
+        "the exact width was answered from this list and the interpolation "
+        f"was not: {detail}")
+    assert between["interpolated"] is True
+
+
+def test_a_gemm_interpolates_across_group_widths(tmp_path):
+    """TP1 and TP2 shards of the same shape are the same matrix multiply."""
+    library = ParametricPriceLibrary(max_gap_ratio=2.0)
+    library.add(*_local(tmp_path, "t32", 32, 1e-4, TP1, UNREGISTERED))
+    library.add(*_local(tmp_path, "t64", 64, 2e-4, TP2, REGISTERED))
+
+    record, detail = library.lookup(gemm(48), topology=TP4,
+                                    registration=REGISTERED)
+    assert record is not None, detail
+    assert record["interpolated"] is True
+    assert 1e-4 <= record["seconds"] <= 2e-4
+
+
+def test_a_collective_is_not_answered_by_the_parametric_path_at_all(tmp_path):
+    """Which is why scoping local families on the group was wrong.
+
+    `c10d::all_reduce_` has no rows family contract, so a collective never
+    reaches the curve machinery: its scope separation is `PriceLibrary`'s
+    exact-price selection by width and path, and that is where it belongs.
+    Scoping local families the same way bought nothing and cost real
+    interpolations.
     """
     library = ParametricPriceLibrary(max_gap_ratio=2.0)
-    for tag, rows, seconds, topology in (
-            ("a32", 32, 1e-4, TP2), ("a64", 64, 2e-4, TP2),
-            ("b32", 32, 8e-4, TP4), ("b64", 64, 16e-4, TP4)):
-        library.add(*_scoped(tmp_path, tag, gemm(rows), seconds, rows,
-                             topology))
+    for tag, rows, seconds in (("c32", 32, 1e-4), ("c64", 64, 2e-4)):
+        op = dict(all_reduce(), input_shapes=[[rows, 5120]])
+        library.add(*_write(tmp_path, tag, op, seconds, topology=TP2,
+                            registration=REGISTERED, rows=rows))
 
-    record, detail = library.lookup(gemm(48))
-    assert record is None, (
-        f"picked a scope for a request that named none: {record}")
-    assert "more than one scope" in detail, detail
+    wide = dict(all_reduce(), input_shapes=[[48, 5120]])
+    record, detail = library.lookup(wide, topology=TP2,
+                                    registration=REGISTERED)
+    assert record is None, f"interpolated a collective: {record}"
+    assert "no declared family contract" in detail, detail
 
-    named, why = library.lookup(gemm(48), topology=TP4,
-                                registration=REGISTERED)
-    assert named is not None, why
-    assert 8e-4 <= named["seconds"] <= 16e-4
+
+# == (5) one graph, one signature, two calls ==============================
+
+def test_a_duplicate_signature_in_one_graph_takes_the_first_occurrence(
+        tmp_path):
+    """The collector prices the first; this must label it as the first.
+
+    `microbench` keys its example operator with `example.setdefault` and
+    `PriceLibrary._ingest` captures the measured layout with
+    `layouts.setdefault`, so a graph holding a dense and a strided call under
+    one signature is PRICED as the dense one. Labelling it strided here would
+    disagree with the measurement that was actually taken.
+    """
+    op_dense, op_strided = gemm(32), strided_gemm(32)
+    assert signature_of(op_dense) == signature_of(op_strided), (
+        "the premise: layout is not in the signature")
+
+    graph = {"ops": [op_dense, op_strided],
+             "provenance": {"execution": {"body_rows_traced": 32}}}
+    prices = {"prices": {signature_of(op_dense): {
+        "seconds": 1e-4, "kernels": {"k": 1e-4}, "occurrences": 2,
+        "name": op_dense["name"]}}}
+    gpath = tmp_path / "g_dup.json"
+    ppath = tmp_path / "p_dup.json"
+    gpath.write_text(json.dumps(graph))
+    ppath.write_text(json.dumps(prices))
+
+    library = ParametricPriceLibrary(max_gap_ratio=2.0)
+    library.add(str(ppath), str(gpath))
+    library._build()
+
+    recorded = next(iter(library._observations.values()))[0][0]
+    assert not recorded.get("layouts"), (
+        "the second, strided call was taken as the representative for a price "
+        "the collector measured on the first, dense one")
