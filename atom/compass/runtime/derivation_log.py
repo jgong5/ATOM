@@ -30,12 +30,14 @@ is a cost of, which is exactly the confusion the cost record exists to avoid.
 
 from __future__ import annotations
 
+import atexit
 import json
 import os
 import time
+import weakref
 from typing import Any, Optional
 
-__all__ = ["record", "log", "DerivationLog"]
+__all__ = ["record", "log", "watch", "DerivationLog"]
 
 
 class DerivationLog:
@@ -93,3 +95,56 @@ def record(t0: float, t1: float, **fields: Any) -> None:
 def now() -> float:
     """The clock the windows are stamped on, named once so it cannot drift."""
     return time.time()
+
+
+#: Caches whose final counters are wanted, held weakly so watching one cannot
+#: keep a runner's graphs alive past the run.
+_WATCHED: list = []
+
+
+def watch(cache: Any, role: str) -> None:
+    """Snapshot `cache`'s counters at exit, under `role`. No-op when off."""
+    if not log().enabled:
+        return
+    if not _WATCHED:
+        atexit.register(_write_counters)
+    _WATCHED.append((role, weakref.ref(cache)))
+
+
+def _counters_path() -> str:
+    base, _ = os.path.splitext(log().path)
+    return f"{base}.counters.{os.getpid()}.json"
+
+
+def _write_counters() -> None:
+    """One object per watched cache. Never raises."""
+    try:
+        rows = []
+        for role, ref in _WATCHED:
+            cache = ref()
+            if cache is None:
+                continue
+            rows.append({
+                "role": role,
+                "at": now(),
+                # The cache's own accessors, not a reconstruction: `hits` and
+                # `derivations` are incremented on the two branches of one
+                # `if`, so they partition the answered lookups and a refusal
+                # is in neither.
+                "templates": len(getattr(cache, "_templates", ()) or ()),
+                "hits": getattr(cache, "hits", None),
+                "representative_hits": getattr(cache, "representative_hits",
+                                               None),
+                "derivations": getattr(cache, "derivations", None),
+                "derivation_seconds": getattr(cache, "derivation_seconds",
+                                              None),
+                "binds": getattr(cache, "binds", None),
+                "refusals": len(getattr(cache, "refusals", ()) or ()),
+                "describe": cache.describe(),
+            })
+        if not rows:
+            return
+        with open(_counters_path(), "w", encoding="utf-8") as fh:
+            json.dump(rows, fh, indent=2, default=str)
+    except Exception:  # noqa: BLE001, S110 - see `record`
+        pass

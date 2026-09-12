@@ -926,6 +926,11 @@ class TemplateGraphs:
         self.derivation_seconds = 0.0
         self.representative_hits = 0
         self.refusals = {}
+        # A hit leaves no interval in the journal, so without this a run's
+        # derivation rows cannot be read as a rate. Off unless the journal is.
+        from atom.compass.runtime import derivation_log
+
+        derivation_log.watch(self, "template_graphs")
 
     def add(self, shape: StepShape, graph: dict) -> None:
         self._templates[template_key(shape)] = graph
