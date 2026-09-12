@@ -90,6 +90,30 @@ it: a flat ~6e-04 population is reachable on this tree and sets several low
 band edges, the 5120-to-8192 interval crosses the two populations and is the
 weakest claim here, and every row was measured with `waiting: 0`.
 
+The same `regions=` line is shared by all three widths, and since 2026-09-13 the
+profile answers at all three. It declares `topologies=(1, 2, 4)`, carried from
+`source-27b-tp1-conc-v2` along with its decode cells and its broadcast, and
+every coefficient under it is measured at TP1. What licenses that is read off
+this engine's source, not fitted to any TP2 or TP4 engine: the runner's only
+TP-conditional statements outside the model are the sampled-token broadcast and
+the logprobs broadcast; `compute_logits` all-gathers the vocabulary shards back
+to the unpadded `config.vocab_size` before postprocess sees them, so the
+sampler's input is identically shaped at every width; and preparation is sized
+by the batch and by `max_model_len`/`block_size`. The one term TP>1 adds is
+`<tp-broadcast>`, measured standalone on the real two- and four-rank groups and
+charged only on steps that sample a token.
+
+Two consequences belong in any report that quotes a wide cell. First,
+`block_size=16` is load-bearing here rather than incidental: at 256 or 1024 the
+per-step attention metadata build is sized by `num_key_value_heads // tp`, so a
+TP1 preparation measurement would be a measurement of different work, and
+`build_source_oracle` refuses that pairing instead of answering it. Second,
+three things stay outside the model at TP>1 -- inter-rank skew (it lands inside
+the body's span, and `rank_aggregation="slowest"` is what the step-level answer
+leans on), engine-core process control (`rpc_broadcast_mq.enqueue` waits for
+every reader, outside `ModelRunner.forward`, unmeasured and deliberately not
+folded into a region), and logprobs broadcasts (never requested by these runs).
+
 The TP1 `price=` line above is the two decode-32 seed pairs, which is where
 this set started. The list the registry passes today is longer: it adds the
 prefill cells, the long-context and mixed steps, the one-sequence row ladder
