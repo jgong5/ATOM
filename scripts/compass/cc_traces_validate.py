@@ -947,8 +947,18 @@ def check_capacity_provenance(
                     f"{tag}={sha[:16]} was produced from the acceptance "
                     f"workload itself"
                 )
+            # The file this rank actually opened, by the name the registry
+            # enumerates contents under and the digest its reader took as it
+            # parsed the bytes. Passing nothing here was wrong in the
+            # direction that matters: `check_artifact_provenance` refuses an
+            # entry that enumerates contents when the server is reported to
+            # have read no file for it, so a registry that honestly declared
+            # its replay target was refused, and one that declared nothing
+            # sailed through. A capacity input is a file that was read, and it
+            # is declared like one.
+            observed = {os.path.basename(row.get("path") or ""): sha}
             bad += check_artifact_provenance(
-                tag, entry, {}, workload_sha, forbidden
+                tag, entry, observed, workload_sha, forbidden
             )
     return bad
 

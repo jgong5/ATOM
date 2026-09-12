@@ -18,6 +18,7 @@ These drive the real validator over the real passing cell.
 """
 
 import json
+import os
 
 from . import test_cc_traces_validate as base
 
@@ -50,9 +51,13 @@ def _failures(cell_dir):
     return verdict(cell_dir)["failures"]
 
 
-def _input(role, sha=None):
-    """One loaded-input row, defaulting to the declared capacity artifact."""
-    return {"role": role, "requested": "/x/f.json", "path": "/x/f.json",
+def _input(role, sha=None, path="/x/target.json"):
+    """One loaded-input row, defaulting to the declared capacity artifact.
+
+    The path matters: the registry enumerates its contents by basename, and
+    the validator compares that against the file the rank reports opening.
+    """
+    return {"role": role, "requested": path, "path": path,
             "rank_own": False, "sha256": sha or base.TARGET_SHA, "size": 1,
             "rank_coords": {}}
 
@@ -216,6 +221,112 @@ class TestACapacityInputLeaksLikeAPricedOne:
         assert run(cell) == 1
         assert any("names a file rather than a file's contents" in f
                    for f in _failures(cell))
+
+
+class TestTheDeclarationMustEnumerateTheFileThatWasRead:
+    """Through a record the real loader wrote, over a real file on disk.
+
+    The fixtures elsewhere here omit `contents`, and that omission hid a
+    producer/consumer mismatch: the shared checker refuses an entry that
+    enumerates contents when nothing is reported as having been read for it,
+    so a registry that honestly declared its replay target was refused while
+    one that declared nothing passed. A capacity input is a file that was
+    read; it is declared like one, and these drive it from the loader rather
+    than from a hand-written row.
+    """
+
+    def _real_input(self, cell_dir, payload=None):
+        """A runtime input as `load_json` records it, from a file on disk."""
+        from atom.compass.core.loaded_input import load_json
+
+        path = cell_dir / "target.json"
+        path.write_text(json.dumps(payload or {"version": 1,
+                                               "blocks": {"n": 4096}}),
+                        encoding="utf-8")
+        _, loaded = load_json(str(path), role="runtime.replay_target")
+        return loaded
+
+    def _declare(self, cell_dir, loaded, **overrides):
+        """Register that exact file, as the protocol registry would."""
+        entry = {
+            "sha256": loaded.sha256,
+            "kind": "derived_graph",
+            "measured_at_tp": 1,
+            "produced_by": "replay_target_out",
+            "workload_sha256": None,
+            "contents": {os.path.basename(loaded.path): loaded.sha256},
+            "sources": [{"path": "/m/capture.json",
+                         "sha256": base.TARGET_CAPTURE_SHA}],
+            "code": {"atom/compass/replay/runner.py": base.CODE_SHA},
+        }
+        entry.update(overrides)
+        path = cell_dir / "registry.json"
+        blob = json.loads(path.read_text())
+        blob["artifacts"] = [
+            e for e in blob["artifacts"] if e.get("sha256") != base.TARGET_SHA
+        ] + [entry]
+        path.write_text(json.dumps(blob))
+
+    def _use(self, cell_dir, loaded):
+        _rank(cell_dir, "modelled", inputs=[loaded.as_dict()])
+
+    def test_a_registry_that_enumerates_the_file_read_is_accepted(self, cell):
+        """The case that was refused. Everything here is real: the bytes on
+        disk, the digest the loader took as it parsed them, and a registry
+        naming that file by the name it was read under."""
+        loaded = self._real_input(cell)
+        self._declare(cell, loaded)
+        self._use(cell, loaded)
+
+        assert run(cell) == 0, _failures(cell)
+
+    def test_a_registry_that_enumerates_nothing_is_refused(self, cell):
+        """The other half. A single digest hides what is inside it, which is
+        the whole reason contents are enumerated."""
+        loaded = self._real_input(cell)
+        self._declare(cell, loaded, contents={})
+        self._use(cell, loaded)
+
+        assert run(cell) == 1
+        assert any("the registry enumerates none of them" in f
+                   for f in _failures(cell))
+
+    def test_a_registry_naming_a_different_file_is_refused(self, cell):
+        loaded = self._real_input(cell)
+        self._declare(cell, loaded,
+                      contents={"some_other.json": loaded.sha256})
+        self._use(cell, loaded)
+
+        assert run(cell) == 1
+        failures = _failures(cell)
+        assert any("which the registry does not declare" in f
+                   for f in failures)
+        assert any("the server did not read" in f for f in failures)
+
+    def test_a_registry_declaring_a_different_digest_is_refused(self, cell):
+        """The file was replaced after it was declared, or declared from
+        another copy. Either way the bytes that sized this deployment are not
+        the bytes anybody measured."""
+        loaded = self._real_input(cell)
+        self._declare(
+            cell, loaded,
+            contents={os.path.basename(loaded.path): "9" * 64})
+        self._use(cell, loaded)
+
+        assert run(cell) == 1
+        assert any("differs between what the server read" in f
+                   for f in _failures(cell))
+
+    def test_editing_the_file_after_the_read_does_not_rescue_it(self, cell):
+        """The loader's digest is of the bytes it parsed. Rewriting the file
+        to match a registry that declares something else changes nothing,
+        because nothing re-reads it."""
+        loaded = self._real_input(cell)
+        self._declare(cell, loaded)
+        self._use(cell, loaded)
+        (cell / "target.json").write_text('{"version": 2}', encoding="utf-8")
+
+        assert run(cell) == 0, _failures(cell)
 
 
 class TestTheReferenceSideMustHaveBeenAMachine:

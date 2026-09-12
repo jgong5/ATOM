@@ -75,6 +75,10 @@ def capacity_artifact():
         "measured_at_tp": 1,
         "produced_by": "replay_target_out",
         "workload_sha256": None,
+        # Enumerated, like every other artifact the server reads. The file is
+        # named by its basename, which is what the validator compares against
+        # what the rank reports having opened.
+        "contents": {"target.json": TARGET_SHA},
         "sources": [
             {"path": "/m/target_capture.json", "sha256": TARGET_CAPTURE_SHA}
         ],
@@ -513,20 +517,7 @@ def cell(tmp_path, monkeypatch):
                     # What sized the deployment. Declared like any other
                     # measured input, because it is one: it decides how many
                     # requests fit, which decides the schedule.
-                    {
-                        "sha256": TARGET_SHA,
-                        "kind": "derived_graph",
-                        "measured_at_tp": 1,
-                        "produced_by": "replay_target_out",
-                        "workload_sha256": None,
-                        "sources": [
-                            {
-                                "path": "/m/target_capture.json",
-                                "sha256": TARGET_CAPTURE_SHA,
-                            }
-                        ],
-                        "code": {"atom/compass/replay/runner.py": CODE_SHA},
-                    },
+                    capacity_artifact(),
                 ]
             }
         )
