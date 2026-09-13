@@ -74,6 +74,7 @@ ADDRESS_COMPONENTS = (
     "non_spec_state_indices_in_tensor",
     "state_indices",
 )
+_ADDRESS_MARKERS = tuple(name + "=" for name in ADDRESS_COMPONENTS)
 
 #: How a normalised component is written into the key. Distinct enough from any
 #: real value that an un-normalised key and a normalised one cannot collide.
@@ -168,6 +169,12 @@ def cost_key(signature: str) -> str:
     it alone, so a library may be reindexed more than once.
     """
     if not signature:
+        return signature
+    # Most body operators carry no allocator addresses. Their key is already
+    # exact, so avoid splitting/rebuilding their scalar and shape segments on
+    # every layer of every token step. The full parser still handles every
+    # signature that might contain a normalized address field.
+    if not any(marker in signature for marker in _ADDRESS_MARKERS):
         return signature
     return "|".join(_normalize_segment(part) if "=" in part else part
                     for part in signature.split("|"))

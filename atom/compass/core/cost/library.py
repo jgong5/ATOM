@@ -629,7 +629,8 @@ class PriceLibrary:
         """
         from atom.compass.runtime.microbench import _is_collective_op
 
-        key = _cost_key_of(op)
+        signature = _signature_of(op)
+        key = cost_key(signature)
         candidates = self._prices.get(key) or []
         if not candidates:
             refusal = self._refusals.get(key)
@@ -648,7 +649,7 @@ class PriceLibrary:
         # cannot be audited if the normalisation later turns out to be wrong.
         measured_signature = record.get("signature")
         if (measured_signature is not None
-                and measured_signature != _signature_of(op)):
+                and measured_signature != signature):
             self.address_shifted[key] = self.address_shifted.get(key, 0) + 1
         # Against the layout of the record that was *selected*, which for a
         # collective is chosen by width and path above. A price and the layout
