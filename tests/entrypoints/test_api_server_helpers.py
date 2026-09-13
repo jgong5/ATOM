@@ -371,6 +371,27 @@ class TestCompletionTokenPrompts:
         assert list(admitted[0].token_ids) == [1, 2, 3]
         assert response.usage["prompt_tokens"] == 3
 
+    def test_declared_order_reaches_the_scheduler_handoff(self, monkeypatch):
+        from atom.utils.clock import VirtualClock, get_clock, set_clock
+
+        _, _, _, admitted = self._engine(monkeypatch)
+        previous = get_clock()
+        set_clock(VirtualClock(epoch=1000.0))
+        try:
+            request = api_server.CompletionRequest(
+                prompt=[1, 8, 9], max_tokens=1,
+                compass_arrival=5.0, compass_workload_size=4,
+                compass_workload_index=2,
+            )
+            asyncio.run(api_server.completions(request, None))
+        finally:
+            set_clock(previous)
+        assert len(admitted) == 1
+        seq = admitted[0]
+        assert seq.arrive_time == 1005.0
+        assert seq.compass_workload_size == 4
+        assert seq.compass_workload_index == 2
+
     @pytest.mark.parametrize("model_size,invalid_id", [(10, 10), (20, 12)])
     @pytest.mark.parametrize("stream", [False, True])
     def test_out_of_range_ids_refuse_before_preprocessing(

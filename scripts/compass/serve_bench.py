@@ -77,7 +77,7 @@ def _prompts(model: str, n: int, length: int, seed: int) -> list[str]:
             for _ in range(n)]
 
 
-async def _one(session, url, model, prompt, out_len, arrival, declare, total):
+async def _one(session, url, model, prompt, out_len, arrival, declare, total, index):
     body = {
         "model": model,
         "prompt": prompt,
@@ -92,6 +92,7 @@ async def _one(session, url, model, prompt, out_len, arrival, declare, total):
         # been told about, and these are submitted concurrently, so they reach
         # it out of order. Told the total, it holds until all have landed.
         body["compass_workload_size"] = total
+        body["compass_workload_index"] = index
     started = time.perf_counter()
     async with session.post(url, json=body) as resp:
         await resp.read()
@@ -104,7 +105,7 @@ async def _run(args, prompts, schedule) -> float:
     began = time.perf_counter()
     async with aiohttp.ClientSession(timeout=timeout) as session:
         tasks = []
-        for prompt, arrival in zip(prompts, schedule):
+        for index, (prompt, arrival) in enumerate(zip(prompts, schedule)):
             if not args.declare_arrivals and arrival > 0:
                 # Paced: the real server's arrivals are made real by waiting.
                 delay = arrival - (time.perf_counter() - began)
@@ -112,7 +113,7 @@ async def _run(args, prompts, schedule) -> float:
                     await asyncio.sleep(delay)
             tasks.append(asyncio.create_task(
                 _one(session, url, args.model, prompt, args.output_len,
-                     arrival, args.declare_arrivals, len(prompts))))
+                     arrival, args.declare_arrivals, len(prompts), index)))
         await asyncio.gather(*tasks)
     return time.perf_counter() - began
 

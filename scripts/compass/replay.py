@@ -12,8 +12,9 @@ So this client declares each request's arrival as an **offset into the run**
 rather than delivering it at that moment. Requests are posted as fast as the
 socket allows; `compass_arrival` says when the engine should treat each as having
 arrived, and `compass_workload_size` tells the arrival barrier how many to expect
-so it never advances virtual time past an arrival still in flight. Delivery order
-and socket latency then stop mattering, which is the point.
+so it never advances virtual time past an arrival still in flight. The existing
+workload row index travels as `compass_workload_index` to order equal-time
+arrivals. Delivery order and socket latency then stop changing the schedule.
 
 Against a real server there is no start-of-run to offset from, so declared
 arrivals are ignored and "now" is used -- the same script measures both sides.
@@ -556,6 +557,8 @@ def main(argv=None) -> int:
             # had arrived when the 120s ran out, and the first batch landed
             # after the barrier had already given up.
             body["compass_workload_size"] = len(workload)
+            # Preserve the workload's stable row order for equal arrivals.
+            body["compass_workload_index"] = i
         try:
             return {"index": i, "ok": True, "response": _send(base + "/v1/completions",
                                                               body, args.timeout)}

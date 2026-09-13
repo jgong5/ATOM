@@ -664,6 +664,16 @@ class TestEveryDescendantIsSubmittedAndCounted:
             0.05,
         ]
 
+    def test_equal_arrivals_carry_the_original_workload_order(self, served, tmp_path):
+        base, stub = served
+        stub.provenance = self.VIRTUAL
+        code, _ = self._run(base, tmp_path)
+        assert code == 0
+        assert sorted(
+            (body["max_tokens"], body["compass_workload_index"])
+            for body in stub.posted
+        ) == [(11, 0), (12, 1), (13, 2), (14, 3), (15, 4)]
+
     def test_the_provenance_a_row_carries_is_not_something_to_select_on(
         self, served, tmp_path
     ):
@@ -861,7 +871,8 @@ class TestTheServerSideOfTheBarrierReading:
         scheduler._arrival_barrier_open = False
         scheduler._arrival_barrier_since = time.monotonic() - waited if waited else None
         scheduler.waiting = [
-            SimpleNamespace(compass_workload_size=declared) for _ in range(arrived)
+            SimpleNamespace(compass_workload_size=declared, arrive_time=0.0)
+            for _ in range(arrived)
         ]
         return scheduler
 

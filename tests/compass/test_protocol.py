@@ -146,6 +146,7 @@ class TestPreparationDoesNotSpendTheArrivalBarrier:
             pass
 
         seq = Seq()
+        seq.arrive_time = 0.0
         if declared is not None:
             seq.compass_workload_size = declared
         return seq

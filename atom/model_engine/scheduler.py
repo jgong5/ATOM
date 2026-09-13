@@ -1263,6 +1263,22 @@ class Scheduler:
             return False  # nobody declared a workload; nothing to hold for
 
         if len(self.waiting) >= expected:
+            # HTTP receipt order is not the declared arrival order. Once a
+            # long step makes several arrivals due, merely skipping future
+            # requests would let a later arrival overtake an earlier one.
+            # Order the initial queue once; subsequent preemption/requeue
+            # operations keep their normal priority after the latch opens.
+            # Replay supplies its existing row index to break equal-time ties
+            # independently of socket/worker order. Legacy clients without an
+            # index retain receipt order for ties; duplicate keys are stable.
+            def arrival_order(item):
+                received, seq = item
+                index = getattr(seq, "compass_workload_index", None)
+                return seq.arrive_time, received if index is None else index
+
+            self.waiting = deque(
+                seq for _, seq in sorted(enumerate(self.waiting), key=arrival_order)
+            )
             self._arrival_barrier_open = True
             logger.info(
                 "ATOMCompass: all %d declared requests have arrived; "

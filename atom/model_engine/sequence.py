@@ -254,6 +254,8 @@ class Sequence:
         # it has not been told about, so it holds until it has them all -- see
         # Scheduler._arrival_barrier_unmet. None on any normal request.
         self.compass_workload_size: int | None = None
+        # Replay row index: stable order for equal declared arrival times.
+        self.compass_workload_index: int | None = None
 
         # statistics fields
         self.arrive_time = 0.0

@@ -269,6 +269,9 @@ class CompletionRequest(BaseModel):
     # order. Told the total, it holds until every one has arrived and then every
     # jump is safe. Only useful for a closed workload; ignored without Compass.
     compass_workload_size: int | None = None
+    # Stable row index within that declared workload. Equal arrival times use
+    # this order rather than HTTP delivery order; ignored on a real clock.
+    compass_workload_index: int | None = Field(default=None, ge=0)
 
     def get_max_tokens(self) -> int:
         """Return the effective generation cap for completion requests."""
