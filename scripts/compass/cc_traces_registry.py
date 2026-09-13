@@ -150,7 +150,7 @@ SHARED_OPTIONS = (
     # group on the token axis.
     # Native absolute costs plus independently measured history differences,
     # with separate support bounds at each capture cell.
-    ("regions", "source-27b-tp1-history-delta"),
+    ("regions", "source-27b-tp1-history-2m"),
     # Family-price mode, explicitly on. Without it `gap_ratio(None)` is None,
     # `_price_library` builds a plain `PriceLibrary` with no curves, and every
     # parametric family -- the head row ladder below above all -- is dead
@@ -876,11 +876,83 @@ _WIDE_PREFILL_GDN = tuple(
 )
 
 
+#: Supplemental standalone local GEMM domains. The exports declare dense
+#: BF16 operands, no bias, the exact (N,K) geometry and MI308X hardware scope;
+#: no collective or target-engine measurement enters these sources. Their
+#: unsuffixed books are shared across logical ranks under that local-operator
+#: independence, not as another rank's measurement. Each book is exact_only
+#: and is appended after every existing measured source.
+_GEMM_DOMAIN_EXPORTS = {
+    1: (
+        "{root}/codex_regions/gemm_domain_v1/export_n14336_v1",
+        "{root}/codex_gemm_campaign_20260913_v1/tp1/export_n16480_k5120_v1",
+        "{root}/codex_gemm_campaign_20260913_v1/tp1/export_n5120_k6144_v1",
+        "{root}/codex_gemm_campaign_20260913_v1/tp1/export_n34816_k5120_v1",
+        "{root}/codex_gemm_campaign_20260913_v1/tp1/export_n5120_k17408_v1",
+        # The full dispatch survey exposed further holes in formerly
+        # interpolated brackets. These new exact rows follow every older book.
+        "{root}/codex_regions/gemm_closure_v1/export_n14336_k5120_v1",
+        "{root}/codex_regions/gemm_closure_v1/export_n16480_k5120_v1",
+        "{root}/codex_regions/gemm_closure_v1/export_n5120_k6144_v1",
+        "{root}/codex_regions/gemm_closure_v1/export_n34816_k5120_v1",
+        "{root}/codex_regions/gemm_closure_v1/export_n5120_k17408_v1",
+    ),
+    2: (
+        "{root}/codex_regions/gemm_domain_v1/export_n7168_v1",
+        "{root}/codex_gemm_campaign_20260913_v1/tp2_v2/export_n8240_k5120_v1",
+        "{root}/codex_gemm_campaign_20260913_v1/tp2_v2/export_n5120_k3072_v1",
+        "{root}/codex_gemm_campaign_20260913_v1/tp2_v2/export_n17408_k5120_v1",
+        "{root}/codex_gemm_campaign_20260913_v1/tp2_v2/export_n5120_k8704_v1",
+    ),
+    4: (
+        "{root}/codex_regions/gemm_domain_v1/export_n3584_v1",
+        "{root}/codex_gemm_campaign_20260913_v1/tp4_v2/export_n4120_k5120_v1",
+        "{root}/codex_gemm_campaign_20260913_v1/tp4_v2/export_n5120_k1536_v1",
+        "{root}/codex_gemm_campaign_20260913_v1/tp4_v2/export_n8704_k5120_v1",
+        "{root}/codex_gemm_campaign_20260913_v1/tp4_v2/export_n5120_k4352_v1",
+    ),
+}
+
+
+#: Qualified source use, frozen before E2E validation. These 85 training
+#: records use B8/4096 iterations/100 warmups and retain their three repeats.
+#: The ten reference anchors are validation-only and never enter these books.
+#: First-match precedence is legacy measurements, repairs, then supplements.
+_GEMM_REPAIR_ROOT = "{root}/codex_gemm_campaign_20260913_v1/source_stability_repair_v1"
+_GEMM_REPAIR_EXPORTS = {
+    1: tuple(f"{_GEMM_REPAIR_ROOT}/export_n{n}_k{k}_v1" for n, k in (
+        (5120, 6144), (5120, 17408), (16480, 5120), (34816, 5120))),
+    2: tuple(f"{_GEMM_REPAIR_ROOT}/export_n{n}_k{k}_v1" for n, k in (
+        (5120, 3072), (5120, 8704), (7168, 5120))),
+    4: tuple(f"{_GEMM_REPAIR_ROOT}/export_n{n}_k{k}_v1" for n, k in (
+        (3584, 5120), (4120, 5120), (5120, 1536), (5120, 4352), (8704, 5120))),
+}
+GEMM_SOURCE_DECISION = f"{_GEMM_REPAIR_ROOT}/SOURCE_USE_DECISION.json"
+GEMM_SOURCE_DECISION_SHA256 = (
+    "0ddec6a7614370d04a470de34afbe27983e341b34a48cef6a0edecf04ac11249")
+GEMM_SOURCE_QUALIFICATIONS = (
+    "M320/N5120/K3072 retains a 6.07% three-repeat range. Its projected "
+    "64-occurrence body contribution spans 0.275072 ms; this is not an E2E bound.",
+    "Five stable historical-anchor mismatches remain reported. All ten "
+    "reference anchors are validation-only; legacy exact prices stay first.",
+    "The first N5120/K6144 timing retains an unclassified transient-node "
+    "observation; it is not relabeled as a clean serial observation.",
+    "Source quality flags remain open. Paired E2E cc-traces must still prove "
+    "accuracy, memory, feasibility and ranking; MHA domain coverage is open.",
+)
+
+
 def per_width_options(tp: int) -> tuple:
     """The options this width adds to `SHARED_OPTIONS`, unresolved."""
+    gemm_exports = _GEMM_DOMAIN_EXPORTS[tp]
+    gemm_prices = tuple(f"{path}/prices.median.json:{path}/gemm_points.json:unregistered"
+                       for path in _GEMM_REPAIR_EXPORTS[tp] + gemm_exports)
+    bands = ",".join((dict(SHARED_OPTIONS)["dispatch_bands"],) + tuple(
+        f"aiter::gemm_a16w16={path}/bands.json" for path in gemm_exports))
     if tp == 1:
         return (
             ("tp", "1"),
+            ("dispatch_bands", bands),
             # The native BF16 binder produces shuffled five-dimensional KV
             # views. These audited declarations correct the old NHD label;
             # source books, coefficients and held-out predictions are intact.
@@ -890,7 +962,7 @@ def per_width_options(tp: int) -> tuple:
              "{root}/codex_decode_domain_v1/native_scope_v2/MEASURED_SCOPE.json"),
             ("attention_treatments", "{root}/codex_decode_domain_v1/TREATMENTS.json"),
             ("replay_target", _CAPTURED_TARGET),
-            ("price", ",".join(_tp1_prices())),
+            ("price", ",".join(_tp1_prices() + gemm_prices)),
             # src2c, not src1: the templates are what the step binds, and the
             # src1 capture recorded a decode whose attention chain was not
             # the deployed one. See `_tp1_prices` for what that changed and
@@ -937,8 +1009,10 @@ def per_width_options(tp: int) -> tuple:
         # nothing. It is a narrowed run and says so in its own provenance, so
         # PriceLibrary marks the library PARTIAL when it is on.
         prices = (_GEMM_SUPPLEMENT_V1,) + prices
+    prices += gemm_prices
     return (
         ("tp", str(tp)),
+        ("dispatch_bands", bands),
         ("attention_scope",
          "{root}/codex_wide_20260913/deployment_prefill_v2/tp{tp}/SCOPE.json"),
         ("measured_attention_scope",
@@ -955,8 +1029,12 @@ def per_width_options(tp: int) -> tuple:
 def options(tp: int, root) -> list:
     """The `KEY=VALUE` strings for this width, resolved against `root`."""
     root = str(Path(root))
+    # A per-width dispatch survey augments the shared witnesses. Emit the
+    # effective option once, as the served factory's dictionary consumes it.
+    configured = dict(SHARED_OPTIONS)
+    configured.update(per_width_options(tp))
     return [f"{key}={value.format(root=root, tp=tp)}"
-            for key, value in SHARED_OPTIONS + per_width_options(tp)]
+            for key, value in configured.items()]
 
 
 def option_paths(tp: int, root) -> dict:
@@ -994,6 +1072,9 @@ def option_paths(tp: int, root) -> dict:
     # it is what the pool is sized from at every width -- so it is reported
     # here with the files that are.
     found["memory_model"] = memory_model(tp, root)
+    # The qualification is shared across widths and is required evidence,
+    # not an oracle option or a new price source.
+    found["source_use_decision"] = GEMM_SOURCE_DECISION.format(root=str(Path(root)))
     return found
 
 
@@ -1013,7 +1094,8 @@ _GROUP_STEMS = ("ar_capture.json", "ar_plain.json", "ag_prices.json",
 
 
 def _group_level(role: str, path: str) -> bool:
-    return role in ("replay_target", "memory_model") or path.endswith(_GROUP_STEMS)
+    return (role in ("replay_target", "memory_model", "source_use_decision")
+            or path.endswith(_GROUP_STEMS))
 
 
 def resolution(tp: int, root) -> dict:
@@ -1261,6 +1343,13 @@ def cell_config(tp: int, klass: str, clients: int, root, resolved=None) -> dict:
         "oracle_options": options(tp, root),
         "rank_aggregation": RANK_AGGREGATION,
         "allocation": "native",
+        "source_use_decision": {
+            "path": GEMM_SOURCE_DECISION.format(root=str(Path(root))),
+            "sha256": GEMM_SOURCE_DECISION_SHA256,
+            "qualifications": list(GEMM_SOURCE_QUALIFICATIONS),
+            "all_source_quality_checks_passed": False,
+            "poc_accepted": False,
+        },
         "artifacts": option_paths(tp, root),
         # `resolved` is this width's, handed in by `check` so that twenty-four
         # cells do not stat the same hundred-odd files eight times each. It is

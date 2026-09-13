@@ -73,6 +73,93 @@ def test_interpolation_explicitly_preserves_the_existing_support_bound():
     assert limit == ParametricPriceLibrary().max_gap_ratio == 2.0
 
 
+@pytest.mark.parametrize("tp,n", [(1, 14336), (2, 7168), (4, 3584)])
+def test_gemm_domain_is_last_and_keeps_the_existing_dispatch_witnesses(tp, n):
+    items = registry.options(tp, "/source")
+    assert len({item.partition("=")[0] for item in items}) == len(items)
+    options = dict(item.split("=", 1) for item in items)
+    prefix = f"/source/codex_regions/gemm_domain_v1/export_n{n}_v1"
+    prices = options["price"].split(",")
+    new_exports = [path.format(root="/source", tp=tp)
+                   for path in registry._GEMM_DOMAIN_EXPORTS[tp]]
+    first_new = len(prices) - len(new_exports)
+    assert prices[first_new] == (
+        f"{prefix}/prices.median.json:{prefix}/gemm_points.json:unregistered")
+    assert prices[first_new:] == [
+        f"{path}/prices.median.json:{path}/gemm_points.json:unregistered"
+        for path in new_exports]
+    # Existing exact measurements win before the new exact-only supplement.
+    old = (list(registry._tp1_prices()) if tp == 1 else [
+        registry._WIDE_PREFILL_NONATTENTION,
+        registry._WIDE_PREFILL_MHA_EXACT[-1], registry._WIDE_PREFILL_GDN[-1]])
+    for spec in old:
+        assert prices.index(spec.format(root="/source", tp=tp)) < first_new
+    shared = dict(registry.SHARED_OPTIONS)["dispatch_bands"].format(
+        root="/source", tp=tp)
+    assert options["dispatch_bands"] == (
+        shared + "," + ",".join(
+            f"aiter::gemm_a16w16={path}/bands.json" for path in new_exports))
+    required = set(registry.required_artifacts(tp, "/source").values())
+    assert {f"{prefix}/prices.median.json", f"{prefix}/gemm_points.json",
+            f"{prefix}/bands.json"} <= required
+
+
+def test_gemm_domain_sources_are_explicit_shared_local_artifacts(tmp_path):
+    prefix = tmp_path / "codex_regions/gemm_domain_v1/export_n3584_v1"
+    prefix.mkdir(parents=True)
+    for filename in ("prices.median.json", "gemm_points.json", "bands.json"):
+        (prefix / filename).write_text("{}")
+    resolved = registry.resolution(4, tmp_path)
+    for rank in range(4):
+        source_rows = [row for row in resolved[rank].values()
+                       if str(prefix) in row["path"]]
+        assert len(source_rows) == 3
+        assert all(row["exists"] and not row["own"] for row in source_rows)
+
+
+@pytest.mark.parametrize("tp,count", [(1, 4), (2, 3), (4, 5)])
+def test_qualified_repairs_follow_legacy_and_precede_supplements(tp, count):
+    options = dict(item.split("=", 1) for item in registry.options(tp, "/source"))
+    prices = options["price"].split(",")
+    repairs = [(f"{path}/prices.median.json:{path}/gemm_points.json:unregistered")
+               .format(root="/source") for path in registry._GEMM_REPAIR_EXPORTS[tp]]
+    supplements = registry._GEMM_DOMAIN_EXPORTS[tp]
+    first_supplement = len(prices) - len(supplements)
+    assert len(repairs) == count
+    assert prices[first_supplement - count:first_supplement] == repairs
+    assert not any("export_n8240_k5120_v1" in p for p in repairs)
+    assert not any("anchor" in p or "holdout" in p for p in repairs)
+    legacy = (list(registry._tp1_prices()) if tp == 1 else [
+        registry._WIDE_PREFILL_NONATTENTION, registry._WIDE_PREFILL_GDN[-1]])
+    assert all(prices.index(p.format(root="/source", tp=tp)) < first_supplement - count
+               for p in legacy)
+
+
+def test_source_use_retains_qualifications_without_claiming_acceptance(tmp_path):
+    report = registry.check(tmp_path)
+    for cell in report["cells"]:
+        decision = cell["source_use_decision"]
+        assert decision["sha256"] == registry.GEMM_SOURCE_DECISION_SHA256
+        assert decision["all_source_quality_checks_passed"] is False
+        assert decision["poc_accepted"] is False
+        qualifications = " ".join(decision["qualifications"])
+        assert all(term in qualifications for term in (
+            "6.07%", "0.275072 ms", "Five stable", "ten reference anchors",
+            "transient-node", "Paired E2E", "MHA domain coverage is open"))
+        assert cell["artifacts"]["source_use_decision"] == decision["path"]
+        for roles in cell["resolution"].values():
+            assert roles["source_use_decision"]["path"] == decision["path"]
+            assert roles["source_use_decision"]["own"] is True
+
+
+def test_registry_selects_the_measured_2m_region_extension():
+    from atom.compass.core.cost.regions import region_model, SOURCE_27B_TP1_HISTORY_2M
+
+    for tp in registry.TPS:
+        options = dict(item.split("=", 1) for item in registry.options(tp, "/source"))
+        assert region_model(options["regions"]) is SOURCE_27B_TP1_HISTORY_2M
+
+
 def test_acceptance_never_carries_the_template_s_own_allocation():
     # The refusal this registry exists for. `carry_allocation=1` prices a step
     # against another step's blocks and says it is unmeasured; a diagnostic

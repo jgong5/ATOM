@@ -39,7 +39,7 @@ Every width shares these:
     --compass-oracle-option position_rows=3
     --compass-oracle-option cudagraph_mode=full
     --compass-oracle-option head=1
-    --compass-oracle-option regions=source-27b-tp1-history-delta
+    --compass-oracle-option regions=source-27b-tp1-history-2m
     --compass-oracle-option require_complete=1
     --compass-oracle-option allocation=native
     --compass-oracle-option derive=1
@@ -89,6 +89,27 @@ point cost with signed measured bands. Sixteen held-out cases had maximum
 increment error 6.081 microseconds, below the declared 110-microsecond source
 step-impact limit. This supports a component approximation; it does not close
 E2E accuracy, kernel-source stability, or cross-width validation.
+
+The registry now selects this 2M preparation profile and the qualified local
+GEMM source extension. Exact lookup keeps all 931 legacy measurements first,
+then reads 85 long-protocol repair records from 12 nonempty exports, followed
+by the 20 prior supplemental and closure books. The added books remain
+`exact_only`; no reference anchor or held-out observation enters fitting.
+The existing dispatch witnesses remain in use. The immutable source-use
+decision is
+`codex_gemm_campaign_20260913_v1/source_stability_repair_v1/SOURCE_USE_DECISION.json`,
+SHA256 `0ddec6a7614370d04a470de34afbe27983e341b34a48cef6a0edecf04ac11249`.
+
+This is qualified source use for E2E validation. The M320/N5120/K3072 repair
+retains its 6.07% three-repeat range; the projected 64-occurrence body
+contribution spans 0.275072 ms, which is not an E2E bound. Five stable
+historical-anchor mismatches and the first N5120/K6144 timing's unclassified
+transient-node observation also remain reported. All ten reference anchors
+stay validation-only, and none replaces a legacy price. The registry carries
+these qualifications with the decision reference; it does not mark source
+quality checks or PoC acceptance passed. MHA coverage beyond the previous
+measured domain remains open until its separate source experiment and the
+paired E2E cc-trace gates pass.
 
 The preceding `source-27b-tp1-history-64k` adds independently measured TP1 history
 support to `source-27b-tp1-prefill-seqs`. Single-row decode supports histories
