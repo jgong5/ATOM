@@ -182,6 +182,21 @@ def _locate(blob, key, name):
 
 class TestTheCanonicalDSLReachesTheValidator:
 
+    def test_scope_identity_comes_from_the_factory_read_not_a_later_disk_read(
+            self, monkeypatch, tmp_path):
+        scope = tmp_path / "scope.json"
+        scope.write_text('{"kv_cache_dtype": "bfloat16"}')
+        original = _sha(scope)
+        options = _tree(tmp_path)
+        options["attention_scope"] = str(scope)
+        options["interpolate"] = "1"
+        engine, _ = _served(tmp_path, options)
+        scope.write_text('{"kv_cache_dtype": "float16"}')
+        blob = _provenance(monkeypatch, engine)
+        compass = blob["compass"]
+        assert compass["oracle_option_sha256"]["attention_scope"] == original
+        assert compass["oracle_option_digest_source"]["attention_scope"] == "loaded"
+
     def test_same_named_price_books_both_reach_calibration_validation(
             self, monkeypatch, tmp_path):
         options = _tree(tmp_path)

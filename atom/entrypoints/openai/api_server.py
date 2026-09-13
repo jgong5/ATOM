@@ -2582,6 +2582,10 @@ _ROLE_OPTIONS = {
     "oracle.template": "template",
     "oracle.head_template": "head_template",
     "oracle.replay_target": "replay_target",
+    "oracle.attention_scope": "attention_scope",
+    "oracle.measured_attention_scope": "measured_attention_scope",
+    "oracle.attention_treatments": "attention_treatments",
+    "oracle.dispatch_bands": "dispatch_bands",
 }
 
 
