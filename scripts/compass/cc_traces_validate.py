@@ -147,6 +147,7 @@ MEASURED_COST_TERMS = (
     "execution_modelled",
 )
 SUPPLIED_COST_TERMS = ("capture", "calibration", "derivation", "load")
+OPTIONAL_DISCLOSURES = ("capture", "calibration", "load")
 
 #: The record shape whose supplied terms were bare numbers. Refused rather
 #: than upgraded: it never stated containment, so there is nothing to read.
@@ -2744,6 +2745,9 @@ def cell(args) -> int:
     missing = [t for t in MEASURED_COST_TERMS if not _finite(costs.get(t))]
     for term in SUPPLIED_COST_TERMS:
         value = costs.get(term)
+        if term in OPTIONAL_DISCLOSURES and _unknown_disclosure(value):
+            notes.append(f"{term} duration unknown: {value['source']}")
+            continue
         if isinstance(value, (int, float)):
             # A version 2 bare float. It never said whether it happens inside
             # a measured window, so it cannot be placed in a total now.
@@ -2782,8 +2786,8 @@ def cell(args) -> int:
     if missing:
         failures.append(
             f"costs.json does not record {', '.join(missing)}: the "
-            f"speedup claim cannot be separated from the capture "
-            f"and calibration it rests on"
+            f"replay gate requires measured execution and derivation; "
+            f"other durations must be measured or explicitly disclosed as unknown"
         )
     off_wall = _off_wall_clocks(costs)
     if off_wall:
@@ -3116,6 +3120,26 @@ def _supplied_seconds(costs: dict, term: str) -> float:
         if _finite(seconds):
             total += float(seconds)
     return total
+
+
+def _unknown_disclosure(value) -> bool:
+    """An explicit unknown, rather than an omitted or malformed measurement."""
+    return (
+        isinstance(value, dict)
+        and value.get("status") == "unknown"
+        and "seconds" in value and value["seconds"] is None
+        and isinstance(value.get("source"), str) and bool(value["source"].strip())
+        and "within" in value
+        and value["within"] in (None,) + MEASURED_COST_TERMS
+    )
+
+
+def _disclosed_seconds(costs: dict, term: str):
+    """Known seconds, or None. No part of an unknown total becomes zero."""
+    parts = _parts(costs, term)
+    if not parts or any(not _finite(p.get("seconds")) for p in parts):
+        return None
+    return sum(float(p["seconds"]) for p in parts)
 
 
 def _outside(costs: dict, term: str, *windows: str) -> float:
@@ -3606,10 +3630,31 @@ def _speedup(costs: dict, reuse_cells: int) -> dict:
     # was. A structure derived while the server came up is not in that window
     # and is added. Nothing here decides which is which: a part that does not
     # say what contains it is refused by `_costs` before this runs.
+    derivation_parts = _parts(costs, "derivation")
+    if not derivation_parts or any(
+        not _finite(p.get("seconds")) or p["seconds"] < 0
+        or not p.get("source") or "within" not in p
+        or p["within"] not in (None,) + MEASURED_COST_TERMS
+        for p in derivation_parts
+    ):
+        return {
+            "replay_ratio": None, "amortised_ratio": None, "meets_gate": None,
+            "reason": "required derivation has no complete measured duration and containment",
+        }
     derivation = _supplied_seconds(costs, "derivation")
     derivation_added = _outside(costs, "derivation", "execution_modelled")
     derivation_in_execution = derivation - derivation_added
-    acquisition = sum(_supplied_seconds(costs, t) for t in ("capture", "calibration"))
+    acquisition_terms = {t: _disclosed_seconds(costs, t)
+                         for t in ("capture", "calibration")}
+    acquisition = (sum(acquisition_terms.values())
+                   if all(v is not None for v in acquisition_terms.values()) else None)
+    unknown_disclosures = {
+        term: ((costs.get(term) or {}).get("source")
+               if isinstance(costs.get(term), dict) else None)
+              or "duration not recorded"
+        for term in OPTIONAL_DISCLOSURES
+        if _disclosed_seconds(costs, term) is None
+    }
     startup_real = float(costs.get("startup_real") or 0.0)
     startup_modelled = float(costs.get("startup_modelled") or 0.0)
     if modelled_repeats:
@@ -3657,9 +3702,17 @@ def _speedup(costs: dict, reuse_cells: int) -> dict:
             execution_modelled + _uncontained(costs, "derivation") + startup_modelled
         )
     replay_ratio = execution_real / predict_once if predict_once > 0 else None
-    per_cell = acquisition / max(1, reuse_cells)
-    amortised_total = modelled_total + per_cell
-    saved_per_cell = real_total - modelled_total
+    # `load` is already contained by measured startup under §5. Its unknown
+    # amount does not prevent a startup-inclusive ratio when that containment
+    # is explicit; an unknown uncontained amount does prevent it.
+    load = costs.get("load")
+    if _disclosed_seconds(costs, "load") is None and not (
+        _unknown_disclosure(load) and load["within"] == "startup_real"
+    ):
+        real_total = None
+    amortised_total = (modelled_total + acquisition / max(1, reuse_cells)
+                       if acquisition is not None else None)
+    saved_per_cell = (real_total - modelled_total if real_total is not None else None)
     return {
         "gate": (
             f"execution_real / (execution_modelled + the derivation that "
@@ -3678,19 +3731,20 @@ def _speedup(costs: dict, reuse_cells: int) -> dict:
         "derivation_per_repeat_s": derivation_added_reported,
         "predict_once_s": predict_once,
         "acquisition_s": acquisition,
-        "acquisition_terms": {
-            "capture": _supplied_seconds(costs, "capture"),
-            "calibration": _supplied_seconds(costs, "calibration"),
-        },
+        "acquisition_terms": acquisition_terms,
+        "unknown_disclosures": unknown_disclosures,
         "startup_inclusive_ratio": (
-            real_total / modelled_total if modelled_total > 0 else None
+            real_total / modelled_total
+            if real_total is not None and modelled_total > 0 else None
         ),
         "amortised_ratio": (
-            real_total / amortised_total if amortised_total > 0 else None
+            real_total / amortised_total if real_total is not None
+            and amortised_total is not None and amortised_total > 0 else None
         ),
         "amortised_over_cells": reuse_cells,
         "break_even_cells": (
-            math.ceil(acquisition / saved_per_cell)
+            None if acquisition is None or saved_per_cell is None
+            else math.ceil(acquisition / saved_per_cell)
             if saved_per_cell > 0 and acquisition > 0
             else (0 if acquisition == 0 else None)
         ),

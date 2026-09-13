@@ -1363,6 +1363,60 @@ class TestCalibrationLeakage:
 
 
 class TestCostAndSpeedup:
+    def test_unknown_disclosures_do_not_refuse_valid_execution_and_derivation(self, cell):
+        costs = json.loads((cell / "costs.json").read_text())
+        expected = validate._speedup(costs, reuse_cells=24)["replay_ratio"]
+        for term in validate.OPTIONAL_DISCLOSURES:
+            costs[term] = {
+                "seconds": None, "status": "unknown",
+                "source": f"ledger.json: {term} wall interval was not recorded",
+                "within": "startup_real" if term == "load" else None,
+            }
+        (cell / "costs.json").write_text(json.dumps(costs))
+        assert run(cell) == 0
+        result = verdict(cell)["speedup"]
+        assert result["replay_ratio"] == pytest.approx(expected)
+        assert result["acquisition_s"] is None
+        assert result["acquisition_terms"] == {"capture": None, "calibration": None}
+        assert result["amortised_ratio"] is None
+        assert result["break_even_cells"] is None
+        assert set(result["unknown_disclosures"]) == set(validate.OPTIONAL_DISCLOSURES)
+        assert any("capture duration unknown" in note for note in verdict(cell)["notes"])
+
+    def test_only_figures_depending_on_unknown_terms_are_unknown(self):
+        costs = self._wall_costs(
+            capture={"seconds": None, "status": "unknown", "source": "missing log", "within": None},
+            calibration=_supplied(12.0),
+            load={"seconds": None, "status": "unknown", "source": "not separately timed",
+                  "within": "startup_real"},
+            startup_real=50, startup_modelled=5)
+        result = validate._speedup(costs, reuse_cells=24)
+        assert result["replay_ratio"] == pytest.approx(30)
+        assert result["startup_inclusive_ratio"] == pytest.approx(350 / 15)
+        assert result["acquisition_terms"] == {"capture": None, "calibration": 12.0}
+        assert result["amortised_ratio"] is None
+        costs["load"]["within"] = None
+        outside = validate._speedup(costs, reuse_cells=24)
+        assert outside["replay_ratio"] == result["replay_ratio"]
+        assert outside["startup_inclusive_ratio"] is None
+
+    @pytest.mark.parametrize("value", [None, {}, {"seconds": None, "status": "unknown",
+        "source": "unrecorded", "within": None}])
+    def test_speedup_itself_refuses_unknown_required_derivation(self, value):
+        costs = self._wall_costs(derivation=value)
+        result = validate._speedup(costs, reuse_cells=24)
+        assert result["replay_ratio"] is None
+        assert result["meets_gate"] is None
+        assert "required derivation" in result["reason"]
+
+    def test_unknown_derivation_remains_a_cell_refusal(self, cell):
+        costs = json.loads((cell / "costs.json").read_text())
+        costs["derivation"] = {"seconds": None, "status": "unknown",
+                               "source": "unrecorded", "within": None}
+        (cell / "costs.json").write_text(json.dumps(costs))
+        assert run(cell) == 1
+        assert verdict(cell)["speedup"]["meets_gate"] is None
+
     def test_missing_cost_terms_are_refused(self, cell):
         (cell / "costs.json").write_text(json.dumps({"execution_real": 100.0}))
         assert run(cell) == 1
@@ -3258,7 +3312,7 @@ class TestEveryRepeatIsAccountedFor:
         return self._costs(
             real_by_repeat={"1": 20.0, "2": 20.0, "3": 20.0},
             modelled_by_repeat={"1": 20.0, "2": 20.0, "3": 20.0},
-            derivation=[],
+            derivation=_supplied(0.0, source="derivations.jsonl (no derivations)"),
             **over,
         )
 

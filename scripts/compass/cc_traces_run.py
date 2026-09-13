@@ -198,6 +198,9 @@ MEASURED_TERMS = (
     "execution_modelled",
 )
 SUPPLIED_TERMS = ("capture", "calibration", "derivation", "load")
+# Protocol §5 reports these beside the replay gate. Their absence must be
+# disclosed, but cannot turn a measured replay ratio into an unknown one.
+OPTIONAL_DISCLOSURES = ("capture", "calibration", "load")
 
 #: Which measured window each supplied term happens *inside*, when it does.
 #: `CC_TRACES_PROTOCOL.md` §5 defines `load` as "weight load and graph capture
@@ -1926,10 +1929,27 @@ def costs(args) -> int:
         sources = getattr(args, f"{term}_source") or []
         withins = getattr(args, f"{term}_within") or []
         repeats = getattr(args, f"{term}_repeat") or []
+        unknown = getattr(args, f"{term}_unknown", None)
+        if unknown is not None:
+            if not unknown.strip() or values or sources or withins or repeats:
+                missing.append(
+                    f"--{term}-unknown needs a nonempty source/reason and "
+                    f"cannot be combined with measured --{term} parts"
+                )
+            else:
+                within = CONTAINED_BY_DEFAULT[term]
+                merged[term] = {
+                    "seconds": None, "status": "unknown", "source": unknown,
+                    "within": None if within == "none" else within,
+                    "repeat": None,
+                }
+            continue
         if not values:
             missing.append(
                 f"--{term} (nothing in this cell measures it; it is an input. "
-                f"If it was never recorded, say so -- it is not zero)"
+                + (f"Use --{term}-unknown SOURCE_OR_REASON if it was never "
+                   "recorded -- it is not zero)" if term in OPTIONAL_DISCLOSURES
+                   else "Required derivation cannot be unknown or omitted)")
             )
             continue
         if (
@@ -2010,7 +2030,7 @@ def costs(args) -> int:
         print(
             f"  {term}: "
             + " + ".join(
-                f"{p['seconds']:.3f}"
+                (f"{p['seconds']:.3f}" if p["seconds"] is not None else "unknown")
                 + (f" (inside {p['within']})" if p["within"] else " (inside nothing)")
                 for p in parts
             )
@@ -2113,6 +2133,13 @@ def main(argv=None) -> int:
                 f"{CONTAINED_BY_DEFAULT[term] or 'none -- must be stated'}"
             ),
         )
+        if term in OPTIONAL_DISCLOSURES:
+            c.add_argument(
+                f"--{term}-unknown", default=None, metavar="SOURCE_OR_REASON",
+                help="explicitly disclose an unrecorded duration as null; "
+                     "figures that require it stay unknown, without changing "
+                     "the execution plus derivation replay gate",
+            )
     c.add_argument(
         "--derivation-journal",
         action="append",

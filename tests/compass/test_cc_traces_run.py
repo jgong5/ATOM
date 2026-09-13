@@ -836,6 +836,42 @@ class TestTheCostsItCanMeasure:
         assert run_mod.main(argv) == 2
         assert "costs.modelled.json" in capsys.readouterr().err
 
+    def test_unknown_acquisition_and_load_can_be_disclosed_beside_the_gate(self, tmp_path):
+        cell = tmp_path / "tp2_clients_large_c4"
+        self._partials(cell)
+        argv = ["costs", str(cell), "--derivation", "5",
+                "--derivation-source", "derivation.jsonl", "--derivation-within", "none"]
+        for term in run_mod.OPTIONAL_DISCLOSURES:
+            argv += [f"--{term}-unknown", f"ledger.json: {term} wall interval was not recorded"]
+        assert run_mod.main(argv) == 0
+        costs = json.loads((cell / "costs.json").read_text())
+        for term in run_mod.OPTIONAL_DISCLOSURES:
+            assert costs[term]["seconds"] is None
+            assert costs[term]["status"] == "unknown"
+        assert costs["load"]["within"] == "startup_real"
+        validate = _load("cc_traces_validate")
+        result = validate._speedup(costs, reuse_cells=24)
+        assert result["replay_ratio"] == pytest.approx(300 / 35)
+        assert result["meets_gate"] is True
+        assert result["acquisition_s"] is None
+        assert result["amortised_ratio"] is None
+        assert result["break_even_cells"] is None
+
+    def test_unknown_optional_terms_do_not_allow_missing_derivation(self, tmp_path):
+        cell = tmp_path / "tp2_clients_large_c4"
+        self._partials(cell)
+        argv = ["costs", str(cell)]
+        for term in run_mod.OPTIONAL_DISCLOSURES:
+            argv += [f"--{term}-unknown", "ledger.json: wall interval unavailable"]
+        assert run_mod.main(argv) == 2
+        assert not (cell / "costs.json").exists()
+
+    def test_unknown_cannot_overwrite_a_supplied_measurement(self, tmp_path):
+        cell = tmp_path / "tp2_clients_large_c4"
+        self._partials(cell)
+        assert run_mod.main(self._argv(cell) + ["--capture-unknown", "not recorded"]) == 2
+        assert not (cell / "costs.json").exists()
+
     def test_a_complete_merge_carries_every_term_the_validator_reads(self, tmp_path):
         cell = tmp_path / "tp2_clients_large_c4"
         self._partials(cell)
