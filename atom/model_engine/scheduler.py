@@ -888,6 +888,7 @@ class ScheduledBatchOutput:
         logprobs=None,
         dspark_ell: np.ndarray | None = None,
         compass_step_seconds: float | None = None,
+        compass_output_ready_seconds: float | None = None,
     ):
         self.req_ids = req_ids
         self.token_ids = token_ids
@@ -896,6 +897,9 @@ class ScheduledBatchOutput:
         # waiting, because the runner executes in a different process and has
         # no clock of its own. None during a normal run.
         self.compass_step_seconds = compass_step_seconds
+        # Timing and token identity are separate: buffered previous tokens
+        # may still wait for a synchronization in the current forward.
+        self.compass_output_ready_seconds = compass_output_ready_seconds
         self.draft_token_ids = draft_token_ids
         self.num_rejected = num_rejected
         self.num_bonus = num_bonus
@@ -2708,6 +2712,13 @@ class Scheduler:
                 # decides which of it to act on.
                 returned=[str(r) for r in (fwd_output.req_ids or [])],
                 deferred=bool(is_deferred_out),
+                step_seconds=getattr(fwd_output, "compass_step_seconds", None),
+                output_ready_seconds=getattr(fwd_output, "compass_output_ready_seconds", None),
+                step_started_at=getattr(batch, "compass_started_at", None),
+                query_lens=([int(n) for n in batch.num_scheduled_tokens]
+                            if batch is not None else None),
+                context_lens=([int(n) for n in batch.context_lens]
+                              if batch is not None else None),
                 token_rows=len(prev_token_ids) if prev_token_ids is not None else 0,
                 # What was actually scheduled, and whether it was a step that
                 # samples anything at all.

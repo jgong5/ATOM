@@ -317,7 +317,9 @@ class CompassPredictMixin:
                                  req_ids=list(batch.req_ids),
                                  started_at=started_at,
                                  decision=getattr(batch, "compass_decision", None),
-                                 ranks=ranks)
+                                 ranks=ranks,
+                                 visibility={"seconds": cost.output_ready_seconds,
+                                             "basis": dict(cost.output_ready_basis)})
         self._step_count = getattr(self, "_step_count", 0) + 1
         logger.debug(
             "COMPASS step %d: reqs=%d tokens=%d prefill_tokens=%d cost=%.6fs",
@@ -386,6 +388,7 @@ class CompassPredictMixin:
             # the virtual clock advances by, and it belongs to the step that
             # just ran.
             compass_step_seconds=cost.seconds,
+            compass_output_ready_seconds=cost.output_ready_seconds,
         )
 
     def _estimate_over_ranks(self, shape: StepShape):
@@ -433,7 +436,9 @@ class CompassPredictMixin:
         import dataclasses
 
         seconds_by_rank: dict[str, float] = {}
+        ready_by_rank: dict[str, float] = {}
         slowest = None
+        last_ready = None
         for r in range(width):
             at_rank = dataclasses.replace(
                 shape, rank_coords={**dict(shape.rank_coords or {}), "tp": r})
@@ -442,15 +447,28 @@ class CompassPredictMixin:
             # averaging-away this policy exists to stop.
             cost_r = self._oracle.estimate(at_rank)
             seconds_by_rank[str(r)] = cost_r.seconds
+            ready_by_rank[str(r)] = cost_r.output_ready_seconds
+            if last_ready is None or cost_r.output_ready_seconds > last_ready[1].output_ready_seconds:
+                last_ready = (r, cost_r)
             if slowest is None or cost_r.seconds > slowest[1].seconds:
                 slowest = (r, cost_r)
         assert slowest is not None
         spread = max(seconds_by_rank.values()) - min(seconds_by_rank.values())
-        return slowest[1], {
+        # One rank can own the blocking prefix while another owns the largest
+        # whole-step total. Waiting only for the latter's prefix publishes
+        # group outputs before all ranks can have reached the drain.
+        group_cost = dataclasses.replace(
+            slowest[1], output_ready_seconds=last_ready[1].output_ready_seconds,
+            output_ready_basis=(dict(last_ready[1].output_ready_basis,
+                                     rank=last_ready[0], aggregation="maximum rank prefix")
+                                if last_ready[1].output_ready_seconds else {}))
+        return group_cost, {
             "policy": "slowest",
             "priced_ranks": list(range(width)),
             "group_width": width,
             "seconds_by_rank": seconds_by_rank,
+            "output_ready_seconds_by_rank": ready_by_rank,
+            "output_ready_rank": last_ready[0],
             "slowest_rank": slowest[0],
             "spread_seconds": spread,
             "exactness": "approximation: max of whole-rank totals; exact only "
@@ -490,7 +508,8 @@ class CompassPredictMixin:
                             started_at: Optional[float] = None,
                             decision: Optional[dict] = None,
                             spans: Optional[dict] = None,
-                            ranks: Optional[dict] = None) -> None:
+                            ranks: Optional[dict] = None,
+                            visibility: Optional[dict] = None) -> None:
         """Append one timed step to the table.
 
         Appended and flushed per step rather than collected and written at exit.
@@ -574,6 +593,7 @@ class CompassPredictMixin:
             # reduced to one. Absent at TP1, where there is one rank and the
             # question does not arise.
             **({"rank_aggregation": ranks} if ranks else {}),
+            **({"output_visibility": visibility} if visibility is not None else {}),
         }) + "\n")
         self._measure_fh.flush()
 

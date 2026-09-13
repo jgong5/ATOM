@@ -92,10 +92,16 @@ class StepCost:
 
     seconds: float
     breakdown: Mapping[str, float] = field(default_factory=dict)
+    #: Current-step work that must elapse before a previous step's buffered
+    #: tokens can be published. Part of seconds, never an additional cost.
+    output_ready_seconds: float = 0.0
+    output_ready_basis: Mapping[str, object] = field(default_factory=dict)
 
     def __post_init__(self) -> None:
         if self.seconds < 0.0:
             raise ValueError(f"step cost must be non-negative, got {self.seconds}")
+        if not 0.0 <= self.output_ready_seconds <= self.seconds:
+            raise ValueError("output-ready offset must lie within the step cost")
 
 
 @runtime_checkable

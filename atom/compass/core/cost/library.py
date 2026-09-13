@@ -696,8 +696,13 @@ class PriceLibrary:
                 f"(have: {'; '.join(sorted({_scope_note(r['scope']) for r in fits}))})")
         return matched[0], ""
 
+    def host_sync_reason(self, op: dict) -> Optional[str]:
+        """A source-witnessed synchronization in this operator, if declared."""
+        return None
+
     def body(self, graph_blob: dict,
-             registration: Optional[str] = None) -> tuple[float, Coverage, int]:
+             registration: Optional[str] = None, *,
+             timing: Optional[dict] = None) -> tuple[float, Coverage, int]:
         """Sum a graph's operators against the library.
 
         Returns the seconds, the coverage, and the launch count -- the last
@@ -716,6 +721,9 @@ class PriceLibrary:
         """
         from atom.compass.core.cost.priced import HOST_SYNC
 
+        if timing is not None:
+            timing.clear()
+
         topology = dict(((graph_blob.get("key") or {}).get("topology") or []))
         if registration is None:
             declared = (graph_blob.get("provenance") or {}).get(REQUIRED_KEY)
@@ -731,7 +739,16 @@ class PriceLibrary:
         #: them, so the record a reader gets back is the step's own order and
         #: not a dict's.
         by_key: dict[str, dict] = {}
-        for op in ops:
+        for index, op in enumerate(ops):
+            if timing is not None:
+                reason = self.host_sync_reason(op)
+                if reason is not None:
+                    # The same ordered sum used for the total. No second
+                    # pricing pass, and no estimate of the opaque op's
+                    # unresolved internal prefix before its synchronization.
+                    timing.update(seconds=total, launches=launches,
+                                  operator=op["name"], priced_operator_index=index,
+                                  reason=reason)
             record, detail = self.lookup(op, topology, registration)
             if record is None:
                 refused[op["name"]] = refused.get(op["name"], 0) + 1
@@ -1142,8 +1159,15 @@ class LibraryCostOracle:
         key = _price_key(shape, graph, head_graph)
         priced = self._priced.get(key)
         if priced is None:
-            body, coverage, launches = self.library.body(
-                graph, self.body_registration)
+            timing = ({} if shape.is_prefill and shape.produces_output and any(
+                c > q for q, c in zip(shape.num_scheduled_tokens,
+                                     shape.context_lens)) else None)
+            if timing is None:
+                body, coverage, launches = self.library.body(
+                    graph, self.body_registration)
+            else:
+                body, coverage, launches = self.library.body(
+                    graph, self.body_registration, timing=timing)
             if head_graph is None:
                 head, head_coverage, head_launches = 0.0, None, 0
             else:
@@ -1157,9 +1181,9 @@ class LibraryCostOracle:
             self.price_cache_misses += 1
             if len(self._priced) < self.price_cache_limit:
                 self._priced[key] = (body, coverage, launches, head,
-                                     head_coverage, head_launches)
+                                     head_coverage, head_launches, timing)
         else:
-            body, coverage, launches, head, head_coverage, head_launches = priced
+            body, coverage, launches, head, head_coverage, head_launches, timing = priced
             self.price_cache_hits += 1
         self.last_coverage = coverage
         if self.require_complete and not coverage.complete:
@@ -1183,7 +1207,16 @@ class LibraryCostOracle:
             if runner:
                 breakdown["<runner>"] = runner
         total = max(body + overhead + head + runner, self.floor_seconds)
-        return StepCost(seconds=total, breakdown=breakdown)
+        ready, basis = 0.0, {}
+        if timing:
+            ready = (timing["seconds"]
+                     + timing["launches"] * self.seconds_per_launch
+                     + breakdown.get("<prepare>", 0.0))
+            basis = dict(timing, placement="before the last synchronizing operator",
+                         approximation="preceding complete operators plus preparation; "
+                                       "opaque operator internal prefix unresolved")
+        return StepCost(seconds=total, breakdown=breakdown,
+                        output_ready_seconds=ready, output_ready_basis=basis)
 
     def _check_body_rows(self, graph: dict, shape: StepShape) -> None:
         """Refuse a body graph traced over a different number of rows.

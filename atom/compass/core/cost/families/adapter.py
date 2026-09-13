@@ -1443,6 +1443,11 @@ class ParametricPriceLibrary(PriceLibrary):
             scope.setdefault("topology", _topology_key(topology))
         return scope or None
 
+    def host_sync_reason(self, op: dict):
+        from atom.compass.core.cost.visibility import cached_prefill_sync_reason
+
+        return cached_prefill_sync_reason(op, self._declared_scope(op))
+
     def _declared_scope(self, op: dict) -> dict:
         """What the asking deployment declares, for THIS call's family.
 

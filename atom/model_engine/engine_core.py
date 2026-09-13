@@ -101,7 +101,7 @@ def _stamp_step_start(scheduled_batch) -> None:
         pass
 
 
-def _advance_clock_for(fwd_out) -> None:
+def _advance_clock_for(fwd_out, *, before_output: bool | None = None) -> None:
     """Advance a virtual clock by a simulated step's predicted duration.
 
     A no-op during a normal run: the output carries no duration, and the wall
@@ -112,6 +112,13 @@ def _advance_clock_for(fwd_out) -> None:
     seconds = getattr(fwd_out, "compass_step_seconds", None)
     if seconds is None:
         return
+    if before_output is not None:
+        ready = getattr(fwd_out, "compass_output_ready_seconds", None)
+        if ready is None:
+            ready = 0.0 if _defers_output(fwd_out) else seconds
+        if not 0.0 <= ready <= seconds:
+            raise ValueError("output-ready offset must lie within the step cost")
+        seconds = ready if before_output else seconds - ready
     advance = getattr(get_clock(), "advance", None)
     if advance is not None:
         advance(seconds)
@@ -120,45 +127,13 @@ def _advance_clock_for(fwd_out) -> None:
 def _defers_output(fwd_out) -> bool:
     """Whether this output carries the *previous* step's tokens.
 
-    When it does, the clock must not be advanced past that step before
-    ``postprocess`` stamps them, or every token the previous step produced is
-    published at this step's completion instead of its own.
-
-    The flag alone would not justify that. It says the buffer holds the
-    previous step's tokens; it does not say when the host received them, and a
-    path that synchronised would hand them over only once the current step's
-    device work had finished -- in which case charging the drain at the
-    previous step's completion would be wrong in the other direction. So the
-    rule comes from the recorded events. Placing every real publication instant
-    on the reconstructed device timeline (``end[i] = max(end[i-1],
-    started_at[i]) + seconds[i]``, because the host launch and the CUDA-event
-    span describe a launch rather than an execution), all 192 first-token
-    publications across the 27B short cells at TP 1, 2 and 4 landed on the
-    completion of the step that produced them, none on the next step's:
-    slack after that completion was 0.117s / 0.125s / 0.118s median, against
-    next-step gaps of 4.47s, 2.34s and 1.19s. See ``agent_scratch/poc``'s
-    publication placement for the artifact.
-
-    Two things follow. The ordering here is right: a deferred output is drained
-    at the producing step's completion. And the residual ~0.12s is host drain
-    latency the virtual clock does not carry -- it is a constant on both the
-    first-token and the finish stamp, so it cancels out of TPOT and adds about
-    half a percent to a 26s TTFT.
-
-    On a real engine none of this shows, because the CPU launches step N+1
-    while the device is still finishing step N: on the TP=1 cell step 1 was
-    launched 0.259s before step 0's forward completed. The wall clock at drain
-    time therefore already reads the producing step's completion. A virtual
-    clock has no such head start; it moves in whole steps.
-
-    Measured consequence on 27B TP=1 short, before this: simulated TPOT median
-    0.0343s against 0.0681s real, while total latency stayed exact. Time moved
-    between the two metrics rather than being lost, which is why a summed
-    step-cost check could not see it.
-
-    The clock stays monotonic either way -- this changes only *when* a step's
-    cost is charged, never the sign or the amount, and ``VirtualClock.advance``
-    refuses a negative in any case.
+    This is token identity, not a statement of host visibility. Cold prefill
+    and decode can drain those tokens while the current forward runs. Cached
+    ASM prefill instead synchronizes inside its prefix gather, so draining
+    must wait for part of the current forward. The predicted output carries
+    that distinct offset as compass_output_ready_seconds; the engine charges
+    it before publication and the remaining step cost afterward. The default
+    remains the original overlapping drain for outputs with no such offset.
     """
     return bool(getattr(fwd_out, "is_deferred_out", False))
 
@@ -492,11 +467,12 @@ class EngineCore:
             fwd_out = self.runner_mgr.call_func(
                 "forward", scheduled_batch, wait_out=True
             )
-            # Charged after postprocess when the output is deferred; see
-            # `_defers_output`. A step whose own tokens are in its own output
-            # is charged here, as before.
+            # Deferred identity still permits a blocking prefix in this
+            # forward. Charge only that prefix before publishing old tokens.
             if not _defers_output(fwd_out):
                 _advance_clock_for(fwd_out)
+            else:
+                _advance_clock_for(fwd_out, before_output=True)
             if (
                 self.scheduler.prefill_delayer is not None
                 and scheduled_batch.total_seqs_num_prefill > 0
@@ -522,7 +498,7 @@ class EngineCore:
             batch=scheduled_batch,
         )
         if _defers_output(fwd_out):
-            _advance_clock_for(fwd_out)
+            _advance_clock_for(fwd_out, before_output=False)
 
         # Send stream outputs to main process via output_queue
         try:
@@ -1378,6 +1354,8 @@ class DecodeEngineCore(EngineCore):
         fwd_out = self.runner_mgr.call_func("forward", scheduled_batch, wait_out=True)
         if not _defers_output(fwd_out):
             _advance_clock_for(fwd_out)
+        else:
+            _advance_clock_for(fwd_out, before_output=True)
         iter_ms = (get_clock().perf_counter() - t0) * 1000
         logger.info(
             f"iter {iter_ms:.2f}ms | "
@@ -1392,7 +1370,7 @@ class DecodeEngineCore(EngineCore):
             seqs.values(), fwd_out, stream_output_queue=self.stream_output_queue
         )
         if _defers_output(fwd_out):
-            _advance_clock_for(fwd_out)
+            _advance_clock_for(fwd_out, before_output=False)
         try:
             while not self.stream_output_queue.empty():
                 stream_outputs = self.stream_output_queue.get_nowait()
