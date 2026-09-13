@@ -782,6 +782,17 @@ _WIDE_GDN_NATIVE = (
 )
 
 
+#: AG32 v3 supplies every head row count at the final wide device mapping.
+#: Per-rank points preserve five repeats, both operand fills, and their union
+#: bounds. The one-row record additionally retains the indistinguishable
+#: prefill-tail case; the declared decode/row calibration point is unchanged.
+#: TP4 low-row scatter remains explicit and is not an acceptance claim.
+_WIDE_HEAD_GATHER = (
+    "{root}/codex_wide_20260913/gather_tp{tp}/prices.json:"
+    "{root}/codex_wide_20260913/gather_tp{tp}/graphs.json:unregistered"
+)
+
+
 def per_width_options(tp: int) -> tuple:
     """The options this width adds to `SHARED_OPTIONS`, unresolved."""
     if tp == 1:
@@ -830,7 +841,8 @@ def per_width_options(tp: int) -> tuple:
     #
     # `unified_attention_with_output_base` appears in no base book at either
     # wide width, so that family displaces nothing at any rank.
-    prices = (_WIDE_AR_ROWS + (_WIDE_MROPE_ROW1, _WIDE_GDN_NATIVE)
+    prices = (_WIDE_AR_ROWS + (_WIDE_MROPE_ROW1, _WIDE_GDN_NATIVE,
+                               _WIDE_HEAD_GATHER)
               + _WIDE_BODY_ROWS + (_WIDE_BOUNDED,) + prices)
     if tp == 4 and INCLUDE_GEMM_SUPPLEMENT_V1:
         # Ahead of the list: within one scope the first price wins, so a
