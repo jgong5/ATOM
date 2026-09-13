@@ -2559,21 +2559,35 @@ _ROLE_OPTIONS = {
 def _loaded_option_files(ranks: list) -> dict:
     """Per option key, the files the ranks actually read, by name and digest.
 
-    Keyed by basename to match what `_artifact_digests` produced, so every
-    existing consumer keeps working. Ranks are merged rather than reported
-    separately here because the per-rank detail is published whole, beside
-    this, under `compass.loaded_inputs`: two ranks that read different files
-    both appear, and a reader that wants to know which rank read which looks
-    there rather than at this summary.
+    Unambiguous basenames retain their existing names. If different paths
+    share one basename, every member of that group uses its attested path:
+    pricing campaigns commonly each produce `prices.tp0.json`, and choosing
+    one would hide another calibration input from validation. All identities
+    still come from the rank records, not from re-reading files on disk.
     """
-    found: dict = {}
+    by_option: dict = {}
     for record in ranks or ():
         for row in (record or {}).get("inputs") or ():
             key = _ROLE_OPTIONS.get(row.get("role"))
             if not key or not row.get("sha256"):
                 continue
-            found.setdefault(key, {})[
-                os.path.basename(row.get("path") or "")] = row["sha256"]
+            path = row.get("path") or ""
+            paths = by_option.setdefault(key, {})
+            if path in paths and paths[path] != row["sha256"]:
+                raise ValueError(
+                    f"{key}: {path!r} was read with different digests")
+            paths[path] = row["sha256"]
+    found = {}
+    for key, paths in by_option.items():
+        basenames: dict = {}
+        for path in paths:
+            name = os.path.basename(path)
+            basenames[name] = basenames.get(name, 0) + 1
+        found[key] = {
+            (os.path.basename(path) if basenames[os.path.basename(path)] == 1
+             else path): digest
+            for path, digest in paths.items()
+        }
     return found
 
 

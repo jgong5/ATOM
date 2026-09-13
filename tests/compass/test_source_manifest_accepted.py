@@ -175,12 +175,44 @@ def _locate(blob, key, name):
     """Where on disk a reported basename came from, per the rank's own record."""
     for rank in blob["compass"]["loaded_inputs"]["ranks"]:
         for row in rank["inputs"]:
-            if os.path.basename(row["path"]) == name:
+            if row["path"] == name or os.path.basename(row["path"]) == name:
                 return row["path"]
     raise AssertionError(f"{key}: {name} is not in any rank's record")
 
 
 class TestTheCanonicalDSLReachesTheValidator:
+
+    def test_same_named_price_books_both_reach_calibration_validation(
+            self, monkeypatch, tmp_path):
+        options = _tree(tmp_path)
+        books = []
+        for index, folder in enumerate(("mrope", "gdn")):
+            directory = tmp_path / folder
+            directory.mkdir()
+            for rank in range(WIDTH):
+                books.append(_price_file(directory, f"prices.tp{rank}.json",
+                                         0.001 * (index + 1) + rank / 10000))
+        options["price"] = ",".join(
+            f"{tmp_path / folder / 'prices.json'}:"
+            f"{tmp_path / 'pricegraph.json'}:unregistered"
+            for folder in ("mrope", "gdn"))
+        engine, _ = _served(tmp_path, options)
+        blob = _provenance(monkeypatch, engine)
+        members = blob["compass"]["oracle_option_files"]["price"]
+        for path in books:
+            assert members[path] == _sha(path)
+        assert "prices.tp0.json" not in members
+        assert "pricegraph.tp0.json" in members
+        registry = _registry_from_disk(blob)
+        assert validate.check_calibration(
+            _run(blob), registry, WIDTH, "d" * 64, {}) == []
+
+        # The first campaign must remain reachable by the leakage check,
+        # even after the second one reads a different `prices.tp0.json`.
+        bad = validate.check_calibration(
+            _run(blob), registry, WIDTH, "d" * 64,
+            {"real.r1_steps.jsonl": _sha(books[0])})
+        assert any("this cell's own" in reason for reason in bad)
 
     def test_the_option_members_are_the_files_the_ranks_opened(
             self, monkeypatch, tmp_path):
