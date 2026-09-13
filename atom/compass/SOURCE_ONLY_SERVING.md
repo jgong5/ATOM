@@ -39,7 +39,7 @@ Every width shares these:
     --compass-oracle-option position_rows=3
     --compass-oracle-option cudagraph_mode=full
     --compass-oracle-option head=1
-    --compass-oracle-option regions=source-27b-tp1-history-64k
+    --compass-oracle-option regions=source-27b-tp1-history-delta
     --compass-oracle-option require_complete=1
     --compass-oracle-option allocation=native
     --compass-oracle-option derive=1
@@ -48,6 +48,9 @@ Every width shares these:
 and adds its own prices and templates. At TP1 (`$SRC1` is `g4/src1`):
 
     --compass-oracle-option tp=1
+    --compass-oracle-option attention_scope=$ARTIFACTS/codex_decode_domain_v1/COMBINED_SCOPE.json
+    --compass-oracle-option measured_attention_scope=$ARTIFACTS/codex_decode_domain_v1/MEASURED_DECODE_SCOPE.json
+    --compass-oracle-option attention_treatments=$ARTIFACTS/codex_decode_domain_v1/TREATMENTS.json
     --compass-oracle-option price=$SRC1/p27bdec32.tp1.r0.json:$SRC1/b27dec32.tp1.r0.json:unregistered,$SRC1/p27hdec32.tp1.r0.json:$SRC1/h27dec32.tp1.r0.json:unregistered
     --compass-oracle-option template=$SRC1/b27dec32.tp1.r0.json
     --compass-oracle-option head_template=$SRC1/h27dec32.tp1.r0.json
@@ -60,7 +63,16 @@ measured row counts the evidence supports interpolating across. `1` used to be
 taken literally as that ratio, which no two distinct row counts can meet, and
 run 8 refused 2118 of 2443 operators for it.
 
-`regions=source-27b-tp1-history-64k` adds independently measured TP1 history
+`regions=source-27b-tp1-history-delta` retains the native preparation baseline
+and adds a bounded history contribution measured in the source runner. Every
+capture cell has its own summed-history limit, with per-request histories
+128..196608. The correction is at most 11.04 microseconds over the measured
+domain; inputs outside it are refused. Standalone absolute timing did not
+match the native remainder, so only history differences are transferred.
+The original 1025..1152-token answers are unchanged. Final end-to-end traces
+must validate this approximation and its transfer across widths.
+
+The preceding `source-27b-tp1-history-64k` adds independently measured TP1 history
 support to `source-27b-tp1-prefill-seqs`. Single-row decode supports histories
 1025..65600; exact two-row decode supports 513..65600 with summed history at
 most 66176. The coefficients are retained after a bounded source comparison;

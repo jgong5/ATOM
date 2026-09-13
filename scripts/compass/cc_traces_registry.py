@@ -148,10 +148,9 @@ SHARED_OPTIONS = (
     # `prefill-seqs` carries all of its anchors unchanged -- 1 and 2 sequences
     # answer exactly what they answered -- and adds one pooled 3..32-sequence
     # group on the token axis.
-    # The TP1 history extension covers the measured one-row and mixed two-row
-    # decode cells through 65600 tokens, with a separate summed-history bound.
-    # Other capture cells keep their previous support.
-    ("regions", "source-27b-tp1-history-64k"),
+    # Native absolute costs plus independently measured history differences,
+    # with separate support bounds at each capture cell.
+    ("regions", "source-27b-tp1-history-delta"),
     # Family-price mode, explicitly on. Without it `gap_ratio(None)` is None,
     # `_price_library` builds a plain `PriceLibrary` with no curves, and every
     # parametric family -- the head row ladder below above all -- is dead
@@ -167,10 +166,8 @@ SHARED_OPTIONS = (
     # declared nothing and its 64 attention operators were all refused by name
     # while agreeing on backend, KV layout, geometry and treatment.
     #
-    # The selected cached source population has eight KV variants. Its scope
-    # must move with its training inputs: mixing V=8 and V=16 would create two
-    # different treatments. The previous V=16 inputs remain archived below.
-    ("attention_scope", "{root}/z8v/acq_train/SCOPE.json"),
+    # Declarations are selected per width below. TP1 keeps cached V=8 facts
+    # separate from the measured decode kernel and its selected treatment.
     # The dispatch probe, as evidence rather than as a planning note. It says
     # which Tensile kernel the source serves each row count with on the
     # 64-token grid over 8192..16384, and the fitted GEMM family reads it to
@@ -414,6 +411,17 @@ def _tp1_prices() -> tuple:
     add(f"{_SRC2P}/prices/p27bdec32attn.tp1.r0.{_REP}.json",
         f"{_SRC2C}/b27dec32.tp1.r0.json")
     add(f"{_TP1}/p27hdec32.tp1.r0.json", f"{_SRC2C}/h27dec32.tp1.r0.json")
+
+    # Frozen native-order decode training only. These are the eighteen pairs
+    # in codex_decode_domain_v1/TRAINING_MANIFEST.json, including new-ID
+    # replacements for two failed attempts. Both holdouts remain excluded.
+    decode = "{root}/codex_decode_domain_v1"
+    for point, repeats in ((0, (2, 3, 4)), (1, (1, 2, 3)), (2, (1, 2, 3)),
+                           (3, (1, 2, 3)), (4, (1, 2, 3)), (5, (1, 2, 4))):
+        for repeat in repeats:
+            spec.append(
+                f"{decode}/prices/t10_{point}.rot2.tp1.r0.rep{repeat}.json:"
+                f"{decode}/seeds/b_t10_{point}.json:registered")
 
     # The 640- and 16384-token prefill cells.
     p640 = f"{_PC}/p640"
@@ -718,6 +726,10 @@ def per_width_options(tp: int) -> tuple:
     if tp == 1:
         return (
             ("tp", "1"),
+            ("attention_scope", "{root}/codex_decode_domain_v1/COMBINED_SCOPE.json"),
+            ("measured_attention_scope",
+             "{root}/codex_decode_domain_v1/MEASURED_DECODE_SCOPE.json"),
+            ("attention_treatments", "{root}/codex_decode_domain_v1/TREATMENTS.json"),
             ("replay_target", _CAPTURED_TARGET),
             ("price", ",".join(_tp1_prices())),
             # src2c, not src1: the templates are what the step binds, and the
@@ -762,6 +774,7 @@ def per_width_options(tp: int) -> tuple:
         prices = (_GEMM_SUPPLEMENT_V1,) + prices
     return (
         ("tp", str(tp)),
+        ("attention_scope", "{root}/z8v/acq_train/SCOPE.json"),
         ("replay_target", _DERIVED_TARGET),
         ("price", ",".join(prices)),
         ("template", f"{_WIDE}/b27dec32.json"),
@@ -802,7 +815,9 @@ def option_paths(tp: int, root) -> dict:
             for n, entry in enumerate(value.split(",")):
                 _, _, path = entry.partition("=")
                 found[f"dispatch_bands[{n}]"] = path
-        elif key in ("template", "head_template", "replay_target"):
+        elif key in ("template", "head_template", "replay_target",
+                     "attention_scope", "measured_attention_scope",
+                     "attention_treatments"):
             found[key] = value
     # Not an oracle option: the profile is a server flag, read by the replay
     # runner and not by the price composition. It is required all the same --
@@ -828,7 +843,9 @@ _GROUP_STEMS = ("ar_capture.json", "ar_plain.json", "ag_prices.json",
 
 
 def _group_level(role: str, path: str) -> bool:
-    return role in ("replay_target", "memory_model") or path.endswith(_GROUP_STEMS)
+    return role in ("replay_target", "memory_model", "attention_scope",
+                    "measured_attention_scope", "attention_treatments") \
+        or path.endswith(_GROUP_STEMS)
 
 
 def resolution(tp: int, root) -> dict:
