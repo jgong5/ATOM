@@ -879,6 +879,11 @@ class ShapeDeriver:
     an ``AllocationSource``.
     """
 
+    # spec_for and TraceRequest do not consume StepShape.compiled. ModelTracer
+    # always derives logical operators with compilation_level=0; the requested
+    # cudagraph mode/bucket remain independent structural inputs.
+    compilation_independent = True
+
     def __init__(self, tracer: ModelTracer, *, block_size: int,
                  max_model_len: int, position_rows: int = 1,
                  block_policy: str = "rounds", region: str = "body",

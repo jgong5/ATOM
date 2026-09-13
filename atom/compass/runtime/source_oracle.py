@@ -589,8 +589,13 @@ def seeded_graphs(paths, derive, allocation, coords=None, *,
         if collect is not None:
             collect.append(loaded)
         graphs[template_key(template_shape(graph))] = graph
+    compilation_independent = bool(
+        getattr(derive, "compilation_independent", False)
+        and all((graph.get("provenance") or {}).get("compilation_level") == 0
+                for graph in graphs.values()))
     return TemplateGraphs(graphs, derive=derive, allocation=allocation,
-                          cudagraph_mode=cudagraph_mode)
+                          cudagraph_mode=cudagraph_mode,
+                          compilation_independent=compilation_independent)
 
 
 class SourceComposition(NamedTuple):

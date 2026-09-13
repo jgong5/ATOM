@@ -407,13 +407,16 @@ def _reads_cache(shape: StepShape) -> bool:
                                         shape.context_lens))
 
 
-def template_key(shape: StepShape):
+def template_key(shape: StepShape, *, compilation_independent=False):
     """What makes two cohorts share a template.
 
     Everything ``StaticGraphs.key`` uses except the context lengths: the query
     lengths row by row (which set every tensor dimension and the attention
     branch), how much of the batch is prefill, the group widths and this rank's
-    coordinates, the replay bucket, and whether it ran compiled. Context lengths
+    coordinates, the replay bucket, and whether it ran compiled. A logical
+    deriver that explicitly does not consume the compilation flag can omit
+    that flag; this does not change the separate cost/coverage cache key.
+    Context lengths
     are exactly what binding supplies, so they are exactly what the template key
     drops.
     """
@@ -423,7 +426,9 @@ def template_key(shape: StepShape):
     coords = tuple(sorted((str(k), int(v))
                           for k, v in (shape.rank_coords or {}).items()))
     return (queries, int(shape.num_prefill_tokens), groups, coords,
-            shape.capture_bucket, shape.compiled, _reads_cache(shape))
+            shape.capture_bucket,
+            None if compilation_independent else shape.compiled,
+            _reads_cache(shape))
 
 
 def _cu_seqlens(queries):
@@ -912,10 +917,15 @@ class TemplateGraphs:
     """
 
     def __init__(self, templates=None, derive=None, allocation=None,
-                 representative_rank: int = 0, cudagraph_mode=None) -> None:
+                 representative_rank: int = 0, cudagraph_mode=None,
+                 compilation_independent: bool = False) -> None:
         import copy
 
+        self._compilation_independent = bool(compilation_independent)
         self._templates = copy.deepcopy(dict(templates or {}))
+        if self._compilation_independent:
+            self._templates = {key[:5] + (None,) + key[6:]: graph
+                               for key, graph in self._templates.items()}
         self._prepared_operators = {}
         self._prepared_plans = {}
         self._derive = derive
@@ -939,10 +949,14 @@ class TemplateGraphs:
     def add(self, shape: StepShape, graph: dict) -> None:
         import copy
 
-        key = template_key(shape)
+        key = self._key(shape)
         self._templates[key] = copy.deepcopy(graph)
         self._prepared_operators.clear()
         self._prepared_plans.clear()
+
+    def _key(self, shape):
+        return template_key(shape,
+                            compilation_independent=self._compilation_independent)
 
     def _representative_key(self, key):
         """``key`` with every rank coordinate moved to the representative."""
@@ -962,7 +976,7 @@ class TemplateGraphs:
         return self._graph_for(shape, prepare=True)
 
     def _graph_for(self, shape: StepShape, *, prepare: bool) -> Optional[dict]:
-        key = template_key(shape)
+        key = self._key(shape)
         template = self._templates.get(key)
         if template is None:
             standin = self._representative_key(key)

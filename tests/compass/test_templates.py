@@ -261,6 +261,22 @@ def test_template_graphs_binds_a_hit_and_counts_it():
     assert (cache.hits, cache.binds, cache.derivations) == (1, 1, 0)
 
 
+@pytest.mark.parametrize("independent", [False, True])
+def test_compilation_sharing_requires_an_explicit_logical_deriver_contract(independent):
+    from dataclasses import replace
+    from atom.compass.core.cost.library import StaticGraphs
+
+    original = shape([1] * 4, [1151] * 4)
+    compiled = replace(original, compiled=True)
+    cache = TemplateGraphs(allocation=carried(),
+                           compilation_independent=independent)
+    cache.add(original, template_for([(1, 1151)] * 4))
+    assert (cache.graph_for(compiled) is not None) is independent
+    assert cache.derivations == 0
+    # Graph equivalence does not merge execution cost contracts.
+    assert StaticGraphs.key(original) != StaticGraphs.key(compiled)
+
+
 def test_template_graphs_refuses_a_miss_with_no_deriver():
     cache = TemplateGraphs(allocation=carried())
     cache.add(shape([1] * 4, [1151] * 4), template_for([(1, 1151)] * 4))

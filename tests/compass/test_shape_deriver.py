@@ -48,6 +48,16 @@ def test_declared_deployment_rules_reach_the_spec():
     assert spec.position_rows == 3
 
 
+@pytest.mark.parametrize("compiled", [False, True])
+def test_compilation_cost_flag_is_not_an_input_to_logical_derivation(compiled):
+    from dataclasses import replace
+
+    source = deriver(cudagraph_mode="full")
+    original = shape([1, 1], [128, 256], bucket=2)
+    assert source.compilation_independent
+    assert source.spec_for(original) == source.spec_for(replace(original, compiled=compiled))
+
+
 def test_prompt_lens_are_left_to_the_block_policy():
     """Not invented here: ``admitted_lens`` already falls back to cached_lens."""
     spec = deriver().spec_for(shape([1] * 2, [100, 200]))
