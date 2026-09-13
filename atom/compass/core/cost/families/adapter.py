@@ -1444,6 +1444,8 @@ class ParametricPriceLibrary(PriceLibrary):
         return scope or None
 
     def host_sync_reason(self, op: dict):
+        if op.get("name") != attention.UNIFIED:
+            return None
         from atom.compass.core.cost.visibility import cached_prefill_sync_reason
 
         return cached_prefill_sync_reason(op, self._declared_scope(op))

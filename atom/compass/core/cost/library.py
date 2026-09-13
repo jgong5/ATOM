@@ -92,6 +92,8 @@ def _layout_fingerprint(op: dict) -> str:
     describe a dense rebuild.
     """
     layouts = op.get("layouts") or ()
+    if not layouts:
+        return "[]"
     return json.dumps([[int(pos), list(tuple(value))]
                        for pos, value in (tuple(x) for x in layouts)],
                       sort_keys=True)
