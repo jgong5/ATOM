@@ -641,6 +641,9 @@ class ParametricPriceLibrary(PriceLibrary):
         #: at different ragged structures are two design points and the second
         #: would be dropped as a duplicate.
         self._attention_obs: list = []
+        from atom.compass.core.cost.families.exact_attention import ExactAttentionOverrides
+
+        self._attention_exact = ExactAttentionOverrides()
         #: The observations above, each classified once. `None` means "not
         #: built"; `_collect_attention` drops it whenever `add()` changes the
         #: observations, so it can never answer for a population it was not
@@ -720,6 +723,9 @@ class ParametricPriceLibrary(PriceLibrary):
         # to be a digest of.
         _blob, graph = self._ingest(price_path, graph_path, registration,
                                     coords)
+        if "attention_exact_override" in (_blob.get("provenance") or {}):
+            self._attention_exact.add(self, price_path, _blob, graph)
+            return
         if (_blob.get("provenance") or {}).get("exact_only") is True:
             # A finite native domain can be measured exhaustively without
             # identifying a law outside it. Keep the paired graph's layout
@@ -1187,6 +1193,9 @@ class ParametricPriceLibrary(PriceLibrary):
 
     def lookup(self, op: dict, topology=None, registration=None, *,
                _modelled_memo=None):
+        exact = self._attention_exact.lookup(self, op, topology)
+        if exact is not None:
+            return exact
         if self.request_attention_treatments and op.get("name") in (
                 attention.UNIFIED, attention.GDN):
             regime = attention.regime_of(op, None, self._declared_scope(op))

@@ -50,12 +50,19 @@ from atom.compass.core.cost.prepared import (
     PreparedOperator, immutable_content_key, materialize_graph,
 )
 from atom.compass.core.cost.prepared_plan import PreparedGraph, StaticSegment
+from atom.compass.core.cost.families.exact_attention import AttestedAttentionRecord
 from atom.compass.core.loaded_input import load_json
 
 logger = logging.getLogger(__name__)
 
 __all__ = ["Coverage", "PriceLibrary", "GraphSource", "StaticGraphs",
            "LibraryCostOracle", "head_placement", "executed_body_rows"]
+
+
+def _record_launch_count(record):
+    if isinstance(record, AttestedAttentionRecord):
+        return record.attested_launch_count
+    return max(1, len(record.get("kernels") or {}))
 
 
 def _signature_of(op: dict) -> str:
@@ -590,6 +597,11 @@ class PriceLibrary:
         # under. The cost key is a reusable lookup index. It is not an
         # association, and anything per-record stays on the observation it
         # belongs to.
+        if "attention_exact_override" in provenance:
+            # Tagged attention evidence is admitted only by the scoped,
+            # witnessed override reader. It must never leak into an ordinary
+            # exact lookup when no generic treatment selector is configured.
+            return blob, graph
         layouts = {}
         if graph is not None:
             for op in graph["ops"]:
@@ -807,7 +819,7 @@ class PriceLibrary:
                     timing.clear()
                 return None
             total += float(record["seconds"])
-            launches += max(1, len(record.get("kernels") or {}))
+            launches += _record_launch_count(record)
             operators += 1
             if record.get(ZERO_WORK_FLAG):
                 zero_work += 1
@@ -933,7 +945,7 @@ class PriceLibrary:
                 continue
             seconds = float(record["seconds"])
             total += seconds
-            launches += max(1, len(record.get("kernels") or {}))
+            launches += _record_launch_count(record)
             # Three counts, decided here and not by subtraction downstream, and
             # both markers are read rather than inferred. A zero *time* is not
             # a zero-work operator -- a measurement can round to zero and a fit
