@@ -811,6 +811,20 @@ _WIDE_HEAD_GEMM = (
 )
 
 
+
+#: Exactly the seven source designs frozen before the two low-context
+#: holdouts: six native launch designs plus context 2048, three repeats.
+#: Byte-identical per-rank aliases retain raw timings, kernel observations and
+#: acquisition policies. MHA_DECODE_EXPORT_V1.json ties each alias to the
+#: immutable freeze's source manifest; heldout timings never enter this list.
+_WIDE_MHA_DECODE = tuple(
+    f"{{root}}/codex_wide_20260913/mha_decode_tp{{tp}}/point{point}.rep{rep}.json:"
+    f"{{root}}/codex_wide_20260913/mha_decode_tp{{tp}}/graph{point}.json:unregistered"
+    for point in range(7)
+    for rep in (1, 2, 3)
+)
+
+
 def per_width_options(tp: int) -> tuple:
     """The options this width adds to `SHARED_OPTIONS`, unresolved."""
     if tp == 1:
@@ -859,7 +873,7 @@ def per_width_options(tp: int) -> tuple:
     #
     # `unified_attention_with_output_base` appears in no base book at either
     # wide width, so that family displaces nothing at any rank.
-    prices = (_WIDE_AR_ROWS + (_WIDE_MROPE_ROW1, _WIDE_GDN_NATIVE,
+    prices = (_WIDE_MHA_DECODE + _WIDE_AR_ROWS + (_WIDE_MROPE_ROW1, _WIDE_GDN_NATIVE,
                                _WIDE_EMBEDDING, _WIDE_HEAD_GEMM,
                                _WIDE_HEAD_GATHER)
               + _WIDE_BODY_ROWS + (_WIDE_BOUNDED,) + prices)
@@ -871,7 +885,12 @@ def per_width_options(tp: int) -> tuple:
         prices = (_GEMM_SUPPLEMENT_V1,) + prices
     return (
         ("tp", str(tp)),
-        ("attention_scope", "{root}/z8v/acq_train/SCOPE.json"),
+        ("attention_scope",
+         "{root}/codex_wide_decode_tp{tp}_v1/NATIVE_DECODE_SCOPE.json"),
+        ("measured_attention_scope",
+         "{root}/codex_wide_decode_tp{tp}_v1/NATIVE_DECODE_SCOPE.json"),
+        ("attention_treatments",
+         "{root}/codex_wide_decode_tp{tp}_v1/TREATMENTS.json"),
         ("replay_target", _DERIVED_TARGET),
         ("price", ",".join(prices)),
         ("template", f"{_WIDE}/b27dec32.json"),
