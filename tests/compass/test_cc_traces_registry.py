@@ -412,7 +412,7 @@ def test_a_collective_s_price_list_is_the_group_s_not_a_rank_s(tmp_path):
         if Path(path).name in ("ar_capture.json", "ar_plain.json",
                                "ag_prices.json", "prices_registered.json",
                                "prices_unregistered.json"))
-    assert len(collectives) == 5
+    assert len(collectives) == 7
     for rank in range(4):
         for role in collectives:
             assert found[rank][role]["own"] is True
@@ -679,3 +679,34 @@ class TestTheRegistryIsOfTheMatrixThatRuns:
             assert cell in text
         for name in registry.check(tmp_path)["groups"]:
             assert f"## {name} -- " in text
+
+
+@pytest.mark.parametrize("tp", (2, 4))
+def test_ranked_attention_declarations_resolve_without_a_shared_file(tmp_path, tp):
+    roles = ("attention_scope", "measured_attention_scope", "attention_treatments")
+    paths = registry.required_artifacts(tp, tmp_path)
+    expected = {}
+    for role in roles:
+        base = Path(paths[role])
+        base.parent.mkdir(parents=True, exist_ok=True)
+        for rank in range(tp):
+            path = base.with_name(f"{base.stem}.tp{rank}{base.suffix}")
+            path.write_text("{}")
+            expected[role, rank] = str(path)
+    found = registry.resolution(tp, tmp_path)
+    for rank in range(tp):
+        for role in roles:
+            assert found[rank][role] == {
+                "path": expected[role, rank], "own": True, "exists": True}
+
+
+def test_ranked_attention_declaration_takes_precedence_over_shared(tmp_path):
+    base = Path(registry.required_artifacts(2, tmp_path)["attention_scope"])
+    base.parent.mkdir(parents=True, exist_ok=True)
+    base.write_text("{}")
+    rank1 = base.with_name(f"{base.stem}.tp1{base.suffix}")
+    rank1.write_text("{}")
+    found = registry.resolution(2, tmp_path)
+    assert found[0]["attention_scope"]["path"] == str(base)
+    assert found[1]["attention_scope"]["path"] == str(rank1)
+    assert all(found[r]["attention_scope"]["own"] for r in range(2))

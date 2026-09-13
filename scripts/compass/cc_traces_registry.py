@@ -825,6 +825,27 @@ _WIDE_MHA_DECODE = tuple(
 )
 
 
+
+#: Exact native prefill operands at the 27 token extents reached by the
+#: preserved client shapes. Each rank has its independently derived layout
+#: bundle and three source repeats on the final device mapping. Profiling was
+#: disabled after ROCm teardown failures, so these books declare exact_only:
+#: they supply no kernel-ID-dependent fit or dispatch interpolation.
+_WIDE_PREFILL_NONATTENTION = (
+    "{root}/codex_wide_20260913/prefill_nonattention_tp{tp}_prices_v1/prices.median.json:"
+    "{root}/codex_wide_20260913/prefill_nonattention_tp{tp}_v1/points.json:unregistered"
+)
+
+#: Every native prefill all-reduce message, checked for correct values in both
+#: capture contexts. Fifteen extents use custom all-reduce; twelve use RCCL.
+#: The custom registered-input flag is explicitly null on the RCCL branch.
+#: Exact books preserve that switch and all repeat ranges.
+_WIDE_PREFILL_AR = (
+    "{root}/codex_wide_20260913/ar_prefill_tp{tp}_v1/prices_unregistered.json",
+    "{root}/codex_wide_20260913/ar_prefill_tp{tp}_v1/prices_registered.json",
+)
+
+
 def per_width_options(tp: int) -> tuple:
     """The options this width adds to `SHARED_OPTIONS`, unresolved."""
     if tp == 1:
@@ -877,6 +898,8 @@ def per_width_options(tp: int) -> tuple:
                                _WIDE_EMBEDDING, _WIDE_HEAD_GEMM,
                                _WIDE_HEAD_GATHER)
               + _WIDE_BODY_ROWS + (_WIDE_BOUNDED,) + prices)
+    # Existing decoder/head sources keep precedence for shared signatures.
+    prices += (_WIDE_PREFILL_NONATTENTION,) + _WIDE_PREFILL_AR
     if tp == 4 and INCLUDE_GEMM_SUPPLEMENT_V1:
         # Ahead of the list: within one scope the first price wins, so a
         # supplement that is loaded after the book it supplements answers
@@ -959,9 +982,7 @@ _GROUP_STEMS = ("ar_capture.json", "ar_plain.json", "ag_prices.json",
 
 
 def _group_level(role: str, path: str) -> bool:
-    return role in ("replay_target", "memory_model", "attention_scope",
-                    "measured_attention_scope", "attention_treatments") \
-        or path.endswith(_GROUP_STEMS)
+    return role in ("replay_target", "memory_model") or path.endswith(_GROUP_STEMS)
 
 
 def resolution(tp: int, root) -> dict:
@@ -982,6 +1003,15 @@ def resolution(tp: int, root) -> dict:
     for rank in range(tp):
         per = {}
         for role, path in option_paths(tp, root).items():
+            if role in ("attention_scope", "measured_attention_scope",
+                        "attention_treatments"):
+                # The runtime prefers a rank's declaration when present and
+                # otherwise accepts a shared declaration. Follow the same
+                # resolution here; native wide scopes are rank-specific.
+                resolved, _own = resolve_rank_path(path, {"tp": rank})
+                per[role] = {"path": resolved, "own": True,
+                             "exists": Path(resolved).exists()}
+                continue
             if _group_level(role, path):
                 per[role] = {"path": path, "own": True,
                              "exists": Path(path).exists()}
