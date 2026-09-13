@@ -46,7 +46,10 @@ from typing import Optional, Protocol
 
 from atom.compass.core.cost.base import StepCost, StepShape
 from atom.compass.core.cost.identity import cost_key
-from atom.compass.core.cost.prepared import PreparedOperator, materialize_graph
+from atom.compass.core.cost.prepared import (
+    PreparedOperator, immutable_content_key, materialize_graph,
+)
+from atom.compass.core.cost.prepared_plan import PreparedGraph, StaticSegment
 from atom.compass.core.loaded_input import load_json
 
 logger = logging.getLogger(__name__)
@@ -461,6 +464,8 @@ class PriceLibrary:
         #: keeps its own ``signature``, which is the observation identity and
         #: is never rewritten.
         self._prices: dict[str, list] = {}
+        self._pricing_revision = 0
+        self._prepared_plan_prices = {}
         self._refusals: dict[str, str] = {}
         #: cost key -> how many lookups this library answered from a record
         #: measured under a different allocation. Not an error and not a
@@ -529,6 +534,8 @@ class PriceLibrary:
         """
         from atom.compass.core.cost.priced import _declared_topology
 
+        self._pricing_revision += 1
+        self._prepared_plan_prices.clear()
         blob, loaded = load_json(price_path, role="oracle.price", coords=coords)
         records = [loaded]
         graph = None
@@ -712,6 +719,107 @@ class PriceLibrary:
         """A source-witnessed synchronization in this operator, if declared."""
         return None
 
+    def _prepared_config_key(self, topology, registration):
+        if (not self._can_reuse_prepared_lookups()
+                or getattr(self.host_sync_reason, "__func__", None) is not PriceLibrary.host_sync_reason):
+            return None
+        return immutable_content_key((self._pricing_revision, topology, registration))
+
+    def _body_from_prepared_plan(self, graph, registration, timing):
+        """Reuse static arithmetic while retaining every dynamic boundary."""
+        from atom.compass.core.cost.priced import HOST_SYNC
+
+        plan = graph.current_plan()
+        if plan is None:
+            return None
+        topology = dict(((graph.get("key") or {}).get("topology") or []))
+        if registration is None:
+            declared = (graph.get("provenance") or {}).get(REQUIRED_KEY)
+            registration = declared if declared in _REGIMES else None
+        config = self._prepared_config_key(topology, registration)
+        if config is None:
+            return None
+        key = (plan.identity, config)
+        priced = self._prepared_plan_prices.get(key)
+        if priced is False:
+            return None
+        before = dict(self.address_shifted)
+        cold = priced is None
+        if cold:
+            parts = []
+            static_sources = {}
+            measured = interpolated = zero_work = 0
+            for step in plan.steps:
+                if not isinstance(step, StaticSegment):
+                    parts.append(None)
+                    continue
+                seconds, coverage, launches = self.body(
+                    {"ops": step.operators, "key": {"topology": list(topology.items())}},
+                    registration)
+                if not coverage.complete:
+                    self.address_shifted.clear()
+                    self.address_shifted.update(before)
+                    self._prepared_plan_prices[key] = False
+                    return None
+                parts.append((seconds, launches, coverage.operators))
+                measured += coverage.measured
+                interpolated += coverage.interpolated
+                zero_work += coverage.zero_work
+                for source, count in coverage.sources.items():
+                    static_sources[source] = static_sources.get(source, 0) + count
+            shifted = {name: count - before.get(name, 0)
+                       for name, count in self.address_shifted.items()
+                       if count != before.get(name, 0)}
+            priced = (tuple(parts), measured, interpolated, zero_work, static_sources, shifted)
+            if len(self._prepared_plan_prices) >= 64:
+                self._prepared_plan_prices.pop(next(iter(self._prepared_plan_prices)))
+            self._prepared_plan_prices[key] = priced
+        parts, measured, interpolated, zero_work, static_sources, shifted = priced
+        if not cold:
+            for name, count in shifted.items():
+                self.address_shifted[name] = self.address_shifted.get(name, 0) + count
+        sources = dict(static_sources)
+        total, launches, operators = 0.0, 0, 0
+        modelled_memo = {}
+        for step, part in zip(plan.steps, parts):
+            if part is not None:
+                seconds, count, size = part
+                total += seconds
+                launches += count
+                operators += size
+                continue
+            op = graph["ops"][step]
+            if op.get("name", "") in HOST_SYNC:
+                continue
+            if timing is not None:
+                reason = self.host_sync_reason(op)
+                if reason is not None:
+                    timing.update(seconds=total, launches=launches,
+                                  operator=op["name"], priced_operator_index=operators,
+                                  reason=reason)
+            record, detail = self._body_lookup(op, topology, registration, modelled_memo)
+            if record is None:
+                # The ordinary path owns complete ordered refusal evidence.
+                # Undo this attempted fast pass's counter charges before it runs.
+                self.address_shifted.clear()
+                self.address_shifted.update(before)
+                if timing is not None:
+                    timing.clear()
+                return None
+            total += float(record["seconds"])
+            launches += max(1, len(record.get("kernels") or {}))
+            operators += 1
+            if record.get(ZERO_WORK_FLAG):
+                zero_work += 1
+            elif record.get(INTERPOLATED_FLAG):
+                interpolated += 1
+            else:
+                measured += 1
+            sources[detail] = sources.get(detail, 0) + 1
+        return (total, Coverage(operators=operators, measured=measured, seconds=total,
+                               interpolated=interpolated, zero_work=zero_work,
+                               sources=sources), launches)
+
     def _body_lookup(self, op, topology, registration, modelled_memo):
         return self.lookup(op, topology, registration)
 
@@ -741,6 +849,10 @@ class PriceLibrary:
 
         if timing is not None:
             timing.clear()
+        if isinstance(graph_blob, PreparedGraph):
+            prepared = self._body_from_prepared_plan(graph_blob, registration, timing)
+            if prepared is not None:
+                return prepared
 
         topology = dict(((graph_blob.get("key") or {}).get("topology") or []))
         if registration is None:

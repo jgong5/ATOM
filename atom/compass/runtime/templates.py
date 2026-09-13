@@ -917,6 +917,7 @@ class TemplateGraphs:
 
         self._templates = copy.deepcopy(dict(templates or {}))
         self._prepared_operators = {}
+        self._prepared_plans = {}
         self._derive = derive
         self._allocation = allocation
         self._representative = int(representative_rank)
@@ -941,6 +942,7 @@ class TemplateGraphs:
         key = template_key(shape)
         self._templates[key] = copy.deepcopy(graph)
         self._prepared_operators.clear()
+        self._prepared_plans.clear()
 
     def _representative_key(self, key):
         """``key`` with every rank coordinate moved to the representative."""
@@ -1006,6 +1008,7 @@ class TemplateGraphs:
             template = copy.deepcopy(template)
             self._templates[key] = template
             self._prepared_operators.clear()
+            self._prepared_plans.clear()
         else:
             self.hits += 1
         # The same scope on the cold return and every warm one after it. A
@@ -1024,14 +1027,17 @@ class TemplateGraphs:
         self.binds += 1
         if prepare:
             from atom.compass.core.cost.prepared import prepare_static_operator
+            from atom.compass.core.cost.prepared_plan import PreparedGraph, prepare_plan
 
             prepared = self._prepared_operators.get(key)
             if prepared is None:
                 prepared = tuple(prepare_static_operator(op)
                                  for op in template["ops"])
                 self._prepared_operators[key] = prepared
+                self._prepared_plans[key] = prepare_plan(prepared)
             bound["ops"] = [frozen if frozen is not None else op
                             for frozen, op in zip(prepared, bound["ops"])]
+            return PreparedGraph(bound, self._prepared_plans[key])
         return bound
 
     def describe(self) -> str:

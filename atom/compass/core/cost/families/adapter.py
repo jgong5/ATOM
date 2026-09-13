@@ -1115,6 +1115,19 @@ class ParametricPriceLibrary(PriceLibrary):
 
     # -- lookup ---------------------------------------------------------
 
+    def _prepared_config_key(self, topology, registration):
+        if (not self._can_reuse_prepared_lookups()
+                or getattr(self.host_sync_reason, "__func__", None) is not ParametricPriceLibrary.host_sync_reason):
+            return None
+        scope = self.request_attention_scope
+        if type(scope) is attention_scope.Declaration:
+            scope = scope.scopes
+        if scope is not None and type(scope) is not dict:
+            return None
+        return immutable_content_key((self._pricing_revision, topology, registration,
+                                      self.max_gap_ratio, self.launch_charge_seconds,
+                                      scope, self.request_attention_treatments))
+
     def _body_lookup(self, op, topology, registration, modelled_memo):
         if getattr(self.lookup, "__func__", None) is not ParametricPriceLibrary.lookup:
             return self.lookup(op, topology, registration)
@@ -1738,6 +1751,8 @@ class ParametricPriceLibrary(PriceLibrary):
         No timing in a probe file is read. Returns the number of geometries
         the evidence now covers.
         """
+        self._pricing_revision += 1
+        self._prepared_plan_prices.clear()
         added = load_band_map(paths, family)
         for key in added.keys():
             self._bands.add(key, added.get(key))
