@@ -135,11 +135,53 @@ def test_unrecorded_kernels_do_not_invent_a_band(tmp_path):
     assert (evidence.low, evidence.high) == (8192, 8320)
 
 
-def test_static_shapes_drops_every_operand_carrying_the_row_count():
+@pytest.mark.parametrize("rows", [5760, 14336, 5120])
+def test_static_shapes_keeps_the_gemm_weight_by_operand_role(rows):
     op = {"name": "aiter::gemm_a16w16",
-          "input_shapes": [[14592, 5120], [5120, 6144]],
+          "input_shapes": [[rows, 5120], [14336, 5120]],
           "dtypes": ["bfloat16", "bfloat16"]}
-    assert static_shapes(op, 14592) == ((5120, 6144),)
+    assert static_shapes(op, rows) == ((14336, 5120),)
+
+
+@pytest.mark.parametrize("asked,lower,upper,switch", [
+    (14336, 13248, 14400, 13376),  # Actual TP1 source-library counterexample.
+    (5120, 4992, 5248, 5056),     # M equals the weight's K instead of N.
+])
+def test_equal_weight_dimensions_do_not_hide_a_probed_switch(
+    tmp_path, asked, lower, upper, switch
+):
+    from atom.compass.core.cost.families import ParametricPriceLibrary
+    from atom.compass.runtime.microbench import signature_of
+
+    def op(rows):
+        return {"name": "aiter::gemm_a16w16",
+                "input_shapes": [[rows, 5120], [14336, 5120]],
+                "output_shapes": [[rows, 14336]],
+                "dtypes": ["bfloat16", "bfloat16"],
+                "scalars": [["#2", None]]}
+
+    library = ParametricPriceLibrary(max_gap_ratio=2.0)
+    for rows in (lower, upper):
+        measured = op(rows)
+        graph = tmp_path / f"graph{rows}.json"
+        prices = tmp_path / f"prices{rows}.json"
+        graph.write_text(json.dumps({"ops": [measured], "provenance": {
+            "execution": {"body_rows_traced": rows}}}))
+        prices.write_text(json.dumps({"prices": {signature_of(measured): {
+            "seconds": 0.001, "kernels": {A: 0.001}, "occurrences": 1,
+            "name": measured["name"]}}}))
+        library.add(str(prices), str(graph))
+    assert library.lookup(op(asked))[0] is not None
+    probe = _probe(tmp_path / "bands.json", [
+        (lower, A), (switch, B), (upper - 64, B), (upper, A)],
+        weight=(14336, 5120))
+    library.add_dispatch_bands([probe], "aiter::gemm_a16w16")
+    record, reason = library.lookup(op(asked))
+    assert record is None
+    assert "dispatch probe changes kernel" in reason
+    assert str(switch) in reason
+    assert library.lookup(op(lower))[0] is not None
+    assert library.lookup(op(upper))[0] is not None
 
 
 def test_describe_names_the_probe_and_the_brackets_it_rules_out():

@@ -64,13 +64,20 @@ def geometry_key(family: str, dtypes: Iterable[str],
 
 
 def static_shapes(op: dict, rows: int) -> tuple:
-    """The operand shapes of `op` that do not carry the row count."""
+    """The static operand geometry used to select a dispatch survey.
+
+    GEMM operand 0 is A[M,K]; its remaining tensor operands are static in M.
+    In particular, B[N,K] stays the weight when M happens to equal N or K.
+    Numeric equality cannot identify the operand's role.
+    """
     out = []
-    for shape in op.get("input_shapes") or ():
+    gemm = op.get("name") == "aiter::gemm_a16w16"
+    for position, shape in enumerate(op.get("input_shapes") or ()):
         if not isinstance(shape, (list, tuple)):
             continue
         dims = tuple(int(d) for d in shape)
-        if rows in dims:
+        is_row_operand = (position == 0) if gemm else (rows in dims)
+        if is_row_operand:
             continue
         out.append(dims)
     return tuple(out)
