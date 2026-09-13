@@ -23,8 +23,9 @@ def library_for(tmp_path, op):
     graph = tmp_path / "graph.json"
     price = tmp_path / "price.json"
     graph.write_text(json.dumps({"ops": [op], "key": {"topology": [["tp", 2]]}}))
-    price.write_text(json.dumps({"prices": {signature_of(op): {"seconds": .001,
-                               "name": op["name"]}}}))
+    price.write_text(json.dumps({"provenance": {"topology": {"tp": 2}},
+                                "prices": {signature_of(op): {"seconds": .001,
+                                            "name": op["name"]}}}))
     library = PriceLibrary()
     library.add(str(price), str(graph), registration="unregistered")
     return library
@@ -111,3 +112,24 @@ def test_prepared_lookup_keeps_address_shift_counters(tmp_path):
     for _ in range(3):
         assert library.lookup(prepared)[0] is not None
     assert sum(library.address_shifted.values()) == 3
+
+
+def test_prepared_static_calls_preserve_the_ordered_visibility_prefix():
+    from .test_attention_family import _unified
+    from .test_output_visibility import SCOPE, TimedLibrary
+
+    library = TimedLibrary()
+    library.request_attention_scope = SCOPE
+    attention = _unified([8], [16], is_prefill=True, has_cached=True)
+    def static(name, seconds):
+        return {"name": name, "input_shapes": [], "dtypes": [], "test_seconds": seconds}
+    ops = [static("prefix", 2.0), dict(attention, test_seconds=3.0),
+           static("between", 5.0), dict(attention, test_seconds=7.0), static("suffix", 11.0)]
+    ordinary = {"ops": ops}
+    prepared = {"ops": [prepare_static_operator(op) or op for op in ops]}
+    assert sum(isinstance(op, PreparedOperator) for op in prepared["ops"]) == 3
+    before, after = {}, {}
+    assert library.body(ordinary, timing=before) == library.body(prepared, timing=after)
+    assert before == after
+    assert after["seconds"] == 10.0
+    assert after["priced_operator_index"] == 3
