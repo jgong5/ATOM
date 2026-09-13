@@ -111,6 +111,27 @@ quality checks or PoC acceptance passed. MHA coverage beyond the previous
 measured domain remains open until its separate source experiment and the
 paired E2E cc-trace gates pass.
 
+
+TP1 also reads the native padded GDN book after all prior prices. When a
+32-request decode loses a request, the next step has 31 active state lanes
+inside a 32-row capture; a dense 32-row measurement does not describe that
+mask. The added `codex_gdn_tp1_native_v1/export_candidate_v2` book contains
+1,248 exact-only records for all 26 non-rung active counts on the native
+`1,2,4,8,16,32` capture ladder. Its measured process recorded lossy-fast
+disabled and the actual 32-slot state views. The six dense anchors and all
+hole/permutation timings remain validation-only; TP2/TP4 keep their existing
+native books.
+
+This GDN selection is qualified by
+`codex_gdn_tp1_native_v1/SOURCE_USE_DECISION.json`, SHA256
+`1213611cd1cd1800e7e5c5de17f812e7bc4f11dcfd67e296641ab8ddbc393316`.
+The hole and reversed-state checks differ from the frozen GDN-sum prediction
+by +0.0445% and +0.4290%. The 85 individual repeat-spread flags and the original
+unclassified PID/device observations remain explicit. Eleven keys had a
+partial kernel-profile observation; every selected witness comes from a
+complete observed repeat, without rescaling any timing. These source checks
+do not declare PoC acceptance or relax any paired E2E gate.
+
 The preceding `source-27b-tp1-history-64k` adds independently measured TP1 history
 support to `source-27b-tp1-prefill-seqs`. Single-row decode supports histories
 1025..65600; exact two-row decode supports 513..65600 with summed history at

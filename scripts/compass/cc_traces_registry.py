@@ -942,6 +942,23 @@ GEMM_SOURCE_QUALIFICATIONS = (
 )
 
 
+_GDN_TP1_PADDED = "{root}/codex_gdn_tp1_native_v1/export_candidate_v2"
+GDN_SOURCE_DECISION = "{root}/codex_gdn_tp1_native_v1/SOURCE_USE_DECISION.json"
+GDN_SOURCE_DECISION_SHA256 = (
+    "1213611cd1cd1800e7e5c5de17f812e7bc4f11dcfd67e296641ab8ddbc393316")
+GDN_SOURCE_QUALIFICATIONS = (
+    "TP1 adds 1248 exact-only GDN records for 26 padded active counts; "
+    "all prior prices retain precedence. Dense anchors and state-layout "
+    "holdout timings are excluded.",
+    "85 individual repeat-spread flags and the original unclassified "
+    "PID/device observations remain reported; source quality is not all passed.",
+    "Eleven keys retain partial kernel-profile observations. Each selected "
+    "kernel witness is a complete observed repeat, without timing rescaling.",
+    "Hole and permutation source checks passed; final paired E2E cc-traces "
+    "still govern accuracy, memory, feasibility and ranking.",
+)
+
+
 def per_width_options(tp: int) -> tuple:
     """The options this width adds to `SHARED_OPTIONS`, unresolved."""
     gemm_exports = _GEMM_DOMAIN_EXPORTS[tp]
@@ -962,7 +979,9 @@ def per_width_options(tp: int) -> tuple:
              "{root}/codex_decode_domain_v1/native_scope_v2/MEASURED_SCOPE.json"),
             ("attention_treatments", "{root}/codex_decode_domain_v1/TREATMENTS.json"),
             ("replay_target", _CAPTURED_TARGET),
-            ("price", ",".join(_tp1_prices() + gemm_prices)),
+            ("price", ",".join(_tp1_prices() + gemm_prices + (
+                f"{_GDN_TP1_PADDED}/prices.json:"
+                f"{_GDN_TP1_PADDED}/graphs.json:unregistered",))),
             # src2c, not src1: the templates are what the step binds, and the
             # src1 capture recorded a decode whose attention chain was not
             # the deployed one. See `_tp1_prices` for what that changed and
@@ -1075,6 +1094,8 @@ def option_paths(tp: int, root) -> dict:
     # The qualification is shared across widths and is required evidence,
     # not an oracle option or a new price source.
     found["source_use_decision"] = GEMM_SOURCE_DECISION.format(root=str(Path(root)))
+    if tp == 1:
+        found["gdn_source_use_decision"] = GDN_SOURCE_DECISION.format(root=str(Path(root)))
     return found
 
 
@@ -1094,7 +1115,8 @@ _GROUP_STEMS = ("ar_capture.json", "ar_plain.json", "ag_prices.json",
 
 
 def _group_level(role: str, path: str) -> bool:
-    return (role in ("replay_target", "memory_model", "source_use_decision")
+    return (role in ("replay_target", "memory_model", "source_use_decision",
+                     "gdn_source_use_decision")
             or path.endswith(_GROUP_STEMS))
 
 
@@ -1334,7 +1356,7 @@ def cell_config(tp: int, klass: str, clients: int, root, resolved=None) -> dict:
     point -- a readiness report that resolved artifacts per *width* and then
     printed six lines would be silent about eighteen cells that exist.
     """
-    return {
+    cell = {
         "cell": cell_id(tp, klass, clients),
         "tp": tp,
         "class": klass,
@@ -1360,6 +1382,15 @@ def cell_config(tp: int, klass: str, clients: int, root, resolved=None) -> dict:
         "open_refusals": sorted(k for k, v in OPEN_REFUSALS.items()
                                 if cell_id(tp, klass, clients) in v["cells"]),
     }
+    if tp == 1:
+        cell["gdn_source_use_decision"] = {
+            "path": GDN_SOURCE_DECISION.format(root=str(Path(root))),
+            "sha256": GDN_SOURCE_DECISION_SHA256,
+            "qualifications": list(GDN_SOURCE_QUALIFICATIONS),
+            "all_source_quality_checks_passed": False,
+            "poc_accepted": False,
+        }
+    return cell
 
 
 def group_id(klass: str, clients: int) -> str:

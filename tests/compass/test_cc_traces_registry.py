@@ -74,7 +74,7 @@ def test_interpolation_explicitly_preserves_the_existing_support_bound():
 
 
 @pytest.mark.parametrize("tp,n", [(1, 14336), (2, 7168), (4, 3584)])
-def test_gemm_domain_is_last_and_keeps_the_existing_dispatch_witnesses(tp, n):
+def test_gemm_domain_keeps_its_order_and_existing_dispatch_witnesses(tp, n):
     items = registry.options(tp, "/source")
     assert len({item.partition("=")[0] for item in items}) == len(items)
     options = dict(item.split("=", 1) for item in items)
@@ -82,10 +82,11 @@ def test_gemm_domain_is_last_and_keeps_the_existing_dispatch_witnesses(tp, n):
     prices = options["price"].split(",")
     new_exports = [path.format(root="/source", tp=tp)
                    for path in registry._GEMM_DOMAIN_EXPORTS[tp]]
-    first_new = len(prices) - len(new_exports)
+    first_new = prices.index(
+        f"{prefix}/prices.median.json:{prefix}/gemm_points.json:unregistered")
     assert prices[first_new] == (
         f"{prefix}/prices.median.json:{prefix}/gemm_points.json:unregistered")
-    assert prices[first_new:] == [
+    assert prices[first_new:first_new + len(new_exports)] == [
         f"{path}/prices.median.json:{path}/gemm_points.json:unregistered"
         for path in new_exports]
     # Existing exact measurements win before the new exact-only supplement.
@@ -124,7 +125,9 @@ def test_qualified_repairs_follow_legacy_and_precede_supplements(tp, count):
     repairs = [(f"{path}/prices.median.json:{path}/gemm_points.json:unregistered")
                .format(root="/source") for path in registry._GEMM_REPAIR_EXPORTS[tp]]
     supplements = registry._GEMM_DOMAIN_EXPORTS[tp]
-    first_supplement = len(prices) - len(supplements)
+    first_path = supplements[0].format(root="/source", tp=tp)
+    first_supplement = prices.index(
+        f"{first_path}/prices.median.json:{first_path}/gemm_points.json:unregistered")
     assert len(repairs) == count
     assert prices[first_supplement - count:first_supplement] == repairs
     assert not any("export_n8240_k5120_v1" in p for p in repairs)
@@ -806,3 +809,26 @@ def test_ranked_attention_declaration_takes_precedence_over_shared(tmp_path):
     assert found[0]["attention_scope"]["path"] == str(base)
     assert found[1]["attention_scope"]["path"] == str(rank1)
     assert all(found[r]["attention_scope"]["own"] for r in range(2))
+
+def test_tp1_padded_gdn_is_appended_after_all_prior_prices():
+    prices = dict(x.split("=", 1) for x in registry.options(1, "/source"))["price"].split(",")
+    assert prices[-1] == (
+        "/source/codex_gdn_tp1_native_v1/export_candidate_v2/prices.json:"
+        "/source/codex_gdn_tp1_native_v1/export_candidate_v2/graphs.json:unregistered"
+    )
+    assert sum("codex_gdn_tp1_native_v1" in p for p in prices) == 1
+    for tp in (2, 4):
+        assert not any("codex_gdn_tp1_native_v1" in option
+                       for option in registry.options(tp, "/source"))
+
+
+def test_tp1_gdn_qualification_is_required_group_evidence(tmp_path):
+    cell = registry.cell_config(1, "clients_large", 8, tmp_path)
+    decision = cell["gdn_source_use_decision"]
+    assert decision["sha256"] == registry.GDN_SOURCE_DECISION_SHA256
+    assert decision["all_source_quality_checks_passed"] is False
+    assert decision["poc_accepted"] is False
+    assert cell["artifacts"]["gdn_source_use_decision"] == decision["path"]
+    assert cell["resolution"][0]["gdn_source_use_decision"]["own"] is True
+    assert "gdn_source_use_decision" not in registry.cell_config(
+        2, "clients_large", 8, tmp_path)
