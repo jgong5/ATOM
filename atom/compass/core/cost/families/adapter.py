@@ -308,6 +308,15 @@ def _acquisition_policy(blob: dict) -> tuple:
     else:
         digest = entry if isinstance(entry, str) else None
     if not digest:
+        # Standalone primitives recorded source-file hashes before they
+        # recorded imported-module identities. Keep that evidence, under a
+        # distinct identity: a file hash must not masquerade as an import
+        # verification, or pool with one merely because the bytes match.
+        collector = (blob.get("provenance") or {}).get("collector") or {}
+        sources = (collector.get("hashes") or {}).get("sources") or {}
+        digest = sources.get(_POLICY_MODULE.replace(".", "/") + ".py")
+        if digest:
+            return ("recorded_source_file", _POLICY_MODULE, str(digest))
         return ("unevidenced",)
     return (_POLICY_MODULE, str(digest))
 

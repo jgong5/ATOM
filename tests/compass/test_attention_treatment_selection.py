@@ -98,3 +98,17 @@ def test_selection_file_is_digested_and_reported(tmp_path, monkeypatch):
     records = [r for r in library.loaded_inputs if r.role == "oracle.attention_treatments"]
     assert len(records) == 1 and records[0].sha256 == hashlib.sha256(raw).hexdigest()
     assert library.attention_coverage()['requested_treatments'][NAME]['kv_regions'] == 2
+
+
+def test_recorded_file_hash_is_evidence_but_not_an_import_attestation():
+    from atom.compass.core.cost.families.adapter import _acquisition_policy
+    module = "atom.compass.runtime.microbench"
+    digest = "a" * 64
+    legacy = {"provenance": {"collector": {"hashes": {
+        "sources": {"atom/compass/runtime/microbench.py": digest}}}}}
+    imported = {"provenance": {"collector": {"source_identity": {
+        "modules": {module: {"sha256": digest}}}}}}
+    assert _acquisition_policy(legacy) == ("recorded_source_file", module, digest)
+    assert _acquisition_policy(imported) == (module, digest)
+    assert _acquisition_policy(legacy) != _acquisition_policy(imported)
+    assert _acquisition_policy({}) == ("unevidenced",)
