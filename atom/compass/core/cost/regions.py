@@ -58,7 +58,7 @@ refusal where it has not looked.
 
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Optional
 
 #: The sequence slot a pooled prefill anchor group is keyed under. Negative so
@@ -719,6 +719,9 @@ class BucketedRunnerRegions:
             lines.append(
                 f"pooled prefill group: sequence counts {lo}..{hi} share one "
                 "token axis; 1 and 2 remain separate groups")
+        for cell, limits in self.decode_context_cells:
+            lines.append(f"decode history cell {cell}: per-row "
+                         f"{limits[0]}..{limits[1]}, sum <= {limits[2]}")
         lines.append(f"provenance          : {self.provenance}")
         return "\n".join(lines)
 
@@ -1489,6 +1492,91 @@ SOURCE_27B_TP1_PREFILL_SEQS = BucketedRunnerRegions(
 )
 
 
+# The independently chosen source shapes [65536] and [512, 65536] ran on
+# TP1 GPU7, committed native-recording snapshot 02d1ec40, max_model_len
+# 262144, block_size 16, token budget 16384, max_num_seqs 32, prefix cache
+# off. Each shape had two matching warmup bursts followed by three retained
+# bursts of 64 decode steps. Cohorts single=[18],[19],[20] and
+# mixed=[25,26],[27,28],[29,30] are selected by native request ids. All 702 raw
+# rows remain in agent_scratch/codex_regions/d65536_source_v1, capture SHA256
+# bc461c150b35e2f4f418be33a0c6150fa040a20b2e1782dbb79b909a77dc9923.
+#
+# Median-of-burst-median preparation is 102.003 us at one sequence and
+# 109.163 us at two. Keeping the published 107.9/113.8 us coefficients moves
+# the step by 0.027%/0.021% against old source median steps 22.157/22.711 ms.
+# This passes the preregistered 1%-of-step impact threshold; it is a bounded
+# approximation, not evidence of per-region accuracy or a closed E2E gate.
+# The mean preparation is higher (166..288 us) and all retained excursions
+# up to 3.083/4.180 ms stay in the bands. Nothing is dropped by timing.
+_HISTORY_64K_PREPARE = {
+    (1, False): (9.220103919506125e-5, 0.0030831820368766786,
+                 "N=1, histories 65537..65600, median 102.003 us"),
+    (2, False): (9.911935031414012e-5, 0.004179747112095355,
+                 "N=2, histories 513..65600, sum <= 66176, median 109.163 us"),
+}
+
+SOURCE_27B_TP1_HISTORY_64K = replace(
+    SOURCE_27B_TP1_PREFILL_SEQS,
+    prepare_decode_cells=tuple(
+        (key, replace(
+            measured,
+            low=min(measured.low, _HISTORY_64K_PREPARE[key][0]),
+            high=max(measured.high, _HISTORY_64K_PREPARE[key][1]),
+            samples=measured.samples + 192,
+            how=measured.how + "; coefficient retained after independent "
+                "d65536_source_v1 acquisition: " + _HISTORY_64K_PREPARE[key][2]
+                + "; 3 bursts x 64 retained rows, union with their full "
+                "[min,max], including every excursion"))
+        if key in _HISTORY_64K_PREPARE else (key, measured)
+        for key, measured in SOURCE_27B_TP1_PREFILL_SEQS.prepare_decode_cells
+    ),
+    postprocess_decode=replace(
+        SOURCE_27B_TP1_PREFILL_SEQS.postprocess_decode,
+        low=9.86810028553009e-5, high=0.00011100099980831146,
+        samples=SOURCE_27B_TP1_PREFILL_SEQS.postprocess_decode.samples + 384,
+        how=SOURCE_27B_TP1_PREFILL_SEQS.postprocess_decode.how
+            + "; coefficient retained after d65536_source_v1: N=1/N=2 "
+            "medians 102.200/102.480 us, 384 retained rows; union band "
+            "includes their full [min,max]"),
+    decode_context_cells=(
+        ((1, False), (1025, 65600, 65600)),
+        ((2, False), (513, 65600, 66176)),
+    ),
+    # The native final chunk at cached history 16384, reusing Memory's
+    # t32768chunked capture, SHA256
+    # 0c6b424f4cc1175f28cdd1160a9a6a5cfbb5b0c016cd4ebdb56bfd7813e7bf04.
+    # Requests 16/17 are warmup; 18/19/20 retained.
+    # This key was absent. Middle chunks and all published cells stay intact.
+    prepare_prefill_cells=(
+        SOURCE_27B_TP1_PREFILL_SEQS.prepare_prefill_cells + (
+            ((1, 16384, True), Measured(
+                seconds=0.001189327, low=0.001129060, high=0.001381607,
+                samples=3,
+                how="upper median [min,max] of native final chunks "
+                    "req18/19/20, memwire/memref_gpu7/t32768chunked; "
+                    "cached history 16384, produces_output=True")),
+        )),
+    postprocess_prefill_cells=(
+        SOURCE_27B_TP1_PREFILL_SEQS.postprocess_prefill_cells + (
+            ((1, 16384, True), Measured(
+                seconds=0.000101200, low=0.000100920, high=0.000102280,
+                samples=3,
+                how="native span_seconds.postprocess over the same three "
+                    "retained t32768chunked final chunks")),
+        )),
+    version="history-64k-2026-09-13",
+    provenance=SOURCE_27B_TP1_PREFILL_SEQS.provenance
+        + "; extended only at decode cells (1,False)/(2,False) by native "
+        "TP1 d65536_source_v1 (02d1ec40), independent 65536 and 512/65536 "
+        "source prompts, all bursts retained, waiting=0. Source coefficients "
+        "unchanged; per-cell history and summed-history limits enforced. "
+        "Other decode cells remain at 1025..1152. Final-prefill (1,16384,True) "
+        "reused from memwire/memref_gpu7/t32768chunked native req18/19/20. "
+        "No evaluated development or wide-engine times fitted; no E2E gate "
+        "is closed by these region measurements",
+)
+
+
 #: Block sizes whose per-step attention metadata build is sized by the rank's
 #: own KV head count, and therefore is NOT width-invariant.
 #:
@@ -1548,6 +1636,7 @@ REGION_MODELS = {
     "source-27b-tp1-prefill-cells": SOURCE_27B_TP1_PREFILL_CELLS,
     "source-27b-tp1-prefill-interp": SOURCE_27B_TP1_PREFILL_INTERP,
     "source-27b-tp1-prefill-seqs": SOURCE_27B_TP1_PREFILL_SEQS,
+    "source-27b-tp1-history-64k": SOURCE_27B_TP1_HISTORY_64K,
     "none": None,
 }
 

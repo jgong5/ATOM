@@ -3,7 +3,8 @@
 from dataclasses import replace
 
 from atom.compass.core.cost.base import StepShape
-from atom.compass.core.cost.regions import SOURCE_27B_TP1_PREFILL_SEQS
+from atom.compass.core.cost.regions import (
+    SOURCE_27B_TP1_PREFILL_SEQS, SOURCE_27B_TP1_HISTORY_64K)
 
 
 def _model():
@@ -45,3 +46,22 @@ def test_history_support_keeps_both_boundaries_closed():
 def test_new_support_does_not_move_published_profile():
     assert SOURCE_27B_TP1_PREFILL_SEQS.refusal(
         _shape([641, 63745], 2)) is not None
+
+
+def test_measured_source_covers_unchanged_development_decode_domain():
+    model = SOURCE_27B_TP1_HISTORY_64K
+    for short in range(641, 661):
+        assert model.refusal(_shape([short, short + 63104], 2)) is None
+    for long in range(63765, 64140):
+        assert model.refusal(_shape([long], 1)) is None
+    assert model.refusal(_shape([64000] * 4, 4)) is not None
+
+
+def test_native_final_prefill_anchor_keeps_middle_chunk_separate():
+    model = SOURCE_27B_TP1_HISTORY_64K
+    final = StepShape(num_scheduled_tokens=(16384,), context_lens=(32768,),
+                      num_prefill_tokens=16384, produces_output=True)
+    middle = replace(final, context_lens=(16384,), produces_output=False)
+    assert model.refusal(final) is None
+    assert model.breakdown(final)["<postprocess>"] > 0
+    assert model.breakdown(middle)["<postprocess>"] == 0
