@@ -1091,6 +1091,9 @@ class ParametricPriceLibrary(PriceLibrary):
 
     # -- lookup ---------------------------------------------------------
 
+    def _can_reuse_prepared_lookups(self):
+        return getattr(self.lookup, "__func__", None) is ParametricPriceLibrary.lookup
+
     def lookup(self, op: dict, topology=None, registration=None):
         if self.request_attention_treatments and op.get("name") in (
                 attention.UNIFIED, attention.GDN):

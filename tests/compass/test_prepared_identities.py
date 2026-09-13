@@ -133,3 +133,29 @@ def test_prepared_static_calls_preserve_the_ordered_visibility_prefix():
     assert before == after
     assert after["seconds"] == 10.0
     assert after["priced_operator_index"] == 3
+
+
+def test_repeated_prepared_body_entries_repay_address_shifts(tmp_path):
+    measured = operation()
+    measured["scalars"] = [["slot_mapping", [1, 2]]]
+    library = library_for(tmp_path, measured)
+    current = dict(measured, scalars=[["slot_mapping", [11, 12]]])
+    prepared = prepare_static_operator(current)
+    graph = {"ops": [prepared, prepared, prepared]}
+    for count in (3, 6):
+        seconds, coverage, launches = library.body(graph)
+        assert seconds == .003 and coverage.measured == launches == 3
+        assert sum(library.address_shifted.values()) == count
+
+
+def test_body_reuse_stays_within_current_layout_and_scope(tmp_path):
+    op = operation()
+    op["group"] = "tp"
+    library = library_for(tmp_path, op)
+    prepared = prepare_static_operator(op)
+    changed = prepare_static_operator(dict(op, layouts=[[0, [[8, 1], 8, 16, 0]]]))
+    graph = {"key": {"topology": [["tp", 2]]}, "ops": [prepared, prepared, changed]}
+    assert library.body(graph, "unregistered")[1].measured == 2
+    assert library.body(graph, "registered")[1].measured == 0
+    graph["key"]["topology"] = [["tp", 4]]
+    assert library.body(graph, "unregistered")[1].measured == 0
