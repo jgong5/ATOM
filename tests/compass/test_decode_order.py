@@ -64,8 +64,8 @@ def test_partial_context_metadata_does_not_shrink_the_launched_grid():
     assert "different decode grids" in out.reason
 
 
-def test_model_uses_recorded_order_and_keeps_domain_refusal(monkeypatch):
-    monkeypatch.setitem(A.DECODE_KERNELS, "paged_gluon", NAME)
+def test_model_uses_recorded_order_and_keeps_domain_refusal():
+    assert A.DECODE_KERNELS["paged_gluon"] == NAME
     balanced = op_for([4096] * 16 + [128] * 16)
     concentrated = op_for([4096, 128] * 16)
     a, b = features(balanced), features(concentrated)

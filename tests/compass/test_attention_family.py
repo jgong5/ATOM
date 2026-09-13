@@ -207,7 +207,7 @@ class TestTheRegimesAreNativeBranches:
         gluon paged decode. They tile the context differently."""
         op = _unified([1], [99], is_prefill=False, has_cached=False)
         gluon = dict(SCOPE, attention_backend="paged_gluon")
-        assert regime_of(op, None, gluon).name == "unified.decode.paged_gluon"
+        assert regime_of(op, None, gluon).name == "unified.decode.paged_gluon_order"
         assert regime_of(op, None, SCOPE).name == "unified.decode.unified_attn"
 
     def test_an_undeclared_decode_kernel_is_refused(self):

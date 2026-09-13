@@ -860,7 +860,7 @@ DECODE_PARTITION_SIZE_SLIDING = 128
 #: priced under the wrong branch's law is the failure this table prevents.
 DECODE_KERNELS = {
     "unified_attention": "unified.decode.unified_attn",
-    "paged_gluon": "unified.decode.paged_gluon",
+    "paged_gluon": "unified.decode.paged_gluon_order",
 }
 
 #: Decode kernels that exist and have no law here. They are listed rather than
@@ -1055,7 +1055,7 @@ def features_for(regime: Regime, structure: Structure, scope=None):
                     f"the call was launched over {rows} rows but declares a "
                     f"capture bucket of {structure.bucket}; one of the two "
                     "does not describe this step")
-            splits = _decode_splits(scope, rows)
+            splits = _decode_splits(scope, structure.sequences)
             if isinstance(splits, Refusal):
                 return splits
             heads = int((scope or {}).get("num_kv_heads") or 0)

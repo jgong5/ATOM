@@ -544,3 +544,60 @@ executed rows, the padded-row count and the bucket contradiction; and on GDN
 decode fixtures, which must not move -- the recurrence still prices `[calls,
 active, tail_pad_rows]` off its own output operand and `num_actual_tokens`, and
 still carries no full-history term.
+
+
+## Order-aware decode selection (2026-09-13)
+
+`paged_gluon` now selects `unified.decode.paged_gluon_order`:
+`c0 + max(c_latency * cu_max, c_bandwidth * work_waves)`.
+`cu_max` preserves native request order and distributes source-derived CTA tile
+work across cyclic grid-residue classes. It is an empirical descriptor, not a
+claim that hardware dispatches CTAs cyclically. Native padded contexts are zero;
+their grid positions remain present. The historical max-CTA regime remains
+available by name for old diagnostics.
+
+The source-only TP1 campaign in `agent_scratch/codex_decode_domain_v1` uses six
+native Scheduler orders from the current client manifests. The scheduler runs
+used a virtual clock; only their shapes were consumed. Three standalone GPU2
+repeats per point were acquired with KV rotation 2, all 16 full-attention layer
+slots, BF16 NHD, block 16, head dimension 256, four KV heads and 80 CUs. No evaluated
+target-engine duration was used. Two SIGSEGV attempts remain in the record;
+eager buffer diagnostics passed and separately named rep4 replacements supplied
+the missing repeats.
+
+The measured maximum has 21 active rows in bucket 32, 81,943 KV blocks per variant,
+163,886 total blocks, and a 166,874 MiB measured allocation peak. This fits on the
+192 GiB device: the earlier 131,072-block scratch-design ceiling was not a device
+capacity limit. The staged contexts, zero padding, distinct blocks and pool
+layouts were read back before timing.
+
+The production fitter admits 284 complete-composition records and retains four
+records with incomplete profiler IDs separately. Admission depends only on
+kernel metadata. The source branch requires cache write, decode, and reduction
+for all acquired split counts 2/8; complete captures witness that composition.
+The resulting six independent points have 1.23% worst in-sample error. Their
+feature bounds, `cu_max` 2..773 and `work_waves` 0.4..128.725, cover all 56,646
+recorded client decode shapes when recomputed with native zero padding.
+
+The fresh held-out shape with 5 active rows in bucket 8 was predicted at 2041.0565 microseconds
+before acquisition. Its three repeat medians are 2018.4343,2018.3615 and 2019.0186
+microseconds: +1.12% error and 0.0326% repeat spread. The freeze digest is
+`50ee6b69fc17d74a6c27f7ba3badfd1d56ae6d8f96dab8ce998fbef02f248345`.
+`h10_0` and the earlier `h7_cli8` remain outside training. This is standalone
+source evidence; final acceptance still requires the real/modelled cc-traces
+matrix and all engine-level gates.
+
+Runtime integration uses `TRAINING_MANIFEST.json` only, plus the attested
+`TREATMENTS.json` selector. `COMBINED_SCOPE.json` keeps prefill/GDN declarations
+from the frozen V8 source and adds the independently attested `unified.decode`
+declaration. `MEASURED_DECODE_SCOPE.json` fills only decode-source silences.
+Neither original scope file is modified. Explicit treatment selection prevents
+legacy exact records from bypassing the selected law and retains refusal for
+missing/ambiguous treatments and for features outside measured bounds.
+
+The ordinary price-library factory reproduces the frozen holdout prediction on
+all 16 operators and prices the actual development-refusal graph at histories
+641/63,745 (bucket 2) at 254.5535 microseconds per unified-attention operator. Its
+input hashes and scope/selector digests are retained in `FACTORY_PROOF.json`.
+These coefficients are scoped to TP1 geometry; TP2/TP4 require their own source
+calibration and are not certified by this campaign.

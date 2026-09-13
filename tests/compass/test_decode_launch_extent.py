@@ -229,11 +229,11 @@ class TestTheModelReadsTheExecutedExtent:
 
     @pytest.mark.parametrize("rows,active", [(4, 3), (32, 31), (4, 4),
                                              (32, 32)])
-    def test_a_padded_launch_is_charged_at_its_launched_width(self, rows,
+    def test_historical_crit_waves_counts_launched_width(self, rows,
                                                              active):
-        """Padding is still charged -- through the launch, not beside it.
+        """The historical max-CTA basis charges the full launch width.
 
-        The gluon decode regime no longer carries `bucket_pad`. It does not
+        The historical regime does not carry `bucket_pad`. It does not
         need to: `crit_waves` counts the CTAs the grid actually launches, and
         a padded row launches its CTAs like any other. So an 8-of-16 bucket
         occupies a 16-row launch and is charged for one, which is what the
@@ -245,7 +245,7 @@ class TestTheModelReadsTheExecutedExtent:
         """
         st = A.structure_of(unified_op(rows, active))
         scope = dict(GLUON_SCOPE)
-        regime = A.regime_of(unified_op(rows, active), st, scope)
+        regime = A.REGIMES["unified.decode.paged_gluon"]
         assert not isinstance(regime, A.Refusal), regime
         vec = A.features_for(regime, st, scope)
         assert not isinstance(vec, A.Refusal), vec
@@ -395,7 +395,7 @@ class TestTheLongestCTAIsItsOwnFact:
         op = gluon_op(list(contexts))
         st = A.structure_of(op)
         scope = dict(GLUON_SCOPE, compute_units=80)  # the measured part
-        regime = A.regime_of(op, st, scope)
+        regime = A.REGIMES["unified.decode.paged_gluon"]
         assert not isinstance(regime, A.Refusal), regime
         vec = A.features_for(regime, st, scope)
         assert not isinstance(vec, A.Refusal), vec
@@ -455,7 +455,7 @@ class TestTheLongestCTAIsItsOwnFact:
         assert vec[regime.features.index("calls")] == 1.0
 
 
-class TestTheMakespanLawIsFittedAndBounded:
+class TestTheLegacyMakespanLawIsFittedAndBounded:
     """The law is `c0 + max(c_lat * max_cta_tiles, c_bw * crit_waves)`.
 
     Not a sum: the launch is concurrent, so the call ends when its last CTA
@@ -476,6 +476,13 @@ class TestTheMakespanLawIsFittedAndBounded:
               ((4080,) * 8, 79.3375), ((16384,) * 8, 236.4947),
               ((128, 256, 512, 1024, 2048, 4096, 8192, 16384), 218.6679),
               ((32768,) * 2, 138.7911), ((8192,) * 32, 508.1840)]
+
+    @pytest.fixture(autouse=True)
+    def _select_historical_basis(self, monkeypatch):
+        # These observations and assertions document the historical max-CTA
+        # law. The selected order-aware law is exercised in test_decode_order.
+        monkeypatch.setitem(A.DECODE_KERNELS, "paged_gluon",
+                            "unified.decode.paged_gluon")
 
     def _observation(self, contexts, microseconds):
         """One training observation, scoped the way `price` scopes a request.
