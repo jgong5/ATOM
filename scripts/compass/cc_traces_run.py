@@ -107,6 +107,7 @@ compare = _load("compare")
 replay_client = _load("replay")
 plan_module = _load("cc_traces_plan")
 execution_id = _load("execution_id")
+isolation = _load("isolation")
 process_identity = _core("process_identity")
 
 
@@ -446,6 +447,7 @@ class SideRun:
         self.journal: list[dict] = []
         self.failures: list[str] = []
         self.refused = False
+        self.isolation_evidence = None
 
     # -- the pieces ------------------------------------------------------
 
@@ -1329,14 +1331,120 @@ class SideRun:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(execution, indent=1) + "\n")
 
+    def _check_advisory_isolation(self) -> bool:
+        """Allow node-level interference only with complete selected-device evidence.
+
+        The audit's busy-node switch also allows an unknown verdict. Recheck
+        its raw observations so that blind samples or unexplained activity on
+        our baseline devices cannot enter through that broader switch. Keep
+        the original audit untouched, including its non-isolated verdict.
+        """
+        evidence = {
+            "qualification": plan_module.ADVISORY_ISOLATION_QUALIFICATION,
+            "isolated_node_timing_proof": False,
+            "ok": False,
+        }
+        self.isolation_evidence = evidence
+
+        def finite_reading(value):
+            if isinstance(value, bool) or value in (None, ""):
+                return False
+            try:
+                return math.isfinite(float(value)) and float(value) >= 0
+            except (TypeError, ValueError):
+                return False
+
+        try:
+            audit_path, sample_path = self.cell / "isolation.json", self.cell / "gpu.jsonl"
+            evidence["audit"] = file_digest(audit_path)
+            evidence["samples"] = file_digest(sample_path)
+            report = json.loads(audit_path.read_text())
+            if not isinstance(report, dict):
+                raise ValueError("isolation.json does not contain an audit object")
+            evidence.update(verdict=report.get("verdict"),
+                            own_clean=report.get("own_clean"),
+                            node_quiet=report.get("node_quiet"))
+            samples = [json.loads(line) for line in sample_path.read_text().splitlines()
+                       if line.strip()]
+            if not samples:
+                raise ValueError("no GPU observations")
+            inventory, owned = None, None
+            for n, sample in enumerate(samples, 1):
+                if not isinstance(sample, dict):
+                    raise ValueError(f"sample {n} is not an observation object")
+                if sample.get("error"):
+                    raise ValueError(f"sample {n} has a failed GPU or PID probe")
+                if (not isinstance(sample.get("t"), (int, float))
+                        or not finite_reading(sample["t"])):
+                    raise ValueError(f"sample {n} has no finite timestamp")
+                if not isinstance(sample.get("pids"), (dict, list)):
+                    raise ValueError(f"sample {n} has no PID observation")
+                if not isinstance(sample.get("own_pids"), list):
+                    raise ValueError(f"sample {n} has no owned-process observation")
+                mask = str(sample.get("visible") or "").split(",")
+                if not all(part.strip().isdigit() for part in mask):
+                    raise ValueError(f"sample {n} does not identify selected physical devices")
+                selected = {int(part) for part in mask}
+                if len(selected) < self.plan["tp"]:
+                    raise ValueError(f"sample {n} identifies fewer devices than TP")
+                if owned is not None and selected != owned:
+                    raise ValueError(f"sample {n} changes the selected devices")
+                owned = selected
+                if not isinstance(sample.get("smi"), dict):
+                    raise ValueError(f"sample {n} has no GPU observations")
+                cards = isolation._cards(sample)
+                if not cards or not owned.issubset(cards):
+                    raise ValueError(f"sample {n} is missing selected-device observations")
+                if inventory is not None and set(cards) != inventory:
+                    raise ValueError(f"sample {n} changes the observed GPU inventory")
+                inventory = set(cards)
+                for index in cards:
+                    raw = sample["smi"][f"card{index}"]
+                    if not finite_reading(raw.get("GPU use (%)")):
+                        raise ValueError(f"sample {n}, card {index}: missing/invalid GPU use")
+                    memory = next((raw[key] for key in (
+                        "VRAM Total Used Memory (B)", "VRAM Total Used Memory (b)",
+                        "vram_total_used_memory") if raw.get(key) not in (None, "")),
+                        raw.get("GPU Memory Allocated (VRAM%)"))
+                    if not finite_reading(memory):
+                        raise ValueError(f"sample {n}, card {index}: missing/invalid GPU memory")
+            baseline = [s for s in samples if s.get("phase") == "baseline"]
+            if not baseline:
+                raise ValueError("no phase-stamped baseline observations")
+            launches = [e["process"]["launched_at"] for e in self.executions.values()
+                        if e["process"].get("launched_at") is not None]
+            if launches and any(s["t"] > min(launches) for s in baseline):
+                raise ValueError("baseline observations occur after server launch")
+            if report != isolation.audit(samples):
+                raise ValueError("isolation.json does not match the raw GPU observations")
+            if report.get("own_clean") is not True or report.get("occupied_at_start"):
+                raise ValueError("selected devices were contaminated at the baseline")
+            if report.get("unclear_at_start"):
+                raise ValueError("selected devices had unexplained baseline activity")
+            if report.get("verdict") not in ("clean", "node_busy", "unknown"):
+                raise ValueError(f"unsupported isolation verdict: {report.get('verdict')}")
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            evidence["failure"] = str(exc)
+            self.failures.append(f"isolation: advisory collection refused: {exc}")
+            return False
+        evidence["ok"] = True
+        evidence["isolated_node_timing_proof"] = report["verdict"] == "clean"
+        return True
+
     def _command(self, step) -> bool:
         started = self.now()
         code = self.processes.run(step["command"], log=self._log(step))
-        self._record(step, exit=code, seconds=self.now() - started, ok=code == 0)
+        observed = True
+        fields = {}
+        if step["id"] == "isolation" and self.plan.get("allow_advisory_isolation"):
+            observed = self._check_advisory_isolation()
+            fields["isolation_evidence"] = self.isolation_evidence
+        self._record(step, exit=code, seconds=self.now() - started,
+                     ok=code == 0 and observed, **fields)
         if code != 0:
             self.failures.append(f"{step['id']}: exited {code}; see {self._log(step)}")
             return False
-        return True
+        return observed
 
     def _sample(self, step) -> bool:
         proc = self.processes.start(step["command"], log=self._log(step))
@@ -1412,6 +1520,9 @@ class SideRun:
                     "tp": self.plan["tp"],
                     "class": self.plan["class"],
                     "clients": self.plan["clients"],
+                    "allow_advisory_isolation": bool(self.plan.get("allow_advisory_isolation")),
+                    "isolation_qualification": self.plan.get("isolation_qualification"),
+                    "isolation_evidence": self.isolation_evidence,
                     "ok": not self.failures,
                     "executions": [self.executions[n] for n in sorted(self.executions)],
                     "refused": self.refused,
@@ -1567,6 +1678,7 @@ def _cell_plan(args) -> dict:
         corpus=getattr(args, "corpus", None) or "$CC_TRACES_CORPUS",
         request_timeout=getattr(args, "request_timeout", plan_module.REQUEST_TIMEOUT),
         pretokenize=getattr(args, "pretokenize", False),
+        allow_advisory_isolation=getattr(args, "allow_advisory_isolation", False),
     )
     if Path(built["cell"]).name != cell.name:
         raise SystemExit(
@@ -2067,6 +2179,8 @@ def main(argv=None) -> int:
                    help="per-request transport deadline in seconds; not an SLO gate")
     s.add_argument("--pretokenize", action="store_true",
                    help="encode prompts inside the measured window before pacing")
+    s.add_argument("--allow-advisory-isolation", action="store_true",
+                   help=plan_module.ADVISORY_ISOLATION_QUALIFICATION)
     s.add_argument(
         "--port",
         type=int,

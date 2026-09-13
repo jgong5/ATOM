@@ -1580,6 +1580,132 @@ class TestTheWatchHasToCoverTheWindow:
         assert any("before the last server did" in f for f in runner.failures)
 
 
+class AdvisoryAuditProcesses(FakeProcesses):
+    """Execute the actual isolation audit against controlled sampler readings."""
+
+    def __init__(self, *, scenario="clean", **kwargs):
+        super().__init__(**kwargs)
+        self.scenario = scenario
+
+    def _gpu_sample(self, command, phase):
+        path = Path(next(a for a in command if a.endswith("gpu.jsonl")))
+        path.parent.mkdir(parents=True, exist_ok=True)
+        cards = {
+            f"card{i}": {"GPU use (%)": "0", "GPU Memory Allocated (VRAM%)": "0",
+                         "VRAM Total Used Memory (B)": "0"}
+            for i in range(3)
+        }
+        if self.scenario == "node_busy":
+            cards["card2"]["VRAM Total Used Memory (B)"] = str(1 << 30)
+        if self.scenario == "own_contaminated" and phase == "baseline":
+            cards["card0"]["VRAM Total Used Memory (B)"] = str(1 << 30)
+        if self.scenario == "own_activity" and phase == "baseline":
+            cards["card0"]["GPU use (%)"] = "10"
+        if self.scenario == "node_unknown" and phase == "window":
+            cards["card2"]["GPU use (%)"] = "10"
+        if self.scenario == "blind" and phase == "window":
+            cards = {}
+        if self.scenario == "missing_card" and phase == "window":
+            del cards["card1"]
+        if self.scenario == "missing_use" and phase == "window":
+            del cards["card0"]["GPU use (%)"]
+        if self.scenario == "missing_memory" and phase == "window":
+            del cards["card0"]["VRAM Total Used Memory (B)"]
+            del cards["card0"]["GPU Memory Allocated (VRAM%)"]
+        if self.scenario == "nonfinite_use" and phase == "window":
+            cards["card0"]["GPU use (%)"] = "nan"
+        row = {"t": self.wall(), "phase": phase, "visible": "0,1",
+               "own_pids": [], "smi": cards, "pids": {}}
+        if self.scenario == "missing_pids" and phase == "window":
+            del row["pids"]
+        if self.scenario == "unidentified_devices":
+            row["visible"] = "all"
+        if self.scenario == "insufficient_devices":
+            row["visible"] = "0"
+        if self.scenario == "probe_error" and phase == "window":
+            row["error"] = "process query failed"
+        with path.open("a") as stream:
+            stream.write(json.dumps(row) + "\n")
+            if self.scenario == "malformed" and phase == "window":
+                stream.write("{unfinished sample\n")
+
+    def run(self, command, **kwargs):
+        if "scripts/compass/isolation.py" not in command:
+            return super().run(command, **kwargs)
+        self.ran.append(list(command))
+        if self.scenario == "missing_audit":
+            return 0
+        audit = _load("isolation")
+        code = audit.main(command[command.index("scripts/compass/isolation.py") + 1:])
+        if self.scenario == "stale_audit":
+            path = Path(command[command.index("--json") + 1])
+            report = json.loads(path.read_text())
+            report["samples"] += 1
+            path.write_text(json.dumps(report))
+        return code
+
+
+class TestAdvisoryIsolationCollection:
+    def runner(self, tmp_path, scenario, allow=True):
+        clock = Clock()
+        processes = AdvisoryAuditProcesses(cell=tmp_path, wall=clock.wall,
+                                          scenario=scenario)
+        runner = _runner(tmp_path, "real", processes=processes, clock=clock)
+        runner.plan = plan_mod.cell_steps(
+            2, "clients_large", 4, root=str(tmp_path), oracle="transfer",
+            options=(), port=8000, repeats=3, target="/w/target.json",
+            allow_advisory_isolation=allow)
+        return runner
+
+    @pytest.mark.parametrize("scenario,verdict", [
+        ("clean", "clean"), ("node_busy", "node_busy"),
+        ("node_unknown", "unknown"),
+    ])
+    def test_only_node_level_uncertainty_is_advisory(self, tmp_path, scenario, verdict):
+        runner = self.runner(tmp_path, scenario)
+        assert runner.run() == 0
+        audit = json.loads((runner.cell / "isolation.json").read_text())
+        assert audit["verdict"] == verdict
+        assert audit["isolated"] is (verdict == "clean")
+        journal = _journal(runner)
+        assert journal["allow_advisory_isolation"] is True
+        assert "advisory" in journal["isolation_qualification"]
+        assert journal["isolation_evidence"]["verdict"] == verdict
+        assert journal["isolation_evidence"]["isolated_node_timing_proof"] is (verdict == "clean")
+
+    def test_busy_node_still_fails_without_opt_in(self, tmp_path):
+        runner = self.runner(tmp_path, "node_busy", allow=False)
+        assert runner.run() == 1
+        assert _journal(runner)["allow_advisory_isolation"] is False
+        assert any("exited 2" in reason for reason in runner.failures)
+
+    @pytest.mark.parametrize("scenario", [
+        "own_contaminated", "own_activity", "blind", "missing_card",
+        "missing_use", "missing_memory", "nonfinite_use", "missing_pids",
+        "unidentified_devices", "insufficient_devices", "probe_error",
+        "malformed", "missing_audit", "stale_audit",
+    ])
+    def test_advisory_mode_does_not_admit_unsafe_or_unobserved_own_devices(
+            self, tmp_path, scenario):
+        runner = self.runner(tmp_path, scenario)
+        assert runner.run() == 1
+        assert _journal(runner)["ok"] is False
+        assert any("isolation" in reason for reason in runner.failures)
+
+    def test_run_cli_carries_the_option_into_the_same_plan(self, tmp_path, monkeypatch):
+        captured = []
+        monkeypatch.setattr(run_mod, "side", lambda args: captured.append(
+            run_mod._cell_plan(args)) or 0)
+        assert run_mod.main([
+            "side", "--cell", str(tmp_path / "tp2_clients_large_c4"),
+            "--side", "real", "--tp", "2", "--class", "clients_large",
+            "--clients", "4", "--allow-advisory-isolation",
+        ]) == 0
+        assert captured[0]["allow_advisory_isolation"] is True
+        step = next(s for s in captured[0]["steps"] if s["id"] == "isolation")
+        assert "--allow-busy-node" in step["command"]
+
+
 class TestOnlyTheServerThisRepeatStartedCounts:
     """A code digest is a fact about bytes on disk, not about who replied.
 

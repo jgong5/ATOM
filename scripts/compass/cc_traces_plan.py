@@ -143,6 +143,12 @@ REQUEST_TIMEOUT = 3600.0
 ACCEPTANCE = "acceptance"
 DIAGNOSTIC = "diagnostic"
 
+ADVISORY_ISOLATION_QUALIFICATION = (
+    "Node-level interference may be collected only as advisory timing evidence. "
+    "Selected devices must remain clean and fully observed; this option does "
+    "not establish isolated-node timing proof."
+)
+
 MODEL = "Qwen/Qwen3.8-27B"
 
 #: The HTTP listener: what the health check polls and the replay client dials.
@@ -487,6 +493,7 @@ def cell_steps(
     corpus: str = "$CC_TRACES_CORPUS",
     request_timeout: float = REQUEST_TIMEOUT,
     pretokenize: bool = False,
+    allow_advisory_isolation: bool = False,
 ):
     """Every step of one cell, in the order it has to happen."""
     if port == engine_port:
@@ -624,7 +631,9 @@ def cell_steps(
                 f"{cell}/gpu.jsonl",
                 "--json",
                 f"{cell}/isolation.json",
-            ],
+            ] + (["--allow-busy-node"] if allow_advisory_isolation else []),
+            "qualification": (ADVISORY_ISOLATION_QUALIFICATION
+                              if allow_advisory_isolation else None),
             "produces": ["isolation.json"],
         },
     ]
@@ -715,6 +724,9 @@ def cell_steps(
         "clients": clients,
         "workload": workload(klass, clients),
         "request_timeout": request_timeout,
+        "allow_advisory_isolation": bool(allow_advisory_isolation),
+        "isolation_qualification": (ADVISORY_ISOLATION_QUALIFICATION
+                                    if allow_advisory_isolation else None),
         "steps": steps,
     }
 
@@ -741,6 +753,7 @@ def build(args) -> dict:
             corpus=getattr(args, "corpus", None) or "$CC_TRACES_CORPUS",
             request_timeout=getattr(args, "request_timeout", REQUEST_TIMEOUT),
             pretokenize=getattr(args, "pretokenize", False),
+            allow_advisory_isolation=getattr(args, "allow_advisory_isolation", False),
         )
         for tp in TPS
         for klass in CLASSES
@@ -754,6 +767,10 @@ def build(args) -> dict:
         "repeats": args.repeats,
         "request_timeout": getattr(args, "request_timeout", REQUEST_TIMEOUT),
         "prompt_encoding": "token_ids" if getattr(args, "pretokenize", False) else "text",
+        "allow_advisory_isolation": bool(getattr(args, "allow_advisory_isolation", False)),
+        "isolation_qualification": (ADVISORY_ISOLATION_QUALIFICATION
+                                    if getattr(args, "allow_advisory_isolation", False)
+                                    else None),
         "processes_per_side": args.repeats,
         # What the plan as built can be: a run of fewer than the registered
         # repeats is a legitimate thing to want, but it is a diagnostic, and
@@ -796,6 +813,8 @@ def render(plan: dict) -> str:
         ),
         "",
     ]
+    if plan.get("allow_advisory_isolation"):
+        out += ["# ADVISORY ISOLATION: " + ADVISORY_ISOLATION_QUALIFICATION, ""]
     if plan.get("purpose") == DIAGNOSTIC:
         out += [
             (
@@ -886,6 +905,8 @@ def main(argv=None) -> int:
                     help="per-request transport deadline in seconds; not an SLO gate")
     ap.add_argument("--pretokenize", action="store_true",
                     help="encode prompts inside each measured window before pacing, on both sides")
+    ap.add_argument("--allow-advisory-isolation", action="store_true",
+                    help=ADVISORY_ISOLATION_QUALIFICATION)
     ap.add_argument("--out", default=None, help="write the plan as JSON here")
     ap.add_argument(
         "--shell", action="store_true", help="print the commands instead of JSON"

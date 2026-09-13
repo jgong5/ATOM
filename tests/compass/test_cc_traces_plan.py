@@ -325,6 +325,25 @@ class TestTheNodeIsWatchedForTheWholeWindow:
             assert f"{cell['cell']}/gpu.jsonl" in audit
 
 
+class TestAdvisoryIsolationIsExplicit:
+    def test_default_plan_keeps_strict_isolation(self, plan):
+        assert plan["allow_advisory_isolation"] is False
+        for cell in plan["cells"]:
+            assert cell["allow_advisory_isolation"] is False
+            assert "--allow-busy-node" not in _by_id(cell)["isolation"]["command"]
+
+    def test_opt_in_reaches_audit_and_plan_qualification(self):
+        plan = json.loads(_run(["--root", "/r", "--allow-advisory-isolation"]))
+        assert plan["allow_advisory_isolation"] is True
+        assert "advisory" in plan["isolation_qualification"]
+        assert "ADVISORY ISOLATION" in plan_mod.render(plan)
+        for cell in plan["cells"]:
+            assert cell["allow_advisory_isolation"] is True
+            audit = _by_id(cell)["isolation"]
+            assert "--allow-busy-node" in audit["command"]
+            assert "advisory" in audit["qualification"]
+
+
 class TestTheOrderIsTheProtocolS:
     def test_the_device_free_probe_happens_before_the_verdict(self, plan):
         for cell in plan["cells"]:
