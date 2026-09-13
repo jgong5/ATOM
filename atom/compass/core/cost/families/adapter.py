@@ -625,6 +625,11 @@ class ParametricPriceLibrary(PriceLibrary):
         #: observations, so it can never answer for a population it was not
         #: built from. See `_classified_evidence`.
         self._attention_evidence: Optional[list] = None
+        # Static resolutions repeat across layers and token steps. Keys keep
+        # full geometry/scope/selector identities; population changes clear
+        # both caches, including cached ambiguity or absence.
+        self._attention_treatment_cache: dict = {}
+        self._attention_composition_cache: dict = {}
         #: canonical kernel symbol -> the specializations pooled under it.
         #: Empty unless `_canonical_kernel` actually substituted something.
         #: Reported by `attention_coverage`, because pooling two symbols the
@@ -839,6 +844,8 @@ class ParametricPriceLibrary(PriceLibrary):
         # record arriving now can change which regime an EARLIER record falls
         # in -- the scope comparison is between records, not per record.
         self._attention_evidence = None
+        self._attention_treatment_cache.clear()
+        self._attention_composition_cache.clear()
 
     def _with_declared_scope(self, scope: dict, op: dict,
                              price_path: str) -> dict:
@@ -1361,8 +1368,19 @@ class ParametricPriceLibrary(PriceLibrary):
         stops carrying the composition, and it is kept because the cost of
         being wrong about it is a silently altered launch count.
         """
-        compositions = set()
         wanted = attention.scope_key(fit.scope)
+        key = (regime_name, wanted)
+        if key not in self._attention_composition_cache:
+            if len(self._attention_composition_cache) >= 128:
+                self._attention_composition_cache.clear()
+            self._attention_composition_cache[key] = self._find_launch_composition(
+                regime_name, wanted)
+        names, reason, state = self._attention_composition_cache[key]
+        # Keep the return value caller-owned as it was before caching.
+        return None if names is None else list(names), reason, state
+
+    def _find_launch_composition(self, regime_name, wanted):
+        compositions = set()
         for obs in self._classified_evidence():
             if obs["regime"] != regime_name:
                 continue
@@ -1500,6 +1518,15 @@ class ParametricPriceLibrary(PriceLibrary):
         requested = dict(scope or {})
         requested.pop("measurement_treatment", None)
         selector = self.request_attention_treatments.get(wanted, {})
+        key = (family, geometry, wanted, _hashable(requested), _hashable(selector))
+        if key not in self._attention_treatment_cache:
+            if len(self._attention_treatment_cache) >= 128:
+                self._attention_treatment_cache.clear()
+            self._attention_treatment_cache[key] = self._find_treatment(
+                family, geometry, wanted, requested, selector)
+        return self._attention_treatment_cache[key]
+
+    def _find_treatment(self, family, geometry, wanted, requested, selector):
         treatments = set()
         for obs in self._classified_evidence():
             if obs["family"] != family:
@@ -1541,6 +1568,8 @@ class ParametricPriceLibrary(PriceLibrary):
             selected[regime] = {key: _hashable(value)
                                 for key, value in fields.items()}
         self.request_attention_treatments = selected
+        self._attention_treatment_cache.clear()
+        self._attention_composition_cache.clear()
 
     def _layout_note(self, op: dict) -> str:
         """Say so when operand layout is why nothing matched.

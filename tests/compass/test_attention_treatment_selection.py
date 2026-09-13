@@ -112,3 +112,48 @@ def test_recorded_file_hash_is_evidence_but_not_an_import_attestation():
     assert _acquisition_policy(imported) == (module, digest)
     assert _acquisition_policy(legacy) != _acquisition_policy(imported)
     assert _acquisition_policy({}) == ("unevidenced",)
+
+
+def test_new_evidence_can_make_a_warmed_resolution_ambiguous(tmp_path):
+    entries, asked, _cold, _cached = files(tmp_path)
+    library = build(entries, {NAME: {"kv_regions": 2}})
+    first, _ = library.lookup(asked)
+    assert first is not None
+    # A caller owns its returned record; changing it must not alter a cached
+    # launch composition used by a later lookup.
+    first['kernels'].clear()
+    assert library.lookup(asked)[0]['kernels'] == {'decode_kernel': None}
+    other = file_pair(tmp_path, 'added_treatment', asked, .0001, 2, 'different_kernel')
+    library.add(*other)
+    answer, reason = library.lookup(asked)
+    assert answer is None and 'measurement_treatment' in reason
+    # Restricting the treatment again must clear cached ambiguity.
+    library.select_attention_treatments({NAME: {'kv_regions': 2, 'kernels': ['decode_kernel']}})
+    assert library.lookup(asked)[0] is not None
+
+
+def test_adding_a_previously_absent_treatment_invalidates_cached_absence(tmp_path):
+    entries, asked, _cold, _cached = files(tmp_path)
+    library = build(entries, {NAME: {'kv_regions': 4}})
+    assert library.lookup(asked)[0] is None
+    for index, (price, graph) in enumerate(entries[1:7]):
+        op = json.loads(open(graph).read())['ops'][0]
+        seconds = next(iter(json.loads(open(price).read())['prices'].values()))['seconds']
+        library.add(*file_pair(tmp_path, 'new_rotation_' + str(index), op, seconds, 4))
+    answer, reason = library.lookup(asked)
+    assert answer is not None, reason
+    assert answer['interpolation']['regime'] == NAME
+
+
+def test_cached_resolution_observes_scope_and_selector_changes(tmp_path):
+    entries, asked, _cold, _cached = files(tmp_path)
+    library = build(entries, {NAME: {'kv_regions': 2}})
+    assert library.lookup(asked)[0] is not None
+    library.select_attention_treatments({NAME: {'kv_regions': 4}})
+    assert library.lookup(asked)[0] is None
+    library.select_attention_treatments({NAME: {'kv_regions': 2}})
+    assert library.lookup(asked)[0] is not None
+    library.request_attention_scope = dict(SCOPE, compute_units=81)
+    assert library.lookup(asked)[0] is None
+    library.request_attention_scope = dict(SCOPE)
+    assert library.lookup(asked)[0] is not None
