@@ -7,10 +7,10 @@ without calling a missed 5x target a pass; `cc_traces_validate.py matrix
 --speed-advisory` records this policy explicitly. Existing strict protocol
 registrations and their historical verdicts remain unchanged.
 
-**2026-09-13 update:** G3c now has a frozen negative cc-traces witness; the
-24 positive serving cells still require their final three real and three
-modelled repeats. Native Codex subagents perform the current implementation
-and acquisition work.
+**2026-09-13 update:** G3c retains its frozen negative cc-traces witness. The
+24 positive serving cells still require valid final acceptance evidence; the
+first v1 paired numerical results below do not change a gate status. Native
+Codex subagents perform the current implementation and acquisition work.
 
 At commit `6e5596dfaeab0b682bcbf9f7cdd7672435ef0b32`, TP1 with
 `gpu_memory_utilization=0.34` rejected the first registered `clients_large_c8`
@@ -33,6 +33,42 @@ result hashes, both attempts and qualifications are under node18's
 `PREDICTION_FROZEN.json`, `OBSERVED_FIRST.json`, and `OBSERVED_STEADY.json`.
 The parent workload SHA256 is
 `3ba365adc2c39bf0fb56a5e9154b372f9d44291d4d4a0d2bdc1ed67a5ca7df95`.
+
+**Positive v1 progress — numerical agreement, not acceptance.** Artifacts are
+retained under node18's
+`/workspace/ATOM/agent_scratch/codex_final_20260913_v1/`. In
+`results/tp1_clients_short_c1/`, all three real/modelled pairs completed the
+same two requests per repeat. `all_pairs_numeric_comparison.json` records
+throughput errors **−3.80%, −3.25%, −3.23%**, TTFT aggregate errors **≤5.48%**,
+TPOT aggregate errors **≤4.03%**, non-KV component errors **≤0.036%**, and a
+one-block KV difference (**112,773 predicted / 112,772 real**). These numerical
+comparisons are within their error bars; the cell is **not acceptance**:
+`run.real.json` and `gpu.jsonl` retain a failed sampler endpoint, with the last
+sample 0.574 s before the last server exit. The v1 command also used
+`interpolate=1`, leaving the supported interpolation ratio implicit.
+
+`results/tp2_clients_short_c1/run.modelled.json` records three completed
+modelled repeats. Its old output lacks memory predictions for every target
+rank, so it cannot establish the TP2 memory gate. The v1 artifacts remain
+unchanged. Three fixes are integrated for the next frozen source snapshot:
+
+| Commit | Integrated correction |
+| --- | --- |
+| `b5c9d412` | Publish and validate memory predictions for every target TP rank. |
+| `9b65a370` | Align acceptance with the actual source factory contract and explicitly record `interpolate=2.0` support. |
+| `1e95b1ca` | Take a fresh closing GPU observation and publish phase/owned-process provenance without claiming foreign processes. |
+
+The local device-free lane, `jgong5_compass_cpu` on `hjbog-srdc-39`, is ready
+for execution: no GPU device nodes, 1,548 runtime files aligned, and all 1,710
+frozen inputs verified. Its TP2 factory canary reported 675 reads and 266,768
+KV blocks; the local receipt is
+`/workspace/ATOM/agent_scratch/local_cpu_readiness.json`. This establishes lane
+readiness only. The first local TP1 `clients_short_c2` repeat, retained in the
+v1 tree at `results/tp1_clients_short_c2/run.modelled.json`, stopped at the still-open
+**5,760-token GEMM dispatch support gap** (M=5760, K=5120, N=14336, bf16,
+between the 5440/5824 kernel-switch anchors). That gap is being addressed
+separately. Corrected end-to-end runs and the complete configuration matrix
+remain required; no positive gate is promoted by these checks.
 
 **Maintained document. One row per completion gate, and nothing in it may be
 loosened.** `POC_SUMMARY.md` is the narrative handover, `DESIGN_NOTES.md` the
