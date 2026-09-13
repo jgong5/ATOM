@@ -857,6 +857,97 @@ def _rank_records(modelled) -> list:
     return [rank for rank in ranks if isinstance(rank, dict)]
 
 
+def _memory_rank_id(coords, world):
+    if coords == {} and world == 1:
+        return 0
+    if (isinstance(coords, dict) and set(coords) == {"tp"}
+            and type(coords["tp"]) is int and 0 <= coords["tp"] < world):
+        return coords["tp"]
+    return None
+
+
+def _target_memory_predictions(modelled, label):
+    """Target-rank budgets, separately from physical predictor readbacks.
+
+    A GPU-free wide replay has one physical reader. Its explicit homogeneous
+    memory model must still derive every target rank, and each derivation must
+    use inputs that reader actually attested. An old single-budget record is
+    not expanded here; it still fails when target ranks have no counterpart.
+    """
+    physical = _rank_records(modelled)
+    owners = [row for row in physical if "memory_predictions" in row]
+    if not owners:
+        return None, []
+    if len(owners) != 1 or len(physical) != 1:
+        return [], [f"{label}: target memory predictions need one physical reader"]
+    owner = owners[0]
+    group = owner["memory_predictions"]
+    server = modelled.manifest.get("server") or {}
+    world = server.get("tensor_parallel_size")
+    if type(world) is not int or world < 1:
+        return [], [f"{label}: target memory predictions have no deployment width"]
+    if (not isinstance(group, dict)
+            or group.get("schema") != "compass.memory.predicted_ranks/1"
+            or group.get("topology") != {"tp": world}
+            or group.get("assumption") != "homogeneous_tp"):
+        return [], [f"{label}: target memory prediction schema, topology or "
+                    "homogeneous TP assumption is missing or mismatched"]
+    rows = group.get("ranks")
+    if not isinstance(rows, list):
+        return [], [f"{label}: target memory predictions contain no rank list"]
+    primary = _budget_record(owner.get("budget_source")) or {}
+    if (primary.get("kind") != "source-derived"
+            or primary.get("served") is not True
+            or primary.get("hardware_reference") is not False
+            or (primary.get("deployment") or {}).get("tensor_parallel_size") != world
+            or (primary.get("deployment") or {}).get("pipeline_parallel_size") != 1):
+        return [], [f"{label}: target memory predictions do not describe a "
+                    "served source-derived budget"]
+    attested = {json.dumps(row, sort_keys=True)
+                for row in owner.get("inputs") or [] if isinstance(row, dict)}
+    bad, found = [], {}
+    for row in rows:
+        if not isinstance(row, dict):
+            bad.append(f"{label}: a target memory rank is not an object")
+            continue
+        index = _memory_rank_id(row.get("rank_coords"), world)
+        if index is None:
+            bad.append(f"{label}: mismatched target memory rank coordinates")
+            continue
+        where = f"{label}: target rank {index}"
+        if index in found:
+            bad.append(f"{where}: duplicate target memory prediction")
+        found[index] = row
+        budget = _budget_record(row.get("budget_source")) or {}
+        deployment = budget.get("deployment") or {}
+        inputs = budget.get("inputs") or {}
+        if (budget.get("kind") != "source-derived"
+                or budget.get("hardware_reference") is not False
+                or budget.get("served") is not True
+                or deployment.get("coords") != {"tp": index}
+                or inputs.get("rank_coords") != {"tp": index}
+                or {k: v for k, v in deployment.items() if k != "coords"}
+                    != primary.get("deployment")):
+            bad.append(f"{where}: budget identity or serving deployment mismatches")
+        if (budget.get("lineage") != primary.get("lineage")
+                or (budget.get("lineage") or {}).get("world_size") != world
+                or budget.get("num_kvcache_blocks")
+                    != primary.get("num_kvcache_blocks")):
+            bad.append(f"{where}: budget disagrees with the served homogeneous "
+                       "source derivation")
+        used = inputs.get("inputs")
+        if (not isinstance(used, list) or not used
+                or any(not isinstance(value, dict)
+                       or json.dumps(value, sort_keys=True) not in attested
+                       for value in used)):
+            bad.append(f"{where}: a memory input was not attested by the "
+                       "physical predictor")
+    if set(found) != set(range(world)) or len(rows) != world:
+        bad.append(f"{label}: target memory predictions cover {sorted(found)}, "
+                   f"expected every TP rank {list(range(world))} exactly once")
+    return [found[index] for index in sorted(found)], bad
+
+
 def check_capacity_inputs(modelled, label: str) -> list[str]:
     """That the run says what sized it, and read something to size it from.
 
@@ -1327,9 +1418,22 @@ def check_memory_terms(real, modelled, cell_dir: Path, repeat: int, label: str):
         )
         return [missing], {}
 
-    modelled_ranks = _rank_records(modelled)
+    predictions, prediction_bad = _target_memory_predictions(modelled, label)
+    modelled_ranks = (_rank_records(modelled) if predictions is None
+                      else predictions)
     real_ranks = _rank_records(real)
-    bad, measured = [], {
+    world = int((modelled.manifest.get("server") or {}).get(
+        "tensor_parallel_size") or 1)
+    predicted_by_rank = {
+        _memory_rank_id(row.get("rank_coords"), world): row
+        for row in modelled_ranks
+    } if predictions is not None else {}
+    published_by_rank = {
+        _memory_rank_id(row.get("rank_coords"), world): row
+        for row in real_ranks
+    }
+    seen_real = set()
+    bad, measured = list(prediction_bad), {
         "terms": [],
         "components": [],
         "components_not_compared": [],
@@ -1358,10 +1462,24 @@ def check_memory_terms(real, modelled, cell_dir: Path, repeat: int, label: str):
             )
             continue
 
+        if predictions is not None:
+            config = record.get("config") or {}
+            target_rank = _memory_rank_id(config.get("rank_coords"), world)
+            if target_rank is None or _world_of(config) != world:
+                bad.append(f"{where}: real memory rank identity or topology "
+                           "does not match the predicted deployment")
+                continue
+            if target_rank in seen_real:
+                bad.append(f"{label}: duplicate real memory rank {target_rank}")
+            seen_real.add(target_rank)
+            index = target_rank
+            where = f"{label}: rank {index}"
+
         # The modelled side states its terms in the lineage of the budget it
         # served -- the one `derived_block_info` filled in as it derived them,
         # not a second reading taken afterwards.
-        rank = modelled_ranks[index] if index < len(modelled_ranks) else None
+        rank = (predicted_by_rank.get(index) if predictions is not None else
+                modelled_ranks[index] if index < len(modelled_ranks) else None)
         lineage = (_budget_record((rank or {}).get("budget_source")) or {}).get(
             "lineage"
         )
@@ -1441,7 +1559,8 @@ def check_memory_terms(real, modelled, cell_dir: Path, repeat: int, label: str):
         # does not describe this run.
         published = (
             _budget_record(
-                (real_ranks[index] if index < len(real_ranks) else {}).get(
+                (published_by_rank.get(index, {}) if predictions is not None else
+                 real_ranks[index] if index < len(real_ranks) else {}).get(
                     "budget_source"
                 )
             )
@@ -1486,6 +1605,9 @@ def check_memory_terms(real, modelled, cell_dir: Path, repeat: int, label: str):
             f"{len(modelled_ranks)} modelled ranks; the ranks are not "
             f"symmetric and an unmatched one was not compared"
         )
+    if predictions is not None and seen_real != set(range(world)):
+        bad.append(f"{label}: real memory records cover {sorted(seen_real)}, "
+                   f"expected every TP rank {list(range(world))} exactly once")
     return bad, measured
 
 

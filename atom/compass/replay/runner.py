@@ -180,6 +180,7 @@ class ReplayModelRunner(CompassPredictMixin):
         #: device, and that is the one kind final acceptance's hardware side
         #: may treat as evidence about the card.
         self.compass_budget_source: Optional[dict] = None
+        self.compass_memory_predictions: Optional[dict] = None
         differences = self.target.disagreements(config)
         if differences:
             logger.warning(
@@ -304,24 +305,49 @@ class ReplayModelRunner(CompassPredictMixin):
         # now rather than as it was used.
         read: list = []
         lineage: dict = {}
+        primary_inputs = None
+        predicted_ranks = []
+        self.compass_memory_predictions = None
         served = False
         path = (getattr(self._compass_config, "memory_model", "") or "").strip()
         try:
             if not path:
                 blocks = dict(self.target.blocks)
             else:
-                blocks = derived_block_info(
-                    path, self.config,
-                    state_runtime=self.target.blocks.get("state_runtime"),
-                    captured=self.target.blocks,
-                    # No rank coordinates on purpose. A memory profile is a
-                    # per-*width* artifact -- `profile.tp2.json` is the one for
-                    # a TP=2 deployment, not the one for rank 2 -- and the
-                    # rank-suffix convention would collide with that naming
-                    # head-on. The option names the file it means.
-                    coords=None,
-                    collect=read,
-                    lineage=lineage)
+                # One physical executor represents every target TP rank. The
+                # width profile has no rank-dependent parameters: derive each
+                # rank under that explicit homogeneous model, retaining its
+                # own inputs and reply rather than expanding a saved reading.
+                for target_rank in range(self.logical_tp):
+                    first_input = len(read)
+                    rank_lineage = {}
+                    rank_blocks = derived_block_info(
+                        path, self.config,
+                        state_runtime=self.target.blocks.get("state_runtime"),
+                        captured=self.target.blocks,
+                        # Profiles are per width, not rank-suffixed artifacts.
+                        coords=None, collect=read, lineage=rank_lineage)
+                    rank_inputs = (tuple(self.compass_runtime_inputs)
+                                   + tuple(read[first_input:]))
+                    if target_rank == 0:
+                        blocks, lineage = rank_blocks, rank_lineage
+                        primary_inputs = rank_inputs
+                    elif rank_blocks != blocks or rank_lineage != lineage:
+                        from atom.compass.core.memory_model import UnfoundedPrediction
+                        raise UnfoundedPrediction(
+                            "homogeneous TP memory derivations disagree across "
+                            "target ranks; no common serving budget is founded")
+                    coords = {"tp": target_rank}
+                    deployment = dict(self._capacity_context(path)["deployment"],
+                                      coords=coords)
+                    predicted_ranks.append({
+                        "rank_coords": coords,
+                        "budget_source": budget_source(
+                            SOURCE_DERIVED, inputs=rank_inputs, served=False,
+                            num_kvcache_blocks=rank_blocks["num_kvcache_blocks"],
+                            deployment=deployment, lineage=rank_lineage,
+                            coords=coords),
+                    })
             served = True
         finally:
             # Published on the refusal path too: what a run that stopped had
@@ -347,11 +373,25 @@ class ReplayModelRunner(CompassPredictMixin):
                 kind, provenance = CAPTURED, None
             self.compass_budget_source = budget_source(
                 kind,
-                inputs=self.compass_runtime_inputs,
+                inputs=(primary_inputs if primary_inputs is not None
+                        else self.compass_runtime_inputs),
                 served=served,
                 num_kvcache_blocks=count,
                 deployment=context["deployment"],
                 lineage=provenance)
+            if path:
+                for prediction in predicted_ranks:
+                    prediction["budget_source"]["served"] = served
+                self.compass_memory_predictions = {
+                    "schema": "compass.memory.predicted_ranks/1",
+                    "topology": {"tp": self.logical_tp},
+                    "assumption": "homogeneous_tp",
+                    "assumption_detail": (
+                        "Every target TP rank is derived from the same "
+                        "width-specific source profile. Rank-dependent memory "
+                        "variation is not modelled or measured."),
+                    "ranks": predicted_ranks,
+                }
         self.compass_loaded_inputs["num_kvcache_blocks"] = count
         return blocks
 

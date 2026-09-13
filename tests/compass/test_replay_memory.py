@@ -599,6 +599,60 @@ class TestTheRunSaysWhereItsBudgetActuallyCameFrom:
         assert "lineage" not in record
 
 
+class TestTargetRankMemoryPredictions:
+    @pytest.mark.parametrize("width", [1, 2, 4])
+    def test_one_executor_derives_each_target_rank(self, tmp_path, width):
+        runner = ReplayModelRunner(0, _config(
+            tmp_path, width=width, profile=_profile(tmp_path, width)))
+        blocks = runner.get_num_blocks()
+        physical = runner.compass_input_manifest()
+        group = physical["memory_predictions"]
+        assert group["topology"] == {"tp": width}
+        assert group["assumption"] == "homogeneous_tp"
+        assert [row["rank_coords"] for row in group["ranks"]] == [
+            {"tp": rank} for rank in range(width)]
+        # The physical reader actually ran the derivation at every rank; its
+        # primary budget still names one profile, not all repeated reads.
+        assert sum(row.role == "runtime.memory_model"
+                   for row in runner.compass_runtime_inputs) == width
+        assert sum(row["role"] == "runtime.memory_model" for row in
+                   runner.compass_budget_source["inputs"]["inputs"]) == 1
+        for rank, prediction in enumerate(group["ranks"]):
+            budget = prediction["budget_source"]
+            assert budget["kind"] == SOURCE_DERIVED
+            assert budget["hardware_reference"] is False
+            assert budget["served"] is True
+            assert budget["num_kvcache_blocks"] == blocks["num_kvcache_blocks"]
+            assert budget["deployment"]["coords"] == {"tp": rank}
+            assert budget["inputs"]["rank_coords"] == {"tp": rank}
+            assert budget["lineage"]["world_size"] == width
+            assert sum(row["role"] == "runtime.memory_model"
+                       for row in budget["inputs"]["inputs"]) == 1
+
+    def test_disagreeing_rank_derivations_never_serve_a_partial_budget(
+        self, tmp_path, monkeypatch
+    ):
+        from atom.compass.core import memory_blocks
+        original = memory_blocks.derived_block_info
+        calls = []
+
+        def differing(*args, **kwargs):
+            reply = original(*args, **kwargs)
+            calls.append(reply)
+            if len(calls) == 2:
+                reply["num_kvcache_blocks"] += 1
+            return reply
+
+        monkeypatch.setattr(memory_blocks, "derived_block_info", differing)
+        runner = ReplayModelRunner(0, _config(
+            tmp_path, width=2, profile=_profile(tmp_path, 2)))
+        with pytest.raises(UnfoundedPrediction, match="homogeneous TP"):
+            runner.get_num_blocks()
+        assert runner.compass_budget_source["served"] is False
+        assert all(not row["budget_source"]["served"] for row in
+                   runner.compass_memory_predictions["ranks"])
+
+
 class TestATargetForAWidthNoDeviceRan:
     """The record a wider GPU-free deployment is replayed against.
 

@@ -4050,6 +4050,113 @@ class TestEveryMemoryTermIsGatedAgainstTheCard:
         assert run(cell) == 1
 
 
+class TestTargetRankMemoryPredictions:
+    """The actual wide replay shape: one physical reader, two target ranks."""
+
+    def _setup(self, cell):
+        path = cell / "modelled.r1.json"
+        blob = json.loads(path.read_text())
+        physical = blob["run"]["server"]["compass"]["loaded_inputs"]["ranks"]
+        assert len(physical) == 1
+        owner = physical[0]
+        owner["rank_coords"] = {"tp": 0}
+        primary = owner["budget_source"]
+        primary["hardware_reference"] = False
+        primary["deployment"] = {
+            "tensor_parallel_size": 2, "pipeline_parallel_size": 1,
+            "mode": "predict"}
+        predictions = []
+        for rank in range(2):
+            budget = json.loads(json.dumps(primary))
+            budget["deployment"]["coords"] = {"tp": rank}
+            budget["inputs"]["rank_coords"] = {"tp": rank}
+            predictions.append({"rank_coords": {"tp": rank},
+                                "budget_source": budget})
+        owner["memory_predictions"] = {
+            "schema": "compass.memory.predicted_ranks/1",
+            "topology": {"tp": 2}, "assumption": "homogeneous_tp",
+            "ranks": predictions}
+        _write(path, blob)
+        original = cell / "real.r1_memory.json"
+        reference = json.loads(original.read_text())
+        original.unlink()
+        # Deliberately opposite filename order: identity must decide which
+        # prediction is held against each measured rank.
+        for rank, suffix in ((0, "z"), (1, "a")):
+            reference["config"]["rank_coords"] = {"tp": rank}
+            _write(cell / f"real.r1_memory.{suffix}.json", reference)
+        return blob
+
+    def _check(self, cell):
+        return validate.check_memory_terms(
+            validate.compare.load_run(str(cell / "real.r1.json"), "real"),
+            validate.compare.load_run(str(cell / "modelled.r1.json"), "modelled"),
+            cell, 1, "repeat 1")
+
+    def test_every_target_rank_is_compared_by_identity(self, cell):
+        self._setup(cell)
+        bad, measured = self._check(cell)
+        assert not bad
+        assert [row["rank"] for row in measured["blocks"]] == [1, 0]
+        assert len(measured["components"]) == 2 * len(validate.GATED_COMPONENT_TERMS)
+
+    def test_old_single_budget_is_not_silently_expanded(self, cell):
+        blob = self._setup(cell)
+        del blob["run"]["server"]["compass"]["loaded_inputs"]["ranks"][0][
+            "memory_predictions"]
+        _write(cell / "modelled.r1.json", blob)
+        bad, _ = self._check(cell)
+        assert any("2 real memory records against 1 modelled ranks" in why
+                   for why in bad)
+
+    @pytest.mark.parametrize("mutation", [
+        "missing", "duplicate", "coordinates", "topology", "assumption",
+        "unattested_input", "budget", "deployment"])
+    def test_incomplete_or_unfounded_target_predictions_fail(self, cell, mutation):
+        blob = self._setup(cell)
+        group = blob["run"]["server"]["compass"]["loaded_inputs"]["ranks"][0][
+            "memory_predictions"]
+        rows = group["ranks"]
+        if mutation == "missing":
+            rows.pop()
+        elif mutation == "duplicate":
+            rows[1] = rows[0]
+        elif mutation == "coordinates":
+            rows[1]["rank_coords"] = {"tp": 2}
+        elif mutation == "topology":
+            group["topology"] = {"tp": 4}
+        elif mutation == "assumption":
+            group.pop("assumption")
+        elif mutation == "unattested_input":
+            rows[1]["budget_source"]["inputs"]["inputs"][0]["sha256"] = "f" * 64
+        elif mutation == "budget":
+            rows[1]["budget_source"]["num_kvcache_blocks"] += 1
+        elif mutation == "deployment":
+            rows[1]["budget_source"]["deployment"]["coords"] = {"tp": 0}
+        _write(cell / "modelled.r1.json", blob)
+        bad, _ = self._check(cell)
+        assert bad
+
+    @pytest.mark.parametrize("coords", [{"tp": 0}, {"tp": 2}, {}])
+    def test_duplicate_or_mismatched_real_rank_fails(self, cell, coords):
+        self._setup(cell)
+        path = cell / "real.r1_memory.a.json"
+        record = json.loads(path.read_text())
+        record["config"]["rank_coords"] = coords
+        _write(path, record)
+        bad, _ = self._check(cell)
+        assert bad
+
+    def test_each_real_rank_retains_its_own_numeric_gate(self, cell):
+        self._setup(cell)
+        path = cell / "real.r1_memory.a.json"
+        record = json.loads(path.read_text())
+        record["readings"]["non_torch"] *= 2
+        _write(path, record)
+        bad, _ = self._check(cell)
+        assert any("rank 1: non_torch modelled" in why for why in bad)
+
+
 class TestTheComponentTermsAreGatedIndividually:
     """The eight non-KV terms `POC_STATUS.md` G3a tracks, each at 10%.
 

@@ -214,6 +214,11 @@ class CompassPredictMixin:
         # run can be sized from an analytical profile with nothing in the
         # record to show it. Reported as the selector states it, or None.
         out["budget_source"] = getattr(self, "compass_budget_source", None)
+        predictions = getattr(self, "compass_memory_predictions", None)
+        if predictions is not None:
+            # Physical reader identity stays on this manifest. Target memory
+            # ranks are predictions made by it, not additional worker records.
+            out["memory_predictions"] = predictions
         # Both readings, from the process that produced the prediction. Carried
         # here rather than on a second RPC because it answers the same question
         # this one does -- what was this prediction actually made from -- and a
