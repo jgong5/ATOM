@@ -306,9 +306,9 @@ def test_a_rank_reading_another_rank_s_file_is_named_not_counted_present(tmp_pat
     for name in ("wb.json", "wbg.json"):
         (bounded / name).write_text("{}")
     for path in registry.required_artifacts(2, tmp_path).values():
-        if "/codex_wide_20260913/" in path:
-            artifact = Path(path)
-            artifact.parent.mkdir(parents=True, exist_ok=True)
+        artifact = Path(path)
+        artifact.parent.mkdir(parents=True, exist_ok=True)
+        if not artifact.exists():
             artifact.write_text("{}")
     # The dispatch probe's band shards. They are not a price -- no timing in
     # them is read -- but they are what stops an interpolant from crossing a

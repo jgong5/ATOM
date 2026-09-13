@@ -846,6 +846,34 @@ _WIDE_PREFILL_AR = (
 )
 
 
+
+#: Frozen standalone prefill MHA designs, retaining the native cold graph
+#: treatment and cached non-captured treatment as separate laws. The exact
+#: low-work supplement is explicitly tagged and leaves those fits unchanged.
+_WIDE_PREFILL_MHA = tuple(
+    f"{{root}}/codex_regions/wide_prefill_attention_v1/export_tp{{tp}}_v1/{point}.rep{rep}.json:"
+    f"{{root}}/codex_regions/wide_prefill_attention_v1/export_tp{{tp}}_v1/{point}.mha.json:unregistered"
+    for point in tuple(f"C{i}" for i in range(8)) + tuple(f"K{i}" for i in range(9))
+    for rep in (1, 2, 3)
+)
+_WIDE_PREFILL_MHA_EXACT = tuple(
+    f"{{root}}/codex_regions/wide_prefill_mha_exact_low_v1/export_tp{{tp}}_v2/prices.rep{rep}.json:"
+    "{root}/codex_regions/wide_prefill_mha_exact_low_v1/export_tp{tp}_v2/points.json:unregistered"
+    for rep in (1, 2, 3)
+)
+
+#: GDN source conditioning explicitly executes the 16384-token C4 design
+#: before timing and records the selected Triton configuration digest. These
+#: aliases contain only the successor training repeats; original and heldout
+#: measurements remain separate. Native-engine seed equivalence is not claimed.
+_WIDE_PREFILL_GDN = tuple(
+    f"{{root}}/codex_wide_20260913/gdn_prefill_v1/registry_tp{{tp}}_v2/point{point}.rep{rep}.json:"
+    f"{{root}}/codex_wide_20260913/gdn_prefill_v1/registry_tp{{tp}}_v2/graph{point}.json:unregistered"
+    for point in range(18)
+    for rep in (1, 2, 3)
+)
+
+
 def per_width_options(tp: int) -> tuple:
     """The options this width adds to `SHARED_OPTIONS`, unresolved."""
     if tp == 1:
@@ -899,7 +927,8 @@ def per_width_options(tp: int) -> tuple:
                                _WIDE_HEAD_GATHER)
               + _WIDE_BODY_ROWS + (_WIDE_BOUNDED,) + prices)
     # Existing decoder/head sources keep precedence for shared signatures.
-    prices += (_WIDE_PREFILL_NONATTENTION,) + _WIDE_PREFILL_AR
+    prices += ((_WIDE_PREFILL_NONATTENTION,) + _WIDE_PREFILL_AR
+               + _WIDE_PREFILL_MHA + _WIDE_PREFILL_MHA_EXACT + _WIDE_PREFILL_GDN)
     if tp == 4 and INCLUDE_GEMM_SUPPLEMENT_V1:
         # Ahead of the list: within one scope the first price wins, so a
         # supplement that is loaded after the book it supplements answers
@@ -909,11 +938,11 @@ def per_width_options(tp: int) -> tuple:
     return (
         ("tp", str(tp)),
         ("attention_scope",
-         "{root}/codex_wide_decode_tp{tp}_v1/NATIVE_DECODE_SCOPE.json"),
+         "{root}/codex_wide_20260913/deployment_prefill_v2/tp{tp}/SCOPE.json"),
         ("measured_attention_scope",
-         "{root}/codex_wide_decode_tp{tp}_v1/NATIVE_DECODE_SCOPE.json"),
+         "{root}/codex_wide_20260913/deployment_prefill_v2/tp{tp}/SCOPE.json"),
         ("attention_treatments",
-         "{root}/codex_wide_decode_tp{tp}_v1/TREATMENTS.json"),
+         "{root}/codex_wide_20260913/deployment_prefill_v2/tp{tp}/TREATMENTS.json"),
         ("replay_target", _DERIVED_TARGET),
         ("price", ",".join(prices)),
         ("template", f"{_WIDE}/b27dec32.json"),
