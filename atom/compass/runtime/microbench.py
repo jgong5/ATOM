@@ -1165,7 +1165,10 @@ def _kernels_of_replay(graph) -> dict:
     import torch
     from torch.profiler import ProfilerActivity, profile
 
-    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
+    # Only GPU kernel events are consumed below. Repeated CPU+GPU profiler
+    # sessions can corrupt profiler teardown on ROCm under TP4; GPU-only
+    # activity retains the kernel evidence without CPU autograd callbacks.
+    with profile(activities=[ProfilerActivity.CUDA]) as prof:
         graph.replay()
         torch.cuda.synchronize()
 
