@@ -724,13 +724,16 @@ _WIDE_AR_ROWS = (
 #: FULL decode executes these six body widths even when the active count is
 #: between buckets. The source ladder is measured on the final device lanes:
 #: TP2 cards 3/4, TP4 cards 3/4/5/6, with each rank keeping its own timings.
-#: Alias samples select the first three parseable original attempts in repeat
-#: order; BODY_INPUT_INDEX_V1.json retains failed and extra attempt identities.
+#: Alias samples select the first three completed original attempts in repeat
+#: order. Admission checks exact writer completion, clean rank logs, the parent
+#: source assertion, and no failed rank in that rung/repeat group. Legacy
+#: per-process return codes were not recorded; this is completion evidence,
+#: not an rc0 claim. BODY_INPUT_INDEX_V2.json retains every admission witness.
 #: Old books remain loaded behind this coherent source set. Their GPU0..3
 #: card offsets and unresolved GPU1 outlier are not corrections to these data.
 _WIDE_BODY_ROWS = tuple(
-    f"{{root}}/codex_wide_20260913/body_tp{{tp}}/fit.row{rows}.sample{sample}.json:"
-    f"{{root}}/codex_wide_20260913/body_tp{{tp}}/graph.row{rows}.json:unregistered"
+    f"{{root}}/codex_wide_20260913/body_v2_tp{{tp}}/fit.row{rows}.sample{sample}.json:"
+    f"{{root}}/codex_wide_20260913/body_v2_tp{{tp}}/graph.row{rows}.json:unregistered"
     for rows in (1, 2, 4, 8, 16, 32)
     for sample in (1, 2, 3)
 )
