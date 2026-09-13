@@ -593,6 +593,21 @@ def seeded_graphs(paths, derive, allocation, coords=None, *,
         getattr(derive, "compilation_independent", False)
         and all((graph.get("provenance") or {}).get("compilation_level") == 0
                 for graph in graphs.values()))
+    if compilation_independent and str(cudagraph_mode).lower() == "full":
+        from atom.compass.runtime.templates import BindRefusal, _check_traced_as_captured
+
+        # An old seed may have matched only compiled=None and consequently
+        # never reached a compiled runner. Do not make that dormant seed a hit
+        # unless its own FULL-capture declaration is valid. A compiled miss
+        # continues through the existing fresh-derivation path instead.
+        for graph in graphs.values():
+            shape = template_shape(graph)
+            if shape.capture_bucket is not None and not shape.is_prefill:
+                try:
+                    _check_traced_as_captured(graph)
+                except BindRefusal:
+                    compilation_independent = False
+                    break
     return TemplateGraphs(graphs, derive=derive, allocation=allocation,
                           cudagraph_mode=cudagraph_mode,
                           compilation_independent=compilation_independent)

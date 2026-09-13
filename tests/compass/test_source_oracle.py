@@ -513,6 +513,39 @@ class TestTheRankTheServedPathActuallyBuildsWith:
         assert built.body_graphs.representative_hits == 1
 
 
+def test_compilation_sharing_does_not_activate_a_stale_full_seed(tmp_path):
+    from dataclasses import replace
+    from atom.compass.runtime.source_oracle import seeded_graphs, template_shape
+    from atom.compass.runtime.templates import CarriedAllocation
+
+    graph = {
+        "ops": [], "key": {"topology": [["tp", 2]], "rank_coords": [["tp", 0]]},
+        "provenance": {"compilation_level": 0,
+            "execution": {"capture_bucket": 1},
+            "batch_spec": {"kind": "decode", "query_lens": [1],
+                           "context_lens": [32], "block_size": 16,
+                           "max_model_len": 4096}},
+    }
+    path = tmp_path / "old.json"
+    path.write_text(json.dumps(graph))
+
+    class Deriver:
+        compilation_independent = True
+
+        def __call__(self, shape):
+            current = json.loads(json.dumps(graph))
+            current["provenance"]["batch_spec"].update(
+                cudagraph_mode="full", capture_bucket=1)
+            return current
+
+    cache = seeded_graphs([str(path)], Deriver(), CarriedAllocation("test"),
+                          cudagraph_mode="full")
+    current = cache.graph_for(replace(template_shape(graph), compiled=True))
+    assert current is not None
+    assert cache.derivations == 1 and cache.hits == 0
+    assert current["provenance"]["batch_spec"]["cudagraph_mode"] == "full"
+
+
 class TestAskingForFittedPrices:
     """The family provider, reachable from the same command line.
 
