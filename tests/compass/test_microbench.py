@@ -520,6 +520,57 @@ class TestAStrideIntoMemoryTheGraphNeverSaw:
         assert _stride_past_its_tensors(self._kernel([("#11", 6144)])) is None
         assert _stride_past_its_tensors(self._kernel([("#9", 6145)]))
 
+    def test_a_one_row_argument_states_its_own_dense_row(self):
+        """`_mrope_qk_kernel` at one decode row, beside multi-row tables.
+
+        q is `[1, 1536]` and `q_stride_t` is 1536 -- q's own dense row, which
+        the same arithmetic cannot overrun at `d0 == 1`. But `extents` skips
+        one-row arguments, so the cos/sin tables' 32 became the limit and this
+        kernel was refused at one row while pricing at every other rung. q is
+        contiguous, offset zero and sole owner, so `_layouts_of` records
+        nothing to appeal to; the row it fits is its own.
+        """
+        from atom.compass.runtime.microbench import _stride_past_its_tensors
+
+        op = _op(shapes=[(1, 1536), (262144, 1, 1, 32)],
+                 dtypes=["bfloat16", "bfloat16"],
+                 scalars=[("#7", 1536), ("#11", 1)])
+        op["name"] = "triton::_mrope_qk_kernel"
+        op["param_names"] = [[0, "q_ptr"], [1, "cos_ptr"],
+                             [7, "q_stride_t"], [11, "pos_stride_row"]]
+        assert _stride_past_its_tensors(op) is None
+
+    def test_but_only_a_row_some_argument_actually_has(self):
+        """1537 is no argument's dense row, so it still names an allocation."""
+        from atom.compass.runtime.microbench import _stride_past_its_tensors
+
+        op = _op(shapes=[(1, 1536), (262144, 1, 1, 32)],
+                 dtypes=["bfloat16", "bfloat16"],
+                 scalars=[("#7", 1537)])
+        op["name"] = "triton::_mrope_qk_kernel"
+        op["param_names"] = [[0, "q_ptr"], [7, "q_stride_t"]]
+        assert _stride_past_its_tensors(op) == ("#7", 1537, 32)
+
+    def test_and_an_unnamed_kernel_keeps_the_size_test(self):
+        """Without `param_names` there is still nothing better than the guess."""
+        from atom.compass.runtime.microbench import _stride_past_its_tensors
+
+        op = _op(shapes=[(1, 1536), (262144, 1, 1, 32)],
+                 dtypes=["bfloat16", "bfloat16"],
+                 scalars=[("#7", 1536)])
+        op["name"] = "triton::k"
+        assert _stride_past_its_tensors(op) == ("#7", 1536, 32)
+
+    def test_an_unrelated_one_row_tensor_does_not_prove_a_stride_safe(self):
+        from atom.compass.runtime.microbench import _stride_past_its_tensors
+
+        op = _op(shapes=[(4, 32), (1, 1536)],
+                 dtypes=["bfloat16", "bfloat16"],
+                 scalars=[("#2", 1536)])
+        op["param_names"] = [[0, "q_ptr"], [1, "other_ptr"],
+                             [2, "q_stride_t"]]
+        assert _stride_past_its_tensors(op) == ("#2", 1536, 32)
+
 
 class TestRebuildingAViewIntoItsBuffer:
     """With layout recorded, q comes back as a window on the fused qkv buffer.

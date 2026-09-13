@@ -768,6 +768,12 @@ def _stride_past_its_tensors(op: dict):
     to fit before it is used (`_operand_tensors`) -- or by fitting a dense row
     of some argument, which is what the rebuild produces anyway.
 
+    A single-row tensor has no second row to overrun. Admit its own dense row
+    stride when recorded parameter names associate it with that tensor:
+    `q_stride_t` with `q_ptr`, for example. This matters for one-row MRoPE,
+    whose dense q/k operands sit beside multi-row cosine/sine tables. A wider
+    unrelated one-row tensor must not excuse another operand's unsafe stride.
+
     An operator whose names were never recorded falls back to the size test
     unchanged, layouts or not, because for it there is still nothing better.
     Returns the first refusal as (name, value, largest extent), or None. Both
@@ -785,14 +791,25 @@ def _stride_past_its_tensors(op: dict):
              for _, v in (op.get("layouts") or ())
              for s in tuple(v)[0]}
     params = {int(i): str(n) for i, n in (op.get("param_names") or ())}
+    args, _ = _rebuild_args(op, shapes)
+    dense_rows = {
+        params[i][:-4]: math.prod(shape[1:])
+        for i, shape in enumerate(args)
+        if params.get(i, "").endswith("_ptr")
+        and isinstance(shape, tuple) and len(shape) >= 2 and shape[0] == 1
+    }
     for key, value in (tuple(x) for x in op.get("scalars") or ()):
         if not (key.startswith("#") and isinstance(value, int)
                 and not isinstance(value, bool) and value > limit):
             continue
         if value in known:
             continue
-        if params and "stride" not in params.get(int(key[1:]), ""):
-            continue
+        if params:
+            if "stride" not in params.get(int(key[1:]), ""):
+                continue
+            owner, _, _ = params.get(int(key[1:]), "").partition("_stride")
+            if value == dense_rows.get(owner):
+                continue
         return (key, value, limit)
     return None
 
