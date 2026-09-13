@@ -334,8 +334,22 @@ def _load_dispatch_bands(library, value, coords=None):
         library.add_dispatch_bands([loaded.path], family.strip())
         library.loaded_inputs = library.loaded_inputs + (loaded,)
 
+def _load_attention_treatments(library, value, coords=None):
+    """Load and attest per-regime restrictions on source measurement policy."""
+    if isinstance(value, dict):
+        library.select_attention_treatments(value)
+        return
+    from atom.compass.core.loaded_input import load_json
+
+    payload, loaded = load_json(str(value), role="oracle.attention_treatments",
+                                coords=coords)
+    library.select_attention_treatments(payload)
+    library.loaded_inputs = library.loaded_inputs + (loaded,)
+
+
 def _price_library(entries, gap_ratio, coords=None, attention_scope=None,
-                   measured_attention_scope=None, dispatch_bands=None):
+                   measured_attention_scope=None, dispatch_bands=None,
+                   attention_treatments=None):
     """The exact-signature library, or the family provider in front of it.
 
     The provider is a subclass that overrides `lookup` alone, so everything
@@ -408,6 +422,11 @@ def _price_library(entries, gap_ratio, coords=None, attention_scope=None,
                 "may give, and modelling is off, so nothing would read it. "
                 "Turn the family provider on with interpolate, or drop it.")
         _load_dispatch_bands(library, dispatch_bands, coords)
+    if attention_treatments:
+        if gap_ratio is None:
+            raise ValueError("attention_treatments selects a fitted family, "
+                             "but modelling is off")
+        _load_attention_treatments(library, attention_treatments, coords)
     extra = {"coords": coords} if coords else {}
     for entry in entries:
         if isinstance(entry, (tuple, list)):
@@ -825,6 +844,7 @@ def build_source_oracle(
     attention_scope=None,
     measured_attention_scope=None,
     dispatch_bands=None,
+    attention_treatments=None,
     rank_coords=None,
     _shared_derivers=None,
     _shared_allocation=None,
@@ -915,7 +935,7 @@ def build_source_oracle(
     price_entries = price_specs(requested_prices)
     library = _price_library(price_entries, gap_ratio(interpolate), coords,
                              attention_scope, measured_attention_scope,
-                             dispatch_bands)
+                             dispatch_bands, attention_treatments)
     regions_model = region_model(regions)
     # A preset declared above TP1 carries an argument about which of the
     # runner's preparation branches this deployment takes, and one of those

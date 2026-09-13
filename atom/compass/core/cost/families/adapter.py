@@ -638,6 +638,9 @@ class ParametricPriceLibrary(PriceLibrary):
         #: answering for another. An empty request matches only an unscoped
         #: fit, which under `strict` does not exist.
         self.request_attention_scope: dict = {}
+        #: Explicit restrictions on recorded acquisition treatments, per
+        #: regime. They never alter an observation or a deployment scope.
+        self.request_attention_treatments: dict = {}
         #: The deployment a price file that is SILENT about its own was
         #: measured under, declared by whoever resolved it -- an
         #: `attention_scope.Declaration`, carrying the facts behind every
@@ -982,6 +985,7 @@ class ParametricPriceLibrary(PriceLibrary):
             path: dict(entry["context"])
             for path, entry in sorted(self._attention_acquisition.items())}
         coverage["launch_charge_seconds"] = self.launch_charge_seconds
+        coverage["requested_treatments"] = self.request_attention_treatments
         # Whether any of this was filed under a scope the FILES stated or one
         # a caller declared for them. A law fitted over declared facts is
         # exactly as good as the declaration, and a reader cannot weigh it
@@ -1064,6 +1068,16 @@ class ParametricPriceLibrary(PriceLibrary):
     # -- lookup ---------------------------------------------------------
 
     def lookup(self, op: dict, topology=None, registration=None):
+        if self.request_attention_treatments and op.get("name") in (
+                attention.UNIFIED, attention.GDN):
+            regime = attention.regime_of(op, None, self._declared_scope(op))
+            if not isinstance(regime, attention.Refusal) and regime.name in \
+                    self.request_attention_treatments:
+                # A selected calibration must not be bypassed by a legacy
+                # exact-signature record from another acquisition treatment.
+                return self._modelled(op, _OPEN_QUESTION,
+                                      contract_for(op["name"]), topology,
+                                      registration)
         record, detail = super().lookup(op, topology, registration)
         if record is not None or detail != _OPEN_QUESTION:
             # Either answered, or refused for a reason that is a finding rather
@@ -1468,6 +1482,7 @@ class ParametricPriceLibrary(PriceLibrary):
         wanted = None if isinstance(asked, attention.Refusal) else asked.name
         requested = dict(scope or {})
         requested.pop("measurement_treatment", None)
+        selector = self.request_attention_treatments.get(wanted, {})
         treatments = set()
         for obs in self._classified_evidence():
             if obs["family"] != family:
@@ -1478,8 +1493,37 @@ class ParametricPriceLibrary(PriceLibrary):
                 continue
             if wanted is not None and obs["regime"] != wanted:
                 continue
+            recorded = {"kernels": obs["measurement"][0],
+                        **dict(obs["measurement"][1:])}
+            if any(recorded.get(key, attention.ABSENT) != value
+                   for key, value in selector.items()):
+                continue
             treatments.add(obs["measurement"])
         return treatments.pop() if len(treatments) == 1 else None
+
+    def select_attention_treatments(self, selectors: dict) -> None:
+        """Restrict each named regime to one identifiable source treatment.
+
+        A selector is a subset of recorded treatment fields. It must still
+        identify exactly one treatment for the requested deployment/geometry;
+        no match and multiple matches retain the normal scope refusal.
+        """
+        if not isinstance(selectors, dict):
+            raise ValueError("attention_treatments must map regimes to selectors")
+        allowed = set(_TREATMENT_FIELDS) | {"acquisition_policy", "kernels"}
+        selected = {}
+        for regime, fields in selectors.items():
+            if regime not in attention.REGIMES:
+                raise ValueError(f"unknown attention regime {regime!r}")
+            if not isinstance(fields, dict) or not fields:
+                raise ValueError(f"attention treatment for {regime} is empty")
+            unknown = set(fields) - allowed
+            if unknown:
+                raise ValueError("unknown attention treatment fields: "
+                                 + ", ".join(sorted(unknown)))
+            selected[regime] = {key: _hashable(value)
+                                for key, value in fields.items()}
+        self.request_attention_treatments = selected
 
     def _layout_note(self, op: dict) -> str:
         """Say so when operand layout is why nothing matched.
