@@ -64,11 +64,42 @@ frozen inputs verified. Its TP2 factory canary reported 675 reads and 266,768
 KV blocks; the local receipt is
 `/workspace/ATOM/agent_scratch/local_cpu_readiness.json`. This establishes lane
 readiness only. The first local TP1 `clients_short_c2` repeat, retained in the
-v1 tree at `results/tp1_clients_short_c2/run.modelled.json`, stopped at the still-open
+v1 tree at `results/tp1_clients_short_c2/run.modelled.json`, stopped at the
 **5,760-token GEMM dispatch support gap** (M=5760, K=5120, N=14336, bf16,
 between the 5440/5824 kernel-switch anchors). That gap is being addressed
 separately. Corrected end-to-end runs and the complete configuration matrix
 remain required; no positive gate is promoted by these checks.
+
+**Subsequent source and C8 checks (2026-09-13).** Provisional supplemental
+sources now pass all 8,960 ordinary GEMM lookups: five native weight geometries,
+256 prefill row counts, and seven rank libraries. All 931 earlier exact
+measurements retain their values; new books remain exact-only. This establishes
+functional coverage on the 64-token grid, not numerical acceptance. Source
+stability and reference-condition holds remain explicit while longer measurements
+repair the affected rows (`codex_gemm_campaign_20260913_v1/`).
+
+The local TP1 `clients_large_c8` diagnostic preserved all 37 requests from
+eight root clients. It completed 99 prefill steps and reached 32 running requests
+before refusing summed decode history 1,618,144, above the previous preparation
+limit 1,572,864. No preemption or non-64-aligned prefill was observed before
+that refusal. Evidence is under `provisional_tp1_c8_v1/` on node18; the run
+failed and is not acceptance.
+
+Commit `99c6af0c` adds the independently measured
+`source-27b-tp1-history-2m` profile through total history 2,097,152, preserving
+all old-domain predictions and bands. Its 56 source cases include 16 heldouts;
+maximum incremental error is 6.081 microseconds against the declared
+110-microsecond component-impact criterion. All 223 relevant region and oracle
+tests pass with the production replay bootstrap. Source evidence is under
+`codex_regions/prepare_history_2m_v1/`; the larger source-only KV pool does not
+change the target's allocation settings.
+
+A separate structural probe at the same C8 decode contexts prices every GDN
+and other body operator, and the head, but refuses all 16 unified MHA calls:
+`work_waves=159.3` exceeds measured support 128.725. Its block/state assignment
+is explicitly reconstructed, not observed. The independent MHA source-domain
+extension remains required before another C8 replay. No positive E2E gate has
+been promoted by these source checks.
 
 **Maintained document. One row per completion gate, and nothing in it may be
 loosened.** `POC_SUMMARY.md` is the narrative handover, `DESIGN_NOTES.md` the
