@@ -450,6 +450,28 @@ class TestEventDraining:
         stub._drain_pending()
         assert stub._written[0][3] == {}
 
+    def test_native_middle_chunk_records_skipped_postprocess_as_zero_work(self):
+        from dataclasses import replace
+
+        stub = self._runner()
+        pair = (self.FakeEvent(), self.FakeEvent(ms=6.0))
+        step = self._step(ms=10.0, spans={"run_model": pair})
+        middle = replace(prefill(16384), produces_output=False)
+        stub._pending.append((middle, *step[1:]))
+        stub._drain_pending()
+        assert stub._written[0][3] == {
+            "run_model": 0.006, "postprocess": 0.0}
+
+    def test_missing_inner_spans_are_not_inferred_from_output_predicate(self):
+        from dataclasses import replace
+
+        stub = self._runner()
+        step = self._step(ms=10.0)
+        middle = replace(prefill(16384), produces_output=False)
+        stub._pending.append((middle, *step[1:]))
+        stub._drain_pending()
+        assert stub._written[0][3] == {}
+
     def test_warmup_is_counted_per_kind(self):
         """Prefill happens a handful of times in a whole run, so a warmup
         counted in total steps discards every prefill sample there is."""

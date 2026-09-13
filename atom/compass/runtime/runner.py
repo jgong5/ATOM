@@ -196,6 +196,14 @@ class CompassModelRunner(CompassPredictMixin, ModelRunner):
             # that was recorded at all has completed by now.
             sub = {name: b.elapsed_time(e) / 1000.0
                    for name, (b, e) in (spans or {}).items()}
+            if (shape.is_prefill and not shape.produces_output
+                    and "run_model" in sub and "postprocess" not in sub):
+                # ModelRunner.forward returns before postprocess for a pure
+                # middle chunk. This is structural zero work, known from the
+                # native predicate, rather than a missing timing assumed zero.
+                # Recording it makes the outer-minus-inner preparation/idle
+                # remainder interpretable on these steps too.
+                sub["postprocess"] = 0.0
             self._count_and_record(shape, began.elapsed_time(ended) / 1000.0,
                                    gap, req_ids=req_ids, started_at=started_at,
                                    decision=decision, spans=sub)

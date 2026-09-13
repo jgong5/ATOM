@@ -63,6 +63,7 @@ def shape_of(row: dict) -> StepShape:
         rank_coords=dict(row.get("rank_coords") or {}),
         capture_bucket=row.get("capture_bucket"),
         compiled=row.get("compiled"),
+        produces_output=row.get("produces_output", True),
     )
 
 
