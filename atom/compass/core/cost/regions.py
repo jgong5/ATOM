@@ -382,6 +382,12 @@ class BucketedRunnerRegions:
     #: support for two long histories, whose block-table packing copies more
     #: live entries. Unlisted cells retain ``decode_context`` unchanged.
     decode_context_cells: tuple = ()
+    #: Optional additive history effects at each cell's measured summed-history
+    #: limit. The native remainder stays unchanged through its original
+    #: ``decode_context`` plateau; beyond that, only this small contribution
+    #: is interpolated linearly in summed history. These measurements concern
+    #: preparation, not the whole native preparation/idle remainder.
+    prepare_decode_history_deltas: tuple = ()
     version: str = ""
     provenance: str = ""
 
@@ -636,8 +642,30 @@ class BucketedRunnerRegions:
 
     def _decode_prepare(self, shape) -> Measured:
         seqs = len(shape.num_scheduled_tokens)
-        return self._cells()[(int(shape.capture_bucket),
-                              shape.capture_bucket != seqs)]
+        cell = (int(shape.capture_bucket), shape.capture_bucket != seqs)
+        native = self._cells()[cell]
+        delta = dict(self.prepare_decode_history_deltas).get(cell)
+        anchor = seqs * self.decode_context[1]
+        history = sum(shape.context_lens)
+        if delta is None or history <= anchor:
+            return native
+        limits = dict(self.decode_context_cells).get(cell)
+        if limits is None or limits[2] <= anchor:
+            raise ValueError(f"history delta for {cell} has no measured span")
+        fraction = (history - anchor) / (limits[2] - anchor)
+        # Refusal is checked before _parts reaches this method. A cap must
+        # never make an unsupported sum look like the last measured point.
+        if not 0.0 <= fraction <= 1.0:
+            raise ValueError(f"history delta for {cell} is outside its support")
+        return Measured(
+            seconds=native.seconds + fraction * delta.seconds,
+            low=max(0.0, native.low + fraction * delta.low),
+            high=native.high + fraction * delta.high,
+            samples=native.samples + delta.samples,
+            how=native.how + "; plus an additive history approximation "
+                f"at {fraction:.6f} of the measured summed-history span: "
+                + delta.how,
+        )
 
     def _parts(self, shape) -> list:
         why = self.refusal(shape)
@@ -1577,6 +1605,85 @@ SOURCE_27B_TP1_HISTORY_64K = replace(
 )
 
 
+# Conditioned direct preparation isolates the history-dependent work; it is
+# not the native outer-forward minus run_model minus postprocess remainder.
+# In prepare_probe_v2, direct/native agreement is -2.13% at N32 but -21% at
+# N1/N2. That failed absolute-equivalence check is retained. No direct absolute
+# time replaces a native coefficient below.
+#
+# Source audit for PP1, no speculation, block16: live history enters
+# prepare_model via Aiter prepare_decode (block-table packing, positions,
+# kv_indptr/indices, MROPE). Outside prepare_model and the separately measured
+# body/postprocess spans, forward performs staging/ring bookkeeping, fixed PP
+# checks, disabled drafter checks and context reset. Those have no history
+# input. Aiter/GDN preparation uses the current stream; auxiliary preparation
+# streams belong to MLA/V4, not this source. Sampling's D2H stream is separate;
+# the source probe preserves native previous-token bindings and admits no
+# pending MTP-status copies.
+#
+# V2 queues a measured 4.899ms device interval before the preparation begin
+# event, allowing CPU submission to overlap a predecessor as native serving
+# does. That interval is excluded from the measurement and is not a model
+# body. The independent native source median step is >=22ms. V1 exposed CPU
+# submission on an idle device and is kept as a separate diagnostic.
+#
+# Each row below is (cell, sum limit, active counts, retained samples,
+#                   (point delta, low delta, high delta) in MICROSECONDS).
+# Point = greatest nonnegative difference of the three-repeat medians at the
+# same active count. Band = union of differences between per-repeat medians,
+# including negative variation; it is not a tail interval over raw timings.
+# All 8256 raw V2 timings remain in prepare_probe_v2/prepare_rows.jsonl, SHA256
+# 892ebf93db61c94c025b7bfc8711328d1a3a3e9308c91ab9a697e8d58290b6ef.
+# The largest point, 11.04us, is 0.0502% of a 22ms source step. Linear use
+# between source endpoints is an explicit approximation; final E2E traces,
+# not this component experiment, decide its accuracy and TP transfer.
+# The lower endpoint comes from separate prepare_probe_v3: histories 128
+# and 1032 at all fourteen active counts, 5376 retained timings. The largest
+# median change is 0.241us, below its predeclared 110us absolute step-impact
+# threshold. V3 raw SHA256:
+# 822e54786bb4b36b884eaa614b47e26f0f795f2b0884c44180e54266d01e0b5f.
+_HISTORY_DELTA_ROWS = (
+    ((1, False), 196608, (1,), 576, (0.360, -0.080, 0.520)),
+    ((2, False), 393216, (2,), 768, (0.440, -0.240, 0.440)),
+    ((4, True), 589824, (3,), 576, (0.600, 0.000, 0.720)),
+    ((4, False), 786432, (4,), 576, (0.480, 0.000, 0.560)),
+    ((8, True), 1376256, (5, 7), 1152, (1.080, -0.160, 1.280)),
+    ((8, False), 1572864, (8,), 576, (1.201, -0.040, 3.119)),
+    ((16, True), 1572864, (9, 15), 1152, (5.961, -4.201, 6.600)),
+    ((16, False), 1572864, (16,), 576, (0.000, -4.000, 7.440)),
+    ((32, True), 1572864, (17, 21, 31), 1728, (11.040, -2.880, 11.440)),
+    ((32, False), 1572864, (32,), 576, (0.000, -1.001, 0.560)),
+)
+
+SOURCE_27B_TP1_HISTORY_DELTA = replace(
+    SOURCE_27B_TP1_HISTORY_64K,
+    decode_context_cells=tuple(
+        (cell, (128, 196608, total))
+        for cell, total, _counts, _samples, _deltas in _HISTORY_DELTA_ROWS),
+    prepare_decode_history_deltas=tuple(
+        (cell, Measured(
+            seconds=values[0] * 1e-6, low=values[1] * 1e-6,
+            high=values[2] * 1e-6, samples=samples,
+            how=f"prepare_probe_v2 active counts {counts}; native absolute "
+                "remainder retained, conditioned preparation history delta "
+                f"only, bounded by summed history {total}; band over "
+                "per-repeat median differences, not raw timing tails"))
+        for cell, total, counts, samples, values in _HISTORY_DELTA_ROWS),
+    version="history-delta-2026-09-13",
+    provenance=SOURCE_27B_TP1_HISTORY_64K.provenance
+        + "; independent prepare_probe_v2 measures only additional "
+        "history work, with explicitly conditioned predecessor overlap. "
+        "Direct absolute preparation is not equivalent to the native "
+        "remainder at N1/N2 (-21%); that failed criterion is retained, "
+        "not relabelled as a pass. Native coefficients and answers over "
+        "1025..1152 are unchanged. Each cell has its own summed-history "
+        "bound; no clipped extrapolation. Source-order audit identifies "
+        "history dependence inside prepare_model only for PP1/no-spec/"
+        "block16. Minimum 128 is acquired separately in prepare_probe_v3. "
+        "This is an additive approximation requiring final E2E validation",
+)
+
+
 #: Block sizes whose per-step attention metadata build is sized by the rank's
 #: own KV head count, and therefore is NOT width-invariant.
 #:
@@ -1637,6 +1744,7 @@ REGION_MODELS = {
     "source-27b-tp1-prefill-interp": SOURCE_27B_TP1_PREFILL_INTERP,
     "source-27b-tp1-prefill-seqs": SOURCE_27B_TP1_PREFILL_SEQS,
     "source-27b-tp1-history-64k": SOURCE_27B_TP1_HISTORY_64K,
+    "source-27b-tp1-history-delta": SOURCE_27B_TP1_HISTORY_DELTA,
     "none": None,
 }
 
