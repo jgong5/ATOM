@@ -431,6 +431,14 @@ def _tp1_prices() -> tuple:
                 f"{decode}/prices/t10_{point}.rot2.tp1.r0.rep{repeat}.json:"
                 f"{decode}/seeds/b_t10_{point}.json:registered")
 
+    # The smaller client counts can reach a singleton at cu_max=1, outside
+    # the original C8-derived box. One independent source point extends that
+    # boundary; both low-work holdouts remain outside the training list.
+    low_decode = "{root}/codex_decode_low_v1"
+    for repeat in (1, 2, 3):
+        add(f"{low_decode}/prices/t_low_2048.rot2.tp1.r0.rep{repeat}.json",
+            f"{low_decode}/seeds/b_t_low_2048.json")
+
     # The 640- and 16384-token prefill cells.
     p640 = f"{_PC}/p640"
     add(f"{p640}/p27_body_640.tp1.r0.{_REP}.json",
