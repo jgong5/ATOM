@@ -27,7 +27,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from .attention import GDN, GDN_SCOPE, UNIFIED, UNIFIED_SCOPE
+from .attention import GDN, GDN_SCOPE, UNIFIED, UNIFIED_SCOPE, structure_of
 
 __all__ = ["Declaration", "Fact", "FAMILY_LABELS", "declaration_of",
            "read_resolved"]
@@ -38,6 +38,12 @@ __all__ = ["Declaration", "Fact", "FAMILY_LABELS", "declaration_of",
 #: treatments and identified by different facts -- the GDN kernel never reads
 #: the paged KV cache, so a KV layout is not a fact about it.
 FAMILY_LABELS = {UNIFIED: "unified", GDN: "gdn"}
+
+# Native branch identity is available before the dispatch backend is resolved.
+# A decode kernel declaration can therefore coexist with the backend/flags
+# declaration used by prefill, without assigning either to the wrong call.
+CALL_SCOPE_LABELS = ("unified.decode", "unified.prefill.cold",
+                     "unified.prefill.cached", "gdn.decode", "gdn.prefill")
 
 #: How the record names each family's module class. Matched on the class the
 #: process actually instantiated, not on the module path: a layer called
@@ -105,9 +111,31 @@ class Declaration:
         return dict(self.scopes.get(label) or {})
 
     def for_op(self, op: dict) -> dict:
-        """The scope for the family this operator belongs to."""
+        """The explicit native-branch scope, falling back to its family.
+
+        Branch declarations are complete scopes, not patches to a different
+        branch's facts. Missing/ambiguous native metadata never chooses one.
+        """
         label = FAMILY_LABELS.get((op or {}).get("name"))
-        return self.for_family(label) if label else {}
+        if not label:
+            return {}
+        if any(key.startswith(label + ".") for key in self.scopes):
+            structure = structure_of(op)
+            call = None
+            if structure is not None and label == "unified":
+                if structure.is_prefill is False:
+                    call = "unified.decode"
+                elif structure.is_prefill is True and structure.has_cached is not None:
+                    call = ("unified.prefill.cached" if structure.has_cached
+                            else "unified.prefill.cold")
+            elif structure is not None and label == "gdn":
+                if structure.num_prefills and not structure.num_decodes:
+                    call = "gdn.prefill"
+                elif structure.num_decodes and not structure.num_prefills:
+                    call = "gdn.decode"
+            if call in self.scopes:
+                return self.for_family(call)
+        return self.for_family(label)
 
     def as_dict(self) -> dict:
         return {
@@ -154,7 +182,7 @@ def declaration_of(payload, *, where: str) -> Declaration:
     block = payload.get("attention_scope")
     if isinstance(block, dict):
         return _declared(block, where + ".attention_scope")
-    labels = set(FAMILY_LABELS.values())
+    labels = set(FAMILY_LABELS.values()) | set(CALL_SCOPE_LABELS)
     if payload and set(payload) <= labels and all(
             isinstance(value, dict) for value in payload.values()):
         # A per-family declaration: the two families run different kernels and
@@ -185,7 +213,7 @@ def _declared(block: dict, where: str) -> Declaration:
         return {key: _freeze(value) for key, value in scope.items()}
 
     per_family = {label: frozen(block[label])
-                  for label in FAMILY_LABELS.values()
+                  for label in (*FAMILY_LABELS.values(), *CALL_SCOPE_LABELS)
                   if isinstance(block.get(label), dict)}
     scopes = per_family or {label: frozen(block)
                             for label in FAMILY_LABELS.values()}
