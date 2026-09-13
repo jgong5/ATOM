@@ -2956,6 +2956,31 @@ class TestTheSpeedupGateIsPartOfTheVerdict:
         assert report["gates"]["speedup"] is False
         assert report["accepted"] is False
 
+    def test_explicit_advisory_policy_retains_the_missed_target(self, tmp_path):
+        out = tmp_path / "advisory.json"
+        assert validate.main(["matrix", *self._slow(tmp_path), "--speed-advisory",
+                              "--out", str(out)]) == 0
+        report = json.loads(out.read_text())
+        assert report["gates"]["speedup"] is False
+        assert report["gates"]["cost_reporting"] is True
+        assert report["acceptance_policy"]["speedup"] == "advisory"
+        assert "speedup" not in report["required_gates"]
+        assert report["accepted"] is True
+
+    def test_advisory_speed_does_not_relax_accuracy(self, tmp_path):
+        bad = _cell_verdict("tp4_clients_large_c8", "clients_large", 400., 400.,
+                            tp=4, clients=8, metrics=ALL_METRICS, speedup=2.)
+        bad["metrics"]["ttft"]["within_tolerance"] = False
+        dirs = _whole_matrix(tmp_path, {(4, "clients_large", 8): bad})
+        assert validate.main(["matrix", *dirs, "--speed-advisory"]) == 1
+
+    def test_advisory_speed_still_requires_measured_costs(self, tmp_path):
+        unknown = _cell_verdict("tp4_clients_large_c8", "clients_large", 400., 400.,
+                                tp=4, clients=8, metrics=ALL_METRICS)
+        unknown["speedup"] = {"replay_ratio": None, "meets_gate": None}
+        dirs = _whole_matrix(tmp_path, {(4, "clients_large", 8): unknown})
+        assert validate.main(["matrix", *dirs, "--speed-advisory"]) == 1
+
     def test_a_cell_whose_gate_was_never_computed_is_not_accepted(self, tmp_path):
         unknown = _cell_verdict(
             "tp1_clients_short_c1",

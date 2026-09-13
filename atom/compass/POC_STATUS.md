@@ -1,5 +1,12 @@
 # ATOMCompass — PoC gate status
 
+**Current user priority (2026-09-13):** the 5x speed target is advisory and may
+be compromised. Accuracy, memory, feasibility, configuration selection and
+ranking retain their requirements. Report observed speed and derivation costs
+without calling a missed 5x target a pass; `cc_traces_validate.py matrix
+--speed-advisory` records this policy explicitly. Existing strict protocol
+registrations and their historical verdicts remain unchanged.
+
 **2026-09-13 update:** G3c now has a frozen negative cc-traces witness; the
 24 positive serving cells still require their final three real and three
 modelled repeats. Native Codex subagents perform the current implementation

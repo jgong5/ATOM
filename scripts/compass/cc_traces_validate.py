@@ -4152,13 +4152,32 @@ def matrix(args) -> int:
         "speedup": all(
             ((c.get("speedup") or {}).get("meets_gate") is True) for c in cells
         ),
+        "cost_reporting": all(
+            isinstance((c.get("speedup") or {}).get("replay_ratio"), (int, float))
+            and math.isfinite(c["speedup"]["replay_ratio"])
+            and c["speedup"]["replay_ratio"] > 0
+            for c in cells
+        ),
         "decided": all(not r.get("reason") for r in results),
     }
+    speed_advisory = bool(getattr(args, "speed_advisory", False))
+    required = {name: held for name, held in gates.items()
+                if name != "speedup" or not speed_advisory}
     report["gates"] = gates
-    report["accepted"] = all(gates.values())
+    report["required_gates"] = list(required)
+    report["acceptance_policy"] = {
+        "speedup": "advisory" if speed_advisory else "required",
+        "speedup_target": SPEEDUP_MIN,
+    }
+    report["evidence_qualifications"] = {
+        c["cell"]: {"isolation": c.get("isolation"), "notes": c.get("notes") or []}
+        for c in cells if c.get("notes") or c.get("isolation") not in (None, "clean")
+    }
+    report["accepted"] = all(required.values())
     for name, held in gates.items():
         if not held:
-            print(f"  GATE FAILED: {name}")
+            label = "ADVISORY TARGET NOT MET" if name == "speedup" and speed_advisory else "GATE FAILED"
+            print(f"  {label}: {name}")
     if args.out:
         Path(args.out).write_text(json.dumps(report, indent=1) + "\n")
     print("MATRIX " + ("PASS" if report["accepted"] else "FAIL"))
@@ -4215,6 +4234,8 @@ def main(argv=None) -> int:
     m = sub.add_parser("matrix")
     m.add_argument("dirs", nargs="+")
     m.add_argument("--out", default=None)
+    m.add_argument("--speed-advisory", action="store_true",
+                   help="report the registered speed target without making it a condition of acceptance")
     args = ap.parse_args(argv)
     return {"cell": cell, "gpu-free": gpu_free, "matrix": matrix}[args.cmd](args)
 
