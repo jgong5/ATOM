@@ -132,3 +132,24 @@ def test_unwitnessed_duration_or_count_is_not_admitted(tmp_path, field):
     path.write_text(json.dumps(blob))
     with pytest.raises(ValueError):
         library.add(str(path), graph)
+
+
+def test_missing_request_scope_refuses_instead_of_raising(tmp_path):
+    from types import SimpleNamespace
+
+    library, op, graph, exports = fixture(tmp_path)
+    library.add(exports[0], graph)
+    for declaration in (None, SimpleNamespace(for_op=lambda _op: None)):
+        library.request_attention_scope = declaration
+        record, reason = library.lookup(op, {"tp": 1})
+        assert record is None and "scope" in reason
+
+
+def test_scope_treatment_cannot_overrule_an_explicit_conflicting_selector(tmp_path):
+    library, op, graph, exports = fixture(tmp_path)
+    library.add(exports[0], graph)
+    scopes = copy.deepcopy(library.request_attention_scope.scopes)
+    scopes["unified.prefill.cached"]["measurement_treatment"] = {"cache": "over"}
+    library.request_attention_scope = attention_scope.Declaration(scopes=scopes)
+    library.request_attention_treatments = {"unified.prefill.cached": {"cache": "graph"}}
+    assert library.lookup(op, {"tp": 1})[0] is None

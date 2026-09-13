@@ -236,7 +236,7 @@ class ExactAttentionOverrides:
             return None
         if op.get("group") is not None:
             return None, "exact attention override cannot answer a collective call"
-        requested = library._declared_scope(op)
+        requested = dict(library._declared_scope(op) or {})
         explicit_treatment = requested.pop("measurement_treatment", None)
         if topology:
             requested.setdefault("topology", _topology_key(topology))
@@ -246,11 +246,14 @@ class ExactAttentionOverrides:
         for entry in candidates:
             if entry["layout"] != layout or A._scope_matches(entry["scope"], requested) is not None:
                 continue
-            selector = dict(library.request_attention_treatments.get(entry["regime"], {}))
+            selectors = [dict(library.request_attention_treatments.get(entry["regime"], {}))]
             if explicit_treatment is not None:
-                selector.update({"kernels": explicit_treatment[0], **dict(explicit_treatment[1:])})
+                if isinstance(explicit_treatment, dict):
+                    selectors.append(explicit_treatment)
+                else:
+                    selectors.append({"kernels": explicit_treatment[0], **dict(explicit_treatment[1:])})
             if any(_hashable(entry["treatment"].get(k, A.ABSENT)) != _hashable(v)
-                   for k, v in selector.items()):
+                   for selector in selectors for k, v in selector.items()):
                 continue
             selected.append(entry)
         if not selected:
