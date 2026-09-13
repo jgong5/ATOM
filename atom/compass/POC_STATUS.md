@@ -1,5 +1,32 @@
 # ATOMCompass — PoC gate status
 
+**2026-09-13 update:** G3c now has a frozen negative cc-traces witness; the
+24 positive serving cells still require their final three real and three
+modelled repeats. Native Codex subagents perform the current implementation
+and acquisition work.
+
+At commit `6e5596dfaeab0b682bcbf9f7cdd7672435ef0b32`, TP1 with
+`gpu_memory_utilization=0.34` rejected the first registered `clients_large_c8`
+request (83,968 input tokens, 3,008 requested output tokens) on both the real
+and device-free servers. Both returned HTTP 400 because the prompt exceeded
+the single-request KV capacity. The model's prediction was frozen before
+execution: 3,535 blocks versus 3,534 on the real server after a prior process
+had loaded its compiled cache (0.0283% difference). The API performs this
+capacity check before scheduler admission. One unservable member suffices to
+reject this deployment for that workload; this is a negative witness, not a
+shortened positive acceptance cell.
+
+The first cache-loading native attempt is also retained: it reported 3,105
+blocks and 1.50 GiB non-Torch memory versus the warm model's 1.08 GiB. Its
+rejection was correct, but it is not capacity-accuracy evidence. The subsequent
+cache-steady process reported 1.08 GiB and 3,534 blocks. No memory coefficient
+was fitted to either observation. Prediction, original request identity,
+result hashes, both attempts and qualifications are under node18's
+`/workspace/ATOM/agent_scratch/codex_supervision/infeasible_admission_v1/`:
+`PREDICTION_FROZEN.json`, `OBSERVED_FIRST.json`, and `OBSERVED_STEADY.json`.
+The parent workload SHA256 is
+`3ba365adc2c39bf0fb56a5e9154b372f9d44291d4d4a0d2bdc1ed67a5ca7df95`.
+
 **Maintained document. One row per completion gate, and nothing in it may be
 loosened.** `POC_SUMMARY.md` is the narrative handover, `DESIGN_NOTES.md` the
 working log, `RETROSPECTIVE.md` a dated audit. This file is the score.
@@ -201,7 +228,7 @@ not), **UNPROVEN** (no valid measurement yet).
 | **G2c** | TTFT error | ≤ 15% | **FAIL on short, PARTIAL on long** | E2a short-input median **−10.4% / −20.5% / −46.1%** at TP=1/2/4 — within bar at TP=1 only. E1 long-input at TP=4: mean −0.14%, p90 −0.27%, median −6.4%, on the workload the model was developed against |
 | **G3a** | Non-KV memory terms | each within 10% | **PARTIAL, and the graph-pool term is under correction** | E3b: 27B at TP=1/2/4. weights +1.6/−0.1/−3.3%, non-torch +4.9/+1.2/+1.3%, load residue −3.3/−6.7% at TP≥2. Terms outside: load residue at TP=1 (−93%, 0.01% of budget), persistent (−51%, 0.07% of budget), activations (no prefill-shaped graph for this model). **The "graph pool +0.0% everywhere" claim in this row is retracted pending integration**: an independent comparison on the `compass/memory-validation` branch puts TP4 at **+26.8%**, outside the bar. See the note under this table |
 | **G3b** | KV block count | within 5% | **PARTIAL** | E3: −0.09% (27B TP=2), −0.02/−0.02/+0.07% (0.6B TP=1/2/4). Not yet predicted from a profile at 27B TP=1/4 — the measured ground truth now exists (112 740 / 265 520 / 584 880 blocks) |
-| **G3c** | One infeasible configuration rejected for the right reason | same error as the engine | **UNPROVEN** | — |
+| **G3c** | One infeasible configuration rejected for the right reason | same error as the engine | **PASS — negative cc-traces witness** | TP1, utilization 0.34; the same 83,968-token registered request is rejected for insufficient KV capacity on both servers; frozen prediction and retained attempts documented above |
 | **G4** | Prediction outside the calibration configurations | stated per prediction | **UNPROVEN on the acceptance source; the two step-level diagnostics split, one within and one outside** | No end-to-end cc-traces transfer has been run, and the gate is an end-to-end quantity. Diagnostics, both `ModelRunner.forward` decode steps frozen before measurement with no target timing among their inputs: **E7, TP2, 20.970 ms frozen against 19.845 ms, +5.7%** — within 10% (`G4_TRANSFER.md` §12). **E8, TP4, 16.157 ms frozen against 12.807 ms, +26.2% — outside 10%, a failed prediction** (§13). E8's miss is localised to one input: rank 1's frozen body price is 17.1% above what a later repeat measurement of the same thing produced, and the other three ranks predicted +5.1 to +5.5%. **A repeat that does not reproduce a value establishes that the value is unstable; it does not establish which of the two is right, nor what made them differ.** No corrected number follows from it either way — the frozen prediction stands as it was frozen. Both share the shape `bucket=32, cohort=32, tokens_each=1, context=1151`. E6 is their coverage precondition — a priced body at TP=1 (23.122 ms, 2423/2439 operators) and TP=2 (15.467 ms, 2552/2568) |
 | **G5a** | Replay speedup, **after capture** | ≥ 5× | **UNPROVEN on the acceptance source** | The bar is what it has always been: replay-after-capture ≥ 5×, GPU-free. It is **not** an amortised-cost threshold — G5c reports acquisition and amortisation separately and is a different row, and folding the two would silently raise this bar. Observed on the diagnostic workload, device-free, at 27B: 36 s of serving → 1.46 s (**24.7×**), or 133 s → 23 s (5.8×) including server startup. That is measured and it clears 5×; what is missing is the acceptance workload, not the arithmetic. An earlier 309 s → 3 s figure is superseded — its simulated half still held the model on a GPU |
 | **G5b** | GPU-free replay after capture | no device | **PASS at 0.6B and 27B** | E5: served 32/32 (0.6B) and 64/64 (27B) in `xiaobizh_n18_cpu`, a container with **no `/dev/kfd` and no `/dev/dri`** — zero driver handles and no KFD process registration in any process of the tree. Both reproduce the GPU-resident simulator's schedule step for step and its TTFT/TPOT/latency distributions exactly; at 27B ten of 64 requests sit in a different slot of that same schedule, which is the burst's admission order, not the GPU-free path (E5). This is the no-device gate only; G5a and G5c are separate and still open |
