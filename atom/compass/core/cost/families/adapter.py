@@ -87,6 +87,7 @@ from atom.compass.core.cost.library import (
 )
 
 from atom.compass.core.cost.prepared import immutable_content_key
+from atom.compass.core.cost.kv_layout import kv_layout_key
 
 logger = logging.getLogger(__name__)
 
@@ -554,7 +555,10 @@ def _shown_to_match(obs_scope, requested) -> bool:
     for field, value in (requested or {}).items():
         if field not in obs_scope:
             return False
-        if _hashable(obs_scope[field]) != _hashable(value):
+        observed = obs_scope[field]
+        if field == "kv_cache_layout":
+            observed, value = kv_layout_key(observed), kv_layout_key(value)
+        if _hashable(observed) != _hashable(value):
             return False
     return True
 
@@ -1415,6 +1419,9 @@ class ParametricPriceLibrary(PriceLibrary):
                     in self._attention_obs}),
             },
         }, f"{INTERPOLATED_SCHEME}{contract.family}/{name}")
+        if "kv_cache_layout" in fit.scope:
+            result[0]["interpolation"]["source_conditioning"] = {
+                "kv_cache_layout": fit.scope["kv_cache_layout"]}
         if memo_key is not None:
             _memo[memo_key] = result
         return result

@@ -8,23 +8,13 @@ import math
 from pathlib import Path
 
 from atom.compass.core.loaded_input import load_json
+from atom.compass.core.cost.records import AttestedAttentionRecord
+from atom.compass.core.cost.kv_layout import kv_layout_key
 
 
 TAG_SCHEMA = "compass.attention_exact_override/1"
 WITNESS_SCHEMA = "compass.attention_composition_witness/1"
 EQUIVALENCE_SCHEMA = "compass.attention_rank_equivalence/2"
-
-
-class AttestedAttentionRecord(dict):
-    """Only validated evidence can create the special launch-count result."""
-
-    __slots__ = ("attested_launch_count",)
-
-    def __init__(self, record, count, **metadata):
-        super().__init__(record, **metadata)
-        self.attested_launch_count = count
-        self["attention_exact_override"] = True
-        self["launch_count"] = count
 
 
 def _digest(value):
@@ -51,31 +41,11 @@ def _reference(path, expected):
 
 
 def _layout_without_capacity(scope):
-    """KV allocation extent is source conditioning, not the view's layout."""
     from atom.compass.core.cost.families.attention import _hashable
 
     result = {key: _hashable(value) for key, value in scope.items()}
-    layout = result.get("kv_cache_layout")
-    if not isinstance(layout, (list, tuple)):
-        return result
-    try:
-        views = dict(layout)
-        if set(views) != {"k", "v"}:
-            return result
-        normalized = []
-        for name, description in layout:
-            fields = dict(description)
-            shape, stride = fields.get("shape"), fields.get("stride")
-            if (not isinstance(shape, (list, tuple)) or len(shape) != 5
-                    or not isinstance(stride, (list, tuple)) or len(stride) != 5
-                    or type(shape[0]) is not int or shape[0] <= 0):
-                return result
-            normalized.append((name, tuple((key, ("*blocks",) + tuple(value[1:])
-                                           if key == "shape" else value)
-                                          for key, value in description)))
-        result["kv_cache_layout"] = _hashable(normalized)
-    except (TypeError, ValueError):
-        pass
+    if "kv_cache_layout" in result:
+        result["kv_cache_layout"] = kv_layout_key(result["kv_cache_layout"])
     return result
 
 

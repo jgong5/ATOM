@@ -71,6 +71,8 @@ produced that way can never be mistaken for one that was scoped.
 from __future__ import annotations
 
 import math
+
+from atom.compass.core.cost.kv_layout import kv_layout_key
 from typing import Optional
 
 __all__ = ["REQUIRED_SCOPE", "UNIFIED_SCOPE", "GDN_SCOPE", "UNIFIED", "GDN",
@@ -1751,8 +1753,11 @@ def _scope_matches(fit_scope, request_scope) -> Optional[str]:
         theirs = request_scope.get(field, ABSENT)
         if (mine is ABSENT) != (theirs is ABSENT):
             return field
-        if mine is not ABSENT and mine != theirs:
-            return field
+        if mine is not ABSENT:
+            if field == "kv_cache_layout":
+                mine, theirs = kv_layout_key(mine), kv_layout_key(theirs)
+            if mine != theirs:
+                return field
     return None
 
 
