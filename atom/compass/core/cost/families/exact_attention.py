@@ -130,12 +130,18 @@ class ExactAttentionOverrides:
         resolved = attention_scope.read_resolved(resolved_blob, where=price_path)
         declared = _attention_scope(blob, None)
         policy = _acquisition_policy(blob)
+        collector = provenance.get("collector") or {}
+        if (policy == ("unevidenced",)
+                or collector.get("served_workload") is not False
+                or collector.get("weights_loaded") is not False
+                or collector.get("model_runner_initialized") is not False):
+            raise ValueError(f"{price_path}: a recorded source-only acquisition is required")
         rank = int(provenance["collector"]["rank"])
         width = int(provenance["collector"]["world_size"])
         operators = {signature_of(op): op for op in graph.get("ops") or ()}
         for signature, record in (blob.get("prices") or {}).items():
             op = operators.get(signature)
-            if op is None or op.get("name") != A.UNIFIED:
+            if op is None or op.get("name") != A.UNIFIED or op.get("group") is not None:
                 raise ValueError(f"{price_path}: exact timing has no matching native operator")
             seconds = record.get("seconds")
             if not isinstance(seconds, (int, float)) or not math.isfinite(seconds) or seconds < 0:
@@ -221,6 +227,8 @@ class ExactAttentionOverrides:
         candidates = self.entries.get(key)
         if not candidates:
             return None
+        if op.get("group") is not None:
+            return None, "exact attention override cannot answer a collective call"
         requested = library._declared_scope(op)
         explicit_treatment = requested.pop("measurement_treatment", None)
         if topology:
