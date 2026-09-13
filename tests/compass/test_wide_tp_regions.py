@@ -121,7 +121,7 @@ class TestTheDeclaredWidths:
         why = SEQS.refusal(_decode(tp=8))
         assert why is not None and "outside the measured widths" in why
 
-    def test_the_ordinary_wide_configuration_names_this_profile(self):
+    def test_the_ordinary_configuration_preserves_width_support(self):
         """What the earlier `regions=none` was: a caller configuration, not a
         missing implementation. The acceptance matrix names this profile for
         every cell, so the profile has to answer at every width the matrix
@@ -129,8 +129,12 @@ class TestTheDeclaredWidths:
         from scripts.compass.cc_traces_registry import SHARED_OPTIONS
 
         options = dict(SHARED_OPTIONS)
-        assert REGION_MODELS[options["regions"]] is SEQS
-        assert set(WIDTHS) <= set(SEQS.topologies)
+        selected = REGION_MODELS[options["regions"]]
+        assert selected is not None
+        assert set(WIDTHS) <= set(selected.topologies)
+        for tp in WIDTHS:
+            assert selected.refusal(_decode(tp=tp)) is None
+            assert selected.refusal(_prefill(8, 12288, tp=tp)) is None
         assert int(options["block_size"]) not in (
             KV_HEAD_SIZED_PREPARE_BLOCK_SIZES)
 
