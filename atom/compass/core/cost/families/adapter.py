@@ -271,8 +271,11 @@ _LAYER_IDENTITY = ("layer_name", "layer", "layer_idx", "block_tables",
 #: cold-cache point and a warm-cache point are not two points on one law, and
 #: separating them only at collapse time would let them rejoin as independent
 #: points of the same fit -- which is the same averaging, moved one step later.
+# Autotuning can select different configurations under identical source code.
+# An observed configuration digest is optional for legacy books, and identifies
+# a distinct treatment whenever a collector records it.
 _TREATMENT_FIELDS = ("cache", "kv_regions", "version",
-                     "collector_version", "schema_version")
+                     "collector_version", "schema_version", "kernel_config_digest")
 
 #: Shape-derived outputs of the acquisition policy. Kept with the point as
 #: evidence -- a reader still sees how many operand sets a record actually
