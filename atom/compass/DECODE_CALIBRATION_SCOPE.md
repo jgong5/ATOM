@@ -560,7 +560,7 @@ The source-only TP1 campaign in `agent_scratch/codex_decode_domain_v1` uses six
 native Scheduler orders from the current client manifests. The scheduler runs
 used a virtual clock; only their shapes were consumed. Three standalone GPU2
 repeats per point were acquired with KV rotation 2, all 16 full-attention layer
-slots, BF16 NHD, block 16, head dimension 256, four KV heads and 80 CUs. No evaluated
+slots, BF16 SHUFFLE, block 16, head dimension 256, four KV heads and 80 CUs. No evaluated
 target-engine duration was used. Two SIGSEGV attempts remain in the record;
 eager buffer diagnostics passed and separately named rep4 replacements supplied
 the missing repeats.
@@ -601,3 +601,29 @@ all 16 operators and prices the actual development-refusal graph at histories
 input hashes and scope/selector digests are retained in `FACTORY_PROOF.json`.
 These coefficients are scoped to TP1 geometry; TP2/TP4 require their own source
 calibration and are not certified by this campaign.
+
+
+### Native layout audit
+
+The inherited `NHD` declaration was incorrect: it interpreted the allocation
+tensor before the native binder made the layer views. Re-running the original
+collector snapshot's `AiterAttentionMetadataBuilder.build_kv_cache_tensor` on
+meta, using the recorded TP1 pool, gives K `[163886,4,32,16,8]` and V
+`[163886,4,2,256,8]`. The BF16 cache writer uses `asm_layout=True` for this 5D V
+view; its layout identity is SHUFFLE. `TP1_LAYOUT_AUDIT.json` preserves the input
+record digest, original binder digest, and derived views. No new GPU duration
+was needed for this audit.
+
+The corrected TP1 declarations are
+`agent_scratch/codex_decode_domain_v1/native_scope_v2/REQUEST_SCOPE.json` and
+`MEASURED_SCOPE.json`. The 18 raw source books contain no explicit layout label
+and remain unchanged. The old declaration files remain available under their
+original names. Recertification reproduces the fitted coefficients and every
+frozen held-out operator prediction bit for bit; this repairs the scope's
+identity without presenting another holdout result.
+
+Two semantic aliases are separate from that layout correction: configuration
+`bf16` names `torch.bfloat16`, and both window 0 and window -1 disable the
+positive-window branch. Corrected declarations retain the canonical dtype name
+`bfloat16` and use the native buffer probe's actual window value -1. NHD and
+SHUFFLE are different layouts, not aliases.
