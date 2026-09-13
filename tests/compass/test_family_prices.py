@@ -1273,3 +1273,30 @@ def test_an_alternate_valid_selector_is_answered_with_the_declared_band(
     record, source = library.lookup(_selector_gather(3, rows=[5, 900, 16383]))
     assert record is not None, source
     assert record["interpolation"]["uncertainty"] > 0.1864
+
+
+def test_exact_only_books_keep_layout_checks_without_training_a_curve(tmp_path):
+    from atom.compass.runtime.microbench import signature_of
+
+    library = ParametricPriceLibrary(max_gap_ratio=2.0)
+    for rows in (32, 64):
+        op = gemm(rows)
+        graph = {"ops": [op],
+                 "provenance": {"execution": {"body_rows_traced": rows}}}
+        book = {"prices": {signature_of(op): {"name": op["name"],
+                    "seconds": rows * 1e-6, "kernels": {"kernel": rows * 1e-6}}},
+                "provenance": {"exact_only": True}}
+        graph_path, price_path = tmp_path / f"g{rows}.json", tmp_path / f"p{rows}.json"
+        graph_path.write_text(json.dumps(graph))
+        price_path.write_text(json.dumps(book))
+        library.add(str(price_path), str(graph_path))
+
+    measured, _ = library.lookup(gemm(32))
+    assert measured["seconds"] == pytest.approx(32e-6)
+    assert not measured.get("interpolated")
+    missing, _ = library.lookup(gemm(48))
+    assert missing is None
+    strided = gemm(32)
+    strided["layouts"] = [[0, [[17409, 1], 0, 32 * 17409, 0]]]
+    wrong_layout, _ = library.lookup(strided)
+    assert wrong_layout is None

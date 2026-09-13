@@ -688,6 +688,14 @@ class ParametricPriceLibrary(PriceLibrary):
         # to be a digest of.
         _blob, graph = self._ingest(price_path, graph_path, registration,
                                     coords)
+        if (_blob.get("provenance") or {}).get("exact_only") is True:
+            # A finite native domain can be measured exhaustively without
+            # identifying a law outside it. Keep the paired graph's layout
+            # checks from _ingest, but contribute nothing to any fitted family.
+            self.unbuildable[price_path] = (
+                "the collector declares exact_only; paired layouts are checked "
+                "but these observations do not train a fitted family")
+            return
         if graph is None:
             self.unbuildable[price_path] = (
                 "no graph supplied, so its operators have no structure to "
