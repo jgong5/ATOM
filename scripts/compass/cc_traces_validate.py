@@ -415,6 +415,17 @@ def check_side_roles(real, modelled) -> list[str]:
     """Each side did its own job: one measured warm, one predicted cold."""
     bad = []
     rm, mm = real.manifest, modelled.manifest
+    # Older clients accepted text only. The optional token-ID mode moves
+    # encoding before the pacing epoch, while keeping it inside the measured
+    # machine-time window; both sides must use the same mode and pay for it.
+    encodings = [(manifest.get("prompt_encoding") or {}) for manifest in (rm, mm)]
+    kinds = [encoding.get("kind", "text") for encoding in encodings]
+    if kinds[0] != kinds[1]:
+        bad.append("the real and modelled sides used different prompt encodings")
+    for label, encoding in zip(("real", "modelled"), encodings):
+        if (encoding.get("kind") == "token_ids"
+                and encoding.get("conversion_in_execution") is not True):
+            bad.append(f"the {label} token-ID conversion was not included in measured execution")
     if not rm.get("paced"):
         bad.append(
             "the real side was not paced: its arrivals were declared "

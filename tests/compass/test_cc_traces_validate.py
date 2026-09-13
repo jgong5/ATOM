@@ -1211,6 +1211,24 @@ class TestWhatTheServerActuallyServed:
 
 
 class TestTheTwoSidesRoles:
+    def test_prompt_encoding_must_match_between_sides(self, cell):
+        path = cell / "modelled.r1.json"
+        blob = json.loads(path.read_text())
+        blob["run"]["prompt_encoding"] = {
+            "kind": "token_ids", "conversion_in_execution": True}
+        _write(path, blob)
+        assert run(cell) == 1
+
+    @pytest.mark.parametrize("included", [True, False])
+    def test_token_conversion_is_paid_inside_both_execution_windows(self, cell, included):
+        for side in ("real", "modelled"):
+            path = cell / f"{side}.r1.json"
+            blob = json.loads(path.read_text())
+            blob["run"]["prompt_encoding"] = {
+                "kind": "token_ids", "conversion_in_execution": included}
+            _write(path, blob)
+        assert run(cell) == (0 if included else 1)
+
     def test_an_unprepared_real_side_is_refused(self, cell):
         path = cell / "real.r1.json"
         blob = json.loads(path.read_text())

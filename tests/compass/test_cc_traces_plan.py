@@ -146,6 +146,13 @@ class TestARepeatIsAProcess:
 
 
 class TestTheTwoSidesAreNotRunTheSameWay:
+    def test_token_id_mode_reaches_every_repeat_on_both_sides(self):
+        plan = json.loads(_run(["--root", "/r", "--pretokenize"]))
+        assert plan["prompt_encoding"] == "token_ids"
+        replays = [step for cell in plan["cells"] for step in _role(cell, "replay")]
+        assert len(replays) == 24 * 2 * 3
+        assert all("--pretokenize" in step["command"] for step in replays)
+
     def test_request_deadline_is_explicit_and_configurable_for_both_sides(self):
         for timeout in (3600.0, 1800.0):
             plan = json.loads(_run(["--root", "/r", "--request-timeout", str(timeout)]))

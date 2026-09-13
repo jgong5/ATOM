@@ -331,6 +331,7 @@ def workload(klass: str, clients: int, suffix: str = "jsonl") -> str:
 def _replay(
     klass: str, clients: int, out: str, *, paced: bool, prepare: int, port: int,
     request_timeout: float = REQUEST_TIMEOUT,
+    pretokenize: bool = False,
 ):
     cmd = [
         "python",
@@ -347,6 +348,8 @@ def _replay(
         "--timeout",
         str(request_timeout),
     ]
+    if pretokenize:
+        cmd += ["--pretokenize"]
     if paced:
         # The real engine stamps arrivals on receipt, so a declared arrival is
         # discarded there: without --pace the real side answers a burst while
@@ -378,6 +381,7 @@ def _lifecycle(
     target,
     memory_model=None,
     request_timeout: float = REQUEST_TIMEOUT,
+    pretokenize: bool = False,
 ):
     """One repeat: its own server, its replay, and the end of that process."""
     modelled = side == "modelled"
@@ -439,6 +443,7 @@ def _lifecycle(
                 prepare=0 if modelled else 3,
                 port=port,
                 request_timeout=request_timeout,
+                pretokenize=pretokenize,
             ),
             "produces": (
                 [f"{side}.r{n}.json"]
@@ -481,6 +486,7 @@ def cell_steps(
     memory_model=None,
     corpus: str = "$CC_TRACES_CORPUS",
     request_timeout: float = REQUEST_TIMEOUT,
+    pretokenize: bool = False,
 ):
     """Every step of one cell, in the order it has to happen."""
     if port == engine_port:
@@ -592,6 +598,7 @@ def cell_steps(
             target=None,
             memory_model=None,
             request_timeout=request_timeout,
+            pretokenize=pretokenize,
         )
     steps += [
         {
@@ -637,6 +644,7 @@ def cell_steps(
             target=target,
             memory_model=memory_model,
             request_timeout=request_timeout,
+            pretokenize=pretokenize,
         )
     steps += [
         {
@@ -732,6 +740,7 @@ def build(args) -> dict:
             memory_model=profiles.get(tp) or _registry_profile(args, tp),
             corpus=getattr(args, "corpus", None) or "$CC_TRACES_CORPUS",
             request_timeout=getattr(args, "request_timeout", REQUEST_TIMEOUT),
+            pretokenize=getattr(args, "pretokenize", False),
         )
         for tp in TPS
         for klass in CLASSES
@@ -744,6 +753,7 @@ def build(args) -> dict:
         "engine_args": list(ENGINE_ARGS),
         "repeats": args.repeats,
         "request_timeout": getattr(args, "request_timeout", REQUEST_TIMEOUT),
+        "prompt_encoding": "token_ids" if getattr(args, "pretokenize", False) else "text",
         "processes_per_side": args.repeats,
         # What the plan as built can be: a run of fewer than the registered
         # repeats is a legitimate thing to want, but it is a diagnostic, and
@@ -874,6 +884,8 @@ def main(argv=None) -> int:
     ap.add_argument("--repeats", type=int, default=REPEATS)
     ap.add_argument("--request-timeout", type=float, default=REQUEST_TIMEOUT,
                     help="per-request transport deadline in seconds; not an SLO gate")
+    ap.add_argument("--pretokenize", action="store_true",
+                    help="encode prompts inside each measured window before pacing, on both sides")
     ap.add_argument("--out", default=None, help="write the plan as JSON here")
     ap.add_argument(
         "--shell", action="store_true", help="print the commands instead of JSON"

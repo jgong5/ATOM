@@ -1097,6 +1097,11 @@ class SideRun:
             execution["replay"]["measured_window"] = window
         # Manifest field names below are `replay.py`'s, from the dict it
         # writes as `run`.
+        if "--pretokenize" in step["command"]:
+            encoding = manifest.get("prompt_encoding") or {}
+            if (encoding.get("kind") != "token_ids"
+                    or encoding.get("conversion_in_execution") is not True):
+                bad.append("planned token-ID replay lacks conversion inside its measured window")
         prepare = manifest.get("prepare") or {}
         if self.side == "real":
             if not manifest.get("paced"):
@@ -1561,6 +1566,7 @@ def _cell_plan(args) -> dict:
         memory_model=getattr(args, "memory_model", None),
         corpus=getattr(args, "corpus", None) or "$CC_TRACES_CORPUS",
         request_timeout=getattr(args, "request_timeout", plan_module.REQUEST_TIMEOUT),
+        pretokenize=getattr(args, "pretokenize", False),
     )
     if Path(built["cell"]).name != cell.name:
         raise SystemExit(
@@ -2059,6 +2065,8 @@ def main(argv=None) -> int:
     s.add_argument("--repeats", type=int, default=plan_module.REPEATS)
     s.add_argument("--request-timeout", type=float, default=plan_module.REQUEST_TIMEOUT,
                    help="per-request transport deadline in seconds; not an SLO gate")
+    s.add_argument("--pretokenize", action="store_true",
+                   help="encode prompts inside the measured window before pacing")
     s.add_argument(
         "--port",
         type=int,
