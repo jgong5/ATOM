@@ -418,6 +418,39 @@ def _journal(runner):
 # --------------------------------------------------------------------------
 
 
+class TestRefusalCapture:
+    def test_modelled_servers_receive_separate_refusal_directories(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.delenv("COMPASS_REFUSAL_DUMP", raising=False)
+        runner = _runner(tmp_path, "modelled")
+        assert runner.run() == 0
+        assert [p.env["COMPASS_REFUSAL_DUMP"] for p in runner.processes.started] == [
+            str(runner.cell / "refusals" / f"modelled.r{repeat}")
+            for repeat in (1, 2, 3)
+        ]
+
+    @pytest.mark.parametrize("override", ["", "/explicit/refusal-dumps"])
+    def test_modelled_servers_preserve_an_explicit_override(
+        self, tmp_path, monkeypatch, override
+    ):
+        monkeypatch.setenv("COMPASS_REFUSAL_DUMP", override)
+        runner = _runner(tmp_path, "modelled")
+        assert runner.run() == 0
+        assert all(
+            p.env["COMPASS_REFUSAL_DUMP"] == override
+            for p in runner.processes.started
+        )
+
+    def test_real_servers_keep_inheriting_the_caller_environment(
+        self, tmp_path, monkeypatch
+    ):
+        monkeypatch.delenv("COMPASS_REFUSAL_DUMP", raising=False)
+        runner = _runner(tmp_path, "real")
+        assert runner.run() == 0
+        assert all(p.env is None for p in runner.processes.started)
+
+
 class TestARepeatIsItsOwnProcess:
     def test_three_servers_are_started_and_each_is_stopped(self, tmp_path):
         runner = _runner(tmp_path, "modelled")

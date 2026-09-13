@@ -674,6 +674,11 @@ class SideRun:
         env = dict(os.environ)
         env["ATOM_COMPASS_DERIVATION_LOG"] = str(
             self.cell / f"derivation.{self.side}.r{step['repeat']}.jsonl")
+        # Preserve the exact graph and shape when prediction refuses a step.
+        env.setdefault(
+            "COMPASS_REFUSAL_DUMP",
+            str(self.cell / "refusals" / f"{self.side}.r{step['repeat']}"),
+        )
         return env
 
     def _serve(self, step) -> bool:
