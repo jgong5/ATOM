@@ -568,7 +568,10 @@ def _journal(cell_dir, side, repeats, *, executions=None, seconds=10.0):
                 "execution_id": f"cx-{side}{index}",
                 "purpose": "acceptance",
                 "repeat": index + 1,
-                "replay": {"seconds": seconds},
+                "replay": {"seconds": seconds, "measured_window": {
+                    "schema": validate.replay_client.WALL_WINDOW_SCHEMA,
+                    "clock": "wall", "started_at": 1000.0,
+                    "ended_at": 1000.0 + seconds, "seconds": seconds}},
                 "server_process": {
                     "said": _identity(),
                     "observed": {
@@ -4100,3 +4103,19 @@ class TestTheComponentTermsAreGatedIndividually:
         assert measured["components"] == []
         assert "attested input manifest" in (
             measured["components_not_compared"][0]["reason"])
+
+
+def test_cost_journal_uses_request_window_and_excludes_client_setup_reporting():
+    journal = {"executions": [{"repeat": 1, "replay": {
+        "seconds": 60.0,
+        "measured_window": {"schema": validate.replay_client.WALL_WINDOW_SCHEMA,
+                            "clock": "wall", "started_at": 1030.0,
+                            "ended_at": 1040.0, "seconds": 10.0},
+    }}]}
+    timing, problems = validate._journal_timing(journal, "real")
+    assert timing == {1: 10.0}
+    assert problems == []
+    journal["executions"][0]["replay"].pop("measured_window")
+    timing, problems = validate._journal_timing(journal, "real")
+    assert timing == {}
+    assert "explicit measured request window" in problems[0]

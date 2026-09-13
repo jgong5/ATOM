@@ -51,6 +51,7 @@ def _load(name: str):
 
 
 compare = _load("compare")
+replay_client = _load("replay")
 
 # --------------------------------------------------------------------------
 # what the protocol registers
@@ -3367,12 +3368,18 @@ def _journal_timing(journal, side: str):
     out = {}
     for index, execution in enumerate(executions):
         repeat = execution.get("repeat")
-        seconds = (execution.get("replay") or {}).get("seconds")
+        try:
+            window = replay_client.read_wall_window(
+                (execution.get("replay") or {}).get("measured_window"))
+            seconds = window["seconds"]
+        except ValueError:
+            seconds = None
         if not isinstance(repeat, int) or not _finite(seconds):
             return {}, [
                 (
                     f"{side}: run.{side}.json records an execution "
-                    f"(#{index + 1}) the replay never timed, so there is "
+                    f"(#{index + 1}) the replay never timed with an explicit "
+                    f"measured request window, so there is "
                     f"nothing to bind this cell's price to. A repeat nobody "
                     f"timed is not a repeat that cost what a summary says"
                 )
