@@ -80,3 +80,19 @@ def test_model_uses_recorded_order_and_keeps_domain_refusal():
     outside = model.price(op_for([262144] * 32), SCOPE)
     assert isinstance(outside, A.Refusal)
     assert "outside the measured range" in outside.reason
+
+
+@pytest.mark.parametrize("bound", [1, 2])
+def test_makespan_keeps_exact_nonnegative_single_bound_solution(bound):
+    # Wide feature scales made the grid miss a valid boundary minimum when a
+    # low-work source point was added. This identifiable linear limit has an
+    # analytic answer, independent of the grid's spacing or refinement count.
+    rows = [[1.0, 1.0, .2], [1.0, 2.0, .4], [1.0, 3.0, .5],
+            [1.0, 35.0, 9.7], [1.0, 88.0, 23.375],
+            [1.0, 445.0, 64.625], [1.0, 773.0, 128.725]]
+    observed = [1.031e-5 + 7.403e-6 * row[bound] for row in rows]
+    fit = A._solve_makespan(rows, observed)
+    assert fit is not None and all(coefficient >= 0 for coefficient in fit)
+    predicted = [fit[0] * row[0] + max(fit[1] * row[1], fit[2] * row[2])
+                 for row in rows]
+    assert predicted == pytest.approx(observed, rel=1e-10, abs=1e-15)

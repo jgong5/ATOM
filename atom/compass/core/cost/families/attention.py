@@ -1382,6 +1382,22 @@ def _solve_makespan(rows, rhs):
                         best_params, best_cost = params, value
         lows = [max(0.0, p - w) for p, w in zip(best_params, widths)]
         highs = [p + w for p, w in zip(best_params, widths)]
+    # Keep the existing grid refinement path, then compare its result.
+    # Each single-bound case is nonnegative linear least squares. Include its
+    # exact solution: a coarse grid can miss this boundary and return a worse
+    # fit merely because a new source point changed the search's scale.
+    # Dividing both sides by y preserves the same relative-error objective.
+    for bound in (1, 2):
+        matrix = [[row[0] / y, row[bound] / y]
+                  for row, y in zip(rows, rhs)]
+        solved = _solve_nonnegative(matrix, [1.0] * len(rhs))
+        if solved is None:
+            continue
+        params = [solved[0][0], 0.0, 0.0]
+        params[bound] = solved[0][1]
+        value = cost(params)
+        if best_cost is None or value < best_cost:
+            best_params, best_cost = tuple(params), value
     return best_params
 
 
