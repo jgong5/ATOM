@@ -375,6 +375,13 @@ class BucketedRunnerRegions:
     #: groups would need roughly sixty campaigns to say something the evidence
     #: says is not there.
     prefill_pooled_sequences: tuple = ()
+    #: Optional per-cell history support: ``(bucket, padded) ->
+    #: (minimum history, maximum history, maximum summed history)``.
+    #: A source acquired at one or two sequences must not widen every decode
+    #: rung. The sum bound also keeps a measured short/long pair from claiming
+    #: support for two long histories, whose block-table packing copies more
+    #: live entries. Unlisted cells retain ``decode_context`` unchanged.
+    decode_context_cells: tuple = ()
     version: str = ""
     provenance: str = ""
 
@@ -612,13 +619,19 @@ class BucketedRunnerRegions:
             return (f"{seqs} sequences at capture bucket {bucket} is the "
                     f"{'padded' if cell[1] else 'exact'} cell of bucket "
                     f"{bucket}, measured only at {measured}")
-        lo, hi = self.decode_context
+        support = dict(self.decode_context_cells)
+        lo, hi, total_hi = support.get(cell, (*self.decode_context, None))
         histories = [int(c) for c in shape.context_lens]
         if histories and not (lo <= min(histories) and max(histories) <= hi):
             return (f"decode over histories {min(histories)}-{max(histories)} "
                     f"tokens, measured only over [{lo}, {hi}]; preparation has "
                     "a term that grows with history and this capture did not "
                     "reach it")
+        if total_hi is not None and sum(histories) > total_hi:
+            return (f"decode cell {cell} has summed history {sum(histories)} "
+                    f"tokens, above its measured limit {total_hi}; a mixed "
+                    "short/long source does not cover every row at its "
+                    "longest history")
         return None
 
     def _decode_prepare(self, shape) -> Measured:
