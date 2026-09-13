@@ -2555,34 +2555,19 @@ class TestTheSourceFactoryWasGivenAWholeModel:
         )
 
     def test_the_option_list_is_exactly_what_the_factory_takes(self):
-        assert set(validate.SOURCE_FACTORY_OPTIONS) == {
-            "model",
-            "tp",
-            "device",
-            "replay_target",
-            "block_size",
-            "max_model_len",
-            "position_rows",
-            "block_policy",
-            "cudagraph_mode",
-            "price",
-            "template",
-            "head_template",
-            "head",
-            "regions",
-            "seconds_per_launch",
-            "require_complete",
-            "carry_allocation",
-            "derive",
-            "interpolate",
-        }
+        import inspect
+        from atom.compass.runtime.source_oracle import build_source_oracle
+
+        public = {name for name in inspect.signature(build_source_oracle).parameters
+                  if name != "rank_coords" and not name.startswith("_")}
+        assert set(validate.SOURCE_FACTORY_OPTIONS) == public
 
     def test_an_option_the_factory_does_not_take_is_refused(self):
         reasons = self._reasons({**GOOD_FACTORY, "require_complete_": "true"})
         assert any("takes no such option" in r for r in reasons)
 
     def test_every_documented_option_passes_through_unremarked(self):
-        """None of the nineteen is itself a complaint."""
+        """Public options compose under their actual factory constraints."""
         options = {
             **GOOD_FACTORY,
             "model": "/models/qwen3-27b",
@@ -2596,9 +2581,55 @@ class TestTheSourceFactoryWasGivenAWholeModel:
             "carry_allocation": "false",
             "derive": "true",
             "interpolate": 2.0,
+            "allocation": "native",
+            "attention_scope": "request-scope.json",
+            "measured_attention_scope": "measured-scope.json",
+            "dispatch_bands": "bands.json",
+            "attention_treatments": "treatments.json",
         }
         assert set(options) == set(validate.SOURCE_FACTORY_OPTIONS)
         assert self._reasons(options) == []
+
+    @pytest.mark.parametrize("name", ["rank_coords", "_shared_derivers",
+                                       "_shared_allocation", "unknown_option"])
+    def test_internal_injection_and_unknown_options_are_refused(self, name):
+        assert any("takes no such option" in why for why in self._reasons(
+            {**GOOD_FACTORY, name: "anything"}))
+
+    @pytest.mark.parametrize("value", [False, 0, "off"])
+    def test_explicit_exact_only_mode_is_supported(self, value):
+        assert self._reasons({**GOOD_FACTORY, "interpolate": value}) == []
+
+    @pytest.mark.parametrize("value", [float("inf"), float("nan")])
+    def test_nonfinite_interpolation_cannot_remove_support_bounds(self, value):
+        assert any("finite support" in why for why in self._reasons(
+            {**GOOD_FACTORY, "interpolate": value}))
+
+    @pytest.mark.parametrize("name", ["attention_scope", "measured_attention_scope",
+                                       "dispatch_bands", "attention_treatments"])
+    def test_family_options_require_interpolation(self, name):
+        assert any("interpolation is off" in why for why in self._reasons(
+            {**GOOD_FACTORY, name: "source.json", "interpolate": "off"}))
+
+    def test_the_carried_allocation_alias_remains_ungraded(self):
+        assert any("unmeasured" in why for why in self._reasons(
+            {**GOOD_FACTORY, "allocation": "carry"}))
+
+    def test_unknown_allocation_mode_is_refused(self):
+        assert any("factory supports" in why for why in self._reasons(
+            {**GOOD_FACTORY, "allocation": "guessed"}))
+
+    def test_conflicting_allocation_sources_are_refused(self):
+        assert any("both select" in why for why in self._reasons(
+            {**GOOD_FACTORY, "allocation": "native", "carry_allocation": True,
+             "block_size": 16, "max_model_len": 262144}))
+
+    @pytest.mark.parametrize("name", ["block_size", "max_model_len"])
+    def test_native_allocation_requires_its_geometry(self, name):
+        options = {**GOOD_FACTORY, "allocation": "native", "block_size": 16,
+                   "max_model_len": 262144}
+        options[name] = 0
+        assert any(f"positive {name}" in why for why in self._reasons(options))
 
     def test_fitted_prices_are_allowed_when_the_density_is_stated(self):
         """A fit inside its own declared support is a prediction, not a gap.

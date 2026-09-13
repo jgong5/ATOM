@@ -43,7 +43,7 @@ Every width shares these:
     --compass-oracle-option require_complete=1
     --compass-oracle-option allocation=native
     --compass-oracle-option derive=1
-    --compass-oracle-option interpolate=1
+    --compass-oracle-option interpolate=2.0
 
 and adds its own prices and templates. At TP1 (`$SRC1` is `g4/src1`):
 
@@ -56,12 +56,13 @@ and adds its own prices and templates. At TP1 (`$SRC1` is `g4/src1`):
     --compass-oracle-option head_template=$SRC1/h27dec32.tp1.r0.json
 
 
-`interpolate=1` turns the family price provider on at the density the provider
-itself declares -- it is the word `true`, not a ratio. A number there is read
-as a ratio and means something else: the widest ratio between two adjacent
-measured row counts the evidence supports interpolating across. `1` used to be
-taken literally as that ratio, which no two distinct row counts can meet, and
-run 8 refused 2118 of 2443 operators for it.
+`interpolate=2.0` states the widest ratio between adjacent measured row counts
+the family provider may interpolate across. This is its existing default,
+now explicit so an acceptance artifact records the support it used.
+Historical `interpolate=1` requests enabled that default without stating its
+value and remain qualified as such. An earlier parser instead took `1`
+literally as the ratio, which no two distinct row counts can meet; run 8
+refused 2118 of 2443 operators for that earlier interpretation.
 
 `regions=source-27b-tp1-history-delta` retains the native preparation baseline
 and adds a bounded history contribution measured in the source runner. Every

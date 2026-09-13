@@ -64,6 +64,15 @@ def test_every_documented_key_is_in_the_registry():
     assert keys - registered == set()
 
 
+def test_interpolation_explicitly_preserves_the_existing_support_bound():
+    from atom.compass.core.cost.families import ParametricPriceLibrary
+    from atom.compass.runtime.source_oracle import gap_ratio
+
+    limit = gap_ratio(dict(registry.SHARED_OPTIONS)["interpolate"])
+    assert isinstance(limit, float)
+    assert limit == ParametricPriceLibrary().max_gap_ratio == 2.0
+
+
 def test_acceptance_never_carries_the_template_s_own_allocation():
     # The refusal this registry exists for. `carry_allocation=1` prices a step
     # against another step's blocks and says it is unmeasured; a diagnostic

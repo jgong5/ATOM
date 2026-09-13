@@ -156,7 +156,9 @@ SHARED_OPTIONS = (
     # parametric family -- the head row ladder below above all -- is dead
     # weight: each refusal reads "no entry for this signature" with no
     # parametric reason attached. Run 5 omitted it and that is what it cost.
-    ("interpolate", "1"),
+    # State the existing provider bound numerically: the boolean spelling
+    # enables the same 2.0 default but leaves acceptance's support unstated.
+    ("interpolate", "2.0"),
     ("require_complete", "1"),
     ("allocation", "native"),
     ("derive", "1"),

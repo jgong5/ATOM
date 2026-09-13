@@ -2028,8 +2028,13 @@ SOURCE_FACTORY_OPTIONS = (
     "seconds_per_launch",
     "require_complete",
     "carry_allocation",
+    "allocation",
     "derive",
     "interpolate",
+    "attention_scope",
+    "measured_attention_scope",
+    "dispatch_bands",
+    "attention_treatments",
 )
 
 #: Options an acceptance run must state rather than default. Each has a working
@@ -2119,6 +2124,23 @@ def check_source_factory(modelled, tp: int, label: str) -> list[str]:
     require_complete = flags.get("require_complete", True)
     carry_allocation = flags.get("carry_allocation", False)
     derive = flags.get("derive", True)
+    allocation = str(options.get("allocation") or "").strip().lower()
+    if allocation not in ("", "none", "native", "carry"):
+        bad.append(f"{label}: allocation={allocation!r} is not a source the "
+                   "factory supports")
+    if allocation and carry_allocation is True:
+        bad.append(f"{label}: allocation and carry_allocation both select "
+                   "the block assignment; the factory refuses that combination")
+    if allocation == "carry":
+        carry_allocation = True
+    if allocation == "native":
+        for name in ("block_size", "max_model_len"):
+            try:
+                valid = int(options.get(name)) > 0
+            except (TypeError, ValueError, OverflowError):
+                valid = False
+            if not valid:
+                bad.append(f"{label}: allocation=native needs a positive {name}")
 
     for name in SOURCE_FACTORY_STATED:
         if not _given(options, name):
@@ -2150,6 +2172,7 @@ def check_source_factory(modelled, tp: int, label: str) -> list[str]:
     # coverage record says which operators were fitted. What is not allowed is
     # a density nobody can read: `interpolate=maybe` reaches the factory, which
     # refuses it, so a record carrying one describes a run that never started.
+    limit = None
     if _given(options, "interpolate"):
         from atom.compass.runtime.source_oracle import gap_ratio
 
@@ -2167,13 +2190,23 @@ def check_source_factory(modelled, tp: int, label: str) -> list[str]:
             # keeps the option as written, so a cell graded under `true` has
             # nothing in it saying how wide a gap was crossed, and the answer
             # moves if the provider's default ever does.
-            if not isinstance(limit, float):
+            if limit is not None and not isinstance(limit, float):
                 bad.append(
                     f"{label}: interpolate={options['interpolate']!r} takes "
                     f"whatever density the provider currently defaults to, so "
                     f"the record does not state the support fitted prices were "
                     f"allowed over; state the ratio"
                 )
+            elif isinstance(limit, float) and not math.isfinite(limit):
+                bad.append(f"{label}: interpolation needs a finite support "
+                           "ratio, not an unbounded or undefined density")
+    if limit is None:
+        scoped = [name for name in (
+            "attention_scope", "measured_attention_scope", "dispatch_bands",
+            "attention_treatments") if options.get(name)]
+        if scoped:
+            bad.append(f"{label}: {', '.join(scoped)} requires the fitted "
+                       "family provider, but interpolation is off")
 
     if _factory_flag(options.get("regions")) is False or str(
         options.get("regions", "")
