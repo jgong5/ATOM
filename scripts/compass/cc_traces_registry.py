@@ -793,6 +793,24 @@ _WIDE_HEAD_GATHER = (
 )
 
 
+#: Correct native vocabulary windows at all six FULL-decode body buckets.
+#: Each rank was measured on its final physical card with three repeats;
+#: declared repeat ranges and the default integer fill remain in the books.
+_WIDE_EMBEDDING = (
+    "{root}/codex_wide_20260913/embedding_tp{tp}/prices.json:"
+    "{root}/codex_wide_20260913/embedding_tp{tp}/graphs.json:unregistered"
+)
+
+#: The head executes actual active rows, so it needs every integer 1..32.
+#: These exact sources use the final TP2/TP4 device mapping and three repeats,
+#: with bounded graph timing for the large vocabulary projection. Missing
+#: profiler records are explicitly qualified; all durations remain included.
+_WIDE_HEAD_GEMM = (
+    "{root}/codex_wide_20260913/head_gemm_tp{tp}/prices_v2.json:"
+    "{root}/codex_wide_20260913/head_gemm_tp{tp}/graphs_v2.json:unregistered"
+)
+
+
 def per_width_options(tp: int) -> tuple:
     """The options this width adds to `SHARED_OPTIONS`, unresolved."""
     if tp == 1:
@@ -842,6 +860,7 @@ def per_width_options(tp: int) -> tuple:
     # `unified_attention_with_output_base` appears in no base book at either
     # wide width, so that family displaces nothing at any rank.
     prices = (_WIDE_AR_ROWS + (_WIDE_MROPE_ROW1, _WIDE_GDN_NATIVE,
+                               _WIDE_EMBEDDING, _WIDE_HEAD_GEMM,
                                _WIDE_HEAD_GATHER)
               + _WIDE_BODY_ROWS + (_WIDE_BOUNDED,) + prices)
     if tp == 4 and INCLUDE_GEMM_SUPPLEMENT_V1:
