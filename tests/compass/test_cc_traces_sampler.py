@@ -312,7 +312,7 @@ class TestTheLoop:
         s.one = one
         s.run()
         rows = _rows(s.out)
-        assert len(rows) == 2
+        assert len(rows) == 3
         assert rows[-1]["smi"]
 
     def test_it_appends_rather_than_truncating(self, tmp_path, smi, clock):
@@ -342,3 +342,122 @@ class TestWhatItAsksRocmSmiFor:
         assert any("--showmeminfo" in call and "vram" in call for call in asked)
         assert any("--showpids" in call for call in asked)
         assert all("--json" in call for call in asked)
+
+
+class TestClosingObservation:
+    def test_stop_during_interval_takes_a_fresh_final_sample(self, tmp_path, smi, clock):
+        s = _sampler(tmp_path, clock, interval=5.0)
+        ended = []
+
+        def stop_after_server_exits(seconds):
+            clock.sleep(0.574046)
+            ended.append(clock.wall())
+            s.stop()
+
+        s.sleep = stop_after_server_exits
+        s.run()
+        rows = _rows(s.out)
+        assert len(rows) == 2
+        assert rows[-1]["t"] >= ended[0]
+        assert rows[-1]["smi"] and rows[-1]["pids"] is not None
+
+    def test_stop_during_probe_does_not_reuse_its_old_timestamp(
+        self, tmp_path, monkeypatch, clock
+    ):
+        s = _sampler(tmp_path, clock, interval=0.0)
+        probe = FakeSmi()
+        ended = []
+
+        def stopping_probe(*args, **kwargs):
+            if not probe.calls:
+                clock.sleep(0.6)
+                ended.append(clock.wall())
+                s.stop()
+            return probe(*args, **kwargs)
+
+        monkeypatch.setattr(sampler_mod, "_smi_json", stopping_probe)
+        s.run()
+        rows = _rows(s.out)
+        assert len(rows) == 2
+        assert rows[0]["t"] < ended[0] <= rows[-1]["t"]
+
+    def test_final_probe_failure_stays_in_the_record(self, tmp_path, smi, clock):
+        s = _sampler(tmp_path, clock, interval=5.0, phase="run")
+
+        def stop_with_failed_probe(seconds):
+            clock.sleep(seconds)
+            smi.fail = "terminal probe timeout"
+            s.stop()
+
+        s.sleep = stop_with_failed_probe
+        s.run()
+        rows = _rows(s.out)
+        assert len(rows) == 2
+        assert rows[-1]["error"] == "terminal probe timeout; terminal probe timeout"
+        assert isolation.audit(rows)["verdict"] == "unknown"
+
+    def test_timestamp_precision_does_not_move_a_reading_before_shutdown(self, smi):
+        instant = 1_700_000_000.0004
+        assert sampler_mod.sample("smi", "run", [], at=instant)["t"] == instant
+
+
+def _proc_entry(root, pid, ppid, ticks, kernel_pid):
+    path = root / str(pid)
+    path.mkdir(parents=True)
+    fields = ["S", str(ppid)] + ["0"] * 17 + [str(ticks)]
+    (path / "stat").write_text(f"{pid} (python worker) " + " ".join(fields))
+    (path / "sched").write_text(f"python worker ({kernel_pid}, #threads: 1)\n")
+    return path
+
+
+class TestOwnedProcessProvenance:
+    @pytest.mark.parametrize("root_ticks,missing_mapping,expected", [
+        (100, False, ["111", "112"]),
+        (99, False, []),
+        (100, True, ["111"]),
+    ])
+    def test_only_witnessed_descendants_are_ours(
+        self, tmp_path, monkeypatch, clock, root_ticks, missing_mapping, expected
+    ):
+        proc = tmp_path / "proc"
+        _proc_entry(proc, 11, 1, 100, 111)
+        child = _proc_entry(proc, 12, 11, 101, 112)
+        _proc_entry(proc, 13, 1, 99, 1685833)
+        if missing_mapping:
+            (child / "sched").unlink()
+        monkeypatch.setattr(sampler_mod, "PROC_ROOT", proc, raising=False)
+        monkeypatch.setattr(sampler_mod, "_smi_json", FakeSmi(
+            pids={"system": {"PID111": "server", "PID112": "worker",
+                             "PID1685833": "foreign"}}))
+        phase = tmp_path / "phase.json"
+        phase.write_text(json.dumps({"phase": "serving", "own_pids": [],
+            "process_roots": [{"pid": 11, "start_ticks": root_ticks}]}))
+        s = _sampler(tmp_path, clock, interval=0, phase_file=str(phase))
+        s.run(limit=1)
+        row = _rows(s.out)[0]
+        assert row["own_pids"] == expected
+        assert [str(p["kernel_pid"]) for p in row["own_processes"]] == expected
+        report = isolation.audit([row])
+        assert "1685833" in report["foreign_pids"]
+        assert "1685833" not in report["own_pids"]
+
+
+    def test_root_reused_during_snapshot_cannot_claim_its_old_descendants(
+        self, tmp_path, monkeypatch
+    ):
+        proc = tmp_path / "proc"
+        _proc_entry(proc, 11, 1, 100, 111)
+        _proc_entry(proc, 12, 11, 101, 112)
+        monkeypatch.setattr(sampler_mod, "PROC_ROOT", proc)
+        identity = sampler_mod._process_identity
+        root_reads = []
+
+        def reused(pid):
+            if pid == 11:
+                root_reads.append(pid)
+                if len(root_reads) > 1:
+                    return 1, 200
+            return identity(pid)
+
+        monkeypatch.setattr(sampler_mod, "_process_identity", reused)
+        assert sampler_mod._owned_processes([{"pid": 11, "start_ticks": 100}]) == []

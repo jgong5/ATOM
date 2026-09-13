@@ -2281,3 +2281,49 @@ class TestDerivationIsAttributedToTheRepeatThatSpentIt:
             "--load-source",
             "server.log",
         ]
+
+
+class TestSamplerShutdownCoverage:
+    def test_actual_sampler_closes_the_last_server_window(self, tmp_path, monkeypatch):
+        sampler = _load("gpu_sampler")
+        monkeypatch.setattr(sampler, "_smi_json", lambda *a, **k: ({}, None))
+        runner = _runner(tmp_path, "real")
+        runner.cell.mkdir(parents=True)
+        path = runner.cell / "gpu.jsonl"
+        ended = 1_789_289_636.6280458
+        path.write_text(json.dumps({"t": ended - 600, "phase": "baseline"}) + "\n")
+        runner.executions = {1: {"process": {"launched_at": ended - 599,
+                                            "ended_at": ended}}}
+        now = [ended - 0.574046]
+        watch = sampler.Sampler(str(path), interval=5, now=lambda: now[0],
+                                wall=lambda: now[0])
+
+        def stop_after_shutdown(seconds):
+            now[0] = ended + 4.9724022
+            watch.stop()
+
+        watch.sleep = stop_after_shutdown
+        watch.run()
+        assert runner._check_sampler({"id": "stop-sample"}, path)
+        assert not runner.failures
+
+    def test_phase_file_names_only_the_exact_launched_server(self, tmp_path):
+        procs = FakeProcesses(cell=tmp_path)
+        phases = []
+        runner = None
+
+        def health(url):
+            phases.append(json.loads((runner.cell / "phase.json").read_text()))
+            return {}
+
+        runner = _runner(tmp_path, "real", processes=procs, health=health)
+        assert runner.run() == 0
+        servers = [p for p in procs.started if "api_server" in " ".join(p.command)]
+        assert len(phases) == len(servers) == 3
+        for phase, server in zip(phases, servers):
+            assert phase["phase"] == "serving"
+            assert phase["process_roots"] == [
+                {"pid": server.pid, "start_ticks": 900_000 + server.pid}]
+            assert phase["own_pids"] == []
+        final = json.loads((runner.cell / "phase.json").read_text())
+        assert final["phase"] == "finished" and final["process_roots"] == []

@@ -707,7 +707,10 @@ class SideRun:
             "pid": proc.pid,
             "step": step,
             "execution": execution,
+            "sampling_root": {"pid": proc.pid,
+                              "start_ticks": self.probe.start_ticks(proc.pid)},
         }
+        self._publish_phase("serving")
         healthy, reason = self._await_health(step, proc, started)
         seconds = self.now() - started
         entry = self._record(
@@ -1242,12 +1245,15 @@ class SideRun:
         if held is None:
             self._record(step, ok=True, reason="nothing of ours was running")
             return True
+        if held["step"]["role"] == "sample":
+            self._publish_phase("finished")
         code = self.processes.stop(held["proc"])
         execution = held.get("execution")
         if execution is not None:
             execution["process"]["ended_at"] = self.wall()
             execution["process"]["exit"] = code
             self._write_execution(execution)
+            self._publish_phase("between")
         watched = True
         if held["step"]["role"] == "sample":
             # Now that it has stopped, ask what it saw -- before the run ends
@@ -1446,7 +1452,22 @@ class SideRun:
             return False
         return observed
 
+    def _publish_phase(self, phase):
+        """Give the real sampler only identities this harness actually launched."""
+        if self.side != "real":
+            return
+        roots = [held["sampling_root"] for held in self.running.values()
+                 if "sampling_root" in held]
+        payload = {"phase": phase, "own_pids": [], "process_roots": roots}
+        # Readers must see a whole phase transition, never a partially written
+        # file that silently falls back to empty process ownership.
+        path = self.cell / "phase.json"
+        temporary = path.with_suffix(".json.tmp")
+        temporary.write_text(json.dumps(payload) + "\n")
+        temporary.replace(path)
+
     def _sample(self, step) -> bool:
+        self._publish_phase("between")
         proc = self.processes.start(step["command"], log=self._log(step))
         self.running[step["id"]] = {"proc": proc, "pid": proc.pid, "step": step}
         self._record(step, pid=proc.pid, ok=True)

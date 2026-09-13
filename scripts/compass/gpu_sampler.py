@@ -67,6 +67,8 @@ VISIBILITY_VARS = (
 #: hanging subprocess also holds the file.
 SMI_TIMEOUT = 30.0
 
+PROC_ROOT = Path("/proc")
+
 
 def visible() -> str:
     """Which cards this process was given, in `isolation.py`'s own spelling."""
@@ -98,6 +100,67 @@ def _smi_json(smi: str, arguments, timeout: float = SMI_TIMEOUT):
         return None, f"unparsable rocm-smi output: {exc}"
 
 
+def _process_identity(pid):
+    """Parent and start time in the sampler's PID namespace, or no witness."""
+    try:
+        raw = (PROC_ROOT / str(pid) / "stat").read_text()
+        fields = raw[raw.rindex(")") + 1:].split()
+        return int(fields[1]), int(fields[19])
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _owned_processes(roots) -> list[dict]:
+    """Translate witnessed server descendants to the kernel PIDs SMI reports.
+
+    A container PID is not a ROCm PID. Linux's /proc/<pid>/sched header names
+    the kernel task even when stat and children are viewed in a container PID
+    namespace. Keep that mapping beside the observation; an unreadable mapping
+    stays unclassified, and a new SMI PID is never evidence of ownership.
+    """
+    if not roots:
+        return []
+    processes = {}
+    for path in PROC_ROOT.iterdir():
+        if path.name.isdigit():
+            identity = _process_identity(int(path.name))
+            if identity is not None:
+                processes[int(path.name)] = identity
+    owned = {}
+    for root in roots or []:
+        pid, ticks = root.get("pid"), root.get("start_ticks")
+        if pid in processes and ticks is not None and processes[pid][1] == ticks:
+            owned[pid] = {"root_pid": pid, "root_start_ticks": ticks}
+    changed = True
+    while changed:
+        changed = False
+        for pid, (parent, ticks) in processes.items():
+            if (pid not in owned and parent in owned
+                    and ticks >= processes[parent][1]):
+                owned[pid] = owned[parent]
+                changed = True
+    witnessed = []
+    for pid in sorted(owned):
+        try:
+            header = (PROC_ROOT / str(pid) / "sched").read_text().splitlines()[0]
+            kernel_pid = int(header.rsplit(" (", 1)[1].split(", #threads:", 1)[0])
+        except (OSError, ValueError, IndexError):
+            continue
+        # Every link must still identify the process whose ancestry we
+        # walked. Reusing a parent PID must not confer ownership on a later
+        # process or on that later process's children.
+        chain = [pid]
+        while chain[-1] != owned[pid]["root_pid"]:
+            chain.append(processes[chain[-1]][0])
+        if kernel_pid <= 0 or any(_process_identity(p) != processes[p] for p in chain):
+            continue
+        parent, ticks = processes[pid]
+        witnessed.append({"pid": pid, "ppid": parent, "start_ticks": ticks,
+                          "kernel_pid": kernel_pid, **owned[pid],
+                          "kernel_pid_source": "/proc/<pid>/sched"})
+    return witnessed
+
+
 def _phase(path: str | None, fallback: str, own_pids: list) -> tuple:
     """What the run says is happening, read fresh for every sample.
 
@@ -107,18 +170,22 @@ def _phase(path: str | None, fallback: str, own_pids: list) -> tuple:
     its command-line phase rather than stopping it.
     """
     if not path:
-        return fallback, own_pids, None
+        return fallback, own_pids, None, None
     try:
         blob = json.loads(Path(path).read_text())
     except (OSError, ValueError) as exc:
-        return fallback, own_pids, f"{type(exc).__name__}: {exc}"
+        return fallback, own_pids, f"{type(exc).__name__}: {exc}", None
     phase = blob.get("phase") or fallback
     pids = blob.get("own_pids")
     if isinstance(pids, list):
         own = [str(p) for p in pids]
     else:
         own = own_pids
-    return str(phase), own, None
+    witnessed = None
+    if "process_roots" in blob:
+        witnessed = _owned_processes(blob["process_roots"])
+        own = sorted(set(own) | {str(p["kernel_pid"]) for p in witnessed})
+    return str(phase), own, None, witnessed
 
 
 def sample(
@@ -133,7 +200,7 @@ def sample(
     cards, cards_error = _smi_json(smi, SMI_CARDS)
     pids, pids_error = _smi_json(smi, SMI_PIDS)
     row = {
-        "t": round(at, 3),
+        "t": at,
         "phase": phase,
         "visible": visible(),
         "own_pids": [str(p) for p in own_pids],
@@ -187,13 +254,16 @@ class Sampler:
         self.failed = 0
 
     def stop(self, *_args) -> None:
-        """Finish the sample in hand and leave. Bound to SIGTERM and SIGINT."""
+        """Finish in-flight work, then take a closing sample. Bound to signals."""
         self.stopping = True
 
     def one(self, handle) -> dict:
-        phase, own, phase_error = _phase(self.phase_file, self.phase, self.own_pids)
+        phase, own, phase_error, witnessed = _phase(
+            self.phase_file, self.phase, self.own_pids)
         self.phase, self.own_pids = phase, own
         row = sample(self.smi, phase, own, at=self.wall(), note=phase_error)
+        if witnessed is not None:
+            row["own_processes"] = witnessed
         handle.write(json.dumps(row) + "\n")
         handle.flush()
         self.written += 1
@@ -216,8 +286,14 @@ class Sampler:
                     break
                 if duration is not None and self.now() - began >= duration:
                     break
-                if self.interval:
+                if self.interval and not self.stopping:
                     self.sleep(self.interval)
+            if self.stopping:
+                # The harness signals only after the last server exits. A
+                # sample started before that signal cannot close its window,
+                # even if its probes finished later. Take a fresh observation;
+                # keep any probe failure so the audit can refuse it.
+                self.one(handle)
         return 0
 
 
@@ -268,8 +344,8 @@ def main(argv=None) -> int:
     )
     if not args.once:
         # A run harness stops this with a signal; the sample in hand is
-        # finished and the file is closed, rather than the last line being
-        # half a JSON object the audit then skips.
+        # finished, followed by one fresh closing observation. Neither an
+        # interrupted JSON line nor a pre-stop timestamp can close the window.
         for name in (signal.SIGTERM, signal.SIGINT):
             signal.signal(name, sampler.stop)
     limit = 1 if args.once else args.samples
