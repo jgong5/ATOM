@@ -300,6 +300,100 @@ class TestValidateContextLength:
         )
 
 
+class TestCompletionTokenPrompts:
+    class Tokenizer:
+        vocab_size = 8
+
+        def __init__(self):
+            self.encoded = []
+
+        def __len__(self):
+            return 12  # Four added tokens are valid input IDs as well.
+
+        def encode(self, text, **kwargs):
+            assert isinstance(text, str), "token IDs must never be re-tokenized"
+            self.encoded.append(text)
+            return [1, 2, 3]
+
+        def decode(self, tokens, **kwargs):
+            return "done"
+
+    def _engine(self, monkeypatch, *, model_vocab_size=10):
+        from atom.model_engine.llm_engine import InputOutputProcessor
+        from atom.model_engine.request import RequestOutput
+
+        tokenizer = self.Tokenizer()
+        config = SimpleNamespace(
+            hf_config=SimpleNamespace(model_type="test", vocab_size=model_vocab_size),
+            max_model_len=32)
+        processor = InputOutputProcessor(config, tokenizer, 16)
+        received, admitted = [], []
+        original = processor.preprocess_fanout
+
+        def preprocess(prompt, *args, **kwargs):
+            received.append(prompt)
+            return original(prompt, *args, **kwargs)
+
+        processor.preprocess_fanout = preprocess
+
+        def add_request(sequences):
+            admitted.extend(sequences)
+            for seq in sequences:
+                seq.stream_callback(RequestOutput(seq.id, [7], True, "length"))
+
+        engine = SimpleNamespace(config=config, io_processor=processor,
+                                 core_mgr=SimpleNamespace(add_request=add_request))
+        monkeypatch.setattr(api_server, "engine", engine)
+        monkeypatch.setattr(api_server, "tokenizer", tokenizer)
+        monkeypatch.setattr(api_server, "model_name", "test")
+        return tokenizer, processor, received, admitted
+
+    @pytest.mark.parametrize("n", [1, 2])
+    def test_token_ids_reach_real_preprocessing_without_tokenization(self, monkeypatch, n):
+        tokenizer, processor, received, admitted = self._engine(monkeypatch)
+        request = api_server.CompletionRequest(prompt=[1, 8, 9], max_tokens=1, n=n)
+        response = asyncio.run(api_server.completions(request, None))
+        assert received == [[1, 8, 9]]
+        assert received[0] is request.prompt
+        assert all(list(seq.token_ids) == [1, 8, 9] for seq in admitted)
+        assert len(admitted) == n
+        assert tokenizer.encoded == []
+        assert response.usage["prompt_tokens"] == 3
+        assert response.usage["completion_tokens"] == n
+        assert not processor.requests
+
+    def test_text_prompt_keeps_normal_tokenization(self, monkeypatch):
+        tokenizer, _, received, admitted = self._engine(monkeypatch)
+        request = api_server.CompletionRequest(prompt="ordinary text", max_tokens=1)
+        response = asyncio.run(api_server.completions(request, None))
+        assert received == ["ordinary text"]
+        assert tokenizer.encoded == ["ordinary text"]
+        assert list(admitted[0].token_ids) == [1, 2, 3]
+        assert response.usage["prompt_tokens"] == 3
+
+    @pytest.mark.parametrize("model_size,invalid_id", [(10, 10), (20, 12)])
+    @pytest.mark.parametrize("stream", [False, True])
+    def test_out_of_range_ids_refuse_before_preprocessing(
+            self, monkeypatch, model_size, invalid_id, stream):
+        _, _, received, admitted = self._engine(monkeypatch, model_vocab_size=model_size)
+        request = api_server.CompletionRequest(prompt=[invalid_id], max_tokens=1, stream=stream)
+        with pytest.raises(api_server.HTTPException) as exc:
+            asyncio.run(api_server.completions(request, None))
+        assert exc.value.status_code == 400
+        assert "Prompt token IDs" in str(exc.value.detail)
+        assert received == admitted == []
+
+    def test_token_ids_keep_context_length_validation(self, monkeypatch):
+        _, processor, received, admitted = self._engine(monkeypatch)
+        request = api_server.CompletionRequest(prompt=[1] * 32, max_tokens=1)
+        with pytest.raises(api_server.HTTPException) as exc:
+            asyncio.run(api_server.completions(request, None))
+        assert exc.value.status_code == 400
+        assert "maximum context length" in str(exc.value.detail)
+        assert received and not admitted
+        assert not processor.requests
+
+
 class TestARequestIsNotSerialisedForALogNobodyKeeps:
     """Building the log entry is the callee's job, not the caller's.
 

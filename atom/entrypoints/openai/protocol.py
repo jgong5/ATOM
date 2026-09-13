@@ -5,7 +5,7 @@
 
 import json
 import time
-from typing import Any
+from typing import Annotated, Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -236,7 +236,12 @@ class CompletionRequest(BaseModel):
     model_config = {"extra": "ignore"}
 
     model: str | None = None
-    prompt: str
+    # OpenAI completions accepts either text or one pre-tokenized prompt.
+    # Strict integer validation prevents strings, floats and booleans from
+    # silently changing token identities before they reach the engine.
+    prompt: str | Annotated[
+        list[Annotated[int, Field(strict=True, ge=0)]], Field(min_length=1)
+    ]
     temperature: float | None = DEFAULT_TEMPERATURE
     top_k: int | None = DEFAULT_TOP_K
     top_p: float | None = DEFAULT_TOP_P

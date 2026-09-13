@@ -254,6 +254,17 @@ class TestCompletionRequest:
         assert req.get_max_tokens() == 8192
         assert req.n == 1
 
+    def test_pretokenized_prompt_preserves_token_ids(self):
+        request = CompletionRequest.model_validate({"prompt": [0, 7, 151650]})
+        assert request.prompt == [0, 7, 151650]
+
+    @pytest.mark.parametrize("prompt", [[], [-1], [1.0], [True], ["7"], [[7]]])
+    def test_invalid_token_lists_are_refused_without_coercion(self, prompt):
+        from pydantic import ValidationError
+
+        with pytest.raises(ValidationError):
+            CompletionRequest.model_validate({"prompt": prompt})
+
     def test_max_completion_tokens_sets_effective_limit(self):
         req = CompletionRequest.model_validate(
             {

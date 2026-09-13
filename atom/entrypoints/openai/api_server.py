@@ -607,6 +607,33 @@ def _get_engine_max_model_len() -> int | None:
     return getattr(_get_engine_config(), "max_model_len", None)
 
 
+def _validate_completion_prompt(prompt: str | list[int]) -> None:
+    """Bound pre-tokenized input by the loaded tokenizer and model vocabulary.
+
+    The request schema already requires nonempty, nonnegative integer lists.
+    `len(tokenizer)` includes added tokens; `tokenizer.vocab_size` alone can
+    reject valid special tokens. The model's embedding vocabulary can be
+    smaller, so both bounds apply before any sequence enters the scheduler.
+    """
+    if isinstance(prompt, str):
+        return
+    try:
+        tokenizer_size = len(tokenizer)
+    except TypeError:
+        tokenizer_size = getattr(tokenizer, "vocab_size", None)
+    hf_config = getattr(_get_engine_config(), "hf_config", None)
+    model_size = getattr(hf_config, "vocab_size", None)
+    if any(not isinstance(size, int) or size <= 0
+           for size in (tokenizer_size, model_size)):
+        raise ValueError("Token-ID prompts require the loaded tokenizer and model vocabulary limits")
+    limit = min(tokenizer_size, model_size)
+    if max(prompt) >= limit:
+        raise ValueError(
+            f"Prompt token IDs must be between 0 and {limit - 1}; "
+            f"tokenizer size is {tokenizer_size} and model vocabulary size is {model_size}"
+        )
+
+
 def _get_engine_max_pool_tokens() -> int | None:
     """Longest prompt the KV pool can hold, as each engine rank reported it.
 
@@ -881,7 +908,7 @@ def _send_stream_chunk_tagged(
 
 
 async def generate_async(
-    prompt: str,
+    prompt: str | list[int],
     sampling_params: SamplingParams,
     request_id: str,
     kv_transfer_params: dict[str, Any] | None = None,
@@ -985,7 +1012,8 @@ async def generate_async(
 
     text = tokenizer.decode(all_token_ids, skip_special_tokens=True)
     num_tokens_input = (
-        seq.num_prompt_tokens if seq is not None else len(tokenizer.encode(prompt))
+        seq.num_prompt_tokens if seq is not None else
+        len(prompt) if isinstance(prompt, list) else len(tokenizer.encode(prompt))
     )
     num_tokens_output = len(all_token_ids)
     finished_at = time.time()
@@ -1921,6 +1949,7 @@ async def completions(request: CompletionRequest, raw_request: Request):
     validate_model(request.model)
 
     try:
+        _validate_completion_prompt(request.prompt)
         effective_n = _coerce_n(request.n, request.temperature)
         sampling_params = _build_sampling_params(
             temperature=request.temperature,
