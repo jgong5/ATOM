@@ -164,11 +164,10 @@ SHARED_OPTIONS = (
     # declared nothing and its 64 attention operators were all refused by name
     # while agreeing on backend, KV layout, geometry and treatment.
     #
-    # `xacq`, not `b2acq`, which is what run 6 declared. The two SCOPE records
-    # differ only in KV variants -- 16 against 32, and the blocks-per-variant
-    # and pointers that follow -- and `kv_regions` is a treatment field, so
-    # they are two deployments and the V=16 law is fitted for this one.
-    ("attention_scope", "{root}/xacq/SCOPE.json"),
+    # The selected cached source population has eight KV variants. Its scope
+    # must move with its training inputs: mixing V=8 and V=16 would create two
+    # different treatments. The previous V=16 inputs remain archived below.
+    ("attention_scope", "{root}/z8v/acq_train/SCOPE.json"),
     # The dispatch probe, as evidence rather than as a planning note. It says
     # which Tensile kernel the source serves each row count with on the
     # 64-token grid over 8192..16384, and the fitted GEMM family reads it to
@@ -310,7 +309,7 @@ _B2_GDN = (
 #: the original rule was protecting.
 #:
 #: The cost, stated rather than buried: the cold law is V=32 while the cached
-#: law is V=16, a mixed treatment across regimes. The two are separate laws
+#: law is V=8, a mixed treatment across regimes. The two are separate laws
 #: and no fit ever sees both populations, so nothing is pooled -- but the
 #: qualification travels with this baseline and must not be dropped when its
 #: end-to-end numbers are quoted. The alternative on offer is not a cleaner
@@ -339,10 +338,23 @@ _V16_DESIGNS = (
 )
 _V16_REPEATS = (1, 2, 3, 4)
 
+#: Frozen V=8 cached training population: 63 z8v + 59 s8v records. The two
+#: first-use exclusions are declared in s8v_freeze/v1/FROZEN.json; all eight
+#: holdout records stay outside this list. This extends history_rows down to
+#: 64. The S9 holdout error is -4.637%, but worst training error remains 53.3%;
+#: selection for development does not establish end-to-end acceptance.
+_V8_CACHED_DESIGNS = (
+    ("z8v", ("K1", "K2", "K3", "K4", "K5", "X2", "X3", "X4", "X5",
+             "Z1", "Z2", "Z3", "Z4", "Z5", "Z6", "Z7")),
+    ("s8v", ("H1", "H2", "H3", "H4", "H5", "H6", "H7", "H8", "H9",
+             "H10", "H11", "R1", "R2", "R3", "R4")),
+)
+_V8_COLD_FIRST = {("z8v", "K1"), ("s8v", "H1")}
+
 #: The cached-MHA inputs this book used to carry, kept as a name rather than
-#: as a load. Both are still on disk and both remain the evidence for what
+#: as a load. All are still on disk and remain the evidence for what
 #: they measured; neither is in `options` any more, because each is its own
-#: `kv_regions` treatment and loading them beside V=16 is the ambiguity the
+#: `kv_regions` treatment and loading them beside V=8 is the ambiguity the
 #: composition refuses. Listed so that "archived" is a fact in the registry
 #: and not only in a handoff.
 ARCHIVED_CACHED_MHA = (
@@ -358,6 +370,9 @@ ARCHIVED_CACHED_MHA = (
      "files of ONE design. Archived, not loaded: it cannot fit the "
      "three-feature cold law by itself, and loading it beside the B2 cold "
      "set would put two treatments in the cold domain"),
+    *((f"{_XACQ}/PRICE_{design}.rep{rep}.json",
+       "unified.prefill.cached, kv_regions=16; preserved previous population")
+      for design, _graph in _V16_DESIGNS for rep in _V16_REPEATS),
 )
 
 
@@ -520,24 +535,15 @@ def _tp1_prices() -> tuple:
         add(f"{_PC}/g1b/p27_lad_b{batch}.tp1.r0.{_REP}.json",
             f"{_CARD}/b27_tp1_r0_lad_b{batch}.json")
 
-    # The cached-MHA calibration inputs: the V=16 campaign, and nothing else.
-    #
-    # What used to stand here was two aggregated attention files, and asking
-    # the library rather than their names showed they were two *different*
-    # cached populations -- `agg_att_q16384_c16384` at `kv_regions=1` and
-    # `AGG_caseb_unified_q16384_c32768` at `kv_regions=32`, 16 observations
-    # each. `kv_regions` is a treatment field, so those are two laws by
-    # identity; with the B2 V=32 set that is three, and a deployment that
-    # declares none of them is refused for ambiguity rather than priced.
-    #
-    # Replacing both with the V=16 set leaves exactly one cached treatment in
-    # the book, so `_treatment_for` resolves without a declaration. The cold
-    # MHA observations are NOT touched: they come from the two body-prefill
-    # files above at `('cache', 'graph')`, a different regime, and dropping
-    # the cached files leaves them exactly as they were.
-    for design, graph in _V16_DESIGNS:
-        for rep in _V16_REPEATS:
-            add(f"{_XACQ}/PRICE_{design}.rep{rep}.json", graph)
+    # One cached treatment, with the frozen training membership and its own
+    # graphs. Cold attention and GDN retain their separate populations below.
+    for campaign, designs in _V8_CACHED_DESIGNS:
+        for design in designs:
+            repeats = ((2, 3, 4) if (campaign, design) in _V8_COLD_FIRST
+                       else (1, 2, 3, 4))
+            for rep in repeats:
+                add(f"{{root}}/{campaign}/acq_train/training/PRICE_{design}.rep{rep}.json",
+                    f"{{root}}/{campaign}/graphs/{campaign}_{design}.reduced.json")
 
     # The cold-MHA observation of the same deployment, and the fitted B2 GDN
     # family. Neither is supplied by the body-prefill files above: those carry
