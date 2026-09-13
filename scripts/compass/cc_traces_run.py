@@ -1557,6 +1557,7 @@ def _cell_plan(args) -> dict:
         target=getattr(args, "replay_target", None),
         memory_model=getattr(args, "memory_model", None),
         corpus=getattr(args, "corpus", None) or "$CC_TRACES_CORPUS",
+        request_timeout=getattr(args, "request_timeout", plan_module.REQUEST_TIMEOUT),
     )
     if Path(built["cell"]).name != cell.name:
         raise SystemExit(
@@ -2036,6 +2037,8 @@ def main(argv=None) -> int:
         help="root sessions offered, which is this cell's registered workload",
     )
     s.add_argument("--repeats", type=int, default=plan_module.REPEATS)
+    s.add_argument("--request-timeout", type=float, default=plan_module.REQUEST_TIMEOUT,
+                   help="per-request transport deadline in seconds; not an SLO gate")
     s.add_argument(
         "--port",
         type=int,

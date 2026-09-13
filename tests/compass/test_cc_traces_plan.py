@@ -146,6 +146,15 @@ class TestARepeatIsAProcess:
 
 
 class TestTheTwoSidesAreNotRunTheSameWay:
+    def test_request_deadline_is_explicit_and_configurable_for_both_sides(self):
+        for timeout in (3600.0, 1800.0):
+            plan = json.loads(_run(["--root", "/r", "--request-timeout", str(timeout)]))
+            assert plan["request_timeout"] == timeout
+            for cell in plan["cells"]:
+                for step in _role(cell, "replay"):
+                    cmd = step["command"]
+                    assert float(cmd[cmd.index("--timeout") + 1]) == timeout
+
     def test_the_real_side_is_paced_and_prepared(self, plan):
         for cell in plan["cells"]:
             for step in _role(cell, "replay", "real"):

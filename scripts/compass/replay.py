@@ -639,6 +639,7 @@ def main(argv=None) -> int:
         "server": server or None,
         "paced": bool(args.pace),
         "time_scale": float(args.time_scale),
+        "request_timeout_seconds": float(args.timeout),
         "requests": len(workload),
         "arrival_span_s": (round(workload[-1]["arrival_s"], 6)
                            if workload else 0.0),

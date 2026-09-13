@@ -46,6 +46,7 @@ from __future__ import annotations
 import argparse
 import importlib.util
 import json
+import math
 import shlex
 import sys
 from pathlib import Path
@@ -130,6 +131,10 @@ CLIENTS = (1, 2, 4, 8)
 #: Repeats per side, from the protocol's §3. Three on the modelled side too: a
 #: single simulated run is not a distribution.
 REPEATS = 3
+
+# A client transport deadline, not an accuracy or latency gate. The largest
+# TP1 workload can serve for more than the replay client's 600-second default.
+REQUEST_TIMEOUT = 3600.0
 
 #: What a plan is for. `--repeats` below the registered count does not build a
 #: cheaper acceptance run; it builds a diagnostic, and the plan is labelled
@@ -324,7 +329,8 @@ def workload(klass: str, clients: int, suffix: str = "jsonl") -> str:
 
 
 def _replay(
-    klass: str, clients: int, out: str, *, paced: bool, prepare: int, port: int
+    klass: str, clients: int, out: str, *, paced: bool, prepare: int, port: int,
+    request_timeout: float = REQUEST_TIMEOUT,
 ):
     cmd = [
         "python",
@@ -338,6 +344,8 @@ def _replay(
         "--out",
         out,
         "--check-lengths",
+        "--timeout",
+        str(request_timeout),
     ]
     if paced:
         # The real engine stamps arrivals on receipt, so a declared arrival is
@@ -369,6 +377,7 @@ def _lifecycle(
     options,
     target,
     memory_model=None,
+    request_timeout: float = REQUEST_TIMEOUT,
 ):
     """One repeat: its own server, its replay, and the end of that process."""
     modelled = side == "modelled"
@@ -429,6 +438,7 @@ def _lifecycle(
                 paced=not modelled,
                 prepare=0 if modelled else 3,
                 port=port,
+                request_timeout=request_timeout,
             ),
             "produces": (
                 [f"{side}.r{n}.json"]
@@ -470,6 +480,7 @@ def cell_steps(
     target=None,
     memory_model=None,
     corpus: str = "$CC_TRACES_CORPUS",
+    request_timeout: float = REQUEST_TIMEOUT,
 ):
     """Every step of one cell, in the order it has to happen."""
     if port == engine_port:
@@ -478,6 +489,8 @@ def cell_steps(
             f"{port}: they are two different sockets on one host and the "
             f"server cannot bind one of them"
         )
+    if not math.isfinite(request_timeout) or request_timeout <= 0:
+        raise SystemExit("request timeout must be a positive finite number of seconds")
     if klass not in CLASSES:
         raise SystemExit(f"{klass!r} is not a registered class of this matrix")
     if clients not in CLIENTS:
@@ -578,6 +591,7 @@ def cell_steps(
             options=(),
             target=None,
             memory_model=None,
+            request_timeout=request_timeout,
         )
     steps += [
         {
@@ -622,6 +636,7 @@ def cell_steps(
             options=options,
             target=target,
             memory_model=memory_model,
+            request_timeout=request_timeout,
         )
     steps += [
         {
@@ -691,6 +706,7 @@ def cell_steps(
         "class": klass,
         "clients": clients,
         "workload": workload(klass, clients),
+        "request_timeout": request_timeout,
         "steps": steps,
     }
 
@@ -715,6 +731,7 @@ def build(args) -> dict:
             target=targets.get(tp) or _registry_target(args, tp),
             memory_model=profiles.get(tp) or _registry_profile(args, tp),
             corpus=getattr(args, "corpus", None) or "$CC_TRACES_CORPUS",
+            request_timeout=getattr(args, "request_timeout", REQUEST_TIMEOUT),
         )
         for tp in TPS
         for klass in CLASSES
@@ -726,6 +743,7 @@ def build(args) -> dict:
         "model": MODEL,
         "engine_args": list(ENGINE_ARGS),
         "repeats": args.repeats,
+        "request_timeout": getattr(args, "request_timeout", REQUEST_TIMEOUT),
         "processes_per_side": args.repeats,
         # What the plan as built can be: a run of fewer than the registered
         # repeats is a legitimate thing to want, but it is a diagnostic, and
@@ -854,6 +872,8 @@ def main(argv=None) -> int:
               "typing them; --oracle/--oracle-option still override"),
     )
     ap.add_argument("--repeats", type=int, default=REPEATS)
+    ap.add_argument("--request-timeout", type=float, default=REQUEST_TIMEOUT,
+                    help="per-request transport deadline in seconds; not an SLO gate")
     ap.add_argument("--out", default=None, help="write the plan as JSON here")
     ap.add_argument(
         "--shell", action="store_true", help="print the commands instead of JSON"
