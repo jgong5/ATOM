@@ -378,6 +378,44 @@ class Structure:
                 longest = max(longest, -(-high // partition) - low // partition)
         return longest
 
+    def cu_class_work(self, partition: int, splits: int, kv_heads: int,
+                      compute_units: int, window: Optional[int] = None) -> int:
+        """Maximum tile work in a cyclic grid-residue class.
+
+        This is an empirical order-sensitive descriptor, not an asserted GPU
+        scheduling rule. A CTA at ``(row, head, split)`` has linear index
+        ``row + rows * head + rows * kv_heads * split``. Summing its page
+        iterations modulo the CU count distinguishes native request orders
+        that have identical maximum context and total work. Keep the recorded
+        order: sorting contexts changes the descriptor and the measured cost.
+
+        The page arithmetic is the same as ``split_tiles``. Padded contexts
+        are zero and add no work, while their positions remain in the grid.
+        """
+        contexts = tuple(self.contexts() or ())
+        rows = len(contexts)
+        classes = [0] * compute_units
+        for index in range(splits):
+            for head in range(kv_heads):
+                for row, context in enumerate(contexts):
+                    if context <= 0:
+                        continue
+                    if window is not None and window > 0:
+                        if index:
+                            continue
+                        start = max(0, (context - window) // partition)
+                        tiles = max(0, -(-context // partition) - start)
+                    else:
+                        page = -(-context // splits)
+                        low = page * index
+                        if low >= context:
+                            continue
+                        high = min(context, low + page)
+                        tiles = -(-high // partition) - low // partition
+                    linear = row + rows * head + rows * kv_heads * index
+                    classes[linear % compute_units] += tiles
+        return max(classes, default=0)
+
     def continued(self) -> Optional[int]:
         """Sequences whose scan resumes from a recurrent state already held.
 
@@ -733,6 +771,13 @@ REGIMES = {
         "unified.decode.paged_gluon",
         ("calls", "max_cta_tiles", "crit_waves"),
         PAGED_GLUON_SCOPE, law=MAKESPAN),
+    # Same makespan law and scope, with order-sensitive latency and actual
+    # tile throughput. Source-only calibration and frozen holdout evidence
+    # live in DECODE_CALIBRATION_SCOPE.md. Selection remains explicit below.
+    "unified.decode.paged_gluon_order": Regime(
+        "unified.decode.paged_gluon_order",
+        ("calls", "cu_max", "work_waves"),
+        PAGED_GLUON_SCOPE, law=MAKESPAN),
     # On the unified/flash branch there is no per-sequence partition to count.
     # What the measurements show instead is that raggedness dominates: a
     # 32-sequence mixed batch summing 394164 context rows costs ~3.70ms while a
@@ -994,6 +1039,42 @@ def features_for(regime: Regime, structure: Structure, scope=None):
             values.append(float(structure.split_tiles(
                 partition, splits,
                 window if isinstance(window, int) and window > 0 else None)))
+        elif feature in ("cu_max", "work_waves"):
+            contexts = structure.contexts()
+            if not contexts:
+                return Refusal("the call records no per-sequence context, so "
+                               "the work carried by its CTA grid is unknown")
+            rows = structure.executed_rows
+            if rows is None:
+                rows = structure.sequences
+            if rows != len(contexts):
+                return Refusal("the launched row count and per-row contexts "
+                               "describe different decode grids")
+            if structure.bucket is not None and int(structure.bucket) != rows:
+                return Refusal(
+                    f"the call was launched over {rows} rows but declares a "
+                    f"capture bucket of {structure.bucket}; one of the two "
+                    "does not describe this step")
+            splits = _decode_splits(scope, rows)
+            if isinstance(splits, Refusal):
+                return splits
+            heads = int((scope or {}).get("num_kv_heads") or 0)
+            units = int((scope or {}).get("compute_units") or 0)
+            missing = tuple(name for name, value in (("num_kv_heads", heads),
+                                                     ("compute_units", units))
+                            if value <= 0)
+            if missing:
+                return Refusal("the decode CTA grid requires %s"
+                               % ", ".join(missing), missing=missing)
+            window = (scope or {}).get("sliding_window")
+            window = window if isinstance(window, int) and window > 0 else None
+            if feature == "cu_max":
+                values.append(float(structure.cu_class_work(
+                    partition, splits, heads, units, window)))
+            else:
+                tiles = structure.split_tiles(partition, splits, window)
+                values.append(float(tiles) * heads
+                              / float(units * DECODE_OCCUPANCY))
         elif feature in ("max_cta_tiles", "crit_waves"):
             if not structure.contexts():
                 return Refusal(
