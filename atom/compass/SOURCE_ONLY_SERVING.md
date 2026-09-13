@@ -48,8 +48,8 @@ Every width shares these:
 and adds its own prices and templates. At TP1 (`$SRC1` is `g4/src1`):
 
     --compass-oracle-option tp=1
-    --compass-oracle-option attention_scope=$ARTIFACTS/codex_decode_domain_v1/COMBINED_SCOPE.json
-    --compass-oracle-option measured_attention_scope=$ARTIFACTS/codex_decode_domain_v1/MEASURED_DECODE_SCOPE.json
+    --compass-oracle-option attention_scope=$ARTIFACTS/codex_decode_domain_v1/native_scope_v2/REQUEST_SCOPE.json
+    --compass-oracle-option measured_attention_scope=$ARTIFACTS/codex_decode_domain_v1/native_scope_v2/MEASURED_SCOPE.json
     --compass-oracle-option attention_treatments=$ARTIFACTS/codex_decode_domain_v1/TREATMENTS.json
     --compass-oracle-option price=$SRC1/p27bdec32.tp1.r0.json:$SRC1/b27dec32.tp1.r0.json:unregistered,$SRC1/p27hdec32.tp1.r0.json:$SRC1/h27dec32.tp1.r0.json:unregistered
     --compass-oracle-option template=$SRC1/b27dec32.tp1.r0.json

@@ -779,9 +779,13 @@ def per_width_options(tp: int) -> tuple:
     if tp == 1:
         return (
             ("tp", "1"),
-            ("attention_scope", "{root}/codex_decode_domain_v1/COMBINED_SCOPE.json"),
+            # The native BF16 binder produces shuffled five-dimensional KV
+            # views. These audited declarations correct the old NHD label;
+            # source books, coefficients and held-out predictions are intact.
+            ("attention_scope",
+             "{root}/codex_decode_domain_v1/native_scope_v2/REQUEST_SCOPE.json"),
             ("measured_attention_scope",
-             "{root}/codex_decode_domain_v1/MEASURED_DECODE_SCOPE.json"),
+             "{root}/codex_decode_domain_v1/native_scope_v2/MEASURED_SCOPE.json"),
             ("attention_treatments", "{root}/codex_decode_domain_v1/TREATMENTS.json"),
             ("replay_target", _CAPTURED_TARGET),
             ("price", ",".join(_tp1_prices())),
