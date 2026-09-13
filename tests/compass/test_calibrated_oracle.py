@@ -499,6 +499,19 @@ class TestTheSubSpanWindowIsOnlyOpenForAMeasuredStep:
     `_timed_span` passes straight through whenever it is shut.
     """
 
+    @pytest.fixture(autouse=True)
+    def _events(self, monkeypatch):
+        import torch
+
+        class Event:
+            def __init__(self, **kwargs):
+                self.recorded = False
+
+            def record(self):
+                self.recorded = True
+
+        monkeypatch.setattr(torch.cuda, "Event", Event)
+
     @staticmethod
     def _stub():
         from atom.compass.runtime.runner import CompassModelRunner
@@ -523,6 +536,7 @@ class TestTheSubSpanWindowIsOnlyOpenForAMeasuredStep:
         assert list(stub._subspans) == ["run_model"]
         began, ended = stub._subspans["run_model"]
         assert began is not ended
+        assert began.recorded and ended.recorded
 
     def test_a_raising_region_does_not_leave_the_window_open(self):
         """A forward that raises must still shut it, or the next graph capture
@@ -534,7 +548,7 @@ class TestTheSubSpanWindowIsOnlyOpenForAMeasuredStep:
         def boom():
             raise RuntimeError("kernel")
 
-        with pytest.raises(RuntimeError):
+        with pytest.raises(RuntimeError, match="kernel"):
             stub._timed_span("run_model", boom)
         # `_timed_span` itself leaves the window alone; `_forward_measured`'s
         # `finally` is what shuts it. What must hold here is that the failure
