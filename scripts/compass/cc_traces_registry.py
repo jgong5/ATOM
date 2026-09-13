@@ -721,6 +721,37 @@ _WIDE_AR_ROWS = (
 )
 
 
+#: FULL decode executes these six body widths even when the active count is
+#: between buckets. The source ladder is measured on the final device lanes:
+#: TP2 cards 3/4, TP4 cards 3/4/5/6, with each rank keeping its own timings.
+#: Alias samples select the first three parseable original attempts in repeat
+#: order; BODY_INPUT_INDEX_V1.json retains failed and extra attempt identities.
+#: Old books remain loaded behind this coherent source set. Their GPU0..3
+#: card offsets and unresolved GPU1 outlier are not corrections to these data.
+_WIDE_BODY_ROWS = tuple(
+    f"{{root}}/codex_wide_20260913/body_tp{{tp}}/fit.row{rows}.sample{sample}.json:"
+    f"{{root}}/codex_wide_20260913/body_tp{{tp}}/graph.row{rows}.json:unregistered"
+    for rows in (1, 2, 4, 8, 16, 32)
+    for sample in (1, 2, 3)
+)
+
+#: The repaired single-row MRoPE descriptor, measured three times per rank.
+_WIDE_MROPE_ROW1 = (
+    "{root}/codex_wide_20260913/mrope_tp{tp}/prices.json:"
+    "{root}/codex_wide_20260913/mrope_tp{tp}/graph.json:unregistered"
+)
+
+#: Exact native GDN FULL-decode cases for active counts 1..32 at their real
+#: capture buckets. Every book records all 48 layers, three repeats, the
+#: same-process resolved 32-slot state geometry and physical GPU identity.
+#: `exact_only` preserves layout checks without fitting a law outside that
+#: finite domain. This declares no GDN-prefill or alternate-treatment support.
+_WIDE_GDN_NATIVE = (
+    "{root}/codex_wide_20260913/gdn_native_tp{tp}/prices.json:"
+    "{root}/codex_wide_20260913/gdn_native_tp{tp}/graphs.json:unregistered"
+)
+
+
 def per_width_options(tp: int) -> tuple:
     """The options this width adds to `SHARED_OPTIONS`, unresolved."""
     if tp == 1:
@@ -765,7 +796,8 @@ def per_width_options(tp: int) -> tuple:
     #
     # `unified_attention_with_output_base` appears in no base book at either
     # wide width, so that family displaces nothing at any rank.
-    prices = _WIDE_AR_ROWS + (_WIDE_BOUNDED,) + prices
+    prices = (_WIDE_AR_ROWS + (_WIDE_MROPE_ROW1, _WIDE_GDN_NATIVE)
+              + _WIDE_BODY_ROWS + (_WIDE_BOUNDED,) + prices)
     if tp == 4 and INCLUDE_GEMM_SUPPLEMENT_V1:
         # Ahead of the list: within one scope the first price wins, so a
         # supplement that is loaded after the book it supplements answers
