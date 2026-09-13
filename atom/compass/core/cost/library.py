@@ -1162,7 +1162,7 @@ class LibraryCostOracle:
         key = _price_key(shape, graph, head_graph)
         priced = self._priced.get(key)
         if priced is None:
-            timing = ({} if shape.is_prefill and shape.produces_output and any(
+            timing = ({} if shape.is_prefill and any(
                 c > q for q, c in zip(shape.num_scheduled_tokens,
                                      shape.context_lens)) else None)
             if timing is None:
@@ -1219,7 +1219,8 @@ class LibraryCostOracle:
                          approximation="preceding complete operators plus preparation; "
                                        "opaque operator internal prefix unresolved")
         return StepCost(seconds=total, breakdown=breakdown,
-                        output_ready_seconds=ready, output_ready_basis=basis)
+                        output_ready_seconds=ready, output_ready_basis=basis,
+                        preparation_seconds=breakdown.get("<prepare>"))
 
     def _check_body_rows(self, graph: dict, shape: StepShape) -> None:
         """Refuse a body graph traced over a different number of rows.

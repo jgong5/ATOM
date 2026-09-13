@@ -889,6 +889,8 @@ class ScheduledBatchOutput:
         dspark_ell: np.ndarray | None = None,
         compass_step_seconds: float | None = None,
         compass_output_ready_seconds: float | None = None,
+        compass_preparation_seconds: float | None = None,
+        compass_produces_output: bool | None = None,
     ):
         self.req_ids = req_ids
         self.token_ids = token_ids
@@ -900,6 +902,8 @@ class ScheduledBatchOutput:
         # Timing and token identity are separate: buffered previous tokens
         # may still wait for a synchronization in the current forward.
         self.compass_output_ready_seconds = compass_output_ready_seconds
+        self.compass_preparation_seconds = compass_preparation_seconds
+        self.compass_produces_output = compass_produces_output
         self.draft_token_ids = draft_token_ids
         self.num_rejected = num_rejected
         self.num_bonus = num_bonus

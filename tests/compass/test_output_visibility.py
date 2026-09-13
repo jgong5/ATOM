@@ -62,11 +62,17 @@ def test_ordered_prefix_leaves_the_last_opaque_operator_and_suffix_after_output(
     assert oracle.price_cache_hits == 1
 
 
-@pytest.mark.parametrize("over", [{"cached": False}, {"prefill": False},
-                                  {"produces": False}])
-def test_cold_decode_and_outputless_paths_keep_the_old_timing(over):
+@pytest.mark.parametrize("over", [{"cached": False}, {"prefill": False}])
+def test_cold_and_decode_paths_have_no_internal_blocking_prefix(over):
     oracle, shape, _ = composition(**over)
     assert oracle.estimate(shape).output_ready_seconds == 0.0
+
+
+def test_outputless_cached_prefill_still_blocks_the_host():
+    oracle, shape, _ = composition(produces=False)
+    cost = oracle.estimate(shape)
+    assert cost.output_ready_seconds == pytest.approx(11.3)
+    assert cost.preparation_seconds == 1.0
 
 
 def test_unified_triton_or_unstated_backend_does_not_inherit_asm_synchronization():

@@ -84,7 +84,9 @@ class StepCost:
     """A predicted duration, and optionally where it went.
 
     Attributes:
-        seconds: Total predicted wall time for the step.
+        seconds: Total predicted execution interval for the step. Component
+            oracles can additionally locate stream boundaries, so the engine
+            can distinguish queued device work from a host forward's return.
         breakdown: Optional per-operator or per-category attribution. Present
             when the oracle can attribute; empty when it cannot. A gap analysis
             is the difference between two oracles' breakdowns.
@@ -92,16 +94,24 @@ class StepCost:
 
     seconds: float
     breakdown: Mapping[str, float] = field(default_factory=dict)
-    #: Current-step work that must elapse before a previous step's buffered
-    #: tokens can be published. Part of seconds, never an additional cost.
+    #: Stream prefix forced complete by a synchronization in this forward.
+    #: It delays host return even when the step samples no output. A previous
+    #: step's buffered tokens cannot be published before it. Part of seconds.
     output_ready_seconds: float = 0.0
     output_ready_basis: Mapping[str, object] = field(default_factory=dict)
+    #: Stream offset of the runner's preparation/staging boundary. None means
+    #: this oracle has no evidence for asynchronous scheduling. When present,
+    #: the engine tracks queued device work separately from host-return time.
+    preparation_seconds: float | None = None
 
     def __post_init__(self) -> None:
         if self.seconds < 0.0:
             raise ValueError(f"step cost must be non-negative, got {self.seconds}")
         if not 0.0 <= self.output_ready_seconds <= self.seconds:
             raise ValueError("output-ready offset must lie within the step cost")
+        if (self.preparation_seconds is not None
+                and not 0.0 <= self.preparation_seconds <= self.seconds):
+            raise ValueError("preparation offset must lie within the step cost")
 
 
 @runtime_checkable

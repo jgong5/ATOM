@@ -319,7 +319,8 @@ class CompassPredictMixin:
                                  decision=getattr(batch, "compass_decision", None),
                                  ranks=ranks,
                                  visibility={"seconds": cost.output_ready_seconds,
-                                             "basis": dict(cost.output_ready_basis)})
+                                             "basis": dict(cost.output_ready_basis),
+                                             "preparation_seconds": cost.preparation_seconds})
         self._step_count = getattr(self, "_step_count", 0) + 1
         logger.debug(
             "COMPASS step %d: reqs=%d tokens=%d prefill_tokens=%d cost=%.6fs",
@@ -365,6 +366,9 @@ class CompassPredictMixin:
                 num_bonus=None,
                 draft_token_ids=None,
                 compass_step_seconds=cost.seconds,
+                compass_output_ready_seconds=cost.output_ready_seconds,
+                compass_preparation_seconds=cost.preparation_seconds,
+                compass_produces_output=False,
             )
 
         previous = self._deferred_output
@@ -389,6 +393,8 @@ class CompassPredictMixin:
             # just ran.
             compass_step_seconds=cost.seconds,
             compass_output_ready_seconds=cost.output_ready_seconds,
+            compass_preparation_seconds=cost.preparation_seconds,
+            compass_produces_output=True,
         )
 
     def _estimate_over_ranks(self, shape: StepShape):
@@ -437,6 +443,7 @@ class CompassPredictMixin:
 
         seconds_by_rank: dict[str, float] = {}
         ready_by_rank: dict[str, float] = {}
+        preparation_by_rank: dict[str, float | None] = {}
         slowest = None
         last_ready = None
         for r in range(width):
@@ -448,17 +455,23 @@ class CompassPredictMixin:
             cost_r = self._oracle.estimate(at_rank)
             seconds_by_rank[str(r)] = cost_r.seconds
             ready_by_rank[str(r)] = cost_r.output_ready_seconds
+            preparation_by_rank[str(r)] = cost_r.preparation_seconds
             if last_ready is None or cost_r.output_ready_seconds > last_ready[1].output_ready_seconds:
                 last_ready = (r, cost_r)
             if slowest is None or cost_r.seconds > slowest[1].seconds:
                 slowest = (r, cost_r)
         assert slowest is not None
+        preparations = list(preparation_by_rank.values())
+        if any(p is None for p in preparations) and any(p is not None for p in preparations):
+            raise ValueError("preparation boundary must be supplied by every rank or none")
+        preparation = None if preparations[0] is None else max(preparations)
         spread = max(seconds_by_rank.values()) - min(seconds_by_rank.values())
         # One rank can own the blocking prefix while another owns the largest
         # whole-step total. Waiting only for the latter's prefix publishes
         # group outputs before all ranks can have reached the drain.
         group_cost = dataclasses.replace(
             slowest[1], output_ready_seconds=last_ready[1].output_ready_seconds,
+            preparation_seconds=preparation,
             output_ready_basis=(dict(last_ready[1].output_ready_basis,
                                      rank=last_ready[0], aggregation="maximum rank prefix")
                                 if last_ready[1].output_ready_seconds else {}))
@@ -468,6 +481,7 @@ class CompassPredictMixin:
             "group_width": width,
             "seconds_by_rank": seconds_by_rank,
             "output_ready_seconds_by_rank": ready_by_rank,
+            "preparation_seconds_by_rank": preparation_by_rank,
             "output_ready_rank": last_ready[0],
             "slowest_rank": slowest[0],
             "spread_seconds": spread,

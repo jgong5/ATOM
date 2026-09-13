@@ -131,11 +131,43 @@ def _defers_output(fwd_out) -> bool:
     and decode can drain those tokens while the current forward runs. Cached
     ASM prefill instead synchronizes inside its prefix gather, so draining
     must wait for part of the current forward. The predicted output carries
-    that distinct offset as compass_output_ready_seconds; the engine charges
-    it before publication and the remaining step cost afterward. The default
-    remains the original overlapping drain for outputs with no such offset.
+    that distinct offset as compass_output_ready_seconds. Component oracles
+    also supply a preparation boundary so the engine can keep device-queue
+    time separate from scheduling time. Total-only oracles retain the original
+    split charge around publication.
     """
     return bool(getattr(fwd_out, "is_deferred_out", False))
+
+
+def _advance_native_pipeline(core, fwd_out) -> bool:
+    """Move host time only to the native forward's required waits.
+
+    Component oracles with a measured preparation boundary can distinguish
+    queued GPU work from the time the host regains control. A total-only oracle
+    retains the legacy whole-step clock contract.
+    """
+    preparation = getattr(fwd_out, "compass_preparation_seconds", None)
+    clock = get_clock()
+    advance = getattr(clock, "advance", None)
+    if preparation is None or advance is None:
+        return False
+    from atom.compass.runtime.timeline import ForwardTimeline
+
+    timeline = getattr(core, "_compass_forward_timeline", None)
+    if timeline is None:
+        timeline = core._compass_forward_timeline = ForwardTimeline()
+    produces = getattr(fwd_out, "compass_produces_output", None)
+    if produces is None:
+        raise ValueError("pipelined timing requires the current output predicate")
+    now = clock.time()
+    marks = timeline.submit(
+        now, fwd_out.compass_step_seconds, preparation,
+        fwd_out.compass_output_ready_seconds or 0.0, produces)
+    advance(marks["host_returned_at"] - now)
+    from atom.compass.runtime.lifecycle import trace
+
+    trace().emit("forward_timeline", **marks)
+    return True
 
 
 class EngineCore:
@@ -467,12 +499,12 @@ class EngineCore:
             fwd_out = self.runner_mgr.call_func(
                 "forward", scheduled_batch, wait_out=True
             )
-            # Deferred identity still permits a blocking prefix in this
-            # forward. Charge only that prefix before publishing old tokens.
-            if not _defers_output(fwd_out):
-                _advance_clock_for(fwd_out)
-            else:
-                _advance_clock_for(fwd_out, before_output=True)
+            pipelined = _advance_native_pipeline(self, fwd_out)
+            if not pipelined:
+                if not _defers_output(fwd_out):
+                    _advance_clock_for(fwd_out)
+                else:
+                    _advance_clock_for(fwd_out, before_output=True)
             if (
                 self.scheduler.prefill_delayer is not None
                 and scheduled_batch.total_seqs_num_prefill > 0
@@ -498,7 +530,8 @@ class EngineCore:
             batch=scheduled_batch,
         )
         if _defers_output(fwd_out):
-            _advance_clock_for(fwd_out, before_output=False)
+            if not pipelined:
+                _advance_clock_for(fwd_out, before_output=False)
 
         # Send stream outputs to main process via output_queue
         try:
@@ -1352,10 +1385,12 @@ class DecodeEngineCore(EngineCore):
         t0 = get_clock().perf_counter()
         _stamp_step_start(scheduled_batch)
         fwd_out = self.runner_mgr.call_func("forward", scheduled_batch, wait_out=True)
-        if not _defers_output(fwd_out):
-            _advance_clock_for(fwd_out)
-        else:
-            _advance_clock_for(fwd_out, before_output=True)
+        pipelined = _advance_native_pipeline(self, fwd_out)
+        if not pipelined:
+            if not _defers_output(fwd_out):
+                _advance_clock_for(fwd_out)
+            else:
+                _advance_clock_for(fwd_out, before_output=True)
         iter_ms = (get_clock().perf_counter() - t0) * 1000
         logger.info(
             f"iter {iter_ms:.2f}ms | "
@@ -1370,7 +1405,8 @@ class DecodeEngineCore(EngineCore):
             seqs.values(), fwd_out, stream_output_queue=self.stream_output_queue
         )
         if _defers_output(fwd_out):
-            _advance_clock_for(fwd_out, before_output=False)
+            if not pipelined:
+                _advance_clock_for(fwd_out, before_output=False)
         try:
             while not self.stream_output_queue.empty():
                 stream_outputs = self.stream_output_queue.get_nowait()
