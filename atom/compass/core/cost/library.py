@@ -46,6 +46,7 @@ from typing import Optional, Protocol
 
 from atom.compass.core.cost.base import StepCost, StepShape
 from atom.compass.core.cost.identity import cost_key
+from atom.compass.core.cost.prepared import PreparedOperator, materialize_graph
 from atom.compass.core.loaded_input import load_json
 
 logger = logging.getLogger(__name__)
@@ -65,6 +66,8 @@ def _signature_of(op: dict) -> str:
     plausible numbers: prices keyed one way and looked up another agree on most
     operators and disagree on whichever detail drifted.
     """
+    if isinstance(op, PreparedOperator):
+        return op.signature
     from atom.compass.runtime.microbench import signature_of
 
     return signature_of(op)
@@ -78,6 +81,8 @@ def _cost_key_of(op: dict) -> str:
     `atom.compass.core.cost.identity` so that the key a file was written with
     and the key a lookup computes cannot drift apart.
     """
+    if isinstance(op, PreparedOperator):
+        return op.cost_key
     from atom.compass.runtime.microbench import cost_key_of
 
     return cost_key_of(op)
@@ -91,6 +96,8 @@ def _layout_fingerprint(op: dict) -> str:
     Two empty fingerprints therefore match, and that match is meaningful -- both
     describe a dense rebuild.
     """
+    if isinstance(op, PreparedOperator):
+        return op.layout
     layouts = op.get("layouts") or ()
     if not layouts:
         return "[]"
@@ -632,13 +639,15 @@ class PriceLibrary:
         from atom.compass.runtime.microbench import _is_collective_op
 
         signature = _signature_of(op)
-        key = cost_key(signature)
+        prepared = isinstance(op, PreparedOperator)
+        key = op.cost_key if prepared else cost_key(signature)
         candidates = self._prices.get(key) or []
         if not candidates:
             refusal = self._refusals.get(key)
             return None, (f"refused when priced: {refusal}" if refusal
                           else "no entry for this signature")
-        if _is_collective_op(op):
+        collective = op.collective if prepared else _is_collective_op(op)
+        if collective:
             record, why = self._collective(candidates, topology, registration)
             if record is None:
                 return None, why
@@ -754,6 +763,8 @@ class PriceLibrary:
                                   reason=reason)
             record, detail = self.lookup(op, topology, registration)
             if record is None:
+                if isinstance(op, PreparedOperator):
+                    op = op.as_dict()
                 refused[op["name"]] = refused.get(op["name"], 0) + 1
                 reasons.setdefault(op["name"], detail)
                 key = _cost_key_of(op)
@@ -971,8 +982,8 @@ def _dump_refusal(shape: StepShape, graph, head_graph, coverage) -> None:
             # Both regions, whole. The refused operators are in here at their
             # real shapes and dtypes, which is what a price acquisition or a
             # family model is actually written against.
-            "body_graph": graph,
-            "head_graph": head_graph,
+            "body_graph": materialize_graph(graph),
+            "head_graph": materialize_graph(head_graph),
         }
         with open(path, "w") as handle:
             json.dump(payload, handle, default=str)
@@ -1147,7 +1158,9 @@ class LibraryCostOracle:
                 # what there is instead of nothing.
                 _dump_region_refusal(shape, why)
                 raise ValueError(f"no measured region for this shape: {why}")
-        graph = self.graphs.graph_for(shape)
+        graph_for = getattr(self.graphs, "prepared_graph_for",
+                            self.graphs.graph_for)
+        graph = graph_for(shape)
         if graph is None:
             raise KeyError(
                 f"no graph for {len(shape.num_scheduled_tokens)} requests, "

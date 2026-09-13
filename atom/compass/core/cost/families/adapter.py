@@ -1107,6 +1107,10 @@ class ParametricPriceLibrary(PriceLibrary):
             # Either answered, or refused for a reason that is a finding rather
             # than a gap. Both are returned as they came.
             return record, detail
+        from atom.compass.core.cost.prepared import PreparedOperator
+
+        if isinstance(op, PreparedOperator):
+            op = op.as_dict()
         return self._parametric(op, detail, topology, registration)
 
     def _parametric(self, op: dict, original: str, topology=None,
