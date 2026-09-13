@@ -138,13 +138,20 @@ class ExactAttentionOverrides:
             raise ValueError(f"{price_path}: a recorded source-only acquisition is required")
         rank = int(provenance["collector"]["rank"])
         width = int(provenance["collector"]["world_size"])
+        for item in raw:
+            actual = (item.get("provenance") or {}).get("collector") or {}
+            if (_acquisition_policy(item) != policy
+                    or actual.get("rank") != rank or actual.get("world_size") != width
+                    or any(actual.get(field) is not False for field in (
+                        "served_workload", "weights_loaded", "model_runner_initialized"))):
+                raise ValueError(f"{price_path}: raw acquisition identity differs from the export")
         operators = {signature_of(op): op for op in graph.get("ops") or ()}
         for signature, record in (blob.get("prices") or {}).items():
             op = operators.get(signature)
             if op is None or op.get("name") != A.UNIFIED or op.get("group") is not None:
                 raise ValueError(f"{price_path}: exact timing has no matching native operator")
             seconds = record.get("seconds")
-            if not isinstance(seconds, (int, float)) or not math.isfinite(seconds) or seconds < 0:
+            if type(seconds) not in (int, float) or not math.isfinite(seconds) or seconds < 0:
                 raise ValueError(f"{price_path}: invalid exact duration")
             originals = [item.get("prices", {}).get(signature) for item in raw]
             if not any(item is not None and item.get("seconds") == seconds
