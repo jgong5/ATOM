@@ -2100,6 +2100,65 @@ class TestTheRankingGate:
         assert len(out["real_tied_with_best"]) == 3
         assert out["top1_agrees"] is True
 
+    def test_overlap_ties_do_not_create_a_false_rank_reversal(self):
+        cells = [
+            _cell_verdict("tp1", "short", 50.0, 50.1, spread=0.05),
+            _cell_verdict("tp2", "short", 100.0, 102.0, spread=0.05),
+            _cell_verdict("tp4", "short", 101.0, 100.5, spread=0.05),
+        ]
+        out = validate._decide(cells, "throughput_tok_s", "max")
+        assert out["top1_agrees"] is True
+        assert out["separation_faithful"] is True
+        assert out["spearman_rho"] == pytest.approx(1.0)
+        assert out["rho_meets_gate"] is True
+        assert out["raw_centre_spearman_rho"] == pytest.approx(0.5)
+        assert out["repeat_overlap_ranks"] == {
+            "real": [1.0, 2.5, 2.5], "modelled": [1.0, 2.5, 2.5]}
+
+    def test_tied_ranks_do_not_approve_an_invented_separation(self):
+        cells = [
+            _cell_verdict("tp1", "short", 50.0, 50.0, spread=0.05,
+                          modelled_spread=0.0001),
+            _cell_verdict("tp2", "short", 100.0, 100.0, spread=0.05,
+                          modelled_spread=0.0001),
+            _cell_verdict("tp4", "short", 101.0, 101.0, spread=0.05,
+                          modelled_spread=0.0001),
+        ]
+        out = validate._decide(cells, "throughput_tok_s", "max")
+        assert out["raw_centre_spearman_rho"] == pytest.approx(1.0)
+        assert out["rho_meets_gate"] is False
+        assert out["separation_faithful"] is False
+        assert any("invent" in why for why in out["separation_failures"])
+
+    def test_nontransitive_overlap_is_not_merged_into_one_tie(self):
+        cells = [
+            _cell_verdict("tp1", "short", 1.0, 1.0),
+            _cell_verdict("tp2", "short", 2.0, 2.0),
+            _cell_verdict("tp4", "short", 3.5, 3.5),
+        ]
+        for cell, span in zip(cells, ([0.0, 2.0], [1.0, 3.0], [2.5, 4.0])):
+            block = cell["metrics"]["throughput_tok_s"]
+            block["real_range"] = block["modelled_range"] = span
+        out = validate._decide(cells, "throughput_tok_s", "max")
+        assert out["raw_centre_spearman_rho"] == pytest.approx(1.0)
+        assert out["separation_faithful"] is True
+        assert out["spearman_rho"] is None
+        assert out["rho_meets_gate"] is False
+        assert "non-transitive" in out["reason"]
+        assert out["repeat_overlap_ranks"] == {"real": None, "modelled": None}
+
+    def test_all_overlap_tied_ranks_report_undefined_correlation(self):
+        cells = [
+            _cell_verdict("tp1", "short", 100.0, 101.0, spread=0.05),
+            _cell_verdict("tp2", "short", 101.0, 100.0, spread=0.05),
+            _cell_verdict("tp4", "short", 100.5, 100.5, spread=0.05),
+        ]
+        out = validate._decide(cells, "throughput_tok_s", "max")
+        assert out["top1_agrees"] is True
+        assert out["separation_faithful"] is True
+        assert out["spearman_rho"] is None
+        assert "no rank variation" in out["reason"]
+
     def test_a_matrix_missing_a_cell_reports_no_ranking(self, tmp_path):
         first = tmp_path / "a"
         first.mkdir()
@@ -3077,12 +3136,10 @@ class TestTiesAndSeparationsAreBothGated:
     def test_the_matrix_reads_it(self, tmp_path, capsys):
         """Separation is a gate in its own right.
 
-        The three widths of one (class, client count) order the same way on
-        both sides and are inside tolerance, so ranking, tolerance and speedup
-        all hold. What fails is that the hardware's repeats overlap and the
-        model's do not: the model claims three distinct configurations where
-        the machine shows one. A matrix that did not read separation would
-        accept this.
+        The centres order the same way and are inside tolerance, but the
+        hardware's repeats overlap and the model's do not. The separation
+        failure must remain explicit even though repeat-overlap ranks also
+        leave correlation undefined on the all-tied real side.
         """
         short = {
             (tp, "clients_short", 1): _cell_verdict(
@@ -3102,12 +3159,16 @@ class TestTiesAndSeparationsAreBothGated:
         report = tmp_path / "matrix.json"
         assert validate.main(["matrix", "--out", str(report)] + dirs) == 1
         assert "MATRIX FAIL" in capsys.readouterr().out
-        gates = json.loads(report.read_text())["gates"]
+        verdict = json.loads(report.read_text())
+        gates = verdict["gates"]
         assert gates["separation"] is False
-        assert gates["ranking"] is True
+        assert gates["ranking"] is False
         assert gates["tolerance"] is True
         assert gates["speedup"] is True
-        assert gates["decided"] is True
+        assert gates["decided"] is False
+        for result in verdict["by_group"]["clients_short c1"].values():
+            assert result["raw_centre_spearman_rho"] == pytest.approx(1.0)
+            assert result["spearman_rho"] is None
 
 
 class TestTheGateDividesLikeForLike:

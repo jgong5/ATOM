@@ -3828,6 +3828,56 @@ def _overlap(left, right) -> bool:
     return left[0] <= right[1] and right[0] <= left[1]
 
 
+
+def _repeat_overlap_ranks(named: list, side: str):
+    """Average ranks for unambiguous repeat-overlap tie groups.
+
+    Overlap is not transitive. A chain A~B~C with disjoint A and C does not
+    define one tied rank, nor is there a unique place to split it. Connected
+    components must therefore also be pairwise overlapping; otherwise this
+    side's ranking is explicitly undecided. Disjoint components are ordered
+    by their intervals, without using noisy centre differences inside a tie.
+    """
+    intervals = []
+    for index, (cell, block) in enumerate(named):
+        span = _spread(block, side)
+        if span is None:
+            return None, None, (
+                f"{cell['cell']}: no {side} repeat spread for tied ranking")
+        intervals.append((span[0], span[1], index))
+
+    components = []
+    right = None
+    for interval in sorted(intervals):
+        low, high, _index = interval
+        if right is None or low > right:
+            components.append([interval])
+            right = high
+        else:
+            components[-1].append(interval)
+            right = max(right, high)
+
+    ranks = [0.0] * len(named)
+    groups = []
+    before = 0
+    for component in components:
+        members = sorted(entry[2] for entry in component)
+        names = [named[index][0]["cell"] for index in members]
+        # Intervals are pairwise overlapping exactly when they share an
+        # intersection. Testing this avoids silently closing an overlap chain.
+        if max(entry[0] for entry in component) > min(
+                entry[1] for entry in component):
+            return None, None, (
+                f"{side} repeat-overlap ties are non-transitive among "
+                f"{', '.join(names)}; no unambiguous tied ranking exists")
+        shared = before + (len(component) + 1) / 2.0
+        for index in members:
+            ranks[index] = shared
+        before += len(component)
+        groups.append(names)
+    return ranks, groups, None
+
+
 def _fidelity(named: list) -> list:
     """Where the model disagrees with the hardware about a tie, pair by pair.
 
@@ -3913,11 +3963,23 @@ def _decide(cells: list[dict], metric: str, direction: str) -> dict:
     regret = ((chosen_real[1] - best[1]) / best[1] * 100.0) if best[1] else None
     if direction == "max" and regret is not None:
         regret = -regret
-    rho = spearman(
+    raw_rho = spearman(
         [m["real_centre"] for _, m in named], [m["modelled_centre"] for _, m in named]
     )
+    repeat_ranks, tie_groups, ranking_reasons = {}, {}, []
+    for side in ("real", "modelled"):
+        ranks, groups, reason = _repeat_overlap_ranks(named, side)
+        repeat_ranks[side], tie_groups[side] = ranks, groups
+        if reason:
+            ranking_reasons.append(reason)
+    rho = (None if ranking_reasons else
+           spearman(repeat_ranks["real"], repeat_ranks["modelled"]))
+    if rho is None and not ranking_reasons:
+        ranking_reasons.append(
+            "repeat-overlap ranks have no rank variation on at least one "
+            "side; Spearman correlation is undefined")
     separation_failures = _fidelity(named)
-    return {
+    result = {
         "comparable_cells": len(named),
         "real_best": best[0]["cell"],
         "real_best_value": best[1],
@@ -3926,6 +3988,10 @@ def _decide(cells: list[dict], metric: str, direction: str) -> dict:
         "top1_agrees": chosen[0]["cell"] in [t[0]["cell"] for t in tied],
         "regret_pct": regret,
         "spearman_rho": rho,
+        "spearman_basis": "repeat_overlap_tie_groups",
+        "raw_centre_spearman_rho": raw_rho,
+        "repeat_overlap_ranks": repeat_ranks,
+        "repeat_overlap_tie_groups": tie_groups,
         "rho_meets_gate": (rho is not None and rho >= RHO_MIN),
         "separation_failures": separation_failures,
         "separation_faithful": not separation_failures,
@@ -3939,6 +4005,9 @@ def _decide(cells: list[dict], metric: str, direction: str) -> dict:
             c["cell"] for c, m in named if m.get("within_tolerance") is None
         ],
     }
+    if ranking_reasons:
+        result["reason"] = "; ".join(ranking_reasons)
+    return result
 
 
 #: The cells `CC_TRACES_PROTOCOL.md` §3 registers: twenty-four, each identified
