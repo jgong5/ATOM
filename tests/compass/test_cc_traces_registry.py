@@ -102,6 +102,8 @@ def test_both_all_reduce_regimes_are_loaded_at_the_wide_widths():
         price = next(o for o in registry.options(tp, "/r")
                      if o.startswith("price="))
         assert "ar_capture.json" in price and "ar_plain.json" in price
+        assert f"ar_tp{tp}/prices_registered.json" in price
+        assert f"ar_tp{tp}/prices_unregistered.json" in price
     tp1 = next(o for o in registry.options(1, "/r") if o.startswith("price="))
     assert "ar_capture.json" not in tp1
 
@@ -303,6 +305,10 @@ def test_a_rank_reading_another_rank_s_file_is_named_not_counted_present(tmp_pat
     bounded.mkdir(parents=True)
     for name in ("wb.json", "wbg.json"):
         (bounded / name).write_text("{}")
+    ar_rows = tmp_path / "codex_wide_20260913" / "ar_tp2"
+    ar_rows.mkdir(parents=True)
+    for name in ("prices_registered.json", "prices_unregistered.json"):
+        (ar_rows / name).write_text("{}")
     # The dispatch probe's band shards. They are not a price -- no timing in
     # them is read -- but they are what stops an interpolant from crossing a
     # kernel switch, so a run without them is a run with a constraint missing.
@@ -396,8 +402,9 @@ def test_a_collective_s_price_list_is_the_group_s_not_a_rank_s(tmp_path):
     collectives = sorted(
         role for role, path in arts.items()
         if Path(path).name in ("ar_capture.json", "ar_plain.json",
-                               "ag_prices.json"))
-    assert len(collectives) == 3
+                               "ag_prices.json", "prices_registered.json",
+                               "prices_unregistered.json"))
+    assert len(collectives) == 5
     for rank in range(4):
         for role in collectives:
             assert found[rank][role]["own"] is True

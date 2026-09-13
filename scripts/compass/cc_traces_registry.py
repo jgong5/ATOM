@@ -701,6 +701,18 @@ _WIDE_BOUNDED = ("{root}/wide_bounded_registry/tp{tp}/wb.json:"
                  "{root}/wide_bounded_registry/tp{tp}/wbg.json:unregistered")
 
 
+#: Exact all-reduce messages for every decode row count admitted by this plan.
+#: Source-only TP2/TP4 groups on cards 3/4 and 3/4/5/6 verified reduced values
+#: and the observed registration flag at rows 1..32, three repeats per rank.
+#: Each point is the median of the synchronized per-repeat group maxima.
+#: The books retain repeat ranges and instability flags; the old row-32 books
+#: remain loaded and agree within 2.6%. This supplies no prefill extrapolation.
+_WIDE_AR_ROWS = (
+    "{root}/codex_wide_20260913/ar_tp{tp}/prices_registered.json",
+    "{root}/codex_wide_20260913/ar_tp{tp}/prices_unregistered.json",
+)
+
+
 def per_width_options(tp: int) -> tuple:
     """The options this width adds to `SHARED_OPTIONS`, unresolved."""
     if tp == 1:
@@ -741,7 +753,7 @@ def per_width_options(tp: int) -> tuple:
     #
     # `unified_attention_with_output_base` appears in no base book at either
     # wide width, so that family displaces nothing at any rank.
-    prices = (_WIDE_BOUNDED,) + prices
+    prices = _WIDE_AR_ROWS + (_WIDE_BOUNDED,) + prices
     if tp == 4 and INCLUDE_GEMM_SUPPLEMENT_V1:
         # Ahead of the list: within one scope the first price wins, so a
         # supplement that is loaded after the book it supplements answers
@@ -811,7 +823,8 @@ required_artifacts = option_paths
 #: not of a member: nothing writes `ar_capture.tp2.json`, so asking for one
 #: and then reporting the unsuffixed file as a fallback would file a claim
 #: against a file that is correct.
-_GROUP_STEMS = ("ar_capture.json", "ar_plain.json", "ag_prices.json")
+_GROUP_STEMS = ("ar_capture.json", "ar_plain.json", "ag_prices.json",
+                "prices_registered.json", "prices_unregistered.json")
 
 
 def _group_level(role: str, path: str) -> bool:
