@@ -10,6 +10,16 @@ import json
 import marshal
 
 
+def immutable_content_key(value):
+    """Type-preserving current content, or None for unsupported Python values."""
+    try:
+        key = marshal.dumps(value)
+        json.dumps(value)
+        return key
+    except (TypeError, ValueError, RecursionError):
+        return None
+
+
 @dataclass(frozen=True)
 class PreparedOperator:
     name: str
@@ -50,10 +60,8 @@ def prepare_static_operator(op):
                 "aiter::unified_attention_with_output_base",
                 "aiter::linear_attention_with_output_base")):
         return None
-    try:
-        snapshot = marshal.dumps(op)
-        json.dumps(op)
-    except (TypeError, ValueError, RecursionError):
+    snapshot = immutable_content_key(op)
+    if snapshot is None:
         return None
     from atom.compass.core.cost.identity import cost_key
     from atom.compass.core.cost.library import _layout_fingerprint

@@ -86,6 +86,8 @@ from atom.compass.core.cost.library import (
     PriceLibrary,
 )
 
+from atom.compass.core.cost.prepared import immutable_content_key
+
 logger = logging.getLogger(__name__)
 
 __all__ = ["ParametricPriceLibrary", "coverage_split", "INTERPOLATED_SCHEME"]
@@ -496,19 +498,11 @@ def _modelled_identity(op, scope, launch_charge):
     signature contract. Scalars (including layer labels) are not law inputs;
     exact per-layer measurements still go through the base lookup first.
     """
-    import json
-    import marshal
-
     context = [pair for pair in op.get("context") or ()
                if tuple(pair)[0] != "block_tables"]
     value = (op.get("name"), op.get("input_shapes"), op.get("dtypes"),
              op.get("layouts"), context, scope, launch_charge)
-    try:
-        key = marshal.dumps(value)
-        json.dumps(value)
-        return key
-    except (TypeError, ValueError, RecursionError):
-        return None
+    return immutable_content_key(value)
 
 
 def _scope_key(scope) -> tuple:
@@ -654,6 +648,10 @@ class ParametricPriceLibrary(PriceLibrary):
         # both caches, including cached ambiguity or absence.
         self._attention_treatment_cache: dict = {}
         self._attention_composition_cache: dict = {}
+        # Exact GDN layer inputs often stay identical over successive histories.
+        # Full current content is the key; each layer keeps its own measurement.
+        self._body_exact_cache = {}
+        self._body_exact_revision = 0
         #: canonical kernel symbol -> the specializations pooled under it.
         #: Empty unless `_canonical_kernel` actually substituted something.
         #: Reported by `attention_coverage`, because pooling two symbols the
@@ -711,6 +709,8 @@ class ParametricPriceLibrary(PriceLibrary):
         it, so this override cannot become a second place that resolves a
         rank's path.
         """
+        self._body_exact_cache.clear()
+        self._body_exact_revision += 1
         # `_ingest` rather than `super().add`, so the graph is parsed once and
         # this override reads the payload the base class already has. Opening
         # it again here would give the retained digest a second set of bytes
@@ -1118,8 +1118,53 @@ class ParametricPriceLibrary(PriceLibrary):
     def _body_lookup(self, op, topology, registration, modelled_memo):
         if getattr(self.lookup, "__func__", None) is not ParametricPriceLibrary.lookup:
             return self.lookup(op, topology, registration)
-        return self.lookup(op, topology, registration,
-                           _modelled_memo=modelled_memo)
+        cache_key = None
+        if (type(op) is dict and op.get("name") == attention.GDN
+                and op.get("group") is None):
+            state = modelled_memo.get("exact_scope")
+            if state is None or state[0] != self._body_exact_revision:
+                scope = self.request_attention_scope
+                if type(scope) is attention_scope.Declaration:
+                    scope = scope.scopes
+                scope_key = (immutable_content_key((topology, registration, scope,
+                              self.request_attention_treatments, self.launch_charge_seconds))
+                             if scope is None or type(scope) is dict else None)
+                state = (self._body_exact_revision, scope_key)
+                modelled_memo["exact_scope"] = state
+            op_key = immutable_content_key(op) if state[1] is not None else None
+            if op_key is not None:
+                cache_key = (state, op_key)
+                cached = self._body_exact_cache.get(cache_key)
+                if cached is not None:
+                    record, cost_key, signature, layout = cached
+                    candidates = self._prices.get(cost_key) or ()
+                    # Keep edits/replacements of the selected measurement live,
+                    # including a changed layout or source label. Grouped calls
+                    # never enter this non-collective cache.
+                    if (candidates and candidates[0] is record
+                            and (record.get("layout") is None
+                                 or record["layout"] == layout)):
+                        measured_signature = record.get("signature")
+                        if measured_signature is not None and measured_signature != signature:
+                            self.address_shifted[cost_key] = self.address_shifted.get(cost_key, 0) + 1
+                        return record, record.get("source", "?")
+                    self._body_exact_cache.pop(cache_key, None)
+        result = self.lookup(op, topology, registration,
+                             _modelled_memo=modelled_memo)
+        record = result[0]
+        if cache_key is not None and record is not None:
+            from atom.compass.core.cost.library import (
+                _cost_key_of, _layout_fingerprint, _signature_of,
+            )
+
+            cost_key = _cost_key_of(op)
+            candidates = self._prices.get(cost_key) or ()
+            if candidates and candidates[0] is record:
+                if len(self._body_exact_cache) >= 1024:
+                    self._body_exact_cache.pop(next(iter(self._body_exact_cache)))
+                self._body_exact_cache[cache_key] = (
+                    record, cost_key, _signature_of(op), _layout_fingerprint(op))
+        return result
 
     def _can_reuse_prepared_lookups(self):
         return getattr(self.lookup, "__func__", None) is ParametricPriceLibrary.lookup

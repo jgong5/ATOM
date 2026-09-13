@@ -5,7 +5,7 @@ import pytest
 
 from atom.compass.core.cost.library import PriceLibrary
 from .test_attention_family import (
-    SCOPE, _cold_designs, _gdn_designs, _layer_copy, _library, _unified,
+    SCOPE, _cold_designs, _gdn_designs, _gdn_full, _layer_copy, _library, _unified,
 )
 
 
@@ -70,3 +70,46 @@ def test_modelled_refusals_keep_their_full_graph_evidence(tmp_path):
     answer = library.body(graph)
     assert answer == without_model_memo(library, graph)
     assert sum(answer[1].refused.values()) == 2
+
+
+def test_exact_gdn_reuse_keeps_current_inputs_and_record_layout(tmp_path):
+    source = _gdn_full(2, 2)
+    library = _library(tmp_path, [(source, .001)], layers=1)
+    library.request_attention_scope = dict(SCOPE)
+    op = _layer_copy(source, 0)
+    graph = {"ops": [op]}
+    assert library.body(graph)[1].measured == 1
+    changed = copy.deepcopy(graph)
+    changed["ops"][0]["dtypes"] = ["float32"]
+    assert library.body(changed) == without_model_memo(library, changed)
+    assert library.body(changed)[1].measured == 0
+    record, _ = library.lookup(op)
+    record["layout"] = "different"
+    assert library.body(graph) == without_model_memo(library, graph)
+    assert library.body(graph)[1].measured == 0
+
+
+def test_exact_gdn_reuse_repays_every_address_shift(tmp_path):
+    source = _gdn_full(2, 2)
+    library = _library(tmp_path, [(source, .001)], layers=1)
+    library.request_attention_scope = dict(SCOPE)
+    op = _layer_copy(source, 0)
+    op = copy.deepcopy(op)
+    for pair in op["context"]:
+        if pair[0] == "non_spec_state_indices_tensor":
+            pair[1] = [11, 12]
+    graph = {"ops": [op, op]}
+    for expected in (2, 4, 6):
+        assert library.body(graph)[1].measured == 2
+        assert sum(library.address_shifted.values()) == expected
+
+
+def test_new_selected_treatment_cannot_spend_cached_exact_gdn_price(tmp_path):
+    source = _gdn_full(2, 2)
+    library = _library(tmp_path, [(source, .001)], layers=1)
+    library.request_attention_scope = dict(SCOPE)
+    graph = {"ops": [_layer_copy(source, 0)]}
+    assert library.body(graph)[1].measured == 1
+    library.request_attention_treatments = {"gdn.decode": {"cache": "cold"}}
+    assert library.body(graph) == without_model_memo(library, graph)
+    assert library.body(graph)[1].measured == 0
