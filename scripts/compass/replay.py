@@ -235,6 +235,22 @@ def _prompt(tokens: int, index: int) -> str:
     return prompt_of_tokens(tokens, index)
 
 
+def _load_prompt_tokenizer(model: str):
+    from transformers import AutoTokenizer
+
+    return AutoTokenizer.from_pretrained(model)
+
+
+def _encoded_prompt(tokens: int, index: int, tokenizer):
+    text = _prompt(tokens, index)
+    if tokenizer is None:
+        return text
+    encoded = tokenizer.encode(text, add_special_tokens=False)
+    if len(encoded) != tokens:
+        raise ValueError(f"tokenizer produced {len(encoded)} tokens, expected {tokens}")
+    return encoded
+
+
 def _send(url: str, body: dict, timeout: float) -> dict:
     data = json.dumps(body).encode()
     req = urllib.request.Request(url, data=data,
@@ -340,7 +356,9 @@ def _prepare(base: str, model: str, workload: list[dict], args) -> dict:
         # would be scored against blocks preparation had already filled. Warm
         # the kernels, not the workload's own prefixes.
         body = {"model": model,
-                "prompt": _prompt(row["input_tokens"], _PREPARE_PROMPT_BASE + i),
+                "prompt": _encoded_prompt(
+                    row["input_tokens"], _PREPARE_PROMPT_BASE + i,
+                    getattr(args, "_prompt_tokenizer", None)),
                 "max_tokens": row["output_tokens"], "temperature": 0.0,
                 # Same fixed-length generation as the measured phase below.
                 # Preparation warms the kernels the measured run will use, so
@@ -405,6 +423,10 @@ def main(argv=None) -> int:
                         "engine: a real clock discards a declared arrival, so "
                         "without this the real side answers a burst while the "
                         "simulated side answers the trace")
+    p.add_argument("--pretokenize", action="store_true",
+                   help="send the same synthetic prompts as token IDs; tokenize "
+                        "before the pacing epoch while retaining that work in "
+                        "the measured wall window")
     p.add_argument("--time-scale", type=float, default=1.0,
                    help="divide every arrival offset by this, to replay a "
                         "long trace in less time. 1.0 keeps the trace's own "
@@ -463,6 +485,8 @@ def main(argv=None) -> int:
               "fresh empty run.", file=sys.stderr)
         return 3
 
+    args._prompt_tokenizer = (_load_prompt_tokenizer(model)
+                              if args.pretokenize else None)
     prepare = _prepare(base, model, workload, args) if args.prepare else None
     if prepare is not None and not prepare["drained"]:
         print("ATOMCompass WARNING: preparation did not drain -- the engine's "
@@ -473,6 +497,17 @@ def main(argv=None) -> int:
 
     execution_started_at = _time.time()
     began = _time.monotonic()
+    # Tokenization on the real server delays engine admission by length. The
+    # predictor admits declared token workloads, so that delay can change the
+    # schedule being compared. Convert identical prompts before pacing starts;
+    # conversion remains inside the execution cost on both sides.
+    encoded_prompts = None
+    if args.pretokenize:
+        encoded_prompts = [
+            _encoded_prompt(row["input_tokens"], i, args._prompt_tokenizer)
+            for i, row in enumerate(workload)]
+    pacing_began = _time.monotonic() if args.pretokenize else began
+    pacing_started_at = _time.time() if args.pretokenize else execution_started_at
 
     def one(i_row):
         i, row = i_row
@@ -484,12 +519,13 @@ def main(argv=None) -> int:
             # arrival cannot achieve -- a declared workload is posted up front
             # and sits in `waiting`, so the scheduler always sees a full queue
             # however the arrivals are stamped.
-            delay = at - (_time.monotonic() - began)
+            delay = at - (_time.monotonic() - pacing_began)
             if delay > 0:
                 _time.sleep(delay)
         body = {
             "model": model,
-            "prompt": _prompt(row["input_tokens"], i),
+            "prompt": (encoded_prompts[i] if encoded_prompts is not None
+                       else _prompt(row["input_tokens"], i)),
             "max_tokens": row["output_tokens"],
             "temperature": 0.0,
             # Fixed-length generation, asked for rather than hoped for. Each
@@ -668,6 +704,15 @@ def main(argv=None) -> int:
             "seconds": execution_seconds,
             "includes": "measured request construction, pacing, dispatch and completion",
             "excludes": "preparation/drain, executor teardown and post-run reporting",
+        },
+        "prompt_encoding": {
+            "kind": "token_ids" if args.pretokenize else "text",
+            "tokenizer_model": model if args.pretokenize else None,
+            "tokenizer_revision": (getattr(args._prompt_tokenizer, "init_kwargs", {})
+                                   .get("_commit_hash") if args.pretokenize else None),
+            "conversion_seconds": pacing_began - began if args.pretokenize else None,
+            "pacing_started_at": pacing_started_at,
+            "conversion_in_execution": bool(args.pretokenize),
         },
     }
     if prepare and args.prepare_out:
