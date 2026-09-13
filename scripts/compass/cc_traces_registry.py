@@ -148,7 +148,10 @@ SHARED_OPTIONS = (
     # `prefill-seqs` carries all of its anchors unchanged -- 1 and 2 sequences
     # answer exactly what they answered -- and adds one pooled 3..32-sequence
     # group on the token axis.
-    ("regions", "source-27b-tp1-prefill-seqs"),
+    # The TP1 history extension covers the measured one-row and mixed two-row
+    # decode cells through 65600 tokens, with a separate summed-history bound.
+    # Other capture cells keep their previous support.
+    ("regions", "source-27b-tp1-history-64k"),
     # Family-price mode, explicitly on. Without it `gap_ratio(None)` is None,
     # `_price_library` builds a plain `PriceLibrary` with no curves, and every
     # parametric family -- the head row ladder below above all -- is dead

@@ -39,7 +39,7 @@ Every width shares these:
     --compass-oracle-option position_rows=3
     --compass-oracle-option cudagraph_mode=full
     --compass-oracle-option head=1
-    --compass-oracle-option regions=source-27b-tp1-prefill-seqs
+    --compass-oracle-option regions=source-27b-tp1-history-64k
     --compass-oracle-option require_complete=1
     --compass-oracle-option allocation=native
     --compass-oracle-option derive=1
@@ -60,7 +60,16 @@ measured row counts the evidence supports interpolating across. `1` used to be
 taken literally as that ratio, which no two distinct row counts can meet, and
 run 8 refused 2118 of 2443 operators for it.
 
-`regions=source-27b-tp1-prefill-seqs` is the successor to
+`regions=source-27b-tp1-history-64k` adds independently measured TP1 history
+support to `source-27b-tp1-prefill-seqs`. Single-row decode supports histories
+1025..65600; exact two-row decode supports 513..65600 with summed history at
+most 66176. The coefficients are retained after a bounded source comparison;
+all measured excursions remain in the reported bands. Other decode buckets
+retain their earlier support. The native three-repeat final-prefill anchor at
+`(1, 16384, produces_output=True)` is also included. These source measurements
+do not establish end-to-end accuracy.
+
+`source-27b-tp1-prefill-seqs` is the successor to
 `source-27b-tp1-prefill-interp`, which is in turn the successor to
 `source-27b-tp1-conc-v2`. Both predecessors stay in the registry and are not
 edited; a prediction already made does not improve by being recomputed.
