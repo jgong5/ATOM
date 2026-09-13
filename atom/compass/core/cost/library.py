@@ -1340,7 +1340,9 @@ class LibraryCostOracle:
                 "placement is unstated -- both answers are plausible and both "
                 "failures are silent. Re-derive it so provenance carries "
                 "'head_placement'.")
-        head_graph = self.head_graphs.graph_for(shape)
+        graph_for = getattr(self.head_graphs, "prepared_graph_for",
+                            self.head_graphs.graph_for)
+        head_graph = graph_for(shape)
         if head_graph is None:
             raise KeyError(
                 f"no head graph for {len(shape.num_scheduled_tokens)} "
