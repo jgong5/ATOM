@@ -326,6 +326,13 @@ def test_a_rank_reading_another_rank_s_file_is_named_not_counted_present(tmp_pat
     profile.parent.mkdir(parents=True, exist_ok=True)
     profile.write_text("{}")
 
+    for role, path in registry.required_artifacts(2, tmp_path).items():
+        if role in ("attention_scope", "measured_attention_scope",
+                    "attention_treatments"):
+            declared = Path(path)
+            declared.parent.mkdir(parents=True, exist_ok=True)
+            declared.write_text("{}")
+
     cell = next(c for c in registry.check(tmp_path)["cells"]
                 if c["cell"] == "tp2_clients_short_c1")
     assert cell["absent_artifacts"] == []
