@@ -182,6 +182,7 @@ EVIDENCE = {
     "provenance.real.r{n}.json": "what that server said it was, read when it came up",
     "provenance.modelled.r{n}.json": "the same for the modelled repeat",
     "real.r{n}_steps.jsonl": "that repeat's step table, from that repeat's server",
+    "modelled.r{n}_steps.jsonl": "that repeat's predicted steps on the virtual clock",
     "real.r{n}_memory.json": "the memory terms that repeat's card reported, and "
                              "the budget the engine made of them",
     "gpu.jsonl": "rocm-smi samples across the whole window, baseline first",
@@ -279,6 +280,8 @@ def _serve(
         "--compass",
         "--compass-mode",
         "predict" if modelled else "measure",
+        "--compass-measure-out",
+        f"{cell}/{'modelled' if modelled else 'real'}.r{n}_steps.jsonl",
     ]
     if modelled:
         # Named here rather than left at the parser default. One process stands
@@ -296,7 +299,6 @@ def _serve(
     else:
         # Per repeat: the engine opens this path with "w", so three repeats
         # sharing one name would leave one table and two overwritten ones.
-        cmd += ["--compass-measure-out", f"{cell}/real.r{n}_steps.jsonl"]
         # The terms the card actually reported, beside the budget they sized.
         # Protocol section 6 gates non-KV memory terms at 10% and the KV block
         # count at 5%, and until this flag was passed the reference side of
@@ -405,7 +407,7 @@ def _lifecycle(
             },
             "produces": (
                 [f"server.{side}.r{n}.log", f"provenance.{side}.r{n}.json"]
-                + ([] if modelled
+                + ([f"modelled.r{n}_steps.jsonl"] if modelled
                    else [f"real.r{n}_steps.jsonl", f"real.r{n}_memory.json"])
             ),
         },

@@ -33,6 +33,7 @@ requests batch together.
 
 import argparse
 import json
+import math
 import random
 import sys
 import time as _time
@@ -89,6 +90,27 @@ MAX_IN_FLIGHT = 1024
 #: than the refusal's 3 or the arrival barrier's 1, so a log line says which
 #: boundary rejected the run without anyone having to read the artifact.
 INCOMPLETE_EXIT = 4
+
+WALL_WINDOW_SCHEMA = "compass.replay_wall_window/1"
+
+
+def read_wall_window(value):
+    """Validate the measured request interval, independently of virtual time."""
+    if not isinstance(value, dict) or value.get("schema") != WALL_WINDOW_SCHEMA:
+        raise ValueError("no explicit measured wall window from replay.py")
+    if value.get("clock") != "wall":
+        raise ValueError("the measured execution window is not on the wall clock")
+    fields = ("started_at", "ended_at", "seconds")
+    if not all(isinstance(value.get(k), (int, float))
+               and not isinstance(value[k], bool) and math.isfinite(value[k])
+               for k in fields):
+        raise ValueError("the measured wall window has missing or non-finite times")
+    start, end, seconds = (float(value[k]) for k in fields)
+    if end < start or seconds < 0:
+        raise ValueError("the measured wall window runs backwards")
+    if not math.isclose(end - start, seconds, rel_tol=1e-4, abs_tol=0.005):
+        raise ValueError("wall timestamps disagree with the monotonic execution duration")
+    return dict(value)
 
 
 def _completion_shortfall(response, want: int):
@@ -449,6 +471,7 @@ def main(argv=None) -> int:
               file=sys.stderr)
         return 3
 
+    execution_started_at = _time.time()
     began = _time.monotonic()
 
     def one(i_row):
@@ -531,6 +554,8 @@ def main(argv=None) -> int:
             f"workload meanwhile.")
     with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
         results = list(pool.map(one, enumerate(workload)))
+        execution_seconds = _time.monotonic() - began
+        execution_ended_at = _time.time()
 
     # What the run produced, against what it was asked to produce. This client
     # counted only the requests whose *send* raised and reported "0 failed"
@@ -634,6 +659,15 @@ def main(argv=None) -> int:
         "prompt_lengths": length_check,
         "prepare": ({k: v for k, v in prepare.items() if k != "records"}
                     if prepare else None),
+        "wall_execution": {
+            "schema": WALL_WINDOW_SCHEMA,
+            "clock": "wall",
+            "started_at": execution_started_at,
+            "ended_at": execution_ended_at,
+            "seconds": execution_seconds,
+            "includes": "measured request construction, pacing, dispatch and completion",
+            "excludes": "preparation/drain, executor teardown and post-run reporting",
+        },
     }
     if prepare and args.prepare_out:
         with open(args.prepare_out, "w", encoding="utf-8") as fh:

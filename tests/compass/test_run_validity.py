@@ -271,6 +271,50 @@ def _run(stub: _Stub, trace: Path, out: Path, extra=()) -> int:
         server.server_close()
 
 
+def test_client_wall_window_excludes_warmup_drain_and_reporting(tmp_path, trace, monkeypatch):
+    class Clock:
+        value = 0.0
+
+        def monotonic(self):
+            return self.value
+
+        def time(self):
+            return 1_700_000_000.0 + self.value
+
+        def sleep(self, seconds):
+            self.value += seconds
+
+    clock = Clock()
+
+    class DelayedStub(_Stub):
+        def completion(self, body):
+            response = super().completion(body)
+            clock.sleep(30.0 if self.served == 1 else 2.0)
+            return response
+
+        def requests_blob(self):
+            if self.records:
+                clock.sleep(5.0 if self.served == 1 else 7.0)
+            return super().requests_blob()
+
+        def provenance_blob(self):
+            if self.served == 4:
+                clock.sleep(20.0)
+            return super().provenance_blob()
+
+    monkeypatch.setattr(replay, "_time", clock)
+    out = tmp_path / "timed.json"
+    assert _run(DelayedStub(arrivals="serial"), trace, out,
+                ("--prepare", "1", "--pace")) == 0
+    run = json.loads(out.read_text())["run"]
+    window = replay.read_wall_window(run["wall_execution"])
+    assert window["seconds"] == 6.0
+    assert window["started_at"] == 1_700_000_035.0
+    assert window["ended_at"] == 1_700_000_041.0
+    assert run["prepare"]["wall_seconds"] == 30.0
+    assert clock.value == 68.0  # preparation + drain + requests + reporting
+
+
 class TestARunThatDidNotCompleteExitsNonZero:
     """Reporting "0 failed" was the client's opinion of its own sending.
 

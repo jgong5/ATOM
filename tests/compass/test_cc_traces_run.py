@@ -261,6 +261,7 @@ class FakeProcesses:
         # fake that reads the real checkout would hand the runner a digest of
         # bytes the runner never looked at.
         full = Path(run_mod.ROOT) / trace
+        instant = getattr(self, "execution_wall", self.wall)()
         manifest = {
             "paced": side == "real",
             "trace": str(trace),
@@ -281,6 +282,11 @@ class FakeProcesses:
             ),
             "server_code_sha256": self.served,
             "prepare": None,
+            "wall_execution": {
+                "schema": run_mod.replay_client.WALL_WINDOW_SCHEMA,
+                "clock": "wall", "started_at": instant,
+                "ended_at": instant, "seconds": 0.0,
+            },
         }
         if side == "real":
             manifest["prepare"] = {
@@ -379,11 +385,13 @@ def _runner(
     provenance=None,
     probe=None,
     held_ports=(),
+    clock=None,
     **kw,
 ):
-    clock = Clock()
+    clock = clock or Clock()
     mode = "predict" if side == "modelled" else "measure"
     procs = processes or FakeProcesses(cell=tmp_path, wall=clock.wall)
+    procs.execution_wall = clock.wall
     said = provenance or (lambda url: fake_provenance(mode))
     return run_mod.SideRun(
         _plan(tmp_path),
@@ -666,6 +674,50 @@ class TestWhatAnsweredIsWhatWeThinkAnswered:
 
 
 class TestTheCostsItCanMeasure:
+    def test_preparation_and_reporting_are_not_measured_execution(self, tmp_path):
+        clock = Clock()
+
+        class DelayedClient(FakeProcesses):
+            def run(self, command, **kwargs):
+                if "replay.py" not in " ".join(command):
+                    return super().run(command, **kwargs)
+                clock.sleep(30.0)  # preparation and drain
+                start = clock.wall()
+                clock.sleep(10.0)  # measured requests
+                end = clock.wall()
+                code = super().run(command, **kwargs)
+                path = Path(command[command.index("--out") + 1])
+                blob = json.loads(path.read_text())
+                blob["run"]["wall_execution"].update(
+                    started_at=start, ended_at=end, seconds=10.0)
+                path.write_text(json.dumps(blob))
+                clock.sleep(20.0)  # request-store/provenance reporting
+                return code
+
+        procs = DelayedClient(cell=tmp_path, wall=clock.wall)
+        runner = _runner(tmp_path, "real", processes=procs, clock=clock)
+        assert runner.run() == 0
+        costs = json.loads((runner.cell / "costs.real.json").read_text())
+        assert costs["execution_s"] == [10.0] * 3
+        assert costs["client_process_s"] == [60.0] * 3
+        row = costs["per_execution"][0]
+        assert row["execution_window"][0] - row["client_process_window"][0] == 30
+        assert row["client_process_window"][1] - row["execution_window"][1] == 20
+
+    def test_missing_window_never_falls_back_to_client_process_duration(self, tmp_path):
+        class LegacyClient(FakeProcesses):
+            def _write_artifact(self, command):
+                super()._write_artifact(command)
+                path = Path(command[command.index("--out") + 1])
+                blob = json.loads(path.read_text())
+                blob["run"].pop("wall_execution")
+                path.write_text(json.dumps(blob))
+
+        runner = _runner(tmp_path, "modelled", processes=LegacyClient(cell=tmp_path))
+        assert runner.run() == 1
+        assert any("no explicit measured wall window" in why for why in runner.failures)
+        assert not (runner.cell / "costs.modelled.json").exists()
+
     def test_a_side_records_its_own_startup_and_window(self, tmp_path, monkeypatch):
         monkeypatch.setattr(
             run_mod.compare,
@@ -1978,6 +2030,28 @@ class TestDerivationIsAttributedToTheRepeatThatSpentIt:
         assert [(p["within"], p.get("repeat"), p["seconds"]) for p in parts] == [
             (None, None, 3.0)
         ]
+
+    def test_derivation_outside_requests_is_charged_once_to_its_process(self, tmp_path):
+        cell = self._cell(tmp_path, repeats=1)
+        path = cell / "costs.modelled.json"
+        blob = json.loads(path.read_text())
+        blob["per_execution"][0].update(
+            execution_window=[1030.0, 1040.0], process_window=[1000.0, 1050.0])
+        path.write_text(json.dumps(blob))
+        journal = tmp_path / "derivations.jsonl"
+        journal.write_text(json.dumps({"t0": 1015.0, "t1": 1045.0}) + "\n")
+        assert run_mod.main(self._argv(cell, journal)) == 0
+        costs = json.loads((cell / "costs.json").read_text())
+        parts = costs["derivation"]
+        assert {(p["within"], p["repeat"]): p["seconds"] for p in parts} == {
+            ("startup_modelled", 1): 5.0,
+            ("execution_modelled", 1): 10.0,
+            (None, 1): 15.0,
+        }
+        assert sum(p["seconds"] for p in parts) == 30.0
+        validate = _load("cc_traces_validate")
+        # Ten seconds already inside execution; add only the other twenty.
+        assert validate._speedup(costs, reuse_cells=1)["replay_ratio"] == pytest.approx(4.0)
 
     def _mangle(self, cell, rows):
         blob = json.loads((cell / "costs.modelled.json").read_text())

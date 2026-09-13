@@ -140,9 +140,9 @@ class TestARepeatIsAProcess:
         for cell in plan["cells"]:
             tables = [
                 s["command"][s["command"].index("--compass-measure-out") + 1]
-                for s in _role(cell, "serve", "real")
+                for s in _role(cell, "serve")
             ]
-            assert len(set(tables)) == len(tables) == plan["repeats"]
+            assert len(set(tables)) == len(tables) == 2 * plan["repeats"]
 
 
 class TestTheTwoSidesAreNotRunTheSameWay:

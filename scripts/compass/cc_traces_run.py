@@ -104,6 +104,7 @@ def _core(name: str):
 
 
 compare = _load("compare")
+replay_client = _load("replay")
 plan_module = _load("cc_traces_plan")
 execution_id = _load("execution_id")
 process_identity = _core("process_identity")
@@ -1080,6 +1081,17 @@ class SideRun:
             return False
         manifest = blob.get("run") or {}
         bad = []
+        try:
+            window = replay_client.read_wall_window(manifest.get("wall_execution"))
+            process = execution.get("replay") or {}
+            if (window["started_at"] < process["started_at"] - 0.005
+                    or window["ended_at"] > process["ended_at"] + 0.005):
+                raise ValueError("the measured wall window is outside this replay process")
+        except (ValueError, KeyError) as exc:
+            bad.append(f"{exc}; whole-client duration is not an execution fallback")
+        else:
+            entry["execution_s"] = window["seconds"]
+            execution["replay"]["measured_window"] = window
         # Manifest field names below are `replay.py`'s, from the dict it
         # writes as `run`.
         prepare = manifest.get("prepare") or {}
@@ -1428,7 +1440,7 @@ class SideRun:
             for e in self.journal
             if e["role"] == "serve" and e.get("startup_s") is not None
         ]
-        executions, served_windows, per_execution = [], [], []
+        executions, served_windows, client_processes, per_execution = [], [], [], []
         clocks = set()
         for entry in self.journal:
             if entry["role"] != "replay" or not entry.get("ok"):
@@ -1436,20 +1448,28 @@ class SideRun:
             path = self.cell / f"{self.side}.r{entry['repeat']}.json"
             run = compare.load_run(str(path), f"{self.side}[{entry['repeat']}]")
             served = compare.metrics(run, sorted(run.joined))["window_s"]
-            # The client's own elapsed, already recorded when the replay ran.
-            wall = entry.get("seconds")
+            held = self.executions.get(entry["repeat"]) or {}
+            replay = held.get("replay") or {}
+            window = replay.get("measured_window")
+            if window is None:
+                self.failures.append(
+                    f"repeat {entry['repeat']} has no measured wall window; "
+                    "cannot substitute preparation and reporting time")
+                return
+            wall = window["seconds"]
             clocks.add(run.clock)
             executions.append(wall)
+            client_processes.append(entry.get("seconds"))
             served_windows.append(served)
             # Each second attributed to the execution that spent it, so a
             # reader can tell a source residual from an independent repeat.
-            held = self.executions.get(entry["repeat"]) or {}
             process = held.get("process", {})
             per_execution.append(
                 {
                     "execution_id": entry.get("execution_id"),
                     "repeat": entry["repeat"],
                     "execution_s": wall,
+                    "client_process_s": entry.get("seconds"),
                     "served_window_s": served,
                     "startup_s": process.get("startup_s"),
                     # The absolute wall interval each measured window occupied,
@@ -1457,15 +1477,19 @@ class SideRun:
                     # placed inside one by intersection rather than by someone
                     # declaring which phase it belonged to. `startup_modelled`
                     # is launch to the first /health answer; `execution_*` is
-                    # the replay client's own window.
+                    # only measured request dispatch/completion. The broader
+                    # process windows remain available for cost attribution.
                     "startup_window": [
                         process.get("launched_at"),
                         process.get("healthy_at"),
                     ],
                     "execution_window": [
-                        (held.get("replay") or {}).get("started_at"),
-                        (held.get("replay") or {}).get("ended_at"),
+                        window["started_at"], window["ended_at"],
                     ],
+                    "client_process_window": [replay.get("started_at"),
+                                              replay.get("ended_at")],
+                    "process_window": [process.get("launched_at"),
+                                       process.get("ended_at")],
                 }
             )
         payload = {
@@ -1474,6 +1498,7 @@ class SideRun:
             "repeats": len(executions),
             "startup_s": startups,
             "execution_s": executions,
+            "client_process_s": client_processes,
             "served_window_s": served_windows,
             # Declared, not inferred from the side: the artifact says which
             # clock its records were stamped on, and that is what is recorded.
@@ -1487,12 +1512,14 @@ class SideRun:
             "per_execution": per_execution,
             f"startup_{self.side}": _median(startups),
             f"execution_{self.side}": _median(executions),
+            f"client_process_{self.side}": _median(client_processes),
             f"served_window_{self.side}": _median(served_windows),
             "convention": compare.QUANTILE_CONVENTION,
             "means": (
                 "seconds. startup is launch to the first /health answer, on "
-                "the wall clock. execution is the replay's own wall-clock "
-                "window: the machine time this side spent. served_window is "
+                "the wall clock. execution is the replay's measured request "
+                "window, excluding preparation/drain and post-run reporting. "
+                "client_process reports the whole client separately. served_window is "
                 "the window the engine reports having served, from "
                 "compare.metrics, on the engine's own clock -- virtual on a "
                 "predicting server, and never a runtime cost"
@@ -1649,6 +1676,19 @@ def _overlap(span, windows) -> float:
     return sum(max(0.0, min(end, stop) - max(start, begin)) for begin, stop in windows)
 
 
+def _process_windows(cell: Path) -> list:
+    """Which repeat owns work outside its startup and request windows."""
+    path = cell / "costs.modelled.json"
+    if not path.exists():
+        return []
+    found = []
+    for row in json.loads(path.read_text()).get("per_execution") or []:
+        span = row.get("process_window") or []
+        if len(span) == 2 and all(isinstance(t, (int, float)) for t in span):
+            found.append((row.get("repeat"), tuple(map(float, span))))
+    return found
+
+
 def _per_repeat(partial: dict, side: str, missing: list, where: str) -> dict:
     """What each repeat of one side cost, or {} when there was only one.
 
@@ -1745,6 +1785,7 @@ def _derivation_from_journal(cell: Path, paths, missing: list):
     if not paths:
         return None
     windows = _windows(cell)
+    owners = _process_windows(cell)
     if not windows:
         missing.append(
             "startup_window/execution_window in costs.modelled.json (the "
@@ -1766,6 +1807,7 @@ def _derivation_from_journal(cell: Path, paths, missing: list):
                 return None
             rows += 1
             placed = 0.0
+            placed_by_repeat = {}
             for name, spans in windows.items():
                 for repeat, span in spans:
                     inside = _overlap((float(start), float(end)), [span])
@@ -1774,6 +1816,18 @@ def _derivation_from_journal(cell: Path, paths, missing: list):
                     key = (name, repeat)
                     by_container[key] = by_container.get(key, 0.0) + inside
                     placed += inside
+                    placed_by_repeat[repeat] = placed_by_repeat.get(repeat, 0.0) + inside
+            # Provenance collection can derive between health and the first
+            # request, or after the measured requests complete. That work is
+            # outside execution but still belongs to this server's repeat,
+            # and must be added once rather than omitted or spread over runs.
+            for repeat, span in owners:
+                owned = _overlap((float(start), float(end)), [span])
+                extra = max(0.0, owned - placed_by_repeat.get(repeat, 0.0))
+                if extra:
+                    key = (None, repeat)
+                    by_container[key] = by_container.get(key, 0.0) + extra
+                    placed += extra
             loose = max(0.0, (float(end) - float(start)) - placed)
             if loose > 0.0:
                 by_container[(None, None)] = by_container.get((None, None), 0.0) + loose
