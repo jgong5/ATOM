@@ -534,6 +534,17 @@ def _tp1_prices() -> tuple:
         add(f"{_anc}/p27_body_{row}.tp1.r0.{_REP}.json",
             f"{_anc}/graphs/b27_tp1_r0_pref_body_{row}.json")
 
+    # The preserved clients-C8 prefill shapes exposed 61 further GEMM gaps
+    # across five weight geometries. Existing measured dispatch bands reduce
+    # them to 56 source endpoints; no interpolation crosses a kernel switch.
+    # Only those GEMMs were timed on TP1 GPU1, with three repeats, graph batch
+    # 4, 64 timed calls and 8 warmups. Every signature retained its kernel;
+    # repeat spread is <=1.487%. The median book preserves all raw repeats
+    # through digested provenance and contributes no attention observations.
+    _gemm_endpoints = f"{_PC}/prefill_gemm_endpoints_v1"
+    add(f"{_gemm_endpoints}/prices.median.json",
+        f"{_gemm_endpoints}/gemm_points.json")
+
     # The long-context cells and the mixed step.
     for stem in ("ctx_b32_c4096", "ctx_b32_c16384", "mix_b32"):
         add(f"{_PC}/long/p27_{stem}.tp1.r0.{_REP}.json",
