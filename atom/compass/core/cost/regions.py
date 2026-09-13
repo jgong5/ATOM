@@ -388,6 +388,12 @@ class BucketedRunnerRegions:
     #: is interpolated linearly in summed history. These measurements concern
     #: preparation, not the whole native preparation/idle remainder.
     prepare_decode_history_deltas: tuple = ()
+    #: A measured continuation of an existing history segment, keyed by cell:
+    #: ``(old summed-history limit, additional Measured at the new limit)``.
+    #: The new limit is declared in ``decode_context_cells``. Keeping the old
+    #: limit separately prevents a support extension from changing the slope,
+    #: point estimates or bands anywhere in the previously measured domain.
+    prepare_decode_history_extensions: tuple = ()
     version: str = ""
     provenance: str = ""
 
@@ -652,12 +658,20 @@ class BucketedRunnerRegions:
         limits = dict(self.decode_context_cells).get(cell)
         if limits is None or limits[2] <= anchor:
             raise ValueError(f"history delta for {cell} has no measured span")
-        fraction = (history - anchor) / (limits[2] - anchor)
+        extension = dict(self.prepare_decode_history_extensions).get(cell)
+        reference_limit = limits[2]
+        if extension is not None:
+            reference_limit, additional = extension
+            if not anchor < reference_limit < limits[2]:
+                raise ValueError(f"history extension for {cell} has no measured span")
+        reference_history = (min(history, reference_limit)
+                             if extension is not None else history)
+        fraction = (reference_history - anchor) / (reference_limit - anchor)
         # Refusal is checked before _parts reaches this method. A cap must
         # never make an unsupported sum look like the last measured point.
         if not 0.0 <= fraction <= 1.0:
             raise ValueError(f"history delta for {cell} is outside its support")
-        return Measured(
+        measured = Measured(
             seconds=native.seconds + fraction * delta.seconds,
             low=max(0.0, native.low + fraction * delta.low),
             high=native.high + fraction * delta.high,
@@ -665,6 +679,19 @@ class BucketedRunnerRegions:
             how=native.how + "; plus an additive history approximation "
                 f"at {fraction:.6f} of the measured summed-history span: "
                 + delta.how,
+        )
+        if extension is None or history <= reference_limit:
+            return measured
+        continuation = (history - reference_limit) / (limits[2] - reference_limit)
+        if not 0.0 <= continuation <= 1.0:
+            raise ValueError(f"history extension for {cell} is outside its support")
+        return Measured(
+            seconds=measured.seconds + continuation * additional.seconds,
+            low=max(0.0, measured.low + continuation * additional.low),
+            high=measured.high + continuation * additional.high,
+            samples=measured.samples + additional.samples,
+            how=measured.how + "; plus a measured high-history continuation "
+                f"at {continuation:.6f} of its span: " + additional.how,
         )
 
     def _parts(self, shape) -> list:
@@ -1684,6 +1711,61 @@ SOURCE_27B_TP1_HISTORY_DELTA = replace(
 )
 
 
+# prepare_history_2m_v1 keeps the v2 conditioned prepare_model/staging boundary:
+# no model body consumes the varied metadata. The source-only pool was enlarged
+# to 132784 blocks (utilization 1.0, allocator safety reserve retained), so every
+# disjoint block-table entry through 2097152 tokens is physically in range.
+# Target allocation settings are unchanged. Old absolute coefficients and the
+# complete old history segment remain intact; only high-minus-legacy differences
+# enter the continuation. All new endpoint median differences were negative,
+# so the conservative nonnegative point increment is zero. Bands retain signed
+# repeat-median differences and the shared zero anchor, not raw timing tails.
+#
+# Frozen plan be453df9c51af6bfdc0da20eda4b97c61935d3ed370f5acb8765641f3cdf5037:
+# 56 cases, 10752 retained event timings; raw SHA256
+# 2d45ea137d0f51ca5da1d477add25e1c7b0ce919e7b2e89046f1879bd02243c0.
+# Sixteen heldout cases include intermediate totals, unseen distributions and
+# N9's all-long upper shape. Their maximum increment error is 6.081008us against
+# the predeclared 110us (0.5% of a 22ms source step) impact limit. This bounds a
+# component approximation, not E2E accuracy. Same-run N32 direct/native short
+# preparation differs by -1.829%; the earlier N1/N2 mismatch remains recorded.
+_HISTORY_2M_EXTENSION_ROWS = (
+    ((16, True), (15,), 768, -1.3599991798400883e-6),
+    ((16, False), (16,), 768, -2.3999959230423064e-6),
+    ((32, True), (17, 21, 31), 2304, -2.440005540847766e-6),
+    ((32, False), (32,), 768, -2.2800117731094363e-6),
+)
+
+SOURCE_27B_TP1_HISTORY_2M = replace(
+    SOURCE_27B_TP1_HISTORY_DELTA,
+    decode_context_cells=tuple(
+        (cell, (lo, hi, 2097152 if cell in {(16, True), (16, False),
+                                         (32, True), (32, False)} else total))
+        for cell, (lo, hi, total) in SOURCE_27B_TP1_HISTORY_DELTA.decode_context_cells
+    ),
+    prepare_decode_history_extensions=tuple(
+        (cell, (1572864, Measured(
+            seconds=0.0, low=low, high=0.0, samples=samples,
+            how=f"prepare_history_2m_v1 active counts {counts}; high-minus-"
+                "legacy preparation increment over summed histories "
+                "1572864..2097152; nonnegative point and signed median-"
+                "difference band, independently checked on heldout histories")))
+        for cell, counts, samples, low in _HISTORY_2M_EXTENSION_ROWS
+    ),
+    version="history-2m-2026-09-13",
+    provenance=SOURCE_27B_TP1_HISTORY_DELTA.provenance
+        + "; independent prepare_history_2m_v1 extends only capture cells "
+        "16/32 exact/padded through summed history 2097152, retaining "
+        "per-request limits 128..196608. Source-only larger KV pool uses "
+        "disjoint valid block tables; no varied history enters a model body. "
+        "All old coefficients, point predictions and bands are unchanged. "
+        "New endpoints fit only a bounded additional preparation increment; "
+        "16 heldout cases pass the declared 110us source-step impact limit "
+        "with maximum error 6.081008us. No target-engine time was fitted. "
+        "Final E2E accuracy and cross-width transfer remain to be validated",
+)
+
+
 #: Block sizes whose per-step attention metadata build is sized by the rank's
 #: own KV head count, and therefore is NOT width-invariant.
 #:
@@ -1745,6 +1827,7 @@ REGION_MODELS = {
     "source-27b-tp1-prefill-seqs": SOURCE_27B_TP1_PREFILL_SEQS,
     "source-27b-tp1-history-64k": SOURCE_27B_TP1_HISTORY_64K,
     "source-27b-tp1-history-delta": SOURCE_27B_TP1_HISTORY_DELTA,
+    "source-27b-tp1-history-2m": SOURCE_27B_TP1_HISTORY_2M,
     "none": None,
 }
 

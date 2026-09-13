@@ -73,6 +73,23 @@ match the native remainder, so only history differences are transferred.
 The original 1025..1152-token answers are unchanged. Final end-to-end traces
 must validate this approximation and its transfer across widths.
 
+`regions=source-27b-tp1-history-2m` extends the exact and padded capture cells
+16/32 through 2,097,152 summed history tokens. It preserves every point and
+band in the previous profile's domain and retains the per-request history
+range 128..196608. A separate continuation uses independently measured
+high-minus-legacy preparation differences; raising the support limit does not
+change the old interpolation denominator. Smaller capture cells are unchanged.
+
+The frozen `prepare_history_2m_v1` source experiment collected 10,752 event
+timings over 56 cases using the same conditioned preparation boundary. A larger
+source-only KV pool kept all disjoint block-table entries in range; target
+allocation settings were unchanged, and no varied history entered a model body.
+All endpoint increments were nonpositive, giving a conservative zero added
+point cost with signed measured bands. Sixteen held-out cases had maximum
+increment error 6.081 microseconds, below the declared 110-microsecond source
+step-impact limit. This supports a component approximation; it does not close
+E2E accuracy, kernel-source stability, or cross-width validation.
+
 The preceding `source-27b-tp1-history-64k` adds independently measured TP1 history
 support to `source-27b-tp1-prefill-seqs`. Single-row decode supports histories
 1025..65600; exact two-row decode supports 513..65600 with summed history at
