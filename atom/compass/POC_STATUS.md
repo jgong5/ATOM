@@ -101,6 +101,29 @@ is explicitly reconstructed, not observed. The independent MHA source-domain
 extension remains required before another C8 replay. No positive E2E gate has
 been promoted by these source checks.
 
+
+**Qualified registry and MHA diagnosis (2026-09-14).** Commit `e8b94244`
+selects the qualified GEMM repairs and the measured 2M preparation profile.
+All 8,960 ordinary GEMM lookups pass, all 931 legacy exact measurements retain
+precedence, and all 85 repair records are selected at their intended widths.
+The source-quality qualifications remain explicit. The successor calibration
+registry (`codex_decode_domain_v1/calibration_registry_v7_e8b94244/`) passes
+all 24 provenance checks and retains all 4,994 historical index records.
+
+The TP1 MHA extension completed five independent heldouts. Four meet the
+frozen 10% component criterion; the reordered 32-request case misses it at
+**+14.714%** (7.350762 ms predicted versus 6.407904 ms measured), with repeat
+ranges below 0.30%. The failed validation is preserved in
+`codex_regions/mha_decode_2m_v1/VALIDATION.json` (SHA256
+`1a52017b0e08f1a4bab294f1de2589314d1057e967ffa1d2c9ad79f9295e92f7`).
+It has not been admitted to the acceptance registry. A CPU reproduction
+refits only the 33 training books and reproduces the miss in about 2.6 seconds.
+The source investigation distinguishes launch-order scheduling, physical KV
+page placement, and between-job conditions. A separately labeled, unvalidated
+C8 diagnostic is being prepared with the unchanged failed fit to expose later
+functional gaps; it cannot establish numerical acceptance. No positive E2E
+gate has been promoted.
+
 **Maintained document. One row per completion gate, and nothing in it may be
 loosened.** `POC_SUMMARY.md` is the narrative handover, `DESIGN_NOTES.md` the
 working log, `RETROSPECTIVE.md` a dated audit. This file is the score.
