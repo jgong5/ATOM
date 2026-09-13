@@ -412,6 +412,14 @@ def _tp1_prices() -> tuple:
         f"{_SRC2C}/b27dec32.tp1.r0.json")
     add(f"{_TP1}/p27hdec32.tp1.r0.json", f"{_SRC2C}/h27dec32.tp1.r0.json")
 
+    # The old N1 book refused MRoPE before the named-stride safety fix.
+    # Independent TP1/context1024 acquisition now supplies its exact ABI:
+    # three successful repeats, verified against all sixteen refused calls.
+    mrope_n1 = "{root}/codex_tp1_mrope_n1"
+    for repeat in (1, 2, 3):
+        add(f"{mrope_n1}/raw.tp1.r0.rep{repeat}.json",
+            f"{mrope_n1}/body_n1_c1024.json")
+
     # Frozen native-order decode training only. These are the eighteen pairs
     # in codex_decode_domain_v1/TRAINING_MANIFEST.json, including new-ID
     # replacements for two failed attempts. Both holdouts remain excluded.
