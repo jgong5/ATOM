@@ -712,6 +712,9 @@ class PriceLibrary:
         """A source-witnessed synchronization in this operator, if declared."""
         return None
 
+    def _body_lookup(self, op, topology, registration, modelled_memo):
+        return self.lookup(op, topology, registration)
+
     def _can_reuse_prepared_lookups(self):
         return getattr(self.lookup, "__func__", None) is PriceLibrary.lookup
 
@@ -758,6 +761,7 @@ class PriceLibrary:
         # are constant. Only immutable identities and exact library records
         # enter it; another body validates against the current library again.
         prepared_lookups = {} if self._can_reuse_prepared_lookups() else None
+        modelled_memo = {}
         for index, op in enumerate(ops):
             if timing is not None:
                 reason = self.host_sync_reason(op)
@@ -779,7 +783,8 @@ class PriceLibrary:
                 if measured_signature is not None and measured_signature != op.signature:
                     self.address_shifted[op.cost_key] = self.address_shifted.get(op.cost_key, 0) + 1
             else:
-                record, detail = self.lookup(op, topology, registration)
+                record, detail = self._body_lookup(
+                    op, topology, registration, modelled_memo)
                 if (prepared_key is not None and record is not None
                         and any(record is candidate for candidate
                                 in self._prices.get(op.cost_key, ()))):

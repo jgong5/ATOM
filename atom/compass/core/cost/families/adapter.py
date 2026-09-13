@@ -487,6 +487,30 @@ def _design_identity(op: dict) -> tuple:
             context, scalars, grid, values)
 
 
+def _modelled_identity(op, scope, launch_charge):
+    """Complete current inputs to the attention law after scope resolution.
+
+    Model.price/structure_of/regime_of/geometry_of consume name, input shapes,
+    dtypes, layouts and context; scope adds every deployment/treatment gate.
+    Block tables select addresses and are not read by that law, matching the
+    signature contract. Scalars (including layer labels) are not law inputs;
+    exact per-layer measurements still go through the base lookup first.
+    """
+    import json
+    import marshal
+
+    context = [pair for pair in op.get("context") or ()
+               if tuple(pair)[0] != "block_tables"]
+    value = (op.get("name"), op.get("input_shapes"), op.get("dtypes"),
+             op.get("layouts"), context, scope, launch_charge)
+    try:
+        key = marshal.dumps(value)
+        json.dumps(value)
+        return key
+    except (TypeError, ValueError, RecursionError):
+        return None
+
+
 def _scope_key(scope) -> tuple:
     """A scope as a hashable key. Same two fields ``_same_scope`` compares."""
     scope = scope or {}
@@ -1091,10 +1115,17 @@ class ParametricPriceLibrary(PriceLibrary):
 
     # -- lookup ---------------------------------------------------------
 
+    def _body_lookup(self, op, topology, registration, modelled_memo):
+        if getattr(self.lookup, "__func__", None) is not ParametricPriceLibrary.lookup:
+            return self.lookup(op, topology, registration)
+        return self.lookup(op, topology, registration,
+                           _modelled_memo=modelled_memo)
+
     def _can_reuse_prepared_lookups(self):
         return getattr(self.lookup, "__func__", None) is ParametricPriceLibrary.lookup
 
-    def lookup(self, op: dict, topology=None, registration=None):
+    def lookup(self, op: dict, topology=None, registration=None, *,
+               _modelled_memo=None):
         if self.request_attention_treatments and op.get("name") in (
                 attention.UNIFIED, attention.GDN):
             regime = attention.regime_of(op, None, self._declared_scope(op))
@@ -1104,7 +1135,7 @@ class ParametricPriceLibrary(PriceLibrary):
                 # exact-signature record from another acquisition treatment.
                 return self._modelled(op, _OPEN_QUESTION,
                                       contract_for(op["name"]), topology,
-                                      registration)
+                                      registration, _memo=_modelled_memo)
         record, detail = super().lookup(op, topology, registration)
         if record is not None or detail != _OPEN_QUESTION:
             # Either answered, or refused for a reason that is a finding rather
@@ -1114,10 +1145,11 @@ class ParametricPriceLibrary(PriceLibrary):
 
         if isinstance(op, PreparedOperator):
             op = op.as_dict()
-        return self._parametric(op, detail, topology, registration)
+        return self._parametric(op, detail, topology, registration,
+                                _modelled_memo=_modelled_memo)
 
     def _parametric(self, op: dict, original: str, topology=None,
-                    registration=None):
+                    registration=None, *, _modelled_memo=None):
         contract = contract_for(op.get("name", ""))
         if contract is None:
             return None, (f"{original}; and {op.get('name', '?')} has no "
@@ -1129,7 +1161,7 @@ class ParametricPriceLibrary(PriceLibrary):
             return self._view_price(op, original, contract)
         if contract.kind != "rows":
             return self._modelled(op, original, contract, topology,
-                                  registration)
+                                  registration, _memo=_modelled_memo)
 
         self._build()
         curve, verified_rows = self._curve_for(op, topology, registration)
@@ -1210,7 +1242,7 @@ class ParametricPriceLibrary(PriceLibrary):
                  }},
                 f"structural://{contract.family}/alias")
     def _modelled(self, op: dict, original: str, contract, topology=None,
-                  registration=None):
+                  registration=None, *, _memo=None):
         """A ragged family's price from its regime's law, or why there is none.
 
         Reached only behind the open question -- an operator nobody priced --
@@ -1243,6 +1275,12 @@ class ParametricPriceLibrary(PriceLibrary):
                           "histories, so no row count stands in for one")
         scope = self._request_scope(op, topology, registration)
         model = self.attention_model()
+        memo_key = (_modelled_identity(op, scope, self.launch_charge_seconds)
+                    if _memo is not None
+                    and getattr(model.price, "__func__", None) is attention.Model.price
+                    else None)
+        if memo_key is not None and memo_key in _memo:
+            return _memo[memo_key]
         answer = model.price(op, scope)
         if isinstance(answer, attention.Refusal):
             # The family is named in the refusal, not only the reason: a
@@ -1286,7 +1324,7 @@ class ParametricPriceLibrary(PriceLibrary):
         if unevidenced:
             return None, (f"{original}; this is a ragged attention family, "
                           f"and {unevidenced}")
-        return ({
+        result = ({
             "seconds": answer,
             # Names, not an attribution. `None` rather than a share, so
             # anything that reads a per-kernel number finds an absence instead
@@ -1307,6 +1345,9 @@ class ParametricPriceLibrary(PriceLibrary):
                     in self._attention_obs}),
             },
         }, f"{INTERPOLATED_SCHEME}{contract.family}/{name}")
+        if memo_key is not None:
+            _memo[memo_key] = result
+        return result
 
     def _classified_evidence(self) -> list:
         """Every observation classified once, not once per priced call.
