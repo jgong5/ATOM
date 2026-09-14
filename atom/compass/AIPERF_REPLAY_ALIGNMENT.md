@@ -3,15 +3,19 @@
 The current `4b433` and `31dd` completion workloads are **prefix-mechanics
 diagnostics**. They preserve declared source prompt-prefix identities and exact
 proxy lengths, but do not yet establish AIPerf chat, full-history cache, or
-dependency-scheduling fidelity. A paired timing result for either remains useful
-within that narrower scope.
+dependency-scheduling fidelity. `4b433` now has a completed paired result within
+that narrower scope: TTFT median +8.59%, TPOT median +4.92%, throughput −1.88%.
+Its original isolation failure keeps timings advisory; the post-run aggregate
+registry correction and unavailable normal cost merge remain explicit in
+[PoC status](POC_STATUS.md). No faithful AIPerf opening pair is established.
 
 The reviewed `4b433` native structural closeout now establishes a true 32,768-token
 hit against 38,400 wanted tokens, 13 retained checkpoints and no evictions. Its
 physical pool contains 112,760 KV blocks plus 32 state slots, totaling
 121,671,450,624 bytes. All memory gates pass against the unchanged source memory model;
-the preparation/final resets and cleanup pass. This closes bounded native cache
-mechanics and memory checks, not paired timing or default-chat proof. The receipt
+the preparation/final resets and cleanup pass. This structural receipt establishes
+bounded native cache mechanics and memory checks; the subsequent paired
+surrogate result above still does not establish default-chat fidelity. The receipt
 and the superseding seeded chat audit are pinned below.
 
 This audit pins SemiAnalysisAI/aiperf commit

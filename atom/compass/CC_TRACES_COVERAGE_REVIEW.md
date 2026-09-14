@@ -19,15 +19,47 @@ workload rewrite; subsequent execution results are dated below.
 **Prefix caching enabled is now the main cc-traces validation path.** The
 original cache-disabled suite stays at **9/24** passing paired cells, including
 8/8 original TP1. Those historical results do not establish cache-on accuracy,
-whole-corpus generalization or **99% confidence**. No cache-enabled paired
-accuracy result has been completed.
+whole-corpus generalization or **99% confidence**. The first bounded cache-on
+surrogate pair is complete; it adds no registered acceptance cell.
 
-**Bounded native cache and memory proof is complete.** Structural closeout
-`eb120c52…` records a true 32,768-token hit against 38,400 wanted, 13 retained
-checkpoints, no evictions, 112,760 KV blocks plus 32 state slots and a
-121,671,450,624-byte physical pool. Memory checks pass against the unchanged
-source candidate; preparation/final resets and cleanup pass. This does not
-establish paired timing, pool pressure or full-root cache continuity.
+**First cache-on paired milestone: the two-request `4b433` token surrogate.**
+The fresh pair on `aa8bd80e2` completed 2/2 requests and 366 output tokens per
+side, preserving source requests 919/920, 92,928/92,672 input lengths,
+12/354 output lengths and the original 114.735-second gap. Independent review
+reconstructed both prompt digests from the pinned codec and checked request,
+clock, process and GPU-free identities. TTFT median **+8.59%**, TPOT median
+**+4.92%** and throughput **−1.88%** meet the numerical reference bars.
+
+Both sides reproduce the prefill query sequence, a 32,768-token cache hit
+against 38,400 wanted, 13 retained checkpoints and no evictions. Empty-cache
+reset receipts and cleanup pass. All five memory budget terms and eight
+non-KV components pass; KV counts are 112,760 real / 112,773 modelled,
+**0.01153%** error. The physical pool remains 112,760 KV blocks plus 32 state
+slots and 121,671,450,624 bytes. These observations do not establish pool
+pressure or full-root cache continuity.
+
+The real harness's original **exit 1** is preserved: the 93-sample isolation
+audit says GPU1 was owned exclusively but the node was not quiet because of
+unrelated PID1685833. Timings remain advisory. The raw replay wall-window
+ratio is 155.844406/28.253012 = **5.516×**, excluding preparation/drain and
+post-run reporting; it is not a full-cost or amortized speedup. No
+`costs.real.json` was emitted after the failed lifecycle, so the normal cost
+merge remains unavailable.
+
+The original registry `5f04fa7e…` failed the unchanged calibration check because
+it omitted the aggregate digest for the actual 413-file price bundle, despite
+declaring every member individually. Post-run metadata registry `42329052…`
+adds exactly that bundle (`3c6ccf75…`): the prior 401 members plus 12 finite-GEMM
+and q16 graph/price files. All 452 prior registry entries, source bytes and
+coefficients are unchanged. The same calibration checks pass against the
+labelled successor; the original refusal remains recorded. The actual wrapper,
+overlay, q16 scope and selected region snapshot also pass explicit source
+checks, while the **FAILED outputless** source remains diagnostic-only.
+Closeout `PAIRED_CLOSEOUT_V3_POSTRUN_METADATA.json` (`8f871739…`) and independent
+`INDEPENDENT_REVIEW_V1.json` (`cfb20e7f…`), under
+`agent_scratch/codex_cache_pair_4b433_v1/` in the artifact container, retain
+both outcomes. This is one bounded surrogate pair,
+not faithful/default AIPerf replay, statistical confirmation or new matrix credit.
 
 **The actual published replay adds role and release semantics.** AIPerf defaults
 to synthetic assistant history, so original text is not an additional blocker.
@@ -37,8 +69,13 @@ completion/open-loop mechanism diagnostics. The seeded `4b433` chat inputs are
 prove these shapes. The next faithful candidate is the complete opening of root
 `72d021…`: inputs 38,240/39,982, output maxima 338/186, no prior cached history
 and second release `max(run origin + 21.437 seconds, first target response)`.
-Later branches are excluded. The adapter and native/source support remain to be
-reviewed. [AIPerf replay alignment](AIPERF_REPLAY_ALIGNMENT.md) pins the valid
+Later branches are excluded. The maintained opening adapter and wrapper checks
+are reviewed and integrated (`4078a5bae`, `9950bb532`). All 524 inventoried
+decode shapes are covered; the bounded q16 primitive source is qualified.
+Remaining source gaps are 11 GEMM keys across q5456/q1744/q14, q14 GDN/MHA/gather
+and cached-prefill region qualification. The finite q1–15 source campaign and
+region transfer controls are prepared, with no new low-query GPU acquisition
+or faithful opening pair established. [AIPerf replay alignment](AIPERF_REPLAY_ALIGNMENT.md) pins the valid
 local-file fixed profile, exact token evidence and its branch-planner limitation;
 AgentX gap compression is a separate profile, not an implicit replacement.
 
@@ -50,8 +87,8 @@ checks; and readiness-gated prefix demand. The current target policy is cache
 on, checkpoint interval 8192, demand enabled and one-token GDN forks. Legacy
 plans stay cache off. Source memory geometry remains an explicit derived
 candidate with the bounded native memory/hit/checkpoint validation above.
-Pool-pressure behavior, remaining region coverage and paired E2E accuracy still
-require evidence. Combined
+Pool-pressure behavior, remaining region coverage and faithful paired E2E
+accuracy still require evidence. Combined
 CPU verification passed **648 tests**, with zero failures, errors or skips on
 exact source `2782333abba2135050072f5966f41c79472c2142` in a container without GPU
 device nodes. This cannot substitute for those observations.
@@ -74,9 +111,9 @@ The non-Torch discrepancy is preserved as a failure with unresolved
 attribution. Native sizing/recording uses the current PyTorch device's memory
 APIs, not an SMI device index; that specific mapping hypothesis is unsupported.
 No cause, corrected constant or cache-on conclusion follows from this result.
-The next execution evidence is reviewed cache-on region/source support and a
-fresh paired mechanism run, followed by the faithful response-gated opening
-above. These are not more cache-disabled gap closure or an entire-root claim.
+The next execution evidence is qualified low-query primitive and cached-prefill
+region support, followed by the faithful response-gated opening above. The
+completed surrogate pair does not close those remaining gaps.
 
 ## Remediation update — 2026-09-14
 

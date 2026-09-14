@@ -13,16 +13,43 @@ review](CC_TRACES_COVERAGE_REVIEW.md) controls coverage and case selection.
 The original cache-disabled registration and its **9/24** passing cells
 (including **8/8 original TP1**) retain their historical meaning. They do not
 prove the cache-enabled configuration, whole-corpus accuracy or **99%
-confidence**. No cache-enabled paired accuracy result is established yet.
+confidence**. The first bounded cache-on surrogate pair is now complete, with
+advisory timing results and no increase in the registered count.
 The earlier short-c4 campaign and staged cache-disabled long real run are held.
 
-**Native cache/memory mechanics now have bounded proof.** Reviewed structural
-closeout `eb120c52…` completed the `4b433` two-request token-surrogate case with
-32,768 tokens reused against 38,400 wanted, 13 retained checkpoints and no
-evictions. The physical pool is 112,760 KV blocks plus 32 state slots,
-121,671,450,624 bytes; memory checks pass against the unchanged source memory
-candidate, and preparation/final resets plus cleanup pass. This is structural
-evidence, not a paired timing result or full-root cache proof.
+**First cache-on paired milestone — bounded `4b433` surrogate.** On source
+`aa8bd80e2`, both sides completed the two requests with 92,928/92,672 input
+tokens and 12/354 output tokens, preserving the 114.735-second source gap.
+TTFT median **+8.59%**, TPOT median **+4.92%** and throughput **−1.88%** meet
+their numerical reference bars. Request/source/token/clock identity and the
+GPU-free predictor checks pass. Both sides reproduce the same prefill chunks,
+32,768 cached tokens against 38,400 wanted, 13 retained checkpoints and no
+evictions, with acknowledged empty-cache resets and completed cleanup.
+All five memory budget terms and all eight non-KV components pass; KV blocks
+are 112,760 real / 112,773 modelled (**0.01153%** error). The native physical
+pool remains 112,760 KV blocks plus 32 state slots, 121,671,450,624 bytes.
+
+The original real harness remains **exit 1 solely for isolation**. An independent
+re-audit of all 93 samples reproduces GPU1 `own_clean=true`, `node_busy`, with
+unrelated PID1685833 preserved. Timings therefore remain advisory. Raw measured
+replay wall windows are 155.844406/28.253012 seconds (**5.516×**); this is only
+an advisory replay-window ratio, not an amortized or full-cost speedup. The
+failed real lifecycle produced no `costs.real.json`, so the normal cost merge
+is unavailable and has not been bypassed.
+
+Independent review also caught a missing aggregate price-bundle declaration
+in the frozen registry `5f04fa7e…`: the original calibration check failed even
+though all 413 loaded price/graph files were individually registered. Labelled
+post-run registry `42329052…` appends the exact observed bundle `3c6ccf75…`;
+all 452 existing entries, source bytes and coefficients remain unchanged.
+The unchanged calibration checks then pass. Both verdicts are retained in
+`PAIRED_CLOSEOUT_V3_POSTRUN_METADATA.json` (`8f871739…`) and the independent
+`INDEPENDENT_REVIEW_V1.json` (`cfb20e7f…`), under
+`agent_scratch/codex_cache_pair_4b433_v1/` in the artifact container. The actual
+cache-region wrapper and q16 inputs pass their
+explicit source contract; the selected **FAILED outputless** source retains
+that qualification. This remains one token-surrogate mechanism diagnostic,
+not a registered acceptance cell, faithful AIPerf replay or full-root proof.
 
 **Actual AIPerf replay alignment remains a key gap.** The pinned published
 loader uses synthetic assistant history, chat role reconstruction and
@@ -33,7 +60,13 @@ native tail/region support must follow those actual shapes. The proposed first
 faithful opening is root `72d021…` requests 0/1: rendered 38,240/39,982 inputs,
 338/186 output maxima, empty start, and second release at
 `max(run origin + 21.437 seconds, first target response)`. Later branches are
-excluded; the adapter and source support need review before execution. Exact
+excluded. The maintained adapter/harness and exact wrapper checks are reviewed
+and integrated (`4078a5bae`, `9950bb532`). All 524 inventoried decode shapes are
+covered, and the bounded q16 primitive source is qualified. Remaining opening
+gaps include 11 GEMM keys across q5456/q1744/q14, q14 GDN/MHA/gather support and
+cached-prefill region qualification. A finite q1–15 source campaign and region
+transfer controls are prepared; no new low-query GPU acquisition or faithful
+opening pair is established. Exact
 pins, the fixed-profile branch-planner limitation and the explicit ignore-EOS
 variant are in [AIPerf replay alignment](AIPERF_REPLAY_ALIGNMENT.md).
 
@@ -140,9 +173,8 @@ gather price `aten::index.Tensor|128,5120;1|bfloat16,int32|1:127`
 (2,442/2,443 operators priced). That pre-overlay attempt completed no tiny
 response. The later finite-overlay pair and intact-root QK-norm refusal are
 recorded above; the failed low-region criterion remains a failure.
-**TP2/TP4 remain paused.** Next useful evidence is a cache-enabled native
-source/oracle preflight and a paired run of complete consecutive episodes from
-an exposed root.
+**TP2/TP4 remain paused.** Next useful evidence is qualified low-query and
+cached-prefill region support, followed by the faithful `72d021` opening pair.
 N1 low-prefill
 support must not stand in for multi-client N2/pool support; the coverage review
 records a minimal exposed-root C2/C4 cold-opening proposal, with actual batching
