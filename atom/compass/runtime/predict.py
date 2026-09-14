@@ -678,11 +678,13 @@ class CompassPredictMixin:
         # An older batch that does not carry them offers no mapping, and
         # binding refuses rather than assuming the identity.
         state_rows = getattr(batch, "state_rows", None)
+        fork_srcs = getattr(batch, "state_fork_srcs", None)
         allocation.offer(NativeStepAllocation(
             rows=rows,
             block_tables=tables,
             state_slots=(list(slots) if slots else None),
             state_rows=(list(state_rows) if state_rows is not None else None),
+            state_fork_srcs=(list(fork_srcs) if fork_srcs is not None else None),
             num_prefill_seqs=int(getattr(batch, "total_seqs_num_prefill", 0)),
             source="ScheduledBatch",
             rank_coords=self._rank_coords(),

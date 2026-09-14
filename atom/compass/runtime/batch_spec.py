@@ -593,7 +593,8 @@ class BatchSpec:
         ]
         return tuple(recorded)
 
-    def gdn_context(self, state_slots=None) -> tuple[tuple[str, Any], ...]:
+    def gdn_context(self, state_slots=None, state_fork_srcs=None
+                    ) -> tuple[tuple[str, Any], ...]:
         """What ``_capture_linear_attention`` would record for this batch.
 
         DeltaNet counts prefills and decodes separately and indexes a
@@ -605,6 +606,9 @@ class BatchSpec:
 
         ``state_slots`` is which per-request state entry each request occupies;
         the default is the batch order, which is what a fresh pool hands out.
+        ``state_fork_srcs`` selects incoming checkpoint slots while writes stay
+        in ``state_slots``. As in the native backend, -1 means read the write
+        slot. Both vectors use request order before FULL decode padding.
 
         **The padding here is the capture's, not the attention backend's, and
         only a FULL capture applies it.** The two modes build this metadata
@@ -638,6 +642,12 @@ class BatchSpec:
         slots = list(state_slots if state_slots is not None else range(n))
         if len(slots) != n:
             raise ValueError("one state slot per request")
+        sources = list(state_fork_srcs) if state_fork_srcs is not None else [-1] * n
+        if len(sources) != n:
+            raise ValueError("one state fork source per request")
+        if self.kind == "decode" and self.num_spec_step and any(s >= 0 for s in sources):
+            raise ValueError("state fork on the spec-decode path is unsupported")
+        read_slots = [src if src >= 0 else dst for src, dst in zip(sources, slots)]
         starts = [0]
         for q in self.query_lens:
             starts.append(starts[-1] + q)
@@ -659,6 +669,7 @@ class BatchSpec:
         pad_bs = bs - self.batch_size
         starts += [starts[-1]] * pad_bs
         slots = slots + [PAD_SLOT_ID] * pad_bs
+        read_slots = read_slots + [PAD_SLOT_ID] * pad_bs
         # Under FULL these are the bucket's, because the capture baked them in
         # and the replay runs the captured kernel whatever the refilled buffers
         # say; the offsets and indices above are what keep the padded lanes off
@@ -675,7 +686,7 @@ class BatchSpec:
             ("replayssm", False),
             ("non_spec_query_start_loc", [starts, "int32"]),
             ("non_spec_state_indices_tensor", [slots, "int32"]),
-            ("non_spec_state_indices_in_tensor", [slots, "int32"]),
+            ("non_spec_state_indices_in_tensor", [read_slots, "int32"]),
         ]
         # Which prefills continue a sequence whose convolution state is already
         # in the pool. The conv takes it as a pointer, not a flag: absent, the

@@ -163,18 +163,22 @@ class NativeStepAllocation:
     that a producer for which it is false can say so and be refused.
     """
 
-    __slots__ = ("rows", "block_tables", "state_slots", "state_rows",
+    __slots__ = ("rows", "block_tables", "state_slots", "state_rows", "state_fork_srcs",
                  "num_prefill_seqs", "source", "rank_coords",
                  "shared_across_ranks")
 
     def __init__(self, *, rows, block_tables, state_slots, num_prefill_seqs,
-                 state_rows=None, source="", rank_coords=None,
+                 state_rows=None, state_fork_srcs=None, source="", rank_coords=None,
                  shared_across_ranks=True) -> None:
         self.rows = tuple((int(q), int(c)) for q, c in rows)
         self.block_tables = tuple(tuple(int(b) for b in row)
                                   for row in block_tables)
         self.state_slots = (None if state_slots is None
                             else tuple(int(s) for s in state_slots))
+        # Read-side slots have the same filtered row order as state_slots.
+        # Missing sources preserve the native no-fork (in-place) behavior.
+        self.state_fork_srcs = (None if state_fork_srcs is None
+                               else tuple(int(s) for s in state_fork_srcs))
         #: Batch row per entry of ``state_slots``. Defaults to the leading rows
         #: only when the two lengths already agree, which is the case where the
         #: filtered list and the batch coincide; otherwise it is required.
@@ -337,6 +341,9 @@ class NativeAllocation:
                     "the allocation carries "
                     f"{len(record.state_rows)} state rows for "
                     f"{len(record.state_slots)} state slots")
+            if record.state_fork_srcs is not None and len(
+                    record.state_fork_srcs) != len(record.state_slots):
+                raise BindRefusal("one state fork source per state slot is required")
             by_row = dict(zip(record.state_rows, record.state_slots))
             missing = [i for i in range(len(rows)) if i not in by_row]
             if missing:
@@ -348,8 +355,13 @@ class NativeAllocation:
                     "gaps with row numbers is the fresh-pool assumption under "
                     "another name.")
             ordered = [by_row[i] for i in range(len(rows))]
+            sources = None
+            if record.state_fork_srcs is not None:
+                sources_by_row = dict(zip(record.state_rows, record.state_fork_srcs))
+                sources = [sources_by_row[i] for i in range(len(rows))]
             try:
-                gdn = dict(spec.gdn_context(state_slots=ordered))
+                gdn = dict(spec.gdn_context(state_slots=ordered,
+                                            state_fork_srcs=sources))
             except ValueError as exc:
                 # An undeclared capture mode, most often. A refusal here is
                 # this module's own vocabulary; a bare ValueError out of a
