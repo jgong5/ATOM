@@ -29,14 +29,46 @@ this review.
   precedes the pacing epoch, so **fresh paired E2E runs remain required**; old real
   references are not interchangeable. Recorded aiohttp callbacks are pre-write
   events, not wire-completion or target-ingress timestamps.
-* **The low-range candidate `6e26d4cb…` passed source-support validation and remains
-  unactivated at this update.** Its serialized-byte domain is 2,033–1,050,371.
+* **The low-range candidate `6e26d4cb…` passed source-support validation.** It was
+  unactivated at the source handoff and was subsequently selected only for the
+  corpus diagnostics below, with registry `94ef3d0f…`. No registered acceptance
+  cell was changed. Its serialized-byte domain is 2,033–1,050,371.
   All 84 heldout source-component median checks pass the unchanged 100 µs limit
   (maximum error 49.155 µs); all 532 formerly refused requests pass both native
   layout variants, giving 1,064 accepted canaries, and 56 CPU regressions pass.
   These source-median and layout checks do not bound individual source-frame
   tails, establish E2E accuracy, or provide 99% confidence. The pinned handoff and
   candidate identities are added to §7's evidence record.
+
+### Subsequent corpus diagnostics and source work — 2026-09-14
+
+Readiness-byte support did not establish native region support. The two new
+modelled attempts exposed separate region bounds; neither completed its request
+or produced a paired accuracy result. The original nine passing paired cells
+retain their previous scope and `node_busy` qualification.
+
+| Diagnostic | Observed result and original status |
+| --- | --- |
+| Tiny 128-token episode | Compiled TP1 output-producing prefill `[128]`, context `[128]`, refused the selected N1 span `[640,16384]`. Wrapper v1 recorded the wrong reconstructed source path; actual `--trace` and separate workload/manifest pins survive. Its owned replay was stopped after the exception; journal remains `exit=-15`, `ok=false`, `refused=false`. This is a domain witness with a provenance defect, not a valid E2E pair. |
+| Near-limit 250,048/39 request | Wrapper v2 has the actual source identity and passing provenance checks. It priced 15 prefills of 16,384 tokens plus the 4,288-token tail, then refused the first decode at history 250,049 against `[128,196608]`. The owned replay was stopped; its journal also remains `exit=-15`, `ok=false`, `refused=false` (wrapper exit 1). No completed 39-token response or accuracy claim. |
+| Complete seven-request root `1493faff…` | Held by explicit preflight: its opening 448-token prefill is below the selected N1 lower bound. No execution occurred. |
+| Other four emitted cases | Long decode, sustained arrivals, fanout and opening continuity remain separate development cases; no completed paired result is claimed here. |
+
+Both attempted CPU lanes are closed. The maintained diagnostic entry point and
+owned-refusal watcher are now integrated in `60dc92c84`; their exit-5 model-refusal
+classification applies to future executions and does not rewrite those old
+wrapper journals. All seven manifests are unchanged and use exposed roots;
+the exposure inventory remains **249 exposed / at most 144 potentially untouched**.
+
+The source audit recovered cold 128/256/512 and N2-total 512/1,536 captures for
+review, not automatic selection. The existing “2M history” source extended
+summed history for selected 16/32-request cells; it did not raise the 196,608
+per-request bound. The disjoint-interval representation is integrated in
+`b27d0e7f2`, with 11 legacy snapshots unchanged and 125 CPU tests passing.
+A finite source-only high-history acquisition is approved: 90 cases, 17,280
+intervals, per-row guard 262,143 and 56 heldouts including asymmetric layouts
+(plan `23779826…`). **No fitted continuation or selected region activation is
+claimed at this checkpoint.** TP2/TP4 work remains paused.
 
 ## 1. Population and meaning of replay
 
@@ -279,9 +311,9 @@ from one root must remain linked in any uncertainty calculation.
    token-latency metrics where no token exists, or declare the exclusion and
    reduced population. Validate standard serialized
    descriptors, token/context limits, model-domain bounds and request accounting
-   over every retained leaf. Confirm native replay transport above 1,024 with CPU
-   response-holding tests: complete registration, stable ordinal/timestamp
-   semantics, no lost rows, no barrier timeout and bounded client resources.
+   over every retained leaf, including output-producing low prefill, cached tails
+   and decode history reached during generation. Retain the completed async
+   transport qualification and its socket/memory limits.
    Check intact roots, not just individually eligible leaves. Keep these checks
    separate from target timing claims.
 2. **Use a few corpus-native development cases to expose mechanisms.** Prefer
@@ -290,7 +322,12 @@ from one root must remain linked in any uncertainty calculation.
    descendants. The compact witness list below specifies mechanisms and costs;
    source overlap/volume nominate cases but do not prove target saturation or
    preemption. Require actual target scheduler/KV witnesses for those claims.
-   Add a complete-root continuity check after transport support, and keep the
+   First close the tiny-prefill and near-limit decode refusals with source-only
+   evidence, then obtain fresh pairs for those cases and the seven-request root.
+   The 21-request sustained case is the next complementary scheduler check;
+   use fanout/long-decode cases when their extra mechanism is needed, not merely
+   to fill a grid. Keep multi-client cold small groups open: N1 evidence does
+   not establish N2/pool support. Add complete-root continuity and keep the
    C=1/2/4/8 axis as roots rather than a request throttle.
 3. **Freeze a separate confirmation design.** After model, transport and
    diagnostics stabilize, preregister untouched roots/bundles, exact workloads,
@@ -335,83 +372,51 @@ submission limits. Prefer the cheap complete-root case
 and a minimal complementary subset first, and do not make the largest extrema
 mandatory early GPU runs merely because they are extrema.
 
-## 6. What a defensible 99% statement requires
+A minimal cold-opening follow-on is available without using reserve roots:
+`0bcd99353218b9a386b1c4aec13d77abecdb` and
+`4b88101f5ed7507b73138a73dfbf55f972de` each has one complete initial source
+episode containing only `/requests/0` at time zero, with inputs 320/320 and
+outputs 21/16. Their zero-aligned C2 offer can exercise a small N2 group, but
+**actual batching must be witnessed, never forced or inferred from C**. C4 can
+add the intact 384- and 448-token openings from
+`48f9644a9b17cade09142b3d8f964bea35be` and
+`6d5c6b957d5f634a7f820ddff7389e161def`. Only six eligible exposed complete first
+episodes have every input below 640; do not manufacture C8 by duplicating roots
+or dropping larger neighbours. This is a metadata-only development proposal,
+not a full-session or confidence sample; no new workload or run was created.
 
-**99% confidence about fixed configuration-level gate estimates is distinct from
-“at least 99% of requests/workloads pass.”** The latter is a separate reliability
-estimand and has not been added as a PoC requirement. Nor does 99% descriptor
-coverage imply either statement. Exhaustively evaluating a declared finite
-scenario set establishes facts about that set, with remaining hardware
-repeatability uncertainty; it does not create independent samples of deployment
-workloads. Even replaying every individual root at C=1 does not exhaust the
-possible C=2/4/8 root combinations; the scenario distribution must remain explicit.
+## 6. Confidence limitation and next step
 
-Use the root as the minimum workload cluster. For the C axis, a practical common
-statistical design, conditional on a feasible execution budget, is randomly
-ordered, disjoint bundles of eight untouched roots, preserving
-each root's full trajectory. C=1/2/4/8 use nested prefixes within each bundle;
-all TP variants and repeats share those identities. The bundle is the outer
-statistical unit, and requests, C values, TP values and repeats are dependent
-measurements within it. With the current conservative reserve there can be at
-most **18 disjoint eight-root bundles**, before any further quarantine or new
-development use. This is a ceiling, not a justified sample size. Other valid
-root-sampling designs are possible, but must state their dependence explicitly.
+**No currently practical small suite establishes literal joint 99% confidence
+over all 393 roots.** Static coverage and repeatability do not establish workload
+generalization. Confidence in configuration estimates is also different from a
+claim that at least 99% of requests/workloads pass; no such pass-rate gate is
+added here.
 
-Root strata can be chosen from census-only properties such as size, input/output
-tails, fanout and trajectory span. A probability sample must give every member of
-its declared population a known nonzero inclusion probability; use fixed stratum
-weights for oversampling. Pure greedy mechanism selection belongs in development.
-Sampling only the untouched partition supports that partition directly. An
-all-corpus estimate must also account for the exposed/quarantined partition with
-explicit weights and evidence; it cannot silently drop it and retain the
-393-root label. Fresh evaluation of exposed roots can be labelled regression or
-finite-corpus verification, but does not restore unseen-workload status.
+Prioritize the source-supported tiny, near-limit and intact-root pairs, followed
+by complementary sustained/fanout and multi-client cold-opening evidence.
+Before confirmation, freeze the predictor and a probability design covering
+both the 249 exposed and at-most-144 untouched partitions, with known inclusion
+probabilities. The untouched partition cannot stand in for all 393 roots.
+Specify the C=1/2/4/8 root-bundle construction, preserve complete within-root
+structure and gaps, and keep each root's requests, nested C scenarios and
+hardware repeats together in uncertainty calculations. Three paired repeats
+remain a useful run-noise check, not three independent workload samples.
 
-The registration must define the **estimand before the interval**. Preserve the
-existing per-scenario metric functionals and tolerance bars, and say how scenarios
-aggregate into each configuration estimate. For example, request-weighted TTFT
-quantiles require a root-sampling-weighted request distribution, whereas an
-equal-root quantile is different. Throughput of a synchronized root cohort is
-tokens divided by its own end-to-end window; a mean of root throughputs or one
-giant pooled clock is a different estimand. Do not substitute median or mean
-per-request error for error between the registered aggregate summaries. Keep
-request-level absolute error and failures as visible diagnostics beside the
-configuration gates. Idle-dominated throughput can obscure service-time error;
-retain queue/latency and sustained-load diagnostics alongside it without silently
-changing the gated functional.
+A later registration must fix sample size, repeat count, budget, population
+aggregation and a validated simultaneous confidence method before outcomes are
+seen. Preserve the existing metric functionals/bars and mandatory memory,
+feasibility and ranking checks; allocate total alpha 0.01 across the claimed
+family rather than calling separate intervals jointly 99%. Insufficient
+clusters, uncertain interval coverage, bounds crossing a bar, incomplete runs
+or budget exhaustion mean inconclusive. Do not reroll expensive/failing roots
+or add repeats until a nominal bootstrap interval passes. Resolve zero-output
+semantics before retaining an all-393-root claim. All current timing evidence
+remains node-busy/advisory; TP2/TP4 remain paused.
 
-For uncertainty, keep real/modelled observations paired and propagate workload
-cluster and hardware-repeat variation separately, preserving strata and all
-within-bundle dependence. Use simultaneous intervals for the predeclared family
-of configuration/metric claims: independent 99% intervals per gate do not give
-99% joint confidence. A Bonferroni allocation of total alpha 0.01 across the
-fixed family is a simple conservative option; a justified simultaneous method
-can be more efficient. Ranking/top-1, memory, infeasibility and speedup retain
-their stated roles: ranking/top-1, memory and infeasibility remain mandatory,
-while speedup is advisory under the user's override. Mandatory claims need
-explicit treatment if included in the joint 99% statement; a speed estimate can
-be reported separately. Bootstrap intervals from a small bundle sample are approximate; validate
-the chosen design's assumptions and label that approximation rather than claim
-an exact guarantee.
-
-**Stop rule:** use exposed-root development measurements to plan cost and
-precision, then fix the confirmation sample size and hardware-repeat count
-within a written budget. Pass only if all mandatory functionality checks pass
-and the simultaneous confidence intervals for every claimed error gate lie
-wholly within its unchanged tolerance. An interval crossing a tolerance is
-inconclusive, even when its point estimate passes. Exhausting the budget or
-reserve is also inconclusive. Do not repeatedly add roots until a naive interval
-passes. If sequential confirmation is necessary, register a valid alpha-spending
-or confidence-sequence procedure first. Any model change after inspecting a
-confirmation outcome moves those roots to development and requires a new frozen
-confirmation set.
-
-As an illustration of why a different reliability claim is demanding, with n
-independent IID Bernoulli trials and all successes, the one-sided exact 99%
-lower bound is `0.01**(1/n)`. Requiring that bound to reach 0.99 needs at least
-459 independent trials. The current correlated requests/repeats are not such
-trials, and that calculation is **not** a sample-size prescription for the
-configuration-error estimands above or for this finite corpus.
+The feasible cost/precision decision and detailed sampling registration are
+deferred until mechanism results justify them. This review allocates no reserve
+roots and launches no confirmation experiment.
 
 ## 7. Cost and evidence record
 
@@ -424,8 +429,11 @@ configuration variants and repeats. This is a cost floor for that schedule,
 not a claim that all runs must execute sequentially. Thus CPU census and deterministic support checks are
 cheap compared with raw-paced confirmation. The predictor can advance virtual
 idle time, but the real reference cannot silently compress gaps while retaining
-the same registration. An accelerated-idle protocol would require a separate
-scope and evidence of state equivalence. Runtime budgets must be based on
+the same registration. Future idle-skipping would need a separately qualified
+protocol, paired evidence of target drain and equivalent native state/time
+semantics at each skipped gap, and hardware wake/cooling effects accounted for.
+Source G=0 boundaries alone do not supply that evidence; no gap is compressed
+in the proposed confirmation. Runtime budgets must be based on
 preserved arrivals, target execution and preparation/startup/derivation costs,
 not input+output volume alone.
 
@@ -455,12 +463,20 @@ accuracy/exposure inventories are under its sibling
 | Baseline request-accuracy `INVENTORY.json` | `e930c135ac15b07e3e7dcf97faf716a3fd8856bfe63fabed9dd108d9fd9809f6` |
 | Historical outcome-prefix `LEGACY_EMBEDDED_IDENTITY_V1.json` | `45f6964243dbfd8fa1d9fae6911ec6079251247b7a765b4450984fa76a450660` |
 | Low-range `SOURCE_SUPPORT_HANDOFF_V1.json` | `e5ddcc22a7452f7580cade6c7dafdda9ba2a4e6f7c4a2705aaa9ec63d19ead55` |
-| Low-range `CANDIDATE_PROFILE_V1.json` (unactivated) | `6e26d4cb7304b9d6868308deca808dd0334bf30747146ce4f3682a7adf38e3f9` |
+| Low-range `CANDIDATE_PROFILE_V1.json` (diagnostic-only selection) | `6e26d4cb7304b9d6868308deca808dd0334bf30747146ce4f3682a7adf38e3f9` |
+| Tiny `REFUSAL_HANDOFF_V1.json` | `38f9ba230d252dbd3821d2725d3f903bad981ade28d2c1cdc9fd07bec5d881a8` |
+| Near-limit `REFUSAL_HANDOFF_V1.json` | `b2f44ec02f84db1b9425a98b4f300ead3a51793d1fff06c7b562470b64e2a059` |
+| `REGION_SUPPORT_HANDOFF_V1.json` | `59870d4c9dbc5668fd71927f4f56447fdaba84a8011365d6103c5a59f3779b66` |
 
 The low-range handoff and candidate are under
 `agent_scratch/codex_decode_domain_v1/ingress_handoff_low_extension_v1` in the
 same CPU evidence tree. Earlier profiles, canaries and audit findings remain
 historical evidence; the candidate does not relabel them.
+The refusal handoffs are under the respective case directories in
+`agent_scratch/codex_corpus_diagnostics_v1/results/`; the source audit is under
+`agent_scratch/codex_small_prefill_regions_v1/`. The metadata-only C2/C4 proposal
+is retained in the confidence worktree's
+`agent_scratch/corpus_confidence_v1/COLD_OPENING_BUNDLE_PROPOSAL.json`.
 
 The current root exposure ledger is
 `agent_scratch/corpus_review_v1/EXPOSURE_LEDGER_V2.json` in the review worktree.

@@ -15,6 +15,45 @@ passing cells do not establish whole-corpus accuracy or 99% confidence.
 The earlier corrected short-c4 paired campaign is held while these priorities
 are addressed.
 
+**New corpus diagnostics (2026-09-14): two region-domain refusals, no new paired
+acceptance.** Low-byte readiness support passed, but the selected region model
+still refuses compiled output-producing N1 prefill at 128 tokens against
+`[640,16384]`. The seven-request full root begins at 448 and was held by explicit
+preflight without a run. The near-limit 250,048/39 case priced all 16 prefills
+(15 × 16,384 plus 4,288), then refused first decode history **250,049** against
+`[128,196608]`. Its 39-token response did not complete. The “2M history” source
+extended summed history at selected 16/32-request cells, not the per-row bound.
+
+Tiny used the old wrapper v1: its reconstructed source-path defect remains in
+the original record, while actual `--trace` and separate identity pins survive.
+Near-limit used wrapper v2 with correct source identity and passing provenance
+checks. Both owned waiting replays were stopped after worker refusal; original
+journals remain `exit=-15`, `ok=false`, `refused=false` (near-limit wrapper exit
+1). They are domain witnesses and incomplete diagnostics, not valid paired
+accuracy results. Both CPU lanes are closed. The maintained diagnostic CLI and
+owned-refusal monitor are now integrated in `60dc92c84`; their future exit-5
+model-refusal classification does not rewrite those old outcomes.
+
+The disjoint-interval seam is integrated in `b27d0e7f2`, preserving 11 legacy
+snapshots with 125 CPU tests passing. Historical cold 128/256/512 and N2-total
+512/1,536 source captures were recovered for review. A finite high-history
+source acquisition is approved (90 cases, 17,280 intervals, per-row guard
+262,143, 56 heldouts including asymmetric layouts; plan `23779826…`). No fitted
+continuation or selected region activation is claimed here. **TP2/TP4 remain
+paused.** Next useful evidence is source-supported tiny/near-limit/intact-root
+pairs and the complementary 21-request sustained diagnostic. N1 low-prefill
+support must not stand in for multi-client N2/pool support; the coverage review
+records a minimal exposed-root C2/C4 cold-opening proposal, with actual batching
+to be witnessed and no manufactured C8 case.
+
+The seven diagnostic manifests are unchanged; **249 roots remain exposed and
+at most 144 potentially untouched**, with no new reserve allocation. The
+[confirmation next step](CC_TRACES_COVERAGE_REVIEW.md#6-confidence-limitation-and-next-step)
+requires a frozen probability design spanning both partitions, cluster-aware
+uncertainty and an inconclusive stop; detailed sampling is deferred. It does not claim that a small suite,
+static coverage or a bootstrap establishes literal joint 99% over all 393 roots.
+The original paired count below remains **9/24, including 8/8 original TP1**.
+
 **2026-09-14 checkpoint: nine paired cc-traces cells pass the current
 aggregate checks, including all 8/8 original TP1 cells.** The original TP1
 execution sweep is closed. Its eight cells use the frozen candidate at commit
@@ -76,8 +115,9 @@ excluded timings were released. **All 84 heldout component checks pass** the
 unchanged 100-microsecond limit; the maximum error is **49.154504 microseconds**.
 Candidate profile `6e26d4cb` accepts all **532 previously refused requests /
 1,064 byte variants across 340 roots** in the positive canary; **56 CPU
-regressions pass**. The candidate is **not activated**. These are CPU source
-and profile checks: they add no E2E acceptance cell and do not prove
+regressions pass**. The candidate was subsequently selected **only for the new
+modelled corpus diagnostics**, with registry `94ef3d0f`; no registered acceptance
+cell was changed. These CPU source/profile checks add no E2E acceptance cell and do not prove
 whole-corpus accuracy. Representative fresh E2E confirmation remains required.
 Probe v1's failure and all earlier acceptance artifacts remain preserved.
 
@@ -211,6 +251,13 @@ its raw `target_host_v1/handoff/RESULT.json` has SHA256
 `bba73a22bb64824bb466921d329b13259a55efd61e8044c3186cdda2f16fbff9`.
 Raw traces, source probe outputs and temporary reviews remain ignored
 scratch artifacts.
+
+New refusal evidence is under `codex_corpus_diagnostics_v1/results/` in the
+tiny and near-limit case directories. Their `REFUSAL_HANDOFF_V1.json` hashes
+are `38f9ba230d252dbd3821d2725d3f903bad981ade28d2c1cdc9fd07bec5d881a8`
+and `b2f44ec02f84db1b9425a98b4f300ead3a51793d1fff06c7b562470b64e2a059`.
+The source audit's `REGION_SUPPORT_HANDOFF_V1.json` hash is
+`59870d4c9dbc5668fd71927f4f56447fdaba84a8011365d6103c5a59f3779b66`.
 
 **First TP2 E2E transfer cell verified.** The frozen `8a637eff` candidate's
 three real/modelled pairs preserve both registered requests and pass all
