@@ -5,15 +5,13 @@ from its final snapshot; clearing indexes must not look like cache eviction.
 This module performs no device operations. Workers own their completion fence.
 """
 
-from atom.compass.core.cache_policy import snapshot as policy_snapshot
-from atom.utils.clock import get_clock
-
-
 SNAPSHOT_SCHEMA = "compass.cache_snapshot/1"
 RESET_SCHEMA = "compass.cache_reset/1"
 
 
 def snapshot(engine, *, input_batches=None):
+    from atom.compass.core.cache_policy import snapshot as policy_snapshot
+
     scheduler = engine.scheduler
     if scheduler is None:
         raise RuntimeError("this engine has no scheduler")
@@ -70,6 +68,8 @@ def reset(engine):
     the final check/clear with input ingestion; newly accepted requests belong
     after the boundary. A retained, already completed token output is preserved.
     """
+    from atom.utils.clock import get_clock
+
     before = snapshot(engine)
     result = {"acknowledged": False, "before": before}
     if not before["quiescence"]["idle"]:
