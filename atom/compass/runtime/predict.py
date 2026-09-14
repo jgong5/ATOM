@@ -49,6 +49,17 @@ class CompassPredictMixin:
     reaches -- ``_forward_traced`` and ``_forward_measured``.
     """
 
+    def compass_cache_barrier(self) -> dict:
+        """The predicting runner has no GPU work to fence."""
+        if self._compass_config.mode != "predict":
+            return super().compass_cache_barrier()
+        if self._pending:
+            return {"acknowledged": False,
+                    "why": "a predicting runner holds measured device events"}
+        return {"acknowledged": True, "kind": "modelled_no_device",
+                "retained_output_requests": len(self._deferred_output or ()),
+                "retained_outputs_preserved": True}
+
     def _init_compass_state(self) -> None:
         """Everything Compass adds, once the runner underneath it exists.
 

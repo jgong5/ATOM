@@ -2433,6 +2433,22 @@ async def health():
     return {"status": "ok"}
 
 
+@app.get("/compass/cache")
+async def compass_cache():
+    if engine is None:
+        raise HTTPException(status_code=503, detail="Engine is not initialized")
+    return engine.get_compass_cache()
+
+
+@app.post("/compass/cache/reset")
+async def compass_cache_reset():
+    """Acknowledge a native idle boundary before measured traffic begins."""
+    if engine is None:
+        raise HTTPException(status_code=503, detail="Engine is not initialized")
+    result = engine.reset_compass_cache()
+    return JSONResponse(content=result, status_code=200 if result["acknowledged"] else 409)
+
+
 @app.get("/compass/requests")
 async def compass_requests(drain: bool = True):
     """Per-request timings as the engine measured them, on the engine's clock.

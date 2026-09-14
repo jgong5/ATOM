@@ -1631,6 +1631,23 @@ class ModelRunner:
         """
         return freeze_gc_heap(worker_process_name(self.config, self.rank))
 
+    def compass_cache_barrier(self) -> dict:
+        """Complete this worker's GPU work before a native idle index reset.
+
+        The token pipeline can retain its final unused output after all
+        requests finish. Synchronize its D2H stream too, preserving the output
+        and prev_batch for the normal next-forward lifecycle.
+        """
+        torch.cuda.synchronize(self.device)
+        processor = self.tokenID_processor
+        previous = processor.prev_batch
+        return {
+            "acknowledged": True,
+            "kind": "device_synchronize",
+            "retained_output_requests": len(previous.req_ids) if previous else 0,
+            "retained_outputs_preserved": True,
+        }
+
     def get_num_blocks(self) -> dict[str, object]:
         torch.set_default_device(self.device)
         config = self.config

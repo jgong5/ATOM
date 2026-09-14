@@ -513,6 +513,24 @@ class LLMEngine:
         )
         return {"ranks": [resp.get("result", resp) for resp in responses]}
 
+    def get_compass_cache(self, timeout: float = 30.0) -> dict[str, Any]:
+        from atom.compass.core.cache_boundary import SNAPSHOT_SCHEMA
+
+        responses = self.core_mgr.broadcast_utility_command_sync(
+            "get_compass_cache", timeout=timeout)
+        return {"schema": SNAPSHOT_SCHEMA,
+                "ranks": [resp.get("result", resp) for resp in responses]}
+
+    def reset_compass_cache(self, timeout: float = 30.0) -> dict[str, Any]:
+        from atom.compass.core.cache_boundary import RESET_SCHEMA
+
+        responses = self.core_mgr.broadcast_utility_command_sync(
+            "reset_compass_cache", timeout=timeout)
+        ranks = [resp.get("result", resp) for resp in responses]
+        return {"schema": RESET_SCHEMA, "ranks": ranks,
+                "acknowledged": bool(ranks) and all(
+                    rank.get("acknowledged") is True for rank in ranks)}
+
     def get_cache_statistics(self, timeout: float = 30.0) -> dict[str, Any]:
         """Return aggregated prefix-cache statistics across DP ranks.
 

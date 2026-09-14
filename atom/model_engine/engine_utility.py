@@ -47,16 +47,20 @@ class EngineUtilityHandler:
         "get_cache_statistics": "_handle_get_cache_statistics",
         "get_compass_arrival_barrier": "_handle_get_compass_arrival_barrier",
         "get_compass_inputs": "_handle_get_compass_inputs",
+        "get_compass_cache": "_handle_get_compass_cache",
+        "reset_compass_cache": "_handle_reset_compass_cache",
         "abort_request": "_handle_abort_request",
     }
 
     def __init__(
-        self, runner_mgr, output_queue, label: str = "Engine Core", scheduler=None
+        self, runner_mgr, output_queue, label: str = "Engine Core", scheduler=None,
+        engine=None,
     ):
         self.runner_mgr = runner_mgr
         self.output_queue = output_queue
         self.label = label
         self.scheduler = scheduler
+        self.engine = engine
 
     def process_queue(self, utility_queue, engine):
         """Drain *utility_queue* and execute each command.
@@ -216,6 +220,29 @@ class EngineUtilityHandler:
         logger.info(f"{self.label}: KV cache cleared")
         self.output_queue.put_nowait(
             ("UTILITY_RESPONSE", {"cmd": "clear_kv_cache", "result": result})
+        )
+
+    def _handle_get_compass_cache(self, args: dict):
+        from atom.compass.core.cache_boundary import snapshot
+
+        try:
+            result = snapshot(self.engine)
+        except Exception as exc:
+            result = {"why": f"{type(exc).__name__}: {exc}"}
+        self.output_queue.put_nowait(
+            ("UTILITY_RESPONSE", {"cmd": "get_compass_cache", "result": result})
+        )
+
+    def _handle_reset_compass_cache(self, args: dict):
+        from atom.compass.core.cache_boundary import reset
+
+        try:
+            result = reset(self.engine)
+        except Exception as exc:
+            logger.warning("Cache reset failed", exc_info=True)
+            result = {"acknowledged": False, "reasons": [f"{type(exc).__name__}: {exc}"]}
+        self.output_queue.put_nowait(
+            ("UTILITY_RESPONSE", {"cmd": "reset_compass_cache", "result": result})
         )
 
     def _handle_abort_request(self, args: dict):

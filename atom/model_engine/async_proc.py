@@ -226,6 +226,7 @@ class AsyncIOProc:
     _BARRIER_FUNCS: ClassVar[set[str]] = {
         "update_weights_from_ipc",
         "update_weights_from_shm",
+        "compass_cache_barrier",
     }
 
     def busy_loop(self):

@@ -325,6 +325,7 @@ class EngineCore:
             self.output_queue,
             label=self.label,
             scheduler=self.scheduler,
+            engine=self,
         )
 
         # KV cache allocated, graphs captured, BlockPool built: everything this
