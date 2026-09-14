@@ -1671,6 +1671,11 @@ class Scheduler:
         self._rejected = []
         return out
 
+    def _notify_release_failure(self, seq: Sequence) -> None:
+        fail = getattr(getattr(self, "_release_calendar", None), "fail", None)
+        if callable(fail):
+            fail(seq, seq.leave_reason)
+
     def _decision_record(self, kind: str, batched_tokens: int) -> dict:
         """What the scheduler could see when it chose this step.
 
@@ -1843,6 +1848,7 @@ class Scheduler:
                 seq.finish_time = get_clock().time()
                 seq.leave_reason = f"unschedulable: {unschedulable}"
                 self._rejected.append(seq)
+                self._notify_release_failure(seq)
                 continue
 
             if len(self.running) >= self.max_num_seqs:
@@ -2276,6 +2282,7 @@ class Scheduler:
         seq.finish_time = get_clock().time()
         seq.leave_reason = "aborted"
         self._rejected.append(seq)
+        self._notify_release_failure(seq)
         if not has_inflight_load or not self._connector_flag("is_offload"):
             self._uncount_inflight_load(seq)
             return

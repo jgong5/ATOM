@@ -516,7 +516,8 @@ async def _submit_requests(base, payloads, arrivals, *, pace, timeout,
             except asyncio.CancelledError:
                 row["ok"] = False
                 row.pop("response", None)
-                row["error"] = "CancelledError: request cancelled"
+                row["error"] = (f"CancelledError: request cancelled after fixed-absolute request {causal_failure} failed"
+                                if causal_failure is not None else "CancelledError: request cancelled")
             except (aiohttp.ClientError, OSError, ValueError, RuntimeError) as exc:
                 row["ok"] = False
                 row.pop("response", None)
@@ -527,21 +528,27 @@ async def _submit_requests(base, payloads, arrivals, *, pace, timeout,
                     row["send_timing"]["client_response_returned_wall_time"] = _time.time()
                 if finished is not None:
                     finished[i].set()
-                if releases is not None:
-                    if row["ok"]:
+                if fixed_absolute_plan is not None:
+                    if row["ok"] and releases is not None:
                         releases.complete(i, row["send_timing"]["finished_offset_s"])
-                    elif causal_failure is None:
+                    elif not row["ok"] and causal_failure is None:
                         causal_failure = i
                     completion_changed.set()
 
-        async def drive_releases():
-            while not releases.done:
+        async def drive_fixed_requests():
+            """Keep release ownership, but stop either finite mode on failure."""
+            while True:
                 completion_changed.clear()
                 if causal_failure is not None:
                     for task in tasks:
                         if not task.done():
                             task.cancel()
                     return
+                if releases is None:
+                    if all(task.done() for task in tasks):
+                        return
+                    await completion_changed.wait()
+                    continue
                 for index, when in releases.pop_due(_time.monotonic() - epoch):
                     results[index]["send_timing"]["causal_release_offset_s"] = when
                     released[index].set()
@@ -565,8 +572,8 @@ async def _submit_requests(base, payloads, arrivals, *, pace, timeout,
             epoch = _time.monotonic()
             epoch_wall = _time.time()
             start.set()
-            if releases is not None:
-                coordinator = asyncio.create_task(drive_releases())
+            if fixed_absolute_plan is not None:
+                coordinator = asyncio.create_task(drive_fixed_requests())
                 try:
                     await asyncio.gather(coordinator, *tasks)
                 finally:
@@ -598,7 +605,8 @@ async def _submit_requests(base, payloads, arrivals, *, pace, timeout,
             "release_owner": "client_response_callbacks" if pace else "virtual_engine_calendar",
             "clients": len(fixed_absolute_plan.roots),
             "root_complete_offsets": releases.root_completion_times() if releases is not None else None,
-            "all_leaves_returned": releases.done if releases is not None else None,
+            "all_leaves_returned": releases.done if releases is not None else all(row["ok"] for row in results),
+            "failed_index": causal_failure,
         }
     return results, submission
 

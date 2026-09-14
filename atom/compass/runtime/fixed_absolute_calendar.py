@@ -15,6 +15,7 @@ class FixedAbsoluteCalendar:
         self.state = FixedAbsoluteReleases(plan, clock.epoch)
         self.sequences = None
         self.released, self.completed = {}, {}
+        self.failures = {}
 
     def register(self, sequences):
         if self.sequences is not None or self.clock.time() != self.clock.epoch:
@@ -33,11 +34,11 @@ class FixedAbsoluteCalendar:
 
     @property
     def next_release_at(self):
-        return self.state.next_due if self.sequences is not None else math.inf
+        return self.state.next_due if self.sequences is not None and not self.failures else math.inf
 
     def drain(self):
         """Mature events before reserving ingress; caller maintains waiting order."""
-        if self.sequences is None:
+        if self.sequences is None or self.failures:
             return set()
         changed = set()
         for index, released_at in self.state.pop_due(self.clock.time()):
@@ -56,7 +57,27 @@ class FixedAbsoluteCalendar:
     def is_released(self, seq):
         return seq.id in self.released
 
+    def fail(self, seq, reason):
+        """Record terminal rejection without satisfying any prerequisite.
+
+        The client cancels its other preregistered HTTP requests after the
+        failed response. Their native abort cleanup may notify us again;
+        preserve each failure and stop maturing future releases immediately.
+        """
+        index = seq.compass_workload_index
+        if (type(index) is not int or not 0 <= index < len(self.rows)
+                or (self.sequences is not None and self.sequences[index] is not seq)):
+            raise ValueError("failed request differs from the fixed-absolute registration")
+        self.failures.setdefault(seq.id, {
+            "index": index, "seq_id": str(seq.id), "reason": str(reason),
+            "failed_at": self.clock.time(), "released": self.is_released(seq)})
+
     def complete(self, seq):
+        if getattr(seq, "leave_reason", None) == "aborted":
+            self.fail(seq, "aborted")
+            return
+        if self.failures:
+            return  # A failed finite run cannot release further descendants.
         if self.sequences is None or not self.is_released(seq) or seq.id in self.completed:
             raise ValueError("fixed-absolute terminal notification is out of order")
         index = self.released[seq.id]["index"]
@@ -73,6 +94,10 @@ class FixedAbsoluteCalendar:
 
     def evidence(self):
         return {**self.plan.evidence(), "clock": "virtual", "epoch": self.clock.epoch,
-                "registered": self.sequences is not None, "complete": self.state.done,
+                "registered": self.sequences is not None,
+                "complete": self.state.done and not self.failures, "failed": bool(self.failures),
+                "failures": list(self.failures.values()),
+                "uncompleted_indices": [row["index"] for row in self.rows
+                                        if row["index"] not in self.state.completed],
                 "root_completed_at": self.state.root_completion_times(),
                 "releases": list(self.released.values()), "completions": list(self.completed.values())}
