@@ -7,20 +7,25 @@ without calling a missed 5x target a pass; `cc_traces_validate.py matrix
 --speed-advisory` records this policy explicitly. Existing strict protocol
 registrations and their historical verdicts remain unchanged.
 
-**2026-09-14 checkpoint: four paired cc-traces cells pass the current
-aggregate checks.** The three TP1 cells use the frozen candidate at commit
-`2feea392`; the first TP2 cell uses `8a637eff`. Each has three fresh real and
-three fresh GPU-free modelled runs. Independent review reproduced aggregate
-metrics, per-rank memory, exact requests, provenance, process identities, derivation accounting and
-sampler coverage from the raw artifacts. Each combined validator reports
-`accepted=true`, `passed=true`, and no failures under the current contract.
+**2026-09-14 checkpoint: seven paired cc-traces cells pass the current
+aggregate checks, including six TP1 cells.** TP1 configurations are the current
+execution priority. The six TP1 cells use the frozen candidate at commit
+`2feea392`; the retained first TP2 cell uses `8a637eff`. Each has three fresh
+real and three fresh GPU-free modelled runs. Independent review reproduced
+aggregate metrics, per-rank memory, exact requests, provenance, process
+identities, derivation accounting and sampler coverage from the raw artifacts.
+Each combined validator reports `accepted=true`, `passed=true`, and no
+failures under the current contract.
 
-| Paired cell | Requests per repeat | Throughput error | TTFT median error | TPOT median error |
-| --- | --- | --- | --- | --- |
-| `tp1_clients_short_c1` | 2 | −3.542386% | +9.796520% | +4.475799% |
-| `tp1_clients_short_c2` | 4 | −3.067558% | +3.686786% | +3.270906% |
-| `tp1_clients_large_c1` | 7 | −6.113405% | +12.660296% | +5.035067% |
-| `tp2_clients_short_c1` | 2 | −6.742557% | +3.791065% | +6.445119% |
+| Paired cell | Requests per repeat | Throughput error | TTFT median error | TPOT median error | Replay ratio |
+| --- | --- | --- | --- | --- | --- |
+| `tp1_clients_short_c1` | 2 | −3.542386% | +9.796520% | +4.475799% | 1.36249× |
+| `tp1_clients_short_c2` | 4 | −3.067558% | +3.686786% | +3.270906% | 1.30190× |
+| `tp1_clients_short_c4` | 8 | −2.363219% | −1.069261% | +3.665594% | 1.22940× |
+| `tp1_clients_short_c8` | 17 | −2.843880% | +3.461302% | +9.147776% | 1.12427× |
+| `tp1_clients_large_c1` | 7 | −6.113405% | +12.660296% | +5.035067% | 2.29158× |
+| `tp1_clients_large_c2` | 14 | −6.046615% | +9.740734% | +6.159878% | 2.48310× |
+| `tp2_clients_short_c1` | 2 | −6.742557% | +3.791065% | +6.445119% | 0.61627× |
 
 The registered aggregate tolerances are 10% throughput, 15% TTFT and 10%
 TPOT. All eight non-KV components were compared on every rank in every
@@ -29,39 +34,65 @@ repeat. TP1 maximum component error is **0.035461%**; TP2 maximum is
 blocks** (**0.000887%** error). Both TP2 ranks have **265,540 real / 266,768
 modelled blocks** (**0.462454%** error), within the 5% bar.
 
-**Short-c2 tail/admission discrepancy remains open.** Its median-based gates
-pass, while p90 TTFT is **+30.164484%** and p90 TPOT is **−10.013389%**. These
-tail diagnostics exceed the corresponding 15% and 10% bars and remain
-separate from the passing medians. The admission/tail difference still needs
-an explanation; no coefficient or threshold was changed to hide it.
-Large-c1 p90 TTFT is **+12.261761%** and p90 TPOT **+8.321208%**, within those
-bars; its per-repeat median and p90 comparisons also remain inside.
+**Short-workload tail/admission discrepancies remain open.** The existing
+median-based gates pass; the following p90 diagnostics remain separate.
 
-**Scope: 4 of 24 positive cells pass the current aggregate and memory
-checks; 20 remain.** All eight TP1 modelled cells have completed three fresh
-repeats without refusals. Five of those TP1 cells still need paired real
-evidence. The first TP2 cell establishes one E2E transfer result; broader
-configuration selection, transfer and ranking remain incomplete. The short-c2
-tail discrepancy is not closed by this count. G3c retains its separate frozen negative cc-traces
-witness below. Earlier sampler, source and serving failures remain preserved.
+| TP1 cell | TTFT p90 error | TPOT p90 error |
+| --- | --- | --- |
+| `clients_short_c2` | **+30.164484%** | **−10.013389%** |
+| `clients_short_c4` | +8.283975% | **−22.096999%** |
+| `clients_short_c8` | +5.849286% | **−14.687403%** |
 
-**Shared-node qualification:** all four assigned-device audits report
-`own_clean=true`, with 113, 115, 305 and 90 sampler observations respectively
-covering launch through final server exit. Foreign jobs elsewhere leave the
-isolation verdict `node_busy`, so timing results remain advisory. Closing
-samples and later release observations remain separate evidence; the first
-cell's original closing sample and subsequent idle-baseline check are intact.
+The highlighted tails exceed the corresponding 15% TTFT or 10% TPOT
+reference bars. They are not silently substituted for the existing aggregate
+gate or hidden by its passing medians. Short-c8 median TPOT has only
+**0.852224 percentage points** of margin. Large-c1 p90 TTFT/TPOT errors are
+**+12.261761% / +8.321208%**; large-c2 values are
+**+10.087576% / +8.219798%**, within those reference bars. No acceptance
+coefficient, workload or threshold was changed to obtain these comparisons.
+
+Native TP1 host-enqueue source probes v2 and v3 completed with the accepted
+FULL compilation configuration and cache `dd263e63bc`, preserving native
+waits and natural drains. V3 adds prepare-model and postprocess host
+boundaries. The separate CPU handoff source collection passed structural
+checks, and its endpoint-only models passed all 24 heldout component
+comparisons under the predeclared 100-microsecond absolute service-error
+budget after predictions were frozen. These source observations are not a
+corrected E2E tail verdict. A readiness/preparation-fence successor will first
+be checked diagnostically against retained references; a new acceptance claim
+requires fresh paired proof from its frozen snapshot. Probe v1's failure and
+all earlier acceptance artifacts remain preserved.
+
+**Scope: 7 of 24 positive cells pass the current aggregate and memory
+checks; 17 remain.** All eight TP1 modelled cells have completed three fresh
+repeats without refusals. Six now have paired real evidence, covering all four
+short-workload client counts and large-c1/c2. **Large-c4 real repeats are
+running serially on GPU1; large-c8 follows directly under the same frozen
+source/cache contract.** Their complete modelled counterparts are retained.
+TP2/TP4 expansion is paused under the TP1-first priority. The retained TP2 cell
+establishes one E2E transfer result; broader configuration selection, transfer
+and ranking remain incomplete. The tail discrepancies are not closed by this
+count. G3c retains its separate frozen negative cc-traces witness below.
+Earlier sampler, source and serving failures remain preserved.
+
+**Shared-node qualification:** all seven assigned-device audits report
+`own_clean=true`, with sampler coverage through final server exit. Foreign
+processes and activity outside the assigned set leave the isolation verdict
+`node_busy`, so timing results remain advisory. Closing samples and later
+release observations remain separate evidence; the first cell's original
+closing sample and subsequent idle-baseline check are intact. Large-c2
+recorded unassigned GPU6 activity in 43 of 616 observations, up to 97% use;
+this qualification remains attached to the passing aggregate result.
 TP2 also observed neighbour activity up to 51%. Its final sample covers server
-exit and still reported 72% VRAM on GPU4. Separate allocation
-release and process-identity checks found no live original process; three
-defunct children without file descriptors remain recorded. New foreign GPU
-work after release is separate from the accepted timing window; no idle-node
-claim is made.
+exit and still reported 72% VRAM on GPU4. Separate allocation release and
+process-identity checks found no live original process; three defunct children
+without file descriptors remain recorded. New foreign GPU work after release
+is separate from the accepted timing window; no idle-node claim is made.
 Local modelled-lane and bounded factory-check overlap is disclosed in
 `codex_tp1_remaining_v1/LOCAL_CPU_OVERLAP_DISCLOSURE.json`.
 
-Replay ratios are **1.36249×**, **1.30190×**, **2.29158×** and **0.61627×**,
-respectively, below the advisory 5× target. Startup, execution and derivation windows are
+All replay ratios in the table are below the advisory 5× target; none is
+reported as a speed pass. Startup, execution and derivation windows are
 recorded. Full historical capture/calibration durations and a separate load
 duration remain unknown, so acquisition amortisation is not established.
 
@@ -69,17 +100,31 @@ The first-cell evidence remains in the local `jgong5_compass_cpu` stage at
 `/workspace/ATOM/agent_scratch/codex_tp1_first_pair_v2/`.
 `results/tp1_clients_short_c1/cc_traces_cell.json` has SHA256
 `9f1b5ce16cf68ec658520a48f1a0f055f65e9d2664b53b27a624e9b5d6924a23`.
+
 `FIRST_CELL_EXECUTION_REVIEW.json` records the execution qualification;
-`INDEPENDENT_FIRST_CELL_REVIEW.json` preserves the accepted independent review,
-and `CLOSE_AFTER_RUN.json` preserves the separate release check.
-The two continuation cells are under
+`INDEPENDENT_FIRST_CELL_REVIEW.json` preserves the accepted independent
+review, and `CLOSE_AFTER_RUN.json` preserves the separate release check.
+The five paired TP1 continuation cells are under
 `/workspace/ATOM/agent_scratch/codex_tp1_remaining_v1/results/`.
-Their `cc_traces_cell.json` hashes are
-`883f8d992b262b17bd19fd042239a114d2648613e78f8344b3592e37162d6dd6`
-for `tp1_clients_short_c2` and
-`70400e1aab1f43b1d592cc7a061271d5050fdb6026fb07f8e6f4885b6985410a`
-for `tp1_clients_large_c1`. The adjacent execution reviews retain the p90
-diagnostics; `TP1_CONTINUATION_COMPLETION.json` records modelled completion.
+Their `cc_traces_cell.json` hashes are:
+
+| TP1 continuation cell | SHA256 |
+| --- | --- |
+| `clients_short_c2` | `883f8d992b262b17bd19fd042239a114d2648613e78f8344b3592e37162d6dd6` |
+| `clients_short_c4` | `9c6bc5fab5a291b2ba02f4d106a097065ff288d5ce1bc035b4d11b5f9a898917` |
+| `clients_short_c8` | `44c3d33dcdc6ae871bea4ab2a91c14d76a73b1bd4a49893ae516e3c43e28c220` |
+| `clients_large_c1` | `70400e1aab1f43b1d592cc7a061271d5050fdb6026fb07f8e6f4885b6985410a` |
+| `clients_large_c2` | `ffa075ae4531c2f10c8f485297899d8d961ea1b6b02c2d583fc4ee7c4d57cce7` |
+
+Each `<cell>.EXECUTION_REVIEW.json` in the continuation root retains median,
+p90, memory and closing-sampler evidence; `TP1_CONTINUATION_COMPLETION.json`
+records the completed modelled sweep. Source probe evidence is under
+`codex_decode_domain_v1/native_host_enqueue_v3/target_gpu1_v1/`; its
+`COMPLETE.json` has SHA256
+`39ed2cb3a6ae4d82ce0fa1b63be1e46e6e8830718ad93b33d8d5a6a5d9ad661d`.
+The CPU contract, endpoint prediction freeze and heldout verdict remain under
+`codex_decode_domain_v1/ingress_handoff_support_v2/`. Raw traces, source probe
+outputs and temporary reviews remain ignored scratch artifacts.
 
 **First TP2 E2E transfer cell verified.** The frozen `8a637eff` candidate's
 three real/modelled pairs preserve both registered requests and pass all
