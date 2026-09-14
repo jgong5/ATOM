@@ -281,23 +281,29 @@ Concrete native witnesses already present in the census:
 | Current-root continuity | Current short root `4b433e21f63822412e0f27d5473da9ea1322` | 2,141 API leaves, 2,139 individually eligible, 548,931.661-second span; current workload retains only a two-request episode |
 | Cheap complete-root continuity | Historically exposed root `1493faffdc8942e99daa22277f44871a40b8` | Seven requests, 194,368 input proxy tokens, 4,097 output tokens, 373.459-second arrival span; use as the first intact-root E2E witness after deterministic support passes |
 
-Compact cases from the initial episode inventory are now known to belong to
-historically exposed roots through the outcome-prefix audit. They can exercise
-additional mechanisms without spending an untouched root:
+The final compact-case inventory (`ADDITIONAL_CASES_V4.json`) prefers roots
+already exposed through the outcome-prefix audit. It can exercise additional
+mechanisms without spending an untouched root:
 
 | Mechanism | Exposed root, source episode | Requests | Input proxy/output tokens | Native arrival span |
 | --- | --- | ---: | ---: | ---: |
-| Mixed near-limit/short inputs | `27de9ca964aa7905c2f5438db8bdd72d8b02`, episode 63, root paths 69–71 | 3 | 248,640 / 2,779 | 19.938 s |
+| Smallest native request | `a26302776b9ed6524bac18bdf9a9430f4170`, episode 22, `/requests/22` | 1 | 128 / 16 | 0 s, then generation |
+| Near context limit | `65c7b96990e2e7f206a2c01ed90474f56c57`, episode 163, `/requests/173` | 1 | 250,048 / 39 | 0 s, then generation |
 | Long decode | `6c6be4bc5a49a5d1062b8becdbf188480843`, episode 22, `/requests/31` | 1 | 195,840 / 40,339 | 0 s, then generation |
-| Native fanout | `5fc70a9165e6a1fd4bfd1add7ef5452205b2`, episode 50 | 13 | 345,984 / 11,284 | 40.341 s; source peak 9 |
-| Sustained input-volume candidate | `21cde366f5bd2f0ff2031b0538496c7e2a05`, episode 63 | 34 | 2,001,280 / 32,360 | 59.893 s; source peak 4 |
-| Idle continuity | `94055207ca7ba1e62a4bdaf29652e35fdf14`, adjacent episodes 100–101 | 2 | 4,736 / 793 | 90.119 s; preserve the 82.498 s source-idle gap |
+| Sustained variable arrivals | Current short root `509ad65c576a007df9c0cf1e9863874da21d`, episode 284 | 21 | 459,072 / 15,979 | 68.342 s; source peak 5 |
+| Fanout/target-pressure candidate | `5fc8495d01a2ad301e8ca7879579f2529029`, episode 10 | 95 | 2,019,392 / 92,183 | 333.885 s; source peak 12 |
+| Opening growth and continuity | `7ff48bb238572dba164f441fc274d0cb6e52`, opening episodes 0–2 | 4 | 50,176 / 730 | 11.832 s; root input 384→384→33,408, then a descendant |
+| Complete-root continuity | `1493faffdc8942e99daa22277f44871a40b8`, all five episodes | 7 | 194,368 / 4,097 | 373.459 s; longest source-idle gap 180.652 s |
 
-Episode indices and complete native paths are retained in `ADDITIONAL_CASES.json`.
+Episode indices and complete native paths are retained in `ADDITIONAL_CASES_V4.json`.
 Selection here is for mechanism discovery, not statistical certification.
 Arrival span excludes final generation time; input+output volume is a work proxy,
 not predicted GPU runtime. Fanout and volume nominate target-pressure tests but
-do not establish saturation or preemption. Prefer the cheap complete-root case
+do not establish saturation or preemption. The four-request opening preserves
+its 0.864- and 0.068-second source-idle gaps with no artificial target drain; it
+does not stand for the remainder of that root. A 95-request case is a useful
+mechanism witness but does not qualify the 969-request episode or larger root
+submission limits. Prefer the cheap complete-root case
 and a minimal complementary subset first, and do not make the largest extrema
 mandatory early GPU runs merely because they are extrema.
 
@@ -417,6 +423,7 @@ accuracy/exposure inventories are under its sibling
 | `COVERAGE_REPORT.json` | `796d790d8663faecf5f43b7eb9c018c72ffb82e041b3e3df69de2d863925f8c3` |
 | `LOW_PROMPT_BYTE_CANARY.json` | `90c3d1ea9f5a4448824bf56d74ee72e02d2c0d3fc1b1f85156d2cdce7742d0f3` |
 | `ADDITIONAL_CASES.json` (initial, before exposure preference) | `3c2538559dd22a061daa17c951c22f39510ea35e2fbed2ed32a2f79136289a12` |
+| `ADDITIONAL_CASES_V4.json` (final exposed-root preference) | `29eb56aa0f0b1801194cb75a57e94c3da1bf49410a50a74f22c7084528fcd51f` |
 | Baseline request-accuracy `INVENTORY.json` | `e930c135ac15b07e3e7dcf97faf716a3fd8856bfe63fabed9dd108d9fd9809f6` |
 | Historical outcome-prefix `LEGACY_EMBEDDED_IDENTITY_V1.json` | `45f6964243dbfd8fa1d9fae6911ec6079251247b7a765b4450984fa76a450660` |
 
