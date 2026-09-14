@@ -70,6 +70,7 @@ produced that way can never be mistaken for one that was scoped.
 
 from __future__ import annotations
 
+import heapq
 import math
 
 from atom.compass.core.cost.kv_layout import kv_layout_key
@@ -126,6 +127,12 @@ UNIFIED_SCOPE = ("kv_cache_dtype", "kv_cache_layout", "kv_cache_block_size",
 #: measurements taken on parts with different CU counts are measurements of
 #: different grids, which is the other reason this belongs in the scope.
 PAGED_GLUON_SCOPE = UNIFIED_SCOPE + ("num_kv_heads", "compute_units")
+
+# The mapping probe on gfx942 SPX observed four XCCs, four dispatch groups
+# per XCC and five active CUs per group. This is an explicit declaration:
+# compute_units=80 alone does not identify a dispatch topology.
+PAGED_DISPATCH_SCOPE = PAGED_GLUON_SCOPE + ("decode_dispatch_topology",)
+DECODE_DISPATCH_TOPOLOGIES = {"gfx942-spx-4xcc-80cu": (16, 5)}
 
 #: The static facts a *linear attention* call turns on. No KV cache appears
 #: here: GDN reads the conv and recurrent state pool, never the paged KV cache,
@@ -417,6 +424,42 @@ class Structure:
                     linear = row + rows * head + rows * kv_heads * index
                     classes[linear % compute_units] += tiles
         return max(classes, default=0)
+
+    def dispatch_group_work(self, partition: int, splits: int, kv_heads: int,
+                            groups: int, cus_per_group: int,
+                            window: Optional[int] = None) -> int:
+        """Native tile work list-scheduled within each dispatch group.
+
+        Linear workgroup IDs stay in their modulo-group class, while the
+        hardware can send later work to any free CU in that class. The
+        earliest-free queue is a work-balance descriptor; it does not claim
+        to reproduce each physical CU assignment or instruction timing.
+        Group counts come from declared hardware evidence, never a fit.
+        """
+        contexts = tuple(self.contexts() or ())
+        rows = len(contexts)
+        queues = [[0] * cus_per_group for _ in range(groups)]
+        for index in range(splits):
+            for head in range(kv_heads):
+                for row, context in enumerate(contexts):
+                    if context <= 0:
+                        continue
+                    if window is not None and window > 0:
+                        if index:
+                            continue
+                        start = max(0, (context - window) // partition)
+                        tiles = max(0, -(-context // partition) - start)
+                    else:
+                        page = -(-context // splits)
+                        low = page * index
+                        if low >= context:
+                            continue
+                        high = min(context, low + page)
+                        tiles = -(-high // partition) - low // partition
+                    linear = row + rows * head + rows * kv_heads * index
+                    queue = queues[linear % groups]
+                    heapq.heapreplace(queue, queue[0] + tiles)
+        return max((max(queue) for queue in queues), default=0)
 
     def continued(self) -> Optional[int]:
         """Sequences whose scan resumes from a recurrent state already held.
@@ -780,6 +823,12 @@ REGIMES = {
         "unified.decode.paged_gluon_order",
         ("calls", "cu_max", "work_waves"),
         PAGED_GLUON_SCOPE, law=MAKESPAN),
+    # Separate identity preserves historical fits and their feature meaning.
+    # Selection requires an explicit supported dispatch-topology declaration.
+    "unified.decode.paged_gluon_dispatch": Regime(
+        "unified.decode.paged_gluon_dispatch",
+        ("calls", "dispatch_max", "cu_tiles"),
+        PAGED_DISPATCH_SCOPE, law=MAKESPAN),
     # On the unified/flash branch there is no per-sequence partition to count.
     # What the measurements show instead is that raggedness dominates: a
     # 32-sequence mixed batch summing 394164 context rows costs ~3.70ms while a
@@ -962,6 +1011,8 @@ def regime_of(op: dict, structure: Optional[Structure] = None, scope=None):
                     "one of %s" % (backend, known,
                                    ", ".join(sorted(DECODE_KERNELS))),
                     missing=("attention_backend",))
+            if backend == "paged_gluon" and "decode_dispatch_topology" in (scope or {}):
+                return REGIMES["unified.decode.paged_gluon_dispatch"]
             return REGIMES[regime]
         if structure.has_cached is None:
             return Refusal(
@@ -1041,7 +1092,7 @@ def features_for(regime: Regime, structure: Structure, scope=None):
             values.append(float(structure.split_tiles(
                 partition, splits,
                 window if isinstance(window, int) and window > 0 else None)))
-        elif feature in ("cu_max", "work_waves"):
+        elif feature in ("cu_max", "work_waves", "dispatch_max", "cu_tiles"):
             contexts = structure.contexts()
             if not contexts:
                 return Refusal("the call records no per-sequence context, so "
@@ -1070,6 +1121,27 @@ def features_for(regime: Regime, structure: Structure, scope=None):
                                % ", ".join(missing), missing=missing)
             window = (scope or {}).get("sliding_window")
             window = window if isinstance(window, int) and window > 0 else None
+            if feature in ("dispatch_max", "cu_tiles"):
+                topology = (scope or {}).get("decode_dispatch_topology")
+                dispatch = (DECODE_DISPATCH_TOPOLOGIES.get(topology)
+                            if isinstance(topology, str) else None)
+                if dispatch is None:
+                    return Refusal(
+                        "the decode dispatch topology has no hardware mapping evidence",
+                        missing=("decode_dispatch_topology",))
+                groups, cus_per_group = dispatch
+                if groups * cus_per_group != units:
+                    return Refusal(
+                        "the declared dispatch topology and compute-unit count disagree")
+                if feature == "dispatch_max":
+                    values.append(float(structure.dispatch_group_work(
+                        partition, splits, heads, groups, cus_per_group, window)))
+                else:
+                    # DECODE_OCCUPANCY is a launcher split heuristic, not two
+                    # independent throughput lanes on a CU. Use active CUs.
+                    values.append(float(structure.split_tiles(
+                        partition, splits, window)) * heads / units)
+                continue
             if feature == "cu_max":
                 values.append(float(structure.cu_class_work(
                     partition, splits, heads, units, window)))
