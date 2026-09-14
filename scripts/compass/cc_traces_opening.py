@@ -9,6 +9,7 @@ import json
 from pathlib import Path
 import re
 import sys
+from types import SimpleNamespace
 
 
 CASE_SCHEMA = "compass.aiperf_opening_case/1"
@@ -23,6 +24,11 @@ WORKER_CONFIGURATION = {
     "compilation_level": 3, "cudagraph_mode": "FULL",
     "declared_capture_sizes": DECLARED_CAPTURE_SIZES,
 }
+CACHE_REGION_FACTORY = "atom.compass.runtime.cache_region_oracle.source_cost_oracle"
+CACHE_REGION_OPTIONS = frozenset((
+    "region_overlay", "region_overlay_sha256", "include_failed_outputless",
+    "diagnostic_only", "q16_handoff", "q16_handoff_sha256", "rank_coords",
+))
 
 
 @lru_cache
@@ -147,6 +153,115 @@ def check_result(blob, case):
         raise ValueError("; ".join(errors))
 
 
+def _source_view(modelled, **changes):
+    """A validator-only view; never alter the recorded factory or its options."""
+    manifest = modelled.manifest
+    server = manifest.get("server") or {}
+    return SimpleNamespace(manifest={**manifest, "server": {
+        **server, "compass": {**(server.get("compass") or {}), **changes}}})
+
+
+def check_source_contract(modelled, registry, workload_sha, forbidden, label):
+    """Check the exact diagnostic wrapper, retaining the base protocol checks.
+
+    Pair validation needs the pinned overlay and optional q16 bundle mounted
+    at their configured paths. Reopening verifies those bytes against the
+    worker's original read; it never replaces the worker's attestation. This
+    lets the selected region snapshot be rebuilt with the actual flags, rather
+    than accepting an arbitrary region name from the record itself.
+    """
+    validate = _script("cc_traces_validate")
+    compass = (modelled.manifest.get("server") or {}).get("compass") or {}
+    if compass.get("oracle") != CACHE_REGION_FACTORY:
+        return (validate.check_source_factory(modelled, 1, label)
+                + validate.check_region_calibration(modelled, registry, 1, workload_sha, forbidden)), []
+    options = dict(compass.get("oracle_options") or {})
+    base_options = {key: value for key, value in options.items() if key not in CACHE_REGION_OPTIONS}
+    bad = validate.check_source_factory(
+        _source_view(modelled, oracle=validate.SOURCE_FACTORY, oracle_options=base_options), 1, label)
+    notes = []
+    try:
+        from atom.compass.runtime import cache_region_oracle as wrapper
+        from atom.compass.runtime.source_oracle import _flag, _rank_coords, region_snapshot
+        from atom.compass.core.loaded_input import load_json
+
+        expected = {"model": "Qwen/Qwen3.8-27B", "tp": 1, "block_size": 16,
+                    "max_model_len": 262144, "position_rows": 3,
+                    "cudagraph_mode": "full", "allocation": "native"}
+        for key, value in expected.items():
+            actual = options.get(key)
+            if isinstance(value, int):
+                actual = int(actual) if actual is not None else None
+            elif key == "cudagraph_mode":
+                actual = str(actual).lower()
+            if actual != value:
+                raise ValueError(f"cached-prefill source scope requires {key}={value!r}")
+        if any(rank != 0 for rank in _rank_coords(options.get("rank_coords")).values()):
+            raise ValueError("cached-prefill source scope requires rank zero")
+        ranks = validate._rank_records(modelled)
+        if len(ranks) != 1 or any(value != 0 for value in (ranks[0].get("rank_coords") or {}).values()):
+            raise ValueError("cached-prefill source needs one TP1 reader at rank zero")
+        inputs = ranks[0].get("inputs") or []
+
+        def pinned(option, role):
+            path, sha = options.get(option), options.get(option + "_sha256")
+            rows = [row for row in inputs if row.get("role") == role]
+            if (not isinstance(path, str) or not path or not validate._hexish(sha)
+                    or len(rows) != 1 or rows[0].get("requested") != path
+                    or rows[0].get("sha256") != sha):
+                raise ValueError(f"{option} needs one loaded input matching its explicit path/SHA-256")
+            data, loaded = load_json(path, role=role)
+            if loaded.sha256 != sha or loaded.size != rows[0].get("size"):
+                raise ValueError(f"{option} bytes differ from its pinned worker read")
+            # The option summary is not enough for new roles: independently
+            # retain the existing source provenance/leakage check on this read.
+            bad.extend(validate._check_calibration_records(
+                {role: sha}, {role: {Path(rows[0]["path"]).name: sha}},
+                registry, 1, workload_sha, forbidden))
+            return data
+
+        overlay = pinned("region_overlay", "oracle.region_overlay")
+        if options.get("regions") != overlay["base"]["name"]:
+            raise ValueError("region overlay and requested base preset differ")
+        include_failed = _flag(options.get("include_failed_outputless", False), "include_failed_outputless")
+        diagnostic = _flag(options.get("diagnostic_only", False), "diagnostic_only")
+        selected = wrapper.model_from_artifact(
+            overlay, include_failed_outputless=include_failed, diagnostic_only=diagnostic)
+        snapshot = region_snapshot(overlay["name"], selected)
+        if ranks[0].get("regions") != snapshot:
+            raise ValueError("selected region snapshot differs from its loaded overlay and flags")
+        if include_failed:
+            notes.append("FAILED outputless source qualification retained; diagnostic_only=1; no acceptance credit")
+        selected_options = dict(options, regions=overlay["name"])
+        bad.extend(validate.check_region_calibration(
+            _source_view(modelled, oracle_options=selected_options), registry, 1, workload_sha, forbidden))
+
+        if bool(options.get("q16_handoff")) != bool(options.get("q16_handoff_sha256")):
+            raise ValueError("q16 source handoff and its SHA-256 are required together")
+        if options.get("q16_handoff"):
+            pinned("q16_handoff", "oracle.q16_sources")
+            scopes = [row for row in inputs if row.get("role") == "oracle.attention_scope"]
+            if (len(scopes) != 1 or not options.get("attention_scope")
+                    or scopes[0].get("requested") != options["attention_scope"]
+                    or scopes[0].get("sha256") != (overlay.get("q16_request_scope") or {}).get("sha256")):
+                raise ValueError("q16 addition differs from its pinned deployment request scope")
+            from atom.compass.core.cost.cached_q16 import CachedQ16Prices
+            from atom.compass.core.cost.library import PriceLibrary
+            base = PriceLibrary()
+            base.launch_charge_seconds = float(options.get("seconds_per_launch", 0))
+            q16 = CachedQ16Prices(base, options["q16_handoff"], options["q16_handoff_sha256"])
+            for source in q16.loaded_inputs:
+                matches = [row for row in inputs if row.get("role") == source.role
+                           and row.get("path") == source.path and row.get("sha256") == source.sha256]
+                if len(matches) != 1:
+                    raise ValueError(f"q16 source {source.path} lacks its exact loaded-input identity")
+        elif any(row.get("role") == "oracle.q16_sources" for row in inputs):
+            raise ValueError("unconfigured q16 source handoff was loaded")
+    except (OSError, ValueError, TypeError, KeyError, OverflowError) as exc:
+        bad.append(f"{label}: opening source contract: {exc}")
+    return bad, notes
+
+
 def pair(args):
     try:
         return _pair(args)
@@ -170,7 +285,7 @@ def _pair(args):
     registry_path = Path(args.calibration_registry)
     registry = json.loads(registry_path.read_text())
     paths = {side: validate._runs(cell, side) for side in ("real", "modelled")}
-    failures, notes, reports, memory = [], [case["qualification"]], [], []
+    failures, notes, reports, memory, sources = [], [case["qualification"]], [], [], []
     if len(paths["real"]) != len(paths["modelled"]) or len(paths["real"]) != args.repeats:
         failures.append("opening diagnostic does not contain the requested paired repeats")
     journals = {side: json.loads((cell / f"run.{side}.json").read_text()) for side in paths}
@@ -215,7 +330,18 @@ def _pair(args):
         real, modelled = runs["real"], runs["modelled"]
         failures += compare.check_pair(real, modelled)
         failures += validate.check_side_roles(real, modelled)
-        failures += validate.check_source_factory(modelled, 1, f"repeat {index}")
+        source_bad, source_notes = check_source_contract(
+            modelled, registry, case["workload_sha256"], forbidden, f"repeat {index}")
+        failures += source_bad
+        notes += [note for note in source_notes if note not in notes]
+        compass = (modelled.manifest.get("server") or {}).get("compass") or {}
+        options = compass.get("oracle_options") or {}
+        sources.append({"repeat": index, "observed_oracle": compass.get("oracle"),
+                        "base_validation_factory": validate.SOURCE_FACTORY,
+                        "region_overlay_sha256": options.get("region_overlay_sha256"),
+                        "q16_handoff_sha256": options.get("q16_handoff_sha256"),
+                        "include_failed_outputless": options.get("include_failed_outputless", False),
+                        "diagnostic_only": options.get("diagnostic_only", False)})
         failures += validate.check_predictor_device_freedom(modelled, f"repeat {index}")
         failures += validate.check_capacity_inputs(modelled, f"repeat {index}")
         failures += validate.check_reference_budget_is_measured(real, f"repeat {index}")
@@ -226,8 +352,7 @@ def _pair(args):
         failures += validate.check_calibration(
             modelled, registry, 1, case["workload_sha256"], forbidden,
             expected_opening_plan_sha256=case["workload_sha256"])
-        for check in (validate.check_scalar_overheads, validate.check_capacity_provenance,
-                      validate.check_region_calibration):
+        for check in (validate.check_scalar_overheads, validate.check_capacity_provenance):
             failures += check(modelled, registry, 1, case["workload_sha256"], forbidden)
         reports.append(compare.compare(real, modelled))
     metrics = validate._across_repeats(reports)
@@ -238,7 +363,8 @@ def _pair(args):
     verdict = {"schema": "compass.aiperf_opening_diagnostic/1", "purpose": "diagnostic",
                "accepted": False, "passed": bool(reports) and not failures,
                "case": identity(case), "repeats": len(reports), "metrics": metrics,
-               "memory": memory, "isolation": isolation, "failures": failures, "notes": notes,
+               "memory": memory, "source_contracts": sources,
+               "isolation": isolation, "failures": failures, "notes": notes,
                "calibration_registry_sha256": hashlib.sha256(registry_path.read_bytes()).hexdigest(),
                "cost_accounting": "Use maintained cc_traces_run costs and its per-side partial costs; speed remains advisory"}
     out = Path(args.out) if args.out else cell / "opening_diagnostic.json"

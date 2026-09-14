@@ -176,6 +176,19 @@ execution-identity machinery. `opening-pair` reuses the maintained metric,
 provenance, calibration and policy-aware memory checks, then writes
 `opening_diagnostic.json` with `purpose=diagnostic` and `accepted=false`.
 
+The opening route also checks the exact optional
+`atom.compass.runtime.cache_region_oracle.source_cost_oracle` wrapper. It
+retains the ordinary completeness, head, native-allocation, topology and
+option checks on the base composition. Pair validation requires the pinned
+overlay and optional q16 bundle at their configured paths: their bytes must
+match the worker's original loaded inputs. It rebuilds the selected region
+snapshot with the recorded flags and checks the selected coefficients against
+the source registry. q16 source files and the deployment request scope must
+match their loaded identities. The result retains the observed wrapper name;
+the base-factory check is a separately labelled validation view. Selecting the
+FAILED outputless source remains explicit in the diagnostic notes and never
+gains acceptance credit. The registered acceptance route remains unchanged.
+
 The opening deployment pins bf16 KV, block size 16, batch budget 16,384,
 level 3/FULL and the declared capture ladder through 256. Core policy and
 scheduler limits come from the core cache utility; worker configuration and
@@ -223,6 +236,10 @@ are in `maintained_handoff_v1/HANDOFF.json`, SHA256
 `a6a8facc24e373e0e40719002c47bab99866dc5f002f12580d1e9074fd1b635b`.
 Those plans retain the existing source registry for review; plan construction
 does not establish primitive/region support or authorize a server launch.
+They predate wrapper selection and must be superseded with complete source
+pins before an opening run. The currently qualified q16 bundle for the
+separate `4b433` mechanism fixture does not cover the opening's final q14 or
+its other newly inventoried shapes.
 
 The sibling `codex_cache_on_preflight_v1/STRUCTURAL_CLOSEOUT.json` has SHA256
 `eb120c52550c310b177d1c012bf231baeb4f38cbe45c600cab792afbf523b74d`;

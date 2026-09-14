@@ -24,6 +24,20 @@ import pytest
 from import_guard import skip_if_dependency_missing
 
 
+def test_cache_wrapper_option_files_use_original_worker_reads(tmp_path):
+    overlay, q16 = tmp_path / "overlay.json", tmp_path / "q16.json"
+    overlay.write_text("changed after the worker read")
+    q16.write_text("changed after the worker read")
+    ranks = [{"inputs": [
+        {"role": "oracle.region_overlay", "path": str(overlay), "sha256": "a" * 64},
+        {"role": "oracle.q16_sources", "path": str(q16), "sha256": "b" * 64},
+    ]}]
+    assert api_server._loaded_option_files(ranks) == {
+        "region_overlay": {"overlay.json": "a" * 64},
+        "q16_handoff": {"q16.json": "b" * 64},
+    }
+
+
 def _install_api_server_stubs() -> list[str]:
     """Ensure attribute access ``atom.SamplingParams`` works under the stubbed
     ``atom`` package that ``tests/conftest.py`` installs, and stub any heavy

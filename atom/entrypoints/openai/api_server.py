@@ -2648,6 +2648,8 @@ _ROLE_OPTIONS = {
     "oracle.measured_attention_scope": "measured_attention_scope",
     "oracle.attention_treatments": "attention_treatments",
     "oracle.dispatch_bands": "dispatch_bands",
+    "oracle.region_overlay": "region_overlay",
+    "oracle.q16_sources": "q16_handoff",
 }
 
 

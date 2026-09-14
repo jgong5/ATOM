@@ -29,6 +29,56 @@ opening = run.opening_module
 validate = opening._script("cc_traces_validate")
 
 
+@pytest.fixture
+def wrapper_evidence(tmp_path):
+    """Real wrapper, base factory, qualified q16 loader and reader manifests."""
+    from .test_cache_region_overlay import artifact
+    from .test_cached_q16_prices import bundle
+    from .test_source_oracle import _template_file
+    from .test_attention_call_scopes import PREFILL
+    from atom.compass.core.loaded_input import manifest
+    from atom.compass.runtime.cache_region_oracle import source_cost_oracle
+
+    scope = tmp_path / "scope.json"
+    scope.write_text(json.dumps({"attention_scope": {"unified": PREFILL}}))
+    overlay = artifact.__wrapped__()
+    overlay["q16_request_scope"] = {"sha256": hashlib.sha256(scope.read_bytes()).hexdigest()}
+    path = tmp_path / "overlay.json"
+    path.write_text(json.dumps(overlay))
+    q16_path, q16_sha = bundle.__wrapped__(tmp_path)
+    template = _template_file(tmp_path)
+    options = dict(model=run.plan_module.MODEL, tp=1, block_size=16,
+                   max_model_len=262144, position_rows=3, cudagraph_mode="full",
+                   allocation="native", require_complete=True, head=True, derive=False,
+                   template=template, head_template=template, regions=overlay["base"]["name"],
+                   interpolate=4, attention_scope=str(scope), region_overlay=str(path),
+                   region_overlay_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
+                   include_failed_outputless=1, diagnostic_only=1,
+                   q16_handoff=q16_path, q16_handoff_sha256=q16_sha)
+    oracle = source_cost_oracle(**options)
+    rank = manifest(oracle.compass_loaded_inputs)
+    rank["regions"] = oracle.compass_region_snapshot
+    # Same option grouping as the reporting boundary, including the new aliases.
+    grouped = {}
+    for row in rank["inputs"]:
+        role = row["role"].removeprefix("oracle.")
+        option = {"price_graph": "price", "q16_sources": "q16_handoff"}.get(role, role)
+        grouped.setdefault(option, {})[Path(row["path"]).name] = row["sha256"]
+    digests = {key: next(iter(files.values())) if len(files) == 1 else validate._rolled_digest(files)
+               for key, files in grouped.items()}
+    compass = {"oracle": opening.CACHE_REGION_FACTORY, "oracle_options": options,
+               "loaded_inputs": {"ranks": [rank]}, "oracle_option_sha256": digests,
+               "oracle_option_files": grouped}
+    provenance = {"measured_at_tp": 1, "from_target_engine": False,
+                  "sources": [{"path": "/isolated/source.json", "sha256": "8" * 64}],
+                  "code": {"collector.py": "9" * 64}}
+    registry = {"artifacts": [dict(provenance, kind="source_calibration", sha256=sha,
+                                    contents=grouped[key]) for key, sha in digests.items()]}
+    registry["artifacts"].append(dict(provenance, kind="region_model",
+                                      sha256=rank["regions"]["sha256"]))
+    return compass, registry
+
+
 def case_file(tmp_path):
     path, _, _, _ = fixtures.opening_fixture(tmp_path, 1.)
     data = json.loads(path.read_text())
@@ -162,8 +212,10 @@ def test_opening_result_requires_real_chat_identity_and_causal_release(tmp_path,
             opening.check_result(blob, case)
 
 
-@pytest.mark.parametrize("failure", [None, "calibration", "memory", "journal"])
-def test_pair_route_stays_diagnostic_and_preserves_source_or_memory_failure(tmp_path, monkeypatch, failure):
+@pytest.mark.parametrize("failure", [None, "calibration", "memory", "journal",
+                                      "overlay_pin", "q16_pin", "head", "complete", "allocation"])
+def test_pair_route_stays_diagnostic_and_preserves_source_or_memory_failure(
+        tmp_path, monkeypatch, failure, wrapper_evidence):
     path, sha = case_file(tmp_path)
     case = opening.load_case(path, sha, "aiperf_opening_fixture", target_model=run.plan_module.MODEL)
     cell = tmp_path / "tp1_aiperf_opening_fixture_c1"
@@ -171,25 +223,37 @@ def test_pair_route_stays_diagnostic_and_preserves_source_or_memory_failure(tmp_
     (cell / "diagnostic_case.json").write_text(json.dumps(case))
     (cell / "isolation.json").write_text(json.dumps({"isolated": True, "verdict": "isolated"}))
     registry = tmp_path / "registry.json"
-    registry.write_text("{}")
+    compass, registry_data = wrapper_evidence
+    if failure == "calibration":
+        registry_data["artifacts"][0]["from_target_engine"] = True
+    options = compass["oracle_options"]
+    if failure in ("overlay_pin", "q16_pin"):
+        options["region_overlay_sha256" if failure == "overlay_pin" else "q16_handoff_sha256"] = "0" * 64
+    elif failure in ("head", "complete"):
+        options["head" if failure == "head" else "require_complete"] = False
+    elif failure == "allocation":
+        options["allocation"] = "none"
+    registry.write_text(json.dumps(registry_data))
     plan = opening._plan(path, sha)
     for side in ("real", "modelled"):
         (cell / f"run.{side}.json").write_text(json.dumps({
             "ok": failure != "journal", "purpose": "diagnostic"}))
         blob = {"run": {"server": runtime_readings(side)}, "workload": plan.workload(), "results": [],
                 "execution": {"purpose": "diagnostic", "diagnostic_case": case}}
+        if side == "modelled":
+            blob["run"]["server"].update(compass=compass, tensor_parallel_size=1)
         (cell / f"{side}.r1.json").write_text(json.dumps(blob))
     called = []
     names = ("check_gpu_free", "check_who_served", "check_clocks_finite",
              "check_workload_is_registered", "check_usage_against_workload", "check_engine",
-             "check_cache_policy_evidence", "check_side_roles", "check_source_factory",
+             "check_cache_policy_evidence", "check_side_roles",
              "check_predictor_device_freedom", "check_capacity_inputs",
-             "check_reference_budget_is_measured", "check_calibration",
-             "check_scalar_overheads", "check_capacity_provenance", "check_region_calibration")
+             "check_reference_budget_is_measured",
+             "check_scalar_overheads", "check_capacity_provenance")
     for name in names:
         def check(*args, _name=name, **kwargs):
             called.append((_name, kwargs))
-            return ["source provenance failed"] if failure == "calibration" and _name == "check_calibration" else []
+            return []
         monkeypatch.setattr(validate, name, check)
     def memory(*args, **kwargs):
         called.append(("check_memory_terms", kwargs))
@@ -209,5 +273,50 @@ def test_pair_route_stays_diagnostic_and_preserves_source_or_memory_failure(tmp_
     assert report["purpose"] == "diagnostic" and report["accepted"] is False
     assert report["passed"] is (failure is None)
     assert not (cell / "cc_traces_cell.json").exists()
-    assert next(kw for name, kw in called if name == "check_calibration")["expected_opening_plan_sha256"] == sha
     assert next(kw for name, kw in called if name == "check_memory_terms")["expected_cache_policy"] == cache_on_policy()
+    assert report["source_contracts"][0]["observed_oracle"] == opening.CACHE_REGION_FACTORY
+    if failure is None:
+        assert any("FAILED outputless" in note for note in report["notes"])
+
+
+@pytest.mark.parametrize("damage, expected", [
+    ("base", "base preset"), ("snapshot", "snapshot"), ("diagnostic", "diagnostic_only"),
+    ("unknown", "no such option"), ("topology", "tp="), ("rank", "rank zero"),
+    ("scope", "request scope"), ("missing_q16_source", "loaded-input identity"),
+    ("overlay_bytes", "bytes differ"), ("missing_overlay", "No such file"),
+])
+def test_wrapper_contract_preserves_selection_scope_and_pinned_reads(wrapper_evidence, damage, expected):
+    compass, registry = wrapper_evidence
+    options, rank = compass["oracle_options"], compass["loaded_inputs"]["ranks"][0]
+    if damage == "base":
+        options["regions"] = "source-27b-tp1"
+    elif damage == "snapshot":
+        rank["regions"]["parameters"]["final"]["prepare_intercept"] += .1
+    elif damage == "diagnostic":
+        options["diagnostic_only"] = 0
+    elif damage == "unknown":
+        options["invented_option"] = 1
+    elif damage == "topology":
+        options["tp"] = 2
+    elif damage == "rank":
+        options["rank_coords"] = "tp:1"
+    elif damage == "scope":
+        next(row for row in rank["inputs"] if row["role"] == "oracle.attention_scope")["sha256"] = "0" * 64
+    elif damage == "missing_q16_source":
+        rank["inputs"] = [row for row in rank["inputs"] if row["role"] != "oracle.price_graph"]
+    elif damage == "overlay_bytes":
+        path = Path(options["region_overlay"])
+        path.write_text(path.read_text() + " ")
+    elif damage == "missing_overlay":
+        Path(options["region_overlay"]).unlink()
+    modelled = SimpleNamespace(manifest={"server": {"compass": compass, "tensor_parallel_size": 1}})
+    before = copy.deepcopy(modelled.manifest)
+    bad, _ = opening.check_source_contract(modelled, registry, "7" * 64, {}, "fixture")
+    assert any(expected in issue for issue in bad), bad
+    assert modelled.manifest == before
+
+
+def test_registered_validation_still_refuses_diagnostic_wrapper(wrapper_evidence):
+    compass, _ = wrapper_evidence
+    modelled = SimpleNamespace(manifest={"server": {"compass": compass}})
+    assert "not a cc-traces acceptance cell" in validate.check_source_factory(modelled, 1, "fixture")[0]
