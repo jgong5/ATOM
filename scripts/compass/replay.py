@@ -64,7 +64,11 @@ def _workload(args) -> list[dict]:
         # arrival process into a half-second burst left no trace in the
         # artifact -- the run looked paced and was not.
         scale = max(1e-9, float(args.time_scale))
-        return [{"arrival_s": (float(r.get("arrival_s", 0.0)) - base) / scale,
+        prefix_mode = bool(getattr(args, "prompt_encoding", None))
+        if not prefix_mode and any("prompt_token_sha256" in r for r in rows):
+            raise ValueError("prefix-aware rows require explicit --prompt-encoding")
+        return [{**(r if prefix_mode else {}),
+                 "arrival_s": (float(r.get("arrival_s", 0.0)) - base) / scale,
                  "input_tokens": int(r.get("input_tokens", args.input_tokens)),
                  "output_tokens": int(r.get("output_tokens", args.output_tokens))}
                 for r in rows]
@@ -304,7 +308,7 @@ def _send(url: str, body: dict, timeout: float) -> dict:
 
 
 def _encode_requests(workload, model, tokenizer, *, declared, byte_budget,
-                     prompt_index_base=0):
+                     prompt_index_base=0, prefix_encoding=None, phase="measured"):
     """Construct identical per-request JSON before pacing; retain only bytes.
 
     Tokenization and JSON encoding are measured separately. The measured call
@@ -314,9 +318,19 @@ def _encode_requests(workload, model, tokenizer, *, declared, byte_budget,
     """
     payloads, total_bytes = [], 0
     token_seconds = json_seconds = 0.0
+    token_digests = []
     for i, row in enumerate(workload):
         started = _time.monotonic()
-        prompt = _encoded_prompt(row["input_tokens"], prompt_index_base + i, tokenizer)
+        if prefix_encoding is None:
+            prompt = _encoded_prompt(row["input_tokens"], prompt_index_base + i, tokenizer)
+        else:
+            from atom.compass.prefix_workload import token_digest
+            prompt = prefix_encoding.tokens(
+                row, phase=phase, warmup_index=i if phase == "warmup" else None)
+            digest = token_digest(prompt)
+            if phase == "measured" and digest != row.get("prompt_token_sha256"):
+                raise ValueError("encoded prompt differs from the pinned row token digest")
+            token_digests.append(digest)
         token_seconds += _time.monotonic() - started
         body = {"model": model, "prompt": prompt,
                 "max_tokens": row["output_tokens"], "temperature": 0.0,
@@ -333,9 +347,37 @@ def _encode_requests(workload, model, tokenizer, *, declared, byte_budget,
                 f"prepared request bytes {total_bytes} exceed client memory "
                 f"budget {byte_budget}; no requests from this phase were sent")
         payloads.append(data)
-    return payloads, {"prompt_construction_seconds": token_seconds,
-                      "json_encoding_seconds": json_seconds,
-                      "prepared_request_bytes": total_bytes}
+    encoding = {"prompt_construction_seconds": token_seconds,
+                "json_encoding_seconds": json_seconds,
+                "prepared_request_bytes": total_bytes}
+    if prefix_encoding is not None:
+        encoding["corpus_encoding"] = prefix_encoding.evidence(token_digests, phase)
+    return payloads, encoding
+
+
+def _reset_prefix_cache(base, timeout):
+    from atom.compass.core.cache_boundary import reset_receipt_errors
+
+    clock = _clock_of(base, timeout)
+    if clock not in ("wall", "virtual"):
+        raise ValueError("cache boundary requires a known wall or virtual server clock")
+    receipt = _send(base + "/compass/cache/reset", {}, timeout)
+    errors = reset_receipt_errors(
+        receipt, expected_worker_kind=("modelled_no_device" if clock == "virtual"
+                                       else "device_synchronize"),
+        require_fresh_modelled=clock == "virtual")
+    if errors:
+        raise ValueError("; ".join(errors))
+    return receipt
+
+
+def _prefix_cache_snapshot(base, timeout):
+    with urllib.request.urlopen(base + "/compass/cache", timeout=timeout) as response:
+        snapshot = json.loads(response.read())
+    if (not isinstance(snapshot, dict) or snapshot.get("schema") != "compass.cache_snapshot/1"
+            or not isinstance(snapshot.get("ranks"), list) or not snapshot["ranks"]):
+        raise ValueError("server returned no per-rank prefix-cache snapshot")
+    return snapshot
 
 
 async def _submit_requests(base, payloads, arrivals, *, pace, timeout):
@@ -547,7 +589,9 @@ def _prepare(base: str, model: str, workload: list[dict], args) -> dict:
     payloads, encoding = _encode_requests(
         shapes, model, getattr(args, "_prompt_tokenizer", None), declared=False,
         byte_budget=getattr(args, "client_memory_budget_mib", DEFAULT_CLIENT_MEMORY_MIB) * 1024 * 1024,
-        prompt_index_base=_PREPARE_PROMPT_BASE)
+        prompt_index_base=_PREPARE_PROMPT_BASE,
+        **({"prefix_encoding": args._prefix_encoding, "phase": "warmup"}
+           if getattr(args, "_prefix_encoding", None) is not None else {}))
     results, submission = asyncio.run(_submit_requests(
         base, payloads, [0.0] * len(shapes), pace=False, timeout=args.timeout))
     seconds = _time.monotonic() - began
@@ -621,6 +665,8 @@ def main(argv=None) -> int:
                    help="send the same synthetic prompts as token IDs; tokenize "
                         "before the pacing epoch while retaining that work in "
                         "the measured wall window")
+    p.add_argument("--prompt-encoding", help="explicit pinned corpus-prefix encoding; sends token IDs")
+    p.add_argument("--prompt-encoding-sha256", help="required digest of --prompt-encoding")
     p.add_argument("--time-scale", type=float, default=1.0,
                    help="divide every arrival offset by this, to replay a "
                         "long trace in less time. 1.0 keeps the trace's own "
@@ -648,7 +694,21 @@ def main(argv=None) -> int:
         if args.diagnostic_prepare_output_cap < 2 or args.prepare < 1:
             p.error("--diagnostic-prepare-output-cap requires a cap of at least 2 and --prepare")
 
-    workload = _workload(args)
+    if bool(args.prompt_encoding) != bool(args.prompt_encoding_sha256):
+        p.error("--prompt-encoding and --prompt-encoding-sha256 are required together")
+    args._prefix_encoding = None
+    try:
+        if args.prompt_encoding:
+            from atom.compass.prefix_workload import PrefixEncoding
+            args._prefix_encoding = PrefixEncoding.load(
+                args.prompt_encoding, args.prompt_encoding_sha256)
+            args.pretokenize = True
+        workload = _workload(args)
+        if args._prefix_encoding is not None:
+            args._prefix_encoding.validate_rows(workload)
+    except (OSError, ValueError) as exc:
+        print(f"ATOMCompass refusing prompt encoding: {exc}", file=sys.stderr)
+        return 3
     if not workload:
         print("empty workload", file=sys.stderr)
         return 2
@@ -696,6 +756,12 @@ def main(argv=None) -> int:
 
     args._prompt_tokenizer = (_load_prompt_tokenizer(model)
                               if args.pretokenize else None)
+    if args._prefix_encoding is not None:
+        try:
+            args._prefix_encoding.verify_tokenizer(args._prompt_tokenizer, model)
+        except ValueError as exc:
+            print(f"ATOMCompass refusing tokenizer: {exc}", file=sys.stderr)
+            return 3
     prepare = _prepare(base, model, workload, args) if args.prepare else None
     if prepare is not None and not prepare["drained"]:
         print("ATOMCompass WARNING: preparation did not drain -- the engine's "
@@ -704,6 +770,17 @@ def main(argv=None) -> int:
               file=sys.stderr)
         return 3
 
+    cache_reset = None
+    if args._prefix_encoding is not None:
+        if prepare is not None and args.prepare_out:
+            with open(args.prepare_out, "w", encoding="utf-8") as fh:
+                json.dump(prepare, fh, indent=1)
+        try:
+            cache_reset = _reset_prefix_cache(base, args.timeout)
+        except (OSError, RuntimeError, ValueError) as exc:
+            print(f"ATOMCompass refusing cache boundary: {exc}", file=sys.stderr)
+            return 3
+
     execution_started_at = _time.time()
     began = _time.monotonic()
     # Keep prompt/token and JSON work inside measured execution but before the
@@ -711,7 +788,9 @@ def main(argv=None) -> int:
     try:
         payloads, encoding = _encode_requests(
             workload, model, args._prompt_tokenizer, declared=not args.pace,
-            byte_budget=resource_plan["memory_budget_bytes"])
+            byte_budget=resource_plan["memory_budget_bytes"],
+            **({"prefix_encoding": args._prefix_encoding}
+               if args._prefix_encoding is not None else {}))
     except (MemoryError, ValueError) as exc:
         print(f"ATOMCompass refusing prepared workload: {exc}", file=sys.stderr)
         return 3
@@ -720,6 +799,12 @@ def main(argv=None) -> int:
         pace=args.pace, timeout=args.timeout))
     execution_seconds = _time.monotonic() - began
     execution_ended_at = _time.time()
+    cache_end, cache_error = None, None
+    if args._prefix_encoding is not None:
+        try:
+            cache_end = _prefix_cache_snapshot(base, args.timeout)
+        except (OSError, RuntimeError, ValueError) as exc:
+            cache_error = str(exc)
 
     # What the run produced, against what it was asked to produce. This client
     # counted only the requests whose *send* raised and reported "0 failed"
@@ -849,6 +934,15 @@ def main(argv=None) -> int:
             "conversion_in_execution": bool(args.pretokenize),
         },
     }
+    if args._prefix_encoding is not None:
+        manifest["prompt_encoding"]["corpus_encoding"] = encoding["corpus_encoding"]
+        manifest["cache_boundary"] = cache_reset
+        manifest["cache_state_after"] = cache_end
+        if cache_error:
+            manifest["cache_state_error"] = cache_error
+            manifest["complete"] = False
+            manifest["incomplete_reasons"] = {
+                **(manifest["incomplete_reasons"] or {}), "cache_observation": cache_error}
     if prepare and args.prepare_out:
         with open(args.prepare_out, "w", encoding="utf-8") as fh:
             json.dump(prepare, fh, indent=1)
@@ -884,6 +978,9 @@ def main(argv=None) -> int:
               f"Every latency in this run is invalid: {json.dumps(detail)}",
               file=sys.stderr)
         return 1
+    if cache_error:
+        print(f"ATOMCompass refusing cache evidence: {cache_error}", file=sys.stderr)
+        return 3
     if not manifest["complete"]:
         # After the artifact is written, for the same reason the barrier check
         # is: the file is the evidence, and a run that exits non-zero without

@@ -113,7 +113,8 @@ def load_case(workload, manifest, manifest_sha256, case_id, *, target_model):
     workload_sha = _digest(stated.get("sha256"), "workload digest")
     if _sha(data) != workload_sha:
         raise ValueError("diagnostic workload digest differs from the pinned manifest")
-    rows = replay_rows([json.loads(line) for line in data.splitlines() if line.strip()])
+    raw_rows = [json.loads(line) for line in data.splitlines() if line.strip()]
+    rows = replay_rows(raw_rows)
     has_zero_output = any(row["output_tokens"] == 0 for row in rows)
     if has_zero_output and stated.get("zero_output_semantics") != ZERO_OUTPUT_SEMANTICS:
         raise ValueError(
@@ -180,6 +181,31 @@ def load_case(workload, manifest, manifest_sha256, case_id, *, target_model):
     }
     if has_zero_output:
         case["zero_output_semantics"] = ZERO_OUTPUT_SEMANTICS
+    encoding_ref = stated.get("prompt_encoding")
+    if encoding_ref is not None:
+        from atom.compass.prefix_workload import PrefixEncoding
+        from atom.compass.core.cache_policy import cache_on_policy, policy_errors
+
+        if not isinstance(encoding_ref, dict) or not encoding_ref.get("path"):
+            raise ValueError("prompt_encoding must identify a pinned encoding artifact")
+        path = Path(encoding_ref["path"])
+        if not path.is_absolute():
+            path = manifest.parent / path
+        codec = PrefixEncoding.load(path, _digest(encoding_ref.get("sha256"), "encoding digest"))
+        if codec.spec["tokenizer"]["model"] != target_model:
+            raise ValueError("prefix encoding names a different target tokenizer")
+        tokens = codec.validate_rows(raw_rows)
+        if codec.rows_digest(raw_rows) != codec.rows_digest(provenance):
+            raise ValueError("prefix rows disagree with native source provenance")
+        problems = policy_errors(stated.get("cache_policy"), cache_on_policy())
+        if problems:
+            raise ValueError("; ".join(problems))
+        case.update(prompt_encoding={"path": codec.path, "sha256": codec.sha256},
+                    prompt_token_sha256=tokens, cache_policy=stated["cache_policy"],
+                    rows_sha256=codec.rows_digest(raw_rows))
+    elif (any("prompt_token_sha256" in row for row in raw_rows)
+          or stated.get("cache_policy") is not None):
+        raise ValueError("cache-aware diagnostics require an explicit prompt_encoding")
     return case
 
 
@@ -199,6 +225,10 @@ def identity(case):
     result = {key: case[key] for key in keys}
     if "zero_output_semantics" in case:
         result["zero_output_semantics"] = case["zero_output_semantics"]
+    if "prompt_encoding" in case:
+        result.update(prompt_encoding={"sha256": case["prompt_encoding"]["sha256"]},
+                      prompt_token_sha256=case["prompt_token_sha256"],
+                      cache_policy=case["cache_policy"])
     return result
 
 
@@ -208,5 +238,18 @@ def check_result(blob, case):
         raise ValueError("diagnostic result request count differs from the pinned case")
     if len(blob.get("results") or []) != case["requests"]:
         raise ValueError("diagnostic result count differs from the pinned case")
-    if rows_digest(blob.get("workload") or []) != case["rows_sha256"]:
+    rows = blob.get("workload") or []
+    if "prompt_encoding" in case:
+        from atom.compass.prefix_workload import PrefixEncoding
+
+        codec = PrefixEncoding.load(**case["prompt_encoding"])
+        actual = ((blob.get("run") or {}).get("prompt_encoding") or {}).get("corpus_encoding") or {}
+        if (actual.get("sha256") != codec.sha256 or actual.get("codec") != codec.spec["codec"]
+                or actual.get("phase") != "measured"
+                or actual.get("row_token_sha256") != case["prompt_token_sha256"]):
+            raise ValueError("diagnostic result does not attest its pinned encoded token rows")
+        got = codec.rows_digest(rows)
+    else:
+        got = rows_digest(rows)
+    if got != case["rows_sha256"]:
         raise ValueError("diagnostic result rows differ from the pinned case")
