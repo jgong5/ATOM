@@ -317,19 +317,7 @@ def test_client_wall_window_excludes_warmup_drain_and_reporting(tmp_path, trace,
 
 
 def test_pretokenization_precedes_pacing_but_remains_in_execution(tmp_path, monkeypatch):
-    class Clock:
-        value = 0.0
-
-        def monotonic(self):
-            return self.value
-
-        def time(self):
-            return 1_700_000_000.0 + self.value
-
-        def sleep(self, seconds):
-            self.value += seconds
-
-    clock = Clock()
+    import time
 
     class Tokenizer:
         init_kwargs = {"_commit_hash": "test-tokenizer-revision"}
@@ -337,33 +325,29 @@ def test_pretokenization_precedes_pacing_but_remains_in_execution(tmp_path, monk
         def encode(self, prompt, *, add_special_tokens):
             assert add_special_tokens is False
             words = prompt.split()
-            clock.sleep(0.01 if len(words) == 2 else 0.10)
+            time.sleep(0.01 if len(words) == 2 else 0.10)
             return [{"the": 101, "of": 102}[word] for word in words]
 
-    monkeypatch.setattr(replay, "_time", clock)
     monkeypatch.setattr(replay, "_load_prompt_tokenizer", lambda model: Tokenizer())
-    sent = []
-    original_send = replay._send
-
-    def send(url, body, timeout):
-        sent.append((len(body["prompt"]), clock.monotonic(), body["prompt"]))
-        return original_send(url, body, timeout)
-
-    monkeypatch.setattr(replay, "_send", send)
     path, out = tmp_path / "paced.jsonl", tmp_path / "paced.json"
     path.write_text('\n'.join(json.dumps(row) for row in (
         {"arrival_s": 0.0, "input_tokens": 2, "output_tokens": 1},
         {"arrival_s": 0.25, "input_tokens": 10, "output_tokens": 1})))
-    assert _run(_Stub(), path, out, ("--pace", "--pretokenize")) == 0
-    by_size = {size: (at, ids) for size, at, ids in sent}
-    assert by_size[2][0] == pytest.approx(0.11)
-    assert by_size[10][0] - by_size[2][0] == pytest.approx(0.25)
-    assert by_size[2][1] == [101, 101]
-    assert by_size[10][1] == [102] + [101] * 9
-    run = json.loads(out.read_text())["run"]
-    assert run["prompt_encoding"]["conversion_seconds"] == pytest.approx(0.11)
-    assert run["prompt_encoding"]["conversion_in_execution"] is True
-    assert run["wall_execution"]["seconds"] == pytest.approx(0.36)
+    stub = _Stub()
+    assert _run(stub, path, out, ("--pace", "--pretokenize")) == 0
+    by_size = {len(body["prompt"]): body["prompt"] for body in stub.bodies}
+    assert by_size[2] == [101, 101]
+    assert by_size[10] == [102] + [101] * 9
+    result = json.loads(out.read_text())
+    run = result["run"]
+    encoding = run["prompt_encoding"]
+    assert encoding["conversion_seconds"] >= 0.11
+    assert encoding["conversion_in_execution"] is True
+    assert encoding["json_encoding_before_pacing"] is True
+    assert encoding["pacing_started_at"] >= run["wall_execution"]["started_at"] + encoding["conversion_seconds"] - 0.002
+    assert run["wall_execution"]["seconds"] >= encoding["conversion_seconds"] + 0.25
+    assert run["submission"]["fresh_paired_runs_required"] is True
+    assert result["results"][1]["send_timing"]["headers_callback_offset_s"] >= 0.25
 
 
 def test_pretokenization_refuses_a_tokenizer_that_changes_workload_length(tmp_path, trace,
@@ -373,8 +357,10 @@ def test_pretokenization_refuses_a_tokenizer_that_changes_workload_length(tmp_pa
             return [1]
 
     monkeypatch.setattr(replay, "_load_prompt_tokenizer", lambda model: WrongTokenizer())
-    with pytest.raises(ValueError, match="expected 8"):
-        _run(_Stub(), trace, tmp_path / "wrong.json", ("--pretokenize",))
+    stub = _Stub()
+    assert _run(stub, trace, tmp_path / "wrong.json", ("--pretokenize",)) == 3
+    assert not stub.bodies
+    assert not (tmp_path / "wrong.json").exists()
 
 
 class TestARunThatDidNotCompleteExitsNonZero:

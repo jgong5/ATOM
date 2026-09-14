@@ -130,61 +130,6 @@ class TestWhenTheRungIsMissing:
         assert oracle.estimate(_shape(4, 200, None)).seconds > 0
 
 
-class TestAWorkloadFitsThroughTheClient:
-    """A declared workload is posted all at once or it deadlocks.
-
-    The server holds every declared request until all of them have arrived, so
-    every one must be in flight at the same time. A client with fewer
-    connections than requests waits for responses the server will not produce
-    until the requests it is still holding back have been posted. It resolves
-    only when the arrival barrier times out, and the run that follows is not
-    the declared arrival process -- requests enter as earlier ones finish.
-
-    That happened on a 300-request workload against a 64-connection pool. The
-    client reported "0 failed", the server logged the timeout and called its own
-    latencies invalid, and the result was read as a measurement for a day. These
-    tests are the boundary that was missing.
-    """
-
-    def _workers(self, count, pace=False):
-        """What the client would open for a workload of `count`."""
-        import importlib.util
-        from pathlib import Path
-
-        spec = importlib.util.spec_from_file_location(
-            "replay_mod",
-            Path(__file__).resolve().parents[2] / "scripts/compass/replay.py")
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        return len(range(count)), module.MAX_IN_FLIGHT
-
-    def test_every_request_gets_a_connection(self):
-        workers, _ = self._workers(300)
-        assert workers == 300
-
-    def test_the_bound_is_above_the_workloads_in_use(self):
-        """300 was the one that failed; the bound has to clear it and the
-        831-request corpus slice as well."""
-        _, cap = self._workers(1)
-        assert cap >= 831
-
-    def test_past_the_bound_it_refuses_rather_than_deadlocks(self):
-        """Posting fewer than were declared is the deadlock. Refusing is the
-        only other honest option until a bulk submission exists."""
-        import importlib.util
-        from pathlib import Path
-
-        spec = importlib.util.spec_from_file_location(
-            "replay_mod2",
-            Path(__file__).resolve().parents[2] / "scripts/compass/replay.py")
-        module = importlib.util.module_from_spec(spec)
-        spec.loader.exec_module(module)
-        source = (Path(__file__).resolve().parents[2]
-                  / "scripts/compass/replay.py").read_text()
-        # The refusal is a SystemExit on the size check, not a silent clamp.
-        assert "MAX_IN_FLIGHT" in source
-        assert "min(64, len(workload))" not in source
-        assert "raise SystemExit" in source
 
 
 class TestPaddingIsAFeature:

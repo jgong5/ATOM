@@ -33,14 +33,16 @@ requests batch together.
 """
 
 import argparse
+import asyncio
 import json
 import math
+import os
 import random
+import resource
 import sys
 import time as _time
 import urllib.error
 import urllib.request
-from concurrent.futures import ThreadPoolExecutor
 
 
 def _workload(args) -> list[dict]:
@@ -79,11 +81,43 @@ def _workload(args) -> list[dict]:
     return out
 
 
-#: Most requests this client will hold open at once. One thread each, so this
-#: is a thread count as much as a connection count. Not a tuning knob: past it
-#: the declared-arrival protocol needs a bulk submission the server does not
-#: have, and quietly posting fewer would reintroduce the deadlock this bounds.
-MAX_IN_FLIGHT = 1024
+DEFAULT_CLIENT_MEMORY_MIB = 4096
+
+
+def _client_resource_plan(workload, prepare, memory_mib):
+    """Refuse a workload that cannot be submitted whole, before warming a server.
+
+    This is a conservative client allocation budget, not target KV accounting or
+    an RSS guarantee. Allow 64 bytes per input/output token and 64 KiB per open
+    request for Python/HTTP state. Actual prepared JSON bytes are also bounded.
+    Never turn a resource shortage into a smaller completion-dependent pool.
+    """
+    if memory_mib <= 0 or prepare < 0:
+        raise ValueError("client memory budget must be positive; preparation cannot be negative")
+    n = len(workload)
+    token_sum = sum(r["input_tokens"] + r["output_tokens"] for r in workload)
+    cycles, remainder = divmod(prepare, n)
+    prepare_tokens = cycles * token_sum + sum(
+        r["input_tokens"] + r["output_tokens"] for r in workload[:remainder])
+    estimate = max(64 * token_sum + 65536 * n,
+                   64 * prepare_tokens + 65536 * prepare)
+    budget = memory_mib * 1024 * 1024
+    if estimate > budget:
+        raise ValueError(
+            f"client memory estimate {estimate} bytes exceeds the {budget}-byte "
+            "budget; provide a sufficient --client-memory-budget-mib or a "
+            "different explicitly registered workload (no requests were sent)")
+    opened = len(os.listdir("/proc/self/fd"))
+    soft_limit, _ = resource.getrlimit(resource.RLIMIT_NOFILE)
+    needed = opened + max(n, prepare) + 64
+    if soft_limit != resource.RLIM_INFINITY and needed > soft_limit:
+        raise ValueError(
+            f"whole-workload submission needs {needed} file descriptors including "
+            f"reserve, above RLIMIT_NOFILE={soft_limit}; no requests were sent")
+    return {"memory_budget_bytes": budget, "memory_estimate_bytes": estimate,
+            "estimate_rule": "64 bytes/input-or-output token + 64 KiB/request; max of measured/preparation",
+            "open_fds_before": opened, "fd_reserve": 64,
+            "required_fds": needed, "fd_soft_limit": soft_limit}
 
 
 #: `main` exits with this when the workload did not complete -- a request that
@@ -269,6 +303,155 @@ def _send(url: str, body: dict, timeout: float) -> dict:
         raise RuntimeError(f"HTTP {exc.code}: {detail}") from exc
 
 
+def _encode_requests(workload, model, tokenizer, *, declared, byte_budget,
+                     prompt_index_base=0):
+    """Construct identical per-request JSON before pacing; retain only bytes.
+
+    Tokenization and JSON encoding are measured separately. The measured call
+    belongs inside the execution wall window, after preparation/drain. This
+    changes client encode jitter versus the old threaded sender and requires
+    fresh paired runs; retained real references are not interchangeable.
+    """
+    payloads, total_bytes = [], 0
+    token_seconds = json_seconds = 0.0
+    for i, row in enumerate(workload):
+        started = _time.monotonic()
+        prompt = _encoded_prompt(row["input_tokens"], prompt_index_base + i, tokenizer)
+        token_seconds += _time.monotonic() - started
+        body = {"model": model, "prompt": prompt,
+                "max_tokens": row["output_tokens"], "temperature": 0.0,
+                "ignore_eos": True}
+        if declared:
+            body.update(compass_arrival=row["arrival_s"],
+                        compass_workload_size=len(workload), compass_workload_index=i)
+        started = _time.monotonic()
+        data = json.dumps(body).encode()
+        json_seconds += _time.monotonic() - started
+        total_bytes += sys.getsizeof(data)
+        if total_bytes > byte_budget:
+            raise ValueError(
+                f"prepared request bytes {total_bytes} exceed client memory "
+                f"budget {byte_budget}; no requests from this phase were sent")
+        payloads.append(data)
+    return payloads, {"prompt_construction_seconds": token_seconds,
+                      "json_encoding_seconds": json_seconds,
+                      "prepared_request_bytes": total_bytes}
+
+
+async def _submit_requests(base, payloads, arrivals, *, pace, timeout):
+    """Submit every row independently of response completion, using native HTTP.
+
+    A declared workload needs all N connections until its closed registration
+    barrier opens. aiohttp's default pool of 100 would deadlock at N>100.
+    Coroutines remove the OS-thread ceiling; they do not remove socket costs.
+    Paced requests wait on their own timers, never another request's response.
+    """
+    import aiohttp
+
+    if len(payloads) != len(arrivals):
+        raise ValueError("one arrival is required for every prepared request")
+    if not math.isfinite(timeout) or timeout <= 0:
+        raise ValueError("network attempt timeout must be finite and positive")
+    setup_started = _time.monotonic()
+    trace = aiohttp.TraceConfig()
+    epoch = epoch_wall = None
+    start = asyncio.Event()
+    ready = asyncio.Event()
+    ready_count = 0
+
+    async def headers_callback(_session, context, _params):
+        timing = context.trace_request_ctx
+        timing["headers_callback_offset_s"] = _time.monotonic() - epoch
+        timing["headers_callback_at"] = _time.time()
+
+    async def body_chunk_callback(_session, context, params):
+        timing = context.trace_request_ctx
+        timing["body_chunk_callback_offset_s"] = _time.monotonic() - epoch
+        timing["body_chunk_callback_at"] = _time.time()
+        timing["body_chunk_callback_bytes"] = timing.get("body_chunk_callback_bytes", 0) + len(params.chunk)
+
+    # Despite aiohttp's hook names, 3.13.5 invokes these before header buffering
+    # and before chunk transport.write/drain. They do not witness wire delivery.
+    trace.on_request_headers_sent.append(headers_callback)
+    trace.on_request_chunk_sent.append(body_chunk_callback)
+    results = [{"index": i, "ok": False, "error": "not submitted",
+                "send_timing": {"source_arrival_s": arrivals[i]}}
+               for i in range(len(payloads))]
+    # Keep the old urllib connection-close policy. No per-host or global pool
+    # limit may hold a declared row behind a response from an earlier row.
+    connector = aiohttp.TCPConnector(limit=0, limit_per_host=0, force_close=True)
+    request_timeout = aiohttp.ClientTimeout(total=timeout, sock_connect=timeout,
+                                           sock_read=timeout, ceil_threshold=math.inf)
+    async with aiohttp.ClientSession(connector=connector, timeout=request_timeout,
+                                     trace_configs=[trace]) as session:
+        async def one(i):
+            nonlocal ready_count
+            row = results[i]
+            try:
+                ready_count += 1
+                if ready_count == len(payloads):
+                    ready.set()
+                await start.wait()
+                if pace:
+                    await asyncio.sleep(max(0.0, arrivals[i] - (_time.monotonic() - epoch)))
+                timing = row["send_timing"]
+                timing["request_started_offset_s"] = _time.monotonic() - epoch
+                timing["request_started_at"] = _time.time()
+                if pace:
+                    timing["request_start_lateness_s"] = timing["request_started_offset_s"] - arrivals[i]
+                # sock_connect/sock_read alone leave upload backpressure
+                # unbounded. The attempt deadline starts after the pacing wait
+                # and covers connecting, body writes and response completion.
+                async with session.post(
+                    base + "/v1/completions", data=payloads[i],
+                    headers={"Content-Type": "application/json"},
+                    trace_request_ctx=timing,
+                ) as response:
+                    raw = await response.read()
+                    if response.status >= 400:
+                        raise RuntimeError(f"HTTP {response.status}: {raw.decode(errors='replace')[:400]}")
+                    row.update(ok=True, response=json.loads(raw))
+                    row.pop("error", None)
+            except asyncio.CancelledError:
+                row["ok"] = False
+                row.pop("response", None)
+                row["error"] = "CancelledError: request cancelled"
+            except (aiohttp.ClientError, OSError, ValueError, RuntimeError) as exc:
+                row["ok"] = False
+                row.pop("response", None)
+                row["error"] = f"{type(exc).__name__}: {exc}"
+            finally:
+                row["send_timing"]["finished_offset_s"] = _time.monotonic() - epoch
+
+        tasks = [asyncio.create_task(one(i)) for i in range(len(payloads))]
+        try:
+            if tasks:
+                await ready.wait()
+            # All tasks and bodies exist before a common pacing epoch. Creating
+            # thousands of tasks must not consume the first source intervals.
+            epoch = _time.monotonic()
+            epoch_wall = _time.time()
+            start.set()
+            await asyncio.gather(*tasks)
+        except asyncio.CancelledError:
+            if epoch is None:
+                epoch, epoch_wall = _time.monotonic(), _time.time()
+            for task in tasks:
+                task.cancel()
+            await asyncio.gather(*tasks, return_exceptions=True)
+    return results, {
+        "schema": "compass.http_submission/1", "implementation": "aiohttp",
+        "version": aiohttp.__version__, "connection_limit": None,
+        "connection_reuse": False, "pacing_started_at": epoch_wall,
+        "task_setup_seconds": epoch - setup_started,
+        "network_attempt_timeout_s": timeout,
+        "timeout_scope": "after pacing wait, through connection, upload and complete response",
+        "requests_with_header_callback": sum("headers_callback_at" in r["send_timing"] for r in results),
+        "timing_meaning": "request start and aiohttp pre-write trace callbacks; not wire completion, target ingress or engine arrival",
+        "fresh_paired_runs_required": True,
+    }
+
+
 def _served_model(base: str, timeout: float) -> str | None:
     """Ask the server what it is serving.
 
@@ -339,44 +522,15 @@ def _prepare(base: str, model: str, workload: list[dict], args) -> dict:
     """
     shapes = [workload[i % len(workload)] for i in range(args.prepare)]
     began = _time.monotonic()
-
-    def send(i_row):
-        i, row = i_row
-        # No `compass_workload_size`, deliberately. The scheduler's arrival
-        # barrier latches open once a declared workload has fully arrived and
-        # never re-arms -- so a preparation batch that declared itself would
-        # open it, and the *measured* workload would then run unheld. That is
-        # the failure the barrier exists to prevent: requests reach the engine
-        # out of declared order, an idle virtual clock jumps to the first one
-        # it sees, and everything declared earlier is retroactively late.
-        # Undeclared, `_arrival_barrier_unmet` finds no expected count, holds
-        # nothing, and leaves the latch armed for the phase that needs it.
-        # `_PREPARE_PROMPT_BASE + i`, not `i`: `prompt_of_tokens` is a function
-        # of the index, so preparation reusing the measured indices would send
-        # byte-identical prompts, and with prefix caching on the measured run
-        # would be scored against blocks preparation had already filled. Warm
-        # the kernels, not the workload's own prefixes.
-        body = {"model": model,
-                "prompt": _encoded_prompt(
-                    row["input_tokens"], _PREPARE_PROMPT_BASE + i,
-                    getattr(args, "_prompt_tokenizer", None)),
-                "max_tokens": row["output_tokens"], "temperature": 0.0,
-                # Same fixed-length generation as the measured phase below.
-                # Preparation warms the kernels the measured run will use, so
-                # it has to walk the same decode lengths; a request that ends
-                # early here warms a shorter step sequence than the one being
-                # prepared for.
-                "ignore_eos": True}
-        try:
-            return {"index": i, "ok": True,
-                    "response": _send(base + "/v1/completions", body,
-                                      args.timeout)}
-        except (urllib.error.URLError, OSError, ValueError, RuntimeError) as exc:
-            return {"index": i, "ok": False,
-                    "error": f"{type(exc).__name__}: {exc}"}
-
-    with ThreadPoolExecutor(max_workers=max(1, len(shapes))) as pool:
-        results = list(pool.map(send, enumerate(shapes)))
+    # Preparation must never arm the measured workload's one-shot barrier or
+    # reuse its prompt identities. Each HTTP request still reaches one native
+    # CoreManager.add_request([seq]); this does not batch engine admission.
+    payloads, encoding = _encode_requests(
+        shapes, model, getattr(args, "_prompt_tokenizer", None), declared=False,
+        byte_budget=getattr(args, "client_memory_budget_mib", DEFAULT_CLIENT_MEMORY_MIB) * 1024 * 1024,
+        prompt_index_base=_PREPARE_PROMPT_BASE)
+    results, submission = asyncio.run(_submit_requests(
+        base, payloads, [0.0] * len(shapes), pace=False, timeout=args.timeout))
     seconds = _time.monotonic() - began
     returned = sum(1 for r in results if r["ok"])
 
@@ -390,6 +544,7 @@ def _prepare(base: str, model: str, workload: list[dict], args) -> dict:
           f"{not (after.get('requests') or [])}")
     return {"requested": len(shapes), "returned": returned,
             "wall_seconds": round(seconds, 3),
+            "encoding": encoding, "submission": submission,
             "drained_records": len(rows),
             "store_empty_after_drain": not (after.get("requests") or []),
             "drained": bool(ok),
@@ -417,6 +572,11 @@ def main(argv=None) -> int:
     p.add_argument("--output-tokens", type=int, default=32)
     p.add_argument("--seed", type=int, default=0)
     p.add_argument("--timeout", type=float, default=600.0)
+    p.add_argument("--client-memory-budget-mib", type=int,
+                   default=DEFAULT_CLIENT_MEMORY_MIB,
+                   help="client allocation planning budget (default 4096 MiB); "
+                        "insufficient memory or file descriptors refuse the "
+                        "whole workload, never throttle requests")
     p.add_argument("--out", required=True)
     p.add_argument("--pace", action="store_true",
                    help="deliver each request when its arrival really comes "
@@ -445,11 +605,19 @@ def main(argv=None) -> int:
                    help="compare the server's reported prompt_tokens against "
                         "what was asked for, and warn if they differ")
     args = p.parse_args(argv)
+    if not math.isfinite(args.timeout) or args.timeout <= 0:
+        p.error("--timeout must be finite and positive")
 
     workload = _workload(args)
     if not workload:
         print("empty workload", file=sys.stderr)
         return 2
+    try:
+        resource_plan = _client_resource_plan(
+            workload, args.prepare, args.client_memory_budget_mib)
+    except (OSError, ValueError) as exc:
+        print(f"ATOMCompass refusing whole-workload submission: {exc}", file=sys.stderr)
+        return 3
     base = f"http://{args.host}:{args.port}"
     model = args.model or _served_model(base, args.timeout)
     if model is None:
@@ -498,103 +666,20 @@ def main(argv=None) -> int:
 
     execution_started_at = _time.time()
     began = _time.monotonic()
-    # Tokenization on the real server delays engine admission by length. The
-    # predictor admits declared token workloads, so that delay can change the
-    # schedule being compared. Convert identical prompts before pacing starts;
-    # conversion remains inside the execution cost on both sides.
-    encoded_prompts = None
-    if args.pretokenize:
-        encoded_prompts = [
-            _encoded_prompt(row["input_tokens"], i, args._prompt_tokenizer)
-            for i, row in enumerate(workload)]
-    pacing_began = _time.monotonic() if args.pretokenize else began
-    pacing_started_at = _time.time() if args.pretokenize else execution_started_at
-
-    def one(i_row):
-        i, row = i_row
-        at = row["arrival_s"]  # already scaled when the workload was built
-        if args.pace:
-            # Hold the request until its moment really comes round. Against a
-            # real engine this is what makes the arrival process real: the
-            # queue is genuinely empty between arrivals, which declaring an
-            # arrival cannot achieve -- a declared workload is posted up front
-            # and sits in `waiting`, so the scheduler always sees a full queue
-            # however the arrivals are stamped.
-            delay = at - (_time.monotonic() - pacing_began)
-            if delay > 0:
-                _time.sleep(delay)
-        body = {
-            "model": model,
-            "prompt": (encoded_prompts[i] if encoded_prompts is not None
-                       else _prompt(row["input_tokens"], i)),
-            "max_tokens": row["output_tokens"],
-            "temperature": 0.0,
-            # Fixed-length generation, asked for rather than hoped for. Each
-            # output token is a decode step, so a request that stops on the
-            # model's EOS runs a shorter step sequence than the one the
-            # workload registered -- and the two sides of a comparison would
-            # stop at different places. `CompletionRequest.ignore_eos`
-            # (atom/entrypoints/openai/protocol.py:246) reaches
-            # `SamplingParams` at api_server.py:1697, and `serve_bench.py`
-            # has always sent it; this client had not, which is why the count
-            # check below could be argued with.
-            "ignore_eos": True,
-        }
-        if not args.pace:
-            # Declared rather than delivered: against a simulated engine the
-            # wall clock and the virtual clock race, so the arrival is stated
-            # and the engine honours it. Ignored by a server on a real clock,
-            # which is why --pace exists for that side.
-            body["compass_arrival"] = at
-            # The count travels with the declaration and only with it. The
-            # barrier holds the virtual clock until `compass_workload_size`
-            # requests are waiting, which a declared workload satisfies as fast
-            # as the socket allows. A paced client delivers them across the
-            # trace's own span instead, so declaring the count under --pace
-            # arms a barrier that submission cannot fill: it waits out
-            # `ARRIVAL_BARRIER_TIMEOUT_S`, opens anyway, and every latency from
-            # that point is invalid. Seen on a 62-request cc_pilot run where 11
-            # had arrived when the 120s ran out, and the first batch landed
-            # after the barrier had already given up.
-            body["compass_workload_size"] = len(workload)
-            # Preserve the workload's stable row order for equal arrivals.
-            body["compass_workload_index"] = i
-        try:
-            return {"index": i, "ok": True, "response": _send(base + "/v1/completions",
-                                                              body, args.timeout)}
-        except (urllib.error.URLError, OSError, ValueError, RuntimeError) as exc:
-            return {"index": i, "ok": False, "error": f"{type(exc).__name__}: {exc}"}
-
-    # Posted concurrently and as fast as the socket allows: *when* each lands is
-    # deliberately not the arrival the engine uses.
-    # One thread per request, in both modes, for two different reasons.
-    #
-    # Paced: each thread spends its wait sleeping, so a pool of 64 would
-    # serialise the 65th arrival behind an earlier request's *generation*
-    # rather than behind its arrival.
-    #
-    # Declared: the server holds every declared request until all of them have
-    # arrived, so all of them must be in flight at once. A pool of 64 against a
-    # 300-request workload is a deadlock -- 64 threads each blocked on a
-    # response the server will not produce until 300 have been posted. It
-    # resolves only when the arrival barrier times out, and then the run is not
-    # the workload that was asked for: requests enter as earlier ones complete,
-    # which is not the declared arrival process. This happened, went unnoticed
-    # because the client still reported "0 failed", and a day's conclusions
-    # were drawn from the result.
-    workers = len(workload)
-    if workers > MAX_IN_FLIGHT:
-        raise SystemExit(
-            f"{workers} requests needs {workers} concurrent connections, over "
-            f"the {MAX_IN_FLIGHT} this client will open. A declared workload "
-            f"cannot be posted in batches -- the server waits for all of it "
-            f"before it starts -- so this needs a bulk submission endpoint "
-            f"rather than a larger pool. Use --num-requests to bound the "
-            f"workload meanwhile.")
-    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
-        results = list(pool.map(one, enumerate(workload)))
-        execution_seconds = _time.monotonic() - began
-        execution_ended_at = _time.time()
+    # Keep prompt/token and JSON work inside measured execution but before the
+    # pacing origin. Retain prepared bytes rather than every encoded token list.
+    try:
+        payloads, encoding = _encode_requests(
+            workload, model, args._prompt_tokenizer, declared=not args.pace,
+            byte_budget=resource_plan["memory_budget_bytes"])
+    except (MemoryError, ValueError) as exc:
+        print(f"ATOMCompass refusing prepared workload: {exc}", file=sys.stderr)
+        return 3
+    results, submission = asyncio.run(_submit_requests(
+        base, payloads, [row["arrival_s"] for row in workload],
+        pace=args.pace, timeout=args.timeout))
+    execution_seconds = _time.monotonic() - began
+    execution_ended_at = _time.time()
 
     # What the run produced, against what it was asked to produce. This client
     # counted only the requests whose *send* raised and reported "0 failed"
@@ -679,6 +764,8 @@ def main(argv=None) -> int:
         "paced": bool(args.pace),
         "time_scale": float(args.time_scale),
         "request_timeout_seconds": float(args.timeout),
+        "client_resources": resource_plan,
+        "submission": submission,
         "requests": len(workload),
         "arrival_span_s": (round(workload[-1]["arrival_s"], 6)
                            if workload else 0.0),
@@ -705,16 +792,20 @@ def main(argv=None) -> int:
             "started_at": execution_started_at,
             "ended_at": execution_ended_at,
             "seconds": execution_seconds,
-            "includes": "measured request construction, pacing, dispatch and completion",
-            "excludes": "preparation/drain, executor teardown and post-run reporting",
+            "includes": "measured request construction, async setup, pacing, dispatch, completion and client session teardown",
+            "excludes": "preparation/drain and post-run reporting",
         },
         "prompt_encoding": {
             "kind": "token_ids" if args.pretokenize else "text",
             "tokenizer_model": model if args.pretokenize else None,
             "tokenizer_revision": (getattr(args._prompt_tokenizer, "init_kwargs", {})
                                    .get("_commit_hash") if args.pretokenize else None),
-            "conversion_seconds": pacing_began - began if args.pretokenize else None,
-            "pacing_started_at": pacing_started_at,
+            "conversion_seconds": encoding["prompt_construction_seconds"] if args.pretokenize else None,
+            "prompt_construction_seconds": encoding["prompt_construction_seconds"],
+            "json_encoding_seconds": encoding["json_encoding_seconds"],
+            "prepared_request_bytes": encoding["prepared_request_bytes"],
+            "json_encoding_before_pacing": True,
+            "pacing_started_at": submission["pacing_started_at"],
             "conversion_in_execution": bool(args.pretokenize),
         },
     }
