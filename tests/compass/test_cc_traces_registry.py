@@ -863,3 +863,45 @@ def test_tp1_dispatch_decision_is_required_without_promoting_e2e(tmp_path):
     assert decision["poc_accepted"] is False
     assert cell["artifacts"]["mha_source_use_decision"] == decision["path"]
     assert cell["resolution"][0]["mha_source_use_decision"]["own"] is True
+
+
+def test_tp2_dispatch_adds_only_source_aliases_after_existing_prices():
+    options = dict(x.split("=", 1) for x in registry.options(2, "/source"))
+    root = "/source/codex_decode_domain_v1/mha_dispatch_tp2_selected_v1"
+    labels = ("source_b16_n16_max_work", "source_b32_n24_max_work",
+              "source_b32_n32_max_work", "source_b32_n32_order_skew_max_cu")
+    prices = options["price"].split(",")
+    assert prices[-12:] == [
+        f"{root}/prices/{label}.rep{repeat}.json:"
+        f"{root}/graphs/{label}.json:unregistered"
+        for label in labels for repeat in (1, 2, 3)]
+    assert all("mha_dispatch_tp2_selected_v1" not in p for p in prices[:-12])
+    assert options["attention_scope"] == options["measured_attention_scope"] == f"{root}/SCOPE.json"
+    assert options["attention_treatments"] == f"{root}/TREATMENTS.json"
+    for tp in (1, 4):
+        assert not any("mha_dispatch_tp2_selected_v1" in p
+                       for p in registry.options(tp, "/source"))
+
+
+def test_tp2_dispatch_resolves_its_own_rank_scope_and_retains_qualification(tmp_path):
+    root = tmp_path / "codex_decode_domain_v1/mha_dispatch_tp2_selected_v1"
+    root.mkdir(parents=True)
+    for rank in (0, 1):
+        for stem in ("SCOPE", "TREATMENTS"):
+            (root / f"{stem}.tp{rank}.json").write_text("{}")
+    for name in ("SOURCE_USE_DECISION.json", "ALIASES.json"):
+        (root / name).write_text("{}")
+    cell = registry.cell_config(2, "clients_short", 1, tmp_path)
+    decision = cell["mha_source_use_decision"]
+    assert decision["sha256"] == registry.MHA_TP2_SOURCE_DECISION_SHA256
+    assert decision["source_books_per_rank"] == 33
+    assert decision["fresh_confirmation_used_for_fit"] is False
+    assert decision["poc_accepted"] is False
+    for rank in (0, 1):
+        for role, stem in (("attention_scope", "SCOPE"),
+                           ("measured_attention_scope", "SCOPE"),
+                           ("attention_treatments", "TREATMENTS")):
+            found = cell["resolution"][rank][role]
+            assert found["path"] == str(root / f"{stem}.tp{rank}.json")
+            assert found["exists"] and found["own"]
+        assert cell["resolution"][rank]["mha_source_aliases"]["path"] == str(root / "ALIASES.json")

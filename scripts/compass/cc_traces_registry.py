@@ -961,13 +961,17 @@ GDN_SOURCE_QUALIFICATIONS = (
 
 _MHA_TP1_DISPATCH = "{root}/codex_decode_domain_v1/mha_dispatch_tp1_selected_v1"
 _MHA_TP1_LONG = "{root}/codex_regions/mha_decode_2m_v1"
-_MHA_TP1_LONG_LABELS = (
+_MHA_DISPATCH_LONG_LABELS = (
     "source_b16_n16_max_work", "source_b32_n24_max_work",
     "source_b32_n32_max_work", "source_b32_n32_order_skew_max_cu",
 )
 MHA_TP1_SOURCE_DECISION = f"{_MHA_TP1_DISPATCH}/SOURCE_USE_DECISION.json"
 MHA_TP1_SOURCE_DECISION_SHA256 = (
     "63dd999b4b51754787e97c3034f68506d614f5cec2b13c46e0f654e322fccd00")
+_MHA_TP2_DISPATCH = "{root}/codex_decode_domain_v1/mha_dispatch_tp2_selected_v1"
+MHA_TP2_SOURCE_DECISION = f"{_MHA_TP2_DISPATCH}/SOURCE_USE_DECISION.json"
+MHA_TP2_SOURCE_DECISION_SHA256 = (
+    "6e6576d4a3e23ce6c690265c0f27ff80a5b18414755e48bcc57401b078b90ba2")
 
 
 def per_width_options(tp: int) -> tuple:
@@ -984,7 +988,7 @@ def per_width_options(tp: int) -> tuple:
         mha_prices = tuple(
             f"{_MHA_TP1_LONG}/{label}_one_v1/raw.rep{repeat}.json:"
             f"{_MHA_TP1_LONG}/graphs/{label}.timing.json:unregistered"
-            for label in _MHA_TP1_LONG_LABELS for repeat in (1, 2, 3))
+            for label in _MHA_DISPATCH_LONG_LABELS for repeat in (1, 2, 3))
         return (
             ("tp", "1"),
             ("dispatch_bands", bands),
@@ -1046,15 +1050,23 @@ def per_width_options(tp: int) -> tuple:
         # PriceLibrary marks the library PARTIAL when it is on.
         prices = (_GEMM_SUPPLEMENT_V1,) + prices
     prices += gemm_prices
+    scope = "{root}/codex_wide_20260913/deployment_prefill_v2/tp{tp}/SCOPE.json"
+    treatments = "{root}/codex_wide_20260913/deployment_prefill_v2/tp{tp}/TREATMENTS.json"
+    if tp == 2:
+        # Rank-suffixed aliases retain each original source book's exact bytes.
+        # The old 21 books remain first; fresh confirmations are never fitted.
+        prices += tuple(
+            f"{_MHA_TP2_DISPATCH}/prices/{label}.rep{repeat}.json:"
+            f"{_MHA_TP2_DISPATCH}/graphs/{label}.json:unregistered"
+            for label in _MHA_DISPATCH_LONG_LABELS for repeat in (1, 2, 3))
+        scope = f"{_MHA_TP2_DISPATCH}/SCOPE.json"
+        treatments = f"{_MHA_TP2_DISPATCH}/TREATMENTS.json"
     return (
         ("tp", str(tp)),
         ("dispatch_bands", bands),
-        ("attention_scope",
-         "{root}/codex_wide_20260913/deployment_prefill_v2/tp{tp}/SCOPE.json"),
-        ("measured_attention_scope",
-         "{root}/codex_wide_20260913/deployment_prefill_v2/tp{tp}/SCOPE.json"),
-        ("attention_treatments",
-         "{root}/codex_wide_20260913/deployment_prefill_v2/tp{tp}/TREATMENTS.json"),
+        ("attention_scope", scope),
+        ("measured_attention_scope", scope),
+        ("attention_treatments", treatments),
         ("replay_target", _DERIVED_TARGET),
         ("price", ",".join(prices)),
         ("template", f"{_WIDE}/b27dec32.json"),
@@ -1114,6 +1126,9 @@ def option_paths(tp: int, root) -> dict:
     if tp == 1:
         found["gdn_source_use_decision"] = GDN_SOURCE_DECISION.format(root=str(Path(root)))
         found["mha_source_use_decision"] = MHA_TP1_SOURCE_DECISION.format(root=str(Path(root)))
+    elif tp == 2:
+        found["mha_source_use_decision"] = MHA_TP2_SOURCE_DECISION.format(root=str(Path(root)))
+        found["mha_source_aliases"] = f"{_MHA_TP2_DISPATCH}/ALIASES.json".format(root=str(Path(root)))
     return found
 
 
@@ -1134,7 +1149,8 @@ _GROUP_STEMS = ("ar_capture.json", "ar_plain.json", "ag_prices.json",
 
 def _group_level(role: str, path: str) -> bool:
     return (role in ("replay_target", "memory_model", "source_use_decision",
-                     "gdn_source_use_decision", "mha_source_use_decision")
+                     "gdn_source_use_decision", "mha_source_use_decision",
+                     "mha_source_aliases")
             or path.endswith(_GROUP_STEMS))
 
 
@@ -1413,6 +1429,17 @@ def cell_config(tp: int, klass: str, clients: int, root, resolved=None) -> dict:
             "sha256": MHA_TP1_SOURCE_DECISION_SHA256,
             "regime": "unified.decode.paged_gluon_dispatch",
             "source_books": 33,
+            "fresh_confirmation_used_for_fit": False,
+            "historical_source_qualifications_preserved": True,
+            "poc_accepted": False,
+        }
+    elif tp == 2:
+        cell["mha_source_use_decision"] = {
+            "path": MHA_TP2_SOURCE_DECISION.format(root=str(Path(root))),
+            "sha256": MHA_TP2_SOURCE_DECISION_SHA256,
+            "regime": "unified.decode.paged_gluon_dispatch",
+            "source_books_per_rank": 33,
+            "ranks": [0, 1],
             "fresh_confirmation_used_for_fit": False,
             "historical_source_qualifications_preserved": True,
             "poc_accepted": False,

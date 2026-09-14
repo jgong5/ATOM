@@ -145,6 +145,18 @@ Historical source-condition qualifications and the old descriptor's failed
 heldout remain recorded. TP2/TP4 options are unchanged. The first paired
 `tp1_clients_short_c1` cell must establish E2E agreement before broader execution.
 
+TP2 selects the same dispatch descriptor through its own per-rank source fits.
+Each rank retains its original 21 MHA source books and adds twelve long-domain
+books via byte-identical aliases under
+`codex_decode_domain_v1/mha_dispatch_tp2_selected_v1`. `ALIASES.json` maps every
+price and graph to its original frozen identity. The successor combined scopes
+add only the decode dispatch topology; prefill/GDN scopes and all existing
+treatments remain unchanged. Fresh confirmation and heldout books are excluded.
+The TP2 decision is SHA256
+`6e6576d4a3e23ce6c690265c0f27ff80a5b18414755e48bcc57401b078b90ba2`.
+This prepares TP2 E2E validation; it does not claim a passing TP2 cell. TP1 and
+TP4 option arrays are unchanged by this selection.
+
 The preceding `source-27b-tp1-history-64k` adds independently measured TP1 history
 support to `source-27b-tp1-prefill-seqs`. Single-row decode supports histories
 1025..65600; exact two-row decode supports 513..65600 with summed history at
