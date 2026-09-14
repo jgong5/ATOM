@@ -2,9 +2,10 @@
 
 This review separates the current registered burst suite from a claim about the
 whole pinned cc-traces corpus. **The present evidence does not establish
-full-corpus accuracy or 99% statistical confidence.** Two functionality limits
-come before additional timing campaigns: the readiness profile refuses small
-native requests, and the replay transport cannot submit some intact roots.
+full-corpus accuracy or 99% statistical confidence.** The audit identified two
+functionality limits: the readiness profile refused small native requests, and
+the replay transport could not submit some intact roots. Their remediation
+status is recorded below; the original findings and evidence are preserved.
 Coverage also needs sustained and multi-episode continuity, since success on
 isolated source busy episodes does not imply success on their concatenation.
 
@@ -12,6 +13,30 @@ This is a coverage review and a proposed confirmation design, not a replacement
 registration. Existing workload hashes, run registrations and results retain
 their historical meaning. No GPU run, fit or workload rewrite was performed for
 this review.
+
+## Remediation update — 2026-09-14
+
+* **Async submission is integrated and pushed** in feature commit `0cb6c2f7f`.
+  It replaces the audited 1,024-thread ceiling while retaining native
+  `/v1/completions`, singleton ADD messages and the fatal registration-barrier
+  timeout. Thirteen CPU transport tests pass, including 3,551 and 16,913
+  registrations before any response, 32 full-context request bodies, native ADD
+  byte agreement, cancellation artifacts and an established peer that stops
+  reading uploads. A finite network-attempt deadline covers that backpressure.
+  Declared replay still needs O(N) sockets and memory for prepared request bytes;
+  explicit FD checks and a conservative client memory budget refuse insufficient
+  resources. This does not establish unlimited capacity. JSON encoding now
+  precedes the pacing epoch, so **fresh paired E2E runs remain required**; old real
+  references are not interchangeable. Recorded aiohttp callbacks are pre-write
+  events, not wire-completion or target-ingress timestamps.
+* **The low-range candidate `6e26d4cb…` passed source-support validation and remains
+  unactivated at this update.** Its serialized-byte domain is 2,033–1,050,371.
+  All 84 heldout source-component median checks pass the unchanged 100 µs limit
+  (maximum error 49.155 µs); all 532 formerly refused requests pass both native
+  layout variants, giving 1,064 accepted canaries, and 56 CPU regressions pass.
+  These source-median and layout checks do not bound individual source-frame
+  tails, establish E2E accuracy, or provide 99% confidence. The pinned handoff and
+  candidate identities are added to §7's evidence record.
 
 ## 1. Population and meaning of replay
 
@@ -138,10 +163,11 @@ measurement or justified source model extension is needed; silently widening a
 bound would not provide that evidence. Even among the 378 non-pilot roots with
 every leaf selector-servable, 328 contain one of these confirmed refusals.
 
-**Submission has a finite workload limit.** `replay.py` pretokenizes every prompt
-and uses one blocking thread/HTTP request per workload row. It rejects workloads
-over `MAX_IN_FLIGHT=1024`; the limit is checked after optional preparation and
-pretokenization. Thirteen published roots already exceed 1,024 API leaves,
+**The audited submission predecessor had a fixed thread ceiling.** Its
+`replay.py` pretokenized every prompt and used one blocking thread/HTTP request
+per workload row. It rejected workloads over `MAX_IN_FLIGHT=1024`; the limit was
+checked after optional preparation and pretokenization. Thirteen published roots
+already exceed 1,024 API leaves,
 and combining C roots can exceed it sooner. The maximum root has 3,551 API
 requests. A 969-request episode is below the nominal limit but is not evidence
 that thread, connection, memory or timeout behavior is adequate near the limit.
@@ -151,8 +177,10 @@ virtual time. Replacing the client with K blocking workers while N>K requests
 must register deadlocks behind responses the server cannot yet produce; the
 existing comments document this failure. The 120-second barrier fallback makes
 that replay invalid, and the readiness path now refuses an incomplete barrier.
-A bulk/streamed registration protocol or another explicitly proven transport is
-needed for larger workloads. `--num-requests`, a client-count semaphore, or a
+The audit therefore required a bulk/streamed registration protocol or another
+explicitly proven transport for larger workloads; the async successor above
+addresses that requirement within its tested bounds. `--num-requests`, a
+client-count semaphore, or a
 longer timeout must not silently substitute for an intact workload.
 Preserve the measured per-request admission path when changing transport, or
 requalify source readiness evidence if message layout or admission work changes.
@@ -426,6 +454,13 @@ accuracy/exposure inventories are under its sibling
 | `ADDITIONAL_CASES_V4.json` (final exposed-root preference) | `29eb56aa0f0b1801194cb75a57e94c3da1bf49410a50a74f22c7084528fcd51f` |
 | Baseline request-accuracy `INVENTORY.json` | `e930c135ac15b07e3e7dcf97faf716a3fd8856bfe63fabed9dd108d9fd9809f6` |
 | Historical outcome-prefix `LEGACY_EMBEDDED_IDENTITY_V1.json` | `45f6964243dbfd8fa1d9fae6911ec6079251247b7a765b4450984fa76a450660` |
+| Low-range `SOURCE_SUPPORT_HANDOFF_V1.json` | `e5ddcc22a7452f7580cade6c7dafdda9ba2a4e6f7c4a2705aaa9ec63d19ead55` |
+| Low-range `CANDIDATE_PROFILE_V1.json` (unactivated) | `6e26d4cb7304b9d6868308deca808dd0334bf30747146ce4f3682a7adf38e3f9` |
+
+The low-range handoff and candidate are under
+`agent_scratch/codex_decode_domain_v1/ingress_handoff_low_extension_v1` in the
+same CPU evidence tree. Earlier profiles, canaries and audit findings remain
+historical evidence; the candidate does not relabel them.
 
 The current root exposure ledger is
 `agent_scratch/corpus_review_v1/EXPOSURE_LEDGER_V2.json` in the review worktree.
