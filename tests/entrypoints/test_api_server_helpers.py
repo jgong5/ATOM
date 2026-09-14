@@ -483,6 +483,33 @@ class TestOpeningChatPreprocessing:
 
 
 class TestResolvedCompassProvenance:
+    def test_native_alias_sort_and_filter_preserve_reported_rung_sets(self):
+        from atom.compass.core.resolved_runtime import worker_snapshot
+        declared = [1, 2, 4, 8, 16, 32, 48, 64, 128, 256]
+        config = SimpleNamespace(capture_sizes=list(declared))
+        native = SimpleNamespace(config=config, rank=0,
+                                 _compass_config=SimpleNamespace(mode="measure"))
+        # Reproduce the native mutation when Config exposes a mutable list:
+        # alias, descending capture order, then detach the filtered ladder.
+        native.capture_sizes = config.capture_sizes
+        native.capture_sizes.sort(reverse=True)
+        native.capture_sizes = [size for size in native.capture_sizes if size <= 32]
+        native.capture_sizes.sort()
+        native._compass_native_capture_sizes = list(native.capture_sizes)
+        assert config.capture_sizes == list(reversed(declared))
+        measured = worker_snapshot(native)
+        predictor = SimpleNamespace(config=SimpleNamespace(capture_sizes=list(declared)), rank=0,
+                                    _compass_config=SimpleNamespace(mode="predict"),
+                                    capture_sizes=[1, 2, 4, 8, 16, 32],
+                                    target=SimpleNamespace(graph={"capture_sizes": [1, 2, 4, 8, 16, 32]},
+                                                           loaded_input=None))
+        modelled = worker_snapshot(predictor)
+        assert measured["configuration"]["declared_capture_sizes"] == declared
+        assert measured["configuration"]["declared_capture_sizes"] == modelled["configuration"]["declared_capture_sizes"]
+        assert measured["configuration"]["declared_capture_order_as_read"] == list(reversed(declared))
+        assert measured["graphs"]["effective_decode_order"] == native.capture_sizes
+        assert config.capture_sizes == list(reversed(declared))
+
     @pytest.mark.parametrize("side", ["real", "modelled"])
     @pytest.mark.parametrize("missing_core", [False, True])
     def test_producer_output_satisfies_cache_on_validator_without_api_policy_defaults(
