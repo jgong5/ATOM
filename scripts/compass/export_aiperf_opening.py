@@ -16,12 +16,29 @@ from atom.compass.prefix_workload import token_digest, tokenizer_identity
 AIPERF_COMMIT = "0d2aa0572ac685943d38c580675c4a61023581d3"
 
 
+def weka_reconstruction_policy(environment):
+    """Freeze effective Weka settings and refuse a non-default reconstruction."""
+    fields = type(environment).model_fields
+    defaults = {name: field.default for name, field in fields.items() if name.startswith("WEKA_")}
+    effective = {name: getattr(environment, name) for name in defaults}
+    changed = [name for name in defaults if effective[name] != defaults[name]]
+    if changed:
+        raise ValueError(f"opening exporter requires pinned Weka defaults: {', '.join(changed)}")
+    required = {"WEKA_LIVE_ASSISTANT_RESPONSES": False,
+                "WEKA_SPLIT_FLATTENED_AGENTS": True,
+                "WEKA_TOOL_SHAPED_MESSAGES": False}
+    if any(effective.get(name) is not value for name, value in required.items()):
+        raise ValueError("opening exporter requires synthetic assistant history and default agent/role reconstruction")
+    return {"defaults_verified": True, "effective": effective, "pinned_defaults": defaults}
+
+
 def export_opening(source_root, source_sha256, aiperf_source, model, seed):
     from aiperf.common import random_generator as rng
     from aiperf.common.config import (
         EndpointConfig, InputConfig, LoadGeneratorConfig, TokenizerConfig, UserConfig,
     )
     from aiperf.common.tokenizer import Tokenizer
+    from aiperf.common.environment import Environment
     from aiperf.dataset.generator.coding_content import CodingContentGenerator
     from aiperf.dataset.loader.weka_synth_buf import compute_asst_block_caps
     from aiperf.dataset.loader.weka_trace import WekaTraceLoader
@@ -40,6 +57,7 @@ def export_opening(source_root, source_sha256, aiperf_source, model, seed):
     loader_file = Path(inspect.getfile(WekaTraceLoader)).resolve()
     if not loader_file.is_relative_to(repo):
         raise ValueError("imported AIPerf loader differs from the pinned checkout")
+    weka_policy = weka_reconstruction_policy(Environment.DATASET)
 
     raw = Path(source_root).read_bytes()
     if hashlib.sha256(raw).hexdigest() != source_sha256:
@@ -114,6 +132,7 @@ def export_opening(source_root, source_sha256, aiperf_source, model, seed):
         "chat_template_sha256": hashlib.sha256(tokenizer._tokenizer.chat_template.encode()).hexdigest(),
         "producer": {"aiperf_commit": revision, "seed": seed,
                      "bootstrap_rng_reset": True,
+                     "weka_reconstruction": weka_policy,
                      "loader_sha256": hashlib.sha256(loader_file.read_bytes()).hexdigest(),
                      "coding_pool_tokens_sha256": token_digest(generator._tool_pool),
                      "exporter_sha256": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),

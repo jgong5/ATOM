@@ -78,3 +78,20 @@ def test_client_artifact_binds_payload_cache_and_release_evidence(tmp_path, monk
     assert result["run"]["prompt_encoding"]["kind"] == "chat_messages"
     assert result["run"]["complete"] == (damage is None)
     assert code == (0 if damage is None else replay.INCOMPLETE_EXIT)
+
+
+def test_virtual_opening_refuses_preparation_before_reset_or_inference(tmp_path, monkeypatch):
+    path, digest, _, _ = opening_fixture(tmp_path, 1.)
+    monkeypatch.setattr(replay, "_clock_of", lambda *_: "virtual")
+    class Response:
+        def __enter__(self): return self
+        def __exit__(self, *args): pass
+        def read(self): return json.dumps({"compass": {"opening_plan_sha256": digest}}).encode()
+    monkeypatch.setattr(replay.urllib.request, "urlopen", lambda *_args, **_kwargs: Response())
+    def forbidden(*args, **kwargs):
+        raise AssertionError("virtual preparation reached an execution boundary")
+    for name in ("_prepare", "_reset_prefix_cache", "_submit_requests", "_load_prompt_tokenizer"):
+        monkeypatch.setattr(replay, name, forbidden)
+    assert replay.main(["--port", "1", "--model", "fixture", "--opening-plan", str(path),
+                        "--opening-plan-sha256", digest, "--prepare", "3",
+                        "--out", str(tmp_path / "result.json")]) == 3

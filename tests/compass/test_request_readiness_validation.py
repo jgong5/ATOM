@@ -103,6 +103,29 @@ def test_unregistered_loaded_source_digest_is_refused(evidence):
     assert any("registry does not declare" in reason for reason in check(evidence))
 
 
+@pytest.mark.parametrize("damage", [None, "wrong_pin", "wrong_role", "source_leak"])
+def test_only_exact_typed_opening_workload_is_excluded_from_fitted_sources(evidence, damage):
+    modelled, registry = evidence
+    compass = modelled.manifest["server"]["compass"]
+    compass.update(opening_plan="/workload/opening.json", opening_plan_sha256=WORKLOAD_SHA)
+    row = {"role": "runtime.aiperf_opening", "requested": compass["opening_plan"],
+           "path": compass["opening_plan"], "sha256": WORKLOAD_SHA, "size": 123}
+    core(evidence)["inputs"].append(row)
+    core(evidence)["release_calendar"] = {"input": {"sha256": WORKLOAD_SHA}}
+    if damage == "wrong_pin":
+        row["sha256"] = "5" * 64
+    elif damage == "wrong_role":
+        row["role"] = "runtime.request_readiness.extra_source"
+    elif damage == "source_leak":
+        registry["artifacts"][-1]["workload_sha256"] = WORKLOAD_SHA
+    errors = validate.check_calibration(
+        modelled, registry, 1, WORKLOAD_SHA, {"real step table": FORBIDDEN_SHA},
+        expected_opening_plan_sha256=WORKLOAD_SHA)
+    assert bool(errors) == (damage is not None)
+    # The same input has no exemption in the ordinary registered route.
+    assert check(evidence)
+
+
 def test_registry_contents_must_match_the_core_read(evidence):
     evidence[1]["artifacts"][-1]["contents"]["source.json"] = "5" * 64
     assert any("differs" in reason for reason in check(evidence))
@@ -118,4 +141,3 @@ def test_existing_target_leak_checks_apply_to_core_sources(evidence, leak):
     else:
         entry["sources"] = [{"path": "/evaluated/real_steps.jsonl", "sha256": FORBIDDEN_SHA}]
     assert check(evidence)
-

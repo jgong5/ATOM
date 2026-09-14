@@ -1969,7 +1969,8 @@ def check_predictor_device_freedom(modelled, label: str) -> list[str]:
 
 
 def check_calibration(
-    modelled, registry: dict, tp: int, workload_sha: str, forbidden: dict
+    modelled, registry: dict, tp: int, workload_sha: str, forbidden: dict,
+    *, expected_opening_plan_sha256=None,
 ) -> list[str]:
     """Where the predictor's numbers came from, against a declaration of it.
 
@@ -2001,7 +2002,8 @@ def check_calibration(
         digests, option_files, registry, tp, workload_sha, forbidden
     )
     bad += check_request_readiness_calibration(
-        modelled, registry, tp, workload_sha, forbidden
+        modelled, registry, tp, workload_sha, forbidden,
+        expected_opening_plan_sha256=expected_opening_plan_sha256,
     )
     return bad
 
@@ -2077,7 +2079,8 @@ READINESS_INPUT_ROLES = frozenset(
 
 
 def check_request_readiness_calibration(
-    modelled, registry: dict, tp: int, workload_sha: str, forbidden: dict
+    modelled, registry: dict, tp: int, workload_sha: str, forbidden: dict,
+    *, expected_opening_plan_sha256=None,
 ) -> list[str]:
     """Validate the enabled readiness inputs reported by their core reader.
 
@@ -2104,6 +2107,18 @@ def check_request_readiness_calibration(
                 or type(reader.get("pid")) is not int or reader["pid"] <= 0):
             bad.append(f"{tag}: missing actual EngineCore.Scheduler reader identity")
         rows = [row for row in (core.get("inputs") or []) if isinstance(row, dict)]
+        opening_rows = [row for row in rows if row.get("role") == "runtime.aiperf_opening"]
+        opening_input = None
+        if opening_rows or expected_opening_plan_sha256 is not None:
+            if (len(opening_rows) == 1 and _hexish(expected_opening_plan_sha256)
+                    and opening_rows[0].get("sha256") == expected_opening_plan_sha256
+                    and opening_rows[0].get("requested") == compass.get("opening_plan")
+                    and compass.get("opening_plan_sha256") == expected_opening_plan_sha256
+                    and (core.get("release_calendar") or {}).get("input", {}).get("sha256")
+                    == expected_opening_plan_sha256):
+                opening_input = opening_rows[0]
+            else:
+                bad.append(f"{tag}: runtime opening workload input lacks its exact diagnostic/core pin")
         roles = {row.get("role") for row in rows}
         missing = READINESS_INPUT_ROLES - roles
         if missing:
@@ -2119,6 +2134,10 @@ def check_request_readiness_calibration(
             )
         digests, files = {}, {}
         for row_index, row in enumerate(rows):
+            if row is opening_input:
+                # A verified workload declaration is input to the experiment,
+                # not a fitted service measurement. No source/price role is exempt.
+                continue
             role, path, sha = row.get("role"), row.get("path"), row.get("sha256")
             label = f"{tag} input {row_index} ({role})"
             if not isinstance(path, str) or not path or not _hexish(sha):

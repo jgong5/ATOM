@@ -83,6 +83,7 @@ import time
 import urllib.error
 import urllib.request
 from pathlib import Path
+from types import SimpleNamespace
 
 ROOT = Path(__file__).resolve().parents[2]
 
@@ -126,6 +127,7 @@ compare = _load("compare")
 replay_client = _load("replay")
 plan_module = _load("cc_traces_plan")
 diagnostic_module = _load("cc_traces_diagnostic")
+opening_module = _load("cc_traces_opening")
 refusal_module = _load("cc_traces_refusal")
 execution_id = _load("execution_id")
 isolation = _load("isolation")
@@ -479,6 +481,8 @@ class SideRun:
         self.ports_in_use = ports_in_use
         #: acceptance or diagnostic, stamped into every record this run writes
         self.diagnostic_case = cell_plan.get("diagnostic_case")
+        self.case_reader = (opening_module if (self.diagnostic_case or {}).get("schema")
+                            == opening_module.CASE_SCHEMA else diagnostic_module)
         self.cache_policy = cell_plan.get("cache_policy")
         self.unregistered = cell_plan["class"] not in plan_module.CLASSES
         self.purpose = (DIAGNOSTIC if self.unregistered or self.diagnostic_case is not None
@@ -892,6 +896,19 @@ class SideRun:
             if errors:
                 self.failures += [f"{step['id']}: {reason}" for reason in errors]
                 return None
+        if self.case_reader is opening_module:
+            errors = _load("cc_traces_validate").check_engine(
+                SimpleNamespace(manifest={"server": said}), 1, step["id"],
+                expected_cache_policy=self.cache_policy)
+            errors += opening_module.check_server_configuration(said, self.diagnostic_case, self.side)
+            if self.side == "modelled":
+                pin = self.diagnostic_case["opening_plan"]
+                if (compass.get("opening_plan_sha256") != pin["sha256"]
+                        or compass.get("opening_plan") != pin["path"]):
+                    errors.append("predictor resolved a different opening plan")
+            if errors:
+                self.failures += [f"{step['id']}: {reason}" for reason in errors]
+                return None
         path = self.cell / f"provenance.{self.side}.r{step['repeat']}.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(said, indent=1) + "\n")
@@ -1190,12 +1207,13 @@ class SideRun:
         if self.cache_policy is not None:
             bad += _load("cc_traces_validate").check_cache_policy_evidence(
                 manifest, self.cache_policy, self.side)
-            encoding = (manifest.get("prompt_encoding") or {}).get("corpus_encoding") or {}
-            pinned = self.diagnostic_case.get("prompt_encoding") or {}
-            if (encoding.get("sha256") != pinned.get("sha256")
-                    or encoding.get("phase") != "measured"
-                    or encoding.get("row_token_sha256") != self.diagnostic_case.get("prompt_token_sha256")):
-                bad.append("replay does not attest to the pinned measured prompt encoding")
+            if self.case_reader is diagnostic_module:
+                encoding = (manifest.get("prompt_encoding") or {}).get("corpus_encoding") or {}
+                pinned = self.diagnostic_case.get("prompt_encoding") or {}
+                if (encoding.get("sha256") != pinned.get("sha256")
+                        or encoding.get("phase") != "measured"
+                        or encoding.get("row_token_sha256") != self.diagnostic_case.get("prompt_token_sha256")):
+                    bad.append("replay does not attest to the pinned measured prompt encoding")
             if self.side == "real":
                 memory_path = self.cell / f"real.r{step['repeat']}_memory.json"
                 try:
@@ -1206,7 +1224,7 @@ class SideRun:
                     bad += plan_module.cache_policy.policy_errors(memory.get("cache_policy"), self.cache_policy)
         if self.diagnostic_case:
             try:
-                diagnostic_module.check_result(blob, self.diagnostic_case)
+                self.case_reader.check_result(blob, self.diagnostic_case)
             except (ValueError, TypeError, KeyError) as exc:
                 bad.append(str(exc))
         try:
@@ -1306,6 +1324,8 @@ class SideRun:
         # most expensive on. An unanswerable question is not a pass.
         want_trace = (execution.get("source") or {}).get("workload_sha256")
         got_trace = manifest.get("trace_sha256")
+        if self.case_reader is opening_module:
+            got_trace = (manifest.get("aiperf_opening") or {}).get("input", {}).get("sha256")
         if not want_trace:
             bad.append(
                 "this cell's execution records no frozen workload digest, so "
@@ -1419,7 +1439,7 @@ class SideRun:
                     or Path(self.plan["workload"]).resolve() != Path(case["workload"])
                     or self.cell.name != f"tp{self.plan['tp']}_{case['case_id']}_c{case['clients']}"):
                 raise ValueError("diagnostic plan identity disagrees with its pinned case")
-            diagnostic_module.recheck(case)
+            self.case_reader.recheck(case)
         except (OSError, ValueError, TypeError, KeyError) as exc:
             self.refused = True
             self.failures.append(f"diagnostic case refused: {exc}")
@@ -1683,8 +1703,8 @@ class SideRun:
                 lock = self.cell / "diagnostic_case.json"
                 try:
                     previous = json.loads(lock.read_text()) if lock.exists() else None
-                    different = (previous is not None and diagnostic_module.identity(previous)
-                                 != diagnostic_module.identity(self.diagnostic_case))
+                    different = (previous is not None and self.case_reader.identity(previous)
+                                 != self.case_reader.identity(self.diagnostic_case))
                 except (OSError, ValueError) as exc:
                     self.refused = True
                     self.failures.append(f"diagnostic case lock is unreadable: {exc}")
@@ -1919,6 +1939,16 @@ def _cell_plan(args) -> dict:
         prefill_preparation_fence=getattr(args, "compass_prefill_preparation_fence", False),
         client_memory_budget_mib=getattr(args, "client_memory_budget_mib", None),
     )
+    if getattr(args, "opening", False):
+        if args.side == "modelled" and not options["request_readiness_profile"]:
+            raise ValueError("opening prediction requires a source-backed readiness profile")
+        case = opening_module.load_case(
+            args.opening_plan, args.opening_plan_sha256, args.case_id,
+            target_model=plan_module.MODEL)
+        return plan_module.opening_steps(
+            args.tp, case, cell=str(cell),
+            diagnostic_prepare_output_cap=getattr(args, "diagnostic_prepare_output_cap", None),
+            **options)
     if getattr(args, "diagnostic", False):
         case = diagnostic_module.load_case(
             args.workload, args.manifest, args.manifest_sha256, args.case_id,
@@ -2493,6 +2523,25 @@ def main(argv=None) -> int:
                         "preserve full prompts, measured outputs and diagnostic identity")
     d.add_argument("--plan-only", action="store_true", help="print verified argv and identity without starting processes")
     d.set_defaults(func=side, diagnostic=True, purpose=DIAGNOSTIC, repeats=1)
+
+    o = sub.add_parser("opening-side", help="run a pinned AIPerf opening through the maintained lifecycle")
+    _add_side_options(o)
+    o.add_argument("--case-id", required=True)
+    o.add_argument("--opening-plan", required=True)
+    o.add_argument("--opening-plan-sha256", required=True)
+    o.add_argument("--diagnostic-prepare-output-cap", type=int, default=None)
+    o.add_argument("--plan-only", action="store_true")
+    o.set_defaults(func=side, opening=True, diagnostic=False, purpose=DIAGNOSTIC, repeats=1)
+
+    p = sub.add_parser("opening-pair", help="validate an opening pair without registered-cell credit")
+    p.add_argument("--cell", required=True)
+    p.add_argument("--case-id", required=True)
+    p.add_argument("--opening-plan", required=True)
+    p.add_argument("--opening-plan-sha256", required=True)
+    p.add_argument("--calibration-registry", required=True)
+    p.add_argument("--repeats", type=int, default=1)
+    p.add_argument("--out", default=None)
+    p.set_defaults(func=opening_module.pair)
 
     c = sub.add_parser("costs", help="merge the cell's cost terms")
     c.add_argument("cell")

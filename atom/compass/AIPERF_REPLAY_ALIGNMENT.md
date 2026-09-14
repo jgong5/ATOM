@@ -152,6 +152,8 @@ The bounded adapter now has explicit entry points:
   after checking their full-root inferred ancestry and role-planning constraints.
   It pins the audited AIPerf Python source, exact exporter bytes, environment,
   tokenizer/template, coding pool, messages and rendered token arrays.
+  Effective Weka reconstruction settings are recorded and required to match
+  the pinned defaults, including synthetic rather than live assistant history.
 - The predictor takes `--compass-opening-plan PATH
   --compass-opening-plan-sha256 SHA` with its source-backed
   `--compass-request-readiness-profile`. `ReleaseCalendar` separates registration
@@ -163,6 +165,26 @@ The bounded adapter now has explicit entry points:
   predictor must be fresh and unprepared. Native preparation can use the existing
   synthetic prompts at the exported rendered lengths, followed by the required
   empty-cache reset; measured chat payloads remain frozen.
+
+Use the maintained `cc_traces_run.py opening-side` entry point for a measured
+diagnostic, with `--case-id`, `--opening-plan`, `--opening-plan-sha256` and the
+usual side/source options. `--plan-only` verifies the concrete argv without
+launching a process. This case has schema `compass.aiperf_opening_case/1`; it
+does not claim the source-proxy/prefix-codec contract of `diagnostic-side`.
+Both use the same owned-process lifecycle, isolation, preparation, refusal and
+execution-identity machinery. `opening-pair` reuses the maintained metric,
+provenance, calibration and policy-aware memory checks, then writes
+`opening_diagnostic.json` with `purpose=diagnostic` and `accepted=false`.
+
+The opening deployment pins bf16 KV, block size 16, batch budget 16,384,
+level 3/FULL and the declared capture ladder through 256. Core policy and
+scheduler limits come from the core cache utility; worker configuration and
+graph facts come from the worker's input-manifest RPC. Native capture sizes
+are published only after native capture completes. The predictor separately
+reports effective decode buckets and its borrowed target ladder, with no
+claim that it captured graphs. The same producer fix supplies full cache
+policy to the existing `4b433` mechanism path. Legacy validators retain their
+historical rules; the opening path adds its full owned-configuration checks.
 
 The initial profile is **“AIPerf-aligned opening, zero-response-delivery
 approximation.”** It explicitly approximates modelled client-response
@@ -187,9 +209,20 @@ Ignored evidence resides in `jgong5_compass_cpu` under
 - `AIPERF_OPENING_72d0_TWO_TURNS.json`, SHA256
   `1bcbd296f5c5b5a48889ec6cc7b29b60c41b034243879896812d0759e323ca0e`.
 
-The frozen adapter export is in the sibling
+The original frozen adapter export is retained in the sibling
 `codex_aiperf_opening_v1/OPENING_PLAN.json`, SHA256
 `16182a101d0a9579c1b03e48625ee792852aabd403ac47910e653a5ccaa14fb4`.
+Maintained opening diagnostics use `OPENING_PLAN_V2.json`, SHA256
+`dca12eef53e0d1fa00b0742e58558ebbfcae4e2548f0a69f8b8080182c5306f5`.
+It adds the verified 14-setting Weka producer policy; every request and every
+non-producer field equals the original. The unchanged shape inventory applies.
+`PRODUCER_POLICY_SUPERSESSION_V2.json`, SHA256
+`72c8507fe0a4076233c1fea19de276e54d2489ba2498b72a72755e9f962fb286`,
+records that comparison. Concrete plan-only commands and both lifecycle plans
+are in `maintained_handoff_v1/HANDOFF.json`, SHA256
+`a6a8facc24e373e0e40719002c47bab99866dc5f002f12580d1e9074fd1b635b`.
+Those plans retain the existing source registry for review; plan construction
+does not establish primitive/region support or authorize a server launch.
 
 The sibling `codex_cache_on_preflight_v1/STRUCTURAL_CLOSEOUT.json` has SHA256
 `eb120c52550c310b177d1c012bf231baeb4f38cbe45c600cab792afbf523b74d`;

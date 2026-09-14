@@ -101,6 +101,11 @@ class OpeningPlan:
     def cache_policy(self):
         return copy.deepcopy(self._data["cache_policy"])
 
+    @property
+    def export_identity(self):
+        return {key: copy.deepcopy(self._data.get(key)) for key in (
+            "producer", "source", "tokenizer", "chat_template_sha256")}
+
     def evidence(self):
         return {
             "schema": SCHEMA,

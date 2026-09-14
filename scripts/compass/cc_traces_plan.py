@@ -375,6 +375,7 @@ def _replay(
     workload_path: str | None = None,
     client_memory_budget_mib: int | None = None,
     diagnostic_prepare_output_cap: int | None = None,
+    opening_plan=None,
 ):
     if client_memory_budget_mib is not None and client_memory_budget_mib <= 0:
         raise SystemExit("client memory budget must be positive")
@@ -385,15 +386,16 @@ def _replay(
         str(port),
         "--model",
         MODEL,
-        "--trace",
-        workload(klass, clients) if workload_path is None else workload_path,
+        *(["--trace", workload(klass, clients) if workload_path is None else workload_path]
+          if opening_plan is None else ["--opening-plan", opening_plan["path"],
+                                       "--opening-plan-sha256", opening_plan["sha256"]]),
         "--out",
         out,
         "--check-lengths",
         "--timeout",
         str(request_timeout),
     ]
-    if workload_path is not None:
+    if workload_path is not None and opening_plan is None:
         cmd += ["--num-requests", "0"]
     if client_memory_budget_mib is not None:
         cmd += ["--client-memory-budget-mib", str(client_memory_budget_mib)]
@@ -437,6 +439,7 @@ def _lifecycle(
     workload_path: str | None = None,
     client_memory_budget_mib: int | None = None,
     diagnostic_prepare_output_cap: int | None = None,
+    opening_plan=None,
 ):
     """One repeat: its own server, its replay, and the end of that process."""
     modelled = side == "modelled"
@@ -505,6 +508,7 @@ def _lifecycle(
                 workload_path=workload_path,
                 client_memory_budget_mib=client_memory_budget_mib,
                 diagnostic_prepare_output_cap=diagnostic_prepare_output_cap,
+                opening_plan=opening_plan,
             ),
             "produces": (
                 [f"{side}.r{n}.json"]
@@ -817,6 +821,7 @@ def diagnostic_steps(
     enable_prefix_caching=False,
     prompt_encoding=None,
     prompt_encoding_sha256=None,
+    opening_plan=None,
 ):
     """Execute a pinned case through the same lifecycle, without a matrix alias."""
     klass, clients = case["case_id"], case["clients"]
@@ -839,11 +844,17 @@ def diagnostic_steps(
         errors = cache_policy.policy_errors(selected_policy, cache_policy.cache_on_policy())
         if errors:
             raise SystemExit("; ".join(errors))
-        encoding = case.get("prompt_encoding") or {}
-        if (not prompt_encoding or not prompt_encoding_sha256
-                or Path(prompt_encoding).resolve() != Path(encoding.get("path", "")).resolve()
-                or prompt_encoding_sha256 != encoding.get("sha256")):
-            raise SystemExit("cache-enabled diagnostics require the case's pinned prompt encoding")
+        if opening_plan is not None:
+            if (case.get("schema") != "compass.aiperf_opening_case/1"
+                    or opening_plan != case.get("opening_plan") or pretokenize
+                    or prompt_encoding or prompt_encoding_sha256 or clients != 1):
+                raise SystemExit("opening requires its pinned chat plan, one client and no codec flags")
+        else:
+            encoding = case.get("prompt_encoding") or {}
+            if (not prompt_encoding or not prompt_encoding_sha256
+                    or Path(prompt_encoding).resolve() != Path(encoding.get("path", "")).resolve()
+                    or prompt_encoding_sha256 != encoding.get("sha256")):
+                raise SystemExit("cache-enabled diagnostics require the case's pinned prompt encoding")
     elif selected_policy is not None:
         raise SystemExit("a cache-policy case requires --enable-prefix-caching")
     elif prompt_encoding or prompt_encoding_sha256:
@@ -859,6 +870,14 @@ def diagnostic_steps(
             engine_args.remove("--no-enable_prefix_caching")
             engine_args += ["--enable_prefix_caching", "--state-checkpoint-interval-tokens",
                             "8192", "--state-checkpoint-demand"]
+        if modelled and opening_plan is not None:
+            engine_args += ["--compass-opening-plan", opening_plan["path"],
+                            "--compass-opening-plan-sha256", opening_plan["sha256"]]
+        if opening_plan is not None:
+            engine_args += ["--kv_cache_dtype", "bf16", "--block-size", "16",
+                            "--max-num-batched-tokens", "16384", "--level", "3",
+                            "--cudagraph-mode", "FULL", "--cudagraph-capture-sizes",
+                            "[1,2,4,8,16,32,48,64,128,256]"]
         for n in range(1, repeats + 1):
             steps += _lifecycle(
                 side, n, tp=tp, klass=klass, clients=clients, cell=cell,
@@ -870,6 +889,7 @@ def diagnostic_steps(
                 workload_path=case["workload"], client_memory_budget_mib=client_memory_budget_mib,
                 diagnostic_prepare_output_cap=diagnostic_prepare_output_cap,
                 engine_args=engine_args,
+                opening_plan=opening_plan,
             )
         if not modelled:
             steps += after
@@ -878,7 +898,7 @@ def diagnostic_steps(
         for step in steps:
             if step["role"] in ("serve", "replay"):
                 step["cache_policy"] = selected_policy
-            if step["role"] == "replay":
+            if step["role"] == "replay" and opening_plan is None:
                 step["command"] += ["--prompt-encoding", str(prompt_encoding),
                                     "--prompt-encoding-sha256", prompt_encoding_sha256]
     return {
@@ -893,6 +913,14 @@ def diagnostic_steps(
                                     if allow_advisory_isolation else None),
         "steps": steps,
     }
+
+
+def opening_steps(tp, case, **options):
+    """Use the same owned lifecycle for an explicitly typed chat opening."""
+    if tp != 1 or case.get("schema") != "compass.aiperf_opening_case/1":
+        raise SystemExit("opening diagnostics require TP1 and an OpeningPlan case")
+    return diagnostic_steps(tp, case, enable_prefix_caching=True,
+                            opening_plan=case["opening_plan"], **options)
 
 
 def build(args) -> dict:
