@@ -14,6 +14,48 @@ registration. Existing workload hashes, run registrations and results retain
 their historical meaning. The initial audit performed no GPU run, fit or
 workload rewrite; subsequent execution results are dated below.
 
+## Current main path — 2026-09-15
+
+**Prefix caching enabled is now the main cc-traces validation path.** The
+original cache-disabled suite stays at **9/24** passing paired cells, including
+8/8 original TP1. Those historical results do not establish cache-on accuracy,
+whole-corpus generalization or **99% confidence**. No cache-enabled paired
+accuracy result has been completed.
+
+Implementation is integrated at `2782333ab`: explicit TP1 cache/checkpoint
+policy; a pinned codec for local 64-token source hash blocks with native
+16-token prefix-match safeguards; distinct native GDN fork source/destination
+slots; a quiescent reset with all-worker completion and fresh modelled epoch
+checks; and readiness-gated prefix demand. The current target policy is cache
+on, checkpoint interval 8192, demand enabled and one-token GDN forks. Legacy
+plans stay cache off. Source memory geometry is reused only as an explicit
+derived candidate; actual cache-on memory, hits, checkpoint/pool behavior and
+region coverage still require native source and paired E2E evidence. Combined
+CPU verification passed **648 tests**, with zero failures, errors or skips on
+exact source `2782333abba2135050072f5966f41c79472c2142` in a container without GPU
+device nodes. This cannot substitute for those observations.
+
+Cache-on diagnostic validation explicitly uses
+`check_engine(..., expected_cache_policy=...)`, `check_cache_policy_evidence`
+and `check_memory_terms(..., expected_cache_policy=...)`. The registered
+`cell` checker retains its historical cache-off contract. Final snapshot
+policy binding is not an automatic verdict on cache-hit or pool-pressure
+semantics; those observations must be assessed in the experiment evidence.
+
+| Latest historical cache-disabled diagnostic | Outcome |
+| --- | --- |
+| Near-limit 250,048 / 39 | Fresh pair completed 1/1 on each side; TTFT +5.70%, TPOT +4.30%, throughput −5.38%; maintained provenance/capacity/memory checks pass. One diagnostic, not a new registered cell. |
+| Tiny 128 / 16, finite gather overlay | Pair completed, but TTFT −46.73% fails 15%. TPOT +5.65% and throughput +8.16% pass their 10% bars. Non-Torch memory fails: 2,046,820,352 real versus 1,157,627,904 modelled bytes. KV 111,930 versus 112,773 differs 0.753%; that does not remove the component failure. |
+| Long decode 195,840 / 40,339 | Modelled run completed with all 13 maintained checks. Prediction: TTFT 133.296848 s, TPOT 0.035998853 s, latency 1,585.418576 s. Staged real run is **HOLD**, with its diagnostic cap-32 warmup plan preserved and no measured-output truncation. No paired accuracy result. |
+| Seven-request root `1493faff…` | Modelled run refused 16 unpriced QK-norm occurrences at the opening 448-token prefill. The real side was not launched; further cache-disabled collection/retry is held. |
+
+The non-Torch discrepancy is preserved as a failure with unresolved
+attribution. Native sizing/recording uses the current PyTorch device's memory
+APIs, not an SMI device index; that specific mapping hypothesis is unsupported.
+No cause, corrected constant or cache-on conclusion follows from this result.
+The next execution evidence is a cache-on source/oracle preflight followed by
+a fresh intact exposed-root pair, not more cache-disabled gap closure.
+
 ## Remediation update — 2026-09-14
 
 * **Async submission is integrated and pushed** in feature commit `0cb6c2f7f`.
@@ -42,7 +84,7 @@ workload rewrite; subsequent execution results are dated below.
 
 ### Subsequent corpus diagnostics and source work — 2026-09-14
 
-Readiness-byte support did not establish native region support. The two new
+Readiness-byte support did not establish native region support. The two initial cache-disabled
 modelled attempts exposed separate region bounds; neither completed its request
 or produced a paired accuracy result. The original nine passing paired cells
 retain their previous scope and `node_busy` qualification.
@@ -83,8 +125,9 @@ The high-history source acquisition completed: all **56/56** frozen heldouts
 pass the fixed 110 µs preparation-increment criterion, maximum **12.560 µs**.
 Separate TP1 preset `source-27b-tp1-history-256k` is integrated in **`4b109a968`**,
 with per-row support through 262,143, all 11 old snapshots and 411 old
-breakdown/band comparisons unchanged, and 209 tests passing. A fresh near-limit
-run on this preset is pending; source validation adds no E2E acceptance.
+breakdown/band comparisons unchanged, and 209 tests passing. The later
+near-limit pair on this preset completed with the passing diagnostic results
+above; neither source validation nor this pair adds a registered acceptance cell.
 
 Low-prefill source preparation **failed** the unchanged 110 µs criterion:
 17/30 pass, 13 fail, maximum **427.143 µs**. Postprocess 14/14 and structural
@@ -92,8 +135,9 @@ zeros 16/16 pass. TP1 candidate `e43976eb` is explicitly **diagnostic-only**,
 using already-frozen anchors without default/acceptance activation or N2/pool
 extension. Its tiny follow-on loaded correctly, then exited 5 on missing
 head-row gather price `aten::index.Tensor|128,5120;1|bfloat16,int32|1:127`
-(2,442/2,443 operators priced). No tiny request completed; the original source
-failure remains a failure. TP2/TP4 work remains paused.
+(2,442/2,443 operators priced). That pre-overlay attempt completed no request;
+the later finite-overlay tiny pair failed TTFT/non-Torch as recorded above.
+The original low-source criterion remains failed. TP2/TP4 work remains paused.
 
 ## 1. Population and meaning of replay
 
@@ -128,9 +172,16 @@ minimum-request, subagent-overlap, image, classifier, deduplication and dynamic
 workflow filters; the published invocation uses `--sampling top`. No random
 sample of all Claude Code activity is established.
 
-The claim remains conditional on the declared deployment and replay semantics:
-Qwen/Qwen3.8-27B, TP ∈ {1,2,4}, existing memory and scheduler settings, synthetic
-content, prefix caching disabled, fixed source outputs, and open-loop arrivals.
+The historical evidence is conditional on Qwen/Qwen3.8-27B, TP ∈ {1,2,4},
+its declared memory/scheduler settings, synthetic content, **prefix caching
+disabled**, fixed source output counts and open-loop arrivals. The current
+target semantics instead enable prefix caching and preserve declared local
+source hash-block relationships through a separately pinned synthetic-token
+codec. That reconstructs prefix identity, not original text or true billed
+token lengths; generated-output reuse is not inferred from output counts.
+Fresh cache-on runs must bind that encoding, checkpoint policy and matching
+initial cache state on both engines. Historical cache-off results cannot be
+relabelled as evidence for it.
 All source model labels map to the same Qwen target. Root-relative arrival
 intervals are available; cross-root wall-clock chronology and a causal
 parent/tool-completion DAG are not. C ∈ {1,2,4,8} is the number of
@@ -152,7 +203,7 @@ The census distinguishes three denominators:
   28 zero-output leaves occupy 28 rejected episodes across 14 roots; those
   episodes contain 393 otherwise-eligible neighbours across three roots.
 
-The current short/large C=1/2/4/8 workloads contain **54 unique requests from 16
+The original registered cache-disabled short/large C=1/2/4/8 workloads contain **54 unique requests from 16
 roots**. Nested C workloads produce 110 appearances; these are not 110
 independent workload observations. The selection is the first qualifying
 episode of each of the first eight qualifying roots in corpus order per class.
@@ -182,7 +233,9 @@ no prompt from 4,097 through 16,384, none above 170,368, no output below 100,
 and no selected adjacent root-turn transition. The census records 27,960
 adjacent root transitions, including 25,663 growth transitions and 1,739
 shrinks; descendant transitions add 32,209 growths and 4,165 shrinks. Shared
-prefix hashes describe these histories even though prefix reuse is disabled.
+prefix hashes describe these histories even though the historical suite disabled
+prefix reuse. The cache-on successor must preserve their declared scope and
+must not expose future-request demand before logical readiness.
 
 Coarse input/output-length × actor bins represented by at least one selected
 request contain 42.41% of eligible request mass and 23.53% of input volume.
@@ -207,18 +260,20 @@ the largest input volume per episode is 66,735,744 proxy tokens.
 
 ## 3. Functionality and continuity come first
 
-**Small requests are a demonstrated support failure.** The readiness profile
+**The initial small-request support failure is preserved.** The readiness profile
 `8317c718…` accepts serialized ADD payloads starting at 5,875 bytes. Native
 `Sequence`/`CoreManager.add_request` serialization of all 532 non-pilot eligible
 requests below 1,024 tokens produces 2,329–5,668 bytes under the standard replay
 layout. A separate descriptor calculation agrees for 1,064 ordinary/full-corpus
-ordinal variants; all are refused. This affects **340/392 roots (86.7%)**,
+ordinal variants; that frozen profile refuses all of them. This affects **340/392 roots (86.7%)**,
 including 267 first root turns. Small request mass is therefore not evidence
 that the issue is harmless for complete-session support. These are deterministic
 native serialization checks, not GPU or HTTP timing observations. A source
 measurement or justified source model extension is needed; silently widening a
 bound would not provide that evidence. Even among the 378 non-pilot roots with
 every leaf selector-servable, 328 contain one of these confirmed refusals.
+The later low-byte source extension addresses this serialized-layout bound;
+cache-on checkpoint cuts and native region support remain separate checks.
 
 **The audited submission predecessor had a fixed thread ceiling.** Its
 `replay.py` pretokenized every prompt and used one blocking thread/HTTP request
@@ -330,31 +385,32 @@ from one root must remain linked in any uncertainty calculation.
 
 ## 5. Minimal next work, in order
 
-1. **Finish deterministic support checks and freeze exposure.** Keep the complete
-   census and current registrations. Resolve the 28 zero-output leaves explicitly
-   for a full-corpus claim: define their replay/outcome semantics and undefined
-   token-latency metrics where no token exists, or declare the exclusion and
-   reduced population. Validate standard serialized
-   descriptors, token/context limits, model-domain bounds and request accounting
-   over every retained leaf, including output-producing low prefill, cached tails
-   and decode history reached during generation. Retain the completed async
-   transport qualification and its socket/memory limits.
-   Check intact roots, not just individually eligible leaves. Keep these checks
-   separate from target timing claims.
-2. **Use a few corpus-native development cases to expose mechanisms.** Prefer
-   already-exposed roots wherever they provide equivalent coverage. Retain every
-   leaf in the selected native episode or continuous trajectory, including all
-   descendants. The compact witness list below specifies mechanisms and costs;
-   source overlap/volume nominate cases but do not prove target saturation or
-   preemption. Require actual target scheduler/KV witnesses for those claims.
-   First close the tiny-prefill and near-limit decode refusals with source-only
-   evidence, then obtain fresh pairs for those cases and the seven-request root.
-   Retain the completed 21-request sustained pair and its per-request misses;
-   use fanout/long-decode cases when their extra mechanism is needed, not merely
-   to fill a grid. Keep multi-client cold small groups open: N1 evidence does
-   not establish N2/pool support. Add complete-root continuity and keep the
-   C=1/2/4/8 axis as roots rather than a request throttle.
-3. **Freeze a separate confirmation design.** After model, transport and
+1. **Finish the cache-aware contract and deterministic checks.** Keep the census,
+   exposure ledger and legacy registrations. Bind source-local hash identities,
+   exact synthetic token IDs, cache/checkpoint policy, native fork allocation and
+   a matching empty-cache boundary. Keep future requests' prefix demand hidden
+   until native readiness. The explicit zero-output surrogate is documented in
+   `ZERO_OUTPUT_CONTRACT.md`; fresh diagnostics must declare it and leave TTFT/TPOT
+   undefined where no output token exists, rather than silently dropping leaves.
+   The historical selector's 28 excluded zero-output leaves remain part of its
+   recorded scope. Preserve all source arrivals, descendants and outputs.
+2. **Run an independent cache-on source/oracle preflight.** Check actual allocated
+   KV/state memory separately from occupancy, checkpoint cuts and one-token fork
+   work, cached-prefill dispatch and preparation regions. Reuse existing primitive
+   prices only where signatures and source scope match. Cache-on can cut cold
+   128-token prompts into 112+16 and 448 into 432+16; resolving a cache-off 448-token
+   price does not establish that path. Preserve failed source criteria and the
+   tiny TTFT/non-Torch failures; do not fit their residuals or widen thresholds.
+3. **Obtain fresh cache-aware E2E evidence from exposed roots.** Start with one
+   intact root/trajectory from the pinned corpus and assess actual admitted hits,
+   compressed/wanted/reusable tokens, checkpoint fates and pool pressure alongside
+   timing/memory. Policy tests and source overlap alone prove none of those
+   mechanisms. Keep the completed cache-off near-limit and sustained pairs as
+   history; the old long real run stays held. Expand to complete continuity and
+   C=1/2/4/8 root bundles without request throttles, dropped descendants or altered
+   gaps. N1 support does not establish N2/pool support, and no source proxy alone
+   proves target saturation or preemption.
+4. **Freeze a separate confirmation design.** After model, transport and
    diagnostics stabilize, preregister untouched roots/bundles, exact workloads,
    weighting, configuration gates, environmental scope, sample count, repeats,
    multiplicity and stop rule before looking at confirmation outcomes. Keep
@@ -418,9 +474,9 @@ generalization. Confidence in configuration estimates is also different from a
 claim that at least 99% of requests/workloads pass; no such pass-rate gate is
 added here.
 
-Prioritize the source-price gap and fresh tiny, near-limit and intact-root pairs;
-retain the sustained pair and add fanout or multi-client cold-opening evidence
-where it exercises a remaining mechanism.
+Prioritize the cache-on source/oracle preflight and a fresh intact exposed-root
+pair. Retain historical cache-off results; add cache-aware continuity, fanout
+and multi-client evidence where each exercises a remaining mechanism.
 Before confirmation, freeze the predictor and a probability design covering
 both the 249 exposed and at-most-144 untouched partitions, with known inclusion
 probabilities. The untouched partition cannot stand in for all 393 roots.
@@ -495,6 +551,11 @@ accuracy/exposure inventories are under its sibling
 | `REGION_SUPPORT_HANDOFF_V1.json` | `59870d4c9dbc5668fd71927f4f56447fdaba84a8011365d6103c5a59f3779b66` |
 | Sustained `PAIRED_HANDOFF.json` | `45052b75d5db0fa4cec2257b22be1d3ba9017df9ae249a3da3e88590f34595e1` |
 | High-history `HELDOUT_VERDICT_V1.json` | `ed6896d490a1ad1e327fd2009990b72fba4f475c1faa97f3b3188910e58ea445` |
+| Near-limit `PAIR_VALIDATION_V1.json` | `aadf9f70a21616efaa3c0150261bc8b8b1d53bacc66707b093f835e9d68e8cbc` |
+| Long-decode `MODELLED_VALIDATION_V1.json` | `6fb8a2595ea310441303bdb12d8dfb4f6b79b83d481df8e2f42bde86cd6e7116` |
+| Tiny `TINY_NO_CACHE_PAIR.json` | `799b73abc5c05e92eca8953696c56f2514412c76cb47e8f4670ede856db8bbe4` |
+| Intact-root first QK-norm refusal | `b3d2ff0e4217be77d8dbac60b4bb601be633c562f13113cc785add8c9767e794` |
+| Integrated cache-on `CPU_REGRESSION_V1.json` (CPU contracts only) | `b485bb197addca09c8431b32d3174cceceeda83211ac334f96d2e7de10cb3e53` |
 
 The low-range handoff and candidate are under
 `agent_scratch/codex_decode_domain_v1/ingress_handoff_low_extension_v1` in the
@@ -512,6 +573,13 @@ Low-source failure and diagnostic candidate evidence remain under
 `codex_small_prefill_regions_v1/` and `codex_low_prefill_diagnostic_v1/`.
 The high-history verdict is under
 `codex_high_per_sequence_source_v1/acquisition_v4/`.
+The later near-limit and long-decode receipts are under
+`codex_near_limit_high_v1/` and `codex_long_decode_high_v1/`. The tiny pair is
+under `codex_low_gather_source_v1/finite_overlay_v1/`, with intact-root refusal
+details in `root_modelled_execution/REFUSAL_CLOSEOUT.json`. These are historical
+cache-disabled diagnostic artifacts, not cache-on acceptance or confidence samples.
+The integrated cache-on CPU receipt and JUnit output are under
+`codex_cache_on_integration_2782333_v1/`; they record code-contract checks only.
 
 The current root exposure ledger is
 `agent_scratch/corpus_review_v1/EXPOSURE_LEDGER_V2.json` in the review worktree.

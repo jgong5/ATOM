@@ -7,15 +7,51 @@ without calling a missed 5x target a pass; `cc_traces_validate.py matrix
 --speed-advisory` records this policy explicitly. Existing strict protocol
 registrations and their historical verdicts remain unchanged.
 
-**Current execution priority (2026-09-14): whole-corpus coverage and
-confidence.** The committed [cc-traces coverage and confirmation
-review](CC_TRACES_COVERAGE_REVIEW.md) now controls gap closure and case
-selection. The registered burst suite retains its existing meaning; its
-passing cells do not establish whole-corpus accuracy or 99% confidence.
-The earlier corrected short-c4 paired campaign is held while these priorities
-are addressed.
+**Current execution priority (2026-09-15): prefix caching enabled for the
+main cc-traces completion path.** The [coverage and confirmation
+review](CC_TRACES_COVERAGE_REVIEW.md) controls coverage and case selection.
+The original cache-disabled registration and its **9/24** passing cells
+(including **8/8 original TP1**) retain their historical meaning. They do not
+prove the cache-enabled configuration, whole-corpus accuracy or **99%
+confidence**. No cache-enabled paired accuracy result is established yet.
+The earlier short-c4 campaign and staged cache-disabled long real run are held.
 
-**New corpus diagnostics (2026-09-14): first fresh sustained-arrivals pair;
+**Cache-on implementation is integrated at `2782333ab`.** The new diagnostic
+path binds an explicit cache policy and source-hash prompt encoding; both
+engines use prefix caching, checkpoint interval 8192, demand checkpoints and
+native one-token GDN fork semantics. It retains the original cache-off plan.
+The native/replay allocation bridge now carries distinct fork source and
+destination slots. A quiescent cache reset fences every worker, clears both
+indexes and records policy/pool/counter snapshots; a modelled run must remain
+fresh at its original virtual epoch. Future requests do not publish prefix
+demand before readiness. Captured and derived target/memory provenance retain
+the source policy, with cache-on memory reuse explicitly an unvalidated
+derived candidate. **648 targeted CPU regressions pass** on exact source
+`2782333abba2135050072f5966f41c79472c2142`, with zero failures, errors or skips
+in a container with no GPU device nodes. These contracts alone prove neither
+cache hits, pool pressure, native memory terms, region coverage nor E2E accuracy.
+Cache-aware diagnostics explicitly call the policy-aware engine and memory
+checks plus `check_cache_policy_evidence`; the registered `cell` checker
+retains its historical cache-off contract.
+
+**Latest cache-disabled diagnostic evidence, preserved as history:**
+
+| Case | Completed evidence and remaining qualification |
+| --- | --- |
+| Near-limit 250,048 input / 39 output | Fresh pair on `4b109a968` completed 1/1 on both sides. TTFT **+5.70%**, TPOT **+4.30%**, throughput **−5.38%**; all maintained provenance/capacity/memory checks pass. One paired diagnostic, not a registered cell or confidence sample. |
+| Tiny 128 input / 16 output | The finite gather-price overlay completed a fresh pair. TTFT **−46.73% fails** the 15% bar; TPOT **+5.65%** and throughput **+8.16%** are within their 10% bars. Non-Torch memory **2,046,820,352 real / 1,157,627,904 modelled bytes** fails its component bar; KV **111,930 / 112,773**, error **0.753%**, is within 5%. The smaller KV error does not erase the component failure. |
+| Long decode 195,840 input / 40,339 output | Modelled side on `74bb2d128` completed 1/1 and all 13 maintained checks. Predicted TTFT **133.296848 s**, TPOT **0.035998853 s**, latency **1,585.418576 s**. The real side is staged with an explicit diagnostic warmup-output cap of 32 and unchanged measured output, but is **HOLD** after the cache-policy change. No paired accuracy result. |
+| Intact seven-request root `1493faff…` | Its cache-disabled modelled run refused at the opening 448-token prefill: 16 unpriced `triton::_fused_qk_norm_single_kernel` occurrences. The refusal and cleanup are preserved; the real side was not launched. Further cache-disabled source collection/retry is held. |
+
+The tiny non-Torch discrepancy remains a measured failure with unresolved
+attribution. Native allocation and its recorder use the current PyTorch
+device's `mem_get_info` and `memory_reserved`, not an SMI device-index path;
+the proposed SMI-index mismatch is unsupported by that code. No cause or
+corrected constant follows from the observation, and no retuning was done.
+All owned diagnostic serving processes above are closed; the queued long
+real plan remains unexecuted.
+
+**Historical cache-disabled corpus diagnostics (2026-09-14): first fresh sustained-arrivals pair;
 no new registered acceptance cell.** The TP1 pair on `b27d0e7f2` completed
 **21/21 requests and 15,979 output tokens on each side**, using the unchanged
 `source-27b-tp1-history-2m` preset and diagnostic readiness profile `6e26d4cb`.
@@ -46,7 +82,7 @@ cell and leaves the original **9/24** count unchanged.
 
 **Earlier region-domain refusals remain recorded.** Low-byte readiness support
 passed, but the selected region model
-still refuses compiled output-producing N1 prefill at 128 tokens against
+originally refused compiled output-producing N1 prefill at 128 tokens against
 `[640,16384]`. The seven-request full root begins at 448 and was held by explicit
 preflight without a run. The near-limit 250,048/39 case priced all 16 prefills
 (15 × 16,384 plus 4,288), then refused first decode history **250,049** against
@@ -68,8 +104,9 @@ The separate TP1 preset `source-27b-tp1-history-256k` is integrated in
 frozen source heldouts pass the fixed 110 µs preparation-increment criterion
 (maximum **12.560 µs**). The per-row domain reaches 262,143; 11 legacy
 snapshots and 411 old breakdown/band comparisons remain exact, with 209 tests
-passing. The sustained pair used the old preset; a fresh near-limit diagnostic
-on the new preset is pending, so no near-limit E2E completion is claimed.
+passing. The sustained pair used the old preset; the fresh near-limit pair
+on the new preset subsequently completed with the passing diagnostic results
+above. This does not establish cache-enabled E2E coverage.
 
 Low-prefill native source validation **failed** its fixed 110 µs preparation
 criterion: 17/30 pass, 13 fail, maximum **427.143 µs**. Postprocess 14/14 and
@@ -78,15 +115,18 @@ uses already-frozen anchors; it changes no defaults or acceptance selection,
 does not relabel the failed criterion, and adds no N2/pool support. Its tiny
 CPU follow-on loaded successfully but exited **5** on the missing head-row
 gather price `aten::index.Tensor|128,5120;1|bfloat16,int32|1:127`
-(2,442/2,443 operators priced). No tiny response completed; the intact-root
-follow-on is unlaunched. **TP2/TP4 remain paused.** Next useful evidence is
-closure of this source-price gap and fresh tiny/near-limit/intact-root pairs.
+(2,442/2,443 operators priced). That pre-overlay attempt completed no tiny
+response. The later finite-overlay pair and intact-root QK-norm refusal are
+recorded above; the failed low-region criterion remains a failure.
+**TP2/TP4 remain paused.** Next useful evidence is a cache-enabled native
+source/oracle preflight and a fresh paired exposed-root diagnostic.
 N1 low-prefill
 support must not stand in for multi-client N2/pool support; the coverage review
 records a minimal exposed-root C2/C4 cold-opening proposal, with actual batching
 to be witnessed and no manufactured C8 case.
 
-The seven diagnostic manifests are unchanged; **249 roots remain exposed and
+The seven original cache-disabled diagnostic manifests are unchanged; new
+cache-aware fixtures receive separate identities. **249 roots remain exposed and
 at most 144 potentially untouched**, with no new reserve allocation. The
 [confirmation next step](CC_TRACES_COVERAGE_REVIEW.md#6-confidence-limitation-and-next-step)
 requires a frozen probability design spanning both partitions, cluster-aware
@@ -94,7 +134,7 @@ uncertainty and an inconclusive stop; detailed sampling is deferred. It does not
 static coverage or a bootstrap establishes literal joint 99% over all 393 roots.
 The original paired count below remains **9/24, including 8/8 original TP1**.
 
-**2026-09-14 checkpoint: nine paired cc-traces cells pass the current
+**Historical 2026-09-14 cache-disabled checkpoint: nine paired cc-traces cells pass their registered
 aggregate checks, including all 8/8 original TP1 cells.** The original TP1
 execution sweep is closed. Its eight cells use the frozen candidate at commit
 `2feea392`; the retained first TP2 cell uses `8a637eff`. Each has three fresh
@@ -305,6 +345,23 @@ It pins every artifact, remote-copy hash check, validation result and cleanup
 observation in the local CPU evidence tree. Execution IDs are
 `cx-4c1e447bc8f14546` (real) and `cx-d28d93604c2d5e8a` (modelled).
 
+Later cache-disabled diagnostic receipts are retained separately:
+
+| Artifact | SHA-256 |
+| --- | --- |
+| `codex_near_limit_high_v1/PAIR_VALIDATION_V1.json` | `aadf9f70a21616efaa3c0150261bc8b8b1d53bacc66707b093f835e9d68e8cbc` |
+| `codex_long_decode_high_v1/MODELLED_VALIDATION_V1.json` | `6fb8a2595ea310441303bdb12d8dfb4f6b79b83d481df8e2f42bde86cd6e7116` |
+| `codex_low_gather_source_v1/finite_overlay_v1/TINY_NO_CACHE_PAIR.json` | `799b73abc5c05e92eca8953696c56f2514412c76cb47e8f4670ede856db8bbe4` |
+| Intact-root first QK-norm refusal | `b3d2ff0e4217be77d8dbac60b4bb601be633c562f13113cc785add8c9767e794` |
+| `codex_cache_on_integration_2782333_v1/CPU_REGRESSION_V1.json` (CPU contracts only) | `b485bb197addca09c8431b32d3174cceceeda83211ac334f96d2e7de10cb3e53` |
+
+The intact-root closeout is under
+`codex_low_gather_source_v1/finite_overlay_v1/root_modelled_execution/REFUSAL_CLOSEOUT.json`.
+The tiny registry's metadata-only price-rollup addendum is
+`REGISTRY_WITH_PRICE_ROLLUP.json`, SHA256
+`0329181fd83f01c08195eb1884cbea6b9f817b44128c05a7e8797b860fc9b814`;
+the original omission and all timing failures remain preserved.
+
 **First TP2 E2E transfer cell verified.** The frozen `8a637eff` candidate's
 three real/modelled pairs preserve both registered requests and pass all
 48 non-KV component and six KV comparisons. Non-Torch memory is
@@ -453,11 +510,12 @@ any gate: EP/MoE, PP/DP/PD disaggregation, speculative decoding, an analytical
 SOL oracle.
 
 Production contracts that must survive: `--level 3` compilation, CUDA-graph
-capture and replay, chunked prefill. **Cache policy for every gate run:
-`--no-enable_prefix_caching`.** Prefix caching changes which tokens are
-computed, so a real run with it on and a simulated run with it off are not the
-same experiment; it is off on both sides, always, and any gate run that turns it
-on is a different row.
+capture and replay, chunked prefill. **Current main-path cache policy:
+prefix caching enabled on both engines**, with explicit checkpoint and initial
+cache-state semantics. The original registration used
+`--no-enable_prefix_caching` on both sides; its results remain historical
+cache-disabled rows. Cache-on validation needs fresh matched evidence and a
+separate configuration/workload identity, without relabelling those rows.
 
 ## Final acceptance is end-to-end cc-traces — registered 2026-09-11
 
@@ -569,11 +627,13 @@ result is relabelled by it: the qualification is that a cc_pilot figure must
 carry its request count, and that no cc_pilot run -- at either count -- is
 acceptance evidence.
 
-Three properties of the corpus do not survive the current replay path, and they
-bound what any cc-traces cell can claim (`agent_scratch/cctraces.py`): prefix
-reuse is dropped — the trace's `hash_ids` carry 64-token block sharing, while
-`replay.py` sends synthetic prompts that share no prefix and the engine runs with
-prefix caching off; `in` is a **block-derived token count**, not a tokenizer
+Three properties qualify the historical replay evidence and its cache-on
+successor (`agent_scratch/cctraces.py`). Historical replay dropped prefix
+reuse: the trace's `hash_ids` carry 64-token block sharing, while its synthetic
+prompts shared no prefix and caching was off. The new codec preserves declared
+local hash-block prefix identity using synthetic token IDs; it does not recover
+original text or establish generated-output reuse. `in` is a
+**block-derived token count**, not a tokenizer
 count — a CC source audit on 2026-09-11 established that it is already in token
 units, equal to `len(hash_ids) × block_size` across 28 444 top-level real
 request rows, so it is a true length quantised up to a 64-token boundary rather
@@ -631,6 +691,10 @@ held out**, however small the measurement.
 Status values: **PASS** (evidence exists and is preserved), **FAIL** (measured
 and outside the bar), **PARTIAL** (some cells pass, the gate as stated does
 not), **UNPROVEN** (no valid measurement yet).
+
+The table retains the original cache-disabled registration's results and
+**9/24** count. Cache-enabled main-path gate evidence is still pending; none
+of these historical passes is automatically transferred to that configuration.
 
 | # | Gate | Bar | Status | Evidence |
 | --- | --- | --- | --- | --- |
@@ -1522,23 +1586,20 @@ no GPU held, 0% CPU) and is left to exit on its own timeout.
 
 ## 7. Open items, ranked by which gate they block
 
-Re-ranked 2026-09-11 under the cc-traces acceptance registration. Items that
-block only a diagnostic are marked as such and no longer compete for priority
-with items that block a gate.
+Re-ranked 2026-09-15 for the cache-enabled main path. Historical cache-disabled
+results remain evidence about their registered configuration, not completion
+of these successor tasks.
 
 | # | item | blocks |
 | --- | --- | --- |
-| 1 | register the end-to-end cc-traces acceptance protocol: dataset version, scope, short/long regime definitions, selection rules, request identities and order, lengths, arrival pacing, preparation protocol, hashes | **every gate** — until this is stamped, no gate row can move |
-| 2 | cc-traces coverage: what fraction of the corpus's shapes the price library covers, and the structural cache's cost and hit rate at that coverage | every gate, via the oracle the matrix runs on |
-| 3 | the full short/long × TP{1,2,4} cc-traces serving matrix | G1, G1b, G1c, G2a, G2b, G2c, G4 |
-| 4 | a timed cc-traces workload with capture, calibration and startup costs separated and amortised | G5a, G5c |
-| 5 | per-term memory and KV validation *at the matrix's own deployments*, and an infeasible configuration rejected for ATOM's own reason | G3a, G3b, G3c |
-| 6 | diagnose the long-sweep device fault (E2b) — it blocks any long cc-traces cell that needs a calibration sweep | items 2 and 3 |
-| 7 | witness the token lifecycle on both sides; settle E2a-b | G2, if any synthetic diagnostic is to stay interpretable |
-| 8 | calibrate `warmup_seconds` for this deployment; the cold first forward is ~6.9 s and unmodelled (E2a-a) | G2, and the preparation protocol in item 1 |
-| 9 | prefix-reuse replay from `hash_ids`, so a cc-traces cell can be run with native cache policy rather than with prefix caching off | the scope boundary of item 1, not a gate as currently registered |
-| 10 | **a predeclared stability method for every frozen price** — repeat count, statistic and acceptance band fixed in the freeze script before measurement, spread recorded with the price, an out-of-band spread refusing the freeze rather than choosing a value; never re-measured or re-selected because it moves a residual (§1) | the credibility of every future frozen prediction |
-| 11 | outlier rejection by region (the 4-MAD pass drops 83% of sub-1024-token prefill rows) | fit quality, not a gate unless it moves one |
+| 1 | Complete combined CPU verification and registration of cache-aware prompt identity, policy, native fork binding, quiescent reset and readiness-governed demand | every cache-on gate |
+| 2 | Independent cache-on source/oracle preflight: low checkpoint-cut shapes, resume/fork work, region scope and actual native memory terms; retain the tiny TTFT/non-Torch failures | functionality, G2 and G3 |
+| 3 | Fresh intact exposed-root TP1 pair with actual admitted cache hits, checkpoint/pool evidence and all requests/arrivals preserved | first cache-on E2E accuracy evidence |
+| 4 | Cache-aware short/long × C{1,2,4,8} × TP{1,2,4} paired matrix, with clients kept distinct from in-flight requests | G1, G1b, G1c, G2 and G4; historical 9/24 remains unchanged |
+| 5 | Per-term memory/KV checks and native infeasible rejection at the same cache-on deployments, plus ranking/ties/regret evidence | G1 and G3 |
+| 6 | Freeze a probability design across exposed and potentially untouched roots; preserve cluster dependence and an inconclusive stop | whole-corpus and 99% confidence claim, currently unproved |
+| 7 | Record execution, derivation and acquisition/amortisation costs; keep a missed 5× target explicit and advisory | G5a and G5c |
+| 8 | Keep source statistics, repeat counts and bands fixed before measurement; refuse uncovered work and never fit evaluated cc-trace timings | credibility of every prediction |
 
 **Closed since the last ranking.** Item 5 of the old list — "predict TP=2/4 from
 a TP=1 capture" — is done as a *diagnostic* and is not coming back in that form:
