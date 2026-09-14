@@ -1090,8 +1090,13 @@ class Scheduler:
         from atom.model_engine.prefill_delayer import PrefillDelayer
 
         self.prefill_delayer: PrefillDelayer | None = None
+        from atom.compass.runtime.request_readiness import load_for_scheduler
+
+        self._request_readiness = load_for_scheduler(config, get_clock())
 
     def set_prefill_delayer(self, delayer) -> None:
+        if delayer is not None and self._request_readiness is not None:
+            raise ValueError("request readiness does not support a prefill delayer")
         self.prefill_delayer = delayer
 
     def _can_admit_head_prefill(self) -> bool:
@@ -1260,6 +1265,8 @@ class Scheduler:
                 expected = int(declared)
                 break
         if not expected:
+            if self.waiting and getattr(self, "_request_readiness", None) is not None:
+                raise ValueError("request readiness requires a complete declared workload")
             return False  # nobody declared a workload; nothing to hold for
 
         if len(self.waiting) >= expected:
@@ -1279,6 +1286,12 @@ class Scheduler:
             self.waiting = deque(
                 seq for _, seq in sorted(enumerate(self.waiting), key=arrival_order)
             )
+            readiness = getattr(self, "_request_readiness", None)
+            if readiness is not None:
+                readiness.resolve_closed_workload(self.waiting)
+                self.waiting = deque(sorted(self.waiting, key=lambda seq: (
+                    readiness.record(seq).ready_at,
+                    readiness.record(seq).receipt_order)))
             self._arrival_barrier_open = True
             logger.info(
                 "ATOMCompass: all %d declared requests have arrived; "
@@ -1311,6 +1324,8 @@ class Scheduler:
                 "retroactively late -- treat this run's latencies as invalid.",
                 len(self.waiting), expected, self.ARRIVAL_BARRIER_TIMEOUT_S,
             )
+            if getattr(self, "_request_readiness", None) is not None:
+                raise ValueError("cannot resolve readiness after an incomplete arrival barrier")
         return not self._arrival_barrier_open
 
     @property
@@ -1334,6 +1349,9 @@ class Scheduler:
         the engine, because it is per-request and concurrent: two requests
         arriving together each wait once, not twice.
         """
+        readiness = getattr(self, "_request_readiness", None)
+        if readiness is not None:
+            return readiness.record(seq).ready_at
         return seq.arrive_time + self._admission_seconds
 
     def _declared_arrival_pending(self, seq) -> bool:
@@ -1353,6 +1371,9 @@ class Scheduler:
         clock = get_clock()
         if getattr(clock, "epoch", None) is None:
             return False
+        readiness = getattr(self, "_request_readiness", None)
+        if readiness is not None and readiness.records is None:
+            return True  # registration is not scheduler visibility
         return self._schedulable_at(seq) > clock.time()
 
     def _advance_to_next_arrival(self) -> None:

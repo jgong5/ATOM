@@ -396,6 +396,11 @@ class EngineUtilityHandler:
             result = {"why": f"{type(exc).__name__}: {exc}"}
         if not isinstance(result, dict):
             result = {"why": "this runner records no loaded inputs"}
+        readiness = getattr(self.scheduler, "_request_readiness", None)
+        if readiness is not None:
+            # This reader lives in EngineCore, not in the worker whose manifest
+            # is above. Preserve both records without reopening either input.
+            result = dict(result, core_inputs=readiness.input_manifest())
         self.output_queue.put_nowait(
             ("UTILITY_RESPONSE", {"cmd": "get_compass_inputs",
                                   "result": result})

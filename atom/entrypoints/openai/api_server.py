@@ -2834,6 +2834,8 @@ async def compass_provenance():
             "loaded_inputs": loaded,
             "virtual_clock": compass.virtual_clock,
             "admission_seconds": compass.admission_seconds,
+            "request_readiness_profile": getattr(compass, "request_readiness_profile", ""),
+            "prefill_preparation_fence": getattr(compass, "prefill_preparation_fence", False),
             # Which rank's step the modelled side is reporting. A plan that
             # asks for `slowest` and gets a server still on `rank0` is priced
             # from one rank of the group, which no step row would contradict --

@@ -1936,6 +1936,20 @@ def check_calibration(
             f"the modelled server names {sorted(named)} but reported no "
             f"digest for any of them: what it was fitted to is unrecorded"
         )
+    bad += _check_calibration_records(
+        digests, option_files, registry, tp, workload_sha, forbidden
+    )
+    bad += check_request_readiness_calibration(
+        modelled, registry, tp, workload_sha, forbidden
+    )
+    return bad
+
+
+def _check_calibration_records(
+    digests, option_files, registry: dict, tp: int, workload_sha: str, forbidden: dict
+) -> list[str]:
+    """Apply the existing registry contract to the files a reader loaded."""
+    bad = []
     by_sha = {a.get("sha256"): a for a in (registry.get("artifacts") or [])}
     for role, sha in sorted(digests.items()):
         entry = by_sha.get(sha)
@@ -1992,6 +2006,68 @@ def check_calibration(
                 f"the modelled server read {len(found)} file(s) for {role} "
                 f"and reported no digest for it"
             )
+    return bad
+
+
+READINESS_INPUT_ROLES = frozenset(
+    f"runtime.request_readiness.{name}"
+    for name in ("profile", "endpoint_fit", "validation", "plan", "contract", "source")
+)
+
+
+def check_request_readiness_calibration(
+    modelled, registry: dict, tp: int, workload_sha: str, forbidden: dict
+) -> list[str]:
+    """Validate the enabled readiness inputs reported by their core reader.
+
+    Core inputs are nested beside each worker manifest, not additional worker
+    ranks. The selected profile and its source receipts must all be present
+    and satisfy the same registry and leakage checks as oracle inputs.
+    """
+    compass = (modelled.manifest.get("server") or {}).get("compass") or {}
+    profile = compass.get("request_readiness_profile")
+    if not profile:
+        return []
+    bad = []
+    ranks = _rank_records(modelled)
+    if not ranks:
+        return ["request readiness is enabled but no core input manifest was reported"]
+    for index, rank in enumerate(ranks):
+        tag = f"request readiness core reader {index}"
+        core = rank.get("core_inputs")
+        if not isinstance(core, dict):
+            bad.append(f"{tag}: enabled profile has no core_inputs record")
+            continue
+        reader = core.get("reader") or {}
+        if (reader.get("component") != "EngineCore.Scheduler"
+                or type(reader.get("pid")) is not int or reader["pid"] <= 0):
+            bad.append(f"{tag}: missing actual EngineCore.Scheduler reader identity")
+        rows = [row for row in (core.get("inputs") or []) if isinstance(row, dict)]
+        roles = {row.get("role") for row in rows}
+        missing = READINESS_INPUT_ROLES - roles
+        if missing:
+            bad.append(f"{tag}: missing loaded readiness inputs {sorted(missing)}")
+        profiles = [row for row in rows
+                    if row.get("role") == "runtime.request_readiness.profile"]
+        if len(profiles) != 1:
+            bad.append(f"{tag}: expected one actual loaded readiness profile")
+        elif profiles[0].get("requested") != profile:
+            bad.append(
+                f"{tag}: loaded profile request {profiles[0].get('requested')!r} "
+                f"does not match enabled profile {profile!r}"
+            )
+        digests, files = {}, {}
+        for row_index, row in enumerate(rows):
+            role, path, sha = row.get("role"), row.get("path"), row.get("sha256")
+            label = f"{tag} input {row_index} ({role})"
+            if not isinstance(path, str) or not path or not _hexish(sha):
+                bad.append(f"{label}: loaded input needs a path and parsed-byte sha256")
+                continue
+            digests[label] = sha
+            files[label] = {os.path.basename(path): sha}
+        bad += _check_calibration_records(
+            digests, files, registry, tp, workload_sha, forbidden
+        )
     return bad
 
 

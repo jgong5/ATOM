@@ -134,6 +134,12 @@ class CompassConfig:
     oracle_options: Optional[dict] = None
     virtual_clock: bool = True
     admission_seconds: float = 0.0
+    # Optional core-owned resolver profile. No production profile is selected
+    # by default; it must bind declared arrival to native scheduler visibility.
+    request_readiness_profile: str = ""
+    # Source-witnessed GDN prefill D2H fence, approximated by the existing
+    # priced preparation boundary. Host dispatch remains unpriced/overlapped.
+    prefill_preparation_fence: bool = False
     op_timings_out: Optional[str] = None
     bench_graph: Optional[str] = None
     bench_out: Optional[str] = None
@@ -171,6 +177,8 @@ class CompassConfig:
             self.epoch = _time.time()
         if self.oracle_options is None:
             self.oracle_options = {}
+        if self.request_readiness_profile and self.admission_seconds:
+            raise ValueError("request readiness and admission_seconds are mutually exclusive")
         if self.filler_token_id < 0:
             raise ValueError(f"filler_token_id must be >= 0, got {self.filler_token_id}")
         if self.mode not in ("predict", "trace", "measure"):

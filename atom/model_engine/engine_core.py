@@ -139,7 +139,7 @@ def _defers_output(fwd_out) -> bool:
     return bool(getattr(fwd_out, "is_deferred_out", False))
 
 
-def _advance_native_pipeline(core, fwd_out) -> bool:
+def _advance_native_pipeline(core, fwd_out, scheduled_batch=None) -> bool:
     """Move host time only to the native forward's required waits.
 
     Component oracles with a measured preparation boundary can distinguish
@@ -149,7 +149,27 @@ def _advance_native_pipeline(core, fwd_out) -> bool:
     preparation = getattr(fwd_out, "compass_preparation_seconds", None)
     clock = get_clock()
     advance = getattr(clock, "advance", None)
-    if preparation is None or advance is None:
+    if advance is None:
+        return False
+    config = getattr(getattr(core, "scheduler", None), "config", None)
+    compass = getattr(config, "compass_config", None)
+    fence = bool(getattr(compass, "enabled", False)
+                 and getattr(compass, "prefill_preparation_fence", False))
+    if fence:
+        if scheduled_batch is None:
+            raise ValueError("prefill preparation fence requires the selected batch")
+        fence = scheduled_batch.total_tokens_num_prefill > 0
+    if fence:
+        architectures = getattr(getattr(config, "hf_config", None), "architectures", ()) or ()
+        parallel = getattr(config, "parallel_config", None)
+        if ("Qwen3_5ForConditionalGeneration" not in architectures
+                or getattr(config, "tensor_parallel_size", 1) != 1
+                or getattr(config, "pipeline_parallel_size", 1) != 1
+                or getattr(parallel, "data_parallel_size", 1) != 1):
+            raise ValueError("preparation fence supports the source-proven TP1 dense Qwen3.5 GDN path")
+        if preparation is None:
+            raise ValueError("prefill preparation fence needs a priced preparation boundary")
+    if preparation is None:
         return False
     from atom.compass.runtime.timeline import ForwardTimeline
 
@@ -160,9 +180,19 @@ def _advance_native_pipeline(core, fwd_out) -> bool:
     if produces is None:
         raise ValueError("pipelined timing requires the current output predicate")
     now = clock.time()
+    blocking_prefix = fwd_out.compass_output_ready_seconds or 0.0
+    if fence:
+        # GDN prefill copies GPU cu_seqlens_q.diff() back to CPU while building
+        # metadata, before model dispatch and before the output-less branch.
+        # The source-priced preparation+idle remainder approximates that fence;
+        # it is not an exact D2H timestamp. Reuse the existing prefix rule so
+        # preparation and GPU total are charged once. Dispatch stays unpriced.
+        blocking_prefix = max(blocking_prefix, preparation)
     marks = timeline.submit(
         now, fwd_out.compass_step_seconds, preparation,
-        fwd_out.compass_output_ready_seconds or 0.0, produces)
+        blocking_prefix, produces)
+    if fence:
+        marks["prefill_preparation_fence"] = "priced_preparation_boundary_approximation"
     advance(marks["host_returned_at"] - now)
     from atom.compass.runtime.lifecycle import trace
 
@@ -499,7 +529,7 @@ class EngineCore:
             fwd_out = self.runner_mgr.call_func(
                 "forward", scheduled_batch, wait_out=True
             )
-            pipelined = _advance_native_pipeline(self, fwd_out)
+            pipelined = _advance_native_pipeline(self, fwd_out, scheduled_batch)
             if not pipelined:
                 if not _defers_output(fwd_out):
                     _advance_clock_for(fwd_out)
@@ -1385,7 +1415,7 @@ class DecodeEngineCore(EngineCore):
         t0 = get_clock().perf_counter()
         _stamp_step_start(scheduled_batch)
         fwd_out = self.runner_mgr.call_func("forward", scheduled_batch, wait_out=True)
-        pipelined = _advance_native_pipeline(self, fwd_out)
+        pipelined = _advance_native_pipeline(self, fwd_out, scheduled_batch)
         if not pipelined:
             if not _defers_output(fwd_out):
                 _advance_clock_for(fwd_out)

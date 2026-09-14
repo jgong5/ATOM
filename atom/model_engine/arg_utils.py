@@ -63,6 +63,8 @@ class EngineArgs:
     compass_measure_out: str = ""
     compass_measure_warmup_steps: int = 0
     compass_admission_seconds: float = 0.0
+    compass_request_readiness_profile: str = ""
+    compass_prefill_preparation_fence: bool = False
     compass_op_timings_out: str = ""
     compass_bench_graph: str = ""
     compass_bench_out: str = ""
@@ -289,6 +291,19 @@ class EngineArgs:
             "meaningful with --compass-mode=trace, which runs eagerly: a "
             "replayed CUDA graph is one submission with nothing to observe "
             "inside it, so these are eager times and not production costs.",
+        )
+        parser.add_argument(
+            "--compass-prefill-preparation-fence",
+            action="store_true",
+            help="Model the source-witnessed TP1 GDN prefill preparation fence "
+            "at the existing priced preparation boundary; host dispatch remains overlapped.",
+        )
+        parser.add_argument(
+            "--compass-request-readiness-profile",
+            type=str,
+            default="",
+            help="Optional source-service profile resolving registered requests "
+            "to scheduler-ready events in TP1 virtual replay. No profile is selected by default.",
         )
         parser.add_argument(
             "--compass-admission-seconds",
@@ -864,6 +879,8 @@ class EngineArgs:
         compass_measure_out = kwargs.pop("compass_measure_out", "")
         compass_measure_warmup = kwargs.pop("compass_measure_warmup_steps", 0)
         compass_admission = kwargs.pop("compass_admission_seconds", 0.0)
+        compass_readiness = kwargs.pop("compass_request_readiness_profile", "")
+        compass_preparation_fence = kwargs.pop("compass_prefill_preparation_fence", False)
         compass_op_timings = kwargs.pop("compass_op_timings_out", "")
         compass_bench_graph = kwargs.pop("compass_bench_graph", "")
         compass_bench_out = kwargs.pop("compass_bench_out", "")
@@ -899,6 +916,10 @@ class EngineArgs:
             compass_kwargs["measure_warmup_steps"] = compass_measure_warmup
         if compass_admission:
             compass_kwargs["admission_seconds"] = compass_admission
+        if compass_readiness:
+            compass_kwargs["request_readiness_profile"] = compass_readiness
+        if compass_preparation_fence:
+            compass_kwargs["prefill_preparation_fence"] = True
         if compass_op_timings:
             compass_kwargs["op_timings_out"] = compass_op_timings
         if compass_bench_graph:
