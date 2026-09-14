@@ -37,9 +37,12 @@ receipt is `run.cache_boundary`; the final `/compass/cache` snapshot is
 after-counters. Record draining alone is not a cache reset. There is no reset
 between measured events and no change to the ordinary disk compile-cache policy.
 
-This surrogate preserves declared **prompt-prefix** identities. Original output
-tokens and their causal inclusion in later prompts are unavailable; Qwen output
+This surrogate preserves declared **prompt-prefix** identities. Qwen output
 must not be declared equivalent to later synthetic input from output counts.
+Published AIPerf cc-traces replay also uses synthetic assistant history by
+default, so unavailable original text is not an additional PoC blocker. Its chat
+formatting and dependency scheduling still differ from these completion
+diagnostics; see [AIPerf replay alignment](AIPERF_REPLAY_ALIGNMENT.md).
 Actual hits can be smaller than the declared common prefix because of arrival,
 eviction, the final-block rule and recurrent-state checkpoints. Cache-policy,
 state reuse, memory and timing still require fresh paired validation.
