@@ -119,7 +119,8 @@ gather price `aten::index.Tensor|128,5120;1|bfloat16,int32|1:127`
 response. The later finite-overlay pair and intact-root QK-norm refusal are
 recorded above; the failed low-region criterion remains a failure.
 **TP2/TP4 remain paused.** Next useful evidence is a cache-enabled native
-source/oracle preflight and a fresh paired exposed-root diagnostic.
+source/oracle preflight and a paired run of complete consecutive episodes from
+an exposed root.
 N1 low-prefill
 support must not stand in for multi-client N2/pool support; the coverage review
 records a minimal exposed-root C2/C4 cold-opening proposal, with actual batching
@@ -632,19 +633,22 @@ successor (`agent_scratch/cctraces.py`). Historical replay dropped prefix
 reuse: the trace's `hash_ids` carry 64-token block sharing, while its synthetic
 prompts shared no prefix and caching was off. The new codec preserves declared
 local hash-block prefix identity using synthetic token IDs; it does not recover
-original text or establish generated-output reuse. `in` is a
-**block-derived token count**, not a tokenizer
-count — a CC source audit on 2026-09-11 established that it is already in token
-units, equal to `len(hash_ids) × block_size` across 28 444 top-level real
-request rows, so it is a true length quantised up to a 64-token boundary rather
-than a count of blocks awaiting multiplication. An earlier sentence here called
-it a block count; that was wrong, and any conversion that multiplied it would
-have been 64× too long. It stays accurate in distribution and approximate per
-request, because the quantisation is real; and recorded arrivals are
-**open-loop**, so a faster engine sees the same arrivals a slower one did. The
-source is `semianalysisai/cc-traces-weka-062126-256k`, cached at
-`/md1/users/jgong5/hf_cache/cc-traces-256k/traces.jsonl` (568 864 747 B; full
-corpus 1 847 151 435 B), 393 sessions / 98 827 requests.
+original text or establish generated-output reuse. `in` is a **hash-block input
+proxy**, equal to `len(hash_ids) × 64`, not a true tokenizer count. The earlier
+unit correction established that it is already expressed in proxy-token units;
+multiplying it by 64 again would be wrong. That consistency check does not
+establish true prompt length or accuracy in distribution. The parent dataset
+card warns that cache-write tails can substantially overcount actual prompt
+tokens. Replay reproduces the declared proxy length, not original content or
+billed token length. Recorded arrivals remain **open-loop**, so a faster engine
+sees the same arrivals a slower one did.
+
+The pinned filtered source is `semianalysisai/cc-traces-weka-062126-256k`,
+`/md1/users/jgong5/hf_cache/cc-traces-256k/traces.jsonl`, **568,864,747 bytes**.
+The witnessed census contains **393 root sessions and 68,266 API leaves**:
+28,444 root requests plus 39,822 descendant requests. Its 1,697 subagent
+wrappers express ancestry and are not additional requests. The **98,827**
+request count belongs to the parent release, not this filtered artifact.
 
 ---
 
@@ -1592,9 +1596,9 @@ of these successor tasks.
 
 | # | item | blocks |
 | --- | --- | --- |
-| 1 | Complete combined CPU verification and registration of cache-aware prompt identity, policy, native fork binding, quiescent reset and readiness-governed demand | every cache-on gate |
+| 1 | Implementation and 648 combined CPU checks are complete; finalize the successor cache-aware registration and obtain native evidence for prompt identity, policy, fork binding, reset and readiness-governed demand | every cache-on gate |
 | 2 | Independent cache-on source/oracle preflight: low checkpoint-cut shapes, resume/fork work, region scope and actual native memory terms; retain the tiny TTFT/non-Torch failures | functionality, G2 and G3 |
-| 3 | Fresh intact exposed-root TP1 pair with actual admitted cache hits, checkpoint/pool evidence and all requests/arrivals preserved | first cache-on E2E accuracy evidence |
+| 3 | Paired TP1 run of complete consecutive episodes from an exposed root, with actual admitted cache hits, checkpoint/pool evidence and every member request/arrival preserved | first cache-on E2E accuracy evidence; not an entire-root claim |
 | 4 | Cache-aware short/long × C{1,2,4,8} × TP{1,2,4} paired matrix, with clients kept distinct from in-flight requests | G1, G1b, G1c, G2 and G4; historical 9/24 remains unchanged |
 | 5 | Per-term memory/KV checks and native infeasible rejection at the same cache-on deployments, plus ranking/ties/regret evidence | G1 and G3 |
 | 6 | Freeze a probability design across exposed and potentially untouched roots; preserve cluster dependence and an inconclusive stop | whole-corpus and 99% confidence claim, currently unproved |

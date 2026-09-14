@@ -54,7 +54,8 @@ attribution. Native sizing/recording uses the current PyTorch device's memory
 APIs, not an SMI device index; that specific mapping hypothesis is unsupported.
 No cause, corrected constant or cache-on conclusion follows from this result.
 The next execution evidence is a cache-on source/oracle preflight followed by
-a fresh intact exposed-root pair, not more cache-disabled gap closure.
+a paired run of complete consecutive episodes from an exposed root, not more
+cache-disabled gap closure or a claim to have replayed an entire root.
 
 ## Remediation update — 2026-09-14
 
@@ -401,8 +402,8 @@ from one root must remain linked in any uncertainty calculation.
    128-token prompts into 112+16 and 448 into 432+16; resolving a cache-off 448-token
    price does not establish that path. Preserve failed source criteria and the
    tiny TTFT/non-Torch failures; do not fit their residuals or widen thresholds.
-3. **Obtain fresh cache-aware E2E evidence from exposed roots.** Start with one
-   intact root/trajectory from the pinned corpus and assess actual admitted hits,
+3. **Obtain fresh cache-aware E2E evidence from exposed roots.** Start with a
+   paired run of complete consecutive episodes from an exposed root and assess actual admitted hits,
    compressed/wanted/reusable tokens, checkpoint fates and pool pressure alongside
    timing/memory. Policy tests and source overlap alone prove none of those
    mechanisms. Keep the completed cache-off near-limit and sustained pairs as
@@ -474,8 +475,8 @@ generalization. Confidence in configuration estimates is also different from a
 claim that at least 99% of requests/workloads pass; no such pass-rate gate is
 added here.
 
-Prioritize the cache-on source/oracle preflight and a fresh intact exposed-root
-pair. Retain historical cache-off results; add cache-aware continuity, fanout
+Prioritize the cache-on source/oracle preflight and a paired run of complete
+consecutive episodes from an exposed root. Retain historical cache-off results; add cache-aware continuity, fanout
 and multi-client evidence where each exercises a remaining mechanism.
 Before confirmation, freeze the predictor and a probability design covering
 both the 249 exposed and at-most-144 untouched partitions, with known inclusion
