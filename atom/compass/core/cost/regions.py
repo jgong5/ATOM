@@ -1851,6 +1851,71 @@ SOURCE_27B_TP1_HISTORY_2M = replace(
 )
 
 
+# Independent native prepare-only source, node18 GPU1, source 93618849e.
+# The source-only utilization 0.992 yielded 131224 disjoint blocks, above the
+# 131099 required by the finite plan. This is acquisition scaffolding, not a
+# change to the production replay target, memory model or utilization 0.9.
+# Plan: 9497d6a912e7654a3e900d133de7094698a9ed6e5a3ad83ca643b9040c71eebc
+# Raw: c165ee0c8f0397c871ae976a34a0c2a4c47427bd7e3e2be251bd68912cfc8524
+# Fit: 20b763baacb510aa4683b26b70b8c493726db5e1b09c1be8810768243463680a
+# Verdict: ed6896d490a1ad1e327fd2009990b72fba4f475c1faa97f3b3188910e58ea445
+#
+# Six endpoint/reference pairs fit only previously absent summed-history
+# continuations. All 56 predictions were frozen before heldout release; the
+# maximum increment error was 12.560003us against the fixed 110us criterion.
+# Heldouts include the 196609 boundary and asymmetric/reversed distributions
+# at all fourteen existing active counts. The point is a nonnegative
+# difference of case medians; the band is the hull of zero and all nine
+# endpoint/reference repeat-median differences, not raw timing tails.
+# Each row is (cell, active count, old total, new total, (point, low, high)).
+_HISTORY_256K_EXTENSION_ROWS = (
+    ((1, False), 1, 196608, 262143,
+     (3.999993205070488e-7, -5.200058221817007e-7, 1.4799982309341418e-6)),
+    ((2, False), 2, 393216, 524286,
+     (0.0, -1.1190026998519935e-6, 1.6789957880973858e-6)),
+    ((4, True), 3, 589824, 786429,
+     (8.00043344497634e-8, -1.4009997248649647e-6, 1.5989989042282209e-6)),
+    ((4, False), 4, 786432, 1048572,
+     (7.990002632141097e-7, 0.0, 1.999996602535244e-6)),
+    ((8, True), 7, 1376256, 1835001,
+     (4.009976983070367e-7, -2.4800002574920562e-6, 1.1589974164962836e-6)),
+    ((8, False), 8, 1572864, 2097144,
+     (0.0, -2.31900066137314e-6, 1.8799975514411906e-6)),
+)
+_HISTORY_256K_TOTALS = {
+    cell: new for cell, _n, _old, new, _values in _HISTORY_256K_EXTENSION_ROWS
+}
+
+SOURCE_27B_TP1_HISTORY_256K = replace(
+    SOURCE_27B_TP1_HISTORY_2M,
+    decode_context_cells=tuple(
+        (cell, (lo, 262143, _HISTORY_256K_TOTALS.get(cell, total)))
+        for cell, (lo, _hi, total) in SOURCE_27B_TP1_HISTORY_2M.decode_context_cells
+    ),
+    prepare_decode_history_extensions=(
+        SOURCE_27B_TP1_HISTORY_2M.prepare_decode_history_extensions + tuple(
+            (cell, (old, Measured(
+                seconds=values[0], low=values[1], high=values[2], samples=384,
+                how=f"high-per-sequence acquisition_v4 N{n}; high-minus-legacy "
+                    f"preparation increment over summed histories {old}..{new}; "
+                    "endpoint-only frozen fit, 56 heldouts within 110us; "
+                    "band over repeat-median differences and zero")))
+            for cell, n, old, new, values in _HISTORY_256K_EXTENSION_ROWS
+        )),
+    topologies=(1,),
+    version="history-per-sequence-256k-2026-09-14",
+    provenance=SOURCE_27B_TP1_HISTORY_2M.provenance
+        + "; independent high-per-sequence acquisition_v4: 90 cases and "
+        "17280 retained preparation intervals; per-row support 128..262143 "
+        "at the ten existing capture cells. Six new summed-history "
+        "continuations; existing 16/32 continuations and all old TP1 point "
+        "and band answers preserved. Source-only pool 131224 blocks at "
+        "utilization 0.992 does not replace production allocation. TP1 only; "
+        "no new cross-width support or E2E accuracy claim. Original presets "
+        "and low-prefill support remain unchanged",
+)
+
+
 #: Block sizes whose per-step attention metadata build is sized by the rank's
 #: own KV head count, and therefore is NOT width-invariant.
 #:
@@ -1913,6 +1978,7 @@ REGION_MODELS = {
     "source-27b-tp1-history-64k": SOURCE_27B_TP1_HISTORY_64K,
     "source-27b-tp1-history-delta": SOURCE_27B_TP1_HISTORY_DELTA,
     "source-27b-tp1-history-2m": SOURCE_27B_TP1_HISTORY_2M,
+    "source-27b-tp1-history-256k": SOURCE_27B_TP1_HISTORY_256K,
     "none": None,
 }
 
