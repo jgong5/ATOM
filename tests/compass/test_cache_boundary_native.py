@@ -44,7 +44,8 @@ def test_native_fence_synchronizes_device_and_retains_last_output(native, monkey
     assert processor.prev_batch.req_ids == [3, 4]
 
 
-def test_rank_zero_cannot_ack_before_every_worker_fence_completes(native):
+@pytest.mark.parametrize("failed_rank", [None, 0, 1])
+def test_rank_zero_cannot_ack_before_every_worker_fence_completes(native, failed_rank):
     barrier = threading.Barrier(2)
     entered = [threading.Event(), threading.Event()]
     release_slow_worker = threading.Event()
@@ -56,7 +57,7 @@ def test_rank_zero_cannot_ack_before_every_worker_fence_completes(native):
             entered[rank].set()
             if rank == 1:
                 assert release_slow_worker.wait(5)
-            return {"acknowledged": True, "rank": rank}
+            return {"acknowledged": rank != failed_rank, "rank": rank}
 
         commands = iter([("compass_cache_barrier", ()), ("exit", ())])
         proc = SimpleNamespace(
@@ -83,8 +84,14 @@ def test_rank_zero_cannot_ack_before_every_worker_fence_completes(native):
         release_slow_worker.set()
         for thread in threads:
             thread.join(timeout=5)
-    assert not failures and all(not thread.is_alive() for thread in threads)
-    assert outputs[0].get_nowait()["acknowledged"] is True
+    assert all(not thread.is_alive() for thread in threads)
+    if failed_rank is None:
+        assert not failures
+        assert outputs[0].get_nowait()["acknowledged"] is True
+    else:
+        assert len(failures) == 2
+        assert outputs[0].empty()
+        assert barrier.broken
     assert outputs[1].empty()
 
 

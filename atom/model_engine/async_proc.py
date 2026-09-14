@@ -236,9 +236,24 @@ class AsyncIOProc:
             need_barrier = func_name in self._BARRIER_FUNCS
             for runner in self.runners:
                 func = getattr(runner, func_name, None)
-                if func is None:
+                cache_fence = func_name == "compass_cache_barrier"
+                if func is None and not cache_fence:
                     continue
-                out = func(*args)
+                try:
+                    if func is None:
+                        raise AttributeError("runner has no compass_cache_barrier")
+                    out = func(*args)
+                    if cache_fence and (
+                        not isinstance(out, dict) or out.get("acknowledged") is not True
+                    ):
+                        raise RuntimeError("worker refused the cache completion fence")
+                except BaseException:
+                    # Returning from every worker is insufficient: only rank
+                    # zero's result is sent to EngineCore. A refusal or failed
+                    # fence on any peer must prevent that success response.
+                    if cache_fence and self.all_ranks_barrier is not None:
+                        self.all_ranks_barrier.abort()
+                    raise
                 if need_barrier and self.all_ranks_barrier is not None:
                     self.all_ranks_barrier.wait()
                 if out is not None:
