@@ -34,6 +34,7 @@ requests batch together.
 
 import argparse
 import asyncio
+import hashlib
 import json
 import math
 import os
@@ -677,6 +678,90 @@ def _clock_of(base: str, timeout: float) -> str | None:
     return "virtual" if compass.get("mode") == "predict" else "wall"
 
 
+def _prepare_fixed(base, args):
+    """Sequential exact chat copies; preserve prefix state until the final reset."""
+    from atom.compass.fixed_absolute import sequential_preparation_rows
+    plan = args._fixed_absolute_plan
+    rows = sequential_preparation_rows(plan)
+    if args.prepare != 7 or args.diagnostic_prepare_output_cap != 2:
+        raise ValueError("fixed exact-chat preparation requires seven requests and output cap2")
+    wall_started, began = _time.time(), _time.monotonic()
+    payloads = []
+    for payload in plan.encode_payloads(declared=False):
+        body = json.loads(payload)
+        body["max_completion_tokens"] = 2
+        payloads.append(json.dumps(body).encode())
+    prepared_bytes = sum(sys.getsizeof(payload) for payload in payloads)
+    if prepared_bytes > args.client_memory_budget_mib * 1024 * 1024:
+        raise ValueError("fixed preparation payloads exceed the client memory budget")
+
+    async def submit():
+        results, submissions = [], []
+        for index, payload in enumerate(payloads):
+            batch, receipt = await _submit_requests(
+                base, [payload], [0.0], pace=False, timeout=args.timeout,
+                endpoint="/v1/chat/completions", streaming=True, expected_outputs=[2])
+            result = batch[0]
+            result["index"] = index
+            results.append(result)
+            submissions.append(receipt)
+            if not result["ok"]:
+                break
+        return results, submissions
+
+    results, submissions = asyncio.run(submit())
+    seconds = _time.monotonic() - began
+    drained, after = _drain_records(base, args.timeout), _drain_records(base, args.timeout)
+    records = drained.get("requests") or []
+    by_id = {record.get("request_id"): record for record in records}
+    for result in results:
+        expected = rows[result["index"]]
+        response = result.get("response") or {}
+        usage = response.get("usage") or {}
+        consumed = (by_id.get(response.get("id")) or {}).get("shared_preprocessing") or {}
+        if result["ok"] and (
+                usage.get("prompt_tokens") != expected["input_tokens"]
+                or usage.get("completion_tokens") != 2
+                or consumed.get("input_tokens") != expected["input_tokens"]
+                or consumed.get("prompt_token_sha256") != expected["prompt_token_sha256"]):
+            result.update(ok=False, error="fixed preparation lacks exact consumed prompt/output evidence")
+    returned = sum(bool(result["ok"]) for result in results)
+    response_ids = [(result.get("response") or {}).get("id") for result in results]
+    seq_ids = [record.get("seq_id") for record in records]
+    empty = not (after.get("requests") or [])
+    ok = (returned == 7 and len(records) == len(by_id) == 7
+          and len(set(response_ids)) == 7 and set(response_ids) == set(by_id) and empty
+          and None not in seq_ids and len(set(seq_ids)) == 7
+          and drained.get("clock") == "wall")
+    print(f"  prepared exact chat {returned}/7 sequentially in {seconds:.1f}s, "
+          f"drained {len(records)} records, store empty after: {empty}")
+    return {"requested": 7, "returned": returned, "wall_seconds": round(seconds, 3),
+            "wall_started_at": wall_started, "wall_ended_at": _time.time(),
+            "within": "preparation", "clock": drained.get("clock"),
+            "policy": {"purpose": "diagnostic", "kind": "sequential_exact_chat",
+                       "output_tokens_cap": 2, "prompt_tokens": "exact exported chat",
+                       "measured_requests": "unchanged", "cache_between_requests": "retained"},
+            "plan_sha256": plan.loaded_input.sha256,
+            "prompt_token_sha256": [row["prompt_token_sha256"] for row in rows],
+            "payload_sha256": [hashlib.sha256(payload).hexdigest() for payload in payloads],
+            "sequence_order": list(range(7)), "declared_workload_size": False,
+            "encoding": {"prepared_request_bytes": prepared_bytes},
+            "submission": {"mode": "sequential_unpaced", "requests": submissions},
+            "shapes": [{"input_tokens": row["input_tokens"], "output_tokens": 2} for row in rows],
+            "response_usage": [{"index": r["index"], "usage": (r.get("response") or {}).get("usage")}
+                               for r in results],
+            "responses": [{"index": r["index"], "ok": r["ok"],
+                           "request_id": (r.get("response") or {}).get("id"),
+                           "usage": (r.get("response") or {}).get("usage"),
+                           "send_timing": r["send_timing"]} for r in results],
+            "consumed_prompts": [{"request_id": r.get("request_id"), "seq_id": r.get("seq_id"),
+                                  "shared_preprocessing": r.get("shared_preprocessing")} for r in records],
+            "drained_records": len(records), "store_empty_after_drain": empty, "drained": bool(ok),
+            "boundary_engine_time": max((r.get("finish_time") or 0.0 for r in records), default=None),
+            "native_step_seq_ids": seq_ids, "records": records,
+            "failures": [r for r in results if not r["ok"]]}
+
+
 def _prepare(base: str, model: str, workload: list[dict], args) -> dict:
     """Warm the server, wait for it, and prove the engine forgot about it.
 
@@ -695,6 +780,8 @@ def _prepare(base: str, model: str, workload: list[dict], args) -> dict:
     measured read that follows contains only measured requests, and the rows
     taken out are kept as the evidence that they were taken out.
     """
+    if getattr(args, "fixed_prepare_sequential", False):
+        return _prepare_fixed(base, args)
     shapes = [workload[i % len(workload)] for i in range(args.prepare)]
     cap = getattr(args, "diagnostic_prepare_output_cap", None)
     policy = {}
@@ -798,6 +885,8 @@ def main(argv=None) -> int:
     p.add_argument("--opening-plan-sha256", help="required digest of --opening-plan")
     p.add_argument("--fixed-absolute-plan", help="pinned complete-root corrected fixed-absolute chat plan")
     p.add_argument("--fixed-absolute-plan-sha256", help="required digest of --fixed-absolute-plan")
+    p.add_argument("--fixed-prepare-sequential", action="store_true",
+                   help="diagnostic seven-request exact-chat preparation with cap2, in source order")
     p.add_argument("--time-scale", type=float, default=1.0,
                    help="divide every arrival offset by this, to replay a "
                         "long trace in less time. 1.0 keeps the trace's own "
@@ -836,6 +925,11 @@ def main(argv=None) -> int:
         p.error("opening plan owns its payloads and unscaled source timing")
     if bool(args.fixed_absolute_plan) != bool(args.fixed_absolute_plan_sha256):
         p.error("--fixed-absolute-plan and --fixed-absolute-plan-sha256 are required together")
+    if args.fixed_prepare_sequential and (
+            not args.fixed_absolute_plan or args.prepare != 7 or args.diagnostic_prepare_output_cap != 2):
+        p.error("--fixed-prepare-sequential requires a fixed plan, --prepare 7 and output cap2")
+    if args.fixed_absolute_plan and args.prepare and not args.fixed_prepare_sequential:
+        p.error("fixed-absolute preparation requires the explicit sequential exact-chat policy")
     if args.fixed_absolute_plan and (args.trace or args.prompt_encoding or args.opening_plan or args.time_scale != 1):
         p.error("fixed-absolute plan owns its payloads, source timing and distinct profile")
     args._prefix_encoding = None
@@ -858,6 +952,9 @@ def main(argv=None) -> int:
             args.pretokenize = True
             args.check_lengths = True
             workload = args._fixed_absolute_plan.workload()
+            if args.fixed_prepare_sequential:
+                from atom.compass.fixed_absolute import sequential_preparation_rows
+                sequential_preparation_rows(args._fixed_absolute_plan)
         else:
             workload = _workload(args)
         if args._prefix_encoding is not None:
@@ -944,6 +1041,9 @@ def main(argv=None) -> int:
             print(f"ATOMCompass refusing tokenizer: {exc}", file=sys.stderr)
             return 3
     prepare = _prepare(base, model, workload, args) if args.prepare else None
+    if prepare is not None and args.prepare_out:
+        with open(args.prepare_out, "w", encoding="utf-8") as fh:
+            json.dump(prepare, fh, indent=1)
     if prepare is not None and not prepare["drained"]:
         print("ATOMCompass WARNING: preparation did not drain -- the engine's "
               "record store was not empty at the boundary, so a preparation "

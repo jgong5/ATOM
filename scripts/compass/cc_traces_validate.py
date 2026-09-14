@@ -1970,7 +1970,7 @@ def check_predictor_device_freedom(modelled, label: str) -> list[str]:
 
 def check_calibration(
     modelled, registry: dict, tp: int, workload_sha: str, forbidden: dict,
-    *, expected_opening_plan_sha256=None,
+    *, expected_opening_plan_sha256=None, expected_fixed_absolute_plan=None,
 ) -> list[str]:
     """Where the predictor's numbers came from, against a declaration of it.
 
@@ -2004,6 +2004,7 @@ def check_calibration(
     bad += check_request_readiness_calibration(
         modelled, registry, tp, workload_sha, forbidden,
         expected_opening_plan_sha256=expected_opening_plan_sha256,
+        expected_fixed_absolute_plan=expected_fixed_absolute_plan,
     )
     return bad
 
@@ -2080,7 +2081,7 @@ READINESS_INPUT_ROLES = frozenset(
 
 def check_request_readiness_calibration(
     modelled, registry: dict, tp: int, workload_sha: str, forbidden: dict,
-    *, expected_opening_plan_sha256=None,
+    *, expected_opening_plan_sha256=None, expected_fixed_absolute_plan=None,
 ) -> list[str]:
     """Validate the enabled readiness inputs reported by their core reader.
 
@@ -2091,7 +2092,8 @@ def check_request_readiness_calibration(
     compass = (modelled.manifest.get("server") or {}).get("compass") or {}
     profile = compass.get("request_readiness_profile")
     if not profile:
-        return []
+        return (["fixed-absolute prediction lacks its source-backed readiness profile"]
+                if expected_fixed_absolute_plan is not None else [])
     bad = []
     ranks = _rank_records(modelled)
     if not ranks:
@@ -2107,6 +2109,27 @@ def check_request_readiness_calibration(
                 or type(reader.get("pid")) is not int or reader["pid"] <= 0):
             bad.append(f"{tag}: missing actual EngineCore.Scheduler reader identity")
         rows = [row for row in (core.get("inputs") or []) if isinstance(row, dict)]
+        fixed_inputs = []
+        fixed_rows = [row for row in rows if row.get("role") in (
+            "runtime.fixed_absolute", "runtime.fixed_absolute.source_root")]
+        if fixed_rows or expected_fixed_absolute_plan is not None:
+            try:
+                from atom.compass.fixed_absolute import FixedAbsolutePlan
+                pin = expected_fixed_absolute_plan
+                if not isinstance(pin, dict) or expected_opening_plan_sha256 is not None:
+                    raise ValueError("fixed workload requires its distinct diagnostic plan pin")
+                plan = FixedAbsolutePlan.load(pin["path"], pin["sha256"])
+                expected = [plan.loaded_input.as_dict(), *(item.as_dict() for item in plan.source_inputs)]
+                fields = ("role", "requested", "path", "sha256", "size")
+                signature = lambda items: sorted(tuple(str(row.get(key)) for key in fields) for row in items)
+                if (signature(fixed_rows) != signature(expected)
+                        or compass.get("fixed_absolute_plan") != pin["path"]
+                        or compass.get("fixed_absolute_plan_sha256") != pin["sha256"]
+                        or (core.get("release_calendar") or {}).get("input", {}).get("sha256") != pin["sha256"]):
+                    raise ValueError("fixed plan/source-root reads differ from their actual pinned bytes")
+                fixed_inputs = fixed_rows
+            except (OSError, ValueError, TypeError, KeyError) as exc:
+                bad.append(f"{tag}: {exc}")
         opening_rows = [row for row in rows if row.get("role") == "runtime.aiperf_opening"]
         opening_input = None
         if opening_rows or expected_opening_plan_sha256 is not None:
@@ -2134,7 +2157,7 @@ def check_request_readiness_calibration(
             )
         digests, files = {}, {}
         for row_index, row in enumerate(rows):
-            if row is opening_input:
+            if row is opening_input or any(row is item for item in fixed_inputs):
                 # A verified workload declaration is input to the experiment,
                 # not a fitted service measurement. No source/price role is exempt.
                 continue

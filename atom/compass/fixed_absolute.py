@@ -56,6 +56,17 @@ def source_leaves(data):
     return leaves
 
 
+def sequential_preparation_rows(plan):
+    """Bound the reviewed exact-chat preparation to seven serial N1 requests."""
+    rows = plan.rows
+    reserved = {"compass_arrival", "compass_workload_size", "compass_workload_index"}
+    if (len(plan.roots) != 1 or len(rows) != 7 or plan.dependencies[0]
+            or any(index - 1 not in plan.dependencies[index] for index in range(1, 7))
+            or any(row["output_tokens"] < 2 or reserved.intersection(row["body"]) for row in rows)):
+        raise ValueError("exact-chat preparation supports only seven causally serial N1 requests with cap2")
+    return rows
+
+
 class FixedAbsolutePlan:
     """Validate closed source membership and derive the supported dependency edges.
 

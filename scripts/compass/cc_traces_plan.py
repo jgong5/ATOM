@@ -376,6 +376,8 @@ def _replay(
     client_memory_budget_mib: int | None = None,
     diagnostic_prepare_output_cap: int | None = None,
     opening_plan=None,
+    fixed_absolute_plan=None,
+    fixed_preparation=None,
 ):
     if client_memory_budget_mib is not None and client_memory_budget_mib <= 0:
         raise SystemExit("client memory budget must be positive")
@@ -386,16 +388,19 @@ def _replay(
         str(port),
         "--model",
         MODEL,
-        *(["--trace", workload(klass, clients) if workload_path is None else workload_path]
-          if opening_plan is None else ["--opening-plan", opening_plan["path"],
-                                       "--opening-plan-sha256", opening_plan["sha256"]]),
+        *(["--fixed-absolute-plan", fixed_absolute_plan["path"],
+           "--fixed-absolute-plan-sha256", fixed_absolute_plan["sha256"]]
+          if fixed_absolute_plan is not None else
+          ["--opening-plan", opening_plan["path"], "--opening-plan-sha256", opening_plan["sha256"]]
+          if opening_plan is not None else
+          ["--trace", workload(klass, clients) if workload_path is None else workload_path]),
         "--out",
         out,
         "--check-lengths",
         "--timeout",
         str(request_timeout),
     ]
-    if workload_path is not None and opening_plan is None:
+    if workload_path is not None and opening_plan is None and fixed_absolute_plan is None:
         cmd += ["--num-requests", "0"]
     if client_memory_budget_mib is not None:
         cmd += ["--client-memory-budget-mib", str(client_memory_budget_mib)]
@@ -415,6 +420,8 @@ def _replay(
         ]
         if diagnostic_prepare_output_cap is not None:
             cmd += ["--diagnostic-prepare-output-cap", str(diagnostic_prepare_output_cap)]
+        if fixed_preparation is not None:
+            cmd += ["--fixed-prepare-sequential"]
     return cmd
 
 
@@ -440,6 +447,8 @@ def _lifecycle(
     client_memory_budget_mib: int | None = None,
     diagnostic_prepare_output_cap: int | None = None,
     opening_plan=None,
+    fixed_absolute_plan=None,
+    fixed_preparation=None,
 ):
     """One repeat: its own server, its replay, and the end of that process."""
     modelled = side == "modelled"
@@ -501,7 +510,7 @@ def _lifecycle(
                 clients,
                 f"{cell}/{side}.r{n}.json",
                 paced=not modelled,
-                prepare=0 if modelled else 3,
+                prepare=0 if modelled else fixed_preparation["requests"] if fixed_preparation else 3,
                 port=port,
                 request_timeout=request_timeout,
                 pretokenize=pretokenize,
@@ -509,6 +518,8 @@ def _lifecycle(
                 client_memory_budget_mib=client_memory_budget_mib,
                 diagnostic_prepare_output_cap=diagnostic_prepare_output_cap,
                 opening_plan=opening_plan,
+                fixed_absolute_plan=fixed_absolute_plan,
+                fixed_preparation=fixed_preparation,
             ),
             "produces": (
                 [f"{side}.r{n}.json"]
@@ -822,6 +833,8 @@ def diagnostic_steps(
     prompt_encoding=None,
     prompt_encoding_sha256=None,
     opening_plan=None,
+    fixed_absolute_plan=None,
+    fixed_preparation=None,
 ):
     """Execute a pinned case through the same lifecycle, without a matrix alias."""
     klass, clients = case["case_id"], case["clients"]
@@ -838,6 +851,8 @@ def diagnostic_steps(
     ):
         raise SystemExit("diagnostic preparation output cap must be at least 2")
     selected_policy = case.get("cache_policy")
+    if opening_plan is not None and fixed_absolute_plan is not None:
+        raise SystemExit("opening and fixed-absolute profiles cannot be combined")
     if enable_prefix_caching:
         if tp != 1:
             raise SystemExit("cache-enabled diagnostics currently require TP1")
@@ -849,6 +864,12 @@ def diagnostic_steps(
                     or opening_plan != case.get("opening_plan") or pretokenize
                     or prompt_encoding or prompt_encoding_sha256 or clients != 1):
                 raise SystemExit("opening requires its pinned chat plan, one client and no codec flags")
+        elif fixed_absolute_plan is not None:
+            if (case.get("schema") != "compass.fixed_absolute_case/1"
+                    or fixed_absolute_plan != case.get("fixed_absolute_plan")
+                    or pretokenize or prompt_encoding or prompt_encoding_sha256
+                    or not fixed_preparation or diagnostic_prepare_output_cap != 2):
+                raise SystemExit("fixed diagnostics require the pinned chat plan and bounded exact preparation")
         else:
             encoding = case.get("prompt_encoding") or {}
             if (not prompt_encoding or not prompt_encoding_sha256
@@ -873,7 +894,10 @@ def diagnostic_steps(
         if modelled and opening_plan is not None:
             engine_args += ["--compass-opening-plan", opening_plan["path"],
                             "--compass-opening-plan-sha256", opening_plan["sha256"]]
-        if opening_plan is not None:
+        if modelled and fixed_absolute_plan is not None:
+            engine_args += ["--compass-fixed-absolute-plan", fixed_absolute_plan["path"],
+                            "--compass-fixed-absolute-plan-sha256", fixed_absolute_plan["sha256"]]
+        if opening_plan is not None or fixed_absolute_plan is not None:
             engine_args += ["--kv_cache_dtype", "bf16", "--block-size", "16",
                             "--max-num-batched-tokens", "16384", "--level", "3",
                             "--cudagraph-mode", "FULL", "--cudagraph-capture-sizes",
@@ -890,6 +914,8 @@ def diagnostic_steps(
                 diagnostic_prepare_output_cap=diagnostic_prepare_output_cap,
                 engine_args=engine_args,
                 opening_plan=opening_plan,
+                fixed_absolute_plan=fixed_absolute_plan,
+                fixed_preparation=fixed_preparation,
             )
         if not modelled:
             steps += after
@@ -898,7 +924,7 @@ def diagnostic_steps(
         for step in steps:
             if step["role"] in ("serve", "replay"):
                 step["cache_policy"] = selected_policy
-            if step["role"] == "replay" and opening_plan is None:
+            if step["role"] == "replay" and opening_plan is None and fixed_absolute_plan is None:
                 step["command"] += ["--prompt-encoding", str(prompt_encoding),
                                     "--prompt-encoding-sha256", prompt_encoding_sha256]
     return {
@@ -908,6 +934,7 @@ def diagnostic_steps(
         **({"cache_policy": selected_policy} if enable_prefix_caching else {}),
         **({"diagnostic_prepare_output_cap": diagnostic_prepare_output_cap}
            if diagnostic_prepare_output_cap is not None else {}),
+        **({"fixed_preparation": fixed_preparation} if fixed_preparation is not None else {}),
         "allow_advisory_isolation": bool(allow_advisory_isolation),
         "isolation_qualification": (ADVISORY_ISOLATION_QUALIFICATION
                                     if allow_advisory_isolation else None),
@@ -921,6 +948,15 @@ def opening_steps(tp, case, **options):
         raise SystemExit("opening diagnostics require TP1 and an OpeningPlan case")
     return diagnostic_steps(tp, case, enable_prefix_caching=True,
                             opening_plan=case["opening_plan"], **options)
+
+
+def fixed_steps(tp, case, *, fixed_preparation, **options):
+    if tp != 1 or case.get("schema") != "compass.fixed_absolute_case/1":
+        raise SystemExit("fixed diagnostics require TP1 and a FixedAbsolutePlan case")
+    return diagnostic_steps(tp, case, enable_prefix_caching=True,
+                            fixed_absolute_plan=case["fixed_absolute_plan"],
+                            fixed_preparation=fixed_preparation,
+                            diagnostic_prepare_output_cap=2, **options)
 
 
 def build(args) -> dict:

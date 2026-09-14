@@ -12,7 +12,13 @@ import sys
 from types import SimpleNamespace
 
 
+# Retain this instance if another harness loads a module with the same name.
+_READER = sys.modules[__name__]
 CASE_SCHEMA = "compass.aiperf_opening_case/1"
+PLAN_KEY = "opening_plan"
+EVIDENCE_KEY = "aiperf_opening"
+REPORT_SCHEMA = "compass.aiperf_opening_diagnostic/1"
+REPORT_NAME = "opening_diagnostic.json"
 AIPERF_COMMIT = "0d2aa0572ac685943d38c580675c4a61023581d3"
 DECLARED_CAPTURE_SIZES = [1, 2, 4, 8, 16, 32, 48, 64, 128, 256]
 EFFECTIVE_DECODE_BUCKETS = [1, 2, 4, 8, 16, 32]
@@ -162,6 +168,10 @@ def _source_view(modelled, **changes):
         **server, "compass": {**(server.get("compass") or {}), **changes}}})
 
 
+def calibration_options(case):
+    return {"expected_opening_plan_sha256": case["workload_sha256"]}
+
+
 def check_source_contract(modelled, registry, workload_sha, forbidden, label):
     """Check the exact diagnostic wrapper, retaining the base protocol checks.
 
@@ -308,17 +318,22 @@ def pair(args):
 
 
 def _pair(args):
+    return _pair_case(args, _READER)
+
+
+def _pair_case(args, case_reader):
     """Compose existing offline checks; this route never issues matrix credit."""
     validate, compare = _script("cc_traces_validate"), _script("compare")
     plan_module = _script("cc_traces_plan")
-    case = load_case(args.opening_plan, args.opening_plan_sha256, args.case_id,
-                     target_model=plan_module.MODEL)
+    case = case_reader.load_case(
+        getattr(args, case_reader.PLAN_KEY), getattr(args, case_reader.PLAN_KEY + "_sha256"),
+        args.case_id, target_model=plan_module.MODEL)
     cell = Path(args.cell)
-    if cell.name != f"tp1_{case['case_id']}_c1":
-        raise ValueError("opening directory disagrees with its case identity")
+    if cell.name != f"tp1_{case['case_id']}_c{case['clients']}":
+        raise ValueError("chat diagnostic directory disagrees with its case identity")
     lock = json.loads((cell / "diagnostic_case.json").read_text())
-    if identity(lock) != identity(case):
-        raise ValueError("opening directory belongs to different pins")
+    if case_reader.identity(lock) != case_reader.identity(case):
+        raise ValueError("chat diagnostic directory belongs to different pins")
     registry_path = Path(args.calibration_registry)
     registry = json.loads(registry_path.read_text())
     paths = {side: validate._runs(cell, side) for side in ("real", "modelled")}
@@ -338,7 +353,8 @@ def _pair(args):
         notes.append(f"isolation {isolation.get('verdict')}: timings remain advisory")
     forbidden = {str(path.name): validate._digest(path) for pattern in
                  ("*_steps*.jsonl", "real.r*_memory*.json") for path in cell.glob(pattern)}
-    rows = _plan(args.opening_plan, args.opening_plan_sha256).workload()
+    forbidden.update({item["path"]: item["sha256"] for item in case.get("workload_inputs", [])})
+    rows = case_reader._plan(**case[case_reader.PLAN_KEY]).workload()
     for side in paths:
         manifests = [json.loads(path.read_text()).get("run") or {} for path in paths[side]]
         failures += validate.check_who_served(journals[side], manifests, side)
@@ -351,23 +367,23 @@ def _pair(args):
             if execution.get("purpose") != "diagnostic":
                 failures.append(f"{side}[{index}] lacks diagnostic execution purpose")
             try:
-                if identity(execution.get("diagnostic_case") or {}) != identity(case):
-                    raise ValueError("execution carries different opening pins")
-                check_result(blob, case)
+                if case_reader.identity(execution.get("diagnostic_case") or {}) != case_reader.identity(case):
+                    raise ValueError("execution carries different chat diagnostic pins")
+                case_reader.check_result(blob, case)
             except (ValueError, TypeError, KeyError) as exc:
                 failures.append(f"{side}[{index}]: {exc}")
             run = runs[side]
-            failures += compare.check_run(run, expect_requests=2)
+            failures += compare.check_run(run, expect_requests=case["requests"])
             failures += validate.check_clocks_finite(run)
             failures += validate.check_workload_is_registered(run, rows, side)
             failures += validate.check_usage_against_workload(run, rows, side)
             failures += validate.check_engine(run, 1, side, expected_cache_policy=case["cache_policy"])
-            failures += check_server_configuration(run.manifest.get("server") or {}, case, side)
+            failures += case_reader.check_server_configuration(run.manifest.get("server") or {}, case, side)
             failures += validate.check_cache_policy_evidence(run.manifest, case["cache_policy"], side)
         real, modelled = runs["real"], runs["modelled"]
         failures += compare.check_pair(real, modelled)
         failures += validate.check_side_roles(real, modelled)
-        source_bad, source_notes = check_source_contract(
+        source_bad, source_notes = case_reader.check_source_contract(
             modelled, registry, case["workload_sha256"], forbidden, f"repeat {index}")
         failures += source_bad
         notes += [note for note in source_notes if note not in notes]
@@ -391,7 +407,7 @@ def _pair(args):
         memory.append(measured)
         failures += validate.check_calibration(
             modelled, registry, 1, case["workload_sha256"], forbidden,
-            expected_opening_plan_sha256=case["workload_sha256"])
+            **case_reader.calibration_options(case))
         for check in (validate.check_scalar_overheads, validate.check_capacity_provenance):
             failures += check(modelled, registry, 1, case["workload_sha256"], forbidden)
         reports.append(compare.compare(real, modelled))
@@ -400,14 +416,14 @@ def _pair(args):
                  if value.get("within_tolerance") is False]
     failures += [f"{metric} has no evaluable paired tolerance" for metric in validate.TOLERANCE_PCT
                  if metrics.get(metric, {}).get("within_tolerance") is None]
-    verdict = {"schema": "compass.aiperf_opening_diagnostic/1", "purpose": "diagnostic",
+    verdict = {"schema": case_reader.REPORT_SCHEMA, "purpose": "diagnostic",
                "accepted": False, "passed": bool(reports) and not failures,
-               "case": identity(case), "repeats": len(reports), "metrics": metrics,
+               "case": case_reader.identity(case), "repeats": len(reports), "metrics": metrics,
                "memory": memory, "source_contracts": sources,
                "isolation": isolation, "failures": failures, "notes": notes,
                "calibration_registry_sha256": hashlib.sha256(registry_path.read_bytes()).hexdigest(),
                "cost_accounting": "Use maintained cc_traces_run costs and its per-side partial costs; speed remains advisory"}
-    out = Path(args.out) if args.out else cell / "opening_diagnostic.json"
+    out = Path(args.out) if args.out else cell / case_reader.REPORT_NAME
     out.write_text(json.dumps(verdict, indent=2) + "\n")
     print(json.dumps({"path": str(out), "passed": verdict["passed"], "accepted": False,
                       "failures": failures}, indent=2))

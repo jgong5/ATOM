@@ -128,6 +128,7 @@ replay_client = _load("replay")
 plan_module = _load("cc_traces_plan")
 diagnostic_module = _load("cc_traces_diagnostic")
 opening_module = _load("cc_traces_opening")
+fixed_module = _load("cc_traces_fixed")
 refusal_module = _load("cc_traces_refusal")
 execution_id = _load("execution_id")
 isolation = _load("isolation")
@@ -481,8 +482,9 @@ class SideRun:
         self.ports_in_use = ports_in_use
         #: acceptance or diagnostic, stamped into every record this run writes
         self.diagnostic_case = cell_plan.get("diagnostic_case")
-        self.case_reader = (opening_module if (self.diagnostic_case or {}).get("schema")
-                            == opening_module.CASE_SCHEMA else diagnostic_module)
+        self.case_reader = {opening_module.CASE_SCHEMA: opening_module,
+                            fixed_module.CASE_SCHEMA: fixed_module}.get(
+                                (self.diagnostic_case or {}).get("schema"), diagnostic_module)
         self.cache_policy = cell_plan.get("cache_policy")
         self.unregistered = cell_plan["class"] not in plan_module.CLASSES
         self.purpose = (DIAGNOSTIC if self.unregistered or self.diagnostic_case is not None
@@ -896,16 +898,17 @@ class SideRun:
             if errors:
                 self.failures += [f"{step['id']}: {reason}" for reason in errors]
                 return None
-        if self.case_reader is opening_module:
+        if self.case_reader in (opening_module, fixed_module):
             errors = _load("cc_traces_validate").check_engine(
                 SimpleNamespace(manifest={"server": said}), 1, step["id"],
                 expected_cache_policy=self.cache_policy)
-            errors += opening_module.check_server_configuration(said, self.diagnostic_case, self.side)
+            errors += self.case_reader.check_server_configuration(said, self.diagnostic_case, self.side)
             if self.side == "modelled":
-                pin = self.diagnostic_case["opening_plan"]
-                if (compass.get("opening_plan_sha256") != pin["sha256"]
-                        or compass.get("opening_plan") != pin["path"]):
-                    errors.append("predictor resolved a different opening plan")
+                key = self.case_reader.PLAN_KEY
+                pin = self.diagnostic_case[key]
+                if (compass.get(key + "_sha256") != pin["sha256"]
+                        or compass.get(key) != pin["path"]):
+                    errors.append("predictor resolved a different chat release plan")
             if errors:
                 self.failures += [f"{step['id']}: {reason}" for reason in errors]
                 return None
@@ -1324,8 +1327,8 @@ class SideRun:
         # most expensive on. An unanswerable question is not a pass.
         want_trace = (execution.get("source") or {}).get("workload_sha256")
         got_trace = manifest.get("trace_sha256")
-        if self.case_reader is opening_module:
-            got_trace = (manifest.get("aiperf_opening") or {}).get("input", {}).get("sha256")
+        if self.case_reader in (opening_module, fixed_module):
+            got_trace = (manifest.get(self.case_reader.EVIDENCE_KEY) or {}).get("input", {}).get("sha256")
         if not want_trace:
             bad.append(
                 "this cell's execution records no frozen workload digest, so "
@@ -1939,6 +1942,14 @@ def _cell_plan(args) -> dict:
         prefill_preparation_fence=getattr(args, "compass_prefill_preparation_fence", False),
         client_memory_budget_mib=getattr(args, "client_memory_budget_mib", None),
     )
+    if getattr(args, "fixed", False):
+        if args.side == "modelled" and not options["request_readiness_profile"]:
+            raise ValueError("fixed prediction requires a source-backed readiness profile")
+        case = fixed_module.load_case(
+            args.fixed_absolute_plan, args.fixed_absolute_plan_sha256, args.case_id,
+            target_model=plan_module.MODEL)
+        return plan_module.fixed_steps(
+            args.tp, case, cell=str(cell), fixed_preparation=fixed_module.preparation_policy(case), **options)
     if getattr(args, "opening", False):
         if args.side == "modelled" and not options["request_readiness_profile"]:
             raise ValueError("opening prediction requires a source-backed readiness profile")
@@ -2533,6 +2544,14 @@ def main(argv=None) -> int:
     o.add_argument("--plan-only", action="store_true")
     o.set_defaults(func=side, opening=True, diagnostic=False, purpose=DIAGNOSTIC, repeats=1)
 
+    f = sub.add_parser("fixed-side", help="run a pinned complete-root fixed-absolute diagnostic")
+    _add_side_options(f)
+    f.add_argument("--case-id", required=True)
+    f.add_argument("--fixed-absolute-plan", required=True)
+    f.add_argument("--fixed-absolute-plan-sha256", required=True)
+    f.add_argument("--plan-only", action="store_true")
+    f.set_defaults(func=side, fixed=True, diagnostic=False, purpose=DIAGNOSTIC, repeats=1)
+
     p = sub.add_parser("opening-pair", help="validate an opening pair without registered-cell credit")
     p.add_argument("--cell", required=True)
     p.add_argument("--case-id", required=True)
@@ -2542,6 +2561,16 @@ def main(argv=None) -> int:
     p.add_argument("--repeats", type=int, default=1)
     p.add_argument("--out", default=None)
     p.set_defaults(func=opening_module.pair)
+
+    f = sub.add_parser("fixed-pair", help="validate a complete-root fixed-absolute pair without matrix credit")
+    f.add_argument("--cell", required=True)
+    f.add_argument("--case-id", required=True)
+    f.add_argument("--fixed-absolute-plan", required=True)
+    f.add_argument("--fixed-absolute-plan-sha256", required=True)
+    f.add_argument("--calibration-registry", required=True)
+    f.add_argument("--repeats", type=int, default=1)
+    f.add_argument("--out", default=None)
+    f.set_defaults(func=fixed_module.pair)
 
     c = sub.add_parser("costs", help="merge the cell's cost terms")
     c.add_argument("cell")
