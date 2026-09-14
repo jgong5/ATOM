@@ -15,8 +15,37 @@ passing cells do not establish whole-corpus accuracy or 99% confidence.
 The earlier corrected short-c4 paired campaign is held while these priorities
 are addressed.
 
-**New corpus diagnostics (2026-09-14): two region-domain refusals, no new paired
-acceptance.** Low-byte readiness support passed, but the selected region model
+**New corpus diagnostics (2026-09-14): first fresh sustained-arrivals pair;
+no new registered acceptance cell.** The TP1 pair on `b27d0e7f2` completed
+**21/21 requests and 15,979 output tokens on each side**, using the unchanged
+`source-27b-tp1-history-2m` preset and diagnostic readiness profile `6e26d4cb`.
+One root client reached **21 in-flight requests and a scheduled batch of 21**
+on both native and modelled engines; source overlap was only five. Measured
+steps were 1,538 real (30 prefill / 1,508 decode) and 1,539 modelled
+(30 / 1,509), with maximum context 54,393. This is one intact source episode
+under warm/empty replay semantics, not full-root continuity.
+
+| Sustained diagnostic metric | Signed error, modelled versus real |
+| --- | --- |
+| TTFT median / mean / p90 | −3.38% / +7.30% / −0.12% |
+| TPOT median / mean / p90 | +1.84% / **+10.74%** / +8.18% |
+| Throughput | −7.12% (63.396 versus 68.258 output tokens/s) |
+
+Individual absolute TTFT/TPOT errors reach **32.31% / 38.23%**. The 15% TTFT
+and 10% TPOT reference bars contain 15/21 and 12/21 requests, respectively,
+and only 6/21 jointly; these descriptive counts establish no confidence claim.
+All eight non-KV components pass 10% (maximum 1.075%); KV blocks are
+112,760 real / 112,773 modelled, **0.01153%** error. Request, pair, preparation
+drain, serving identity, calibration and GPU-free provenance checks pass.
+Real/modelled measured wall windows are 234.857/119.615 seconds (**1.963×**,
+advisory). Isolation is `own_clean=true`, `node_busy`; one unknown zero-use
+foreign PID was preserved. Native cache key `28d953bf35` and preparation logs
+are retained. GPU1 and ports were released; one resource-tracker zombie under
+PID1 has no command or FDs. This single pair adds no three-repeat registered
+cell and leaves the original **9/24** count unchanged.
+
+**Earlier region-domain refusals remain recorded.** Low-byte readiness support
+passed, but the selected region model
 still refuses compiled output-producing N1 prefill at 128 tokens against
 `[640,16384]`. The seven-request full root begins at 448 and was held by explicit
 preflight without a run. The near-limit 250,048/39 case priced all 16 prefills
@@ -34,14 +63,25 @@ accuracy results. Both CPU lanes are closed. The maintained diagnostic CLI and
 owned-refusal monitor are now integrated in `60dc92c84`; their future exit-5
 model-refusal classification does not rewrite those old outcomes.
 
-The disjoint-interval seam is integrated in `b27d0e7f2`, preserving 11 legacy
-snapshots with 125 CPU tests passing. Historical cold 128/256/512 and N2-total
-512/1,536 source captures were recovered for review. A finite high-history
-source acquisition is approved (90 cases, 17,280 intervals, per-row guard
-262,143, 56 heldouts including asymmetric layouts; plan `23779826…`). No fitted
-continuation or selected region activation is claimed here. **TP2/TP4 remain
-paused.** Next useful evidence is source-supported tiny/near-limit/intact-root
-pairs and the complementary 21-request sustained diagnostic. N1 low-prefill
+The separate TP1 preset `source-27b-tp1-history-256k` is integrated in
+**`4b109a968`**. All **56/56**
+frozen source heldouts pass the fixed 110 µs preparation-increment criterion
+(maximum **12.560 µs**). The per-row domain reaches 262,143; 11 legacy
+snapshots and 411 old breakdown/band comparisons remain exact, with 209 tests
+passing. The sustained pair used the old preset; a fresh near-limit diagnostic
+on the new preset is pending, so no near-limit E2E completion is claimed.
+
+Low-prefill native source validation **failed** its fixed 110 µs preparation
+criterion: 17/30 pass, 13 fail, maximum **427.143 µs**. Postprocess 14/14 and
+structural-zero 16/16 checks pass. Explicit TP1 diagnostic candidate `e43976eb`
+uses already-frozen anchors; it changes no defaults or acceptance selection,
+does not relabel the failed criterion, and adds no N2/pool support. Its tiny
+CPU follow-on loaded successfully but exited **5** on the missing head-row
+gather price `aten::index.Tensor|128,5120;1|bfloat16,int32|1:127`
+(2,442/2,443 operators priced). No tiny response completed; the intact-root
+follow-on is unlaunched. **TP2/TP4 remain paused.** Next useful evidence is
+closure of this source-price gap and fresh tiny/near-limit/intact-root pairs.
+N1 low-prefill
 support must not stand in for multi-client N2/pool support; the coverage review
 records a minimal exposed-root C2/C4 cold-opening proposal, with actual batching
 to be witnessed and no manufactured C8 case.
@@ -258,6 +298,12 @@ are `38f9ba230d252dbd3821d2725d3f903bad981ade28d2c1cdc9fd07bec5d881a8`
 and `b2f44ec02f84db1b9425a98b4f300ead3a51793d1fff06c7b562470b64e2a059`.
 The source audit's `REGION_SUPPORT_HANDOFF_V1.json` hash is
 `59870d4c9dbc5668fd71927f4f56447fdaba84a8011365d6103c5a59f3779b66`.
+
+The sustained pair's `codex_sustained_arrivals_v1/PAIRED_HANDOFF.json` has SHA256
+`45052b75d5db0fa4cec2257b22be1d3ba9017df9ae249a3da3e88590f34595e1`.
+It pins every artifact, remote-copy hash check, validation result and cleanup
+observation in the local CPU evidence tree. Execution IDs are
+`cx-4c1e447bc8f14546` (real) and `cx-d28d93604c2d5e8a` (modelled).
 
 **First TP2 E2E transfer cell verified.** The frozen `8a637eff` candidate's
 three real/modelled pairs preserve both registered requests and pass all

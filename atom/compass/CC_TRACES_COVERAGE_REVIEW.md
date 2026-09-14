@@ -11,8 +11,8 @@ isolated source busy episodes does not imply success on their concatenation.
 
 This is a coverage review and a proposed confirmation design, not a replacement
 registration. Existing workload hashes, run registrations and results retain
-their historical meaning. No GPU run, fit or workload rewrite was performed for
-this review.
+their historical meaning. The initial audit performed no GPU run, fit or
+workload rewrite; subsequent execution results are dated below.
 
 ## Remediation update — 2026-09-14
 
@@ -52,7 +52,21 @@ retain their previous scope and `node_busy` qualification.
 | Tiny 128-token episode | Compiled TP1 output-producing prefill `[128]`, context `[128]`, refused the selected N1 span `[640,16384]`. Wrapper v1 recorded the wrong reconstructed source path; actual `--trace` and separate workload/manifest pins survive. Its owned replay was stopped after the exception; journal remains `exit=-15`, `ok=false`, `refused=false`. This is a domain witness with a provenance defect, not a valid E2E pair. |
 | Near-limit 250,048/39 request | Wrapper v2 has the actual source identity and passing provenance checks. It priced 15 prefills of 16,384 tokens plus the 4,288-token tail, then refused the first decode at history 250,049 against `[128,196608]`. The owned replay was stopped; its journal also remains `exit=-15`, `ok=false`, `refused=false` (wrapper exit 1). No completed 39-token response or accuracy claim. |
 | Complete seven-request root `1493faff…` | Held by explicit preflight: its opening 448-token prefill is below the selected N1 lower bound. No execution occurred. |
-| Other four emitted cases | Long decode, sustained arrivals, fanout and opening continuity remain separate development cases; no completed paired result is claimed here. |
+| Sustained arrivals, episode 284 of root `509ad65c…` | First fresh TP1 diagnostic pair on `b27d0e7f2`: 21/21 requests and 15,979 output tokens per side. One root client reached 21 in-flight requests and native/modelled scheduled batch 21; source peak overlap was five. Uses the existing `history-2m` preset, not the subsequent high-history extension. |
+| Other three emitted cases | Long decode, fanout and opening continuity remain separate development cases; no completed paired result is claimed here. |
+
+The sustained pair's TTFT median/mean/p90 errors are **−3.38/+7.30/−0.12%**;
+TPOT errors are **+1.84/+10.74/+8.18%**; throughput error is **−7.12%**.
+Individual absolute TTFT/TPOT errors reach 32.31/38.23%; only 6/21 requests
+satisfy both reference bars. All eight non-KV components pass 10% (maximum
+1.075%), and KV block error is 0.01153% (112,760 real / 112,773 modelled).
+Completeness, preparation drain, pair identity, calibration and GPU-free
+provenance checks pass. Measured wall speedup is 1.963×, advisory. The native
+sampler is `own_clean=true`, `node_busy`; timings remain advisory. GPU1 and
+ports were released, with one harmless resource-tracker zombie under PID1
+retained in the cleanup record. This is one paired intact-episode diagnostic
+under warm/empty replay semantics, not full-root continuity, a three-repeat
+registered cell or statistical confirmation. The original count stays **9/24**.
 
 Both attempted CPU lanes are closed. The maintained diagnostic entry point and
 owned-refusal watcher are now integrated in `60dc92c84`; their exit-5 model-refusal
@@ -65,10 +79,21 @@ review, not automatic selection. The existing “2M history” source extended
 summed history for selected 16/32-request cells; it did not raise the 196,608
 per-request bound. The disjoint-interval representation is integrated in
 `b27d0e7f2`, with 11 legacy snapshots unchanged and 125 CPU tests passing.
-A finite source-only high-history acquisition is approved: 90 cases, 17,280
-intervals, per-row guard 262,143 and 56 heldouts including asymmetric layouts
-(plan `23779826…`). **No fitted continuation or selected region activation is
-claimed at this checkpoint.** TP2/TP4 work remains paused.
+The high-history source acquisition completed: all **56/56** frozen heldouts
+pass the fixed 110 µs preparation-increment criterion, maximum **12.560 µs**.
+Separate TP1 preset `source-27b-tp1-history-256k` is integrated in **`4b109a968`**,
+with per-row support through 262,143, all 11 old snapshots and 411 old
+breakdown/band comparisons unchanged, and 209 tests passing. A fresh near-limit
+run on this preset is pending; source validation adds no E2E acceptance.
+
+Low-prefill source preparation **failed** the unchanged 110 µs criterion:
+17/30 pass, 13 fail, maximum **427.143 µs**. Postprocess 14/14 and structural
+zeros 16/16 pass. TP1 candidate `e43976eb` is explicitly **diagnostic-only**,
+using already-frozen anchors without default/acceptance activation or N2/pool
+extension. Its tiny follow-on loaded correctly, then exited 5 on missing
+head-row gather price `aten::index.Tensor|128,5120;1|bfloat16,int32|1:127`
+(2,442/2,443 operators priced). No tiny request completed; the original source
+failure remains a failure. TP2/TP4 work remains paused.
 
 ## 1. Population and meaning of replay
 
@@ -324,7 +349,7 @@ from one root must remain linked in any uncertainty calculation.
    preemption. Require actual target scheduler/KV witnesses for those claims.
    First close the tiny-prefill and near-limit decode refusals with source-only
    evidence, then obtain fresh pairs for those cases and the seven-request root.
-   The 21-request sustained case is the next complementary scheduler check;
+   Retain the completed 21-request sustained pair and its per-request misses;
    use fanout/long-decode cases when their extra mechanism is needed, not merely
    to fill a grid. Keep multi-client cold small groups open: N1 evidence does
    not establish N2/pool support. Add complete-root continuity and keep the
@@ -393,8 +418,9 @@ generalization. Confidence in configuration estimates is also different from a
 claim that at least 99% of requests/workloads pass; no such pass-rate gate is
 added here.
 
-Prioritize the source-supported tiny, near-limit and intact-root pairs, followed
-by complementary sustained/fanout and multi-client cold-opening evidence.
+Prioritize the source-price gap and fresh tiny, near-limit and intact-root pairs;
+retain the sustained pair and add fanout or multi-client cold-opening evidence
+where it exercises a remaining mechanism.
 Before confirmation, freeze the predictor and a probability design covering
 both the 249 exposed and at-most-144 untouched partitions, with known inclusion
 probabilities. The untouched partition cannot stand in for all 393 roots.
@@ -467,6 +493,8 @@ accuracy/exposure inventories are under its sibling
 | Tiny `REFUSAL_HANDOFF_V1.json` | `38f9ba230d252dbd3821d2725d3f903bad981ade28d2c1cdc9fd07bec5d881a8` |
 | Near-limit `REFUSAL_HANDOFF_V1.json` | `b2f44ec02f84db1b9425a98b4f300ead3a51793d1fff06c7b562470b64e2a059` |
 | `REGION_SUPPORT_HANDOFF_V1.json` | `59870d4c9dbc5668fd71927f4f56447fdaba84a8011365d6103c5a59f3779b66` |
+| Sustained `PAIRED_HANDOFF.json` | `45052b75d5db0fa4cec2257b22be1d3ba9017df9ae249a3da3e88590f34595e1` |
+| High-history `HELDOUT_VERDICT_V1.json` | `ed6896d490a1ad1e327fd2009990b72fba4f475c1faa97f3b3188910e58ea445` |
 
 The low-range handoff and candidate are under
 `agent_scratch/codex_decode_domain_v1/ingress_handoff_low_extension_v1` in the
@@ -477,6 +505,13 @@ The refusal handoffs are under the respective case directories in
 `agent_scratch/codex_small_prefill_regions_v1/`. The metadata-only C2/C4 proposal
 is retained in the confidence worktree's
 `agent_scratch/corpus_confidence_v1/COLD_OPENING_BUNDLE_PROPOSAL.json`.
+The sustained handoff is under `agent_scratch/codex_sustained_arrivals_v1/`
+in the same CPU evidence tree; it pins all real/modelled artifacts, remote-copy
+hash checks and the separate final sampler and later release observations.
+Low-source failure and diagnostic candidate evidence remain under
+`codex_small_prefill_regions_v1/` and `codex_low_prefill_diagnostic_v1/`.
+The high-history verdict is under
+`codex_high_per_sequence_source_v1/acquisition_v4/`.
 
 The current root exposure ledger is
 `agent_scratch/corpus_review_v1/EXPOSURE_LEDGER_V2.json` in the review worktree.
