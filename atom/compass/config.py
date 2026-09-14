@@ -139,6 +139,8 @@ class CompassConfig:
     request_readiness_profile: str = ""
     opening_plan: str = ""
     opening_plan_sha256: str = ""
+    fixed_absolute_plan: str = ""
+    fixed_absolute_plan_sha256: str = ""
     # Source-witnessed GDN prefill D2H fence, approximated by the existing
     # priced preparation boundary. Host dispatch remains unpriced/overlapped.
     prefill_preparation_fence: bool = False
@@ -185,6 +187,12 @@ class CompassConfig:
             raise ValueError("opening plan and its digest are required together")
         if self.opening_plan and not self.request_readiness_profile:
             raise ValueError("opening plan requires a source-backed readiness profile")
+        if bool(self.fixed_absolute_plan) != bool(self.fixed_absolute_plan_sha256):
+            raise ValueError("fixed-absolute plan and its digest are required together")
+        if self.fixed_absolute_plan and self.opening_plan:
+            raise ValueError("opening and fixed-absolute profiles are mutually exclusive")
+        if self.fixed_absolute_plan and not self.request_readiness_profile:
+            raise ValueError("fixed-absolute plan requires a source-backed readiness profile")
         if self.filler_token_id < 0:
             raise ValueError(f"filler_token_id must be >= 0, got {self.filler_token_id}")
         if self.mode not in ("predict", "trace", "measure"):

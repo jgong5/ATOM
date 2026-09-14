@@ -1299,6 +1299,7 @@ class Scheduler:
             calendar = getattr(self, "_release_calendar", None)
             if calendar is not None:
                 calendar.register(self.waiting)
+                self._drain_release_calendar()
             elif readiness is not None:
                 readiness.resolve_closed_workload(self.waiting)
                 self.waiting = deque(sorted(self.waiting, key=lambda seq: (
@@ -1391,6 +1392,30 @@ class Scheduler:
             return True  # registration is not scheduler visibility
         return self._schedulable_at(seq) > clock.time()
 
+    def _drain_release_calendar(self) -> None:
+        calendar = getattr(self, "_release_calendar", None)
+        drain = getattr(calendar, "drain", None)
+        if not callable(drain):
+            return
+        released = drain()
+        if not released:
+            return
+        # A single receiver makes new ready events no earlier than prior
+        # events. Preserve native preemption/requeue priority among previously
+        # released requests; insert newly released requests in receipt order.
+        prior, fresh, blocked = [], [], []
+        for seq in self.waiting:
+            if seq.id in released:
+                fresh.append(seq)
+            elif calendar.is_released(seq):
+                prior.append(seq)
+            else:
+                blocked.append(seq)
+        readiness = self._request_readiness
+        fresh.sort(key=lambda seq: (readiness.record(seq).ready_at,
+                                   readiness.record(seq).receipt_order))
+        self.waiting = deque(prior + fresh + blocked)
+
     def _advance_to_next_arrival(self) -> None:
         """Jump the virtual clock forward when there is nothing else to do.
 
@@ -1407,18 +1432,24 @@ class Scheduler:
         advance = getattr(clock, "advance", None)
         if advance is None or getattr(clock, "epoch", None) is None:
             return
+        # Maturing a source release must not wait for the GPU to become idle:
+        # ingress can overlap a forward already in flight.
+        self._drain_release_calendar()
         if self.running or not self.waiting:
             return
         if self._arrival_barrier_unmet():
             return  # an earlier arrival may still be in flight
-        now = clock.time()
-        pending = [self._schedulable_at(seq) for seq in self.waiting
-                   if self._schedulable_at(seq) > now]
-        if len(pending) != len(self.waiting):
-            return  # something has already arrived; let it run
-        if min(pending) == float("inf"):
-            return  # dependency-gated requests have no time-only release yet
-        advance(min(pending) - now)
+        while self.waiting:
+            self._drain_release_calendar()
+            now = clock.time()
+            pending = [self._schedulable_at(seq) for seq in self.waiting]
+            if any(when <= now for when in pending):
+                return  # something is ready; let it run
+            next_release = getattr(getattr(self, "_release_calendar", None), "next_release_at", float("inf"))
+            horizon = min(min(pending), next_release)
+            if horizon == float("inf"):
+                return  # unresolved prerequisites have no time-only event
+            advance(horizon - now)
 
     def _oldest_waiting_prefill_age_ms(self) -> float:
         """Age in ms (since arrival) of the oldest ADMITTABLE waiting prefill,

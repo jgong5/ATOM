@@ -81,6 +81,17 @@ class ReleaseCalendar:
 def load_for_scheduler(config, clock, readiness):
     compass = getattr(config, "compass_config", None)
     path = getattr(compass, "opening_plan", "")
+    fixed_path = getattr(compass, "fixed_absolute_plan", "")
+    if path and fixed_path:
+        raise ValueError("opening and fixed-absolute profiles are mutually exclusive")
+    if fixed_path:
+        if (not getattr(compass, "enabled", False) or getattr(compass, "mode", None) != "predict"
+                or getattr(clock, "epoch", None) is None):
+            raise ValueError("fixed-absolute calendar requires a virtual predictor")
+        from atom.compass.fixed_absolute import FixedAbsolutePlan
+        from atom.compass.runtime.fixed_absolute_calendar import FixedAbsoluteCalendar
+        plan = FixedAbsolutePlan.load(fixed_path, compass.fixed_absolute_plan_sha256)
+        return FixedAbsoluteCalendar(plan, clock, readiness)
     if not path:
         return None
     if (not getattr(compass, "enabled", False) or getattr(compass, "mode", None) != "predict"

@@ -2909,6 +2909,8 @@ async def compass_provenance():
             "request_readiness_profile": getattr(compass, "request_readiness_profile", ""),
             "opening_plan": getattr(compass, "opening_plan", ""),
             "opening_plan_sha256": getattr(compass, "opening_plan_sha256", ""),
+            "fixed_absolute_plan": getattr(compass, "fixed_absolute_plan", ""),
+            "fixed_absolute_plan_sha256": getattr(compass, "fixed_absolute_plan_sha256", ""),
             "prefill_preparation_fence": getattr(compass, "prefill_preparation_fence", False),
             # Which rank's step the modelled side is reporting. A plan that
             # asks for `slowest` and gets a server still on `rank0` is priced

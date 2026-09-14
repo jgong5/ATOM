@@ -26,7 +26,8 @@ def bundle(*, root_times=(0., 100.), child_times=((10., 30.),), join=False, clie
         root_indices = []
         root = {"root_id": root_id, "client_index": client,
                 "source": {"path": f"/source/{root_id}.json", "sha256": "a" * 64},
-                "source_paths": []}
+                "source_paths": [], "_source_fixture": {"id": root_id, "hash_id_scope": "local",
+                                                         "block_size": 64, "requests": []}}
         roots.append(root)
 
         def add_conversation(name, times, depth, parent):
@@ -35,9 +36,11 @@ def bundle(*, root_times=(0., 100.), child_times=((10., 30.),), join=False, clie
                 index = len(rows)
                 source_path = f"/requests/{len(root['source_paths'])}"
                 root["source_paths"].append(source_path)
+                root["_source_fixture"]["requests"].append({"type": "n", "t": arrived, "in": 2, "out": 2})
                 tokens = [100 + index, 200 + index]
                 rows.append({"index": index, "root_id": root_id, "client_index": client,
                     "source_path": source_path, "source_time_s": arrived, "arrival_s": arrived,
+                    "source_input_tokens": 2,
                     "conversation_id": name, "turn_index": turn, "depends_on": indices[-1:],
                     "input_tokens": len(tokens), "output_tokens": 2,
                     "prompt_token_ids": tokens, "prompt_token_sha256": token_digest(tokens),
@@ -71,7 +74,11 @@ def bundle(*, root_times=(0., 100.), child_times=((10., 30.),), join=False, clie
 
 
 def plan_file(tmp_path, data=None):
-    data = bundle() if data is None else data
+    data = copy.deepcopy(bundle() if data is None else data)
+    for root in data["roots"]:
+        source = tmp_path / (root["root_id"] + ".json")
+        source.write_text(json.dumps(root.pop("_source_fixture")))
+        root["source"] = {"path": str(source), "sha256": hashlib.sha256(source.read_bytes()).hexdigest()}
     path = tmp_path / "fixed.json"
     path.write_text(json.dumps(data))
     digest = hashlib.sha256(path.read_bytes()).hexdigest()
@@ -149,6 +156,28 @@ def test_invalid_or_unsupported_bundle_refuses(tmp_path, damage, message):
         data["requests"][0]["prompt_token_ids"][0] += 1
     elif damage == "ground_truth_claim":
         data["dependency_basis"] = "observed causality"
+    with pytest.raises(ValueError, match=message):
+        plan_file(tmp_path, data)
+
+
+@pytest.mark.parametrize("damage, message", [
+    ("dropped_row_and_roster", "source-leaf roster"),
+    ("zero_output", "zero-output"), ("changed_time", "source leaf"),
+    ("changed_output", "source leaf"),
+])
+def test_source_bytes_independently_bind_complete_roster_and_original_times(tmp_path, damage, message):
+    data = bundle()
+    if damage == "dropped_row_and_roster":
+        data["requests"].pop()
+        data["roots"][0]["source_paths"].pop()
+        data["conversations"][1]["request_indices"].pop()
+    elif damage == "zero_output":
+        data["roots"][0]["_source_fixture"]["requests"][-1]["out"] = 0
+    elif damage == "changed_time":
+        data["requests"][1].update(source_time_s=90., arrival_s=90.)
+    elif damage == "changed_output":
+        data["requests"][1]["output_tokens"] = 3
+        data["requests"][1]["body"]["max_completion_tokens"] = 3
     with pytest.raises(ValueError, match=message):
         plan_file(tmp_path, data)
 

@@ -66,6 +66,8 @@ class EngineArgs:
     compass_request_readiness_profile: str = ""
     compass_opening_plan: str = ""
     compass_opening_plan_sha256: str = ""
+    compass_fixed_absolute_plan: str = ""
+    compass_fixed_absolute_plan_sha256: str = ""
     compass_prefill_preparation_fence: bool = False
     compass_op_timings_out: str = ""
     compass_bench_graph: str = ""
@@ -311,6 +313,10 @@ class EngineArgs:
                             help="Pinned two-turn AIPerf opening release plan.")
         parser.add_argument("--compass-opening-plan-sha256", type=str, default="",
                             help="SHA256 of the exact opening plan bytes.")
+        parser.add_argument("--compass-fixed-absolute-plan", type=str, default="",
+                            help="Pinned finite-root corrected fixed-absolute release plan.")
+        parser.add_argument("--compass-fixed-absolute-plan-sha256", type=str, default="",
+                            help="SHA256 of the exact fixed-absolute plan bytes.")
         parser.add_argument(
             "--compass-admission-seconds",
             type=float,
@@ -888,6 +894,8 @@ class EngineArgs:
         compass_readiness = kwargs.pop("compass_request_readiness_profile", "")
         compass_opening = kwargs.pop("compass_opening_plan", "")
         compass_opening_sha = kwargs.pop("compass_opening_plan_sha256", "")
+        compass_fixed = kwargs.pop("compass_fixed_absolute_plan", "")
+        compass_fixed_sha = kwargs.pop("compass_fixed_absolute_plan_sha256", "")
         compass_preparation_fence = kwargs.pop("compass_prefill_preparation_fence", False)
         compass_op_timings = kwargs.pop("compass_op_timings_out", "")
         compass_bench_graph = kwargs.pop("compass_bench_graph", "")
@@ -929,6 +937,9 @@ class EngineArgs:
         if compass_opening or compass_opening_sha:
             compass_kwargs["opening_plan"] = compass_opening
             compass_kwargs["opening_plan_sha256"] = compass_opening_sha
+        if compass_fixed or compass_fixed_sha:
+            compass_kwargs["fixed_absolute_plan"] = compass_fixed
+            compass_kwargs["fixed_absolute_plan_sha256"] = compass_fixed_sha
         if compass_preparation_fence:
             compass_kwargs["prefill_preparation_fence"] = True
         if compass_op_timings:

@@ -28,6 +28,27 @@ def _finite(value):
     return type(value) in (int, float) and math.isfinite(value)
 
 
+def source_leaves(data):
+    """Current bounded source form; refuse unsupported/zero-output leaves whole.
+
+    Flattened Weka requests can still reconstruct one-level SPAWN/joins. Raw
+    nested wrappers need an independently witnessed source-path mapping before
+    this exporter/profile can accept them; they are never silently pruned.
+    """
+    if (not isinstance(data, dict) or data.get("hash_id_scope") != "local"
+            or data.get("block_size") != 64 or not isinstance(data.get("requests"), list)
+            or not data["requests"]):
+        raise ValueError("fixed-absolute source requires the pinned local 64-token Weka format")
+    leaves = {}
+    for index, row in enumerate(data["requests"]):
+        if (not isinstance(row, dict) or row.get("type") not in ("n", "s")
+                or row.get("requests") or type(row.get("out")) is not int or row["out"] <= 0
+                or type(row.get("in")) is not int or row["in"] < 0 or not _finite(row.get("t"))):
+            raise ValueError("fixed-absolute source contains an unsupported or zero-output leaf; root refused intact")
+        leaves[f"/requests/{index}"] = row
+    return leaves
+
+
 class FixedAbsolutePlan:
     """Validate closed source membership and derive the supported dependency edges.
 
@@ -57,7 +78,7 @@ class FixedAbsolutePlan:
         origin = data.get("source_time_origin_s")
         if not _finite(origin):
             raise ValueError("fixed-absolute requires a finite shared source time origin")
-        root_by_id, source_members = {}, set()
+        root_by_id, source_members, originals, source_inputs = {}, set(), {}, []
         for client, root in enumerate(roots):
             root_id, paths = root.get("root_id"), root.get("source_paths")
             source = root.get("source") or {}
@@ -70,6 +91,17 @@ class FixedAbsolutePlan:
                 raise ValueError("root identity or complete source-leaf declaration is invalid")
             root_by_id[root_id] = root
             source_members.update((root_id, path) for path in paths)
+            source_data, source_input = load_json(source["path"], role="runtime.fixed_absolute.source_root")
+            if source_input.sha256 != source["sha256"] or source_data.get("id") != root_id:
+                raise ValueError("fixed-absolute source-root bytes or root identity changed")
+            actual = source_leaves(source_data)
+            if paths != list(actual):
+                raise ValueError("complete source-leaf roster differs from pinned source-root bytes")
+            originals.update(((root_id, path), row) for path, row in actual.items())
+            source_inputs.append(source_input)
+        if origin != min(row["t"] for row in originals.values()):
+            raise ValueError("shared source origin differs from pinned source-root times")
+        self.source_inputs = tuple(source_inputs)
         models, observed_members = set(), set()
         for index, row in enumerate(rows):
             root = root_by_id.get(row.get("root_id"))
@@ -82,6 +114,10 @@ class FixedAbsolutePlan:
                     or not math.isclose(arrival, source_time - origin, rel_tol=0, abs_tol=1e-9)):
                 raise ValueError("request identity or original absolute source offset differs")
             observed_members.add(identity)
+            original = originals[identity]
+            if (source_time != original["t"] or row.get("source_input_tokens") != original["in"]
+                    or row.get("output_tokens") != original["out"]):
+                raise ValueError("request time/input/output differs from its pinned source leaf")
             tokens = row.get("prompt_token_ids")
             if (not isinstance(tokens, list) or not tokens
                     or any(type(token) is not int or not 0 <= token < 2**31 for token in tokens)
@@ -103,6 +139,8 @@ class FixedAbsolutePlan:
             models.add(body["model"])
         if observed_members != source_members or len(models) != 1 or min(row["arrival_s"] for row in rows) != 0:
             raise ValueError("fixed-absolute must retain every declared source leaf under one model and origin")
+        if [(row["root_id"], row["source_path"]) for row in rows] != list(originals):
+            raise ValueError("fixed-absolute tie order must retain selected-root/source-leaf order")
 
         by_conversation, owners, root_chains = {}, {}, {}
         dependencies = [set() for _ in rows]
@@ -217,6 +255,7 @@ class FixedAbsolutePlan:
                 "clients": len(self._data["roots"]), "requests": len(self._data["requests"]),
                 "dependency_basis": DEPENDENCY_BASIS, "qualification": QUALIFICATION,
                 "response_delivery": copy.deepcopy(RESPONSE_DELIVERY),
+                "source_roots": [record.as_dict() for record in self.source_inputs],
                 "root_ids": [root["root_id"] for root in self._data["roots"]],
                 "prompt_token_sha256": [r["prompt_token_sha256"] for r in self._data["requests"]]}
 
