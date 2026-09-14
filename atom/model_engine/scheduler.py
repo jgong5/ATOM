@@ -1122,6 +1122,10 @@ class Scheduler:
         for i, seq in enumerate(self.waiting):
             if i >= 4:
                 break
+            # can_allocate also records checkpoint demand and promotes hits.
+            # Registration of a closed virtual workload is not its arrival.
+            if self._declared_arrival_pending(seq):
+                continue
             if self._unschedulable_reason(seq) is not None:
                 continue
             if seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS:
@@ -1171,6 +1175,8 @@ class Scheduler:
         cap = self.max_num_batched_tokens
         total = 0
         for seq in self.waiting:
+            if self._declared_arrival_pending(seq):
+                continue
             if self._unschedulable_reason(seq) is not None:
                 continue
             if seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS:
@@ -1416,6 +1422,8 @@ class Scheduler:
         """
         oldest_arrive = None
         for seq in self.waiting:
+            if self._declared_arrival_pending(seq):
+                continue
             if self._unschedulable_reason(seq) is not None:
                 continue
             if seq.status == SequenceStatus.WAITING_FOR_REMOTE_KVS:
