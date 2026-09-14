@@ -80,4 +80,5 @@ class NativeWriterReceiver:
         and receiver completed before that predecessor's generation, so neither
         can still occupy a service queue at this release.
         """
-        return self.resolve_closed_workload((request,))[request.request_id]
+        event = self.resolve_closed_workload((request,))[request.request_id]
+        return ReadyEvent(event.ready_at, event.receipt_order, request.arrived_at)

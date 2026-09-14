@@ -78,6 +78,7 @@ class RegisteredRequest:
 class ReadyEvent:
     ready_at: float
     receipt_order: int
+    source_service_started_at: float | None = None
 
 
 @dataclass(frozen=True)
@@ -85,6 +86,7 @@ class RequestReadinessRecord:
     arrived_at: float
     ready_at: float
     receipt_order: int
+    source_service_started_at: float | None = None
 
 
 class RequestReadiness:
@@ -157,9 +159,11 @@ class RequestReadiness:
                                     original.workload_index, original.ingress)
         event = self._provider.resolve_serial_release(request)
         if (not isinstance(event, ReadyEvent) or not math.isfinite(event.ready_at)
-                or event.ready_at < arrived_at):
+                or event.ready_at < arrived_at
+                or event.source_service_started_at != arrived_at):
             raise UnsupportedReadiness("serial source service returned an invalid ready event")
-        record = RequestReadinessRecord(arrived_at, event.ready_at, len(self.records))
+        record = RequestReadinessRecord(arrived_at, event.ready_at, len(self.records),
+                                        event.source_service_started_at)
         self.records = MappingProxyType({**self.records, sequence.id: record})
 
     def resolve_closed_workload(self, sequences) -> None:
@@ -210,7 +214,7 @@ class RequestReadiness:
         return record
 
     def input_manifest(self, extra_inputs=()) -> dict:
-        return {
+        result = {
             **manifest((*self._inputs, *extra_inputs)),
             "reader": {"component": "EngineCore.Scheduler", "pid": self._reader_pid},
             "request_readiness": {
@@ -219,6 +223,14 @@ class RequestReadiness:
                 "resolved_requests": len(self.records) if self.records is not None else 0,
             },
         }
+        if self._serial_requests is not None:
+            result["request_readiness"]["serial_releases"] = [
+                {"seq_id": str(request_id), "arrived_at": record.arrived_at,
+                 "source_service_started_at": record.source_service_started_at,
+                 "ready_at": record.ready_at, "receipt_order": record.receipt_order}
+                for request_id, record in self.records.items()
+            ]
+        return result
 
 
 def load_for_scheduler(config, clock):

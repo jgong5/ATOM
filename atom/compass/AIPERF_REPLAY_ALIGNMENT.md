@@ -146,6 +146,36 @@ scheduler adapter or a separately pinned AgentX profile before broader claims.
 Check server-consumed tokens, native shape/pricing support, empty-start receipts,
 observed cache/state reuse, and paired timing before promoting either case.
 
+The bounded adapter now has explicit entry points:
+
+- `scripts/compass/export_aiperf_opening.py` exports the first two source turns
+  after checking their full-root inferred ancestry and role-planning constraints.
+  It pins the audited AIPerf Python source, exact exporter bytes, environment,
+  tokenizer/template, coding pool, messages and rendered token arrays.
+- The predictor takes `--compass-opening-plan PATH
+  --compass-opening-plan-sha256 SHA` with its source-backed
+  `--compass-request-readiness-profile`. `ReleaseCalendar` separates registration
+  from causal release; only released requests enter the qualified serial ingress
+  service. Intermediate streaming output does not release the continuation.
+- `scripts/compass/replay.py --opening-plan PATH --opening-plan-sha256 SHA
+  --port PORT --out RESULT` selects the chat-opening path. The real clock waits
+  for final SSE/DONE and EOF; the predictor preregisters both requests. The
+  predictor must be fresh and unprepared. Native preparation can use the existing
+  synthetic prompts at the exported rendered lengths, followed by the required
+  empty-cache reset; measured chat payloads remain frozen.
+
+The initial profile is **“AIPerf-aligned opening, zero-response-delivery
+approximation.”** It explicitly approximates modelled client-response
+availability by native engine finish plus zero delivery time, not a calibrated
+coefficient. Real engine finish, SSE terminal frames, EOF, client return and
+the next preprocessing boundary are retained separately. A material gap needs
+independent source calibration, not fitting the evaluated pair's residual.
+Post-run checks require matching consumed tokens and cache policy, the loaded
+core plan, both terminal completions/releases, and readiness service starting at
+the causal releases. Client/server runtime revision remains separate from the
+export's producer identity. These contracts have CPU validation; they do not
+establish native shape support or paired timing.
+
 Ignored evidence resides in `jgong5_compass_cpu` under
 `/workspace/ATOM/agent_scratch/codex_prefix_cache_v1/`:
 
@@ -156,6 +186,10 @@ Ignored evidence resides in `jgong5_compass_cpu` under
   `302544dc7767f488065a3f32c192089a0c276f9f33b26889f73b6618b87f594c`.
 - `AIPERF_OPENING_72d0_TWO_TURNS.json`, SHA256
   `1bcbd296f5c5b5a48889ec6cc7b29b60c41b034243879896812d0759e323ca0e`.
+
+The frozen adapter export is in the sibling
+`codex_aiperf_opening_v1/OPENING_PLAN.json`, SHA256
+`16182a101d0a9579c1b03e48625ee792852aabd403ac47910e653a5ccaa14fb4`.
 
 The sibling `codex_cache_on_preflight_v1/STRUCTURAL_CLOSEOUT.json` has SHA256
 `eb120c52550c310b177d1c012bf231baeb4f38cbe45c600cab792afbf523b74d`;

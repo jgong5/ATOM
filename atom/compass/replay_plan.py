@@ -142,3 +142,66 @@ class OpeningPlan:
                             compass_workload_index=row["index"])
             payloads.append(json.dumps(body).encode())
         return payloads
+
+    def observation_errors(self, server, engine, results):
+        """Bind consumed tokens and causal releases to the loaded plan identity."""
+        errors = []
+        observed = {row["request_id"]: row for row in engine.get("requests", [])}
+        for result, wanted in zip(results, self._data["requests"]):
+            record = observed.get((result.get("response") or {}).get("id"), {})
+            receipt = record.get("shared_preprocessing", {})
+            if (receipt.get("prompt_token_sha256") != wanted["prompt_token_sha256"]
+                    or receipt.get("input_tokens") != wanted["input_tokens"]):
+                errors.append(f"request {result['index']} has no matching consumed-token receipt")
+        if engine.get("clock") == "virtual":
+            loaded = server.get("compass", {}).get("loaded_inputs", {})
+            ranks = loaded.get("ranks", [])
+            if len(ranks) != 1:
+                return errors + ["opening requires one core release-calendar receipt"]
+            core = ranks[0].get("core_inputs", {})
+            calendar = core.get("release_calendar", {})
+            if (calendar.get("input", {}).get("sha256") != self.loaded_input.sha256
+                    or calendar.get("response_delivery") != RESPONSE_DELIVERY):
+                return errors + ["core release calendar differs from the pinned opening"]
+            releases = {row["index"]: row for row in calendar.get("releases", [])}
+            completions = {row["index"]: row for row in calendar.get("completions", [])}
+            if set(releases) != {0, 1} or set(completions) != {0, 1}:
+                return errors + ["core release calendar did not complete both requests"]
+            readiness = {row["seq_id"]: row for row in
+                         core.get("request_readiness", {}).get("serial_releases", [])}
+            if len(readiness) != 2:
+                return errors + ["core has no per-request serial readiness evidence"]
+            epoch = calendar.get("epoch")
+            if not isinstance(epoch, (int, float)) or not math.isfinite(epoch):
+                return errors + ["core release calendar has no finite epoch"]
+            for index, wanted in enumerate(self._data["requests"]):
+                release, completion = releases[index], completions[index]
+                record = observed.get((results[index].get("response") or {}).get("id"), {})
+                service = readiness.get(record.get("seq_id"), {})
+                expected = epoch + wanted["arrival_s"]
+                if index:
+                    expected = max(expected, completions[0]["native_engine_finished_at"])
+                if (release.get("released_at") != expected
+                        or release.get("source_service_started_at") != expected
+                        or service.get("arrived_at") != expected
+                        or service.get("source_service_started_at") != expected
+                        or service.get("ready_at") != release.get("ready_at")
+                        or not isinstance(release.get("ready_at"), (int, float))
+                        or release["ready_at"] < expected
+                        or release.get("seq_id") != record.get("seq_id")
+                        or release.get("released_at") != record.get("arrive_time")
+                        or completion.get("seq_id") != record.get("seq_id")
+                        or completion.get("native_engine_finished_at") != record.get("finish_time")
+                        or completion.get("modelled_client_response_available_at") != record.get("finish_time")
+                        or completion.get("completion_tokens") != wanted["output_tokens"]):
+                    errors.append(f"request {index} release/completion evidence is inconsistent")
+        elif engine.get("clock") == "wall":
+            if len(results) == 2:
+                first, second = [row.get("send_timing", {}) for row in results]
+                due = self._data["requests"][1]["arrival_s"]
+                returned = first.get("finished_offset_s", float("inf"))
+                if second.get("request_started_offset_s", -1) < max(due, returned):
+                    errors.append("real continuation preceded its source or response gate")
+        else:
+            errors.append("opening engine clock is not identified")
+        return errors

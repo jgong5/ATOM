@@ -1055,14 +1055,11 @@ def main(argv=None) -> int:
             kind="chat_messages", conversion_in_execution=False,
             conversion_seconds=None, token_verification="before preparation; shared preprocessing verifies again")
         observed = {row["request_id"]: row for row in engine.get("requests", [])}
-        errors = []
-        for result, wanted in zip(results, workload):
-            request_id = (result.get("response") or {}).get("id")
-            receipt = observed.get(request_id, {}).get("shared_preprocessing", {})
-            if (receipt.get("prompt_token_sha256") != wanted["prompt_token_sha256"]
-                    or receipt.get("input_tokens") != wanted["input_tokens"]):
-                errors.append(f"request {result['index']} has no matching consumed-token receipt")
-        manifest["aiperf_opening"]["consumed_token_errors"] = errors
+        try:
+            errors = args._opening_plan.observation_errors(server, engine, results)
+        except (KeyError, TypeError, ValueError) as exc:
+            errors = [f"malformed opening evidence: {exc}"]
+        manifest["aiperf_opening"]["observation_errors"] = errors
         manifest["aiperf_opening"]["timing_boundaries"] = {
             "engine_clock": engine.get("clock"), "client_clock": "wall",
             "requests": [{
@@ -1075,7 +1072,7 @@ def main(argv=None) -> int:
         if errors:
             manifest["complete"] = False
             manifest["incomplete_reasons"] = {**(manifest["incomplete_reasons"] or {}),
-                                               "opening_tokens": errors}
+                                               "opening_evidence": errors}
     if args._prefix_encoding is not None or args._opening_plan is not None:
         manifest["cache_boundary"] = cache_reset
         manifest["cache_state_after"] = cache_end

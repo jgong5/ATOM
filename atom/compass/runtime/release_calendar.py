@@ -43,8 +43,10 @@ class ReleaseCalendar:
         seq.arrive_time = released_at
         self.readiness.release_serial_request(seq, released_at)
         self.released[seq.id] = {
-            "index": index, "source_earliest_at": self.clock.epoch + self.rows[index]["arrival_s"],
+            "index": index, "seq_id": str(seq.id),
+            "source_earliest_at": self.clock.epoch + self.rows[index]["arrival_s"],
             "released_at": released_at,
+            "source_service_started_at": self.readiness.record(seq).source_service_started_at,
             "ready_at": self.readiness.record(seq).ready_at,
         }
 
@@ -56,12 +58,13 @@ class ReleaseCalendar:
             raise ValueError("opening terminal notification is out of order")
         index = self.released[seq.id]["index"]
         finished_at = float(seq.finish_time)
-        if (not math.isfinite(finished_at) or finished_at < seq.arrive_time
+        if (not math.isfinite(finished_at) or finished_at < self.released[seq.id]["ready_at"]
                 or seq.num_completion_tokens != self.rows[index]["output_tokens"]):
             raise ValueError("opening predecessor did not complete its pinned output")
         response_at = finished_at + self.plan.response_delivery_seconds
         self.completed[seq.id] = {
-            "index": index, "native_engine_finished_at": finished_at,
+            "index": index, "seq_id": str(seq.id), "native_engine_finished_at": finished_at,
+            "completion_tokens": seq.num_completion_tokens,
             "modelled_client_response_available_at": response_at,
             "response_delivery": self.plan.evidence()["response_delivery"],
         }

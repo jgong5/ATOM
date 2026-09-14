@@ -30,7 +30,7 @@ class SerialService:
 
     def resolve_serial_release(self, request):
         self.calls.append(request)
-        return ReadyEvent(request.arrived_at + self.delay["seconds"], 0)
+        return ReadyEvent(request.arrived_at + self.delay["seconds"], 0, request.arrived_at)
 
 
 def opening_fixture(tmp_path, gap):
@@ -150,3 +150,68 @@ def test_unqualified_readiness_provider_cannot_use_the_serial_shortcut(tmp_path)
     service._provider.resolve_serial_release = None
     with pytest.raises(UnsupportedReadiness, match="qualify serial"):
         service.register_serial_workload([])
+
+
+def test_incomplete_registration_never_starts_service_or_rebases_time(tmp_path):
+    path, digest, profile, rows = opening_fixture(tmp_path, 1.)
+    previous = get_clock()
+    clock = VirtualClock(epoch=1000.)
+    set_clock(clock)
+    try:
+        scheduler = Scheduler(MockConfig(
+            num_kvcache_blocks=8192, max_model_len=262144,
+            compass_config=CompassConfig(enabled=True, epoch=1000.,
+                request_readiness_profile=str(profile), opening_plan=str(path), opening_plan_sha256=digest)))
+        seq = Sequence(rows[0]["prompt_token_ids"], 16,
+                       sampling_params=SamplingParams(max_tokens=3, ignore_eos=True))
+        seq.arrive_time = 1000.
+        seq.compass_workload_size, seq.compass_workload_index = 2, 0
+        scheduler.add(seq)
+        assert scheduler.schedule() is None
+        assert scheduler._release_calendar.sequences is None
+        assert scheduler._request_readiness._provider.calls == []
+        assert clock.elapsed == 0
+        scheduler._arrival_barrier_since = float("-inf")
+        with pytest.raises(ValueError, match="incomplete arrival barrier"):
+            scheduler.schedule()
+        assert scheduler.arrival_barrier_timed_out["expected"] == 2
+        assert clock.elapsed == 0 and scheduler._release_calendar.sequences is None
+    finally:
+        set_clock(previous)
+
+
+@pytest.mark.parametrize("damage", [None, "unused_calendar", "early_service", "wrong_plan", "wrong_tokens"])
+def test_final_observation_requires_used_plan_and_causally_started_service(tmp_path, damage):
+    path, digest, _, rows = opening_fixture(tmp_path, 1.)
+    plan = OpeningPlan.load(path, digest)
+    records, releases, completions, services, results = [], [], [], [], []
+    for index, row in enumerate(rows):
+        arrived, finished = (1000., 1002.) if index == 0 else (1002., 1004.)
+        seq_id = str(index + 10)
+        records.append({"request_id": f"r{index}", "seq_id": seq_id,
+                        "arrive_time": arrived, "finish_time": finished,
+                        "shared_preprocessing": {"input_tokens": row["input_tokens"],
+                                                  "prompt_token_sha256": row["prompt_token_sha256"]}})
+        releases.append({"index": index, "seq_id": seq_id, "released_at": arrived,
+                         "ready_at": arrived + .25, "source_service_started_at": arrived})
+        completions.append({"index": index, "seq_id": seq_id, "native_engine_finished_at": finished,
+                            "modelled_client_response_available_at": finished,
+                            "completion_tokens": row["output_tokens"]})
+        services.append({"seq_id": seq_id, "arrived_at": arrived,
+                         "source_service_started_at": arrived, "ready_at": arrived + .25})
+        results.append({"index": index, "response": {"id": f"r{index}"}})
+    calendar = {"input": plan.loaded_input.as_dict(), "response_delivery": RESPONSE_DELIVERY,
+                "epoch": 1000., "releases": releases, "completions": completions}
+    core = {"release_calendar": calendar, "request_readiness": {"serial_releases": services}}
+    server = {"compass": {"opening_plan_sha256": digest, "loaded_inputs": {"ranks": [{"core_inputs": core}]}}}
+    engine = {"clock": "virtual", "requests": records}
+    if damage == "unused_calendar":
+        core.pop("release_calendar")
+    elif damage == "early_service":
+        services[1]["source_service_started_at"] = 1001.
+    elif damage == "wrong_plan":
+        calendar["input"]["sha256"] = "0" * 64
+    elif damage == "wrong_tokens":
+        records[1]["shared_preprocessing"]["prompt_token_sha256"] = "0" * 64
+    errors = plan.observation_errors(server, engine, results)
+    assert bool(errors) == (damage is not None)
