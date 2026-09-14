@@ -1,4 +1,4 @@
-"""Exact small-query cells with independently qualified, bounded layer transfer."""
+"""Exact small-query cells with bounded layer transfer and explicit qualification."""
 
 from copy import deepcopy
 import math
@@ -240,6 +240,8 @@ class LowQueryPrices(PriceLibrary):
                         or record["seconds"] <= 0 or record.get("cache") != case["observed_cache"]
                         or record.get("kv_regions") != case["kv_regions"] or record.get("arg_sets") != case["arg_sets"]):
                     raise ValueError(f"low-query reference differs from frozen point/treatment: {why}")
+                record = dict(record, source_qualified=self.source_qualified,
+                              source_handoff_sha256=self.handoff_sha256)
                 if family == "gdn":
                     identity = _gdn_identity(op)
                     if (op["name"] != GDN or identity is None or identity[1] != 0
@@ -296,7 +298,7 @@ class LowQueryPrices(PriceLibrary):
                 low, high = (points[c] for c in PREFIXES)
                 record = dict(low, seconds=(1 - weight) * low["seconds"] + weight * high["seconds"],
                               **{INTERPOLATED_FLAG: True})
-                record["interpolation"] = {"basis": "exact query, bounded cached prefix, qualified layer family",
+                record["interpolation"] = {"basis": "exact query, bounded cached prefix and layer transfer",
                     "prefixes": list(PREFIXES), "weights": [1 - weight, weight],
                     "source_signatures": [low["signature"], high["signature"]],
                     "source_handoff_sha256": self.handoff_sha256}

@@ -149,6 +149,8 @@ def test_failed_shared_control_requires_explicit_diagnostic_selection(tmp_path):
                              allow_failed_spread=True, diagnostic_only=True)
     assert not library.source_qualified and library.failed_spread_controls == ("gdn1_layer62",)
     assert library.lookup(gdn(query=14))[0]["seconds"] == 1e-4
+    assert library.lookup(gdn(query=14))[0]["source_qualified"] is False
+    assert library.lookup(mha(49150, layer=63, query=14))[0]["source_qualified"] is False
 
 
 @pytest.mark.parametrize("damage", ["error", "kernel", "reference", "membership", "undeclared", "scope"])
