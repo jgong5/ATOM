@@ -22,15 +22,36 @@ original cache-disabled suite stays at **9/24** passing paired cells, including
 whole-corpus generalization or **99% confidence**. No cache-enabled paired
 accuracy result has been completed.
 
+**Bounded native cache and memory proof is complete.** Structural closeout
+`eb120c52…` records a true 32,768-token hit against 38,400 wanted, 13 retained
+checkpoints, no evictions, 112,760 KV blocks plus 32 state slots and a
+121,671,450,624-byte physical pool. Memory checks pass against the unchanged
+source candidate; preparation/final resets and cleanup pass. This does not
+establish paired timing, pool pressure or full-root cache continuity.
+
+**The actual published replay adds role and release semantics.** AIPerf defaults
+to synthetic assistant history, so original text is not an additional blocker.
+Its reconstructed chat tokens and response-gated continuations differ from our
+completion/open-loop mechanism diagnostics. The seeded `4b433` chat inputs are
+93,986/92,701 with native remainders 2/13; final-16 surrogate coverage does not
+prove these shapes. The next faithful candidate is the complete opening of root
+`72d021…`: inputs 38,240/39,982, output maxima 338/186, no prior cached history
+and second release `max(run origin + 21.437 seconds, first target response)`.
+Later branches are excluded. The adapter and native/source support remain to be
+reviewed. [AIPerf replay alignment](AIPERF_REPLAY_ALIGNMENT.md) pins the valid
+local-file fixed profile, exact token evidence and its branch-planner limitation;
+AgentX gap compression is a separate profile, not an implicit replacement.
+
 Implementation is integrated at `2782333ab`: explicit TP1 cache/checkpoint
 policy; a pinned codec for local 64-token source hash blocks with native
 16-token prefix-match safeguards; distinct native GDN fork source/destination
 slots; a quiescent reset with all-worker completion and fresh modelled epoch
 checks; and readiness-gated prefix demand. The current target policy is cache
 on, checkpoint interval 8192, demand enabled and one-token GDN forks. Legacy
-plans stay cache off. Source memory geometry is reused only as an explicit
-derived candidate; actual cache-on memory, hits, checkpoint/pool behavior and
-region coverage still require native source and paired E2E evidence. Combined
+plans stay cache off. Source memory geometry remains an explicit derived
+candidate with the bounded native memory/hit/checkpoint validation above.
+Pool-pressure behavior, remaining region coverage and paired E2E accuracy still
+require evidence. Combined
 CPU verification passed **648 tests**, with zero failures, errors or skips on
 exact source `2782333abba2135050072f5966f41c79472c2142` in a container without GPU
 device nodes. This cannot substitute for those observations.
@@ -53,9 +74,9 @@ The non-Torch discrepancy is preserved as a failure with unresolved
 attribution. Native sizing/recording uses the current PyTorch device's memory
 APIs, not an SMI device index; that specific mapping hypothesis is unsupported.
 No cause, corrected constant or cache-on conclusion follows from this result.
-The next execution evidence is a cache-on source/oracle preflight followed by
-a paired run of complete consecutive episodes from an exposed root, not more
-cache-disabled gap closure or a claim to have replayed an entire root.
+The next execution evidence is reviewed cache-on region/source support and a
+fresh paired mechanism run, followed by the faithful response-gated opening
+above. These are not more cache-disabled gap closure or an entire-root claim.
 
 ## Remediation update — 2026-09-14
 

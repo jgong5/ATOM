@@ -8,13 +8,34 @@ without calling a missed 5x target a pass; `cc_traces_validate.py matrix
 registrations and their historical verdicts remain unchanged.
 
 **Current execution priority (2026-09-15): prefix caching enabled for the
-main cc-traces completion path.** The [coverage and confirmation
+main cc-traces validation path.** The [coverage and confirmation
 review](CC_TRACES_COVERAGE_REVIEW.md) controls coverage and case selection.
 The original cache-disabled registration and its **9/24** passing cells
 (including **8/8 original TP1**) retain their historical meaning. They do not
 prove the cache-enabled configuration, whole-corpus accuracy or **99%
 confidence**. No cache-enabled paired accuracy result is established yet.
 The earlier short-c4 campaign and staged cache-disabled long real run are held.
+
+**Native cache/memory mechanics now have bounded proof.** Reviewed structural
+closeout `eb120c52…` completed the `4b433` two-request token-surrogate case with
+32,768 tokens reused against 38,400 wanted, 13 retained checkpoints and no
+evictions. The physical pool is 112,760 KV blocks plus 32 state slots,
+121,671,450,624 bytes; memory checks pass against the unchanged source memory
+candidate, and preparation/final resets plus cleanup pass. This is structural
+evidence, not a paired timing result or full-root cache proof.
+
+**Actual AIPerf replay alignment remains a key gap.** The pinned published
+loader uses synthetic assistant history, chat role reconstruction and
+response-gated continuation. Current open-loop completion fixtures establish
+prefix mechanics, not that full behavior. The seeded full-history `4b433`
+chat inputs are 93,986/92,701 tokens, rather than the proxy's 92,928/92,672;
+native tail/region support must follow those actual shapes. The proposed first
+faithful opening is root `72d021…` requests 0/1: rendered 38,240/39,982 inputs,
+338/186 output maxima, empty start, and second release at
+`max(run origin + 21.437 seconds, first target response)`. Later branches are
+excluded; the adapter and source support need review before execution. Exact
+pins, the fixed-profile branch-planner limitation and the explicit ignore-EOS
+variant are in [AIPerf replay alignment](AIPERF_REPLAY_ALIGNMENT.md).
 
 **Cache-on implementation is integrated at `2782333ab`.** The new diagnostic
 path binds an explicit cache policy and source-hash prompt encoding; both
@@ -25,8 +46,9 @@ destination slots. A quiescent cache reset fences every worker, clears both
 indexes and records policy/pool/counter snapshots; a modelled run must remain
 fresh at its original virtual epoch. Future requests do not publish prefix
 demand before readiness. Captured and derived target/memory provenance retain
-the source policy, with cache-on memory reuse explicitly an unvalidated
-derived candidate. **648 targeted CPU regressions pass** on exact source
+the source policy. The derived cache-on memory candidate has the bounded native
+validation above; that does not establish general pool-pressure behavior.
+**648 targeted CPU regressions pass** on exact source
 `2782333abba2135050072f5966f41c79472c2142`, with zero failures, errors or skips
 in a container with no GPU device nodes. These contracts alone prove neither
 cache hits, pool pressure, native memory terms, region coverage nor E2E accuracy.
