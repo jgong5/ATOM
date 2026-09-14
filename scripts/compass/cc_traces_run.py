@@ -614,7 +614,7 @@ class SideRun:
             ),
             "ports": self._ports(step, after),
             "mode": after("--compass-mode"),
-            "engine_args": list(plan_module.ENGINE_ARGS),
+            "engine_args": list(step.get("engine_args", plan_module.ENGINE_ARGS)),
             "provenance": None,
             "provenance_sha256": None,
         }
@@ -1705,6 +1705,8 @@ def _cell_plan(args) -> dict:
         request_timeout=getattr(args, "request_timeout", plan_module.REQUEST_TIMEOUT),
         pretokenize=getattr(args, "pretokenize", False),
         allow_advisory_isolation=getattr(args, "allow_advisory_isolation", False),
+        request_readiness_profile=getattr(args, "compass_request_readiness_profile", ""),
+        prefill_preparation_fence=getattr(args, "compass_prefill_preparation_fence", False),
     )
     if Path(built["cell"]).name != cell.name:
         raise SystemExit(
@@ -2207,6 +2209,7 @@ def main(argv=None) -> int:
                    help="encode prompts inside the measured window before pacing")
     s.add_argument("--allow-advisory-isolation", action="store_true",
                    help=plan_module.ADVISORY_ISOLATION_QUALIFICATION)
+    plan_module.add_modelled_timing_arguments(s)
     s.add_argument(
         "--port",
         type=int,

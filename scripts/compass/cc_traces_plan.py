@@ -183,6 +183,28 @@ ENGINE_ARGS = (
     "32",
 )
 
+def add_modelled_timing_arguments(parser):
+    """Optional timing controls shared by the plan and side-run CLIs."""
+    parser.add_argument(
+        "--compass-request-readiness-profile", default="",
+        help="source readiness profile for TP1 modelled cells only",
+    )
+    parser.add_argument(
+        "--compass-prefill-preparation-fence", action="store_true",
+        help="enable the source preparation fence for TP1 modelled cells only",
+    )
+
+
+def _modelled_engine_args(tp, request_readiness_profile, prefill_preparation_fence):
+    args = list(ENGINE_ARGS)
+    if tp == 1:
+        if request_readiness_profile:
+            args += ["--compass-request-readiness-profile", request_readiness_profile]
+        if prefill_preparation_fence:
+            args.append("--compass-prefill-preparation-fence")
+    return args
+
+
 #: What each cell keeps, and which step writes it. The validator refuses a cell
 #: that is missing any of it, so the plan names it rather than leaving it to be
 #: noticed afterwards.
@@ -248,6 +270,7 @@ def _serve(
     cell: str,
     target,
     memory_model=None,
+    engine_args=None,
 ):
     """The server command for one side of one cell.
 
@@ -287,7 +310,7 @@ def _serve(
         str(engine_port),
         "-tp",
         str(tp),
-        *ENGINE_ARGS,
+        *(ENGINE_ARGS if engine_args is None else engine_args),
         "--compass",
         "--compass-mode",
         "predict" if modelled else "measure",
@@ -388,9 +411,11 @@ def _lifecycle(
     memory_model=None,
     request_timeout: float = REQUEST_TIMEOUT,
     pretokenize: bool = False,
+    engine_args=None,
 ):
     """One repeat: its own server, its replay, and the end of that process."""
     modelled = side == "modelled"
+    engine_args = list(ENGINE_ARGS if engine_args is None else engine_args)
     return [
         {
             "id": f"serve-{side}-{n}",
@@ -414,7 +439,9 @@ def _lifecycle(
                 cell=cell,
                 target=target,
                 memory_model=memory_model,
+                engine_args=engine_args,
             ),
+            "engine_args": engine_args,
             "background": True,
             "health": f"http://127.0.0.1:{port}/health",
             # Named by scope, and by the flag that carries each one, so the
@@ -494,6 +521,8 @@ def cell_steps(
     request_timeout: float = REQUEST_TIMEOUT,
     pretokenize: bool = False,
     allow_advisory_isolation: bool = False,
+    request_readiness_profile: str = "",
+    prefill_preparation_fence: bool = False,
 ):
     """Every step of one cell, in the order it has to happen."""
     if port == engine_port:
@@ -654,6 +683,8 @@ def cell_steps(
             memory_model=memory_model,
             request_timeout=request_timeout,
             pretokenize=pretokenize,
+            engine_args=_modelled_engine_args(
+                tp, request_readiness_profile, prefill_preparation_fence),
         )
     steps += [
         {
@@ -754,6 +785,8 @@ def build(args) -> dict:
             request_timeout=getattr(args, "request_timeout", REQUEST_TIMEOUT),
             pretokenize=getattr(args, "pretokenize", False),
             allow_advisory_isolation=getattr(args, "allow_advisory_isolation", False),
+            request_readiness_profile=getattr(args, "compass_request_readiness_profile", ""),
+            prefill_preparation_fence=getattr(args, "compass_prefill_preparation_fence", False),
         )
         for tp in TPS
         for klass in CLASSES
@@ -907,6 +940,7 @@ def main(argv=None) -> int:
                     help="encode prompts inside each measured window before pacing, on both sides")
     ap.add_argument("--allow-advisory-isolation", action="store_true",
                     help=ADVISORY_ISOLATION_QUALIFICATION)
+    add_modelled_timing_arguments(ap)
     ap.add_argument("--out", default=None, help="write the plan as JSON here")
     ap.add_argument(
         "--shell", action="store_true", help="print the commands instead of JSON"

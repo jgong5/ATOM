@@ -34,6 +34,29 @@ plan_mod = _load("cc_traces_plan")
 validate = _load("cc_traces_validate")
 
 
+@pytest.mark.parametrize("profile_enabled,fence_enabled", [(True, False), (False, True), (True, True)])
+def test_timing_options_only_reach_selected_tp1_modelled_servers(profile_enabled, fence_enabled):
+    profile = "/profiles/source readiness.json"
+    argv = ["--root", "/r"]
+    extra = []
+    if profile_enabled:
+        extra += ["--compass-request-readiness-profile", profile]
+    if fence_enabled:
+        extra.append("--compass-prefill-preparation-fence")
+    original = tuple(plan_mod.ENGINE_ARGS)
+    plan = json.loads(_run(argv + extra))
+    for cell in plan["cells"]:
+        for step in _role(cell, "serve"):
+            selected = cell["tp"] == 1 and step["side"] == "modelled"
+            expected = list(original) + (extra if selected else [])
+            assert step["engine_args"] == expected
+            start = step["command"].index("--gpu-memory-utilization")
+            assert step["command"][start:start + len(expected)] == expected
+            for flag in ("--compass-request-readiness-profile", "--compass-prefill-preparation-fence"):
+                assert (flag in step["command"]) == (selected and flag in extra)
+    assert plan_mod.ENGINE_ARGS == original
+
+
 @pytest.fixture
 def plan():
     return json.loads(_run(["--root", "/r"]))

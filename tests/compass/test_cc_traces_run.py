@@ -415,6 +415,41 @@ def _journal(runner):
     return json.loads((runner.cell / f"run.{runner.side}.json").read_text())
 
 
+@pytest.mark.parametrize("tp,side", [(1, "modelled"), (1, "real"), (2, "modelled"), (4, "modelled")])
+def test_timing_cli_reaches_server_argv_and_recorded_configuration(tmp_path, monkeypatch, tp, side):
+    profile = "/profiles/source readiness.json"
+    selected = tp == 1 and side == "modelled"
+    extra = ["--compass-request-readiness-profile", profile, "--compass-prefill-preparation-fence"]
+
+    def execute(args):
+        built = run_mod._cell_plan(args)
+        monkeypatch.setattr(sys.modules[__name__], "_plan", lambda root: built)
+        said = fake_provenance("predict" if side == "modelled" else "measure", tp=tp)
+        said["compass"].update(request_readiness_profile=profile if selected else "",
+                               prefill_preparation_fence=selected)
+        runner = _runner(tmp_path, side, provenance=lambda url: said)
+        assert runner.run() == 0
+        for execution in runner.executions.values():
+            expected = list(plan_mod.ENGINE_ARGS) + (extra if selected else [])
+            assert execution["config"]["engine_args"] == expected
+            command = execution["process"]["command"]
+            start = command.index("--gpu-memory-utilization")
+            assert command[start:start + len(expected)] == expected
+            for flag in (extra[0], extra[-1]):
+                assert (flag in command) == selected
+            observed = execution["config"]["provenance"]["compass"]
+            assert observed["request_readiness_profile"] == (profile if selected else "")
+            assert observed["prefill_preparation_fence"] is selected
+        return 0
+
+    monkeypatch.setattr(run_mod, "side", execute)
+    assert run_mod.main([
+        "side", "--cell", str(tmp_path / f"tp{tp}_clients_large_c4"),
+        "--side", side, "--tp", str(tp), "--class", "clients_large", "--clients", "4",
+        *extra,
+    ]) == 0
+
+
 # --------------------------------------------------------------------------
 
 
