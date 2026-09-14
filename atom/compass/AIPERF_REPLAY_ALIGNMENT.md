@@ -130,6 +130,48 @@ The handoff pins scripts, metadata, source files and reproduction commands.
 All 14 scenarios use declared artificial response delays; they establish
 dispatch/callback behavior and chat reconstruction, not live HTTP or GPU timing.
 
+The bounded corrected profile is implemented separately as
+`compass.fixed_absolute_root_bundle/1`, profile
+`aiperf_corrected_fixed_absolute_ignore_eos_v1`. It supports complete selected
+C1/C2/C4/C8 root bundles, same-chain turns and single-level post-response
+SPAWN/SPAWN_JOIN. The exporter and plan reader compare every source path,
+original time, input and output count against the pinned source-root bytes;
+zero-output or unsupported raw leaves refuse the whole root. Additional loader
+`replay_predecessors` must already be implied transitively by the executed
+dependencies. They are retained and checked, not silently discarded.
+
+The actual pinned-loader export of `1493faff` passes this guard: all seven leaves
+and its 373.459-second span survive, and its additional predecessors are
+transitively enforced. Full `72d021` is refused intact because 15 cross-stream
+predecessors require additional semantics; the refusal retains all 21 metadata
+turns and lists every missing constraint. Its separate two-turn opening remains
+unchanged. CPU export evidence under `agent_scratch/codex_fixed_absolute_export_v1/`
+includes `ROOT_1493.json`, SHA256
+`c0769dfd6274b26cfb185e34fdb9da0f441ea0f8d61702b5efa81aec30d33d10`, and
+`ROOT_72D021.json.refusal.json`, SHA256
+`b5fb7169ba515227e1cdd93f1fbff4ed62301eccaeb4a16c633ab80b0a1104cb`.
+
+Export with `scripts/compass/export_fixed_absolute.py --source-root PATH
+--source-root-sha256 SHA --aiperf-source PATH --out PLAN` (repeat the source
+path/hash pair for multiple roots). On the modelled server, add
+`--compass-fixed-absolute-plan PLAN --compass-fixed-absolute-plan-sha256 SHA`
+alongside the source-backed readiness profile. The client uses
+`scripts/compass/replay.py --fixed-absolute-plan PLAN
+--fixed-absolute-plan-sha256 SHA --port PORT --out RESULT`. All referenced source
+roots must be staged at their pinned paths before launch. These are distinct
+entry points; `opening-side`/`opening-pair` retain their two-request contract.
+
+Real client releases follow completed SSE/EOF responses and original absolute
+due times. The modelled calendar preregisters the whole bundle, matures release
+events chronologically, and retains writer/receiver availability across them.
+Its next-event horizon advances idle virtual time through release and readiness
+events. Every source read is reported by the core. Final observation checks bind
+source identities, consumed tokens, request IDs, all releases/completions,
+re-derived source ingress service and root/queue drain. Focused CPU tests include
+early/late joins, future-due ordering, reverse registration, multi-root ties and
+more outstanding requests than clients. This establishes adapter behavior, not
+native shape coverage, source-price support or paired E2E accuracy for `1493faff`.
+
 AgentX is a different, scenario-locked profile: response-relative end-to-start
 delays after per-root start-gap compression, trajectory cache warmup, recycle
 markers, and tree-slot accounting. Only that mode installs the extra recorded
