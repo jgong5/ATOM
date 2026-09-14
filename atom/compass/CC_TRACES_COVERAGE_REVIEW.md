@@ -72,10 +72,31 @@ and second release `max(run origin + 21.437 seconds, first target response)`.
 Later branches are excluded. The maintained opening adapter and wrapper checks
 are reviewed and integrated (`4078a5bae`, `9950bb532`). All 524 inventoried
 decode shapes are covered; the bounded q16 primitive source is qualified.
-Remaining source gaps are 11 GEMM keys across q5456/q1744/q14, q14 GDN/MHA/gather
-and cached-prefill region qualification. The finite q1–15 source campaign and
-region transfer controls are prepared, with no new low-query GPU acquisition
-or faithful opening pair established. [AIPerf replay alignment](AIPERF_REPLAY_ALIGNMENT.md) pins the valid
+The remaining primitive dependencies have now been measured: source v3
+completed **249 references and 480 heldouts**, with predictions sealed before
+heldout release. Every numerical/kernel gate passes, while five reference and
+five heldout repeat-spread failures leave the full domain **unqualified**.
+The strict opening dependencies have 22/22 qualified references and 82/83
+qualified controls; the required `heldout_gdn_q1_l62_fork2_3` control has
+**5.21917495%** spread against 5%, although its prediction error is 0.032394%.
+No dependency is removed and no threshold is relaxed. A separately reviewed
+diagnostic bundle must retain this failure through explicit
+`low_q_allow_failed_spread` and `diagnostic_only` selection.
+
+Final-region transfer remains **FAILED**, with 21/24 checks passing and all
+q16 controls/postprocess checks passing. The q8/q9/q15 preparation misses at
+history 33,792 are 145–160 µs, about 0.13–0.15% of their native forwards;
+the unchanged 110 µs verdict is retained. The explicit diagnostic q1–15
+selection reuses the frozen q16 formula only over cached history
+`[33792,66560]`, with no fit or default/acceptance activation. The completed
+region collection was not repeated in v3.
+
+The source verdict is `e00b20ad…`, closeout `da8817a4…`, and final-region
+result `108a18a2…`; [PoC status](POC_STATUS.md) records their full paths and
+digests. Final provider input closure and aggregate bundle registration are
+still required before the next modelled-first opening. No faithful opening
+pair, new accepted cell or confidence claim follows from these acquisitions.
+[AIPerf replay alignment](AIPERF_REPLAY_ALIGNMENT.md) pins the valid
 local-file fixed profile, exact token evidence and its branch-planner limitation;
 AgentX gap compression is a separate profile, not an implicit replacement.
 
@@ -111,9 +132,10 @@ The non-Torch discrepancy is preserved as a failure with unresolved
 attribution. Native sizing/recording uses the current PyTorch device's memory
 APIs, not an SMI device index; that specific mapping hypothesis is unsupported.
 No cause, corrected constant or cache-on conclusion follows from this result.
-The next execution evidence is qualified low-query primitive and cached-prefill
-region support, followed by the faithful response-gated opening above. The
-completed surrogate pair does not close those remaining gaps.
+The next execution evidence is the response-gated opening above, explicitly
+diagnostic with its retained spread/region failures and zero response-delivery
+approximation. Qualified full-domain support and broader E2E validation remain
+gaps; the completed surrogate pair does not close them.
 
 ## Remediation update — 2026-09-14
 

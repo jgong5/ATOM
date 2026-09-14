@@ -62,13 +62,61 @@ faithful opening is root `72d021…` requests 0/1: rendered 38,240/39,982 inputs
 `max(run origin + 21.437 seconds, first target response)`. Later branches are
 excluded. The maintained adapter/harness and exact wrapper checks are reviewed
 and integrated (`4078a5bae`, `9950bb532`). All 524 inventoried decode shapes are
-covered, and the bounded q16 primitive source is qualified. Remaining opening
-gaps include 11 GEMM keys across q5456/q1744/q14, q14 GDN/MHA/gather support and
-cached-prefill region qualification. A finite q1–15 source campaign and region
-transfer controls are prepared; no new low-query GPU acquisition or faithful
-opening pair is established. Exact
+covered, and the bounded q16 primitive source is qualified. The new source
+acquisition below measures the remaining opening dependencies: 11 GEMM keys
+across q5456/q1744/q14 and q14 GDN/MHA/gather. Its qualification failures remain
+explicit; no faithful opening pair or new acceptance result is established. Exact
 pins, the fixed-profile branch-planner limitation and the explicit ignore-EOS
 variant are in [AIPerf replay alignment](AIPERF_REPLAY_ALIGNMENT.md).
+
+**Low-query source acquisition completed (2026-09-15).** Executable v3 on
+source `47d57fe33` completed **249 reference measurements (83 cells × 3)** and
+**480 heldout measurements (160 cells × 3)**. The device-free CPU controller
+sealed predictions before release and retained all six boundary receipts.
+All predeclared numerical and kernel-identity gates pass, but full-domain
+`source_qualified` remains **false**: five reference and five heldout points
+fail the unchanged **5% repeat-spread** rule. No partial references from the
+failed v2 attempt were reused. That failure exposed allocated argument-set
+count versus captured-call-count accounting; v3 corrected validation of that
+distinction without changing the measurement treatment. Cleanup passed.
+
+The strict opening dependency set has **22/22 qualified references and 82/83
+qualified controls**. Its sole control miss is
+`heldout_gdn_q1_l62_fork2_3`: **5.21917495%** spread, despite **0.032394%**
+prediction error and a passing kernel check. It cannot be called a qualified
+subset. The next opening uses a separately reviewed, explicitly unqualified
+diagnostic bundle with `low_q_allow_failed_spread` requiring `diagnostic_only`; the
+failed control, all dependencies and all other gates remain intact.
+
+The separate final-region transfer collection also completed: 60 synthetic
+requests plus three seeds, 36 retained terminal intervals, and **21/24**
+component checks pass. Both q16 controls and every postprocess check pass.
+Preparation at cached history 33,792 fails for q8/q9/q15 by
+**160.417/144.990/150.710 µs**, respectively, or **0.14944/0.13414/0.13921%**
+of the measured native forward. The **110 µs** verdict remains **FAILED**;
+those fractions do not replace the gate. Integrated `669f86015` permits only
+an explicit diagnostic transfer of the unchanged q16 formula to q1–15,
+cached history `[33792,66560]`, N1/TP1 cached compiled prefill. No residual fit,
+default activation or acceptance credit follows. The completed region
+collection was not repeated in primitive v3.
+
+Source evidence is under `agent_scratch/` in the artifact container:
+
+| Artifact | SHA-256 |
+| --- | --- |
+| `codex_low_q_layer_family_source_v1/executable_v3/EXECUTABLE_PLAN.json` | `824d11b40523d7839527622e5ebc1474db542151516e11634ff14898108ad9f1` |
+| `executable_v3/acquisition_v1/REFERENCE_FREEZE.json` | `02c7ae95d4be0c916d4cf94ad4f06aa64297a27ca1e9e1ec93ef4c3e7ca9b34a` |
+| `executable_v3/acquisition_v1/VERDICT.json` | `e00b20ad7f1d66d8367589fee6a2d552683f32545f7a651ce1bd254cc4b450ba` |
+| `executable_v3/ACQUISITION_V1_CLOSEOUT.json` | `da8817a4e33194d2a2caf322835fadd5d9787477d91129f1bee6a34d21700edc` |
+| `executable_v2/acquisition_v1/region_controls/RESULT.json` | `108a18a27304b8eff654aa74282486cbf16a5e1f590a60f43dda914276fa60cc` |
+| `codex_failed_final_transfer_v1/CACHE_REGION_OVERLAY.json` | `18a4eda460088e6a7d2e1033436569001b892e19c0a23fd4da17e3958e8476d8` |
+
+The shortened `executable_v2/` and `executable_v3/` paths share the
+`codex_low_q_layer_family_source_v1/` prefix. Final opening readiness/oracle
+input closure and the actual aggregate price-bundle digest must be frozen
+before its registry and launch. The zero response-delivery approximation and
+earlier shared-node isolation result remain explicit. Registered results stay
+at **9/24**; neither source campaign is a paired opening or confidence sample.
 
 **Cache-on implementation is integrated at `2782333ab`.** The new diagnostic
 path binds an explicit cache policy and source-hash prompt encoding; both
