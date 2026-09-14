@@ -81,16 +81,54 @@ overhead. The loader also records source start-to-start `delay_ms`; fixed mode
 uses the timestamp in preference to that delay. Generic request-rate mode instead
 adds this delay after target return ([fixed][fixed], [clock][clock], [rate][rate]).
 
-Branch behavior needs separate qualification. Return callbacks spawn children;
-their offsets are relative to the branch start. An unsatisfied `SPAWN_JOIN`
-blocks the parent; its eventual release goes directly through the issuer, without
-the ordinary fixed-timestamp path. Already-satisfied joins fall through to that
-ordinary path ([callback][callback], [branches][branches], [issuer][issuer]).
-A bounded CPU execution of `FixedScheduleStrategy.setup_phase/execute_phase`
-also produced independent depth-0 first credits for **both** root metadata and
-branch-referenced child metadata. This is planner/issuer-capture evidence, not
-an observed duplicate HTTP send. Use a branch-free opening for the first fixed
-profile pair; do not infer correct fan-out behavior from the tutorial alone.
+**The stock fixed profile has witnessed branch correctness failures.** A bounded
+CPU probe now exercises the real loader, phase configuration, issuer, concurrency
+manager, branch orchestrator, return callbacks and worker session manager with a
+fake transport and event clock. For the full exposed `72d021` root, concurrency
+1 issues 21 requests but only 14 unique source requests; indices 14–20 are
+omitted. Stock concurrency 2/4/8 yields 13 unique requests. These settings are
+probes of one original root, not new multi-client validation cells.
+
+The loader produces four root turns and three child streams (15/1/1 turns),
+grouped in one background `SPAWN`. Fixed scheduling starts the child metadata
+independently at depth 0 and the return callback also spawns it at depth 1.
+Distinct correlation IDs prevent worker deduplication; the dataset-size request
+cap then truncates the original tail. The first child submissions at
+54.182/73.321/86.701 seconds precede their source timestamps
+4177.070/4196.209/4209.589 by **4122.888 seconds**, because offsets relative to
+the branch start are applied at the parent return ([fixed][fixed],
+[callback][callback], [branches][branches]). Filtering initial dispatch to true
+roots removes duplicates in this probe but leaves the premature child releases.
+
+The full `72d021` root has no joins. Separate bounded probes show an active
+`SPAWN_JOIN` releasing a parent due at 10 seconds at child completion 0.020
+seconds; an already-satisfied join retains the ordinary 10-second schedule.
+Active joins go directly through the issuer and bypass the absolute timestamp
+([issuer][issuer]). The seven-request `1493faff` root also needs branch handling:
+five root turns, two children, a foreground join and a final background leaf.
+Its C1 probe duplicates source request 2 and omits leaf 6. Its rendered input
+lengths by source index are 498/42007/2993/44833/46569/46506/11242; its original
+373.459-second span and all leaves must be preserved.
+
+The approved corrected adapter is a distinct fixed-absolute profile over a
+finite selected-root bundle with loader-inferred dependencies, not recovered
+ground-truth causality. Every release must respect both its original absolute
+due time and prerequisite responses. It requires unique source identities,
+root-client accounting through all leaves, chronological release events,
+persistent ingress queues and an idle-clock release horizon. No general DAG
+scheduler or stock-profile equivalence follows from this design. The existing
+branch-free two-request opening remains unaffected.
+
+Evidence is preserved in `agent_scratch/codex_aiperf_branch_runtime_v1/` in the
+artifact container: `HANDOFF.json` SHA256
+`1961ae84f0fbeca194db2ceb67b0d5d6414f99f957822053dab664dc6cc37a4e`,
+`RESULT.json` SHA256
+`1c60383a22f95689beb2d6d8875da3d57f4aab104ac697e83eb9e524b46495b5`,
+and `CANDIDATE_1493.json` SHA256
+`e90259f2533812ed784d407b2582cca9a7ee7cff38d572e080b61aafe838e6ae`.
+The handoff pins scripts, metadata, source files and reproduction commands.
+All 14 scenarios use declared artificial response delays; they establish
+dispatch/callback behavior and chat reconstruction, not live HTTP or GPU timing.
 
 AgentX is a different, scenario-locked profile: response-relative end-to-start
 delays after per-root start-gap compression, trajectory cache warmup, recycle
