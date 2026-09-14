@@ -149,6 +149,7 @@ tokenizer: AutoTokenizer | None = None
 # Bounded, and dropped oldest-first: a long-running server must not accumulate a
 # row per request forever. A benchmark drains it at the end of a run.
 _compass_records: "OrderedDict[str, dict]" = OrderedDict()
+_compass_prompt_evidence: dict[str, dict] = {}
 COMPASS_MAX_RECORDS = 100_000
 
 
@@ -182,6 +183,9 @@ def _record_engine_timings(request_id: str, out: "RequestOutput") -> None:
         "ttft": (first - arrive) if first else None,
         "latency": finish - arrive,
     }
+    prompt_evidence = _compass_prompt_evidence.pop(request_id, None)
+    if prompt_evidence is not None:
+        _compass_records[request_id]["shared_preprocessing"] = prompt_evidence
 # The tool-call format this model emits, resolved once at startup from its
 # chat template. `None` means none was recognised and tool calls, if any, are
 # delivered as plain text -- said out loud at startup, never discovered here.
@@ -1304,6 +1308,7 @@ async def setup_streaming_request(
     arrival_time: float | None = None,
     workload_size: int | None = None,
     workload_index: int | None = None,
+    prompt_token_sha256: str | None = None,
 ) -> tuple[int, StreamOutputCollector, int]:
     """Set up a streaming request with the engine.
 
@@ -1342,6 +1347,8 @@ async def setup_streaming_request(
             arrival_time=arrival_time,
             workload_size=workload_size,
             workload_index=workload_index,
+            **({"prompt_token_sha256": prompt_token_sha256}
+               if prompt_token_sha256 is not None else {}),
         )
         _seq_id_to_request_id[seq.id] = request_id
         return seq
@@ -1350,9 +1357,20 @@ async def setup_streaming_request(
     try:
         seq = await executor_loop.run_in_executor(None, do_preprocess)
         _validate_sequence_context_length(seq)
+        if prompt_token_sha256 is not None:
+            from atom.compass.prefix_workload import token_digest
+
+            _compass_prompt_evidence[request_id] = {
+                "prompt_token_sha256": token_digest(seq.token_ids),
+                "input_tokens": seq.num_prompt_tokens,
+                "preprocess_arrive_time": seq.arrive_time,
+                "api_preprocess_returned_wall_time": time.time(),
+                "timing_meaning": "IOProcessor arrival stamp and API observation after preprocessing; wall observation is not virtual cost",
+            }
     except Exception:
         _stream_loops.pop(request_id, None)
         _request_start_times.pop(request_id, None)
+        _compass_prompt_evidence.pop(request_id, None)
         if seq is not None:
             _seq_id_to_request_id.pop(seq.id, None)
             engine.io_processor.requests.pop(seq.id, None)
@@ -1403,6 +1421,7 @@ def cleanup_request(request_id: str) -> None:
     """
     _stream_loops.pop(request_id, None)
     _request_start_times.pop(request_id, None)
+    _compass_prompt_evidence.pop(request_id, None)
 
 
 class _ClientDisconnected(Exception):
@@ -1743,6 +1762,16 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
         _log_request_model("request", request_id, request)
 
         is_multimodal = _has_multimodal_content(messages)
+        compass_fields = {
+            name: value for name, value in (
+                ("arrival_time", request.compass_arrival),
+                ("workload_size", request.compass_workload_size),
+                ("workload_index", request.compass_workload_index),
+                ("prompt_token_sha256", request.compass_prompt_token_sha256),
+            ) if value is not None
+        }
+        if compass_fields and (is_multimodal or effective_n != 1 or not request.stream):
+            raise ValueError("Compass chat opening requires one streaming text response")
         if is_multimodal:
             # Image loading (blocking network I/O, up to a 30s urlopen) plus
             # processor preprocessing are heavy and would stall the event loop;
@@ -1815,6 +1844,7 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                         multimodal_data=stream_multimodal_data,
                         kv_transfer_params=request.kv_transfer_params,
                         **dp_routing,
+                        **compass_fields,
                     )
                 )
                 gen = stream_chat_response(
@@ -2851,6 +2881,8 @@ async def compass_provenance():
             "virtual_clock": compass.virtual_clock,
             "admission_seconds": compass.admission_seconds,
             "request_readiness_profile": getattr(compass, "request_readiness_profile", ""),
+            "opening_plan": getattr(compass, "opening_plan", ""),
+            "opening_plan_sha256": getattr(compass, "opening_plan_sha256", ""),
             "prefill_preparation_fence": getattr(compass, "prefill_preparation_fence", False),
             # Which rank's step the modelled side is reporting. A plan that
             # asks for `slowest` and gets a server still on `rank0` is priced

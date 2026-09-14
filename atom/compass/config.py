@@ -137,6 +137,8 @@ class CompassConfig:
     # Optional core-owned resolver profile. No production profile is selected
     # by default; it must bind declared arrival to native scheduler visibility.
     request_readiness_profile: str = ""
+    opening_plan: str = ""
+    opening_plan_sha256: str = ""
     # Source-witnessed GDN prefill D2H fence, approximated by the existing
     # priced preparation boundary. Host dispatch remains unpriced/overlapped.
     prefill_preparation_fence: bool = False
@@ -179,6 +181,10 @@ class CompassConfig:
             self.oracle_options = {}
         if self.request_readiness_profile and self.admission_seconds:
             raise ValueError("request readiness and admission_seconds are mutually exclusive")
+        if bool(self.opening_plan) != bool(self.opening_plan_sha256):
+            raise ValueError("opening plan and its digest are required together")
+        if self.opening_plan and not self.request_readiness_profile:
+            raise ValueError("opening plan requires a source-backed readiness profile")
         if self.filler_token_id < 0:
             raise ValueError(f"filler_token_id must be >= 0, got {self.filler_token_id}")
         if self.mode not in ("predict", "trace", "measure"):

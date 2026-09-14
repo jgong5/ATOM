@@ -813,6 +813,7 @@ class InputOutputProcessor:
         arrival_time: float | None = None,
         workload_size: int | None = None,
         workload_index: int | None = None,
+        prompt_token_sha256: str | None = None,
     ):
         """responsible for:
         1) Tokenize
@@ -840,6 +841,7 @@ class InputOutputProcessor:
             arrival_time=arrival_time,
             workload_size=workload_size,
             workload_index=workload_index,
+            prompt_token_sha256=prompt_token_sha256,
         )
         return seqs[0]
 
@@ -858,6 +860,7 @@ class InputOutputProcessor:
         arrival_time: float | None = None,
         workload_size: int | None = None,
         workload_index: int | None = None,
+        prompt_token_sha256: str | None = None,
     ) -> list[Sequence]:
         """Tokenize once and materialize ``sampling_params.n`` Sequences.
 
@@ -882,6 +885,11 @@ class InputOutputProcessor:
             if isinstance(prompt_or_tokens, str)
             else prompt_or_tokens
         )
+        if prompt_token_sha256 is not None:
+            from atom.compass.prefix_workload import token_digest
+
+            if token_digest(tokens) != prompt_token_sha256:
+                raise ValueError("preprocessed prompt differs from the pinned token identity")
         mrope_positions = None
         mrope_position_delta = 0
         if multimodal_data is not None:

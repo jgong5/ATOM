@@ -415,6 +415,73 @@ class TestCompletionTokenPrompts:
         assert not processor.requests
 
 
+class TestOpeningChatPreprocessing:
+    @pytest.mark.parametrize("wrong_digest", [False, True])
+    def test_chat_metadata_and_consumed_tokens_cross_shared_preprocessing(self, monkeypatch, wrong_digest):
+        from collections import OrderedDict
+        from atom.compass.prefix_workload import token_digest
+        from atom.model_engine.llm_engine import InputOutputProcessor
+        from atom.model_engine.request import RequestOutput
+        from atom.utils.clock import VirtualClock, get_clock, set_clock
+
+        class Tokenizer:
+            def encode(self, text, **kwargs):
+                assert text == "rendered opening"
+                return [1, 2, 3]
+
+        config = SimpleNamespace(hf_config=SimpleNamespace(model_type="test"), max_model_len=32)
+        processor = InputOutputProcessor(config, Tokenizer(), 16)
+        admitted = []
+
+        def add(sequences):
+            admitted.extend(sequences)
+            for seq in sequences:
+                seq.stream_callback(RequestOutput(
+                    seq.id, [7], True, "length", arrive_time=seq.arrive_time,
+                    first_token_time=seq.arrive_time + .1, finish_time=seq.arrive_time + .2))
+
+        monkeypatch.setattr(api_server, "engine", SimpleNamespace(
+            config=config, io_processor=processor, core_mgr=SimpleNamespace(add_request=add)))
+        monkeypatch.setattr(api_server, "model_name", "test")
+        monkeypatch.setattr(api_server, "tokenizer", processor.tokenizer)
+        monkeypatch.setattr(api_server, "apply_chat_template", lambda *a, **kw: "rendered opening")
+        monkeypatch.setattr(api_server, "_stream_batch_dispatcher", SimpleNamespace(
+            new_state=lambda: object(), enqueue=lambda **kw: None))
+        monkeypatch.setattr(api_server, "_compass_records", OrderedDict())
+        monkeypatch.setattr(api_server, "_compass_prompt_evidence", {})
+        digest = token_digest([1, 2, 3])
+        request = api_server.ChatCompletionRequest(
+            model="test", messages=[{"role": "user", "content": "source message"}],
+            max_completion_tokens=1, temperature=0, ignore_eos=True, stream=True,
+            compass_arrival=21.437, compass_workload_size=2, compass_workload_index=1,
+            compass_prompt_token_sha256="0" * 64 if wrong_digest else digest)
+        previous = get_clock()
+        set_clock(VirtualClock(epoch=1000.))
+        try:
+            if wrong_digest:
+                with pytest.raises(api_server.HTTPException) as exc:
+                    asyncio.run(api_server.chat_completions(request, None))
+                assert exc.value.status_code == 400
+                assert "pinned token identity" in str(exc.value.detail)
+                assert not admitted and not processor.requests
+            else:
+                asyncio.run(api_server.chat_completions(request, None))
+                assert len(admitted) == 1
+                seq = admitted[0]
+                assert list(seq.token_ids) == [1, 2, 3]
+                assert seq.arrive_time == 1021.437
+                assert seq.compass_workload_size == 2 and seq.compass_workload_index == 1
+                assert not hasattr(seq, "prompt_token_sha256")  # No Sequence wire-layout change.
+                record, = api_server._compass_records.values()
+                assert record["shared_preprocessing"]["prompt_token_sha256"] == digest
+                assert record["shared_preprocessing"]["input_tokens"] == 3
+                assert record["shared_preprocessing"]["api_preprocess_returned_wall_time"] > 0
+                api_server.cleanup_stream(seq.id)
+                api_server.cleanup_request(record["request_id"])
+        finally:
+            set_clock(previous)
+
+
 class TestARequestIsNotSerialisedForALogNobodyKeeps:
     """Building the log entry is the callee's job, not the caller's.
 

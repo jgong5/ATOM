@@ -211,6 +211,10 @@ class ChatCompletionRequest(BaseModel):
     # Optional KV-transfer metadata for P/D disaggregation.
     kv_transfer_params: dict[str, Any] | None = None
     data_parallel_rank: int | None = None
+    compass_arrival: float | None = None
+    compass_workload_size: int | None = None
+    compass_workload_index: int | None = Field(default=None, ge=0)
+    compass_prompt_token_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
     def get_max_tokens(self) -> int:
         """Return the effective generation cap for OpenAI chat requests."""

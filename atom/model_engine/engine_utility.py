@@ -427,7 +427,13 @@ class EngineUtilityHandler:
         if readiness is not None:
             # This reader lives in EngineCore, not in the worker whose manifest
             # is above. Preserve both records without reopening either input.
-            result = dict(result, core_inputs=readiness.input_manifest())
+            calendar = getattr(self.scheduler, "_release_calendar", None)
+            if calendar is None:
+                core = readiness.input_manifest()
+            else:
+                core = readiness.input_manifest((calendar.plan.loaded_input,))
+                core["release_calendar"] = calendar.evidence()
+            result = dict(result, core_inputs=core)
         self.output_queue.put_nowait(
             ("UTILITY_RESPONSE", {"cmd": "get_compass_inputs",
                                   "result": result})

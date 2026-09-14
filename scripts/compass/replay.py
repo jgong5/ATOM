@@ -380,8 +380,39 @@ def _prefix_cache_snapshot(base, timeout):
     return snapshot
 
 
-async def _submit_requests(base, payloads, arrivals, *, pace, timeout):
-    """Submit every row independently of response completion, using native HTTP.
+async def _read_stream_response(response, timing):
+    """Keep final usage and terminal framing without feeding generated history back."""
+    request_id = finish_reason = usage = None
+    done = False
+    async for raw in response.content:
+        line = raw.strip()
+        if not line.startswith(b"data:"):
+            continue
+        value = line[5:].strip()
+        if value == b"[DONE]":
+            done = True
+            timing["sse_done_wall_time"] = _time.time()
+            continue
+        chunk = json.loads(value)
+        if chunk.get("error"):
+            raise RuntimeError(f"stream error: {chunk['error']}")
+        request_id = chunk.get("id", request_id)
+        if chunk.get("usage") is not None:
+            usage = chunk["usage"]
+        for choice in chunk.get("choices", []):
+            if choice.get("finish_reason") is not None:
+                finish_reason = choice["finish_reason"]
+                timing["sse_finish_wall_time"] = _time.time()
+    timing["response_eof_wall_time"] = _time.time()
+    if not done or not request_id or finish_reason is None or usage is None:
+        raise ValueError("stream lacks its terminal finish, usage or DONE frame")
+    return {"id": request_id, "usage": usage, "choices": [{"finish_reason": finish_reason}]}
+
+
+async def _submit_requests(base, payloads, arrivals, *, pace, timeout,
+                           endpoint="/v1/completions", streaming=False, response_gated=False,
+                           expected_outputs=None):
+    """Submit independent legacy rows, or a paced two-turn chat continuation.
 
     A declared workload needs all N connections until its closed registration
     barrier opens. aiohttp's default pool of 100 would deadlock at N>100.
@@ -394,12 +425,15 @@ async def _submit_requests(base, payloads, arrivals, *, pace, timeout):
         raise ValueError("one arrival is required for every prepared request")
     if not math.isfinite(timeout) or timeout <= 0:
         raise ValueError("network attempt timeout must be finite and positive")
+    if response_gated and (not pace or len(payloads) != 2):
+        raise ValueError("client response gating is the two-turn real-clock opening only")
     setup_started = _time.monotonic()
     trace = aiohttp.TraceConfig()
     epoch = epoch_wall = None
     start = asyncio.Event()
     ready = asyncio.Event()
     ready_count = 0
+    finished = [asyncio.Event() for _ in payloads] if response_gated else None
 
     async def headers_callback(_session, context, _params):
         timing = context.trace_request_ctx
@@ -434,6 +468,10 @@ async def _submit_requests(base, payloads, arrivals, *, pace, timeout):
                 if ready_count == len(payloads):
                     ready.set()
                 await start.wait()
+                if response_gated and i:
+                    await finished[i - 1].wait()
+                    if not results[i - 1]["ok"]:
+                        raise RuntimeError("predecessor response did not complete")
                 if pace:
                     await asyncio.sleep(max(0.0, arrivals[i] - (_time.monotonic() - epoch)))
                 timing = row["send_timing"]
@@ -445,14 +483,23 @@ async def _submit_requests(base, payloads, arrivals, *, pace, timeout):
                 # unbounded. The attempt deadline starts after the pacing wait
                 # and covers connecting, body writes and response completion.
                 async with session.post(
-                    base + "/v1/completions", data=payloads[i],
+                    base + endpoint, data=payloads[i],
                     headers={"Content-Type": "application/json"},
                     trace_request_ctx=timing,
                 ) as response:
-                    raw = await response.read()
                     if response.status >= 400:
+                        raw = await response.read()
                         raise RuntimeError(f"HTTP {response.status}: {raw.decode(errors='replace')[:400]}")
-                    row.update(ok=True, response=json.loads(raw))
+                    if streaming:
+                        result = await _read_stream_response(response, timing)
+                        if expected_outputs is not None:
+                            error = _completion_shortfall(result, expected_outputs[i])
+                            if error:
+                                raise ValueError(error)
+                    else:
+                        raw = await response.read()
+                        result = json.loads(raw)
+                    row.update(ok=True, response=result)
                     row.pop("error", None)
             except asyncio.CancelledError:
                 row["ok"] = False
@@ -464,6 +511,10 @@ async def _submit_requests(base, payloads, arrivals, *, pace, timeout):
                 row["error"] = f"{type(exc).__name__}: {exc}"
             finally:
                 row["send_timing"]["finished_offset_s"] = _time.monotonic() - epoch
+                if streaming:
+                    row["send_timing"]["client_response_returned_wall_time"] = _time.time()
+                if finished is not None:
+                    finished[i].set()
 
         tasks = [asyncio.create_task(one(i)) for i in range(len(payloads))]
         try:
@@ -667,6 +718,8 @@ def main(argv=None) -> int:
                         "the measured wall window")
     p.add_argument("--prompt-encoding", help="explicit pinned corpus-prefix encoding; sends token IDs")
     p.add_argument("--prompt-encoding-sha256", help="required digest of --prompt-encoding")
+    p.add_argument("--opening-plan", help="pinned two-turn AIPerf chat opening")
+    p.add_argument("--opening-plan-sha256", help="required digest of --opening-plan")
     p.add_argument("--time-scale", type=float, default=1.0,
                    help="divide every arrival offset by this, to replay a "
                         "long trace in less time. 1.0 keeps the trace's own "
@@ -696,14 +749,25 @@ def main(argv=None) -> int:
 
     if bool(args.prompt_encoding) != bool(args.prompt_encoding_sha256):
         p.error("--prompt-encoding and --prompt-encoding-sha256 are required together")
+    if bool(args.opening_plan) != bool(args.opening_plan_sha256):
+        p.error("--opening-plan and --opening-plan-sha256 are required together")
+    if args.opening_plan and (args.trace or args.prompt_encoding or args.time_scale != 1):
+        p.error("opening plan owns its payloads and unscaled source timing")
     args._prefix_encoding = None
+    args._opening_plan = None
     try:
         if args.prompt_encoding:
             from atom.compass.prefix_workload import PrefixEncoding
             args._prefix_encoding = PrefixEncoding.load(
                 args.prompt_encoding, args.prompt_encoding_sha256)
             args.pretokenize = True
-        workload = _workload(args)
+        if args.opening_plan:
+            from atom.compass.replay_plan import OpeningPlan
+            args._opening_plan = OpeningPlan.load(args.opening_plan, args.opening_plan_sha256)
+            args.pretokenize = True  # Tokenizer also supplies exact-length preparation prompts.
+            workload = args._opening_plan.workload()
+        else:
+            workload = _workload(args)
         if args._prefix_encoding is not None:
             args._prefix_encoding.validate_rows(workload)
     except (OSError, ValueError) as exc:
@@ -724,6 +788,23 @@ def main(argv=None) -> int:
         print("could not determine the served model; pass --model",
               file=sys.stderr)
         return 2
+
+    if args._opening_plan is not None:
+        if model != args._opening_plan.model:
+            print("opening model differs from the served model", file=sys.stderr)
+            return 3
+        clock = _clock_of(base, args.timeout)
+        if clock == "wall":
+            args.pace = True
+        elif clock != "virtual":
+            print("opening requires an identified wall or virtual clock", file=sys.stderr)
+            return 3
+        if clock == "virtual":
+            with urllib.request.urlopen(base + "/compass/provenance", timeout=args.timeout) as response:
+                runtime = json.loads(response.read())
+            if runtime.get("compass", {}).get("opening_plan_sha256") != args.opening_plan_sha256:
+                print("predictor has not loaded the same opening release plan", file=sys.stderr)
+                return 3
 
     if args.pace and _clock_of(base, args.timeout) == "virtual":
         print("ATOMCompass WARNING: refusing to pace a predictor. --pace "
@@ -756,6 +837,12 @@ def main(argv=None) -> int:
 
     args._prompt_tokenizer = (_load_prompt_tokenizer(model)
                               if args.pretokenize else None)
+    if args._opening_plan is not None:
+        try:
+            args._opening_plan.verify_tokenizer(args._prompt_tokenizer)
+        except ValueError as exc:
+            print(f"ATOMCompass refusing opening tokenizer: {exc}", file=sys.stderr)
+            return 3
     if args._prefix_encoding is not None:
         try:
             args._prefix_encoding.verify_tokenizer(args._prompt_tokenizer, model)
@@ -771,12 +858,19 @@ def main(argv=None) -> int:
         return 3
 
     cache_reset = None
-    if args._prefix_encoding is not None:
+    if args._prefix_encoding is not None or args._opening_plan is not None:
         if prepare is not None and args.prepare_out:
             with open(args.prepare_out, "w", encoding="utf-8") as fh:
                 json.dump(prepare, fh, indent=1)
         try:
             cache_reset = _reset_prefix_cache(base, args.timeout)
+            if args._opening_plan is not None:
+                from atom.compass.core.cache_policy import policy_errors
+                errors = [error for rank in cache_reset["ranks"]
+                          for error in policy_errors(rank["after"].get("policy"),
+                                                     args._opening_plan.cache_policy)]
+                if errors:
+                    raise ValueError("; ".join(errors))
         except (OSError, RuntimeError, ValueError) as exc:
             print(f"ATOMCompass refusing cache boundary: {exc}", file=sys.stderr)
             return 3
@@ -786,23 +880,42 @@ def main(argv=None) -> int:
     # Keep prompt/token and JSON work inside measured execution but before the
     # pacing origin. Retain prepared bytes rather than every encoded token list.
     try:
-        payloads, encoding = _encode_requests(
-            workload, model, args._prompt_tokenizer, declared=not args.pace,
-            byte_budget=resource_plan["memory_budget_bytes"],
-            **({"prefix_encoding": args._prefix_encoding}
-               if args._prefix_encoding is not None else {}))
+        if args._opening_plan is not None:
+            encoded_at = _time.monotonic()
+            payloads = args._opening_plan.encode_payloads(declared=not args.pace)
+            encoding = {"prompt_construction_seconds": 0.0,
+                        "json_encoding_seconds": _time.monotonic() - encoded_at,
+                        "prepared_request_bytes": sum(sys.getsizeof(data) for data in payloads)}
+            if encoding["prepared_request_bytes"] > resource_plan["memory_budget_bytes"]:
+                raise ValueError("opening payloads exceed the client memory budget")
+        else:
+            payloads, encoding = _encode_requests(
+                workload, model, args._prompt_tokenizer, declared=not args.pace,
+                byte_budget=resource_plan["memory_budget_bytes"],
+                **({"prefix_encoding": args._prefix_encoding}
+                   if args._prefix_encoding is not None else {}))
     except (MemoryError, ValueError) as exc:
         print(f"ATOMCompass refusing prepared workload: {exc}", file=sys.stderr)
         return 3
     results, submission = asyncio.run(_submit_requests(
         base, payloads, [row["arrival_s"] for row in workload],
-        pace=args.pace, timeout=args.timeout))
+        pace=args.pace, timeout=args.timeout,
+        **({"endpoint": "/v1/chat/completions", "streaming": True,
+            "response_gated": args.pace,
+            "expected_outputs": [row["output_tokens"] for row in workload]}
+           if args._opening_plan is not None else {})))
     execution_seconds = _time.monotonic() - began
     execution_ended_at = _time.time()
     cache_end, cache_error = None, None
-    if args._prefix_encoding is not None:
+    if args._prefix_encoding is not None or args._opening_plan is not None:
         try:
             cache_end = _prefix_cache_snapshot(base, args.timeout)
+            if args._opening_plan is not None:
+                from atom.compass.core.cache_policy import policy_errors
+                errors = [error for rank in cache_end["ranks"]
+                          for error in policy_errors(rank.get("policy"), args._opening_plan.cache_policy)]
+                if errors:
+                    raise ValueError("; ".join(errors))
         except (OSError, RuntimeError, ValueError) as exc:
             cache_error = str(exc)
 
@@ -936,6 +1049,34 @@ def main(argv=None) -> int:
     }
     if args._prefix_encoding is not None:
         manifest["prompt_encoding"]["corpus_encoding"] = encoding["corpus_encoding"]
+    if args._opening_plan is not None:
+        manifest["aiperf_opening"] = args._opening_plan.evidence()
+        manifest["prompt_encoding"].update(
+            kind="chat_messages", conversion_in_execution=False,
+            conversion_seconds=None, token_verification="before preparation; shared preprocessing verifies again")
+        observed = {row["request_id"]: row for row in engine.get("requests", [])}
+        errors = []
+        for result, wanted in zip(results, workload):
+            request_id = (result.get("response") or {}).get("id")
+            receipt = observed.get(request_id, {}).get("shared_preprocessing", {})
+            if (receipt.get("prompt_token_sha256") != wanted["prompt_token_sha256"]
+                    or receipt.get("input_tokens") != wanted["input_tokens"]):
+                errors.append(f"request {result['index']} has no matching consumed-token receipt")
+        manifest["aiperf_opening"]["consumed_token_errors"] = errors
+        manifest["aiperf_opening"]["timing_boundaries"] = {
+            "engine_clock": engine.get("clock"), "client_clock": "wall",
+            "requests": [{
+                "index": result["index"],
+                "engine": observed.get((result.get("response") or {}).get("id")),
+                "client": result["send_timing"],
+            } for result in results],
+            "qualification": "Client wall times are observations, not predictor costs; cross-host clock offset is not calibrated here",
+        }
+        if errors:
+            manifest["complete"] = False
+            manifest["incomplete_reasons"] = {**(manifest["incomplete_reasons"] or {}),
+                                               "opening_tokens": errors}
+    if args._prefix_encoding is not None or args._opening_plan is not None:
         manifest["cache_boundary"] = cache_reset
         manifest["cache_state_after"] = cache_end
         if cache_error:

@@ -72,3 +72,12 @@ class NativeWriterReceiver:
             receiver_available = receiver_started + (receiver_base + receiver_slope * size) * 1e-6
             result[request.request_id] = ReadyEvent(receiver_available, order)
         return result
+
+    def resolve_serial_release(self, request):
+        """Reuse the source law after a serial predecessor has fully completed.
+
+        ReleaseCalendar admits only one request at a time. Its previous writer
+        and receiver completed before that predecessor's generation, so neither
+        can still occupy a service queue at this release.
+        """
+        return self.resolve_closed_workload((request,))[request.request_id]

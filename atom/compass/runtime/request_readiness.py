@@ -124,6 +124,43 @@ class RequestReadiness:
         self._resolver = qualname
         self._reader_pid = os.getpid()
         self.records = None
+        self._serial_requests = None
+
+    def register_serial_workload(self, sequences):
+        """Pin descriptors while leaving unreleased requests outside all service."""
+        if self.records is not None or self._serial_requests is not None:
+            raise UnsupportedReadiness("request readiness was already registered")
+        if not callable(getattr(self._provider, "resolve_serial_release", None)):
+            raise UnsupportedReadiness("source provider does not qualify serial causal releases")
+        sequences = tuple(sequences)
+        if len(sequences) != 2 or any(seq.compass_workload_size != 2 for seq in sequences):
+            raise UnsupportedReadiness("serial opening requires complete two-request registration")
+        self._serial_requests = {
+            seq.id: RegisteredRequest(seq.id, float(seq.arrive_time), int(seq.num_prompt_tokens),
+                                      seq.compass_workload_index, ingress_descriptor(seq))
+            for seq in sequences
+        }
+        if len(self._serial_requests) != 2:
+            raise UnsupportedReadiness("serial opening request identities must be unique")
+        self.records = MappingProxyType({})
+
+    def release_serial_request(self, sequence, arrived_at):
+        """Start source service only once its predecessor has completed."""
+        if self._serial_requests is None or sequence.id not in self._serial_requests:
+            raise UnsupportedReadiness("serial request was not registered")
+        if sequence.id in self.records or not math.isfinite(arrived_at):
+            raise UnsupportedReadiness("serial release is duplicated or non-finite")
+        original = self._serial_requests[sequence.id]
+        if arrived_at < original.arrived_at:
+            raise UnsupportedReadiness("causal release precedes the source timestamp")
+        request = RegisteredRequest(original.request_id, arrived_at, original.prompt_tokens,
+                                    original.workload_index, original.ingress)
+        event = self._provider.resolve_serial_release(request)
+        if (not isinstance(event, ReadyEvent) or not math.isfinite(event.ready_at)
+                or event.ready_at < arrived_at):
+            raise UnsupportedReadiness("serial source service returned an invalid ready event")
+        record = RequestReadinessRecord(arrived_at, event.ready_at, len(self.records))
+        self.records = MappingProxyType({**self.records, sequence.id: record})
 
     def resolve_closed_workload(self, sequences) -> None:
         if self.records is not None:
@@ -172,9 +209,9 @@ class RequestReadiness:
             raise UnsupportedReadiness("declared arrival changed after readiness resolution")
         return record
 
-    def input_manifest(self) -> dict:
+    def input_manifest(self, extra_inputs=()) -> dict:
         return {
-            **manifest(self._inputs),
+            **manifest((*self._inputs, *extra_inputs)),
             "reader": {"component": "EngineCore.Scheduler", "pid": self._reader_pid},
             "request_readiness": {
                 "resolver": self._resolver,

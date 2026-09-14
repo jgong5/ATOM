@@ -1093,6 +1093,9 @@ class Scheduler:
         from atom.compass.runtime.request_readiness import load_for_scheduler
 
         self._request_readiness = load_for_scheduler(config, get_clock())
+        from atom.compass.runtime.release_calendar import load_for_scheduler as load_release_calendar
+
+        self._release_calendar = load_release_calendar(config, get_clock(), self._request_readiness)
 
     def set_prefill_delayer(self, delayer) -> None:
         if delayer is not None and self._request_readiness is not None:
@@ -1293,7 +1296,10 @@ class Scheduler:
                 seq for _, seq in sorted(enumerate(self.waiting), key=arrival_order)
             )
             readiness = getattr(self, "_request_readiness", None)
-            if readiness is not None:
+            calendar = getattr(self, "_release_calendar", None)
+            if calendar is not None:
+                calendar.register(self.waiting)
+            elif readiness is not None:
                 readiness.resolve_closed_workload(self.waiting)
                 self.waiting = deque(sorted(self.waiting, key=lambda seq: (
                     readiness.record(seq).ready_at,
@@ -1355,6 +1361,9 @@ class Scheduler:
         the engine, because it is per-request and concurrent: two requests
         arriving together each wait once, not twice.
         """
+        calendar = getattr(self, "_release_calendar", None)
+        if calendar is not None and not calendar.is_released(seq):
+            return float("inf")
         readiness = getattr(self, "_request_readiness", None)
         if readiness is not None:
             return readiness.record(seq).ready_at
@@ -1407,6 +1416,8 @@ class Scheduler:
                    if self._schedulable_at(seq) > now]
         if len(pending) != len(self.waiting):
             return  # something has already arrived; let it run
+        if min(pending) == float("inf"):
+            return  # dependency-gated requests have no time-only release yet
         advance(min(pending) - now)
 
     def _oldest_waiting_prefill_age_ms(self) -> float:
@@ -3177,6 +3188,9 @@ class Scheduler:
             else:
                 self.block_manager.deallocate(seq)
             self.running.remove(seq)
+            calendar = getattr(self, "_release_calendar", None)
+            if calendar is not None:
+                calendar.complete(seq)
         return finished_seqs
 
     def compute_detailed_aggregates(

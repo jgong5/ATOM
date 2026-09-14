@@ -64,6 +64,8 @@ class EngineArgs:
     compass_measure_warmup_steps: int = 0
     compass_admission_seconds: float = 0.0
     compass_request_readiness_profile: str = ""
+    compass_opening_plan: str = ""
+    compass_opening_plan_sha256: str = ""
     compass_prefill_preparation_fence: bool = False
     compass_op_timings_out: str = ""
     compass_bench_graph: str = ""
@@ -305,6 +307,10 @@ class EngineArgs:
             help="Optional source-service profile resolving registered requests "
             "to scheduler-ready events in TP1 virtual replay. No profile is selected by default.",
         )
+        parser.add_argument("--compass-opening-plan", type=str, default="",
+                            help="Pinned two-turn AIPerf opening release plan.")
+        parser.add_argument("--compass-opening-plan-sha256", type=str, default="",
+                            help="SHA256 of the exact opening plan bytes.")
         parser.add_argument(
             "--compass-admission-seconds",
             type=float,
@@ -880,6 +886,8 @@ class EngineArgs:
         compass_measure_warmup = kwargs.pop("compass_measure_warmup_steps", 0)
         compass_admission = kwargs.pop("compass_admission_seconds", 0.0)
         compass_readiness = kwargs.pop("compass_request_readiness_profile", "")
+        compass_opening = kwargs.pop("compass_opening_plan", "")
+        compass_opening_sha = kwargs.pop("compass_opening_plan_sha256", "")
         compass_preparation_fence = kwargs.pop("compass_prefill_preparation_fence", False)
         compass_op_timings = kwargs.pop("compass_op_timings_out", "")
         compass_bench_graph = kwargs.pop("compass_bench_graph", "")
@@ -918,6 +926,9 @@ class EngineArgs:
             compass_kwargs["admission_seconds"] = compass_admission
         if compass_readiness:
             compass_kwargs["request_readiness_profile"] = compass_readiness
+        if compass_opening or compass_opening_sha:
+            compass_kwargs["opening_plan"] = compass_opening
+            compass_kwargs["opening_plan_sha256"] = compass_opening_sha
         if compass_preparation_fence:
             compass_kwargs["prefill_preparation_fence"] = True
         if compass_op_timings:
