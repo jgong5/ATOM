@@ -10,6 +10,7 @@ RESET_SCHEMA = "compass.cache_reset/1"
 
 
 def snapshot(engine, *, input_batches=None):
+    import os
     from atom.compass.core.cache_policy import snapshot as policy_snapshot
 
     scheduler = engine.scheduler
@@ -51,6 +52,13 @@ def snapshot(engine, *, input_batches=None):
     if bm.paged_state_checkpoints is not None:
         reasons.append("PAGE checkpoint reset is unsupported")
     return {
+        "reader": {"component": "EngineCore.Scheduler", "pid": os.getpid()},
+        "scheduler_configuration": {
+            "max_model_len": scheduler.max_model_len,
+            "max_num_seqs": scheduler.max_num_seqs,
+            "max_num_batched_tokens": scheduler.max_num_batched_tokens,
+            "kv_cache_block_size": bm.block_size,
+        },
         "policy": policy_snapshot(bm, engine.state_runtime, environment={}),
         "pool_pressure": pressure,
         "cache_statistics": cache_stats,

@@ -225,6 +225,8 @@ class CompassPredictMixin:
         # run can be sized from an analytical profile with nothing in the
         # record to show it. Reported as the selector states it, or None.
         out["budget_source"] = getattr(self, "compass_budget_source", None)
+        from atom.compass.core.resolved_runtime import worker_snapshot
+        out["runtime_configuration"] = worker_snapshot(self)
         predictions = getattr(self, "compass_memory_predictions", None)
         if predictions is not None:
             # Physical reader identity stays on this manifest. Target memory

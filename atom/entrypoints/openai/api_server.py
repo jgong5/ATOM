@@ -2565,6 +2565,16 @@ def _compass_clock_is_virtual() -> bool:
                 and compass.mode == "predict")
 
 
+def _compass_core_cache() -> dict:
+    """Policy comes from the core's resolved block/state managers, not API defaults."""
+    if engine is None:
+        return {"ranks": [], "why": "engine is not initialized"}
+    try:
+        return engine.get_compass_cache(timeout=10.0)
+    except Exception as exc:
+        return {"ranks": [], "why": f"{type(exc).__name__}: {exc}"}
+
+
 def _sha256_of(path) -> "str | None":
     """Digest of a file this *server* read, or None if it read no such file."""
     import hashlib
@@ -2819,6 +2829,11 @@ async def compass_provenance():
     # has to be able to tell a digest of what ran from a digest of what is on
     # the disk now.
     loaded = _compass_loaded_inputs()
+    core_cache = _compass_core_cache()
+    core_policies = [rank.get("policy") for rank in core_cache.get("ranks", [])
+                     if isinstance(rank, dict)]
+    resolved_policy = (core_policies[0] if core_policies and all(
+        policy == core_policies[0] for policy in core_policies) else None)
     from_ranks = _loaded_option_files(loaded.get("ranks") or [])
 
     option_digests = {}
@@ -2861,6 +2876,10 @@ async def compass_provenance():
         "enable_prefix_caching": pick("enable_prefix_caching"),
         "gpu_memory_utilization": pick("gpu_memory_utilization"),
         "max_num_seqs": pick("max_num_seqs"),
+        "cache_policy": resolved_policy,
+        "core_cache": core_cache,
+        "worker_runtime": [rank["runtime_configuration"] for rank in loaded.get("ranks", [])
+                           if isinstance(rank, dict) and "runtime_configuration" in rank],
         "compass": None if not compass else {
             "enabled": compass.enabled,
             "mode": compass.mode,

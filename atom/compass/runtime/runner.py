@@ -539,6 +539,7 @@ class CompassModelRunner(CompassPredictMixin, ModelRunner):
             # keys the cost table, so a replay reporting a different rung than
             # the deployment would look up a different row.
             cap_cost, sizes, pool_bytes = result
+            self._compass_native_capture_sizes = list(sizes or [])
             self._write_replay_target(graph={
                 "capture_seconds": float(cap_cost or 0.0),
                 "capture_sizes": list(sizes or []),
