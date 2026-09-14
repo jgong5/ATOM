@@ -67,6 +67,8 @@ def bundle(*, root_times=(0., 100.), child_times=((10., 30.),), join=False, clie
                 "after_request": root_indices[0], "child_conversation_ids": children,
                 "mode": "spawn", "dispatch_timing": "post", "is_background": not join,
                 "join_before_request": root_indices[-1] if join else None})
+    for row in rows:
+        row["loader_replay_predecessors"] = list(row["depends_on"])
     return {"schema": SCHEMA, "profile": PROFILE, "dependency_basis": DEPENDENCY_BASIS,
             "clients": clients, "roots": roots, "conversations": conversations, "branches": branches,
             "source_time_origin_s": 0., "time_scale": 1, "response_delivery": RESPONSE_DELIVERY,
@@ -180,6 +182,17 @@ def test_source_bytes_independently_bind_complete_roster_and_original_times(tmp_
         data["requests"][1]["body"]["max_completion_tokens"] = 3
     with pytest.raises(ValueError, match=message):
         plan_file(tmp_path, data)
+
+
+def test_only_transitively_enforced_extra_loader_predecessors_are_allowed(tmp_path):
+    data = bundle(root_times=(0., 50., 100.), child_times=((10.,),))
+    data["requests"][2]["loader_replay_predecessors"] = [0]
+    plan_file(tmp_path, data)  # The chain already implies this non-adjacent edge.
+    data["requests"][2]["loader_replay_predecessors"] = [3]
+    from atom.compass.fixed_absolute import UnsupportedPredecessors
+    with pytest.raises(UnsupportedPredecessors) as error:
+        plan_file(tmp_path, data)
+    assert error.value.missing == [{"request_index": 2, "predecessor_index": 3}]
 
 
 @pytest.mark.parametrize("child_finished, expected", [(15., 20.), (30., 30.)])

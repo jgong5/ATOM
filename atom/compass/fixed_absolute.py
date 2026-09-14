@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import copy
+from collections import Counter
 import hashlib
 import heapq
 import json
@@ -22,6 +23,12 @@ QUALIFICATION = (
     "Corrected fixed-absolute replay; loader-inferred dependencies, "
     "not recovered ground-truth causality; zero-response-delivery approximation"
 )
+
+
+class UnsupportedPredecessors(ValueError):
+    def __init__(self, missing):
+        self.missing = missing
+        super().__init__(f"{len(missing)} loader replay predecessor(s) are not implied by the supported dependencies")
 
 
 def _finite(value):
@@ -217,11 +224,28 @@ class FixedAbsolutePlan:
             if not ready:
                 raise ValueError("fixed-absolute dependency cycle")
             remaining = {i: deps - ready for i, deps in remaining.items() if i not in ready}
+        missing = []
+        for index, row in enumerate(rows):
+            predecessors = row.get("loader_replay_predecessors")
+            if (not isinstance(predecessors, list) or predecessors != sorted(set(predecessors))
+                    or any(type(p) is not int or not 0 <= p < len(rows) for p in predecessors)):
+                raise ValueError("each request must retain explicit loader replay predecessors")
+            for predecessor in predecessors:
+                seen, pending = set(), list(dependencies[index])
+                while pending and predecessor not in seen:
+                    node = pending.pop()
+                    if node not in seen:
+                        seen.add(node)
+                        pending.extend(dependencies[node])
+                if predecessor not in seen:
+                    missing.append({"request_index": index, "predecessor_index": predecessor})
+        if missing:
+            raise UnsupportedPredecessors(missing)
         self._dependencies = tuple(tuple(sorted(deps)) for deps in dependencies)
 
     @classmethod
     def load(cls, path, sha256):
-        payload, loaded = load_json(path, role="runtime.fixed_absolute")
+        payload, loaded = load_json(str(path), role="runtime.fixed_absolute")
         if loaded.sha256 != sha256:
             raise ValueError("fixed-absolute artifact digest changed")
         return cls(payload, loaded)
@@ -287,6 +311,150 @@ class FixedAbsolutePlan:
                             compass_workload_index=row["index"])
             payloads.append(json.dumps(body).encode())
         return payloads
+
+    def observation_errors(self, server, engine, results):
+        """Require every source leaf, used plan, causal gate and ingress receipt."""
+        # Source files are part of the validation closure, not declarations
+        # accepted merely because they were copied into the submitted plan.
+        FixedAbsolutePlan.load(self.loaded_input.requested, self.loaded_input.sha256)
+        rows = self._data["requests"]
+        errors = []
+        by_index = {result.get("index"): result for result in results}
+        engine_rows = engine.get("requests") or []
+        observed = {row.get("request_id"): row for row in engine_rows}
+        response_ids = [(result.get("response") or {}).get("id") for result in results]
+        if (len(results) != len(rows) or set(by_index) != set(range(len(rows)))
+                or len(set(response_ids)) != len(rows) or None in response_ids
+                or len(engine_rows) != len(rows) or set(observed) != set(response_ids)):
+            return ["fixed-absolute results/engine records do not cover each unique source request exactly once"]
+        records = {}
+        for index, wanted in enumerate(rows):
+            result = by_index[index]
+            record = observed[result["response"]["id"]]
+            records[index] = record
+            receipt, usage = record.get("shared_preprocessing") or {}, result["response"].get("usage") or {}
+            if (result.get("ok") is not True
+                    or receipt.get("prompt_token_sha256") != wanted["prompt_token_sha256"]
+                    or receipt.get("input_tokens") != wanted["input_tokens"]
+                    or usage.get("prompt_tokens") != wanted["input_tokens"]
+                    or usage.get("completion_tokens") != wanted["output_tokens"]):
+                errors.append(f"request {index} lacks matching consumed tokens and complete output")
+        seq_ids = [record.get("seq_id") for record in records.values()]
+        if None in seq_ids or len(set(seq_ids)) != len(rows):
+            return errors + ["fixed-absolute engine sequence bindings are incomplete or duplicated"]
+        if engine.get("clock") == "wall":
+            for index, wanted in enumerate(rows):
+                timing = by_index[index].get("send_timing") or {}
+                predecessors = [(by_index[p].get("send_timing") or {}).get("finished_offset_s")
+                                for p in self.dependencies[index]]
+                if any(not _finite(value) for value in predecessors):
+                    errors.append(f"request {index} has no complete prerequisite response time")
+                    continue
+                expected = max([wanted["arrival_s"], *predecessors])
+                started, finished = timing.get("request_started_offset_s"), timing.get("finished_offset_s")
+                if (timing.get("causal_release_offset_s") != expected or not _finite(started)
+                        or not _finite(finished) or started < expected or finished < started):
+                    errors.append(f"request {index} violates its real source/response release gate")
+            return errors
+        if engine.get("clock") != "virtual":
+            return errors + ["fixed-absolute engine clock is not identified"]
+
+        compass = server.get("compass") or {}
+        ranks = (compass.get("loaded_inputs") or {}).get("ranks") or []
+        if len(ranks) != 1:
+            return errors + ["fixed-absolute requires one owning core receipt"]
+        core = ranks[0].get("core_inputs") or {}
+        reader = core.get("reader") or {}
+        if reader.get("component") != "EngineCore.Scheduler" or type(reader.get("pid")) is not int or reader["pid"] <= 0:
+            errors.append("fixed-absolute core receipt has no owning reader")
+        inputs = core.get("inputs") or []
+        plan_reads = [row for row in inputs if row.get("role") == "runtime.fixed_absolute"]
+        if (compass.get("fixed_absolute_plan_sha256") != self.loaded_input.sha256
+                or len(plan_reads) != 1 or plan_reads[0].get("sha256") != self.loaded_input.sha256
+                or plan_reads[0].get("requested") != compass.get("fixed_absolute_plan")):
+            errors.append("core did not load the configured fixed-absolute plan")
+        actual_sources = Counter((row.get("requested"), row.get("sha256"), row.get("size"))
+                                 for row in inputs if row.get("role") == "runtime.fixed_absolute.source_root")
+        expected_sources = Counter((row.requested, row.sha256, row.size) for row in self.source_inputs)
+        if actual_sources != expected_sources:
+            errors.append("core loaded source-root inputs differ from the independently verified source bytes")
+        calendar = core.get("release_calendar") or {}
+        epoch = calendar.get("epoch")
+        if (not _finite(epoch) or calendar.get("schema") != SCHEMA or calendar.get("profile") != PROFILE
+                or (calendar.get("input") or {}).get("sha256") != self.loaded_input.sha256
+                or calendar.get("response_delivery") != RESPONSE_DELIVERY
+                or calendar.get("dependency_basis") != DEPENDENCY_BASIS
+                or calendar.get("registered") is not True or calendar.get("complete") is not True):
+            return errors + ["core did not complete the pinned corrected fixed-absolute calendar"]
+        releases = {row.get("index"): row for row in calendar.get("releases") or []}
+        completions = {row.get("index"): row for row in calendar.get("completions") or []}
+        services = (core.get("request_readiness") or {}).get("causal_releases") or []
+        by_seq = {row.get("seq_id"): row for row in services}
+        if (len(calendar.get("releases") or []) != len(rows) or set(releases) != set(range(len(rows)))
+                or len(calendar.get("completions") or []) != len(rows) or set(completions) != set(releases)
+                or len(services) != len(rows) or set(by_seq) != set(seq_ids)):
+            return errors + ["calendar/readiness does not cover every source leaf exactly once"]
+        root_done = {}
+        for index, wanted in enumerate(rows):
+            release, completion, record = releases[index], completions[index], records[index]
+            service = by_seq[record["seq_id"]]
+            responses = [completions[p].get("modelled_client_response_available_at") for p in self.dependencies[index]]
+            if any(not _finite(value) for value in responses):
+                errors.append(f"request {index} has no completed prerequisite")
+                continue
+            expected = max([epoch + wanted["arrival_s"], *responses])
+            ready, started, finished = service.get("ready_at"), service.get("source_service_started_at"), record.get("finish_time")
+            if (release.get("seq_id") != record["seq_id"] or completion.get("seq_id") != record["seq_id"]
+                    or release.get("root_id") != wanted["root_id"] or release.get("released_at") != expected
+                    or release.get("source_earliest_at") != epoch + wanted["arrival_s"]
+                    or record.get("arrive_time") != expected or service.get("arrived_at") != expected
+                    or release.get("ready_at") != ready or release.get("source_service_started_at") != started
+                    or release.get("receipt_order") != service.get("receipt_order")
+                    or not _finite(ready) or not _finite(started) or not expected <= started <= ready
+                    or not _finite(finished) or finished < ready
+                    or completion.get("native_engine_finished_at") != finished
+                    or completion.get("modelled_client_response_available_at") != finished + self.response_delivery_seconds
+                    or completion.get("completion_tokens") != wanted["output_tokens"]):
+                errors.append(f"request {index} release/completion/readiness binding differs")
+            if _finite(finished):
+                root_done[wanted["root_id"]] = max(root_done.get(wanted["root_id"], -math.inf), finished + self.response_delivery_seconds)
+            ingress = service.get("ingress") or {}
+            if ingress.get("token_bytes") != 4 * wanted["input_tokens"]:
+                errors.append(f"request {index} ingress token storage differs")
+        if calendar.get("root_completed_at") != root_done or set(root_done) != {root["root_id"] for root in self.roots}:
+            errors.append("original root clients did not drain through all their leaves")
+        if sorted(service.get("receipt_order", -1) for service in services) != list(range(len(rows))):
+            return errors + ["causal ingress receipt order is incomplete or duplicated"]
+        ordered = sorted(services, key=lambda row: row["receipt_order"])
+        source_order = sorted(releases, key=lambda i: (releases[i]["released_at"], i))
+        if [row["seq_id"] for row in ordered] != [releases[i]["seq_id"] for i in source_order]:
+            errors.append("ingress service order differs from chronological causal release order")
+        # Rebuild the independent source queue from its actual loaded profile,
+        # not from reported elapsed request times or evaluated-pair residuals.
+        try:
+            from atom.compass.runtime.request_readiness import IngressDescriptor, RegisteredRequest, RequestReadiness
+            source = RequestReadiness(compass.get("request_readiness_profile", ""))
+            expected_inputs = Counter((row.role, row.requested, row.sha256) for row in source._inputs)
+            actual_inputs = Counter((row.get("role"), row.get("requested"), row.get("sha256"))
+                                   for row in inputs if str(row.get("role", "")).startswith("runtime.request_readiness."))
+            if expected_inputs != actual_inputs:
+                errors.append("source ingress profile/fit inputs differ from the core's actual reads")
+            queue = source._provider.new_release_queue()
+            for row in ordered:
+                descriptor = IngressDescriptor(**row["ingress"])
+                event = queue.resolve_release(RegisteredRequest(row["seq_id"], row["arrived_at"],
+                    descriptor.token_bytes // 4, row["receipt_order"], descriptor))
+                if (event.ready_at != row["ready_at"] or event.source_service_started_at != row["source_service_started_at"]
+                        or event.receipt_order != row["receipt_order"]):
+                    errors.append(f"source ingress queue re-derivation differs for sequence {row['seq_id']}")
+            state = queue.evidence()
+            if (core["request_readiness"].get("causal_queue") != state
+                    or state["released_requests"] != len(rows)
+                    or max(state["writer_available_at"], state["receiver_available_at"]) > max(root_done.values())):
+                errors.append("source ingress queues did not drain consistently with completed roots")
+        except (OSError, ValueError, TypeError, KeyError, AttributeError) as exc:
+            errors.append(f"cannot verify source ingress queue: {exc}")
+        return errors
 
 
 class FixedAbsoluteReleases:

@@ -277,10 +277,12 @@ class RequestReadiness:
                 for request_id, record in self.records.items()
             ]
         if self._causal_requests is not None:
+            from dataclasses import asdict
             result["request_readiness"]["causal_releases"] = [
                 {"seq_id": str(request_id), "arrived_at": record.arrived_at,
                  "source_service_started_at": record.source_service_started_at,
-                 "ready_at": record.ready_at, "receipt_order": record.receipt_order}
+                 "ready_at": record.ready_at, "receipt_order": record.receipt_order,
+                 "ingress": asdict(self._causal_requests[request_id].ingress)}
                 for request_id, record in self.records.items()]
             if callable(getattr(self._causal_queue, "evidence", None)):
                 result["request_readiness"]["causal_queue"] = self._causal_queue.evidence()

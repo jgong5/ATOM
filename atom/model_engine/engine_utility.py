@@ -431,7 +431,8 @@ class EngineUtilityHandler:
             if calendar is None:
                 core = readiness.input_manifest()
             else:
-                core = readiness.input_manifest((calendar.plan.loaded_input,))
+                core = readiness.input_manifest((calendar.plan.loaded_input,
+                    *getattr(calendar.plan, "source_inputs", ())))
                 core["release_calendar"] = calendar.evidence()
             result = dict(result, core_inputs=core)
         self.output_queue.put_nowait(
