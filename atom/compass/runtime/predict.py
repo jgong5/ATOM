@@ -52,7 +52,23 @@ class CompassPredictMixin:
     def compass_cache_barrier(self) -> dict:
         """The predicting runner has no GPU work to fence."""
         if self._compass_config.mode != "predict":
-            return super().compass_cache_barrier()
+            result = super().compass_cache_barrier()
+            if result.get("acknowledged") is True:
+                pending = len(self._pending)
+                # The native fence has already synchronized every stream. Read
+                # the original events now, outside the measured request window;
+                # a final forward has no later forward to drain its timing row.
+                self._drain_pending()
+                result["measurement_journal"] = {
+                    "worker_rank": self.rank,
+                    "pending_steps_before": pending,
+                    "drained_steps": pending - len(self._pending),
+                    "pending_steps_after": len(self._pending),
+                }
+                if self._pending:
+                    result.update(acknowledged=False,
+                                  why="timing events remained pending after device fence")
+            return result
         if self._pending:
             return {"acknowledged": False,
                     "why": "a predicting runner holds measured device events"}

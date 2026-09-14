@@ -49,6 +49,7 @@ class EngineUtilityHandler:
         "get_compass_inputs": "_handle_get_compass_inputs",
         "get_compass_cache": "_handle_get_compass_cache",
         "reset_compass_cache": "_handle_reset_compass_cache",
+        "flush_compass_measurements": "_handle_flush_compass_measurements",
         "abort_request": "_handle_abort_request",
     }
 
@@ -243,6 +244,18 @@ class EngineUtilityHandler:
             result = {"acknowledged": False, "reasons": [f"{type(exc).__name__}: {exc}"]}
         self.output_queue.put_nowait(
             ("UTILITY_RESPONSE", {"cmd": "reset_compass_cache", "result": result})
+        )
+
+    def _handle_flush_compass_measurements(self, args: dict):
+        from atom.compass.core.cache_boundary import flush_measurements
+
+        try:
+            result = flush_measurements(self.engine)
+        except Exception as exc:
+            logger.warning("Measurement flush failed", exc_info=True)
+            result = {"acknowledged": False, "reasons": [f"{type(exc).__name__}: {exc}"]}
+        self.output_queue.put_nowait(
+            ("UTILITY_RESPONSE", {"cmd": "flush_compass_measurements", "result": result})
         )
 
     def _handle_abort_request(self, args: dict):

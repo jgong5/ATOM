@@ -2479,6 +2479,15 @@ async def compass_cache_reset():
     return JSONResponse(content=result, status_code=200 if result["acknowledged"] else 409)
 
 
+@app.post("/compass/measurements/flush")
+async def compass_measurements_flush():
+    """Complete timing journals after measured traffic, retaining cache content."""
+    if engine is None:
+        raise HTTPException(status_code=503, detail="Engine is not initialized")
+    result = engine.flush_compass_measurements()
+    return JSONResponse(content=result, status_code=200 if result["acknowledged"] else 409)
+
+
 @app.get("/compass/requests")
 async def compass_requests(drain: bool = True):
     """Per-request timings as the engine measured them, on the engine's clock.

@@ -7,6 +7,7 @@ This module performs no device operations. Workers own their completion fence.
 
 SNAPSHOT_SCHEMA = "compass.cache_snapshot/1"
 RESET_SCHEMA = "compass.cache_reset/1"
+FLUSH_SCHEMA = "compass.measurement_flush/1"
 
 
 def snapshot(engine, *, input_batches=None):
@@ -76,6 +77,15 @@ def reset(engine):
     the final check/clear with input ingestion; newly accepted requests belong
     after the boundary. A retained, already completed token output is preserved.
     """
+    return _quiescent_fence(engine, clear_indexes=True)
+
+
+def flush_measurements(engine):
+    """Finish timed worker events after measurement, preserving cached content."""
+    return _quiescent_fence(engine, clear_indexes=False)
+
+
+def _quiescent_fence(engine, *, clear_indexes):
     from atom.utils.clock import get_clock
 
     before = snapshot(engine)
@@ -120,7 +130,8 @@ def reset(engine):
             return result
         bm = engine.scheduler.block_manager
         bm.state.release_pins()
-        bm.clear_cache()
+        if clear_indexes:
+            bm.clear_cache()
         after = snapshot(engine, input_batches=len(engine.input_queue.queue))
     result["after"] = after
     result["counter_delta"] = {
@@ -128,11 +139,49 @@ def reset(engine):
         for key, value in after["counters"].items()}
     result["acknowledged"] = (
         after["quiescence"]["idle"] and after["quiescence"]["state_readers"] == 0
-        and after["indexes"] == {"kv": 0, "state": 0}
+        and after["indexes"] == ({"kv": 0, "state": 0} if clear_indexes
+                                 else before["indexes"])
         and not any(result["counter_delta"].values()))
     if not result["acknowledged"]:
-        result["reasons"] = ["cache reset postconditions failed"]
+        result["reasons"] = ["quiescent worker fence postconditions failed"]
     return result
+
+
+def flush_receipt_errors(receipt):
+    """Require a native all-worker fence and an empty timing-event queue."""
+    if not isinstance(receipt, dict) or receipt.get("schema") != FLUSH_SCHEMA:
+        return ["missing measurement flush receipt schema"]
+    errors = []
+    if receipt.get("acknowledged") is not True:
+        errors.append("measurement flush was not acknowledged")
+    ranks = receipt.get("ranks")
+    if not isinstance(ranks, list) or not ranks:
+        return errors + ["measurement flush has no rank receipts"]
+    for i, rank in enumerate(ranks):
+        if not isinstance(rank, dict):
+            errors.append(f"rank {i} measurement flush is not an object")
+            continue
+        before, after, barrier = (rank.get(k) for k in
+                                  ("before", "after", "worker_barrier"))
+        if not all(isinstance(value, dict) for value in (before, after, barrier)):
+            errors.append(f"rank {i} measurement flush lacks snapshots or worker proof")
+            continue
+        quiet = after.get("quiescence") or {}
+        journal = barrier.get("measurement_journal") or {}
+        workers = barrier.get("workers_completed")
+        if (rank.get("acknowledged") is not True
+                or quiet.get("idle") is not True or quiet.get("state_readers") != 0
+                or barrier.get("acknowledged") is not True
+                or barrier.get("kind") != "device_synchronize"
+                or type(workers) is not int or workers < 1
+                or barrier.get("core_timeline_drained") is not True
+                or journal.get("pending_steps_after") != 0):
+            errors.append(f"rank {i} measurement flush lacks completed native timing proof")
+        if (after.get("indexes") != before.get("indexes")
+                or not before.get("counters")
+                or after.get("counters") != before.get("counters")):
+            errors.append(f"rank {i} measurement flush changed cache indexes or counters")
+    return errors
 
 
 def reset_receipt_errors(receipt, *, expected_worker_kind=None,

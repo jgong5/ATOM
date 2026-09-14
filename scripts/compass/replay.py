@@ -371,6 +371,16 @@ def _reset_prefix_cache(base, timeout):
     return receipt
 
 
+def _flush_measurements(base, timeout):
+    from atom.compass.core.cache_boundary import flush_receipt_errors
+
+    receipt = _send(base + "/compass/measurements/flush", {}, timeout)
+    errors = flush_receipt_errors(receipt)
+    if errors:
+        raise ValueError("; ".join(errors))
+    return receipt
+
+
 def _prefix_cache_snapshot(base, timeout):
     with urllib.request.urlopen(base + "/compass/cache", timeout=timeout) as response:
         snapshot = json.loads(response.read())
@@ -808,6 +818,9 @@ def main(argv=None) -> int:
     p.add_argument("--check-lengths", action="store_true",
                    help="compare the server's reported prompt_tokens against "
                         "what was asked for, and warn if they differ")
+    p.add_argument("--flush-measurements", action="store_true",
+                   help="finish native timing journals after the measured request window, "
+                        "preserving cached content and recording the flush separately")
     args = p.parse_args(argv)
     if not math.isfinite(args.timeout) or args.timeout <= 0:
         p.error("--timeout must be finite and positive")
@@ -988,6 +1001,19 @@ def main(argv=None) -> int:
            if chat_plan is not None else {})))
     execution_seconds = _time.monotonic() - began
     execution_ended_at = _time.time()
+    measurement_flush, flush_error = None, None
+    if args.flush_measurements:
+        flush_started_at, flush_began = _time.time(), _time.monotonic()
+        try:
+            flush_receipt = _flush_measurements(base, args.timeout)
+        except (OSError, RuntimeError, ValueError) as exc:
+            flush_receipt, flush_error = None, str(exc)
+        measurement_flush = {
+            "clock": "wall", "started_at": flush_started_at,
+            "ended_at": _time.time(), "seconds": _time.monotonic() - flush_began,
+            "within": "post_run_reporting", "receipt": flush_receipt,
+            "error": flush_error,
+        }
     cache_end, cache_error = None, None
     if args._prefix_encoding is not None or chat_plan is not None:
         try:
@@ -1165,6 +1191,12 @@ def main(argv=None) -> int:
             manifest["complete"] = False
             manifest["incomplete_reasons"] = {
                 **(manifest["incomplete_reasons"] or {}), "cache_observation": cache_error}
+    if measurement_flush is not None:
+        manifest["measurement_flush"] = measurement_flush
+        if flush_error:
+            manifest["complete"] = False
+            manifest["incomplete_reasons"] = {
+                **(manifest["incomplete_reasons"] or {}), "measurement_flush": flush_error}
     if prepare and args.prepare_out:
         with open(args.prepare_out, "w", encoding="utf-8") as fh:
             json.dump(prepare, fh, indent=1)
@@ -1202,6 +1234,9 @@ def main(argv=None) -> int:
         return 1
     if cache_error:
         print(f"ATOMCompass refusing cache evidence: {cache_error}", file=sys.stderr)
+        return 3
+    if flush_error:
+        print(f"ATOMCompass refusing measurement flush: {flush_error}", file=sys.stderr)
         return 3
     if not manifest["complete"]:
         # After the artifact is written, for the same reason the barrier check

@@ -84,9 +84,10 @@ class CompassModelRunner(CompassPredictMixin, ModelRunner):
         was worth. That was most of the residual TPOT error.
 
         Events are recorded on the stream and read back later, so the host never
-        waits. Completed pairs are drained on subsequent steps; a few of the
-        very last ones are simply not written, which costs a calibration run
-        nothing.
+        waits. Completed pairs are drained on subsequent steps. The maintained
+        replay flushes the final pairs at a quiescent worker fence after its
+        measured request window; an interrupted run can still leave a partial
+        journal.
         """
         import torch
 

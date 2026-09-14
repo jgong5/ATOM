@@ -531,6 +531,16 @@ class LLMEngine:
                 "acknowledged": bool(ranks) and all(
                     rank.get("acknowledged") is True for rank in ranks)}
 
+    def flush_compass_measurements(self, timeout: float = 30.0) -> dict[str, Any]:
+        from atom.compass.core.cache_boundary import FLUSH_SCHEMA
+
+        responses = self.core_mgr.broadcast_utility_command_sync(
+            "flush_compass_measurements", timeout=timeout)
+        ranks = [resp.get("result", resp) for resp in responses]
+        return {"schema": FLUSH_SCHEMA, "ranks": ranks,
+                "acknowledged": bool(ranks) and all(
+                    rank.get("acknowledged") is True for rank in ranks)}
+
     def get_cache_statistics(self, timeout: float = 30.0) -> dict[str, Any]:
         """Return aggregated prefix-cache statistics across DP ranks.
 

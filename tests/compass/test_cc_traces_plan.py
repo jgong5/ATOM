@@ -190,6 +190,7 @@ class TestTheTwoSidesAreNotRunTheSameWay:
             for step in _role(cell, "replay", "real"):
                 assert "--pace" in step["command"]
                 assert "--prepare" in step["command"]
+                assert "--flush-measurements" in step["command"]
                 assert step["where"] == "gpu"
 
     def test_the_modelled_side_is_neither(self, plan):
@@ -199,6 +200,7 @@ class TestTheTwoSidesAreNotRunTheSameWay:
             for step in _role(cell, "replay", "modelled"):
                 assert "--pace" not in step["command"]
                 assert "--prepare" not in step["command"]
+                assert "--flush-measurements" not in step["command"]
                 assert step["where"] == "device_free"
 
     def test_the_modelled_side_predicts_and_the_real_side_measures(self, plan):

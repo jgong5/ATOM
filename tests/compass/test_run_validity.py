@@ -272,7 +272,8 @@ def _run(stub: _Stub, trace: Path, out: Path, extra=()) -> int:
         server.server_close()
 
 
-def test_client_wall_window_excludes_warmup_drain_and_reporting(tmp_path, trace, monkeypatch):
+@pytest.mark.parametrize("flush", [None, "pass", "refuse"])
+def test_client_wall_window_excludes_warmup_drain_and_reporting(tmp_path, trace, monkeypatch, flush):
     class Clock:
         value = 0.0
 
@@ -304,16 +305,34 @@ def test_client_wall_window_excludes_warmup_drain_and_reporting(tmp_path, trace,
             return super().provenance_blob()
 
     monkeypatch.setattr(replay, "_time", clock)
+    def finish_journal(*args):
+        assert clock.value == 41.0
+        clock.sleep(11.0)
+        if flush == "refuse":
+            raise ValueError("fixture worker refused flush")
+        return {"acknowledged": True, "fixture": "post-measurement"}
+
+    monkeypatch.setattr(replay, "_flush_measurements", finish_journal)
     out = tmp_path / "timed.json"
     assert _run(DelayedStub(arrivals="serial"), trace, out,
-                ("--prepare", "1", "--pace")) == 0
+                ("--prepare", "1", "--pace", *(["--flush-measurements"] if flush else []))) == (
+                    3 if flush == "refuse" else 0)
     run = json.loads(out.read_text())["run"]
     window = replay.read_wall_window(run["wall_execution"])
     assert window["seconds"] == 6.0
     assert window["started_at"] == 1_700_000_035.0
     assert window["ended_at"] == 1_700_000_041.0
     assert run["prepare"]["wall_seconds"] == 30.0
-    assert clock.value == 68.0  # preparation + drain + requests + reporting
+    assert clock.value == 68.0 + (11.0 if flush else 0.0)
+    if flush:
+        finalization = run["measurement_flush"]
+        assert finalization["started_at"] == window["ended_at"]
+        assert finalization["seconds"] == 11.0
+        assert finalization["within"] == "post_run_reporting"
+        assert run["complete"] is (flush == "pass")
+        assert bool(finalization["error"]) is (flush == "refuse")
+    else:
+        assert "measurement_flush" not in run
 
 
 def test_pretokenization_precedes_pacing_but_remains_in_execution(tmp_path, monkeypatch):

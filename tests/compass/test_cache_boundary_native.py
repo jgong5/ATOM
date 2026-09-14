@@ -5,6 +5,7 @@ import importlib
 import json
 import queue
 import threading
+from collections import deque
 from types import SimpleNamespace
 
 import pytest
@@ -42,6 +43,71 @@ def test_native_fence_synchronizes_device_and_retains_last_output(native, monkey
     assert result["retained_output_requests"] == 2
     assert processor.token_ids_cpu is pending_output
     assert processor.prev_batch.req_ids == [3, 4]
+
+
+def test_native_final_timing_row_is_flushed_once_from_original_events(
+        native, monkeypatch, tmp_path):
+    from atom.compass.core.cost.base import StepShape
+    from atom.compass.config import CompassConfig
+    from atom.compass.runtime.runner import CompassModelRunner
+
+    ready, synchronized, elapsed_reads = False, [], []
+
+    class Event:
+        def __init__(self, name, milliseconds=0.0):
+            self.name, self.milliseconds = name, milliseconds
+
+        def query(self):
+            return ready
+
+        def elapsed_time(self, end):
+            assert ready
+            elapsed_reads.append((self.name, end.name))
+            return self.milliseconds
+
+    def synchronize(device):
+        nonlocal ready
+        synchronized.append(device)
+        ready = True
+
+    monkeypatch.setattr(native.model_runner.torch.cuda, "synchronize", synchronize)
+    runner = object.__new__(CompassModelRunner)
+    runner.device, runner.rank = "cuda:0", 0
+    runner.tokenID_processor = SimpleNamespace(prev_batch=SimpleNamespace(req_ids=[4]))
+    path = tmp_path / "steps.jsonl"
+    runner.config = SimpleNamespace(compass_config=CompassConfig(
+        mode="measure", measure_out=str(path), measure_warmup_steps=0))
+    runner._measured_by_kind, runner._measured_steps, runner._measure_fh = {}, 0, None
+    runner._topology = lambda: {"tp": 1}
+    shape = StepShape((1,), (40168,), topology={"tp": 1}, rank_coords={"tp": 0},
+                      capture_bucket=1, compiled=True)
+    runner._pending = deque([(shape, Event("outer_begin", 24.5), Event("outer_end"),
+                              0.0008, [4], 123.0, {"kind": "decode"},
+                              {"run_model": (Event("model_begin", 24.0), Event("model_end"))})])
+    runner._drain_pending()
+    assert len(runner._pending) == 1 and not path.exists()
+    assert synchronized == elapsed_reads == []
+    try:
+        result = runner.compass_cache_barrier()
+        assert synchronized == ["cuda:0"]
+        assert result["measurement_journal"] == {
+            "worker_rank": 0, "pending_steps_before": 1,
+            "drained_steps": 1, "pending_steps_after": 0}
+        first_bytes = path.read_bytes()
+        rows = [json.loads(line) for line in first_bytes.splitlines()]
+        assert len(rows) == 1
+        assert rows[0]["seconds"] == 0.0245
+        assert rows[0]["span_seconds"] == {"run_model": 0.024}
+        assert rows[0]["started_at"] == 123.0
+        assert rows[0]["context_lens"] == [40168] and rows[0]["req_ids"] == ["4"]
+        assert elapsed_reads == [("model_begin", "model_end"), ("outer_begin", "outer_end")]
+        second = runner.compass_cache_barrier()
+        assert second["measurement_journal"]["drained_steps"] == 0
+        assert path.read_bytes() == first_bytes and len(elapsed_reads) == 2
+        assert runner.tokenID_processor.prev_batch.req_ids == [4]
+    finally:
+        if runner._measure_fh is not None:
+            runner._measure_fh.close()
 
 
 @pytest.mark.parametrize("failed_rank", [None, 0, 1])
@@ -113,15 +179,28 @@ def test_http_reset_carries_native_ack_and_busy_refusal(native, monkeypatch):
         broadcast_utility_command_sync=broadcast))
     engine.reset_compass_cache = lambda: native.llm.LLMEngine.reset_compass_cache(engine)
     engine.get_compass_cache = lambda: native.llm.LLMEngine.get_compass_cache(engine)
+    engine.flush_compass_measurements = lambda: native.llm.LLMEngine.flush_compass_measurements(engine)
     monkeypatch.setattr(native.api, "engine", engine)
     snapshot = asyncio.run(native.api.compass_cache())
     assert snapshot["schema"] == "compass.cache_snapshot/1"
     assert snapshot["ranks"][0]["indexes"]["state"] > 0
     core.scheduler.waiting.append(Sequence([1], 16))
+    assert asyncio.run(native.api.compass_measurements_flush()).status_code == 409
     refused = asyncio.run(native.api.compass_cache_reset())
     assert refused.status_code == 409
     assert json.loads(refused.body)["acknowledged"] is False
     core.scheduler.waiting.clear()
+    original_fence = core.runner_mgr.call_func
+    core.runner_mgr.call_func = lambda *a, **kw: {
+        **original_fence(*a, **kw), "kind": "device_synchronize",
+        "measurement_journal": {"pending_steps_before": 1,
+                                "drained_steps": 1, "pending_steps_after": 0}}
+    flushed = asyncio.run(native.api.compass_measurements_flush())
+    assert flushed.status_code == 200
+    proof = json.loads(flushed.body)
+    from atom.compass.core.cache_boundary import flush_receipt_errors
+    assert not flush_receipt_errors(proof)
+    assert proof["ranks"][0]["after"]["indexes"] == snapshot["ranks"][0]["indexes"]
     response = asyncio.run(native.api.compass_cache_reset())
     assert response.status_code == 200
     assert not reset_receipt_errors(json.loads(response.body))

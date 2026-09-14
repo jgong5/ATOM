@@ -157,6 +157,29 @@ def test_unacknowledged_worker_does_not_clear_indexes():
     assert cache_boundary.snapshot(engine) == before
 
 
+@pytest.mark.parametrize("busy", [False, True])
+def test_measurement_flush_preserves_cache_and_requires_quiescence(busy):
+    engine, calls = engine_with_cache()
+    native_fence = engine.runner_mgr.call_func
+
+    def fence(*args, **kwargs):
+        return {**native_fence(*args, **kwargs), "kind": "device_synchronize",
+                "measurement_journal": {"pending_steps_before": 1,
+                                        "drained_steps": 1, "pending_steps_after": 0}}
+
+    engine.runner_mgr.call_func = fence
+    if busy:
+        engine.scheduler.waiting.append(Sequence([1], 16))
+    before = cache_boundary.snapshot(engine)
+    result = cache_boundary.flush_measurements(engine)
+    assert result["acknowledged"] is (not busy)
+    assert calls == ([] if busy else ["compass_cache_barrier"])
+    assert cache_boundary.snapshot(engine) == before
+    proof = {"schema": cache_boundary.FLUSH_SCHEMA,
+             "acknowledged": result["acknowledged"], "ranks": [result]}
+    assert bool(cache_boundary.flush_receipt_errors(proof)) is busy
+
+
 def test_modelled_reset_drains_core_device_timeline_without_discarding_output():
     from atom.compass.runtime.timeline import ForwardTimeline
     from atom.utils.clock import VirtualClock, get_clock, set_clock

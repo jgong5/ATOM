@@ -405,7 +405,7 @@ def _replay(
         # The real engine stamps arrivals on receipt, so a declared arrival is
         # discarded there: without --pace the real side answers a burst while
         # the modelled side answers the trace, and the two are not comparable.
-        cmd += ["--pace"]
+        cmd += ["--pace", "--flush-measurements"]
     if prepare:
         cmd += [
             "--prepare",
