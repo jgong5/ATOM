@@ -9,7 +9,9 @@ from atom.compass.core.cost.cache_regions import (
 )
 from atom.compass.core.cost.regions import REGION_MODELS
 from atom.compass.core.loaded_input import load_json
-from atom.compass.runtime.source_oracle import _flag, build_source_oracle, region_snapshot
+from atom.compass.runtime.source_oracle import (
+    _flag, _rank_coords, build_source_oracle, region_snapshot,
+)
 
 
 SCHEMA = "compass.cached_prefill_region_overlay/1"
@@ -82,6 +84,7 @@ def model_from_artifact(data, *, include_failed_outputless=False, diagnostic_onl
 
 def source_cost_oracle(*, region_overlay, region_overlay_sha256, regions,
                        include_failed_outputless=False, diagnostic_only=False,
+                       q16_handoff=None, q16_handoff_sha256=None,
                        rank_coords=None, **options):
     """Build the existing source composition, then select a separate region object.
 
@@ -100,6 +103,10 @@ def source_cost_oracle(*, region_overlay, region_overlay_sha256, regions,
             actual = str(actual).lower()
         if actual != value:
             raise ValueError(f"cached-prefill source scope requires {key}={value!r}")
+    if any(rank != 0 for rank in _rank_coords(rank_coords).values()):
+        raise ValueError("cached-prefill source scope requires rank zero")
+    if bool(q16_handoff) != bool(q16_handoff_sha256):
+        raise ValueError("q16 source handoff and its explicit SHA-256 are required together")
     data, loaded = load_json(region_overlay, role="oracle.region_overlay")
     if loaded.sha256 != region_overlay_sha256:
         raise ValueError("region overlay differs from its explicit SHA-256")
@@ -112,4 +119,19 @@ def source_cost_oracle(*, region_overlay, region_overlay_sha256, regions,
     result.regions = model
     result.compass_region_snapshot = region_snapshot(data["name"], model)
     result.compass_loaded_inputs += (loaded,)
+    if q16_handoff:
+        from atom.compass.core.cost.cached_q16 import CachedQ16Prices
+
+        # The operator ABI does not encode the installed backend or KV/state
+        # layout. Bind this addition to the explicit deployment scope in its
+        # reviewed artifact; this is not a claim that it independently proves
+        # every live backend flag. The maintained harness checks live policy.
+        expected_scope = (data.get("q16_request_scope") or {}).get("sha256")
+        scopes = [entry for entry in result.library.loaded_inputs
+                  if entry.role == "oracle.attention_scope"]
+        if not expected_scope or len(scopes) != 1 or scopes[0].sha256 != expected_scope:
+            raise ValueError("q16 addition requires its pinned deployment request scope")
+        base_inputs = len(result.library.loaded_inputs)
+        result.library = CachedQ16Prices(result.library, q16_handoff, q16_handoff_sha256)
+        result.compass_loaded_inputs += result.library.loaded_inputs[base_inputs:]
     return result

@@ -172,3 +172,30 @@ def test_factory_attests_loaded_bytes_and_deployment_scope(artifact, tmp_path, m
     with pytest.raises(ValueError, match="diagnostic_only"):
         runtime.source_cost_oracle(**dict(options, include_failed_outputless="1"))
     assert len(calls) == 1
+
+
+def test_q16_addition_binds_the_artifact_deployment_scope(artifact, tmp_path, monkeypatch):
+    from atom.compass.core.cost import cached_q16
+
+    path = tmp_path / "overlay.json"
+    scope = SimpleNamespace(role="oracle.attention_scope", sha256="native-scope")
+    added = SimpleNamespace(role="oracle.q16_sources", sha256="q16-source")
+    monkeypatch.setattr(runtime, "build_source_oracle", lambda **kw: SimpleNamespace(
+        oracle=SimpleNamespace(compass_loaded_inputs=(scope,),
+                               library=SimpleNamespace(loaded_inputs=(scope,)))))
+    monkeypatch.setattr(cached_q16, "CachedQ16Prices", lambda base, *args: SimpleNamespace(
+        loaded_inputs=base.loaded_inputs + (added,)))
+    options = dict(region_overlay=str(path), regions=BASE, model="Qwen/Qwen3.8-27B",
+                   tp=1, block_size=16, max_model_len=262144, position_rows=3,
+                   cudagraph_mode="full", allocation="native",
+                   q16_handoff="handoff.json", q16_handoff_sha256="q16-source")
+    for declared in (None, "other-scope", "native-scope"):
+        artifact["q16_request_scope"] = {"sha256": declared}
+        path.write_text(json.dumps(artifact))
+        options["region_overlay_sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
+        if declared != "native-scope":
+            with pytest.raises(ValueError, match="pinned deployment"):
+                runtime.source_cost_oracle(**options)
+        else:
+            oracle = runtime.source_cost_oracle(**options)
+            assert oracle.compass_loaded_inputs[-1] is added
