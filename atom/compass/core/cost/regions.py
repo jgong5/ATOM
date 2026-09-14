@@ -58,7 +58,7 @@ refusal where it has not looked.
 
 from __future__ import annotations
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, replace
 from typing import Optional
 
 #: The sequence slot a pooled prefill anchor group is keyed under. Negative so
@@ -420,6 +420,10 @@ class BucketedRunnerRegions:
         return sorted(t for (s, t, o) in table
                       if s == seqs and o == produces)
 
+    def _prefill_support_span(self, table: dict, key: tuple) -> list:
+        """Anchors eligible to bracket this query; legacy sources use one span."""
+        return self._prefill_span(table, key[0], key[2])
+
     def _pool(self, seqs: int) -> int:
         """The group `seqs` is looked up under: itself, or the pooled slot."""
         if self.prefill_pooled_sequences:
@@ -460,7 +464,7 @@ class BucketedRunnerRegions:
                 f"prefill cell {key} is absent and this source declares no "
                 "interpolation anchors; `refusal` should have rejected it")
         seqs, tokens, produces = key
-        span = self._prefill_span(table, seqs, produces)
+        span = self._prefill_support_span(table, key)
         lo = max(t for t in span if t <= tokens)
         hi = min(t for t in span if t >= tokens)
         left, right = table[(seqs, lo, produces)], table[(seqs, hi, produces)]
@@ -553,7 +557,7 @@ class BucketedRunnerRegions:
                 cells = self._prefill_table(self.prepare_prefill_cells,
                                             self.prepare_prefill_anchors)
                 key = self._prefill_key(shape)
-                span = self._prefill_span(cells, key[0], key[2])
+                span = self._prefill_support_span(cells, key)
                 produced = 'a token' if key[2] else 'no token'
                 if not self._interpolates():
                     # Cells only: the published lookup, cell by cell. This is
@@ -592,7 +596,7 @@ class BucketedRunnerRegions:
                     post = self._prefill_table(
                         self.postprocess_prefill_cells,
                         self.postprocess_prefill_anchors)
-                    post_span = self._prefill_span(post, key[0], key[2])
+                    post_span = self._prefill_support_span(post, key)
                     if not post_span or not (post_span[0] <= key[1]
                                              <= post_span[-1]):
                         return (f"prefill cell {key} has a preparation "
@@ -714,7 +718,7 @@ class BucketedRunnerRegions:
                                             self.postprocess_prefill_anchors)
                 key = self._prefill_key(shape)
                 covered = (key in cells if not self._interpolates()
-                           else bool(self._prefill_span(cells, key[0], key[2])))
+                           else bool(self._prefill_support_span(cells, key)))
                 if covered:
                     postprocess = self._prefill_at(cells, key)
                 else:
@@ -778,6 +782,87 @@ class BucketedRunnerRegions:
             lines.append(f"decode history cell {cell}: per-row "
                          f"{limits[0]}..{limits[1]}, sum <= {limits[2]}")
         lines.append(f"provenance          : {self.provenance}")
+        return "\n".join(lines)
+
+
+@dataclass(frozen=True)
+class PrefillIntervalRegions(BucketedRunnerRegions):
+    """Bucketed regions with explicit, disjoint prefill interpolation intervals.
+
+    Each entry is ``((sequence_group, produces_output), ((lo, hi), ...))``.
+    A declared group may interpolate only between anchors inside the same
+    inclusive interval. Exact measured points remain valid even outside an
+    interval; groups without a declaration retain their original behaviour.
+
+    This is a separate type so adding the capability does not change any
+    existing preset's fields or calibration digest. No built-in preset selects
+    it until independent source validation licenses the new support.
+    """
+
+    prefill_interpolation_intervals: tuple = ()
+
+    def __post_init__(self):
+        groups = set()
+        for group, intervals in self.prefill_interpolation_intervals:
+            if group in groups:
+                raise ValueError(f"duplicate prefill interval group {group}")
+            groups.add(group)
+            seqs, output = group
+            if (not isinstance(seqs, int) or seqs == 0 or seqs < POOLED_SEQS
+                    or not isinstance(output, bool)):
+                raise ValueError(f"invalid prefill interval group {group}")
+            previous = 0
+            for lo, hi in intervals:
+                if (not isinstance(lo, int) or not isinstance(hi, int)
+                        or lo <= previous or hi < lo):
+                    raise ValueError(
+                        f"prefill intervals for {group} must be positive, "
+                        "ordered and disjoint")
+                previous = hi
+
+    @classmethod
+    def from_model(cls, model: BucketedRunnerRegions, intervals: tuple):
+        """Keep the source's immutable measurements and add interval declarations."""
+        return cls(**{field.name: getattr(model, field.name)
+                      for field in fields(BucketedRunnerRegions)},
+                   prefill_interpolation_intervals=intervals)
+
+    def _interval(self, key: tuple):
+        group = (key[0], key[2])
+        intervals = dict(self.prefill_interpolation_intervals).get(group)
+        if intervals is None:
+            return None
+        return next(((lo, hi) for lo, hi in intervals if lo <= key[1] <= hi), ())
+
+    def _prefill_support_span(self, table: dict, key: tuple) -> list:
+        # An exact point is measured; it needs no interpolating neighbours.
+        if key in table:
+            return [key[1]]
+        span = super()._prefill_support_span(table, key)
+        interval = self._interval(key)
+        if interval is None:
+            return span
+        if not interval:
+            return []
+        lo, hi = interval
+        return [tokens for tokens in span if lo <= tokens <= hi]
+
+    def refusal(self, shape) -> Optional[str]:
+        if shape.num_prefill_tokens:
+            key = self._prefill_key(shape)
+            table = self._prefill_table(self.prepare_prefill_cells,
+                                        self.prepare_prefill_anchors)
+            if key not in table and self._interval(key) == ():
+                intervals = dict(self.prefill_interpolation_intervals)[key[0], key[2]]
+                return (f"prefill of {key[1]} tokens over "
+                        f"{self._seqs_label(key[0])}, produces_output={key[2]}, "
+                        f"is outside declared interpolation intervals {list(intervals)}")
+        return super().refusal(shape)
+
+    def describe(self) -> str:
+        lines = [super().describe()]
+        for group, intervals in self.prefill_interpolation_intervals:
+            lines.append(f"prefill interpolation group {group}: {list(intervals)}")
         return "\n".join(lines)
 
 
