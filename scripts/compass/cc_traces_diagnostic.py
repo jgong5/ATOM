@@ -16,6 +16,9 @@ from pathlib import Path
 SCHEMA = "compass.explicit_corpus_diagnostic_workload/1"
 CASE_SCHEMA = "compass.corpus_diagnostic_case/1"
 RESERVED_CLASSES = {"short", "long", "clients_short", "clients_large"}
+# Declared target behavior, not a reconstruction of source cancellation/errors.
+# See atom/compass/ZERO_OUTPUT_CONTRACT.md.
+ZERO_OUTPUT_SEMANTICS = "full_prompt_zero_retained_output_v1"
 
 
 def registered_cell_name(name):
@@ -111,6 +114,12 @@ def load_case(workload, manifest, manifest_sha256, case_id, *, target_model):
     if _sha(data) != workload_sha:
         raise ValueError("diagnostic workload digest differs from the pinned manifest")
     rows = replay_rows([json.loads(line) for line in data.splitlines() if line.strip()])
+    has_zero_output = any(row["output_tokens"] == 0 for row in rows)
+    if has_zero_output and stated.get("zero_output_semantics") != ZERO_OUTPUT_SEMANTICS:
+        raise ValueError(
+            "zero-output diagnostics must explicitly declare zero_output_semantics="
+            f"{ZERO_OUTPUT_SEMANTICS!r}"
+        )
     count = _integer(stated.get("requests"), "requests", 1)
     clients = _integer(stated.get("clients"), "clients", 1)
     provenance = stated.get("provenance")
@@ -160,7 +169,7 @@ def load_case(workload, manifest, manifest_sha256, case_id, *, target_model):
     for field, key in (("input_token_total", "input_tokens"), ("output_token_total", "output_tokens")):
         if stated.get(field) != sum(r[key] for r in rows):
             raise ValueError(f"case {field} disagrees with workload rows")
-    return {
+    case = {
         "schema": CASE_SCHEMA, "case_id": case_id,
         "manifest": str(manifest), "manifest_sha256": manifest_sha256,
         "workload": str(workload), "workload_sha256": workload_sha,
@@ -169,6 +178,9 @@ def load_case(workload, manifest, manifest_sha256, case_id, *, target_model):
         "selection_scope": stated["selection_scope"], "emitter": emitter,
         "source_validation": "Emitter validation in the pinned manifest; not an independent corpus census",
     }
+    if has_zero_output:
+        case["zero_output_semantics"] = ZERO_OUTPUT_SEMANTICS
+    return case
 
 
 def recheck(case):
@@ -184,7 +196,10 @@ def identity(case):
             "requests", "clients", "target_model", "corpus_sha256")
     if not isinstance(case, dict) or any(key not in case for key in keys):
         raise ValueError("diagnostic case identity is incomplete")
-    return {key: case[key] for key in keys}
+    result = {key: case[key] for key in keys}
+    if "zero_output_semantics" in case:
+        result["zero_output_semantics"] = case["zero_output_semantics"]
+    return result
 
 
 def check_result(blob, case):

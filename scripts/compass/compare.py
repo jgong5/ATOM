@@ -175,21 +175,38 @@ def check_run(run: Run, *, expect_requests: int | None = None,
                    f"{len(run.workload)} requests: the trace was not fully "
                    f"drained, or the engine served something else")
 
-    # Time ordering, per request, on one clock. `arrival <= first <= finish`
-    # cannot be assumed: it is what tells a mixed clock domain from a slow run.
+    # Zero retained output has a terminal interval, but no first-token event.
+    # It remains in request accounting and latency/throughput windows.
     for i, rec in sorted(run.joined.items()):
         a = rec.get("arrive_time")
         f = rec.get("first_token_time")
         z = rec.get("finish_time")
-        if a is None or f is None or z is None:
+        zero_output = (0 <= i < len(run.workload)
+                       and type(run.workload[i].get("output_tokens")) is int
+                       and run.workload[i].get("output_tokens") == 0)
+        if zero_output:
+            produced = (run.usage.get(i) or {}).get("completion_tokens")
+            if type(produced) is not int or produced != 0:
+                bad.append(f"zero-output request {i} produced {produced!r} tokens")
+            if "first_token_time" not in rec:
+                bad.append(f"zero-output request {i} must explicitly record "
+                           "first_token_time as null")
+            if f is not None or rec.get("ttft") is not None:
+                bad.append(f"zero-output request {i} must leave first-token time "
+                           "and TTFT undefined")
+        if a is None or z is None or (not zero_output and f is None):
             bad.append(f"request {i} is missing a timestamp "
                        f"(arrive={a}, first={f}, finish={z})")
             continue
-        if not (a <= f <= z):
+        if zero_output and not a <= z:
+            bad.append(f"request {i} out of order: arrive {a:.6f}, finish {z:.6f}")
+        elif not zero_output and not (a <= f <= z):
             bad.append(f"request {i} out of order: arrive {a:.6f}, "
                        f"first {f:.6f}, finish {z:.6f}")
-        for name, derived, computed in (("ttft", rec.get("ttft"), f - a),
-                                        ("latency", rec.get("latency"), z - a)):
+        durations = [("latency", rec.get("latency"), z - a)]
+        if not zero_output:
+            durations.insert(0, ("ttft", rec.get("ttft"), f - a))
+        for name, derived, computed in durations:
             if derived is not None and abs(derived - computed) > 1e-3:
                 bad.append(f"request {i}: reported {name} {derived:.6f} does "
                            f"not match its own timestamps ({computed:.6f}); "
@@ -284,10 +301,11 @@ def metrics(run: Run, indices) -> dict:
     for i in indices:
         rec = run.joined[i]
         a, f, z = rec["arrive_time"], rec["first_token_time"], rec["finish_time"]
-        ttft[i] = f - a
         latency[i] = z - a
         # `check_run` refuses a run without this, so it is present here.
         n = int((run.usage.get(i) or {}).get("completion_tokens") or 0)
+        if n >= 1:
+            ttft[i] = f - a
         if n >= 2:
             tpot[i] = (z - f) / (n - 1)
         arrivals.append(a)
@@ -346,6 +364,10 @@ def compare(real: Run, modelled: Run) -> dict:
             "real_per_request": [rm[name][i] for i in keys],
             "modelled_per_request": [mm[name][i] for i in keys],
         }
+        if any(row.get("output_tokens") == 0 for row in real.workload):
+            # Quantile n states the denominator; indices identify which
+            # requests contribute when some metrics are undefined.
+            report["metrics"][name]["request_indices"] = keys
     rt, mt = rm["throughput_tok_s"], mm["throughput_tok_s"]
     report["metrics"]["throughput_tok_s"] = {
         "real": rt, "modelled": mt,
@@ -382,17 +404,24 @@ def _print(report: dict) -> None:
               f"  p90 {r['p90']:9.4f}  max {r['max']:9.4f}")
         print(f"    {'modelled':<10} med {m['median']:9.4f}  mean {m['mean']:9.4f}"
               f"  p90 {m['p90']:9.4f}  max {m['max']:9.4f}")
-        print(f"    {'error':<10} med {e['median']:+8.2f}%  "
-              f"mean {e['mean']:+8.2f}%  p90 {e['p90']:+8.2f}%")
+        error_text = {key: (f"{value:+8.2f}%" if value is not None else "undefined")
+                      for key, value in e.items()}
+        print(f"    {'error':<10} med {error_text['median']}  "
+              f"mean {error_text['mean']}  p90 {error_text['p90']}")
         pr = block["per_request_error_pct"]
-        print(f"    {'per req':<10} med {pr['median']:+8.2f}%  "
-              f"mean {pr['mean']:+8.2f}%  p90 {pr['p90']:+8.2f}%  "
-              f"worst {max(abs(pr['min']), abs(pr['max'])):8.2f}%")
+        if pr.get("n"):
+            print(f"    {'per req':<10} med {pr['median']:+8.2f}%  "
+                  f"mean {pr['mean']:+8.2f}%  p90 {pr['p90']:+8.2f}%  "
+                  f"worst {max(abs(pr['min']), abs(pr['max'])):8.2f}%")
+        else:
+            print("    per req error undefined: all real durations are zero")
     t = report["metrics"]["throughput_tok_s"]
+    error = (f"{t['error_pct']:+.2f}%" if t["error_pct"] is not None
+             else "undefined (zero reference throughput)")
     print("\n  throughput, output tokens/s")
     print(f"    real {t['real']:9.3f} over {t['real_window_s']:.3f}s   "
           f"modelled {t['modelled']:9.3f} over {t['modelled_window_s']:.3f}s   "
-          f"error {t['error_pct']:+.2f}%")
+          f"error {error}")
     if report.get("throughput_warning"):
         print(f"    WARNING: {report['throughput_warning']}")
 

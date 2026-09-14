@@ -252,3 +252,54 @@ def test_case_lock_identity_allows_different_mount_paths(tmp_path, monkeypatch):
     (task.cell / "diagnostic_case.json").write_text(json.dumps(other))
     assert task.run() == 0
     assert json.loads((task.cell / "diagnostic_case.json").read_text()) == other
+
+
+def zero_case(tmp_path, semantics=None):
+    case = fixture_case(tmp_path, count=2)
+    rows = [json.loads(line) for line in case[0].read_text().splitlines()]
+    rows[0]["output_tokens"] = 0
+    case[0].write_text("".join(json.dumps(row) + "\n" for row in rows))
+    stated = json.loads(case[1].read_text())
+    stated["sha256"] = digest(case[0])
+    stated["provenance"][0]["output_tokens"] = 0
+    stated["output_token_total"] = 16
+    if semantics is not None:
+        stated["zero_output_semantics"] = semantics
+    case[1].write_text(json.dumps(stated))
+    return case
+
+
+@pytest.mark.parametrize("semantics", [None, "cancel_at_source_finish", "no_op"])
+def test_zero_diagnostic_requires_the_explicit_surrogate_before_launch(
+        tmp_path, monkeypatch, semantics):
+    case = zero_case(tmp_path, semantics)
+    monkeypatch.setattr(run, "SideRun", lambda *a, **k: pytest.fail("invalid case launched"))
+    assert run.main(argv(tmp_path, case)) == 2
+
+
+def test_zero_contract_is_pinned_and_carried_with_the_complete_execution(tmp_path, monkeypatch):
+    case = zero_case(tmp_path, diagnostic.ZERO_OUTPUT_SEMANTICS)
+    identity = load(case)
+    assert diagnostic.identity(identity)["zero_output_semantics"] == diagnostic.ZERO_OUTPUT_SEMANTICS
+    task = runner(tmp_path, monkeypatch, case)
+    assert task.run() == 0
+    result = json.loads((task.cell / "modelled.r1.json").read_text())
+    assert result["execution"]["diagnostic_case"]["zero_output_semantics"] == diagnostic.ZERO_OUTPUT_SEMANTICS
+    assert result["run"]["requests"] == 2 and len(result["results"]) == 2
+    assert result["workload"][0]["output_tokens"] == 0
+
+
+def test_zero_contract_change_after_planning_is_refused(tmp_path):
+    case = zero_case(tmp_path, diagnostic.ZERO_OUTPUT_SEMANTICS)
+    identity = load(case)
+    stated = json.loads(case[1].read_text())
+    stated["zero_output_semantics"] = "no_op"
+    case[1].write_text(json.dumps(stated))
+    with pytest.raises(ValueError, match="digest"):
+        diagnostic.recheck(identity)
+
+
+def test_positive_diagnostic_identity_needs_no_zero_contract(tmp_path):
+    identity = load(fixture_case(tmp_path))
+    assert "zero_output_semantics" not in identity
+    assert "zero_output_semantics" not in diagnostic.identity(identity)
