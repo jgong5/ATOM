@@ -27,7 +27,8 @@ WORKER_CONFIGURATION = {
 CACHE_REGION_FACTORY = "atom.compass.runtime.cache_region_oracle.source_cost_oracle"
 CACHE_REGION_OPTIONS = frozenset((
     "region_overlay", "region_overlay_sha256", "include_failed_outputless", "include_failed_final",
-    "diagnostic_only", "q16_handoff", "q16_handoff_sha256", "rank_coords",
+    "diagnostic_only", "q16_handoff", "q16_handoff_sha256",
+    "low_q_handoff", "low_q_handoff_sha256", "low_q_allow_failed_spread", "rank_coords",
 ))
 
 
@@ -164,7 +165,7 @@ def _source_view(modelled, **changes):
 def check_source_contract(modelled, registry, workload_sha, forbidden, label):
     """Check the exact diagnostic wrapper, retaining the base protocol checks.
 
-    Pair validation needs the pinned overlay and optional q16 bundle mounted
+    Pair validation needs the pinned overlay and optional source bundles mounted
     at their configured paths. Reopening verifies those bytes against the
     worker's original read; it never replaces the worker's attestation. This
     lets the selected region snapshot be rebuilt with the actual flags, rather
@@ -261,6 +262,38 @@ def check_source_contract(modelled, registry, workload_sha, forbidden, label):
                     raise ValueError(f"q16 source {source.path} lacks its exact loaded-input identity")
         elif any(row.get("role") == "oracle.q16_sources" for row in inputs):
             raise ValueError("unconfigured q16 source handoff was loaded")
+
+        if bool(options.get("low_q_handoff")) != bool(options.get("low_q_handoff_sha256")):
+            raise ValueError("low-query source handoff and its SHA-256 are required together")
+        if options.get("low_q_handoff"):
+            pinned("low_q_handoff", "oracle.low_q_sources")
+            scopes = [row for row in inputs if row.get("role") == "oracle.attention_scope"]
+            if (len(scopes) != 1 or not options.get("attention_scope")
+                    or scopes[0].get("requested") != options["attention_scope"]):
+                raise ValueError("low-query addition lacks its loaded deployment request scope")
+            from atom.compass.core.cost.low_query import LowQueryPrices
+            from atom.compass.core.cost.library import PriceLibrary
+            base = PriceLibrary()
+            base.launch_charge_seconds = float(options.get("seconds_per_launch", 0))
+            low_q = LowQueryPrices(base, options["low_q_handoff"], options["low_q_handoff_sha256"],
+                deployment_scope_sha256=scopes[0]["sha256"], diagnostic_only=diagnostic,
+                allow_failed_spread=_flag(options.get("low_q_allow_failed_spread", False),
+                                         "low_q_allow_failed_spread"))
+            for source in low_q.loaded_inputs:
+                matches = [row for row in inputs if row == source.as_dict()]
+                if len(matches) != 1:
+                    raise ValueError(f"low-query source {source.path} lacks its exact loaded-input identity")
+                bad.extend(validate._check_calibration_records(
+                    {source.role: source.sha256},
+                    {source.role: {Path(source.path).name: source.sha256}},
+                    registry, 1, workload_sha, forbidden))
+            if not low_q.source_qualified:
+                notes.append("FAILED low-query heldout spread retained; diagnostic_only=1; no acceptance credit: "
+                             + ", ".join(low_q.failed_spread_controls))
+            elif not low_q.campaign_source_qualified:
+                notes.append("Selected low-query sources qualified; full source campaign remains unqualified")
+        elif any(str(row.get("role", "")).startswith("oracle.low_q_") for row in inputs):
+            raise ValueError("unconfigured low-query source evidence was loaded")
     except (OSError, ValueError, TypeError, KeyError, OverflowError) as exc:
         bad.append(f"{label}: opening source contract: {exc}")
     return bad, notes
@@ -344,6 +377,8 @@ def _pair(args):
                         "base_validation_factory": validate.SOURCE_FACTORY,
                         "region_overlay_sha256": options.get("region_overlay_sha256"),
                         "q16_handoff_sha256": options.get("q16_handoff_sha256"),
+                        "low_q_handoff_sha256": options.get("low_q_handoff_sha256"),
+                        "low_q_allow_failed_spread": options.get("low_q_allow_failed_spread", False),
                         "include_failed_outputless": options.get("include_failed_outputless", False),
                         "include_failed_final": options.get("include_failed_final", False),
                         "diagnostic_only": options.get("diagnostic_only", False)})

@@ -322,3 +322,54 @@ def test_registered_validation_still_refuses_diagnostic_wrapper(wrapper_evidence
     compass, _ = wrapper_evidence
     modelled = SimpleNamespace(manifest={"server": {"compass": compass}})
     assert "not a cc-traces acceptance cell" in validate.check_source_factory(modelled, 1, "fixture")[0]
+
+
+@pytest.mark.parametrize("damage", [None, "missing_read", "unregistered", "opt_in"])
+def test_low_query_diagnostic_contract_reopens_every_source(wrapper_evidence, tmp_path, damage):
+    from .test_low_query_prices import make_bundle
+    from atom.compass.core.loaded_input import manifest
+    from atom.compass.runtime.cache_region_oracle import source_cost_oracle
+
+    compass, registry = wrapper_evidence
+    options = compass["oracle_options"]
+    scope_sha = hashlib.sha256(Path(options["attention_scope"]).read_bytes()).hexdigest()
+    path, sha = make_bundle(tmp_path / "low_q", scope_sha, failed=True)
+    options.update(low_q_handoff=path, low_q_handoff_sha256=sha, low_q_allow_failed_spread=1)
+    oracle = source_cost_oracle(**options)
+    rank = manifest(oracle.compass_loaded_inputs)
+    rank["regions"] = oracle.compass_region_snapshot
+    compass["loaded_inputs"]["ranks"] = [rank]
+    provenance = {"kind": "source_calibration", "measured_at_tp": 1, "from_target_engine": False,
+                  "sources": [{"path": "/isolated/source.json", "sha256": "8" * 64}],
+                  "code": {"collector.py": "9" * 64}}
+    grouped = {}
+    for row in rank["inputs"]:
+        role = row["role"].removeprefix("oracle.")
+        option = ("low_q_handoff" if role.startswith("low_q_") else
+                  {"price_graph": "price", "q16_sources": "q16_handoff"}.get(role, role))
+        grouped.setdefault(option, {})[Path(row["path"]).name] = row["sha256"]
+        registry["artifacts"].append(dict(provenance, sha256=row["sha256"],
+                                          contents={Path(row["path"]).name: row["sha256"]}))
+    digests = {key: next(iter(files.values())) if len(files) == 1 else validate._rolled_digest(files)
+               for key, files in grouped.items()}
+    registry["artifacts"] += [dict(provenance, sha256=sha, contents=grouped[key])
+                              for key, sha in digests.items()]
+    compass.update(oracle_option_sha256=digests, oracle_option_files=grouped)
+    if damage == "missing_read":
+        rank["inputs"] = [row for row in rank["inputs"] if row["role"] != "oracle.low_q_validation"]
+    elif damage == "unregistered":
+        verdict_sha = next(row["sha256"] for row in rank["inputs"] if row["role"] == "oracle.low_q_validation")
+        registry["artifacts"] = [row for row in registry["artifacts"] if row["sha256"] != verdict_sha]
+    elif damage == "opt_in":
+        options["low_q_allow_failed_spread"] = 0
+    modelled = SimpleNamespace(manifest={"server": {"compass": compass, "tensor_parallel_size": 1}})
+    before = copy.deepcopy(modelled.manifest)
+    bad, notes = opening.check_source_contract(modelled, registry, "7" * 64, {}, "fixture")
+    if damage:
+        assert bad
+    else:
+        assert not bad
+        assert any("FAILED low-query heldout spread retained" in note for note in notes)
+        assert len(grouped["low_q_handoff"]) == 5
+        assert "not a cc-traces acceptance cell" in validate.check_source_factory(modelled, 1, "fixture")[0]
+    assert modelled.manifest == before

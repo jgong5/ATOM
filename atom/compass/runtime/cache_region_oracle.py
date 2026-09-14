@@ -112,6 +112,8 @@ def model_from_artifact(data, *, include_failed_outputless=False,
 def source_cost_oracle(*, region_overlay, region_overlay_sha256, regions,
                        include_failed_outputless=False, include_failed_final=False, diagnostic_only=False,
                        q16_handoff=None, q16_handoff_sha256=None,
+                       low_q_handoff=None, low_q_handoff_sha256=None,
+                       low_q_allow_failed_spread=False,
                        rank_coords=None, **options):
     """Build the existing source composition, then select a separate region object.
 
@@ -134,6 +136,8 @@ def source_cost_oracle(*, region_overlay, region_overlay_sha256, regions,
         raise ValueError("cached-prefill source scope requires rank zero")
     if bool(q16_handoff) != bool(q16_handoff_sha256):
         raise ValueError("q16 source handoff and its explicit SHA-256 are required together")
+    if bool(low_q_handoff) != bool(low_q_handoff_sha256):
+        raise ValueError("low-query source handoff and its explicit SHA-256 are required together")
     data, loaded = load_json(region_overlay, role="oracle.region_overlay")
     if loaded.sha256 != region_overlay_sha256:
         raise ValueError("region overlay differs from its explicit SHA-256")
@@ -161,5 +165,18 @@ def source_cost_oracle(*, region_overlay, region_overlay_sha256, regions,
             raise ValueError("q16 addition requires its pinned deployment request scope")
         base_inputs = len(result.library.loaded_inputs)
         result.library = CachedQ16Prices(result.library, q16_handoff, q16_handoff_sha256)
+        result.compass_loaded_inputs += result.library.loaded_inputs[base_inputs:]
+    if low_q_handoff:
+        from atom.compass.core.cost.low_query import LowQueryPrices
+
+        scopes = [entry for entry in result.library.loaded_inputs
+                  if entry.role == "oracle.attention_scope"]
+        if len(scopes) != 1:
+            raise ValueError("low-query addition requires one loaded deployment request scope")
+        base_inputs = len(result.library.loaded_inputs)
+        result.library = LowQueryPrices(result.library, low_q_handoff, low_q_handoff_sha256,
+            deployment_scope_sha256=scopes[0].sha256,
+            allow_failed_spread=_flag(low_q_allow_failed_spread, "low_q_allow_failed_spread"),
+            diagnostic_only=_flag(diagnostic_only, "diagnostic_only"))
         result.compass_loaded_inputs += result.library.loaded_inputs[base_inputs:]
     return result

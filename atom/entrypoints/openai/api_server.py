@@ -2650,6 +2650,11 @@ _ROLE_OPTIONS = {
     "oracle.dispatch_bands": "dispatch_bands",
     "oracle.region_overlay": "region_overlay",
     "oracle.q16_sources": "q16_handoff",
+    "oracle.low_q_sources": "low_q_handoff",
+    "oracle.low_q_plan": "low_q_handoff",
+    "oracle.low_q_reference_freeze": "low_q_handoff",
+    "oracle.low_q_validation": "low_q_handoff",
+    "oracle.low_q_live_abi": "low_q_handoff",
 }
 
 
