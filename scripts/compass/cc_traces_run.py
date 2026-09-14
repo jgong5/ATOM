@@ -46,6 +46,25 @@ inputs to the merge, which refuses to write a `costs.json` without them.
     python scripts/compass/cc_traces_run.py costs RESULTS/tp2_clients_large_c4 \
         --capture 412.0 --calibration 1980.0 --derivation 31.5 --load 96.0
 
+Pinned corpus cases use `diagnostic-side`, with their actual case name and
+manifest digest, rather than a registered short/large alias. For example:
+
+    python scripts/compass/cc_traces_run.py diagnostic-side \
+        --cell RESULTS/tp1_corpus_full_root_1493faff_v1_c1 --side real --tp 1 \
+        --case-id corpus_full_root_1493faff_v1 --workload "$CASE_WORKLOAD" \
+        --manifest "$CASE_MANIFEST" --manifest-sha256 "$CASE_MANIFEST_SHA256" \
+        --pretokenize --client-memory-budget-mib 4096 --plan-only
+
+Remove `--plan-only` to execute. Diagnostics default to one repeat, always carry
+diagnostic purpose, and preserve their emitter's source-validation provenance;
+the launcher does not independently prove corpus membership/completeness. Each
+side can run once in a case directory; repeated attempts need a fresh directory.
+A modelled oracle refusal in the current
+execution's fresh dump directory stops only its owned replay and returns exit
+5 with the marker hash, original exception text when present, and incomplete
+status. Runtime harness refusals remain exit 3; invalid CLI/case plans exit 2.
+No refusal is an acceptance result.
+
 No result is claimed by this file. It runs commands and writes down what they
 did, including when what they did was fail.
 """
@@ -106,6 +125,8 @@ def _core(name: str):
 compare = _load("compare")
 replay_client = _load("replay")
 plan_module = _load("cc_traces_plan")
+diagnostic_module = _load("cc_traces_diagnostic")
+refusal_module = _load("cc_traces_refusal")
 execution_id = _load("execution_id")
 isolation = _load("isolation")
 process_identity = _core("process_identity")
@@ -189,6 +210,7 @@ STOP_GRACE = 60.0
 #: `replay.py` exits 3 when it refuses: a warmed predictor, or a preparation it
 #: could not drain. A refusal is evidence, not an error to retry away.
 REFUSAL_EXIT = 3
+MODEL_REFUSAL_EXIT = 5
 
 #: The terms a cell's costs.json must carry; the four the harness cannot see
 #: are named separately so the message can say which is missing and why.
@@ -348,6 +370,23 @@ class Processes:
                 env=env,
             )
 
+    def run_observed(self, command, *, log: Path, observe, cwd=None, env=None):
+        """Stop only this replay handle when its execution produces a refusal."""
+        proc = self.start(command, log=log, cwd=cwd, env=env)
+        try:
+            while True:
+                refusal = observe()
+                if refusal is not None:
+                    code = self.stop(proc, grace=1.0)
+                    return {"exit": code, "pid": proc.pid, "model_refusal": refusal}
+                try:
+                    code = proc.wait(timeout=0.1)
+                    return {"exit": code, "pid": proc.pid, "model_refusal": observe()}
+                except subprocess.TimeoutExpired:
+                    pass
+        finally:
+            self.stop(proc, grace=1.0)
+
     def alive(self, proc) -> bool:
         return proc.poll() is None
 
@@ -439,7 +478,13 @@ class SideRun:
         #: because a test describing a held port must not need one held
         self.ports_in_use = ports_in_use
         #: acceptance or diagnostic, stamped into every record this run writes
-        self.purpose = purpose
+        self.diagnostic_case = cell_plan.get("diagnostic_case")
+        self.unregistered = cell_plan["class"] not in plan_module.CLASSES
+        self.purpose = (DIAGNOSTIC if self.unregistered or self.diagnostic_case is not None
+                        else purpose)
+        if ((self.unregistered or self.diagnostic_case is not None)
+                and diagnostic_module.registered_cell_name(self.cell.name)):
+            raise ValueError("corpus diagnostics cannot write into a registered cell directory")
         #: step id -> the handle we started, so nothing is signalled by name
         self.running: dict[str, dict] = {}
         #: repeat -> its execution record, minted when its process launched
@@ -448,6 +493,8 @@ class SideRun:
         self.failures: list[str] = []
         self.refused = False
         self.isolation_evidence = None
+        self.refusal_watches = {}
+        self.model_refusals = []
 
     # -- the pieces ------------------------------------------------------
 
@@ -519,14 +566,16 @@ class SideRun:
             "server_process": None,
             "artifacts": {},
         }
+        if step["id"] in self.refusal_watches:
+            record["refusal_watch"] = self.refusal_watches[step["id"]].description()
         self.executions[step["repeat"]] = record
         return record
 
     def _source(self, step) -> dict:
         """What this repeat was run *from*, with digests where there is a file."""
-        workload = ROOT / plan_module.workload(
-            self.plan["class"], self.plan["clients"]
-        )
+        planned = self.plan.get("workload")
+        workload = ROOT / (planned if planned is not None else plan_module.workload(
+            self.plan["class"], self.plan["clients"]))
         command = step["command"]
         target = None
         if "--compass-replay-target" in command:
@@ -543,7 +592,9 @@ class SideRun:
         )
         return {
             "workload": str(workload),
-            "workload_sha256": (file_digest(workload) or {}).get("sha256"),
+            "workload_sha256": (self.diagnostic_case["workload_sha256"] if self.diagnostic_case
+                                else (file_digest(workload) or {}).get("sha256")),
+            **({"diagnostic_case": self.diagnostic_case} if self.diagnostic_case else {}),
             "replay_target": target,
             "replay_target_sha256": (
                 (file_digest(Path(target)) or {}).get("sha256") if target else None
@@ -675,14 +726,21 @@ class SideRun:
         env["ATOM_COMPASS_DERIVATION_LOG"] = str(
             self.cell / f"derivation.{self.side}.r{step['repeat']}.jsonl")
         # Preserve the exact graph and shape when prediction refuses a step.
-        env.setdefault(
-            "COMPASS_REFUSAL_DUMP",
-            str(self.cell / "refusals" / f"{self.side}.r{step['repeat']}"),
-        )
+        if self.diagnostic_case:
+            watch = refusal_module.RefusalWatch.create(self.cell, self.side, step["repeat"])
+            self.refusal_watches[step["id"]] = watch
+            env["COMPASS_REFUSAL_DUMP"] = str(watch.directory)
+        else:
+            env.setdefault(
+                "COMPASS_REFUSAL_DUMP",
+                str(self.cell / "refusals" / f"{self.side}.r{step['repeat']}"),
+            )
         return env
 
     def _serve(self, step) -> bool:
         """Start this repeat's server, wait for health, read what it is."""
+        if not self._check_diagnostic_case(step):
+            return False
         # Only another server: the sampler is meant to outlive every repeat,
         # and counting it here would refuse the run it exists to watch.
         servers = [
@@ -1032,6 +1090,8 @@ class SideRun:
 
     def _replay(self, step) -> bool:
         """This repeat's replay, against the server this repeat started."""
+        if not self._check_diagnostic_case(step):
+            return False
         serve_id = f"serve-{self.side}-{step['repeat']}"
         held = self.running.get(serve_id)
         if held is None:
@@ -1040,11 +1100,19 @@ class SideRun:
             return False
         execution = held["execution"]
         started_at, started = self.wall(), self.now()
-        code = self.processes.run(step["command"], log=self._log(step))
+        watch = self.refusal_watches.get(serve_id)
+        refusal, replay_pid = None, held["pid"]
+        if watch is not None:
+            observed = self.processes.run_observed(
+                step["command"], log=self._log(step), observe=watch.read)
+            code, replay_pid = observed["exit"], observed["pid"]
+            refusal = observed["model_refusal"]
+        else:
+            code = self.processes.run(step["command"], log=self._log(step))
         seconds = self.now() - started
         alive = self.processes.alive(held["proc"])
         execution["replay"] = {
-            "pid": held["pid"],
+            "pid": replay_pid,
             "command": list(step["command"]),
             "log": str(self._log(step)),
             "started_at": started_at,
@@ -1054,12 +1122,25 @@ class SideRun:
         }
         entry = self._record(
             step,
-            pid=held["pid"],
+            pid=replay_pid,
             execution_id=execution["execution_id"],
             exit=code,
             seconds=seconds,
             ok=code == 0 and alive,
         )
+        if refusal is not None:
+            execution["model_refusal"] = refusal
+            execution["replay"].update(outcome="model_refusal", incomplete=True)
+            marker = Path(refusal["path"])
+            execution["artifacts"][str(marker.relative_to(self.cell.resolve()))] = {
+                "sha256": refusal["sha256"], "bytes": refusal["bytes"]}
+            self.model_refusals.append({"execution_id": execution["execution_id"], **refusal})
+            entry.update(ok=False, model_refusal=refusal, incomplete=True)
+            self.failures.append(
+                f"{step['id']}: model refusal; replay incomplete: "
+                f"{refusal['exception_text'] or refusal['kind']} ({refusal['path']})")
+            self._stamp_diagnostic_failure(step, execution)
+            return False
         if code == REFUSAL_EXIT:
             self.refused = True
             entry["refusal"] = True
@@ -1067,17 +1148,20 @@ class SideRun:
                 f"{step['id']}: the replay refused this run (exit 3); see "
                 f"{self._log(step)}. A refusal is the result, not a retry."
             )
+            self._stamp_diagnostic_failure(step, execution)
             return False
         if code != 0:
             self.failures.append(
                 f"{step['id']}: the replay exited {code}; see {self._log(step)}"
             )
+            self._stamp_diagnostic_failure(step, execution)
             return False
         if not alive:
             self.failures.append(
                 f"{step['id']}: the server died during the replay, so the "
                 f"artifact covers a run that did not finish being served"
             )
+            self._stamp_diagnostic_failure(step, execution)
             return False
         return self._check_artifact(step, entry, execution)
 
@@ -1094,6 +1178,11 @@ class SideRun:
             return False
         manifest = blob.get("run") or {}
         bad = []
+        if self.diagnostic_case:
+            try:
+                diagnostic_module.check_result(blob, self.diagnostic_case)
+            except (ValueError, TypeError, KeyError) as exc:
+                bad.append(str(exc))
         try:
             window = replay_client.read_wall_window(manifest.get("wall_execution"))
             process = execution.get("replay") or {}
@@ -1218,6 +1307,7 @@ class SideRun:
         for reason in bad:
             self.failures.append(f"{step['id']}: {reason}")
         if bad:
+            self._stamp_diagnostic_failure(step, execution)
             return False
         self._stamp(path, blob, execution)
         for name in (
@@ -1240,9 +1330,51 @@ class SideRun:
         # Beyond the canonical identity fields, which the runtime package owns:
         # what the run was for, so a reader holding only this file can tell.
         stamp["purpose"] = execution.get("purpose", ACCEPTANCE)
+        case = (execution.get("source") or {}).get("diagnostic_case")
+        if case:
+            stamp["diagnostic_case"] = case
+        if execution.get("model_refusal"):
+            stamp["model_refusal"] = execution["model_refusal"]
+            stamp["incomplete"] = True
         blob["execution"] = stamp
         path.write_text(json.dumps(blob, indent=1) + "\n")
         execution["artifacts"][path.name] = file_digest(path)
+
+    def _stamp_diagnostic_failure(self, step, execution):
+        """Keep diagnostic identity on failed JSON outcomes, without accepting them."""
+        if not self.diagnostic_case:
+            return
+        path = self.cell / f"{self.side}.r{step['repeat']}.json"
+        try:
+            blob = json.loads(path.read_text())
+        except (OSError, ValueError):
+            return
+        if not isinstance(blob, dict):
+            return
+        previous = (blob.get("execution") or {}).get("execution_id")
+        if previous and previous != execution["execution_id"]:
+            return  # A stale outcome must not be relabelled as this execution.
+        self._stamp(path, blob, execution)
+
+    def _check_diagnostic_case(self, step=None):
+        if not self.unregistered and self.diagnostic_case is None:
+            return True
+        try:
+            case = self.diagnostic_case
+            if not case:
+                raise ValueError("unregistered workloads require an explicit pinned diagnostic case")
+            if (self.plan["class"] != case["case_id"] or self.plan["clients"] != case["clients"]
+                    or Path(self.plan["workload"]).resolve() != Path(case["workload"])
+                    or self.cell.name != f"tp{self.plan['tp']}_{case['case_id']}_c{case['clients']}"):
+                raise ValueError("diagnostic plan identity disagrees with its pinned case")
+            diagnostic_module.recheck(case)
+        except (OSError, ValueError, TypeError, KeyError) as exc:
+            self.refused = True
+            self.failures.append(f"diagnostic case refused: {exc}")
+            if step is not None:
+                self._record(step, ok=False, reason=str(exc))
+            return False
+        return True
 
     def _stop(self, step) -> bool:
         """End exactly the process the named step started, by its own handle."""
@@ -1485,9 +1617,35 @@ class SideRun:
 
     def run(self) -> int:
         """Every step of this side. Stops at the first failure, cleans up."""
+        if self.unregistered or self.diagnostic_case is not None:
+            existing = list(self.cell.glob(f"execution.{self.side}.r*.json"))
+            existing += list(self.cell.glob(f"{self.side}.r*.json"))
+            if existing or (self.cell / f"run.{self.side}.json").exists():
+                self.refused = True
+                self.failures.append("diagnostic side already has evidence; use a fresh case directory")
+                return REFUSAL_EXIT
         self.cell.mkdir(parents=True, exist_ok=True)
         try:
-            for step in self.steps():
+            valid_case = self._check_diagnostic_case()
+            if valid_case and self.diagnostic_case:
+                lock = self.cell / "diagnostic_case.json"
+                try:
+                    previous = json.loads(lock.read_text()) if lock.exists() else None
+                    different = (previous is not None and diagnostic_module.identity(previous)
+                                 != diagnostic_module.identity(self.diagnostic_case))
+                except (OSError, ValueError) as exc:
+                    self.refused = True
+                    self.failures.append(f"diagnostic case lock is unreadable: {exc}")
+                    valid_case = False
+                    previous = None
+                    different = False
+                if different:
+                    self.refused = True
+                    self.failures.append("diagnostic case directory already belongs to different pins")
+                    valid_case = False
+                elif valid_case and not lock.exists():
+                    lock.write_text(json.dumps(self.diagnostic_case, indent=1) + "\n")
+            for step in self.steps() if valid_case else []:
                 role = step["role"]
                 if role == "serve":
                     ok = self._serve(step)
@@ -1506,6 +1664,8 @@ class SideRun:
         if not self.failures:
             self._write_costs()
         self._write_journal()
+        if self.model_refusals:
+            return MODEL_REFUSAL_EXIT
         if self.refused:
             return REFUSAL_EXIT
         return 1 if self.failures else 0
@@ -1542,6 +1702,7 @@ class SideRun:
                     "cell": str(self.cell),
                     "side": self.side,
                     "purpose": self.purpose,
+                    **({"diagnostic_case": self.diagnostic_case} if self.diagnostic_case else {}),
                     "host": self.host,
                     "tp": self.plan["tp"],
                     "class": self.plan["class"],
@@ -1553,6 +1714,8 @@ class SideRun:
                     "executions": [self.executions[n] for n in sorted(self.executions)],
                     "refused": self.refused,
                     "failures": list(self.failures),
+                    **({"model_refusals": self.model_refusals, "incomplete": True}
+                       if self.model_refusals else {}),
                     "steps": self.journal,
                 },
                 indent=1,
@@ -1689,11 +1852,7 @@ def _median(values):
 def _cell_plan(args) -> dict:
     """This cell's steps, from the plan both sides read."""
     cell = Path(args.cell).resolve()
-    built = plan_module.cell_steps(
-        args.tp,
-        args.klass,
-        args.clients,
-        root=str(cell.parent),
+    options = dict(
         oracle=getattr(args, "oracle", None),
         options=getattr(args, "oracle_option", ()) or (),
         port=args.port,
@@ -1701,13 +1860,21 @@ def _cell_plan(args) -> dict:
         repeats=args.repeats,
         target=getattr(args, "replay_target", None),
         memory_model=getattr(args, "memory_model", None),
-        corpus=getattr(args, "corpus", None) or "$CC_TRACES_CORPUS",
         request_timeout=getattr(args, "request_timeout", plan_module.REQUEST_TIMEOUT),
         pretokenize=getattr(args, "pretokenize", False),
         allow_advisory_isolation=getattr(args, "allow_advisory_isolation", False),
         request_readiness_profile=getattr(args, "compass_request_readiness_profile", ""),
         prefill_preparation_fence=getattr(args, "compass_prefill_preparation_fence", False),
+        client_memory_budget_mib=getattr(args, "client_memory_budget_mib", None),
     )
+    if getattr(args, "diagnostic", False):
+        case = diagnostic_module.load_case(
+            args.workload, args.manifest, args.manifest_sha256, args.case_id,
+            target_model=plan_module.MODEL)
+        return plan_module.diagnostic_steps(args.tp, case, cell=str(cell), **options)
+    built = plan_module.cell_steps(
+        args.tp, args.klass, args.clients, root=str(cell.parent),
+        corpus=getattr(args, "corpus", None) or "$CC_TRACES_CORPUS", **options)
     if Path(built["cell"]).name != cell.name:
         raise SystemExit(
             f"--cell {cell.name} is not tp{args.tp}_{args.klass}_c"
@@ -1779,7 +1946,15 @@ def side(args) -> int:
         getattr(args, "purpose", ACCEPTANCE),
         getattr(args, "repeats", plan_module.REPEATS),
     )
-    runner = SideRun(_cell_plan(args), args.side, purpose=purpose)
+    try:
+        planned = _cell_plan(args)
+    except (OSError, ValueError, TypeError, KeyError) as exc:
+        print(f"case plan refused: {exc}", file=sys.stderr)
+        return 2
+    if getattr(args, "plan_only", False):
+        print(json.dumps(planned, indent=1))
+        return 0
+    runner = SideRun(planned, args.side, purpose=purpose)
     code = runner.run()
     for reason in runner.failures:
         print(reason, file=sys.stderr)
@@ -2184,14 +2359,44 @@ def costs(args) -> int:
     return 0
 
 
+def _add_side_options(parser):
+    parser.add_argument("--cell", required=True)
+    parser.add_argument("--side", required=True, choices=("real", "modelled"))
+    parser.add_argument("--tp", type=int, required=True)
+    parser.add_argument("--repeats", type=int, default=plan_module.REPEATS)
+    parser.add_argument("--request-timeout", type=float, default=plan_module.REQUEST_TIMEOUT,
+                   help="per-request transport deadline in seconds; not an SLO gate")
+    parser.add_argument("--pretokenize", action="store_true",
+                   help="encode prompts inside the measured window before pacing")
+    parser.add_argument("--allow-advisory-isolation", action="store_true",
+                   help=plan_module.ADVISORY_ISOLATION_QUALIFICATION)
+    plan_module.add_modelled_timing_arguments(parser)
+    parser.add_argument(
+        "--port",
+        type=int,
+        default=plan_module.PORT,
+        help="the HTTP listener this cell's servers bind (--server-port)",
+    )
+    parser.add_argument(
+        "--engine-port",
+        type=int,
+        default=plan_module.ENGINE_PORT,
+        help="the engine's internal rendezvous port, a different socket",
+    )
+    parser.add_argument("--oracle", default=None)
+    parser.add_argument("--oracle-option", action="append", default=[])
+    parser.add_argument("--replay-target", default=None)
+    parser.add_argument("--memory-model", default=None)
+    parser.add_argument("--client-memory-budget-mib", type=int, default=None,
+                        help="explicit replay client memory planning budget")
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description=__doc__)
     sub = ap.add_subparsers(dest="cmd", required=True)
 
-    s = sub.add_parser("side", help="run one side of one cell")
-    s.add_argument("--cell", required=True)
-    s.add_argument("--side", required=True, choices=("real", "modelled"))
-    s.add_argument("--tp", type=int, required=True)
+    s = sub.add_parser("side", help="run one side of one registered cell")
+    _add_side_options(s)
     s.add_argument(
         "--class", dest="klass", required=True, choices=plan_module.CLASSES
     )
@@ -2202,30 +2407,6 @@ def main(argv=None) -> int:
         choices=plan_module.CLIENTS,
         help="root sessions offered, which is this cell's registered workload",
     )
-    s.add_argument("--repeats", type=int, default=plan_module.REPEATS)
-    s.add_argument("--request-timeout", type=float, default=plan_module.REQUEST_TIMEOUT,
-                   help="per-request transport deadline in seconds; not an SLO gate")
-    s.add_argument("--pretokenize", action="store_true",
-                   help="encode prompts inside the measured window before pacing")
-    s.add_argument("--allow-advisory-isolation", action="store_true",
-                   help=plan_module.ADVISORY_ISOLATION_QUALIFICATION)
-    plan_module.add_modelled_timing_arguments(s)
-    s.add_argument(
-        "--port",
-        type=int,
-        default=plan_module.PORT,
-        help="the HTTP listener this cell's servers bind (--server-port)",
-    )
-    s.add_argument(
-        "--engine-port",
-        type=int,
-        default=plan_module.ENGINE_PORT,
-        help="the engine's internal rendezvous port, a different socket",
-    )
-    s.add_argument("--oracle", default=None)
-    s.add_argument("--oracle-option", action="append", default=[])
-    s.add_argument("--replay-target", default=None)
-    s.add_argument("--memory-model", default=None)
     s.add_argument("--corpus", default=None)
     s.add_argument(
         "--purpose",
@@ -2237,7 +2418,16 @@ def main(argv=None) -> int:
             "built from them however the directory is named"
         ),
     )
-    s.set_defaults(func=side)
+    s.set_defaults(func=side, diagnostic=False)
+
+    d = sub.add_parser("diagnostic-side", help="run a pinned corpus diagnostic without a matrix alias")
+    _add_side_options(d)
+    d.add_argument("--case-id", required=True)
+    d.add_argument("--workload", required=True)
+    d.add_argument("--manifest", required=True)
+    d.add_argument("--manifest-sha256", required=True)
+    d.add_argument("--plan-only", action="store_true", help="print verified argv and identity without starting processes")
+    d.set_defaults(func=side, diagnostic=True, purpose=DIAGNOSTIC, repeats=1)
 
     c = sub.add_parser("costs", help="merge the cell's cost terms")
     c.add_argument("cell")

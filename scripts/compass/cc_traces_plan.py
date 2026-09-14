@@ -361,7 +361,11 @@ def _replay(
     klass: str, clients: int, out: str, *, paced: bool, prepare: int, port: int,
     request_timeout: float = REQUEST_TIMEOUT,
     pretokenize: bool = False,
+    workload_path: str | None = None,
+    client_memory_budget_mib: int | None = None,
 ):
+    if client_memory_budget_mib is not None and client_memory_budget_mib <= 0:
+        raise SystemExit("client memory budget must be positive")
     cmd = [
         "python",
         "scripts/compass/replay.py",
@@ -370,13 +374,17 @@ def _replay(
         "--model",
         MODEL,
         "--trace",
-        workload(klass, clients),
+        workload(klass, clients) if workload_path is None else workload_path,
         "--out",
         out,
         "--check-lengths",
         "--timeout",
         str(request_timeout),
     ]
+    if workload_path is not None:
+        cmd += ["--num-requests", "0"]
+    if client_memory_budget_mib is not None:
+        cmd += ["--client-memory-budget-mib", str(client_memory_budget_mib)]
     if pretokenize:
         cmd += ["--pretokenize"]
     if paced:
@@ -412,6 +420,8 @@ def _lifecycle(
     request_timeout: float = REQUEST_TIMEOUT,
     pretokenize: bool = False,
     engine_args=None,
+    workload_path: str | None = None,
+    client_memory_budget_mib: int | None = None,
 ):
     """One repeat: its own server, its replay, and the end of that process."""
     modelled = side == "modelled"
@@ -477,6 +487,8 @@ def _lifecycle(
                 port=port,
                 request_timeout=request_timeout,
                 pretokenize=pretokenize,
+                workload_path=workload_path,
+                client_memory_budget_mib=client_memory_budget_mib,
             ),
             "produces": (
                 [f"{side}.r{n}.json"]
@@ -504,6 +516,98 @@ def _lifecycle(
     ]
 
 
+def _real_monitoring_steps(cell, allow_advisory_isolation):
+    """The same baseline, window sampler and isolation audit for any workload."""
+    before = [
+        {
+            "id": "sample-baseline",
+            "role": "command",
+            "side": "real",
+            "where": "gpu",
+            "why": (
+                "the one sample that can show a card was already somebody "
+                "else's: after our server starts, every byte on our cards is "
+                "ours"
+            ),
+            "command": [
+                "python",
+                "scripts/compass/gpu_sampler.py",
+                f"{cell}/gpu.jsonl",
+                "--once",
+                "--phase",
+                "baseline",
+            ],
+            "produces": ["gpu.jsonl"],
+        },
+        {
+            "id": "sample",
+            "role": "sample",
+            "side": "real",
+            "where": "gpu",
+            "why": "isolation is a property of the whole window, not of two instants",
+            "command": [
+                "python",
+                "scripts/compass/gpu_sampler.py",
+                f"{cell}/gpu.jsonl",
+                "--interval",
+                str(SAMPLE_INTERVAL),
+                "--phase-file",
+                f"{cell}/phase.json",
+            ],
+            "background": True,
+            "produces": ["gpu.jsonl"],
+        },
+    ]
+    after = [
+        {
+            "id": "stop-sample",
+            "role": "stop",
+            "side": "real",
+            "where": "gpu",
+            "stops": "sample",
+            "why": "the window the audit covers ends with the last real repeat",
+            "command": None,
+            "provided_by": "the run harness, by signalling the sampler it started",
+            "produces": [],
+        },
+        {
+            "id": "isolation",
+            "role": "command",
+            "side": "real",
+            "where": "cpu",
+            "why": "who else was on the node while this was measured",
+            "command": [
+                "python",
+                "scripts/compass/isolation.py",
+                f"{cell}/gpu.jsonl",
+                "--json",
+                f"{cell}/isolation.json",
+            ] + (["--allow-busy-node"] if allow_advisory_isolation else []),
+            "qualification": (ADVISORY_ISOLATION_QUALIFICATION
+                              if allow_advisory_isolation else None),
+            "produces": ["isolation.json"],
+        },
+    ]
+    return before, after
+
+
+def _gpu_free_step(cell):
+    return {
+        "id": "gpu-free",
+        "role": "command",
+        "side": "modelled",
+        "where": "device_free",
+        "why": "the device-free claim, observed in the container that made the prediction",
+        "command": [
+            "python",
+            "scripts/compass/cc_traces_validate.py",
+            "gpu-free",
+            cell,
+        ],
+        "produces": ["gpu_free.json"],
+    }
+
+
 def cell_steps(
     tp: int,
     klass: str,
@@ -523,6 +627,7 @@ def cell_steps(
     allow_advisory_isolation: bool = False,
     request_readiness_profile: str = "",
     prefill_preparation_fence: bool = False,
+    client_memory_budget_mib: int | None = None,
 ):
     """Every step of one cell, in the order it has to happen."""
     if port == engine_port:
@@ -579,45 +684,9 @@ def cell_steps(
             ],
             "produces": [],
         },
-        {
-            "id": "sample-baseline",
-            "role": "command",
-            "side": "real",
-            "where": "gpu",
-            "why": (
-                "the one sample that can show a card was already somebody "
-                "else's: after our server starts, every byte on our cards is "
-                "ours"
-            ),
-            "command": [
-                "python",
-                "scripts/compass/gpu_sampler.py",
-                f"{cell}/gpu.jsonl",
-                "--once",
-                "--phase",
-                "baseline",
-            ],
-            "produces": ["gpu.jsonl"],
-        },
-        {
-            "id": "sample",
-            "role": "sample",
-            "side": "real",
-            "where": "gpu",
-            "why": "isolation is a property of the whole window, not of two instants",
-            "command": [
-                "python",
-                "scripts/compass/gpu_sampler.py",
-                f"{cell}/gpu.jsonl",
-                "--interval",
-                str(SAMPLE_INTERVAL),
-                "--phase-file",
-                f"{cell}/phase.json",
-            ],
-            "background": True,
-            "produces": ["gpu.jsonl"],
-        },
     ]
+    before, after = _real_monitoring_steps(cell, allow_advisory_isolation)
+    steps += before
     for n in range(1, repeats + 1):
         steps += _lifecycle(
             "real",
@@ -635,37 +704,9 @@ def cell_steps(
             memory_model=None,
             request_timeout=request_timeout,
             pretokenize=pretokenize,
+            client_memory_budget_mib=client_memory_budget_mib,
         )
-    steps += [
-        {
-            "id": "stop-sample",
-            "role": "stop",
-            "side": "real",
-            "where": "gpu",
-            "stops": "sample",
-            "why": "the window the audit covers ends with the last real repeat",
-            "command": None,
-            "provided_by": "the run harness, by signalling the sampler it started",
-            "produces": [],
-        },
-        {
-            "id": "isolation",
-            "role": "command",
-            "side": "real",
-            "where": "cpu",
-            "why": "who else was on the node while this was measured",
-            "command": [
-                "python",
-                "scripts/compass/isolation.py",
-                f"{cell}/gpu.jsonl",
-                "--json",
-                f"{cell}/isolation.json",
-            ] + (["--allow-busy-node"] if allow_advisory_isolation else []),
-            "qualification": (ADVISORY_ISOLATION_QUALIFICATION
-                              if allow_advisory_isolation else None),
-            "produces": ["isolation.json"],
-        },
-    ]
+    steps += after
     for n in range(1, repeats + 1):
         steps += _lifecycle(
             "modelled",
@@ -683,24 +724,12 @@ def cell_steps(
             memory_model=memory_model,
             request_timeout=request_timeout,
             pretokenize=pretokenize,
+            client_memory_budget_mib=client_memory_budget_mib,
             engine_args=_modelled_engine_args(
                 tp, request_readiness_profile, prefill_preparation_fence),
         )
     steps += [
-        {
-            "id": "gpu-free",
-            "role": "command",
-            "side": "modelled",
-            "where": "device_free",
-            "why": "the device-free claim, observed in the container that made the prediction",
-            "command": [
-                "python",
-                "scripts/compass/cc_traces_validate.py",
-                "gpu-free",
-                cell,
-            ],
-            "produces": ["gpu_free.json"],
-        },
+        _gpu_free_step(cell),
         {
             "id": "costs",
             "role": "command",
@@ -762,6 +791,54 @@ def cell_steps(
     }
 
 
+def diagnostic_steps(
+    tp, case, *, cell, oracle, options, port, repeats=1,
+    engine_port=ENGINE_PORT, target=None, memory_model=None,
+    request_timeout=REQUEST_TIMEOUT, pretokenize=False,
+    allow_advisory_isolation=False, request_readiness_profile="",
+    prefill_preparation_fence=False, client_memory_budget_mib=None,
+):
+    """Execute a pinned case through the same lifecycle, without a matrix alias."""
+    klass, clients = case["case_id"], case["clients"]
+    if klass in CLASSES or klass in ("short", "long"):
+        raise SystemExit("a corpus diagnostic cannot alias a registered class")
+    if Path(cell).name != f"tp{tp}_{klass}_c{clients}":
+        raise SystemExit(f"diagnostic --cell must end in tp{tp}_{klass}_c{clients}")
+    if port == engine_port:
+        raise SystemExit("HTTP listener and engine rendezvous need different ports")
+    if not math.isfinite(request_timeout) or request_timeout <= 0 or repeats < 1:
+        raise SystemExit("diagnostic repeats and request timeout must be positive")
+    before, after = _real_monitoring_steps(cell, allow_advisory_isolation)
+    steps = before
+    for side in ("real", "modelled"):
+        modelled = side == "modelled"
+        for n in range(1, repeats + 1):
+            steps += _lifecycle(
+                side, n, tp=tp, klass=klass, clients=clients, cell=cell,
+                where="device_free" if modelled else "gpu", port=port,
+                engine_port=engine_port, oracle=oracle if modelled else None,
+                options=options if modelled else (), target=target if modelled else None,
+                memory_model=memory_model if modelled else None,
+                request_timeout=request_timeout, pretokenize=pretokenize,
+                workload_path=case["workload"], client_memory_budget_mib=client_memory_budget_mib,
+                engine_args=(_modelled_engine_args(tp, request_readiness_profile,
+                                                   prefill_preparation_fence)
+                             if modelled else None),
+            )
+        if not modelled:
+            steps += after
+    steps.append(_gpu_free_step(cell))
+    return {
+        "cell": cell, "tp": tp, "class": klass, "clients": clients,
+        "workload": case["workload"], "diagnostic_case": case,
+        "purpose": "diagnostic", "request_timeout": request_timeout,
+        "allow_advisory_isolation": bool(allow_advisory_isolation),
+        "isolation_qualification": (ADVISORY_ISOLATION_QUALIFICATION
+                                    if allow_advisory_isolation else None),
+        "steps": steps,
+    }
+
+
 def build(args) -> dict:
     # Resolved per width, not once: what is handed over on the command line
     # overrides the registry, and neither can cover a width it was not named
@@ -787,6 +864,7 @@ def build(args) -> dict:
             allow_advisory_isolation=getattr(args, "allow_advisory_isolation", False),
             request_readiness_profile=getattr(args, "compass_request_readiness_profile", ""),
             prefill_preparation_fence=getattr(args, "compass_prefill_preparation_fence", False),
+            client_memory_budget_mib=getattr(args, "client_memory_budget_mib", None),
         )
         for tp in TPS
         for klass in CLASSES
@@ -936,6 +1014,8 @@ def main(argv=None) -> int:
     ap.add_argument("--repeats", type=int, default=REPEATS)
     ap.add_argument("--request-timeout", type=float, default=REQUEST_TIMEOUT,
                     help="per-request transport deadline in seconds; not an SLO gate")
+    ap.add_argument("--client-memory-budget-mib", type=int, default=None,
+                    help="explicit replay client memory planning budget")
     ap.add_argument("--pretokenize", action="store_true",
                     help="encode prompts inside each measured window before pacing, on both sides")
     ap.add_argument("--allow-advisory-isolation", action="store_true",
