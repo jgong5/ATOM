@@ -7,46 +7,97 @@ without calling a missed 5x target a pass; `cc_traces_validate.py matrix
 --speed-advisory` records this policy explicitly. Existing strict protocol
 registrations and their historical verdicts remain unchanged.
 
-**2026-09-14 checkpoint: one verified paired cc-traces cell.** The frozen
-`tp1_clients_short_c1` candidate at commit `2feea392` completed three fresh
-real runs and three fresh GPU-free modelled runs, preserving both registered
-requests in every repeat. The combined validator reports `accepted=true`,
-`passed=true`, and no failures. Independent review reproduced all three pairs
-from their raw artifacts and reproduced the final verdict.
+**2026-09-14 checkpoint: four paired cc-traces cells pass the current
+aggregate checks.** The three TP1 cells use the frozen candidate at commit
+`2feea392`; the first TP2 cell uses `8a637eff`. Each has three fresh real and
+three fresh GPU-free modelled runs. Independent review reproduced aggregate
+metrics, per-rank memory, exact requests, provenance, process identities, derivation accounting and
+sampler coverage from the raw artifacts. Each combined validator reports
+`accepted=true`, `passed=true`, and no failures under the current contract.
 
-| First-cell comparison | Observed error | Registered tolerance |
-| --- | --- | --- |
-| Throughput | −3.542386% | 10% |
-| TPOT | +4.475799% | 10% |
-| TTFT | +9.796520% | 15% |
-| Eight non-KV memory components | maximum 0.035462% | 10% per component |
-| KV blocks | 112,772 real / 112,773 modelled; 0.000887% | 5% |
+| Paired cell | Requests per repeat | Throughput error | TTFT median error | TPOT median error |
+| --- | --- | --- | --- | --- |
+| `tp1_clients_short_c1` | 2 | −3.542386% | +9.796520% | +4.475799% |
+| `tp1_clients_short_c2` | 4 | −3.067558% | +3.686786% | +3.270906% |
+| `tp1_clients_large_c1` | 7 | −6.113405% | +12.660296% | +5.035067% |
+| `tp2_clients_short_c1` | 2 | −6.742557% | +3.791065% | +6.445119% |
 
-**Scope: 1 of 24 positive cells has passing accuracy and memory evidence;
-23 remain.** The configuration-selection matrix, cross-configuration transfer
-and ranking gates are not complete. G3c retains its separate frozen negative
-cc-traces witness below. The earlier v1 sampler failure and failed source and
-serving predictions remain historical failures.
+The registered aggregate tolerances are 10% throughput, 15% TTFT and 10%
+TPOT. All eight non-KV components were compared on every rank in every
+repeat. TP1 maximum component error is **0.035461%**; TP2 maximum is
+**7.859768%**, both within 10%. TP1 has **112,772 real / 112,773 modelled KV
+blocks** (**0.000887%** error). Both TP2 ranks have **265,540 real / 266,768
+modelled blocks** (**0.462454%** error), within the 5% bar.
 
-**Shared-node qualification:** the assigned GPU was clean (`own_clean=true`),
-with 113 sampler observations spanning launch through server exit. Foreign
-jobs elsewhere leave the isolation verdict `node_busy`, so timing results
-remain advisory. The separate post-teardown check confirms the assigned GPU
-returned to its idle baseline and the owned processes and experiment ports
-were released. The original closing sample is retained alongside that later
-settling observation.
+**Short-c2 tail/admission discrepancy remains open.** Its median-based gates
+pass, while p90 TTFT is **+30.164484%** and p90 TPOT is **−10.013389%**. These
+tail diagnostics exceed the corresponding 15% and 10% bars and remain
+separate from the passing medians. The admission/tail difference still needs
+an explanation; no coefficient or threshold was changed to hide it.
+Large-c1 p90 TTFT is **+12.261761%** and p90 TPOT **+8.321208%**, within those
+bars; its per-repeat median and p90 comparisons also remain inside.
 
-The replay speed ratio is **1.36249×**, below the advisory 5× target. Startup,
-execution and derivation windows are recorded; full historical capture and
-calibration durations and a separate load duration remain unknown, so full
-acquisition amortisation is not established.
+**Scope: 4 of 24 positive cells pass the current aggregate and memory
+checks; 20 remain.** All eight TP1 modelled cells have completed three fresh
+repeats without refusals. Five of those TP1 cells still need paired real
+evidence. The first TP2 cell establishes one E2E transfer result; broader
+configuration selection, transfer and ranking remain incomplete. The short-c2
+tail discrepancy is not closed by this count. G3c retains its separate frozen negative cc-traces
+witness below. Earlier sampler, source and serving failures remain preserved.
 
-Combined evidence is in the local `jgong5_compass_cpu` stage at
+**Shared-node qualification:** all four assigned-device audits report
+`own_clean=true`, with 113, 115, 305 and 90 sampler observations respectively
+covering launch through final server exit. Foreign jobs elsewhere leave the
+isolation verdict `node_busy`, so timing results remain advisory. Closing
+samples and later release observations remain separate evidence; the first
+cell's original closing sample and subsequent idle-baseline check are intact.
+TP2 also observed neighbour activity up to 51%. Its final sample covers server
+exit and still reported 72% VRAM on GPU4. Separate allocation
+release and process-identity checks found no live original process; three
+defunct children without file descriptors remain recorded. New foreign GPU
+work after release is separate from the accepted timing window; no idle-node
+claim is made.
+Local modelled-lane and bounded factory-check overlap is disclosed in
+`codex_tp1_remaining_v1/LOCAL_CPU_OVERLAP_DISCLOSURE.json`.
+
+Replay ratios are **1.36249×**, **1.30190×**, **2.29158×** and **0.61627×**,
+respectively, below the advisory 5× target. Startup, execution and derivation windows are
+recorded. Full historical capture/calibration durations and a separate load
+duration remain unknown, so acquisition amortisation is not established.
+
+The first-cell evidence remains in the local `jgong5_compass_cpu` stage at
 `/workspace/ATOM/agent_scratch/codex_tp1_first_pair_v2/`.
 `results/tp1_clients_short_c1/cc_traces_cell.json` has SHA256
 `9f1b5ce16cf68ec658520a48f1a0f055f65e9d2664b53b27a624e9b5d6924a23`.
 `FIRST_CELL_EXECUTION_REVIEW.json` records the execution qualification;
-`CLOSE_AFTER_RUN.json` preserves the separate release check.
+`INDEPENDENT_FIRST_CELL_REVIEW.json` preserves the accepted independent review,
+and `CLOSE_AFTER_RUN.json` preserves the separate release check.
+The two continuation cells are under
+`/workspace/ATOM/agent_scratch/codex_tp1_remaining_v1/results/`.
+Their `cc_traces_cell.json` hashes are
+`883f8d992b262b17bd19fd042239a114d2648613e78f8344b3592e37162d6dd6`
+for `tp1_clients_short_c2` and
+`70400e1aab1f43b1d592cc7a061271d5050fdb6026fb07f8e6f4885b6985410a`
+for `tp1_clients_large_c1`. The adjacent execution reviews retain the p90
+diagnostics; `TP1_CONTINUATION_COMPLETION.json` records modelled completion.
+
+**First TP2 E2E transfer cell verified.** The frozen `8a637eff` candidate's
+three real/modelled pairs preserve both registered requests and pass all
+48 non-KV component and six KV comparisons. Non-Torch memory is
+**7,417,626,624 B observed / 6,834,618,368 B predicted** on both ranks in all
+repeats, a 556 MiB underprediction within the 10% component bar. The primer's
+transient 7.74 GiB reading did not persist; no calibration was changed to
+absorb either observation.
+
+Evidence is under `codex_tp2_first_pair_v1/` in the same local stage.
+`results/tp2_clients_short_c1/cc_traces_cell.json` has SHA256
+`c0949a7290a89ef65fabd595823cb68c6aaf52e8f5600c8e8460c802e1c2ef11`.
+`TP2_FIRST_CELL_EXECUTION_REVIEW.json`, `CLOSE_AFTER_RUN.json` and
+`OWNED_PROCESS_CLOSURE_V2.json` retain the timing, memory and release
+qualifications. `BUNDLE_MANIFEST.json` preserves all eight workloads in one
+source snapshot, verified reader/provenance reuse, and the identical absolute
+source path/cache environment used by primer and real execution. TP4 remains
+a separate unresolved validation task.
 
 At commit `6e5596dfaeab0b682bcbf9f7cdd7672435ef0b32`, TP1 with
 `gpu_memory_utilization=0.34` rejected the first registered `clients_large_c8`
@@ -159,8 +210,10 @@ CUs each. The successor descriptor models scheduling within each group and
 was fitted only to the original training books. All nine fresh TP1/TP2
 confirmation cases passed; those confirmation timings and the instrumented
 probe never entered fitting. Commit `0ffcc4f6` adds the explicitly scoped
-descriptor, and `2feea392` selects the confirmed TP1 sources used by the first
-paired cell above. TP4 retains source residuals near 20% and 17%; its separate
+descriptor, and `2feea392` selects the confirmed TP1 sources used by the three
+paired TP1 cells above. `8a637eff` selects the verified per-rank TP2 sources
+used by the first passing TP2 aggregate/memory comparison. TP4 retains source
+residuals near 20% and 17%; its separate
 `head_1` investigation remains open. These component results do not establish
 the remaining serving cells or any matrix/ranking gate.
 
@@ -357,27 +410,29 @@ not), **UNPROVEN** (no valid measurement yet).
 
 | # | Gate | Bar | Status | Evidence |
 | --- | --- | --- | --- | --- |
-| **G1** | Correct feasible-configuration selection | top-1 matches hardware | **UNPROVEN** | One positive cell passes; the remaining 23 cells and cross-configuration selection are not established |
+| **G1** | Correct feasible-configuration selection | top-1 matches hardware | **UNPROVEN** | Four positive cells pass current aggregate checks; 20 cells and cross-configuration selection remain unestablished |
 | **G1b** | Ranking correlation within comparable groups | Spearman ρ ≥ 0.90 | **UNPROVEN** | — |
 | **G1c** | Ties reported honestly, selection regret reported | stated, not assumed | **UNPROVEN** | — |
-| **G2a** | Throughput error | ≤ 10% | **PARTIAL — 1/24 cells** | Current paired `tp1_clients_short_c1`: **−3.542386%**, with shared-node timing qualification above. Historical E2a, 27B short-input: **+27.3% / +37.0% / +85.9%** at TP=1/2/4. Measured, not missing — the modelled run finishes the same 64 requests in 27.5/16.3/8.5 s against 35.1/22.3/15.9 s real. Those failed diagnostic predictions remain preserved |
-| **G2b** | TPOT / ITL error | ≤ 10% | **PARTIAL — 1/24 cells** | Current paired `tp1_clients_short_c1` TPOT: **+4.475799%**, with shared-node timing qualification above. Historical E2a short-input median **−49.6% / −45.9% / −39.7%** at TP=1/2/4, and the modelled TPOT is near-constant across requests (p90 ≈ median) where the real one is not. E1 long-input passes at TP=4 |
-| **G2c** | TTFT error | ≤ 15% | **PARTIAL — 1/24 cells** | Current paired `tp1_clients_short_c1`: **+9.796520%**, with shared-node timing qualification above. Historical E2a short-input median **−10.4% / −20.5% / −46.1%** at TP=1/2/4 — within bar at TP=1 only. E1 long-input at TP=4: mean −0.14%, p90 −0.27%, median −6.4%, on the workload the model was developed against |
-| **G3a** | Non-KV memory terms | each within 10% | **PARTIAL — first paired TP1 cell passes** | Current cell compares all eight components, maximum error **0.035462%**. Historical E3b: 27B at TP=1/2/4. weights +1.6/−0.1/−3.3%, non-torch +4.9/+1.2/+1.3%, load residue −3.3/−6.7% at TP≥2. Terms outside: load residue at TP=1 (−93%, 0.01% of budget), persistent (−51%, 0.07% of budget), activations (no prefill-shaped graph for this model). The historical "graph pool +0.0% everywhere" claim remains retracted: the independent TP4 comparison was **+26.8%**, outside the bar. The new TP1 result does not resolve TP4 |
-| **G3b** | KV block count | within 5% | **PARTIAL — first paired TP1 cell passes** | Current cell: **112,772 real / 112,773 modelled**, error **0.000887%**. Historical E3: −0.09% (27B TP=2), −0.02/−0.02/+0.07% (0.6B TP=1/2/4); its 27B ground truth was 112,740 / 265,520 / 584,880 blocks. Remaining cc-traces configurations still require matched evidence |
+| **G2a** | Throughput error | ≤ 10% | **PARTIAL — 4/24 aggregate checks** | Current errors are **−3.542386%, −3.067558%, −6.113405%, −6.742557%**, in the table's cell order, with shared-node timing qualification. Historical E2a, 27B short-input: **+27.3% / +37.0% / +85.9%** at TP=1/2/4. Measured, not missing — the modelled run finishes the same 64 requests in 27.5/16.3/8.5 s against 35.1/22.3/15.9 s real. Those failed diagnostic predictions remain preserved |
+| **G2b** | TPOT / ITL error | ≤ 10% | **PARTIAL — 4/24 median checks; tail gap open** | Current medians are **+4.475799%, +3.270906%, +5.035067%, +6.445119%**. Short-c2 p90 is **−10.013389%**, retained separately as an open discrepancy. Shared-node timing qualification applies. Historical E2a short-input median **−49.6% / −45.9% / −39.7%** at TP=1/2/4, and the modelled TPOT is near-constant across requests (p90 ≈ median) where the real one is not. E1 long-input passes at TP=4 |
+| **G2c** | TTFT error | ≤ 15% | **PARTIAL — 4/24 median checks; tail gap open** | Current medians are **+9.796520%, +3.686786%, +12.660296%, +3.791065%**. Short-c2 p90 is **+30.164484%**; its tail/admission discrepancy remains open. Shared-node timing qualification applies. Historical E2a short-input median **−10.4% / −20.5% / −46.1%** at TP=1/2/4 — within bar at TP=1 only. E1 long-input at TP=4: mean −0.14%, p90 −0.27%, median −6.4%, on the workload the model was developed against |
+| **G3a** | Non-KV memory terms | each within 10% | **PARTIAL — 4/24 paired cells** | All eight components are compared on every rank/repeat. Maximum error is **0.035461% at TP1**, **7.859768% at TP2** (non-Torch). Historical E3b: 27B at TP=1/2/4. weights +1.6/−0.1/−3.3%, non-torch +4.9/+1.2/+1.3%, load residue −3.3/−6.7% at TP≥2. Terms outside: load residue at TP=1 (−93%, 0.01% of budget), persistent (−51%, 0.07% of budget), activations (no prefill-shaped graph for this model). The historical "graph pool +0.0% everywhere" claim remains retracted: the independent TP4 comparison was **+26.8%**, outside the bar. TP1/TP2 results do not resolve TP4 |
+| **G3b** | KV block count | within 5% | **PARTIAL — 4/24 paired cells** | TP1: **112,772 real / 112,773 modelled**, error **0.000887%**. Both TP2 ranks: **265,540 real / 266,768 modelled**, error **0.462454%**. Historical E3: −0.09% (27B TP=2), −0.02/−0.02/+0.07% (0.6B TP=1/2/4); its 27B ground truth was 112,740 / 265,520 / 584,880 blocks. Remaining cc-traces configurations still require matched evidence |
 | **G3c** | One infeasible configuration rejected for the right reason | same error as the engine | **PASS — negative cc-traces witness** | TP1, utilization 0.34; the same 83,968-token registered request is rejected for insufficient KV capacity on both servers; frozen prediction and retained attempts documented above |
-| **G4** | Prediction outside the calibration configurations | stated per prediction | **UNPROVEN on the acceptance source; the two step-level diagnostics split, one within and one outside** | No end-to-end cc-traces transfer has been run, and the gate is an end-to-end quantity. Diagnostics, both `ModelRunner.forward` decode steps frozen before measurement with no target timing among their inputs: **E7, TP2, 20.970 ms frozen against 19.845 ms, +5.7%** — within 10% (`G4_TRANSFER.md` §12). **E8, TP4, 16.157 ms frozen against 12.807 ms, +26.2% — outside 10%, a failed prediction** (§13). E8's miss is localised to one input: rank 1's frozen body price is 17.1% above what a later repeat measurement of the same thing produced, and the other three ranks predicted +5.1 to +5.5%. **A repeat that does not reproduce a value establishes that the value is unstable; it does not establish which of the two is right, nor what made them differ.** No corrected number follows from it either way — the frozen prediction stands as it was frozen. Both share the shape `bucket=32, cohort=32, tokens_each=1, context=1151`. E6 is their coverage precondition — a priced body at TP=1 (23.122 ms, 2423/2439 operators) and TP=2 (15.467 ms, 2552/2568) |
-| **G5a** | Replay speedup, **after capture** | ≥ 5× | **FAIL against 5×; advisory** | First paired cell: **1.36249×**, including derivation not already counted in execution. The target is advisory under the user policy above, and shared-node timings remain advisory. Full acquisition amortisation is separate (G5c). Historical device-free 27B diagnostics reported 36 s → 1.46 s (**24.7×**) and 133 s → 23 s (5.8×) including startup; they are not this cc-traces result |
-| **G5b** | GPU-free replay after capture | no device | **PASS at 0.6B and 27B; confirmed on first paired cell** | All three current TP1 modelled repeats ran in the device-free local lane. Historical E5: served 32/32 (0.6B) and 64/64 (27B) in `xiaobizh_n18_cpu`, a container with **no `/dev/kfd` and no `/dev/dri`** — zero driver handles and no KFD process registration in any process of the tree. Both reproduce the GPU-resident simulator's schedule step for step and its TTFT/TPOT/latency distributions exactly; at 27B ten of 64 requests sit in a different slot of that same schedule, which is the burst's admission order, not the GPU-free path (E5). This is the no-device gate only; G5a and G5c are separate |
-| **G5c** | Capture / calibration / startup / load / execution costs reported separately, with amortisation | reported | **PARTIAL — acquisition durations unknown** | First-cell startup/execution windows are measured and derivation is assigned to its containing windows. Full historical capture/calibration totals and a separate load duration remain unknown; amortised ratio and break-even remain unproven |
+| **G4** | Prediction outside the calibration configurations | stated per prediction | **PARTIAL — first TP2 E2E transfer cell passes current checks** | `tp2_clients_short_c1` passes three paired aggregate/memory comparisons with no target timing used for fitting; remaining TP2/TP4 cells are unproven. Historical diagnostics, both `ModelRunner.forward` decode steps frozen before measurement with no target timing among their inputs: **E7, TP2, 20.970 ms frozen against 19.845 ms, +5.7%** — within 10% (`G4_TRANSFER.md` §12). **E8, TP4, 16.157 ms frozen against 12.807 ms, +26.2% — outside 10%, a failed prediction** (§13). E8's miss is localised to one input: rank 1's frozen body price is 17.1% above what a later repeat measurement of the same thing produced, and the other three ranks predicted +5.1 to +5.5%. **A repeat that does not reproduce a value establishes that the value is unstable; it does not establish which of the two is right, nor what made them differ.** No corrected number follows from it either way — the frozen prediction stands as it was frozen. Both share the shape `bucket=32, cohort=32, tokens_each=1, context=1151`. E6 is their coverage precondition — a priced body at TP=1 (23.122 ms, 2423/2439 operators) and TP=2 (15.467 ms, 2552/2568) |
+| **G5a** | Replay speedup, **after capture** | ≥ 5× | **FAIL against 5×; advisory** | Current paired ratios: **1.36249×, 1.30190×, 2.29158×, 0.61627×**, including derivation not already counted in execution. The target is advisory under the user policy above, and shared-node timings remain advisory. Full acquisition amortisation is separate (G5c). Historical device-free 27B diagnostics reported 36 s → 1.46 s (**24.7×**) and 133 s → 23 s (5.8×) including startup; they are not these cc-traces results |
+| **G5b** | GPU-free replay after capture | no device | **PASS at 0.6B and 27B; confirmed on four paired cells** | All twelve modelled repeats of the four paired cells pass device-free evidence checks; all eight TP1 modelled cells are complete. Historical E5: served 32/32 (0.6B) and 64/64 (27B) in `xiaobizh_n18_cpu`, a container with **no `/dev/kfd` and no `/dev/dri`** — zero driver handles and no KFD process registration in any process of the tree. Both reproduce the GPU-resident simulator's schedule step for step and its TTFT/TPOT/latency distributions exactly; at 27B ten of 64 requests sit in a different slot of that same schedule, which is the burst's admission order, not the GPU-free path (E5). This is the no-device gate only; G5a and G5c are separate |
+| **G5c** | Capture / calibration / startup / load / execution costs reported separately, with amortisation | reported | **PARTIAL — acquisition durations unknown** | Current paired startup/execution windows are measured and derivation is assigned to its containing windows. Full historical capture/calibration totals and a separate load duration remain unknown; amortised ratio and break-even remain unproven |
 
-**One positive cell passes; the full PoC remains open.** G2a–c and G3a–b now
-have matched passing evidence for `tp1_clients_short_c1`, subject to the shared-node
-qualification above. G3c retains its negative witness and G5b its no-device
-proof. The remaining 23 cells, configuration selection, ranking and transfer
-are not established. The 5× target is missed and advisory; full acquisition
-costs and amortisation remain incomplete. The dated diagnoses below preserve
-the earlier evidence and failures without replacing this current status.
+**Four positive cells pass current aggregate checks; the full PoC remains
+open.** Their median/throughput and memory evidence is matched, subject to
+shared-node qualification. Short-c2's p90 TTFT/TPOT and admission discrepancy
+remain open. G3c retains its negative witness and G5b its no-device proof.
+The remaining 20 cells, configuration selection, ranking and broader transfer
+are not established. The first TP2 transfer cell passes; its 7.859768%
+non-Torch residual remains reported without recalibration. The 5× target is
+missed and advisory, and acquisition costs/amortisation remain incomplete.
+The dated diagnoses below preserve earlier evidence and failures.
 
 **The graph-pool memory term, flagged 2026-09-11, not yet integrated.** E3b
 reported graph pool at +0.0% at every width, and an independent comparison being
