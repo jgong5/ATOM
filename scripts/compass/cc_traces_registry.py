@@ -959,6 +959,17 @@ GDN_SOURCE_QUALIFICATIONS = (
 )
 
 
+_MHA_TP1_DISPATCH = "{root}/codex_decode_domain_v1/mha_dispatch_tp1_selected_v1"
+_MHA_TP1_LONG = "{root}/codex_regions/mha_decode_2m_v1"
+_MHA_TP1_LONG_LABELS = (
+    "source_b16_n16_max_work", "source_b32_n24_max_work",
+    "source_b32_n32_max_work", "source_b32_n32_order_skew_max_cu",
+)
+MHA_TP1_SOURCE_DECISION = f"{_MHA_TP1_DISPATCH}/SOURCE_USE_DECISION.json"
+MHA_TP1_SOURCE_DECISION_SHA256 = (
+    "63dd999b4b51754787e97c3034f68506d614f5cec2b13c46e0f654e322fccd00")
+
+
 def per_width_options(tp: int) -> tuple:
     """The options this width adds to `SHARED_OPTIONS`, unresolved."""
     gemm_exports = _GEMM_DOMAIN_EXPORTS[tp]
@@ -967,21 +978,27 @@ def per_width_options(tp: int) -> tuple:
     bands = ",".join((dict(SHARED_OPTIONS)["dispatch_bands"],) + tuple(
         f"aiter::gemm_a16w16={path}/bands.json" for path in gemm_exports))
     if tp == 1:
+        # Eleven source designs, three repeats each: the prior 21 books keep
+        # their identity and order, followed by these 12 long-domain sources.
+        # Fresh confirmation and all heldout timings stay outside the fit.
+        mha_prices = tuple(
+            f"{_MHA_TP1_LONG}/{label}_one_v1/raw.rep{repeat}.json:"
+            f"{_MHA_TP1_LONG}/graphs/{label}.timing.json:unregistered"
+            for label in _MHA_TP1_LONG_LABELS for repeat in (1, 2, 3))
         return (
             ("tp", "1"),
             ("dispatch_bands", bands),
-            # The native BF16 binder produces shuffled five-dimensional KV
-            # views. These audited declarations correct the old NHD label;
-            # source books, coefficients and held-out predictions are intact.
+            # Preserve the audited native KV views and other family scopes;
+            # add the independently confirmed decode dispatch topology.
             ("attention_scope",
-             "{root}/codex_decode_domain_v1/native_scope_v2/REQUEST_SCOPE.json"),
+             f"{_MHA_TP1_DISPATCH}/REQUEST_SCOPE.json"),
             ("measured_attention_scope",
-             "{root}/codex_decode_domain_v1/native_scope_v2/MEASURED_SCOPE.json"),
-            ("attention_treatments", "{root}/codex_decode_domain_v1/TREATMENTS.json"),
+             f"{_MHA_TP1_DISPATCH}/MEASURED_SCOPE.json"),
+            ("attention_treatments", f"{_MHA_TP1_DISPATCH}/TREATMENTS.json"),
             ("replay_target", _CAPTURED_TARGET),
             ("price", ",".join(_tp1_prices() + gemm_prices + (
                 f"{_GDN_TP1_PADDED}/prices.json:"
-                f"{_GDN_TP1_PADDED}/graphs.json:unregistered",))),
+                f"{_GDN_TP1_PADDED}/graphs.json:unregistered",) + mha_prices)),
             # src2c, not src1: the templates are what the step binds, and the
             # src1 capture recorded a decode whose attention chain was not
             # the deployed one. See `_tp1_prices` for what that changed and
@@ -1096,6 +1113,7 @@ def option_paths(tp: int, root) -> dict:
     found["source_use_decision"] = GEMM_SOURCE_DECISION.format(root=str(Path(root)))
     if tp == 1:
         found["gdn_source_use_decision"] = GDN_SOURCE_DECISION.format(root=str(Path(root)))
+        found["mha_source_use_decision"] = MHA_TP1_SOURCE_DECISION.format(root=str(Path(root)))
     return found
 
 
@@ -1116,7 +1134,7 @@ _GROUP_STEMS = ("ar_capture.json", "ar_plain.json", "ag_prices.json",
 
 def _group_level(role: str, path: str) -> bool:
     return (role in ("replay_target", "memory_model", "source_use_decision",
-                     "gdn_source_use_decision")
+                     "gdn_source_use_decision", "mha_source_use_decision")
             or path.endswith(_GROUP_STEMS))
 
 
@@ -1388,6 +1406,15 @@ def cell_config(tp: int, klass: str, clients: int, root, resolved=None) -> dict:
             "sha256": GDN_SOURCE_DECISION_SHA256,
             "qualifications": list(GDN_SOURCE_QUALIFICATIONS),
             "all_source_quality_checks_passed": False,
+            "poc_accepted": False,
+        }
+        cell["mha_source_use_decision"] = {
+            "path": MHA_TP1_SOURCE_DECISION.format(root=str(Path(root))),
+            "sha256": MHA_TP1_SOURCE_DECISION_SHA256,
+            "regime": "unified.decode.paged_gluon_dispatch",
+            "source_books": 33,
+            "fresh_confirmation_used_for_fit": False,
+            "historical_source_qualifications_preserved": True,
             "poc_accepted": False,
         }
     return cell

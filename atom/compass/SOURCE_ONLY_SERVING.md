@@ -132,6 +132,19 @@ partial kernel-profile observation; every selected witness comes from a
 complete observed repeat, without rescaling any timing. These source checks
 do not declare PoC acceptance or relax any paired E2E gate.
 
+TP1 now selects `unified.decode.paged_gluon_dispatch` with the declared
+`gfx942-spx-4xcc-80cu` topology and the existing c9e/graph/KV2 kernel treatment.
+The original 21 source books retain their identities; twelve long-domain source
+books are appended after the qualified GDN book. The frozen source-only fit is
+independently confirmed on three fresh TP1 cases. Confirmation, heldout, and
+instrumented diagnostic timings do not enter fitting. Successor declarations
+under `codex_decode_domain_v1/mha_dispatch_tp1_selected_v1` preserve all other
+attention scope facts and reference the original files. Their source-use decision
+is SHA256 `63dd999b4b51754787e97c3034f68506d614f5cec2b13c46e0f654e322fccd00`.
+Historical source-condition qualifications and the old descriptor's failed
+heldout remain recorded. TP2/TP4 options are unchanged. The first paired
+`tp1_clients_short_c1` cell must establish E2E agreement before broader execution.
+
 The preceding `source-27b-tp1-history-64k` adds independently measured TP1 history
 support to `source-27b-tp1-prefill-seqs`. Single-row decode supports histories
 1025..65600; exact two-row decode supports 513..65600 with summed history at

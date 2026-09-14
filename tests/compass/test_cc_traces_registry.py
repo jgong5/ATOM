@@ -812,7 +812,7 @@ def test_ranked_attention_declaration_takes_precedence_over_shared(tmp_path):
 
 def test_tp1_padded_gdn_is_appended_after_all_prior_prices():
     prices = dict(x.split("=", 1) for x in registry.options(1, "/source"))["price"].split(",")
-    assert prices[-1] == (
+    assert prices[-13] == (
         "/source/codex_gdn_tp1_native_v1/export_candidate_v2/prices.json:"
         "/source/codex_gdn_tp1_native_v1/export_candidate_v2/graphs.json:unregistered"
     )
@@ -832,3 +832,34 @@ def test_tp1_gdn_qualification_is_required_group_evidence(tmp_path):
     assert cell["resolution"][0]["gdn_source_use_decision"]["own"] is True
     assert "gdn_source_use_decision" not in registry.cell_config(
         2, "clients_large", 8, tmp_path)
+
+
+def test_tp1_dispatch_selection_adds_only_the_twelve_training_pairs():
+    options = dict(x.split("=", 1) for x in registry.options(1, "/source"))
+    root = "/source/codex_regions/mha_decode_2m_v1"
+    labels = ("source_b16_n16_max_work", "source_b32_n24_max_work",
+              "source_b32_n32_max_work", "source_b32_n32_order_skew_max_cu")
+    assert options["price"].split(",")[-12:] == [
+        f"{root}/{label}_one_v1/raw.rep{repeat}.json:"
+        f"{root}/graphs/{label}.timing.json:unregistered"
+        for label in labels for repeat in (1, 2, 3)]
+    selected = "/source/codex_decode_domain_v1/mha_dispatch_tp1_selected_v1"
+    assert options["attention_scope"] == f"{selected}/REQUEST_SCOPE.json"
+    assert options["measured_attention_scope"] == f"{selected}/MEASURED_SCOPE.json"
+    assert options["attention_treatments"] == f"{selected}/TREATMENTS.json"
+    for tp in (2, 4):
+        assert not any("mha_dispatch_tp1_selected_v1" in value or
+                       "mha_decode_2m_v1" in value
+                       for value in registry.options(tp, "/source"))
+
+
+def test_tp1_dispatch_decision_is_required_without_promoting_e2e(tmp_path):
+    cell = registry.cell_config(1, "clients_short", 1, tmp_path)
+    decision = cell["mha_source_use_decision"]
+    assert decision["sha256"] == registry.MHA_TP1_SOURCE_DECISION_SHA256
+    assert decision["regime"] == "unified.decode.paged_gluon_dispatch"
+    assert decision["source_books"] == 33
+    assert decision["fresh_confirmation_used_for_fit"] is False
+    assert decision["poc_accepted"] is False
+    assert cell["artifacts"]["mha_source_use_decision"] == decision["path"]
+    assert cell["resolution"][0]["mha_source_use_decision"]["own"] is True
