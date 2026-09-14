@@ -13,8 +13,8 @@ review](CC_TRACES_COVERAGE_REVIEW.md) controls coverage and case selection.
 The original cache-disabled registration and its **9/24** passing cells
 (including **8/8 original TP1**) retain their historical meaning. They do not
 prove the cache-enabled configuration, whole-corpus accuracy or **99%
-confidence**. The first bounded cache-on surrogate pair is now complete, with
-advisory timing results and no increase in the registered count.
+confidence**. The bounded cache-on surrogate and AIPerf opening pairs are now
+complete, with advisory timing results and no increase in the registered count.
 The earlier short-c4 campaign and staged cache-disabled long real run are held.
 
 **First cache-on paired milestone — bounded `4b433` surrogate.** On source
@@ -51,23 +51,63 @@ explicit source contract; the selected **FAILED outputless** source retains
 that qualification. This remains one token-surrogate mechanism diagnostic,
 not a registered acceptance cell, faithful AIPerf replay or full-root proof.
 
-**Actual AIPerf replay alignment remains a key gap.** The pinned published
-loader uses synthetic assistant history, chat role reconstruction and
-response-gated continuation. Current open-loop completion fixtures establish
-prefix mechanics, not that full behavior. The seeded full-history `4b433`
-chat inputs are 93,986/92,701 tokens, rather than the proxy's 92,928/92,672;
-native tail/region support must follow those actual shapes. The proposed first
-faithful opening is root `72d021…` requests 0/1: rendered 38,240/39,982 inputs,
-338/186 output maxima, empty start, and second release at
-`max(run origin + 21.437 seconds, first target response)`. Later branches are
-excluded. The maintained adapter/harness and exact wrapper checks are reviewed
-and integrated (`4078a5bae`, `9950bb532`). All 524 inventoried decode shapes are
-covered, and the bounded q16 primitive source is qualified. The new source
-acquisition below measures the remaining opening dependencies: 11 GEMM keys
-across q5456/q1744/q14 and q14 GDN/MHA/gather. Its qualification failures remain
-explicit; no faithful opening pair or new acceptance result is established. Exact
-pins, the fixed-profile branch-planner limitation and the explicit ignore-EOS
-variant are in [AIPerf replay alignment](AIPERF_REPLAY_ALIGNMENT.md).
+**Bounded AIPerf opening passed (2026-09-15).** On frozen source `b9a9518cc`,
+root `72d021…` requests 0/1 completed on both engines: rendered 38,240/39,982
+input tokens and 338/186 output tokens. The pinned chat reconstruction,
+empty initial cache and second release at
+`max(run origin + 21.437 seconds, first target response)` pass the maintained
+checks. Response delivery remains an explicit assumed-zero approximation from
+native engine finish to client response availability; later branches are excluded.
+Both lifecycle commands exited 0, and `opening_diagnostic.json` reports
+**`passed=true`, `accepted=false`, `failures=[]`**. TTFT median **+9.175%**,
+TPOT median **+4.793%** and throughput **−6.021%** meet the maintained
+15%/10%/10% bars. Independent review exactly reproduced the maintained result;
+all five memory budget terms, eight components and KV checks pass.
+
+The modelled side was fresh and device-free. The real side completed three
+full-prompt preparation requests with output cap 32, drained all records, and
+acknowledged an empty-cache reset before measurement. Both sides share the six
+prefill queries **16384, 16384, 5456, 16, 1744, 14** and reuse **38,224** cached
+tokens for request two. The native journal records **529 rows (6 prefill,
+523 decode)** versus **530 (6/524)** modelled. The terminal q1/history-40168 row
+is absent from the native recording, consistent with the runner's documented
+unflushed final asynchronous event pair. Neither a scheduling difference nor
+observed native terminal equality is established by that missing row.
+
+The final registry was frozen before either side, including all 451 source
+input records and all 11 actual option-bundle digests. The **FAILED outputless,
+final-transfer and low-query spread qualifications remain unchanged**, selected
+only through their explicit diagnostic flags; `source_qualified=false` remains.
+The sampler records **`node_busy`** with selected GPU1 clean. Both runs explicitly
+allow advisory node isolation, so the normal lifecycle and cost records exist;
+the earlier `4b433` isolation failure is not rewritten. Both containers have no
+remaining owned source processes, ports are free, and GPU1 returned to its idle
+baseline.
+
+Real/modelled replay wall windows are **28.292/20.839 seconds (1.35766×)**.
+The maintained cost calculation includes 2.81227 seconds of derivation already
+inside execution and adds 1.38116 seconds from startup, yielding **1.27327×**.
+The missed 5× target remains advisory under the user policy. Aggregate historical
+capture/calibration cost allocation and amortized speed remain unknown; load is
+inside native startup and was not extracted separately. This is one bounded
+opening diagnostic, not complete-root, multi-client, pool-pressure or confidence
+proof. The next execution priority is intact `1493faff…` root continuity, followed
+by short/long and C1/C2/C4/C8 coverage, feasibility and ranking.
+
+Opening evidence is under `agent_scratch/` in the artifact container; the cell
+prefix is `codex_aiperf_opening_pair_v2/tp1_aiperf_opening_72d021_v1_c1/`:
+
+| Artifact | SHA-256 |
+| --- | --- |
+| Cell `opening_diagnostic.json` | `7b100aae542db8c5baaff2eb5a7ccd690cb3716028e6cc631e23b2b7db908a75` |
+| Cell `costs.json` | `36a3b1bb55c6bc474a4d58e5c2aa3e34e66576056bf7fa9613ab91063f891c9e` |
+| Cell `SPEED_ACCOUNTING_V1.json` | `6fde774224171e9d9ca6c66286a46391e1bded5310e6b14cffab0cdec52041cf` |
+| `codex_opening_preparation_v3/REGISTRY_FINAL.json` | `296241d318ec9c1b8e50763d9c2721b3e173689e13efe21debfc5a24a02555a9` |
+| `codex_aiperf_opening_pair_v2/PAIRED_CLOSEOUT_V1.json` | `51e31bccb3652f9adf7a4df9e72e02d94809218c6543856d026d9edf0d276399` |
+| `codex_aiperf_opening_pair_v2/PAIR_INDEPENDENT_REVIEW_V1.json` | `ff600fce54d5cc78002566ab7ea755ea2ac8f05aae599f6edd17b1a0548f2544` |
+
+Exact profile pins, the fixed-profile branch-planner limitation and explicit
+ignore-EOS variant remain in [AIPerf replay alignment](AIPERF_REPLAY_ALIGNMENT.md).
 
 **Low-query source acquisition completed (2026-09-15).** Executable v3 on
 source `47d57fe33` completed **249 reference measurements (83 cells × 3)** and
@@ -84,7 +124,7 @@ The strict opening dependency set has **22/22 qualified references and 82/83
 qualified controls**. Its sole control miss is
 `heldout_gdn_q1_l62_fork2_3`: **5.21917495%** spread, despite **0.032394%**
 prediction error and a passing kernel check. It cannot be called a qualified
-subset. The next opening uses a separately reviewed, explicitly unqualified
+subset. The completed opening used a separately reviewed, explicitly unqualified
 diagnostic bundle with `low_q_allow_failed_spread` requiring `diagnostic_only`; the
 failed control, all dependencies and all other gates remain intact.
 
@@ -112,11 +152,11 @@ Source evidence is under `agent_scratch/` in the artifact container:
 | `codex_failed_final_transfer_v1/CACHE_REGION_OVERLAY.json` | `18a4eda460088e6a7d2e1033436569001b892e19c0a23fd4da17e3958e8476d8` |
 
 The shortened `executable_v2/` and `executable_v3/` paths share the
-`codex_low_q_layer_family_source_v1/` prefix. Final opening readiness/oracle
-input closure and the actual aggregate price-bundle digest must be frozen
-before its registry and launch. The zero response-delivery approximation and
-earlier shared-node isolation result remain explicit. Registered results stay
-at **9/24**; neither source campaign is a paired opening or confidence sample.
+`codex_low_q_layer_family_source_v1/` prefix. Opening readiness/oracle input
+closure and aggregate bundle registration were frozen before the completed pair
+above. Its source failures, zero response-delivery approximation and advisory
+node isolation remain explicit. Registered results stay at **9/24**; neither
+source campaign is a paired opening or confidence sample.
 
 **Cache-on implementation is integrated at `2782333ab`.** The new diagnostic
 path binds an explicit cache policy and source-hash prompt encoding; both
@@ -221,8 +261,8 @@ gather price `aten::index.Tensor|128,5120;1|bfloat16,int32|1:127`
 (2,442/2,443 operators priced). That pre-overlay attempt completed no tiny
 response. The later finite-overlay pair and intact-root QK-norm refusal are
 recorded above; the failed low-region criterion remains a failure.
-**TP2/TP4 remain paused.** Next useful evidence is qualified low-query and
-cached-prefill region support, followed by the faithful `72d021` opening pair.
+**TP2/TP4 remain paused.** Next useful evidence is intact-root cache continuity
+on `1493faff…`, followed by broader short/long and multi-client coverage.
 N1 low-prefill
 support must not stand in for multi-client N2/pool support; the coverage review
 records a minimal exposed-root C2/C4 cold-opening proposal, with actual batching

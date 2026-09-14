@@ -19,8 +19,8 @@ workload rewrite; subsequent execution results are dated below.
 **Prefix caching enabled is now the main cc-traces validation path.** The
 original cache-disabled suite stays at **9/24** passing paired cells, including
 8/8 original TP1. Those historical results do not establish cache-on accuracy,
-whole-corpus generalization or **99% confidence**. The first bounded cache-on
-surrogate pair is complete; it adds no registered acceptance cell.
+whole-corpus generalization or **99% confidence**. The bounded cache-on surrogate
+and AIPerf opening pairs are complete; neither adds a registered acceptance cell.
 
 **First cache-on paired milestone: the two-request `4b433` token surrogate.**
 The fresh pair on `aa8bd80e2` completed 2/2 requests and 366 output tokens per
@@ -66,12 +66,28 @@ to synthetic assistant history, so original text is not an additional blocker.
 Its reconstructed chat tokens and response-gated continuations differ from our
 completion/open-loop mechanism diagnostics. The seeded `4b433` chat inputs are
 93,986/92,701 with native remainders 2/13; final-16 surrogate coverage does not
-prove these shapes. The next faithful candidate is the complete opening of root
+prove these shapes. The completed bounded AIPerf case is the opening of root
 `72d021…`: inputs 38,240/39,982, output maxima 338/186, no prior cached history
 and second release `max(run origin + 21.437 seconds, first target response)`.
-Later branches are excluded. The maintained opening adapter and wrapper checks
-are reviewed and integrated (`4078a5bae`, `9950bb532`). All 524 inventoried
-decode shapes are covered; the bounded q16 primitive source is qualified.
+Later branches are excluded, and response delivery is explicitly assumed zero
+from native finish to client availability. On frozen source `b9a9518cc`, both
+sides completed all requests and output budgets; the maintained paired validator
+reports **passed, `accepted=false`, no failures**. TTFT **+9.175%**, TPOT
+**+4.793%** and throughput **−6.021%** meet their bars, and all memory checks pass.
+The six prefill queries and 38,224-token cache reuse match. Native/modelled
+recorded journals contain **529/530** rows (6/6 prefill, 523/524 decode). The
+native terminal q1/history-40168 row is unobserved, consistent with the runner's
+documented unflushed final asynchronous event pair; this establishes neither
+a scheduling difference nor observed terminal equality. This is bounded opening
+evidence, not full journal equality or continuity through later branches.
+
+Fresh modelled/device-free and native preparation/drained-empty-reset checks
+pass. GPU1 stayed clean, but the sampler records `node_busy`; explicit advisory
+isolation preserves that qualification while allowing normal lifecycle/cost
+outputs. Raw replay ratio is **1.35766×**, or **1.27327×** including derivation
+outside replay. The missed 5× target is advisory, with aggregate acquisition and
+amortized costs still unknown. Full artifact pins are in [PoC status](POC_STATUS.md).
+The bounded q16 primitive source is qualified.
 The remaining primitive dependencies have now been measured: source v3
 completed **249 references and 480 heldouts**, with predictions sealed before
 heldout release. Every numerical/kernel gate passes, while five reference and
@@ -80,7 +96,7 @@ The strict opening dependencies have 22/22 qualified references and 82/83
 qualified controls; the required `heldout_gdn_q1_l62_fork2_3` control has
 **5.21917495%** spread against 5%, although its prediction error is 0.032394%.
 No dependency is removed and no threshold is relaxed. A separately reviewed
-diagnostic bundle must retain this failure through explicit
+diagnostic bundle retained this failure through explicit
 `low_q_allow_failed_spread` and `diagnostic_only` selection.
 
 Final-region transfer remains **FAILED**, with 21/24 checks passing and all
@@ -93,9 +109,10 @@ region collection was not repeated in v3.
 
 The source verdict is `e00b20ad…`, closeout `da8817a4…`, and final-region
 result `108a18a2…`; [PoC status](POC_STATUS.md) records their full paths and
-digests. Final provider input closure and aggregate bundle registration are
-still required before the next modelled-first opening. No faithful opening
-pair, new accepted cell or confidence claim follows from these acquisitions.
+digests. Provider input closure and all 11 actual bundle digests were registered
+before the modelled-first opening under registry `296241d3…`. The completed pair
+retains all FAILED source qualifications and `source_qualified=false`; it adds
+no accepted cell or confidence claim.
 [AIPerf replay alignment](AIPERF_REPLAY_ALIGNMENT.md) pins the valid
 local-file fixed profile, exact token evidence and its branch-planner limitation;
 AgentX gap compression is a separate profile, not an implicit replacement.
@@ -108,8 +125,8 @@ checks; and readiness-gated prefix demand. The current target policy is cache
 on, checkpoint interval 8192, demand enabled and one-token GDN forks. Legacy
 plans stay cache off. Source memory geometry remains an explicit derived
 candidate with the bounded native memory/hit/checkpoint validation above.
-Pool-pressure behavior, remaining region coverage and faithful paired E2E
-accuracy still require evidence. Combined
+Pool-pressure behavior, remaining region coverage and E2E accuracy beyond the
+bounded opening still require evidence. Combined
 CPU verification passed **648 tests**, with zero failures, errors or skips on
 exact source `2782333abba2135050072f5966f41c79472c2142` in a container without GPU
 device nodes. This cannot substitute for those observations.
@@ -132,10 +149,11 @@ The non-Torch discrepancy is preserved as a failure with unresolved
 attribution. Native sizing/recording uses the current PyTorch device's memory
 APIs, not an SMI device index; that specific mapping hypothesis is unsupported.
 No cause, corrected constant or cache-on conclusion follows from this result.
-The next execution evidence is the response-gated opening above, explicitly
-diagnostic with its retained spread/region failures and zero response-delivery
-approximation. Qualified full-domain support and broader E2E validation remain
-gaps; the completed surrogate pair does not close them.
+The next execution priority is complete `1493faff…` root continuity under the
+current cache-on policy, followed by short/long and C1/C2/C4/C8 coverage,
+feasibility and ranking. Client count continues to mean root sessions, not a cap
+on outstanding requests. Qualified full-domain support and broader E2E validation
+remain gaps; neither bounded pair closes them.
 
 ## Remediation update — 2026-09-14
 
