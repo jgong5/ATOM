@@ -411,7 +411,7 @@ async def _read_stream_response(response, timing):
 
 async def _submit_requests(base, payloads, arrivals, *, pace, timeout,
                            endpoint="/v1/completions", streaming=False, response_gated=False,
-                           expected_outputs=None):
+                           expected_outputs=None, fixed_absolute_plan=None):
     """Submit independent legacy rows, or a paced two-turn chat continuation.
 
     A declared workload needs all N connections until its closed registration
@@ -427,6 +427,13 @@ async def _submit_requests(base, payloads, arrivals, *, pace, timeout,
         raise ValueError("network attempt timeout must be finite and positive")
     if response_gated and (not pace or len(payloads) != 2):
         raise ValueError("client response gating is the two-turn real-clock opening only")
+    if fixed_absolute_plan is not None:
+        if response_gated or arrivals != [row["arrival_s"] for row in fixed_absolute_plan.rows]:
+            raise ValueError("fixed-absolute submission differs from its pinned plan")
+        from atom.compass.fixed_absolute import FixedAbsoluteReleases
+        releases = FixedAbsoluteReleases(fixed_absolute_plan) if pace else None
+    else:
+        releases = None
     setup_started = _time.monotonic()
     trace = aiohttp.TraceConfig()
     epoch = epoch_wall = None
@@ -434,6 +441,9 @@ async def _submit_requests(base, payloads, arrivals, *, pace, timeout,
     ready = asyncio.Event()
     ready_count = 0
     finished = [asyncio.Event() for _ in payloads] if response_gated else None
+    released = [asyncio.Event() for _ in payloads] if releases is not None else None
+    completion_changed = asyncio.Event()
+    causal_failure = None
 
     async def headers_callback(_session, context, _params):
         timing = context.trace_request_ctx
@@ -461,18 +471,20 @@ async def _submit_requests(base, payloads, arrivals, *, pace, timeout,
     async with aiohttp.ClientSession(connector=connector, timeout=request_timeout,
                                      trace_configs=[trace]) as session:
         async def one(i):
-            nonlocal ready_count
+            nonlocal ready_count, causal_failure
             row = results[i]
             try:
                 ready_count += 1
                 if ready_count == len(payloads):
                     ready.set()
                 await start.wait()
+                if released is not None:
+                    await released[i].wait()
                 if response_gated and i:
                     await finished[i - 1].wait()
                     if not results[i - 1]["ok"]:
                         raise RuntimeError("predecessor response did not complete")
-                if pace:
+                if pace and releases is None:
                     await asyncio.sleep(max(0.0, arrivals[i] - (_time.monotonic() - epoch)))
                 timing = row["send_timing"]
                 timing["request_started_offset_s"] = _time.monotonic() - epoch
@@ -515,6 +527,34 @@ async def _submit_requests(base, payloads, arrivals, *, pace, timeout,
                     row["send_timing"]["client_response_returned_wall_time"] = _time.time()
                 if finished is not None:
                     finished[i].set()
+                if releases is not None:
+                    if row["ok"]:
+                        releases.complete(i, row["send_timing"]["finished_offset_s"])
+                    elif causal_failure is None:
+                        causal_failure = i
+                    completion_changed.set()
+
+        async def drive_releases():
+            while not releases.done:
+                completion_changed.clear()
+                if causal_failure is not None:
+                    for task in tasks:
+                        if not task.done():
+                            task.cancel()
+                    return
+                for index, when in releases.pop_due(_time.monotonic() - epoch):
+                    results[index]["send_timing"]["causal_release_offset_s"] = when
+                    released[index].set()
+                if releases.done:
+                    return
+                delay = max(0., releases.next_due - (_time.monotonic() - epoch))
+                if math.isinf(delay):
+                    await completion_changed.wait()
+                else:
+                    try:
+                        await asyncio.wait_for(completion_changed.wait(), timeout=delay)
+                    except asyncio.TimeoutError:
+                        pass
 
         tasks = [asyncio.create_task(one(i)) for i in range(len(payloads))]
         try:
@@ -525,14 +565,23 @@ async def _submit_requests(base, payloads, arrivals, *, pace, timeout,
             epoch = _time.monotonic()
             epoch_wall = _time.time()
             start.set()
-            await asyncio.gather(*tasks)
+            if releases is not None:
+                coordinator = asyncio.create_task(drive_releases())
+                try:
+                    await asyncio.gather(coordinator, *tasks)
+                finally:
+                    if not coordinator.done():
+                        coordinator.cancel()
+                    await asyncio.gather(coordinator, return_exceptions=True)
+            else:
+                await asyncio.gather(*tasks)
         except asyncio.CancelledError:
             if epoch is None:
                 epoch, epoch_wall = _time.monotonic(), _time.time()
             for task in tasks:
                 task.cancel()
             await asyncio.gather(*tasks, return_exceptions=True)
-    return results, {
+    submission = {
         "schema": "compass.http_submission/1", "implementation": "aiohttp",
         "version": aiohttp.__version__, "connection_limit": None,
         "connection_reuse": False, "pacing_started_at": epoch_wall,
@@ -543,6 +592,15 @@ async def _submit_requests(base, payloads, arrivals, *, pace, timeout,
         "timing_meaning": "request start and aiohttp pre-write trace callbacks; not wire completion, target ingress or engine arrival",
         "fresh_paired_runs_required": True,
     }
+    if fixed_absolute_plan is not None:
+        submission["fixed_absolute"] = {
+            "input_sha256": fixed_absolute_plan.loaded_input.sha256,
+            "release_owner": "client_response_callbacks" if pace else "virtual_engine_calendar",
+            "clients": len(fixed_absolute_plan.roots),
+            "root_complete_offsets": releases.root_completion_times() if releases is not None else None,
+            "all_leaves_returned": releases.done if releases is not None else None,
+        }
+    return results, submission
 
 
 def _served_model(base: str, timeout: float) -> str | None:
@@ -720,6 +778,8 @@ def main(argv=None) -> int:
     p.add_argument("--prompt-encoding-sha256", help="required digest of --prompt-encoding")
     p.add_argument("--opening-plan", help="pinned two-turn AIPerf chat opening")
     p.add_argument("--opening-plan-sha256", help="required digest of --opening-plan")
+    p.add_argument("--fixed-absolute-plan", help="pinned complete-root corrected fixed-absolute chat plan")
+    p.add_argument("--fixed-absolute-plan-sha256", help="required digest of --fixed-absolute-plan")
     p.add_argument("--time-scale", type=float, default=1.0,
                    help="divide every arrival offset by this, to replay a "
                         "long trace in less time. 1.0 keeps the trace's own "
@@ -753,8 +813,13 @@ def main(argv=None) -> int:
         p.error("--opening-plan and --opening-plan-sha256 are required together")
     if args.opening_plan and (args.trace or args.prompt_encoding or args.time_scale != 1):
         p.error("opening plan owns its payloads and unscaled source timing")
+    if bool(args.fixed_absolute_plan) != bool(args.fixed_absolute_plan_sha256):
+        p.error("--fixed-absolute-plan and --fixed-absolute-plan-sha256 are required together")
+    if args.fixed_absolute_plan and (args.trace or args.prompt_encoding or args.opening_plan or args.time_scale != 1):
+        p.error("fixed-absolute plan owns its payloads, source timing and distinct profile")
     args._prefix_encoding = None
     args._opening_plan = None
+    args._fixed_absolute_plan = None
     try:
         if args.prompt_encoding:
             from atom.compass.prefix_workload import PrefixEncoding
@@ -766,6 +831,12 @@ def main(argv=None) -> int:
             args._opening_plan = OpeningPlan.load(args.opening_plan, args.opening_plan_sha256)
             args.pretokenize = True  # Tokenizer also supplies exact-length preparation prompts.
             workload = args._opening_plan.workload()
+        elif args.fixed_absolute_plan:
+            from atom.compass.fixed_absolute import FixedAbsolutePlan
+            args._fixed_absolute_plan = FixedAbsolutePlan.load(args.fixed_absolute_plan, args.fixed_absolute_plan_sha256)
+            args.pretokenize = True
+            args.check_lengths = True
+            workload = args._fixed_absolute_plan.workload()
         else:
             workload = _workload(args)
         if args._prefix_encoding is not None:
@@ -773,6 +844,8 @@ def main(argv=None) -> int:
     except (OSError, ValueError) as exc:
         print(f"ATOMCompass refusing prompt encoding: {exc}", file=sys.stderr)
         return 3
+    chat_plan = args._opening_plan or args._fixed_absolute_plan
+    plan_key = "opening_plan_sha256" if args._opening_plan is not None else "fixed_absolute_plan_sha256"
     if not workload:
         print("empty workload", file=sys.stderr)
         return 2
@@ -789,21 +862,21 @@ def main(argv=None) -> int:
               file=sys.stderr)
         return 2
 
-    if args._opening_plan is not None:
-        if model != args._opening_plan.model:
-            print("opening model differs from the served model", file=sys.stderr)
+    if chat_plan is not None:
+        if model != chat_plan.model:
+            print("chat plan model differs from the served model", file=sys.stderr)
             return 3
         clock = _clock_of(base, args.timeout)
         if clock == "wall":
             args.pace = True
         elif clock != "virtual":
-            print("opening requires an identified wall or virtual clock", file=sys.stderr)
+            print("chat replay requires an identified wall or virtual clock", file=sys.stderr)
             return 3
         if clock == "virtual":
             with urllib.request.urlopen(base + "/compass/provenance", timeout=args.timeout) as response:
                 runtime = json.loads(response.read())
-            if runtime.get("compass", {}).get("opening_plan_sha256") != args.opening_plan_sha256:
-                print("predictor has not loaded the same opening release plan", file=sys.stderr)
+            if runtime.get("compass", {}).get(plan_key) != chat_plan.loaded_input.sha256:
+                print("predictor has not loaded the same chat release plan", file=sys.stderr)
                 return 3
 
     if args.pace and _clock_of(base, args.timeout) == "virtual":
@@ -837,9 +910,9 @@ def main(argv=None) -> int:
 
     args._prompt_tokenizer = (_load_prompt_tokenizer(model)
                               if args.pretokenize else None)
-    if args._opening_plan is not None:
+    if chat_plan is not None:
         try:
-            args._opening_plan.verify_tokenizer(args._prompt_tokenizer)
+            chat_plan.verify_tokenizer(args._prompt_tokenizer)
         except ValueError as exc:
             print(f"ATOMCompass refusing opening tokenizer: {exc}", file=sys.stderr)
             return 3
@@ -858,17 +931,17 @@ def main(argv=None) -> int:
         return 3
 
     cache_reset = None
-    if args._prefix_encoding is not None or args._opening_plan is not None:
+    if args._prefix_encoding is not None or chat_plan is not None:
         if prepare is not None and args.prepare_out:
             with open(args.prepare_out, "w", encoding="utf-8") as fh:
                 json.dump(prepare, fh, indent=1)
         try:
             cache_reset = _reset_prefix_cache(base, args.timeout)
-            if args._opening_plan is not None:
+            if chat_plan is not None:
                 from atom.compass.core.cache_policy import policy_errors
                 errors = [error for rank in cache_reset["ranks"]
                           for error in policy_errors(rank["after"].get("policy"),
-                                                     args._opening_plan.cache_policy)]
+                                                     chat_plan.cache_policy)]
                 if errors:
                     raise ValueError("; ".join(errors))
         except (OSError, RuntimeError, ValueError) as exc:
@@ -880,9 +953,9 @@ def main(argv=None) -> int:
     # Keep prompt/token and JSON work inside measured execution but before the
     # pacing origin. Retain prepared bytes rather than every encoded token list.
     try:
-        if args._opening_plan is not None:
+        if chat_plan is not None:
             encoded_at = _time.monotonic()
-            payloads = args._opening_plan.encode_payloads(declared=not args.pace)
+            payloads = chat_plan.encode_payloads(declared=not args.pace)
             encoding = {"prompt_construction_seconds": 0.0,
                         "json_encoding_seconds": _time.monotonic() - encoded_at,
                         "prepared_request_bytes": sum(sys.getsizeof(data) for data in payloads)}
@@ -901,19 +974,20 @@ def main(argv=None) -> int:
         base, payloads, [row["arrival_s"] for row in workload],
         pace=args.pace, timeout=args.timeout,
         **({"endpoint": "/v1/chat/completions", "streaming": True,
-            "response_gated": args.pace,
-            "expected_outputs": [row["output_tokens"] for row in workload]}
-           if args._opening_plan is not None else {})))
+            "expected_outputs": [row["output_tokens"] for row in workload],
+            **({"response_gated": args.pace} if args._opening_plan is not None
+               else {"fixed_absolute_plan": args._fixed_absolute_plan})}
+           if chat_plan is not None else {})))
     execution_seconds = _time.monotonic() - began
     execution_ended_at = _time.time()
     cache_end, cache_error = None, None
-    if args._prefix_encoding is not None or args._opening_plan is not None:
+    if args._prefix_encoding is not None or chat_plan is not None:
         try:
             cache_end = _prefix_cache_snapshot(base, args.timeout)
-            if args._opening_plan is not None:
+            if chat_plan is not None:
                 from atom.compass.core.cache_policy import policy_errors
                 errors = [error for rank in cache_end["ranks"]
-                          for error in policy_errors(rank.get("policy"), args._opening_plan.cache_policy)]
+                          for error in policy_errors(rank.get("policy"), chat_plan.cache_policy)]
                 if errors:
                     raise ValueError("; ".join(errors))
         except (OSError, RuntimeError, ValueError) as exc:
@@ -1005,10 +1079,11 @@ def main(argv=None) -> int:
         "client_resources": resource_plan,
         "submission": submission,
         "requests": len(workload),
-        "arrival_span_s": (round(workload[-1]["arrival_s"], 6)
+        "arrival_span_s": (round(max(row["arrival_s"] for row in workload)
+                                 if args._fixed_absolute_plan is not None else workload[-1]["arrival_s"], 6)
                            if workload else 0.0),
-        "trace": args.trace,
-        "trace_sha256": _digest(args.trace),
+        "trace": args.fixed_absolute_plan or args.trace,
+        "trace_sha256": _digest(args.fixed_absolute_plan or args.trace),
         "model": model,
         "failed": len(failed),
         "missing": len(incomplete["missing"]),
@@ -1049,18 +1124,19 @@ def main(argv=None) -> int:
     }
     if args._prefix_encoding is not None:
         manifest["prompt_encoding"]["corpus_encoding"] = encoding["corpus_encoding"]
-    if args._opening_plan is not None:
-        manifest["aiperf_opening"] = args._opening_plan.evidence()
+    if chat_plan is not None:
+        evidence_key = "aiperf_opening" if args._opening_plan is not None else "fixed_absolute"
+        manifest[evidence_key] = chat_plan.evidence()
         manifest["prompt_encoding"].update(
             kind="chat_messages", conversion_in_execution=False,
             conversion_seconds=None, token_verification="before preparation; shared preprocessing verifies again")
         observed = {row["request_id"]: row for row in engine.get("requests", [])}
         try:
-            errors = args._opening_plan.observation_errors(server, engine, results)
+            errors = chat_plan.observation_errors(server, engine, results)
         except (KeyError, TypeError, ValueError) as exc:
             errors = [f"malformed opening evidence: {exc}"]
-        manifest["aiperf_opening"]["observation_errors"] = errors
-        manifest["aiperf_opening"]["timing_boundaries"] = {
+        manifest[evidence_key]["observation_errors"] = errors
+        manifest[evidence_key]["timing_boundaries"] = {
             "engine_clock": engine.get("clock"), "client_clock": "wall",
             "requests": [{
                 "index": result["index"],
@@ -1072,8 +1148,8 @@ def main(argv=None) -> int:
         if errors:
             manifest["complete"] = False
             manifest["incomplete_reasons"] = {**(manifest["incomplete_reasons"] or {}),
-                                               "opening_evidence": errors}
-    if args._prefix_encoding is not None or args._opening_plan is not None:
+                ("opening_evidence" if args._opening_plan is not None else "fixed_absolute_evidence"): errors}
+    if args._prefix_encoding is not None or chat_plan is not None:
         manifest["cache_boundary"] = cache_reset
         manifest["cache_state_after"] = cache_end
         if cache_error:
