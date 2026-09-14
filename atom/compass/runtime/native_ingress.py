@@ -51,25 +51,28 @@ class NativeWriterReceiver:
             self._services[name] = coefficients
         self.loaded_inputs = tuple(inputs)
 
+    def _service_times(self, request):
+        layout = request.ingress
+        if (layout.frame_request_count != 1 or layout.pickle_protocol != 4
+                or layout.token_typecode != "i" or layout.token_itemsize != 4):
+            raise UnsupportedReadiness("native ingress source requires single-Sequence ADD/protocol4/int32")
+        size = layout.reconstructed_add_bytes
+        if not self.min_bytes <= size <= self.max_bytes:
+            raise UnsupportedReadiness(
+                f"native ingress payload {size} bytes is outside source support "
+                f"[{self.min_bytes}, {self.max_bytes}]")
+        return tuple((base + slope * size) * 1e-6 for base, slope in
+                     (self._services["writer"], self._services["receiver"]))
+
     def resolve_closed_workload(self, requests):
         writer_available = receiver_available = float("-inf")
         result = {}
         for order, request in enumerate(requests):
-            layout = request.ingress
-            if (layout.frame_request_count != 1 or layout.pickle_protocol != 4
-                    or layout.token_typecode != "i" or layout.token_itemsize != 4):
-                raise UnsupportedReadiness("native ingress source requires single-Sequence ADD/protocol4/int32")
-            size = layout.reconstructed_add_bytes
-            if not self.min_bytes <= size <= self.max_bytes:
-                raise UnsupportedReadiness(
-                    f"native ingress payload {size} bytes is outside source support "
-                    f"[{self.min_bytes}, {self.max_bytes}]")
-            writer_base, writer_slope = self._services["writer"]
-            receiver_base, receiver_slope = self._services["receiver"]
+            writer_seconds, receiver_seconds = self._service_times(request)
             writer_started = max(request.arrived_at, writer_available)
-            writer_available = writer_started + (writer_base + writer_slope * size) * 1e-6
+            writer_available = writer_started + writer_seconds
             receiver_started = max(writer_available, receiver_available)
-            receiver_available = receiver_started + (receiver_base + receiver_slope * size) * 1e-6
+            receiver_available = receiver_started + receiver_seconds
             result[request.request_id] = ReadyEvent(receiver_available, order)
         return result
 
@@ -82,3 +85,35 @@ class NativeWriterReceiver:
         """
         event = self.resolve_closed_workload((request,))[request.request_id]
         return ReadyEvent(event.ready_at, event.receipt_order, request.arrived_at)
+
+    def new_release_queue(self):
+        """One persistent service queue per finite causal replay, not per client."""
+        return NativeIngressReleaseQueue(self)
+
+
+class NativeIngressReleaseQueue:
+    """Advance source writer/receiver availability in matured release order."""
+
+    def __init__(self, provider):
+        self.provider = provider
+        self.writer_available = self.receiver_available = -math.inf
+        self.last_release = -math.inf
+        self.count = 0
+
+    def resolve_release(self, request):
+        arrival = request.arrived_at
+        if not math.isfinite(arrival) or arrival < self.last_release:
+            raise UnsupportedReadiness("causal ingress releases must be chronological")
+        writer_seconds, receiver_seconds = self.provider._service_times(request)
+        writer_started = max(arrival, self.writer_available)
+        self.writer_available = writer_started + writer_seconds
+        self.receiver_available = max(self.writer_available, self.receiver_available) + receiver_seconds
+        event = ReadyEvent(self.receiver_available, self.count, writer_started)
+        self.count += 1
+        self.last_release = arrival
+        return event
+
+    def evidence(self):
+        return {"released_requests": self.count,
+                "writer_available_at": self.writer_available if self.count else None,
+                "receiver_available_at": self.receiver_available if self.count else None}

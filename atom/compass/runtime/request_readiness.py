@@ -127,6 +127,52 @@ class RequestReadiness:
         self._reader_pid = os.getpid()
         self.records = None
         self._serial_requests = None
+        self._causal_requests = None
+        self._causal_queue = None
+        self._causal_records = None
+
+    def register_causal_workload(self, sequences):
+        """Pin all requests without charging service before calendar release."""
+        if self.records is not None:
+            raise UnsupportedReadiness("request readiness was already registered")
+        factory = getattr(self._provider, "new_release_queue", None)
+        if not callable(factory):
+            raise UnsupportedReadiness("source provider does not qualify persistent causal ingress")
+        sequences = tuple(sequences)
+        if not sequences or any(seq.compass_workload_size != len(sequences) for seq in sequences):
+            raise UnsupportedReadiness("causal readiness requires complete registration")
+        requests = {seq.id: RegisteredRequest(
+            seq.id, float(seq.arrive_time), int(seq.num_prompt_tokens),
+            seq.compass_workload_index, ingress_descriptor(seq)) for seq in sequences}
+        if (len(requests) != len(sequences)
+                or any(not math.isfinite(r.arrived_at) for r in requests.values())
+                or {r.workload_index for r in requests.values()} != set(range(len(sequences)))):
+            raise UnsupportedReadiness("causal requests need unique identities and complete indices")
+        queue = factory()
+        if not callable(getattr(queue, "resolve_release", None)):
+            raise UnsupportedReadiness("causal source queue has no release method")
+        self._causal_requests, self._causal_queue = requests, queue
+        self._causal_records = {}
+        self.records = MappingProxyType(self._causal_records)
+
+    def release_causal_request(self, sequence, arrived_at):
+        if self._causal_requests is None or sequence.id not in self._causal_requests:
+            raise UnsupportedReadiness("causal request was not registered")
+        original = self._causal_requests[sequence.id]
+        if (sequence.id in self.records or not math.isfinite(arrived_at)
+                or arrived_at < original.arrived_at):
+            raise UnsupportedReadiness("causal release is duplicated or precedes its source timestamp")
+        event = self._causal_queue.resolve_release(RegisteredRequest(
+            original.request_id, arrived_at, original.prompt_tokens, original.workload_index, original.ingress))
+        previous_ready = next(reversed(self._causal_records.values())).ready_at if self.records else -math.inf
+        if (not isinstance(event, ReadyEvent) or not math.isfinite(event.ready_at)
+                or event.source_service_started_at is None or not math.isfinite(event.source_service_started_at)
+                or not arrived_at <= event.source_service_started_at <= event.ready_at
+                or event.ready_at < previous_ready or type(event.receipt_order) is not int
+                or event.receipt_order != len(self.records)):
+            raise UnsupportedReadiness("causal source queue returned invalid service or receipt order")
+        self._causal_records[sequence.id] = RequestReadinessRecord(
+            arrived_at, event.ready_at, event.receipt_order, event.source_service_started_at)
 
     def register_serial_workload(self, sequences):
         """Pin descriptors while leaving unreleased requests outside all service."""
@@ -230,6 +276,14 @@ class RequestReadiness:
                  "ready_at": record.ready_at, "receipt_order": record.receipt_order}
                 for request_id, record in self.records.items()
             ]
+        if self._causal_requests is not None:
+            result["request_readiness"]["causal_releases"] = [
+                {"seq_id": str(request_id), "arrived_at": record.arrived_at,
+                 "source_service_started_at": record.source_service_started_at,
+                 "ready_at": record.ready_at, "receipt_order": record.receipt_order}
+                for request_id, record in self.records.items()]
+            if callable(getattr(self._causal_queue, "evidence", None)):
+                result["request_readiness"]["causal_queue"] = self._causal_queue.evidence()
         return result
 
 
