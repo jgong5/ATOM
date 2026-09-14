@@ -53,7 +53,7 @@ def wrapper_evidence(tmp_path):
                    template=template, head_template=template, regions=overlay["base"]["name"],
                    interpolate=4, attention_scope=str(scope), region_overlay=str(path),
                    region_overlay_sha256=hashlib.sha256(path.read_bytes()).hexdigest(),
-                   include_failed_outputless=1, diagnostic_only=1,
+                   include_failed_outputless=1, include_failed_final=1, diagnostic_only=1,
                    q16_handoff=q16_path, q16_handoff_sha256=q16_sha)
     oracle = source_cost_oracle(**options)
     rank = manifest(oracle.compass_loaded_inputs)
@@ -277,6 +277,8 @@ def test_pair_route_stays_diagnostic_and_preserves_source_or_memory_failure(
     assert report["source_contracts"][0]["observed_oracle"] == opening.CACHE_REGION_FACTORY
     if failure is None:
         assert any("FAILED outputless" in note for note in report["notes"])
+        assert any("FAILED final-query transfer" in note for note in report["notes"])
+        assert report["source_contracts"][0]["include_failed_final"] == 1
 
 
 @pytest.mark.parametrize("damage, expected", [

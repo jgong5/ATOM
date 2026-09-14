@@ -21,6 +21,22 @@ class FinalPrefillRegion:
 
 
 @dataclass(frozen=True)
+class DiagnosticFinalTransfer:
+    queries: tuple[int, int]
+    cached_history: tuple[int, int]
+    # Reuse the selected final16 formula; this experiment supplies no fit.
+    source: FinalPrefillRegion
+    validation: str
+
+    def contains(self, query, history):
+        return (self.queries[0] <= query <= self.queries[1]
+                and self.cached_history[0] <= history <= self.cached_history[1])
+
+    def breakdown(self, history):
+        return self.source.breakdown(history)
+
+
+@dataclass(frozen=True)
 class DiagnosticOutputlessRegion:
     histories: tuple[int, int]
     queries: tuple[int, ...]
@@ -59,6 +75,7 @@ class CachedPrefillRegions:
     diagnostic_outputless: DiagnosticOutputlessRegion | None
     version: str
     provenance: str
+    diagnostic_final: DiagnosticFinalTransfer | None = None
 
     @property
     def topologies(self):
@@ -82,6 +99,9 @@ class CachedPrefillRegions:
             return None
         if shape.produces_output and self.final and self.final.contains(query, history):
             return self.final.breakdown(history)
+        if (shape.produces_output and self.diagnostic_final
+                and self.diagnostic_final.contains(query, history)):
+            return self.diagnostic_final.breakdown(history)
         if (not shape.produces_output and self.diagnostic_outputless
                 and self.diagnostic_outputless.contains(query, history)):
             return self.diagnostic_outputless.breakdown(query, history)
@@ -105,4 +125,5 @@ class CachedPrefillRegions:
     def describe(self):
         return (f"{self.version}: passed final prefill={self.final is not None}; "
                 f"FAILED-source diagnostic outputless={self.diagnostic_outputless is not None}; "
+                f"FAILED final-query transfer={self.diagnostic_final is not None}; "
                 f"base={self.base.describe()}; {self.provenance}")

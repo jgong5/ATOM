@@ -40,6 +40,14 @@ def artifact():
             "validation": {"status": "FAILED", "checks": [
                 {"pass": True}, {"pass": False, "error_seconds": .00018}]},
         },
+        "failed_final_transfer": {
+            "queries": [1, 15], "cached_history": [33792, 66560],
+            "formula_source": "final",
+            "validation": {"status": "FAILED", "baseline_q16_controls_pass": True,
+                           "checks": [{"role": "baseline_q16_control", "pass": True},
+                                      {"role": "boundary_transfer", "pass": False,
+                                       "error_seconds": -.00016}]},
+        },
     }
 
 
@@ -140,6 +148,57 @@ def test_failed_source_cannot_be_relabelled_as_passed(artifact):
     with pytest.raises(ValueError, match="FAILED qualification"):
         runtime.model_from_artifact(
             artifact, include_failed_outputless=True, diagnostic_only=True)
+
+
+def test_failed_final_transfer_is_separate_and_reuses_the_exact_q16_formula(artifact):
+    default = runtime.model_from_artifact(artifact)
+    assert default.diagnostic_final is None
+    assert default.refusal(shape(14, 39968)) is not None
+    with pytest.raises(ValueError, match="diagnostic_only"):
+        runtime.model_from_artifact(artifact, include_failed_final=True)
+    selected = runtime.model_from_artifact(
+        artifact, include_failed_final=True, diagnostic_only=True)
+    assert selected.diagnostic_final.source is selected.final
+    assert selected.diagnostic_outputless is None
+    assert "FAILED" in selected.diagnostic_final.validation
+    for query in range(1, 16):
+        for history in (33792, 50176, 66560):
+            s = shape(query, history)
+            assert selected.refusal(s) is None
+            assert selected.breakdown(s) == default.final.breakdown(history)
+    assert selected.breakdown(shape(16, 39968)) == default.breakdown(shape(16, 39968))
+    with pytest.raises(ValueError, match="no calibrated uncertainty"):
+        selected.band(shape(14, 39968))
+
+
+@pytest.mark.parametrize("s", [
+    shape(1, 33791), shape(15, 66561), shape(17, 39968), shape(14, 0),
+    shape(1, 39968, num_prefill_tokens=0, capture_bucket=1),
+    shape(14, 39968, produces_output=False), shape(14, 39968, compiled=False),
+    shape(14, 39968, topology={"tp": 2}),
+    shape(14, 39968, num_scheduled_tokens=(7, 7), context_lens=(20000, 20000)),
+])
+def test_failed_final_selection_keeps_its_own_narrow_scope(artifact, s):
+    selected = runtime.model_from_artifact(
+        artifact, include_failed_final=True, diagnostic_only=True)
+    assert selected._selection(s) is None
+    assert selected.refusal(s) == selected.base.refusal(s)
+
+
+@pytest.mark.parametrize("change", [
+    lambda spec: spec.update(queries=[1, 16]),
+    lambda spec: spec.update(cached_history=[32768, 66560]),
+    lambda spec: spec.update(prepare_intercept=.0004),
+    lambda spec: spec.update(formula_source="new_fit"),
+    lambda spec: spec["validation"].update(status="PASSED"),
+    lambda spec: spec["validation"].update(baseline_q16_controls_pass=False),
+    lambda spec: spec["validation"]["checks"][0].update({"pass": False}),
+    lambda spec: spec["validation"]["checks"][1].update({"pass": True}),
+])
+def test_failed_final_cannot_refit_widen_or_relabel_qualification(artifact, change):
+    change(artifact["failed_final_transfer"])
+    with pytest.raises(ValueError):
+        runtime.model_from_artifact(artifact, include_failed_final=True, diagnostic_only=True)
 
 
 def test_factory_attests_loaded_bytes_and_deployment_scope(artifact, tmp_path, monkeypatch):

@@ -26,7 +26,7 @@ WORKER_CONFIGURATION = {
 }
 CACHE_REGION_FACTORY = "atom.compass.runtime.cache_region_oracle.source_cost_oracle"
 CACHE_REGION_OPTIONS = frozenset((
-    "region_overlay", "region_overlay_sha256", "include_failed_outputless",
+    "region_overlay", "region_overlay_sha256", "include_failed_outputless", "include_failed_final",
     "diagnostic_only", "q16_handoff", "q16_handoff_sha256", "rank_coords",
 ))
 
@@ -224,14 +224,18 @@ def check_source_contract(modelled, registry, workload_sha, forbidden, label):
         if options.get("regions") != overlay["base"]["name"]:
             raise ValueError("region overlay and requested base preset differ")
         include_failed = _flag(options.get("include_failed_outputless", False), "include_failed_outputless")
+        include_failed_final = _flag(options.get("include_failed_final", False), "include_failed_final")
         diagnostic = _flag(options.get("diagnostic_only", False), "diagnostic_only")
         selected = wrapper.model_from_artifact(
-            overlay, include_failed_outputless=include_failed, diagnostic_only=diagnostic)
+            overlay, include_failed_outputless=include_failed,
+            include_failed_final=include_failed_final, diagnostic_only=diagnostic)
         snapshot = region_snapshot(overlay["name"], selected)
         if ranks[0].get("regions") != snapshot:
             raise ValueError("selected region snapshot differs from its loaded overlay and flags")
         if include_failed:
             notes.append("FAILED outputless source qualification retained; diagnostic_only=1; no acceptance credit")
+        if include_failed_final:
+            notes.append("FAILED final-query transfer retained with unchanged q16 formula; diagnostic_only=1; no acceptance credit")
         selected_options = dict(options, regions=overlay["name"])
         bad.extend(validate.check_region_calibration(
             _source_view(modelled, oracle_options=selected_options), registry, 1, workload_sha, forbidden))
@@ -341,6 +345,7 @@ def _pair(args):
                         "region_overlay_sha256": options.get("region_overlay_sha256"),
                         "q16_handoff_sha256": options.get("q16_handoff_sha256"),
                         "include_failed_outputless": options.get("include_failed_outputless", False),
+                        "include_failed_final": options.get("include_failed_final", False),
                         "diagnostic_only": options.get("diagnostic_only", False)})
         failures += validate.check_predictor_device_freedom(modelled, f"repeat {index}")
         failures += validate.check_capacity_inputs(modelled, f"repeat {index}")

@@ -5,7 +5,7 @@ import math
 
 from atom.compass.core.cache_policy import cache_on_policy, policy_errors
 from atom.compass.core.cost.cache_regions import (
-    CachedPrefillRegions, DiagnosticOutputlessRegion, FinalPrefillRegion,
+    CachedPrefillRegions, DiagnosticFinalTransfer, DiagnosticOutputlessRegion, FinalPrefillRegion,
 )
 from atom.compass.core.cost.regions import REGION_MODELS
 from atom.compass.core.loaded_input import load_json
@@ -32,7 +32,8 @@ def _axis(values, *, count=None):
     return tuple(values)
 
 
-def model_from_artifact(data, *, include_failed_outputless=False, diagnostic_only=False):
+def model_from_artifact(data, *, include_failed_outputless=False,
+                        include_failed_final=False, diagnostic_only=False):
     if data.get("schema") != SCHEMA or data.get("model") != "Qwen/Qwen3.8-27B":
         raise ValueError("unknown cached-prefill source artifact")
     errors = policy_errors(data.get("cache_policy"), cache_on_policy())
@@ -59,6 +60,30 @@ def model_from_artifact(data, *, include_failed_outputless=False, diagnostic_onl
             raise ValueError("final-prefill cost is negative inside its source domain")
         final = FinalPrefillRegion(query, history, intercept, slope, post,
                                    json.dumps(validation, sort_keys=True))
+    final_transfer = None
+    if include_failed_final:
+        if not diagnostic_only:
+            raise ValueError("failed final-query transfer requires diagnostic_only=1")
+        spec = data["failed_final_transfer"]
+        validation = spec["validation"]
+        checks = validation.get("checks") or []
+        controls = [check for check in checks if check.get("role") == "baseline_q16_control"]
+        transfer = [check for check in checks if check.get("role") != "baseline_q16_control"]
+        if (validation.get("status") != "FAILED"
+                or validation.get("baseline_q16_controls_pass") is not True
+                or not controls or not all(check.get("pass") is True for check in controls)
+                or not any(check.get("pass") is False for check in transfer)):
+            raise ValueError("final-query transfer must retain FAILED transfer and passing q16 controls")
+        queries = _axis(spec["queries"], count=2)
+        history = _axis(spec["cached_history"], count=2)
+        if queries != (1, 15) or history != (33792, 66560):
+            raise ValueError("failed final-query transfer is bounded to q1..15 and history [33792,66560]")
+        if (final is None or spec.get("formula_source") != "final"
+                or final.cached_history[0] > history[0] or final.cached_history[1] < history[1]
+                or any(key in spec for key in ("prepare_intercept", "prepare_slope", "postprocess"))):
+            raise ValueError("failed final-query transfer must reuse the unchanged selected final16 formula")
+        final_transfer = DiagnosticFinalTransfer(queries, history, final,
+                                                 json.dumps(validation, sort_keys=True))
     diagnostic = None
     if include_failed_outputless:
         if not diagnostic_only:
@@ -79,11 +104,13 @@ def model_from_artifact(data, *, include_failed_outputless=False, diagnostic_onl
         raise ValueError("no cached-prefill source addition was selected")
     return CachedPrefillRegions(base, final, diagnostic, data["name"],
         json.dumps({"cache_policy": data["cache_policy"], "evidence": data["evidence"],
-                    "diagnostic_outputless_enabled": include_failed_outputless}, sort_keys=True))
+                    "diagnostic_outputless_enabled": include_failed_outputless,
+                    "diagnostic_final_transfer_enabled": include_failed_final}, sort_keys=True),
+        diagnostic_final=final_transfer)
 
 
 def source_cost_oracle(*, region_overlay, region_overlay_sha256, regions,
-                       include_failed_outputless=False, diagnostic_only=False,
+                       include_failed_outputless=False, include_failed_final=False, diagnostic_only=False,
                        q16_handoff=None, q16_handoff_sha256=None,
                        rank_coords=None, **options):
     """Build the existing source composition, then select a separate region object.
@@ -114,6 +141,7 @@ def source_cost_oracle(*, region_overlay, region_overlay_sha256, regions,
         raise ValueError("region overlay and requested base preset differ")
     model = model_from_artifact(data,
         include_failed_outputless=_flag(include_failed_outputless, "include_failed_outputless"),
+        include_failed_final=_flag(include_failed_final, "include_failed_final"),
         diagnostic_only=_flag(diagnostic_only, "diagnostic_only"))
     result = build_source_oracle(regions=regions, rank_coords=rank_coords, **options).oracle
     result.regions = model
