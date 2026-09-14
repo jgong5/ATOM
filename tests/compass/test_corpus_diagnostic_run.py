@@ -123,6 +123,46 @@ def test_acceptance_override_and_registered_alias_are_refused(tmp_path):
                     "modelled", purpose="acceptance")
 
 
+def test_preparation_cap_changes_only_real_warmup_plan(tmp_path, capsys):
+    case = fixture_case(tmp_path)
+    command = argv(tmp_path, case) + ["--plan-only"]
+    assert run.main(command) == 0
+    default = json.loads(capsys.readouterr().out)
+    assert run.main(command + ["--diagnostic-prepare-output-cap", "32"]) == 0
+    capped = json.loads(capsys.readouterr().out)
+    assert default["diagnostic_case"] == capped["diagnostic_case"] == load(case)
+    assert capped["purpose"] == "diagnostic"
+    assert capped.pop("diagnostic_prepare_output_cap") == 32
+    for step in capped["steps"]:
+        if step["role"] == "replay" and step["side"] == "real":
+            assert step["command"][-2:] == ["--diagnostic-prepare-output-cap", "32"]
+            step["command"] = step["command"][:-2]
+    assert capped == default
+
+
+@pytest.mark.parametrize("cap", ["0", "1", "-32"])
+def test_preparation_cap_requires_decode_iterations(tmp_path, cap):
+    case = fixture_case(tmp_path)
+    with pytest.raises(SystemExit, match="at least 2"):
+        run.main(argv(tmp_path, case) + ["--plan-only", "--diagnostic-prepare-output-cap", cap])
+
+
+def test_registered_cli_cannot_select_capped_preparation(tmp_path):
+    with pytest.raises(SystemExit):
+        run.main(["side", "--cell", str(tmp_path / "tp1_clients_short_c1"),
+                  "--side", "real", "--tp", "1", "--class", "clients_short",
+                  "--clients", "1", "--diagnostic-prepare-output-cap", "32"])
+
+
+def test_acceptance_stamp_cannot_hide_capped_preparation(tmp_path):
+    validate = run._load("cc_traces_validate")
+    journal = {"purpose": "acceptance", "executions": [{"purpose": "acceptance"}]}
+    artifact = {"execution": {"purpose": "acceptance"}, "run": {"prepare": {
+        "policy": {"purpose": "diagnostic", "output_tokens_cap": 32}}}}
+    errors = validate.check_not_diagnostic(tmp_path, {"real": journal}, {"real": [artifact]})
+    assert len(errors) == 1 and "capped diagnostic preparation" in errors[0]
+
+
 class CaseProcesses(harness.FakeProcesses):
     def __init__(self, *args, mutate=None, refuse=False, **kwargs):
         super().__init__(*args, **kwargs)
@@ -153,14 +193,39 @@ class CaseProcesses(harness.FakeProcesses):
         return {"exit": code, "pid": 98765, "model_refusal": observe()}
 
 
-def runner(tmp_path, monkeypatch, case, processes=None):
+def runner(tmp_path, monkeypatch, case, processes=None, *, side="modelled", cap=None):
     identity = load(case)
     plan = run.plan_module.diagnostic_steps(
         2, identity, cell=str(tmp_path / f"tp2_{case[2]}_c1"), oracle="transfer",
-        options=(), port=8000, repeats=1, target="/w/target.json")
+        options=(), port=8000, repeats=1, target="/w/target.json",
+        diagnostic_prepare_output_cap=cap)
     monkeypatch.setattr(harness, "_plan", lambda *_a, **_k: plan)
-    return harness._runner(tmp_path, "modelled", processes=processes or CaseProcesses(cell=tmp_path),
+    return harness._runner(tmp_path, side, processes=processes or CaseProcesses(cell=tmp_path),
                            purpose="acceptance")
+
+
+@pytest.mark.parametrize("change", [None, "policy", "shape", "unplanned"])
+def test_capped_warmup_evidence_matches_the_real_plan(tmp_path, monkeypatch, change):
+    case = fixture_case(tmp_path)
+
+    def preparation(blob):
+        blob["run"]["prepare"].update(
+            policy={"purpose": "diagnostic", "output_tokens_cap": 32},
+            shapes=[{"input_tokens": 128, "output_tokens": 16}] * 3)
+        if change == "policy":
+            blob["run"]["prepare"].pop("policy")
+        if change == "shape":
+            blob["run"]["prepare"]["shapes"][0] = {"input_tokens": 64, "output_tokens": 16}
+
+    task = runner(tmp_path, monkeypatch, case,
+                  CaseProcesses(cell=tmp_path, mutate=preparation),
+                  side="real", cap=None if change == "unplanned" else 32)
+    assert task.run() == (0 if change is None else 1), task.failures
+    result = json.loads((task.cell / "real.r1.json").read_text())
+    assert result["execution"]["purpose"] == "diagnostic"
+    assert result["execution"]["diagnostic_case"]["workload_sha256"] == digest(case[0])
+    if change is not None:
+        assert any("preparation" in reason for reason in task.failures)
 
 
 def test_case_identity_and_forced_purpose_travel_with_execution(tmp_path, monkeypatch):

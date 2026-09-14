@@ -511,16 +511,35 @@ def _clock_of(base: str, timeout: float) -> str | None:
 def _prepare(base: str, model: str, workload: list[dict], args) -> dict:
     """Warm the server, wait for it, and prove the engine forgot about it.
 
-    The measured workload's own shapes, so what warms is what will be
-    measured: a server warmed on one shape and measured on another has warmed
-    the wrong kernels. Unpaced and concurrent -- preparation is not a workload
-    and its arrival process means nothing.
+    By default, preparation traverses the measured workload's full shapes.
+    An explicit diagnostic cap preserves full prompts but shortens warmup
+    outputs; its policy and sent shapes travel with the drain evidence.
+    Unpaced and concurrent -- preparation has no workload arrival process.
+
+    For the PoC's native FULL graph, capture/replay keys are (batch, query
+    length); GDN's capture metadata fixes max_seqlen_k to max_model_len and
+    reads growing contexts from buffers. A cap of 32 exercises decode without
+    repeating a long output walk. This is a different preparation policy,
+    with no claim of full-sequence or thermal equivalence for acceptance.
 
     The drain is the point. `_drain_records` clears the engine's store, so the
     measured read that follows contains only measured requests, and the rows
     taken out are kept as the evidence that they were taken out.
     """
     shapes = [workload[i % len(workload)] for i in range(args.prepare)]
+    cap = getattr(args, "diagnostic_prepare_output_cap", None)
+    policy = {}
+    if cap is not None:
+        if type(cap) is not int or cap < 2:
+            raise ValueError("diagnostic preparation output cap must be at least 2")
+        policy = {
+            "policy": {"purpose": "diagnostic", "output_tokens_cap": cap,
+                       "prompt_tokens": "full", "measured_requests": "unchanged"},
+            "source_shapes": [{"input_tokens": row["input_tokens"],
+                               "output_tokens": row["output_tokens"]} for row in shapes],
+        }
+        shapes = [dict(row, output_tokens=min(row["output_tokens"], cap))
+                  for row in shapes]
     began = _time.monotonic()
     # Preparation must never arm the measured workload's one-shot barrier or
     # reuse its prompt identities. Each HTTP request still reaches one native
@@ -532,6 +551,19 @@ def _prepare(base: str, model: str, workload: list[dict], args) -> dict:
     results, submission = asyncio.run(_submit_requests(
         base, payloads, [0.0] * len(shapes), pace=False, timeout=args.timeout))
     seconds = _time.monotonic() - began
+    if cap is not None:
+        policy["response_usage"] = [
+            {"index": result["index"],
+             "usage": (result.get("response") or {}).get("usage")}
+            for result in results]
+        for result in results:
+            usage = (result.get("response") or {}).get("usage") or {}
+            expected = shapes[result["index"]]
+            if result["ok"] and (
+                usage.get("prompt_tokens") != expected["input_tokens"]
+                or usage.get("completion_tokens") != expected["output_tokens"]
+            ):
+                result.update(ok=False, error="diagnostic preparation served different token lengths")
     returned = sum(1 for r in results if r["ok"])
 
     drained = _drain_records(base, args.timeout)
@@ -553,6 +585,7 @@ def _prepare(base: str, model: str, workload: list[dict], args) -> dict:
             "declared_workload_size": False,
             "shapes": [{"input_tokens": r["input_tokens"],
                         "output_tokens": r["output_tokens"]} for r in shapes],
+            **policy,
             "records": rows,
             "failures": [r for r in results if not r["ok"]]}
 
@@ -601,12 +634,19 @@ def main(argv=None) -> int:
     p.add_argument("--prepare-out", default=None,
                    help="where to keep the drained preparation records; they "
                         "are evidence of the drain, not waste")
+    p.add_argument("--diagnostic-prepare-output-cap", type=int, default=None,
+                   help="diagnostic only: cap warmup outputs (at least 2), "
+                        "preserving full prompts and every measured request; "
+                        "default is the full preparation sequence")
     p.add_argument("--check-lengths", action="store_true",
                    help="compare the server's reported prompt_tokens against "
                         "what was asked for, and warn if they differ")
     args = p.parse_args(argv)
     if not math.isfinite(args.timeout) or args.timeout <= 0:
         p.error("--timeout must be finite and positive")
+    if args.diagnostic_prepare_output_cap is not None:
+        if args.diagnostic_prepare_output_cap < 2 or args.prepare < 1:
+            p.error("--diagnostic-prepare-output-cap requires a cap of at least 2 and --prepare")
 
     workload = _workload(args)
     if not workload:

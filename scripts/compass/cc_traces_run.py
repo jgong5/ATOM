@@ -1202,6 +1202,25 @@ class SideRun:
                     or encoding.get("conversion_in_execution") is not True):
                 bad.append("planned token-ID replay lacks conversion inside its measured window")
         prepare = manifest.get("prepare") or {}
+        cap_flag = "--diagnostic-prepare-output-cap"
+        preparation_policy = prepare.get("policy") or {}
+        if cap_flag in step["command"]:
+            cap = int(step["command"][step["command"].index(cap_flag) + 1])
+            if self.diagnostic_case is None or self.purpose != DIAGNOSTIC:
+                bad.append("capped preparation requires a pinned corpus diagnostic")
+            if (preparation_policy.get("purpose") != DIAGNOSTIC
+                    or preparation_policy.get("output_tokens_cap") != cap):
+                bad.append("preparation evidence does not record the planned diagnostic output cap")
+            requested = int(step["command"][step["command"].index("--prepare") + 1])
+            measured_rows = blob.get("workload") or []
+            expected_shapes = [
+                {"input_tokens": measured_rows[i % len(measured_rows)]["input_tokens"],
+                 "output_tokens": min(measured_rows[i % len(measured_rows)]["output_tokens"], cap)}
+                for i in range(requested)] if measured_rows else []
+            if prepare.get("shapes") != expected_shapes:
+                bad.append("preparation shapes do not preserve full prompts and the planned output cap")
+        elif preparation_policy.get("output_tokens_cap") is not None:
+            bad.append("preparation applied an unplanned diagnostic output cap")
         if self.side == "real":
             if not manifest.get("paced"):
                 bad.append(
@@ -1871,7 +1890,10 @@ def _cell_plan(args) -> dict:
         case = diagnostic_module.load_case(
             args.workload, args.manifest, args.manifest_sha256, args.case_id,
             target_model=plan_module.MODEL)
-        return plan_module.diagnostic_steps(args.tp, case, cell=str(cell), **options)
+        return plan_module.diagnostic_steps(
+            args.tp, case, cell=str(cell),
+            diagnostic_prepare_output_cap=getattr(args, "diagnostic_prepare_output_cap", None),
+            **options)
     built = plan_module.cell_steps(
         args.tp, args.klass, args.clients, root=str(cell.parent),
         corpus=getattr(args, "corpus", None) or "$CC_TRACES_CORPUS", **options)
@@ -2426,6 +2448,9 @@ def main(argv=None) -> int:
     d.add_argument("--workload", required=True)
     d.add_argument("--manifest", required=True)
     d.add_argument("--manifest-sha256", required=True)
+    d.add_argument("--diagnostic-prepare-output-cap", type=int, default=None,
+                   help="cap real-side warmup outputs only (at least 2); "
+                        "preserve full prompts, measured outputs and diagnostic identity")
     d.add_argument("--plan-only", action="store_true", help="print verified argv and identity without starting processes")
     d.set_defaults(func=side, diagnostic=True, purpose=DIAGNOSTIC, repeats=1)
 

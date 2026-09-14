@@ -7,6 +7,7 @@ import pickle
 import resource
 from contextlib import asynccontextmanager
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 from aiohttp import web
@@ -159,6 +160,64 @@ def test_prepared_bytes_refuse_as_a_whole_before_dispatch(monkeypatch):
     with pytest.raises(ValueError, match="no requests from this phase were sent"):
         replay._encode_requests([{"input_tokens": 1000, "output_tokens": 2, "arrival_s": 0}],
                                 "m", None, declared=True, byte_budget=100)
+
+
+@pytest.mark.parametrize("cap,failure", [
+    (None, None), (32, None), (32, "prompt"), (32, "output"), (32, "drain")])
+def test_preparation_preserves_full_prompts_and_measured_bytes(monkeypatch, cap, failure):
+    workload = [{"arrival_s": 0.0, "input_tokens": 128, "output_tokens": 40339},
+                {"arrival_s": 7.25, "input_tokens": 64, "output_tokens": 16}]
+    original = json.dumps(workload)
+    monkeypatch.setattr(replay, "_encoded_prompt", lambda n, i, _: [i] * n)
+    measured_before, _ = replay._encode_requests(
+        workload, "m", None, declared=True, byte_budget=65536)
+    captured = []
+
+    async def submit(base, payloads, arrivals, *, pace, timeout):
+        assert arrivals == [0.0] * 3 and pace is False
+        captured.extend(json.loads(payload) for payload in payloads)
+        results = [{"index": i, "ok": True, "response": {"usage": {
+            "prompt_tokens": len(body["prompt"]), "completion_tokens": body["max_tokens"]}}}
+            for i, body in enumerate(captured)]
+        if failure in ("prompt", "output"):
+            field = "prompt_tokens" if failure == "prompt" else "completion_tokens"
+            results[0]["response"]["usage"][field] -= 1
+        return results, {"pacing_started_at": 0.0}
+
+    monkeypatch.setattr(replay, "_submit_requests", submit)
+    drained = iter([{"clock": "wall", "requests": [{"finish_time": 9.0}] * 3},
+                    {"clock": "wall", "requests": [{}] if failure == "drain" else []}])
+    monkeypatch.setattr(replay, "_drain_records", lambda *_: next(drained))
+    result = replay._prepare("http://fixture", "m", workload, SimpleNamespace(
+        prepare=3, timeout=10, diagnostic_prepare_output_cap=cap))
+    assert [len(body["prompt"]) for body in captured] == [128, 64, 128]
+    assert [body["prompt"][0] for body in captured] == [1000000, 1000001, 1000002]
+    assert [body["max_tokens"] for body in captured] == ([40339, 16, 40339] if cap is None else [32, 16, 32])
+    assert all(body["ignore_eos"] and not any(k.startswith("compass_") for k in body)
+               for body in captured)
+    assert result["drained"] is (failure is None) and result["drained_records"] == 3
+    assert result["store_empty_after_drain"] is (failure != "drain")
+    assert result["boundary_engine_time"] == 9.0
+    assert bool(result["failures"]) is (failure in ("prompt", "output"))
+    if cap is None:
+        assert "policy" not in result and "response_usage" not in result
+    else:
+        assert result["policy"]["purpose"] == "diagnostic"
+        assert result["policy"]["output_tokens_cap"] == 32
+        assert [shape["output_tokens"] for shape in result["source_shapes"]] == [40339, 16, 40339]
+        assert [shape["output_tokens"] for shape in result["shapes"]] == [32, 16, 32]
+        assert [r["usage"]["completion_tokens"] for r in result["response_usage"]] == (
+            [31, 16, 32] if failure == "output" else [32, 16, 32])
+    measured_after, _ = replay._encode_requests(
+        workload, "m", None, declared=True, byte_budget=65536)
+    assert json.dumps(workload) == original and measured_after == measured_before
+
+
+def test_preparation_cap_without_preparation_is_refused_before_submission(tmp_path, monkeypatch):
+    monkeypatch.setattr(replay, "_workload", lambda *_: pytest.fail("invalid cap reached workload"))
+    with pytest.raises(SystemExit):
+        replay.main(["--port", "1", "--out", str(tmp_path / "result.json"),
+                     "--diagnostic-prepare-output-cap", "32"])
 
 
 def test_received_rows_keep_native_singleton_add_bytes(seq_factory):

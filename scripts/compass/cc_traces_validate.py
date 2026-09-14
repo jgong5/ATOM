@@ -2658,6 +2658,13 @@ def check_not_diagnostic(cell_dir: Path, journals: dict, manifests: dict) -> lis
                 )
     for side, blobs in manifests.items():
         for index, blob in enumerate(blobs):
+            preparation = ((blob or {}).get("run") or {}).get("prepare") or {}
+            policy = preparation.get("policy") or {}
+            if policy.get("output_tokens_cap") is not None:
+                problems.append(
+                    f"{side}[{index}]: capped diagnostic preparation is not "
+                    "the registered acceptance preparation protocol"
+                )
             said = _stated_purpose((blob or {}).get("execution"))
             if said is None:
                 problems.append(

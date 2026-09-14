@@ -363,6 +363,7 @@ def _replay(
     pretokenize: bool = False,
     workload_path: str | None = None,
     client_memory_budget_mib: int | None = None,
+    diagnostic_prepare_output_cap: int | None = None,
 ):
     if client_memory_budget_mib is not None and client_memory_budget_mib <= 0:
         raise SystemExit("client memory budget must be positive")
@@ -399,6 +400,8 @@ def _replay(
             "--prepare-out",
             out.replace(".json", ".prepare.json"),
         ]
+        if diagnostic_prepare_output_cap is not None:
+            cmd += ["--diagnostic-prepare-output-cap", str(diagnostic_prepare_output_cap)]
     return cmd
 
 
@@ -422,6 +425,7 @@ def _lifecycle(
     engine_args=None,
     workload_path: str | None = None,
     client_memory_budget_mib: int | None = None,
+    diagnostic_prepare_output_cap: int | None = None,
 ):
     """One repeat: its own server, its replay, and the end of that process."""
     modelled = side == "modelled"
@@ -489,6 +493,7 @@ def _lifecycle(
                 pretokenize=pretokenize,
                 workload_path=workload_path,
                 client_memory_budget_mib=client_memory_budget_mib,
+                diagnostic_prepare_output_cap=diagnostic_prepare_output_cap,
             ),
             "produces": (
                 [f"{side}.r{n}.json"]
@@ -797,6 +802,7 @@ def diagnostic_steps(
     request_timeout=REQUEST_TIMEOUT, pretokenize=False,
     allow_advisory_isolation=False, request_readiness_profile="",
     prefill_preparation_fence=False, client_memory_budget_mib=None,
+    diagnostic_prepare_output_cap=None,
 ):
     """Execute a pinned case through the same lifecycle, without a matrix alias."""
     klass, clients = case["case_id"], case["clients"]
@@ -808,6 +814,10 @@ def diagnostic_steps(
         raise SystemExit("HTTP listener and engine rendezvous need different ports")
     if not math.isfinite(request_timeout) or request_timeout <= 0 or repeats < 1:
         raise SystemExit("diagnostic repeats and request timeout must be positive")
+    if diagnostic_prepare_output_cap is not None and (
+        type(diagnostic_prepare_output_cap) is not int or diagnostic_prepare_output_cap < 2
+    ):
+        raise SystemExit("diagnostic preparation output cap must be at least 2")
     before, after = _real_monitoring_steps(cell, allow_advisory_isolation)
     steps = before
     for side in ("real", "modelled"):
@@ -821,6 +831,7 @@ def diagnostic_steps(
                 memory_model=memory_model if modelled else None,
                 request_timeout=request_timeout, pretokenize=pretokenize,
                 workload_path=case["workload"], client_memory_budget_mib=client_memory_budget_mib,
+                diagnostic_prepare_output_cap=diagnostic_prepare_output_cap,
                 engine_args=(_modelled_engine_args(tp, request_readiness_profile,
                                                    prefill_preparation_fence)
                              if modelled else None),
@@ -832,6 +843,8 @@ def diagnostic_steps(
         "cell": cell, "tp": tp, "class": klass, "clients": clients,
         "workload": case["workload"], "diagnostic_case": case,
         "purpose": "diagnostic", "request_timeout": request_timeout,
+        **({"diagnostic_prepare_output_cap": diagnostic_prepare_output_cap}
+           if diagnostic_prepare_output_cap is not None else {}),
         "allow_advisory_isolation": bool(allow_advisory_isolation),
         "isolation_qualification": (ADVISORY_ISOLATION_QUALIFICATION
                                     if allow_advisory_isolation else None),
