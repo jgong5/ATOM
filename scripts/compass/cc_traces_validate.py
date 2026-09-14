@@ -494,7 +494,7 @@ def check_side_roles(real, modelled) -> list[str]:
     return bad
 
 
-def check_engine(run, tp: int, label: str) -> list[str]:
+def check_engine(run, tp: int, label: str, *, expected_cache_policy=None) -> list[str]:
     """The configuration the server reports, against the registered one."""
     bad = []
     server = run.manifest.get("server") or {}
@@ -509,7 +509,15 @@ def check_engine(run, tp: int, label: str) -> list[str]:
             f"{label}: served at TP={server.get('tensor_parallel_size')}"
             f", not the cell's TP={tp}"
         )
-    for key, want in ENGINE.items():
+    expected_engine = dict(ENGINE)
+    if expected_cache_policy is not None:
+        from atom.compass.core.cache_policy import cache_on_policy, policy_errors
+        bad += policy_errors(expected_cache_policy, cache_on_policy())
+        bad += policy_errors(server.get("cache_policy"), expected_cache_policy)
+        if tp != 1:
+            bad.append(f"{label}: cache-enabled diagnostics require TP1")
+        expected_engine["enable_prefix_caching"] = True
+    for key, want in expected_engine.items():
         have = server.get(key)
         if have is None:
             bad.append(f"{label}: the server does not report {key}")
@@ -518,6 +526,42 @@ def check_engine(run, tp: int, label: str) -> list[str]:
                 bad.append(f"{label}: {key} is {have}, not the registered {want}")
         elif bool(have) != want if isinstance(want, bool) else have != want:
             bad.append(f"{label}: {key} is {have!r}, not the registered {want!r}")
+    return bad
+
+
+def check_cache_policy_evidence(manifest, expected_policy, side):
+    """Bind a cache-on diagnostic to its live policy and native cache boundary."""
+    from atom.compass.core.cache_policy import cache_on_policy, policy_errors
+    bad = policy_errors(expected_policy, cache_on_policy())
+    server = manifest.get("server") or {}
+    bad += policy_errors(server.get("cache_policy"), expected_policy)
+    if server.get("enable_prefix_caching") is not True:
+        bad.append("cache-on diagnostic did not report prefix caching enabled")
+    try:
+        from atom.compass.core.cache_boundary import reset_receipt_errors
+    except ImportError:
+        return bad + ["native cache boundary validation is unavailable"]
+    receipt = manifest.get("cache_boundary")
+    boundary_bad = reset_receipt_errors(
+        receipt, expected_worker_kind=("device_synchronize" if side == "real" else "modelled_no_device"),
+        require_fresh_modelled=side == "modelled")
+    bad += boundary_bad
+    if boundary_bad:
+        return bad
+    if len(receipt["ranks"]) != 1:
+        bad.append("cache-on diagnostic reset must describe exactly one TP1 rank")
+    for rank in (receipt or {}).get("ranks", []):
+        for phase in ("before", "after"):
+            bad += policy_errors((rank.get(phase) or {}).get("policy"), expected_policy)
+    final = manifest.get("cache_state_after")
+    ranks = final.get("ranks") if isinstance(final, dict) else None
+    if (not isinstance(final, dict) or final.get("schema") != "compass.cache_snapshot/1"
+            or not isinstance(ranks, list) or len(ranks) != 1 or not isinstance(ranks[0], dict)):
+        bad.append("cache-on diagnostic has no final TP1 cache snapshot")
+    else:
+        bad += policy_errors(ranks[0].get("policy"), expected_policy)
+    if manifest.get("cache_state_error"):
+        bad.append("cache-on diagnostic failed its final cache snapshot")
     return bad
 
 
@@ -971,8 +1015,21 @@ def check_capacity_inputs(modelled, label: str) -> list[str]:
             )
         ]
     bad = []
+    server = modelled.manifest.get("server") or {}
+    selected_policy = server.get("cache_policy") if server.get("enable_prefix_caching") is True else None
+    if server.get("enable_prefix_caching") is True:
+        from atom.compass.core.cache_policy import cache_on_policy, policy_errors
+        bad += policy_errors(selected_policy, cache_on_policy())
     for index, rank in enumerate(ranks):
         where = f"{label}: rank {index}"
+        if selected_policy is not None:
+            budget = _budget_record(rank.get("budget_source")) or {}
+            lineage = budget.get("lineage") or {}
+            bad += [f"{where}: {reason}" for reason in policy_errors(lineage.get("cache_policy"), selected_policy)]
+            assumption = lineage.get("cache_policy_assumption") or {}
+            if (assumption.get("status") != "declared_candidate"
+                    or assumption.get("native_cache_on_memory_validated") is not False):
+                bad.append(f"{where}: cache-on memory must retain its declared candidate qualification")
         roles = {
             row.get("role")
             for row in (rank.get("inputs") or [])
@@ -1385,7 +1442,7 @@ def check_component_terms(record: dict, rank, where: str):
     return bad, rows, None
 
 
-def check_memory_terms(real, modelled, cell_dir: Path, repeat: int, label: str):
+def check_memory_terms(real, modelled, cell_dir: Path, repeat: int, label: str, *, expected_cache_policy=None):
     """The gate protocol section 6 declares and nothing implemented.
 
     Two numbers exist for every memory term in this cell: what the card
@@ -1447,6 +1504,10 @@ def check_memory_terms(real, modelled, cell_dir: Path, repeat: int, label: str):
         except (OSError, ValueError) as exc:
             bad.append(f"{where}: {path.name} could not be read ({exc})")
             continue
+        if expected_cache_policy is not None:
+            from atom.compass.core.cache_policy import cache_on_policy, policy_errors
+            bad += policy_errors(expected_cache_policy, cache_on_policy())
+            bad += [f"{where}: {reason}" for reason in policy_errors(record.get("cache_policy"), expected_cache_policy)]
         if record.get("version") != MEMORY_RECORD_VERSION:
             bad.append(
                 f"{where}: {path.name} is a version {record.get('version')!r} "

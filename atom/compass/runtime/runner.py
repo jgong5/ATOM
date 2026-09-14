@@ -1138,6 +1138,7 @@ class CompassModelRunner(CompassPredictMixin, ModelRunner):
                     record = json.load(fh)
             except (OSError, ValueError):
                 record = {}
+        from atom.compass.core.cache_policy import configuration, snapshot
         record["version"] = 1
         config = self.config
         record["config"] = {
@@ -1151,6 +1152,7 @@ class CompassModelRunner(CompassPredictMixin, ModelRunner):
             "enable_prefix_caching": bool(
                 getattr(config, "enable_prefix_caching", False)),
             "enforce_eager": bool(getattr(config, "enforce_eager", False)),
+            **configuration(config),
         }
         # The machine, not just the deployment. A GPU-free replay has to be
         # told which architecture it is about: AITER resolves capability flags
@@ -1166,6 +1168,8 @@ class CompassModelRunner(CompassPredictMixin, ModelRunner):
             record["blocks"] = dict(blocks)
         if graph is not None:
             record["graph"] = dict(graph)
+        record["cache_policy"] = snapshot(
+            config, (record.get("blocks") or {}).get("state_runtime"))
         try:
             with open(path, "w", encoding="utf-8") as fh:
                 json.dump(record, fh, indent=1)
@@ -1183,9 +1187,11 @@ class CompassModelRunner(CompassPredictMixin, ModelRunner):
         if any(size > 1 for size in self._topology().values()):
             path = self._rank_path(path, coords)
         config = self.config
+        from atom.compass.core.cache_policy import configuration, snapshot
         record = {
             "version": 1,
             "readings": readings,
+            "cache_policy": snapshot(config, result.get("state_runtime")),
             # What the engine made of them, so a modelled budget can be checked
             # against the decision it actually drove rather than against bytes.
             "blocks": {
@@ -1209,6 +1215,7 @@ class CompassModelRunner(CompassPredictMixin, ModelRunner):
                 "block_size": getattr(config, "kv_cache_block_size", None),
                 "topology": self._topology(),
                 "rank_coords": dict(coords),
+                **configuration(config),
             },
         }
         try:

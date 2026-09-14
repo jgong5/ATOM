@@ -126,6 +126,8 @@ def derive_target(
 
     width = int(getattr(config, "tensor_parallel_size", 1) or 1)
     capture_sizes = list(layout.graph.get("capture_sizes") or [])
+    from atom.compass.core.cache_policy import CONFIG_FIELDS, configuration, snapshot
+    selected_policy = snapshot(config, state_runtime)
     record = {
         "version": TARGET_VERSION,
         "blocks": blocks,
@@ -136,6 +138,7 @@ def derive_target(
             "max_num_seqs": int(getattr(config, "max_num_seqs", 0) or 0),
             "gpu_memory_utilization": float(
                 getattr(config, "gpu_memory_utilization", 0.0) or 0.0),
+            **{key: value for key, value in configuration(config).items() if value is not None},
         },
         "graph": {
             # No device captured graphs for this width, so there is no capture
@@ -165,6 +168,12 @@ def derive_target(
             },
         },
     }
+    if selected_policy["enable_prefix_caching"] is not None:
+        record["cache_policy"] = selected_policy
+    if selected_policy["enable_prefix_caching"] is True:
+        record["derivation"]["borrowed"]["source_cache_policy"] = (
+            layout.cache_policy if layout.cache_policy is not None
+            else {key: layout.config.get(key) for key in CONFIG_FIELDS})
     logger.info(
         "ATOMCompass: derived a TP%d replay target from %s -- %d KV blocks, "
         "%d state slots, nothing measured at this width",

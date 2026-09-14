@@ -67,6 +67,7 @@ class TargetRecord:
         self.version = int(blob.get("version") or 0)
         self.blocks: dict = dict(blob.get("blocks") or {})
         self.config: dict = dict(blob.get("config") or {})
+        self.cache_policy = blob.get("cache_policy")
         self.graph: dict = dict(blob.get("graph") or {})
         # Optional on purpose, and not guarded by the version above. The
         # version guard is for fields a replay would silently *misread*; a
@@ -132,11 +133,17 @@ class TargetRecord:
             "gpu_memory_utilization": float(
                 getattr(config, "gpu_memory_utilization", 0.0) or 0.0),
         }
+        from atom.compass.core.cache_policy import CONFIG_FIELDS, configuration
+        checks.update({key: value for key, value in configuration(config).items()
+                       if value is not None})
         out = []
         for key, now in checks.items():
             was = self.config.get(key)
             if was is not None and was != now:
                 out.append(f"{key}: captured {was!r}, replaying {now!r}")
+            elif (was is None and key in CONFIG_FIELDS
+                  and checks.get("enable_prefix_caching") is True):
+                out.append(f"{key}: source capture did not record it, replaying {now!r}")
         return out
 
 
@@ -327,6 +334,11 @@ class ReplayModelRunner(CompassPredictMixin):
                         captured=self.target.blocks,
                         # Profiles are per width, not rank-suffixed artifacts.
                         coords=None, collect=read, lineage=rank_lineage)
+                    if "cache_policy" in rank_lineage:
+                        from atom.compass.core.cache_policy import CONFIG_FIELDS
+                        rank_lineage["borrowed_target_cache_policy"] = (
+                            self.target.cache_policy if self.target.cache_policy is not None
+                            else {key: self.target.config.get(key) for key in CONFIG_FIELDS})
                     rank_inputs = (tuple(self.compass_runtime_inputs)
                                    + tuple(read[first_input:]))
                     if target_rank == 0:

@@ -70,6 +70,17 @@ def _load(name: str):
 registry = _load("cc_traces_registry")
 
 
+def _cache_policy_module():
+    path = ROOT / "atom/compass/core/cache_policy.py"
+    spec = importlib.util.spec_from_file_location("compass_cache_policy", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+cache_policy = _cache_policy_module()
+
+
 def _registry_oracle(args):
     return registry.ORACLE if getattr(args, "artifact_root", None) else None
 
@@ -803,6 +814,9 @@ def diagnostic_steps(
     allow_advisory_isolation=False, request_readiness_profile="",
     prefill_preparation_fence=False, client_memory_budget_mib=None,
     diagnostic_prepare_output_cap=None,
+    enable_prefix_caching=False,
+    prompt_encoding=None,
+    prompt_encoding_sha256=None,
 ):
     """Execute a pinned case through the same lifecycle, without a matrix alias."""
     klass, clients = case["case_id"], case["clients"]
@@ -818,10 +832,33 @@ def diagnostic_steps(
         type(diagnostic_prepare_output_cap) is not int or diagnostic_prepare_output_cap < 2
     ):
         raise SystemExit("diagnostic preparation output cap must be at least 2")
+    selected_policy = case.get("cache_policy")
+    if enable_prefix_caching:
+        if tp != 1:
+            raise SystemExit("cache-enabled diagnostics currently require TP1")
+        errors = cache_policy.policy_errors(selected_policy, cache_policy.cache_on_policy())
+        if errors:
+            raise SystemExit("; ".join(errors))
+        encoding = case.get("prompt_encoding") or {}
+        if (not prompt_encoding or not prompt_encoding_sha256
+                or Path(prompt_encoding).resolve() != Path(encoding.get("path", "")).resolve()
+                or prompt_encoding_sha256 != encoding.get("sha256")):
+            raise SystemExit("cache-enabled diagnostics require the case's pinned prompt encoding")
+    elif selected_policy is not None:
+        raise SystemExit("a cache-policy case requires --enable-prefix-caching")
+    elif prompt_encoding or prompt_encoding_sha256:
+        raise SystemExit("prompt encoding requires the explicit cache-enabled diagnostic policy")
     before, after = _real_monitoring_steps(cell, allow_advisory_isolation)
     steps = before
     for side in ("real", "modelled"):
         modelled = side == "modelled"
+        engine_args = (_modelled_engine_args(tp, request_readiness_profile,
+                                            prefill_preparation_fence)
+                       if modelled else list(ENGINE_ARGS))
+        if enable_prefix_caching:
+            engine_args.remove("--no-enable_prefix_caching")
+            engine_args += ["--enable_prefix_caching", "--state-checkpoint-interval-tokens",
+                            "8192", "--state-checkpoint-demand"]
         for n in range(1, repeats + 1):
             steps += _lifecycle(
                 side, n, tp=tp, klass=klass, clients=clients, cell=cell,
@@ -832,17 +869,23 @@ def diagnostic_steps(
                 request_timeout=request_timeout, pretokenize=pretokenize,
                 workload_path=case["workload"], client_memory_budget_mib=client_memory_budget_mib,
                 diagnostic_prepare_output_cap=diagnostic_prepare_output_cap,
-                engine_args=(_modelled_engine_args(tp, request_readiness_profile,
-                                                   prefill_preparation_fence)
-                             if modelled else None),
+                engine_args=engine_args,
             )
         if not modelled:
             steps += after
     steps.append(_gpu_free_step(cell))
+    if enable_prefix_caching:
+        for step in steps:
+            if step["role"] in ("serve", "replay"):
+                step["cache_policy"] = selected_policy
+            if step["role"] == "replay":
+                step["command"] += ["--prompt-encoding", str(prompt_encoding),
+                                    "--prompt-encoding-sha256", prompt_encoding_sha256]
     return {
         "cell": cell, "tp": tp, "class": klass, "clients": clients,
         "workload": case["workload"], "diagnostic_case": case,
         "purpose": "diagnostic", "request_timeout": request_timeout,
+        **({"cache_policy": selected_policy} if enable_prefix_caching else {}),
         **({"diagnostic_prepare_output_cap": diagnostic_prepare_output_cap}
            if diagnostic_prepare_output_cap is not None else {}),
         "allow_advisory_isolation": bool(allow_advisory_isolation),

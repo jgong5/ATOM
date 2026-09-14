@@ -479,6 +479,7 @@ class SideRun:
         self.ports_in_use = ports_in_use
         #: acceptance or diagnostic, stamped into every record this run writes
         self.diagnostic_case = cell_plan.get("diagnostic_case")
+        self.cache_policy = cell_plan.get("cache_policy")
         self.unregistered = cell_plan["class"] not in plan_module.CLASSES
         self.purpose = (DIAGNOSTIC if self.unregistered or self.diagnostic_case is not None
                         else purpose)
@@ -668,6 +669,7 @@ class SideRun:
             "engine_args": list(step.get("engine_args", plan_module.ENGINE_ARGS)),
             "provenance": None,
             "provenance_sha256": None,
+            **({"cache_policy": self.cache_policy} if self.cache_policy is not None else {}),
         }
 
     def _port_conflicts(self, step):
@@ -883,6 +885,13 @@ class SideRun:
                 f"{declared}, and this cell is tp{self.plan['tp']}"
             )
             return None
+        if self.cache_policy is not None:
+            errors = plan_module.cache_policy.policy_errors(said.get("cache_policy"), self.cache_policy)
+            if said.get("enable_prefix_caching") is not True:
+                errors.append("the server does not report prefix caching enabled")
+            if errors:
+                self.failures += [f"{step['id']}: {reason}" for reason in errors]
+                return None
         path = self.cell / f"provenance.{self.side}.r{step['repeat']}.json"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(json.dumps(said, indent=1) + "\n")
@@ -1178,6 +1187,23 @@ class SideRun:
             return False
         manifest = blob.get("run") or {}
         bad = []
+        if self.cache_policy is not None:
+            bad += _load("cc_traces_validate").check_cache_policy_evidence(
+                manifest, self.cache_policy, self.side)
+            encoding = (manifest.get("prompt_encoding") or {}).get("corpus_encoding") or {}
+            pinned = self.diagnostic_case.get("prompt_encoding") or {}
+            if (encoding.get("sha256") != pinned.get("sha256")
+                    or encoding.get("phase") != "measured"
+                    or encoding.get("row_token_sha256") != self.diagnostic_case.get("prompt_token_sha256")):
+                bad.append("replay does not attest to the pinned measured prompt encoding")
+            if self.side == "real":
+                memory_path = self.cell / f"real.r{step['repeat']}_memory.json"
+                try:
+                    memory = json.loads(memory_path.read_text())
+                except (OSError, ValueError) as exc:
+                    bad.append(f"cache policy memory evidence missing: {exc}")
+                else:
+                    bad += plan_module.cache_policy.policy_errors(memory.get("cache_policy"), self.cache_policy)
         if self.diagnostic_case:
             try:
                 diagnostic_module.check_result(blob, self.diagnostic_case)
@@ -1382,6 +1408,13 @@ class SideRun:
             case = self.diagnostic_case
             if not case:
                 raise ValueError("unregistered workloads require an explicit pinned diagnostic case")
+            if self.cache_policy is not None:
+                errors = plan_module.cache_policy.policy_errors(case.get("cache_policy"), self.cache_policy)
+                errors += plan_module.cache_policy.policy_errors(self.cache_policy, plan_module.cache_policy.cache_on_policy())
+                if errors:
+                    raise ValueError("; ".join(errors))
+            elif case.get("cache_policy") is not None:
+                raise ValueError("case cache policy is absent from the execution plan")
             if (self.plan["class"] != case["case_id"] or self.plan["clients"] != case["clients"]
                     or Path(self.plan["workload"]).resolve() != Path(case["workload"])
                     or self.cell.name != f"tp{self.plan['tp']}_{case['case_id']}_c{case['clients']}"):
@@ -1893,6 +1926,9 @@ def _cell_plan(args) -> dict:
         return plan_module.diagnostic_steps(
             args.tp, case, cell=str(cell),
             diagnostic_prepare_output_cap=getattr(args, "diagnostic_prepare_output_cap", None),
+            enable_prefix_caching=getattr(args, "enable_prefix_caching", False),
+            prompt_encoding=getattr(args, "prompt_encoding", None),
+            prompt_encoding_sha256=getattr(args, "prompt_encoding_sha256", None),
             **options)
     built = plan_module.cell_steps(
         args.tp, args.klass, args.clients, root=str(cell.parent),
@@ -2448,6 +2484,10 @@ def main(argv=None) -> int:
     d.add_argument("--workload", required=True)
     d.add_argument("--manifest", required=True)
     d.add_argument("--manifest-sha256", required=True)
+    d.add_argument("--enable-prefix-caching", action="store_true",
+                   help="explicit TP1 cache-on diagnostic policy; legacy registered plans stay unchanged")
+    d.add_argument("--prompt-encoding", default=None)
+    d.add_argument("--prompt-encoding-sha256", default=None)
     d.add_argument("--diagnostic-prepare-output-cap", type=int, default=None,
                    help="cap real-side warmup outputs only (at least 2); "
                         "preserve full prompts, measured outputs and diagnostic identity")

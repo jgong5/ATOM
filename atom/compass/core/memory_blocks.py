@@ -181,6 +181,7 @@ def capacity_context(config, compass_config, memory_model: str = "") -> dict:
     a different pool at another width, block size or utilization. One shape for
     both runners, because the question a reader asks of either is the same.
     """
+    from atom.compass.core.cache_policy import configuration
     return {
         "modelled": bool(memory_model),
         "memory_model": memory_model or None,
@@ -204,6 +205,7 @@ def capacity_context(config, compass_config, memory_model: str = "") -> dict:
                 getattr(config, "kv_cache_block_size", 0) or 0),
             "kv_cache_dtype": str(getattr(config, "kv_cache_dtype", "auto")),
             "enforce_eager": bool(getattr(config, "enforce_eager", False)),
+            **{key: value for key, value in configuration(config).items() if value is not None},
         },
     }
 
@@ -419,6 +421,13 @@ def derived_block_info(
                 "rather than of the budget -- there is nothing to derive it "
                 "from here")
 
+    from atom.compass.core.cache_policy import cache_on_policy, policy_errors, snapshot
+    selected_policy = snapshot(config, state_runtime)
+    if selected_policy["enable_prefix_caching"] is True:
+        errors = policy_errors(selected_policy, cache_on_policy())
+        if errors:
+            _refuse("; ".join(errors))
+
     entries = dict(plan.entries)
     if captured:
         was = set((captured.get("pool_entries") or {}))
@@ -440,6 +449,13 @@ def derived_block_info(
         lineage.update(derivation_lineage(
             profile, payloads.get(PROFILE_ROLE + ".calibration"),
             path=path, world=world, activation=activation, readings=readings))
+        if selected_policy["enable_prefix_caching"] is True:
+            lineage["cache_policy"] = selected_policy
+            lineage["cache_policy_assumption"] = {
+                "status": "declared_candidate",
+                "capacity_geometry": "unchanged native KV/state pool geometry",
+                "native_cache_on_memory_validated": False,
+            }
 
     return {
         "num_kvcache_blocks": int(plan.paged_entries),
