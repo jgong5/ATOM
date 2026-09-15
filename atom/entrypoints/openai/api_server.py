@@ -2664,6 +2664,20 @@ _ROLE_OPTIONS = {
     "oracle.low_q_reference_freeze": "low_q_handoff",
     "oracle.low_q_validation": "low_q_handoff",
     "oracle.low_q_live_abi": "low_q_handoff",
+    "oracle.root_prefill_sources": "root_prefill_handoff",
+    "oracle.root_prefill_plan": "root_prefill_handoff",
+    "oracle.root_prefill_proposal": "root_prefill_handoff",
+    "oracle.root_prefill_primitive_freeze": "root_prefill_handoff",
+    "oracle.root_prefill_primitive_verdict": "root_prefill_handoff",
+    "oracle.root_prefill_primitive_preflight": "root_prefill_handoff",
+    "oracle.root_prefill_region_freeze": "root_prefill_handoff",
+    "oracle.root_prefill_region_verdict": "root_prefill_handoff",
+    "oracle.root_prefill_prior_plan": "root_prefill_handoff",
+    "oracle.root_prefill_prior_freeze": "root_prefill_handoff",
+    "oracle.root_prefill_prior_verdict": "root_prefill_handoff",
+    "oracle.root_prefill_prior_preflight": "root_prefill_handoff",
+    "oracle.root_prefill_final_verdict": "root_prefill_handoff",
+    "oracle.root_prefill_native_complete": "root_prefill_handoff",
 }
 
 

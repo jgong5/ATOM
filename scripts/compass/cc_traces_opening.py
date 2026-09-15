@@ -35,6 +35,7 @@ CACHE_REGION_OPTIONS = frozenset((
     "region_overlay", "region_overlay_sha256", "include_failed_outputless", "include_failed_final",
     "diagnostic_only", "q16_handoff", "q16_handoff_sha256",
     "low_q_handoff", "low_q_handoff_sha256", "low_q_allow_failed_spread", "rank_coords",
+    "root_prefill_handoff", "root_prefill_handoff_sha256", "root_prefill_allow_failed_spread",
 ))
 
 
@@ -247,17 +248,11 @@ def check_source_contract(modelled, registry, workload_sha, forbidden, label):
         selected = wrapper.model_from_artifact(
             overlay, include_failed_outputless=include_failed,
             include_failed_final=include_failed_final, diagnostic_only=diagnostic)
-        snapshot = region_snapshot(overlay["name"], selected)
-        if ranks[0].get("regions") != snapshot:
-            raise ValueError("selected region snapshot differs from its loaded overlay and flags")
+        selected_name = overlay["name"]
         if include_failed:
             notes.append("FAILED outputless source qualification retained; diagnostic_only=1; no acceptance credit")
         if include_failed_final:
             notes.append("FAILED final-query transfer retained with unchanged q16 formula; diagnostic_only=1; no acceptance credit")
-        selected_options = dict(options, regions=overlay["name"])
-        bad.extend(validate.check_region_calibration(
-            _source_view(modelled, oracle_options=selected_options), registry, 1, workload_sha, forbidden))
-
         if bool(options.get("q16_handoff")) != bool(options.get("q16_handoff_sha256")):
             raise ValueError("q16 source handoff and its SHA-256 are required together")
         if options.get("q16_handoff"):
@@ -311,6 +306,50 @@ def check_source_contract(modelled, registry, workload_sha, forbidden, label):
                 notes.append("Selected low-query sources qualified; full source campaign remains unqualified")
         elif any(str(row.get("role", "")).startswith("oracle.low_q_") for row in inputs):
             raise ValueError("unconfigured low-query source evidence was loaded")
+        if bool(options.get("root_prefill_handoff")) != bool(options.get("root_prefill_handoff_sha256")):
+            raise ValueError("root prefill handoff and its SHA-256 are required together")
+        if options.get("root_prefill_handoff"):
+            pinned("root_prefill_handoff", "oracle.root_prefill_sources")
+            scopes = [row for row in inputs if row.get("role") == "oracle.attention_scope"]
+            if (len(scopes) != 1 or not options.get("attention_scope")
+                    or scopes[0].get("requested") != options["attention_scope"]):
+                raise ValueError("root prefill addition lacks its loaded deployment request scope")
+            from atom.compass.core.cost.root_prefill import ExactPrefillRegions, RootPrefillPrices
+            from atom.compass.core.cost.library import PriceLibrary
+            base = PriceLibrary()
+            base.launch_charge_seconds = float(options.get("seconds_per_launch", 0))
+            root_prefill = RootPrefillPrices(base, options["root_prefill_handoff"], options["root_prefill_handoff_sha256"],
+                deployment_scope_sha256=scopes[0]["sha256"], diagnostic_only=diagnostic,
+                allow_failed_spread=_flag(options.get("root_prefill_allow_failed_spread", False),
+                                         "root_prefill_allow_failed_spread"))
+            files = {}
+            for source in root_prefill.loaded_inputs:
+                if sum(row == source.as_dict() for row in inputs) != 1:
+                    raise ValueError(f"root prefill source {source.path} lacks its exact loaded-input identity")
+                bad.extend(validate._check_calibration_records(
+                    {source.role: source.sha256}, {source.role: {Path(source.path).name: source.sha256}},
+                    registry, 1, workload_sha, forbidden))
+                if source.role.startswith("oracle.root_prefill_"):
+                    files[Path(source.path).name] = source.sha256
+            digest = next(iter(files.values())) if len(files) == 1 else validate._rolled_digest(files)
+            if ((compass.get("oracle_option_files") or {}).get("root_prefill_handoff") != files
+                    or (compass.get("oracle_option_sha256") or {}).get("root_prefill_handoff") != digest):
+                raise ValueError("root prefill aggregate option does not retain every loaded evidence file")
+            bad.extend(validate._check_calibration_records(
+                {"root_prefill_handoff": digest}, {"root_prefill_handoff": files},
+                registry, 1, workload_sha, forbidden))
+            selected = ExactPrefillRegions(selected, root_prefill.region_points, root_prefill.handoff_sha256)
+            selected_name = "root-prefill-sources"
+            if not root_prefill.source_qualified:
+                notes.append("FAILED root prefill heldout spread retained; diagnostic_only=1; no acceptance credit")
+        elif any(str(row.get("role", "")).startswith("oracle.root_prefill_") for row in inputs):
+            raise ValueError("unconfigured root prefill source evidence was loaded")
+        snapshot = region_snapshot(selected_name, selected)
+        if ranks[0].get("regions") != snapshot:
+            raise ValueError("selected region snapshot differs from its loaded overlay and flags")
+        selected_options = dict(options, regions=selected_name)
+        bad.extend(validate.check_region_calibration(
+            _source_view(modelled, oracle_options=selected_options), registry, 1, workload_sha, forbidden))
     except (OSError, ValueError, TypeError, KeyError, OverflowError) as exc:
         bad.append(f"{label}: opening source contract: {exc}")
     return bad, notes
@@ -402,6 +441,8 @@ def _pair_case(args, case_reader):
                         "q16_handoff_sha256": options.get("q16_handoff_sha256"),
                         "low_q_handoff_sha256": options.get("low_q_handoff_sha256"),
                         "low_q_allow_failed_spread": options.get("low_q_allow_failed_spread", False),
+                        "root_prefill_handoff_sha256": options.get("root_prefill_handoff_sha256"),
+                        "root_prefill_allow_failed_spread": options.get("root_prefill_allow_failed_spread", False),
                         "include_failed_outputless": options.get("include_failed_outputless", False),
                         "include_failed_final": options.get("include_failed_final", False),
                         "diagnostic_only": options.get("diagnostic_only", False)})
