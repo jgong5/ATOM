@@ -72,3 +72,31 @@ It observed 235 credits: 33 whole root cycles, one initial rootless child and a
 final partial root cut off normally. That external evidence is not bundled
 here and is not proof of nonempty cache priming, actual model performance or
 paired E2E acceptance.
+
+## Controlled clocks and raw transport boundaries
+
+The additive `aiperf-controlled-clock.patch` scopes semantic clocks for the
+controlled runner while retaining native clock defaults. After applying the
+zero-warmup prerequisite, use `apply-controlled` and `verify-controlled`.
+
+The separately pinned `aiperf-raw-transport-timestamps.patch` adds optional
+`end_perf_ns` and `recv_start_perf_ns` fields to raw exports, copied directly
+from the existing `RequestRecord`. The last SSE packet and
+`metadata.request_end_ns` keep their existing meanings. Missing new fields in
+an older export mean the transport boundaries are unavailable.
+
+```bash
+bash "$ATOM_CHECKOUT/scripts/compass/aiperf_dependency.sh" apply-controlled "$AIPERF_PRIVATE_CHECKOUT"
+bash "$ATOM_CHECKOUT/scripts/compass/aiperf_dependency.sh" verify-controlled "$AIPERF_PRIVATE_CHECKOUT"
+bash "$ATOM_CHECKOUT/scripts/compass/aiperf_dependency.sh" apply-export "$AIPERF_PRIVATE_CHECKOUT"
+bash "$ATOM_CHECKOUT/scripts/compass/aiperf_dependency.sh" verify-export "$AIPERF_PRIVATE_CHECKOUT"
+```
+
+The export extension requires controlled-clock patch SHA-256
+`c8035a3cac1061a817e87af31ab440508d9b23dfe5a3b2cc27e5708e96e45d06`.
+Its patch SHA-256 is
+`f2ab352de580a250ea2ea151541e92b2a741ee20603b9f66d47506642b838f3b`;
+the adjacent JSON manifest pins the complete resulting dependency state.
+It changes export evidence only; HTTP, SSE, clocks and credit control remain
+unchanged. `tests/compass/test_aiperf_raw_timestamps.py` checks the real writer's
+serialization round-trip with distinct last-SSE and transport-completion times.

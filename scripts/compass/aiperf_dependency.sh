@@ -36,22 +36,34 @@ check_files() {
     done
 }
 
-[[ $# == 2 ]] || die "usage: $0 {check-base|apply|verify|apply-controlled|verify-controlled} PRIVATE_AIPERF_CHECKOUT"
+[[ $# == 2 ]] || die "usage: $0 {check-base|apply|verify|apply-controlled|verify-controlled|apply-export|verify-export} PRIVATE_AIPERF_CHECKOUT"
 action=$1
-case "$action" in check-base|apply|verify|apply-controlled|verify-controlled) ;; *) die "unknown action: $action" ;; esac
+case "$action" in check-base|apply|verify|apply-controlled|verify-controlled|apply-export|verify-export) ;; *) die "unknown action: $action" ;; esac
 source_root=$(cd -- "$2" && pwd -P)
 git_cmd=(git -c "safe.directory=$source_root" -C "$source_root")
 [[ $("${git_cmd[@]}" rev-parse --show-toplevel) == "$source_root" ]] || die "name the checkout root"
 [[ $("${git_cmd[@]}" rev-parse HEAD) == "$base" ]] || die "HEAD must be $base"
 check_hash "$patch_file" "$patch_sha"
 
-if [[ $action == apply-controlled || $action == verify-controlled ]]; then
+if [[ $action == apply-controlled || $action == verify-controlled || $action == apply-export || $action == verify-export ]]; then
     controlled_patch="${patch_file%/*}/aiperf-controlled-clock.patch"
     controlled_manifest="${patch_file%/*}/aiperf-controlled-clock.json"
     check_hash "$controlled_patch" "c8035a3cac1061a817e87af31ab440508d9b23dfe5a3b2cc27e5708e96e45d06"
     check_hash "$controlled_manifest" "ae7b2b93753f1d88a2332be0bfb16d4e6d12730f7b6253a53771eb4b593ad32b"
-    if [[ $action == apply-controlled ]]; then
-        bash "${BASH_SOURCE[0]}" verify "$source_root"
+    profile_state=atomcompass-controlled-clock-v1
+    selected_patch_sha=c8035a3cac1061a817e87af31ab440508d9b23dfe5a3b2cc27e5708e96e45d06
+    prerequisite_action=verify
+    if [[ $action == apply-export || $action == verify-export ]]; then
+        controlled_patch="${patch_file%/*}/aiperf-raw-transport-timestamps.patch"
+        controlled_manifest="${patch_file%/*}/aiperf-raw-transport-timestamps.json"
+        selected_patch_sha=f2ab352de580a250ea2ea151541e92b2a741ee20603b9f66d47506642b838f3b
+        profile_state=atomcompass-raw-transport-timestamps-v1
+        prerequisite_action=verify-controlled
+        check_hash "$controlled_patch" "$selected_patch_sha"
+        check_hash "$controlled_manifest" "260260bba75ae8004d29362a99bba0366f8a726376d86f16050e2c99ec3e2eac"
+    fi
+    if [[ $action == apply-controlled || $action == apply-export ]]; then
+        bash "${BASH_SOURCE[0]}" "$prerequisite_action" "$source_root"
         "${git_cmd[@]}" apply --check --whitespace=error-all "$controlled_patch"
         "${git_cmd[@]}" apply --whitespace=error-all "$controlled_patch"
     fi
@@ -75,7 +87,7 @@ PY
     )
     actual_status=$("${git_cmd[@]}" status --porcelain=v1 --untracked-files=all | LC_ALL=C sort)
     [[ $actual_status == "$expected_status" ]] || die "checkout has changes beyond the reviewed controlled profile"
-    printf 'dependency=aiperf state=atomcompass-controlled-clock-v1 base_commit=%s patch_sha256=%s\n' "$base" "c8035a3cac1061a817e87af31ab440508d9b23dfe5a3b2cc27e5708e96e45d06"
+    printf 'dependency=aiperf state=%s base_commit=%s patch_sha256=%s\n' "$profile_state" "$base" "$selected_patch_sha"
     exit 0
 fi
 
