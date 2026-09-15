@@ -36,6 +36,7 @@ CACHE_REGION_OPTIONS = frozenset((
     "diagnostic_only", "q16_handoff", "q16_handoff_sha256",
     "low_q_handoff", "low_q_handoff_sha256", "low_q_allow_failed_spread", "rank_coords",
     "root_prefill_handoff", "root_prefill_handoff_sha256", "root_prefill_allow_failed_spread",
+    "region_supplement_handoff", "region_supplement_handoff_sha256",
 ))
 
 
@@ -344,6 +345,34 @@ def check_source_contract(modelled, registry, workload_sha, forbidden, label):
                 notes.append("FAILED root prefill heldout spread retained; diagnostic_only=1; no acceptance credit")
         elif any(str(row.get("role", "")).startswith("oracle.root_prefill_") for row in inputs):
             raise ValueError("unconfigured root prefill source evidence was loaded")
+        if bool(options.get("region_supplement_handoff")) != bool(options.get("region_supplement_handoff_sha256")):
+            raise ValueError("region supplement handoff and its SHA-256 are required together")
+        if options.get("region_supplement_handoff"):
+            if not options.get("root_prefill_handoff"):
+                raise ValueError("region supplement requires the original root prefill handoff")
+            from atom.compass.core.cost.region_supplement import PrefillRegionSupplement
+            selected = PrefillRegionSupplement.load(selected, root_prefill,
+                options["region_supplement_handoff"], options["region_supplement_handoff_sha256"],
+                deployment_scope_sha256=scopes[0]["sha256"])
+            pinned("region_supplement_handoff", "oracle.region_supplement_sources")
+            files = {}
+            for source in selected.loaded_inputs:
+                if sum(row == source.as_dict() for row in inputs) != 1:
+                    raise ValueError(f"region supplement source {source.path} lacks its exact loaded-input identity")
+                bad.extend(validate._check_calibration_records(
+                    {source.role: source.sha256}, {source.role: {Path(source.path).name: source.sha256}},
+                    registry, 1, workload_sha, forbidden))
+                files[Path(source.path).name] = source.sha256
+            digest = validate._rolled_digest(files)
+            if ((compass.get("oracle_option_files") or {}).get("region_supplement_handoff") != files
+                    or (compass.get("oracle_option_sha256") or {}).get("region_supplement_handoff") != digest):
+                raise ValueError("region supplement aggregate option omits loaded evidence")
+            bad.extend(validate._check_calibration_records(
+                {"region_supplement_handoff": digest}, {"region_supplement_handoff": files},
+                registry, 1, workload_sha, forbidden))
+            selected_name = "root-prefill-supplement"
+        elif any(str(row.get("role", "")).startswith("oracle.region_supplement_") for row in inputs):
+            raise ValueError("unconfigured region supplement evidence was loaded")
         snapshot = region_snapshot(selected_name, selected)
         if ranks[0].get("regions") != snapshot:
             raise ValueError("selected region snapshot differs from its loaded overlay and flags")
@@ -443,6 +472,7 @@ def _pair_case(args, case_reader):
                         "low_q_allow_failed_spread": options.get("low_q_allow_failed_spread", False),
                         "root_prefill_handoff_sha256": options.get("root_prefill_handoff_sha256"),
                         "root_prefill_allow_failed_spread": options.get("root_prefill_allow_failed_spread", False),
+                        "region_supplement_handoff_sha256": options.get("region_supplement_handoff_sha256"),
                         "include_failed_outputless": options.get("include_failed_outputless", False),
                         "include_failed_final": options.get("include_failed_final", False),
                         "diagnostic_only": options.get("diagnostic_only", False)})

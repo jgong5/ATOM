@@ -2686,6 +2686,12 @@ _ROLE_OPTIONS = {
     "oracle.root_prefill_region_event_5": "root_prefill_handoff",
     "oracle.root_prefill_region_event_6": "root_prefill_handoff",
     "oracle.root_prefill_region_parent_failure": "root_prefill_handoff",
+    "oracle.region_supplement_sources": "region_supplement_handoff",
+    "oracle.region_supplement_candidate": "region_supplement_handoff",
+    "oracle.region_supplement_plan": "region_supplement_handoff",
+    "oracle.region_supplement_verdict": "region_supplement_handoff",
+    "oracle.region_supplement_native_complete": "region_supplement_handoff",
+    "oracle.region_supplement_heldout_phase": "region_supplement_handoff",
 }
 
 

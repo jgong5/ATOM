@@ -116,6 +116,7 @@ def source_cost_oracle(*, region_overlay, region_overlay_sha256, regions,
                        low_q_allow_failed_spread=False,
                        root_prefill_handoff=None, root_prefill_handoff_sha256=None,
                        root_prefill_allow_failed_spread=False,
+                       region_supplement_handoff=None, region_supplement_handoff_sha256=None,
                        rank_coords=None, **options):
     """Build the existing source composition, then select a separate region object.
 
@@ -142,6 +143,10 @@ def source_cost_oracle(*, region_overlay, region_overlay_sha256, regions,
         raise ValueError("low-query source handoff and its explicit SHA-256 are required together")
     if bool(root_prefill_handoff) != bool(root_prefill_handoff_sha256):
         raise ValueError("root prefill handoff and its explicit SHA-256 are required together")
+    if bool(region_supplement_handoff) != bool(region_supplement_handoff_sha256):
+        raise ValueError("region supplement handoff and its explicit SHA-256 are required together")
+    if region_supplement_handoff and not root_prefill_handoff:
+        raise ValueError("region supplement requires the original root prefill handoff")
     data, loaded = load_json(region_overlay, role="oracle.region_overlay")
     if loaded.sha256 != region_overlay_sha256:
         raise ValueError("region overlay differs from its explicit SHA-256")
@@ -199,4 +204,12 @@ def source_cost_oracle(*, region_overlay, region_overlay_sha256, regions,
                                              result.library.handoff_sha256)
         result.compass_region_snapshot = region_snapshot("root-prefill-sources", result.regions)
         result.compass_loaded_inputs += result.library.loaded_inputs[base_inputs:]
+    if region_supplement_handoff:
+        from atom.compass.core.cost.region_supplement import PrefillRegionSupplement
+
+        result.regions = PrefillRegionSupplement.load(result.regions, result.library,
+            region_supplement_handoff, region_supplement_handoff_sha256,
+            deployment_scope_sha256=scopes[0].sha256)
+        result.compass_region_snapshot = region_snapshot("root-prefill-supplement", result.regions)
+        result.compass_loaded_inputs += result.regions.loaded_inputs
     return result
