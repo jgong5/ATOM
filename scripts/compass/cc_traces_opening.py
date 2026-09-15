@@ -53,6 +53,22 @@ def _plan(path, sha256):
     return OpeningPlan.load(path, sha256)
 
 
+def check_producer(producer, *, label):
+    """Both named chat profiles require the same pinned Weka reconstruction."""
+    producer = producer if isinstance(producer, dict) else {}
+    policy = producer.get("weka_reconstruction") or {}
+    policy = policy if isinstance(policy, dict) else {}
+    effective = policy.get("effective") or {}
+    effective = effective if isinstance(effective, dict) else {}
+    if (producer.get("aiperf_commit") != AIPERF_COMMIT
+            or policy.get("defaults_verified") is not True
+            or effective != policy.get("pinned_defaults")
+            or effective.get("WEKA_LIVE_ASSISTANT_RESPONSES") is not False
+            or effective.get("WEKA_SPLIT_FLATTENED_AGENTS") is not True
+            or effective.get("WEKA_TOOL_SHAPED_MESSAGES") is not False):
+        raise ValueError(f"{label} case lacks verified effective Weka reconstruction defaults")
+
+
 def load_case(path, sha, case_id, *, target_model):
     if not re.fullmatch(r"aiperf_opening_[A-Za-z0-9_-]+", case_id):
         raise ValueError("opening case-id must use the explicit aiperf_opening_ prefix")
@@ -60,16 +76,7 @@ def load_case(path, sha, case_id, *, target_model):
     if plan.model != target_model:
         raise ValueError("opening case targets a different model")
     export = plan.export_identity
-    producer = export.get("producer") or {}
-    policy = producer.get("weka_reconstruction") or {}
-    effective = policy.get("effective") or {}
-    if (producer.get("aiperf_commit") != AIPERF_COMMIT
-            or policy.get("defaults_verified") is not True
-            or effective != policy.get("pinned_defaults")
-            or effective.get("WEKA_LIVE_ASSISTANT_RESPONSES") is not False
-            or effective.get("WEKA_SPLIT_FLATTENED_AGENTS") is not True
-            or effective.get("WEKA_TOOL_SHAPED_MESSAGES") is not False):
-        raise ValueError("opening case lacks verified effective Weka reconstruction defaults")
+    check_producer(export.get("producer"), label="opening")
     source = export.get("source") or {}
     if (source.get("selected_entries") != [0, 1]
             or source.get("full_plan_opening_roles_match") is not True

@@ -2,6 +2,7 @@
 
 import asyncio
 import copy
+import hashlib
 import json
 from pathlib import Path
 from types import SimpleNamespace
@@ -11,7 +12,7 @@ import pytest
 
 from .test_fixed_absolute import bundle, plan_file
 from .test_fixed_absolute_evidence import completed_evidence
-from .test_opening_harness import run, runtime_readings
+from .test_opening_harness import run, runtime_readings, opening, case_file as opening_case_file
 from .test_fixed_absolute_transport import endpoint
 
 fixed = run.fixed_module
@@ -67,7 +68,7 @@ def test_unreviewed_preparation_form_refuses_before_launch(tmp_path, capsys, cou
     assert "seven causally serial" in capsys.readouterr().err
 
 
-@pytest.mark.parametrize("damage", [None, "source_read", "profile", "missing_request"])
+@pytest.mark.parametrize("damage", [None, "source_read", "profile", "producer", "missing_request"])
 def test_fixed_result_uses_complete_root_observations(tmp_path, damage):
     plan, server, engine, results = completed_evidence(tmp_path)
     case = fixed.load_case(plan.loaded_input.requested, plan.loaded_input.sha256,
@@ -80,6 +81,8 @@ def test_fixed_result_uses_complete_root_observations(tmp_path, damage):
         core["inputs"] = [r for r in core["inputs"] if r["role"] != "runtime.fixed_absolute.source_root"]
     elif damage == "profile":
         blob["run"]["fixed_absolute"]["profile"] = "opening"
+    elif damage == "producer":
+        blob["run"]["fixed_absolute"]["producer"]["aiperf_commit"] = "0" * 40
     elif damage == "missing_request":
         blob["results"].pop()
     if damage:
@@ -87,6 +90,56 @@ def test_fixed_result_uses_complete_root_observations(tmp_path, damage):
             fixed.check_result(blob, case)
     else:
         fixed.check_result(blob, case)
+
+
+@pytest.mark.parametrize("reader", [opening, fixed])
+@pytest.mark.parametrize("damage", [None, "missing", "commit", "unverified", "effective",
+                                    "live", "split", "tool_shaped", "malformed"])
+def test_named_chat_cases_share_pinned_producer_guard(tmp_path, reader, damage):
+    path, _ = opening_case_file(tmp_path) if reader is opening else serial_plan(tmp_path)[:2]
+    payload = json.loads(path.read_text())
+    producer = payload["producer"]
+    policy = producer["weka_reconstruction"]
+    if damage == "missing":
+        payload.pop("producer")
+    elif damage == "commit":
+        producer["aiperf_commit"] = "0" * 40
+    elif damage == "unverified":
+        policy["defaults_verified"] = False
+    elif damage == "effective":
+        policy["effective"]["changed"] = True
+    elif damage in ("live", "split", "tool_shaped"):
+        key, value = {"live": ("WEKA_LIVE_ASSISTANT_RESPONSES", True),
+                      "split": ("WEKA_SPLIT_FLATTENED_AGENTS", False),
+                      "tool_shaped": ("WEKA_TOOL_SHAPED_MESSAGES", True)}[damage]
+        # Even mutually consistent effective/default declarations cannot
+        # enable a reconstruction mode outside the named profile.
+        policy["effective"][key] = policy["pinned_defaults"][key] = value
+    elif damage == "malformed":
+        payload["producer"] = ["not producer metadata"]
+    path.write_text(json.dumps(payload))
+    sha = hashlib.sha256(path.read_bytes()).hexdigest()
+    case_id = "aiperf_opening_fixture" if reader is opening else "aiperf_fixed_fixture"
+    if damage:
+        with pytest.raises(ValueError, match="verified effective Weka reconstruction defaults"):
+            reader.load_case(path, sha, case_id, target_model=run.plan_module.MODEL)
+    else:
+        case = reader.load_case(path, sha, case_id, target_model=run.plan_module.MODEL)
+        assert case["registered_acceptance_cell"] is False
+
+
+def test_fixed_producer_evidence_is_immutable_and_bound_to_case(tmp_path):
+    path, sha, plan = serial_plan(tmp_path)
+    candidate = plan.producer
+    candidate["aiperf_commit"] = "0" * 40
+    assert plan.producer["aiperf_commit"] == opening.AIPERF_COMMIT
+    plan.evidence()["producer"]["weka_reconstruction"]["effective"].clear()
+    assert plan.producer["weka_reconstruction"]["effective"]
+    case = fixed.load_case(path, sha, "aiperf_fixed_fixture", target_model=plan.model)
+    assert case["producer"] == plan.producer
+    case["producer"]["aiperf_commit"] = "0" * 40
+    with pytest.raises(ValueError, match="case identity changed"):
+        fixed.recheck(case)
 
 
 @pytest.mark.parametrize("damage", [None, "missing", "duplicate", "unapproved", "changed_bytes"])

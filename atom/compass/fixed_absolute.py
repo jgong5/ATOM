@@ -278,6 +278,11 @@ class FixedAbsolutePlan:
         return self._data["requests"][0]["body"]["model"]
 
     @property
+    def producer(self):
+        """Pinned exporter evidence without exposing the plan's mutable storage."""
+        return copy.deepcopy(self._data.get("producer"))
+
+    @property
     def cache_policy(self):
         return copy.deepcopy(self._data["cache_policy"])
 
@@ -287,6 +292,7 @@ class FixedAbsolutePlan:
 
     def evidence(self):
         return {"schema": SCHEMA, "profile": PROFILE, "input": self.loaded_input.as_dict(),
+                "producer": self.producer,
                 "clients": len(self._data["roots"]), "requests": len(self._data["requests"]),
                 "dependency_basis": DEPENDENCY_BASIS, "qualification": QUALIFICATION,
                 "response_delivery": copy.deepcopy(RESPONSE_DELIVERY),

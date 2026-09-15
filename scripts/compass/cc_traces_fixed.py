@@ -41,6 +41,7 @@ def load_case(path, sha, case_id, *, target_model):
     plan = _plan(path, sha)
     if plan.model != target_model:
         raise ValueError("fixed case targets a different model")
+    _shared.check_producer(plan.producer, label="fixed")
     evidence = plan.evidence()
     pin = {"path": str(Path(path).resolve()), "sha256": sha}
     return {"schema": CASE_SCHEMA, "case_id": case_id,
@@ -50,6 +51,7 @@ def load_case(path, sha, case_id, *, target_model):
             "workload_sha256": sha, PLAN_KEY: pin,
             "workload_inputs": [plan.loaded_input.as_dict(), *evidence["source_roots"]],
             "root_ids": evidence["root_ids"], "cache_policy": plan.cache_policy,
+            "producer": evidence["producer"],
             "prompt_token_sha256": evidence["prompt_token_sha256"],
             "profile": evidence["profile"], "dependency_basis": evidence["dependency_basis"],
             "response_delivery": evidence["response_delivery"],
@@ -61,7 +63,7 @@ def identity(case):
         raise ValueError("case is not a fixed-absolute complete-root diagnostic")
     return {key: case[key] for key in (
         "schema", "case_id", "clients", "requests", "purpose", "registered_acceptance_cell",
-        "target_model", "workload_sha256", "workload_inputs", "root_ids",
+        "target_model", "workload_sha256", "workload_inputs", "root_ids", "producer",
         "prompt_token_sha256", "cache_policy", "profile", "dependency_basis",
         "response_delivery", "qualification")}
 

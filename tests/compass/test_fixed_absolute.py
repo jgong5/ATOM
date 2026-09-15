@@ -69,7 +69,12 @@ def bundle(*, root_times=(0., 100.), child_times=((10., 30.),), join=False, clie
                 "join_before_request": root_indices[-1] if join else None})
     for row in rows:
         row["loader_replay_predecessors"] = list(row["depends_on"])
+    defaults = {"WEKA_LIVE_ASSISTANT_RESPONSES": False,
+                "WEKA_SPLIT_FLATTENED_AGENTS": True, "WEKA_TOOL_SHAPED_MESSAGES": False}
     return {"schema": SCHEMA, "profile": PROFILE, "dependency_basis": DEPENDENCY_BASIS,
+            "producer": {"aiperf_commit": "0d2aa0572ac685943d38c580675c4a61023581d3",
+                         "weka_reconstruction": {"defaults_verified": True,
+                                                 "effective": defaults, "pinned_defaults": dict(defaults)}},
             "clients": clients, "roots": roots, "conversations": conversations, "branches": branches,
             "source_time_origin_s": 0., "time_scale": 1, "response_delivery": RESPONSE_DELIVERY,
             "initial_cache": "acknowledged_empty", "cache_policy": cache_on_policy(), "requests": rows}
