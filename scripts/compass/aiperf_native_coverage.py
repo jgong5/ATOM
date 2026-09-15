@@ -39,6 +39,8 @@ def validate_plan(plan, output):
         raise ValueError("native driver is not running from the sealed isolated source tree")
     if Path(plan["output_directory"]).resolve() != output.resolve():
         raise ValueError("native output path differs from the sealed plan")
+    if Path(plan["environment"]["ATOM_COMPILE_CACHE_ROOT"]).resolve() != output / "private/compile":
+        raise ValueError("native compile cache must be owned beneath the private run output")
     for item in plan["source_files"]:
         checked_path({"path": str(ROOT / item["path"]), "sha256": item["sha256"]})
     for name in ("prepared", "config_builder", "source", "request_scope", "metadata_audit"):
@@ -74,6 +76,12 @@ def check_native_scope(plan, provenance):
     if not cache_dir or not Path(cache_dir).is_relative_to(plan["environment"]["ATOM_COMPILE_CACHE_ROOT"]):
         raise ValueError("native worker used a different compile-cache root")
     native = workers[0].get("native_attention") or {}
+    cache_paths = native.get("generated_cache_paths") or {}
+    for key in ("TORCHINDUCTOR_CACHE_DIR", "TRITON_CACHE_DIR", "TORCH_EXTENSIONS_DIR"):
+        expected_path = plan["environment"].get(key)
+        if (not expected_path or cache_paths.get(key) != expected_path
+                or not Path(expected_path).is_relative_to(plan["environment"]["ATOM_COMPILE_CACHE_ROOT"])):
+            raise ValueError(f"native generated cache path is not the owned plan path: {key}")
     expected = read_pinned(plan["request_scope"])["attention_scope"]
     actual = native.get("declaration", {}).get("scopes")
     if actual is None:
@@ -284,6 +292,13 @@ def main(argv=None):
         multiprocessing.set_start_method("spawn", force=True)
         for name in ("tmp", "mmap"):
             (private / name).mkdir()
+        cache_root = Path(plan["environment"]["ATOM_COMPILE_CACHE_ROOT"])
+        cache_root.mkdir(parents=True, exist_ok=False)
+        for key in ("TORCHINDUCTOR_CACHE_DIR", "TRITON_CACHE_DIR", "TORCH_EXTENSIONS_DIR"):
+            cache_path = Path(plan["environment"][key])
+            if not cache_path.is_relative_to(cache_root):
+                raise ValueError(f"generated cache escapes the owned root: {key}")
+            cache_path.mkdir(parents=True, exist_ok=False)
         os.environ.update(plan["environment"])
         sys.path.insert(0, str(Path(plan["aiperf_dependency"]["checkout"]) / "src"))
         from aiperf.common.config import ServiceConfig
@@ -305,8 +320,6 @@ def main(argv=None):
             raise ValueError("unsealed AIPerf API is enabled")
         ipc = services.comm_config.path
         ipc.mkdir(parents=True, exist_ok=False)
-        cache_root = Path(plan["environment"]["ATOM_COMPILE_CACHE_ROOT"])
-        cache_root.mkdir(parents=True, exist_ok=False)
         endpoint = config.endpoint.model_copy(update={"urls": [plan["url"]]})
         export = config.output.model_copy(update={"artifact_directory": private / "aiperf",
                   "export_level": ExportLevel.RAW, "export_http_trace": True})
@@ -388,7 +401,10 @@ def main(argv=None):
               "engine": engine, "cache_before": before, "cache_after": after,
               "flush": flush, "metadata_comparison": metadata_comparison,
               "preparation": preparation, "server": final_provenance})
-        facts["native_runtime_scope"] = scope
+        facts["native_runtime_scope"] = {
+            "attention_scope": scope["native"]["declaration"]["scopes"],
+            "body_flags": scope["native"]["body_flags"],
+            "kv_capacity_differences": scope["kv_capacity_differences"]}
         write(output / "COVERAGE_FACTS.json", facts)
         receipt("WORKLOAD_COMPLETE.json", success=True, completed_at=time.time(),
                 coverage=pin(output / "COVERAGE_FACTS.json"),

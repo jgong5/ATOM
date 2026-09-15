@@ -81,9 +81,12 @@ def test_backend_scope_and_resolved_body_flags_must_match(tmp_path):
                 "gdn": {"gdn_decode_lossy_fast": False}}
     path = tmp_path / "scope.json"
     path.write_text(json.dumps({"attention_scope": expected}))
-    native = {"declaration": {"scopes": expected}, "body_flags": {"FLA_GDN_FIX_BT": False}}
+    cache_paths = {key: "/owned/cache/" + key.lower() for key in (
+        "TORCHINDUCTOR_CACHE_DIR", "TRITON_CACHE_DIR", "TORCH_EXTENSIONS_DIR")}
+    native = {"declaration": {"scopes": expected}, "body_flags": {"FLA_GDN_FIX_BT": False},
+              "generated_cache_paths": cache_paths}
     plan = {"request_scope": m.pin(path), "backend_body_flags": dict(native["body_flags"]),
-            "environment": {"ATOM_COMPILE_CACHE_ROOT": "/owned/cache"}}
+            "environment": {"ATOM_COMPILE_CACHE_ROOT": "/owned/cache", **cache_paths}}
     provenance = {"worker_runtime": [{"native_attention": native,
                     "configuration": {"compilation_cache_dir": "/owned/cache/native-hash"}}]}
     native["declaration"]["scopes"] = json.loads(json.dumps(expected))
@@ -97,6 +100,10 @@ def test_backend_scope_and_resolved_body_flags_must_match(tmp_path):
     native["declaration"]["scopes"]["unified"]["kv_cache_layout"][0][1][1][1][0] = 64
     native["body_flags"]["FLA_GDN_FIX_BT"] = True
     with pytest.raises(ValueError, match="resolved FLA"):
+        m.check_native_scope(plan, provenance)
+    native["body_flags"]["FLA_GDN_FIX_BT"] = False
+    native["generated_cache_paths"]["TRITON_CACHE_DIR"] = "/shared/default"
+    with pytest.raises(ValueError, match="generated cache path"):
         m.check_native_scope(plan, provenance)
 
 

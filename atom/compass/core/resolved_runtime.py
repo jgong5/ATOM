@@ -92,6 +92,8 @@ def native_attention_snapshot(runner):
                                  "pool_shapes": {"kv_cache": [
                                      list(runner.kv_cache.shape), str(runner.kv_cache.dtype)]}}}
     return {"record": record, "declaration": read_resolved(record).as_dict(),
+            "generated_cache_paths": {key: os.environ[key] for key in (
+                "TORCHINDUCTOR_CACHE_DIR", "TRITON_CACHE_DIR", "TORCH_EXTENSIONS_DIR")},
             "body_flags": {"FLA_GDN_FIX_BT": bool(chunk_o.FLA_GDN_FIX_BT),
                            "USE_DEFAULT_FLA_NORM": int(l2norm.USE_DEFAULT_FLA_NORM)}}
 

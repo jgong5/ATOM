@@ -95,14 +95,85 @@ def observe_native_phases(service_config, *, require_terminal=False, drain_secon
 
 
 def run_native_profile(user_config, service_config):
-    """Invoke the exact ordinary CLI entry, retaining native ServiceConfig/ZMQ."""
-    from aiperf.cli_runner import run_system_controller
+    """Own the ordinary CLI process; its native controller exits with os._exit."""
+    import json
+    import os
+    from pathlib import Path
+    import subprocess
+    import sys
+    import aiperf
+    from aiperf.common.config import ServiceConfig, UserConfig
     from aiperf.plugin.enums import CommunicationBackend
 
     if service_config.comm_config.comm_backend not in (
         CommunicationBackend.ZMQ_IPC, CommunicationBackend.ZMQ_TCP,
     ):
         raise ValueError("proper native replay requires ordinary AIPerf communication")
-    with observe_native_phases(service_config, require_terminal=True) as messages:
-        run_system_controller(user_config, service_config)
+    # This is the same serialization used by AIPerf's MultiRunOrchestrator.
+    # Validate its round trip before starting the native service fleet.
+    payload = {
+        "user_config": user_config.model_dump(mode="json", exclude_defaults=True,
+            exclude_none=True, context={"include_secrets": True}),
+        "service_config": service_config.model_dump(mode="json", exclude_defaults=True, exclude_none=True),
+    }
+    def identity(config):
+        value = config.model_dump(mode="json")
+        value.pop("cli_command", None)
+        return value
+    if (identity(UserConfig.model_validate(payload["user_config"])) != identity(user_config)
+            or identity(ServiceConfig.model_validate(payload["service_config"])) != identity(service_config)):
+        raise ValueError("ordinary AIPerf subprocess serialization changes configuration")
+    directory = Path(user_config.output.artifact_directory).parent
+    directory.mkdir(parents=True, exist_ok=True)
+    config_path = directory / "native_aiperf_config.json"
+    with config_path.open("x") as stream:
+        json.dump(payload, stream, allow_nan=False)
+    root = Path(__file__).resolve().parents[3]
+    env = dict(os.environ)
+    env["PYTHONPATH"] = os.pathsep.join((str(root), str(Path(aiperf.__file__).resolve().parents[1]),
+                                       env.get("PYTHONPATH", "")))
+    command = [sys.executable, "-m", "atom.compass.replay.aiperf_native", str(config_path)]
+    process = None
+    began = time.time()
+    with (directory / "native_aiperf_controller.log").open("x") as log:
+        with observe_native_phases(service_config, require_terminal=True) as messages:
+            try:
+                process = subprocess.Popen(command, cwd=root, env=env, stdout=log, stderr=subprocess.STDOUT)
+                process.wait()
+            finally:
+                if process is not None:
+                    if process.poll() is None:
+                        process.terminate()
+                        try:
+                            process.wait(timeout=5)
+                        except subprocess.TimeoutExpired:
+                            process.kill()
+                            process.wait(timeout=5)
+                    with (directory / "native_aiperf_exit.json").open("x") as stream:
+                        json.dump({"pid": process.pid, "exit_code": process.returncode,
+                                   "command": command, "started_at": began,
+                                   "ended_at": time.time()}, stream, indent=2)
+    if process.returncode != 0:
+        error = RuntimeError(f"ordinary AIPerf controller exited {process.returncode}")
+        error.phase_messages = messages
+        raise error
     return messages
+
+
+def _main():
+    """A process entry only: preserve the exact ordinary controller behavior."""
+    import json
+    import multiprocessing
+    from pathlib import Path
+    import sys
+    from aiperf.cli_runner import run_system_controller
+    from aiperf.common.config import ServiceConfig, UserConfig
+
+    multiprocessing.set_start_method("spawn", force=True)
+    payload = json.loads(Path(sys.argv[1]).read_bytes())
+    run_system_controller(UserConfig.model_validate(payload["user_config"]),
+                          ServiceConfig.model_validate(payload["service_config"]))
+
+
+if __name__ == "__main__":
+    _main()
