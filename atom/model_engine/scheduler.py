@@ -612,6 +612,10 @@ class ScheduledBatch:
             [seq.temperature for seq in seqs.values()], dtype=np.float32
         )
         self.return_logprobs = [seq.return_logprobs for seq in seqs.values()]
+        # Carry admission reuse separately from already-computed history. A
+        # new request hitting a checkpoint is not an in-request continuation.
+        self.prefix_cache_hit_tokens = tuple(getattr(seq, "prefix_cache_hit_tokens", None) for seq in seqs.values())
+        self.prefill_continuations = tuple(getattr(seq, "is_partial_prefill", None) for seq in seqs.values())
         # `context_lens` is set further down, once `num_cached_tokens` is known:
         # a chunked prefill's context ends at this chunk, not at the whole
         # prompt, so `seq.num_tokens` is only right for decode.

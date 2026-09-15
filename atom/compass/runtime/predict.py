@@ -41,6 +41,44 @@ logger = logging.getLogger(__name__)
 __all__ = ["CompassPredictMixin"]
 
 
+def _native_region_context(config, batch):
+    """CPU metadata only; termination policy is applied outside the forward."""
+    def values(name, convert):
+        value = getattr(batch, name, None)
+        return None if value is None or any(x is None for x in value) else tuple(convert(x) for x in value)
+
+    compilation = getattr(config, "compilation_config", None)
+    mode = getattr(compilation, "cudagraph_mode", None)
+    maintenance = getattr(batch, "state_maintenance_ops", None)
+    maintenance_fields = ("relocations", "checkpoint_stores", "checkpoint_restores")
+    maintenance_known = (maintenance is not None and
+                         all(hasattr(maintenance, name) for name in maintenance_fields))
+    return {
+        "model": getattr(config, "model", None),
+        "kv_cache_dtype": str(getattr(config, "kv_cache_dtype", "")),
+        "compilation_level": getattr(compilation, "level", None),
+        "cudagraph_mode": getattr(mode, "name", None),
+        "pipeline_parallel_size": getattr(config, "pipeline_parallel_size", None),
+        "enable_prefix_caching": getattr(config, "enable_prefix_caching", None),
+        "checkpoint_interval_tokens": getattr(config, "state_checkpoint_interval_tokens", None),
+        "checkpoint_demand": getattr(config, "state_checkpoint_demand", None),
+        "speculative_config_absent": (getattr(config, "speculative_config") is None
+                                      if hasattr(config, "speculative_config") else None),
+        "num_spec_step": getattr(batch, "num_spec_step", None),
+        "prefix_cache_hit_tokens": values("prefix_cache_hit_tokens", int),
+        "prefill_continuations": values("prefill_continuations", bool),
+        "temperatures": values("temperatures", float),
+        "top_ks": values("top_ks", int),
+        "top_ps": values("top_ps", float),
+        "return_logprobs": values("return_logprobs", bool),
+        "independent_noise": values("needs_independent_noise", bool),
+        "state_maintenance_empty": (not any(getattr(maintenance, name) for name in maintenance_fields)
+                                    if maintenance_known else None),
+        "midstep_saves_empty": (not any(batch.state_save_all)
+                                if hasattr(batch, "state_save_all") else None),
+    }
+
+
 class CompassPredictMixin:
     """Pricing, recording and step description, without a device.
 
@@ -718,6 +756,8 @@ class CompassPredictMixin:
             source="ScheduledBatch",
             rank_coords=self._rank_coords(),
             shared_across_ranks=True,
+            region_context=(_native_region_context(self.config, batch)
+                            if getattr(allocation, "capture_region_context", False) else None),
         ))
 
     def _describe(self, batch: ScheduledBatch) -> StepShape:

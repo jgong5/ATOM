@@ -10,6 +10,18 @@ the unchanged upstream assertion requires a positive count, while the reviewed
 empty-warmup prerequisite permits zero. The same failure was reproduced on the
 prerequisite alone, without the new clock patch.
 
+A completed native source experiment collected **34 requests and 81 target
+forwards**. All **12/12 predeclared median component checks passed**: the
+maximum prepare/postprocess error was **59.631 μs against a 110 μs gate**.
+The measured domain is N1 prefill at Q8192/history0, Q3056/history8192, and
+final Q1–16/history11248 with the validated allocation and execution path.
+Raw scatter remains broad; the median gate is not an uncertainty band.
+The first Q8192 body primitive sum overpredicted native body medians by
+**7.14–7.18%**, an observation rather than a new acceptance result. The
+portable region adapter is implemented and reviewed, with a qualified source
+handoff for this limited A/P domain. No proper E2E acceptance, whole-library
+qualification or historical acceptance count changes follow from this experiment.
+
 The first frozen proper **C1/cache-on, source-backed diagnostic** reached a
 source-region coverage refusal at **Q8192, cached history 0, N1, outputless**:
 `<prepare>` has no qualified support for that shape. It stopped before any
@@ -22,11 +34,21 @@ perturbed. It produces **no new prices or acceptance result**. In particular,
 duration cannot be substituted for it or added wholesale to the existing
 forward cost.
 
-**Next steps remain TP1:** qualify portable region coverage with explicit
-history/execution-path scope, and resolve host-dispatch accounting without
+**Next steps remain TP1:** integrate the qualified region handoff with its
+explicit history/execution-path scope, fill the remaining Q3056 GEMM and
+short-final attention/head primitive gaps, and resolve host-dispatch accounting without
 double-counting existing stream work or waits, then resume proper E2E
 cc-traces validation. The strongest completed pair and its qualifications
 remain below.
+
+Compilation occurred in the source run, including dynamic torch.compile and
+six decode capture buckets. The short-prefill dispatch evidence still needs
+accounting: Q32 host dispatch and device body are both about 105.5 ms. Q2's
+67.7 ms host prepare/enqueue interval may largely wait for the prior Q496
+device tail, which the timeline already represents. Neither caller duration
+is a new A/P price. The broad assumption that compiled dispatch pays neither
+eager nor replay overhead remains a main-logic issue to revisit using these
+observations.
 
 **Strongest completed result (2026-09-15): the first complete-root fixed-profile pair passed
 its development checks.** Both cache-on `ROOT_1493` sides completed **7/7 requests

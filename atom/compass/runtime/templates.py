@@ -165,11 +165,11 @@ class NativeStepAllocation:
 
     __slots__ = ("rows", "block_tables", "state_slots", "state_rows", "state_fork_srcs",
                  "num_prefill_seqs", "source", "rank_coords",
-                 "shared_across_ranks")
+                 "shared_across_ranks", "region_context")
 
     def __init__(self, *, rows, block_tables, state_slots, num_prefill_seqs,
                  state_rows=None, state_fork_srcs=None, source="", rank_coords=None,
-                 shared_across_ranks=True) -> None:
+                 shared_across_ranks=True, region_context=None) -> None:
         self.rows = tuple((int(q), int(c)) for q, c in rows)
         self.block_tables = tuple(tuple(int(b) for b in row)
                                   for row in block_tables)
@@ -193,6 +193,7 @@ class NativeStepAllocation:
         self.source = str(source)
         self.rank_coords = dict(rank_coords or {})
         self.shared_across_ranks = bool(shared_across_ranks)
+        self.region_context = None if region_context is None else dict(region_context)
 
 
 class NativeAllocation:
@@ -227,7 +228,8 @@ class NativeAllocation:
 
     def __init__(self, *, block_size: int, max_model_len: int,
                  position_rows: int = 1, num_spec_step: int = 0,
-                 needs_state: bool = True, cudagraph_mode=None) -> None:
+                 needs_state: bool = True, cudagraph_mode=None,
+                 capture_region_context: bool = False) -> None:
         self.block_size = int(block_size)
         self.max_model_len = int(max_model_len)
         self.position_rows = int(position_rows)
@@ -240,6 +242,7 @@ class NativeAllocation:
         #: under whichever rule happened to be the default.
         self.cudagraph_mode = cudagraph_mode
         self.needs_state = bool(needs_state)
+        self.capture_region_context = bool(capture_region_context)
         self._record = None
         self.offered = 0
         self.answered = 0
@@ -251,6 +254,23 @@ class NativeAllocation:
 
     def clear(self) -> None:
         self._record = None
+
+    def region_context_for(self, shape: StepShape) -> dict:
+        """Read factual region scope from the same offered native assignment."""
+        record = self._record
+        if record is None or record.region_context is None:
+            raise BindRefusal("no native region context was offered for this step")
+        if record.rows != _rows(shape):
+            raise BindRefusal("native region context belongs to a different shape")
+        if (dict(shape.rank_coords) != record.rank_coords and not record.shared_across_ranks):
+            raise BindRefusal("native region context belongs to another rank")
+        if record.num_prefill_seqs != len(record.rows):
+            raise BindRefusal("native region context is not an all-prefill batch")
+        return {**record.region_context, "block_size": self.block_size,
+                "max_model_len": self.max_model_len, "position_rows": self.position_rows,
+                "allocation_blocks": tuple(len(t) for t in record.block_tables),
+                "state_slots": record.state_slots, "state_rows": record.state_rows,
+                "state_fork_srcs": record.state_fork_srcs}
 
     def allocation_for(self, shape: StepShape) -> dict:
         record = self._record

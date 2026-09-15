@@ -110,6 +110,7 @@ def model_from_artifact(data, *, include_failed_outputless=False,
 
 
 def source_cost_oracle(*, region_overlay, region_overlay_sha256, regions,
+                       native_prefill_handoff=None, native_prefill_handoff_sha256=None,
                        include_failed_outputless=False, include_failed_final=False, diagnostic_only=False,
                        q16_handoff=None, q16_handoff_sha256=None,
                        low_q_handoff=None, low_q_handoff_sha256=None,
@@ -124,7 +125,9 @@ def source_cost_oracle(*, region_overlay, region_overlay_sha256, regions,
 
     This deliberately distinct factory is not registered as an acceptance
     factory. It mutates neither REGION_MODELS nor the base preset. The harness
-    must independently verify the artifact's required native cache policy.
+    must independently verify the artifact's required native cache policy and
+    actual effective backend/environment equality. The pinned attention scope
+    is a deployment declaration, not a fresh observation of the live worker.
     """
     expected = {"model": "Qwen/Qwen3.8-27B", "tp": 1, "block_size": 16,
                 "max_model_len": 262144, "position_rows": 3,
@@ -139,6 +142,8 @@ def source_cost_oracle(*, region_overlay, region_overlay_sha256, regions,
             raise ValueError(f"cached-prefill source scope requires {key}={value!r}")
     if any(rank != 0 for rank in _rank_coords(rank_coords).values()):
         raise ValueError("cached-prefill source scope requires rank zero")
+    if bool(native_prefill_handoff) != bool(native_prefill_handoff_sha256):
+        raise ValueError("native prefill source handoff and its explicit SHA-256 are required together")
     if bool(q16_handoff) != bool(q16_handoff_sha256):
         raise ValueError("q16 source handoff and its explicit SHA-256 are required together")
     if bool(low_q_handoff) != bool(low_q_handoff_sha256):
@@ -237,4 +242,19 @@ def source_cost_oracle(*, region_overlay, region_overlay_sha256, regions,
         result.regions = ExactPrefillRegions(result.regions, result.library.supplement_points, result.library.handoff_sha256)
         result.compass_region_snapshot = region_snapshot("root-reference-diagnostic", result.regions)
         result.compass_loaded_inputs += result.library.loaded_inputs[base_inputs:]
+    if native_prefill_handoff:
+        from atom.compass.core.cost.native_prefill_regions import NativePrefillRegions
+
+        scopes = [entry for entry in result.library.loaded_inputs
+                  if entry.role == "oracle.attention_scope"]
+        if len(scopes) != 1:
+            raise ValueError("native prefill sources require one loaded deployment attention scope")
+        selected = NativePrefillRegions.load(result.regions, native_prefill_handoff,
+            native_prefill_handoff_sha256, result.native_allocation,
+            deployment_scope_sha256=scopes[0].sha256)
+        if not selected.source_qualified:
+            raise ValueError("native prefill source is a review candidate; qualification is required for activation")
+        result.regions = selected
+        result.compass_region_snapshot = region_snapshot("native-prefill-sources", result.regions)
+        result.compass_loaded_inputs += result.regions.loaded_inputs
     return result
