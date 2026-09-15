@@ -16,8 +16,11 @@ prove the cache-enabled configuration, whole-corpus accuracy or **99%
 confidence**. The bounded cache-on surrogate and AIPerf opening pairs are now
 complete, with advisory timing results and no increase in the registered count.
 The earlier short-c4 campaign and staged cache-disabled long real run are held.
-The later intact-root R5 source run failed; source closure and fresh native
-qualification of the separate ten-region supplement remain open.
+The later intact-root R5 source run failed. Fresh GPU3 confirmation of the
+separate ten-region supplement completed but failed three of twenty component
+gates. Both sources remain unqualified. The immediate priority is an intact-root
+diagnostic using frozen reference prices with every source failure visible;
+its loading contract, registry and execution still require review.
 
 **First cache-on paired milestone — bounded `4b433` surrogate.** On source
 `aa8bd80e2`, both sides completed the two requests with 92,928/92,672 input
@@ -199,14 +202,51 @@ Its candidate uses only the 30 original R3 reference joins; previously inspected
 R3 heldouts cannot validate it. **116 focused CPU checks pass**, and the final
 synthetic collector/controller handoff selects all **19 exact prefill shapes**
 with FAILED outputless/final-region opt-ins disabled; the failed synthetic
-handoff is refused. One region-only native run is authorized; its actual
-qualification verdict remains pending.
+handoff is refused. The subsequent native confirmation result is recorded below.
 Neither this wiring proof nor source microbenchmarks substitute for intact
 E2E cc-traces; registered acceptance remains **9/24**.
 The maintained fixed-root checker still reports `accepted=false` and a
 diagnostic lifecycle purpose. Even a passing intact-root pair with qualified
 sources would be a complete-root development witness; cache-on acceptance
 registration and the broader confirmation protocol remain separate gaps.
+
+**Fresh ten-region confirmation completed and failed (2026-09-15).** The single
+GPU3 run retained the reference-only candidate `c8fc3550…`, one seven-request
+warm fixture and three independent seven-request heldout fixtures. All **28
+requests**, four fixtures and **30 scored rows** completed, with
+`NATIVE_COMPLETE.json`, `CPU_COMPLETE.json` and `HANDOFF.json` preserved.
+**17/20 component gates pass** the unchanged **110 µs** median absolute-error
+limit. The three preparation misses are **205.932617 µs** at C42000/Q2832,
+**114.868164 µs** at C44832/Q1728 and **117.107801 µs** at C46496/Q10.
+All ten postprocess gates pass. The complete verdict is
+**`source_qualified=false`, `candidate_activated=false`**; no subset is activated,
+no price is refitted and no retry is implied. The original R3 nine-key result
+and all R3/R4/R5 failures retain their identities.
+
+The original outer supervisor **exit 124** is also preserved. It read source
+status before the terminal files were written, then observed the CPU controller
+after exit and incorrectly reported missing completion. The closed native and
+controller files contain the complete failing verdict, with no source failure
+file; this supervision race is separate from the numerical rejection. Cleanup
+verified no live owned processes, free ports and released GPU memory. All
+**67 evidence files / 991,195 bytes** were copied and hash-verified, excluding
+compilation caches. The reviewed GPU3 resource policy explicitly retained the
+observed background graphics/SDMA activity and made **no isolated-performance
+claim**. The original GPU1 plan and its preflight refusal remain preserved.
+
+**Next: intact-root diagnostic before further sub-millisecond source tuning.**
+Prepare a modelled-first/native pair using unchanged R5 reference prices and
+the supplement's reference medians, with incomplete acquisition, repeat-spread
+failures and failed region gates visible in the diagnostic loading contract.
+Keep the seven exact `ROOT_1493` prompts, offsets/dependencies and output lengths,
+native preparation output cap 2 and acknowledged empty-cache reset. The new
+code, registry and launch remain held pending review; this decision authorizes
+neither source activation nor acceptance credit. The available structural
+inventory counts **4,116 step occurrences** and **4,034 unique shape/fork
+representatives**. `STRUCTURE.json.gz` (`9aa94a33…`) uses artificial 10 ms
+progression and zero oracle costs; duplicate steps omit allocation payloads.
+These counts establish neither E2E timing nor allocation evidence. The intact
+paired cc-traces must still provide those observations.
 
 R5 evidence remains under the same ignored source directory:
 
@@ -218,7 +258,7 @@ R5 evidence remains under the same ignored source directory:
 | `executable_v5_r1/R5_FAILURE_CLOSEOUT.json` | `d799ef20430cb2c5608f76a54ffb556d688468d950b223481a2a4ce887e027ec` |
 
 The closeout binds control `EXIT.json` (`10c6dd9d21d04991bdc89213d02cbfb21cecf0cacb55dd0e6f3707ed412c8abe`)
-and the verified 1,925-file evidence copy. Supplement plan
+and the verified 1,925-file evidence copy. The preserved original GPU1 supplement plan
 `agent_scratch/codex_root1493_region_supplement_v1/executable_v2/EXECUTABLE_PLAN.json`
 is pinned at `8b805461aad06f7a7afc92e94df21f3d3d4da7f77baa3c12596f4e33f78e2415`.
 Its final synthetic producer/consumer receipt is
@@ -226,6 +266,21 @@ Its final synthetic producer/consumer receipt is
 (`5b408aef3cb3096e316102d67c71fb83a35d16420336257546eef07df8215622`);
 the 116-test receipt is `FOCUSED_TEST_RECEIPT.json` in that directory
 (`2b42618cab75cd17d7ec24855c9f1981d29ff8ed59774319b5f30d4e2897c02e`).
+
+Completed GPU3 supplement records are under
+`agent_scratch/codex_root1493_region_supplement_v1/executable_v3/`:
+
+| Artifact | SHA-256 |
+| --- | --- |
+| `EXECUTABLE_PLAN_GPU3_FINAL_R3.json` | `ca2c0b1d1ff8dba1f9f615bb4c6d02c699119cd9905774ad2b8dc26150f8d76d` |
+| `acquisition_v1/VERDICT.json` | `61e481a554413f98312407f09512eeefb18a8bc4f36aa1c734c51594ee2714ea` |
+| `acquisition_v1/NATIVE_COMPLETE.json` | `880c723cc21b8cde004a4d206478e5380500df123bcdb7b92c636a9d3fb5d2af` |
+| `acquisition_v1/HANDOFF.json` | `944f0d8fce81e9e9e0776b14d7d5245e79ceb22d0466f6a6702843870fb5ad78` |
+| `GPU3_SUPPLEMENT_CLOSEOUT.json` | `f49988f03d3836c50ebc9f63533e753f8c664a5ebb130b13639ec89f39ff0148` |
+| `REGION_SUPPLEMENT_EVIDENCE_COPY.json` | `03c9e11cb97cc9dd6c21fe4d05884292881c26f716bf1fc14a065da40d8e1065` |
+
+The closeout separately pins the original regions-control outer `EXIT.json`
+(`57280a99f45a23265a9ab74df1c0eca8ede26fc2d3d5dbd71a30aa265fa46608`).
 
 **Low-query source acquisition completed (2026-09-15).** Executable v3 on
 source `47d57fe33` completed **249 reference measurements (83 cells × 3)** and

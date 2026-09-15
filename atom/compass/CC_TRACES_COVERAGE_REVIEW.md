@@ -21,8 +21,11 @@ original cache-disabled suite stays at **9/24** passing paired cells, including
 8/8 original TP1. Those historical results do not establish cache-on accuracy,
 whole-corpus generalization or **99% confidence**. The bounded cache-on surrogate
 and AIPerf opening pairs are complete; neither adds a registered acceptance cell.
-Intact-root source closure remains incomplete after R5's failure, and the
-implemented ten-region supplement still awaits fresh native qualification.
+Intact-root source closure remains incomplete after R5's failure. Fresh GPU3
+confirmation of the ten-region supplement completed but failed three of twenty
+component gates. The immediate priority is a frozen-price intact-root diagnostic
+that exposes all source failures; its loading contract and execution remain
+subject to review.
 
 **First cache-on paired milestone: the two-request `4b433` token surrogate.**
 The fresh pair on `aa8bd80e2` completed 2/2 requests and 366 output tokens per
@@ -165,12 +168,39 @@ the final synthetic producer/consumer flow prove that the unchanged original
 nine plus ten disjoint exact keys can cover all **19 prefill shapes**, with both
 FAILED region opt-ins disabled. The candidate preserves all 30 original R3
 reference joins and requires a separate fresh passing native verdict; inspected
-R3 heldouts cannot provide that qualification. **Fresh native validation remains
-pending** under the separately authorized region-only plan, so these ten keys
-are not activated. R3/R4/R5 failures remain visible;
-[PoC status](POC_STATUS.md) records closeout and CPU evidence pins. The remaining
-proof is qualified source closure followed by intact paired cc-traces, then
-short/long, C1/C2/C4/C8, feasibility and ranking coverage. Client count still
+R3 heldouts cannot provide that qualification. Fresh GPU3 confirmation completed
+all **28 requests**, four fixtures and **30 scored rows**, but only **17/20**
+component gates pass the unchanged **110 µs** limit. Preparation errors at
+C42000/Q2832, C44832/Q1728 and C46496/Q10 are **205.932617**, **114.868164** and
+**117.107801 µs** respectively. All ten postprocess gates pass. The complete
+verdict remains **`source_qualified=false`, `candidate_activated=false`**;
+there is no partial activation, refit or retry. The original nine-region result
+and all R3/R4/R5 failures remain visible.
+
+The native/controller terminal receipts bind the complete failing verdict.
+The outer's original **exit 124** is retained separately: a stale source-status
+read followed by an observed controller exit caused a false missing-completion
+report. No source failure file was produced. Cleanup verified no live owned
+processes, free ports and released GPU memory; all **67 files / 991,195 bytes**
+were copied and hash-verified without compilation caches. The reviewed GPU3
+policy retains the observed graphics/SDMA background and makes no isolated
+performance claim. The original GPU1 plan and refused preflight remain preserved.
+[PoC status](POC_STATUS.md) records the full verdict, terminal and closeout pins.
+
+The next bounded execution is an **intact-root diagnostic using frozen reference
+prices**, ahead of further sub-millisecond source tuning. It must retain R5's
+incomplete acquisition and spread failures and the supplement's failed gates,
+without fitting any target or heldout timings. The proposed pair preserves all
+seven exact `ROOT_1493` prompts, offsets/dependencies and output lengths,
+modelled-first order, native preparation output cap 2 and acknowledged empty
+cache reset. Its diagnostic loading code, registry and launch remain held for
+review. The available inventory comprises **4,116 structural step occurrences**
+and **4,034 unique shape/fork representatives**. Its `STRUCTURE.json.gz`
+(`9aa94a33…`) uses artificial 10 ms progression and zero oracle costs, and
+duplicate steps omit allocation payloads. Neither count is E2E timing or
+allocation evidence. A paired cc-traces witness must still establish timing,
+cache continuity and memory behavior. Qualified source closure, short/long,
+C1/C2/C4/C8, feasibility and ranking coverage remain gaps. Client count still
 counts root sessions, not concurrent requests or subagents.
 The shared fixed-root evaluator still hardcodes `accepted=false`, and the
 cache-region wrapper is not a registered acceptance factory. A passing intact
