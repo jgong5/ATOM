@@ -178,7 +178,7 @@ class TestTheEngineLoopChargesItInThatOrder:
             for node in ast.walk(fn):
                 if isinstance(node, ast.If):
                     body = ast.dump(ast.Module(body=node.body, type_ignores=[]))
-                    if "_advance_clock_for" not in body:
+                    if not any(name in body for name in ("_advance_clock_for", "_clock_wait_for")):
                         continue
                     test = ast.dump(node.test)
                     if "_defers_output" not in test:

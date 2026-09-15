@@ -210,6 +210,11 @@ class TestTheEngineHonoursDeclaredArrivals:
 
             return Scheduler._schedulable_at(self, seq)
 
+        def _drain_release_calendar(self):
+            from atom.model_engine.scheduler import Scheduler
+
+            return Scheduler._drain_release_calendar(self)
+
         @property
         def _admission_seconds(self):
             return self.admission
@@ -489,6 +494,7 @@ class TestAdmissionDelay:
             _admission_seconds = Scheduler._admission_seconds
             _schedulable_at = Scheduler._schedulable_at
             _arrival_barrier_unmet = Scheduler._arrival_barrier_unmet
+            _drain_release_calendar = Scheduler._drain_release_calendar
 
         s = S()
         s.waiting = list(waiting)

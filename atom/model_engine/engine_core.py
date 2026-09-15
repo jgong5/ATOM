@@ -7,6 +7,7 @@ import queue
 import threading
 import time
 from contextlib import ExitStack
+from dataclasses import dataclass
 
 import torch
 import zmq
@@ -101,14 +102,8 @@ def _stamp_step_start(scheduled_batch) -> None:
         pass
 
 
-def _advance_clock_for(fwd_out, *, before_output: bool | None = None) -> None:
-    """Advance a virtual clock by a simulated step's predicted duration.
-
-    A no-op during a normal run: the output carries no duration, and the wall
-    clock cannot be advanced anyway. Under Compass the runner has predicted the
-    step rather than performed it, so time only moves if we move it here — this
-    process owns scheduling, and therefore owns the clock.
-    """
+def _clock_delta_for(fwd_out, *, before_output: bool | None = None):
+    """Calculate one existing whole-step or split clock charge."""
     seconds = getattr(fwd_out, "compass_step_seconds", None)
     if seconds is None:
         return
@@ -119,8 +114,14 @@ def _advance_clock_for(fwd_out, *, before_output: bool | None = None) -> None:
         if not 0.0 <= ready <= seconds:
             raise ValueError("output-ready offset must lie within the step cost")
         seconds = ready if before_output else seconds - ready
+    return seconds
+
+
+def _advance_clock_for(fwd_out, *, before_output: bool | None = None) -> None:
+    """Apply the existing clock charge; wall-clock execution remains a no-op."""
+    seconds = _clock_delta_for(fwd_out, before_output=before_output)
     advance = getattr(get_clock(), "advance", None)
-    if advance is not None:
+    if seconds is not None and advance is not None:
         advance(seconds)
 
 
@@ -139,18 +140,13 @@ def _defers_output(fwd_out) -> bool:
     return bool(getattr(fwd_out, "is_deferred_out", False))
 
 
-def _advance_native_pipeline(core, fwd_out, scheduled_batch=None) -> bool:
-    """Move host time only to the native forward's required waits.
-
-    Component oracles with a measured preparation boundary can distinguish
-    queued GPU work from the time the host regains control. A total-only oracle
-    retains the legacy whole-step clock contract.
-    """
+def _native_pipeline_marks(core, fwd_out, scheduled_batch=None):
+    """Reserve the existing forward timeline once, without advancing host time."""
     preparation = getattr(fwd_out, "compass_preparation_seconds", None)
     clock = get_clock()
     advance = getattr(clock, "advance", None)
     if advance is None:
-        return False
+        return None
     config = getattr(getattr(core, "scheduler", None), "config", None)
     compass = getattr(config, "compass_config", None)
     fence = bool(getattr(compass, "enabled", False)
@@ -170,7 +166,7 @@ def _advance_native_pipeline(core, fwd_out, scheduled_batch=None) -> bool:
         if preparation is None:
             raise ValueError("prefill preparation fence needs a priced preparation boundary")
     if preparation is None:
-        return False
+        return None
     from atom.compass.runtime.timeline import ForwardTimeline
 
     timeline = getattr(core, "_compass_forward_timeline", None)
@@ -193,11 +189,43 @@ def _advance_native_pipeline(core, fwd_out, scheduled_batch=None) -> bool:
         blocking_prefix, produces)
     if fence:
         marks["prefill_preparation_fence"] = "priced_preparation_boundary_approximation"
-    advance(marks["host_returned_at"] - now)
-    from atom.compass.runtime.lifecycle import trace
+    return marks
 
+
+def _emit_native_pipeline(marks):
+    from atom.compass.runtime.lifecycle import trace
     trace().emit("forward_timeline", **marks)
+
+
+def _advance_native_pipeline(core, fwd_out, scheduled_batch=None) -> bool:
+    """Legacy synchronous application of the same native pipeline calculation."""
+    marks = _native_pipeline_marks(core, fwd_out, scheduled_batch)
+    if marks is None:
+        return False
+    get_clock().advance(marks["host_returned_at"] - get_clock().time())
+    _emit_native_pipeline(marks)
     return True
+
+
+@dataclass(frozen=True)
+class _ClockWait:
+    at: float
+    seconds: float
+
+
+@dataclass(frozen=True)
+class _OutputReady:
+    at: float
+    streams: tuple
+    finished: tuple
+    after_at: float | None = None
+
+
+def _clock_wait_for(fwd_out, *, before_output=None):
+    seconds = _clock_delta_for(fwd_out, before_output=before_output)
+    if seconds is None or getattr(get_clock(), "advance", None) is None:
+        return None
+    return _ClockWait(get_clock().time() + seconds, seconds)
 
 
 class EngineCore:
@@ -481,19 +509,47 @@ class EngineCore:
                 logger.exception("KV event publish during shutdown failed")
             self.scheduler.shutdown_kv_events()
 
+    def _publish_step_kv_events(self):
+        try:
+            self.scheduler.publish_kv_events()
+        except Exception:
+            logger.exception("KV event publish in engine-step finally failed")
+
     def _process_engine_step(self):
         try:
             return self._process_engine_step_inner()
         finally:
-            # Swallow publisher errors so they cannot mask an exception from
-            # the engine step itself.
-            try:
-                self.scheduler.publish_kv_events()
-            except Exception:
-                logger.exception("KV event publish in engine-step finally failed")
+            self._publish_step_kv_events()
 
     def _process_engine_step_inner(self):
-        result = self.scheduler.schedule()
+        """Run the shared program synchronously for the existing engine loop."""
+        if getattr(self, "_controlled_owner", None) is not None:
+            raise RuntimeError("engine step is owned by a controlled driver")
+        program = self._process_engine_step_program()
+        reply = None
+        while True:
+            try:
+                event = program.send(reply)
+            except StopIteration as done:
+                return done.value
+            if isinstance(event, _ClockWait):
+                get_clock().advance(event.seconds)
+                reply = None
+            elif isinstance(event, _OutputReady):
+                reply = False  # Legacy publication remains at its original point.
+            else:
+                raise RuntimeError("unknown engine step checkpoint")
+
+    def _publish_step_output(self, output):
+        for streams in output.streams:
+            self.output_queue.put_nowait(("STREAM", streams))
+        if output.finished:
+            self.output_queue.put_nowait(list(output.finished))
+
+    def _process_engine_step_program(self, *, advance_idle=True):
+        """One forward/postprocess implementation, suspended only at explicit events."""
+        result = (self.scheduler.schedule() if advance_idle
+                  else self.scheduler.schedule(advance_idle=False))
 
         # Surface admit-rejected seqs (those `_unschedulable_reason` flags in
         # the scheduler) through the same finished-seq path as normal seqs.
@@ -501,7 +557,10 @@ class EngineCore:
         # the rejected seq will never produce.
         rejected = self.scheduler.take_rejected()
         if rejected:
-            self.output_queue.put_nowait(rejected)
+            output = _OutputReady(get_clock().time(), (), tuple(rejected))
+            published = yield output
+            if not published:
+                self._publish_step_output(output)
 
         if result is None:
             self._advance_idle_kv_transfer()
@@ -530,12 +589,18 @@ class EngineCore:
             fwd_out = self.runner_mgr.call_func(
                 "forward", scheduled_batch, wait_out=True
             )
-            pipelined = _advance_native_pipeline(self, fwd_out, scheduled_batch)
-            if not pipelined:
+            marks = _native_pipeline_marks(self, fwd_out, scheduled_batch)
+            pipelined = marks is not None
+            if pipelined:
+                yield _ClockWait(marks["host_returned_at"], marks["host_returned_at"] - get_clock().time())
+                _emit_native_pipeline(marks)
+            else:
                 if not _defers_output(fwd_out):
-                    _advance_clock_for(fwd_out)
+                    wait = _clock_wait_for(fwd_out)
                 else:
-                    _advance_clock_for(fwd_out, before_output=True)
+                    wait = _clock_wait_for(fwd_out, before_output=True)
+                if wait is not None:
+                    yield wait
             if (
                 self.scheduler.prefill_delayer is not None
                 and scheduled_batch.total_seqs_num_prefill > 0
@@ -560,22 +625,23 @@ class EngineCore:
             stream_output_queue=self.stream_output_queue,
             batch=scheduled_batch,
         )
+        trailing = None
         if _defers_output(fwd_out):
             if not pipelined:
-                _advance_clock_for(fwd_out, before_output=False)
-
-        # Send stream outputs to main process via output_queue
+                trailing = _clock_wait_for(fwd_out, before_output=False)
+        streams = []
         try:
             while not self.stream_output_queue.empty():
-                stream_outputs = self.stream_output_queue.get_nowait()
-                # Send stream outputs as intermediate results
-                self.output_queue.put_nowait(("STREAM", stream_outputs))
+                streams.append(self.stream_output_queue.get_nowait())
         except queue.Empty:
             pass
-
-        if finished_seqs:
-            self.output_queue.put_nowait(finished_seqs)
-
+        output = _OutputReady(get_clock().time(), tuple(streams), tuple(finished_seqs),
+                              trailing.at if trailing is not None else get_clock().time())
+        published = (yield output) if output.streams or output.finished else False
+        if trailing is not None:
+            yield trailing
+        if not published:
+            self._publish_step_output(output)
         return True
 
     def has_pending_kv_work(self) -> bool:

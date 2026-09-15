@@ -1259,6 +1259,10 @@ class Scheduler:
         and re-checking after requests start finishing would compare a shrinking
         queue against the original total and stall the run.
         """
+        if getattr(self, "_issued_admission", False):
+            for seq in self.waiting:
+                self._request_readiness.record(seq)
+            return False
         if self._arrival_barrier_open:
             return False
         if not hasattr(self, "arrival_barrier_timed_out"):
@@ -1506,6 +1510,19 @@ class Scheduler:
             and not self.deferred_free_blocks
         )
 
+    def begin_issued_admission(self):
+        """Enable explicit core-owned issuance without a finite arrival barrier."""
+        if self.waiting or self.running or self._release_calendar is not None:
+            raise ValueError("issued admission requires an empty scheduler without a release calendar")
+        if self._request_readiness is None:
+            raise ValueError("issued admission requires source-backed readiness")
+        self._request_readiness.begin_issued_requests()
+        self._issued_admission = True
+
+    @property
+    def next_ready_at(self):
+        return min((self._schedulable_at(seq) for seq in self.waiting), default=float("inf"))
+
     def add(self, seq: Sequence):
         self._warn_if_unschedulable(seq)
         self.waiting.append(seq)
@@ -1717,7 +1734,7 @@ class Scheduler:
             "token_budget": int(getattr(self.config, "max_num_batched_tokens", 0) or 0),
         }
 
-    def schedule(self) -> tuple[ScheduledBatch, dict[int, Sequence]]:
+    def schedule(self, *, advance_idle=True) -> tuple[ScheduledBatch, dict[int, Sequence]]:
         """Select the next batch of sequences for a forward pass.
 
         Tries prefill first; if no new prefills are ready, falls back to
@@ -1726,7 +1743,8 @@ class Scheduler:
         self._schedule_tick += 1
         # Nothing runnable and every arrival still in the future: move virtual
         # time to the next one rather than spinning. No-op off a virtual clock.
-        self._advance_to_next_arrival()
+        if advance_idle:
+            self._advance_to_next_arrival()
         # Sources borrowed by the previous batch: its forward has been issued,
         # so they can go back on the free list.
         self.block_manager.complete_previous_state_batch()
