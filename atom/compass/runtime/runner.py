@@ -92,6 +92,7 @@ class CompassModelRunner(CompassPredictMixin, ModelRunner):
         import torch
 
         shape = self._describe(batch)
+        coverage_decision = self._coverage_decision(batch)
         if not torch.cuda.is_available():
             # No device to time: fall back to wall clock, which is exact here
             # because there is nothing asynchronous to miss.
@@ -102,7 +103,7 @@ class CompassModelRunner(CompassPredictMixin, ModelRunner):
             self._count_and_record(shape, time.perf_counter() - began, None,
                                    req_ids=list(batch.req_ids),
                                    started_at=began,
-                                   decision=getattr(batch, "compass_decision", None))
+                                   decision=coverage_decision)
             return output
 
         import time
@@ -138,7 +139,7 @@ class CompassModelRunner(CompassPredictMixin, ModelRunner):
         # is the scheduler's and does not survive the step.
         self._pending.append((shape, began, ended, gap, list(batch.req_ids),
                               started_at,
-                              getattr(batch, "compass_decision", None), spans))
+                              coverage_decision, spans))
         self._drain_pending()
         return output
 
@@ -179,6 +180,14 @@ class CompassModelRunner(CompassPredictMixin, ModelRunner):
     def postprocess(self, *args, **kwargs):
         return self._timed_span("postprocess", ModelRunner.postprocess,
                                 self, *args, **kwargs)
+
+    def _coverage_decision(self, batch):
+        import os
+        decision = getattr(batch, "compass_decision", None)
+        if os.environ.get("COMPASS_NATIVE_COVERAGE") != "1":
+            return decision
+        from atom.compass.core.resolved_runtime import native_batch_allocation
+        return dict(decision or {}, allocation=native_batch_allocation(batch))
 
     def _drain_pending(self) -> None:
         """Write out every timed step whose events have completed.
