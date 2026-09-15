@@ -193,8 +193,12 @@ incomplete acquisition and spread failures and the supplement's failed gates,
 without fitting any target or heldout timings. The proposed pair preserves all
 seven exact `ROOT_1493` prompts, offsets/dependencies and output lengths,
 modelled-first order, native preparation output cap 2 and acknowledged empty
-cache reset. Its diagnostic loading code, registry and launch remain held for
-review. The available inventory comprises **4,116 structural step occurrences**
+cache reset. It is a **corrected fixed-profile development diagnostic**, with
+serial dependencies despite source overlap between requests 0/1 and 1/child 2.
+The final request 6 is a background leaf spawned by 5 with no later parent join.
+The fixed scheduler lacks AIPerf's `AGENTIC_REPLAY` overlap-on-issue behavior;
+this pair cannot establish raw-concurrency preservation or cc-traces-proper
+replay. Its diagnostic loading code, registry and launch remain held for review. The available inventory comprises **4,116 structural step occurrences**
 and **4,034 unique shape/fork representatives**. Its `STRUCTURE.json.gz`
 (`9aa94a33…`) uses artificial 10 ms progression and zero oracle costs, and
 duplicate steps omit allocation payloads. Neither count is E2E timing or

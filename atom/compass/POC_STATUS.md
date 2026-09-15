@@ -239,8 +239,12 @@ Prepare a modelled-first/native pair using unchanged R5 reference prices and
 the supplement's reference medians, with incomplete acquisition, repeat-spread
 failures and failed region gates visible in the diagnostic loading contract.
 Keep the seven exact `ROOT_1493` prompts, offsets/dependencies and output lengths,
-native preparation output cap 2 and acknowledged empty-cache reset. The new
-code, registry and launch remain held pending review; this decision authorizes
+native preparation output cap 2 and acknowledged empty-cache reset. This is a
+**corrected fixed-profile development diagnostic**: its declared dependencies
+serialize request 0 before 1 and request 1 before child 2, although those source
+windows overlap. It lacks AIPerf's `AGENTIC_REPLAY` overlap-on-issue behavior and
+proves neither raw-concurrency preservation nor cc-traces-proper replay. The
+new code, registry and launch remain held pending review; this decision authorizes
 neither source activation nor acceptance credit. The available structural
 inventory counts **4,116 step occurrences** and **4,034 unique shape/fork
 representatives**. `STRUCTURE.json.gz` (`9aa94a33…`) uses artificial 10 ms
