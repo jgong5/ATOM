@@ -1,6 +1,34 @@
 # ATOMCompass — PoC gate status
 
-**Current result (2026-09-15): the first complete-root fixed-profile pair passed
+**Current implementation and diagnostic status (2026-09-16).** The actual
+AIPerf/controlled-core bridge is implemented and pushed in `fef57a553`. It
+runs AIPerf's workers, credit routing and phase logic through native chat
+preprocessing and SSE parsing against the shared controlled engine.
+**86 focused component/engine/clock checks pass.** Native dependency checks
+retain **364 passes and one known zero-count contract assertion failure**:
+the unchanged upstream assertion requires a positive count, while the reviewed
+empty-warmup prerequisite permits zero. The same failure was reproduced on the
+prerequisite alone, without the new clock patch.
+
+The first frozen proper **C1/cache-on, source-backed diagnostic** reached a
+source-region coverage refusal at **Q8192, cached history 0, N1, outputless**:
+`<prepare>` has no qualified support for that shape. It stopped before any
+priced output. This establishes that the actual replay path reaches the
+source oracle; it supplies no completed proper-replay pair or new acceptance.
+
+The source profiler diagnosis is complete, but its short-query timings are
+perturbed. It produces **no new prices or acceptance result**. In particular,
+`<prepare>` includes preparation plus in-stream idle; host dispatch-call
+duration cannot be substituted for it or added wholesale to the existing
+forward cost.
+
+**Next steps remain TP1:** qualify portable region coverage with explicit
+history/execution-path scope, and resolve host-dispatch accounting without
+double-counting existing stream work or waits, then resume proper E2E
+cc-traces validation. The strongest completed pair and its qualifications
+remain below.
+
+**Strongest completed result (2026-09-15): the first complete-root fixed-profile pair passed
 its development checks.** Both cache-on `ROOT_1493` sides completed **7/7 requests
 and 4,097 outputs**. Aggregate prediction errors are **−3.138% TTFT**, **+5.355%
 TPOT** and **−0.308% throughput**, within the maintained 15%/10%/10% bars.
