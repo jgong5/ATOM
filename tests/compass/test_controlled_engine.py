@@ -9,8 +9,9 @@ from conftest import MockConfig
 from atom.compass.config import CompassConfig
 from atom.compass.runtime.controlled_engine import ControlledEngine
 from atom.model_engine.engine_core import EngineCore
+from atom.model_engine.engine_utility import EngineUtilityHandler
 from atom.model_engine.scheduler import Scheduler
-from atom.model_engine.sequence import Sequence
+from atom.model_engine.sequence import Sequence, SequenceStatus
 from atom.sampling_params import SamplingParams
 from atom.utils.clock import VirtualClock, WallClock, get_clock, reset_clock, set_clock
 from .test_native_ingress_service import sources, write
@@ -74,6 +75,10 @@ def make_core(tmp_path):
             batches.append((get_clock().time(), tuple(batch.req_ids), tuple(batch.num_scheduled_tokens)))
             return runner.forward(batch)
         core.runner_mgr = SimpleNamespace(call_func=worker)
+        core.utility_queue = queue.Queue()
+        core._has_pending_utility = False
+        core.utility_handler = EngineUtilityHandler(
+            core.runner_mgr, core.output_queue, scheduler=sched, engine=core)
         postprocess = sched.postprocess
         def post(*args, **kwargs):
             post_calls.append(get_clock().time())
@@ -337,3 +342,187 @@ def test_zero_output_completion_has_no_fabricated_first_token(make_core, clock):
     assert [(e.kind, e.request_id) for e in result.output_events] == [("completion", seq.id)]
     assert seq.num_completion_tokens == 0 and seq.first_token_time == 0.
     assert result.output_events[0].at == seq.finish_time == clock.time()
+
+
+def test_abort_while_waiting_uses_native_rejection(make_core, clock):
+    fixture = make_core(ingress_service=(2., 3.))
+    control = ControlledEngine(fixture.core)
+    seq = request(100., prompt=20)
+    control.submit_issued(seq, 100.)
+    control.abort_issued(seq.id, 100.)
+    assert seq.status != SequenceStatus.ABORTED
+
+    result = control.advance_until(100., include_horizon=True)
+
+    assert result.reason == "outputs"
+    assert [(e.kind, e.at) for e in result.output_events] == [("completion", 100.)]
+    assert seq.leave_reason == "aborted" and seq.first_token_time == 0.
+    assert not fixture.batches and not seq.block_table
+    assert clock.time() == 100.
+
+
+def test_abort_during_forward_waits_for_the_native_whole_step_boundary(make_core):
+    fixture = make_core(seconds=10., output_ready=2.)
+    control = ControlledEngine(fixture.core)
+    seq = request(100., outputs=5)
+    control.submit_issued(seq, 100.)
+    control.advance_until(101.)
+    selected = list(fixture.batches)
+    assert fixture.posts == []
+    control.abort_issued(seq.id, 101.)
+    assert seq.status != SequenceStatus.ABORTED
+    control.advance_until(110., include_horizon=True)
+    assert seq.status != SequenceStatus.ABORTED
+    assert fixture.batches == selected and fixture.posts == [102.]
+    result = control.advance_until(150.)
+    controlled_tokens = list(seq.token_ids)
+    assert seq.leave_reason == "aborted"
+    assert seq.finish_time == result.now == 112.
+    control.advance_until(120., include_horizon=True)
+    controlled_batches = [(at, sizes) for at, _, sizes in fixture.batches]
+    assert fixture.scheduler.is_finished()
+
+    set_clock(VirtualClock(epoch=100.))
+    legacy = make_core(seconds=10., output_ready=2., controlled=False)
+    native = request(100., outputs=5)
+    legacy.scheduler.add(native)
+    legacy.core._process_engine_step_inner()
+    legacy.core.utility_queue.put_nowait(
+        ("abort_request", {"cmd": "abort_request", "req_id": native.id}))
+    legacy.core._has_pending_utility = True
+    legacy.core.utility_handler.process_queue(legacy.core.utility_queue, legacy.core)
+    legacy.core._process_engine_step_inner()
+    assert native.leave_reason == seq.leave_reason
+    assert (native.first_token_time, native.finish_time) == (seq.first_token_time, seq.finish_time)
+    assert list(native.token_ids) == controlled_tokens
+    assert [(at, sizes) for at, _, sizes in legacy.batches] == controlled_batches
+    assert get_clock().time() == 120.
+
+
+def test_abort_after_output_waits_for_trailing_charge(make_core):
+    fixture = make_core(seconds=10., output_ready=2.)
+    control = ControlledEngine(fixture.core)
+    seq = request(100., outputs=5)
+    control.submit_issued(seq, 100.)
+    first = control.advance_until(150.)
+    assert first.now == 112. and [e.kind for e in first.output_events] == ["first_token"]
+    control.abort_issued(seq.id, 112.)
+    control.advance_until(116.)
+    assert seq.status != SequenceStatus.ABORTED
+    control.advance_until(120., include_horizon=True)
+    assert seq.status != SequenceStatus.ABORTED
+    result = control.advance_until(150.)
+    assert [(e.kind, e.at) for e in result.output_events] == [("completion", 122.)]
+    assert seq.leave_reason == "aborted"
+
+
+def test_abort_after_natural_completion_is_a_drained_noop(make_core):
+    fixture = make_core(seconds=10., output_ready=2.)
+    control = ControlledEngine(fixture.core)
+    seq = request(100.)
+    control.submit_issued(seq, 100.)
+    finished = control.advance_until(150.)
+    assert finished.now == 112.
+    control.abort_issued(seq.id, 112.)
+    drain_outputs(fixture.core)
+
+    result = control.advance_until(150.)
+
+    assert result.idle and not result.output_events
+    assert seq.finish_time == 112. and seq.leave_reason != "aborted"
+    assert not drain_outputs(fixture.core)
+    assert fixture.core.utility_queue.empty()
+    assert not fixture.core._has_pending_utility
+
+
+def test_abort_requires_the_current_frontier(make_core):
+    fixture = make_core()
+    control = ControlledEngine(fixture.core)
+    for at in (99., 101., float("nan"), True):
+        with pytest.raises(ValueError, match="frontier"):
+            control.abort_issued(1, at)
+    assert fixture.core.utility_queue.empty()
+
+
+def test_in_process_startup_reuses_the_real_replay_runner_and_scheduler(tmp_path):
+    from atom.compass.replay.local_proc import LocalProcManager
+    from atom.compass.replay.runner import ReplayModelRunner
+    from atom.model_engine.state_runtime import StateRuntime
+    from .test_replay import _target
+
+    target = _target(tmp_path, blocks={
+        "num_kvcache_blocks": 128, "pool_entries": {}, "pool_entries_per_req": {},
+        "state_runtime": StateRuntime().to_wire(),
+    })
+    config = MockConfig(
+        num_kvcache_blocks=128, kv_cache_block_size=4,
+        max_num_seqs=4, max_model_len=64,
+        model="Qwen/Qwen3.8-27B", gpu_memory_utilization=.9,
+        tensor_parallel_size=1, pipeline_parallel_size=1,
+        prefill_context_parallel_size=1, tp_world_size=1,
+        parallel_config=SimpleNamespace(control_address=None, data_parallel_size=1),
+        compilation_config=None, kv_transfer_config=None, enforce_eager=False,
+        disagg_is_decode=False,
+        runner_manager_qualname="atom.compass.replay.local_proc.LocalProcManager",
+        runner_qualname="atom.compass.replay.runner.ReplayModelRunner",
+        compass_config=CompassConfig(enabled=True, mode="predict", epoch=100.,
+                                     replay_target=target),
+    )
+    core = EngineCore(config, None, None, in_process=True)
+    try:
+        assert type(core.scheduler) is Scheduler
+        assert type(core.runner_mgr) is LocalProcManager
+        assert type(core.runner_mgr.runner) is ReplayModelRunner
+        assert core.input_thread is core.output_thread is None
+        assert core.scheduler.block_manager.max_pool_tokens > 0
+        assert core.output_queue.get_nowait()[0] == "READY"
+        assert get_clock().time() == 100.
+    finally:
+        core.exit()
+    assert core.output_queue.get_nowait()[0].status == SequenceStatus.EXIT_ENGINE
+
+
+def test_in_process_startup_rejects_non_replay_before_starting_threads(make_core):
+    config = make_core().scheduler.config
+    config.runner_manager_qualname = "native"
+    config.runner_qualname = "native"
+    with pytest.raises(ValueError, match="local virtual prediction replay"):
+        EngineCore(config, None, None, in_process=True)
+
+
+def test_control_rejects_an_active_socket_thread(make_core):
+    import threading
+
+    fixture = make_core()
+    stopped = threading.Event()
+    fixture.core.input_thread = threading.Thread(target=stopped.wait)
+    fixture.core.input_thread.start()
+    try:
+        with pytest.raises(ValueError, match="exclusive ownership"):
+            ControlledEngine(fixture.core)
+    finally:
+        stopped.set()
+        fixture.core.input_thread.join()
+
+
+@pytest.mark.parametrize("feature", [
+    "tensor_parallel_size", "pipeline_parallel_size", "prefill_context_parallel_size",
+    "decode_context_parallel_size", "data_parallel_size", "kv_transfer_config",
+    "speculative_config", "disagg_is_decode",
+])
+def test_in_process_rejects_unsupported_features_before_initialization(make_core, feature):
+    config = make_core().scheduler.config
+    config.compass_config.replay_target = "/missing-target-must-not-be-opened"
+    config.runner_manager_qualname = "atom.compass.replay.local_proc.LocalProcManager"
+    config.runner_qualname = "atom.compass.replay.runner.ReplayModelRunner"
+    config.parallel_config = SimpleNamespace(control_address=None, data_parallel_size=1)
+    if feature == "data_parallel_size":
+        config.parallel_config.data_parallel_size = 2
+    else:
+        setattr(config, feature, True if feature.endswith("_config") or feature == "disagg_is_decode" else 2)
+    clock_before = get_clock()
+
+    with pytest.raises(ValueError, match="TP1/PP1/DP1"):
+        EngineCore(config, None, None, in_process=True)
+
+    assert get_clock() is clock_before

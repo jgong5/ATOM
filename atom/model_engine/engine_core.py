@@ -234,7 +234,29 @@ class EngineCore:
     # its own interpreter; `_setup_engine_process` is the only writer.
     _process_name = "EngineCore"
 
-    def __init__(self, config: Config, input_address: str, output_address: str):
+    def __init__(
+        self, config: Config, input_address: str | None, output_address: str | None,
+        *, in_process: bool = False,
+    ):
+        if in_process:
+            compass = getattr(config, "compass_config", None)
+            if (type(self) is not EngineCore or input_address is not None
+                    or output_address is not None
+                    or not getattr(compass, "enabled", False)
+                    or getattr(compass, "mode", None) != "predict"
+                    or not getattr(compass, "virtual_clock", False)
+                    or not getattr(compass, "replay_target", "")
+                    or any(getattr(config, name, 1) != 1 for name in (
+                        "tensor_parallel_size", "pipeline_parallel_size",
+                        "prefill_context_parallel_size", "decode_context_parallel_size"))
+                    or getattr(getattr(config, "parallel_config", None), "data_parallel_size",
+                               getattr(config, "data_parallel_size", 1)) != 1
+                    or getattr(config, "kv_transfer_config", None)
+                    or getattr(config, "speculative_config", None)
+                    or getattr(config, "disagg_is_decode", False)
+                    or config.runner_manager_qualname != "atom.compass.replay.local_proc.LocalProcManager"
+                    or config.runner_qualname != "atom.compass.replay.runner.ReplayModelRunner"):
+                raise ValueError("in-process EngineCore requires a local virtual prediction replay at TP1/PP1/DP1 without KV transfer, speculation or socket addresses")
         _install_compass_clock(config)
         self.label = "Engine Core"
         self.input_queue = queue.Queue[Sequence]()
@@ -255,28 +277,30 @@ class EngineCore:
         # Control traffic arrives on its own socket so CoreManager can keep the
         # request socket single-writer; see CoreManager._send_request.
         self.control_address = config.parallel_config.control_address
-        assert self.control_address, (
-            "parallel_config.control_address is unset -- an EngineCore must be "
-            "launched through CoreManager, which allocates the control channel"
-        )
-        self.output_thread = threading.Thread(
-            target=self.process_output_sockets, args=(self.output_address,), daemon=True
-        )
-        self.output_thread.start()
+        self.output_thread = self.input_thread = None
+        if not in_process:
+            assert self.control_address, (
+                "parallel_config.control_address is unset -- an EngineCore must be "
+                "launched through CoreManager, which allocates the control channel"
+            )
+            self.output_thread = threading.Thread(
+                target=self.process_output_sockets, args=(self.output_address,), daemon=True
+            )
+            self.output_thread.start()
 
-        # Start input thread BEFORE _init_data_parallel so that CoreManager
-        # can receive the input socket connection and proceed to start the
-        # remaining DP ranks.  Without this, _init_data_parallel blocks on
-        # rendezvous waiting for all DP ranks, but they haven't been spawned
-        # yet because CoreManager is still waiting for *this* rank's socket.
-        # The READY signal (sent at the end of __init__) gates actual request
-        # processing, so starting the input thread early is safe.
-        self.input_thread = threading.Thread(
-            target=self.process_input_sockets,
-            args=(self.input_address, self.control_address),
-            daemon=True,
-        )
-        self.input_thread.start()
+            # Start input thread BEFORE _init_data_parallel so that CoreManager
+            # can receive the input socket connection and proceed to start the
+            # remaining DP ranks.  Without this, _init_data_parallel blocks on
+            # rendezvous waiting for all DP ranks, but they haven't been spawned
+            # yet because CoreManager is still waiting for *this* rank's socket.
+            # The READY signal (sent at the end of __init__) gates actual request
+            # processing, so starting the input thread early is safe.
+            self.input_thread = threading.Thread(
+                target=self.process_input_sockets,
+                args=(self.input_address, self.control_address),
+                daemon=True,
+            )
+            self.input_thread.start()
 
         self.mark_trace = getattr(config, "mark_trace", False)
         init_exit_handler(self)
@@ -444,7 +468,8 @@ class EngineCore:
     def _send_engine_dead(self):
         logger.debug(f"{self.label}: send SHUTDOWN request")
         self.output_queue.put_nowait([get_exit_sequence()])
-        self.output_thread.join(timeout=0.5)
+        if self.output_thread is not None:
+            self.output_thread.join(timeout=0.5)
 
     @staticmethod
     def run_engine(config: Config, input_address: str, output_address: str):

@@ -50,7 +50,10 @@ class ControlledEngine:
                 or getattr(scheduler, "deferred_free_blocks", None)
                 or getattr(core, "_compass_forward_timeline", None) is not None
                 or not core.stream_output_queue.empty()
-                or (getattr(core, "input_queue", None) is not None and not core.input_queue.empty())):
+                or (getattr(core, "input_queue", None) is not None and not core.input_queue.empty())
+                or (getattr(core, "utility_queue", None) is not None and not core.utility_queue.empty())
+                or any(thread is not None and thread.is_alive() for thread in (
+                    getattr(core, "input_thread", None), getattr(core, "output_thread", None)))):
             raise ValueError("controlled engine requires exclusive ownership of a fresh empty core")
         # This also refuses finite/serial calendars and previously resolved
         # readiness records. No future request descriptor is constructed.
@@ -79,8 +82,23 @@ class ControlledEngine:
         self.scheduler.add(sequence)
         return record
 
+    def abort_issued(self, request_id, at):
+        """Queue native abort intent for the next whole-step boundary.
+
+        An active forward, its postprocess and any trailing charge finish
+        before the utility queue is drained, matching EngineCore.busy_loop.
+        An abort for an already-finished request is the native no-op.
+        """
+        self._check_active()
+        if type(at) not in (int, float) or at != self._frontier:
+            raise ValueError("abort only at the current committed frontier")
+        self.core.utility_queue.put_nowait(
+            ("abort_request", {"cmd": "abort_request", "req_id": request_id}))
+        self.core._has_pending_utility = True
+
     def _step_program(self):
         try:
+            self.core.utility_handler.process_queue(self.core.utility_queue, self.core)
             return (yield from self.core._process_engine_step_program(advance_idle=False))
         finally:
             self.core._publish_step_kv_events()
@@ -97,12 +115,14 @@ class ControlledEngine:
         if next_at is None:
             if isinstance(self._event, _ClockWait):
                 next_at = self._event.at
-            elif self._program is not None or self.scheduler.running:
+            elif (self._program is not None or self.scheduler.running
+                  or self.core._has_pending_utility):
                 next_at = self._frontier
             else:
                 next_at = self.scheduler.next_ready_at
         return EngineYield(self._frontier, reason, tuple(events), next_at,
-                           self._program is None and not self.scheduler.running and not self.scheduler.waiting)
+                           self._program is None and not self.scheduler.running
+                           and not self.scheduler.waiting and not self.core._has_pending_utility)
 
     def _output_events(self, output):
         if output.at != self._frontier:
