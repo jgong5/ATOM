@@ -249,10 +249,21 @@ class Sequence:
         # Next decode step sizes this seq's verification to dspark_next_ell+1.
         self.dspark_next_ell: int | None = None
 
+        # How many requests the whole workload contains, when a simulated run
+        # declared it. The engine may not advance virtual time past an arrival
+        # it has not been told about, so it holds until it has them all -- see
+        # Scheduler._arrival_barrier_unmet. None on any normal request.
+        self.compass_workload_size: int | None = None
+
         # statistics fields
         self.arrive_time = 0.0
         self.first_token_time = 0.0
         self.leave_time = 0.0
+        # Stamped by the engine core when the sequence finishes, on whichever
+        # clock the engine is running. The client stamps leave_time on its own
+        # clock, which under a simulated run does not advance — so latency and
+        # TPOT must be derived from this instead.
+        self.finish_time = 0.0
         self.leave_reason = ""
 
         # kv_transfer params

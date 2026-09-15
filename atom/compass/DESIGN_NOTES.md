@@ -1,0 +1,6689 @@
+# ATOMCompass — design notes and open problems
+
+What is settled and why, and what is not. Recorded as each was established, so
+the reasoning survives the context it was found in, including the things that
+were wrong first.
+
+The target is to simulate ATOM **as it is deployed**: compilation on
+(`--level 3`), CUDA graphs on, prefix caching on, chunked prefill on. Anything
+that only works under `--enforce-eager` or `--level 0` is a step towards that,
+not an instance of it. `--enforce-eager` does **not** disable compilation — it
+disables CUDA graphs; compilation is `--level`, and its default is on.
+
+Effort estimates are rough: **S** hours, **M** days, **L** weeks or unknown.
+
+Defects in ATOM itself, rather than in Compass, are collected separately in
+[ATOM_DEFECTS.md](ATOM_DEFECTS.md).
+
+**Start with [RETROSPECTIVE.md](RETROSPECTIVE.md)** for the evidence audit and
+priorities updated on 10 September 2026 through `87838198`. It reviews the
+replay/timing repairs, repeated 27B results, new decision records, and remaining
+validity gaps. The [9 September review](RETROSPECTIVE_2026-09-09.md) preserves
+the original audit. [POC_SUMMARY.md](POC_SUMMARY.md) provides the earlier handover.
+This file is the chronological working log; later corrections can supersede
+earlier conclusions.
+
+---
+
+# Status
+
+**Scope.** Two quantities are modelled: **time** (what a step costs, and what
+serving adds around it) and, as of the survey revision, **memory** (what a
+configuration consumes, and therefore whether it fits and how many KV blocks it
+gets). Memory is #22 and is currently `empirical/measured` only -- see there for
+what it needs.
+
+
+A simulated serving run predicts a real one on Qwen3-0.6B on MI308X, calibrated
+on a sweep of shapes and evaluated on a workload neither saw, so the error is a
+generalisation error rather than a fit residual. Five runs of the identical
+command at TP=1, at roughly 6× wall clock:
+
+| run | TTFT | TPOT | latency |
+| --- | --- | --- | --- |
+| 1 | −6.1% | −1.8% | −3.3% |
+| 2 | −14.0% | −5.4% | −8.7% |
+| 3 | −14.7% | −5.3% | −8.8% |
+| 4 | −14.4% | −1.9% | −6.7% |
+| 5 | −0.5% | +2.4% | +1.4% |
+| **mean ± sd** | **−9.9 ± 6.4** | **−2.4 ± 3.2** | **−5.2 ± 4.3** |
+
+Since then: decode fitted per CUDA-graph rung, every fit moved to relative error,
+and admission time modelled (items 2, 3 and 11). Three repeats each:
+
+| | TTFT | TPOT | latency |
+| --- | --- | --- | --- |
+| before any of it | −9.9 ± 6.4 | −2.4 ± 3.2 | −5.2 ± 4.3 |
+| rungs + relative fit | −20.7 ± 4.5 | −0.4 ± 4.1 | −8.0 ± 1.7 |
+| **+ admission (13 ms)** | **+2.0 ± 7.0** | **−1.0 ± 3.3** | **+0.0 ± 1.8** |
+
+All three are now **inside the noise** — the harness says so itself, because the
+spread across repeats exceeds the error. That is the point at which further
+modelling stops being measurable on this workload, and it is the honest ceiling
+for a single-GPU 0.6B model on a shared machine.
+
+The middle row is worth keeping. TTFT looked worse there, and not because prefill
+got worse — prefill improved from +18.3% to +3.9% at the shape this workload
+actually uses. Correcting the fit removed an over-prediction that had been paying
+for the admission cost, and made the missing term visible. See "A quarter of TTFT
+happens outside any forward".
+
+Reproduce with `scripts/compass/validate.py`.
+
+**Read the spread before the mean.** This document reported run 1 alone for some
+time, as −6.1/−1.8/−3.3, and treated it as the project's result. It is one draw
+from a distribution whose TPOT runs from −5.4% to +2.4% — the reported error was
+smaller than the interval it came from. Nothing was wrong with that run; what was
+wrong was quoting it. The machine is shared with about twenty other containers
+and the GPUs are not partitioned, so a run is a sample of the box as much as of
+the model.
+
+The same comparison at **TP=2**, on the same model and the same hardware.
+One run, so read it with the caveat above — and note that calling it
+significant below borrows the TP=1 spread as an estimate of this one's,
+which is an assumption and not a measurement:
+
+| metric | real | modelled | error |
+| --- | --- | --- | --- |
+| TTFT | 69.10 ms | 46.80 ms | **−32.3%** |
+| TPOT | 3.54 ms | 3.06 ms | **−13.6%** |
+| latency | 178.90 ms | 141.71 ms | **−20.8%** |
+
+TP=2 is worse than TP=1 by more than the noise: −13.6% TPOT sits 3.5 standard
+deviations below the TP=1 mean, so it is a real effect and not another draw. Two
+things are under it. The linear fit under-predicts the region both evaluations
+land in, at both widths — that is item 12, and it is in-sample. And run 1 of the
+TP=1 series happened to land at the optimistic end of the band, which made the
+gap between the two widths look larger than the −2.4% mean justifies.
+
+How it got there, because the shape of the sequence matters more than the
+endpoint:
+
+| iteration | TTFT | TPOT | latency |
+| --- | --- | --- | --- |
+| first end-to-end run | +107% | +800% | +560% |
+| CUDA graphs captured in measure mode | +39.6% | +13.1% | +22.9% |
+| prefill calibration widened | −23.9% | +22.5% | +4.7% |
+| batch calibration widened | −11.9% | +17.5% | +7.1% |
+| timing switched to CUDA events | −6.1% | −1.8% | −3.3% |
+| ...the same command, four more times | −0.5 to −14.7% | +2.4 to −5.4% | +1.4 to −8.8% |
+| the same, at TP=2 | −32.3% | −13.6% | −20.8% |
+
+Every step up to the last was a defect in how Compass measured or calibrated,
+never in the cost model's form; three of the four were configurations or methods
+that looked entirely reasonable and were quietly wrong. **The last row is the
+first exception.** Widening to a second rank did not introduce an error so much
+as stop concealing one: the linear fit cannot reproduce its own training data in
+the region both evaluations land in, by −3.8% at TP=1 and −8.3% at TP=2, and at
+TP=1 that was cancelled by run-to-run variation pointing the other way.
+
+---
+
+# Open problems
+
+Ranked by what is known about their size. Anything without a measured magnitude
+is ranked by argument, which is weaker — the whole reason the end-to-end
+comparison was built first is that structural findings cannot rank each other.
+
+## Vocabulary
+
+Two questions, and everything here is one answer to each.
+
+**What is costed.** A **model step** -- the forward, for a step of a given shape
+-- or **serving**: admission, scheduling, KV cache management. Serving
+*decisions* are not costed at all, because they are not modelled: Compass runs
+ATOM's real scheduler and replaces only the forward. What serving contributes to
+a prediction is the time it consumes, not the choices it makes.
+
+**How the cost is obtained.** **analytical**, computed without measuring the
+subject; or **empirical**, derived from measuring it. Empirical is a genus and is
+written `empirical/<species>`:
+
+| | |
+| --- | --- |
+| `empirical/measured` | the unit itself is timed -- `priced` prices operators and sums them |
+| `empirical/fitted` | a form is chosen, coefficients regressed over measured steps -- `calibrated` |
+| `empirical/interpolated` | no form assumed, nearby measurements looked up -- `interpolated` |
+
+**"Priced" is not a species.** *Pricing* is the act of measuring one operator at
+one shape, a *price* is that measurement and a *price list* the artifact -- all
+useful words, and all `empirical/measured`. So a price should never be set
+against "measured" as though the two were different kinds of number. What differs
+is the unit: write **measured (op-level)** and **measured (step-level)**, and say
+"summed" where op-level measurements are added up to stand for a step. Both are
+measurements; only one of them was taken on the thing being predicted.
+
+Those are the species built so far, **not a closed set**: `empirical/extrapolated`
+and others are equally admissible, and naming the genus separately is what leaves
+room for them.
+
+| oracle | subject | how |
+| --- | --- | --- |
+| `constant` | model step | declared -- a stub, for proving the plumbing |
+| `calibrated` | model step | `empirical/fitted` |
+| `interpolated` | model step | `empirical/interpolated` |
+| `priced` | model step | `empirical/measured` |
+| admission | serving | `empirical/measured` |
+
+`priced` reaches a model step by summing operators and `calibrated` by fitting
+the step directly. A difference of method, not of subject: both answer what one
+step costs, so "step-level" and "operator-level" describe how an oracle works
+rather than what it is for.
+
+**What quantity.** All of the above is written for *time*, and applies unchanged
+to **bytes**. Memory consumption has the same two subjects -- **model memory**
+(weights, activations, the CUDA-graph pool) and **serving memory** (the KV cache
+and its block pools) -- and the same dial. What ATOM does today is
+`empirical/measured`: four readings off a live device. `analytical` would derive
+the same terms from the checkpoint index and the traced op graph.
+
+Reading a budget captured by an earlier run is **not** a further species. It is
+still `empirical/measured` -- the number is a direct measurement of the quantity,
+and *when* it was taken is not provenance. Every empirical oracle here already
+works that way: a price list, the boundary constant, the admission figure and the
+calibration table are all measurements written to an artifact and read back
+later. What changes between reading a device and reading an artifact is only
+whether the key matched, and that already has species -- exact match is
+`empirical/measured`, nearest is `empirical/interpolated`, past the range is
+`empirical/extrapolated`.
+
+So "cost" should not be read as meaning time. Say **time cost** or **memory
+cost** where it matters, and the subject and provenance words carry over.
+
+Nothing analytical exists yet for either quantity. The word is reserved rather
+than aspirational.
+
+This replaces an earlier three-point dial (`analytical` / `calibrated` /
+`empirical`) that described a design never built: it defined `calibrated` as the
+analytical shape scaled by a measured efficiency factor, which has no analytical
+component and never did, and gave the genus name to one species of it.
+
+## The product gap
+
+### 1. No op-graph work feeds the cost model — **L**
+
+Both oracles predict from a step's **shape** alone: token counts, batch size,
+context lengths. The graphs, the meta derivation, the TP validation — none of it
+contributes to a single prediction.
+
+This is the difference between **empirical/fitted**, which is where the project
+was, and **empirical/measured** -- per-operator cost attributed from a captured
+graph. It also decides whether Compass can predict a configuration
+nobody has measured, or only interpolate between ones that were. Everything
+under *Settled* about graphs is groundwork for this and is not yet paying for
+itself.
+
+**Done, for one decode shape.** `PricedGraphCostOracle` costs a step as the sum
+of its priced operators plus a fixed cost per kernel launch, and it is the first
+oracle here that reads an operator at all. Against the workload it was fitted on:
+TTFT -1.3%, TPOT **-0.4%**, latency -0.7%. Held out at 96 output tokens instead
+of 32: TTFT -1.7%, TPOT -3.7%, latency -3.4%.
+
+The second term is not a fudge and its shape was the open question (#21): priced
+kernels sum to 0.740 of a step at 98.8% coverage, and the missing quarter is
+additive per launch rather than multiplicative -- 2.02 µs, fitted without a
+profiler, matching a profiled per-kernel median of 2.05 µs arrived at
+separately.
+
+With admission measured and both overhead constants refitted over three runs,
+every metric is inside the run-to-run noise of a shared GPU:
+
+| | predicted | real (n=3) | error | noise |
+| --- | --- | --- | --- | --- |
+| ttft | 55.580 ms | 54.731 ms | +1.6% | ±1.0% |
+| tpot | 3.200 ms | 3.189 ms | +0.3% | ±1.8% |
+| latency | 154.783 ms | 153.594 ms | +0.8% | ±0.8% |
+| **held out, 96 tokens** | | | | |
+| ttft | 55.580 ms | 53.954 ms | +3.0% | ±1.6% |
+| tpot | 3.200 ms | 3.208 ms | **-0.2%** | ±1.9% |
+| latency | 359.591 ms | 358.687 ms | **+0.3%** | ±1.4% |
+
+Both constants had to be refitted, and why is worth keeping. They were first
+fitted on one step each: a 37.27 ms prefill and a 3.115 ms decode. Over three
+runs those steps are 42.64 ± 0.22 ms and 3.201 ± 0.06 ms, so the single samples
+were 13% and 3% low, and the constants came out at 67.4 µs/op and 2.02 µs/launch
+instead of **86.35** and **2.25**. The prefill step had been reported as -1.9%
+against that one sample and was really -14%. On a shared GPU one step is a poor
+estimator, and the caveat #21 records turned out to matter within the hour.
+
+These remain fits on this deployment, so the table is not a held-out test of the
+*constants* -- two numbers for the whole model. The graph and the prices are
+independent of it, and the 96-token rows are held out in shape.
+
+**It holds at TP=2.** The graph and the prices transfer unchanged -- collectives
+included -- and only the two overhead constants move:
+
+| TP=2 | TP=1 constants | refitted | real (n=3) | noise |
+| --- | --- | --- | --- | --- |
+| ttft | -5.8% | **-2.2%** | 63.822 ms | ±2.9% |
+| tpot | +6.2% | **+2.4%** | 3.290 ms | ±3.9% |
+| latency | +1.6% | **+0.6%** | 165.805 ms | ±2.2% |
+
+Reused from TP=1 the constants cost a few percent and pull in opposite
+directions -- tpot over, ttft under -- which is what said they were the problem
+rather than the prices. Refitted they are 1.97 µs/launch against 2.25, and
+92.5 µs/op against 86.35: **7% and 12% off, in different directions.** So the
+constants are a property of a deployment, not of the hardware, and #21's
+"one calibration factor" would have been wrong even had the ratio been constant.
+
+What that costs the product is worth stating: predicting a configuration nobody
+has run needs either one measured step from it to fit two numbers, or an accepted
+~5% error on metrics whose overhead term is a quarter of the step. Everything
+else -- the graph, every price, the collectives -- carries over.
+
+Admission carries over untouched: 12.89 ms at TP=2 against 13.19 at TP=1, as it
+should, being engine-side work that never reaches a device.
+
+Prefill is priced too, from its own graph. `--compass-trace-prefill 2` records a
+prefill step alongside the decode one, `--compass-bench-graph` takes both, and
+the oracle picks by kind. With that, the calibrated fallback is not used at all:
+
+| | fallback for prefill | prefill priced |
+| --- | --- | --- |
+| ttft | -1.3% (the fallback's) | **-12.5%** |
+| tpot | -0.4% | **-0.1%** |
+| latency | -0.7% | **-4.7%** |
+| ttft, 96 tokens | -1.7% (the fallback's) | -12.9% |
+| tpot, 96 tokens | -3.7% | **-3.5%** |
+| latency, 96 tokens | -3.4% | **-4.9%** |
+
+The TTFT column looks like a regression and is not: -1.3% was a calibrated
+oracle fitted to the very steps it was predicting, and this is the op graph
+answering for the first time. The prefill **step** comes out at 36.6 ms against a
+measured 37.3 -- **-1.9%** -- and the rest of TTFT is admission and scheduling
+that happen outside any step, which is #3 and not this oracle's to fix.
+
+Three things had to be right, and two were wrong first.
+
+*Prefill reads more metadata than decode.* The varlen fmha kernel wants
+`cu_seqlens_k` and `min_seqlen_q` as well, and raises on a missing one rather
+than defaulting it. Recording only what decode needed left every prefill
+attention unpriced -- 28 operators, and the whole of prefill's attention cost.
+Coverage went from 94.6% to 98.9% when they were added.
+
+*A prefill step runs eager, and that is most of it.* Prefill's kernels are
+15.1 ms of a 37.3 ms step. The priced sum was right and the model was wrong. A
+decode step is one graph replay with the host out of the loop; a prefill step's
+token count is not on the capture ladder -- the ladder is captured at one token
+per sequence -- so the host dispatches all 319 operators individually. Hence two
+overhead constants rather than one:
+
+| | replayed | eager |
+| --- | --- | --- |
+| paid per | kernel launch | operator |
+| fitted | 2.02 µs | 67.4 µs |
+
+Thirtyfold apart, which is why using the replayed constant for prefill priced it
+at 0.42 of its step. Both are one-step fits on one deployment, with the caveats
+#21 records.
+
+*And the engine has to say which.* `StepShape.capture_bucket` is documented as
+None when nothing was replayed, but `_capture_bucket` returned a rung for prefill
+steps too -- it only ever looked at batch size. A four-sequence prefill was
+reported as replaying the batch-4 graph it cannot use, so the oracle charged it
+2 µs a launch instead of 67 µs an operator, and the fix above did nothing until
+this was corrected. Once right it is engine-agnostic: the oracle asks whether the
+step was replayed, not whether it is prefill, and gets a straight answer.
+
+*Not done, deliberately: several graphs of the same kind.* Recording four decode
+graphs across a run's context range and interpolating between them moved the
+held-out error from -3.7% to -1.5%, and covering the range rather than
+extrapolating over it made no further difference -- so context is not what
+dominates, and the machinery was dropped as not worth its complexity. One graph
+per kind is enough.
+
+Precondition, from the event-timing finding below: per-operator attribution must
+be checked for the same observer effect — run the workload with and without it
+and compare the engine's own numbers.
+
+**Checked, and the obvious route is closed.** `OpTimingTracer` brackets every
+dispatched operator with its own pair of CUDA events, and the region containing
+them with one more, in the same forward — so the comparison carries no
+run-to-run variance. On a decode step at batch 4, compiled at level 3:
+
+| | |
+| --- | --- |
+| 327 operators, summed | 45.664 ms |
+| the region containing them | 68.949 ms |
+| covered | **66.2%** |
+| the same step, replayed | **3.946 ms** |
+| its 113 gemms alone, timed per-op | **15.368 ms** |
+
+Two separate problems, and the second is fatal. A third of the eager region
+belongs to no operator, so the parts do not account for the whole. And the parts
+are themselves inflated by roughly an order of magnitude: the gemms alone cost
+nearly four times the entire replayed step, and every operator together costs
+nearly twelve times it. A gemm reads 0.121 ms where its true cost must be tens of
+microseconds. **The instrumentation costs several times the kernel it measures**,
+which is the same observer effect that made the first step timer report a machine
+33% slower than the real one, at a scale where it cannot be tuned away: these
+kernels are simply too small to bracket individually.
+
+So in-line per-operator events are not a cost source. What survives is more
+encouraging than that sounds:
+
+* The concentration is extreme. Sixteen distinct operators, **half the time in
+  two of them** — `aiter::gemm_a16w16` at 33.7% and
+  `aiter::unified_attention_with_output_base` at 23.8% — and twelve kinds cover
+  99.7%. Pricing a handful of kernels would cover almost all of a step, rather
+  than needing a model per operator across hundreds.
+* That makes **offline microbenchmarking** the indicated route: run each
+  `(kernel, shapes, dtypes)` many times back to back and take the steady state.
+  No per-operator instrumentation, no observer effect, and a price list that is
+  reusable across every configuration rather than remeasured per deployment —
+  which is also the answer to the calibration-economics problem.
+
+**Where such a harness can live is not a free choice.** `aiter` registers its
+operators lazily, through a JIT that fires on first call: importing the module
+that defines `gemm_a16w16` does not put it in `torch.ops.aiter`. So a benchmark
+cannot look a kernel up cold. Worse, running a whole model first does not help
+either — a process that created an engine and generated tokens still reports
+`torch.ops.aiter.gemm_a16w16` missing, because ATOM runs the model in a **worker
+subprocess** and the registration happens there. The traced graph is the proof
+from the other side: it holds `aiter::`, `triton::` and `inductor::` operators,
+recorded inside the runner.
+
+So the price list has to be produced **inside the model-runner process, after
+warmup** — a Compass mode rather than a standalone script. That is not a
+concession: the kernels priced are then the deployment's own, already autotuned
+for the shapes it uses, rather than a fresh JIT build tuned differently.
+
+The shape of it: after warmup, read a captured graph, take each distinct
+`(name, input_shapes, dtypes)`, allocate tensors to match, call it a few thousand
+times inside one pair of events, and divide.
+
+**Built and run.** `--compass-bench-graph` / `--compass-bench-out`, priced after
+warmup inside the runner. On the batch-4 decode graph:
+
+| | |
+| --- | --- |
+| signatures priced | 24 of 36 |
+| operators covered | 181 of 330 (54.8%) |
+| `aiter::gemm_a16w16` | **31.4 µs** each |
+| the same gemm, in-line events | **121 µs** |
+
+The instrumentation overhead is confirmed quantitatively at **3.9x**, which is
+what the in-line route was rejected for.
+
+**But summed prices overshoot the step.** 113 gemms at 31.4 µs is 3.552 ms and
+the priced total is 4.235 ms, against a replayed step of **3.946 ms** — and that
+total does not include attention or rmsnorm, the second and third largest
+consumers, which are unpriced. So the parts already exceed the whole while a
+third of the whole is missing.
+
+Two candidates, neither yet separated: a standalone call allocates its output
+every iteration where the model reuses a buffer, so the price carries an
+allocation the real step does not; and a replay overlaps kernels that a
+back-to-back loop serialises. Both inflate a sum of standalone prices. This is
+the same shape of question as "does Σ ops explain a step", asked of better
+numbers, and it is what phase C has to answer.
+
+**Scalars recorded, and coverage nearly doubled.** Twelve signatures failed at
+first, nine of them wanting a non-tensor argument the graph did not keep --
+`aiter::rmsnorm2d_fwd_` wants `eps`. `OpSpec` now carries them, positional ones
+named by index so the call can be interleaved back together, and coverage went
+from **54.8% to 90.3%** of operators. Graph comparison is untouched: `_signature`
+in `diff.py` never looked at scalars.
+
+The three that remain are `triton::` and `inductor::` kernels, recorded by the
+Triton launch tracer patching `JITFunction.run` rather than by the dispatcher, so
+`torch.ops` can never resolve them. Those need the launch path, which is a
+different mechanism rather than a missing field.
+
+### A step is not the sum of its kernels
+
+With 90% of the operators priced:
+
+| | |
+| --- | --- |
+| priced total, hot | 9.239 ms |
+| priced total, cold | 8.640 ms |
+| the replayed step | **3.946 ms** |
+
+**Summed prices are 2.2-2.3x the step they are meant to explain.** The earlier
+agreement to 7% was an artifact of pricing only 55% of the operators: adding
+rmsnorm's 113 doubled the sum. A replay overlaps its kernels heavily, and a
+back-to-back loop measures each one alone.
+
+**The root cause of the 2.3x, found.** A per-call benchmark cannot price a
+kernel smaller than its own call overhead. Pricing one gemm at twelve shapes:
+
+| M | per-call loop | in a CUDA graph |
+| --- | --- | --- |
+| 1 | 30.9 µs | 9.09 µs |
+| 8 | 30.2 µs | 9.24 µs |
+| 64 | 30.0 µs | 12.65 µs |
+| 256 | 30.4 µs | 29.29 µs |
+| 1024 | 135.3 µs | 137.58 µs |
+
+**A flat 30 µs floor from M=1 to M=256** — 256 times the work for the same price.
+The kernel only becomes visible past M=512, and the two methods converge there,
+which is what a launch-overhead explanation predicts. The arithmetic closes it:
+298 priced operators times 30 µs is 8.9 ms, against a priced total of 9.24 ms.
+**The price list was the operator count times the floor.**
+
+**And the floor is the host, measured directly.** A CUDA event is timestamped
+when the *device* reaches it, so the elapsed time between two of them is
+device-side wall clock across the loop — not a sum of kernel durations. That
+leaves two possibilities, and timing the enqueue loop's own wall clock separates
+them:
+
+| M | device (event) | host (enqueue) | host/device | in graph |
+| --- | --- | --- | --- | --- |
+| 1 | 31.9 µs | 31.9 µs | **1.00** | 9.09 µs |
+| 8 | 31.4 µs | 31.4 µs | **1.00** | 9.24 µs |
+| 64 | 31.3 µs | 31.2 µs | **1.00** | 12.65 µs |
+| 256 | 30.7 µs | 30.7 µs | **1.00** | 29.29 µs |
+| 512 | 43.3 µs | 31.7 µs | 0.73 | 48.44 µs |
+| 1024 | 136.0 µs | 30.7 µs | **0.23** | 137.58 µs |
+
+They are the same number up to M=256. The device was idle waiting for the host
+for the whole loop, so the price is not the kernel plus an overhead — it is the
+host's cost, with the kernel finishing early inside the wait. At M=4 that is 9 µs
+of work inside a 34 µs wait.
+
+The host figure is flat across every shape, which is what per-call work that
+cannot depend on tensor size looks like: the Python call, the dispatcher, aiter's
+ctypes wrapper, the operator's output allocation, the HIP launch. Not decomposed
+further here.
+
+The crossover falls where it must. At M=256 the kernel is 29.3 µs against 31 µs
+of host and the two are neck and neck; by M=1024 the kernel is 138 µs and the
+host is irrelevant. Past that point a per-call loop measures the kernel correctly,
+which is exactly where loop and graph pricing agree.
+
+A third measurement settles it, and its surprise is the useful part. Bracketing
+each call in its own pair of events -- meant to time one kernel alone -- returns
+the *largest* number of the three:
+
+| M | loop | host | own event pair | in graph |
+| --- | --- | --- | --- | --- |
+| 4 | 33.9 µs | 33.9 µs | **52.20 µs** | 9.22 µs |
+| 64 | 31.3 µs | 31.2 µs | 52.08 µs | 12.65 µs |
+| 256 | 30.7 µs | 30.7 µs | 65.72 µs | 29.29 µs |
+| 1024 | 136.0 µs | 30.7 µs | 174.46 µs | 137.58 µs |
+
+Because `began` is recorded before the call: the stream is empty, the device
+timestamps it immediately, and then idles through the entire host dispatch before
+the kernel arrives. So it measures dispatch **plus** kernel with no overlap --
+174 ≈ 31 + 138 at M=1024, and 52 ≈ 34 + 9 plus a synchronise at M=4. There is no
+way with this API to start a clock after dispatch and before execution, so a
+single call cannot be timed in isolation at all.
+
+The loop, by contrast, pipelines: while the device runs kernel *i* the host
+dispatches *i+1*, so it returns `max(host, kernel)`. That model reproduces every
+row — 31.2 against 31.3 at M=64, 30.7 against 30.7 at M=256, 137.6 against 136.0
+at M=1024.
+
+**Three measurements, one model:** host dispatch about 31 µs per call, kernel
+from 9 µs at M=4 to 138 µs at M=1024, the loop host-bound below M≈256 and
+device-bound above it. **The loop number is the host's cost and the in-graph
+number is the kernel's**, and `host_seconds` sits beside every price so a reader
+can tell which one they are holding.
+
+Hoisting the event construction out of the loop is worth doing and worth very
+little: `torch.cuda.Event` builds its CUDA event lazily on first `record()`, so
+constructing `ended` inside the loop put that construction between the two
+timestamps. Removing it saves **0.95 µs** per call at the median.
+
+**A claim retracted.** It looked for a while as though graph mode understated a
+kernel by 1.5-1.8x, on the grounds that it captures 64 independent calls the
+device could overlap, with `own pair − host` as the honest figure. That
+subtraction is invalid: part of the host's 31 µs happens *after* the kernel is
+enqueued and runs concurrently with it, so removing the whole host cost removes
+work that overlapped the kernel and inflates what is left.
+
+Varying the capture size settles it, because the two stories predict opposite
+things -- overlap keeps falling with more captured calls, serialisation does not:
+
+| M | B=1 | B=2 | B=8 | B=32 | B=128 |
+| --- | --- | --- | --- | --- | --- |
+| 1 | 14.78 µs | 11.56 | 9.38 | 8.87 | **9.04** |
+| 64 | 18.12 µs | 15.18 | 12.68 | 12.31 | **12.63** |
+| 1024 | 143.07 µs | 139.91 | 137.39 | 138.23 | **137.88** |
+
+Falls to B=8, flat after. That is a fixed per-replay cost being amortised --
+`kernel + overhead/B`, with the overhead measuring 5.7 µs at M=1 and 5.2 µs at
+M=1024, the same constant regardless of kernel size, which is what a graph launch
+must look like. The model reproduces the intermediate points (M=1, B=2 predicts
+11.91 against 11.56 measured).
+
+**Flat across B means the captured calls serialise**, as stream-ordered capture
+implies. So the in-graph figure is a latency, not a throughput, and it is the
+kernel's cost.
+
+### So graph pricing is the right measurement
+
+It removes the ~31 µs of host dispatch that swamps a decode-shaped kernel, and it
+measures the kernel in a replayed graph -- the context production runs it in. The
+only requirement is a capture past the knee, since a one-call capture charges the
+whole 5.5 µs replay cost to one kernel; B=8 is enough and 64 is used.
+
+Which means the gap between the priced total of 1.765 ms and the 3.946 ms step is
+**not** a measurement error waiting to be corrected. It is mostly the 28 unpriced
+attention operators.
+
+### Attention cannot be priced from a shape signature at all
+
+Not a missing scalar. `unified_attention_with_output_base(q, q_scale, k, v,
+positions, layer_name, use_mla, qkv)` takes a `layer_name` and a `use_mla` that
+the tracer does record — but the body looks the layer up in
+`static_forward_context` and calls into its implementation, which begins
+(`attention_mha.py:175`):
+
+```python
+fwd_ctx: ForwardContext = get_forward_context()
+if fwd_ctx.context.is_dummy_run:      # .context is None outside a forward
+```
+
+and goes on to need `attn_metadata`: block tables, sequence lengths, a populated
+paged KV cache. Rebuilding the call means rebuilding the runner's per-step state.
+
+So **attention's cost is not a function of its tensor arguments.** It depends on
+paged-KV state — how many blocks the sequences occupy and how scattered they are
+— which a signature of `(name, input_shapes, dtypes)` cannot express and which no
+amount of extra recorded arguments would fix. A price list keyed that way has a
+hole in it exactly where a quarter of the work is.
+
+**Fixed by moving the boundary, not the granularity.** Pricing a whole layer
+would have worked and was the wrong answer: a layer is a model-structure concept,
+and Compass does not have those -- its graph knows group sizes and ranks and
+nothing else. Putting layers in it to serve a benchmark would trade the property
+that makes the representation general.
+
+The op boundary moved instead. `unified_attention_with_output_base` now takes
+`block_tables`, `context_lens`, `slot_mapping`, `cu_seqlens_q`, `max_seqlen_q`
+and `max_seqlen_k` as arguments, resolved by the caller from the same context the
+backends read. Production takes the same path it always did and ignores them; off
+the serving path, with no live forward, the operator stands up a context from
+them and the backends work unchanged. Eight attention backends were left
+untouched. The KV cache needs no argument -- it lives in its own context,
+installed once at startup, and `set_forward_context` picks it up, which is also
+why the benchmark had to move from after warmup to after CUDA graph capture: at
+warmup the runner is still being built and there is no cache to walk.
+
+Coverage went from 90.3% to **98.8%** of operators, and the graph is better for
+it independently of pricing: attention used to be an opaque node whose real
+inputs were invisible.
+
+### Callable is not the same as priced
+
+The number that came back is not credible, and the way it fails is the finding:
+
+| kernel | n | each | total |
+| --- | --- | --- | --- |
+| `unified_attention_with_output_base` | 28 | 163.6 µs | **4.582 ms** |
+| `gemm_a16w16` | 113 | 11.3 µs | 1.275 ms |
+| priced total | | | 6.347 ms |
+| the replayed step | | | **3.946 ms** |
+
+Attention alone exceeds the whole step. The harness fills integer tensors with
+zeros, so `context_lens` is all zero, while the recorded scalars carry
+`max_seqlen_k = 16384` -- the padded bound, not the actual context. The kernel
+sizes its work from those and walks 16K of KV per sequence where the real step
+walks a few dozen tokens.
+
+So a signature of `(name, shapes, dtypes, scalars)` is not enough for a
+**data-dependent** kernel: its cost turns on argument *values*.
+
+`OpSpec` now carries `int_values` -- the contents of small integer tensor
+arguments, recorded during trace and used to rebuild the call. The signature
+includes them, so the same kernel at two context lengths prices as two entries
+rather than one, which took the graph from 36 signatures to 44. That is correct
+and was needed regardless of what follows.
+
+**It did not move attention's price.** With `context_lens` recorded truthfully as
+`[155, 155, 155, 155]` instead of zeros, attention costs 163.7 µs against 163.6 µs
+before. So the zero-filled metadata was never the cause, and the hypothesis that
+motivated the work was wrong.
+
+What attention must cost in situ can be bounded: the step is 3.946 ms and the
+other priced kernels account for about 1.6 ms of it, leaving roughly 84 µs per
+call. The benchmark says 163.7 µs -- about twice too slow, and indifferent to the
+metadata values.
+
+**The reconstruction is incomplete in a way arguments cannot fix.**
+`AttentionMetaData` has 29 fields and the synthetic one fills 7. The backend
+reads `has_cached` and `cu_seqlens_k`, which are not among them, and it also
+reaches into runner-owned buffers -- `var["slot_mapping"].gpu[:running_bs]` --
+that are not arguments to the operator at all. So the benchmark is very likely
+executing a different branch from production, and passing more arguments does not
+close that: some of what the kernel consumes belongs to the runner, not the call.
+
+Which sharpens the earlier rule. An operator is priceable when it is a pure
+function of its arguments; attention was made *callable* by supplying its
+metadata, but it is still not *pure*, because the backend sources state from
+elsewhere.
+
+### What attention actually costs, measured rather than inferred
+
+Three hypotheses about the initialisation were tested and all three were wrong.
+Recording `context_lens` truthfully as `[155, 155, 155, 155]` instead of zeros
+left the price at 163.7 µs against 163.6 µs. Correcting the extents from the
+configured bound to the decode-actual values -- `max_qlen` 16384 to 1,
+`max_klen` 16384 to 155 -- gave 163.73 µs against 163.61 µs. And the
+work-partitioning fields (`kv_indices`, `work_info_set`) are not on this path at
+all: `use_pa_decode_bf16_asm()` requires `gfx1250` and this is `gfx942`, so the
+backend is `paged_attention_asm`, which reads only `block_tables`,
+`context_lens`, `max_qlen` and `qo_indptr`.
+
+The benchmark's figure is invariant to every attention parameter there is to
+vary, which is itself the finding: it is not measuring attention's work. Why it
+is not is settled below, and the answer is duller and worse than a modelling
+error -- the arguments were never read.
+
+So the cost was measured by **ablation** instead -- return the right shape
+without doing the work, and difference the step:
+
+| | |
+| --- | --- |
+| decode step with attention | 3.041 ms |
+| decode step without | 2.396 ms |
+| attention, per call | **23.0 µs** |
+| the microbenchmark | 163.7 µs |
+
+**The benchmark overstates attention by 7.1x.** And the earlier estimate of
+84 µs, arrived at by subtracting the other priced kernels from the step, was
+also wrong -- which says those prices do not sum correctly either. Substituting
+the measured 23 µs, the priced total becomes 2.41 ms against a 3.946 ms step:
+the sum now *under*-counts by 1.5 ms, where with the benchmark's attention it
+over-counted by 2.4 ms.
+
+Two lessons worth keeping. Ablation is the ground truth this line of work needed
+and was reached for only after three rounds of guessing at inputs; differencing a
+step with and without an operator answers "what does this cost here" directly,
+where a microbenchmark answers "what does this cost somewhere". And a benchmark
+figure that does not move when its inputs do is not a measurement of those
+inputs -- that invariance should have been checked first, since it is one run.
+
+`ATOM_ABLATE_ATTN` is kept for the purpose, read once at import because it is
+consulted 28 times per decode step.
+
+(A false lead worth recording so nobody follows it twice: the implementation
+returns `torch.empty_like(q)` when `is_dummy_run` is set, with a comment saying
+attention is skipped during CUDA graph capture — which would mean the captured
+graph omits attention entirely. It does not. `is_dummy_run=True` is set only in
+`dummy_execution` and `warmup_model`, never in `capture_cudagraph`, so the skip
+applies to the dummy runs *around* capture and attention is captured normally.)
+
+### Why it was 7x over: the arguments were never read
+
+`unified_attention_with_output_base` rebuilds a forward context from its
+arguments only when there is not one already:
+
+    if get_forward_context().context is None:
+
+and after `capture_cudagraph()` there always is one. `set_forward_context`
+assigns a module global and nothing clears it, so what stands when capture
+returns is the **last rung of the ladder** -- capture walks it descending, so the
+last rung is batch 1, describing one sequence at the model's maximum context.
+Printing what the kernel was handed:
+
+    ambient context is None: False
+    KERNEL SEES q=(4,16,128) block_tables=(1,2560)
+                context_lens=(1,) [16384] max_qlen=1 qo_indptr=(2,) [0,1]
+
+Four sequences of 155 tokens were passed in; one sequence of 16384 was attended
+-- 26x the KV traffic. Every explicit argument was dead, which is precisely why
+varying them changed nothing. The invariance was not a property of attention.
+
+Worth recording that the 163.7 µs is real device time in a real kernel, since
+the standing suspicion had been the opposite:
+
+    one eager call:    163.7 µs  aiter::pa_bf16_noquant_gqa8_1tg_4w
+                         7.3 µs  rope_cached_positions_2c_fwd_impl
+                         1.9 µs  reshape_and_cache
+    loop over 2000:    device 183.47 µs   host 183.40 µs   ratio 1.00
+    graph B=1/4/16/64: 169.6 / 165.1 / 163.9 / 163.5 µs
+
+Flat in batch, and the profile puts the whole of it in one kernel. Nothing here
+was harness overhead; the kernel really did walk 16384 tokens of KV.
+
+The fix is one call -- `reset_forward_context()` before each signature is priced.
+Nothing a benchmark prices is inside a live forward, and an operator that reads
+ambient state must not be allowed to inherit the last one. Per signature rather
+than once, because an operator that rebuilds the context leaves it behind for
+whatever is priced next.
+
+### An op graph cannot record anything that is not a tensor
+
+With the context reset, attention stops being mispriced and starts failing
+outright -- `'NoneType' object has no attribute 'stride'` -- because the rebuild
+now honours the recorded arguments and two of them are wrong. Against the live
+values at the same eager step:
+
+| field | live | recorded |
+| --- | --- | --- |
+| `context_lens` | `[315,315,315,315]` | `[315,315,315,315]` |
+| `slot_mapping` | live | live |
+| `block_tables` | `(4, 2560)` tensor | **`None`** |
+| `max_seqlen_q` | `1` | **`16384`** |
+
+Tensors survive. An `int`, and an argument that happened to be `None` when the
+graph was compiled, do not. `md = get_forward_context().attn_metadata` is traced
+by Dynamo: the tensor reads become graph inputs and flow per step, while
+`md.max_seqlen_q` is constant-folded and a then-`None` `md.block_tables` is baked
+in as the constant `None`. Both constants come from the forward that compiled --
+the warmup dummy, a 16384-token prefill that has no block table. 16384 is
+`max_num_batched_tokens`, which is the tell.
+
+Production never notices, because the operator ignores its arguments and reads
+the context. Compass notices because reading the arguments is the entire point of
+having added them.
+
+### The pure-function plan, and why it is abandoned
+
+The plan this project had been building toward was to make each operator a
+**pure function of its arguments**. It is the property that makes an op graph
+worth having: if an operator's cost is decided entirely by what is passed to it,
+then a recorded `(name, shapes, dtypes, scalars)` is a complete description, any
+recorded call can be replayed anywhere to find out what it costs, and Compass can
+price a configuration nobody has run by deriving its graph and pricing the
+operators in it. Every other design decision here assumed it.
+
+Attention was the operator that did not have the property, and `c337ee3a` --
+"Make attention a pure function of its arguments" -- was the attempt to give it
+one: add the metadata to the operator's signature, have production pass what it
+already holds, and let the operator stand up its own context when there is no
+live forward. It reads well and it does not work.
+
+**A compiled caller destroys the property faster than an operator signature can
+establish it.** `md = get_forward_context().attn_metadata` is traced by Dynamo.
+Tensor reads become graph inputs and flow per step. Everything else is a compile
+-time constant, read once from whichever forward triggered compilation --
+`max_seqlen_q` because it is an `int`, `block_tables` because it happened to be
+`None` in the warmup dummy. The compiled graph then passes those constants
+forever. The operator's signature says it is a function of its arguments; the
+call site guarantees it is not.
+
+This is not a fact about attention. It applies to any operator whose cost depends
+on something that is not a tensor, in any engine that compiles its model -- which
+is every engine worth simulating. So the generalisation is worth stating plainly:
+
+> An op graph records arguments. Arguments cannot carry non-tensor state through
+> `torch.compile`. Therefore an op graph cannot, on its own, describe an operator
+> whose cost depends on non-tensor ambient state, and no change to that
+> operator's signature will make it able to.
+
+Two smaller repairs were considered and rejected. Passing the extents as 0-d
+tensors makes them flow, but does nothing for `block_tables`, which folded
+because of *when* it was `None` rather than because of its type. Giving the
+operator a Dynamo-opaque metadata argument is the largest change and still
+leaves production carrying an argument only a simulator reads.
+
+### What replaced it: record the context beside the operator
+
+`c337ee3a` is reverted -- `base_attention.py` and `paged_attention.py` are back
+to what ATOM ships -- and the ambient state is recorded *alongside* the operator
+instead of *through* it. `atom/compass/runtime/forward_ctx.py` holds both halves:
+the tracer reads the live forward context, where the values are true, and the
+benchmark stands one up before calling. `OpSpec` gains a `context` field for
+them.
+
+`block_tables` is kept by full shape but only the columns the kernel reads. The
+full width is `max_model_len / block_size` -- 2560 here -- and is part of the
+call because it is the row stride the kernel indexes with, but a decode at 315
+tokens of context touches 20 columns of it. Shape plus used prefix reproduces
+both the addressing and the traffic without an artifact that grows with the
+model's maximum context; the graph grew 89 KB to 107 KB.
+
+The recorded context also has to be part of the price key, because after the
+revert it is the *only* place the difference between a 40-token and a 4000-token
+decode is written down. `block_tables` contents are excluded from the key: they
+decide which blocks are walked, not how many.
+
+Measured against the ablation ground truth, on the same workload:
+
+| | |
+| --- | --- |
+| benchmark, before | 163.7 µs/call — **7.1x over** |
+| benchmark, now | **18.3 µs/call** |
+| ablation | **26.1 µs/call** |
+
+28 layers priced independently, 18.29 to 18.49 µs, a spread of 1%. Coverage is
+back to 98.8% (326/330), this time honestly. The remaining 30% is taken apart
+below; it is **not** overlap, which is what it was first attributed to.
+
+The cost of this design, stated so nobody is surprised by it: Compass now knows
+something about attention specifically, which the rest of the op graph is built
+to avoid. It is confined to one module and one operator. Any future operator
+whose cost turns on ambient state will need an entry there too, and the honest
+reading is that the op graph's "records only arguments" purity was never
+achievable and this is where the exception now lives.
+
+### The residual 30% is not overlap
+
+Read the kernels out of a profile of the real run rather than differencing a
+step, and the operator's cost in situ resolves into three kernels. 896 launches,
+being 28 layers over 32 decode steps:
+
+| kernel | in situ | in the benchmark |
+| --- | --- | --- |
+| `pa_bf16_noquant_gqa8_1tg_4w` | 11.07 µs | 7.70 µs |
+| `kn_entry_..._cached_indirect_inplace` (rope) | 9.04 µs | 6.87 µs |
+| `reshape_and_cache_kernel` (the KV write) | 6.33 µs | 5.37 µs |
+| **the operator** | **26.44 µs** | **19.94 µs** |
+
+26.44 against the ablation's 26.1 -- two methods that share no machinery, 1%
+apart. Ablation can stay as a cheap cross-check, but a profile is the better
+instrument: it attributes, where a difference only subtracts.
+
+**Every kernel is cheaper in the benchmark, by 15% to 30%.** That rules out a
+single pathological kernel and it rules out overlap, which would show up in one
+place and not uniformly across three unrelated kernels. The batch sweep rules
+overlap out directly. Fitting `measured = c + r/B` to B=1 and B=64:
+
+| B | measured | c + r/B, for c=18.2 r=6.1 |
+| --- | --- | --- |
+| 1 | 24.33 µs | 24.33 |
+| 4 | 19.93 µs | 19.76 |
+| 16 | 18.71 µs | 18.61 |
+| 64 | 18.33 µs | 18.32 |
+
+A constant ~6.1 µs per replay, amortised, over a flat ~18.2 µs per call. Per-call
+cost **asymptotes**; concurrency would keep driving it down as B grew. The
+captured calls run one after another, as stream-ordered capture implies.
+
+What is left is cache residency -- partly. The benchmark replays one operator
+against **one layer's** KV cache, so after the first call the whole working set
+is resident and every kernel that touches it runs warm. A real step touches each
+of 28 layers' regions once, separated by the other ~300 kernels of a model far
+larger than the last level of cache.
+
+### Making the benchmark cool the KV cache
+
+The cache is not an argument. It is reached through the forward context, so no
+argument-rotation mode can touch it: `hot` and `cold` alike price it warm, and
+`_build_arg_sets` rotating 64 sets of q/k/v changes nothing about it.
+
+Since the context is now installed by Compass, the fix goes there. `install`
+returns one thunk per distinct KV region, each offsetting the recorded call's
+block ids and slots by the span the recorded call used, so successive regions are
+disjoint. `_time_in_graph` calls the i-th before capturing the i-th call, which
+is host-only work -- it swaps which pre-built metadata the call reads, so nothing
+is allocated inside the capture. A region is then revisited only after every
+other one has been walked, which is what evicts it.
+
+Eviction reproduced rather than simulated, and at no cost. The alternative --
+scrubbing the cache between calls -- is numerically hopeless here: clearing 256 MB
+of last-level cache takes ~100 µs against an 18 µs operator, so the measurement
+would be a 350x baseline subtraction.
+
+It works, and the sweep shows the mechanism directly. Per-call cost against the
+number of regions the batch rotates over:
+
+| regions | µs/call |
+| --- | --- |
+| 1 | 18.31 |
+| 16 | 19.78 |
+| 64 | 20.19 |
+| 128 | 20.77 |
+| 256 | 20.75 |
+| 512 | 20.66 |
+
+Cost rises with footprint and plateaus by 128 regions -- 650 MB, past any cache
+on the device -- and is flat out to 512 (2.6 GB). One region per captured call is
+the default, which is where the knee is for this shape.
+
+### But most of the gap was never attention's
+
+Against the in-situ figures at matched context, per kernel:
+
+| | in situ | rotating | single region |
+| --- | --- | --- | --- |
+| attention | 10.24 µs | 8.52 µs | 7.70 µs |
+| rope | 9.19 µs | 7.54 µs | 6.87 µs |
+| KV write | 5.79 µs | 5.00 µs | 5.37 µs |
+| **operator** | **25.21 µs** | **21.06 µs** | **19.94 µs** |
+
+So the KV rotation closed 2.4 µs of a 6.9 µs gap -- a third of it -- and the
+error went from 27% to 18%. What remains is still a *uniform* discount across
+three kernels with quite different memory profiles, which is not what a cache
+effect looks like.
+
+It is not attention's at all. The gemms in the same graph are priced against
+their own in-situ kernels, and they never touch the KV cache:
+
+| measured (op-level) | measured (in a step) | ratio |
+| --- | --- | --- |
+| 13.030 µs | 14.061 µs | 0.93 |
+| 9.150 µs | 10.699 µs | 0.86 |
+| 9.079 µs | 10.456 µs | 0.87 |
+| 7.926 µs | 9.577 µs | 0.83 |
+| **39.19 µs** | **44.79 µs** | **0.875** |
+
+**Every kernel is priced 13-16% under what it costs in a step**, whatever it
+touches. That is a global property of pricing kernels apart from the step, not
+a property of attention or of the KV cache, and no cache modelling will remove
+it. Two candidates, untested:
+
+* *Clocks.* A benchmark replaying one small kernel draws far less power than a
+  dense decode step, so it boosts higher. A uniform multiplicative discount
+  across kernels of different shapes is what that looks like. Sampling
+  `rocm-smi` clocks during each would separate it.
+* *Kernel boundaries.* The captured copies are mutually independent where a
+  step's are a dependency chain. They still serialise -- the batch sweep says so
+  -- but the hardware may pipeline the boundary between two independent kernels
+  more tightly than between two dependent ones. A much narrower claim than the
+  "they run concurrently" one it replaces, and this harness has already measured
+  something that looks exactly like it: cold mode came out **0.94x** hot,
+  against the expectation that streaming a weight costs more than rereading a
+  resident one, and the reading at the time was that hot reuses one output
+  buffer and serialises on a write-after-write where rotating buffers pipeline
+  (below). 6% from that, on top of what the cache rotation now recovers, is most
+  of the 13%. Testable by capturing a batch whose calls share an output buffer.
+
+Worth stating plainly, because it bounds what this whole approach can deliver:
+priced kernels are systematically optimistic by about an eighth, before any
+question of whether they sum to a step.
+
+One thing worth noticing while reading a recorded context: ATOM's decode
+metadata carries `state=prefill_native` on a step whose `is_prefill` is `False`.
+`paged_attention_asm` does not read `state`, so nothing is wrong today, and it
+is recorded verbatim rather than corrected -- but a backend that does read it
+would be reading a stale default.
+
+A consequence of recording `layer_name` as a scalar: the 28 layers are 28
+signatures rather than one, so attention is benchmarked 28 times to produce 28
+numbers that agree to 1%. Harmless and slow, and it means the price list cannot
+generalise one attention price across depth. Left alone for now, since the
+agreement across layers is itself a useful check on the measurement.
+
+Capturing the calls into a CUDA graph removes what production removes — one
+submission, no host in the loop — and takes ~21 µs off. A ~9 µs floor survives,
+and that one is real: the gemm reads an 8 MB weight whatever M is.
+
+### And the fix over-corrects, which is the more interesting result
+
+| | |
+| --- | --- |
+| priced total, per-call loop | 9.239 ms — **2.34x** the step |
+| priced total, in a graph | 1.765 ms — **0.45x** the step |
+| the replayed step | 3.946 ms |
+
+Two reasons, and the second is structural.
+
+*Attention was not priced at all when this table was measured* — 28 operators
+and about a quarter of the work, missing from the total. It is priced now, from
+a recorded forward context rather than from its arguments (above), so this
+table's totals are stale in that respect. The second reason below is not.
+
+*The graph benchmark prices some operators at nothing.* `aten::slice` falls
+**315x** to essentially zero, because it is a view: it launches no kernel, so
+what a loop measures for it is host dispatch and what a capture measures is the
+absence of any GPU work. Correct, and useless — a graph cannot price an operator
+that does not exist on the device.
+
+(This was originally written up as *overlap* — 64 mutually independent copies
+running concurrently. That is wrong, and is refuted further down: per-call cost
+asymptotes with batch size, which is what serialisation predicts.)
+
+**So neither mode measures a kernel in the dependency context it runs in.** The
+loop adds a host launch the replay does not pay; the graph removes a
+serialisation the model cannot avoid. They bracket the answer —
+1.765 ms < 3.946 ms < 9.239 ms — and neither converges to it.
+
+That is a limit of per-operator pricing itself, not of this harness: **a step's
+cost is a property of the sequence, not of the multiset of kernels in it.**
+Pricing kernels independently discards exactly the information that decides how
+they compose.
+
+The route that survives is to benchmark a *chain* rather than a kernel — capture
+one transformer layer's operator sequence, price that, and multiply by depth.
+It keeps the dependency structure inside the measurement, stays far cheaper than
+a shape sweep, and should transfer across batch size and width. Pricing the whole
+step that way would just be measuring the step again, which is what the
+calibrated oracle already does; a layer is the largest unit that is not circular.
+
+### Hot and cold do not isolate what they were meant to
+
+Cache state is per argument, not per kernel: in a real decode step a gemm's
+activation is hot because the previous operator wrote it, while its weight is
+cold and every one of the 113 gemms uses a different one. So the harness prices
+either way — `--compass-bench-cache hot|cold`, the latter rotating over enough
+input sets to overflow the cache.
+
+(Since amended: state an operator does not take as an argument is reached
+separately now -- the KV cache is cooled by rotating the region each captured
+call addresses, above. Neither mode says anything about it.)
+
+The expectation was that cold would be dearer, since streaming a weight from
+memory costs more than rereading a resident one. **Cold came out cheaper**:
+0.94x overall, 0.94x on gemm, 0.87x on rmsnorm. The likely reason is that hot
+mode reuses one output buffer, so consecutive calls serialise on a
+write-after-write dependency, while rotating buffers lets them pipeline. The two
+modes therefore conflate cache residency with output-buffer serialisation, and
+neither isolates cache by itself.
+
+Worth keeping — they bracket a 6% band and cost nothing to run — but the honest
+reading is that at this kernel size overlap dominates cache, and the 2.2x gap
+above is not something cache realism will close.
+
+The tracer is kept, because the question it answers is the right one and the
+answer needs to stay reproducible. `scripts/compass/op_cost.py` reports it.
+
+### 22. Memory is `empirical/measured` only, so a configuration must exist to be sized — **M**, in PoC scope
+
+**In scope as of the survey revision**: memory consumption is now a modelled
+quantity alongside time, not an implementation detail of getting a run to start.
+
+In the vocabulary: model memory (weights, activations, the CUDA-graph pool) and
+serving memory (the KV cache and its block pools) are today `empirical/measured`
+-- four readings off a live device. The PoC needs at least one more species, so
+that a configuration can be sized without being run.
+
+This runner's docstring says weight loading and KV-cache sizing are "inherited and
+therefore real". They are. What that sentence does not say is what it costs: they
+are real because a predict-mode run still loads real weights onto a real device
+with a live RCCL context, and calls `ModelRunner.get_num_blocks` unmodified.
+
+That budget (`atom/model_engine/model_runner.py:1629`) is four device
+measurements and some arithmetic:
+
+| term | source |
+| --- | --- |
+| `total`, and a physical `min(budget, free)` clamp | `torch.cuda.mem_get_info()` |
+| weights + peak activations | `memory_stats()["allocated_bytes.all.peak"]` |
+| non-torch — RCCL buffers, CUDA context | `(total - free) - memory_reserved()` |
+| CUDA-graph pool | `_estimate_cudagraph_overhead()` |
+
+Take the GPU away and all four are gone. Everything downstream of the byte
+number already runs on a CPU: `plan_pools` over `SubPoolSpec`
+(`atom/model_ops/attentions/sub_pool_spec.py`) is pure arithmetic, and it is the
+part that gets a hybrid right — PAGE against STATE, the GDN recurrent state and
+the V4 compressor ring counted separately, an Eagle3 draft KV merged onto the
+target's block ids by name. Item 16's model is a hybrid, and that sizing is
+correct today for free.
+
+So the gap is one number, not a subsystem. A memory oracle on the same dial,
+which is the same dial because the vocabulary does not care whether the quantity
+is seconds or bytes:
+
+| species | what it does |
+| --- | --- |
+| `empirical/measured` | the terms as measured for this configuration -- read off a live device, or off an artifact an earlier run of the same build wrote. Same species: reading a recorded measurement is what every oracle here already does |
+| `empirical/interpolated` | no artifact for this configuration, so the nearest ones are used |
+| `analytical` | derives the terms: weights from the checkpoint's safetensors headers, non-torch from a per-rank constant, the graph pool from the geometry term ATOM already computes, and **activations from a def-use walk over the traced op graph** |
+
+The activation term is the one everybody else guesses at, and the one this
+project happens to already have the artifact for.
+
+**Why it is in the PoC scope rather than a convenience.** Memory decides which
+configurations exist. Sizing the 27B at TP=1 failed before any timing could be
+taken -- *"per-request cache tensor (37.41GB for 512 slots) exceeds available KV
+budget (19.85GB)"* -- and the fix was a configuration change, not a memory
+change. A tool asked "which configuration should I deploy" answers with a set,
+and every member of that set has to fit. Predicting time for configurations that
+cannot run is answering a different question.
+
+**Steps, in order.**
+
+1. ~~Record the terms.~~ **Done** -- `--compass-memory-out`. The five readings
+   and the block counts they produced, per rank, taken in `get_num_blocks`
+   immediately *before* delegating: `super()` allocates nothing, so they are the
+   same numbers it will see, where afterwards the KV cache exists and
+   `mem_get_info` says something else. Only the readings are recorded, never the
+   derived budget -- that arithmetic is the engine's, is already CPU-only, and
+   copying it here would be one more thing to drift.
+
+   | | 0.6B TP=1 | 27B TP=2 (per rank) |
+   | --- | --- | --- |
+   | total | 192.0 GB | 192.0 GB |
+   | free | 189.5 GB | 156.7 GB |
+   | peak_torch | 2.6 GB | 28.6 GB |
+   | non_torch | 0.9 GB | 7.0 GB |
+   | cudagraph | 0.08 GB | 0.08 GB |
+   | → blocks | 95822 | 37838 |
+
+   First use of the artifact, and the reason `free` is recorded separately: both
+   records can be checked for whether `free` was the binding term, and in both it
+   was not -- the utilization budget was. So both are reusable. (The 35 GB
+   between `total` and `free` at 27B is this process's own weights and
+   activations, not neighbours; that had to be computed rather than assumed.)
+2. ~~Read that artifact instead of the device, on an exact key match.~~
+   **Done** -- `--compass-memory-in`. Still `empirical/measured`: a different
+   source for the same measurement, not a different kind of number.
+
+   **The readings are substituted, not the arithmetic.** `get_num_blocks` runs
+   the engine's own budget computation with `mem_get_info`, `memory_stats`,
+   `memory_reserved` and `_estimate_cudagraph_overhead` returning what an
+   earlier run recorded. Everything downstream -- the utilization budget, the
+   2% margin, the `min(budget, free)` clamp, `plan_pools` over the sub-pool
+   specs -- is untouched, because copying that arithmetic here to feed it
+   numbers directly is exactly the drift the recording step avoided. Checked by
+   sizing the 0.6B from its own record: **95822 blocks, the recorded count**.
+
+   A record whose `free` was the binding term is refused, since that describes
+   what the neighbours left rather than what the configuration needs
+   (`atom.compass.core.memory`). The check is computed without the engine's
+   extra reserve, which is not recorded and only shrinks the budget -- so it
+   overstates how often `free` binds, and errs towards refusing a record that
+   might have been reusable rather than reusing one that was not.
+
+   What this does *not* do is size a configuration nobody has run. That is
+   step 3.
+3. `analytical` — derive each term. **Started**:
+   `atom/compass/core/memory_model.py`.
+
+   **The activation term needed the graph to change.** It is a liveness
+   question -- not how much memory the operators touch but how much is live at
+   once -- and that cannot be answered from shapes, because two tensors of the
+   same shape are the same entry in a graph of shapes. The trace now records
+   `inputs_from`: for each tensor input, the operator that produced it, matched
+   by storage address as the trace runs, with -1 for anything the step did not
+   produce. A prefill of the 0.6B gives 327 operators and 482 def-use edges, and
+   walking them -- add an operator's outputs, drop every tensor whose last
+   reader has just run -- gives the high-water mark.
+
+   First derivation against its own recording, same run:
+
+   | term | derived | recorded |
+   | --- | --- | --- |
+   | weights | 1.400 GB | |
+   | peak activations | 0.087 GB | |
+   | weights + activations | **1.487 GB** | 1.306 GB (**+13.8%**) |
+
+   The error is in the weight term, not the walk: it is the checkpoint's size on
+   disk, and takes every tensor in the file to be resident, where tied
+   embeddings are loaded once. Overestimating weights under-allocates KV, which
+   is the safe direction for a budget, but it is an approximation to remove --
+   reading the safetensors header gives per-tensor sizes and would let a tied
+   tensor be counted once. Two approximations in the walk are stated in its
+   docstring: output dtype is taken from the first input, and a tensor with no
+   reader in the graph dies immediately.
+
+   **Then each term was validated on its own, and the +13.8% turned out to be
+   three errors, two of them cancelling.** Against `peak_torch`, in GB:
+
+   | | | |
+   | --- | --- | --- |
+   | weights over-counted, a tied head that is never resident | **+0.280** |
+   | activations compared at the wrong shape | -0.015 |
+   | a resident term nobody had noticed was there at all | -0.084 |
+   | net, and all that a summed check reports | **+0.181** | (+13.8%) |
+
+   The largest single error is 25% of a term and the sum said 13.8%. That is
+   exactly the shape of mistake this project has already been caught by twice,
+   so `peak_torch` was split at source. Three readings now bracket it: `parameter_bytes` (the model's own
+   parameters and buffers, counted once per storage so a tied head is not
+   counted twice), `weights_torch` (the allocator once loading is done), and
+   `current_torch` (the allocator at sizing time). None of them is a
+   subtraction of the others.
+
+   The activation term got its own ground truth too. `peak_torch` belongs to
+   the *warmup* prefill, whose shape is nobody's choice and is rarely the
+   traced one -- comparing a graph-derived peak against it compares two shapes,
+   and does so at -14.7% on this configuration. So the tracing run resets
+   the allocator's high-water mark around the step it is about to write a graph
+   for, and records the result in that graph's provenance. Derivation and
+   ground truth then describe the same work by construction.
+
+   Qwen3-0.6B, three topologies, one run each (`validate_memory.py`):
+
+   | term | TP=1 | TP=2 | TP=4 | against |
+   | --- | --- | --- | --- | --- |
+   | weights | **-0.9%** | -1.7% | -3.4% | the model's own parameters |
+   | activations | -0.3% | +12.6% | -9.1% | the traced step's own peak |
+   | activations, fixed | **-0.3%** | **-0.7%** | **+0.0%** | the same |
+   | activations, fixed | **+0.0%** | **+0.0%** | **+0.0%** | the warmup peak, scaled |
+   | graph pool | +0.0% | +0.0% | +0.0% | the engine's estimate |
+   | graph pool | **-94.8%** | **-88.3%** | -- | the pool capture measured |
+
+   Four things this says that the sum could not.
+
+   * **The weight term is right, and its residual is a constant.** -0.9% /
+     -1.7% / -3.4% looks like an error growing with TP; in bytes it is 9.8 /
+     9.8 / 9.6 MB. A constant is a buffer the checkpoint does not contain --
+     the model computes it at init -- not a sharding mistake, and reading the
+     percentages alone would have sent the next fix to the wrong place. Two
+     approximations were removed getting here: the checkpoint's size on disk
+     counted a tied head that is never resident (1.400 GB claimed against 1.120
+     GB), and dividing every tensor by the world size under-counted the
+     replicated norms, which is the unsafe direction for a budget. Both now
+     come from the safetensors headers, at two reads of a few KB per shard.
+   * **The activation walk was exact at TP=1 and not at TP>1, which turned out
+     to mean it was wrong everywhere.** See below: the TP=1 agreement was a
+     coincidence, and finding that took comparing curves rather than peaks.
+   * **The graph-pool term reproduces the engine's estimate exactly and the
+     estimate is 8-19x under what capture actually costs** (0.020 GB against
+     0.390 GB measured at TP=1; 0.012 against 0.100 at TP=2). Agreement with a
+     formula is not agreement with a device. This term is 0.2% of the budget on
+     a 192 GB card so nothing here depends on it -- which is the point: it is
+     invisible in a sum, and only a per-term check surfaces it before a
+     configuration where it is not.
+   * **Two terms have no model, and pretending otherwise would have been the
+     easy mistake.** `non_torch` is 0.904 GB at TP=1 and 6.744 / 7.096 GB at
+     TP=2 / TP=4 -- a jump at TP>1 and near-flat after, and near-identical
+     between the 0.6B and the 27B at TP=2 (6.744 against 7.004), so it is a
+     property of the topology rather than of the model. And loading leaves
+     **2.021 GB per rank** resident beyond the parameters at both TP=2 and
+     TP=4, against 1 MB at TP=1: at TP=4 that residue is *seven times the
+     weights it accompanies*, and it is charged to the KV budget. Neither is
+     fitted here. Three topologies of one model is interpolation, not a model,
+     and the constants are stated as measurements.
+
+   **The weight term: ask the model, do not deduce it from the checkpoint.**
+   The checkpoint rule -- 2-D tensors shard, 1-D tensors do not, drop a tied
+   head -- is exact on the dense 0.6B at every width and on the hybrid 27B at
+   TP=2, and **3.3% low** on that same 27B at TP=4, where something does not
+   divide the way the rule assumes. Guessing better was the wrong move: ATOM
+   already knows how it shards, and `derive.py` already has the mechanism to
+   ask it for a width there are no devices for. `meta_probe.py --weights-only`
+   builds the model on meta at a simulated width and sums what it holds.
+
+   | | TP=1 | TP=2 | TP=4 | TP=8 |
+   | --- | --- | --- | --- | --- |
+   | 0.6B, meta against loaded | -0.00% | +0.00% | -0.02% | +0.01% |
+   | 27B, meta against loaded | -- | **0.00%** | **0.00%** | -- |
+
+   Exact, on both models, at every width -- and with no GPU and no weights,
+   which is the point. Two things had to be right for it. The build takes its
+   dtype from the config, not from torch's default, or every byte comes out
+   twice what the model holds. And the width is *simulated*: `--tp 2` used to
+   ask gloo for a world of two from one process and wait forever for a peer
+   that would never arrive, which is exactly the failure `simulate_group_width`
+   exists to prevent and the probe was not using it.
+
+   The one correction left is the tie. A meta-built model has not been through
+   the loader, which is what points the head at the embedding, so the two are
+   separate tensors with separate storages and identity cannot see it. Worth
+   one embedding -- 0.290 GiB on the 0.6B, and the whole of the gap.
+
+   **Model buffers are the rotary tables, and now they are recorded rather
+   than guessed.** Splitting them out of the weight term took it to +0.0% on
+   its own; a formula for them (`max_position_embeddings x head_dim x 2`)
+   matched the 0.6B's 10.0 MiB exactly and was **4x wrong** on the 27B, which
+   uses partial rotary -- so it was tested on a second model, failed, and did
+   not ship. What the trace records instead is what they are:
+
+   | | bytes | shape |
+   | --- | --- | --- |
+   | 0.6B `rotary_emb.cos_cache` / `sin_cache` | 5.00 MiB each | `[40960, 1, 1, 64]` |
+   | 27B `rotary_emb.cos_cache` / `sin_cache` | 16.00 MiB each | `[262144, 1, 1, 32]` |
+
+   The meta build reports them exactly (0.0098 and 0.0312 GiB), so there is no
+   formula to get wrong.
+
+   **`non_torch` is not a property of the configuration.** It is
+   `(total - free) - reserved`, and `total - free` is *device-wide* -- so a
+   neighbour's allocation is charged to this configuration. That is precisely
+   the defect the recorded-`free` guard already refuses a record for, and
+   nothing guarded this one. It shows in the per-rank spread of one run:
+
+   | world size | `non_torch`, min across ranks | spread |
+   | --- | --- | --- |
+   | 1 | 926 MiB | -- |
+   | 2 | 6906 MiB | **0** |
+   | 4 | 7122 MiB | 192 MiB |
+   | 8 | 10064 MiB | 640 MiB |
+
+   At widths 1 and 2 every rank agreed to the byte, which is what makes the
+   rest of the table trustworthy at all. Above that, this box is too busy for
+   finer statements.
+
+   Where the ranks did agree, the structure is exact and additive -- every
+   increment a whole number of MiB, and the same increment for both models:
+
+   * 926 MiB at TP=1: the HIP context and the libraries, no collectives.
+   * +5980 MiB the moment the width exceeds one.
+   * +360 MiB from TP=2 to TP=4, *identically for the 0.6B and the 27B*.
+   * +266 MiB for the 27B over the 0.6B, *identically at TP=2 and TP=4*.
+
+   The last is the only model-dependent part: 3.8% of the term. Two models
+   cannot say what it is a function of, so it is carried as headroom on the
+   larger side. And the width term is a table, not a law: no fixed-plus-per-peer
+   form fits 5980 / 6340 / 9138 at widths 2, 4 and 8, and the jump at 8 is most
+   likely RCCL opening more channels. `validate_memory.py --calibrate` writes a
+   replacement from records, for the same reason `step_accounting.py
+   --calibrate` does for the overhead constant: the constant does not transfer.
+
+   **The load residue is AITER's registered pools, and is flat in width.**
+   1.1 MiB at TP=1 and 2069 MiB at TP=2, 4 and 8 alike -- `CustomAllreduce`
+   registers a 1 GiB pool and the two-stage kernel a second. The model-dependent
+   part is +71 MiB (27B at TP=2) and +147 MiB (at TP=4), against a 2069 MiB
+   constant.
+
+   **The graph pool: the estimate is not low, it is blind.** The derivation
+   reproduced the engine's estimator exactly and the estimator was 8-19x under
+   the pool capture measures -- which said nothing about *why*, because a
+   single number has nothing in it to take apart. The capture ladder is
+   truncated at `max_num_seqs` and also settable outright
+   (`--cudagraph-capture-sizes`), so it is a lever: hold the largest bucket at
+   512 and vary how many buckets there are, and "cost of the biggest graph",
+   "cost per token summed over graphs" and "cost per graph" come apart.
+
+   | ladder | buckets | Σ tokens | measured | engine's estimate |
+   | --- | --- | --- | --- | --- |
+   | `[1,2,4,8,16]` | 5 | 31 | 100.0 MiB | 20.8 MiB |
+   | `[1..64]` | 8 | 175 | 136.0 MiB | 20.8 MiB |
+   | `[512]` | 1 | 512 | 254.0 MiB | 20.8 MiB |
+   | `[256,512]` | 2 | 768 | 332.0 MiB | 20.8 MiB |
+   | `[128,256,512]` | 3 | 896 | 370.0 MiB | 20.8 MiB |
+   | full | 11 | 1071 | 402.0 MiB | 20.8 MiB |
+
+   The right-hand column is the finding. The pool moves over 4x and the
+   estimate does not move at all, because it is `0.2 x` the peak activations
+   and those belong to the *warmup* shape -- the capture ladder does not enter
+   it. The estimator is not a low estimate of the pool; it is an estimate of
+   something else.
+
+   What the pool actually is:
+
+       pool = 91.1 MiB + 0.3033 MiB per captured token, summed over buckets
+
+   Fitted on the five ladders up to Σ=896 it predicts the sixth, at Σ=1071, to
+   **+6.4%**; refitted on all six it holds every point to within 6%. Note that
+   one graph at 512 tokens costs 254 MiB while five graphs totalling 31 tokens
+   cost 100 MiB -- so the *floor* is 87% of a short ladder's pool, and nothing
+   in the engine's estimate corresponds to it.
+
+   Two functions now, deliberately. `graph_pool_bytes` mirrors the engine's
+   estimator, because that is the number that reserves the memory and a
+   modelled budget has to reproduce the engine's decision.
+   `measured_graph_pool_bytes` predicts the cost. Keeping them apart is the
+   same distinction the per-term validation drew: agreement with a formula is
+   not agreement with a device.
+
+   **What under-reserving costs is not an OOM.** The capture loop re-checks
+   free memory per bucket and skips what will not fit, so the price is silently
+   dropped buckets and a decode cliff at those batch sizes. On a 192 GB card
+   nothing has ever been dropped, which is exactly why this went unnoticed --
+   and exactly why a term nobody can see needs an artifact. `--compass-memory-out`
+   now records the measured pool beside the estimate.
+
+   **Width, re-measured: above one, the ladder stops mattering entirely.** The
+   first reading was two byte-identical numbers at TP=2 and TP=4, which was
+   shipped as "a quarter of TP=1" with no mechanism behind it. Two equal
+   numbers cannot distinguish a width-independent pool from a stuck reading, so
+   the test is to vary the ladder *within* a width. The `allocated` delta --
+   what the graphs actually pin, as opposed to `reserved`, which is segment
+   bookkeeping:
+
+   | | Σ=31 | Σ=512 | Σ=1071 |
+   | --- | --- | --- | --- |
+   | TP=1 | 89113088 | 235275264 | 406492672 |
+   | TP=2 | **79692800** | **79692800** | **79692800** |
+   | TP=4 | -- | **79692800** | **79692800** |
+   | TP=8 | -- | **79692800** | **79692800** |
+
+   At width one the pinned memory tracks the ladder over 4.6x. Above it, a 35x
+   change in captured tokens moves it by *nothing* -- seven runs across three
+   widths and three ladders, identical to the byte.
+
+   Identical allocated bytes cannot come from sharded work, so the graphs are
+   not pinning sharded activations at all. With tensor parallelism the
+   per-layer intermediates flow through AITER's registered collective buffer,
+   which is outside the torch allocator and is already charged to `non_torch`
+   and the load residue. What the graphs pin in torch is a fixed set that
+   neither shards nor grows with the ladder.
+
+   So the term is a line in the ladder at width one and a constant above it --
+   104 MiB, the largest `reserved` of the seven (80, 104, 104, 104, 104, 84,
+   84), since under-reserving buys dropped buckets. The earlier quarter was
+   arithmetically close and wrong about why, which is the kind of agreement
+   that stops being right the moment the configuration changes.
+
+   **`non_torch` now has the guard `free` always had.** The case for it got a
+   great deal sharper than "a distorted measurement": six runs on the shared
+   box died at *start-up* with
+
+       available_for_kv=-103667.58MB (budget=57.60GB, peak_torch=2.94GB,
+       non_torch=152.01GB, cudagraph_est=0.05GB, safety=3.84GB, free=37.16GB)
+
+   152 GB of `non_torch` on a card where the process had reserved 2.9 GB. No
+   utilization setting fixes that -- the budget only goes positive above 0.83,
+   which on a box shared with twenty containers is not a number to reach for,
+   and the `min(budget, free)` clamp refuses it anyway.
+
+   Two checks, because they fail in different situations:
+
+   * **Against the model.** A recorded `non_torch` far above what the
+     collective terms say the width should hold is measuring the box. The
+     expectation is passed in rather than imported, so the recorded side of
+     the project does not acquire a dependency on the derived side. The
+     tolerance is deliberately loose -- the case worth catching is 50x, not
+     50%.
+   * **Against the other ranks.** Ranks of a symmetric group do the same work
+     and should agree to the byte. At widths 1 and 2 they did; at 4 they spread
+     192 MiB and at 8 by 640 MiB. A spread is a direct, single-run measurement
+     of contamination that needs no model at all, and it is reported as a
+     warning rather than a refusal because a few hundred MiB on a 192 GB card
+     is not a reason to throw a record away.
+
+   Still to do: a third model for the model-dependent parts of `non_torch` and
+   the load residue (the 30B-A3B checkpoint is only part-downloaded and this
+   box is offline), and the graph pool's width scaling on more than one point.
+
+   **Fixing the TP spread: peaks agreed for the wrong reasons, so compare
+   curves.** -0.3% / +12.6% / -9.1% has no shape as an error, and the peak is
+   one number -- there is nothing in it to take apart. So the trace now reads
+   the allocator after every operator and writes the whole curve beside the
+   graph. The walk produces the same curve, and the two are then comparable
+   point for point: the operator where they *first* part company is the one
+   modelled wrongly, and everything after it is downstream of that.
+
+   It said the TP=1 agreement was luck. The walk's peak was at attention and
+   the allocator's was at the gate-up gemm, eleven operators away, and the two
+   numbers happened to match to 0.3%. Between them the curves were 20-60 MB
+   apart the whole way. Three faults, each found by the curve and each with its
+   own fix:
+
+   1. **Deaths were inferred from the last read, which is a different event.**
+      A tensor lives until its last Python reference goes: a residual held
+      across a block outlives every read of it. The trace now puts a finalizer
+      on each output -- it fires when the allocator takes the memory back --
+      and records where it fired. Recorded liveness, not guessed.
+   2. **Deaths were per operator, and an operator's outputs need not share a
+      life.** The fused add-and-norm returns the normed activation and the new
+      residual; the first dies into the next gemm, the second carries to the
+      end of the block. One death for the pair held an extra tensor per layer,
+      which at TP=4 was 36% of the term.
+   3. **The address map never forgot.** The allocator hands a freed address
+      straight back, so a map keyed on storage address credits the next tensor
+      there to whoever held it before -- which resurrects the dead *and* hides
+      the living. The finalizers already know when to forget, so now they do.
+
+   And one thing the curve exposed that no amount of staring at the graph
+   would have: **`torch.empty` inside a custom operator never reaches a
+   dispatch tracer**, because re-entering `func` from `__torch_dispatch__` runs
+   below the mode. The MLP's silu destination is 13.6 MB a layer at TP=1 and is
+   exactly where the allocator's high-water mark sits, and the graph did not
+   know it existed. An operator that returns no tensor is an out-variant and
+   what it produces is the destination it was handed; recorded as its output
+   when no live tensor already owns that storage.
+
+   | | TP=1 | TP=2 | TP=4 |
+   | --- | --- | --- | --- |
+   | before | -0.3% | +12.6% | -9.1% |
+   | after | **-0.3%** | **-0.7%** | **+0.0%** |
+   | held out, warmup shape | **+0.0%** | **+0.0%** | **+0.0%** |
+
+   The third row is the one that matters. The traced-step comparison shares a
+   shape with the thing it is checked against, so it can only say the walk read
+   one step correctly. The warmup prefill is a *different* shape -- 4096 tokens
+   against the trace's 3494 -- measured independently, and the walk has to
+   reach it by scaling. It lands on it at all three widths, which is what
+   licenses calling this term analytical rather than a recording: a term that
+   only answers at the shape it was taken on answers nothing worth asking.
+
+   What stays recorded is deliberately the structural part -- which outputs are
+   fresh, and how long each lives. Those are facts about an operator, taken
+   once at one shape; the bytes come from the shapes.
+
+   One divergence is left and it is understood: at each attention operator the
+   walk is 27 MB below the allocator, recovering at the next. The finalizers
+   for q, k and v fire before attention dispatches, but the allocator still
+   holds the memory, because they are views onto a storage something else is
+   still keeping alive. It is transient, self-correcting, and nowhere near the
+   peak.
+4. ~~Feed it back: `get_num_blocks` off the modelled budget.~~ **Done** --
+   `--compass-memory-model`, a profile from `meta_probe.py --profile-out`.
+
+   The readings are substituted, never the arithmetic -- the same seam
+   `--compass-memory-in` uses, so the budget, the safety margin, the
+   `min(budget, free)` clamp and `plan_pools` are all still the engine's. Only
+   where the five numbers came from differs, and here none of them came off a
+   device:
+
+   | reading | derived from |
+   | --- | --- |
+   | `total` | supplied. The target card's capacity is the one thing that cannot be derived |
+   | `peak_torch` | weights + buffers (meta build) + load residue + persistent + activations (graph walk, scaled to the warmup shape) |
+   | `non_torch` | the collective table for this width |
+   | `cudagraph_overhead` | the engine's own formula over the derived activations |
+   | `free` | **a clean box**: total minus what this process holds |
+
+   That last one is the point of the exercise. The recorded `free` is what the
+   neighbours happened to leave, which is why a record in which it was the
+   binding term is refused; deriving it removes the accident rather than
+   preserving it, and the answer becomes what the configuration needs rather
+   than what that afternoon allowed.
+
+   Checked against the decision it drives rather than against bytes -- the KV
+   block count, which is what the budget exists to produce:
+
+   | | blocks modelled | blocks measured | |
+   | --- | --- | --- | --- |
+   | 0.6B TP=1 | 96033 | 96051 | **-0.02%** |
+   | 0.6B TP=2 | 183709 | 183745 | **-0.02%** |
+   | 0.6B TP=4 | 367614 | 367364 | **+0.07%** |
+   | 27B TP=2, walk alone | 38202 | 37858 | +0.91% |
+   | **27B TP=2, walk + scratch** | **37825** | **37858** | **-0.09%** |
+
+   The 27B is the point of running this on a hybrid, and it found something.
+   Every term but one is exact -- weights from the meta build, buffers, load
+   residue, persistent and non-torch all from a calibration taken on that node:
+
+   | term | measured | modelled | |
+   | --- | --- | --- | --- |
+   | weights | 25.9077 GB | 25.9077 GB | exact |
+   | buffers | 0.0312 | 0.0312 | exact |
+   | load residue | 2.0901 | 2.0901 | exact |
+   | persistent | 0.1145 | 0.1145 | exact |
+   | non-torch | 6.9941 | 6.9941 | exact |
+   | **activations** | **0.4027** | **0.2617** | **-35%** |
+
+   That one term accounts for the whole +0.91%, and under-reserving it frees
+   memory for KV -- the unsafe direction.
+
+   **It is the walk, not the scaling.** The graph carries the peak its own step
+   measured, so the two come apart: at the traced shape the walk gives 0.2233
+   GB against that step's own 0.3551 GB, **-37.1%**; scaling to the warmup's
+   4096 tokens turns -37.1% into -35.0%, so the linearity that held exactly on
+   the 0.6B costs about two points here and the walk costs thirty-five.
+
+   The allocator curve says where. The walk runs a near-constant **-105.8 MB**
+   behind through the whole layer stack -- introduced and recovered around
+   `unified_attention_with_output_base` and
+   `_fused_qk_rmsnorm_group_quant_kernel` -- and *ends* correct, at -0.012 MB
+   on the last operator. A persistent in-block deficit, sitting exactly where
+   the peak is.
+
+   This is the `torch.empty`-inside-a-custom-operator hole again, and the
+   out-variant rule cannot close it: those operators *return* tensors, so what
+   is invisible is their internal scratch rather than their destination. The
+   0.6B has almost none; the hybrid's chunked-scan and DeltaNet kernels have a
+   great deal.
+
+   **The fix, and the one it is not.** Per-operator attribution was the obvious
+   move and is the wrong one: correcting the walk operator by operator from the
+   recorded curve reproduces the recorded curve. Exact at the traced shape by
+   construction, worth nothing at any other, and dressed up as a model.
+
+   What generalises is a single number -- the shortfall per token -- on the
+   same linear-in-tokens footing as the rest of the term. Fitted at the traced
+   3494 tokens and asked for the 4096-token warmup peak, which was measured
+   independently:
+
+   | | 0.6B | 27B |
+   | --- | --- | --- |
+   | scratch fitted | 0.1 KB/token | 39.6 KB/token |
+   | walk alone, held out | +0.0% | **-35.0%** |
+   | walk + scratch, held out | +0.3% | **+3.4%** |
+
+   End to end, the 27B's block count goes from +0.91% to **-0.09%**, and back
+   to the safe side of the measurement. The 0.6B is untouched, because a model
+   with no invisible scratch records none.
+
+   Two limits, both in the docstring rather than implied. It generalises to a
+   *shape* the trace was not taken at; it does **not** generalise to a model
+   that was never traced, so this does not restore "size a configuration nobody
+   has run" for hybrids -- the graph now has to come from a real run rather
+   than from meta. And it is clamped at zero: a walk that over-counts is a
+   different fault, and subtracting here would hide it.
+
+   TP=1 and TP=2 land under, which is the safe direction -- fewer blocks than
+   the device would have allowed, never more. TP=4 lands 250 blocks *over*, and
+   the reason is the one already documented: the calibration takes the minimum
+   `non_torch` across ranks, and the run it is compared against had 144 MiB
+   more on rank 0 than its quietest rank did. The model reserved for a clean
+   box and the box was not clean. That is the right behaviour and the wrong
+   comparison -- a modelled budget should be checked against a quiet machine --
+   but it is worth stating that 0.07% is inside the contamination band and its
+   sign carries no information.
+
+Two things that will be wrong if they are not designed for:
+
+* `min(available_for_kv_budget, free)` makes a captured budget a property of the
+  box, not of the configuration. On this machine `free` is set by the twenty
+  other containers. Record `free` and `total` separately and refuse a replay in
+  which `free` was the binding term, or the admission cliff moves with the
+  neighbours.
+* `gpu_memory_utilization` here is a fraction of *total*, with the non-KV
+  footprint subtracted after. That is the vLLM convention and not TRT-LLM's.
+  Inheriting it is right; comparing the resulting block count against a number
+  from the other convention is not.
+
+Not modelled and not planned: fragmentation. Nobody models it.
+
+Validation costs no GPU time, because every hardware run already made prints the
+real breakdown — compare the derived terms against the measured ones on runs
+already scheduled. **The gate that matters is not the byte error**: it is whether
+top-1 configuration agreement survives swapping `empirical/measured` for
+`analytical`. If the ranking moves, the memory model is what moved it. A byte
+error of a few percent that never changes which configuration wins is a better
+outcome than a tighter one that does.
+
+Until this exists, only configurations that fit on the box in front of you can be
+simulated at all, which is the wrong constraint for a tool whose question is
+"does this fit".
+
+### 2. Most of this project's numbers are inside their own noise — **S**, done
+
+Five runs of one command, no change between them, gave a TPOT error ranging from
+−5.4% to +2.4% and a TTFT error from −14.7% to −0.5% — see the spread in Status.
+Mean ± sd is −2.4 ± 3.2 (TPOT) and −9.9 ± 6.4 (TTFT): **the standard deviation is
+larger than the mean in both**. At a fixed shape, without the calibration and
+scheduling variance on top, repeats still move ±3–4% and the sign is not stable.
+
+Every row of the trajectory table is therefore a difference of two single draws.
+The early rows are large enough to survive it — +800% is not noise — but the last
+two steps, from +17.5% to −1.8% TPOT, are not distinguishable from a lucky pair
+by the evidence that was recorded for them.
+
+Some of the spread is the box: about twenty containers share these GPUs and they
+are not partitioned, so a run samples the neighbours as much as the model. That
+is not a defect to fix, it is a condition to measure under.
+
+And the variance has **time structure**, so repeats are not independent draws. A
+`--repeats 2` run taken back-to-back reported −2.2% ± 0.1 on TPOT — a hundredth
+of the spread the five separated runs showed. Adjacent runs share whatever the
+machine was doing, so a tight sd from consecutive repeats is a lower bound and
+not a measurement. Spacing repeats, or interleaving the configurations being
+compared, would be the honest design; the script says so rather than pretending
+otherwise.
+
+`validate.py --repeats N` now runs the whole pipeline N times and reports mean,
+sd, range and each draw, and says so plainly when the spread exceeds the mean.
+The remaining work is judgement, not code: nothing should be quoted as an
+accuracy figure from a single run again, and a difference smaller than ~5% needs
+repeats before it means anything.
+
+### 3. Admission time is not modelled, and it is all of the TTFT error — **M**, measured
+
+**Now measured rather than passed in.** `validate.py` derives it from the real
+run as `TTFT - the prefill step that produced the first token`, which is exact
+for an offline workload: every request arrives at once and one prefill step
+serves them all, so there is no queueing between the two to mistake for
+admission. It comes out at 13.7 ms end to end, against 13.19 ± 0.5 ms measured
+independently over three runs -- and against the 13 ms that had been passed by
+hand, which turns out to have been right.
+
+Deriving it from the *modelled* run would have been easier and is circular: it
+would absorb whatever TTFT error the oracle has and report zero. This uses only
+the real run, so the comparison it feeds stays honest. It degrades where requests
+queue, which is why `--admission-seconds` still overrides it.
+
+Recording the real run costs nothing, which had to be checked rather than
+assumed: over three repeats a measured run and a plain one agree on TTFT to 2%
+and on TPOT and latency to well under 1%, all inside the spread of a shared GPU.
+A single pair of runs had suggested a 28% observer effect on TTFT; it was
+contention, and one run could not have told the difference.
+
+
+A request's first token arrives about 13 ms later than the forward that produced
+it can account for. That time is spent getting the request from `preprocess` to
+the engine core and from there to a worker -- two process hops through polling
+loops, with an idle engine on the far side so nothing overlaps it. Measured
+across six runs: 8.25, 11.52, 13.71, 13.91, 17.88, 18.25 ms, unrelated to request
+count or prompt length.
+
+A simulated run advances its clock by predicted *forward* durations, so none of
+it exists, and TTFT comes back short by roughly that amount every time --
+46.09/57.68 predicts −20.1% against an observed −20.7%. It is the whole of the
+TTFT error and no work on the cost model can touch it. See "A quarter of TTFT
+happens outside any forward" for the decomposition.
+
+Modelling it means advancing the clock when a request is **admitted** rather than
+when a step runs, which is `engine_core`'s loop rather than the runner seam this
+project has stayed behind so far. The term's own spread is ±5 ms on 13 ms, so
+expect TTFT accurate to about ±8% afterwards, not better -- worth having against
+−20%, and worth knowing before starting.
+
+Per-*step* engine work needs no term: it measures ~0.5 ms and is overlapped with
+the device, so adding it would make decode worse.
+
+### 4. TP=4 calibrates and evaluates 19% apart on prefill — **RESOLVED**
+
+**It was the host floor.** Re-measured at the shape this entry flagged, on an
+idle machine, both widths are *host-bound* -- the step is waiting on the host,
+not on the device:
+
+| | launches | kernels | idle | window | `max(kernels, launches x h)` | |
+| --- | --- | --- | --- | --- | --- | --- |
+| TP=1 | 391 | 23.690 ms | 40.1% | 39.567 ms | 37.42 ms | -5.4% |
+| TP=4 | 505 | 20.379 ms | 55.5% | 45.832 ms | 45.10 ms | -1.6% |
+
+Kernel work is *lower* at TP=4 -- it shards -- while the floor is *higher*,
+because there are 114 more launches for the collectives. So at four ranks the
+step is much further from being device-determined, and any model whose
+prediction tracks kernel work is proportionally worse there. That is exactly
+the direction this entry recorded, and the eliminations below were all correct:
+it was not admission, and it was not the model's form. What was missing is that
+the machine has a floor.
+
+The max form predicts both widths to within 5.4%. This does not reproduce the
+19% arithmetically -- a different oracle, box and run -- so the claim is the
+mechanism rather than the number.
+
+The original entry follows.
+
+#### 4. TP=4 calibrates and evaluates 19% apart on prefill — the original entry
+
+The cost model generalises to four ranks; the calibration does not. Three
+repeats at TP=4, against three at TP=1, both with 13 ms admission:
+
+| | TP=1 | TP=4 |
+| --- | --- | --- |
+| TPOT | −1.0 ± 3.3 | −2.1 ± 6.9 |
+| TTFT | +2.0 ± 7.0 | **−26.1 ± 11.4** |
+| latency | +0.0 ± 1.8 | −12.1 ± 9.4 |
+
+TPOT is inside its noise at both widths, so the per-rung decode model transfers
+untouched. TTFT is negative on every draw and its best is −16.3%, so it is
+systematic.
+
+**Not admission**, which was the obvious guess and is wrong: measured the same
+way at both widths it is 17.88 ms at TP=1 and 17.94 ms at TP=4. It does not scale
+with worker count, so it is not made of process hops in the way the two-hop
+description suggests.
+
+**Not the model's form either.** At TP=4 the oracle predicts 39.49 ms for the
+evaluation's 2512-token prefill, and its own sweep rows between 1500 and 4000
+tokens average 40.69 ms — faithful to about 3%. The evaluation measured 48.44 ms.
+
+So the sweep and the evaluation disagree by **19%** at a matched shape, where at
+TP=1 the same comparison agrees to 4%. Whatever differs between a calibration run
+and an evaluation run is four times larger at four ranks. Run-to-run spread is
+larger there too — sd 11.4 against 7.0 on TTFT — so some of it is simply variance
+across four contending processes, but a gap that big on a single shape is worth
+separating from noise with repeated calibration rather than repeated evaluation.
+Nothing yet distinguishes "the sweep's prefill steps are warm and the
+evaluation's is cold" from "four processes vary more".
+
+### 5. No collective cost model — **S/M**, done
+
+**Collectives price like any other operator.** The microbenchmark calls them, in
+the worker, where the process group is live:
+
+| collective | shape | price |
+| --- | --- | --- |
+| `aiter::all_reduce_` | `[4, 1024]`, decode | 10.38 µs |
+| `aiter::all_reduce_` | `[1256, 1024]`, prefill | 71.33 µs |
+
+A TP=2 decode graph holds 58 grouped operators, 57 of them `all_reduce_`, and
+coverage came to 98.3% on both ranks. The one failure is `c10d::broadcast_`,
+which takes a `ProcessGroup` object no JSON artifact can hold; it is one operator
+per step.
+
+**Anything a rank does differently from its peers while pricing deadlocks the
+group.** The union of graphs makes the *signature list* identical, which is
+necessary and turned out not to be sufficient: pricing at TP=4 died in a
+distributed `recvBytes` after CUDA-graph capture -- the moment the benchmark
+runs -- with no error of its own. The per-signature kernel breakdown added for
+#21 makes two extra calls per signature, and for a collective those are two extra
+*collectives*; a breakdown that fails on one rank and not another, which the
+profiler does not guarantee, diverges the group silently. It is off by default
+under parallelism now (`COMPASS_PRICE_KERNELS`), and the general rule is that
+anything optional in the pricing loop has to be optional on every rank or on
+none.
+
+**The other thing that makes this safe is pricing the union of every rank's
+graphs rather than each rank's own.** A collective requires all ranks to call it in
+lockstep, so signature lists that differ by a single entry deadlock rather than
+fail -- a hang with no error, in a benchmark that runs inside the worker. The
+union is identical across ranks by construction. That is a rule, not an
+accident, and it is why the first attempt worked.
+
+It does **not** block multi-GPU prediction the way this once claimed. The
+collective runs inside the forward, and the forward is timed with CUDA events, so
+a calibrated oracle at a width it was measured at has already absorbed the
+collective's cost without naming it. The TP=2 error above is not a missing
+collective — it is item 12.
+
+What the gap actually costs is prediction at a width **nobody measured**:
+calibrate at TP=2 and ask about TP=4, and there is nothing to scale. That is a
+narrower and later problem than "blocks any credible multi-GPU prediction".
+
+### 6. An HTTP benchmark cannot measure a simulated engine — **L**
+
+Attempted, and the result is structural rather than numerical. The server takes
+the Compass flags for free (it builds `EngineArgs` like everything else), so
+predict mode serves over HTTP with no new plumbing. Qwen3-0.6B, TP=1, random
+256-in/64-out:
+
+| | real | predict | |
+| --- | --- | --- | --- |
+| **32 requests at 4/s** | | | |
+| duration | 9.54 s | 9.55 s | arrival-bound |
+| TTFT | 48.5 ms | 11.2 ms | |
+| TPOT | 3.27 ms | 0.32 ms | |
+| concurrency | 0.85 | 0.11 | |
+| **64 requests, unpaced** | | | |
+| duration | 0.71 s | 0.22 s | server-bound |
+| TTFT | 371.9 ms | 89.5 ms | |
+| TPOT | 5.13 ms | 1.78 ms | |
+| output tok/s | 5 795 | 18 943 | |
+
+**Nothing in the predict column is a prediction.** `benchmark_serving` times
+requests with `perf_counter` around an HTTP stream and divides every metric by
+its own wall-clock duration, so it measures the process that produced the
+tokens. Predict mode skips the forward, so what it reports is how fast the
+simulator ran. The oracle's estimate influences the run — it advances the
+virtual clock, which the scheduler reads — but it is never reported to anybody.
+
+Three separate defects sit under that, and only the first is about measurement.
+
+**The simulated numbers are computed nowhere in serving.** Offline, `postprocess`
+derives per-request TTFT and TPOT from `arrive_time` and `first_token_time`,
+which under a virtual clock are the simulated values — that is what `run.py`
+compares and what every number in Status rests on. `api_server.py` never calls
+`postprocess` and never touches `first_token_time`. So in serving the quantity
+this project exists to produce is not merely unexported, it is never calculated.
+
+**Arrival is stamped on a clock that does not move, and it costs everything.**
+`seq.arrive_time = get_clock().time()` in the engine process, and that process
+installs a `VirtualClock` which by design never advances — correct for an offline
+batch submitted at once, wrong for a server. Measured over 65 requests:
+
+| | real | simulated |
+| --- | --- | --- |
+| arrival spread | 310.6 ms | **0.000 ms** |
+| distinct arrival stamps | 65 | **1** |
+| mean TTFT | 349.9 ms | 643.2 ms |
+
+Every request is stamped as having arrived at the same instant, so its TTFT is
+measured from the start of the run rather than from when it turned up. The TTFT
+gap is 293 ms and the collapsed arrival spread is 311 ms: **the whole of the
+engine-side TTFT error is this artifact**, and none of it is the cost model. The
+cost model's own errors here point the other way -- decode at batch 63 predicts
+2.47 ms against a real 3.72 ms.
+
+Worth stating plainly, because it is the second time on this page that a headline
+error turned out not to be about the thing being modelled. A simulator returns a
+number for every request whether or not the question it answers is the one that
+was asked.
+
+**A paced workload cannot tell the two apart.** At 4 requests/s the duration and
+throughput matched to within 0.1% — not accuracy, but the client pacing both
+runs: 32 requests at 4/s takes 8 s regardless of the server. Only the unpaced run
+separated them. Any future serving comparison has to saturate, or it measures the
+client. Concurrency looked preserved in the unpaced run (62.9 against 59.6) for
+the same hollow reason — with no arrival process there is no queue behaviour left
+to get wrong.
+
+What *did* work: the extrapolation guard fired correctly through the server,
+catching 16-token prefill steps below the calibrated floor of 64. Chunked prefill
+produces shapes the offline sweep never generated, and the safeguard saw them.
+
+**What was built, and what it settled.** Both halves of the virtual-clock route
+are now in place. The engine's arrival, first-token and finish readings ride out
+on `RequestOutput` and are served by `GET /compass/requests`, reporting which
+clock they came from. Requests carry a declared arrival (`compass_arrival`, an
+offset into the run), the scheduler defers one whose time has not come, and when
+nothing is runnable the clock jumps to the next arrival — the discrete-event
+step, and the reason a simulation can be faster than the thing it simulates.
+`scripts/compass/serve_bench.py` computes one arrival schedule and applies it two
+ways: paced in real time against a real server, declared against a simulated one.
+
+64 requests, Poisson at 8/s, Qwen3-0.6B TP=1:
+
+| | real | simulated |
+| --- | --- | --- |
+| TTFT median | 35.84 ms | **35.85 ms** |
+| TTFT mean | 42.23 ms | 213.50 ms |
+| TTFT max | 82.10 ms | 1653.09 ms |
+| latency median | 262.35 ms | 306.40 ms |
+| wall clock | 9 417 ms | 495 ms |
+
+The median was exact and the mean was not: the first 13 requests shared **two**
+distinct first-token instants where the real run had 13.
+
+**That was a causality constraint, not a bug.** The client submits concurrently,
+so requests reach the engine in a different order from the one they were declared
+in. If the first request *received* is declared for t=0.9 s, the idle engine jumps
+virtual time to 0.9 s — and a request declared for t=0 landing on the socket a
+moment later is retroactively late. A discrete-event clock may only advance when
+it knows no earlier event will still turn up.
+
+**Fixed, for a closed workload, without pacing.** The client says how many
+requests are coming (`compass_workload_size`) and the engine runs nothing until
+it has them all; after that every arrival time is known, so every jump is safe.
+The wait is bounded by how long submission takes — a one-off startup cost, not a
+per-step sleep, which is what makes real-time pacing unacceptable. A timeout
+releases the barrier if a client dies mid-submission, and says outright that the
+run's latencies are then invalid rather than letting a plausible table through.
+
+| | real | declared arrivals | + barrier |
+| --- | --- | --- | --- |
+| TTFT median | 35.84 ms | 35.85 ms | **35.39 ms** |
+| TTFT mean | 42.23 ms | 213.50 ms | **37.39 ms** |
+| TTFT max | 82.10 ms | 1653.09 ms | **67.63 ms** |
+| latency median | 262.35 ms | 306.40 ms | **294.05 ms** |
+| wall clock | 9 417 ms | 495 ms | 847 ms |
+
+64 distinct first-token instants out of 64 requests, and none finishing before it
+arrived. The tail is gone and the maximum is now *below* the real one.
+
+**Re-measured once decode was fitted per rung and every fit moved to relative
+error**, same workload, 64 requests at 8/s:
+
+| | real | simulated | error |
+| --- | --- | --- | --- |
+| **latency mean** | 280.28 ms | 269.00 ms | **−4.0%** |
+| latency median | 271.14 ms | 262.58 ms | −3.2% |
+| TTFT mean | 40.97 ms | 31.79 ms | −22.4% |
+| TTFT median | 35.37 ms | 31.05 ms | −12.2% |
+| wall clock | 9 426 ms | 639 ms | 14.8× faster |
+
+Against +83.8% TTFT and +37.5% latency the first time this ran. End-to-end
+latency at −4% is the closest this project has come to reproducing a served
+workload, and it is on the configuration the whole thing is for.
+
+The remaining TTFT shortfall was 9.18 ms, inside the 8-18 ms admission cost
+measured offline, and the same single cause: item 3. One extrapolation warning
+fired, correctly, on a context below rung 8's calibrated floor.
+
+**With admission modelled** (`--compass-admission-seconds`):
+
+| | real | none | 13 ms | 9 ms |
+| --- | --- | --- | --- | --- |
+| TTFT mean | 40.97 ms | −22.4% | +9.3% | **−0.4%** |
+| latency mean | 280.28 ms | −4.0% | +0.6% | **−0.8%** |
+| latency median | 271.14 ms | −3.2% | +1.6% | **+0.2%** |
+| TTFT median | 35.37 ms | −12.2% | +24.5% | +13.2% |
+
+**The constant is path-specific, not machine-specific.** 13 ms is what the
+offline batch path measured and it overshoots serving by 9%; 9 ms is what the
+serving path measured. Same machine, same model, same process layout — different
+entry code, so a different cost. Calibrate it against the path being simulated,
+not against whichever run was convenient.
+
+**Read the mean, not the median.** A single constant shifts the whole
+distribution, and the real one is right-skewed — mean 40.97 against median 35.37.
+So the means land near-exact while the median overshoots by 13%. Reproducing the
+shape needs a distribution rather than a constant, which is more machinery than
+this is worth until something depends on tail TTFT.
+
+**And this number is in-sample for that term.** 9 ms was derived from the
+previous run of this same workload, so −0.4% is a fit, not a generalisation. It
+is a different run — the spread between runs is real — but a held-out figure
+needs a workload the constant was not measured on.
+
+**What this does not solve.** There is no count to wait for in open-ended
+serving, and a simulator cannot know whether another request is about to arrive.
+That case still needs the schedule handed over up front — the workload as an
+input file, with HTTP demoted to fetching results. The barrier buys a correct
+closed-workload validation harness, which is what validation needs, and defers
+the general problem rather than answering it.
+
+That also reframes the original goal. "Validate against `benchmark_serving`" is
+partly mis-specified: an HTTP benchmark is the right yardstick for the *real*
+engine and cannot drive a simulated one. The three routes, for the record:
+
+* *Export the simulated metrics* — done, and necessary, but measurement only.
+* *Virtual arrival* — half done: declared arrivals and a clock that skips idle
+  time work; the schedule must move from per-request to up-front.
+* *Real-time pacing* — sleep the difference between virtual and wall time. HTTP
+  would work unchanged and queueing would be right, but the speedup that
+  motivates the project is gone, and only systems slower than real time could be
+  simulated. Rejected.
+
+## Graph fidelity against a production launch
+
+### 6b. The priced oracle is a fixed-shape predictor, and serving is not — **L**
+
+Offline it lands inside the noise. Served, on the engine's own clock:
+
+| | real | simulated | error |
+| --- | --- | --- | --- |
+| TTFT | 352.11 ms | 520.75 ms | **+47.9%** |
+| latency | 663.34 ms | 831.24 ms | **+25.3%** |
+
+(Later runs of the same comparison gave +24.9%/+25.2% and +80.4%/+47.6%, with the
+real side alone moving from 311 ms to 346 ms of TTFT. Serving numbers need
+repeats before any of them is treated as a difference; none of the three runs
+here had any.)
+
+The cause is not the prices. It is that an offline workload has exactly one shape
+of each kind -- four prompts of 314 tokens, then decode at batch 4, every step
+identical -- so an oracle holding one graph per kind is *exactly* right, and the
+limitation stayed invisible. A served workload does not:
+
+| | what really ran | what the oracle answers |
+| --- | --- | --- |
+| prefill, 3 steps | 16, 256 and **16128** tokens; 38.6, 151.0, 177.6 ms | ~47 ms for each |
+| decode, 127 steps | batch 1 (64 steps) and batch 64 (63); 2.68 to 10.25 ms | ~3.2 ms for each |
+
+A thousandfold range of prefill sizes and two capture rungs, answered with two
+constants. So the offline result should be read as *the machinery works*, not as
+*the model generalises* -- and "one graph per kind is enough", which was true of
+every workload tested to that point, is false of the first varying one.
+
+**Established, now that predict mode records its steps: the simulation runs a
+different schedule.** Not the same steps at wrong prices -- a different set of
+steps.
+
+| | real | simulated |
+| --- | --- | --- |
+| prefill steps | 3 -- 16, 256, 16128 tokens | **6** -- 16, 256x2, 1536, 3072, 11264 |
+| decode steps | **127** -- buckets 1x64, 64x63 | **189** -- buckets 1x63, **2x63**, 64x63 |
+| prefill total | 371.5 ms | 251.2 ms |
+| decode total | 486.8 ms | 721.9 ms |
+
+62 extra decode steps, and 63 of them at bucket 2 -- a bucket the real run never
+visits. Prefill split six ways instead of three, and the 16128-token step became
+1536 + 3072 + 11264.
+
+This changes what #6b *is*. It is not, or not mainly, that the oracle cannot
+price the shapes serving produces. It is that **a simulated run does not perform
+the same steps as the run it stands for**, because the scheduler batches
+according to the clock the oracle drives, and a different clock coalesces
+requests differently. Aggregate latency cannot separate a wrong step cost from a
+different set of steps, which is why two attempts to attribute this error failed
+before the step tables existed.
+
+It also means the decode-ladder result does not show up here even though it is
+real: the ladder was validated offline against the rungs it was measured at, and
+serving spends 63 steps at a rung that only exists in the simulation.
+
+**The mechanism is that arrivals are on the wall clock while steps are on the
+virtual one.** Sweeping the admission constant over the same workload:
+
+| | prefill | decode | decode buckets |
+| --- | --- | --- | --- |
+| real | 3 | 127 | 1x64, 64x63 |
+| simulated, adm=0 | 20 | 159 | 1x94, **16x2**, 64x63 |
+| simulated, adm=13.2 ms | 13 | **126** | **1x63, 64x63** |
+| simulated, adm=26.4 ms | 7 | 189 | 1x63, **2x63**, 64x63 |
+
+Two things follow, and the second is the important one.
+
+*Admission changes the schedule.* At 0 a bucket-16 cohort appears, at 26.4 ms a
+bucket-2 one, and at the measured 13.2 ms the decode schedule nearly matches
+reality -- 126 steps against 127, in the same two buckets.
+
+*But 13.2 ms is also what the previous run used, and it produced 189 decode steps
+with a phantom bucket 2.* **Identical settings, different schedule.** The
+simulated schedule is not a function of the configuration at all: `serve_probe`
+drives requests over HTTP, so arrivals happen in wall-clock time while the engine
+advances a virtual clock by predicted costs, and the interleaving of the two is a
+race. (Two samples, so read this as the explanation that fits rather than as a
+measured distribution.)
+
+That is #6 in a deeper form than it was recorded. The known problem was that an
+HTTP benchmark *times* a simulated engine wrongly; this is that it *perturbs*
+one -- the schedule itself, which is the thing being validated.
+
+Prefill shows it without the noise: **7, 13 and 20 simulated prefill steps against
+3 real**, in every run and at every admission value. Chunked prefill splits when a
+step's token budget is exceeded, and a scheduler seeing requests arrive at
+scattered virtual times batches fewer of them per step and chunks more.
+
+The fix is not a cost-model fix, and it needed no engine change either: the
+protocol already carries `compass_arrival` (an offset into the run) and
+`compass_workload_size` (so the arrival barrier holds virtual time until every
+declared arrival has landed). `benchmark_serving` simply never sets them.
+
+`scripts/compass/replay.py` does. Requests are posted as fast as the socket
+allows and each carries the instant it should *count* as arriving, so delivery
+order and socket latency stop mattering. Against a real server the declared
+arrival is ignored and "now" is used, so one script drives both sides.
+
+**It fixes the schedule.**
+
+| | real | simulated |
+| --- | --- | --- |
+| prefill steps | 4 | 4 |
+| decode steps | 31 | 32 |
+| decode buckets | {64: 31} | {2: 1, **64: 31**} |
+
+against 3 vs 6 and 127 vs 189 under the HTTP driver. One stray bucket-2 step
+remains; everything else lines up.
+
+### And with the schedule fixed, the error is finally attributable
+
+| | real | simulated |
+| --- | --- | --- |
+| prefill | 4 steps, **691.7 ms** -- 39, 193, 251, 210 ms | 4 steps, **167.5 ms** -- **42 ms each** |
+| decode | 31 steps, 6.060 ms each | 32 steps, 5.116 ms each |
+
+Engine-side TTFT comes out -83.7% and latency -61.0%, and both are now explained
+rather than merely observed:
+
+* **Prefill is 4.1x under because one graph answers for every shape.** The
+  simulated steps cost 42 ms whether they carry 279 tokens or 16368; the real
+  ones run 39 ms to 251 ms and scale with tokens. This is the open half of #6b,
+  now isolated with nothing else mixed into it.
+* **Decode is 15.6% under because the ladder was traced at a different
+  context.** The rungs were traced on 64-word prompts and this workload uses
+  128-word ones, so the same bucket carries more KV history. The ladder fixed
+  the *batch* dimension of decode; context is a second dimension and this is the
+  first measurement that separates them.
+
+That is the serving blocker cleared. What remains is not "serving is wrong" but
+two specific shape gaps, each with an obvious next measurement.
+
+
+
+The fix is not more graphs of the same kind -- that was tried on decode context
+and dropped. It is a graph per *shape*, which is what `runtime/derive.py` exists
+for, and which makes #7 a prerequisite rather than an improvement.
+
+### A rank coordinate left out is not a merge, it is a race
+
+`_rank_coords` reported only `{"tp": rank}` while `_topology` reported `tp` *and*
+`dp`. Under TP=2 x DP=2 all four ranks resolved to one `graph.tp0.json` and wrote
+it in turn, so three quarters of the run's evidence was discarded and the
+surviving file looked complete -- 807 operators, no error, nothing to notice.
+
+This is the same defect the `artifacts.py` convention was written to fix, in the
+same shape, one parallelism later: the write side knew about the group and the
+naming did not. The general rule is worth stating rather than re-learning a third
+time -- **every group in `_topology()` must have a coordinate in
+`_rank_coords()`** -- and the failure it prevents is silent, because a
+single-writer path is indistinguishable from a correct one by inspection.
+
+### Interpolating prices across shapes does not work, and the reason is useful
+
+The cheap candidate for #6b was `empirical/interpolated` at operator level: price
+an operator at a few shapes and interpolate between them, instead of deriving a
+graph per shape. Probed on one gemm from the 0.6B decode graph -- `[M,1024] x
+[4096,1024]` -- priced at 20 values of M from 1 to 1024.
+
+The curve is flat at ~9.2 µs to M=12, then climbs, and then **jumps from 58.07 µs
+at M=768 to 137.45 µs at M=1024** where the trend says ~77.
+
+Interpolation looks fine until you notice that:
+
+| measured shapes | n | median | worst |
+| --- | --- | --- | --- |
+| every other shape | 10 | 5.5% | 57.8% |
+| powers of two | 11 | 2.8% | 60.1% |
+| 1, 8, 64, 512 | 4 | 3.7% | 64.7% |
+| 1, 32, 1024 | 3 | 8.6% | 80.1% |
+
+Median 3-8% from as few as four measurements, which looked like the answer.
+Restricted to the range actually bracketed it is better still: median **2.6%**,
+worst 8.4%. Every "worst" column is the same cliff.
+
+**The cliff is a kernel change, and the price list already knew.** Because each
+signature records which kernels it launched:
+
+| M | µs | tile |
+| --- | --- | --- |
+| 256, 384 | 29.38, 39.74 | `MT128x1…` |
+| 512, 768 | 48.50, 58.07 | `MT256x1…` |
+| 1024 | **137.45** | **`MT256x2…`** |
+
+So the obvious guard is to interpolate only between neighbours that ran the same
+kernel. **That guard refuses almost everything**: the library re-tunes at nearly
+every shape -- twelve distinct tile configurations across twenty values of M --
+so 8 of 10 held-out shapes have no same-kernel bracket at all, and the two that
+do come out at 0.4%.
+
+That is the finding. Interpolation is not sound-but-imprecise; it is **accurate
+most of the time with no way to tell when it is not**. It works when consecutive
+tuned kernels happen to lie on a smooth trend and fails by 2.4x when they do not,
+and the only signal that would distinguish the two cases refuses to answer for
+most shapes. For a tool whose output is a *ranking of configurations*, an
+occasional silent 60% is worse than a uniform 10%.
+
+**What the probe leaves standing.** Decode shapes are not arbitrary -- they are
+the CUDA-graph capture ladder, eleven rungs known from config before anything
+runs. Those can simply be *measured*, which is `empirical/measured` over an
+enumerable set and needs no interpolation at all. Prefill token counts are
+genuinely arbitrary, so prefill is where #6b still needs either
+`empirical/fitted` per operator against M, or derivation (#7).
+
+Which splits #6b into a bounded piece and an open one, where before it was one
+large open one.
+
+### The decode half of #6b, closed by measuring the ladder
+
+Decode shapes are not arbitrary: they are the rungs of the CUDA-graph capture
+ladder, known from config before anything runs. So they can be **measured**,
+which is what the interpolation probe said to do instead of interpolating.
+
+Traced at seven rungs by running seven workloads at 1, 2, 4, 8, 16, 32 and 64
+concurrent requests -- the batch *is* the rung, so no shape rewriting and nothing
+to get silently wrong. Priced as a union: 449 of 471 signatures, 2282 of 2310
+operators, 98.8%.
+
+Two facts worth having on their own:
+
+* **The structure is rung-independent.** 330 operators and 19 distinct kinds at
+  every rung, one identical operator multiset. Only shapes change, which is what
+  makes the ladder a shape family rather than seven different models.
+* **`capture_bucket` matched the rung exactly in all seven runs**, so the key the
+  oracle selects on is the one the engine actually used.
+
+Against measured decode steps, with one constant (382 launches at the 2.04 µs
+median):
+
+| rung | measured | ladder | | one graph |
+| --- | --- | --- | --- | --- |
+| 1 | 2.848 ms | +6.8% | | +10.0% |
+| 2 | 3.222 ms | -4.7% | | -2.8% |
+| 4 | 3.133 ms | 0.0% | | 0.0% |
+| 8 | 3.128 ms | +2.1% | | +0.2% |
+| 16 | 3.442 ms | -1.2% | | -9.0% |
+| 32 | 4.119 ms | -2.5% | | **-23.9%** |
+| 64 | 5.030 ms | +1.3% | | **-37.7%** |
+| | | **median 2.1%, worst 6.8%** | | median 9.0%, worst 37.7% |
+
+The right-hand column is what the oracle did before: one decode graph, traced at
+batch 4, answering for every rung. It is fine near the shape it was traced at and
+-37.7% at rung 64 -- and a served workload spends half its decode steps at
+batch 64. That is a large part of the +47.9% TTFT and it is now gone.
+
+One caveat on the left-hand column: the constant is the median of the same seven
+points, so this is one parameter fitted in-sample. What is being validated is the
+*structure* -- which graph to use for which step -- not that constant, and the
+structure is what the -37.7% was about.
+
+### Prefill does not interpolate either, and the dispatch term is wrong for it
+
+The decode half of #6b was closed by measuring an enumerable set. Prefill token
+counts are not enumerable, so the hope was that a *step* -- hundreds of kernels --
+would be smooth in tokens even though a single gemm is not, letting a handful of
+measured sizes cover the range. Traced and priced at six sizes on the 0.6B, one
+prefill step each, and measured against real steps at the same sizes:
+
+| tokens | measured (op-level, summed) | measured (step-level) | ratio | overhead per operator |
+| --- | --- | --- | --- | --- |
+| 1094 | 15.766 ms | 31.746 ms | **0.50** | 50.1 µs |
+| 2188 | 28.460 ms | 31.985 ms | 0.89 | 11.0 µs |
+| 4376 | 60.685 ms | 63.291 ms | 0.96 | 8.2 µs |
+| 6564 | 76.218 ms | 79.135 ms | 0.96 | 9.1 µs |
+| 8752 | 100.459 ms | 104.421 ms | 0.96 | 12.4 µs |
+| 13530 | 127.520 ms | 132.948 ms | 0.96 | 17.0 µs |
+
+**The hypothesis fails.** Interpolating a measured step between its measured
+neighbours gives a median of 12.2% and a worst of 32.1%, against 2.1% for the
+decode ladder, which measures exactly instead. Averaging over hundreds of kernels
+does not smooth the shape dependence enough to interpolate across.
+
+Two further things fall out, both worth more than the failed hypothesis.
+
+*The dispatch term is wrong for prefill on this model.* Measured overhead per
+operator is 8 to 50 µs where `dispatch_seconds` charges up to 130, and applying
+it gives +35% at 1094 tokens and +59% at 2188 against +4.2% at 13530. The
+overhead also appears to **rise** above 4k -- 8.2, 9.1, 12.4, 17.0 µs -- where
+"dispatch the kernels hide" predicts it should fall; but see below, because that
+sweep confounds token count with sequence count and the rise is as likely to be
+attention's quadratic term as anything about dispatch. What is not in doubt is
+the magnitude: 130 µs is far too large.
+
+*Priced kernels alone are 0.96 of a prefill step above ~4k tokens.* No overhead
+term at all beats the one we have, for every size except the smallest. That is
+worth knowing before more effort goes into modelling the term.
+
+*And the sweep above cannot say what its own trend means.* It varied
+`--num-prompts` at a fixed prompt length, so token count and sequence count moved
+together -- 1094 tokens was one sequence and 13530 was twelve. "Overhead rises
+with tokens" was reported from it and is not supported by it.
+
+Decoupled, by holding total tokens roughly fixed and redistributing them:
+
+| tokens | sequences | step | ms per 1k tokens |
+| --- | --- | --- | --- |
+| 3952 | 8 | 55.255 ms | 13.98 |
+| 4376 | 4 | 63.232 ms | 14.45 |
+| 4588 | 2 | 52.288 ms | 11.40 |
+| 4694 | 1 | 65.027 ms | 13.85 |
+| 8752 | 8 | 104.479 ms | 11.94 |
+| 9176 | 4 | 100.278 ms | 10.93 |
+| 9388 | 2 | 121.868 ms | 12.98 |
+| **10094** | **1** | **174.534 ms** | **17.29** |
+
+**A prefill step's cost is not a function of its token count.** At ~9-10k
+tokens one long sequence costs 174.5 ms where four shorter ones totalling 9176
+cost 100.3 -- 74% more time for 10% more tokens. At ~4.5k the same comparison is
+18% and the group has no clean ordering at all.
+
+That is attention being quadratic *within* a sequence: 10094² against 4 x 2294²
+is 4.8x the attention work, and attention's share of a prefill grows with size,
+which is why the effect is large at 10k and lost in the noise at 4.5k.
+
+So a "prefill shape" is not a scalar. It is the multiset of sequence lengths, and
+two steps carrying identical token counts can differ by 74%. **Measuring the
+shapes that occur is therefore not merely expensive but ill-defined** -- there is
+no enumerable set to measure, the way the decode ladder has rungs.
+
+What this does *not* undermine is the op graph, which already records
+`cu_seqlens_q` per attention call. The quantity that behaves quadratically is
+visible at operator level and invisible at step level, which is an argument for
+`empirical/fitted` per operator -- fitting attention against its own sequence
+lengths and the gemms against total tokens -- rather than for any amount of
+step-level measurement. This is the case the op-graph approach was built for and
+the first place it is clearly necessary rather than merely tidier.
+
+### Fitting prefill: the quadratic term is right, and two other things are wrong
+
+Fitted over all fourteen measured prefill steps, using features the step table
+already carries (`num_scheduled_tokens` gives the sequence lengths):
+
+| model | median | worst |
+| --- | --- | --- |
+| `a·tokens + c` -- what keying on token count assumes | **6.5%** | 30.1% |
+| `a·tokens + b·Σlen² + c` | 8.0% | **21.1%** |
+
+Read as summary statistics that looks like a wash. Per configuration it is not:
+
+| config | seqs | measured | tokens only | + quadratic |
+| --- | --- | --- | --- | --- |
+| **sq_1x1600** | 1 | 174.5 ms | **-30.1%** | **-2.3%** |
+| pm_n12 | 12 | 132.9 ms | +19.2% | +4.1% |
+| sq_2x800 | 2 | 121.9 ms | -6.0% | +2.5% |
+| pm_n1 | 1 | 31.7 ms | -16.1% | -9.3% |
+| pm_n2 | 2 | 32.0 ms | +19.5% | +20.1% |
+| sq_2x400 | 2 | 52.3 ms | +21.7% | +21.1% |
+
+**The quadratic term does exactly what it was introduced for.** The
+single-long-sequence case goes from -30.1% to -2.3%, and the twelve-sequence case
+from +19.2% to +4.1%. Nothing else could have fixed those: they are the two ends
+of the distribution axis, and a token-count model is blind to it. The median got
+worse only because the term does not address the cases below, and cannot.
+
+**There is a floor no model here has.** 1094 tokens cost 31.7 ms and 2188 cost
+32.0 -- twice the tokens for the same time. Both fits assume proportionality and
+so over-predict `pm_n2` by ~20%. Prefill below roughly 2k tokens is not
+token-bound at all, which is the same shape of finding as decode being flat from
+batch 1 to 8.
+
+**And one measurement looked unexplainable.** `sq_2x400` carries 4588 tokens in
+two sequences and measures 52.3 ms, where `sq_4x200` carries *fewer* tokens
+(4376) in more sequences and measures 63.2 ms. More tokens and more attention
+work for less time.
+
+Repeated five times each, it is not noise. The measurements are tight to a tenth
+of a percent:
+
+| config | seqs | tokens | mean ± sd |
+| --- | --- | --- | --- |
+| 8x100 | 8 | 3952 | 55.32 ± 0.07 ms |
+| 4x200 | 4 | 4376 | 63.16 ± 0.02 ms |
+| 2x400 | 2 | 4588 | **52.14 ± 0.03 ms** |
+| 1x800 | 1 | 4694 | 65.13 ± 0.05 ms |
+
+So prefill is **non-monotone in token count**, reproducibly. Pricing one gemm --
+`[M,1024] x [4096,1024]`, whose M *is* the step's token count -- across the same
+range says why:
+
+| M | gemm | tile |
+| --- | --- | --- |
+| 3952 | 539.22 µs | `MT256x224x64` |
+| 4376 | 536.80 µs | `MT256x224x64` |
+| **4500** | **259.68 µs** | **`MT256x192x64`** |
+| 4588 | 267.80 µs | `MT256x256x32` |
+| 4694 | 260.33 µs | `MT256x192x64` |
+
+The gemm **halves** between 4376 and 4500 when the library switches tile. The two
+expensive steps sit on the slow side of that cliff and the cheap one on the fast
+side, and `1x800` is on the fast side yet costs more than `2x400` because it is
+one sequence rather than two -- the quadratic term again.
+
+So the four points need *both* effects, and they are independent: a gemm cliff in
+total tokens, and attention's quadratic in the length distribution. What is not
+reconciled is magnitude -- one gemm's 269 µs saving times the gemms in a step
+would over-explain the 11 ms difference, so the other gemm shapes presumably
+cross at different M and partly cancel. The mechanism is established; the
+arithmetic is not.
+
+**This is the third argument for pricing at operator level, and unlike the first
+two it was tested.** Both effects are invisible in a step's shape and automatic
+at operator level: a gemm priced at its own M carries the tile cliff whether or
+not anyone knows it is there, and attention priced at its own `cu_seqlens_q`
+carries the quadratic. So the prediction is that priced operators reproduce an
+ordering no token-count model can. Traced and priced both members of the
+non-monotone pair:
+
+| graph | tokens | seqs | measured (op-level, summed) | measured (step-level) | ratio |
+| --- | --- | --- | --- | --- | --- |
+| 2x400 | 4588 | 2 | 50.053 ms | 52.140 ms | **0.960** |
+| 4x200 | 4376 | 4 | 60.641 ms | 63.160 ms | **0.960** |
+
+The larger step prices cheaper, as it measures. **10.59 ms of the 11.02 ms gap is
+captured -- 96%** -- and both configurations land on the *same* ratio, so what is
+left is a uniform 4% rather than a shape-dependent error.
+
+The decomposition confirms which effect is which. Attention is 16.38 ms at two
+sequences against 15.09 ms at four: higher for *fewer* sequences, as the
+quadratic requires, and in the **opposite** direction to the total. So the gemms
+carry the difference, which is the tile cliff, and the two effects are separable
+in the priced graph in a way they are not in the step.
+
+That is the case for operator-level pricing closed by measurement rather than
+argument, on the hardest instance available.
+
+### Pricing a token count nobody traced
+
+Which leaves the practical problem: prefill token counts are arbitrary, so the
+shape that occurs is usually one no run traced. There is no enumerable set to
+measure the way decode has rungs, and interpolating across the tile cliff is
+wrong by 2x with nothing to warn you.
+
+But there is a rule. The operator *list* does not depend on the token count --
+319 operators and 19 kinds at every unchunked prefill size traced -- and the
+per-token operators carry the count as a leading dimension. So a graph traced at
+one size can be rewritten to any other and the result **priced exactly**.
+`scripts/compass/synth_shapes.py` does that.
+
+Checked by synthesising *both* members of the non-monotone pair from the 4376
+trace alone, and comparing against graphs actually traced at each size:
+
+| tokens | from a graph traced at that size | synthesised from 4376 | diff |
+| --- | --- | --- | --- |
+| 4376 | 45.555 ms | 45.529 ms | -0.06% |
+| 4588 | 33.669 ms | 33.591 ms | **-0.23%** |
+
+(Non-attention operators; attention is excluded from synthesis on purpose.)
+
+The second row is the one that matters: synthesised from a trace at 4376, the
+4588 shapes come out **26% cheaper**, which is the tile cliff. Rewriting the
+shape and pricing it picks that up because it prices rather than infers -- the
+same reason the priced graph reproduced the ordering at all.
+
+So one trace covers a shape family, and prefill needs a trace per *structure*
+rather than per size. Two structures are known: unchunked at 319 operators, and
+chunked at 356 -- a step that exceeds `max_num_batched_tokens` runs different
+operators, and its graph cannot be synthesised from an unchunked one.
+
+Two limits worth stating. The rewrite rule is "leading dimension equal to the
+traced token count", so a dimension that merely happens to be that number is
+rewritten too; it is validated at two sizes and the tool prints what it changed.
+And **attention is not synthesised**: its cost depends on `cu_seqlens_q`
+quadratically rather than on a token total, so rescaling its shapes would produce
+a number that means nothing. Attention is the one operator that still needs
+tracing or fitting, which is now the whole of the remaining prefill problem.
+
+So the fit confirms the mechanism and refuses to be a model: right feature, wrong
+granularity. Attention's quadratic cost belongs to *attention*, where the graph
+records `cu_seqlens_q` per call, not to a step-level regression that has to
+recover it from a sum. That is the operator-level fit, still unbuilt, and this is
+now the second independent argument for it.
+
+### 6c. Expert parallelism: what ran was not meaningful EP — **L**
+
+Qwen3-30B-A3B, 128 experts and 8 per token, at TP=2 with
+`--enable-expert-parallel`. It traces (488 decode operators, 477 prefill,
+identical on both ranks) and prices at **98.7%** coverage with no new machinery.
+That was first written up as a success. It is not one, and the check that shows
+why is the one that should have been run first: **turn the flag off and see what
+changes.**
+
+The flag is doing what it says. The engine resolves `use_ep=True, ep_size=2,
+ep_rank=0/1` for all 48 layers on both ranks, and `use_ep=False` without it. But:
+
+| | EP on | EP off | ratio |
+| --- | --- | --- | --- |
+| `moe_forward`, prefill | 597.40 µs | 651.28 µs | 0.92x |
+| `moe_forward`, decode | 71.58 µs | 73.47 µs | 0.97x |
+| `fused_allreduce_rmsnorm_` | 140.96 / 9.60 µs | 140.90 / 9.64 µs | 1.00x |
+
+and the graph is structurally identical either way, 488 operators and 23 distinct.
+The reason is arithmetic rather than a bug: at TP=2 with DP=1, *without* EP each
+rank holds all 128 experts sharded along the intermediate dimension, and *with*
+EP each rank holds 64 experts whole. Same FLOPs per rank, different
+decomposition. **EP at `ep_size == tp_size` is close to a no-op**, and there is
+no all-to-all in the graph because this path does not use one.
+
+`ep_size` only exceeds `tp_size` when the DP and TP dims are flattened, which
+`enable_dp_attention` turns on. At TP=2 x DP=2 that resolves correctly --
+`ep_size=4` across four ranks -- and **runs**, once the container could build
+MORI's kernels (ATOM_DEFECTS #5) and once `--level 0` avoided a second defect
+(#10, `VllmBackend can only be called once` under DP-attention; note
+`--enforce-eager` does *not* avoid it, since in ATOM that disables graph capture
+and not `torch.compile`).
+
+**And the expert communication is still not in the graph.** At `ep_size=4` two
+collectives appear that were absent at 2, and neither is expert routing:
+
+| operator | shape | dtype | what it is |
+| --- | --- | --- | --- |
+| `c10d::alltoall_base_` | `[151936]` | bf16 | vocab-sized: DP's logits exchange |
+| `c10d::allgather_` | `[2]` | int32 | token counts across DP |
+
+48 `aiter::moe_forward` and not one per-layer collective. The dispatch and
+combine are MORI kernels called inside the operator, so they never reach the
+dispatcher and cannot be recorded. So the conclusion from `ep_size=2` survives
+being tested at a degree where EP is real: **the graph cannot see expert
+communication at any EP degree**, and re-costing EP across degrees needs
+`moe_forward` to expose it or a model of it.
+
+Two caveats on this run. `--level 0` means the graph is uncompiled -- 807
+operators against 488 compiled -- so it is not production-shaped (#7), and EP=4
+stays unpriceable in a faithful way until #10 is fixed. And `moe_forward` here
+takes `[1, 2048]`: DP split four requests across four ranks, one token each,
+which is a different operating point from the TP-only runs above.
+
+The earlier write-up said this configuration **fails to initialise**:
+
+    moe.py:609 _maybe_make_prepare_finalize
+    hipcc --genco --offload-arch=gfx942 ... mori/_jit-sources ...
+    error: Could not find standard C++ header 'cmath'
+    fatal error: 'cstdlib' file not found
+
+That is defect #5 in ATOM_DEFECTS, unchanged: the container carries gcc runtime
+directories for 13 and 14 but C++ headers only for 13, so clang selects 14 and
+finds no standard library. MORI's dispatch/combine kernels are JIT-built at
+startup, so the *only* EP configuration with a real all-to-all is the one that
+cannot be built here.
+
+So the honest position: EP-as-configured prices fine and tells us nothing, and
+EP-as-intended has never run. The same container defect blocks this and the
+project's actual target model (#16). Two significant items behind one apt-get,
+which is worth weighing against not touching a shared container.
+
+What stands regardless: nothing about the graph, the pricing or the collectives
+needed changing for a MoE model, and `moe_forward` prices at 71.58 µs decode and
+597.40 µs prefill. When the all-to-all does appear it will sit inside
+`moe_forward` -- a single opaque node -- so re-costing EP across degrees will
+need the operator to expose its communication, or a model of it. That problem is
+unchanged by any of the above.
+
+Two smaller notes. Running a 30B MoE needed only the config and tokenizer:
+`--load_dummy=xavier` gives finite, real-scale weights and 60 GB never moves.
+But `--load_dummy` skips *reading* a checkpoint, not *resolving* one, so the hub
+still demands all 16 shards; pointing `--model` at a local directory with the
+shard index removed is what makes a weightless run work. And `moe_forward`
+carries a per-layer identifier, so 48 layers are 48 signatures at each shape: 96
+benchmarks producing two numbers that agree to under a percent, the same thing
+`layer_name` does to attention.
+
+### 7. Derivation is uncompiled; production is not — **L**
+
+Derivation runs the model eagerly on meta. At `--level 3` inductor fuses
+operators and eliminates views and allocations, so a derived graph and a captured
+one differ by construction at the default level: 386 operators against 330 on
+Qwen3-0.6B. Neither is wrong; they cannot be compared, and the sweep story
+depends on comparing them.
+
+Two routes, neither cheap. Run dynamo and inductor during derivation, which means
+compiling for a device the derivation does not have. Or model the fusion —
+predict which operators collapse into one kernel and what that kernel costs —
+which is a research problem, not an implementation one.
+
+Interim: derive and capture at matched levels, and be explicit that a level-0
+validation does not transfer to level 3.
+
+### 8. Trace mode does not observe the CUDA-graph path — **M**
+
+Trace mode skips `capture_cudagraph` deliberately, so its graph is the eager
+operator sequence. A replay is a single opaque submission: there are no
+per-operator events to record, even in principle. So the operators must come from
+eager execution and the replay's cost must be carried as a term the oracle
+applies, not as operators in the graph.
+
+Measure mode does capture, so timings already come from the replayed path. What
+is missing is the bridge between the two artifacts.
+
+### 9. Only decode steps are traced, and only one — **M**
+
+`trace_step` records exactly one step, in practice a small decode. A deployment's
+cost is dominated by shapes never captured: prefill, chunked prefill, mixed
+prefill/decode batches, and long-context decode where attention stops being
+cheap. Speculative decoding and MTP are entirely untraced.
+
+### 10. A custom op's inner Triton kernel is recorded only on hardware — **S**
+
+On a real device `aiter::masked_embedding` both dispatches and launches
+`triton::_masked_embedding_kernel`, so the capture holds both. On meta the kernel
+never launches, so derivation holds only the outer operator. Harmless for cost —
+the outer operator carries the shapes — but a systematic difference between the
+two graphs that will confuse anyone diffing them.
+
+### 11. Simulated TP's `all_gather` is not the real one — **S**
+
+At a physical width of one it builds a zero-padded buffer (`movedim`, `reshape`,
+`view`, `zeros`) where the real path uses `view.dtype`. Seven operators out of
+451. Possibly worth simply accepting — but as a decision, not a residue nobody
+looked at.
+
+### 12. Decode cost falls as batch grows; the model said it rises — **M**, done
+
+Not "not linear". The **sign is wrong**. At matched total context, mean cost per
+step over a sweep of 1662 decode steps:
+
+| batch | 1 | 2 | 4 | 8 | 12 |
+| --- | --- | --- | --- | --- | --- |
+| TP=1 | 3.640 ms | 3.564 | 3.393 | 3.317 | 3.532 |
+| TP=2 | 3.636 ms | 3.563 | 3.403 | 3.351 | 3.310 |
+
+Twelve sequences cost *less* per step than one, because with CUDA graphs the
+replay runs a padded batch-size bucket and the step is bound by launch and replay
+rather than by the work inside it. Per-sequence cost falls more than twelvefold
+across that range, and at TP=1 the curve is not even monotonic. The decode model carries batch size as a positive linear term.
+
+The consequence is in-sample, which is what makes it a statement about the
+model's form rather than about coverage. Asked about 49 of **its own training
+rows** at batch 8 and short context:
+
+| | measured | linear fit | k-NN |
+| --- | --- | --- | --- |
+| TP=1 | 3.282 ms | −3.8% | +0.0% |
+| TP=2 | 3.303 ms | −8.3% | +0.0% |
+
+(k-NN scoring zero on training rows is memorisation and proves nothing about
+k-NN. The linear column is the finding.) Held out on an evaluation workload the
+same contrast survives: −10.3% against −3.4% at TP=2.
+
+This item was **demoted once already**, on the grounds that a nearest-neighbour
+oracle assuming no functional form agreed with the linear fit to within 0.3%.
+That agreement was over a whole workload; it did not hold in the region the
+evaluation actually occupies, and averaging concealed it. Two methods agreeing is
+evidence only where they were both asked the same question — and "the same
+question" has to mean the same *region*, not the same table.
+
+**Repaired by fitting one small model per rung.** `StepShape` now carries
+`capture_bucket` — which rung the replay padded up to — and decode is fitted
+separately within each, as `intercept + slope x total_context`. Batch size is
+dropped inside a rung because the rung already carries it.
+
+Held out on 499 rows none of the models had seen:
+
+| decode model | median \|err\| | RMSE | the bad region |
+| --- | --- | --- | --- |
+| `[1, batch, total_context]` (was) | 5.04% | 0.4216 ms | −3.7% |
+| per-rung intercept, shared slope | 8.09% | 0.3952 ms | −12.6% |
+| **per-rung intercept and slope** | **0.93%** | **0.1259 ms** | **−1.3%** |
+
+A shared slope across rungs is *worse* than what it replaced, which is the
+informative part: a replay at rung 16 reads sixteen padded rows and one at rung 1
+reads one, so cost per unit of history is not the same number at both. The rung
+has to own both coefficients.
+
+In place, over 2174 measured decode steps the fitted oracle sits at 0.73% median
+error, per rung: 0.46 / 0.45 / 0.69 / 1.67 / 2.11 / 1.57 / 0.25 / 0.37% for rungs
+1 to 64.
+
+**It does not explain everything.** The batch-8 short-context region went from
+−3.8% to −1.7%, not to zero, and error is worst at rungs 8 and 16. Something
+still varies with batch *inside* a rung: at matched total context, one long
+sequence is not the same cost as many short ones, and neither the rung nor the
+summed history can see the difference. That is the next feature to look for, and
+it is a smaller effect than the one just removed.
+
+**Getting the rung right was harder than fitting it.** The first implementation
+mirrored `ModelRunner`'s input-buffer padding, which scans `reversed(capture_
+sizes)` — correct only on a descending list. `capture_cudagraph` sorts descending
+for the capture loop and ascending again when it finishes, so at runtime that
+expression returns the *largest* rung, not the smallest: every step in a 1662-row
+sweep came back as bucket 512 and the diagnostic compared three models that had
+all collapsed to one. The rule that actually selects the graph is in
+`ForwardMode.decide`, and Compass now mirrors that instead, written as a `min` so
+it cannot care which way the list is sorted.
+
+That leaves a real defect in ATOM: the padding site takes the largest rung where
+its own comment says a 65-request batch should replay the 128 graph. It
+over-zeroes a buffer rather than mis-selecting a graph, so it costs a little
+bandwidth and nothing else — but it is wrong, and it is not Compass's to fix.
+
+The sweep now reaches rungs 32, 48 and 64, each at two prompt lengths so its
+slope is identifiable. Stopping at 16 is what left the serving run at batch 63
+asking about a rung nothing had measured.
+
+## Configurations that cannot be modelled at all
+
+### 13. Asymmetric parallelism — **L**
+
+`simulated_tp.py`'s `_reject_unsupported` refuses pipeline parallel, prefill and
+decode context parallel, data parallel and DP-attention, TBO, EPLB, and
+disaggregated prefill, because ranks diverge and absent ranks cannot be faked.
+Compass inherits every one of those limits, and the line it draws is exactly
+where this project drew it independently: TP is symmetric and simulable on fewer
+devices, the rest are not, because virtual time would have to be coordinated
+across processes.
+
+Nothing in the field has shipped a solution — Revati claims a multi-process
+timekeeper and released no code, LLM-Emu avoids the problem by hooking a
+single-process executor. Expert parallelism matters most: it is where the
+interesting models are going, and where a rank's graph genuinely depends on which
+experts its tokens chose.
+
+### 14. Shape-changing collectives have no meta stand-in — **S/M**
+
+`all_reduce` and `broadcast` preserve shape, so meta can hand back the input.
+`all_gather` grows and `reduce_scatter` shrinks, so they raise rather than guess
+— deliberately, since assuming "same shape" would corrupt every downstream shape
+while appearing to work. TP alone does not need them; sequence and expert
+parallelism do.
+
+### 15. One communication group is resolvable; several are not — **M**
+
+A collective names its group by elimination: with exactly one group of size above
+one, there is nothing else it could have run on. With TP and EP together the
+ambiguity is real and is recorded as `"?"`.
+
+Settling it means intercepting at the group object rather than the dispatcher —
+`get_tp_group()` and its siblings know their own identity. That is a replacement
+for the current resolver, not an addition, and item 13 needs it too.
+
+### 16. Qwen3.8-27B — **runs**, and is not the model this was scoped for
+
+Fixed by `gpu_docker/fix-cxx-headers.sh` (ATOM_DEFECTS #5): the container had gcc
+runtime directories for 13 and 14 but C++ headers only for 13, so every JIT C++
+build failed. The target model now loads and generates -- two requests, 99.3 s,
+TP=2, with its real 52 GB of weights.
+
+**And it is a hybrid, not a dense transformer.** The decode graph is 1010
+operators over 39 distinct kinds, and among them are 48
+`triton::_causal_conv1d_update_kernel` and 48 `triton::fused_gdn_gating_kernel`:
+48 layers of **gated DeltaNet** -- linear attention with a recurrent state --
+alongside the full-attention ones. The prefill graph carries the matching chunked
+kernels: `chunk_scaled_dot_kkt_fwd`, `recompute_w_u_fwd`,
+`chunk_local_cumsum_scalar`, `l2norm_fwd`.
+
+That matters more than a note. Everything measured on Qwen3-0.6B assumed
+attention that grows with context and a KV cache that is walked; a DeltaNet layer
+carries fixed-size state and its decode cost does not grow with history at all.
+So the context-interpolation question settled on the 0.6B model -- where cost
+rose with context and four graphs bought little -- was settled on an
+architecture that only half applies here. It has to be re-asked.
+
+The first trace also found a hole in the warmup this project added for exactly
+this purpose. Triton autotunes per shape, and the warm pass used prompts of the
+same *word* count rather than the same *token* count, so the shapes differed and
+the linear-attention kernels tuned again during the traced step: **50451 tuning
+launches in a prefill graph of 51179 operators**, and the two ranks disagreed --
+51179 against 50549 -- because they tuned for different times. Coverage read
+2.7%. The decode graph was unaffected, which is why it looked fine.
+
+The fix is to warm with the *same* prompts, which then needs
+`--no-enable_prefix_caching` so the second pass really re-prefills rather than
+being served from cache. A cold prefill does the same work either way. With it:
+prefill drops from 51179 operators to **1280**, the two ranks agree, and coverage
+goes 2.7% to 62.1%.
+
+**62.1% against the dense 0.6B's 98.8% -- and it does not mean what it looks
+like.** 28 of the 37 unpriced signatures fail with *operator not registered in
+this process*, and every one is `triton::` or `inductor::`: the benchmark prices
+by calling `torch.ops.<namespace>.<op>` and a Triton `JITFunction` is not one.
+
+The reflex is to call that 38% of the model missing. It is not. `TritonLaunchTracer`
+records a custom op's **inner** kernels *as well as* the dispatcher-level operator
+that launched them, so the graph holds both `aiter::linear_attention_with_output_base`
+(48 per graph, priced at 4.1 µs) and the `_causal_conv1d_update_kernel` and
+`fused_gdn_gating_kernel` inside it (48 each, unpriced). Pricing both would
+double-count. The unpriced operators are mostly duplicates of priced parents.
+
+Which is why coverage by *time* is nothing like coverage by count:
+
+| | priced kernels | + overhead | real step | error |
+| --- | --- | --- | --- | --- |
+| decode | 16.173 ms | 17.85 ms | 17.919 ms | **-0.4%** |
+
+The overhead constant is the 0.6B's 2.25 µs/launch, unrefitted, on a model 45x
+larger and of a different architecture. Against the warmed decode step of
+17.840 ms it gives 17.854 -- **+0.1%**. That is the strongest evidence so far
+that the shape of the model is right, and it warns that a coverage percentage is
+not a measure of missing work when the graph records two levels of the same call.
+
+### The parallelism sweep on the target model
+
+Qwen3.8-27B, decode and prefill graphs priced per rank, both constants carried
+from Qwen3-0.6B, admission measured on a run instrumented like the baseline:
+
+| TP | ttft | tpot | latency |
+| --- | --- | --- | --- |
+| 1 | -2.58% | +0.94% | -0.90% |
+| 2 | +2.45% | 0.00% | +1.37% |
+| 4 | **+6.46%** | **-5.73%** | +1.37% |
+
+TP=1 and TP=2 are inside a few percent on everything. **TP=4 is where it starts
+to come apart, and in a way that names its own cause.** Decode is under-predicted
+by 5.73%: the priced kernels plus 655 launches at 2.25 µs give 11.690 ms against
+12.401 measured, and closing that needs **3.33 µs a launch**. The same 2.25 µs
+was right at TP=1 and TP=2 and on three different models.
+
+What changes at TP=4 is the group. A decode graph holds 129 `all_reduce_` per
+rank, and the cost at a collective's boundary is not only the hardware's -- it
+includes waiting for the slowest peer, which has more chances to be slow as the
+group grows. So the per-launch constant looks model-independent (it is) and
+group-size-independent (it is not), and a graph whose collectives are a sixth of
+its launches is where the difference shows.
+
+Tested, and it is two constants. `OpSpec.group` already says which launches are
+collective, and **TP=1 has none at all**, so it identifies the plain constant on
+its own and each higher TP then gives the collective one:
+
+| | measured (op-level, summed) | plain launches | collective | measured (step-level) |
+| --- | --- | --- | --- | --- |
+| 27B TP=1 | 26.211 ms | 617 | 0 | 27.334 ms |
+| 27B TP=2 | 16.173 ms | 618 | 129 | 17.840 ms |
+| 27B TP=4 | 10.082 ms | 586 | 129 | 12.402 ms |
+
+    plain      1.82 µs/launch   (from TP=1 alone, where there are no collectives)
+    collective 4.20 µs at TP=2, 9.72 µs at TP=4
+
+**The plain constant is stable across the group and the collective one grows with
+it**, which is what the hypothesis predicted. Stable across the *group*, not
+across models: the 27B fits 1.82 µs where the 0.6B fits 2.25 µs, both at TP=1
+with no collectives at all. Seven independent estimates from the decode ladder
+put the 0.6B between 1.53 and 2.43 µs with a median of 2.04, so the model-to-model
+difference is within the scatter of one model and the honest statement is that
+this constant is known to about ±20% and not better. The single 2.25 µs was a blend of the
+two, which is why it fitted TP=1 and TP=2 -- where collectives are a small share
+or absent -- and broke at TP=4.
+
+Held out to *other models* at the same group size, the split is a real but modest
+improvement, and the honest reading is that it fixes TP-scaling rather than
+accuracy in general:
+
+| | split | single 2.25 µs | measured |
+| --- | --- | --- | --- |
+| Qwen3-0.6B TP=2 | **+2.11%** | +3.71% | 3.369 ms |
+| Qwen3-30B MoE TP=2 | **+9.54%** | +10.54% | 7.900 ms |
+
+The MoE is wrong by about the same amount either way, so whatever ails it is not
+the boundary constant.
+
+Two points cannot fix how the collective term scales: 4.20 to 9.72 is 2.3x for a
+doubled group, which fits linear-in-group (2.1 then 2.43 per rank), linear in
+log2 (4.2 then 4.86) and nothing cleanly. TP=8 would separate them, and until
+then the term should be read as measured per group size rather than as a law.
+
+**TP=8 was run, and the measurement is blocked upstream.** The 27B was traced
+and priced at TP=4 and TP=8 on an idle machine, TP=4 included as an anchor
+because these constants had only ever been measured on one box. The decode
+steps are as clean as they come -- fifteen replayed steps, all bs=4 bucket=4,
+9.761 to 9.829 ms -- and the graph matches them exactly. But:
+
+| | priced plain | priced collective | priced total | measured step |
+| --- | --- | --- | --- | --- |
+| 27B TP=4 | 10.172 ms | 1.243 ms | 11.415 ms | 9.774 ms |
+| 27B TP=8 | 8.454 ms | 1.378 ms | 9.833 ms | 7.864 ms |
+
+The priced sum **exceeds** the step it is inside, so `overhead = step - priced`
+is negative and there is nothing to attribute. The method cannot be applied to
+these runs at all.
+
+It is not the collectives -- the plain launches alone overshoot by +4.1% at
+TP=4 and +7.5% at TP=8 -- and not the inner-kernel double count either:
+excluding every op that carries a `launch` moves the total by 4 microseconds.
+
+**It is that the price list is a mixture, and the caveat was printing all
+along.** Profiling the same configuration and attributing in situ per kernel:
+
+    priced in isolation 11.415 ms
+    same work in situ   10.529 ms
+    (203 operators were timed outside a graph, so their price carries launch
+     overhead; graph-captured alone is 9.975 ms)
+
+203 operators could not be graph-captured and fell back to back-to-back
+timing, so their prices *already contain* the per-launch overhead a graph
+amortises. Summing that mixture against a replayed step charges overhead twice
+for those 203.
+
+Restricted to the graph-captured prices, **9.975 ms isolated against 10.529 ms
+in situ, -5.3%** -- isolated cheaper than in situ, exactly the relationship this
+project has always found. Nothing is inverted. An earlier version of this entry
+said it was; that was wrong, and the mistake was reading a total whose own
+caveat line explains it.
+
+Two kernels are worth naming from the per-kernel table:
+`__amd_rocclr_copyBuffer` prices at **+200.5%** of its in-situ cost, and
+`cross_device_reduce_1stage` at **+19.5%** -- the collective, whose isolated
+price absorbs inter-rank skew for the same reason its in-situ duration does.
+
+**What the fallback-priced operators actually are.** Not 203 signatures --
+203 graph *instances* of two:
+
+| operator | in one 27B decode graph | price | total |
+| --- | --- | --- | --- |
+| `aten::item` | 48 | 17.15 us | 0.823 ms |
+| `aten::is_nonzero` | 24 | 16.02 us | 0.384 ms |
+
+They copy a scalar back and **synchronise**, which is why they cannot be
+captured, and what the back-to-back benchmark measures is the synchronisation.
+Summing that into a step's *kernel* time is the error: their cost is real and
+belongs to the overhead term, which is where host-side waiting already lives.
+`HOST_SYNC` names them and both the priced oracle and `step_accounting` now
+leave them out of kernel sums.
+
+That takes the 27B TP=4 overshoot from +8.4% to **+2.1%**, and turns TP=8's
+residual positive. It does not finish the job:
+
+| | sync excluded | kernels | step, measure table | |
+| --- | --- | --- | --- | --- |
+| 27B TP=4 | 1.440 ms | 9.975 ms | 9.774 ms | +2.1% |
+| 27B TP=8 | 2.290 ms | 7.543 ms | 7.864 ms | -4.1% |
+
+**And there is a baseline problem underneath, which is mine.** Two different
+quantities have been standing in for "the step": the in-situ *kernel sum* from
+a profile (10.529 ms) and the *step wall time* from the measure table (9.774
+ms), from two different runs. They disagree by 7.7%, and for a serial step the
+wall time should not be *below* the kernel sum. Until that is resolved -- one
+run, one baseline, and an explanation for any overlap -- a 2% residual cannot
+be told from a baseline mismatch, and no boundary constant should be fitted to
+it. That is the next thing to settle, and it is smaller and better defined than
+what it replaced.
+
+On #4, which recorded a 19% calibrate-vs-evaluate gap on TP=4 prefill that was
+never explained: the priced oracle gets TTFT to +6.46% on the same configuration.
+That does not explain the 19%, but it does locate most of it in the calibrated
+oracle rather than in the machine.
+
+### The two constants are two different things, and now we know which
+
+They behave completely differently across models:
+
+| | 0.6B dense | 27B hybrid | |
+| --- | --- | --- | --- |
+| replayed, per kernel launch | 2.25 µs | 2.25 µs (+0.1% unrefitted) | transfers |
+| eager, per operator | 86.35 µs | 34.62 µs | 2.5x |
+
+That asymmetry is the explanation. A **replayed** step has no host in the loop,
+so its per-launch cost is a hardware property -- the boundary between two
+dependent kernels -- and there is no reason for it to know what model it is in.
+It transferred across a 45x size difference and an architecture change without
+refitting.
+
+An **eager** step's per-operator cost is host dispatch, and host dispatch does not
+add to kernel time so much as *race* it: the host runs ahead while the device
+works, and only the part it cannot hide is paid. On the 0.6B the kernels are
+small, the host loses, and nearly the whole dispatch shows up -- 86 µs. On the
+27B the kernels are large enough to hide most of it -- 34.6 µs. So the eager
+constant is not a constant at all but roughly `max(0, dispatch - kernel)` summed
+over operators, and it should fall as kernels grow.
+
+Tested, and it holds well enough to use. Solving `sum(max(0, D - kernel)) ==
+step - priced` for the dispatch `D` gives **132.70 µs** on the 0.6B and
+**101.22 µs** on the 27B, against per-operator overheads of 86.35 and 34.62: the
+spread between two very different models narrows from 2.5x to 1.3x once the
+quantity is stated as a dispatch the kernels race rather than a cost they add.
+At a shared `D = 130 µs` both prefill steps come out within about 3%.
+
+The 27B barely constrains it -- 403 of its 708 operators hide the dispatch
+entirely, so its prediction moves only 3% across the whole range 100-132 µs --
+and the 0.6B, where only 29 of 316 hide it, is what pins the value.
+
+**A third model says it is not a machine constant.** Qwen3-30B-A3B, a MoE, fits
+D = 91.72 µs:
+
+| model | fitted D | prefill error at a shared 130 µs |
+| --- | --- | --- |
+| Qwen3-0.6B, dense | 132.70 µs | (pins the value) |
+| Qwen3.8-27B, hybrid | 101.22 µs | +2.8% |
+| Qwen3-30B-A3B, MoE | 91.72 µs | **+16.8%** |
+
+So the reframing narrows the spread -- 2.5x on the raw overhead becomes 1.45x on
+the dispatch -- without removing it, and a shared value is good on one unseen
+model and poor on another. `dispatch_seconds` stays the default because it is
+better than a flat per-operator figure and is at least *bounded*, but **an eager
+step still needs one measured step from the model being predicted** if better
+than ~15% is wanted.
+
+The replayed constant is a different story and survives the same test: on the
+MoE, priced decode plus 481 launches at the 0.6B's 2.25 µs gives 8.193 ms against
+7.900 measured, **+3.7%** -- 2.25 µs now carried unchanged across a dense 0.6B, a
+27B hybrid and a 30B MoE.
+
+### The target model, end to end, with nothing fitted on it
+
+Qwen3.8-27B at TP=2, predicted against three warmed passes:
+
+| | fitted on the 27B | computed | measured (step-level, n=3) | noise |
+| --- | --- | --- | --- | --- |
+| ttft | -0.15% | **+2.45%** | 339.216 ms | ±0.8% |
+| tpot | 0.00% | **0.00%** | 17.854 ms | ±0.1% |
+| latency | -0.08% | **+1.37%** | 607.020 ms | ±0.5% |
+
+The *computed* column is the one that means anything. Its per-launch constant
+(2.25 µs) and its dispatch constant (130 µs) both come from Qwen3-0.6B, a dense
+model 45x smaller; nothing in it was fitted on the 27B except admission, which is
+a measured property of the deployment rather than of the model. The fitted column
+is shown to make the difference visible: it is better, and it is better because
+it saw the answer.
+
+So the graph, the prices, and two machine constants predict a model the constants
+have never seen, to within 2.5% on every metric.
+
+**That claim survives for decode and not for prefill.** The per-launch constant
+transfers across three architectures (+0.1% on the 27B, +3.7% on the MoE). The
+dispatch constant does not: a third model wants 91.72 µs where the first wanted
+132.70, and the shared value costs 16.8% on its prefill. Decode is predicted with
+nothing fitted on the model; prefill still needs one measured step from it. For a
+long generation that is a small caveat on a large result, and for a
+prefill-dominated one it is the whole result.
+
+One thing that is not evidence: admission was measured from the same run it is
+compared against. **Held out, it costs 4 points of TTFT.** Carrying the 18.447 ms
+measured on the 16-token workload over to a 32-token one -- same prompts, same
+prefill graph, same decode graph, only more decode steps -- gives:
+
+| | predicted | real (n=3) | error |
+| --- | --- | --- | --- |
+| ttft | 347.513 ms | 326.073 ms | **+6.58%** |
+| tpot | 17.854 ms | 17.873 ms | -0.11% |
+| latency | 900.980 ms | 880.127 ms | +2.37% |
+
+against +2.45% / 0.00% / +1.37% when admission came from the run being predicted.
+TPOT is untouched, as it must be -- admission is a one-off per request.
+
+The interesting part was in the real column rather than the predicted one: the
+32-token run's TTFT is 326.07 ms where the 16-token run's was 339.22, for
+identical prompts and an identical prefill. TTFT cannot depend on output length,
+so one of the two was wrong by 13 ms -- and it was mine. Running 16 tokens
+*plain* gives **328.04 ms** against the same workload's 339.22 in measure mode.
+
+**Measure mode costs ~11 ms of TTFT on this model, 4% of it**, against about 2%
+on the 0.6B. Admission was measured in one mode and the prediction compared
+against the other, so the instrumentation's own cost went into the constant. The
+constant is fine; the pairing was not. `validate.py` measures and compares on the
+same footing and is unaffected -- this was a defect of the ad-hoc scripts, and
+the rule is that **admission must come from a run instrumented like the one the
+prediction is judged against.** And the workload is one shape -- four prompts, one prefill step, batch-4
+decode -- which is precisely the case #6b showed a fixed-shape oracle handles and
+serving does not.
+
+A harness note, since it nearly cost a wrong conclusion: running several passes
+in one predict process makes TTFT climb by ~588 ms a pass, because the client
+stamps arrival on the wall clock while the engine advances a virtual one (#6).
+The first pass is the only uncorrupted one, and in predict mode it needs no
+warming because no kernels run. Averaging the passes reported TTFT +346%.
+
+**So #10 is not urgent for cost, only for attribution.** A priced parent gives
+the right total; what the graph cannot do is say how that total splits between
+conv1d, gating and the rest -- which matters for asking *why* a configuration is
+slow, not for predicting *that* it is.
+
+
+### 17. The extrapolation warning is per-feature, so it cannot see a hole — **S**
+
+The oracle warns when a query falls outside the range of a feature it was
+calibrated over, and that safeguard has caught two real errors. It checks each
+feature *separately*, so it is blind to a gap in their joint distribution.
+
+The TP=2 evaluation asked about batch 8 with a total context of ~2650. Batch 8
+was covered (1–16 seen) and 2650 was covered (57–41052 seen), so nothing warned.
+The sweep's batch-8 steps actually run 1776–2288 and then jump to 5360: the query
+sits in a hole, and the guard reported it as interpolation.
+
+Not the cause of the TP=2 error — item 12 is, and it is in-sample — but the guard
+claims a property it does not have. A convex hull, or a nearest-neighbour
+distance with a threshold, would say what the bounding box cannot. The k-NN
+oracle already computes the distance this needs.
+
+### 18. No way to tell the runner when to start measuring — **M**
+
+Throwaway warmup requests were served to get Triton autotuning out of the way,
+and the runner measured them anyway: a runner sees steps and has no idea which
+request a step belongs to, or that some were meant to be ignored. The result was
+a 7.5 s prefill sample sitting in a table beside a 0.03 s one.
+
+Worked around by discarding the first step of each kind, which is blunt — it
+drops a real sample when a workload has few and keeps warmup steps when it has
+many. What is missing is a measurement window the engine can open and close
+across the process boundary. The same gap makes it hard to calibrate one phase of
+a deployment without the others polluting the table.
+
+### 19. Derivation is too slow to run per step — **M**
+
+A full meta forward of Qwen3.8-27B (64 layers, 2999 operators) takes **~0.16 s**
+against a modelled decode step of ~1 ms, so deriving inside the serving loop
+would dominate what it measures.
+
+The graph only changes when the batch shape changes, so it should be derived once
+per distinct shape and reused, keyed on the **exact** `GraphKey` rather than a
+quantised bucket. Bucketing trades away precisely the batch-skew sensitivity this
+design keeps: a decode batch mixing short and long histories does not cost what
+its mean history suggests.
+
+Open whether an exact-key cache hits often enough. Decode at a stable batch size
+should repeat shapes constantly; prefill with varied prompt lengths will not. If
+the miss rate is high, the options are incremental re-derivation for the part of
+the batch that changed, or a bucketing scheme with a **measured** error budget
+rather than an assumed one. Not on the critical path for correctness, only for
+speed.
+
+### 20. Capture pays for Triton autotuning — **S**
+
+The first launch of each kernel benchmarks every candidate configuration, which is
+why `trace_step` is never 1 and why capture takes minutes. Fine as it is; worth
+knowing before anyone tries to capture a sweep.
+
+---
+
+# Settled
+
+### 21. Priced kernels are systematically optimistic — **M**
+
+A kernel measured on its own comes out cheaper than the same kernel in a step,
+and it happens to every kernel measured so far. This bounds everything item 1
+could deliver: a price list that reaches every operator and sums correctly still
+under-predicts.
+
+The profiler-free statement, which is the strong one, because it involves no
+instrument beyond the engine's own clock:
+
+| | |
+| --- | --- |
+| priced kernels, one decode step, 98.8% of operators | 2.332 ms |
+| the replayed step | 3.115 ms |
+| **parts / whole** | **0.749** |
+
+Per kernel, comparing each priced value against the same kernel read out of a
+profile of the real run:
+
+| kernel | measured (op-level) | measured (in a step) | ratio |
+| --- | --- | --- | --- |
+| gemm `4,1024;6144,1024` | 13.030 µs | 14.061 µs | 0.93 |
+| gemm `4,1024;4096,1024` | 9.150 µs | 10.699 µs | 0.86 |
+| gemm `4,3072;1024,3072` | 9.079 µs | 10.456 µs | 0.87 |
+| gemm `4,2048;1024,2048` | 7.926 µs | 9.577 µs | 0.83 |
+| attention | 8.52 µs | 10.24 µs | 0.83 |
+| rope | 7.54 µs | 9.19 µs | 0.82 |
+| KV write | 5.00 µs | 5.79 µs | 0.86 |
+
+Seven kernels across two families, memory-bound and compute-bound, clustering at
+0.83 to 0.93. **Answered: the ratio is not constant, and a ratio is the wrong shape to look
+for.** `scripts/compass/price_check.py` widened the sample to every kernel the
+price list reaches, and the ratio runs 0.434 to 0.989 -- far too wide for one
+factor. The same numbers as a **fixed cost per launch** are 0.80 to 3.56 µs,
+median 2.05, and the constant that closes the whole step using no instrument but
+the engine's own clock is `(3.115 - 2.305) / 401 = 2.02 µs`. Two routes, taken
+separately, to the same number.
+
+A ratio looked wrong because the cost is not proportional to the kernel: it is
+invisible on a 13 µs gemm and doubles a 2.7 µs rmsnorm, which is exactly the
+spread that made a factor look impossible.
+
+| kernel | n | measured (op-level) | measured (in a step) | gap/call |
+| --- | --- | --- | --- | --- |
+| gemm `MT64x16x128` | 28 | 12.99 µs | 14.29 µs | 1.30 µs |
+| attention | 28 | 8.74 µs | 11.11 µs | 2.37 µs |
+| rope | 28 | 7.19 µs | 9.34 µs | 2.15 µs |
+| `reshape_and_cache` | 28 | 4.44 µs | 6.04 µs | 1.61 µs |
+| `add_rmsnorm_quant` | 56 | 2.73 µs | 6.29 µs | 3.56 µs |
+| `act_and_mul` (silu) | 28 | 2.96 µs | 6.31 µs | 3.35 µs |
+
+So the correction is additive per kernel launch, which is what
+`PricedGraphCostOracle` applies.
+
+**And it is a property of the deployment, not of the hardware.** Between TP=1 and
+TP=2 on the same GPUs and the same model the two constants move by 12% and 7%,
+in opposite directions -- 2.25 to 1.97 µs/launch and 86.35 to 92.48 µs/op. So the
+"one calibration factor" this section originally hoped for would have been wrong
+even if the ratio had been constant: it is one *pair* of numbers per
+configuration. Reusing another configuration's costs a few percent, which is
+tolerable and is not nothing. What the cost physically *is* remains open --
+the candidates below still stand -- but the model does not depend on knowing.
+
+Two measurement notes worth keeping. Profiled kernel time sums to 3.54 ms inside
+a 3.12 ms step, so the in-situ column is inflated by ~14% and the per-kernel gaps
+are upper bounds; the 2.02 µs fit avoids the profiler entirely. And a profiled
+run is ~16% slower end to end (TPOT 3.619 ms against 3.115), so a prediction must
+never be validated against a profiled baseline -- which cost one comparison here
+before it was caught.
+
+Getting the join right took two attempts, both worth recording. A decode step is
+a replayed CUDA graph -- one host call for all of it -- so its profile has 13232
+kernel events and no operator to charge them to; kernel *names* are the only key
+the two sides share, which is why the price list now records which kernels each
+operator launched. And those names are no help in telling an operator from a
+kernel: `aiter::pa_bf16_noquant_gqa8_1tg_4w` is a kernel while
+`aiter::_pa_fwd_asm` is the operator that launched it. Filtering by prefix
+dropped attention's kernel entirely and handed its price to rope and the KV
+write, which then priced *above* their in-situ cost. Reading the exported trace
+and keeping `cat == "kernel"` -- the same filter the other side uses -- is what
+makes the two comparable.
+
+What it is **not**, each ruled out by measurement rather than argument:
+
+* Not cache residency. Cooling the KV cache by rotating the region each captured
+  call addresses moves attention from 0.79 to 0.83 and then plateaus, flat from
+  128 regions out to 512.
+* Not specific to attention. The gemms show the same ratio and never touch the
+  KV cache.
+* Not overlap between the captured copies. Per-call cost asymptotes with batch
+  size and fits `c + r/B` to within 1%; concurrency would keep driving it down.
+* Not a disagreement between instruments. Ablation and profile agree on
+  attention's in-situ cost to 1%, and they share no machinery.
+
+Two candidate mechanisms, neither tested:
+
+* *Clocks.* A benchmark replaying one small kernel draws far less power than a
+  dense decode step and may boost higher. A uniform multiplicative discount
+  across kernels of different shapes is what that would look like. Sample
+  `rocm-smi` clocks during each.
+* *Kernel boundaries.* The captured copies are mutually independent where a
+  step's are a dependency chain, and the hardware may pipeline the boundary
+  between two independent kernels more tightly. This harness has already
+  measured something that looks like it: cold mode came out **0.94x** hot,
+  against the expectation that streaming a weight costs more than rereading a
+  resident one, read at the time as rotating output buffers removing a
+  write-after-write serialisation. Test by capturing a batch whose calls share
+  an output buffer.
+
+One caveat on the per-kernel column, which the 0.749 does not share: summed
+profiled kernel time for the later decode steps comes to ~3.42 ms against a
+step that is nearer 3.2 ms, so the profiler carries its own inflation of order
+5-10%. That is inside the ratios in the table and would move them *up*, toward
+1. It cannot explain the 0.749, which no profiler touched.
+
+
+## Tracing
+
+### Triton kernels need interception, not shape inference
+
+Triton launches bypass the dispatcher, so no meta kernel can stand in for them,
+and on meta they fail outright: there is no storage behind the pointers.
+
+They do not need shape inference. AITER's Triton kernels take their destination
+as an argument — `run_pa_decode_gluon(output, q, k_cache, ...)` — so the caller
+has already allocated every output with the right shape before the launch.
+Tracing one is therefore: record what it was asked to do, and skip it.
+
+Worth re-checking if a kernel ever traces wrongly: the assumption that every
+intercepted kernel is out-parameter style. One that allocates internally and
+returns a tensor would need real handling.
+
+### Inductor kernels launch through a different path
+
+`torch.compile` does not use `JITFunction.run`; it calls generated kernels
+through `CachingAutotuner`, which is intercepted alongside it. Without that a
+compiled capture silently omits whatever inductor generated.
+
+An earlier version of this note claimed compilation dropped 57 of 386 operators.
+That was wrong in substance, and the correction matters because the wrong version
+argued for capturing at `--level 0`, which nobody deploys. Inductor accounted for
+exactly **one**: `aten::embedding` becomes `inductor::triton_poi_fused_embedding_0`.
+The other 56 are `split_with_sizes` and `empty` — views and allocations, which
+inductor resolves into offsets and a buffer plan rather than executing. They do
+not run at level 3. Compute totals confirm it: 283 operators either way.
+
+So a compiled and an uncompiled capture are both correct and describe different
+configurations. Compilation is the default, so it is the one worth modelling, and
+a derivation may only be compared against a capture at its own level.
+
+### Never trace the first forward — Triton autotunes on it
+
+Tracing step one recorded **90,838** operators. Step two recorded **101**. On a
+kernel's first launch Triton benchmarks every candidate configuration, so step one
+contains tens of thousands of launches steady-state serving never performs —
+`chunk_fwd_kernel_o` alone appeared 34,269 times.
+
+`trace_step` therefore defaults to 2. Anything that captures a graph, times a
+step, or calibrates a cost model has to step past warmup first, and a tool that
+quietly recorded step one would produce numbers that look precise and describe
+nothing that happens in production.
+
+Meta never revealed this, because skipped launches never autotune — a case where
+hardware told us something derivation could not, which is an argument for keeping
+the comparison even after derivation is trusted.
+
+### A failed forward writes no graph
+
+A 101-operator capture of a 64-layer model looked like truncation. The forward had
+**crashed**, and the recording was written anyway from a `finally` block: a
+well-formed artifact from a failed run, structurally valid and merely wrong, which
+would have costed out at a fraction of the model.
+
+Now a failed forward writes nothing and says so, and what does get written is
+checked against the model's depth — attention runs once per layer, so a graph with
+fewer attention operators than the model has layers is reported as truncated.
+
+The lesson generalises: for a tool whose output is an artifact, a plausible
+artifact from a broken run is worse than a crash, because it propagates silently
+into everything fitted against it.
+
+### The meta-kernel worklist is empty for this model
+
+Every AITER operator Qwen3.8-27B reaches already runs on meta. An earlier estimate
+of "22 meta kernels to write" was wrong in both directions: fewer are missing, and
+the real barrier was a different mechanism entirely (Triton interception).
+
+Model-specific. AITER registers operators lazily through JIT, so the worklist for
+another architecture — a MoE model especially — has to be discovered by running
+the probe, not predicted.
+
+## Derivation and comparison
+
+### Derivation reproduces hardware, and the check is repeatable
+
+For Qwen3-0.6B at TP=1 on a one-token decode, all **338** derived operators appear
+in the capture in order, with identical shapes *and* dtypes. At TP=2, all **395**
+do, including all 57 all-reduces.
+
+`graph_diff.py compare` asks **containment, not equality**. A positional
+diff is right between two graphs of the same kind and wrong here: a derivation is
+the model body, a capture is the body plus the runner around it, so compared
+position by position they disagree from the first operator while in fact agreeing
+about everything a cost model is fitted to. Matching is greedy and fails closed —
+on divergence it reports every later derived operator as unfound rather than
+hunting for a match that might be coincidence.
+
+Two conditions must hold, both enforced rather than remembered: the two sides must
+be at the same compilation level, and must describe the same batch. The tool warns
+when the batches disagree.
+
+### Derivation must use the engine's input dtypes
+
+`input_ids` is `int32` and `positions` is `int64` (`model_runner.py`, lines 189
+and 1277). Easy to get wrong in the same way, and the consequence is out of all
+proportion: PyTorch's `int64` default diverges at the embedding, `int32` for both
+diverges at the first attention operator. Because matching fails closed, either
+mistake rejects every operator from that point on — a correct derivation reporting
+as a total structural disagreement. Both live in `derived_inputs()` now.
+
+### Tracing goes through the runner, not the model
+
+Driving `model(input_ids, positions)` directly traces *a* forward, but not the one
+ATOM would run. On hardware it fails at `fwd_ctx.context.is_dummy_run`: attention
+reads a forward context only the runner establishes. Building that by hand means
+reimplementing `prepare_inputs`, which is the re-implementation this design exists
+to avoid. So capture enters through `ModelRunner.forward`.
+
+Derivation still uses a bare model call, which is why the comparison asks
+containment. That is a known limitation rather than a defect — see the division of
+labour below.
+
+A related trap: built at the default fp32 rather than the model's `torch_dtype`,
+meta traces happily while hardware refuses — AITER's fused qk-rmsnorm takes
+fp16/bf16 only. Meta accepts kernels real devices reject, so dtype is pinned
+deliberately on both sides. The diff caught this, which is some evidence it earns
+its keep.
+
+## Parallelism
+
+### The op graph knows world sizes and ranks, nothing else
+
+A collective names the communication group it ran on; the shapes around it already
+reflect whatever sharding produced them. That is what lets one representation
+serve every parallel strategy, including combinations, without Compass being
+taught what any of them mean.
+
+Collectives were being recorded with the literal group `"unknown"`, which hollowed
+that out — a graph in which every collective is indistinguishable cannot tell an
+all-reduce over tensor ranks from one over expert ranks. Resolved by elimination
+now where the rank belongs to a single non-trivial group; genuine ambiguity is
+recorded as `"?"` rather than guessed.
+
+### TP=2 shows the abstraction working
+
+Captured at TP=2, with nothing in Compass that knows what tensor parallelism is:
+
+* the qkv GEMM narrows from `[4096, 1024]` to `[2048, 1024]` — sharding visible in
+  the shapes, exactly as intended
+* 57 `all_reduce_` collectives appear where TP=1 has none
+* the embedding switches to `aiter::masked_embedding` plus its Triton kernel, the
+  vocab-parallel path
+* the two ranks' graphs are identical, correct for symmetric TP — which is why
+  rank attribution comes from the filename and key rather than the contents
+
+### A sharded rank can be derived from one process
+
+TP>1 derivation used to hang, and only on the derivation side: capture at TP=2
+works because it really starts two processes, while one process asking gloo for a
+world of two waits forever for a peer nobody launched.
+
+Fixed with ATOM's own simulated TP, which reports a logical group width over a
+smaller real group. One correction was needed: `apply_simulated_tp` takes the
+physical width from `torch.cuda.device_count()`, right for a worker holding a
+device and wrong for derivation, whose real group is one rank however many GPUs
+exist. On an 8-GPU box it concluded a TP2 derivation needed no simulation, and the
+model built **unsharded, silently**. `simulate_group_width()` states the widths
+outright.
+
+That surfaced a second problem. At a physical width of one there is no
+communicator, so simulated TP replaces `all_reduce` with a passthrough — right for
+benchmarking kernels, wrong here, because the derived graph then holds no
+communication and tensor parallelism costs out as free. Collectives are recorded
+rather than performed, under the name the dispatcher uses on hardware.
+
+### The whole step, at any TP width, on one device
+
+Compass models the serving flow, not the model body, so the runner's own work —
+batch-metadata preparation, the LM head, sampling, the transfer home — is inside
+the scope. Calling those "not part of the model body" excused the gap rather than
+closing it.
+
+The route that closes it is not a meta runner (62 `torch.cuda.` sites in
+`model_runner.py`). It is capture under simulated TP: the runner runs for real, so
+everything it does is recorded, while `--fake-eplb` makes one device stand in for
+a TP-N deployment. A TP2 capture on a single GPU gives **451** operators against
+**448** for the real two-GPU capture.
+
+The residual seven are simulated TP's own zero-padded `all_gather` — item 11.
+
+**The division of labour this settles.** *Capture* on one device gives the
+complete step for any symmetric TP width, and is what a cost model should be
+fitted against. *Derivation* on meta gives the model body with no device at all,
+about a thousand times faster, and is what a sweep should use once the two are
+known to agree.
+
+### Each rank writes its own graph
+
+Every rank traces and under any parallelism their graphs differ — that difference
+is what records how the model is sharded. A single `--compass-graph-out` made the
+ranks race for it and left one file naming no rank: the survivor could not be
+attributed and the rest were lost. Paths carry the rank's coordinates in every
+group it belongs to (`g.json` → `g.tp1.json`, or `g.dp3-tp1.json`).
+
+### ...and must read it back the same way
+
+Writing per-rank artifacts is only half a convention. The measure side suffixed
+the timing table whenever any group was wider than one; the predicting side asked
+for the path it was given. At TP=2 that meant a calibration wrote
+`steps.tp0.jsonl` and `steps.tp1.jsonl` and the run fitted against them looked
+for `steps.jsonl`.
+
+**A single rank cannot expose this.** At width one no suffix is applied, so the
+two sides agree by accident, and every test and every validation run to that
+point had been at width one.
+
+What reached the terminal was worse than the bug: both workers died on a bare
+`FileNotFoundError`, and the engine manager reported *"Received unexpected
+SHUTDOWN signal from DP rank 0 during initialization"* — no DP in the run, and
+nothing to do with initialization. The same shape as the `capture_cudagraph`
+unpacking hang: a worker dies of a specific, nameable cause and the parent
+announces something else entirely.
+
+The convention now lives in `atom/compass/core/artifacts.py` and both sides go
+through it. A rank prefers its own file, falls back to a shared one with a
+warning, and a missing table raises a message that names the path it wanted and
+how to produce one — because that message is the only thing that escapes a
+worker process.
+
+### Ranks of a symmetric group are interchangeable, measured
+
+The engine core owns the clock and advances it by the duration the forward
+reported; that reply comes from rank 0's output channel, so every other rank's
+prediction is discarded. Whether that is sound had never been checked.
+
+Over 1727 steps at TP=2, rank 1 against rank 0: identical shapes on every step,
+median difference **0.03%**, worst **0.82%**, and rank 1 was the slower one on
+**51%** of steps — a coin flip, so there is no systematic skew to correct for.
+Rank-0-only accounting discards 0.01% of the total.
+
+So single-sourcing the clock on rank 0 is right for symmetric TP, and the concern
+belongs entirely to the asymmetric strategies of item 13, where ranks genuinely
+diverge and no rank stands in for another.
+
+**It holds at four ranks too**, which was not obvious — four processes contending
+could have skewed where two did not. Over 2295 steps at TP=4:
+
+| rank | total | vs rank 0 |
+| --- | --- | --- |
+| 0 | 16527.3 ms | — |
+| 1 | 16524.7 ms | −0.02% |
+| 2 | 16530.3 ms | +0.02% |
+| 3 | 16527.8 ms | +0.00% |
+
+Charging every step to its *slowest* rank rather than to rank 0 — which is what a
+barrier actually costs — adds **0.06%**. And the slowest rank was 0/1/2/3 on
+615/555/567/558 steps, near-uniform, so there is no straggler to correct for.
+Rank 0 is a fair proxy at both widths tried.
+
+Everything else structural survived the widening untouched: four per-rank tables
+written and read back, all eight rungs fitted, the arrival barrier and the
+admission delay unchanged. TP=4 needed no code.
+
+### No fixed ports
+
+The rendezvous store was hardcoded to a port. The container runs with host
+networking on a machine shared with about twenty others, so a fixed number
+collides with whatever holds it — including an earlier run of the same script —
+and fails with an `EADDRINUSE` that says nothing about tracing. The OS picks it.
+
+## Measurement
+
+### A quarter of TTFT happens outside any forward
+
+TTFT has been wrong by 15-25% through every version of the cost model, and no
+amount of work on prefill moved it. Measured on the evaluation workload, with
+every step timed:
+
+| | |
+| --- | --- |
+| prefill steps in the whole run | **1** |
+| that step, measured | 43.78 ms |
+| that step, predicted | 46.09 ms (+5.3%) |
+| mean TTFT reported by the engine | 57.68 ms |
+| **TTFT not spent inside any forward** | **13.91 ms — 24%** |
+
+The prefill step is predicted to within 5%. The error is the 14 ms either side of
+it: scheduling, block allocation, sampling, detokenising the first token,
+returning it. A simulated run advances its clock by predicted *forward*
+durations, so none of that time exists — TTFT is short by almost exactly the
+amount that is missing, and 46.09/57.68 is −20.1% against an observed −20.7%.
+
+**This is not the same as the decode finding above, and both are true.** In
+steady-state decode the step period *is* the forward to within 0.4%, because
+steps run back to back and the engine's own work overlaps the device. TTFT is a
+different quantity: it spans one request's arrival to its first token, and
+crosses the scheduling and sampling path once, unoverlapped.
+
+Which explains why two rounds of cost-model work could not fix it, and why the
+prefill fix appeared to make things worse: a fit over-predicting prefill by 18%
+was paying for the missing 14 ms. Correcting the fit to +3.9% removed the
+compensation and exposed the gap. **Two errors cancelling, for the third time on
+this page** — and this is the argument for checking components against their own
+measurements rather than reading a system-level number and calling it accuracy.
+
+**Measured, not subtracted.** The runner now records the wall time between one
+forward returning and the next starting, which is every non-forward thing the
+engine does. That decomposes the gap:
+
+| | 8 x 64 | 16 x 64 |
+| --- | --- | --- |
+| inter-step gap, median | 0.477 ms | 0.563 ms |
+| TTFT − prefill forward | 17.88 ms | 8.46 ms |
+| share one gap explains | 2.7% | 6.7% |
+| decode forward + gap | 4.02 ms | 4.08 ms |
+| decode TPOT | 3.25 ms | 3.44 ms |
+
+Two conclusions, and the second is the useful one.
+
+*Per-step engine work is real but free.* It runs about half a millisecond, and
+forward + gap **overshoots** TPOT rather than matching it — so it is overlapped
+with the device, not added to it. That is why the step period equals the forward
+to within 0.4%: not because the engine does nothing between steps, but because
+what it does happens while the GPU is busy. Adding a per-step term would make
+decode worse.
+
+*The TTFT gap is almost all before the first forward.* One inter-step gap
+accounts for 3-7% of it. The rest is admission: preprocess hands the request to
+the engine core, which hands the batch to a worker — two process hops, each
+through a polling loop, with an idle engine on the far side and therefore nothing
+to overlap against. Across six runs it measured 8.25, 11.52, 13.71, 13.91, 17.88
+and 18.25 ms, with no relationship to request count or prompt length. It looks
+like a fixed cost of order 13 ms whose spread is a polling artifact.
+
+**Implemented, and the seam was not the one first proposed.** The initial reading
+was that this needed the clock advanced when a request is admitted, in
+`engine_core`, reaching past the runner into ATOM's scheduling loop. That was
+wrong twice over. Advancing a global clock per admission double-counts — two
+requests arriving together would pay it twice, when in reality they are admitted
+concurrently. And the machinery already existed: the declared-arrival deferral
+holds a request until `arrive_time`, so holding it until `arrive_time +
+admission` is the same hook with a different threshold.
+
+So it is modelled as a delay on the *request*, not as time the engine consumes:
+`--compass-admission-seconds`, defaulting to zero, which is exactly the previous
+behaviour. It has to be measured per deployment, being a property of the machine
+and the process layout rather than of the model.
+
+The quantity's own spread is ±5 ms on 13 ms, so expect TTFT accurate to roughly
+±8% afterwards and no better.
+
+What it is *not* is a cost-model problem, which is the thing worth recording: TTFT
+was wrong by 15-25% through four separate rounds of work on prefill and decode,
+and none of them could have fixed it.
+
+### The step period is the forward, and TP does not change that
+
+A simulated run advances its clock by the predicted forward alone, so everything
+the engine does *between* forwards — broadcasting the batch to each worker,
+collecting output, scheduling, detokenising — is implicitly zero. With two
+workers instead of one there is more of it, which made a tidy explanation for why
+TP=2 predicted 13.6% fast.
+
+It is wrong. Measure mode reports the real TPOT and records each forward's device
+time in the same run, so the difference between them is exactly that unmodelled
+remainder:
+
+| | real TPOT | forward | remainder |
+| --- | --- | --- | --- |
+| TP=1 | 3.139 ms | 3.150 ms | −0.4% |
+| TP=2 | 3.387 ms | 3.414 ms | −0.8% |
+
+Nil at both widths, and not growing. For offline batch serving the step period
+*is* the forward, so modelling the forward is not the approximation it looked
+like. Whether that survives real request arrival over HTTP — where queueing,
+admission and detokenisation are not overlapped with a saturated engine — is
+item 6 and is untested.
+
+Worth recording as a refutation rather than deleting: the hypothesis was
+plausible, cheap to test, and wrong, and the test is two runs.
+
+### The instrument was changing what it measured — a 33% error
+
+`measure` timed each forward between two `torch.cuda.synchronize()` calls. Same
+workload, same engine:
+
+| | TPOT |
+| --- | --- |
+| plain run | **3.26 ms** |
+| under measure (host sync) | **4.33 ms** |
+
+A serving loop overlaps host and device — while the device runs one step the host
+prepares the next — and a sync on every step destroys that overlap. So what was
+recorded was each step's *isolated latency*, and a model fitted to isolated
+latencies then predicts a pipelined run and over-estimates it by whatever the
+overlap was worth. That was most of the residual TPOT error.
+
+Timed with CUDA events now, recorded on the stream and read back later, drained by
+`query()` rather than `synchronize()` so the host never waits. Perturbation fell
+from 1.33× to 0.97×, recorded decode mean from 4.05 ms to 3.43 ms against a real
+3.26 ms.
+
+Found by disagreement between two methods that should have disagreed: a
+nearest-neighbour oracle assuming no functional form predicted 3.84 ms where the
+linear fit predicted 3.83 ms. Two methods with opposite failure modes agreeing
+meant the fit was faithful to its data and the data was wrong.
+
+Generalises: **a profiler that serialises what it profiles measures a machine that
+only exists while being profiled.**
+
+### CUDA graphs must be captured when the forward is real
+
+`capture_cudagraph` and `warmup_model` were stubbed unconditionally, on the
+reasoning that neither means anything when no kernels run. True for `predict`,
+false for the two modes that perform the real forward — where skipping them skips
+them from a *real* run.
+
+That single assumption produced a **+800%** TPOT error: measure ran eager while
+production replayed a graph. Measured directly, Qwen3-0.6B decode: **28.78 ms**
+eager against **3.24 ms** replayed, 8.9×.
+
+Now `measure` captures for real, `predict` skips having nothing to capture, and
+`trace` skips for the opposite reason to `predict` — a replay is one opaque
+submission, so a traced step would record no operators at all.
+
+### A stub must honour its caller's return contract
+
+`engine_core` calls `capture_cudagraph` across the worker boundary with
+`wait_out=True` and unpacks three values. The override returned `None`, which
+killed the worker on an unpacking error while the parent was still waiting — so
+the failure surfaced as a hang on a shared-memory broadcast that never arrived,
+naming neither CUDA graphs nor Compass.
+
+Across a process boundary a breached contract becomes a hang, not a traceback.
+
+### A subclass's `__init__` body runs too late
+
+`ModelRunner.__init__` warms the model up before returning, and warmup drives a
+forward, so anything mode-dependent is consulted before `CompassModelRunner`'s own
+`__init__` has assigned its config. `_compass_config` resolves lazily from
+`self.config`, which the base sets well before warmup.
+
+Together with the two above: **a subclass that stubs out work the base class
+depends on is wrong in proportion to how much of the base class it never lets
+run.**
+
+### Warmup batches are steps, and must not be counted
+
+`warmup_model` drives synthetic batches through `forward` with `is_dummy_run=True`.
+They must run — they are what autotunes Triton — but they are not steps a
+deployment performs, and counted they spend the trace budget on a dummy shape and
+put dummy rows in the table a cost model is fitted to.
+
+### A real run must not use the virtual clock
+
+`trace` and `measure` perform the real forward, so the wall clock is the truthful
+one. The virtual clock was installed for any Compass run, so every request came
+back with a TTFT of zero — which reads as a broken measurement rather than a
+misconfigured clock.
+
+## Calibration
+
+### Coverage must bracket every dimension the model uses
+
+The same error twice, in two dimensions, an hour apart.
+
+ATOM batches several requests' prefill into one step, so a sweep of large prompts
+produced seven samples spanning 1753–16370 tokens while the evaluation batched to
+~520. The model extrapolated below everything it had seen, where the intercept
+dominates and the slope does no work, and predicted 66.8 ms for a 64-token
+prefill.
+
+Widening the prompt lengths fixed that and left the sweep varying *only* length,
+so it produced decode steps at batch sizes 1–4 — and the evaluation ran 8
+concurrent requests. TTFT improved and TPOT got worse, from +13.1% to +22.5%.
+
+Both times coverage was designed against the dimension that had just caused a
+problem rather than against the model's feature set. The sweep now varies length
+and concurrency together.
+
+The durable fix is not a better sweep: **the oracle says when it is
+extrapolating.** A fitted model answers anything, confidently, including questions
+its evidence does not cover, and neither of these errors announced itself. Warned
+once per kind and direction, since a serving run asks thousands of times.
+
+### Warmup counted in steps destroys the data it protects
+
+`measure_warmup_steps` defaulted to 2, and prefill happens twice in a whole run,
+so it discarded every prefill sample. The oracle had nothing to fit, fell back to a
+mean of zero samples, and predicted a TTFT of 0 ms against a real 7.6 s. Counted
+per kind now, defaulting to zero.
+
+### An oracle asked outside its evidence must refuse
+
+The fallback for "no samples of this kind" was the mean of an empty list, which is
+zero: a confident, precise, entirely fictional answer. It raises now.
+
+### A fit minimising seconds is decided by its largest samples
+
+Widening the sweep to cover decode rungs 32-64 made TTFT worse: −9.9% before,
+−17.3% after, and the standard deviation collapsed from 6.4 to 0.6, so it was
+systematic rather than a draw. Nothing about prefill had changed.
+
+The added rounds run 24-64 concurrent requests, and ATOM batches their prefill
+into one step, so they are large prefill samples. The share of prefill steps
+under 1024 tokens fell from 17% to 9% and the median token count doubled to
+13 008. Ordinary least squares minimises squared *seconds*, so a 250 ms sample
+counts about sixty times a 32 ms one: the fit followed the new mass to the large
+end and the prediction at 512 tokens moved from −13% to −17% against a
+measurement that did not move at all (32.51 ms then, 32.53 ms after).
+
+Every number this project reports is a percentage, so the residual being
+minimised should be a percentage too. Each equation is divided by its own target
+before fitting, which makes every sample worth the same fraction of itself, and
+the outlier test runs on the same relative residuals so it is not dominated by
+the largest samples either. Decode is unaffected: 0.79% median against 0.73%.
+
+| prefill prediction | absolute fit | relative fit | measured |
+| --- | --- | --- | --- |
+| at 512 tokens | −11.8% | −5.3% | 32.53 ms |
+| **at 2512 tokens** | **+18.3%** | **+3.9%** | 43.78 ms |
+| median over 121 rows | 9.51% | 9.03% | |
+
+2512 is the number that matters, and finding that out took longer than the fix.
+The change was first judged at 512 tokens, on the reasoning that eight prompts of
+64 tokens make a 512-token prefill step. They do not: `--prompt-tokens 64` builds
+64 *words*, which tokenise to about 314 each, so the evaluation's one prefill step
+carries 2512. **A model checked at a shape the workload never visits has not been
+checked.** The fix was right anyway, and by a wider margin there than at the point
+used to argue for it.
+
+The general form of the trap: **coverage is not only about range**. The range
+here always bracketed the evaluation — 64 to 16 000 tokens. What changed was the
+*density*, and an unweighted fit is a weighted average whose weights are the
+sample values. Adding evidence in one region degraded prediction in another,
+which is not something a coverage check can catch.
+
+**And making it more accurate made the end-to-end number worse.** TTFT went from
+−17.3% to −20.7% as prefill went from +18.3% to +3.9%, because the
+over-prediction had been paying for something else that is missing — see below.
+
+### The fit resists one-off contamination
+
+**Triton autotunes per shape, not once per process**, so a calibration sweep built
+from deliberately varied shapes pays a benchmarking cost on many of its own
+samples — one prefill row sat at 0.13 s where its neighbour at a larger size took
+0.036 s.
+
+Least squares, then discard points whose residual is far outside the spread of the
+rest, then refit. Spread by median absolute deviation, since the contaminating
+points would otherwise inflate the very quantity used to detect them. The number
+dropped is reported in `describe()`: a fit that discarded half its evidence should
+not describe itself like one that kept it.
+
+### Prefill and decode are fitted separately
+
+They are not two regimes of one function. Prefill is compute-bound in new tokens;
+decode is bandwidth-bound in the KV history it must read. Fitting them together
+produces a model that is wrong about both.
+
+Total context is summed across the batch rather than averaged: a decode batch
+mixing short and long histories does not cost what its mean history suggests, and
+the sum is what the hardware actually moves.
+
+---
+
+# Process notes
+
+* Every defect in this project surfaced by **running** something, never by reading
+  code. The meta-kernel worklist, the autotuning blowup, the passthrough
+  all-reduce, the unpacking hang, the observer effect — all of them.
+* Validating against a convenient configuration (`--enforce-eager`, `--level 0`,
+  one GPU) reads as validation and is not. Three separate bugs hid behind that.
+* Structural validation cannot rank its own findings. Nothing here had a
+  defensible priority until something predicted time and was wrong by a measurable
+  amount.
+* A fitted model is confident everywhere, including outside its evidence. Twice the
+  error was not the fit but the range it was fitted over, and neither time did
+  anything complain.
+* A profiler that serialises what it profiles measures a machine that only exists
+  while being profiled.
+* For a tool whose output is an artifact, a plausible artifact from a broken run is
+  worse than a crash.
+* Two methods agreeing is only evidence when they could have disagreed. The
+  nearest-neighbour oracle earned its place by matching the linear fit, not by
+  beating it. But they have to be asked the same *question*, and a whole-workload
+  average is not one question: the two agreed to within 0.3% over a table while
+  disagreeing by 7 points in the region that decided the answer. An agreement
+  computed over an average can only rule out disagreements that survive
+  averaging.
+* A good end-to-end number can be two errors cancelling. The TP=1 result stood
+  for weeks as evidence the cost model was sound; widening to a second rank
+  showed the fit had been under-predicting the whole time and run-to-run
+  variation had been quietly paying the difference back.
+* Report an interval or report nothing. Five runs of one unchanged command gave
+  TPOT errors from −5.4% to +2.4%: the standard deviation is larger than the
+  mean, and the number this document led with for weeks was simply the luckiest
+  draw of the five. Every single-run comparison here, the trajectory table
+  included, is a difference of two samples from that spread.
+* The thing that finally measured the noise was running the same command five
+  times, which cost twenty minutes and nothing else. It was not done earlier
+  because each individual run had always looked reasonable.
+* Every engine start calls the HuggingFace API to resolve the repo, even with
+  the weights already in the local cache. A day of runs plus one attempt at a
+  27B download exhausted the shared IP's quota, and the next validation died at
+  engine init with `429 Too Many Requests` — surfaced, of course, as the engine
+  manager reporting a DP-rank shutdown. `HF_HUB_OFFLINE=1` avoids it entirely
+  and should be the default for any repeated run.
+* Adding evidence can make a model worse somewhere else. Widening a sweep to
+  cover decode rungs degraded prefill by 4 points, because an unweighted fit is
+  a weighted average whose weights are the sample values. Nothing was removed
+  and no range stopped being covered.
+* Mirroring an engine's rule means finding the rule that runs, not the first one
+  that looks right. The bucket rule was copied from a padding site whose
+  expression only holds on a descending list, against a list that is ascending
+  by then -- so every step in a 1662-row sweep reported the top rung and a
+  three-way model comparison silently became a one-way one. It was caught by a
+  value being impossible, not by the comparison looking wrong.
+* A harness can measure itself instead of the system and still return a full
+  table of plausible numbers. `benchmark_serving` reported TTFT, TPOT, ITL and
+  throughput for a simulated engine; every one of them described the simulator.
+  Nothing failed, nothing warned, and the numbers were in the range a reader
+  would expect.
+* Widening a configuration is a cheaper way to find defects than deepening one.
+  One flag — `--tp 2` — produced a broken artifact convention, a misattributed
+  worker death, a refuted hypothesis, a measured non-issue, and the first
+  functional-form failure in the project.
+
+### Fitting attention, and what the fit turned out to be
+
+Attention is the one prefill operator shape synthesis cannot cover, so it was
+the candidate for fitting: cost quadratic within a sequence, and -- so the
+argument went -- smooth in a way the gemms are not, no tile cliffs, the case
+where a fit is the right tool rather than a way of not measuring.
+
+`scripts/compass/fit_attention.py` fits it, comparing candidate forms on
+leave-one-out error and printing the losers. Eight configurations were traced
+across per-sequence lengths 494..10094 and priced at 100% coverage.
+
+**The first answer was wrong, and how it was wrong is the useful part.** On the
+three lengths first traced (2294, 4694, 10094, each about 2x the last), a power
+law `a*L^p` fitted with LOO median 0.75% and worst 1.08%. That looked
+conclusive. It was not: two independently traced graphs at 3194 and 6594 came
+in at **-6.2% and -6.7%**, both the same direction. Pricing them in the same
+benchmark run as the fit set did not move it (cross-run repeatability is 0.2%),
+so it was not run-to-run offset -- it was model bias, and **leave-one-out could
+not see it**. LOO perturbs the sample; it does not test the family. Dropping one
+of three geometrically spaced lengths leaves the range spanned and the refit
+barely moves, so LOO reported the variance and stayed silent about the shape.
+
+A dense ladder settles it: 13 single-sequence graphs, 2294..10094 in steps of
+600. Cost per token does not vary smoothly. It sits on flat plateaus:
+
+| L | 2294 | 2894 | 3494 | 4094 | 4694 | 5294 | 5894 | 6594 | 7294 | 7994 | 8694 | 9394 | 10094 |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| us/tok | 3.67 | 6.28 | 6.10 | 5.90 | 6.01 | 8.31 | 8.45 | 8.17 | 8.22 | 10.58 | 10.41 | 10.47 | 10.50 |
+
+Four plateaus, steps of about 2.27 us/token, and the plateau index is
+`ceil(L/2530)`. The quadratic term is computed in whole chunks of keys, so
+attention is **quantised in sequence length** -- the same kind of discontinuity
+as the gemm tile cliff, in the operator that was picked precisely because it was
+supposed not to have one. Against a smooth model this appears as a periodic
+sawtooth that refitting cannot remove; on the ladder the power law's residual
+signs read `-++--++--++--`.
+
+Fitting the form the plateaus imply,
+
+    f(L) = L * (a + b * ceil(L / S)),  a = 1.461us, b = 2.272us, S = 2530
+
+gives LOO median 1.59% against 7.78% for the power law, and predicts
+independently traced single-sequence graphs to **0.13%, 0.62% and 1.21%**.
+
+**It does not survive batching.** Fitted on single-sequence graphs and applied
+to batched ones, most land within a few percent but 2x3194 is +23.9%. Tracing
+that length at one and two sequences and pricing both together:
+
+| sequences of 3194 tokens | per sequence |
+| --- | --- |
+| 1 | 19.967 ms |
+| 2 | 15.470 ms |
+
+A 22.5% drop per sequence from adding a neighbour -- while the same comparison
+moves 2.8% at 2294 and 0.9% at 4694. So the chunking is a property of **the
+batch**, not of the sequence, and per-sequence separability (which holds at
+2294 and 4694) fails where the batch changes the chunk count.
+
+Where that leaves attention. The fit is good for single-sequence prefill and is
+kept for that, with its range recorded -- `S` was resolved from data spanning
+2294..10094 and nothing outside that range is evidence. For batched prefill it
+is not a model yet. The direction it points is away from fitting: attention
+wants pricing at the shape *and context* that occurs, as the gemms now get,
+which means synthesising `cu_seqlens_q`/`cu_seqlens_k` and the rest for a
+target sequence-length multiset rather than rescaling shapes. That is
+construction of a real context, not a rescale-and-hope, so it should be exact
+where the fit is approximate.
+
+**Method note worth keeping.** Held-out error on independently produced points
+is not the same test as cross-validation on the sample, and the difference here
+was 1% versus 6%. Where a sample is small and geometrically spaced, LOO reports
+how stable the fit is, not whether the family is right.
+
+#### Pricing chunked prefill
+
+A step exceeding `max_num_batched_tokens` runs the 356-operator chunked
+structure (`state=prefill_prefix`, `has_cached=True`, e.g. 3458 query tokens
+against 6594 keys). Every one of its attention operators was unpriced. Two
+separate causes, and the first hid the second.
+
+**The metadata the prefix path reads was never recorded.** The gather that
+packs cached and new KV into one dense tensor takes its size from
+`total_kv` and its per-sequence offsets from `seq_starts`
+(`attentions/backends.py` sets both, plus `num_cached_tokens`, only under
+`has_cached`). Neither is recoverable from the shapes -- the query length is the
+*new* tokens while the gather spans cached+new -- so the rebuilt metadata had
+`total_kv=None` and the gather allocated `torch.empty((None, ...))`. All 28
+failed identically, which is what a missing field looks like and not what a
+broken operator looks like. They are now captured and installed, recorded only
+under `has_cached`: `total_kv` is set on the unchunked path too, but nothing
+there reads it, and recording it unconditionally would rewrite the signature of
+every attention call already priced for a value that changes no cost.
+
+**Chunked attention cannot be graph-captured at all.** With the metadata fixed
+the failure became `HIP error: operation not permitted when stream is
+capturing`. The gather calls `repeat_interleave` with a device tensor of
+repeats, whose output size is only known on the device, so it synchronises --
+and a synchronise inside a capture is an error. Refusing to price uncapturable
+operators leaves the whole of chunked prefill unpriced, so `price_graph` now
+falls back to timing them back-to-back, and records which mode each price came
+from (`cache: "over"` against `"graph"`) rather than mixing two kinds of number
+silently. The run reports the count.
+
+Chunked prefill now prices at **326 of 356 operators (91.6%)**, attention at 28
+of 28, and predicts the step it came from:
+
+| | |
+| --- | --- |
+| priced kernel time | 99.565 ms |
+| eager dispatch overhead | 20.303 ms |
+| priced total | 119.868 ms |
+| measured step | 132.975 ms |
+| | **-9.86%** |
+
+**What the residual was.** 30 operators were unpriced, 28 of them
+`cp_mha_gather_cache_kernel` -- a raw `@triton.jit` kernel rather than a
+registered torch op. See below; that is now fixed, and the chunked step is
+predicted at -6.65%.
+
+### Pricing kernels that are not torch operators
+
+`torch.ops` cannot find a `@triton.jit` kernel. It is an attribute of the module
+that defined it, and a launch grid is not an argument at all -- so a recorded
+Triton launch named a kernel nobody could call back, and every one went unpriced
+with "operator not registered in this process". That was 28 of 356 operators in
+chunked prefill and 3 of 330 in decode.
+
+The tracer already knew the missing pieces -- `TritonLaunch` carries the grid and
+the constexprs -- and threw them away when building the `OpSpec`. Now recorded:
+
+* **The positional non-tensor arguments**, by index, in the existing `#i`
+  convention `_rebuild_args` already interleaves. The KV gather takes six ints
+  (two strides, head count, head dim, `x`, block-table width) beside its ten
+  pointers, and recording only tensors lost both their values and everyone
+  else's positions. `None` is recorded too, because it holds a place.
+* **`launch`**, a new `OpSpec` field holding `grid` and `origin`. The grid is
+  part of the signature -- it decides how much work runs -- and the origin is
+  not, being where to import the kernel rather than what it costs.
+
+Two capture bugs surfaced doing it. Positional scalars were dropped entirely.
+And `_resolve_grid` kept a dimension only when `isinstance(x, int)`, recording a
+numpy or tensor integer as its own repr, so `kv_indices_generate_kernel` came
+back with grid `['2', 3]` and read as unresolvable -- a resolvable kernel lost
+to a type check.
+
+| | operators priced | |
+| --- | --- | --- |
+| chunked prefill | 326/356 -> **354/356** | 91.6% -> 99.4% |
+| decode | 327/330 -> **328/330** | 99.1% -> 99.4% |
+
+and the chunked step goes from -9.86% to **-6.65%**.
+
+#### Index tensors that reach as far as the real ones
+
+A rebuilt integer tensor was zeros, which is in range for anything and points
+every access at one place. `int_values` exists to replay the recorded contents
+and is off by default because it faults the device -- and it caps at 4096
+entries anyway, so it drops the block tables and per-token maps that are exactly
+the tensors deciding how much memory a kernel walks.
+
+So `int_ranges` records three numbers per integer tensor instead of its
+contents: the span it covered and whether it climbed. Rebuilt from that, a
+climbing tensor becomes a ramp between the recorded bounds -- which reproduces
+`cu_seqlens` exactly at the two-element sizes it usually has -- and anything else
+is spread across the span, so a block table addresses 1239 distinct blocks
+rather than block zero 2560 times.
+
+This is safe where replaying values is not, and the reason is worth stating:
+every tensor argument is rebuilt **at its recorded shape**, so an index that was
+in range for the real tensor is in range for the rebuilt one. Replay faulted
+because a recorded index met a tensor rebuilt at some other shape. On by
+default; `COMPASS_SYNTH_INT_RANGES=0` restores zeros.
+
+**It did not change the gather's price, and the earlier explanation of that
+price was wrong.** The 158 us against the profile's 210 us was attributed above
+to zero-filled block tables re-reading one resident block. Measured directly,
+launching the kernel over three block tables:
+
+| block table | us/call |
+| --- | --- |
+| zeros | 163.35 |
+| spread over the recorded span | 158.02 |
+| spread over the whole 29456-block cache (1.93 GB) | 158.27 |
+
+Scattering every read across a cache far larger than any level of the memory
+hierarchy is worth nothing, so the gather is not bandwidth-bound: its grid is
+6594x8 blocks each moving 128 elements, and it is bound by launching them. What
+a kernel reads decides its price only when reading is what it spends its time
+on, and the diagnosis should have been checked before it was written down.
+
+The 25% remains the in-situ-versus-isolated gap that every graph shows, larger
+here than the 5.5% graph-wide figure. Index realism is kept because it is
+correctness insurance -- a kernel whose control flow reads `cu_seqlens` given
+zeros does no work and prices near nothing -- not because it moved this number.
+
+#### Inductor's kernels
+
+These have no importable name: inductor generates them into a file under the
+codecache and loads them through its own machinery. But `CachingAutotuner` keeps
+`filename`, the file is named by a hash of the code it holds, and it defines the
+kernel at module level under the name inductor calls it. So the origin is
+recorded as a path rather than an import, loaded with
+`spec_from_file_location`, and called through `.run(...)` -- an inductor kernel
+computes its own grid from its arguments, so unlike a hand-written one it needs
+no grid recorded and must not be refused for lacking one.
+
+The assumption is that the codecache outlives the trace. It is a real
+dependency, which is why the origin is a path and says so; a cleared cache
+leaves the operator unpriced, as it was before, rather than priced against
+something else.
+
+#### Where chunked prefill stands
+
+| | operators priced | |
+| --- | --- | --- |
+| at the start | 0 attention, 326/356 | 91.6% |
+| torch operators only | 354/356 | 99.4% |
+| with generated kernels | **365/366** | **99.7%** |
+
+| profiler operators dropped | **364/364** | **100%** |
+
+Recorded and executed are not the same thing. `record_function` dispatches
+`profiler::_record_function_enter_new` and `_record_function_exit`, which run no
+kernel; recording them put operators in every graph that could never be priced
+-- the exit takes an argument no artifact can hold -- so every coverage figure
+carried a permanent shortfall suggesting something was missing. They are now
+executed without being recorded (`NOT_WORK` in `meta.py`).
+
+The step predicts at **-5.53%**, which is the micro-benchmark discount and no
+longer anything specific to chunked prefill.
+
+### The in-situ versus isolated gap, measured on its own
+
+Every validation carried a residual of a few percent, recorded as "the
+micro-benchmark discount" -- isolated prices summing below the measured step,
+assumed to mean kernels run slower in a real step than on their own. It was
+carried as one number for a long time. Measured directly, it is not one thing,
+and it is not that.
+
+`scripts/compass/step_accounting.py` reads a profile and splits a step into the
+time kernels were running and the time the device was running nothing. The step
+is a `gpu_user_annotation` on the device timeline and the kernels are its own
+events, so both come out without assuming any dispatch constant.
+
+**Most of the "gap" was a cold step.** The same chunked prefill, profiled twice:
+
+| | cold | warm |
+| --- | --- | --- |
+| device window | 133.962 ms | **102.982 ms** |
+| kernels running | 97.236 ms | **97.260 ms** |
+| idle between them | 36.726 ms (27.4%) | **5.722 ms (5.6%)** |
+| largest single gap | 14.97 ms | 0.14 ms |
+
+Kernel time is identical to **0.02%**. The 31 ms difference is entirely stalls,
+and they are not spread out: cold, the ten largest gaps are 85.9% of all idle
+(15.0, 8.3, 4.5, 3.0 ms, then a cliff), while the 639 gaps under 100 us total
+2.6 ms. That is compilation, not overhead, and the step being validated against
+had it in. The warm-up bug documented earlier for prefix caching is the same
+mistake in a different place: a warm-up that does not run the shape being
+measured does not warm it.
+
+**Kernels price accurately.** Against the warm step, per kernel: attention
+-0.8%, and the three largest gemms -0.4%, -0.6%, +1.8%, covering 98.7% of the
+step's kernel time. There is no systematic discount at the kernel level -- the
+premise behind "micro-benchmarks always outperform e2e" does not survive being
+measured.
+
+**Pricing a kernel twice.** Priced 104.119 ms against 97.260 in situ. The
+attention operators priced 59.958 ms where their kernels in situ are
+`fmha` 47.382 plus gather 5.883 = 53.265 -- because chunked attention *launches*
+the KV gather, so its price already contains it, and recording the gather as its
+own operator charged the step 4.4 ms of gather on top. Introduced by pricing
+Triton kernels, which is worth stating plainly: that change made the model worse
+in this respect while making its coverage better. Triton launches that happen
+inside a dispatched operator are no longer recorded (`inside_an_operator()`),
+the same way inductor's inner launches already were not. Kernels launched with
+no operator on the stack come from the runner and are still recorded.
+
+After that, priced 99.481 ms against 97.260 in situ, **+2.28%**, and most of the
+remainder is the 31 operators timed outside a graph, whose price is wall time
+per call and so carries launch overhead the in-situ kernel figure does not.
+
+**What is actually wrong is the overhead term.** The cost model charges an eager
+step `max(0, 130us - kernel)` per operator, which here is 21.5 ms. The warm
+step's real idle is **5.7 ms**, 8.5 us per kernel, and the median gap is *zero* --
+kernels run back-to-back and a few dozen small gaps make up the total. Nor does
+a long kernel hide the gap after it, which is what `max(0, dispatch - kernel)`
+assumes: bucketed by the duration of the kernel that ran before them, every
+bucket above 10 us has a median gap of zero.
+
+The constant is not retuned here, because this step runs *compiled* and that
+term was fitted on eager decode steps -- applying it to a compiled prefill is a
+category error rather than a bad constant, and the earlier finding that the
+dispatch constant does not transfer between models (132.70 / 101.22 / 91.72 us)
+says the same thing. What the measurement gives is the target: a compiled step
+pays about 8.5 us per kernel launch, not 130 us per operator.
+
+So the residual decomposes into a cold step, a double count, and an overhead
+model four times too large -- three errors, two of them upward, which partly
+cancelled into a plausible-looking 5.5%. A single number that stays plausible
+across many validations is worth taking apart.
+
+#### Splitting the overhead term
+
+A step runs one of three ways, and the cost model knew two. Replayed: one
+submission, priced per launch at the boundary constant. Eager: dispatched one
+operator at a time, priced `max(0, dispatch - kernel)` per operator. Compiled
+but not replayed is neither -- it submits its kernels from generated code, so
+it pays no eager dispatch, and it is not a single submission, so it pays no
+replay boundary -- and it was being charged the eager term.
+
+`StepShape.compiled` now says which, because nothing in the graph can: tracing
+forces eager, so a compiled step and an eager one record the same operators.
+Only the engine knows, so the runner reports it from `_compilation_level()`.
+A shape that does not say is treated as eager, which is what every graph traced
+before this does.
+
+The constant is 9.71 us per launch, measured rather than fitted: the warm step's
+idle, 5.722 ms, over the 589 launches this model counts for that graph. On the
+chunked prefill:
+
+| overhead model | predicted step | against the warm 102.982 ms |
+| --- | --- | --- |
+| eager (what it was) | 120.997 ms | +17.49% |
+| compiled | **105.200 ms** | **+2.15%** |
+
+**This changes predictions for every compiled non-replayed step, and prior
+end-to-end results were taken with the eager term.** They should be re-measured
+rather than assumed to survive. What can be said without re-running them is why
+the error did not show up before: `max(0, dispatch - kernel)` contributes
+*nothing* for an operator whose kernel exceeds 130 us, so its size depends
+entirely on the kernel-size distribution. On this 0.6B chunked prefill, where
+most kernels are small, it is 21.5 ms. On a 27B prefill, where most are large,
+it is close to zero -- so the term was near-harmless exactly where it was
+validated, and wrong where it was not. Decode steps are unaffected: they replay,
+and the boundary term is untouched.
+
+One step of one model is a thin basis for a constant, and it is exposed as
+`compiled_seconds_per_launch` for that reason.
+
+#### Re-measuring the 27B with the split term
+
+The split was committed with prior end-to-end results flagged as needing
+re-measurement. Re-measured, and the 27B prefill step gets **worse**: -0.14%
+with the old eager term, **-5.59%** with the new compiled one, against a
+measured 320.707 ms.
+
+That is not the term being wrong. Profiling the step and accounting for it:
+
+| | |
+| --- | --- |
+| measured step | 320.707 ms |
+| kernels running in situ | 318.351 ms |
+| real idle | **1.497 ms (0.5%)** |
+| priced kernels | 295.946 ms (**-7.0%** against in situ) |
+| overhead the eager term charged | 24.320 ms |
+| overhead the compiled term charges | 6.849 ms |
+
+The 27B prefill step is 99.5% busy. Its real overhead is 1.5 ms, so *both* terms
+overstate it -- and the eager term's 24.3 ms was standing in for **22.4 ms of
+kernel work that was never priced**, this graph being 62% covered. The -0.14%
+was not a validation of the overhead model. It was a constant fitted on this
+model absorbing a coverage hole, and the two errors cancelling to a number that
+looked like agreement.
+
+So the split did not break the 27B. It removed one of two cancelling errors and
+left the other visible, which is the state that can be fixed. What the 27B needs
+is coverage, and the residual now points at it instead of away.
+
+**And the per-launch idle does not transfer either.** 8.51 us per kernel on the
+0.6B chunked prefill, 0.88 us on this one -- the same failure the dispatch
+constant has across models (132.70 / 101.22 / 91.72 us). Overhead, measured
+honestly, is small in both cases (5.6% and 0.5% of the step); it is only large
+when a fitted constant is quietly carrying something else. `step_accounting.py`
+measures it per deployment in one run, which is the answer to a constant that
+will not transfer: measure it rather than default it. The default stays at the
+0.6B figure and is an argument for that reason.
+
+**A tool bug worth recording.** Accounting for that step first reported *negative*
+idle: under tensor parallelism every rank writes its own kernels into the trace
+under its own pid, and summing across ranks counts two GPUs' work against one
+GPU's window. It now accounts for one device and refuses to report at all when
+the kernels exceed the window, because that is arithmetically impossible and
+every number derived from it would be wrong rather than imprecise.
+
+#### Re-tracing the 27B, and a hypothesis that did not survive
+
+The 27B artifacts predated the Triton, chunked-prefill and profiler work, and
+its prefill graph was 44% `triton::`/`inductor::` operators against 62% coverage.
+The obvious reading was that the 7% shortfall was those unpriced operators. It
+was not.
+
+Re-traced with current code the graph is a different shape:
+
+| | before | after |
+| --- | --- | --- |
+| prefill operators | 1280 | **1005** |
+| of which `triton::` | 433 | **0** |
+| of which `profiler::` | 2 | 0 |
+| coverage | 62.1% | **87.4%** |
+
+Every one of those 433 Triton launches happened *inside* a dispatched operator,
+so they were duplicates of work already in that operator's price, and dropping
+them is the double-count fix arriving on a second model. Coverage rose 25 points.
+
+**And the priced kernel time did not move**: 295.946ms before, 296.999ms after,
+against 318.351ms in situ -- from -7.0% to -6.7%. Twenty-five points of coverage
+bought one millisecond, because what was uncovered was duplicates.
+
+The second guess, that the remaining gap was the 128 still-unpriced
+`inductor::` operators, is also wrong. Profiled, the inductor-generated kernels
+in that step are **2.016 ms, 0.6% of its kernel time** -- against a 21.4 ms gap.
+
+So the 27B's shortfall is not coverage at all. It is in the operators that *are*
+priced: they cost less in isolation than the same work costs in the step, by
+6.7%. That is the opposite direction from the 0.6B, where isolated pricing came
+out 2.28% *high*. Two models, two signs, and the instrument that would settle it
+-- the per-kernel comparison in `step_accounting.py` -- needs the per-signature
+kernel breakdown, which is off under parallelism because it deadlocks. That is
+the next thing to fix, and it is now the only thing between here and an answer.
+
+Predicting the step with the new artifacts: **-4.70%** with the compiled term,
+**+2.03%** with the eager one, against a measured 320.707ms.
+
+**Loading generated kernels faults under tensor parallelism.** Enabled at TP=2
+it kills pricing with "Memory access fault by GPU node-2" partway through, and
+this took two attempts to bound: another rank's module must not be loaded at all
+(the cache path names the rank, and loading one leaves the process on a device
+it cannot use -- "invalid device ordinal" much later, far from the cause), but a
+rank loading only its own still faults. So it is now off under parallelism like
+`PRICE_KERNELS`, for a worse reason: a fault takes the whole run, where an
+unpriced operator takes one signature. The cost of that default is the 2.0 ms
+measured above.
+
+#### The breakdown deadlock that was not one
+
+Per-signature kernel breakdowns were believed to deadlock under parallelism and
+`PRICE_KERNELS` defaulted off there. Both halves were wrong.
+
+**The gate never fired.** It read `WORLD_SIZE`, which the engine never sets --
+it spawns its ranks itself -- so `int(os.environ.get("WORLD_SIZE", "1")) > 1`
+was false in every worker and breakdowns were taken at TP=2 all along. The
+proof was in the artifact the whole time: the 27B price list written under the
+supposedly-off gate carries breakdowns for **164 of its 237** entries.
+
+Three defaults in this file were written that way. `under_parallelism()` now
+asks the process group, which is the thing that knows, and cannot be a
+module constant because the group is not up when the module is imported.
+
+**And a dead gate is worse than no gate**, because it is trusted. Loading
+inductor-generated kernels faults the device at TP=2; that was found, gated
+"off under parallelism", and the explicit override dropped from the run script
+on the strength of the gate. Five runs then faulted, and each fault was read as
+evidence about whatever had changed most recently -- the collective exclusion,
+the eager calls, the profiler -- when the cause was the same known defect,
+ungated. The signature the fault appeared to blame moved between runs
+(`aiter::masked_embedding`, then `aten::item`) because an HSA fault surfaces at
+the next synchronise, not at the kernel that caused it, so the "culprit" was
+whichever operator happened to synchronise next.
+
+Two real improvements came out of chasing it, and both stand on their own:
+
+* **A breakdown is taken from replaying the graph that was timed**, not from two
+  extra eager calls of the operator. No extra launches, nothing run that was not
+  already run, and the kernels are the ones the price is a price *of*. It also
+  removes the one way a breakdown genuinely could have hung a rank: for a
+  collective, two extra calls its peers do not make. Operators that cannot be
+  captured get no breakdown, which is the price of never calling an operator any
+  way but the way it was priced.
+* **Only signatures that carry time get one.** Each is a profiler session, and
+  sessions are the scarce thing; under parallelism the threshold is 1ms of step
+  contribution, taking 312 signatures down to 15.
+
+#### What the 27B's per-kernel comparison says
+
+With breakdowns working at TP=2, the kernels covering **90.5% of the step's
+kernel time** price like this:
+
+| in situ | isolated | diff | kernel |
+| --- | --- | --- | --- |
+| 100.243 ms | 104.285 ms | +4.0% | gemm `MT256x2..` |
+| 46.954 ms | 46.847 ms | -0.2% | gemm `MT208x2..` |
+| 41.029 ms | 40.704 ms | -0.8% | gemm `MT256x1..` |
+| 37.295 ms | 36.246 ms | -2.8% | `cross_device_reduce_1stage` |
+| 35.842 ms | 35.675 ms | -0.5% | gemm `MT256x1..` |
+| 20.422 ms | 20.401 ms | -0.1% | gemm `MT224x2..` |
+
+Everything that carries the step is priced to within a few percent, the
+collective included. So the 27B's -6.7% is **not** spread thinly across the
+priced kernels, which was the remaining hypothesis. It is concentrated in the
+9.5% of kernel time -- about 30 ms -- that no priced signature accounts for.
+That is a much smaller thing to go and find than "the operators are underpriced",
+and it is where the next look should go.
+
+#### The 27B's missing 30ms: the DeltaNet layers were never running
+
+With breakdowns working, the kernels in the step that no priced signature
+accounts for come to **27.214 ms, 8.5%** — and they are one family:
+
+| ms | kernel |
+| --- | --- |
+| 5.745 | `chunk_gated_delta_rule_fwd_kernel_h_blockdim64` |
+| 4.644 | `_fused_merge_recompute_kernel` |
+| 3.120 | `chunk_fwd_kernel_o` |
+| 3.037 | `_causal_conv1d_fwd_kernel` |
+| 1.257 | `solve_tril_16x16_kernel` |
+| 1.186 | `_fused_cumsum_kkt_kernel` |
+| 0.623 | `l2norm_fwd_kernel2` |
+
+The gated-DeltaNet path. Qwen3.8-27B is a hybrid and 48 of its layers are
+DeltaNet rather than attention, and all of them run inside one operator that
+*is* in the graph and *is* priced:
+
+    aiter::linear_attention_with_output_base   x48
+      context recorded : NONE
+      priced           : 5.793 us each, 0.277 ms over all 48
+      breakdown        : one FillFunctor kernel
+      in situ          : 0.567 ms each, 27.214 ms over all 48
+
+Priced at **1% of its cost**, and the breakdown says why in one kernel name.
+`attention_gdn.py` opens with
+
+    gdn_metadata = getattr(fwd_ctx.attn_metadata, "gdn_metadata", None)
+    if gdn_metadata is None:
+        core_attn_out.zero_()
+        return core_attn_out
+
+so with no GDN metadata installed the operator zeroes its output and returns.
+The benchmark was timing 48 `zero_()` calls and pricing the linear-attention
+half of a hybrid model at nothing.
+
+This is the failure that priced attention at 7x, in the other direction and in
+the operator nobody extended `forward_ctx` to. It is worth stating what the
+earlier fix did *not* do: it made attention take its recorded context, and left
+every other context-dependent operator silently taking whatever was installed --
+which for this one is nothing at all, and reads as a very cheap operator rather
+than as an error.
+
+It also explains the sign puzzle. The 0.6B, which has no DeltaNet layers, priced
+2.28% *high*; the 27B priced 6.7% low. Not two models disagreeing about pricing
+-- one model with an entire layer type missing from its cost.
+
+#### Giving the DeltaNet layers their context
+
+`forward_ctx` now captures and installs the GDN metadata for
+`aiter::linear_attention_with_output_base`, the way it already did for
+attention. Two things made it more than a copy of the attention case:
+
+* **The state is not recorded.** The recurrent and convolution state lives in
+  `kv_cache_data`, which the engine sets once at start-up, so it is already real
+  in the process doing the pricing. Recording it would mean carrying a per-layer
+  cache in a JSON artifact to rebuild something already present.
+* **The convolution metadata is recomputed, not recorded.** `causal_conv1d_fn`
+  is handed the GDN metadata as its own and reads `nums_dict`, `batch_ptr` and
+  `token_chunk_offset_ptr` off it. Those are a pure function of the query start
+  offsets, which *are* recorded, so the installer calls the engine's
+  `compute_causal_conv1d_metadata` -- exact, where a recording would be a copy.
+  Without them the operator dies on `batch_ptr.device` with `batch_ptr` None.
+
+| | before | after |
+| --- | --- | --- |
+| linear attention, 48 layers | 0.277 ms | **22.588 ms** |
+| prefill kernels priced | 296.999 ms | **319.310 ms** |
+| against 318.351 ms in situ | -6.7% | **+0.30%** |
+
+The 27B's kernel pricing is now accurate to a third of a percent, and the
+sign puzzle is gone with it.
+
+**What is left is the overhead constant, and only that.** Predicting the whole
+step gives +4.62%: the priced kernels are right to +0.30% and the compiled
+overhead term adds 16.2 ms where the step's measured idle is 1.497 ms. That
+constant was measured on the 0.6B (9.71 us per launch) and this step wants about
+a sixth of it -- the non-transfer already documented, now the *only* term
+between this model and its measured step. `step_accounting.py` measures it per
+deployment in one run.
+
+Two harness fixes came with it, both from failures this exposed:
+
+* Installing a context ran outside the per-signature guard, so one installer
+  raising took the whole pricing run and every signature with it. It is guarded
+  now, and an operator whose context cannot be stood up is unpriced like any
+  other.
+* An unpriced entry records **where** it failed, as `file:line` in this
+  codebase. `AttributeError: 'NoneType' object has no attribute 'device'` names
+  neither the field that was None nor the branch that wanted it; the frame
+  named both, and two rounds of guessing had already been wrong.
+
+#### Measuring the overhead instead of defaulting it
+
+The compiled per-launch constant does not transfer -- 9.71 us on the 0.6B, 0.90
+us on the 27B -- so the answer is not a better default. `step_accounting.py
+--calibrate` writes what the profiled step actually pays, over the launches
+*the cost model counts*, and `PricedGraphCostOracle(calibration=...)` reads it:
+
+    this step pays 1.497 ms of overhead over 1669 launches
+    0.90 us per launch
+
+Counting launches the same way the oracle does matters more than it looks: the
+number is divided by a denominator it will later be multiplied by, and any other
+sense of "launch" would leave a constant that is right about a quantity nobody
+uses.
+
+The 27B prefill step, end to end:
+
+| | predicted | against 320.707 ms measured |
+| --- | --- | --- |
+| eager term (where this started) | 349.499 ms | +8.98% |
+| compiled term, 0.6B constant | 335.516 ms | +4.62% |
+| compiled term, calibrated here | **320.807 ms** | **+0.03%** |
+
+Kernels priced in isolation to +0.30% and overhead measured from one profiled
+step. Worth saying what that number is and is not: it is one step of one model,
+and the calibration was taken from *that* step, so it is a demonstration that
+the two terms are separately right rather than a prediction of an unseen
+configuration. The test of the second thing is a shape the calibration was not
+taken on.
+
+#### That test, run: the constant is not a constant
+
+Cross-applying the constant between the two shapes of one 27B run -- same
+model, same profile, same price list, so nothing varies but the shape:
+
+| step | idle | launches | us/launch |
+| --- | --- | --- | --- |
+| `prefill[bs=4 tok=1256]` | 1.497 ms | 971 | **1.5418** |
+| `decode[bs=4 tok=4 d=4]` | 0.012 ms | 1073 | **0.0114** |
+
+**135x apart** -- and then the interesting part, which is that this does *not*
+show what it first appeared to.
+
+**Correction, and it matters.** These two steps are on opposite sides of a
+regime boundary the oracle already respects. `estimate()` branches on
+`capture_bucket`: a replayed step is charged `launches x boundary_seconds`, a
+compiled-but-not-replayed one `launches x compiled_seconds_per_launch`, an
+eager one a dispatch term -- and the comment beside it already says the
+difference is thirtyfold. The prefill here ran eagerly; the decode has
+essentially no gaps at all, which is the signature of a replay: one submission,
+the host out of the loop, 950 kernels and 0.012 ms between them. So the model
+would never apply the prefill constant to that decode step, and the "8.9% of an
+18.5 ms step, invented" that this entry first claimed does not follow. What the
+135x actually demonstrates is that the regime split is *justified*, which is
+evidence for the model's structure rather than against it.
+
+(The decode graph's own `capture_bucket` is null, but that artifact came from a
+trace-mode run, where capture is skipped by design -- so it cannot testify to
+how the profiled step ran. The near-zero gaps are the evidence, and they are
+strong but indirect.)
+
+So the held-out question is still open, and the test that answers it is a
+**within-regime** one: two eager prefill steps of different shapes, or two
+replayed decode steps at different rungs. Crossing regimes was the wrong
+experiment, and it took building a stall model on top of it to notice.
+
+Validated against the *idle*, not the step, and deliberately. The overhead is
+under half a percent of a prefill step, so a step-level comparison would have
+had any error in the kernel term swamp it -- the two terms have to be checked
+apart or neither is checked at all. `holdout.py` does the cross-application.
+
+**Why it does not transfer is visible in one number: the median gap is zero.**
+In both shapes. So is p90.
+
+| | prefill | decode |
+| --- | --- | --- |
+| median gap | 0.00 us | 0.00 us |
+| p90 gap | 0.00 us | 0.00 us |
+| largest 10 gaps, as a share of all idle | 83.7% | 92.7% |
+
+Nearly every launch is followed by no gap whatever, and the idle is
+concentrated in a few stalls -- the largest ten are 36% of the prefill step's
+idle, and the largest gaps all sit at kernel indices 1 to 34, at the very
+*start* of the step. Whatever they are, they are not a per-launch rate spread
+evenly over the step.
+
+That much survives the correction above, and it is a reason to doubt
+`launches x constant` as the *within-regime* form -- but it is now a
+hypothesis to test rather than a demonstrated failure. The one thing the
+cross-regime comparison did establish is that the constant does not transfer
+between models (9.71 us against 0.90), which was already known.
+
+It also depends on the *price list*, since launches are counted as
+`max(1, len(kernels))` per priced operator: the same prefill step reads 0.90 us
+per launch against one price list and 1.54 against another, from the same
+profile. A constant with three dependencies and no mechanism is a fitted
+residual wearing a mechanism's clothes.
+
+What this does **not** overturn: the kernel term. Prices are validated against
+in-situ kernel time per operator, which is a separate measurement and stands.
+The 27B's +0.03% whole-step figure, though, should be read as what it is -- a
+fit residual on the one step the constant came from.
+
+#### The within-regime test, and what it found
+
+Four warm prefill shapes on the 0.6B, one regime, one model, launch count
+fixed at 391 (prefill runs the same operator sequence whatever its size, which
+is what makes this a clean experiment):
+
+| tokens | kernels | idle | **device window** |
+| --- | --- | --- | --- |
+| 794 | 13.384 ms | 23.360 ms (63.6%) | **36.745 ms** |
+| 2294 | 27.037 ms | 11.195 ms (29.3%) | **38.232 ms** |
+| 6594 | 110.046 ms | 0.033 ms (0.0%) | 110.080 ms |
+| 15694 | 418.164 ms | 0.009 ms (0.0%) | 418.173 ms |
+
+Read the last column, not the idle. The window sits at ~37 ms while the
+kernels double, and then tracks the kernels exactly once they exceed it. The
+step is **host-bound** until the device catches up:
+
+    step = max(kernel time, launches x host time per launch)
+
+At 95.8 us per launch -- fitted to the two host-bound rows -- that holds all
+four to within 2%. The 6594-token row was a held-out prediction before it ran:
+device work ~110 ms against a ~37 ms floor, so device-bound with near-zero
+idle. It came back at 0.033 ms.
+
+The additive term cannot express this, and the failure is not subtle. Fitted
+to the smallest shape it over-predicts the largest by **+5.6%**; fitted to the
+largest it under-predicts the smallest by **-63.6%**. Same model, same regime,
+same launch count -- so the answer to "does the constant transfer within a
+regime" is no, and this time for a reason that names its own replacement.
+
+Two things this vindicates and one it corrects. The regime split was right
+(the cross-regime entry above). The *eager* branch was right too: it already
+computes `sum(max(0, dispatch - kernel))`, which is this same max taken per
+operator. Only the compiled branch was additive, and it now takes the max at
+step level -- which is the right scale, because an asynchronous queue lets the
+host run ahead across operators, not just within one.
+
+`compiled_seconds_per_launch` is kept, reached by setting the host constant to
+zero, so an old calibration still loads and still means what it meant.
+
+**The constant holds across widths, and across machines.** The local box was
+too contended to finish, so the sweep was repeated on `hjbog-srdc-16` -- a
+different machine, whose GPUs are about 20% faster.
+
+| | launches | plateau | us per launch | | node 16 plateau | us per launch |
+| --- | --- | --- | --- | --- | --- | --- |
+| TP=1 | 391 | ~37.5 ms | **95.8** | | ~37.4 ms | **95.7** |
+| TP=2 | 505 | ~45.0 ms | **89.1** | | ~45.1 ms | **89.3** |
+| TP=4 | 505 | -- | -- | | ~45.1 ms | **89.3** |
+
+Two things worth more than the agreement itself.
+
+**The device changed and the floor did not.** Node 16 runs the same kernels
+about 20% faster -- 85.9 ms against 110.0 ms at 6594 tokens -- and its host
+floor is the same 37.4 ms. A floor that ignores a 20% swing in device speed is
+a floor on the host side, which is what the model claims it is. Repeating the
+measurement on one box could never have shown that.
+
+**TP=4 costs exactly what TP=2 costs.** Same 505 launches, same 45.1 ms floor.
+The collectives add a fixed 114 launches the moment the width exceeds one and
+add nothing further after that, so the floor is flat above TP=1 -- the same
+shape the graph pool turned out to have, and for a related reason.
+
+The 7% between 95.7 at TP=1 and 89.3 above it reproduces on both machines, so
+it is real rather than noise: the collective launches appear to be slightly
+cheaper per launch on the host side, pulling the average down.
+
+So `launches x h` picks the width dependence up through the launch count, and
+`h` is a property of the host stack rather than of the machine or the topology.
+
+**It is not a property of the model, though.** The 27B, on the same node at
+TP=2, with three shapes that walk right through the crossover:
+
+| tokens | kernels | idle | window | `max(kernels, 213.5 ms)` | |
+| --- | --- | --- | --- | --- | --- |
+| 294 | 71.2 ms | 67.5% | 219.1 ms | 213.5 ms | -2.6% |
+| 94 | 131.5 ms | 37.9% | 211.7 ms | 213.5 ms | +0.9% |
+| 794 | 205.8 ms | 1.9% | 209.8 ms | 213.5 ms | +1.8% |
+| 2294 | 425.3 ms | 0.8% | 428.8 ms | 425.3 ms | -0.8% |
+
+Idle collapses from 67.5% to under 1% as the device work climbs past the floor,
+and the last row is on the far side of it -- kernels at twice the floor, the
+step tracking the kernels. One constant holds all four within 2.6% across a
+step time that doubles. The plateau is ~213.5 ms over 1708 launches:
+
+| | launches | plateau | us per launch |
+| --- | --- | --- | --- |
+| 0.6B TP=1 | 391 | 37.4 ms | 95.7 |
+| 0.6B TP=2, TP=4 | 505 | 45.1 ms | 89.3 |
+| 27B TP=2 | 1708 | ~213.5 ms | **125.0** |
+
+**40% higher on the 27B.** So `h` survives a change of machine (0.2%) and a
+change of width (exactly), and does not survive a change of model. It has to be
+calibrated per model -- which `step_accounting --calibrate` now does, and
+refuses to do on a device-bound step.
+
+That is a far better position than the additive constant it replaced, which
+differed 10x between the same two models and 2600x between shapes of one. But
+"one constant per box" was too strong, and the 40% is the correction: one
+constant per *model on a stack*, measured on any host-bound shape of it.
+
+#### `busy` at TP>1 is not device work: the collective absorbs the skew
+
+Several campaigns showed a step's device time running *backwards* in its token
+count -- 131.5 ms at 94 tokens against 71.2 ms at 294 on the 27B, 32.9 against
+22.3 at TP=2 on the 0.6B. The obvious explanation was cold caches, and it is
+wrong. Running one shape twice in a freshly cold container:
+
+| | busy | window | idle |
+| --- | --- | --- | --- |
+| original campaign | 131.5 ms | 211.7 ms | 37.9% |
+| pass A, cold container | 43.3 ms | 213.3 ms | 79.7% |
+| pass B, same container | 32.2 ms | 216.6 ms | 85.1% |
+
+`busy` moves 4x and the window does not move at all. Autotuning fires the same
+six times in both passes, so it is not that either. Per kernel, with identical
+counts:
+
+| kernel | n | A | B | B/A |
+| --- | --- | --- | --- | --- |
+| `Cijk_...` gemm | 257 | 19632.9 us | 19662.2 us | 1.00x |
+| **`cross_device_reduce_1stage`** | 129 | **14554.5 us** | **3400.9 us** | **0.23x** |
+| `_fused_merge_recompute_kernel` | 48 | 1497.2 us | 1488.6 us | 0.99x |
+
+Every compute kernel matches within 4%. All of the variance is the all-reduce,
+and the reason is not mysterious: **a collective kernel's duration includes
+waiting for its peer.** A rank that arrives early sits inside the reduce until
+the other catches up, so the measured "kernel time" of a tensor-parallel step
+absorbs inter-rank skew, which is not device work.
+
+Three consequences.
+
+* `step_accounting`'s idle -- `window - busy` -- **understates** true idle at
+  TP>1, because the waiting is counted as busy.
+* Its host-bound test for `--calibrate` (idle above 10% of the window) can
+  therefore call a genuinely host-bound step device-bound and refuse to
+  measure the host constant. It warns about this now rather than silently
+  adjusting: which part of a collective's duration is transfer and which is
+  waiting is not visible in the trace, and inventing a split would be worse
+  than naming the limit.
+* Any in-situ-versus-isolated comparison at TP>1 has the same contamination on
+  its in-situ side.
+
+None of it touches the host constant, which is read from the *window*, or the
+device-bound points, where the device is saturated and there is no skew to
+absorb. It does touch anything that reads `busy` from a host-bound step at
+TP>1, which should now be read as an upper bound on device work.
+
+**Still to do here, and it is the box's fault rather than the method's.** The
+27B and TP=4 runs of the same campaign died at initialisation, repeatedly:
+
+    available_for_kv=-103667.58MB (budget=57.60GB, peak_torch=2.94GB,
+    non_torch=152.01GB, cudagraph_est=0.05GB, safety=3.84GB, free=37.16GB)
+
+`non_torch` at 152 GB on a card where this process had reserved 2.9 GB -- the
+neighbours, charged to this configuration, which is the device-wide reading
+documented under `non_torch` above showing up as a *failure to launch* rather
+than as a distorted measurement. No utilization setting fixes it: the budget
+only goes positive above 0.83, which on a box shared with twenty containers is
+not a setting to reach for, and the `min(budget, free)` clamp would refuse it
+anyway. The campaign needs a quiet box, not a bigger number.
+
+That leaves the host constant measured on one model at two widths. It should
+still be checked on the 27B before it is trusted across models -- the earlier
+per-launch constants differed 10x between these two models, and while this one
+has a mechanism that the additive one lacked, that is a reason to expect it to
+transfer rather than evidence that it does.
+
+**A method note worth keeping.** Two of the numbers on the way here were
+wrong in ways that only checking caught. A naive next-start-minus-previous-end
+gap walk gave 3.885 ms of prefill idle against `step_accounting`'s 1.497 ms;
+the union of kernel intervals showed no overlap at all, so the difference was
+entirely kernels straddling the step boundary that the naive filter dropped --
+`step_accounting`'s figure is the right one. And the cross-regime comparison
+above looked like a model failure until the oracle's own branching was read.
+
+## Being profiled costs about a microsecond a kernel, and that was the baseline
+
+Two quantities had been standing in for "the step", quoted side by side without
+saying which process produced each:
+
+* the **kernel sum** inside a profiled step -- the kernels of one device's step
+  annotation, added up -- at 10.529 ms on a 27B TP=4 decode, and
+* the **event elapsed** from the measure table, a `torch.cuda.Event` pair around
+  the whole forward, at 9.774 ms for the same shape.
+
+Each is reproducible to about 0.2% inside its own run. They are 7.5% apart, and
+the kernel sum -- which measures a *subset* of what the events bracket, and must
+therefore be the smaller -- was on top. That is not a residual to model. One of
+the two was wrong about something.
+
+Three explanations fit. The kernel sum could be double-counting concurrent
+streams; ATOM has an `async_copy_stream`, and a sum over overlapping intervals
+is not busy time. The events could be missing device work, if the forward
+launched onto a stream they do not bracket -- that would be a real defect in the
+measure table, which every fitted constant depends on. Or being profiled could
+cost something.
+
+The first is refutable from a trace already on disk, and was refuted: the 951
+events inside that step are all on one stream, and their sum equals the union of
+their intervals to the microsecond. `busy` is genuine device-busy time.
+
+The other two are separated by a run that is its own control. `profile_shape.py`
+warms for several rounds with the profiler shut and profiles the last one, so a
+measure table written across the whole process holds both regimes in order, in
+one process, at one shape:
+
+       40:  12.293 12.383 12.346 12.353 12.336 12.411 12.366 12.351  <- opens
+       48:  13.370 13.389 13.373 13.302 13.273 13.289 13.366 13.369
+
+The step time steps up by 8.1% exactly where the profiler opens, and stays up.
+So the events do see the extra work: they are not blind to a stream, and the
+measure table has no defect. Within the profiled round the ordering that has to
+hold, holds -- event 13.367 >= window 13.088 >= kernels 13.082 ms.
+
+Repeated on a second model, and the cost is per kernel rather than per step:
+
+| | kernels in a step | profiling costs | per kernel | kernel sum over unprofiled step |
+| --- | --- | --- | --- | --- |
+| 27B TP=4 decode | 951 | +1.002 ms (+8.1%) | +1.05 us | +5.8% |
+| 0.6B TP=1 decode | 396 | +0.276 ms (+8.5%) | +0.70 us | +3.0% |
+
+**So neither number was wrong; the comparison was.** A profiled kernel reports
+about a microsecond more than it takes, a decode step launches hundreds of them,
+and a price list gathered without a profiler cannot be held against an in-situ
+figure gathered with one. `step_accounting` printed exactly that comparison as
+`isolated is X% of in situ`, which is biased by however much the profiler cost,
+in the direction of flattering the prices. It now says the in-situ figure is
+profiled, and takes `--steps` to compare against a step nobody was watching.
+
+**The baseline, stated once.** The cost model is validated against the measure
+table: CUDA events, no profiler, the thing a serving run actually experiences.
+A profile is for attribution *within* a step -- which kernel, what share, how
+much idle -- and never for an absolute. The two must not be mixed, and the
+percentages that mixed them are void.
+
+Two consequences that are not cosmetic.
+
+* The host constant from `--calibrate` is a **floor**. Idle is `window - busy`,
+  a difference, so the profiler's cost lands on it whole and shrinks it. On the
+  shapes it was fitted from -- prefills 30-64% idle -- that is a 1-2%
+  under-estimate, inside the agreement already claimed, so it is stated rather
+  than corrected for. On a step with little idle it would not be, and such a
+  step should not be calibrated from at all.
+* The residuals from the previous section survive, because both of their columns
+  came from one unprofiled process: `run.py --compass-mode measure` writes the
+  price list and the step table together. Re-derived with provenance attached:
+
+| | priced sum, work only | measured decode step | |
+| --- | --- | --- | --- |
+| 27B TP=4 | 9.975 ms | 9.774 ms | +2.1% |
+| 27B TP=8 | 7.543 ms | 7.864 ms | -4.1% |
+
+  The number that never belonged in that table is the profiled 10.529 ms, and
+  removing it is the whole correction.
+
+**A caution about machines, met on the way.** The same 27B TP=4 decode is
+9.774 ms on one box and 12.365 ms on another, both unprofiled, a 26% difference.
+Comparisons must be within one machine as well as within one profiling regime.
+Everything in the table above is from a single box.
+
+## The collective boundary constant at TP=8: there is no boundary to measure
+
+The notes said TP=8 would separate linear-in-group from linear-in-log2 for the
+collective boundary term, with TP=2 at 4.20us and TP=4 at 9.72us as the two
+points and ~20us against ~14.5us as the predictions. Both laws are refuted, and
+so is the quantity they were laws about.
+
+**The residual method had already stopped working.** With `HOST_SYNC` excluded
+the blocked table reads:
+
+| | priced plain | priced coll | total | step | residual |
+| --- | --- | --- | --- | --- | --- |
+| 27B TP=4 | 8.732 ms | 1.243 ms | 9.975 ms | 9.774 ms | -0.201 ms |
+| 27B TP=8 | 6.164 ms | 1.378 ms | 7.543 ms | 7.864 ms | +0.321 ms |
+
+A per-launch constant cannot change sign between two widths of one graph on one
+machine, and the plain term alone -- 883 launches x 1.82us = 1.607 ms -- already
+exceeds the residual at both. Nothing can be fitted from this, and the
+inner-kernel double count the notes warn about is not the reason: of the 130
+operators carrying `launch`, two are priced at all, worth 4 microseconds.
+
+**A profile measures the boundary directly, and needs no price list.** The
+boundary *is* the gap between one kernel ending and the next starting. Three
+widths of the 27B on one machine, each run its own control, gaps in nanoseconds:
+
+| width | step (unprofiled) | idle in a step | gap after plain | gap after collective |
+| --- | --- | --- | --- | --- |
+| TP=2 | 17.830 ms | 0.012 ms (0.06%) | med 1.0 p90 2.0 ns | med 1.0 **max 2.0** ns |
+| TP=4 | 12.398 ms | 0.012 ms (0.09%) | med 1.0 p90 2.0 ns | med 1.0 **max 2.0** ns |
+| TP=8 | 10.094 ms | 0.012 ms (0.11%) | med 1.0 p90 2.0 ns | med 1.0 **max 2.0** ns |
+
+Over roughly 2065 gaps following a collective launch at each width, not one
+exceeds two nanoseconds. The collective boundary is 13ns *below* the plain one
+at all three widths -- which is to say both are nil. A replayed step is its
+kernels, back to back; the 12us of idle is a single gap per step where the graph
+is segmented, identical at every width.
+
+**Why this is not the profiler closing the gaps.** It is the obvious objection,
+since profiling inflates kernel durations, and a profile alone cannot separate
+"no gap" from "gap absorbed into the kernel before it". Three things settle it.
+Trace timestamps carry about a nanosecond of resolution (`...17661.284` us,
+durations like `4.919`). Gaps across a whole trace spread smoothly over the
+sub-microsecond range rather than piling up at exactly zero -- 14888 in (0, 1)us
+against 2343 at exactly zero. And the decisive one: if each launch paid 2.25us,
+every step would show about 950 gaps in the 1-5us band. Across 15200 gaps per
+configuration that band holds **zero**, while the same traces record 16 gaps
+above 5us, and an eager prefill profiled identically came out 63.6% idle. The
+instrument records gaps of the size in question. There are none.
+
+**What does carry group width is the collective kernel itself**, which the price
+list already charges for, and it is nearly flat:
+
+| | TP=2 | TP=4 | TP=8 | TP=2 -> TP=8 |
+| --- | --- | --- | --- | --- |
+| `cross_device_reduce_1stage`, in situ | 9.08 us | 10.40 us | 10.95 us | **+20.6%** |
+| `allgather_lastdim`, in situ | 29.00 us | 23.73 us | 16.39 us | **-43.5%** |
+| collectives as a share of kernel time | 6.6% | 10.4% | 13.4% | |
+
+Linear-in-group predicts +300% across that range and linear-in-log2 +200%. The
+measurement is +20.6%, and the all-gather runs *faster* at eight ranks than at
+two because each rank contributes a smaller slice. The price lists, gathered on
+a different machine by a different instrument, say the same thing: 9.64us per
+collective at TP=4 against 10.68us at TP=8, +10.8% for a doubling. A one-stage
+reduce on a fully-connected fabric is latency-bound at these sizes, so adding
+ranks costs almost nothing -- which is a claim about this interconnect, not
+about collectives, and should be re-measured on a multi-node deployment before
+being relied on there.
+
+**So the term is retired rather than fitted.** The 4.20us and 9.72us figures do
+not reproduce; they were a residual being divided by a launch count, and the
+residual is pricing error. `DEFAULT_BOUNDARY_SECONDS` keeps its value and loses
+its explanation: its docstring now says what it actually is. Removing it would
+make predictions worse without making them righter, because the pricing error it
+absorbs is real and unmodelled -- ~28% low on the 0.6B, ~2% high on the 27B.
+
+**The next measurement is named and small.** A priced sum, a measured step and a
+profile, all from one machine at one width, would separate pricing error from
+everything else for the first time -- every comparison so far has had at least
+one of the three from somewhere else. The runs here have the step and the
+profile; only the price list is missing.
+
+## The residual is pricing error, measured: `scripts/compass/residual.py`
+
+Every comparison in this project had been assembled from at least two runs, and
+sometimes two machines. Node 16 in fact had all three quantities -- a priced
+sum, a step and a profile -- but the constant needed to correct the profile came
+from a different run there. Gathering the set properly on one box, at two
+widths, with the profiler's cost measured *inside one process*, splits the
+residual for the first time:
+
+    step  =  device busy  +  idle between kernels  +  work outside the annotation
+    residual  =  (busy - priced)  +  idle
+                  pricing error      boundary
+
+| | priced | step | residual | boundary (idle) | pricing error |
+| --- | --- | --- | --- | --- | --- |
+| 27B TP=4, box A | 9.971 ms | 9.774 ms | -0.197 ms | +0.010 ms (10.5 ns/launch) | -0.207 ms (-2.1%) |
+| 27B TP=4, box B | 11.249 ms | 12.385 ms | +1.135 ms | +0.012 ms (12.6 ns/launch) | +1.123 ms (+10.0%) |
+| 27B TP=8, box B | 8.806 ms | 10.073 ms | +1.267 ms | +0.012 ms (12.8 ns/launch) | +1.255 ms (+14.3%) |
+
+The boundary is 10.5 to 12.8 nanoseconds per launch on three configurations
+across two machines, against the 2250 ns the model charges. On box A the
+modelled boundary is **twelve times the entire residual**, and of the wrong
+sign. The residual is pricing error almost in full.
+
+**The measurement is trustworthy in a way the earlier ones were not**, because
+the step appears twice. The priced run and the profiled run are separate
+processes with slightly different flags, and they agree on the decode step to
++0.11% at TP=4 and +0.21% at TP=8. That agreement is what licenses reading idle
+off one and the priced sum off the other.
+
+**Where the pricing error lives.** Correcting each kernel's in-situ time by the
+profiler's cost per dispatch -- 0.665 to 0.676 us, measured within the process
+that recorded it -- and comparing against the price list's own per-kernel
+breakdown:
+
+| kernel | box A TP=4 | box B TP=4 | box B TP=8 |
+| --- | --- | --- | --- |
+| `__amd_rocclr_copyBuffer` | +262.7% | +186.6% | +171.3% |
+| `cross_device_reduce_1stage` | +33.3% | +12.4% | +7.4% |
+| the GEMMs (`Cijk_...`) | +1.1 to +31.7% | -1.6 to -9.6% | -0.6 to -13.8% |
+| all checkable names together | +19.2% | +3.9% | +1.9% |
+
+Two errors are structural and survive both the machine and the width: the buffer
+copy is priced at roughly three times what it costs, and the collective at up to
+a third over. The GEMMs are the machine-dependent part, priced above their
+in-situ time on one box and below it on the other, which is what one would
+expect of a tight benchmark loop leaving the device in a different clock state
+than a step does.
+
+**And about a quarter of kernel time cannot be checked at all.** The price
+list's per-kernel breakdowns are sparse under parallelism, so 2.28-2.40 ms a
+step -- 23-24% of it, on both machines and both widths -- has no priced
+counterpart to compare against. It is not unpriced; its operators have prices.
+It simply cannot be audited by name, and the arithmetic says it is where the
+underpricing sits: at TP=4 on box B the checkable kernels are priced 3.9% *over*
+their corrected in-situ time while the total is 10% under.
+
+What is in it is the hybrid's own machinery, and the launch counts identify it
+exactly -- 48 per step for `fused_recurrent_gated_delta_rule_fwd_kernel`,
+`_causal_conv1d_update_kernel` and `fused_gdn_gating_kernel`, which is the
+27B's 48 gated-DeltaNet layers; 16 for `paged_attention_decode_sliding_window`,
+its 16 attention layers; 64 for `act_and_mul_kernel`, every layer's MLP. These
+are Triton kernels launched from inside custom operators, which is the same
+structure `TritonLaunchTracer` records at two levels and `residual.py` skips one
+of. Making them checkable is the next piece of work, and it is a change to what
+the price list records rather than a new measurement campaign.
+
+**A caution that is now quantified.** The pricing error differs between two
+machines running the same model at the same width by 12 percentage points --
+more than it differs between TP=4 and TP=8 on one box (4 points). Any residual
+assembled across machines is measuring the machines. `residual.py` says so in
+its docstring; the campaigns behind the tables above were each run on one box.
+
+## A threshold on the signature cannot see an operator that fragments
+
+A quarter of a replayed step's kernel time had no priced breakdown to be checked
+against. The cause was not a budget and not parallelism. `_time_in_graph` took a
+breakdown for any signature carrying a millisecond of the step, and
+`aiter::linear_attention_with_output_base` never carries one: it arrives as **48
+signatures of 0.093 ms**, one per layer, because its signature holds per-layer
+state. Every fragment falls under the bar while the family is the third largest
+thing in the step at 4.47 ms. Same for `unified_attention_with_output_base` at
+16 signatures, and `silu_and_mul` missed the bar outright at 0.950 ms.
+
+So a signature now earns a breakdown two ways: by carrying a millisecond, or by
+being the first of an operator nobody has taken apart yet. One per family is
+enough to *name* an operator's kernels, which is what an audit needs, and it
+bounds the cost -- 30 distinct operator names against the several hundred
+profiler sessions that fault the device under parallelism. Re-priced at TP=4:
+
+| | before | after |
+| --- | --- | --- |
+| breakdowns taken | 8 | 24 |
+| operators with one | 3 of 28 | 18 of 28 |
+| work-term contribution auditable | 80.2% | **100.0%** |
+| kernel time with nothing to check it | 24% | **6%** |
+
+No fault, which was the real risk. The 6% left is the inductor-generated Triton
+kernels, unpriced by design because loading them faults at TP>1.
+
+**The audit had to change with it.** One breakdown for 48 signatures means a
+tool that sums `kernels` across price entries puts one signature's kernel time
+against 48 launches and reads a 48-fold underpricing. `residual.py` now
+attributes each signature by its own breakdown where it has one -- the six
+shapes of `gemm_a16w16` each launch a different `Cijk` kernel and must not be
+pooled -- and falls back to the family's shares otherwise.
+
+**And that exposed a mistake in the previous section's per-kernel table.** It
+summed the breakdown's *absolute* kernel durations, which do not add up to the
+entry's price. So it was asking whether the breakdown replay matched the step,
+not whether the price the model uses does. Distributing each entry's own price
+across its kernels asks the right question and reconciles with the headline
+residual. On that basis `cross_device_reduce_1stage` is **under**-priced by 21%,
+not over-priced by 7-33% as recorded there. `__amd_rocclr_copyBuffer` survives
+the correction at +260%.
+
+**What reproduces.** Two pricing runs of one graph on one box, back to back
+under identical code, move the summed contribution by 0.96%, with a median
+per-signature change of 1.18% and a p90 of 32%. That p90 is alarming until it is
+broken down: it is a few volatile signatures, and everything carrying the step
+repeats to about a point.
+
+| kernel | run 1 | run 2 |
+| --- | --- | --- |
+| `__amd_rocclr_copyBuffer` | +260% | +259% |
+| `fused_qk_rmsnorm_group_quant` | -37.3% | -36.5% |
+| `fused_recurrent_gated_delta_rule_fwd` | -25.5% | -26.3% |
+| `paged_attention_decode_sliding_window` | -25.1% | -24.5% |
+| `cross_device_reduce_1stage` | -21.2% | -21.8% |
+| the gemms | +11.1 +2.0 +9.2 +0.9 -8.6% | +9.4 +2.4 +12.7 +0.9 -9.9% |
+| `act_and_mul` (`silu_and_mul`) | **+14.0%** | **-22.7%** |
+
+The last row is not a measurement. Its per-call price went 3.08 to 4.51 to
+3.06 us across three runs, so it is the one operator here whose price is
+unstable rather than merely wrong, and it should be investigated as instability
+rather than corrected as an error.
+
+**A limit this puts on the previous section.** The residual on that box is
+-0.0% with one price list and +1.1% with the next, against -2.0% with the older
+one -- all within a couple of percent, which is what a repeat run moves the
+total by. That machine's pricing error is not distinguishable from zero. The
+other box's +10.0% and +14.3% are several times the repeat spread and stand.
+Any residual quoted below about 2% is quoting the instrument.
+
+## The generated-kernel hole is 4.8% of a decode step, not 0.6%
+
+Loading inductor-generated kernels faults the device under tensor parallelism,
+so pricing skips them, and that default was justified above at "2.016 ms, 0.6%
+of its kernel time". That measurement is sound and it is a *prefill*: 2.0 ms of
+a 316 ms step. A decode step is thirty times shorter and runs the same per-layer
+generated kernels, so the share is not the same number. On the 27B at TP=4:
+
+| | |
+| --- | --- |
+| generated-kernel operators in the graph | 130, of which **2 priced** |
+| their kernels in a decode step | 112, 0.465 ms corrected |
+| share of the step's kernel time | **4.8%** |
+
+The largest are `triton_per_fused_add_mean_mul_pow_rsqrt_silu` at 48 a step --
+one per DeltaNet layer -- and `triton_poi_fused_add_cat_mul_slice_split_squeeze`
+at 16. These are compiled graph regions rather than Triton launches nested
+inside a dispatched operator, so unlike the 433 `triton::` duplicates dropped
+earlier they are not covered by some other operator's price. The work is simply
+absent.
+
+**And it explains a coincidence that was about to be read as accuracy.** On that
+box the priced sum came to 9.776 ms against a 9.776 ms step, which looked like
+the price list had become exact. It has not:
+
+    priced sum                       9.776 ms
+    in-situ kernel time, corrected   9.725 ms
+      generated, unpriced            0.465 ms   (4.8%)
+      what the priced sum covers     9.259 ms
+    priced is +5.6% of the work it covers, +0.5% of the whole step
+
+Two errors of about five percent, in opposite directions, cancelling. Pricing
+the generated kernels without fixing the over-pricing would take that box's
+residual from +0.5% to about +5%, which is worth knowing before anyone treats
+the fault as the only thing standing between here and a correct price list. It
+is one of two things, and the smaller one.
+
+## Arrivals against a real engine: the client waits, the server cannot be told
+
+Replaying a recorded trace needs both sides to see the same arrival process.
+The simulated side honours declared arrivals through its virtual clock; the
+real side discarded them, because `WallClock.epoch` is None and `_stamp_arrival`
+falls back to "now". Left alone, real-versus-simulated on a trace compares a
+burst against the trace. On cc-traces that is not a detail: 148 requests over
+1099 seconds is one every seven seconds against a service time of seconds.
+
+**The first attempt was server-side and it does not work.** A `PacedWallClock`
+-- real time with a declared origin -- lights up machinery that already exists
+and is switched off by `epoch is None`: `_stamp_arrival` places the arrival,
+`_declared_arrival_pending` holds the request, and `_advance_to_next_arrival`
+correctly refuses to skip idle because it needs a clock with `advance`. The
+unit tests passed. The smoke test did not: four requests declaring arrivals
+twenty seconds apart completed in **0 seconds** instead of sixty.
+
+The origin was the problem. It cannot be taken at construction -- the engine is
+built minutes before a workload starts -- so it was inferred from the first
+declared arrival, as `now - offset`. Requests are posted by sixty-four threads,
+so the first one *stamped* is not the one with the smallest offset. When the
+request declaring t=60 wins the race the origin is set sixty seconds in the
+past, every earlier arrival is already overdue, and the whole workload is
+released at once. Taking the maximum candidate instead does not help either:
+`arrive_time` is fixed when the request is stamped, so a later correction
+cannot reach the requests already stamped against the wrong origin.
+
+A server can only be *told* the origin, not infer it, and telling it means
+threading a `compass_epoch` through five layers to reach `_stamp_arrival`.
+
+**The client-side answer is smaller and more faithful.** `replay.py --pace`
+holds each request until its arrival really comes round. No origin is needed,
+because the request genuinely arrives then -- and the engine's queue is
+genuinely empty between arrivals, which server-side pacing cannot reproduce: a
+declared workload is posted up front and sits in `waiting`, so the scheduler
+always sees a full queue however the arrivals are stamped. A real deployment is
+idle between requests, and this is the version that is.
+
+Measured on the smoke: 60 seconds for four requests twenty seconds apart, where
+the declared version took 0. The socket-latency objection that made arrivals
+declared in the first place was about racing a *virtual* clock; against a real
+one, milliseconds of socket latency against seconds of arrival gap do not
+signify.
+
+`PacedWallClock` and `--compass-paced-arrivals` are reverted. A flag that
+silently does nothing is worse than no flag, and there is no consumer for the
+protocol change that would make it work.
+
+**A note on the method.** Twelve unit tests passed on the reverted design --
+they tested that a paced clock holds a future arrival, which it does. What they
+could not test is which arrival establishes the origin under concurrent posting,
+because that is a property of the client and the engine together. The smoke run
+cost four requests and two minutes.
+
+## cc-traces, first result: latency is right by cancellation
+
+A real agentic trace, replayed against the real engine and against the
+simulator, 20 requests of a Claude Code session at a median of 163,584 input
+tokens. Both sides read from `/compass/requests`, so both are the engine's own
+measurement -- wall time on one, simulated time on the other.
+
+| | real | modelled | |
+| --- | --- | --- | --- |
+| TTFT, median | 28.35 s | 50.58 s | **+51.6%** on totals |
+| decode time, median | 56.16 s | 25.44 s | **-30.3%** on totals |
+| per output token, median | 120.7 ms | 53.5 ms | **-71.1%** on totals |
+| **latency, median** | **76.28 s** | **75.91 s** | **-5.0%** |
+
+**Latency agrees to 1.3% per request and it means nothing on its own.** The
+model puts half again too much time before the first token and a third too
+little after it, and the two nearly cancel. This is the third time in this
+project that an aggregate has looked good by cancellation -- the priced sum
+matching the step while over-pricing what it covers by 5.6% and omitting 4.8%,
+and the boundary constant absorbing pricing error -- and it is the reason the
+per-request split is printed rather than the total.
+
+**The decode miss has a cause visible in the calibration.** The sweep was run
+with `--max-tokens 4`, so a long round contributes about four decode samples
+against sixteen prefill chunks, and its decode contexts come out at a median of
+258 with a p90 of 65k. The decode model is therefore fitted almost entirely on
+short context and then asked about 164k, where attention over the history is
+most of the step. Real per-token time at that context has a median of 120.7 ms
+against 53.5 ms modelled, and a real mean of 303 ms with a maximum of 3376 ms --
+a spread the fitted model does not reproduce at all.
+
+The fix is in the sweep rather than the model: generate enough tokens after a
+long prompt to sample decode where the workload decodes.
+
+**What did work.** Prompt lengths were verified against the server for every
+request. Arrivals were honoured -- the paced real replay took 309 s for a
+workload spanning that long, where an unpaced one would have finished in the
+time the forwards took. And the simulator ran the same workload in **3 seconds
+against 309**, which is the discrete-event jump doing its job: it skips idle
+that the real engine has to sit through.
+
+**Scale, stated.** One session, 20 requests, 3.3M input tokens -- 0.08% of the
+corpus. It is a pipeline result and a decode finding, not a validation.
+
+## The decode error is not a decode error: it is the schedule
+
+Covering decode properly (previous section) changed the pilot in a way worth
+recording, because it went the opposite way to the prediction.
+
+| on totals | before | after |
+| --- | --- | --- |
+| TTFT | +51.6% | **-16.9%** |
+| decode | -30.3% | **-63.1%** |
+| per output token | -71.1% | **-81.4%** |
+| latency | -5.0% | **-48.4%** |
+
+TTFT was fixed. Decode got worse, and latency with it. The -5.0% latency really
+had been two errors cancelling: removing one exposed the other at full size.
+
+**Then the diagnosis inverted.** The premise for extending decode coverage was
+that the pilot asked rung 32 about a total context of 3.3M against samples at
+2k and 8k. Both halves were wrong:
+
+* The real run's decode steps never exceed **1M** total context, which the sweep
+  now covers to 2M. It is not extrapolating.
+* At matched total context the sweep and the real run agree on what a decode
+  step costs -- 17.75 ms against 17.14 ms in the 100k-500k band, 16.16 against
+  18.56 in 500k-1M. The step cost model is not the problem.
+
+**Where the time actually goes**, from the real run's own step table, rank 0:
+
+    prefill:   106 steps,  239.4 s   (mean 2258.8 ms a chunk)
+    decode :  4116 steps,   69.1 s   (mean    16.8 ms)
+    host gaps between forwards:   2.6 s
+    total                        311.1 s   -- against a 309 s replay
+
+Prefill is **77% of the run**. And the twenty requests report about 1300 s of
+per-request decode time between them, against 69.1 s of decode steps actually
+executed -- a factor of nineteen. A request in its decode phase is overwhelmingly
+*waiting*, and what it waits behind is other requests' prefill chunks, each
+2.26 seconds long.
+
+So "time per output token" on this workload is not a property of a decode step.
+It is a property of how decode interleaves with chunked prefill, and at a
+2.26-second granularity the interleaving dominates. A cost model that prices
+every step correctly can still be 63% low on decode if it schedules the steps in
+a different order.
+
+**This redirects the work.** The remaining error is in the simulated *schedule*,
+not the simulated step. The next comparison is between the two runs' step
+sequences -- how many prefill and decode steps, in what order, at what
+concurrency -- rather than between their step costs, which now agree.
+
+A caution for whoever picks this up: latency alone would have called the first
+pilot a success at -5.0% and the second a regression at -48.4%, when the second
+is the more truthful model. Aggregate latency is the one number this benchmark
+should never be judged on.
+
+## What is left on cc-traces: the first token comes out too late
+
+With prefill priced against its history, the simulated run matches the real one
+almost everywhere:
+
+| | real | modelled |
+| --- | --- | --- |
+| prefill steps / seconds | 106 / 239.4s | 105 / 237.3s |
+| decode steps / seconds | 4116 / 69.1s | 4970 / 65.8s |
+| prefill share of device time | 77.6% | 78.3% |
+| run span | 308.5s | 303.2s |
+| mean requests in flight | 6.20 | 5.92 |
+| arrive to finish, median | 76.2s | 71.2s |
+
+Same steps, same occupancy, same wall time, requests finishing within 7% of when
+they really did. And the split inside each request is wrong in both directions:
+**TTFT +114%** on totals, **decode time -62%**, cancelling into a latency figure
+of -6.2% that flatters both.
+
+**Where the first token goes.** A median request here is 163,584 tokens, ten
+chunks of 16384 at 2.26s each, so 22.6s of prefill that is its own. The real
+engine gets its first token out at 29.9s -- its own prefill plus about seven
+seconds of everyone else's work. The simulator takes about 52.7s, which is its
+own prefill plus roughly thirty. The simulator is interleaving far more of other
+requests' work into a request's prefill phase than the real scheduler does.
+
+That is a scheduling-order difference and not a cost one. Every ingredient is
+now right -- the steps, their costs, how many run, how many requests are in
+flight -- and they are put in a different order, which moves the first-token
+boundary without moving the finish.
+
+**Why this matters more than the latency number.** A serving simulator is asked
+for TTFT and TPOT, not for end-to-end latency; those are the numbers a
+deployment is sized against. This configuration reports latency to 6% and both
+of the numbers anyone would use to about a factor of two.
+
+**Note for whoever takes this on.** Decode time per request has come out near
+-62% in every configuration tried: before decode coverage was added, after it,
+and after the prefill fix. It does not move with pricing, which is the evidence
+that it is not a pricing problem. Comparing per-request step sequences needs the
+step table to record which request each step served, which it does not yet.
+
+## The TTFT error is queueing, not execution
+
+With `req_ids` on each step the prefill phase can be measured per request:
+from a request's first step to its last prefill step, and how much of that
+window went to its own steps rather than to other requests'.
+
+| | real | modelled |
+| --- | --- | --- |
+| first step to last prefill step, median | 12.8s | 13.6s |
+| of that, spent on other requests | 0.2% | 0.0% |
+
+**A request's prefill runs contiguously in both**, and takes about the same time.
+The hypothesis that the simulator interleaves more of other requests' work into
+a prefill is wrong.
+
+So the TTFT gap is elsewhere. TTFT is about 30s real and 53s modelled while the
+prefill phase is 13s, which puts most of it **before the request's first step**:
+roughly 17 seconds of queueing in the real run against 39 in the simulated one.
+The simulator executes a request's prefill correctly and admits it late.
+
+That narrows the remaining error to admission -- when a waiting request is
+allowed to start -- rather than to anything about steps or their costs. It also
+fits the decode side: a request admitted late finishes at about the right time
+(latency is -6.2%), so its decode phase is compressed, which is the -62%.
+
+**What blocks the next step.** The two id spaces do not join. The step table
+records internal sequence ids (`0`, `1`, `10`); `/compass/requests` records
+external completion ids (`cmpl-...`). The engine holds the mapping in
+`_internal_to_external` and exposes neither side of it, so queue wait per
+request -- arrival to first step -- cannot be computed directly, only inferred
+from medians as above. Exposing that mapping is a small change and is what the
+next measurement needs.
+
+## Correction: the queue-wait inference was arithmetic, not measurement
+
+The previous section concluded that the simulator admits requests *late*: TTFT
+about 30s real and 53s modelled against a 13s prefill phase, so "roughly 17
+seconds of queueing in the real run against 39 in the simulated one".
+
+That subtraction is not valid. It takes the median of one distribution (TTFT)
+and the median of another (the prefill phase) and treats the difference as the
+median of a third. With the sequence id now on both tables the wait can be
+measured per request instead, and it comes out the other way round:
+
+| arrival to first step | real | modelled |
+| --- | --- | --- |
+| median | 56.7s | 7.0s |
+| mean | 66.7s | 8.0s |
+
+The simulator admits requests **earlier** than the real engine, not later.
+
+**That run is confounded and the number should not be quoted yet.** A 141 GB
+neighbour arrived on the box between pilots, and the real replay took 507s
+against 309s for the same workload on a quiet machine, so the real queue waits
+include contention the simulated side has no way to know about. Its calibration
+was taken on a quiet box.
+
+An attempt to recover a clean number from the earlier uncontended pilot, by
+joining sequence ids to the workload in arrival order, does not survive
+checking: sequence ids do follow arrival order on the real side, but on the
+simulated side the ordinal join gives -7.2s where the true join gives +7.0s,
+because the virtual clock's origin is not the workload's first arrival. The
+ordinal shortcut is only sound on the real side, which is the half that does not
+need it.
+
+So what is established is narrower than the previous section claimed: the
+prefill phase executes correctly and contiguously in both runs, TTFT is wrong,
+and the wait before a request's first step is now measurable per request. Which
+way that wait errs on a quiet machine is not yet measured. It needs one clean
+run of both sides on an uncontended box, which is a rerun and not a change.
+
+**A note on the shared box.** Three of the last five pilot attempts were lost or
+degraded by other tenants -- two refused to start with a negative KV budget at
+141 GB of neighbour, one ran 64% slow. Reducing `--max-num-seqs` from 512 to 32
+cut the per-request cache tensor from 9.35 GB to 0.58 GB and was not enough on
+its own; utilization had to go to 0.92 as well. Any timing campaign here needs
+the machine checked before and after, not only before.
+
+## A quiet box, a small model, a light load: the model is accurate
+
+Both machines the 27B work ran on became contended, so the admission question
+was put to Qwen3-0.6B on an idle node instead. Scheduling is not a property of
+the model, and the harness is the same: same corpus, same converter, same
+replay, same analysis. Sixty requests of cc-traces filtered to what a 40960
+window can serve -- median 2368 input tokens -- calibrated by the same sweep.
+
+| on totals | error |
+| --- | --- |
+| TTFT | **+5.8%** |
+| latency | +10.5% |
+| decode time | +14.2% |
+| time per output token | +17.4% |
+
+Every figure the same sign and none of them large: no cancellation, and TTFT
+and TPOT -- the two a deployment is actually sized against -- within 6% and 17%.
+Queue wait matches as well, 0.2s median real against 0.3s modelled.
+
+**This does not answer the admission question.** The run lasts 7.5 seconds and
+the median request waits 0.2s to start, so the engine is never loaded and
+admission is never tested. The 27B case is the opposite regime: 77% of its
+device time is prefill and requests wait tens of seconds. What this establishes
+is that the cost model, the harness and the arrival replay are sound where
+nothing is queueing, which is worth having and is not what was being asked.
+
+The loaded case is the same workload with arrivals compressed, which is the next
+run rather than a different experiment.
+
+## Under load the simulator admits late, and that is the whole signature
+
+Same model, same box, same calibration as the section above; the workload's
+arrivals compressed forty times and three hundred requests instead of sixty, so
+the engine is saturated. 239 of 300 requests wait more than a second to start,
+against 3 of 60 before.
+
+| | real | modelled |
+| --- | --- | --- |
+| arrival to first step, median | 4.0s | 4.8s |
+| requests waiting over a second | 239/300 | 246/300 |
+
+**The simulator admits about 20% late**, and everything else follows from it:
+
+| on totals | 0.6B loaded | 27B long context |
+| --- | --- | --- |
+| TTFT | +17.8% | +114% |
+| decode time | -12.4% | -62% |
+| latency | +6.6% | -6.2% |
+
+The same signature at both scales, six times milder on the small model: a
+request admitted late shows a longer TTFT, still finishes near the right time,
+and so reports a compressed decode phase. Latency, being the sum, hides it.
+
+This also settles a contradiction. The direct queue-wait measurement on the 27B
+said the simulator admits *earlier* -- 56.7s real against 7.0s modelled -- but
+that run had a 141 GB neighbour and its real side was 64% slow. On a quiet box
+the sign is the other way, and it agrees with the TTFT error, which the
+contended reading did not.
+
+**Why the 27B case is six times worse** is not measured, but the difference in
+granularity is the obvious candidate: a 0.6B step is milliseconds and a 27B
+prefill chunk is 2.26 seconds, so the same error in *which* step a request is
+admitted after costs three orders of magnitude more.
+
+**And a caution about what a simulator is for.** Under saturation the modelled
+run took 122 seconds against the real run's 36. The discrete-event jump only
+pays when there is idle to skip; with a full queue the simulator is slower than
+the system it stands for, while still being wrong about TTFT by 18%.
+
+
+## P0 repaired, and the first loaded comparison that passes its own checks
+
+The retrospective at `atom/compass/RETROSPECTIVE.md` withdrew the loaded
+experiment this project had drawn three conclusions from. Its findings were
+checked against the artifacts and the code and they hold. Two repairs followed.
+
+**The client could not post a declared workload.** The server holds every
+declared request until all have arrived; the client opened at most 64
+connections and each blocked on its own response. Against 300 requests that is
+a deadlock, resolved only by the arrival barrier timing out after 120 seconds,
+after which requests enter as earlier ones finish -- not the declared arrival
+process. The client still printed "0 failed". One connection per request now,
+and past a bound it refuses rather than posting fewer than it declared.
+
+**Queue wait was reconstructed, and the reconstruction was wrong.** Each step
+now records `started_at`. That immediately exposed a second defect: the runner
+was stamping a *wall* clock while arrivals and first tokens are stamped on the
+engine core's *virtual* clock -- 69 seconds apart, that being the server's
+startup, and advancing at different rates. Every simulated step landed after
+the first token it produced. Installing a virtual clock in the worker would not
+have helped, since only the engine core calls `advance` and the worker's copy
+would sit at the epoch; the engine core stamps the batch instead. The validity
+check caught this rather than letting it become a number, which is what it is
+for.
+
+**With both repaired**, 300 requests, Qwen3-0.6B on an idle node, arrivals as
+recorded, 239 of 300 waiting over a second:
+
+| | real | modelled |
+| --- | --- | --- |
+| arrival to first step, median | 3.689s | 3.923s |
+| TTFT, median | 3.788s | 3.953s |
+| first step to first token | 0.068s | 0.033s |
+
+| on totals | error |
+| --- | --- |
+| TTFT | +11.3% |
+| latency | +5.1% |
+| decode time | -3.3% |
+| time per output token | -1.2% |
+
+The simulator admits about 6% late. The direction survives from the withdrawn
+run; the magnitude does not -- that run reported 20%, and its per-request
+errors were roughly three times these.
+
+**What this does not settle.** It is one run of a small model on short prompts,
+median 2368 input tokens. The 27B long-context case has not been rerun with the
+repaired harness. And it does not address the cost error the retrospective found
+by applying the fit to the *real* step sequence -- decode bucket 8 at -40.6% and
+bucket 16 at -28.9% -- which is independent of scheduling and which this
+workload's bucket mix does not exercise. That remains the next thing, and it
+comes before any further scheduling conclusion, because a service-time bias of
+that size changes queueing on its own.
+
+
+## The admission delay is a constant, not a rate
+
+Two runs that pass their validity checks, same model, same box, same
+calibration table (reused, and the log says so), differing only in size and
+therefore in load:
+
+| | light, 60 requests | loaded, 300 requests |
+| --- | --- | --- |
+| arrival to first step, real | 0.073s | 3.689s |
+| arrival to first step, modelled | 0.348s | 3.923s |
+| **difference** | **+0.275s** | **+0.234s** |
+| requests waiting over a second | 1 of 60 | 239 of 300 |
+| TTFT error on totals | +29.6% | +11.3% |
+
+The simulator admits each request about a quarter of a second late, and that
+figure barely moves between an idle engine and a saturated one. It is a fixed
+cost per request, not a proportional error.
+
+**That explains the load dependence of TTFT error without any load-dependent
+mechanism.** A constant 0.25s is most of a 0.4s TTFT and very little of a 3.8s
+one, so the same defect reads as +29.6% on one workload and +11.3% on the
+other. The earlier attempt to interpret those percentages as different
+behaviours was reading dilution.
+
+It also sharpens what to look for. A rate error would scale with queue length
+or step count; a constant does not. Candidates are things that happen once per
+request rather than once per step: the arrival barrier's real-time wait for the
+client to finish posting, `admission_seconds` (zero by default, and the real
+engine's own admission was measured at 8-18ms, an order of magnitude too small
+to be this), or a request becoming schedulable only at the next step boundary.
+
+Two runs is two runs. But the two agree to 40 milliseconds across a fiftyfold
+difference in queueing, which is a stronger constraint on the mechanism than
+either run alone.
+
+
+## Correction: there is no admission delay. The queue is amplifying cost error
+
+The previous section reported a constant quarter-second admission delay, from
+the median wait on two runs. The median was hiding the shape. Per request,
+by position in the run:
+
+| quartile | real wait | modelled wait |
+| --- | --- | --- |
+| requests 0-15 | 0.046s | **0.000s** |
+| 15-30 | 0.044s | 0.348s |
+| 30-45 | 0.483s | 0.670s |
+| 45-60 | 0.651s | 0.994s |
+
+The simulator admits the first requests *faster* than the real engine, not
+slower, and then falls progressively behind. A constant per-request cost cannot
+do that. The minimum wait is 0.000s simulated against 0.007s real, so nothing is
+being added at admission at all.
+
+**What is happening is queueing.** Both runs execute the same 1028 steps. The
+simulated ones cost 7.245s against 6.979s measured -- 3.8% more. And the engine
+is saturated: 99.6% utilised on the real run, 100.0% on the simulated one. At
+that utilisation a service time is not a small perturbation of the wait; the
+queue grows until arrivals stop. Adding 3.8% to every step is enough to take
+99.6% to 100%, and the wait follows.
+
+So the TTFT error on these workloads is the step-cost error, amplified. There is
+no separate scheduling defect to find, and #56 as posed -- "find why the
+simulator admits requests late" -- has no answer because it does not.
+
+**Two things follow.**
+
+The cost error is the whole remaining story on this path, which makes the
+bucket-8 and bucket-16 residuals the priority rather than a parallel concern.
+The retrospective said exactly this and it is worth quoting: "Under saturation,
+even a small service-time bias can change queueing considerably. Use the real
+sequence to assess cost predictions first; use controlled durations to assess
+the scheduler separately."
+
+And scheduling fidelity cannot be measured on a saturated workload at all. Every
+loaded experiment run here has been at essentially 100% utilisation, where the
+queue term swamps everything and no scheduling property is observable. A
+scheduler comparison needs a workload with slack, or controlled step durations
+that remove the cost error by construction.
+
+
+## The decode error was a rank deficiency, not a coverage gap
+
+Decode predictions ran 29 to 33% low at CUDA-graph rungs 8 and 16 on the real
+step sequence -- holding scheduling fixed, so nothing about simulation is
+involved. Three hypotheses, and only the third was right.
+
+**Not a missing region, though there was one.** Every rung samples its context
+at two widely separated clusters: the short ladder puts eight sequences of 96
+tokens at a total of 768, the long rounds put eight of 16384 at 131k, and
+nothing sits between. Measured, *every* real step fell in that hole -- 117 of
+117 at rung 8, 512 of 512 at rung 16, 1642 of 1642 at rung 32 -- while rung 1,
+the only rung whose samples surrounded its workload, was the only one accurate
+at -0.9%. This is what "inside recorded bounds" conceals: bucket 8's bounds are
+[264, 327168] and a step at 33045 is inside them and inside a gap.
+
+Filling the gap changed almost nothing. Rung 8 went from -32.6% to -32.1%.
+
+**It was a dimension with no variance at all.** Every calibration round runs
+sequences of one length, so within a batch the longest history equals the mean:
+raggedness exactly 1.00 in all 2997 samples. Real decode batches are 2.8 to 3.9
+times ragged, because requests arrive at different times and sit at different
+points in their generation. The model sums context across the batch, which makes
+`[10k, 10k, 10k]` and `[1k, 1k, 28k]` the same step -- and they are not, if
+attention reads a rectangle sized by the longest sequence.
+
+No feature for that could be fitted, because the quantity never varied. Not a
+coverage gap in a feature the model had; a column of zeros where a feature
+should be.
+
+Two changes, and the effect of each, measured on the real steps:
+
+| rung | before | ragged sweep rounds | + padding feature |
+| --- | --- | --- | --- |
+| 8 | -32.6% | -19.8% | **-7.4%** |
+| 16 | -29.1% | -23.1% | **-13.5%** |
+| 32 | -9.2% | -7.8% | **-4.9%** |
+
+The sweep now runs some batches with lengths spread geometrically, so
+raggedness varies from 1.0 to about 3.5. `_decode_bucket_features` gains the
+padding -- `nseq * max(context) - sum(context)` -- which is zero for a uniform
+batch, and `_least_squares` drops any feature with no variance in its samples
+and returns its coefficient as zero. A rung calibrated without ragged batches
+therefore fits the model its evidence supports, rather than failing on a
+singular system or reporting a coefficient nothing constrained.
+
+**Two things still open.** Rungs 2 and 4 have no ragged rounds at all -- rung 4
+is 100% ragged in the workload and got worse, +10.5% to +22.5%, when the other
+rungs improved. And the sweep's raggedness reaches 3.5 while rung 32's real
+steps reach 11.8, so the top of that range is still extrapolation.
+
+**And a caution repeated.** The per-request figures moved the other way while
+this was fixed: TTFT was +11.3% with the badly-fitted model and -9.2% with the
+better one. Those are queueing-amplified on a saturated workload, where a
+service-time bias is multiplied by the queue, and the aggregate that looked
+best came from the model whose step costs were worst. The per-bucket error on a
+fixed real step sequence is the measure of a cost model. The per-request one is
+a measure of cost and scheduling together, and on a saturated run it is mostly
+the queue.
+
+
+## Ragged rounds at every rung: decode within 8% everywhere
+
+The padding feature was fitted only where the sweep had ragged batches, which
+was rungs 8, 16 and 32. Rung 4 is fully ragged in the workload, had no ragged
+samples of its own, and was the one rung that got worse while the others
+improved. And a geometric spread of lengths cannot get very ragged -- its mean
+rises with its maximum, so the ratio tops out near 3.5 -- while rung 32's real
+steps reach 11.8.
+
+Both fixed by adding ragged rounds at every rung, and a skewed pattern: one long
+sequence among short ones, which is a real shape rather than a contrived one --
+a long-running request among freshly arrived ones. Its raggedness approaches the
+rung size instead of a constant, so the sweep now reaches 7.2, 13.0 and 21.5 at
+rungs 8, 16 and 32 against a workload reaching 3.0, 3.6 and 11.8.
+
+Per-bucket error on the real step sequence, with the model in use:
+
+| rung | total context only | with padding |
+| --- | --- | --- |
+| 1 | -0.2% | -- (uniform, correctly dropped) |
+| 2 | +30.7% | **-4.7%** |
+| 4 | +50.9% | **-0.8%** |
+| 8 | -9.4% | **-6.4%** |
+| 16 | -14.0% | **-7.8%** |
+| 32 | -0.0% | +6.5% |
+
+Every rung within 8%, from -32.6% at rung 8 where this started. The middle
+column is worth reading too: total context alone is now *worse* at rungs 2 and 4
+than before the ragged rounds were added, because the sweep contains shapes it
+cannot explain and the fit splits the difference. That is the correct behaviour
+of a model missing a term, and it is what the padding feature is for.
+
+**The outlier rejection was checked for the obvious way this could undo itself.**
+A ragged batch costs more than a uniform one at the same total context, so
+against a model that cannot see raggedness those rows have the largest
+residuals -- exactly what a four-sigma filter removes. It would discard the
+evidence the feature needs, and the fix would decay as the sweep grew. Measured,
+it does not: ragged rows are 91% of samples at rung 2 and 35% of drops, 41% at
+rung 8 and 0% of drops. The filter is removing uniform outliers, which is what
+it was written for.
+
+**Still not closed.** Rung 32 is the one rung the padding term makes worse,
++6.5% against -0.0% without it, and it is also the rung whose real raggedness
+spread is widest. That is worth understanding rather than tuning away. And all
+of this is one model on short prompts: the 27B long-context case has not been
+rerun with any of the repairs.
+
+
+## The 27B, rerun with the repaired harness
+
+Everything previously known about this configuration came through a client that
+could not post a declared workload, a reconstructed timeline with 207 impossible
+orderings, and a calibration with no ragged batches. Rerun with all of those
+repaired, same workload, 20 requests at a median of 163,584 input tokens:
+
+| on totals | through the broken harness | repaired |
+| --- | --- | --- |
+| TTFT | +114% | **+20.9%** |
+| latency | -6.2% | -50.7% |
+| decode time | -62% | -79.2% |
+| time per output token | -88.4% | -93.7% |
+
+TTFT improved fivefold. Everything after the first token got worse, and the
+-6.2% latency that the broken harness reported is gone -- it was the usual
+cancellation.
+
+**The cost model is much worse here than on the small model.** On the real 27B
+step sequence, with the padding feature: rung 8 -7.1%, rung 16 -15.3%, rung 32
+-29.8%, and rung 2 at -54.2%, which is worse than the -25.6% without the
+feature. On the 0.6B every rung was inside 8%.
+
+**Why, and it is the same mistake one level down.** How ragged a batch is
+depends on the workload, not the engine:
+
+| | raggedness of real batches |
+| --- | --- |
+| 0.6B, 2.4k prompts | 2.82 to 3.85 |
+| 27B, 163k prompts | **1.11 to 1.42** |
+
+A 0.6B generating 400 tokens onto a 2k context spreads its batch widely; a 27B
+generating the same onto 163k barely moves it. The ragged rounds were designed
+against the first and sample at 1.0 and at 7 to 21, so the second workload sits
+in a hole between them -- and the padding coefficient is fitted from batches
+twenty times more ragged than the ones it is applied to. That is why the feature
+hurts at rung 2 here and helps everywhere on the 0.6B.
+
+Fixed by adding a barely-ragged round, sequences spread from 12288 to 16384, at
+raggedness 1.15. The sweep now covers 1.0, 1.15, 2.7, 3.5 and 7 to 21, which
+brackets both workloads rather than one.
+
+**The general point, which has now cost three iterations.** Coverage has to be
+checked against the workload in every dimension the model uses, and a bounding
+box is not coverage: the context bounds hid a gap, the raggedness bounds hid a
+gap, and each time the samples were technically inside the box and nowhere near
+the data. The dimensions themselves are also workload-dependent, so "the sweep
+covers this" is a statement about a pair, never about a sweep alone.
+
+
+## Mild-raggedness rounds fix the 27B cost model, and expose a bigger problem
+
+Re-swept with a barely-ragged round at 1.15, which is where the 27B workload
+actually sits. Per-bucket error on the real step sequence, with the padding
+feature:
+
+| rung | before | after |
+| --- | --- | --- |
+| 1 | +1.6% | -0.1% |
+| 2 | **-54.2%** | **-5.4%** |
+| 4 | -10.1% | -7.5% |
+| 8 | -7.1% | **-2.0%** |
+| 16 | -15.3% | -22.7% |
+
+Rung 2 was the one the padding feature had been making worse, and sampling
+raggedness where the workload uses it fixes that. Rung 16 went the other way and
+is now the worst rung.
+
+**But the real run is not reproducible, and that matters more.** The same
+workload on the same idle box, twice:
+
+| | run 1 | run 2 |
+| --- | --- | --- |
+| real arrival to first step, median | 25.647s | 6.174s |
+| real TTFT, median | 56.437s | 27.578s |
+| modelled TTFT, median | 53.385s | 52.557s |
+| rung 32 steps in the real run | 164 | **none** |
+
+The real measurement moved by a factor of two and the simulator moved by 1.5%.
+One real run reached 32 concurrent sequences and the other never did.
+
+The *work* is reproducible -- 239.4s and 235.4s of prefill, 69.1s and 73.3s of
+decode, across three runs including the first pilot. What varies is the
+schedule: timing jitter in the paced arrivals, interacting with an engine at
+full utilisation, puts the run on a different concurrency path.
+
+**So the per-request numbers from a single pair of runs mean much less than they
+appear to.** TTFT came out +20.9% on one pair and +128.8% on the next, with a
+better cost model on the second -- almost all of that difference is the real
+side, not the model. Any per-request claim on this workload needs repeats and an
+interval, which is what the retrospective asked for and what none of these runs
+have.
+
+The per-bucket cost error does not have this problem: it is computed by applying
+the fit to the real run's own steps, so it is a within-run comparison and both
+runs agree about it to a couple of points except at rung 16.
+
+**What to do about it.** Report cost error per bucket, which is stable, and stop
+quoting single-run per-request figures. For a per-request claim, repeat the real
+run several times and compare the simulator against the distribution rather than
+against one draw. A workload with slack would also help, since saturation is
+what makes the concurrency path so sensitive.
+
+
+## Correction: the real runs are reproducible. Repeats say so
+
+The previous section concluded from two runs that the real side was not
+reproducible -- a twofold swing in TTFT on the 27B -- and made that the blocking
+issue for every per-request claim. Four repeats say otherwise.
+
+| 27B, median over four real runs | |
+| --- | --- |
+| TTFT | 27.54, 27.57, 27.61, 27.62s -- spread **0%** |
+| latency | 74.50, 74.53, 74.70, 74.89s -- spread **1%** |
+
+| 0.6B, median over five real runs | |
+| --- | --- |
+| TTFT | 3.55, 3.58, 3.66, 3.80, 3.89s -- spread 9% |
+| latency | 4.45, 4.46, 4.52, 4.69, 4.72s -- spread 6% |
+
+The 27B's earlier 56.4s was a single anomalous first run -- first use of those
+shapes, where Triton autotunes -- and every run since has landed within 0.1s of
+27.6. Diagnosing irreproducibility from two samples, one of them a first run, is
+the error the retrospective warned about, committed while acting on it.
+
+**With repeats, the errors are these**, and they are stable rather than draws:
+
+| | 27B | 0.6B |
+| --- | --- | --- |
+| TTFT against the real median | **+90.5%**, outside the range | -1.1%, inside |
+| latency | +5.4%, outside | +7.8%, outside |
+
+The 27B over-predicts time to first token by ninety percent, reproducibly. On
+the 0.6B the same model is within a percent. Whatever that is, it is specific to
+long prompts and it is not noise.
+
+**And the machine check earned its place by being wrong three times.** It
+reported the machine busy when it was reading our own memory mid-release; it
+mislabelled which run each sample belonged to, because the health-check loop
+shared a variable name with the repeat counter and clobbered it; and it flagged
+a neighbour at 98% on cards this run was not using. All three are false alarms,
+and a validity check that cries wolf is worse than none -- it teaches the reader
+to skip it. It now waits for the server to exit, keeps its own counter, and
+judges only the devices in `HIP_VISIBLE_DEVICES`, while still recording the
+whole machine so a neighbour elsewhere stays on the record.
+
+It also caught a real one: a tenant compute-bound in 0.7 GB, which no
+free-memory check would have seen.
+
+
+## The 27B's TTFT error is one interval, and it is not prefill
+
+TTFT is over-predicted 90.5% on the 27B, reproducibly across four real runs.
+It is not the cost of prefill, not the number of chunks, and not admission.
+
+**Prefill is right.** Fitting on the sweep and applying to the real run's own
+106 prefill steps -- step sequence held fixed -- predicts 235.7s against a
+measured 235.4s, **+0.1%**, median per step -0.3%. Both sides run the same
+chunks over the same tokens:
+
+| | real | modelled |
+| --- | --- | --- |
+| prefill steps | 106 | 105 |
+| prefill seconds | 235.4 | 237.8 |
+| tokens processed | 1,681,024 | 1,681,024 |
+
+**Admission is right.** Arrival to first step is 6.2s real against 4.8s
+modelled -- the simulator starts requests slightly sooner, not later.
+
+**The whole error is after the last prefill chunk**, measured per request rather
+than by subtracting medians:
+
+| median | real | modelled |
+| --- | --- | --- |
+| first step to last prefill chunk | 12.67s | 13.41s |
+| **last prefill chunk to first token** | **9.19s** | **32.21s** |
+| that interval, p90 | 16.23s | **127.32s** |
+| that interval, max | 16.55s | **139.03s** |
+
+A simulated request finishes its prefill and then waits half a minute for its
+first token, where the real one waits nine seconds. At 2.26s a chunk, thirty-two
+seconds is about fourteen other requests' prefill chunks running first.
+
+**So this is prefill-versus-decode scheduling, not cost.** The real engine gets
+a finished request its first token sooner than the simulator does, using the
+same scheduler code, so the difference is in the state or the timing that code
+sees rather than in the code. Two things make that plausible and are worth
+checking before anything else: decode is under-priced at rung 16 by 22.7%, which
+changes what the scheduler thinks a decode step costs relative to a prefill
+chunk; and the virtual clock advances only on steps, so anything the real engine
+does between steps is free in simulation and cannot delay a prefill chunk the
+way it really does.
+
+It also explains why the 0.6B is fine at -1.1%: its prefill chunks are
+milliseconds, so the same ordering difference costs almost nothing. The error
+needs long prefill chunks to be visible, which is why every short-prompt
+experiment missed it.
+
+
+## Prefill streaks: part of the answer, and the limit of what the tables show
+
+The simulator runs longer unbroken stretches of prefill than the real engine:
+
+| | real | modelled |
+| --- | --- | --- |
+| unbroken prefill streaks in the run | 5 | 6 |
+| longest | 42 chunks, **93.95s** | 63 chunks, **152.57s** |
+| median | 15 chunks, 34.78s | 6 chunks, 11.16s |
+
+A request that finishes prefill inside a streak waits for it to end, so the
+simulator's 152s worst case matches the shape of its 139s worst-case wait for a
+first token, against 16.6s real.
+
+**But this does not close it.** The worst streak is 1.6 times longer while the
+median wait after prefill is 3.5 times longer, so streak length is a part of the
+mechanism rather than the whole of it. Saying more needs the scheduler to record
+*why* it chose each step -- what was admissible, what the token budget was, what
+it passed over -- and the step table only records what it did.
+
+That is a code change rather than another pass over saved artifacts, and it is
+where this line of work stops for now. What is established is worth stating
+plainly, because the earlier account of it was wrong in every particular:
+
+* The 27B's TTFT error is 90.5%, reproducible across four runs to within 0.1s.
+* It is not prefill cost, which is +0.1% against the real run's own steps.
+* It is not the number of chunks: 106 against 105, same 1,681,024 tokens.
+* It is not admission: 6.2s real against 4.8s modelled, the simulator earlier.
+* It is entirely the wait between a request's last prefill chunk and its first
+  token: 9.19s real against 32.21s modelled.
+* Longer prefill streaks in the simulator account for part of that wait.
+* None of it shows on a small model, where chunks are milliseconds.
+
+
+## The step table now records why, not only what
+
+Three times a comparison between a real run and a simulated one has stopped for
+the same reason: the artifact recorded the outcome and not the input to the
+decision. Queue wait needed timestamps the table did not carry. Per-request
+attribution needed the request ids it did not carry. The prefill-versus-decode
+ordering needs the scheduler's own view, and now has it -- per step: what was
+waiting, how much of that still had prefill outstanding, what was held for a
+declared arrival, how many requests were running, tokens batched against the
+budget, and which branch was taken.
+
+A handful of integers on ~4500 steps, so it stays on rather than being a mode
+somebody has to remember to enable, which is how the earlier gaps survived. It
+fails safe: a batch that will not take an attribute records null instead of
+breaking the run.
+
+**It found something on its first outing.** The real run's first step is
+scheduling tick 1; the simulated run's is tick **89,337**. Once running, both
+produce a step on essentially every call -- median one tick between steps -- so
+the whole difference is 89,336 calls that returned no batch before the first
+step. That is the arrival barrier spinning while the client posts the declared
+workload.
+
+Virtual time is frozen through all of it, so it costs no fidelity, and the
+earlier claim that a simulated run is "slower under saturation" was withdrawn
+for a different reason. But it is real CPU, it scales with the workload, and it
+is why a simulated run's wall-clock duration does not follow from its virtual
+one. Worth fixing when the barrier is replaced by a bulk submission, which the
+client already needs for workloads past MAX_IN_FLIGHT.
+
+**What it does not yet explain** is the 27B's remaining wait after prefill.
+That needs the same record from a 27B run and a diff of the decision sequence,
+which is the next step and needs no new capacity.
+
+
+## The 27B TTFT error is a scheduling discontinuity, not a cost error
+
+The decision record from the previous section could not be used on the 27B --
+the runs were taken on node 18, which is no longer reachable, and they predate
+the record. So the two inputs the record would have supplied were rebuilt from
+the step tables instead, taking only what the artifacts determine exactly: when
+a request arrived, from the client's own trace, and how much prefill it still
+owed, from the sum of its scheduled chunks. Scheduler-internal state was not
+reconstructed and nothing below depends on it.
+
+**The scheduler behaved identically on both sides.** Neither run ever took a
+decode step while an arrived request still owed prefill -- 0 out of 4378 real
+decode steps and 0 out of 4621 simulated ones. Prefill-first was obeyed the same
+way by both. There is no scheduling disagreement to find.
+
+What differs is when the streaks *broke*. Prefill-first means a decode window
+opens only in the gap between one request's last prefill chunk and the next
+request's arrival, and the margins on that gap are small:
+
+| | ends at | next arrival | margin |
+| --- | --- | --- | --- |
+| real, 42-chunk streak | 213.0 | 214.5 | **+1.5 s** |
+| real, 7-chunk streak | 231.2 | 232.4 | **+1.2 s** |
+| simulated | never breaks; the three merge into one 63-chunk streak | | |
+
+The simulated run reaches the same point 3.9 s later, so both margins go
+negative, both windows close, and ten requests that got a first token at 213.1
+and 231.2 in the real run get one at 271.6 instead. That is the whole of the
++240 s: real post-prefill wait totals 703.6 s, simulated 944.1 s.
+
+**Where the 3.9 s comes from is a cancellation.** Priced against the real run's
+own step shapes, prefill is +0.10% -- the number previously reported as the
+headline. Excluding the first step it is **+3.06%**, and the first step is the
+cold start: 640 tokens, measured 6.87 s, priced 0.13 s. A single -6.75 s error
+almost exactly offsets +6.99 s spread over the other 105 chunks.
+
+The scheduler never sees the total. It sees the running sum, which is 3% high
+from the second step onward and never gets the 6.75 s back. By t = 213 s that is
+3.9 s, and the margin it has to beat is 1.5 s.
+
+**The lesson is about the metric, not the model.** Aggregate cost accuracy does
+not bound schedule accuracy when the scheduler has a discontinuity in it. A
+simulator can be within 1% on total step seconds -- within 1.0% on this run's
+prefill, 1.1% on decode, 1.0% on run length -- and be 90% wrong on TTFT, because
+TTFT here is decided by two comparisons with 1.5 s and 1.2 s of slack. It also
+means a TTFT improvement on this workload is not by itself evidence of a better
+cost model: it may be evidence that a window happened to reopen.
+
+Two consequences worth acting on: the cold-start step should be priced or
+excluded rather than left to cancel a real bias, and an accuracy claim should
+report the error with outliers held out, not only the total.
+
+### The real machine is not on the knife edge; only the simulator is
+
+All four real repeats produce the identical streak structure -- 36, 6, 42, 7, 15
+chunks -- and break at the same two places, 213.0 s and 231.2 s, with margins of
++1.5 s and +1.2 s that vary by at most 0.1 s between repeats. Median TTFT ranges
+over 27.54-27.62 s. So the hardware lands reproducibly on the safe side of the
+discontinuity, and a 3% cost bias is enough to put the simulator on the other.
+The metric is unstable with respect to the *model*, not with respect to the
+machine, which is what makes it a fair thing to be graded on and a bad thing to
+be graded on alone.
+
+The 3.9 s can be accounted for exactly. Splitting each side's time up to the
+deciding request:
+
+| | real | simulated |
+| --- | --- | --- |
+| cold-start step | 6.87 | 0.13 |
+| decode windows before it | 29.2 | 33.7 |
+| comparable prefill | 175.7 | 181.9 (+3.5%) |
+| reaches the deciding request at | **211.8** | **215.7** |
+
+The simulated run starts 6.74 s *ahead* on the unpriced cold start, then spends
+it twice over: 4.5 s on three extra early decode windows -- which the cheap cold
+start itself opened -- and 6.2 s on accumulated prefill bias.
+
+### The prefill bias is shape-dependent, so scaling would not fix it
+
+Priced against the real run's own chunks and split by the history each chunk
+attends over:
+
+| chunk context | chunks | measured | priced | error |
+| --- | --- | --- | --- | --- |
+| 16k-50k | 44 | 83.74 s | 82.77 s | -1.16% |
+| 50k-100k | 50 | 118.29 s | 122.71 s | +3.74% |
+| 100k-150k | 11 | 26.51 s | 30.05 s | **+13.36%** |
+
+The `tokens * history` term was added because long-context chunks were 23%
+under-priced without it. It now overshoots by 13%, and it overshoots exactly
+where the schedule is decided: the late chunks of the long requests. This is not
+an extrapolation -- the sweep has 16 samples in that band and reaches 258k. It is
+a balance problem: 77% of the sweep sits in 16k-50k, the workload never goes past
+131k, and one linear coefficient is fitted across the whole range.
+
+### The confirming experiment could not be run
+
+The test that would close this is to re-run the simulated side with prefill
+priced a few percent cheaper and watch the two windows reopen. It needs no real
+forwards -- predict mode consumes the table and executes nothing -- so it is
+hardware-independent, and the scaled tables are prepared. It did not run:
+node 18, where these runs were taken, is no longer reachable, and on this host
+ROCm device enumeration is wedged. A `rocminfo` from a day-old test run sits in
+uninterruptible sleep with zero CPU time, a fresh one hangs the same way, and a
+27B server started against it sat at engine init for eight minutes on 22 seconds
+of CPU with no device memory allocated. Nothing GPU-side can start here until
+the driver is reset.
+
+Everything above is measured, not inferred from that experiment. What the
+experiment would add is the counterfactual.
+
+
+## The counterfactual: a 3% price change moves TTFT by 29%
+
+The previous section reconstructed the mechanism from saved step tables and said
+the test that would close it is to re-price prefill a few percent cheaper and
+watch the two decode windows reopen. Node 18 came back, so it ran -- on an idle
+machine, four runs: the real workload, and the simulated one at three prefill
+prices.
+
+| prefill price | TTFT median | prefill streaks | longest |
+| --- | --- | --- | --- |
+| **real** | **27.63 s** | 5 | **42** |
+| x1.00 | 52.40 s | 6 | 63 |
+| **x0.97** | **37.31 s** | 8 | **42** |
+| x1.03 | 54.33 s | 6 | 63 |
+
+At x0.97 the 63-chunk streak splits back into 42 + 7 + 15, which is the real
+run's structure exactly, and it breaks where the real run breaks:
+
+| streak ends at | real | x1.00 | x0.97 |
+| --- | --- | --- | --- |
+| 42-chunk | 213.1 (+1.4 s) | merged | **213.7 (+0.8 s)** |
+| 7-chunk | 231.2 (+1.2 s) | merged | **230.6 (+1.9 s)** |
+
+So the mechanism is confirmed end to end: the error is not 90% of cost, it is 3%
+of cost landing on the wrong side of two comparisons with a second or two of
+slack. TTFT does not close all the way -- 37.31 s against 27.63 s -- which is
+consistent with the bias being shape-dependent rather than a uniform scale, and
+that is what the long-context overshoot is about.
+
+Two things worth recording about the runs themselves. They reproduce node 18's
+earlier ones 25 hours apart to three digits: real TTFT 27.63 s against 27.54,
+27.57, 27.61, 27.62; simulated 52.40 s against 52.40. And these carry the
+decision record, so the reconstruction could be checked rather than believed --
+across all four runs, **zero** decode steps were taken while an *eligible*
+prefill was waiting. The reconstruction was right.
+
+The check needed one correction, which is worth keeping. `waiting_prefill_-
+outstanding` counts every waiting request that still owes prefill, arrived or
+not, and by that counter the simulated run has 2340 apparent violations. All of
+them also show `waiting_held_for_arrival`, so the requests owed prefill but were
+not yet eligible. The two sides simply book a future request in different
+places: the paced client has not posted it, the declaring client has, and the
+barrier holds it. Eligibility is the difference of the two counters, and on that
+both sides are clean.
+
+## The sweep's warmth does not transfer to a run's, and it was tried
+
+Its own first three prefill steps cost the 27B sweep 47.5 s, 19.5 s and 6.1 s at
+8, 32 and 96 tokens, where the same shapes later cost 0.11 s. A first thought
+was that this is contaminating the fit. It is not: `_least_squares` already
+rejects all three, at relative residuals of 0.99, and the docstring saying it
+exists for Triton's per-shape autotuning is accurate.
+
+The second thought was that the rejected rows are exactly the information the
+model lacks -- a real run's first step costs 6.87 s and is priced at 0.13 s -- so
+they should be replayed onto the first steps of a simulated run. That was
+implemented and it is wrong:
+
+| | first step | prefill total |
+| --- | --- | --- |
+| measured | 6.87 s | 235.41 s |
+| not charged | 0.13 s | 235.65 s (+0.10%) |
+| sweep's warmth charged | **47.56 s** | 308.45 s (**+31.03%**) |
+
+The two quantities are 72.80 s and 6.87 s and they are not the same thing. A
+server does a profile run and captures graphs before its first *measured* step,
+so most of the process-level warmth is spent by then; a sweep meets it head-on.
+How much is left over is a property of what the server did at startup, which is
+not in the calibration table.
+
+So the oracle now measures the leading warmth and says so in `describe`, and
+charges nothing:
+
+    CalibratedCostOracle(prefill=fitted on 944 steps, 138 dropped, ...,
+                         leading warmup in table=3 steps totalling 72.80s,
+                         not charged)
+
+with a test that the estimate is identical whether detection is on or off,
+because "report it" is one edit away from "use it".
+
+## An accuracy number that cannot cancel
+
+`scripts/compass/price_steps.py` prices a recorded step table against a
+calibration table and refuses to report only the total:
+
+    prefill: 106 steps  measured 235.41s  priced 235.65s
+      on totals              +0.10%
+      holding out step 0       +3.06%   (measured 6.87s, priced 0.13s, -6.75s)
+      median per step        -0.27%
+      ^ one step moves the total by 3.0 points. The total is describing that
+        step, not the model.
+
+It also gets the negative case right, which is what makes it worth having:
+decode on the same run reads -2.83% on totals and -2.82% held out, so nothing is
+hiding there, and the gap between that and its -0.42% median says decode's error
+sits in its expensive steps rather than in one of them.
+
+
+## Prefill attention was charged on the batch totals, not per request
+
+The long-context overshoot -- -1.16% at 16-50k chunk context, +3.74% at 50-100k,
++13.36% at 100-150k -- turned out to be a proxy for something sharper. Split the
+same run's prefill steps by how many requests were in the batch:
+
+| | n | error |
+| --- | --- | --- |
+| pure prefill | 92 | **-4.01%** |
+| mixed prefill | 14 | **+27.28%** |
+
+and the two nearly cancel into the +0.04% headline. Again.
+
+`_prefill_features` reduced the batch to two scalars and multiplied them:
+`tokens * history`, both sums over the batch. For one request that is right; for
+two it cross-multiplies, charging request A's new tokens against request B's
+history, which A never reads. On one real step -- 1856 new tokens on a 67968
+context, batched with 14528 new tokens on a 14528 context:
+
+    charged   16384 * 66112 = 1.08e9
+    attends    1856 * 66112 = 1.23e8      8.8x
+
+The mixed-step error is monotonic in how much foreign context is in the batch:
++0.3% at 576 tokens of it, +79.7% at 14464.
+
+This is the shortcut `StepShape`'s own docstring exists to prevent -- "collapsing
+them is the standard shortcut in this field and it is the standard source of
+error" -- taken in the function that reads it. It survived because a calibration
+sweep is almost all single-request steps, so a sweep-fitted model looked healthy
+while serving runs did not.
+
+The shape of the feature was never wrong. A full 16384-token chunk's marginal
+cost per 16k of extra context is 0.2444 s +/- 2% from 32k all the way to 246k,
+so the cost really is linear in the history attended. It was being fed the wrong
+numbers.
+
+Summing both attention terms per request instead:
+
+| | mixed | pure | all, cold start held out |
+| --- | --- | --- | --- |
+| collapsed | +27.28% | -4.01% | +2.96% |
+| per request | -0.81% | -3.35% | **-0.20%** |
+
+Existing calibration tables stay valid; the change is in how features are
+computed, and it is applied identically when fitting and when predicting.
+
+### What it does to the run
+
+No price scaling, same table, same workload:
+
+| | TTFT median | p90 | streaks | longest |
+| --- | --- | --- | --- | --- |
+| real | 27.63 s | 48.83 | 5 | 42 |
+| before | 52.40 s | 147.85 | 6 | 63 |
+| x0.97 hack | 37.31 s | 89.99 | 8 | 42 |
+| **per request** | **36.59 s** | **88.87** | 8 | **42** |
+
+TTFT error goes from +89.6% to +32.4%, and the deliberate 3% scaling is no
+longer needed to get there -- the principled fix reaches the same place the hack
+did. The two decisive windows now land where the real run's do:
+
+| streak ends at | real | fixed |
+| --- | --- | --- |
+| 42-chunk | 213.1 (+1.4 s) | **212.6 (+1.9 s)** |
+| 7-chunk | 231.2 (+1.2 s) | **231.1 (+1.3 s)** |
+| final streak | 15 chunks | **15 chunks** |
+
+### And what is left is the cold start, alone
+
+The whole remaining error is now at the start of the run. The fixed simulation
+opens three windows the real run does not, at 0.1 s, 8.1 s and 18.7 s, because
+its first step costs 0.13 s where the real one costs 6.80 s -- so it finishes
+before request 1 arrives at 0.2 s, and a window opens that should not exist.
+Both runs execute the same 36 chunks before the first real gap; the simulation
+just breaks them into four streaks instead of one.
+
+That is the term this project decided not to invent, and it is now the only
+thing between the simulated schedule and the real one on this workload.
+
+
+## The measured first-step warmup, and what it uncovered
+
+The cold start cannot come from the calibration table, but it can be measured
+once from a real run of the same deployment and reused -- which is the bargain
+`--compass-admission-seconds` already makes, and it is documented there as "a
+property of the machine and the process layout, not of the model". So
+`warmup_seconds` is an oracle option, defaulting to 0, charged once to the first
+prefill step of a process. On the 27B at tp=4 it is 6.68 s, steady to 1.3% over
+four repeats; on the 0.6B it is 0.01 s. The number used below came from
+yesterday's repeats and was applied to a run taken today.
+
+With it and the per-request attention fix, the simulated schedule stops being
+approximately right and starts being exactly right:
+
+| streak | real ends at | simulated |
+| --- | --- | --- |
+| 36 chunks | 78.6 | **78.8** |
+| 6 chunks | 100.4 | **100.3** |
+| 42 chunks | 213.1 | **212.6** |
+| 7 chunks | 231.2 | **231.1** |
+| 15 chunks | 267.3 | **267.3** |
+
+Five streaks, the same chunk counts, every break within half a second of the
+real one across a 267-second run. Prefill totals 235.11 s against 235.56 s,
+-0.2%. Median latency 73.65 s against 74.63 s. Per request, the step that
+completes each prompt is the same step, at the same time to a tenth of a second.
+
+**And TTFT got worse: 54.03 s against a real 27.63 s.**
+
+That is not a contradiction, it is a discovery. Lining first tokens up against
+the steps that produced them:
+
+| seq | real prefill done | sim prefill done | real 1st token | sim 1st token |
+| --- | --- | --- | --- | --- |
+| 0 | 6.80 | 6.81 | 14.77 | 6.81 |
+| 1 | 14.78 | 14.80 | 22.86 | **78.80** |
+| 2 | 22.87 | 22.90 | 31.05 | **78.80** |
+| 7 | 68.24 | 68.30 | 78.68 | **78.80** |
+
+The real run delivers a first token about one prefill-completion interval after
+each prompt finishes -- +7.97, +8.08, +8.19, +9.93, +8.37, +8.46, +10.51,
++10.44 s, one per request -- and it does this *inside* a 36-step prefill streak
+that contains no decode step at all. The simulation gives all of them their
+first token at 78.80, when the streak ends and the first decode step runs.
+
+So the remaining TTFT error is not a timing error. The work is scheduled at the
+right moment and takes the right time; what differs is when a finished prompt
+becomes a delivered token.
+
+**Which means TTFT is currently not measuring the cost model.** The cost model
+and the schedule now agree with reality to within a fraction of a percent, and
+TTFT is out by 95%. Anyone grading Compass on TTFT today is grading one
+accounting rule about token delivery. That is worth knowing before the next
+number gets quoted -- and it is the third time in this project that a headline
+figure turned out to be about something other than what it appeared to measure.
+
+
+## The simulated forward was not deferring its output, and the engine needs it to
+
+`Scheduler.postprocess` walks `self.running` and skips any sequence absent from
+`fwd_output` -- `idx = fwd_output.get_idx(seq.id); if idx is None: continue`. Its
+own comment says why that is load-bearing:
+
+> ModelRunner runs in deferred-output mode by default
+> (tokenIDProcessor.is_deferred_out), so the prefill step's postprocess sees
+> idx=None and skips this seq. By the time the prefill output surfaces, the next
+> step's schedule has already flipped seq.type to DECODE.
+
+A request finishing its last prompt chunk is not yet in `running` when that step
+is postprocessed. The *only* reason its first token is ever picked up is that
+the output arrives late. `CompassModelRunner` returned the current batch's
+tokens with `is_deferred_out` left at its default of False, so it offered them
+one step early, to a loop that could not see the sequence yet, and never offered
+them again until a decode batch happened to include the request.
+
+Instrumenting the three sites that stamp `first_token_time` shows it exactly.
+All twenty requests are stamped at one site, `postprocess`'s walk over
+`self.running`, and:
+
+| | real | simulated |
+| --- | --- | --- |
+| seq 0, prefill done step 0 | stamped step 4 | stamped step 0 |
+| seq 1, prefill done step 4 | stamped step 8 | stamped **step 37** |
+| seq 2, prefill done step 8 | stamped step 12 | stamped **step 37** |
+| seq 7, prefill done step 30 | stamped step 36 | stamped **step 37** |
+
+Step 37 is the first decode step. Every request whose prefill completed inside
+the 36-step prefill streak waited for it.
+
+Deferring the predicted output by one step, with the zero-filled speculation
+counters `postprocess` subscripts once deferral is declared:
+
+| | TTFT median | mean | p90 |
+| --- | --- | --- | --- |
+| real | 27.63 s | 28.68 | 48.83 |
+| before | 54.03 s (+95.5%) | 49.50 | 88.87 |
+| **after** | **20.52 s (-25.7%)** | 21.54 | 41.67 |
+
+and the schedule is untouched -- five streaks, longest 42, prefill 235.11 s over
+106 chunks, median latency 73.65 s against 74.63 s -- because only the
+bookkeeping moved.
+
+**It now runs early rather than late, and the residual is measured.** Per
+request, from prompt completion to first token:
+
+    real       +7.97 +8.08 +8.19 +9.93 +8.37 +8.46 +10.51 +10.44   (mean 9.0 s)
+    simulated  +1.66 +1.69 +1.69 +1.67 +1.88 +1.80  +1.71  +1.75   (mean 1.7 s)
+
+One step is 1.7 s, so the simulation now defers by exactly the one step it was
+told to. The real engine defers by about nine seconds, which on this workload is
+one *request's* prefill rather than one step -- each request takes about five
+chunks, and each first token lands at the step where the next request's prompt
+completes. At the end of a streak both collapse to nothing: +0.09 s real,
++0.02 s simulated.
+
+So a step is the wrong unit for this deferral and the right one is not yet
+known. What is known is that it is not the cost model: the schedule, the step
+costs and the completion times all agree with the real run to a fraction of a
+percent, and this is the last thing standing between them.
+
+
+## A quarter of the priced step is the host waiting
+
+Chasing `silu_and_mul`'s reported instability turned up something larger. Three
+benchmark runs of one 0.6B graph at 300 iterations priced the step at 2.722,
+2.527 and 2.514 ms, and almost the whole 8.3% swing was one operator:
+
+    aten::is_nonzero   53.44us x 6   |  17.82us x 6  |  17.61us x 6
+
+`silu_and_mul` in the same runs came out 2.274, 2.286, 2.286 us -- a spread of
+0.5%, and 99th of 131 operators by instability. It is one of the steadiest
+things measured here, not one of the least, so whatever was seen on the 27B at
+tp=4 belongs to that configuration and not to the kernel.
+
+Two fields already in each price entry settle what `is_nonzero` is:
+
+    aten::is_nonzero   cache="over"    host_seconds = 52.32 of 53.44us   98%
+    every other op     cache="graph"   host_seconds = 0.0
+
+`microbench` records those and says what they mean -- "where this matches
+`seconds`, the device was idle waiting and the price is the host's, not the
+kernel's" -- but nothing ever added them up. Adding them up:
+
+      of which the host was waiting, not the device (0.709ms, 26.0% of step):
+        aten::is_nonzero    6   53.4us   98%  over
+        aten::item          6   18.9us  100%  over
+        aten::item          3   18.3us  100%  over
+        ...
+
+**Twenty-six percent.** Sixteen `aten::item` calls and nine `is_nonzero` -- the
+classic device-to-host reads -- each timing a wait for whatever the GPU had
+queued rather than any work. That is why they swing: they measure the queue.
+
+And they are all `cache="over"`, the fallback for operators that cannot be
+captured into a CUDA graph. `price_list.py` already says its total is to be
+"compared against the replayed step, not the eager one", and a replayed step
+performs no host synchronisations at all. So a quarter of a number describing
+what a deployment does is spent on something the deployment does not do.
+
+Reported rather than removed for now. Subtracting host time from a `cache="over"`
+operator is right for a pure synchronisation and wrong for one that overlaps real
+device work -- chunked-prefill attention is priced this way too, for a genuine
+reason -- and telling those apart needs the 27B's list, where collectives are in
+play. The number is on screen in the meantime, which is the part that was
+missing: it was recorded per entry from the beginning and never summed.
+
+
+### Correction: they are not absent from a deployment
+
+The section above said a replayed step "performs no host synchronisations at
+all", so the 26% was time spent on work the deployment does not do. That is
+wrong, and the graph says so plainly: all 27 of the `aten::item` and
+`aten::is_nonzero` entries carry an empty `launch` list -- they launch no
+kernels -- but they *are* in the traced step, and the engine runs them every
+step. They are stop-condition reads and sampling. A deployment pays them.
+
+What is actually wrong with the number is narrower and does not shrink: a
+synchronisation's duration is however long the queue in front of it happened to
+be. At benchmark time that is the benchmark's queue. So a quarter of the priced
+total is a quantity measured in one context and quoted in another, which is why
+it swings 53.4 to 17.6 us between runs of the same graph and why it cannot be
+expected to transfer -- not because the work is imaginary, but because the wait
+is not a property of the operator.
+
+The practical consequence is the same either way: the priced total should not be
+compared against a measured step without saying how much of it is this.
+
+
+## The deferral is one *meaningful* step, not one step
+
+Deferring the predicted output by one step moved the 27B's TTFT from +95.5% to
+-25.7% -- late to early. Logging what `fwd_output` actually carries at every
+postprocess call says why the sign flipped.
+
+The real engine does not defer uniformly. `ModelRunner.forward` returns early
+for a pure middle chunk of a chunked prefill -- `batch.produces_output()` is
+false, nothing was sampled -- with `is_deferred_out` unset and no tokens. Every
+other step defers. On the 27B that is 4354 of 4440 postprocess calls: 20 of the
+106 prefill steps, the ones that complete a prompt, plus all 4333 decode steps.
+The other 86 prefill steps are middle chunks and pass straight through.
+
+So the buffer only advances on steps that sampled something real:
+
+    step 0  batch=['0']      fwd=[]     deferred=True    seq 0 held
+    step 1  batch=['1']      fwd=['1']  deferred=False   middle chunk
+    step 2  batch=['1']      fwd=['1']  deferred=False   middle chunk
+    step 3  batch=['1']      fwd=['1']  deferred=False   middle chunk
+    step 4  batch=['1','2']  fwd=['0']  deferred=True    seq 0 released
+
+Four steps and about eight seconds, which is the lag that was measured and could
+not be explained. It is one *request's* prefill only because a request happens
+to take about five chunks here; the rule is one meaningful step, and the middle
+chunks in between are free.
+
+The simulated runner deferred on all 106 prefill steps rather than 20, so its
+buffer advanced every step and the lag came out at 1.7 s -- one chunk. Mirroring
+the engine's own predicate, `_is_pure_middle_chunk`, which the runner already
+inherits:
+
+    if self._is_pure_middle_chunk(batch):
+        return ScheduledBatchOutput(req_ids=list(batch.req_ids), token_ids=[],
+                                    ..., compass_step_seconds=cost.seconds)
+
+`postprocess` is safe to call with those empty token ids because it skips a
+sequence still mid-prefill before it indexes them -- `elif
+seq.is_partial_prefill: continue` -- which is exactly why the real engine can
+return them too.
+
+### What it does
+
+| | TTFT median | mean | p90 | latency median |
+| --- | --- | --- | --- | --- |
+| real | 27.63 s | **28.68** | 48.83 | 74.63 |
+| before deferring at all | 54.03 s (+95.5%) | 49.50 | 88.87 | 73.65 |
+| deferring every step | 20.52 s (-25.7%) | 21.54 | 41.67 | 73.65 |
+| **deferring meaningful steps** | **25.09 s (-9.2%)** | **28.78 (+0.3%)** | **51.78** | 73.65 |
+
+Mean TTFT is within 0.3%, p90 within 6%, median within 9.2%, and the schedule is
+untouched throughout -- five streaks, longest 42, prefill 235.11 s over 106
+chunks. Per request the lag now matches step for step:
+
+    prompt done at step   0     4     8    12    35
+    real                +7.97 +8.08 +8.19 +9.93 +0.09
+    simulated           +8.00 +8.09 +8.18 +9.88 +0.02
+
+mean 8.99 s against 9.00 s. The quantity that could not be explained two
+sections ago is now reproduced by mirroring one predicate.
+
+
+## silu_and_mul is not unstable; one measurement was
+
+It was recorded as pricing 3.08, 4.51 and 3.06 us per call across three runs of
+one graph, a 47% swing where every other operator repeated to about a point, and
+filed as instability to be explained rather than an error to be corrected. It
+does not reproduce. Fifteen runs on a quiet machine, three at each iteration
+count:
+
+| | 100 iters | 300 iters | 1000 iters |
+| --- | --- | --- | --- |
+| 0.6B tp=1 | 2.332 2.336 2.338 | 2.274 2.286 2.286 | 2.251 2.252 2.252 |
+| spread | 0.3% | 0.5% | 0.0% |
+| 27B tp=4 | | 2.991 2.995 2.997 | |
+| spread | | **0.2%** | |
+
+By spread it ranks 118th, 99th and 122nd of 131 operators on the 0.6B -- among
+the steadiest things measured here. And the 27B at tp=4 is the configuration the
+original numbers came from, so this is not a case of the small model being
+better behaved.
+
+Two of the three original values, 3.08 and 3.06, sit right on the 2.994 us
+measured here. Only 4.51 does not. So the finding is one anomalous measurement,
+not an unstable kernel -- and the machine those were taken on runs about twenty
+other containers, which is the obvious candidate and the reason the repeats here
+were run on an idle node.
+
+Worth keeping from the attempt regardless: iteration count is a real knob but a
+small one. The worst spread across all operators falls from 149.5% at 100
+iterations to 74.1% at 1000, and at 1000 everything above 10% is a sub-0.03us
+operator sitting at the timer's resolution. silu_and_mul itself drifts 2.335 ->
+2.282 -> 2.252 us as iterations rise, about 3.7%, which is warm-up amortising.
+
+The attempt was worth more than its result: chasing it is what turned up the
+quarter of the priced step spent waiting on the host.
+
+
+## Coverage is checked against the table, not against the rounds
+
+`scripts/compass/coverage.py` reads a calibration table and a run's steps and
+says, per CUDA-graph rung, whether the run goes outside what was measured. It
+exists because the rounds a sweep asks for and the samples it produces are not
+the same thing -- rounds are clamped to the model's context window silently, and
+a commit here once claimed coverage from the rounds and was wrong by 90k.
+
+On the 27B it found more than expected:
+
+  rung  sweep max ctx   run max ctx   verdict
+     2         33856        200722    EXTRAPOLATES 5.9x on 635 of 635 steps
+     4         57209        427645    EXTRAPOLATES 7.5x on 775 of 775 steps
+     8        524544        816120    EXTRAPOLATES 1.6x on 878 of 987 steps
+
+2288 of 4346 decode steps -- over half -- priced outside the table. The cause was
+in the rounds: rungs 2 and 4 had ragged rounds but no uniform long-context ones,
+so their only long samples came from `_skewed`, whose single long sequence tops
+out at 32768.
+
+### What closing it was worth
+
+Adding uniform long-context rounds at rungs 2, 4 and 8 closes it -- 0 rungs
+extrapolating -- and the error moves, unevenly:
+
+| rung | before | after |
+| --- | --- | --- |
+| 1 | -0.44% | -0.28% |
+| 2 | -2.78% | **-0.38%** |
+| 4 | -4.77% | -3.92% |
+| 8 | -2.12% | -2.27% |
+| 16 | -22.58% | **-22.57%** |
+| overall | -3.23% | -2.70% |
+
+A caution was recorded before this ran -- that extrapolation and inaccuracy are
+not the same thing, since the two rungs extrapolating five to sevenfold were
+within 5% while the worst rung was a covered one. Half right. Rung 2 improved
+sevenfold, so "do not expect much" was too pessimistic. Rung 16 did not move at
+all, which was exactly right and is the more interesting half.
+
+### Rung 16 is covered on both axes and still 22.6% low
+
+Because a bounding box is not coverage. Its context range is covered and its
+raggedness range is covered -- but not together. Among the sweep's rung-16
+samples that reach the contexts the run uses:
+
+    64 samples, raggedness 1.00 to 1.00.   The run runs at 1.18 to 1.32.
+    In the run's band: none.
+
+Rung 8 is the same, 64 samples all at 1.00 against a run at 1.12-1.20. Padding is
+identically zero at raggedness 1.00, so the padding coefficient has no variance
+to be identified from where the workload lives. That is the same rank deficiency
+the term was introduced to fix, surviving locally after being fixed globally.
+
+The uniform rounds above do not touch this -- they add long-context samples at
+raggedness exactly 1.00, so afterwards rungs 2, 4 and 8 have 64 to 128 samples
+at the run's contexts and still none in its raggedness band. Measured, not
+assumed. Mildly ragged long-context rounds are added for that, two per rung, and
+verified to bracket the run: rung 2 spans 1.00-1.24 against a run at 1.03-1.18,
+rung 16 spans 1.00-1.38 against 1.18-1.32.
+
+
+## The padding was the rung's rectangle, measured against the batch
+
+The ragged long-context rounds were run and rung 16 did not move: -22.57% to
+-22.64%. The prediction recorded beforehand was that anything short of a large
+move means the padding term is wrong rather than unconstrained, so: it is wrong.
+
+`_decode_bucket_features` computed padding as ``len(context_lens) * max - sum``
+-- the rectangle over the sequences present. A replay reads ``rung * max``. The
+first paragraph of its own docstring says so: "the replay runs the padded rung
+whatever the batch, so twelve sequences and sixteen perform the same work." The
+feature did not.
+
+Those two are equal exactly when a batch fills its rung, and a sweep that
+requests 2, 4, 8, 16 sequences always fills it. A serving run does not: as
+requests finish, batches drift below their rung and sit there. Per rung on the
+27B run, padding as coded against padding a replay reads:
+
+| rung | batches | ratio | error |
+| --- | --- | --- | --- |
+| 2 | 2 | 1.00x | -0.34% |
+| 8 | 5-8 | 1.40x | -2.41% |
+| 4 | 3-4 | 2.26x | -3.91% |
+| 16 | **9-10** | **5.59x** | **-22.64%** |
+
+The error tracks the ratio. The sweep's own rung-16 batches are 12 to 16, ratio
+1.00, so the coefficient was fitted where the mistake is invisible and applied
+where it is not.
+
+### What each change was actually worth
+
+Holding the corrected feature fixed and varying only the table:
+
+| decode error | overall | rung 2 | rung 4 | rung 8 | rung 16 |
+| --- | --- | --- | --- | --- | --- |
+| original table, original feature | -3.23% | -2.78% | -4.77% | -2.12% | -22.58% |
+| original table, fixed feature | **-0.59%** | -2.78% | -0.77% | +0.02% | **+1.98%** |
+| + long-context rounds | **-0.06%** | **-0.34%** | +0.07% | -0.28% | +1.97% |
+| + mildly ragged rounds | -0.09% | -0.34% | +0.07% | -0.28% | +1.97% |
+
+Three separable things, and they should be credited separately. The feature fix
+carries rungs 4, 8 and 16. The long-context rounds carry rung 2, which was
+genuinely coverage-limited. The mildly ragged rounds -- the hypothesis this
+section started from -- add nothing measurable, on this workload, even after the
+feature they were meant to constrain was corrected. They are kept because the
+evidence gap they close is real, but a reader trading sweep time should know
+they bought nothing here.
+
+Two rounds of sweep changes were spent on the theory that a coefficient was
+unconstrained. It was constrained; it was fitted to the wrong number. The
+symptom of that is worth remembering: widening the evidence twice moved rung 16
+by 0.07 points, which is what "not a coverage problem" looks like from the
+outside.
+
+### Where the cost model now stands on the 27B
+
+    prefill  106 steps   measured 235.56s  priced 228.20s
+      on totals               -3.13%
+      holding out step 0      -0.27%     (the unmodelled cold start)
+      median per step         -0.09%
+
+    decode  4346 steps   measured  73.17s  priced  73.10s
+      on totals               -0.09%
+      holding out step 148    -0.07%
+      median per step         +0.09%
+
+Within 0.3% on both halves, with no single step carrying the total on either.
+
+
+## Where the 27B ends up
+
+Same workload, same machine, same twenty requests, throughout. The simulated
+side changed five times; the real side is one measurement repeated.
+
+| | TTFT median | mean | p90 | latency median | prefill | streaks |
+| --- | --- | --- | --- | --- | --- | --- |
+| **real** | **27.63** | **28.68** | **48.83** | **74.63** | 235.56s / 106 | 5, max 42 |
+| at the start | 52.40 | 65.22 | 147.85 | 78.66 | 237.67s / 105 | 6, max 63 |
+| + per-request attention | 36.59 | 41.53 | 88.87 | 70.01 | 228.44s / 106 | 8, max 42 |
+| + measured warmup | 54.03 | 49.50 | 88.87 | 73.65 | 235.11s / 106 | 5, max 42 |
+| + deferred output | 20.52 | 21.54 | 41.67 | 73.65 | 235.11s / 106 | 5, max 42 |
+| + deferred on meaningful steps | 25.09 | 28.78 | 51.78 | 73.65 | 235.11s / 106 | 5, max 42 |
+| **+ rung padding** | **25.85** | **28.64** | **48.70** | **74.25** | 234.88s / 106 | 5, max 42 |
+
+Mean TTFT -0.14%, p90 -0.27%, median latency -0.51%, prefill total -0.29%, and
+the schedule identical -- five streaks, longest 42, over a 267-second run.
+Median TTFT is -6.4%, the one aggregate still outside half a percent.
+
+Note the middle of that table. Three of the five changes made a headline number
+*worse* on their way through: the warmup term moved TTFT from -32% to +96%, and
+deferring every step moved it from +96% to -26%. Each was right and each was
+incomplete, and reading any one of them as a regression would have stopped the
+sequence. What kept it honest was that the schedule and the step costs were
+checked separately from the latency: prefill total and streak structure locked
+in at the second row and never moved again, which is how it was possible to know
+that a worse TTFT meant an incomplete fix rather than a wrong one.
+
+The five, in order, and what each actually was:
+
+1. **Per-request prefill attention.** The batch was reduced to two scalars and
+   multiplied, charging one request's tokens against another's history. 8.8x too
+   much on a real step.
+2. **Measured first-step warmup.** Not learnable from the sweep -- the sweep's
+   own warmth is 72.8s and a serving run's is 6.87s -- so it is a per-deployment
+   constant like `--compass-admission-seconds`, defaulting to zero.
+3. **Deferred output.** `postprocess` skips a running sequence absent from
+   `fwd_output`, so a completed prefill's first token is only ever picked up
+   because the output arrives late. The simulator did not defer and the token
+   was dropped.
+4. **Deferred on meaningful steps only.** A middle chunk of a chunked prefill
+   samples nothing and does not take a turn in the buffer. Deferring every step
+   made the lag one chunk where the engine's is one prompt.
+5. **Rung padding.** The padded rectangle is the rung's, not the batch's.
+
+None of them is a cost model being wrong about hardware. All five are the
+simulator disagreeing with the engine about bookkeeping, and each was hidden
+behind an aggregate that looked acceptable -- which is the single most repeated
+lesson in this file.
