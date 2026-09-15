@@ -36,14 +36,48 @@ check_files() {
     done
 }
 
-[[ $# == 2 ]] || die "usage: $0 {check-base|apply|verify} PRIVATE_AIPERF_CHECKOUT"
+[[ $# == 2 ]] || die "usage: $0 {check-base|apply|verify|apply-controlled|verify-controlled} PRIVATE_AIPERF_CHECKOUT"
 action=$1
-case "$action" in check-base|apply|verify) ;; *) die "unknown action: $action" ;; esac
+case "$action" in check-base|apply|verify|apply-controlled|verify-controlled) ;; *) die "unknown action: $action" ;; esac
 source_root=$(cd -- "$2" && pwd -P)
 git_cmd=(git -c "safe.directory=$source_root" -C "$source_root")
 [[ $("${git_cmd[@]}" rev-parse --show-toplevel) == "$source_root" ]] || die "name the checkout root"
 [[ $("${git_cmd[@]}" rev-parse HEAD) == "$base" ]] || die "HEAD must be $base"
 check_hash "$patch_file" "$patch_sha"
+
+if [[ $action == apply-controlled || $action == verify-controlled ]]; then
+    controlled_patch="${patch_file%/*}/aiperf-controlled-clock.patch"
+    controlled_manifest="${patch_file%/*}/aiperf-controlled-clock.json"
+    check_hash "$controlled_patch" "c8035a3cac1061a817e87af31ab440508d9b23dfe5a3b2cc27e5708e96e45d06"
+    check_hash "$controlled_manifest" "ae7b2b93753f1d88a2332be0bfb16d4e6d12730f7b6253a53771eb4b593ad32b"
+    if [[ $action == apply-controlled ]]; then
+        bash "${BASH_SOURCE[0]}" verify "$source_root"
+        "${git_cmd[@]}" apply --check --whitespace=error-all "$controlled_patch"
+        "${git_cmd[@]}" apply --whitespace=error-all "$controlled_patch"
+    fi
+    expected_status=$(python - "$source_root" "$controlled_manifest" <<'PY'
+import hashlib
+import json
+from pathlib import Path
+import sys
+
+root, manifest = Path(sys.argv[1]), json.loads(Path(sys.argv[2]).read_text())
+rows = []
+for entry in manifest["files"]:
+    path = root / entry["path"]
+    if not path.is_file() or path.is_symlink():
+        raise SystemExit(f"AIPerf dependency refused: missing or symlinked file: {path}")
+    if hashlib.sha256(path.read_bytes()).hexdigest() != entry["sha256"]:
+        raise SystemExit(f"AIPerf dependency refused: unexpected bytes: {path}")
+    rows.append(entry["status"] + " " + entry["path"])
+print("\n".join(sorted(rows)))
+PY
+    )
+    actual_status=$("${git_cmd[@]}" status --porcelain=v1 --untracked-files=all | LC_ALL=C sort)
+    [[ $actual_status == "$expected_status" ]] || die "checkout has changes beyond the reviewed controlled profile"
+    printf 'dependency=aiperf state=atomcompass-controlled-clock-v1 base_commit=%s patch_sha256=%s\n' "$base" "c8035a3cac1061a817e87af31ab440508d9b23dfe5a3b2cc27e5708e96e45d06"
+    exit 0
+fi
 
 if [[ $action == check-base || $action == apply ]]; then
     [[ -z $("${git_cmd[@]}" status --porcelain=v1 --untracked-files=all) ]] || die "base checkout has changes"
