@@ -66,3 +66,20 @@ def test_matching_token_hash_cannot_hide_sampling_or_boundary_mismatch(mutation)
         raw[0].pop("end_perf_ns")
     with pytest.raises(ValueError):
         normalize_records(raw, **options)
+
+
+def test_cancelled_before_first_sse_retains_actual_native_admission():
+    from atom.compass.replay.aiperf_records import normalize_records
+    raw, options = specimen()
+    raw[0]["responses"] = []
+    raw[0]["metadata"]["was_cancelled"] = True
+    evidence = options["consumed"]["server-id"]
+    options["admissions"] = [{"client_request_id": "client-id", "request_id": "server-id",
+        "seq_id": "native-seq-7", "max_completion_tokens": 2, "shared_preprocessing": evidence,
+        "aborted": True, "tokenized": True, "engine_enqueued": True}]
+    row, = normalize_records(raw, **options)
+    assert row["response_id"] is None and row["first_visible_ns"] is None
+    assert row["engine_request_id"] == "server-id"
+    assert row["engine_seq_id"] == "native-seq-7"
+    assert row["native_tokenized_observed"] is True
+    assert row["cancelled"] and row["native_enqueue_observed"]

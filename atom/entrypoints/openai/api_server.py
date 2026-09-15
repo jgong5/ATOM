@@ -150,6 +150,7 @@ tokenizer: AutoTokenizer | None = None
 # row per request forever. A benchmark drains it at the end of a run.
 _compass_records: "OrderedDict[str, dict]" = OrderedDict()
 _compass_prompt_evidence: dict[str, dict] = {}
+_compass_coverage_admissions: "OrderedDict[str, dict]" = OrderedDict()
 COMPASS_MAX_RECORDS = 100_000
 
 
@@ -1309,6 +1310,7 @@ async def setup_streaming_request(
     workload_size: int | None = None,
     workload_index: int | None = None,
     prompt_token_sha256: str | None = None,
+    coverage_client_request_id: str | None = None,
 ) -> tuple[int, StreamOutputCollector, int]:
     """Set up a streaming request with the engine.
 
@@ -1357,7 +1359,7 @@ async def setup_streaming_request(
     try:
         seq = await executor_loop.run_in_executor(None, do_preprocess)
         _validate_sequence_context_length(seq)
-        if prompt_token_sha256 is not None:
+        if prompt_token_sha256 is not None or os.environ.get("COMPASS_NATIVE_COVERAGE") == "1":
             from atom.compass.prefix_workload import token_digest
 
             _compass_prompt_evidence[request_id] = {
@@ -1386,7 +1388,21 @@ async def setup_streaming_request(
     # %-style, not an f-string: the arguments are formatted only if the
     # record is emitted, and this runs once per request with debug off.
     logger.debug("API: Created request_id=%s, seq_id=%s", request_id, seq_id)
+    if os.environ.get("COMPASS_NATIVE_COVERAGE") == "1":
+        if len(_compass_coverage_admissions) >= COMPASS_MAX_RECORDS:
+            raise RuntimeError("native coverage admission journal capacity exceeded")
+        evidence = _compass_prompt_evidence[request_id]
+        _compass_coverage_admissions[request_id] = {
+            "request_id": request_id, "seq_id": str(seq_id),
+            "client_request_id": coverage_client_request_id,
+            "max_completion_tokens": sampling_params.max_tokens,
+            "shared_preprocessing": {key: evidence[key] for key in (
+                "prompt_token_sha256", "input_tokens")},
+            "aborted": False, "tokenized": True, "engine_enqueued": False,
+        }
     engine.core_mgr.add_request([seq])
+    if request_id in _compass_coverage_admissions:
+        _compass_coverage_admissions[request_id]["engine_enqueued"] = True
 
     return seq_id, stream_collector, seq.num_prompt_tokens
 
@@ -1401,7 +1417,9 @@ def cleanup_stream(seq_id: int, aborted: bool = False) -> None:
     no-op that just floods the control path (one broadcast per engine core, per
     request).
     """
-    _seq_id_to_request_id.pop(seq_id, None)
+    request_id = _seq_id_to_request_id.pop(seq_id, None)
+    if request_id in _compass_coverage_admissions:
+        _compass_coverage_admissions[request_id]["aborted"] = bool(aborted)
     if aborted:
         try:
             engine.core_mgr.abort_request(seq_id)
@@ -1845,6 +1863,8 @@ async def chat_completions(request: ChatCompletionRequest, raw_request: Request)
                         kv_transfer_params=request.kv_transfer_params,
                         **dp_routing,
                         **compass_fields,
+                        **({"coverage_client_request_id": raw_request.headers.get("x-request-id")}
+                           if os.environ.get("COMPASS_NATIVE_COVERAGE") == "1" else {}),
                     )
                 )
                 gen = stream_chat_response(
@@ -2510,9 +2530,17 @@ async def compass_requests(drain: bool = True):
     cannot read the timings without also reading whether they are usable.
     """
     records = list(_compass_records.values())
+    coverage = {}
+    if os.environ.get("COMPASS_NATIVE_COVERAGE") == "1":
+        coverage = {"admissions": list(_compass_coverage_admissions.values()),
+                    "active_streams": len(_stream_loops),
+                    "active_api_requests": len(_request_start_times)}
+        if drain:
+            _compass_coverage_admissions.clear()
     if drain:
         _compass_records.clear()
     return {
+        **coverage,
         "count": len(records),
         "clock": "virtual" if _compass_clock_is_virtual() else "wall",
         "arrival_barrier": _compass_arrival_barrier(),

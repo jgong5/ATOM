@@ -496,6 +496,46 @@ class TestOpeningChatPreprocessing:
             set_clock(previous)
 
 
+    def test_ordinary_cancelled_chat_keeps_consumed_token_and_header_attribution(self, monkeypatch):
+        from collections import OrderedDict
+        from atom.compass.prefix_workload import token_digest
+        from atom.model_engine.llm_engine import InputOutputProcessor
+
+        config = SimpleNamespace(hf_config=SimpleNamespace(model_type="test"), max_model_len=32)
+        processor = InputOutputProcessor(config, SimpleNamespace(encode=lambda *a, **kw: [1, 2, 3]), 16)
+        admitted, aborted = [], []
+        monkeypatch.setenv("COMPASS_NATIVE_COVERAGE", "1")
+        monkeypatch.setattr(api_server, "engine", SimpleNamespace(
+            config=config, io_processor=processor,
+            core_mgr=SimpleNamespace(add_request=lambda rows: admitted.extend(rows),
+                                     abort_request=lambda seq_id: aborted.append(seq_id))))
+        monkeypatch.setattr(api_server, "model_name", "test")
+        monkeypatch.setattr(api_server, "tokenizer", processor.tokenizer)
+        monkeypatch.setattr(api_server, "apply_chat_template", lambda *a, **kw: "ordinary marked prompt")
+        monkeypatch.setattr(api_server, "_stream_batch_dispatcher", SimpleNamespace(
+            new_state=lambda: object(), enqueue=lambda **kw: None))
+        for name in ("_compass_records", "_compass_coverage_admissions"):
+            monkeypatch.setattr(api_server, name, OrderedDict())
+        for name in ("_compass_prompt_evidence", "_stream_loops", "_request_start_times", "_seq_id_to_request_id"):
+            monkeypatch.setattr(api_server, name, {})
+        request = api_server.ChatCompletionRequest(
+            model="test", messages=[{"role": "user", "content": "marked source"}],
+            max_completion_tokens=21, temperature=1, ignore_eos=True, stream=True)
+        asyncio.run(api_server.chat_completions(
+            request, SimpleNamespace(headers={"x-request-id": "actual-client-id"})))
+        assert len(admitted) == 1 and not api_server._compass_records
+        seq = admitted[0]
+        entry, = api_server._compass_coverage_admissions.values()
+        assert entry["client_request_id"] == "actual-client-id" and entry["seq_id"] == str(seq.id)
+        assert entry["tokenized"] is True and entry["engine_enqueued"] is True
+        assert entry["shared_preprocessing"] == {"input_tokens": 3, "prompt_token_sha256": token_digest([1, 2, 3])}
+        api_server.cleanup_stream(seq.id, aborted=True)
+        api_server.cleanup_request(entry["request_id"])
+        assert entry["aborted"] and aborted == [seq.id]
+        assert not api_server._stream_loops and not api_server._request_start_times
+        assert len(api_server._compass_coverage_admissions) == 1
+
+
 class TestResolvedCompassProvenance:
     def test_native_alias_sort_and_filter_preserve_reported_rung_sets(self):
         from atom.compass.core.resolved_runtime import worker_snapshot

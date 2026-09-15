@@ -22,7 +22,7 @@ def driver():
 def test_coverage_projection_rejects_timing_fields_at_every_level():
     m = driver()
     record = {key: None for key in m.REQUEST_FACTS}
-    record.update(request_id="client", response_id="engine", seconds=999)
+    record.update(request_id="client", response_id="engine", engine_seq_id="native-seq", seconds=999)
     allocation = {"source": "ScheduledBatch", "block_tables": [[2, 5]], "cached_tokens": [16],
                   "state_rows": [0], "state_slots": [1], "state_fork_srcs": [-1],
                   "num_prefill_seqs": 1, "seconds": 888,
@@ -31,7 +31,7 @@ def test_coverage_projection_rejects_timing_fields_at_every_level():
     decision = {key: 0 for key in m.DECISION_FACTS}
     decision.update(allocation=allocation, seconds=666)
     step = {key: None for key in m.STEP_FACTS}
-    step.update(req_ids=["engine"], decision=decision, seconds=555, spans={"seconds": 444})
+    step.update(req_ids=["native-seq"], decision=decision, seconds=555, spans={"seconds": 444})
     cache = {"ranks": [{"indexes": {"kv": 0, "state": 0}, "quiescence": {"idle": True},
                        "cache_statistics": dict.fromkeys(("requests", "cached_tokens", "compressed_tokens",
                            "wanted_tokens", "reusable_tokens", "full_tokens"), 0), "seconds": 333}]}
@@ -76,7 +76,8 @@ def test_native_allocation_is_copied_before_batch_changes():
 
 def test_backend_scope_and_resolved_body_flags_must_match(tmp_path):
     m = driver()
-    expected = {"unified": {"attention_backend": [["backend", "AiterBackend"]]},
+    expected = {"unified": {"attention_backend": [["backend", "AiterBackend"]],
+        "kv_cache_layout": [["k", [["shape", [131072, 4, 16]], ["stride", [64, 16, 1]], ["dtype", "bf16"]]]]},
                 "gdn": {"gdn_decode_lossy_fast": False}}
     path = tmp_path / "scope.json"
     path.write_text(json.dumps({"attention_scope": expected}))
@@ -85,7 +86,59 @@ def test_backend_scope_and_resolved_body_flags_must_match(tmp_path):
             "environment": {"ATOM_COMPILE_CACHE_ROOT": "/owned/cache"}}
     provenance = {"worker_runtime": [{"native_attention": native,
                     "configuration": {"compilation_cache_dir": "/owned/cache/native-hash"}}]}
-    assert m.check_native_scope(plan, provenance) is native
+    native["declaration"]["scopes"] = json.loads(json.dumps(expected))
+    native["declaration"]["scopes"]["unified"]["kv_cache_layout"][0][1][0][1][0] = 112760
+    result = m.check_native_scope(plan, provenance)
+    assert result["native"] is native
+    assert result["kv_capacity_differences"][0]["native_capacity"] == 112760
+    native["declaration"]["scopes"]["unified"]["kv_cache_layout"][0][1][1][1][0] = 999
+    with pytest.raises(ValueError, match="trailing geometry/strides"):
+        m.check_native_scope(plan, provenance)
+    native["declaration"]["scopes"]["unified"]["kv_cache_layout"][0][1][1][1][0] = 64
     native["body_flags"]["FLA_GDN_FIX_BT"] = True
     with pytest.raises(ValueError, match="resolved FLA"):
         m.check_native_scope(plan, provenance)
+
+
+def test_closeout_waits_for_abort_then_stable_empty_native_drain(tmp_path):
+    m = driver()
+    journal = tmp_path / "steps.jsonl"
+    journal.write_text("native steps")
+    clock = [0.0]
+    class Replay:
+        polls = 0
+        flushes = 0
+        cache_queries = 0
+        def _prefix_cache_snapshot(self, *args):
+            self.cache_queries += 1
+            # A late native control item can invalidate an earlier quiet read.
+            idle = self.polls >= 1 and self.cache_queries != 7
+            return {"ranks": [{"quiescence": {"idle": idle}}]}
+        def _drain_records(self, *args):
+            self.polls += 1
+            return {"active_streams": 1 if self.polls == 1 else 0,
+                    "active_api_requests": 1 if self.polls == 1 else 0,
+                    "admissions": [{"request_id": "cancelled"}] if self.polls == 1 else [],
+                    "requests": [{"request_id": "late-finish"}] if self.polls == 2 else []}
+        def _flush_measurements(self, *args):
+            self.flushes += 1
+            return {"acknowledged": True}
+    replay, evidence = Replay(), {}
+    _, engine, cache = m.collect_native_closeout("", replay, journal, evidence=evidence,
+        reserve_seconds=1, now=lambda: clock[0], sleep=lambda n: clock.__setitem__(0, clock[0]+n))
+    assert engine["admissions"] == [{"request_id": "cancelled"}]
+    assert engine["requests"] == [{"request_id": "late-finish"}]
+    assert evidence["stable"] and cache["ranks"][0]["quiescence"]["idle"]
+    assert replay.polls >= 7 and replay.flushes >= 6
+
+
+def test_closeout_refuses_nonquiescent_native_stream(tmp_path):
+    m = driver()
+    clock = [0.0]
+    replay = SimpleNamespace(
+        _prefix_cache_snapshot=lambda *args: {"ranks": [{"quiescence": {"idle": False}}]},
+        _drain_records=lambda *args: {"active_streams": 1, "active_api_requests": 1})
+    with pytest.raises(TimeoutError, match="stable flushed"):
+        m.collect_native_closeout("", replay, tmp_path / "unused", evidence={},
+            reserve_seconds=.1, now=lambda: clock[0],
+            sleep=lambda n: clock.__setitem__(0, clock[0]+n))

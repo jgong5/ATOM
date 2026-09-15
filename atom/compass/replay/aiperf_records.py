@@ -26,7 +26,7 @@ def export_controlled_records(records):
 
 
 def normalize_records(raw_records, *, user_config, tokenizer, model_path,
-                      default_chat_template_kwargs=None, consumed, expected_caps):
+                      default_chat_template_kwargs=None, consumed, expected_caps, admissions=()):
     """Keep last packet, first visible content and transport completion separate."""
     from aiperf.common.models import ModelEndpointInfo, RawRecordInfo
     from aiperf.plugin import plugins
@@ -39,6 +39,12 @@ def normalize_records(raw_records, *, user_config, tokenizer, model_path,
         model_endpoint=endpoint_info)
     encoder = load_custom_message_encoder(model_path)
     rows = []
+    admitted = {}
+    for entry in admissions:
+        key = entry["client_request_id"]
+        if not key or key in admitted:
+            raise ValueError("native admissions lack unique actual client request headers")
+        admitted[key] = entry
     for value in raw_records:
         raw = RawRecordInfo.model_validate(value)
         meta = raw.metadata
@@ -83,12 +89,21 @@ def normalize_records(raw_records, *, user_config, tokenizer, model_path,
                                        tools=raw.payload.get("tools"), **kwargs)
         tokens = tokenizer.encode(rendered)
         prompt_sha = token_digest(tokens)
+        admission = admitted.get(meta.x_request_id)
+        engine_request_id, seq_id = response_id, None
         observed = consumed.get(response_id)
+        if admission is not None:
+            engine_request_id, seq_id = admission["request_id"], admission["seq_id"]
+            if (response_id is not None and response_id != engine_request_id
+                    or admission["max_completion_tokens"] != cap):
+                raise ValueError("native admission identity/cap disagrees with the raw request")
+            observed = admission["shared_preprocessing"]
         failed = raw.error is not None or meta.was_cancelled
+        if observed is not None and (observed["prompt_token_sha256"] != prompt_sha
+                                     or observed["input_tokens"] != len(tokens)):
+            raise ValueError("marked rendered prompt differs from actual engine consumption")
         if not failed:
-            if (observed is None or observed["prompt_token_sha256"] != prompt_sha
-                    or observed["input_tokens"] != len(tokens)
-                    or usage.get("prompt_tokens") != len(tokens)):
+            if observed is None or usage.get("prompt_tokens") != len(tokens):
                 raise ValueError("marked rendered prompt differs from actual engine consumption")
             if usage.get("completion_tokens") != cap:
                 raise ValueError("successful native request did not produce its unchanged source cap")
@@ -99,6 +114,9 @@ def normalize_records(raw_records, *, user_config, tokenizer, model_path,
             raise ValueError("proper replay record has no ordinary cache-bust marker")
         rows.append({
             "request_id": meta.x_request_id, "response_id": response_id,
+            "engine_request_id": engine_request_id, "engine_seq_id": seq_id,
+            "native_tokenized_observed": admission is not None,
+            "native_enqueue_observed": admission is not None and admission.get("engine_enqueued") is True,
             "conversation_id": meta.conversation_id, "turn_index": meta.turn_index,
             "source_trace_id": meta.source_trace_id, "source_outer_idx": meta.source_outer_idx,
             "source_inner_idx": meta.source_inner_idx, "source_kind": meta.source_kind,
@@ -120,4 +138,6 @@ def normalize_records(raw_records, *, user_config, tokenizer, model_path,
             "raw_record_sha256": content_sha256(value),
             "transport_completion_basis": "original RequestRecord.end_perf_ns; not last SSE",
         })
+    if admitted.keys() - {row["request_id"] for row in rows}:
+        raise ValueError("native admissions are missing actual AIPerf raw records")
     return rows
