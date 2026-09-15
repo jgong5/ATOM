@@ -172,6 +172,10 @@ are not activated. R3/R4/R5 failures remain visible;
 proof is qualified source closure followed by intact paired cc-traces, then
 short/long, C1/C2/C4/C8, feasibility and ranking coverage. Client count still
 counts root sessions, not concurrent requests or subagents.
+The shared fixed-root evaluator still hardcodes `accepted=false`, and the
+cache-region wrapper is not a registered acceptance factory. A passing intact
+root with qualified sources would therefore be a development witness; a
+cache-on acceptance/confirmation protocol remains a separate requirement.
 
 Implementation is integrated at `2782333ab`: explicit TP1 cache/checkpoint
 policy; a pinned codec for local 64-token source hash blocks with native

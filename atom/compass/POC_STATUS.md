@@ -203,6 +203,10 @@ handoff is refused. One region-only native run is authorized; its actual
 qualification verdict remains pending.
 Neither this wiring proof nor source microbenchmarks substitute for intact
 E2E cc-traces; registered acceptance remains **9/24**.
+The maintained fixed-root checker still reports `accepted=false` and a
+diagnostic lifecycle purpose. Even a passing intact-root pair with qualified
+sources would be a complete-root development witness; cache-on acceptance
+registration and the broader confirmation protocol remain separate gaps.
 
 R5 evidence remains under the same ignored source directory:
 
