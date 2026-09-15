@@ -37,6 +37,8 @@ CACHE_REGION_OPTIONS = frozenset((
     "low_q_handoff", "low_q_handoff_sha256", "low_q_allow_failed_spread", "rank_coords",
     "root_prefill_handoff", "root_prefill_handoff_sha256", "root_prefill_allow_failed_spread",
     "region_supplement_handoff", "region_supplement_handoff_sha256",
+    "root_prefill_diagnostic_handoff", "root_prefill_diagnostic_handoff_sha256",
+    "root_prefill_diagnostic_workload_sha256",
 ))
 
 
@@ -181,7 +183,25 @@ def calibration_options(case):
     return {"expected_opening_plan_sha256": case["workload_sha256"]}
 
 
-def check_source_contract(modelled, registry, workload_sha, forbidden, label):
+def _check_diagnostic_input_registration(item, registry, workload_sha, forbidden):
+    """Check raw-byte provenance; the exact read name is bound by the aggregate.
+
+    A retained PLAN.json can also be read as EXECUTABLE_PLAN.json. A single
+    raw-SHA entry may keep its original name only when it describes exactly
+    those bytes. Multi-file or ambiguous registrations never take this route.
+    """
+    validate = _script("cc_traces_validate")
+    entries = [row for row in registry.get("artifacts", []) if row.get("sha256") == item.sha256]
+    if len(entries) != 1:
+        raise ValueError(f"root diagnostic input {item.path} needs one raw-SHA registry entry")
+    contents = entries[0].get("contents")
+    if not isinstance(contents, dict) or len(contents) != 1 or list(contents.values()) != [item.sha256]:
+        raise ValueError(f"root diagnostic input {item.path} needs a singleton registration of its actual bytes")
+    return validate._check_calibration_records(
+        {item.role: item.sha256}, {item.role: contents}, registry, 1, workload_sha, forbidden)
+
+
+def check_source_contract(modelled, registry, workload_sha, forbidden, label, *, diagnostic_status=None):
     """Check the exact diagnostic wrapper, retaining the base protocol checks.
 
     Pair validation needs the pinned overlay and optional source bundles mounted
@@ -246,6 +266,9 @@ def check_source_contract(modelled, registry, workload_sha, forbidden, label):
         include_failed = _flag(options.get("include_failed_outputless", False), "include_failed_outputless")
         include_failed_final = _flag(options.get("include_failed_final", False), "include_failed_final")
         diagnostic = _flag(options.get("diagnostic_only", False), "diagnostic_only")
+        if options.get("root_prefill_diagnostic_handoff") and (
+                not diagnostic or options.get("root_prefill_handoff") or options.get("region_supplement_handoff")):
+            raise ValueError("root diagnostic source requires separate explicit diagnostic selection")
         selected = wrapper.model_from_artifact(
             overlay, include_failed_outputless=include_failed,
             include_failed_final=include_failed_final, diagnostic_only=diagnostic)
@@ -373,6 +396,50 @@ def check_source_contract(modelled, registry, workload_sha, forbidden, label):
             selected_name = "root-prefill-supplement"
         elif any(str(row.get("role", "")).startswith("oracle.region_supplement_") for row in inputs):
             raise ValueError("unconfigured region supplement evidence was loaded")
+        if (bool(options.get("root_prefill_diagnostic_handoff")) != bool(options.get("root_prefill_diagnostic_handoff_sha256"))
+                or bool(options.get("root_prefill_diagnostic_handoff")) != bool(options.get("root_prefill_diagnostic_workload_sha256"))):
+            raise ValueError("root diagnostic handoff, SHA-256 and fixed workload are required together")
+        if options.get("root_prefill_diagnostic_handoff"):
+            from atom.compass.core.cost.root_diagnostic import DiagnosticRootPrefillPrices, ROLE_PREFIX
+            from atom.compass.core.cost.root_prefill import ExactPrefillRegions
+            from atom.compass.core.cost.library import PriceLibrary
+            from atom.compass.core.loaded_input import file_digests
+
+            if options["root_prefill_diagnostic_workload_sha256"] != workload_sha:
+                raise ValueError("root diagnostic source is bound to another workload")
+            pinned("root_prefill_diagnostic_handoff", ROLE_PREFIX + "sources")
+            scopes = [row for row in inputs if row.get("role") == "oracle.attention_scope"]
+            if len(scopes) != 1 or scopes[0].get("requested") != options.get("attention_scope"):
+                raise ValueError("root diagnostic source lacks its loaded deployment request scope")
+            base = PriceLibrary()
+            base.launch_charge_seconds = float(options.get("seconds_per_launch", 0))
+            source = DiagnosticRootPrefillPrices(base, options["root_prefill_diagnostic_handoff"],
+                options["root_prefill_diagnostic_handoff_sha256"], deployment_scope_sha256=scopes[0]["sha256"],
+                workload_sha256=workload_sha, diagnostic_only=diagnostic)
+            if (sum(str(row.get("role", "")).startswith(ROLE_PREFIX) for row in inputs)
+                    != sum(item.role.startswith(ROLE_PREFIX) for item in source.loaded_inputs)):
+                raise ValueError("root diagnostic worker input roles differ from the actual source reads")
+            for item in source.loaded_inputs:
+                if sum(row == item.as_dict() for row in inputs) != 1:
+                    raise ValueError(f"root diagnostic input {item.path} lacks its exact role/path/digest identity")
+                bad.extend(_check_diagnostic_input_registration(item, registry, workload_sha, forbidden))
+            files = file_digests(item for item in source.loaded_inputs if item.role.startswith(ROLE_PREFIX))
+            digest = validate._rolled_digest(files)
+            if ((compass.get("oracle_option_files") or {}).get("root_prefill_diagnostic_handoff") != files
+                    or (compass.get("oracle_option_sha256") or {}).get("root_prefill_diagnostic_handoff") != digest):
+                raise ValueError("root diagnostic aggregate omits or changes an actual loaded source path")
+            bad.extend(validate._check_calibration_records(
+                {"root_prefill_diagnostic_handoff": digest}, {"root_prefill_diagnostic_handoff": files},
+                registry, 1, workload_sha, forbidden))
+            selected = ExactPrefillRegions(selected, source.region_points, source.handoff_sha256)
+            selected = ExactPrefillRegions(selected, source.supplement_points, source.handoff_sha256)
+            selected_name = "root-reference-diagnostic"
+            if diagnostic_status is not None:
+                diagnostic_status.update(source.diagnostic_status)
+            notes.append("Unqualified root reference diagnostic: R5 validation 171/348 incomplete with two MHA spread failures; "
+                         "supplement 17/20 with three failed prepare gates and outer exit 124; no acceptance credit")
+        elif any(str(row.get("role", "")).startswith("oracle.root_diagnostic_") for row in inputs):
+            raise ValueError("unconfigured root diagnostic evidence was loaded")
         snapshot = region_snapshot(selected_name, selected)
         if ranks[0].get("regions") != snapshot:
             raise ValueError("selected region snapshot differs from its loaded overlay and flags")
@@ -458,12 +525,15 @@ def _pair_case(args, case_reader):
         real, modelled = runs["real"], runs["modelled"]
         failures += compare.check_pair(real, modelled)
         failures += validate.check_side_roles(real, modelled)
-        source_bad, source_notes = case_reader.check_source_contract(
-            modelled, registry, case["workload_sha256"], forbidden, f"repeat {index}")
-        failures += source_bad
-        notes += [note for note in source_notes if note not in notes]
         compass = (modelled.manifest.get("server") or {}).get("compass") or {}
         options = compass.get("oracle_options") or {}
+        diagnostic_source_status = {}
+        source_detail = ({"diagnostic_status": diagnostic_source_status}
+                         if options.get("root_prefill_diagnostic_handoff") else {})
+        source_bad, source_notes = case_reader.check_source_contract(
+            modelled, registry, case["workload_sha256"], forbidden, f"repeat {index}", **source_detail)
+        failures += source_bad
+        notes += [note for note in source_notes if note not in notes]
         sources.append({"repeat": index, "observed_oracle": compass.get("oracle"),
                         "base_validation_factory": validate.SOURCE_FACTORY,
                         "region_overlay_sha256": options.get("region_overlay_sha256"),
@@ -476,6 +546,9 @@ def _pair_case(args, case_reader):
                         "include_failed_outputless": options.get("include_failed_outputless", False),
                         "include_failed_final": options.get("include_failed_final", False),
                         "diagnostic_only": options.get("diagnostic_only", False)})
+        if options.get("root_prefill_diagnostic_handoff"):
+            sources[-1].update(root_prefill_diagnostic_handoff_sha256=options["root_prefill_diagnostic_handoff_sha256"],
+                               diagnostic_status=diagnostic_source_status, source_qualified=False)
         failures += validate.check_predictor_device_freedom(modelled, f"repeat {index}")
         failures += validate.check_capacity_inputs(modelled, f"repeat {index}")
         failures += validate.check_reference_budget_is_measured(real, f"repeat {index}")

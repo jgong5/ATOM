@@ -53,13 +53,14 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import Any
 
 from atom.compass.core.artifacts import resolve_rank_path
 
-__all__ = ["LoadedInput", "load_json", "manifest", "roll"]
+__all__ = ["LoadedInput", "load_json", "manifest", "roll", "file_digests"]
 
 
 @dataclass(frozen=True)
@@ -183,6 +184,23 @@ def roll(inputs: Iterable[LoadedInput]) -> str:
     for row in sorted(f"{i.role}:{i.requested}:{i.path}:{i.sha256}" for i in inputs):
         rolled.update(row.encode() + b"\n")
     return rolled.hexdigest()
+
+
+def file_digests(inputs: Iterable[LoadedInput | Mapping]) -> dict[str, str]:
+    """Group actual reads without hiding files that share a basename."""
+    paths = {}
+    for item in inputs:
+        row = item.as_dict() if isinstance(item, LoadedInput) else item
+        path, digest = row.get("path") or "", row["sha256"]
+        if path in paths and paths[path] != digest:
+            raise ValueError(f"{path!r} was read with different digests")
+        paths[path] = digest
+    counts = {}
+    for path in paths:
+        name = os.path.basename(path)
+        counts[name] = counts.get(name, 0) + 1
+    return {(os.path.basename(path) if counts[os.path.basename(path)] == 1 else path): digest
+            for path, digest in paths.items()}
 
 
 def manifest(

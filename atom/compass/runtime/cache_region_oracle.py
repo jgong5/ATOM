@@ -117,6 +117,8 @@ def source_cost_oracle(*, region_overlay, region_overlay_sha256, regions,
                        root_prefill_handoff=None, root_prefill_handoff_sha256=None,
                        root_prefill_allow_failed_spread=False,
                        region_supplement_handoff=None, region_supplement_handoff_sha256=None,
+                       root_prefill_diagnostic_handoff=None, root_prefill_diagnostic_handoff_sha256=None,
+                       root_prefill_diagnostic_workload_sha256=None,
                        rank_coords=None, **options):
     """Build the existing source composition, then select a separate region object.
 
@@ -147,6 +149,14 @@ def source_cost_oracle(*, region_overlay, region_overlay_sha256, regions,
         raise ValueError("region supplement handoff and its explicit SHA-256 are required together")
     if region_supplement_handoff and not root_prefill_handoff:
         raise ValueError("region supplement requires the original root prefill handoff")
+    if bool(root_prefill_diagnostic_handoff) != bool(root_prefill_diagnostic_handoff_sha256):
+        raise ValueError("root diagnostic handoff and its explicit SHA-256 are required together")
+    if bool(root_prefill_diagnostic_handoff) != bool(root_prefill_diagnostic_workload_sha256):
+        raise ValueError("root diagnostic handoff and its fixed workload are required together")
+    if root_prefill_diagnostic_handoff:
+        if (not _flag(diagnostic_only, "diagnostic_only") or root_prefill_handoff or region_supplement_handoff
+                or not root_prefill_diagnostic_workload_sha256):
+            raise ValueError("root diagnostic source requires explicit diagnostic mode/workload and separate source selection")
     data, loaded = load_json(region_overlay, role="oracle.region_overlay")
     if loaded.sha256 != region_overlay_sha256:
         raise ValueError("region overlay differs from its explicit SHA-256")
@@ -212,4 +222,19 @@ def source_cost_oracle(*, region_overlay, region_overlay_sha256, regions,
             deployment_scope_sha256=scopes[0].sha256)
         result.compass_region_snapshot = region_snapshot("root-prefill-supplement", result.regions)
         result.compass_loaded_inputs += result.regions.loaded_inputs
+    if root_prefill_diagnostic_handoff:
+        from atom.compass.core.cost.root_diagnostic import DiagnosticRootPrefillPrices
+        from atom.compass.core.cost.root_prefill import ExactPrefillRegions
+
+        scopes = [entry for entry in result.library.loaded_inputs if entry.role == "oracle.attention_scope"]
+        if len(scopes) != 1:
+            raise ValueError("root diagnostic addition requires one loaded deployment request scope")
+        base_inputs = len(result.library.loaded_inputs)
+        result.library = DiagnosticRootPrefillPrices(result.library, root_prefill_diagnostic_handoff,
+            root_prefill_diagnostic_handoff_sha256, deployment_scope_sha256=scopes[0].sha256,
+            workload_sha256=root_prefill_diagnostic_workload_sha256, diagnostic_only=True)
+        result.regions = ExactPrefillRegions(result.regions, result.library.region_points, result.library.handoff_sha256)
+        result.regions = ExactPrefillRegions(result.regions, result.library.supplement_points, result.library.handoff_sha256)
+        result.compass_region_snapshot = region_snapshot("root-reference-diagnostic", result.regions)
+        result.compass_loaded_inputs += result.library.loaded_inputs[base_inputs:]
     return result

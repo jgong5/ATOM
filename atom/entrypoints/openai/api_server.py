@@ -2704,29 +2704,23 @@ def _loaded_option_files(ranks: list) -> dict:
     one would hide another calibration input from validation. All identities
     still come from the rank records, not from re-reading files on disk.
     """
+    from atom.compass.core.loaded_input import file_digests
+
     by_option: dict = {}
     for record in ranks or ():
         for row in (record or {}).get("inputs") or ():
             key = _ROLE_OPTIONS.get(row.get("role"))
+            if str(row.get("role", "")).startswith("oracle.root_diagnostic_"):
+                key = "root_prefill_diagnostic_handoff"
             if not key or not row.get("sha256"):
                 continue
-            path = row.get("path") or ""
-            paths = by_option.setdefault(key, {})
-            if path in paths and paths[path] != row["sha256"]:
-                raise ValueError(
-                    f"{key}: {path!r} was read with different digests")
-            paths[path] = row["sha256"]
+            by_option.setdefault(key, []).append(row)
     found = {}
-    for key, paths in by_option.items():
-        basenames: dict = {}
-        for path in paths:
-            name = os.path.basename(path)
-            basenames[name] = basenames.get(name, 0) + 1
-        found[key] = {
-            (os.path.basename(path) if basenames[os.path.basename(path)] == 1
-             else path): digest
-            for path, digest in paths.items()
-        }
+    for key, rows in by_option.items():
+        try:
+            found[key] = file_digests(rows)
+        except ValueError as exc:
+            raise ValueError(f"{key}: {exc}") from exc
     return found
 
 

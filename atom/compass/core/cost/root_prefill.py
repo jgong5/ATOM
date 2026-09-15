@@ -255,11 +255,17 @@ class RootPrefillPrices(PriceLibrary):
         evidence, evidence_inputs = _evidence(handoff, handoff_path)
         active, points, regions = _validate(handoff, evidence,
             allow_failed_spread=allow_failed_spread, diagnostic_only=diagnostic_only)
+        self._load_reference_tables(base, handoff_path, handoff, loaded, evidence_inputs,
+                                    active, points, evidence["plan"]["region_cases"], regions)
+
+    def _load_reference_tables(self, base, handoff_path, handoff, loaded, evidence_inputs,
+                               active, points, region_cases, regions):
+        """Build the same tables after the caller's explicit source validation."""
         self.base, self.source = base, PriceLibrary()
         self.handoff_sha256, self.source_qualified = loaded.sha256, handoff["source_qualified"]
         self.region_points = tuple((c["query"], c["total_history"], c["produces_output"],
             regions["predictions"][c["cell_id"]]["prepare"], regions["predictions"][c["cell_id"]]["postprocess"])
-            for c in evidence["plan"]["region_cases"])
+            for c in region_cases)
         if len(self.region_points) != 9 or len({r[:3] for r in self.region_points}) != 9:
             raise ValueError("root prefill exact region domain differs")
         for q, history, output, prepare, post in self.region_points:

@@ -29,7 +29,7 @@ def _summary(values, structural_zero):
             (max(values) - min(values)) / median, "structural_zero": structural_zero}
 
 
-def _candidate_points(candidate, root_prefill):
+def _candidate_points(candidate, root_prefill, *, original_evidence=None):
     cells = candidate["cells"]
     names = {c["cell_id"] for c in cells}
     keys = {(c["query"], c["total_history"], c["produces_output"]) for c in cells}
@@ -49,10 +49,15 @@ def _candidate_points(candidate, root_prefill):
             or set(candidate["reference_join_rows"]) != names):
         raise ValueError("region supplement reference boundary or exact ten-key domain differs")
     for component in ("freeze", "verdict"):
-        sources = [s for s in root_prefill.loaded_inputs
-                   if s.role == "oracle.root_prefill_region_" + component]
-        if (len(sources) != 1 or sources[0].sha256 !=
-                candidate["original_nine_cell_" + component]["sha256"]):
+        if original_evidence is None:
+            sources = [s for s in root_prefill.loaded_inputs
+                       if s.role == "oracle.root_prefill_region_" + component]
+            if len(sources) != 1:
+                raise ValueError("region supplement replaces the original nine-cell evidence")
+            original_sha = sources[0].sha256
+        else:
+            original_sha = original_evidence[component]["sha256"]
+        if original_sha != candidate["original_nine_cell_" + component]["sha256"]:
             raise ValueError("region supplement replaces the original nine-cell evidence")
     points = []
     for cell in cells:
