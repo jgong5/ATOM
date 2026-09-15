@@ -39,6 +39,7 @@ CACHE_REGION_OPTIONS = frozenset((
     "region_supplement_handoff", "region_supplement_handoff_sha256",
     "root_prefill_diagnostic_handoff", "root_prefill_diagnostic_handoff_sha256",
     "root_prefill_diagnostic_workload_sha256",
+    "native_prefill_handoff", "native_prefill_handoff_sha256",
 ))
 
 
@@ -440,6 +441,47 @@ def check_source_contract(modelled, registry, workload_sha, forbidden, label, *,
                          "supplement 17/20 with three failed prepare gates and outer exit 124; no acceptance credit")
         elif any(str(row.get("role", "")).startswith("oracle.root_diagnostic_") for row in inputs):
             raise ValueError("unconfigured root diagnostic evidence was loaded")
+        if bool(options.get("native_prefill_handoff")) != bool(options.get("native_prefill_handoff_sha256")):
+            raise ValueError("native prefill handoff and its SHA-256 are required together")
+        native_role = "oracle.native_prefill_regions"
+        if options.get("native_prefill_handoff"):
+            from atom.compass.core.cost.native_prefill_regions import NativePrefillRegions
+            from atom.compass.core.loaded_input import file_digests
+            from atom.compass.runtime.templates import NativeAllocation
+
+            pinned("native_prefill_handoff", native_role)
+            scopes = [row for row in inputs if row.get("role") == "oracle.attention_scope"]
+            if len(scopes) != 1 or scopes[0].get("requested") != options.get("attention_scope"):
+                raise ValueError("native prefill sources lack their loaded deployment attention scope")
+            allocation = NativeAllocation(block_size=16, max_model_len=262144,
+                                          position_rows=3, cudagraph_mode="full")
+            selected = NativePrefillRegions.load(
+                selected, options["native_prefill_handoff"], options["native_prefill_handoff_sha256"],
+                allocation, deployment_scope_sha256=scopes[0]["sha256"])
+            if not selected.source_qualified:
+                raise ValueError("native prefill source is a review candidate; qualification is required")
+            observed = [row for row in inputs if row.get("role") == native_role
+                        or str(row.get("role", "")).startswith(native_role + ".")]
+            if len(observed) != len(selected.loaded_inputs):
+                raise ValueError("native prefill source input inventory differs")
+            for item in selected.loaded_inputs:
+                if sum(row == item.as_dict() for row in observed) != 1:
+                    raise ValueError(f"native prefill input {item.path} lacks its exact loaded identity")
+                bad.extend(validate._check_calibration_records(
+                    {item.role: item.sha256}, {item.role: {Path(item.path).name: item.sha256}},
+                    registry, 1, workload_sha, forbidden))
+            files = file_digests(selected.loaded_inputs)
+            digest = validate._rolled_digest(files)
+            if ((compass.get("oracle_option_files") or {}).get("native_prefill_handoff") != files
+                    or (compass.get("oracle_option_sha256") or {}).get("native_prefill_handoff") != digest):
+                raise ValueError("native prefill aggregate omits or changes loaded source evidence")
+            bad.extend(validate._check_calibration_records(
+                {"native_prefill_handoff": digest}, {"native_prefill_handoff": files},
+                registry, 1, workload_sha, forbidden))
+            selected_name = "native-prefill-sources"
+        elif any(row.get("role") == native_role
+                 or str(row.get("role", "")).startswith(native_role + ".") for row in inputs):
+            raise ValueError("unconfigured native prefill source evidence was loaded")
         snapshot = region_snapshot(selected_name, selected)
         if ranks[0].get("regions") != snapshot:
             raise ValueError("selected region snapshot differs from its loaded overlay and flags")
