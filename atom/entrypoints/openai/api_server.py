@@ -2678,6 +2678,14 @@ _ROLE_OPTIONS = {
     "oracle.root_prefill_prior_preflight": "root_prefill_handoff",
     "oracle.root_prefill_final_verdict": "root_prefill_handoff",
     "oracle.root_prefill_native_complete": "root_prefill_handoff",
+    "oracle.root_prefill_region_plan": "root_prefill_handoff",
+    "oracle.root_prefill_region_event_1": "root_prefill_handoff",
+    "oracle.root_prefill_region_event_2": "root_prefill_handoff",
+    "oracle.root_prefill_region_event_3": "root_prefill_handoff",
+    "oracle.root_prefill_region_event_4": "root_prefill_handoff",
+    "oracle.root_prefill_region_event_5": "root_prefill_handoff",
+    "oracle.root_prefill_region_event_6": "root_prefill_handoff",
+    "oracle.root_prefill_region_parent_failure": "root_prefill_handoff",
 }
 
 

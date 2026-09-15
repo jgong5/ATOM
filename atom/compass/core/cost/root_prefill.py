@@ -14,6 +14,11 @@ from atom.compass.core.loaded_input import load_json
 
 QK_NORM = "triton::_fused_qk_norm_single_kernel"
 REPLACED_REFERENCE = "reference_gemm_M9_N5120_K17408"
+REGION_EVENTS = ("REFERENCE_CLOSED", "FREEZE_SEALED", "HELDOUT_RELEASED",
+                 "HELDOUT_STARTED", "HELDOUT_CLOSED", "VERDICT_WRITTEN")
+REGION_SCIENCE_KEYS = ("region_cases", "source_archive", "source_files", "source_commit",
+                       "cache_policy", "resolved_runtime", "backend_flags", "engine_args",
+                       "region_fixture_plan", "region_callback", "minimum_native_page_blocks")
 
 
 def _cold_gdn_identity(op):
@@ -52,6 +57,57 @@ def _evidence(handoff, path):
     return values, tuple(loaded)
 
 
+def validate_region_binding(plan, evidence, pins):
+    """A closed imported cohort keeps its original plan and six-event identity."""
+    imported = plan.get("imported_region_cohort")
+    if not imported:
+        expected_sha = pins["plan"]["sha256"]
+    else:
+        original = evidence["region_plan"]
+        if (imported.get("schema") != "compass.closed_region_import/1"
+                or not imported.get("parent_failure")
+                or imported["plan"]["sha256"] != pins["region_plan"]["sha256"]
+                or original.get("schema") != "compass.root1493_executable/1"
+                or any(plan[key] != original[key] for key in REGION_SCIENCE_KEYS)
+                or imported["freeze"]["sha256"] != pins["region_freeze"]["sha256"]
+                or imported["verdict"]["sha256"] != pins["region_verdict"]["sha256"]
+                or len(imported["chain"]) != 6):
+            raise ValueError("imported region cohort source, cache, cases or original pins differ")
+        previous = None
+        events = []
+        for index, name in enumerate(REGION_EVENTS, 1):
+            role = f"region_event_{index}"
+            event = evidence[role]
+            source = imported["chain"][index - 1]
+            if (source["sha256"] != pins[role]["sha256"] or event.get("index") != index
+                    or event.get("schema") != "compass.root1493_boundary_event/1"
+                    or event.get("event") != name or event.get("cohort") != "regions"
+                    or event.get("plan") != imported["plan"] or event.get("previous") != previous):
+                raise ValueError("imported region cohort original closed chain differs")
+            previous = source
+            events.append(event)
+        frozen, verdict = evidence["region_freeze"], evidence["region_verdict"]
+        if (events[0]["payload"]["phase"] != frozen["reference_evidence"]["phase_result"]
+                or events[1]["payload"]["reference_phase"] != events[0]["payload"]["phase"]
+                or events[1]["payload"]["freeze"] != imported["freeze"]
+                or events[2]["payload"]["freeze"] != imported["freeze"]
+                or events[2]["payload"]["heldout_order_sha256"] != original["region_heldout_order_sha256"]
+                or events[3]["payload"]["release"] != imported["chain"][2]
+                or events[4]["payload"]["phase"] != verdict["heldout_evidence"]["phase_result"]
+                or events[5]["payload"]["verdict"] != imported["verdict"]
+                or frozen["plan"] != imported["plan"] or verdict["plan"] != imported["plan"]
+                or verdict["prediction_freeze"] != imported["freeze"]):
+            raise ValueError("imported region freeze/verdict lost its original chain identity")
+        if imported.get("parent_failure"):
+            if (imported["parent_failure"]["sha256"] != pins["region_parent_failure"]["sha256"]
+                    or evidence["region_parent_failure"].get("plan") != imported["plan"]):
+                raise ValueError("imported region cohort hides its original parent failure")
+        expected_sha = imported["plan"]["sha256"]
+    if any(evidence[key].get("plan", {}).get("sha256") != expected_sha for key in
+           ("region_freeze", "region_verdict")):
+        raise ValueError("region evidence belongs to a different source plan")
+
+
 def _validate(handoff, evidence, *, allow_failed_spread, diagnostic_only):
     plan, proposal = evidence["plan"], evidence["proposal"]
     frozen, verdict = evidence["primitive_freeze"], evidence["primitive_verdict"]
@@ -60,12 +116,13 @@ def _validate(handoff, evidence, *, allow_failed_spread, diagnostic_only):
                                              ("prior_plan", "prior_freeze", "prior_verdict"))
     final = evidence["final_verdict"]
     pins = handoff["evidence"]
+    validate_region_binding(plan, evidence, pins)
     if (plan.get("schema") != "compass.root1493_executable/1"
             or plan["proposal"]["sha256"] != pins["proposal"]["sha256"]
             or frozen.get("schema") != "compass.root1493_primitive_freeze/1"
             or region_freeze.get("schema") != "compass.root1493_region_freeze/1"
             or any(value.get("plan", {}).get("sha256") != pins["plan"]["sha256"]
-                   for value in (frozen, verdict, region_freeze, region_verdict, final))
+                   for value in (frozen, verdict, final))
             or verdict["prediction_freeze"]["sha256"] != pins["primitive_freeze"]["sha256"]
             or region_verdict["prediction_freeze"]["sha256"] != pins["region_freeze"]["sha256"]
             or any(value.get("heldout_timings_read") is not False for value in (frozen, region_freeze))
