@@ -1,0 +1,71 @@
+{
+ "frozen_at_utc": "2026-09-11T08:28:00Z",
+ "tp": 1,
+ "max_num_seqs": 32,
+ "capture_ladder": [
+  1,
+  2,
+  4,
+  8,
+  16,
+  32
+ ],
+ "block_size": 16,
+ "max_model_len": 262144,
+ "max_num_batched_tokens": 16384,
+ "enable_prefix_caching": false,
+ "model": "Qwen/Qwen3.8-27B",
+ "held_fixed_non_kv_readings": {
+  "peak_torch": 57971260416,
+  "non_torch": 1191182336,
+  "cudagraph_overhead": 591396864,
+  "total": 206141652992,
+  "free": 149711486976
+ },
+ "geometry_from_config": {
+  "state_bytes_per_request": 78446592,
+  "paged_block_bytes": 1056768,
+  "state_floor_32": 2510290944
+ },
+ "exact_threshold_utilization": 0.3220453637362477,
+ "predictions": [
+  {
+   "gpu_memory_utilization": 0.32,
+   "predicted_available_for_kv": 2088656282,
+   "predicted_num_kvcache_blocks": 0,
+   "predicted_gate": "pool",
+   "predicted_reason": "state pool needs 2.34GB of 1.95GB available for 32 entries",
+   "expect_engine_starts": false,
+   "expected_engine_message_fragments": [
+    "2.34GB for 32 slots",
+    "exceeds available KV budget (1.95GB)",
+    "--gpu-memory-utilization 0.32",
+    ">= 0.33"
+   ]
+  },
+  {
+   "gpu_memory_utilization": 0.33,
+   "predicted_available_for_kv": 4150072812,
+   "predicted_num_kvcache_blocks": 1551,
+   "predicted_gate": "admission",
+   "predicted_reason": "needs 15940 KV blocks for 255034 tokens > total pool blocks=1551",
+   "expect_engine_starts": true
+  },
+  {
+   "gpu_memory_utilization": 0.4,
+   "predicted_available_for_kv": 18579988521,
+   "predicted_num_kvcache_blocks": 15206,
+   "predicted_gate": "admission",
+   "predicted_reason": "needs 15940 KV blocks for 255034 tokens > total pool blocks=15206",
+   "expect_engine_starts": true
+  },
+  {
+   "gpu_memory_utilization": 0.41,
+   "predicted_available_for_kv": 20641405051,
+   "predicted_num_kvcache_blocks": 17157,
+   "predicted_gate": null,
+   "predicted_reason": null,
+   "expect_engine_starts": true
+  }
+ ]
+}

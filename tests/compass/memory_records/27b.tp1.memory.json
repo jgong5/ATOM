@@ -1,0 +1,79 @@
+{
+ "version": 1,
+ "readings": {
+  "total": 206141652992,
+  "free": 149711486976,
+  "peak_torch": 57971260416,
+  "weights_torch": 54761936384,
+  "parameter_bytes": 54747011552,
+  "buffer_bytes": 33554432,
+  "buffer_breakdown": [
+   {
+    "name": "rotary_emb.cos_cache",
+    "count": 1,
+    "bytes": 16777216,
+    "shape": [
+     262144,
+     1,
+     1,
+     32
+    ],
+    "dtype": null
+   },
+   {
+    "name": "rotary_emb.sin_cache",
+    "count": 1,
+    "bytes": 16777216,
+    "shape": [
+     262144,
+     1,
+     1,
+     32
+    ],
+    "dtype": null
+   }
+  ],
+  "current_torch": 55014276096,
+  "non_torch": 1191182336,
+  "cudagraph_overhead": 591396864
+ },
+ "blocks": {
+  "num_kvcache_blocks": 112740,
+  "pool_entries": {
+   "state": 32,
+   "kv": 112740
+  },
+  "pool_entries_per_req": {
+   "kv": 0,
+   "state": 1
+  }
+ },
+ "config": {
+  "model": "Qwen/Qwen3.8-27B",
+  "gpu_memory_utilization": 0.9,
+  "max_num_seqs": 32,
+  "max_model_len": 262144,
+  "max_num_batched_tokens": 16384,
+  "kv_cache_dtype": "bf16",
+  "block_size": 16,
+  "topology": {
+   "tp": 1
+  },
+  "rank_coords": {
+   "tp": 0
+  }
+ },
+ "graph_pool": {
+  "reserved": 127926272,
+  "allocated": 110981120,
+  "capture_sizes": [
+   1,
+   2,
+   4,
+   8,
+   16,
+   32
+  ],
+  "graphs": 6
+ }
+}

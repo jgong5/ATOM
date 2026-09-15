@@ -1,0 +1,429 @@
+# The source-only serving configuration, and what it still refuses
+
+What a served 27B run passes to `source_cost_oracle` so that its cost oracle is
+the frozen source composition, assembled from artifacts that already exist. It
+is written down here because the composition was reachable from
+`predict_step.py` and from a hand-written script, and a served run names a
+factory and a list of `KEY=VALUE` strings instead.
+
+Nothing here is measured at the target deployment. Two different things are
+being distinguished, and the difference is the whole point of the source-only
+rule:
+
+- **Not allowed, and absent:** any timing or memory reading taken from the
+  engine whose behaviour is being predicted. No target step latency, no target
+  throughput, no target memory high-water mark enters a price, a template or
+  the region model.
+- **Allowed, and used:** standalone measurements of a *primitive* at the width
+  being predicted, taken outside the target run — a two-rank all-reduce probe,
+  a gather probe, a GEMM microbench. These are measurements of hardware, not
+  of the deployment, and the TP2 and TP4 collective prices below are exactly
+  that.
+
+So "the prices are the source deployment's own" is true of the body and head
+GEMM families, which are measured at TP1 and transferred; the collectives at
+TP2 and TP4 are standalone primitive measurements at their own width. The
+graphs are traced on `meta`; the region model is calibrated at TP1 and applied
+unchanged at TP2 and TP4.
+
+## The options
+
+Every width shares these:
+
+    --compass-oracle atom.compass.runtime.source_oracle.source_cost_oracle
+    --compass-oracle-option model=Qwen/Qwen3.8-27B
+    --compass-oracle-option device=meta
+    --compass-oracle-option replay_target=$POC/g5_27b/target.json
+    --compass-oracle-option block_size=16
+    --compass-oracle-option max_model_len=262144
+    --compass-oracle-option position_rows=3
+    --compass-oracle-option cudagraph_mode=full
+    --compass-oracle-option head=1
+    --compass-oracle-option regions=source-27b-tp1-history-2m
+    --compass-oracle-option require_complete=1
+    --compass-oracle-option allocation=native
+    --compass-oracle-option derive=1
+    --compass-oracle-option interpolate=2.0
+
+and adds its own prices and templates. At TP1 (`$SRC1` is `g4/src1`):
+
+    --compass-oracle-option tp=1
+    --compass-oracle-option attention_scope=$ARTIFACTS/codex_decode_domain_v1/native_scope_v2/REQUEST_SCOPE.json
+    --compass-oracle-option measured_attention_scope=$ARTIFACTS/codex_decode_domain_v1/native_scope_v2/MEASURED_SCOPE.json
+    --compass-oracle-option attention_treatments=$ARTIFACTS/codex_decode_domain_v1/TREATMENTS.json
+    --compass-oracle-option price=$SRC1/p27bdec32.tp1.r0.json:$SRC1/b27dec32.tp1.r0.json:unregistered,$SRC1/p27hdec32.tp1.r0.json:$SRC1/h27dec32.tp1.r0.json:unregistered
+    --compass-oracle-option template=$SRC1/b27dec32.tp1.r0.json
+    --compass-oracle-option head_template=$SRC1/h27dec32.tp1.r0.json
+
+
+`interpolate=2.0` states the widest ratio between adjacent measured row counts
+the family provider may interpolate across. This is its existing default,
+now explicit so an acceptance artifact records the support it used.
+Historical `interpolate=1` requests enabled that default without stating its
+value and remain qualified as such. An earlier parser instead took `1`
+literally as the ratio, which no two distinct row counts can meet; run 8
+refused 2118 of 2443 operators for that earlier interpretation.
+
+`regions=source-27b-tp1-history-delta` retains the native preparation baseline
+and adds a bounded history contribution measured in the source runner. Every
+capture cell has its own summed-history limit, with per-request histories
+128..196608. The correction is at most 11.04 microseconds over the measured
+domain; inputs outside it are refused. Standalone absolute timing did not
+match the native remainder, so only history differences are transferred.
+The original 1025..1152-token answers are unchanged. Final end-to-end traces
+must validate this approximation and its transfer across widths.
+
+`regions=source-27b-tp1-history-2m` extends the exact and padded capture cells
+16/32 through 2,097,152 summed history tokens. It preserves every point and
+band in the previous profile's domain and retains the per-request history
+range 128..196608. A separate continuation uses independently measured
+high-minus-legacy preparation differences; raising the support limit does not
+change the old interpolation denominator. Smaller capture cells are unchanged.
+
+The frozen `prepare_history_2m_v1` source experiment collected 10,752 event
+timings over 56 cases using the same conditioned preparation boundary. A larger
+source-only KV pool kept all disjoint block-table entries in range; target
+allocation settings were unchanged, and no varied history entered a model body.
+All endpoint increments were nonpositive, giving a conservative zero added
+point cost with signed measured bands. Sixteen held-out cases had maximum
+increment error 6.081 microseconds, below the declared 110-microsecond source
+step-impact limit. This supports a component approximation; it does not close
+E2E accuracy, kernel-source stability, or cross-width validation.
+
+The registry now selects this 2M preparation profile and the qualified local
+GEMM source extension. Exact lookup keeps all 931 legacy measurements first,
+then reads 85 long-protocol repair records from 12 nonempty exports, followed
+by the 20 prior supplemental and closure books. The added books remain
+`exact_only`; no reference anchor or held-out observation enters fitting.
+The existing dispatch witnesses remain in use. The immutable source-use
+decision is
+`codex_gemm_campaign_20260913_v1/source_stability_repair_v1/SOURCE_USE_DECISION.json`,
+SHA256 `0ddec6a7614370d04a470de34afbe27983e341b34a48cef6a0edecf04ac11249`.
+
+This is qualified source use for E2E validation. The M320/N5120/K3072 repair
+retains its 6.07% three-repeat range; the projected 64-occurrence body
+contribution spans 0.275072 ms, which is not an E2E bound. Five stable
+historical-anchor mismatches and the first N5120/K6144 timing's unclassified
+transient-node observation also remain reported. All ten reference anchors
+stay validation-only, and none replaces a legacy price. The registry carries
+these qualifications with the decision reference; it does not mark source
+quality checks or PoC acceptance passed. MHA coverage beyond the previous
+measured domain remains open until its separate source experiment and the
+paired E2E cc-trace gates pass.
+
+
+TP1 also reads the native padded GDN book after all prior prices. When a
+32-request decode loses a request, the next step has 31 active state lanes
+inside a 32-row capture; a dense 32-row measurement does not describe that
+mask. The added `codex_gdn_tp1_native_v1/export_candidate_v2` book contains
+1,248 exact-only records for all 26 non-rung active counts on the native
+`1,2,4,8,16,32` capture ladder. Its measured process recorded lossy-fast
+disabled and the actual 32-slot state views. The six dense anchors and all
+hole/permutation timings remain validation-only; TP2/TP4 keep their existing
+native books.
+
+This GDN selection is qualified by
+`codex_gdn_tp1_native_v1/SOURCE_USE_DECISION.json`, SHA256
+`1213611cd1cd1800e7e5c5de17f812e7bc4f11dcfd67e296641ab8ddbc393316`.
+The hole and reversed-state checks differ from the frozen GDN-sum prediction
+by +0.0445% and +0.4290%. The 85 individual repeat-spread flags and the original
+unclassified PID/device observations remain explicit. Eleven keys had a
+partial kernel-profile observation; every selected witness comes from a
+complete observed repeat, without rescaling any timing. These source checks
+do not declare PoC acceptance or relax any paired E2E gate.
+
+TP1 now selects `unified.decode.paged_gluon_dispatch` with the declared
+`gfx942-spx-4xcc-80cu` topology and the existing c9e/graph/KV2 kernel treatment.
+The original 21 source books retain their identities; twelve long-domain source
+books are appended after the qualified GDN book. The frozen source-only fit is
+independently confirmed on three fresh TP1 cases. Confirmation, heldout, and
+instrumented diagnostic timings do not enter fitting. Successor declarations
+under `codex_decode_domain_v1/mha_dispatch_tp1_selected_v1` preserve all other
+attention scope facts and reference the original files. Their source-use decision
+is SHA256 `63dd999b4b51754787e97c3034f68506d614f5cec2b13c46e0f654e322fccd00`.
+Historical source-condition qualifications and the old descriptor's failed
+heldout remain recorded. TP2/TP4 options are unchanged. The first paired
+`tp1_clients_short_c1` cell must establish E2E agreement before broader execution.
+
+TP2 selects the same dispatch descriptor through its own per-rank source fits.
+Each rank retains its original 21 MHA source books and adds twelve long-domain
+books via byte-identical aliases under
+`codex_decode_domain_v1/mha_dispatch_tp2_selected_v1`. `ALIASES.json` maps every
+price and graph to its original frozen identity. The successor combined scopes
+add only the decode dispatch topology; prefill/GDN scopes and all existing
+treatments remain unchanged. Fresh confirmation and heldout books are excluded.
+The TP2 decision is SHA256
+`6e6576d4a3e23ce6c690265c0f27ff80a5b18414755e48bcc57401b078b90ba2`.
+This prepares TP2 E2E validation; it does not claim a passing TP2 cell. TP1 and
+TP4 option arrays are unchanged by this selection.
+
+The preceding `source-27b-tp1-history-64k` adds independently measured TP1 history
+support to `source-27b-tp1-prefill-seqs`. Single-row decode supports histories
+1025..65600; exact two-row decode supports 513..65600 with summed history at
+most 66176. The coefficients are retained after a bounded source comparison;
+all measured excursions remain in the reported bands. Other decode buckets
+retain their earlier support. The native three-repeat final-prefill anchor at
+`(1, 16384, produces_output=True)` is also included. These source measurements
+do not establish end-to-end accuracy.
+
+`source-27b-tp1-prefill-seqs` is the successor to
+`source-27b-tp1-prefill-interp`, which is in turn the successor to
+`source-27b-tp1-conc-v2`. Both predecessors stay in the registry and are not
+edited; a prediction already made does not improve by being recomputed.
+
+The interp model carries the measured one-sequence prefill cells
+byte for byte and interpolates only between adjacent measurements of the same
+`(sequences, produces_output)` group, refusing outside their span -- run 7
+died because an exact-cell lookup cannot answer a final chunk, whose token
+count is `prompt mod chunk_budget` and so arbitrary.
+
+The seqs model adds what the corrected client workload needs and nothing else.
+Clients are top-level agent sessions, not an in-flight request cap, so eight
+clients can put more than eight requests in flight and the scheduler batches up
+to `max_num_seqs=32`; the interp model refuses every step above two sequences,
+which no longer covers the workload. Sequence counts 3 through 32 are therefore
+answered as **one pooled group interpolating on the token axis**, because at a
+fixed token count the term spreads 2.4% across 4 and 32 sequences and 9.6%
+across 3, 12 and 24, while across token counts it moves 6.8x. One and two
+sequences keep their own groups and their own published numbers -- there the
+sequence count genuinely matters, five times over -- so this is a bounded
+relaxation, not a general licence to slide along the sequence axis.
+
+Its pooled group is measured from 1536 to 16384 tokens and refuses outside
+that; 16384 is the token budget, so no step exceeds it. Three qualifications
+are carried in the model's own docstring and belong in any report that quotes
+it: a flat ~6e-04 population is reachable on this tree and sets several low
+band edges, the 5120-to-8192 interval crosses the two populations and is the
+weakest claim here, and every row was measured with `waiting: 0`.
+
+The same `regions=` line is shared by all three widths, and since 2026-09-13 the
+profile answers at all three. It declares `topologies=(1, 2, 4)`, carried from
+`source-27b-tp1-conc-v2` along with its decode cells and its broadcast, and
+every coefficient under it is measured at TP1. What licenses that is read off
+this engine's source, not fitted to any TP2 or TP4 engine: the runner's only
+TP-conditional statements outside the model are the sampled-token broadcast and
+the logprobs broadcast; `compute_logits` all-gathers the vocabulary shards back
+to the unpadded `config.vocab_size` before postprocess sees them, so the
+sampler's input is identically shaped at every width; and preparation is sized
+by the batch and by `max_model_len`/`block_size`. The one term TP>1 adds is
+`<tp-broadcast>`, measured standalone on the real two- and four-rank groups and
+charged only on steps that sample a token.
+
+Two consequences belong in any report that quotes a wide cell. First,
+`block_size=16` is load-bearing here rather than incidental: at 256 or 1024 the
+per-step attention metadata build is sized by `num_key_value_heads // tp`, so a
+TP1 preparation measurement would be a measurement of different work, and
+`build_source_oracle` refuses that pairing instead of answering it. Second,
+three things stay outside the model at TP>1 -- inter-rank skew (it lands inside
+the body's span, and `rank_aggregation="slowest"` is what the step-level answer
+leans on), engine-core process control (`rpc_broadcast_mq.enqueue` waits for
+every reader, outside `ModelRunner.forward`, unmeasured and deliberately not
+folded into a region), and logprobs broadcasts (never requested by these runs).
+
+The TP1 `price=` line above is the two decode-32 seed pairs, which is where
+this set started. The list the registry passes today is longer: it adds the
+prefill cells, the long-context and mixed steps, the one-sequence row ladder
+and the cached-MHA calibration inputs. `cc_traces_registry.py` is the
+authority for its contents; reproducing all of it here would be a third copy
+to drift.
+
+At TP2 and TP4 (`$D` is the staged directory below):
+
+    --compass-oracle-option tp=$TP
+    --compass-oracle-option price=$D/p27bdec32.json:$D/b27dec32.json:unregistered,$D/p27hdec32.json:$D/h27dec32.json:unregistered,$D/ar_capture.json,$D/ar_plain.json,$D/ag_prices.json
+    --compass-oracle-option template=$D/b27dec32.json
+    --compass-oracle-option head_template=$D/h27dec32.json
+
+Both all-reduce price lists are loaded on purpose. They hold the same signature
+under different registration regimes and the graph selects between them, so
+which one answers does not depend on load order.
+
+`allocation=native` and `carry_allocation=1` are mutually exclusive, and only
+the first is admissible for acceptance. See refusal 3.
+
+## Staging, and why it is needed
+
+A served run passes one option set to every rank; the rank reaches its own
+files through `resolve_rank_path`, which appends the rank's coordinates —
+`p27bdec32.json` at `{"tp": 1}` is `p27bdec32.tp1.json`. The pricing artifacts
+are named `p27bdec32.tp<width>.r<rank>.json`, which that convention never
+produces. So a directory of links in the convention stands in front of them:
+
+    for r in $(seq 0 $((TP-1))); do
+      for stem in p27bdec32 p27hdec32 b27dec32 h27dec32; do
+        ln -s <source>/$stem.tp$TP.r$r.json $D/$stem.tp$r.json
+      done
+    done
+
+The shared lists — `ar_capture.json`, `ar_plain.json`, `ag_prices.json` — are
+linked unsuffixed and resolve by the documented fallback, recorded in
+`SourceComposition.rank_artifacts` as not this rank's own.
+
+## What it answers today
+
+**These are diagnostic step estimates, not cc-traces acceptance cells.** They
+say that the composition assembles, resolves per rank, and prices a single
+production-shaped decode step with nothing refused. They are not a registered
+cc-traces replay, they are not compared against a measured target run, and no
+acceptance gate is evaluated on them. The acceptance evidence is the e2e
+registered cc-traces TP1/2/4 short and long runs, and none of it is here.
+
+Built per rank with `derive=0`, so that what it answers is exactly what the
+artifacts cover, on the production decode step (32 requests of one token at
+context 1151, capture bucket 32):
+
+| width | rank | step | body | head |
+|-------|------|------|------|------|
+| 1 | 0 | 34.767 ms | 33.378 ms, 2615 launches, 2439 operators | 1.156 ms, 1 launch, 1 operator |
+| 2 | 0 | 20.970 ms | 19.929 ms, 2573 launches, 2568 operators | 0.780 ms, 2 launches, 2 operators |
+| 2 | 1 | 20.814 ms | 19.773 ms, 2573 launches, 2568 operators | 0.779 ms, 2 launches, 2 operators |
+| 4 | 0 | 13.510 ms | 12.814 ms, 2573 launches, 2568 operators | 0.435 ms, 2 launches, 2 operators |
+| 4 | 1 | 16.158 ms | 15.460 ms, 2573 launches, 2568 operators | 0.436 ms, 2 launches, 2 operators |
+| 4 | 2 | 13.459 ms | 12.764 ms, 2573 launches, 2568 operators | 0.433 ms, 2 launches, 2 operators |
+| 4 | 3 | 13.452 ms | 12.753 ms, 2573 launches, 2568 operators | 0.436 ms, 2 launches, 2 operators |
+
+Every cell is `complete` and `complete_measured`: no interpolation, no
+zero-work, nothing refused. The body's collectives are priced from the probe
+(129 all-reduce operators at TP2) and the head's all-gather from the gather
+probe, which is the composition `tpN_frozen.py` assembles by hand.
+
+Rank 1 at TP4 is 20% above its peers and the other three agree to half a
+percent. It is not averaged away here; a rank aggregation rule that hides it
+would hide the thing worth looking at.
+
+## What it refuses
+
+1. **The head is priced at 32 rows and nowhere else.** The head GEMM signature
+   is `32,5120;...` at every width; rows 1 and 20 are unpriced. A decode step
+   with any other running-request count is refused for the head, and
+   `interpolate` cannot answer it either — one measured point fits nothing.
+   This is the refusal a real cc-traces workload meets first.
+2. **Only the decode-32 structure is seeded.** Any other structure — every
+   prefill, every chunked step, every other bucket — needs derivation, which
+   needs the model. Derivation is device-free and costs about 10.5 s per
+   structure, but it produces rank 0's shard whatever rank asks, so at TP>1 the
+   other ranks are served through the representative fallback.
+3. **A step nobody offers an allocation for is refused.** The body template
+   carries `slot_mapping`, `block_tables` and the two `non_spec_state_indices`
+   tensors, and binding will not reuse a capture's copy of them. With
+   `allocation=native` the oracle takes the CPU scheduler's own assignment for
+   the step being priced — `ScheduledBatch.block_tables`,
+   `state_slots_committed` and the `state_rows` that say which batch row each
+   of those slots belongs to — and re-encodes it through `BatchSpec`, the same
+   code that encodes a capture. A step reached with nothing offered is refused
+   by name rather than priced against another step's blocks. Three further
+   things it will not guess, each a refusal:
+   - **the batch kind**, which comes from `total_seqs_num_prefill` and not from
+     the batch's prefill *token* count. A batch holding both prefill and decode
+     rows is refused: `BatchSpec` carries one kind for the batch, and the
+     attention backend sends the whole batch down `prepare_prefill` while
+     preparing metadata for the leading prefill rows only. This is not a gap
+     cc-traces needs closed: with TBO off the scheduler cannot build such a
+     batch. Its prefill branch returns unconditionally (`scheduler.py:1991`),
+     every real `ScheduledBatch(` construction site is of one kind,
+     `model_runner.py:481-483` still carries `# TODO: remove this when we
+     support mixed prefill and decode in one batch`, and TBO is a runner-side
+     split of an already-formed batch (`enable_tbo`/`enable_tbo_decode`
+     default False, and `scheduler.py` does not mention TBO at all).
+     `tests/compass/test_mixed_batch_reachability.py` drives the real
+     scheduler and shows a prompt arriving mid-decode starting its own prefill
+     batch, and every batch of a staggered workload being of one kind. No
+     per-request kind is being added to `BatchSpec` for a batch the engine
+     does not emit; if that TODO is ever done, this refusal is where to look.
+   - **which row a state slot belongs to.** A row with no slot is refused, not
+     filled with its batch index, which is only what a fresh pool happens to
+     hand out.
+   - **the padded tail.** When the active request count is below the capture
+     bucket, the scheduler's entries are written over the template's head, the
+     capture's tail is kept, and the count is recorded per field in
+     `provenance.binding.allocation_padding`. Overwriting the tail would invent
+     an assignment for rows that are not running.
+
+   `carry_allocation=1` — reuse the template's assignment and declare it
+   unmeasured — remains available for diagnostics and is **inadmissible for
+   acceptance**.
+4. **The capture bucket has to be declared at derivation.** `g4/dec32`'s TP2
+   and TP4 graphs record `capture_bucket: null`, so their shape is the
+   uncaptured structure and the region model refuses the step as eager. They
+   were re-derived with `--capture-bucket 32`. The body graphs are
+   operator-identical to the originals. The head graphs differ by one
+   `aten::empty.memory_format`, and the reason is the producer's
+   fresh-collective recording contract rather than the operator's 0.09 µs:
+   simulated TP has no communicator, so it reimplements `all_gather` locally as
+   *allocate the full buffer, copy this rank's shard in, movedim, reshape*, and
+   `record_collectives` replaces that reimplementation with a synthesized
+   `aiter::all_gather_unreg` instead of recording it. Since `6b4bfe8b` the
+   synthesized wrapper allocates its declared output through `fresh_shape`,
+   under `_disable_current_modes()`, precisely "so the stand-in does not appear
+   in the graph as an [allocation] a captured graph has no counterpart for".
+   The extra `aten::empty.memory_format` in the older head graphs is that
+   stand-in's own buffer, which no rank executes; the real allocation
+   production performs is inside the gathered call, and it is already inside
+   the two-rank probe measurement that prices `all_gather_unreg`. Recording it
+   separately would count it twice. Note that the difference is attributable to
+   the code change, not to `--capture-bucket`: the two derivations ran under
+   different `graph_diff.py`/producer hashes (see Provenance).
+5. **The region model is held out at TP2 and TP4.** `source-27b-tp1-conc-v2`
+   is calibrated at TP1 and applied unchanged. Its prepare term was defined as
+   the capture's own remainder, so at TP1 it closes by construction and proves
+   nothing; at the wider widths it is a falsifiable claim nobody has yet
+   falsified.
+
+## Which artifacts a served run should name
+
+The bucket-declared TP2/TP4 graphs are **new source-derived candidate
+artifacts**, not replacements of the old ones. `g4/dec32` and every frozen
+result computed from it stay exactly as they are and keep their labels; nothing
+is retroactively relabelled. What follows is the candidate set, its
+configuration, and its hashes.
+
+Produced by `agent_scratch/serving/derive_b32.sh`, which is
+`derive_dec32_tp24.sh` plus `--capture-bucket 32`, run device-free under
+`--device meta` in `xiaobizh_n18_cpu`, ~10 s per graph:
+
+    dec32b32/  (sha256, first 16)
+      ca60fac1fc1c1670  b27dec32.tp2.r0.json
+      54230ed28c664311  b27dec32.tp2.r1.json
+      f83dce526f979e5b  b27dec32.tp4.r0.json
+      fff63aceb6d21a3e  b27dec32.tp4.r1.json
+      c80b3c700928a01a  b27dec32.tp4.r2.json
+      c1bb1e76a3120f3d  b27dec32.tp4.r3.json
+      548078cbe7396bda  h27dec32.tp2.r0.json
+      f2418f548800133b  h27dec32.tp2.r1.json
+      19458c6f7da0e2a9  h27dec32.tp4.r0.json
+      9d2ed08c7e132e95  h27dec32.tp4.r1.json
+      a1e4b934f4b91cbd  h27dec32.tp4.r2.json
+      f985c61ef4b1ad20  h27dec32.tp4.r3.json
+
+The case for naming them: the originals record no capture bucket, so the region
+model refuses them and they cannot serve at all. The body is operator-identical
+between the two, so the substitution changes no body price; the head loses the
+stand-in's `aten::empty` and with it 0.09 µs, recorded above rather than
+absorbed. TP1's `g4/src1` artifacts already declare the bucket and are used
+unchanged.
+
+## Provenance
+
+Step numbers above are from `agent_scratch/serving/check_serving_config.py` run
+in `xiaobizh_n18_cpu` — device-free — against the committed snapshot of
+`e946c6ce`, verified file-by-file against `git show` before the run.
+
+The native-allocation behaviour in refusal 3 is from
+`agent_scratch/check_native_allocation.py`, run the same way against `b6280165`
+over all seven rank compositions: each refuses with nothing offered, reproduces
+the capture's `slot_mapping`, `block_tables` and state indices when the
+capture's own assignment is offered, and follows the blocks when they are
+rotated by one request.
+
+The graph re-derivations hash `graph_diff.py`, `tracer.py` and `graph.py` into
+`agent_scratch/serving/dec32b32/derive_b32.sha256`:
+
+    84d077369e21aee5…  scripts/compass/graph_diff.py
+    c5dc0b71879aea9f…  atom/compass/runtime/tracer.py
+    c806740b786e5bd7…  atom/compass/core/graph.py
+
+The original `g4/dec32` derivation hashed a different file set
+(`agent_scratch/g4/dec32/derive_dec32.sha256`: `graph_diff.py`,
+`batch_spec.py`, `graph.py`, `library.py`) and a different `graph_diff.py`
+(`62a89c02…`), which is what makes the head-graph difference in refusal 4 a
+producer change rather than a bucket effect.

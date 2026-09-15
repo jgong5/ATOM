@@ -1,0 +1,94 @@
+{
+  "base_commit": "0d2aa0572ac685943d38c580675c4a61023581d3",
+  "files": [
+    {
+      "path": "docs/architecture.md",
+      "sha256": "4b059b1108d48793d4371607f44aa73f249614a849157f45ac4335a2d85b4ff6",
+      "status": " M"
+    },
+    {
+      "path": "src/aiperf/common/clock.py",
+      "sha256": "727ee3910d51b4127369fadb66087be46c09566bcd712cb126f2bd4bce0f2230",
+      "status": "??"
+    },
+    {
+      "path": "src/aiperf/common/loop_scheduler.py",
+      "sha256": "4099764f6f94ac40432a9c9881ea8fb349339707b072f960de2472cef0c33203",
+      "status": " M"
+    },
+    {
+      "path": "src/aiperf/common/models/credit_models.py",
+      "sha256": "f2d584dee0e3c57350168396c058423ff9a053a814838875ac6436f5e153d5be",
+      "status": " M"
+    },
+    {
+      "path": "src/aiperf/common/models/record_models.py",
+      "sha256": "eff0b5a7e7f72b8751795a6f5b5ee9dd69ff6b4b6062d9f087893b8f89c1ebc1",
+      "status": " M"
+    },
+    {
+      "path": "src/aiperf/credit/issuer.py",
+      "sha256": "a642145c3754531f72c924d1623699e4c84b8380607ba1bda4fe974957bb0d23",
+      "status": " M"
+    },
+    {
+      "path": "src/aiperf/credit/sticky_router.py",
+      "sha256": "f226e39cb130ba66128c9b1b42b63393b075b8b1a48de6eb847eaf2441582358",
+      "status": " M"
+    },
+    {
+      "path": "src/aiperf/post_processors/raw_record_writer_processor.py",
+      "sha256": "07f66d31fbf2318777f9bf5a88f3b864db806a8da63bff3c319e81d9931191c5",
+      "status": " M"
+    },
+    {
+      "path": "src/aiperf/timing/branch_orchestrator.py",
+      "sha256": "89a35dc0fea7d67bce1328941594417fcef9affc966c9181b461ca1f855bd432",
+      "status": " M"
+    },
+    {
+      "path": "src/aiperf/timing/config.py",
+      "sha256": "4c7fef26153cd438b297baf52158bb17c08bbfac8cd391dd3de7ec6421debbea",
+      "status": " M"
+    },
+    {
+      "path": "src/aiperf/timing/phase/lifecycle.py",
+      "sha256": "12812ef129d15d52aac403cf230fe1d2f2854be7cdfc0d0abcf82cf56c6decaf",
+      "status": " M"
+    },
+    {
+      "path": "src/aiperf/timing/phase/runner.py",
+      "sha256": "1e8541a8230e3ee4a7bdbdb937eeb79621f03cd38eeb6b7cb5fbc2eeff05462c",
+      "status": " M"
+    },
+    {
+      "path": "src/aiperf/timing/ramping.py",
+      "sha256": "26e76e5cb2c8a8bef4d49945d1648cb81693aee9d34639fc6d376d0099507fcc",
+      "status": " M"
+    },
+    {
+      "path": "src/aiperf/timing/strategies/agentic_replay.py",
+      "sha256": "8cf5eadfe669743650c1cca11cd6f5d094593501054f0e8b25113978522149d2",
+      "status": " M"
+    },
+    {
+      "path": "src/aiperf/transports/sse_utils.py",
+      "sha256": "2be708a46a37c91c7125c90be2a57d02092ed82b1d8b95483205eae376e5f1d7",
+      "status": " M"
+    },
+    {
+      "path": "src/aiperf/workers/inference_client.py",
+      "sha256": "0b2293f0e458a7e9f5ffb28f788fd220b9486dd24312ef8a230a66faf5cb3901",
+      "status": " M"
+    },
+    {
+      "path": "src/aiperf/workers/worker.py",
+      "sha256": "c23f30d5bda79fee63a3407fe67b05ee0f2c18532a5946f9d792c490c48e0709",
+      "status": " M"
+    }
+  ],
+  "patch_sha256": "f2ab352de580a250ea2ea151541e92b2a741ee20603b9f66d47506642b838f3b",
+  "prerequisite_patch_sha256": "c8035a3cac1061a817e87af31ab440508d9b23dfe5a3b2cc27e5708e96e45d06",
+  "prerequisite_state": "atomcompass-controlled-clock-v1",
+  "schema": "compass.aiperf_raw_transport_timestamps/1"
+}

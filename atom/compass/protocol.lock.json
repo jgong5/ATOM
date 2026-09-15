@@ -1,0 +1,13 @@
+{
+ "protocol": "atom/compass/PROTOCOL.md",
+ "sha256": "9732d51e433ff3911b3c39da0a43201fd0e55e7c0b2182a64083eb59af728d74",
+ "registered_at": "2026-09-10T15:43:14Z",
+ "revision": "66ae9d879636bee93ccca018cb854d53531e7475 +uncommitted (working tree; compass changes not yet committed)",
+ "superseded": {
+  "protocol": "atom/compass/PROTOCOL.md",
+  "sha256": "19ead7bac949dcb978e76427aa2af4f00e9a88f82cfc5eb7cd5d886e52c76559",
+  "registered_at": "2026-09-10T15:03:02Z",
+  "revision": "66ae9d879636bee93ccca018cb854d53531e7475 +35-uncommitted (working tree; the compass changes of this session are not yet committed)",
+  "superseded": null
+ }
+}

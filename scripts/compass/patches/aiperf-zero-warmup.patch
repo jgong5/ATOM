@@ -1,0 +1,96 @@
+--- a/src/aiperf/timing/config.py
++++ b/src/aiperf/timing/config.py
+@@ -3,7 +3,7 @@
+ 
+ from __future__ import annotations
+ 
+-from pydantic import ConfigDict, Field
++from pydantic import ConfigDict, Field, model_validator
+ 
+ from aiperf.common.config import InputDefaults, LoadGeneratorConfig, UserConfig
+ from aiperf.common.enums import CreditPhase
+@@ -122,7 +122,10 @@
+         "how to send requests to the workers.",
+     )
+     total_expected_requests: int | None = Field(
+-        default=None, gt=0, description="The total number of expected requests to send."
++        default=None,
++        ge=0,
++        description="The total number of expected requests to send. Zero represents "
++        "a derived empty AgenticReplay warmup without a cache-pressure stage.",
+     )
+     expected_num_sessions: int | None = Field(
+         default=None, gt=0, description="The total number of expected sessions to send."
+@@ -222,6 +225,16 @@
+         "agentic replay warmup.",
+     )
+ 
++    @model_validator(mode="after")
++    def validate_empty_warmup_target(self) -> CreditPhaseConfig:
++        if self.total_expected_requests == 0 and not (
++            self.phase == CreditPhase.WARMUP
++            and self.timing_mode == TimingMode.AGENTIC_REPLAY
++            and self.agentic_cache_warmup_duration_sec is None
++        ):
++            raise ValueError("A zero request target requires an empty AgenticReplay warmup")
++        return self
++
+ 
+ def _agentic_warmup_grace_period(loadgen: LoadGeneratorConfig) -> float | None:
+     warmup_grace_period = loadgen.warmup_grace_period
+--- a/src/aiperf/timing/phase/runner.py
++++ b/src/aiperf/timing/phase/runner.py
+@@ -151,10 +151,7 @@
+             and not cache_warmup_enabled
+         ):
+             trajectory_count = conversation_source.warmup_credit_count
+-            if (
+-                trajectory_count > 0
+-                and trajectory_count != config.total_expected_requests
+-            ):
++            if trajectory_count != config.total_expected_requests:
+                 self._config = self._config.model_copy(
+                     update={"total_expected_requests": trajectory_count}
+                 )
+@@ -386,6 +383,19 @@
+ 
+             self._execution_task = self.execute_async(strategy.execute_phase())
+ 
++            # An empty priming set has no credit whose issuance can signal
++            # completion. Await the strategy so failure/cancellation cannot
++            # become a successful empty phase, then use the normal lifecycle.
++            if (
++                self._config.phase == CreditPhase.WARMUP
++                and self._config.timing_mode == TimingMode.AGENTIC_REPLAY
++                and self._config.total_expected_requests == 0
++            ):
++                await self._execution_task
++                if self._progress.counter.requests_sent != 0:
++                    raise RuntimeError("Empty AgenticReplay warmup issued a credit")
++                self._progress.all_credits_sent_event.set()
++
+             await self._wait_for_sending_complete(strategy)
+ 
+             if self._was_cancelled:
+@@ -707,6 +717,7 @@
+             self.error(
+                 f"Error waiting for phase {self._config.phase} to send all credits: {e!r}"
+             )
++            raise
+         finally:
+             if not self._lifecycle.is_sending_complete:
+                 self._lifecycle.mark_sending_complete(timeout_triggered=timed_out)
+--- a/src/aiperf/common/models/credit_models.py
++++ b/src/aiperf/common/models/credit_models.py
+@@ -38,8 +38,9 @@
+     # Expectation / stop condition fields
+     total_expected_requests: int | None = Field(
+         default=None,
+-        gt=0,
+-        description="The total number of expected requests to send to the workers. If None, the phase is not request count based.",
++        ge=0,
++        description="The total number of expected requests to send to the workers. "
++        "Zero reports an empty warmup. If None, the phase is not request count based.",
+     )
+     expected_duration_sec: float | None = Field(
+         default=None,

@@ -1,0 +1,801 @@
+{
+ "class": "clients_short",
+ "clients": 8,
+ "client_counts": [
+  1,
+  2,
+  4,
+  8
+ ],
+ "pool_size": 8,
+ "nested_pool": "the first 8 roots of one fixed ordered pool of 8, so this cell's requests are a subset of the next client count's",
+ "rule": {
+  "kind": "clients_short",
+  "gap_s": 0.0,
+  "min_input": 64,
+  "max_input": 4096,
+  "min_peak": 2,
+  "min_descendants": 1
+ },
+ "episode_definition": "a maximal run of API-leaf intervals [t, t+api_time) on the root's clock joined by gaps of at most 0.0s; cut from all leaves and accepted or rejected entire",
+ "corpus": {
+  "dataset": "semianalysisai/cc-traces-weka-062126-256k",
+  "file": "traces.jsonl",
+  "bytes": 568864747,
+  "sha256": "e39cd2ff3eba21d4a3664be51da743ac3d2149a1933898cafc7bfeac8147eeef",
+  "sessions": 393
+ },
+ "corpus_sha256_observed": "e39cd2ff3eba21d4a3664be51da743ac3d2149a1933898cafc7bfeac8147eeef",
+ "development_sessions_excluded": [
+  "002001296e8a8c38ad9d7cc436d691afc602"
+ ],
+ "context_tokens": 262144,
+ "servable_types": [
+  "s",
+  "n"
+ ],
+ "generator_sha256": "3f54059888d51f01d7c2ff282231f4d385d9f3bbd6073fbf4b4d0321b557c37a",
+ "base_generator_sha256": "d0a1dc1be2ae777408266d8a18996bd55145cd688edddb1482a179a0ad8b09ff",
+ "arrivals": {
+  "model": "source_paced_open_loop",
+  "within_root": "raw source offsets on the root's own clock, descendants included; nothing clipped, compressed or reordered",
+  "across_roots": "declared: every selected episode's first arrival at 0.0, so the C roots start together. The corpus carries no absolute start time, so this is a construction and not a chronology",
+  "causality": "none assumed. The dataset card defines no completion dependency and does not define api_time or think_time at all, so a descendant fires at its recorded offset whether or not its parent turn has finished"
+ },
+ "target_model": "Qwen/Qwen3.8-27B",
+ "source_models_declared": "the corpus served these requests with several models; every row carries its source label and every row is replayed against target_model. No descendant is dropped for a differing label",
+ "source_models": {
+  "claude-opus-4-6": 2,
+  "claude-opus-4-8": 15
+ },
+ "roots_used": [
+  {
+   "corpus_line_1based": 58,
+   "corpus_index_0based": 57,
+   "id": "208d6e28928b0b3d3b33db3c690173d15be3",
+   "requests": 2,
+   "root_requests": 0,
+   "descendant_requests": 2,
+   "branches": [
+    "subagent_015_79a23340"
+   ],
+   "subagent_types": [
+    "Subagent"
+   ],
+   "source_peak_overlap": 2,
+   "source_t_first_s": 18265.327,
+   "source_t_last_s": 18265.786,
+   "arrival_span_s": 0.459,
+   "input_tokens": 4864,
+   "output_tokens": 2061,
+   "max_input_tokens": 2944,
+   "source_models": {
+    "claude-opus-4-8": 2
+   },
+   "paths": [
+    "/requests/74/requests/14",
+    "/requests/74/requests/15"
+   ]
+  },
+  {
+   "corpus_line_1based": 60,
+   "corpus_index_0based": 59,
+   "id": "212e46e294bd09113e425ebc8a430cc528a6",
+   "requests": 2,
+   "root_requests": 0,
+   "descendant_requests": 2,
+   "branches": [
+    "subagent_010_fb08b4e8"
+   ],
+   "subagent_types": [
+    "Subagent"
+   ],
+   "source_peak_overlap": 2,
+   "source_t_first_s": 14612.941,
+   "source_t_last_s": 14614.103,
+   "arrival_span_s": 1.162,
+   "input_tokens": 6400,
+   "output_tokens": 697,
+   "max_input_tokens": 3840,
+   "source_models": {
+    "claude-opus-4-8": 2
+   },
+   "paths": [
+    "/requests/85/requests/25",
+    "/requests/85/requests/26"
+   ]
+  },
+  {
+   "corpus_line_1based": 70,
+   "corpus_index_0based": 69,
+   "id": "2654d8b687d9c22001c25155ff2a69840acc",
+   "requests": 2,
+   "root_requests": 0,
+   "descendant_requests": 2,
+   "branches": [
+    "subagent_001_55a78537"
+   ],
+   "subagent_types": [
+    "Subagent"
+   ],
+   "source_peak_overlap": 2,
+   "source_t_first_s": 6891.14,
+   "source_t_last_s": 6891.561,
+   "arrival_span_s": 0.421,
+   "input_tokens": 6016,
+   "output_tokens": 2216,
+   "max_input_tokens": 3008,
+   "source_models": {
+    "claude-opus-4-8": 2
+   },
+   "paths": [
+    "/requests/5/requests/158",
+    "/requests/5/requests/159"
+   ]
+  },
+  {
+   "corpus_line_1based": 94,
+   "corpus_index_0based": 93,
+   "id": "3cb1c6dc71a21714587287306ebe52748568",
+   "requests": 2,
+   "root_requests": 0,
+   "descendant_requests": 2,
+   "branches": [
+    "subagent_005_e635be92"
+   ],
+   "subagent_types": [
+    "Subagent"
+   ],
+   "source_peak_overlap": 2,
+   "source_t_first_s": 841.063,
+   "source_t_last_s": 841.602,
+   "arrival_span_s": 0.539,
+   "input_tokens": 5888,
+   "output_tokens": 2444,
+   "max_input_tokens": 2944,
+   "source_models": {
+    "claude-opus-4-8": 2
+   },
+   "paths": [
+    "/requests/7/requests/34",
+    "/requests/7/requests/35"
+   ]
+  },
+  {
+   "corpus_line_1based": 106,
+   "corpus_index_0based": 105,
+   "id": "46350c0355fa3f1922abb20cf7f5724bd7cd",
+   "requests": 3,
+   "root_requests": 0,
+   "descendant_requests": 3,
+   "branches": [
+    "subagent_007_ca9d2734"
+   ],
+   "subagent_types": [
+    "Subagent"
+   ],
+   "source_peak_overlap": 3,
+   "source_t_first_s": 8341.661,
+   "source_t_last_s": 8341.669,
+   "arrival_span_s": 0.008,
+   "input_tokens": 8832,
+   "output_tokens": 2705,
+   "max_input_tokens": 2944,
+   "source_models": {
+    "claude-opus-4-8": 3
+   },
+   "paths": [
+    "/requests/53/requests/37",
+    "/requests/53/requests/38",
+    "/requests/53/requests/39"
+   ]
+  },
+  {
+   "corpus_line_1based": 112,
+   "corpus_index_0based": 111,
+   "id": "4b433e21f63822412e0f27d5473da9ea1322",
+   "requests": 2,
+   "root_requests": 0,
+   "descendant_requests": 2,
+   "branches": [
+    "subagent_005_e422d409"
+   ],
+   "subagent_types": [
+    "Subagent"
+   ],
+   "source_peak_overlap": 2,
+   "source_t_first_s": 168170.176,
+   "source_t_last_s": 168170.195,
+   "arrival_span_s": 0.019,
+   "input_tokens": 4864,
+   "output_tokens": 1330,
+   "max_input_tokens": 2432,
+   "source_models": {
+    "claude-opus-4-6": 2
+   },
+   "paths": [
+    "/requests/466/requests/16",
+    "/requests/466/requests/17"
+   ]
+  },
+  {
+   "corpus_line_1based": 121,
+   "corpus_index_0based": 120,
+   "id": "4dcf5b2627786f87d5f1badf0ccd6e0f6848",
+   "requests": 2,
+   "root_requests": 0,
+   "descendant_requests": 2,
+   "branches": [
+    "subagent_001_b6a8c63f"
+   ],
+   "subagent_types": [
+    "Subagent"
+   ],
+   "source_peak_overlap": 2,
+   "source_t_first_s": 7051.715,
+   "source_t_last_s": 7053.442,
+   "arrival_span_s": 1.727,
+   "input_tokens": 5888,
+   "output_tokens": 2024,
+   "max_input_tokens": 2944,
+   "source_models": {
+    "claude-opus-4-8": 2
+   },
+   "paths": [
+    "/requests/63/requests/1",
+    "/requests/63/requests/2"
+   ]
+  },
+  {
+   "corpus_line_1based": 125,
+   "corpus_index_0based": 124,
+   "id": "509ad65c576a007df9c0cf1e9863874da21d",
+   "requests": 2,
+   "root_requests": 0,
+   "descendant_requests": 2,
+   "branches": [
+    "subagent_009_863fb3a9"
+   ],
+   "subagent_types": [
+    "Subagent"
+   ],
+   "source_peak_overlap": 2,
+   "source_t_first_s": 66177.052,
+   "source_t_last_s": 66177.055,
+   "arrival_span_s": 0.003,
+   "input_tokens": 5888,
+   "output_tokens": 2539,
+   "max_input_tokens": 2944,
+   "source_models": {
+    "claude-opus-4-8": 2
+   },
+   "paths": [
+    "/requests/39/requests/6",
+    "/requests/39/requests/7"
+   ]
+  }
+ ],
+ "roots_pool": [
+  {
+   "corpus_line_1based": 58,
+   "corpus_index_0based": 57,
+   "id": "208d6e28928b0b3d3b33db3c690173d15be3",
+   "requests": 2,
+   "root_requests": 0,
+   "descendant_requests": 2,
+   "branches": [
+    "subagent_015_79a23340"
+   ],
+   "subagent_types": [
+    "Subagent"
+   ],
+   "source_peak_overlap": 2,
+   "source_t_first_s": 18265.327,
+   "source_t_last_s": 18265.786,
+   "arrival_span_s": 0.459,
+   "input_tokens": 4864,
+   "output_tokens": 2061,
+   "max_input_tokens": 2944,
+   "source_models": {
+    "claude-opus-4-8": 2
+   },
+   "paths": [
+    "/requests/74/requests/14",
+    "/requests/74/requests/15"
+   ]
+  },
+  {
+   "corpus_line_1based": 60,
+   "corpus_index_0based": 59,
+   "id": "212e46e294bd09113e425ebc8a430cc528a6",
+   "requests": 2,
+   "root_requests": 0,
+   "descendant_requests": 2,
+   "branches": [
+    "subagent_010_fb08b4e8"
+   ],
+   "subagent_types": [
+    "Subagent"
+   ],
+   "source_peak_overlap": 2,
+   "source_t_first_s": 14612.941,
+   "source_t_last_s": 14614.103,
+   "arrival_span_s": 1.162,
+   "input_tokens": 6400,
+   "output_tokens": 697,
+   "max_input_tokens": 3840,
+   "source_models": {
+    "claude-opus-4-8": 2
+   },
+   "paths": [
+    "/requests/85/requests/25",
+    "/requests/85/requests/26"
+   ]
+  },
+  {
+   "corpus_line_1based": 70,
+   "corpus_index_0based": 69,
+   "id": "2654d8b687d9c22001c25155ff2a69840acc",
+   "requests": 2,
+   "root_requests": 0,
+   "descendant_requests": 2,
+   "branches": [
+    "subagent_001_55a78537"
+   ],
+   "subagent_types": [
+    "Subagent"
+   ],
+   "source_peak_overlap": 2,
+   "source_t_first_s": 6891.14,
+   "source_t_last_s": 6891.561,
+   "arrival_span_s": 0.421,
+   "input_tokens": 6016,
+   "output_tokens": 2216,
+   "max_input_tokens": 3008,
+   "source_models": {
+    "claude-opus-4-8": 2
+   },
+   "paths": [
+    "/requests/5/requests/158",
+    "/requests/5/requests/159"
+   ]
+  },
+  {
+   "corpus_line_1based": 94,
+   "corpus_index_0based": 93,
+   "id": "3cb1c6dc71a21714587287306ebe52748568",
+   "requests": 2,
+   "root_requests": 0,
+   "descendant_requests": 2,
+   "branches": [
+    "subagent_005_e635be92"
+   ],
+   "subagent_types": [
+    "Subagent"
+   ],
+   "source_peak_overlap": 2,
+   "source_t_first_s": 841.063,
+   "source_t_last_s": 841.602,
+   "arrival_span_s": 0.539,
+   "input_tokens": 5888,
+   "output_tokens": 2444,
+   "max_input_tokens": 2944,
+   "source_models": {
+    "claude-opus-4-8": 2
+   },
+   "paths": [
+    "/requests/7/requests/34",
+    "/requests/7/requests/35"
+   ]
+  },
+  {
+   "corpus_line_1based": 106,
+   "corpus_index_0based": 105,
+   "id": "46350c0355fa3f1922abb20cf7f5724bd7cd",
+   "requests": 3,
+   "root_requests": 0,
+   "descendant_requests": 3,
+   "branches": [
+    "subagent_007_ca9d2734"
+   ],
+   "subagent_types": [
+    "Subagent"
+   ],
+   "source_peak_overlap": 3,
+   "source_t_first_s": 8341.661,
+   "source_t_last_s": 8341.669,
+   "arrival_span_s": 0.008,
+   "input_tokens": 8832,
+   "output_tokens": 2705,
+   "max_input_tokens": 2944,
+   "source_models": {
+    "claude-opus-4-8": 3
+   },
+   "paths": [
+    "/requests/53/requests/37",
+    "/requests/53/requests/38",
+    "/requests/53/requests/39"
+   ]
+  },
+  {
+   "corpus_line_1based": 112,
+   "corpus_index_0based": 111,
+   "id": "4b433e21f63822412e0f27d5473da9ea1322",
+   "requests": 2,
+   "root_requests": 0,
+   "descendant_requests": 2,
+   "branches": [
+    "subagent_005_e422d409"
+   ],
+   "subagent_types": [
+    "Subagent"
+   ],
+   "source_peak_overlap": 2,
+   "source_t_first_s": 168170.176,
+   "source_t_last_s": 168170.195,
+   "arrival_span_s": 0.019,
+   "input_tokens": 4864,
+   "output_tokens": 1330,
+   "max_input_tokens": 2432,
+   "source_models": {
+    "claude-opus-4-6": 2
+   },
+   "paths": [
+    "/requests/466/requests/16",
+    "/requests/466/requests/17"
+   ]
+  },
+  {
+   "corpus_line_1based": 121,
+   "corpus_index_0based": 120,
+   "id": "4dcf5b2627786f87d5f1badf0ccd6e0f6848",
+   "requests": 2,
+   "root_requests": 0,
+   "descendant_requests": 2,
+   "branches": [
+    "subagent_001_b6a8c63f"
+   ],
+   "subagent_types": [
+    "Subagent"
+   ],
+   "source_peak_overlap": 2,
+   "source_t_first_s": 7051.715,
+   "source_t_last_s": 7053.442,
+   "arrival_span_s": 1.727,
+   "input_tokens": 5888,
+   "output_tokens": 2024,
+   "max_input_tokens": 2944,
+   "source_models": {
+    "claude-opus-4-8": 2
+   },
+   "paths": [
+    "/requests/63/requests/1",
+    "/requests/63/requests/2"
+   ]
+  },
+  {
+   "corpus_line_1based": 125,
+   "corpus_index_0based": 124,
+   "id": "509ad65c576a007df9c0cf1e9863874da21d",
+   "requests": 2,
+   "root_requests": 0,
+   "descendant_requests": 2,
+   "branches": [
+    "subagent_009_863fb3a9"
+   ],
+   "subagent_types": [
+    "Subagent"
+   ],
+   "source_peak_overlap": 2,
+   "source_t_first_s": 66177.052,
+   "source_t_last_s": 66177.055,
+   "arrival_span_s": 0.003,
+   "input_tokens": 5888,
+   "output_tokens": 2539,
+   "max_input_tokens": 2944,
+   "source_models": {
+    "claude-opus-4-8": 2
+   },
+   "paths": [
+    "/requests/39/requests/6",
+    "/requests/39/requests/7"
+   ]
+  }
+ ],
+ "requests": 17,
+ "root_requests": 0,
+ "descendant_requests": 17,
+ "branches": 8,
+ "input_tokens": {
+  "min": 1920,
+  "p10": 2432,
+  "median": 2944,
+  "p90": 3008,
+  "max": 3840,
+  "sum": 48640
+ },
+ "output_tokens": {
+  "min": 260,
+  "p10": 304,
+  "median": 815,
+  "p90": 1757,
+  "max": 1801,
+  "sum": 16016
+ },
+ "arrival_span_s": 1.727,
+ "source_peak_overlap": 3,
+ "source_peak_overlap_means": "the most requests the source had in flight at once, as evidence that this slice contains concurrency. It is not a bound on the served engine's outstanding requests: Qwen's service times are not the trace's, so these arrivals may reach max_num_seqs or queue past it",
+ "episodes_rejected": {
+  "a development session": 1,
+  "a request is above the 4096-token prompt limit": 9611,
+  "no subagent request in the episode": 76,
+  "the source never has 2 of these in flight": 14
+ },
+ "episodes_rejected_value_range": {
+  "a request is above the 4096-token prompt limit": {
+   "min": 4416,
+   "max": 255488
+  },
+  "no subagent request in the episode": {
+   "min": 0,
+   "max": 0
+  },
+  "the source never has 2 of these in flight": {
+   "min": 1,
+   "max": 1
+  }
+ },
+ "episodes_rejected_scope": "every episode examined while filling this class's pool of 8 roots, in corpus order. Scanning stops once the pool is full, so this is a census of what was refused on the way to the selection, not of the whole corpus",
+ "gaps_clipped": 0,
+ "outputs_altered": 0,
+ "subagents_pruned": 0,
+ "requests_serialised": 0,
+ "scanned_sessions": 393,
+ "scanned_subagent_wrapper_rows": 1697,
+ "scanned_nested_requests": 39822,
+ "input_token_units": "tokens; corpus `in` is already a token count and is block-aligned (in == len(hash_ids) * block_size), never multiplied here",
+ "lengths_checked": "in == len(hash_ids) * block_size on every request",
+ "provenance": [
+  {
+   "client_index": 0,
+   "session": "208d6e28928b0b3d3b33db3c690173d15be3",
+   "json_path": "/requests/74/requests/14",
+   "actor": "subagent",
+   "agent_id": "subagent_015_79a23340",
+   "source_t_s": 18265.327,
+   "origin_shift_s": 18265.327,
+   "arrival_s": 0.0,
+   "input_tokens": 1920,
+   "input_blocks": 30,
+   "output_tokens": 260,
+   "source_model": "claude-opus-4-8"
+  },
+  {
+   "client_index": 1,
+   "session": "212e46e294bd09113e425ebc8a430cc528a6",
+   "json_path": "/requests/85/requests/25",
+   "actor": "subagent",
+   "agent_id": "subagent_010_fb08b4e8",
+   "source_t_s": 14612.941,
+   "origin_shift_s": 14612.941,
+   "arrival_s": 0.0,
+   "input_tokens": 3840,
+   "input_blocks": 60,
+   "output_tokens": 304,
+   "source_model": "claude-opus-4-8"
+  },
+  {
+   "client_index": 2,
+   "session": "2654d8b687d9c22001c25155ff2a69840acc",
+   "json_path": "/requests/5/requests/158",
+   "actor": "subagent",
+   "agent_id": "subagent_001_55a78537",
+   "source_t_s": 6891.14,
+   "origin_shift_s": 6891.14,
+   "arrival_s": 0.0,
+   "input_tokens": 3008,
+   "input_blocks": 47,
+   "output_tokens": 736,
+   "source_model": "claude-opus-4-8"
+  },
+  {
+   "client_index": 3,
+   "session": "3cb1c6dc71a21714587287306ebe52748568",
+   "json_path": "/requests/7/requests/34",
+   "actor": "subagent",
+   "agent_id": "subagent_005_e635be92",
+   "source_t_s": 841.063,
+   "origin_shift_s": 841.063,
+   "arrival_s": 0.0,
+   "input_tokens": 2944,
+   "input_blocks": 46,
+   "output_tokens": 1629,
+   "source_model": "claude-opus-4-8"
+  },
+  {
+   "client_index": 4,
+   "session": "46350c0355fa3f1922abb20cf7f5724bd7cd",
+   "json_path": "/requests/53/requests/37",
+   "actor": "subagent",
+   "agent_id": "subagent_007_ca9d2734",
+   "source_t_s": 8341.661,
+   "origin_shift_s": 8341.661,
+   "arrival_s": 0.0,
+   "input_tokens": 2944,
+   "input_blocks": 46,
+   "output_tokens": 990,
+   "source_model": "claude-opus-4-8"
+  },
+  {
+   "client_index": 5,
+   "session": "4b433e21f63822412e0f27d5473da9ea1322",
+   "json_path": "/requests/466/requests/16",
+   "actor": "subagent",
+   "agent_id": "subagent_005_e422d409",
+   "source_t_s": 168170.176,
+   "origin_shift_s": 168170.176,
+   "arrival_s": 0.0,
+   "input_tokens": 2432,
+   "input_blocks": 38,
+   "output_tokens": 654,
+   "source_model": "claude-opus-4-6"
+  },
+  {
+   "client_index": 6,
+   "session": "4dcf5b2627786f87d5f1badf0ccd6e0f6848",
+   "json_path": "/requests/63/requests/1",
+   "actor": "subagent",
+   "agent_id": "subagent_001_b6a8c63f",
+   "source_t_s": 7051.715,
+   "origin_shift_s": 7051.715,
+   "arrival_s": 0.0,
+   "input_tokens": 2944,
+   "input_blocks": 46,
+   "output_tokens": 965,
+   "source_model": "claude-opus-4-8"
+  },
+  {
+   "client_index": 7,
+   "session": "509ad65c576a007df9c0cf1e9863874da21d",
+   "json_path": "/requests/39/requests/6",
+   "actor": "subagent",
+   "agent_id": "subagent_009_863fb3a9",
+   "source_t_s": 66177.052,
+   "origin_shift_s": 66177.052,
+   "arrival_s": 0.0,
+   "input_tokens": 2944,
+   "input_blocks": 46,
+   "output_tokens": 1757,
+   "source_model": "claude-opus-4-8"
+  },
+  {
+   "client_index": 7,
+   "session": "509ad65c576a007df9c0cf1e9863874da21d",
+   "json_path": "/requests/39/requests/7",
+   "actor": "subagent",
+   "agent_id": "subagent_009_863fb3a9",
+   "source_t_s": 66177.055,
+   "origin_shift_s": 66177.052,
+   "arrival_s": 0.003,
+   "input_tokens": 2944,
+   "input_blocks": 46,
+   "output_tokens": 782,
+   "source_model": "claude-opus-4-8"
+  },
+  {
+   "client_index": 4,
+   "session": "46350c0355fa3f1922abb20cf7f5724bd7cd",
+   "json_path": "/requests/53/requests/38",
+   "actor": "subagent",
+   "agent_id": "subagent_007_ca9d2734",
+   "source_t_s": 8341.666,
+   "origin_shift_s": 8341.661,
+   "arrival_s": 0.005,
+   "input_tokens": 2944,
+   "input_blocks": 46,
+   "output_tokens": 1196,
+   "source_model": "claude-opus-4-8"
+  },
+  {
+   "client_index": 4,
+   "session": "46350c0355fa3f1922abb20cf7f5724bd7cd",
+   "json_path": "/requests/53/requests/39",
+   "actor": "subagent",
+   "agent_id": "subagent_007_ca9d2734",
+   "source_t_s": 8341.669,
+   "origin_shift_s": 8341.661,
+   "arrival_s": 0.008,
+   "input_tokens": 2944,
+   "input_blocks": 46,
+   "output_tokens": 519,
+   "source_model": "claude-opus-4-8"
+  },
+  {
+   "client_index": 5,
+   "session": "4b433e21f63822412e0f27d5473da9ea1322",
+   "json_path": "/requests/466/requests/17",
+   "actor": "subagent",
+   "agent_id": "subagent_005_e422d409",
+   "source_t_s": 168170.195,
+   "origin_shift_s": 168170.176,
+   "arrival_s": 0.019,
+   "input_tokens": 2432,
+   "input_blocks": 38,
+   "output_tokens": 676,
+   "source_model": "claude-opus-4-6"
+  },
+  {
+   "client_index": 2,
+   "session": "2654d8b687d9c22001c25155ff2a69840acc",
+   "json_path": "/requests/5/requests/159",
+   "actor": "subagent",
+   "agent_id": "subagent_001_55a78537",
+   "source_t_s": 6891.561,
+   "origin_shift_s": 6891.14,
+   "arrival_s": 0.421,
+   "input_tokens": 3008,
+   "input_blocks": 47,
+   "output_tokens": 1480,
+   "source_model": "claude-opus-4-8"
+  },
+  {
+   "client_index": 0,
+   "session": "208d6e28928b0b3d3b33db3c690173d15be3",
+   "json_path": "/requests/74/requests/15",
+   "actor": "subagent",
+   "agent_id": "subagent_015_79a23340",
+   "source_t_s": 18265.786,
+   "origin_shift_s": 18265.327,
+   "arrival_s": 0.459,
+   "input_tokens": 2944,
+   "input_blocks": 46,
+   "output_tokens": 1801,
+   "source_model": "claude-opus-4-8"
+  },
+  {
+   "client_index": 3,
+   "session": "3cb1c6dc71a21714587287306ebe52748568",
+   "json_path": "/requests/7/requests/35",
+   "actor": "subagent",
+   "agent_id": "subagent_005_e635be92",
+   "source_t_s": 841.602,
+   "origin_shift_s": 841.063,
+   "arrival_s": 0.539,
+   "input_tokens": 2944,
+   "input_blocks": 46,
+   "output_tokens": 815,
+   "source_model": "claude-opus-4-8"
+  },
+  {
+   "client_index": 1,
+   "session": "212e46e294bd09113e425ebc8a430cc528a6",
+   "json_path": "/requests/85/requests/26",
+   "actor": "subagent",
+   "agent_id": "subagent_010_fb08b4e8",
+   "source_t_s": 14614.103,
+   "origin_shift_s": 14612.941,
+   "arrival_s": 1.162,
+   "input_tokens": 2560,
+   "input_blocks": 40,
+   "output_tokens": 393,
+   "source_model": "claude-opus-4-8"
+  },
+  {
+   "client_index": 6,
+   "session": "4dcf5b2627786f87d5f1badf0ccd6e0f6848",
+   "json_path": "/requests/63/requests/2",
+   "actor": "subagent",
+   "agent_id": "subagent_001_b6a8c63f",
+   "source_t_s": 7053.442,
+   "origin_shift_s": 7051.715,
+   "arrival_s": 1.727,
+   "input_tokens": 2944,
+   "input_blocks": 46,
+   "output_tokens": 1059,
+   "source_model": "claude-opus-4-8"
+  }
+ ],
+ "sha256": "2b6f03c3c4791d80c5399d2a02a16e94c9bf3f05e3d153718723d62595df6980",
+ "emitted_at": "2026-09-12",
+ "file": "cc_traces_clients_short_c8.jsonl"
+}

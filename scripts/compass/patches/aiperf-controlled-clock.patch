@@ -1,0 +1,742 @@
+--- a/docs/architecture.md
++++ b/docs/architecture.md
+@@ -304,3 +304,16 @@
+ - **Inference Server**: The target system being benchmarked (vLLM, Dynamo, SGLang, etc.)
+ - **DCGM Exporter**: Optional GPU telemetry source (exposes GPU metrics in Prometheus format). Alternative: PyNVML queries GPUs directly without an external endpoint.
+ - **Prometheus-compatible endpoints**: Optional server/application metrics source for Server Metrics Manager (inference servers like vLLM expose metrics in Prometheus format at their /metrics endpoint)
++
++
++### Semantic clock ownership
++
++Phase lifecycle timestamps, credit issuance, replay scheduling, branch timers,
++and Worker request records use aiperf.common.clock. Its default provider
++delegates to Python's real clock. An internal simulator can use
++clock.use_clock(provider) with an event loop on the same timeline; the
++provider is scoped to that execution context and its child tasks. This leaves
++the native HTTP transport and unrelated task contexts on their real clocks.
++The simulator must settle request registration and callback delivery before
++advancing its timeline. A clock provider alone does not virtualize asyncio
++timers or replace the replay state machine.
+--- /dev/null
++++ b/src/aiperf/common/clock.py
+@@ -0,0 +1,59 @@
++# SPDX-FileCopyrightText: Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
++# SPDX-License-Identifier: Apache-2.0
++"""Scoped semantic clock; native execution delegates to Python's real clock."""
++
++from collections.abc import Iterator
++from contextlib import contextmanager
++from contextvars import ContextVar
++import time as _native
++from typing import Protocol
++
++
++class ClockProvider(Protocol):
++    def time(self) -> float: ...
++    def time_ns(self) -> int: ...
++    def perf_counter(self) -> float: ...
++    def perf_counter_ns(self) -> int: ...
++    def monotonic(self) -> float: ...
++    def monotonic_ns(self) -> int: ...
++
++
++_provider: ContextVar[ClockProvider] = ContextVar("aiperf_clock", default=_native)
++
++
++@contextmanager
++def use_clock(provider: ClockProvider) -> Iterator[None]:
++    """Use a matching clock inside this task context and its child tasks.
++
++    A virtual provider requires an event loop on the same timeline. This does
++    not change Python's time module or clocks in unrelated execution contexts.
++    """
++    token = _provider.set(provider)
++    try:
++        yield
++    finally:
++        _provider.reset(token)
++
++
++def time() -> float:
++    return _provider.get().time()
++
++
++def time_ns() -> int:
++    return _provider.get().time_ns()
++
++
++def perf_counter() -> float:
++    return _provider.get().perf_counter()
++
++
++def perf_counter_ns() -> int:
++    return _provider.get().perf_counter_ns()
++
++
++def monotonic() -> float:
++    return _provider.get().monotonic()
++
++
++def monotonic_ns() -> int:
++    return _provider.get().monotonic_ns()
+--- a/src/aiperf/common/loop_scheduler.py
++++ b/src/aiperf/common/loop_scheduler.py
+@@ -25,7 +25,7 @@
+ """
+ 
+ import asyncio
+-import time
++from aiperf.common import clock
+ from collections.abc import Callable, Coroutine
+ from typing import TypeAlias
+ 
+@@ -180,12 +180,12 @@
+         """
+         Schedule coroutine at an absolute perf_counter seconds timestamp.
+ 
+-        Bridges between time.perf_counter() (monotonic seconds) and
++        Bridges between clock.perf_counter() (monotonic seconds) and
+         loop.time() (event loop's monotonic seconds). Useful for replaying
+         traces or scheduling at precise absolute times.
+ 
+         Args:
+-            perf_sec: Target time from time.perf_counter().
++            perf_sec: Target time from clock.perf_counter().
+                       If in the past, delegates to execute_async().
+             coro: Coroutine object to execute.
+ 
+@@ -196,7 +196,7 @@
+         Precision: Input is float seconds, uvloop timer resolution is ~1ms.
+         """
+         # Always sample loop.time() FIRST to avoid early firing bias.
+-        cur_loop_time, cur_perf_sec = self._loop.time(), time.perf_counter()
++        cur_loop_time, cur_perf_sec = self._loop.time(), clock.perf_counter()
+         offset_sec = perf_sec - cur_perf_sec
+ 
+         if offset_sec <= 0:
+@@ -209,12 +209,12 @@
+         """
+         Schedule coroutine at an absolute perf_counter_ns timestamp.
+ 
+-        Bridges between time.perf_counter_ns() (monotonic nanoseconds) and
++        Bridges between clock.perf_counter_ns() (monotonic nanoseconds) and
+         loop.time() (event loop's monotonic seconds). Useful for replaying
+         traces or scheduling at precise absolute times.
+ 
+         Args:
+-            perf_time_ns: Target time from time.perf_counter_ns().
++            perf_time_ns: Target time from clock.perf_counter_ns().
+                           If in the past, delegates to execute_async().
+             coro: Coroutine object to execute.
+ 
+@@ -225,7 +225,7 @@
+         Precision: Input is nanoseconds, but uvloop timer resolution is ~1ms.
+         """
+         # Always sample loop.time() FIRST to avoid early firing bias.
+-        cur_loop_time, cur_perf_ns = self._loop.time(), time.perf_counter_ns()
++        cur_loop_time, cur_perf_ns = self._loop.time(), clock.perf_counter_ns()
+         offset_sec = (perf_time_ns - cur_perf_ns) / NANOS_PER_SECOND
+ 
+         if offset_sec <= 0:
+--- a/src/aiperf/common/models/credit_models.py
++++ b/src/aiperf/common/models/credit_models.py
+@@ -1,6 +1,6 @@
+ # SPDX-FileCopyrightText: Copyright (c) 2025-2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+ # SPDX-License-Identifier: Apache-2.0
+-import time
++from aiperf.common import clock
+ 
+ from pydantic import ConfigDict, Field
+ 
+@@ -183,12 +183,12 @@
+ 
+     @property
+     def requests_elapsed_time(self) -> float:
+-        """Get the elapsed time."""
++        """Get the elapsed clock."""
+         if self.start_ns is None:
+             return 0.0
+         if self.requests_end_ns is not None:
+             return (self.requests_end_ns - self.start_ns) / NANOS_PER_SECOND
+-        return (time.time_ns() - self.start_ns) / NANOS_PER_SECOND
++        return (clock.time_ns() - self.start_ns) / NANOS_PER_SECOND
+ 
+     @property
+     def requests_error_percent(self) -> float:
+@@ -220,7 +220,7 @@
+             ) * 100
+             percentages.append(pct_complete)
+         if self.expected_duration_sec:
+-            elapsed_ns = time.time_ns() - self.start_ns
++            elapsed_ns = clock.time_ns() - self.start_ns
+             expected_duration_ns = self.expected_duration_sec * NANOS_PER_SECOND
+             pct_time_elapsed = (elapsed_ns / expected_duration_ns) * 100
+             percentages.append(pct_time_elapsed)
+@@ -247,7 +247,7 @@
+     records_end_ns: int | None = Field(
+         default=None,
+         ge=0,
+-        description="The time at which the phase completed processing all records (time.time_ns()).",
++        description="The time at which the phase completed processing all records (clock.time_ns()).",
+     )
+ 
+     # Progress fields
+@@ -265,12 +265,12 @@
+ 
+     @property
+     def records_elapsed_time(self) -> float:
+-        """Get the elapsed time."""
++        """Get the elapsed clock."""
+         if self.start_ns is None:
+             return 0.0
+         if self.records_end_ns is not None:
+             return (self.records_end_ns - self.start_ns) / NANOS_PER_SECOND
+-        return (time.time_ns() - self.start_ns) / NANOS_PER_SECOND
++        return (clock.time_ns() - self.start_ns) / NANOS_PER_SECOND
+ 
+     @property
+     def records_error_percent(self) -> float:
+--- a/src/aiperf/common/models/record_models.py
++++ b/src/aiperf/common/models/record_models.py
+@@ -4,7 +4,7 @@
+ from __future__ import annotations
+ 
+ import sys
+-import time
++from aiperf.common import clock
+ from dataclasses import dataclass, field
+ from functools import cached_property
+ from typing import Annotated, Any, AnyStr, Protocol, runtime_checkable
+@@ -204,21 +204,21 @@
+     )
+     credit_issued_ns: int | None = Field(
+         default=None,
+-        description="Wall clock timestamp (time.time_ns) when the credit was issued by the rate limiter. "
++        description="Wall clock timestamp (clock.time_ns) when the credit was issued by the rate limiter. "
+         "This is the control point for accurate rate measurement, before ZeroMQ transit to workers.",
+     )
+     request_start_ns: int = Field(
+         ...,
+-        description="The wall clock timestamp of the request start time measured as time.time_ns().",
++        description="The wall clock timestamp of the request start time measured as clock.time_ns().",
+     )
+     request_ack_ns: int | None = Field(
+         default=None,
+-        description="The wall clock timestamp of the request acknowledgement from the server, measured as time.time_ns(), if applicable. "
++        description="The wall clock timestamp of the request acknowledgement from the server, measured as clock.time_ns(), if applicable. "
+         "This is only applicable to streaming requests, and servers that send 200 OK back immediately after the request is received.",
+     )
+     request_end_ns: int = Field(
+         ...,
+-        description="The wall clock timestamp of the request end time measured as time.time_ns(). If the request failed, "
++        description="The wall clock timestamp of the request end time measured as clock.time_ns(). If the request failed, "
+         "this will be the time of the error.",
+     )
+     worker_id: str = Field(
+@@ -238,7 +238,7 @@
+     )
+     cancellation_time_ns: int | None = Field(
+         default=None,
+-        description="The wall clock timestamp of the request cancellation time measured as time.time_ns(), if applicable. "
++        description="The wall clock timestamp of the request cancellation time measured as clock.time_ns(), if applicable. "
+         "This is only applicable to requests that were cancelled.",
+     )
+     context_overflow_skip: bool = Field(
+@@ -713,7 +713,7 @@
+     credit_issued_ns: int | None = Field(
+         default=None,
+         ge=0,
+-        description="Wall clock timestamp (time.time_ns) when the credit was issued by the rate limiter. "
++        description="Wall clock timestamp (clock.time_ns) when the credit was issued by the rate limiter. "
+         "This is the control point for accurate rate measurement, before ZeroMQ transit to workers.",
+     )
+ 
+@@ -816,7 +816,7 @@
+     system_message: str | None = Field(
+         default=None,
+         description="Optional shared system message extracted from "
+-        "``Conversation.system_message`` at request time. Consumed by the "
++        "``Conversation.system_message`` at request clock. Consumed by the "
+         "endpoint's ``format_payload`` (or top-level ``instructions`` on the "
+         "Responses API) and inlined into ``payload_bytes`` before transport; "
+         "lives on ``RequestInfo`` because the record processor reads only "
+@@ -825,7 +825,7 @@
+     user_context_message: str | None = Field(
+         default=None,
+         description="Optional per-conversation user context message extracted "
+-        "from ``Conversation.user_context_message`` at request time. Same "
++        "from ``Conversation.user_context_message`` at request clock. Same "
+         "inlining contract as ``system_message``.",
+     )
+     endpoint_headers: dict[str, str] = Field(
+@@ -880,11 +880,11 @@
+         description="The name of the model targeted by the request.",
+     )
+     timestamp_ns: int = Field(
+-        default_factory=time.time_ns,
+-        description="The wall clock timestamp of the request in nanoseconds. DO NOT USE FOR LATENCY CALCULATIONS. (time.time_ns).",
++        default_factory=clock.time_ns,
++        description="The wall clock timestamp of the request in nanoseconds. DO NOT USE FOR LATENCY CALCULATIONS. (clock.time_ns).",
+     )
+     start_perf_ns: int = Field(
+-        default_factory=time.perf_counter_ns,
++        default_factory=clock.perf_counter_ns,
+         description="The start reference time of the request in nanoseconds used for latency calculations (perf_counter_ns).",
+     )
+     end_perf_ns: int | None = Field(
+@@ -1345,7 +1345,7 @@
+ 
+     @cached_property
+     def timestamp_ns(self) -> int:
+-        """Get the wall clock timestamp of the request in nanoseconds. DO NOT USE FOR LATENCY CALCULATIONS. (time.time_ns)."""
++        """Get the wall clock timestamp of the request in nanoseconds. DO NOT USE FOR LATENCY CALCULATIONS. (clock.time_ns)."""
+         return self.request.timestamp_ns
+ 
+     # TODO: How do we differentiate the end of the request vs the time of the last response?
+@@ -1466,7 +1466,7 @@
+         description="The metadata of the record. Should match the metadata in the MetricRecordsMessage.",
+     )
+     start_perf_ns: int = Field(
+-        default_factory=time.perf_counter_ns,
++        default_factory=clock.perf_counter_ns,
+         description="The start reference time of the request in nanoseconds used for latency calculations (perf_counter_ns).",
+     )
+     payload: dict[str, Any] | None = Field(
+--- a/src/aiperf/credit/issuer.py
++++ b/src/aiperf/credit/issuer.py
+@@ -14,7 +14,7 @@
+ 
+ from __future__ import annotations
+ 
+-import time
++from aiperf.common import clock
+ from typing import TYPE_CHECKING
+ 
+ from msgspec.structs import replace as _struct_replace
+@@ -345,7 +345,7 @@
+             turn, self._phase
+         )
+         issued_at_ns = self._lifecycle.started_at_ns + (
+-            time.perf_counter_ns() - self._lifecycle.started_at_perf_ns
++            clock.perf_counter_ns() - self._lifecycle.started_at_perf_ns
+         )
+ 
+         # Get URL index from strategy (for multi-URL load balancing).
+@@ -458,7 +458,7 @@
+         Cache-bust propagation:
+             The TurnToSend constructed here re-applies the parent's
+             ``cache_bust_marker`` / ``cache_bust_target`` captured on the
+-            ``PendingBranchJoin`` at suspend time. Without this, turn k+1
++            ``PendingBranchJoin`` at suspend clock. Without this, turn k+1
+             (the join turn) would dispatch with no marker while turns 0..k
+             carried one, breaking per-session cache-bust uniqueness for
+             multi-turn parents under DAG joins.
+--- a/src/aiperf/credit/sticky_router.py
++++ b/src/aiperf/credit/sticky_router.py
+@@ -15,7 +15,7 @@
+ - StickyCreditRouter: Main router class
+ """
+ 
+-import time
++from aiperf.common import clock
+ from collections import defaultdict
+ from collections.abc import Awaitable, Callable
+ from dataclasses import dataclass, field
+@@ -495,7 +495,7 @@
+             self._workers[worker_id] = WorkerLoad(
+                 worker_id=worker_id,
+                 virtual_sent_credits=avg_virtual,
+-                last_sent_at_ns=time.perf_counter_ns(),
++                last_sent_at_ns=clock.perf_counter_ns(),
+             )
+             if self.is_trace_enabled:
+                 self.trace(
+@@ -559,7 +559,7 @@
+             worker_load.virtual_sent_credits += 1
+             worker_load.in_flight_credits += 1
+             worker_load.active_credit_ids.add(credit_id)
+-            worker_load.last_sent_at_ns = time.perf_counter_ns()
++            worker_load.last_sent_at_ns = clock.perf_counter_ns()
+ 
+             new_load = worker_load.in_flight_credits
+             # Keep the workers by load updated for faster load balancing.
+--- a/src/aiperf/timing/branch_orchestrator.py
++++ b/src/aiperf/timing/branch_orchestrator.py
+@@ -90,7 +90,7 @@
+ import asyncio
+ import logging
+ import math
+-import time
++from aiperf.common import clock
+ from collections import defaultdict
+ from dataclasses import dataclass, field
+ 
+@@ -138,7 +138,7 @@
+     The set form gives idempotent double-delivery protection; the counter
+     form lets multiple spawn points contribute to the same ``prereq_key``
+     (fan-in) without requiring the orchestrator to know every child
+-    correlation id at registration time.
++    correlation id at registration clock.
+ 
+     ``registered`` is False until the spawning turn actually fires and
+     ``expected`` has been incremented for at least one child. Fan-in
+@@ -185,7 +185,7 @@
+     parent_branch_mode: ConversationBranchMode = ConversationBranchMode.FORK
+     parent_has_forks_on_gated_turn: bool = False
+     is_blocked: bool = False
+-    created_at_ns: int = field(default_factory=time.monotonic_ns)
++    created_at_ns: int = field(default_factory=clock.monotonic_ns)
+     # Cache-bust state captured from the credit that suspends the parent so
+     # the gated turn dispatched after children join carries the same marker
+     # as turns 0..k-1 (otherwise the join turn would silently disable
+@@ -1559,7 +1559,7 @@
+                 len(self._child_to_join),
+                 len(self._descendant_counts),
+             )
+-            now_ns = time.monotonic_ns()
++            now_ns = clock.monotonic_ns()
+             for parent_corr, pending in leaked:
+                 age_ms = (now_ns - pending.created_at_ns) / 1_000_000
+                 logger.warning(
+--- a/src/aiperf/timing/phase/lifecycle.py
++++ b/src/aiperf/timing/phase/lifecycle.py
+@@ -10,7 +10,7 @@
+ 
+ from __future__ import annotations
+ 
+-import time
++from aiperf.common import clock
+ from typing import TYPE_CHECKING
+ 
+ from aiperf.common.constants import NANOS_PER_SECOND
+@@ -43,7 +43,7 @@
+     Cancellation is orthogonal to state - a cancelled phase still completes
+     its lifecycle for cleanup.
+ 
+-    Uses wall-clock time (time.time_ns()) for timestamps since they're published
++    Uses wall-clock time (clock.time_ns()) for timestamps since they're published
+     across services and need to be comparable. perf_counter is process-local.
+     """
+ 
+@@ -51,12 +51,12 @@
+         self._config = config
+         self.state: PhaseState = PhaseState.CREATED
+ 
+-        # Timestamps (wall clock - time.time_ns())
++        # Timestamps (wall clock - clock.time_ns())
+         self.started_at_ns: int | None = None
+         self.sending_complete_at_ns: int | None = None
+         self.complete_at_ns: int | None = None
+ 
+-        # Performance timestamps (process-local - time.perf_counter_ns())
++        # Performance timestamps (process-local - clock.perf_counter_ns())
+         self.started_at_perf_ns: int | None = None
+ 
+         # Transition metadata
+@@ -84,7 +84,7 @@
+         if self.state != PhaseState.CREATED:
+             raise ValueError("Credit phase already started")
+         self.state = PhaseState.STARTED
+-        perf_ns, time_ns = time.perf_counter_ns(), time.time_ns()
++        perf_ns, time_ns = clock.perf_counter_ns(), clock.time_ns()
+         self.started_at_ns = time_ns
+         self.started_at_perf_ns = perf_ns
+ 
+@@ -99,7 +99,7 @@
+         if self.state in _SENDING_COMPLETE_STATES:
+             raise ValueError("Credit phase already completed sending")
+         self.state = PhaseState.SENDING_COMPLETE
+-        self.sending_complete_at_ns = time.time_ns()
++        self.sending_complete_at_ns = clock.time_ns()
+         if timeout_triggered:
+             self.timeout_triggered = True
+ 
+@@ -116,7 +116,7 @@
+                 "Credit phase has not completed sending. Call mark_sending_complete() first."
+             )
+         self.state = PhaseState.COMPLETE
+-        self.complete_at_ns = time.time_ns()
++        self.complete_at_ns = clock.time_ns()
+         if grace_period_triggered:
+             self.grace_period_triggered = True
+ 
+@@ -135,7 +135,7 @@
+         This is the authoritative source for time-left calculations.
+ 
+         Args:
+-            include_grace_period: If True, includes grace_period_sec in remaining time.
++            include_grace_period: If True, includes grace_period_sec in remaining clock.
+                 Used when waiting for in-flight requests to complete.
+ 
+         Returns:
+@@ -148,7 +148,7 @@
+         if self.started_at_perf_ns is None:
+             return None  # Not started yet
+ 
+-        elapsed_ns = time.perf_counter_ns() - self.started_at_perf_ns
++        elapsed_ns = clock.perf_counter_ns() - self.started_at_perf_ns
+         elapsed_sec = elapsed_ns / NANOS_PER_SECOND
+         grace = (self._config.grace_period_sec or 0) if include_grace_period else 0
+         time_left = self._config.expected_duration_sec + grace - elapsed_sec
+--- a/src/aiperf/timing/phase/runner.py
++++ b/src/aiperf/timing/phase/runner.py
+@@ -10,7 +10,7 @@
+ 
+ import asyncio
+ import math
+-import time
++from aiperf.common import clock
+ from collections.abc import Callable
+ from typing import TYPE_CHECKING
+ 
+@@ -958,13 +958,13 @@
+         """
+         self.debug(f"Starting progress reporting loop for phase {self._config.phase}")
+         warmup_log_interval = Environment.SERVICE.WARMUP_PROGRESS_LOG_INTERVAL
+-        next_warmup_log_at = time.monotonic() + warmup_log_interval
++        next_warmup_log_at = clock.monotonic() + warmup_log_interval
+         try:
+             while True:
+                 try:
+                     stats = self._progress.create_stats(self._lifecycle)
+                     await self._phase_publisher.publish_progress(stats)
+-                    now = time.monotonic()
++                    now = clock.monotonic()
+                     if (
+                         self._config.phase == CreditPhase.WARMUP
+                         and warmup_log_interval > 0
+--- a/src/aiperf/timing/ramping.py
++++ b/src/aiperf/timing/ramping.py
+@@ -45,7 +45,7 @@
+ 
+ import asyncio
+ import bisect
+-import time
++from aiperf.common import clock
+ from abc import ABC, abstractmethod
+ from collections.abc import Callable
+ from typing import Protocol, runtime_checkable
+@@ -189,14 +189,14 @@
+         On completion, sets target value. On cancellation, stays at current.
+         """
+         current = self._strategy.start
+-        ramp_start = time.perf_counter()
++        ramp_start = clock.perf_counter()
+ 
+         # Set initial value
+         self._setter(current)
+ 
+         try:
+             while True:
+-                elapsed = time.perf_counter() - ramp_start
++                elapsed = clock.perf_counter() - ramp_start
+                 result = self._strategy.next_step(current, elapsed)
+                 if result is None:
+                     # Ramp complete - ensure target value is set (handles edge cases
+@@ -222,7 +222,7 @@
+         On completion, sets target value. On cancellation, stays at current.
+         """
+         update_interval = self._config.update_interval
+-        ramp_start = time.perf_counter()
++        ramp_start = clock.perf_counter()
+ 
+         # Set initial value
+         self._setter(self._strategy.start)
+@@ -231,7 +231,7 @@
+             while True:
+                 await asyncio.sleep(update_interval)
+ 
+-                elapsed = time.perf_counter() - ramp_start
++                elapsed = clock.perf_counter() - ramp_start
+                 value = self._strategy.value_at(elapsed)
+ 
+                 if value is None:
+@@ -342,7 +342,7 @@
+     def _time_to_value_progress(self, time_progress: float) -> float:
+         """Transform time progress [0,1] to value progress [0,1]. Default: linear.
+ 
+-        Used by continuous sampling mode to compute value at any point in time.
++        Used by continuous sampling mode to compute value at any point in clock.
+         For non-linear strategies, this must be the mathematical inverse of
+         _apply_curve. Override in subclasses that have non-linear curves.
+         """
+--- a/src/aiperf/timing/strategies/agentic_replay.py
++++ b/src/aiperf/timing/strategies/agentic_replay.py
+@@ -51,7 +51,7 @@
+ from __future__ import annotations
+ 
+ import asyncio
+-import time
++from aiperf.common import clock
+ import uuid
+ from collections import Counter, deque
+ from collections.abc import Iterable
+@@ -357,7 +357,7 @@
+         """Phase-specific async setup.
+ 
+         WARMUP: nothing - trajectories already built by TrajectorySource at
+-        TimingManager construction time.
++        TimingManager construction clock.
+ 
+         PROFILING: register the per-tree drain callback (when engaged) so a
+         drained lane recycles into a fresh root. Recycle otherwise draws the
+@@ -688,7 +688,7 @@
+         else:
+             self._handoff_credits[credit.x_correlation_id] = credit
+             self._handoff_returned_at_ns[credit.x_correlation_id] = (
+-                time.perf_counter_ns()
++                clock.perf_counter_ns()
+             )
+ 
+     async def _handle_accelerated_warmup_return(self, credit: Credit) -> None:
+@@ -713,7 +713,7 @@
+         """Persist the drained accelerated-warmup DAG for profiling."""
+         if not self._accelerated_warmup_started:
+             return
+-        finalized_at_ns = time.perf_counter_ns()
++        finalized_at_ns = clock.perf_counter_ns()
+         states_by_lane = self._build_handoff_states(finalized_at_ns=finalized_at_ns)
+         boundaries_by_lane = {
+             lane: self._build_handoff_replay_boundaries(states)
+@@ -732,7 +732,7 @@
+     ) -> dict[int, list[ConversationState]]:
+         """Convert drained credits and join annotations into lane states."""
+         if finalized_at_ns is None:
+-            finalized_at_ns = time.perf_counter_ns()
++            finalized_at_ns = clock.perf_counter_ns()
+         blocked, child_annotations = self._handoff_annotations()
+         states_by_lane: dict[int, list[ConversationState]] = {
+             lane: [] for lane in range(len(self.conversation_source.trajectories))
+--- a/src/aiperf/transports/sse_utils.py
++++ b/src/aiperf/transports/sse_utils.py
+@@ -6,6 +6,7 @@
+ from collections.abc import AsyncIterator
+ 
+ from aiperf.common.aiperf_logger import AIPerfLogger
++from aiperf.common.clock import ClockProvider
+ from aiperf.common.enums import SSEEventType, SSEFieldType
+ from aiperf.common.exceptions import SSEResponseError
+ from aiperf.common.models import SSEMessage
+@@ -66,8 +67,11 @@
+         - Per-message timestamps enable accurate token-level timing
+     """
+ 
+-    def __init__(self, async_iter: AsyncIterator[bytes]):
++    def __init__(
++        self, async_iter: AsyncIterator[bytes], *, clock: ClockProvider | None = None
++    ) -> None:
+         self._async_iter = async_iter
++        self._clock = clock if clock is not None else time
+ 
+     async def read_complete_stream(self) -> list[SSEMessage]:
+         """Read the complete SSE stream and return a list of SSE messages."""
+@@ -119,7 +123,7 @@
+         async for chunk in self._async_iter:
+             # Capture timestamp immediately when chunk arrives
+             # This will provide us with the most accurate TTFT and ICL measurements
+-            chunk_perf_ns = time.perf_counter_ns()
++            chunk_perf_ns = self._clock.perf_counter_ns()
+ 
+             buffer += chunk
+ 
+@@ -181,7 +185,7 @@
+         # Some servers don't send final delimiter
+         remaining = buffer[consumed:].strip()
+         if remaining:
+-            final_perf_ns = time.perf_counter_ns()
++            final_perf_ns = self._clock.perf_counter_ns()
+             raw_message = remaining.decode("utf-8", errors="replace")
+             yield SSEMessage.parse(raw_message, final_perf_ns)
+ 
+--- a/src/aiperf/workers/inference_client.py
++++ b/src/aiperf/workers/inference_client.py
+@@ -3,7 +3,7 @@
+ 
+ from __future__ import annotations
+ 
+-import time
++from aiperf.common import clock
+ from typing import TYPE_CHECKING
+ from urllib.parse import urlparse
+ 
+@@ -192,8 +192,8 @@
+             # Save the current perf_ns before sending the request so it can be used to calculate
+             # the start_perf_ns of the request in case of an exception.
+             pre_send_perf_ns, pre_send_timestamp_ns = (
+-                time.perf_counter_ns(),
+-                time.time_ns(),
++                clock.perf_counter_ns(),
++                clock.time_ns(),
+             )
+ 
+             # Transport handles cancellation internally (cancel_after_ns is in request_info)
+@@ -212,10 +212,10 @@
+             )
+             return RequestRecord(
+                 request_info=request_info,
+-                timestamp_ns=pre_send_timestamp_ns or time.time_ns(),
+-                # Try and use the pre_send_perf_ns if it is available, otherwise use the current time.
+-                start_perf_ns=pre_send_perf_ns or time.perf_counter_ns(),
+-                end_perf_ns=time.perf_counter_ns(),
++                timestamp_ns=pre_send_timestamp_ns or clock.time_ns(),
++                # Try and use the pre_send_perf_ns if it is available, otherwise use the current clock.
++                start_perf_ns=pre_send_perf_ns or clock.perf_counter_ns(),
++                end_perf_ns=clock.perf_counter_ns(),
+                 error=ErrorDetails.from_exception(e),
+             )
+ 
+@@ -268,7 +268,7 @@
+         is set (see ``AIPERF_RECORD_STRIP_PAYLOAD_BYTES``); ``osl_mismatch`` reads
+         ``max_tokens``; image/audio/video metrics derive their counts from
+         the endpoint's single-pass ``extract_payload_inputs`` at
+-        parse-time. ``turns`` is never populated on the attached context
++        parse-clock. ``turns`` is never populated on the attached context
+         — live records travel turn-less and consumers drive off
+         ``payload_bytes``.
+         """
+--- a/src/aiperf/workers/worker.py
++++ b/src/aiperf/workers/worker.py
+@@ -3,7 +3,7 @@
+ from __future__ import annotations
+ 
+ import asyncio
+-import time
++from aiperf.common import clock
+ import uuid
+ from typing import TYPE_CHECKING
+ 
+@@ -656,7 +656,7 @@
+         This simply schedules the task to be executed asynchronously and adds a done callback to
+         ensure the credit is returned. It does not wait for it to actually execute.
+         """
+-        drop_perf_ns = time.perf_counter_ns()
++        drop_perf_ns = clock.perf_counter_ns()
+         credit_context = CreditContext(
+             credit=credit,
+             drop_perf_ns=drop_perf_ns,
+@@ -825,9 +825,9 @@
+                     parent_correlation_id=credit.parent_correlation_id,
+                 ),
+                 model_name=self.model_endpoint.primary_model_name,
+-                timestamp_ns=time.time_ns(),
+-                start_perf_ns=time.perf_counter_ns(),
+-                end_perf_ns=time.perf_counter_ns(),
++                timestamp_ns=clock.time_ns(),
++                start_perf_ns=clock.perf_counter_ns(),
++                end_perf_ns=clock.perf_counter_ns(),
+                 error=error,
+             )
+         )
+@@ -1215,9 +1215,9 @@
+                         parent_correlation_id=credit_context.credit.parent_correlation_id,
+                     ),
+                     model_name=self.model_endpoint.primary_model_name,
+-                    timestamp_ns=time.time_ns(),
+-                    start_perf_ns=time.perf_counter_ns(),
+-                    end_perf_ns=time.perf_counter_ns(),
++                    timestamp_ns=clock.time_ns(),
++                    start_perf_ns=clock.perf_counter_ns(),
++                    end_perf_ns=clock.perf_counter_ns(),
+                     error=error,
+                 )
+             )
