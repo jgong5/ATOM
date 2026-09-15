@@ -21,11 +21,14 @@ original cache-disabled suite stays at **9/24** passing paired cells, including
 8/8 original TP1. Those historical results do not establish cache-on accuracy,
 whole-corpus generalization or **99% confidence**. The bounded cache-on surrogate
 and AIPerf opening pairs are complete; neither adds a registered acceptance cell.
-Intact-root source closure remains incomplete after R5's failure. Fresh GPU3
-confirmation of the ten-region supplement completed but failed three of twenty
-component gates. The immediate priority is a frozen-price intact-root diagnostic
-that exposes all source failures; its loading contract and execution remain
-subject to review.
+Intact-root source closure remains incomplete, with R5 and the ten-region
+supplement unqualified. Their diagnostic loader, registry and execution wrappers
+are implemented and reviewed. The actual `ROOT_1493` modelled run completed
+**7/7 requests and 4,097 outputs**, with **24 closed-run checks passing**.
+The full-root native half **has not launched**: wrapper `83131` was refused in
+resource preflight, exit **124** after **40.1058 s**. Verified native admission
+and the paired full-root witness remain next, followed by broader TP1 coverage.
+**TP2/TP4 stay paused and the 5× speed target stays advisory.**
 
 **First cache-on paired milestone: the two-request `4b433` token surrogate.**
 The fresh pair on `aa8bd80e2` completed 2/2 requests and 366 output tokens per
@@ -187,29 +190,36 @@ policy retains the observed graphics/SDMA background and makes no isolated
 performance claim. The original GPU1 plan and refused preflight remain preserved.
 [PoC status](POC_STATUS.md) records the full verdict, terminal and closeout pins.
 
-The next bounded execution is an **intact-root diagnostic using frozen reference
-prices**, ahead of further sub-millisecond source tuning. It must retain R5's
-incomplete acquisition and spread failures and the supplement's failed gates,
-without fitting any target or heldout timings. The proposed pair preserves all
-seven exact `ROOT_1493` prompts, offsets/dependencies and output lengths,
-modelled-first order, native preparation output cap 2 and acknowledged empty
-cache reset. It is a **corrected fixed-profile development diagnostic**, with
-serial dependencies despite source overlap between requests 0/1 and 1/child 2.
-The final request 6 is a background leaf spawned by 5 with no later parent join.
-The fixed scheduler lacks AIPerf's `AGENTIC_REPLAY` overlap-on-issue behavior;
-this pair cannot establish raw-concurrency preservation or cc-traces-proper
-replay. Its diagnostic loading code, registry and launch remain held for review. The available inventory comprises **4,116 structural step occurrences**
-and **4,034 unique shape/fork representatives**. Its `STRUCTURE.json.gz`
-(`9aa94a33…`) uses artificial 10 ms progression and zero oracle costs, and
-duplicate steps omit allocation payloads. Neither count is E2E timing or
-allocation evidence. A paired cc-traces witness must still establish timing,
-cache continuity and memory behavior. Qualified source closure, short/long,
-C1/C2/C4/C8, feasibility and ranking coverage remain gaps. Client count still
-counts root sessions, not concurrent requests or subagents.
-The shared fixed-root evaluator still hardcodes `accepted=false`, and the
-cache-region wrapper is not a registered acceptance factory. A passing intact
-root with qualified sources would therefore be a development witness; a
-cache-on acceptance/confirmation protocol remains a separate requirement.
+**The intact-root modelled diagnostic is complete; native remains unlaunched.**
+On integrated source `5c7630d56`, the reviewed loader and registry consumed
+unchanged R5 references and supplement medians with every failure retained.
+The actual modelled journal contains **19 prefill + 4,097 decode rows** with
+positive finite costs, all seven requests completed, and normal modelled costs
+were recorded. Closeout `d6867c4b…` passes **24 checks**. The original outer
+**exit 1** for final port verification is preserved; later passive audit
+`8102b8fd…` verifies ownership/port release without identifying the bind-failure
+cause.
+
+Authorized native wrapper `83131` stopped before model/replay launch after
+**40.1058 s**, exit **124**. Both resource failures are retained:
+**host/container KFD PID-set mismatch** and **131,072 B allocation growth above
+the 32,768 B limit**. Post-cleanup KFD coverage still mismatched. Owned-process
+lists are empty and ports free, while **resource verification remains false**.
+Native preflight/exit receipts are `e49ab605…` / `8ed93835…`; their paths and the
+modelled journal receipt are recorded in [PoC status](POC_STATUS.md).
+
+The frozen pair preserves the seven exact prompts, offsets/dependencies and
+output lengths, modelled-first order, native cap-2 preparation and acknowledged
+empty-cache reset. Its **corrected fixed-profile** dependencies serialize raw
+overlaps between requests 0/1 and parent 1/child 2; final request 6 remains a
+background leaf of 5. It does not establish cc-traces-proper replay or raw
+concurrency preservation. The earlier **4,034** unique structural representatives
+do not substitute for the now-recorded modelled journal or the still-missing
+native journal. Paired timing, native cache/memory behavior, qualified source
+closure, broader TP1 short/long and C1/C2/C4/C8 coverage, feasibility and ranking
+remain open. Clients count root sessions, not in-flight requests or subagents.
+**`source_qualified=false` and `accepted=false` remain unchanged**; the diagnostic
+factory and evaluator confer no registered acceptance or confidence credit.
 
 Implementation is integrated at `2782333ab`: explicit TP1 cache/checkpoint
 policy; a pinned codec for local 64-token source hash blocks with native

@@ -16,11 +16,14 @@ prove the cache-enabled configuration, whole-corpus accuracy or **99%
 confidence**. The bounded cache-on surrogate and AIPerf opening pairs are now
 complete, with advisory timing results and no increase in the registered count.
 The earlier short-c4 campaign and staged cache-disabled long real run are held.
-The later intact-root R5 source run failed. Fresh GPU3 confirmation of the
-separate ten-region supplement completed but failed three of twenty component
-gates. Both sources remain unqualified. The immediate priority is an intact-root
-diagnostic using frozen reference prices with every source failure visible;
-its loading contract, registry and execution still require review.
+R5 and the ten-region supplement remain unqualified, but the diagnostic loader,
+registry and execution wrappers are now implemented and reviewed. The fresh
+device-free `ROOT_1493` modelled run completed **7/7 requests and 4,097 outputs**;
+all **24 closed-run checks pass**. Its full-root native half **has not launched**:
+authorized wrapper `83131` stopped in resource preflight, exit **124**, after
+**40.1058 s**. The immediate block is verified native resource admission, followed
+by the paired full-root witness and broader TP1 coverage. **TP2/TP4 remain paused**;
+the 5× speed target remains advisory.
 
 **First cache-on paired milestone — bounded `4b433` surrogate.** On source
 `aa8bd80e2`, both sides completed the two requests with 92,928/92,672 input
@@ -234,25 +237,44 @@ compilation caches. The reviewed GPU3 resource policy explicitly retained the
 observed background graphics/SDMA activity and made **no isolated-performance
 claim**. The original GPU1 plan and its preflight refusal remain preserved.
 
-**Next: intact-root diagnostic before further sub-millisecond source tuning.**
-Prepare a modelled-first/native pair using unchanged R5 reference prices and
-the supplement's reference medians, with incomplete acquisition, repeat-spread
-failures and failed region gates visible in the diagnostic loading contract.
-Keep the seven exact `ROOT_1493` prompts, offsets/dependencies and output lengths,
-native preparation output cap 2 and acknowledged empty-cache reset. This is a
-**corrected fixed-profile development diagnostic**: its declared dependencies
-serialize request 0 before 1 and request 1 before child 2, although those source
-windows overlap. It lacks AIPerf's `AGENTIC_REPLAY` overlap-on-issue behavior and
-proves neither raw-concurrency preservation nor cc-traces-proper replay. The
-new code, registry and launch remain held pending review; this decision authorizes
-neither source activation nor acceptance credit. The available structural
-inventory counts **4,116 step occurrences** and **4,034 unique shape/fork
-representatives**. `STRUCTURE.json.gz` (`9aa94a33…`) uses artificial 10 ms
-progression and zero oracle costs; duplicate steps omit allocation payloads.
-These counts establish neither E2E timing nor allocation evidence. The intact
-paired cc-traces must still provide those observations.
+**ROOT_1493 modelled side closed; native preflight refused (2026-09-15).**
+Integrated source `5c7630d56` uses the reviewed diagnostic loader and frozen
+registry with unchanged R5 references and supplement reference medians.
+The actual modelled journal has **19 prefill + 4,097 decode rows**, with positive
+finite costs; all seven requests and their output budgets completed. Normal
+`costs.modelled.json` exists, and **24 closed-run checks pass**. The modelled
+supervisor's original **exit 1** remains recorded solely for final port
+verification. A later passive ownership/port audit verified release; it does
+not establish the original bind-failure cause or rewrite that exit.
 
-R5 evidence remains under the same ignored source directory:
+The authorized native wrapper `83131` ended **before any model or replay launch**,
+exit **124** after **40.1058 s**. Preflight failed for **both** host/container
+KFD PID-set mismatch and GPU3 allocation growth of **131,072 B > 32,768 B**.
+Post-cleanup KFD coverage also remained mismatched. Owned-process lists are empty
+and ports are free, but **resource verification remains false**. No full-root
+native result, paired timing or native journal equality follows.
+
+The frozen seven prompts, offsets/dependencies, output lengths, native cap-2
+preparation and acknowledged empty-cache reset remain unchanged. This is a
+**corrected fixed-profile development diagnostic**: it serializes requests 0/1
+and parent 1/child 2 despite raw source overlap, and cannot establish
+cc-traces-proper replay or concurrent-client fidelity. The earlier **4,034**
+shape/fork representatives were a structural inventory; the actual modelled
+journal now supplies its own evidence. Native cache/memory/timing validation,
+broader TP1 short/long and C1/C2/C4/C8 coverage, feasibility and ranking remain
+open. All source failures stay visible: **`source_qualified=false`,
+`accepted=false`**, with no new registered acceptance credit.
+
+Compact receipts under ignored `agent_scratch/`: the frozen pair's
+`executable_v1/MODELLED_CLOSEOUT_V1.json` (`d6867c4b…`) and cell
+`tp1_aiperf_fixed_root1493_gpu3_v1_c1/modelled.r1_steps.jsonl` (`2cbb90ba…`); control-side
+`root1493_fixed_pair_gpu3_outer_v1/modelled/POST_EXIT_CLEANUP_AUDIT_V1.json`
+(`8102b8fd…`) and `real/PREFLIGHT.json` / `real/EXIT.json`
+(`e49ab605…` / `8ed93835…`). The fixed-pair prefix is
+`codex_root1493_frozen_pair_gpu3_v1/`; control receipts reside in the
+`codex-regions-e2e` worktree.
+
+R5 evidence remains under `agent_scratch/codex_root1493_prefill_source_v1/`:
 
 | Artifact | SHA-256 |
 | --- | --- |
