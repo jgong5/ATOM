@@ -117,6 +117,34 @@ no accepted cell or confidence claim.
 local-file fixed profile, exact token evidence and its branch-planner limitation;
 AgentX gap compression is a separate profile, not an implicit replacement.
 
+**Intact-root source progress:** R3 qualified the nine additional exact N1
+region cells for `1493faff…`: all 19 prefill paths match across independent
+synthetic warm/reference/heldout fixtures, and all **18/18** median component
+gates pass the fixed 110 µs limit. Maximum preparation/postprocess residuals
+are **100.097656/1.240000 µs**. Its reference freeze preceded heldout release;
+all raw scatter and structural-zero terms are retained. The first cold-GDN q32
+primitive smoke then crashed the worker with SIGSEGV, leaving **no primitive
+references**. Cleanup was verified. The overall R3 acquisition remains failed,
+while its completed region chain was independently revalidated for unchanged
+archival reuse (`8275e54a…`; verdict `54ecd9e7…`). A primitive-only successor
+keeps required GEMM profiling and the original measurement gates; it does not
+repeat region traffic. [PoC status](POC_STATUS.md) records full evidence pins.
+This adds source support, not a completed intact-root E2E witness or acceptance
+cell; the historical count remains **9/24**.
+
+R4 reused that region chain, passed **8/8** fixed primitive smokes and froze
+all **117** new reference measurements before heldout release. **35/39 new**
+and **23/23 retained** reference cells qualify; the four new spread failures
+remain unchanged and `source_qualified=false`. After **25 heldout records**,
+the native worker crashed again, with layer 36 complete and a layer 37 activity
+marker but no layer 37 result. Cleanup is verified. The truncated matching
+native core shows only a post-handler signal re-raise, leaving the original
+fault unresolved. The source and intact-root E2E gates remain open.
+The source-selection audit (`f0acf1f6…`) finds nine of the 19 actual prefill
+paths using the new exact regions, six using **FAILED outputless** regions
+and four using **FAILED final-transfer** regions. These source qualifications
+remain additional acceptance gaps, without any new timing fit.
+
 Implementation is integrated at `2782333ab`: explicit TP1 cache/checkpoint
 policy; a pinned codec for local 64-token source hash blocks with native
 16-token prefix-match safeguards; distinct native GDN fork source/destination

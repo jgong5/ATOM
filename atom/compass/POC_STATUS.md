@@ -109,6 +109,68 @@ prefix is `codex_aiperf_opening_pair_v2/tp1_aiperf_opening_72d021_v1_c1/`:
 Exact profile pins, the fixed-profile branch-planner limitation and explicit
 ignore-EOS variant remain in [AIPerf replay alignment](AIPERF_REPLAY_ALIGNMENT.md).
 
+**ROOT_1493 region source completed (2026-09-15).** The R3 source-only run on
+`d87171fb2` qualified the nine additional exact N1 cache-on prefill cells needed
+by the intact-root case. One seven-request warm fixture, three reference
+fixtures and three heldout fixtures used independent synthetic tokens with
+the declared prefix relationships; all 19 native prefill paths matched for
+every fixture. The CPU controller froze the 27 reference records before
+releasing the 27 heldout records. All **18/18 median component checks pass**
+the unchanged **110 µs** bar: the largest absolute preparation residual is
+**100.097656 µs** (C32/Q8160 outputless), and postprocess is **1.240000 µs**
+(C11232/Q10 final). Six outputless postprocess terms are structural zeros.
+Raw sample scatter remains recorded; this is the declared median gate, not
+a tail or confidence result.
+
+R3 then failed in the first primitive smoke, cold GDN q32/layer 0, with native
+worker **SIGSEGV (-11)** after a profiler warning. No primitive reference,
+heldout or completed smoke price was produced. The driver was stopped through
+owned-process supervision; cleanup verified no live owned processes, free
+ports and GPU1 at its idle baseline. R3 remains a failed overall acquisition.
+Archival validation independently reproduced the completed region verdict
+byte-for-byte, checked its six boundary events and linked all 54 region records
+to immutable native observer/timing bytes while preserving the later failure
+markers. The region chain is reusable with its original identity; its traffic
+is not repeated in the primitive-only successor. That successor limits optional
+post-timing profiling to GEMM, whose profile checks remain required.
+There is **no new E2E acceptance result**; the historical count remains **9/24**.
+
+These records are under `agent_scratch/codex_root1493_prefill_source_v1/`:
+
+| Artifact | SHA-256 |
+| --- | --- |
+| `executable_v3/EXECUTABLE_PLAN_R3.json` | `6ac429b2c2513c6c2e22a1a8d8fae8ba8759a2ffccb0d6f149c5fc04136b8dcf` |
+| `executable_v3/acquisition_v1/regions/VERDICT.json` | `54ecd9e7a359bfd2d2cd1df9d5d88a48cd2409733445b969459e366a09682fdc` |
+| `region_archive_review_v1/RESULT.json` | `8275e54a98114df06e77cdc07cd2c524be619df79ccd78e595420ca413ae25c9` |
+| `executable_v3/R3_PARTIAL_CLOSEOUT_COPY.json` | `022ea016fd0d123b91f966f60e0ca08f2ea8fe84512c5620406bd99f02b7fb0b` |
+
+**ROOT_1493 primitive successor R4 remains incomplete (2026-09-15).** R4
+reused the qualified R3 region chain, passed all **8/8 fixed smoke checks**
+including required GEMM profiling, and collected all **117 new reference
+measurements (39 cells × 3)** before the CPU reference freeze and heldout
+release. **35/39 new** and **23/23 retained** reference cells qualify; four
+new cells fail the unchanged 5% spread rule, so `source_qualified=false`.
+Their measurements and qualifications remain intact. R4 then completed
+**25 heldout records** through cold-GDN q32/layer 36 before a native worker
+**SIGSEGV (-11)**; the activity marker names layer 37, which has no result.
+Cleanup verified no live owned processes, ports free and GPU1 idle.
+
+The retained core matches the R4 worker and identifies a native thread's
+post-handler `pthread_kill`/signal re-raise; its 2 GiB truncation removed the
+caller stacks. It does not identify the original faulting operation. Source
+activation remains paused pending native diagnosis and source closure.
+The source-selection audit (`f0acf1f6…`) also finds that, among the 19 actual
+prefill paths, nine select the new exact regions, six still select **FAILED
+outputless** regions and four select **FAILED final-transfer** regions. Those
+qualifications are additional acceptance gaps; no new timing fit was made.
+There is **no new intact-root E2E result or acceptance credit**.
+
+| R4 artifact under the same source directory | SHA-256 |
+| --- | --- |
+| `executable_v4/EXECUTABLE_PLAN_R4.json` | `18385418554b3832e269144d560b3c973797b546a703f21238b856ed2f827236` |
+| `executable_v4/acquisition_v1/primitives/REFERENCE_FREEZE.json` | `a22c5a9641fb27890b2415e7a6880d7651a2512721f8d1baab2bbeb155220c04` |
+| `executable_v4/R4_FAILURE_HANDOFF.json` | `b7ada22acbf7ccb02fe2010c8bb7c4e8fe49239c59da9b92ec866f70268c732b` |
+
 **Low-query source acquisition completed (2026-09-15).** Executable v3 on
 source `47d57fe33` completed **249 reference measurements (83 cells × 3)** and
 **480 heldout measurements (160 cells × 3)**. The device-free CPU controller
