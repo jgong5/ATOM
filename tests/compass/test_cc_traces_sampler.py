@@ -54,7 +54,7 @@ class FakeSmi:
         self.fail = fail
         self.calls = []
 
-    def __call__(self, smi, arguments, timeout=30.0):
+    def __call__(self, smi, arguments, timeout=30.0, *, evidence=None):
         self.calls.append(tuple(arguments))
         if self.fail:
             return None, self.fail
@@ -461,3 +461,113 @@ class TestOwnedProcessProvenance:
 
         monkeypatch.setattr(sampler_mod, "_process_identity", reused)
         assert sampler_mod._owned_processes([{"pid": 11, "start_ticks": 100}]) == []
+
+
+# Actual ROCm 7.2.4 capture: PROBE.json SHA
+# 9211a04703fceda14adb6130674629f68458c16d2a2cba4611afd61f96e9e15a.
+# The producer exits 0 with these exact bytes for an empty PID report.
+EMPTY_PID_STDERR = b"WARNING: No JSON data to report\n"
+
+
+def _raw_pid_response(monkeypatch, tmp_path, *, stdout=b"", stderr=EMPTY_PID_STDERR,
+                      returncode=0, during_pid=None, cards_returncode=0, cards_stdout=None):
+    import subprocess
+
+    kfd = tmp_path / "kfd"
+    kfd.mkdir(exist_ok=True)
+    monkeypatch.setattr(sampler_mod, "KFD_PROC_ROOT", kfd)
+    monkeypatch.setenv("HIP_VISIBLE_DEVICES", "0")
+
+    def run(argv, **kwargs):
+        if tuple(argv[1:]) == sampler_mod.SMI_PIDS:
+            if during_pid is not None:
+                during_pid(kfd)
+            return subprocess.CompletedProcess(argv, returncode, stdout, stderr)
+        assert tuple(argv[1:]) == sampler_mod.SMI_CARDS
+        raw = json.dumps(_cards()).encode() if cards_stdout is None else cards_stdout
+        return subprocess.CompletedProcess(argv, cards_returncode, raw, b"")
+
+    monkeypatch.setattr(sampler_mod.subprocess, "run", run)
+    return kfd
+
+
+class TestCapturedEmptyPidReport:
+    def test_empty_pid_report_requires_and_records_independent_kernel_observations(
+        self, tmp_path, monkeypatch
+    ):
+        kfd = _raw_pid_response(monkeypatch, tmp_path)
+        row = sampler_mod.sample("rocm-smi", "baseline", [], at=1.0)
+        assert row["pids"] == {} and "error" not in row
+        proof = row["pid_observation"]
+        assert proof["basis"] == "sysfs_kfd_empty_bracket"
+        assert proof["command"] == ["rocm-smi", "--showpids", "--json"]
+        assert proof["returncode"] == 0
+        assert proof["stdout"] == ""
+        assert proof["stderr"].encode() == EMPTY_PID_STDERR
+        assert proof["verified_empty"] is True
+        for name in ("before", "after"):
+            assert proof[name]["path"] == str(kfd)
+            assert proof[name]["entries"] == [] and "error" not in proof[name]
+        assert proof["before"]["observed_at"] <= proof["after"]["observed_at"]
+        assert isolation.audit([row])["verdict"] == "clean"
+
+    @pytest.mark.parametrize("stdout,stderr,returncode", [
+        (b"", b"", 0),
+        (b"\n", EMPTY_PID_STDERR, 0),
+        (b"{", EMPTY_PID_STDERR, 0),
+        (b"", EMPTY_PID_STDERR + b"ERROR: PID query failed\n", 0),
+        (b"", EMPTY_PID_STDERR.rstrip(b"\n"), 0),
+        (b"", EMPTY_PID_STDERR, 1),
+    ])
+    def test_other_empty_malformed_and_failed_responses_stay_errors(
+        self, tmp_path, monkeypatch, stdout, stderr, returncode
+    ):
+        _raw_pid_response(monkeypatch, tmp_path, stdout=stdout, stderr=stderr, returncode=returncode)
+        row = sampler_mod.sample("rocm-smi", "baseline", [], at=1.0)
+        assert row.get("error")
+        assert "pid_observation" not in row
+
+    @pytest.mark.parametrize("failure", [
+        "before_nonempty", "after_nonempty", "before_unreadable", "after_unreadable",
+    ])
+    def test_nonempty_or_unreadable_kernel_observation_refuses_the_empty_report(
+        self, tmp_path, monkeypatch, failure
+    ):
+        def transition(kfd):
+            if failure == "before_nonempty":
+                (kfd / "123").unlink()
+            elif failure == "after_nonempty":
+                (kfd / "123").mkdir()
+            elif failure == "before_unreadable":
+                kfd.mkdir()
+            else:
+                kfd.rmdir()
+        kfd = _raw_pid_response(monkeypatch, tmp_path, during_pid=transition)
+        if failure == "before_nonempty":
+            (kfd / "123").write_text("")
+        elif failure == "before_unreadable":
+            kfd.rmdir()
+        row = sampler_mod.sample("rocm-smi", "baseline", [], at=1.0)
+        assert row.get("error")
+        assert row["pid_observation"]["verified_empty"] is False
+        assert row["pid_observation"]["stderr"].encode() == EMPTY_PID_STDERR
+        assert set(row["pid_observation"]) >= {"before", "after"}
+
+    def test_populated_pid_json_is_unchanged_without_kernel_fallback(self, tmp_path, monkeypatch):
+        pids = {"system": {"PID99": "foreign"}}
+        kfd = _raw_pid_response(monkeypatch, tmp_path, stdout=json.dumps(pids).encode(), stderr=b"")
+        kfd.rmdir()
+        row = sampler_mod.sample("rocm-smi", "baseline", [], at=1.0)
+        assert row["pids"] == pids and "error" not in row
+        assert "pid_observation" not in row
+        assert isolation.audit([row])["foreign_pids"] == ["99"]
+
+    @pytest.mark.parametrize("returncode,stdout", [(0, b""), (1, b"{}"), (0, b"{")])
+    def test_empty_pid_corroboration_cannot_hide_a_card_query_failure(
+        self, tmp_path, monkeypatch, returncode, stdout
+    ):
+        _raw_pid_response(monkeypatch, tmp_path, cards_returncode=returncode, cards_stdout=stdout)
+        row = sampler_mod.sample("rocm-smi", "baseline", [], at=1.0)
+        assert row.get("error")
+        assert row["pid_observation"]["verified_empty"] is True
+        assert isolation.audit([row])["verdict"] == "unwatched"

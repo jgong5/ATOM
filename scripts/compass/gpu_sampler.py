@@ -68,6 +68,8 @@ VISIBILITY_VARS = (
 SMI_TIMEOUT = 30.0
 
 PROC_ROOT = Path("/proc")
+KFD_PROC_ROOT = Path("/sys/class/kfd/kfd/proc")
+EMPTY_PID_WARNING = b"WARNING: No JSON data to report\n"
 
 
 def visible() -> str:
@@ -79,8 +81,19 @@ def visible() -> str:
     return "all"
 
 
-def _smi_json(smi: str, arguments, timeout: float = SMI_TIMEOUT):
+def _kfd_pid_snapshot() -> dict:
+    observation = {"path": str(KFD_PROC_ROOT), "observed_at": time.time()}
+    try:
+        observation["entries"] = sorted(path.name for path in KFD_PROC_ROOT.iterdir())
+    except OSError as exc:
+        observation["error"] = f"{type(exc).__name__}: {exc}"
+    return observation
+
+
+def _smi_json(smi: str, arguments, timeout: float = SMI_TIMEOUT, *, evidence=None):
     """One `rocm-smi --json` call, as a dict, or the reason there is none."""
+    pid_query = tuple(arguments) == SMI_PIDS
+    before = _kfd_pid_snapshot() if pid_query else None
     try:
         done = subprocess.run(
             [smi, *arguments],
@@ -93,6 +106,23 @@ def _smi_json(smi: str, arguments, timeout: float = SMI_TIMEOUT):
     if done.returncode != 0:
         tail = (done.stderr or b"").decode("utf-8", "replace").strip()[-200:]
         return None, f"rocm-smi exited {done.returncode}: {tail}"
+    if pid_query and done.stdout == b"" and done.stderr == EMPTY_PID_WARNING:
+        # ROCm 7.2 emits no JSON for an empty PID list, but can also reset an
+        # enumeration error to exit 0. The CLI warning alone is not evidence
+        # that no process exists: require independent empty kernel snapshots.
+        after = _kfd_pid_snapshot()
+        verified = all(snapshot.get("entries") == [] and not snapshot.get("error")
+                       for snapshot in (before, after))
+        if evidence is not None:
+            evidence.update({
+                "basis": "sysfs_kfd_empty_bracket",
+                "command": [smi, *arguments], "returncode": done.returncode,
+                "stdout": "", "stderr": done.stderr.decode("ascii"),
+                "before": before, "after": after, "verified_empty": verified,
+            })
+        if verified:
+            return {}, None
+        return None, "rocm-smi emitted no PID JSON; empty KFD state was not independently verified"
     try:
         return json.loads(done.stdout.decode("utf-8", "replace")), None
     except json.JSONDecodeError as exc:
@@ -198,7 +228,8 @@ def sample(
     states and never about the interval between samples.
     """
     cards, cards_error = _smi_json(smi, SMI_CARDS)
-    pids, pids_error = _smi_json(smi, SMI_PIDS)
+    pid_evidence = {}
+    pids, pids_error = _smi_json(smi, SMI_PIDS, evidence=pid_evidence)
     row = {
         "t": at,
         "phase": phase,
@@ -207,6 +238,8 @@ def sample(
         "smi": cards or {},
         "pids": pids or {},
     }
+    if pid_evidence:
+        row["pid_observation"] = pid_evidence
     errors = [e for e in (cards_error, pids_error) if e]
     if errors:
         # Kept in the sample rather than dropped. A file of readings that all
