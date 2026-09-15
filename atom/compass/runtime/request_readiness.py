@@ -96,6 +96,8 @@ class RequestReadiness:
     and returns ``{request_id: ReadyEvent}``. It owns service/coverage checks and
     native writer/receiver overlap; this boundary never advances time, chooses
     a batch, rewrites an arrival or assumes a preprocessing queue topology.
+    Explicit issued-request streams use the provider's persistent release queue
+    without registering future requests.
     """
 
     def __init__(self, profile_path: str):
@@ -130,6 +132,67 @@ class RequestReadiness:
         self._causal_requests = None
         self._causal_queue = None
         self._causal_records = None
+        self._issued_requests = None
+        self._issued_queue = None
+        self._issued_records = None
+
+    def begin_issued_requests(self) -> None:
+        """Open an empty ingress stream; future requests have no descriptor or demand.
+
+        The caller owns issue ordering and logical time. This mode neither
+        declares a final workload size nor advances the engine clock.
+        """
+        if (self.records is not None or self._serial_requests is not None
+                or self._causal_requests is not None or self._issued_requests is not None):
+            raise UnsupportedReadiness("request readiness was already registered")
+        factory = getattr(self._provider, "new_release_queue", None)
+        if not callable(factory):
+            raise UnsupportedReadiness("source provider does not qualify persistent issued ingress")
+        queue = factory()
+        if not callable(getattr(queue, "resolve_release", None)):
+            raise UnsupportedReadiness("issued source queue has no release method")
+        self._issued_requests, self._issued_queue = {}, queue
+        self._issued_records = {}
+        self.records = MappingProxyType(self._issued_records)
+
+    def admit_issued_request(self, sequence, issued_at: float) -> RequestReadinessRecord:
+        """Resolve one actual issue through the existing persistent source queue.
+
+        Stamp sequence.arrive_time before calling; this method never changes
+        the sequence. Equal issue times retain call order. Recycled requests
+        need fresh request IDs, independently of their original trace indices.
+        """
+        if self._issued_requests is None:
+            raise UnsupportedReadiness("issued request stream was not initialized")
+        if sequence.id in self._issued_requests:
+            raise UnsupportedReadiness("issued request identity is duplicated")
+        if type(issued_at) not in (int, float):
+            raise UnsupportedReadiness("issued request time must be finite numeric time")
+        try:
+            issued_at = float(issued_at)
+        except OverflowError as exc:
+            raise UnsupportedReadiness("issued request time must be finite numeric time") from exc
+        if (not math.isfinite(issued_at) or type(sequence.arrive_time) not in (int, float)
+                or sequence.arrive_time != issued_at):
+            raise UnsupportedReadiness("issued request time must be finite and match its declared arrival")
+        previous = next(reversed(self._issued_records.values())) if self._issued_records else None
+        if previous is not None and issued_at < previous.arrived_at:
+            raise UnsupportedReadiness("issued requests must be chronological")
+        request = RegisteredRequest(
+            sequence.id, issued_at, int(sequence.num_prompt_tokens),
+            getattr(sequence, "compass_workload_index", None), ingress_descriptor(sequence))
+        event = self._issued_queue.resolve_release(request)
+        if (not isinstance(event, ReadyEvent) or not math.isfinite(event.ready_at)
+                or event.source_service_started_at is None or not math.isfinite(event.source_service_started_at)
+                or not issued_at <= event.source_service_started_at <= event.ready_at
+                or (previous is not None and event.ready_at < previous.ready_at)
+                or type(event.receipt_order) is not int or event.receipt_order != len(self.records)):
+            raise UnsupportedReadiness("issued source queue returned invalid service or receipt order")
+        record = RequestReadinessRecord(
+            issued_at, event.ready_at, event.receipt_order, event.source_service_started_at)
+        self._issued_requests[sequence.id] = request
+        self._issued_records[sequence.id] = record
+        return record
 
     def register_causal_workload(self, sequences):
         """Pin all requests without charging service before calendar release."""
@@ -286,6 +349,16 @@ class RequestReadiness:
                 for request_id, record in self.records.items()]
             if callable(getattr(self._causal_queue, "evidence", None)):
                 result["request_readiness"]["causal_queue"] = self._causal_queue.evidence()
+        if self._issued_requests is not None:
+            from dataclasses import asdict
+            result["request_readiness"]["issued_releases"] = [
+                {"seq_id": str(request_id), "arrived_at": record.arrived_at,
+                 "source_service_started_at": record.source_service_started_at,
+                 "ready_at": record.ready_at, "receipt_order": record.receipt_order,
+                 "ingress": asdict(self._issued_requests[request_id].ingress)}
+                for request_id, record in self.records.items()]
+            if callable(getattr(self._issued_queue, "evidence", None)):
+                result["request_readiness"]["issued_queue"] = self._issued_queue.evidence()
         return result
 
 
