@@ -21,6 +21,8 @@ original cache-disabled suite stays at **9/24** passing paired cells, including
 8/8 original TP1. Those historical results do not establish cache-on accuracy,
 whole-corpus generalization or **99% confidence**. The bounded cache-on surrogate
 and AIPerf opening pairs are complete; neither adds a registered acceptance cell.
+Intact-root source closure remains incomplete after R5's failure, and the
+implemented ten-region supplement still awaits fresh native qualification.
 
 **First cache-on paired milestone: the two-request `4b433` token surrogate.**
 The fresh pair on `aa8bd80e2` completed 2/2 requests and 366 output tokens per
@@ -144,6 +146,32 @@ The source-selection audit (`f0acf1f6…`) finds nine of the 19 actual prefill
 paths using the new exact regions, six using **FAILED outputless** regions
 and four using **FAILED final-transfer** regions. These source qualifications
 remain additional acceptance gaps, without any new timing fit.
+
+**R5 source closure failed.** Its single approved run passed **8 smokes** and
+froze **117 new reference records**: **37/39 new** plus **23/23 retained**
+reference cells qualify. MHA q1/C2992 and q2/C496 retain **11.961073%** and
+**11.270922%** spread against the unchanged **5%** gate. After **171/348 heldout
+records** and **144 completed GEMM child lifecycles**, an isolated child exited
+with **SIGSEGV (-11)** at M2832/N5120/K6144 `new_buffers`, repeat 2, ordinal 55.
+No price/completion was written; its Python stack is in profiler stop/exit.
+Its output was rejected and cleanup completed; no final source verdict exists
+and `source_qualified=false`. Isolation contained the child failure but did not
+identify or fix the native cause.
+No new intact-root E2E or registered acceptance result follows.
+
+The ten region paths previously selecting FAILED sources now have a separate
+implemented consumer and prepared source collector. **116 CPU checks** and
+the final synthetic producer/consumer flow prove that the unchanged original
+nine plus ten disjoint exact keys can cover all **19 prefill shapes**, with both
+FAILED region opt-ins disabled. The candidate preserves all 30 original R3
+reference joins and requires a separate fresh passing native verdict; inspected
+R3 heldouts cannot provide that qualification. **Fresh native validation remains
+pending** under the separately authorized region-only plan, so these ten keys
+are not activated. R3/R4/R5 failures remain visible;
+[PoC status](POC_STATUS.md) records closeout and CPU evidence pins. The remaining
+proof is qualified source closure followed by intact paired cc-traces, then
+short/long, C1/C2/C4/C8, feasibility and ranking coverage. Client count still
+counts root sessions, not concurrent requests or subagents.
 
 Implementation is integrated at `2782333ab`: explicit TP1 cache/checkpoint
 policy; a pinned codec for local 64-token source hash blocks with native

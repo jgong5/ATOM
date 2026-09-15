@@ -16,6 +16,8 @@ prove the cache-enabled configuration, whole-corpus accuracy or **99%
 confidence**. The bounded cache-on surrogate and AIPerf opening pairs are now
 complete, with advisory timing results and no increase in the registered count.
 The earlier short-c4 campaign and staged cache-disabled long real run are held.
+The later intact-root R5 source run failed; source closure and fresh native
+qualification of the separate ten-region supplement remain open.
 
 **First cache-on paired milestone — bounded `4b433` surrogate.** On source
 `aa8bd80e2`, both sides completed the two requests with 92,928/92,672 input
@@ -170,6 +172,56 @@ There is **no new intact-root E2E result or acceptance credit**.
 | `executable_v4/EXECUTABLE_PLAN_R4.json` | `18385418554b3832e269144d560b3c973797b546a703f21238b856ed2f827236` |
 | `executable_v4/acquisition_v1/primitives/REFERENCE_FREEZE.json` | `a22c5a9641fb27890b2415e7a6880d7651a2512721f8d1baab2bbeb155220c04` |
 | `executable_v4/R4_FAILURE_HANDOFF.json` | `b7ada22acbf7ccb02fe2010c8bb7c4e8fe49239c59da9b92ec866f70268c732b` |
+
+**ROOT_1493 successor R5 failed (2026-09-15).** The single approved run passed
+all **8 fixed smokes** and froze all **117 new reference measurements**.
+**37/39 new** and **23/23 retained** reference cells qualify. Two MHA references
+still fail the unchanged **5%** spread gate: q1/C2992 at **11.961073%** and
+q2/C496 at **11.270922%**. All GEMM references qualify; q10/C11232 MHA and
+q496 QK norm now qualify. These fresh observations do not rewrite R4's failures.
+
+R5 completed **171/348 heldout records** and **144 GEMM child lifecycles**
+before child 145 exited with **SIGSEGV (-11)** at
+`heldout_gemm_M2832_N5120_K6144_new_buffers`, repeat 2, ordinal 55.
+No `PRICE.json` or `CHILD_COMPLETE.json` was written for that child. Its Python
+stack is in profiler stop/exit; the native cause remains unresolved. The parent
+rejected its output and returned a structured failure. Cleanup verified no live
+owned processes, free ports and GPU1 idle; one exited zombie was retained.
+There is **no final source verdict**, `source_qualified=false`, no source
+activation and **no new intact-root E2E acceptance**. Process isolation contained
+the failing child but did not resolve the native fault. All partial records,
+the two spread failures and earlier R3/R4 failures remain preserved.
+
+**The separate ten-region supplement is implemented and CPU-tested.** Integrated
+commit `e37794408` composes ten exact keys around the unchanged nine-cell source,
+with separate input/registry identities and mandatory fresh qualification.
+Its candidate uses only the 30 original R3 reference joins; previously inspected
+R3 heldouts cannot validate it. **116 focused CPU checks pass**, and the final
+synthetic collector/controller handoff selects all **19 exact prefill shapes**
+with FAILED outputless/final-region opt-ins disabled; the failed synthetic
+handoff is refused. One region-only native run is authorized; its actual
+qualification verdict remains pending.
+Neither this wiring proof nor source microbenchmarks substitute for intact
+E2E cc-traces; registered acceptance remains **9/24**.
+
+R5 evidence remains under the same ignored source directory:
+
+| Artifact | SHA-256 |
+| --- | --- |
+| `executable_v5_r1/EXECUTABLE_PLAN_R5.json` | `754ccb030d5fc79f3b7b3f228fe3aa31119ba785dc6782dfed2d0c64444c32e2` |
+| `executable_v5_r1/acquisition_v1/primitives/REFERENCE_FREEZE.json` | `8bd5c3035fd8fbe53a5329c9254cc44bce07dedec44e00a5628cfc8b7823a6fa` |
+| `executable_v5_r1/acquisition_v1/NATIVE_FAILURE.json` | `ffe73a2753bad458c637d3c3741d62bee44e108132788d39312c490c09dff0ef` |
+| `executable_v5_r1/R5_FAILURE_CLOSEOUT.json` | `d799ef20430cb2c5608f76a54ffb556d688468d950b223481a2a4ce887e027ec` |
+
+The closeout binds control `EXIT.json` (`10c6dd9d21d04991bdc89213d02cbfb21cecf0cacb55dd0e6f3707ed412c8abe`)
+and the verified 1,925-file evidence copy. Supplement plan
+`agent_scratch/codex_root1493_region_supplement_v1/executable_v2/EXECUTABLE_PLAN.json`
+is pinned at `8b805461aad06f7a7afc92e94df21f3d3d4da7f77baa3c12596f4e33f78e2415`.
+Its final synthetic producer/consumer receipt is
+`agent_scratch/codex_region_supplement_consumer_v1/PRODUCER_CONSUMER_CHECKS_V2.json`
+(`5b408aef3cb3096e316102d67c71fb83a35d16420336257546eef07df8215622`);
+the 116-test receipt is `FOCUSED_TEST_RECEIPT.json` in that directory
+(`2b42618cab75cd17d7ec24855c9f1981d29ff8ed59774319b5f30d4e2897c02e`).
 
 **Low-query source acquisition completed (2026-09-15).** Executable v3 on
 source `47d57fe33` completed **249 reference measurements (83 cells × 3)** and
