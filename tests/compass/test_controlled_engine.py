@@ -670,3 +670,28 @@ def test_in_process_rejects_unsupported_features_before_initialization(make_core
         EngineCore(config, None, None, in_process=True)
 
     assert get_clock() is clock_before
+
+
+@pytest.mark.parametrize("ingress_service", [(0., 0.), (2., 3.)])
+def test_matured_input_after_terminal_trailing_step_is_runnable_now(make_core, ingress_service):
+    fixture = make_core(seconds=10., output_ready=2., ingress_service=ingress_service)
+    control = ControlledEngine(fixture.core)
+    parent = request(100.)
+    control.submit_issued(parent, 100.)
+    published = control.advance_until(200.)
+    assert parent.finish_time == published.now
+    child = request(published.now)
+    record = control.submit_issued(child, published.now)
+    ready_at = record.ready_at
+    trailing_end = published.next_boundary_at
+    assert ready_at < trailing_end
+
+    result = control.advance_until(trailing_end, include_horizon=True)
+
+    assert not result.idle and not result.output_events
+    assert result.next_boundary_at == result.now == trailing_end
+    assert record.ready_at == ready_at
+    assert not child.block_table
+    control.advance_until(trailing_end, include_horizon=True)
+    assert fixture.batches[-1][0] == trailing_end
+    assert child.id in fixture.batches[-1][1]

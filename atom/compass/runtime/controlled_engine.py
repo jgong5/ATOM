@@ -139,7 +139,11 @@ class ControlledEngine:
                   or self.core._has_pending_utility):
                 next_at = self._frontier
             else:
-                next_at = self._next_ready_at
+                ready_at = self._next_ready_at
+                # An ADD can mature while the last forward/trailing charge
+                # owns the core. Its next input-pull opportunity is now;
+                # its source readiness timestamp remains unchanged.
+                next_at = self._frontier if ready_at <= self._frontier else ready_at
         return EngineYield(self._frontier, reason, tuple(events), next_at,
                            self._program is None and not self.scheduler.running
                            and not self.scheduler.waiting and not self._pending_ingress
