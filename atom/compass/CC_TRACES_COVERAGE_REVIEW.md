@@ -16,19 +16,19 @@ workload rewrite; subsequent execution results are dated below.
 
 ## Current main path — 2026-09-15
 
-**Prefix caching enabled is now the main cc-traces validation path.** The
-original cache-disabled suite stays at **9/24** passing paired cells, including
-8/8 original TP1. Those historical results do not establish cache-on accuracy,
-whole-corpus generalization or **99% confidence**. The bounded cache-on surrogate
-and AIPerf opening pairs are complete; neither adds a registered acceptance cell.
-Intact-root source closure remains incomplete, with R5 and the ten-region
-supplement unqualified. Their diagnostic loader, registry and execution wrappers
-are implemented and reviewed. The actual `ROOT_1493` modelled run completed
-**7/7 requests and 4,097 outputs**, with **24 closed-run checks passing**.
-The full-root native half **has not launched**: wrapper `83131` was refused in
-resource preflight, exit **124** after **40.1058 s**. Verified native admission
-and the paired full-root witness remain next, followed by broader TP1 coverage.
-**TP2/TP4 stay paused and the 5× speed target stays advisory.**
+**The first complete-root cache-on fixed-profile pair passed its development
+checks:** **7/7 requests and 4,097 outputs on each side**, with aggregate errors
+**−3.138% TTFT, +5.355% TPOT and −0.308% throughput**, within 15%/10%/10%.
+The **4,116 measured shape rows match**, and cache/reset plus all memory checks
+pass. **Request 0 TTFT is still −29.916%** (0.206268 s modelled / 0.294316 s real),
+outside a per-request 15% reference bar despite the passing aggregate median.
+
+This remains a corrected fixed-profile development witness:
+**`accepted=false`, `source_qualified=false`**, with no raw-concurrency,
+cc-traces-proper or confidence claim. The original cache-disabled suite stays
+at **9/24** passing cells, including 8/8 original TP1. **Proper dynamic replay
+and short-request diagnosis are next; TP2/TP4 remain paused.** Maintained replay
+speedup is **3.396×**; the 5× target remains advisory and unmet.
 
 **First cache-on paired milestone: the two-request `4b433` token surrogate.**
 The fresh pair on `aa8bd80e2` completed 2/2 requests and 366 output tokens per
@@ -190,36 +190,34 @@ policy retains the observed graphics/SDMA background and makes no isolated
 performance claim. The original GPU1 plan and refused preflight remain preserved.
 [PoC status](POC_STATUS.md) records the full verdict, terminal and closeout pins.
 
-**The intact-root modelled diagnostic is complete; native remains unlaunched.**
-On integrated source `5c7630d56`, the reviewed loader and registry consumed
-unchanged R5 references and supplement medians with every failure retained.
-The actual modelled journal contains **19 prefill + 4,097 decode rows** with
-positive finite costs, all seven requests completed, and normal modelled costs
-were recorded. Closeout `d6867c4b…` passes **24 checks**. The original outer
-**exit 1** for final port verification is preserved; later passive audit
-`8102b8fd…` verifies ownership/port release without identifying the bind-failure
-cause.
+**The completed root pair supplies actual measured journal/cache evidence.**
+Its native journal preserves 33 preparation rows plus **19 measured prefill and
+4,097 decode rows**, matching the modelled shape sequence exactly. Seven cap-2
+preparation requests completed before the acknowledged empty-cache reset.
+Measured cache deltas agree at **131,728 hit tokens and 12 retained checkpoints**,
+with no drops/evictions and idle final state; native cumulative counters also
+include preparation. All five memory terms, eight components and KV checks pass
+(112,760 real / 112,773 modelled blocks). The earlier 4,034 representative
+structural inventory remains a separate artificial-clock source audit.
 
-Authorized native wrapper `83131` stopped before model/replay launch after
-**40.1058 s**, exit **124**. Both resource failures are retained:
-**host/container KFD PID-set mismatch** and **131,072 B allocation growth above
-the 32,768 B limit**. Post-cleanup KFD coverage still mismatched. Owned-process
-lists are empty and ports free, while **resource verification remains false**.
-Native preflight/exit receipts are `e49ab605…` / `8ed93835…`; their paths and the
-modelled journal receipt are recorded in [PoC status](POC_STATUS.md).
+The native-only observer snapshot `473c00cf…` includes sampler fix `4d838688bb`
+(`fb9ff913…`): exact empty-PID CLI output requires corroborating empty KFD
+observations. All other 1,417 files, including serving/model and validator code,
+match modelled source `5c7630d56`. Earlier resource and PID-parser refusals are
+preserved. Both successful harnesses wrote normal costs, while their original
+outer **exit 1** port-verification failures remain recorded alongside later
+passive cleanup confirmation. Clean sampled isolation adds no broader isolated
+performance claim. The normal **3.396×** replay ratio includes derivation outside
+replay once; acquisition allocation and amortized costs remain unknown.
 
-The frozen pair preserves the seven exact prompts, offsets/dependencies and
-output lengths, modelled-first order, native cap-2 preparation and acknowledged
-empty-cache reset. Its **corrected fixed-profile** dependencies serialize raw
-overlaps between requests 0/1 and parent 1/child 2; final request 6 remains a
-background leaf of 5. It does not establish cc-traces-proper replay or raw
-concurrency preservation. The earlier **4,034** unique structural representatives
-do not substitute for the now-recorded modelled journal or the still-missing
-native journal. Paired timing, native cache/memory behavior, qualified source
-closure, broader TP1 short/long and C1/C2/C4/C8 coverage, feasibility and ranking
-remain open. Clients count root sessions, not in-flight requests or subagents.
-**`source_qualified=false` and `accepted=false` remain unchanged**; the diagnostic
-factory and evaluator confer no registered acceptance or confidence credit.
+The fixed profile still serializes raw overlaps between requests 0/1 and parent
+1/child 2. Proper dynamic replay and the short-request TTFT miss therefore remain
+the immediate priorities. Broader TP1 short/long, C1/C2/C4/C8, feasibility,
+ranking and confirmation coverage remain open; clients count root sessions,
+not in-flight requests or subagents. All failed source histories and
+**`source_qualified=false`, `accepted=false`** remain unchanged. [PoC status](POC_STATUS.md)
+pins the paired verdict `17dab3d4…`, closeout `447462b7…`, per-request outlier and
+cost accounting; this diagnostic adds no registered acceptance credit.
 
 Implementation is integrated at `2782333ab`: explicit TP1 cache/checkpoint
 policy; a pinned codec for local 64-token source hash blocks with native

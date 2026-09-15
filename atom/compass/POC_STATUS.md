@@ -1,29 +1,26 @@
 # ATOMCompass — PoC gate status
 
-**Current user priority (2026-09-13):** the 5x speed target is advisory and may
-be compromised. Accuracy, memory, feasibility, configuration selection and
-ranking retain their requirements. Report observed speed and derivation costs
-without calling a missed 5x target a pass; `cc_traces_validate.py matrix
---speed-advisory` records this policy explicitly. Existing strict protocol
-registrations and their historical verdicts remain unchanged.
+**Current result (2026-09-15): the first complete-root fixed-profile pair passed
+its development checks.** Both cache-on `ROOT_1493` sides completed **7/7 requests
+and 4,097 outputs**. Aggregate prediction errors are **−3.138% TTFT**, **+5.355%
+TPOT** and **−0.308% throughput**, within the maintained 15%/10%/10% bars.
+All **4,116 measured shape rows match** (19 prefill + 4,097 decode); cache/reset
+and all memory checks pass. **Request 0 remains a TTFT outlier:** 0.206268 s
+modelled versus 0.294316 s real, **−29.916%**. A passing aggregate median does
+not establish per-request 15% accuracy.
 
-**Current execution priority (2026-09-15): prefix caching enabled for the
-main cc-traces validation path.** The [coverage and confirmation
-review](CC_TRACES_COVERAGE_REVIEW.md) controls coverage and case selection.
-The original cache-disabled registration and its **9/24** passing cells
-(including **8/8 original TP1**) retain their historical meaning. They do not
-prove the cache-enabled configuration, whole-corpus accuracy or **99%
-confidence**. The bounded cache-on surrogate and AIPerf opening pairs are now
-complete, with advisory timing results and no increase in the registered count.
-The earlier short-c4 campaign and staged cache-disabled long real run are held.
-R5 and the ten-region supplement remain unqualified, but the diagnostic loader,
-registry and execution wrappers are now implemented and reviewed. The fresh
-device-free `ROOT_1493` modelled run completed **7/7 requests and 4,097 outputs**;
-all **24 closed-run checks pass**. Its full-root native half **has not launched**:
-authorized wrapper `83131` stopped in resource preflight, exit **124**, after
-**40.1058 s**. The immediate block is verified native resource admission, followed
-by the paired full-root witness and broader TP1 coverage. **TP2/TP4 remain paused**;
-the 5× speed target remains advisory.
+This is a **corrected fixed-profile development witness**, with
+**`accepted=false` and `source_qualified=false`**. It does not preserve the raw
+source overlaps or prove cc-traces-proper replay. The historical cache-disabled
+count stays **9/24** (8/8 original TP1); no acceptance or confidence credit is
+added. The [coverage review](CC_TRACES_COVERAGE_REVIEW.md) controls further case
+selection.
+
+**Next priorities:** proper dynamic replay with source overlap semantics, and
+diagnosis of the short-request TTFT miss. **TP2/TP4 remain paused.** Maintained
+replay speedup is **3.396×**; the user-approved 5× target remains advisory and
+unmet. Accuracy, memory, feasibility, selection and ranking keep their existing
+requirements; historical strict registrations are unchanged.
 
 **First cache-on paired milestone — bounded `4b433` surrogate.** On source
 `aa8bd80e2`, both sides completed the two requests with 92,928/92,672 input
@@ -237,42 +234,45 @@ compilation caches. The reviewed GPU3 resource policy explicitly retained the
 observed background graphics/SDMA activity and made **no isolated-performance
 claim**. The original GPU1 plan and its preflight refusal remain preserved.
 
-**ROOT_1493 modelled side closed; native preflight refused (2026-09-15).**
-Integrated source `5c7630d56` uses the reviewed diagnostic loader and frozen
-registry with unchanged R5 references and supplement reference medians.
-The actual modelled journal has **19 prefill + 4,097 decode rows**, with positive
-finite costs; all seven requests and their output budgets completed. Normal
-`costs.modelled.json` exists, and **24 closed-run checks pass**. The modelled
-supervisor's original **exit 1** remains recorded solely for final port
-verification. A later passive ownership/port audit verified release; it does
-not establish the original bind-failure cause or rewrite that exit.
+**ROOT_1493 paired evidence and qualifications (2026-09-15).** The modelled-first
+pair retained the seven exact prompts, offsets/dependencies and full output
+lengths. Native preparation completed seven prompts with output cap 2, drained
+their records and acknowledged an empty-cache reset. The native raw journal
+retains **33 preparation rows plus 4,116 measured rows**; the measured shape
+sequence equals the modelled journal. Measured cache deltas match at **131,728
+hit tokens and 12 retained checkpoints**, with no drops/evictions and both
+engines idle at completion. Native cumulative counters retain preparation
+history. All five memory budget terms, eight components and KV checks pass:
+**112,760 real / 112,773 modelled blocks (0.01153% error)**.
 
-The authorized native wrapper `83131` ended **before any model or replay launch**,
-exit **124** after **40.1058 s**. Preflight failed for **both** host/container
-KFD PID-set mismatch and GPU3 allocation growth of **131,072 B > 32,768 B**.
-Post-cleanup KFD coverage also remained mismatched. Owned-process lists are empty
-and ports are free, but **resource verification remains false**. No full-root
-native result, paired timing or native journal equality follows.
+Modelled source `5c7630d56` remains unchanged. Native observer archive
+`473c00cf…` changes only `scripts/compass/gpu_sampler.py` to `fb9ff913…`, from
+reviewed fix `4d838688bb`: it recognizes the exact empty-PID CLI response only
+with corroborating empty KFD observations. The other 1,417 files, serving/model
+code, validators and server digest remain identical. Earlier resource refusals
+(PID-view mismatch and 131,072 B growth above 32,768 B) and the later PID-parser
+refusal remain preserved; neither launched native requests.
 
-The frozen seven prompts, offsets/dependencies, output lengths, native cap-2
-preparation and acknowledged empty-cache reset remain unchanged. This is a
-**corrected fixed-profile development diagnostic**: it serializes requests 0/1
-and parent 1/child 2 despite raw source overlap, and cannot establish
-cc-traces-proper replay or concurrent-client fidelity. The earlier **4,034**
-shape/fork representatives were a structural inventory; the actual modelled
-journal now supplies its own evidence. Native cache/memory/timing validation,
-broader TP1 short/long and C1/C2/C4/C8 coverage, feasibility and ranking remain
-open. All source failures stay visible: **`source_qualified=false`,
-`accepted=false`**, with no new registered acceptance credit.
+Both maintained harnesses succeeded and wrote normal cost records; the native
+sampler reports clean isolation. **Both original outer exits remain 1** for
+final port verification. Later passive audits confirm released ports and no
+live owned processes, without identifying the original transient cause or
+rewriting either exit. No isolated-performance claim is added.
 
-Compact receipts under ignored `agent_scratch/`: the frozen pair's
-`executable_v1/MODELLED_CLOSEOUT_V1.json` (`d6867c4b…`) and cell
-`tp1_aiperf_fixed_root1493_gpu3_v1_c1/modelled.r1_steps.jsonl` (`2cbb90ba…`); control-side
-`root1493_fixed_pair_gpu3_outer_v1/modelled/POST_EXIT_CLEANUP_AUDIT_V1.json`
-(`8102b8fd…`) and `real/PREFLIGHT.json` / `real/EXIT.json`
-(`e49ab605…` / `8ed93835…`). The fixed-pair prefix is
-`codex_root1493_frozen_pair_gpu3_v1/`; control receipts reside in the
-`codex-regions-e2e` worktree.
+Normal cost accounting reports **3.396× replay speedup**, adding 1.6108 s of
+derivation outside modelled replay and counting its 7.4345 s inside replay only
+once. Startup-inclusive ratio is **3.116×**; preparation is disclosed separately,
+and acquisition allocation/amortized speed remain unknown. Request 0's
+**−29.916% TTFT** miss and every R3/R4/R5/supplement source failure remain visible.
+The fixed profile still serializes source overlaps; proper dynamic replay and
+short-request diagnosis are next, with TP2/TP4 paused.
+
+Evidence under ignored `agent_scratch/codex_root1493_frozen_pair_gpu3_v1/`:
+cell `tp1_aiperf_fixed_root1493_gpu3_v1_c1/fixed_diagnostic.json` (`17dab3d4…`),
+`executable_v1/PAIRED_CLOSEOUT_V1.json` (`447462b7…`),
+`PER_REQUEST_COMPARISON_V1.json` (`a096b8be…`) and `SPEED_ACCOUNTING_V1.json`
+(`09bd6120…`) in the same executable directory. The closeout binds the complete
+journals, cache/reset/memory evidence, original outer failures and later audits.
 
 R5 evidence remains under `agent_scratch/codex_root1493_prefill_source_v1/`:
 
@@ -460,8 +460,9 @@ gather price `aten::index.Tensor|128,5120;1|bfloat16,int32|1:127`
 (2,442/2,443 operators priced). That pre-overlay attempt completed no tiny
 response. The later finite-overlay pair and intact-root QK-norm refusal are
 recorded above; the failed low-region criterion remains a failure.
-**TP2/TP4 remain paused.** Next useful evidence is intact-root cache continuity
-on `1493faff…`, followed by broader short/long and multi-client coverage.
+**TP2/TP4 remain paused.** The completed fixed-profile root pair is recorded
+above; proper dynamic replay and short-request diagnosis now precede broader
+short/long and multi-client coverage.
 N1 low-prefill
 support must not stand in for multi-client N2/pool support; the coverage review
 records a minimal exposed-root C2/C4 cold-opening proposal, with actual batching
