@@ -2,6 +2,7 @@
 import json
 import queue
 from types import SimpleNamespace
+from unittest.mock import patch
 
 import pytest
 from conftest import MockConfig
@@ -344,7 +345,7 @@ def test_zero_output_completion_has_no_fabricated_first_token(make_core, clock):
     assert result.output_events[0].at == seq.finish_time == clock.time()
 
 
-def test_abort_while_waiting_uses_native_rejection(make_core, clock):
+def test_abort_before_ingress_does_not_find_a_scheduler_request(make_core, clock):
     fixture = make_core(ingress_service=(2., 3.))
     control = ControlledEngine(fixture.core)
     seq = request(100., prompt=20)
@@ -354,11 +355,154 @@ def test_abort_while_waiting_uses_native_rejection(make_core, clock):
 
     result = control.advance_until(100., include_horizon=True)
 
-    assert result.reason == "outputs"
-    assert [(e.kind, e.at) for e in result.output_events] == [("completion", 100.)]
-    assert seq.leave_reason == "aborted" and seq.first_token_time == 0.
+    assert result.reason == "horizon" and not result.output_events
+    assert seq.status != SequenceStatus.ABORTED and seq.first_token_time == 0.
+    assert seq not in fixture.scheduler.waiting
+    assert not result.idle and result.next_boundary_at == 105.
     assert not fixture.batches and not seq.block_table
     assert clock.time() == 100.
+
+
+def _native_tick(core, events=()):
+    """One actual busy-loop step, with external queue arrivals during waits."""
+    original_pull = core.pull_and_process_input_queue
+    clock = get_clock()
+    original_advance = clock.advance
+    pending = list(events)
+    pulls = 0
+
+    def bounded_pull():
+        nonlocal pulls
+        pulls += 1
+        return True if pulls > 1 else original_pull()
+
+    def advance_with_arrivals(seconds):
+        target = clock.time() + seconds
+        while pending and pending[0][0] <= target:
+            at, action = pending.pop(0)
+            original_advance(at - clock.time())
+            action()
+        original_advance(target - clock.time())
+
+    core.pull_and_process_input_queue = bounded_pull
+    core._is_rl_weights_offloaded = False
+    core.utility_handler.push_metrics = lambda: None
+    try:
+        with patch.object(VirtualClock, "advance", lambda self, seconds: advance_with_arrivals(seconds)):
+            core.busy_loop()
+    finally:
+        core.pull_and_process_input_queue = original_pull
+    assert not pending
+
+
+def _native_abort(core, seq):
+    core.utility_queue.put_nowait(("abort_request", {"cmd": "abort_request", "req_id": seq.id}))
+    core._has_pending_utility = True
+
+
+def _request_state(seq):
+    return (seq.status, seq.leave_reason, seq.first_token_time, seq.finish_time,
+            list(seq.token_ids), list(seq.block_table))
+
+
+@pytest.mark.parametrize("case", ["before_ready", "same_boundary_first_pull", "after_visible"])
+def test_abort_visibility_matches_native_input_pull(make_core, case):
+    fixture = make_core(seconds=1., ingress_service=(2., 3.))
+    control = ControlledEngine(fixture.core)
+    seq = request(100., prompt=20, outputs=5)
+    assert control.submit_issued(seq, 100.).ready_at == 105.
+    at = {"before_ready": 100., "same_boundary_first_pull": 105., "after_visible": 106.}[case]
+    if case == "same_boundary_first_pull":
+        control.advance_until(105.)
+    elif case == "after_visible":
+        control.advance_until(106., include_horizon=True)
+        assert fixture.batches
+    control.abort_issued(seq.id, at)
+    control.advance_until(at if case == "before_ready" else at + 1., include_horizon=True)
+    observed = _request_state(seq)
+    batches = [(at, sizes) for at, _, sizes in fixture.batches]
+
+    set_clock(VirtualClock(epoch=100.))
+    native = make_core(seconds=1., controlled=False)
+    native_seq = request(100., prompt=20, outputs=5)
+    if case != "before_ready":
+        get_clock().advance(5.)
+        native.core.input_queue.put_nowait([native_seq])
+    if case == "after_visible":
+        _native_tick(native.core)
+    _native_abort(native.core, native_seq)
+    _native_tick(native.core)
+
+    assert _request_state(native_seq) == observed
+    assert [(at, sizes) for at, _, sizes in native.batches] == batches
+
+
+def test_abort_after_visibility_in_waiting_matches_native(make_core):
+    fixture = make_core(seconds=1.)
+    fixture.scheduler.max_num_seqs = 1
+    control = ControlledEngine(fixture.core)
+    first, waiting = request(100., prompt=20), request(100., prompt=20)
+    control.submit_issued(first, 100.)
+    control.submit_issued(waiting, 100.)
+    control.advance_until(101., include_horizon=True)
+    assert waiting in fixture.scheduler.waiting
+    control.abort_issued(waiting.id, 101.)
+    control.advance_until(102., include_horizon=True)
+    observed = _request_state(waiting)
+    assert waiting.status == SequenceStatus.ABORTED
+
+    set_clock(VirtualClock(epoch=100.))
+    native = make_core(seconds=1., controlled=False)
+    native.scheduler.max_num_seqs = 1
+    native_first, native_waiting = request(100., prompt=20), request(100., prompt=20)
+    native.core.input_queue.put_nowait([native_first, native_waiting])
+    _native_tick(native.core)
+    assert native_waiting in native.scheduler.waiting
+    _native_abort(native.core, native_waiting)
+    _native_tick(native.core)
+    assert _request_state(native_waiting) == observed
+
+
+@pytest.mark.parametrize("phase", ["forward", "trailing_output"])
+def test_ready_add_during_an_active_step_stays_invisible_to_abort(make_core, phase):
+    fixture = make_core(seconds=10., output_ready=2., ingress_service=(2., 3.))
+    control = ControlledEngine(fixture.core)
+    first = request(100., prompt=20 if phase == "forward" else 4)
+    control.submit_issued(first, 100.)
+    if phase == "forward":
+        control.advance_until(106.)
+        issue_at, ready_at, abort_at, end_at = 106., 111., 112., 115.
+    else:
+        output = control.advance_until(150.)
+        assert output.reason == "outputs" and output.now == 117.
+        issue_at, ready_at, abort_at, end_at = 117., 122., 123., 125.
+    late = request(issue_at, prompt=20)
+    assert control.submit_issued(late, issue_at).ready_at == ready_at
+    control.advance_until(abort_at)
+    control.abort_issued(late.id, abort_at)
+    control.advance_until(end_at, include_horizon=True)
+    assert late not in fixture.scheduler.waiting and late not in fixture.scheduler.running
+    control.advance_until(end_at + 10., include_horizon=True)
+    observed = _request_state(late)
+    assert late.status != SequenceStatus.ABORTED and late.leave_reason != "aborted"
+    batches = [(at, sizes) for at, _, sizes in fixture.batches]
+
+    set_clock(VirtualClock(epoch=105.))
+    native = make_core(seconds=10., output_ready=2., controlled=False)
+    native_first = request(100., prompt=20 if phase == "forward" else 4)
+    native_late = request(issue_at, prompt=20)
+    native.core.input_queue.put_nowait([native_first])
+    if phase == "trailing_output":
+        _native_tick(native.core)
+        assert get_clock().time() == 115.
+    _native_tick(native.core, events=[
+        (ready_at, lambda: native.core.input_queue.put_nowait([native_late])),
+        (abort_at, lambda: _native_abort(native.core, native_late)),
+    ])
+    assert get_clock().time() == end_at
+    _native_tick(native.core)
+    assert _request_state(native_late) == observed
+    assert [(at, sizes) for at, _, sizes in native.batches] == batches
 
 
 def test_abort_during_forward_waits_for_the_native_whole_step_boundary(make_core):

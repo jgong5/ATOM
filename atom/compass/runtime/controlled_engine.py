@@ -4,6 +4,7 @@ No serving entry point selects this driver. The caller owns the external event
 agenda and acknowledges each output before granting further virtual progress.
 """
 from dataclasses import dataclass
+from collections import deque
 import math
 
 from atom.model_engine.engine_core import EngineCore, _ClockWait, _OutputReady
@@ -65,6 +66,10 @@ class ControlledEngine:
         self._closed = False
         self._failed = None
         self._first_reported, self._completed = set(), set()
+        # Registration is not native scheduler visibility. Source ingress may
+        # finish while a forward is active; ADD is pulled only after utilities
+        # at the next whole-step boundary, just as in EngineCore.busy_loop.
+        self._pending_ingress = deque()
         core._controlled_owner = self
 
     def _check_active(self):
@@ -79,8 +84,22 @@ class ControlledEngine:
         if type(issued_at) not in (int, float) or issued_at != self._frontier:
             raise ValueError("submit only at the current committed issue frontier")
         record = self.scheduler._request_readiness.admit_issued_request(sequence, issued_at)
-        self.scheduler.add(sequence)
+        self._pending_ingress.append((record.ready_at, sequence))
         return record
+
+    @property
+    def _next_ready_at(self):
+        ingress = self._pending_ingress[0][0] if self._pending_ingress else math.inf
+        return min(ingress, self.scheduler.next_ready_at)
+
+    def _pull_ready_inputs(self):
+        ready = []
+        while self._pending_ingress and self._pending_ingress[0][0] <= self._frontier:
+            ready.append(self._pending_ingress.popleft()[1])
+        if ready:
+            self.core.input_queue.put_nowait(ready)
+        if self.core.pull_and_process_input_queue():
+            raise RuntimeError("controlled engine received an unexpected shutdown input")
 
     def abort_issued(self, request_id, at):
         """Queue native abort intent for the next whole-step boundary.
@@ -99,6 +118,7 @@ class ControlledEngine:
     def _step_program(self):
         try:
             self.core.utility_handler.process_queue(self.core.utility_queue, self.core)
+            self._pull_ready_inputs()
             return (yield from self.core._process_engine_step_program(advance_idle=False))
         finally:
             self.core._publish_step_kv_events()
@@ -119,10 +139,11 @@ class ControlledEngine:
                   or self.core._has_pending_utility):
                 next_at = self._frontier
             else:
-                next_at = self.scheduler.next_ready_at
+                next_at = self._next_ready_at
         return EngineYield(self._frontier, reason, tuple(events), next_at,
                            self._program is None and not self.scheduler.running
-                           and not self.scheduler.waiting and not self.core._has_pending_utility)
+                           and not self.scheduler.waiting and not self._pending_ingress
+                           and not self.core._has_pending_utility)
 
     def _output_events(self, output):
         if output.at != self._frontier:
@@ -183,7 +204,7 @@ class ControlledEngine:
                             return self._yield("horizon")
                         if done.value:
                             continue
-                        ready = self.scheduler.next_ready_at
+                        ready = self._next_ready_at
                         if ready <= self._frontier:
                             return self._yield("blocked")
                         self._move_to(min(ready, horizon))
