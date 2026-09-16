@@ -299,3 +299,67 @@ def test_actual_mha_repinning_cannot_mix_modes_or_erase_host_evidence(actual_mha
         reference["artifact"] = pin(path)
     with pytest.raises(ValueError, match="event reference"):
         load(actual_mha)
+
+
+@pytest.fixture
+def actual_decode(tmp_path):
+    source_path = os.environ.get("ATOMCOMPASS_EXACT_MHA_DECODE_SOURCE")
+    scope_path = os.environ.get("ATOMCOMPASS_EXACT_OPERATOR_SCOPE")
+    if not source_path or not scope_path:
+        pytest.skip("set actual decode MHA source and scope paths for the completed controls")
+    source = json.loads(Path(source_path).read_text())
+    local_source = tmp_path / "source.json"
+    local_source.write_text(json.dumps(source))
+    handoff = {"schema": E.SCHEMA, "source_handoff": pin(local_source), "deployment_scope": pin(scope_path),
+               "diagnostic_only": True, "cases": [case["name"] for case in source["cases"]]}
+    base = ParametricPriceLibrary()
+    base.launch_charge_seconds = 0.0
+    base.request_attention_scope = Declaration(scopes=json.loads(Path(scope_path).read_text())["attention_scope"])
+    base.request_attention_treatments = {}
+    return tmp_path, source, handoff, base
+
+
+def test_actual_decode_controls_match_physical_scope_without_inventing_dispatch(actual_decode):
+    library = load(actual_decode)
+    cases = actual_decode[1]["cases"]
+    assert len(cases) == 7
+    for case in cases:
+        op = case["operator"]
+        assert dict(op["context"])["is_prefill"] is False
+        record, why = library.lookup(op, {"tp": 1})
+        assert record is not None, why
+        assert record["seconds"] == case["reference_median_seconds"]
+        assert record["all_three"] == case["reference_values_seconds"]
+        assert record["registered_attention_scope"]["attention_backend"] != "paged_gluon"
+        assert record["kernel_dispatch_observed"] is False
+        assert record["kernel_count"] is None and _record_launch_count(record) == 0
+        seconds, coverage, charges = library.body({"ops": [op], "key": {"topology": [["tp", 1]]}})
+        assert seconds == record["seconds"] and coverage.complete and charges == 0
+
+
+@pytest.mark.parametrize("damage", ["backend", "kv_dtype", "missing_physical"])
+def test_decode_repinning_cannot_change_or_omit_physical_scope(actual_decode, damage):
+    directory, _, handoff, _ = actual_decode
+    scope = json.loads(Path(handoff["deployment_scope"]["path"]).read_text())
+    if damage == "backend":
+        scope["attention_scope"]["unified"]["attention_backend"] = "different backend"
+    elif damage == "kv_dtype":
+        scope["attention_scope"]["unified"]["kv_cache_dtype"] = "fp8"
+    else:
+        scope["attention_scope"].pop("unified")
+    target = directory / "changed_scope.json"
+    target.write_text(json.dumps(scope))
+    handoff["deployment_scope"] = pin(target)
+    with pytest.raises(ValueError, match="resolved backend/KV scope differs"):
+        load(actual_decode)
+
+
+@pytest.mark.parametrize("scope_name,field,value", [
+    ("unified", "kv_cache_dtype", "fp8"),
+    ("unified.decode", "compute_units", 160),
+])
+def test_decode_lookup_rechecks_physical_and_per_call_scopes(actual_decode, scope_name, field, value):
+    library = load(actual_decode)
+    actual_decode[3].request_attention_scope.scopes[scope_name][field] = value
+    record, why = library.lookup(actual_decode[1]["cases"][0]["operator"], {"tp": 1})
+    assert record is None and "scope differs" in why

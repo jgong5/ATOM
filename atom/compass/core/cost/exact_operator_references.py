@@ -146,6 +146,11 @@ def _case(reader, case, declaration):
         reader.read(dict(path=str(root / relative), sha256=pin["sha256"]),
                     name + ".current_code." + relative, json_data=False)
     expected = attention.scoped(op, declaration.for_op(op) or {}) if op["name"] in (GDN, MHA) else {}
+    # Exact operator events witness the registered module and its live KV
+    # views. A per-call decode declaration names the parametric dispatch law;
+    # it is retained for lookup, but is not the physical scope measured here.
+    registered = (attention.scoped(op, declaration.for_family("unified"))
+                  if op["name"] == MHA else expected)
     views = argument_views(op)
     # The pinned graph collector explicitly falls back to its over-time event
     # interval for uncapturable MHA. The handoff must disclose that observed
@@ -196,7 +201,7 @@ def _case(reader, case, declaration):
                     and setup["native_context"]["sha256"] != case["native_context"]["sha256"])
                 or not setup.get("operand_sets") or any(actual != views for actual in setup["operand_sets"])):
             raise ValueError("exact reference did not measure the complete shared operand layouts")
-        _registered_scope(op, raw, expected, plan)
+        _registered_scope(op, raw, registered, plan)
         if signature not in raw["prices"] or (not batched and set(raw["prices"]) != {signature}) or raw.get("unpriced"):
             raise ValueError("exact reference changed its one complete operator inventory")
         record = raw["prices"][signature]
@@ -227,6 +232,7 @@ def _case(reader, case, declaration):
     result = OperatorEventRecord(seconds=center, kernels={}, source=case["references"][values.index(center)]["artifact"]["path"],
         source_references=case["references"], all_three=values, relative_spread=spread,
         source_host_seconds=host_values,
+        registered_attention_scope=registered,
         timer_scope=("device event interval including host starvation, context installation and dispatch"
                      if timer_mode == "over" else "captured graph event interval"),
         precision_warning=spread > .05, source_qualified=False, whole_forward_validation_required=True,
@@ -311,6 +317,17 @@ class ExactOperatorReferences(PriceLibrary):
                 actual = attention.scoped(op, provider._declared_scope(op) or {})
                 if attention._scope_matches(_layout_without_capacity(expected), _layout_without_capacity(actual)) is not None:
                     return None, "exact operator reference current registered attention scope differs"
+                if op["name"] == MHA:
+                    declared = getattr(provider, "request_attention_scope", None)
+                    if not isinstance(declared, attention_scope.Declaration):
+                        try:
+                            declared = attention_scope.declaration_of(declared, where="exact MHA current scope")
+                        except ValueError:
+                            return None, "exact MHA reference lacks the current physical backend/KV scope"
+                    physical = attention.scoped(op, declared.for_family("unified"))
+                    if attention._scope_matches(_layout_without_capacity(record["registered_attention_scope"]),
+                                                _layout_without_capacity(physical)) is not None:
+                        return None, "exact MHA reference current physical backend/KV scope differs"
                 scope_checked = True
                 break
             provider = getattr(provider, "base", None)
