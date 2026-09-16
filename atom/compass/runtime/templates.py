@@ -266,11 +266,21 @@ class NativeAllocation:
             raise BindRefusal("native region context belongs to another rank")
         if record.num_prefill_seqs != len(record.rows):
             raise BindRefusal("native region context is not an all-prefill batch")
+        shared, prefix_only = None, None
+        if len(record.block_tables) == 2:
+            first, second = record.block_tables
+            shared = 0
+            for left, right in zip(first, second):
+                if left != right:
+                    break
+                shared += 1
+            prefix_only = set(first).intersection(second) == set(first[:shared])
         return {**record.region_context, "block_size": self.block_size,
                 "max_model_len": self.max_model_len, "position_rows": self.position_rows,
                 "allocation_blocks": tuple(len(t) for t in record.block_tables),
                 "state_slots": record.state_slots, "state_rows": record.state_rows,
-                "state_fork_srcs": record.state_fork_srcs}
+                "state_fork_srcs": record.state_fork_srcs,
+                "shared_prefix_blocks": shared, "kv_sharing_is_prefix_only": prefix_only}
 
     def allocation_for(self, shape: StepShape) -> dict:
         record = self._record

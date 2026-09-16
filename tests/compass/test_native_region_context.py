@@ -102,3 +102,20 @@ def test_cleared_or_stale_region_context_is_refused():
     allocation.clear()
     with pytest.raises(BindRefusal, match="no native region context"):
         allocation.region_context_for(shape)
+
+
+def test_region_context_reads_predictive_deferred_state_without_inventing_native_queues():
+    allocation, shape, sequence = native_context()
+    batch = ScheduledBatch({sequence.id: sequence}, [8], 8, total_tokens_num_prefill=8,
+        total_seqs_num=1, total_seqs_num_prefill=1, num_cached_tokens=[11248], is_final_chunk=[True])
+    runner = SimpleNamespace(config=SimpleNamespace(speculative_config=None),
+        _oracle=SimpleNamespace(native_allocation=allocation), _rank_coords=lambda: {"tp": 0},
+        _deferred_output=["previous-a", "previous-b"], _deferred_output_has_logprobs=False)
+    CompassPredictMixin._offer_allocation(runner, batch)
+    runner._deferred_output.append("later-change")
+    context = allocation.region_context_for(shape)
+    assert context["output_state_representation"] == "predictive_deferred_batch"
+    assert context["prior_sampled_batch_rows"] == 2
+    assert context["prior_sampled_has_logprobs"] is False
+    assert context["output_rows"] == (True,)
+    assert "pending_token_copies" not in context

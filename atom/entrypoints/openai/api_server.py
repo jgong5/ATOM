@@ -2721,6 +2721,7 @@ _ROLE_OPTIONS = {
     "oracle.region_supplement_native_complete": "region_supplement_handoff",
     "oracle.region_supplement_heldout_phase": "region_supplement_handoff",
     "oracle.native_prefill_regions": "native_prefill_handoff",
+    "oracle.native_ap_regions": "native_ap_handoff",
 }
 
 
@@ -2743,6 +2744,8 @@ def _loaded_option_files(ranks: list) -> dict:
                 key = "root_prefill_diagnostic_handoff"
             if str(row.get("role", "")).startswith("oracle.native_prefill_regions."):
                 key = "native_prefill_handoff"
+            if str(row.get("role", "")).startswith("oracle.native_ap_regions."):
+                key = "native_ap_handoff"
             if not key or not row.get("sha256"):
                 continue
             by_option.setdefault(key, []).append(row)

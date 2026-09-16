@@ -67,6 +67,9 @@ def _native_region_context(config, batch):
         "num_spec_step": getattr(batch, "num_spec_step", None),
         "prefix_cache_hit_tokens": values("prefix_cache_hit_tokens", int),
         "prefill_continuations": values("prefill_continuations", bool),
+        "output_rows": (tuple(True for _ in range(batch.total_seqs_num))
+                        if hasattr(batch, "is_final_chunk") and batch.is_final_chunk is None
+                        else values("is_final_chunk", bool)),
         "temperatures": values("temperatures", float),
         "top_ks": values("top_ks", int),
         "top_ps": values("top_ps", float),
@@ -180,6 +183,7 @@ class CompassPredictMixin:
         # the engine defers real output and `postprocess` depends on it. None
         # until the first forward has run; see the predict branch of `forward`.
         self._deferred_output: Optional[list] = None
+        self._deferred_output_has_logprobs = False
         logger.info(
             "ATOMCompass active: mode=%s oracle=%s",
             self._compass_config.mode,
@@ -445,6 +449,8 @@ class CompassPredictMixin:
 
         previous = self._deferred_output
         self._deferred_output = list(batch.req_ids)
+        logprobs = getattr(batch, "return_logprobs", None)
+        self._deferred_output_has_logprobs = None if logprobs is None else any(logprobs)
 
         req_ids = previous if previous is not None else []
         token_ids = [(filler,) for _ in req_ids]
@@ -746,6 +752,15 @@ class CompassPredictMixin:
         # binding refuses rather than assuming the identity.
         state_rows = getattr(batch, "state_rows", None)
         fork_srcs = getattr(batch, "state_fork_srcs", None)
+        region_context = None
+        if getattr(allocation, "capture_region_context", False):
+            region_context = _native_region_context(self.config, batch)
+            previous = getattr(self, "_deferred_output", None)
+            region_context.update(
+                output_state_representation="predictive_deferred_batch",
+                prior_sampled_batch_rows=len(previous or ()),
+                prior_sampled_has_logprobs=getattr(self, "_deferred_output_has_logprobs", None),
+            )
         allocation.offer(NativeStepAllocation(
             rows=rows,
             block_tables=tables,
@@ -756,8 +771,7 @@ class CompassPredictMixin:
             source="ScheduledBatch",
             rank_coords=self._rank_coords(),
             shared_across_ranks=True,
-            region_context=(_native_region_context(self.config, batch)
-                            if getattr(allocation, "capture_region_context", False) else None),
+            region_context=region_context,
         ))
 
     def _describe(self, batch: ScheduledBatch) -> StepShape:

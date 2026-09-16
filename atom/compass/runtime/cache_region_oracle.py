@@ -111,6 +111,7 @@ def model_from_artifact(data, *, include_failed_outputless=False,
 
 def source_cost_oracle(*, region_overlay, region_overlay_sha256, regions,
                        native_prefill_handoff=None, native_prefill_handoff_sha256=None,
+                       native_ap_handoff=None, native_ap_handoff_sha256=None,
                        include_failed_outputless=False, include_failed_final=False, diagnostic_only=False,
                        q16_handoff=None, q16_handoff_sha256=None,
                        low_q_handoff=None, low_q_handoff_sha256=None,
@@ -144,6 +145,10 @@ def source_cost_oracle(*, region_overlay, region_overlay_sha256, regions,
         raise ValueError("cached-prefill source scope requires rank zero")
     if bool(native_prefill_handoff) != bool(native_prefill_handoff_sha256):
         raise ValueError("native prefill source handoff and its explicit SHA-256 are required together")
+    if bool(native_ap_handoff) != bool(native_ap_handoff_sha256):
+        raise ValueError("native A/P handoff and its explicit SHA-256 are required together")
+    if native_ap_handoff and not native_prefill_handoff:
+        raise ValueError("native A/P families require their retained native-prefill source")
     if bool(q16_handoff) != bool(q16_handoff_sha256):
         raise ValueError("q16 source handoff and its explicit SHA-256 are required together")
     if bool(low_q_handoff) != bool(low_q_handoff_sha256):
@@ -257,4 +262,15 @@ def source_cost_oracle(*, region_overlay, region_overlay_sha256, regions,
         result.regions = selected
         result.compass_region_snapshot = region_snapshot("native-prefill-sources", result.regions)
         result.compass_loaded_inputs += result.regions.loaded_inputs
+    if native_ap_handoff:
+        from atom.compass.core.cost.native_ap_regions import NativeAPFamilyRegions
+
+        selected = NativeAPFamilyRegions.load(result.regions, native_ap_handoff,
+            native_ap_handoff_sha256, result.native_allocation,
+            deployment_scope_sha256=scopes[0].sha256)
+        if not selected.source_qualified:
+            raise ValueError("native A/P source is a review candidate; family qualification is required for activation")
+        result.regions = selected
+        result.compass_region_snapshot = region_snapshot("native-ap-families", selected)
+        result.compass_loaded_inputs += selected.loaded_inputs
     return result
