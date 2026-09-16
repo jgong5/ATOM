@@ -112,6 +112,7 @@ def model_from_artifact(data, *, include_failed_outputless=False,
 def source_cost_oracle(*, region_overlay, region_overlay_sha256, regions,
                        native_prefill_handoff=None, native_prefill_handoff_sha256=None,
                        native_ap_handoff=None, native_ap_handoff_sha256=None,
+                       reached_primitive_handoffs=None,
                        include_failed_outputless=False, include_failed_final=False, diagnostic_only=False,
                        q16_handoff=None, q16_handoff_sha256=None,
                        low_q_handoff=None, low_q_handoff_sha256=None,
@@ -247,6 +248,16 @@ def source_cost_oracle(*, region_overlay, region_overlay_sha256, regions,
         result.regions = ExactPrefillRegions(result.regions, result.library.supplement_points, result.library.handoff_sha256)
         result.compass_region_snapshot = region_snapshot("root-reference-diagnostic", result.regions)
         result.compass_loaded_inputs += result.library.loaded_inputs[base_inputs:]
+    if reached_primitive_handoffs:
+        from atom.compass.core.cost.reached_primitives import ReachedPrimitivePrices
+
+        scopes = [entry for entry in result.library.loaded_inputs if entry.role == "oracle.attention_scope"]
+        if len(scopes) != 1:
+            raise ValueError("reached primitive sources require one loaded deployment attention scope")
+        previous = len(result.library.loaded_inputs)
+        result.library = ReachedPrimitivePrices(result.library, reached_primitive_handoffs,
+            deployment_scope_sha256=scopes[0].sha256)
+        result.compass_loaded_inputs += result.library.loaded_inputs[previous:]
     if native_prefill_handoff:
         from atom.compass.core.cost.native_prefill_regions import NativePrefillRegions
 

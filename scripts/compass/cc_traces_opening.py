@@ -41,6 +41,7 @@ CACHE_REGION_OPTIONS = frozenset((
     "root_prefill_diagnostic_workload_sha256",
     "native_prefill_handoff", "native_prefill_handoff_sha256",
     "native_ap_handoff", "native_ap_handoff_sha256",
+    "reached_primitive_handoffs",
 ))
 
 
@@ -442,6 +443,41 @@ def check_source_contract(modelled, registry, workload_sha, forbidden, label, *,
                          "supplement 17/20 with three failed prepare gates and outer exit 124; no acceptance credit")
         elif any(str(row.get("role", "")).startswith("oracle.root_diagnostic_") for row in inputs):
             raise ValueError("unconfigured root diagnostic evidence was loaded")
+        reached_role = "oracle.reached_primitives."
+        if options.get("reached_primitive_handoffs"):
+            from atom.compass.core.cost.library import PriceLibrary
+            from atom.compass.core.cost.reached_primitives import ReachedPrimitivePrices
+            from atom.compass.core.loaded_input import file_digests
+
+            scopes = [row for row in inputs if row.get("role") == "oracle.attention_scope"]
+            if len(scopes) != 1 or scopes[0].get("requested") != options.get("attention_scope"):
+                raise ValueError("reached primitive sources lack their loaded deployment scope")
+            reached = ReachedPrimitivePrices(PriceLibrary(), options["reached_primitive_handoffs"],
+                deployment_scope_sha256=scopes[0]["sha256"])
+            observed = [row for row in inputs if str(row.get("role", "")).startswith(reached_role)]
+            if len(observed) != len(reached.loaded_inputs):
+                raise ValueError("reached primitive source input inventory differs")
+            by_digest = {}
+            for item in reached.loaded_inputs:
+                if sum(row == item.as_dict() for row in observed) != 1:
+                    raise ValueError(f"reached primitive input {item.path} lacks its exact loaded identity")
+                by_digest.setdefault(item.sha256, []).append(item)
+            for sha, items in by_digest.items():
+                contents = file_digests(items)
+                digest = sha if len(contents) == 1 else validate._rolled_digest(contents)
+                role = reached_role + sha[:16]
+                bad.extend(validate._check_calibration_records(
+                    {role: digest}, {role: contents}, registry, 1, workload_sha, forbidden))
+            files = file_digests(reached.loaded_inputs)
+            digest = next(iter(files.values())) if len(files) == 1 else validate._rolled_digest(files)
+            if ((compass.get("oracle_option_files") or {}).get("reached_primitive_handoffs") != files
+                    or (compass.get("oracle_option_sha256") or {}).get("reached_primitive_handoffs") != digest):
+                raise ValueError("reached primitive aggregate omits or changes loaded evidence")
+            bad.extend(validate._check_calibration_records(
+                {"reached_primitive_handoffs": digest}, {"reached_primitive_handoffs": files},
+                registry, 1, workload_sha, forbidden))
+        elif any(str(row.get("role", "")).startswith(reached_role) for row in inputs):
+            raise ValueError("unconfigured reached primitive source evidence was loaded")
         if bool(options.get("native_prefill_handoff")) != bool(options.get("native_prefill_handoff_sha256")):
             raise ValueError("native prefill handoff and its SHA-256 are required together")
         native_role = "oracle.native_prefill_regions"
