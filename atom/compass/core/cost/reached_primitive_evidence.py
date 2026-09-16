@@ -1,5 +1,5 @@
 """Read the existing reached manifest/freeze/verdict protocol without cohort counts."""
-from collections import defaultdict
+from collections import Counter, defaultdict
 import hashlib
 import json
 import math
@@ -10,6 +10,7 @@ from atom.compass.core.cost.cached_q16 import GATHER, GDN, MHA
 from atom.compass.core.cost.library import INTERPOLATED_FLAG, _cost_key_of, _layout_fingerprint, _signature_of
 from atom.compass.core.cost.low_query import GEMM
 from atom.compass.core.cost.root_prefill import QK_NORM
+from atom.compass.core.cost.reference_precision import reference_precision_policy, reference_values_admitted
 from atom.compass.core.loaded_input import LoadedInput, load_json
 
 SCHEMA = "compass.reached_primitive_reference_export/1"
@@ -391,7 +392,97 @@ def _validation_runtime(reader, handoff, data, reference_runtime, runtime):
         validation_physical_uuid=runtime["physical_uuid"])
 
 
-def load_campaign(reference, deployment_scope_sha256, *, index):
+def _native_body_validation(reader, handoff, plan, frozen, references, points, policy, base):
+    """Recompute the missing contributions and qualified remainder from real inputs."""
+    from atom.compass.core.cost.priced import HOST_SYNC
+    from atom.compass.core.cost.reached_primitives import work_identity
+
+    if base is None or not isinstance(handoff.get("native_body_validation"), dict):
+        raise ValueError("reference precision policy requires independent native-body validation")
+    check = reader.read(handoff["native_body_validation"], "native_body.validation")
+    rules = reader.read(plan["independent_native_body_transfer"], "native_body.rules")
+    if (check.get("schema") != "compass.q3056_native_body_validation/1"
+            or not same_pin(check.get("prediction_freeze"), handoff["evidence"]["freeze"])
+            or not same_pin(check.get("native_source"), rules.get("native_source"))
+            or check.get("point_id") != rules.get("point_id") or check.get("repetitions") != list(range(6))
+            or rules.get("component") != "run_model" or rules.get("observations") != 6
+            or rules.get("relative_error_limit") != policy["native_body_relative_error_limit"]):
+        raise ValueError("native-body check changes its frozen prediction or independent source")
+    composition = reader.read(check["composition"], "native_body.composition")
+    graph = reader.read(composition["graph"], "native_body.graph")
+    inputs = reader.read(composition["baseline_library_inputs"], "native_body.baseline_inputs")
+    if composition.get("baseline_options"):
+        reader.read(composition["baseline_options"], "native_body.baseline_options")
+    source = reader.read(check["native_source"], "native_body.source")
+    rows = sorted((row for row in source.get("rows", []) if row.get("point_id") == check["point_id"]),
+                  key=lambda row: row["repetition"])
+    descriptor = composition.get("native_descriptor") or {}
+    shape = composition.get("shape") or {}
+    provenance = graph.get("provenance") or {}
+    binding, execution = provenance.get("binding") or {}, provenance.get("execution") or {}
+    if (composition.get("schema") != "compass.q3056_body_composition/1" or composition.get("seconds_per_launch") != 0
+            or source.get("source_refitted") is not False or len(rows) != 6
+            or [row["repetition"] for row in rows] != check["repetitions"]
+            or descriptor != rows[0].get("descriptor")
+            or any(row.get("normal_return") is not True or row.get("role") != "transfer"
+                   or any(row["descriptor"].get(key) != value for key, value in rules["descriptor"].items()) for row in rows)
+            or shape.get("num_scheduled_tokens") != [3056] or shape.get("context_lens") != [11248]
+            or shape.get("produces_output") is not False or shape.get("topology") != {"tp": 1}
+            or graph.get("key", {}).get("batch_signature") != [3056]
+            or dict(graph.get("key", {}).get("topology") or []) != {"tp": 1}
+            or binding.get("rows") != [[3056, 11248]] or binding.get("allocation_measured") is not True
+            or execution.get("body_rows_traced") != 3056 or execution.get("body_rows_executed") != 3056
+            or execution.get("capture_bucket") is not None or execution.get("step_kind") != "prefill"
+            or provenance.get("includes") != ["model forward"]
+            or not {"compute_logits", "sampler", "input preparation"} <= set(provenance.get("excludes") or [])
+            or provenance.get("head_placement", {}).get("in_this_graph") is not False):
+        raise ValueError("native-body composition does not match the complete outputless source descriptor")
+    tables = descriptor.get("block_tables") or []
+    contexts = [dict(op.get("context") or []) for op in graph.get("ops", []) if op.get("name") == MHA]
+    if (len(tables) != 1 or len(tables[0]) != 704 or descriptor.get("blocks") != [704]
+            or not contexts or any(context.get("block_tables") != tables[0][:703]
+                or context.get("context_lens") != [11248] or context.get("cu_seqlens_q") != [0, 3056]
+                for context in contexts)):
+        raise ValueError("native-body rebound attention context differs from the recorded allocation")
+    bindings = composition.get("reference_bindings") or []
+    if (len(bindings) != len(references) or {row["reference_cell_id"] for row in bindings} != set(references)
+            or any(row["signature"] != references[row["reference_cell_id"]]["signature"] for row in bindings)):
+        raise ValueError("native-body composition changes frozen reference bindings")
+    by_work = {work_identity(graph_for(reader, case, "native_body.reference." + name))[0]: name
+               for name, case in references.items()}
+    if len(by_work) != len(references):
+        raise ValueError("native-body reference identities overlap")
+    counts, missing = Counter(), Counter()
+    for op in graph.get("ops", []):
+        if op.get("name") in HOST_SYNC:
+            continue
+        name = by_work.get(work_identity(op)[0])
+        if name is not None:
+            counts[name] += 1
+            missing[_cost_key_of(op)] += 1
+    remainder, coverage, _ = base.body(graph, composition.get("body_registration"))
+    refused = {row["cost_key"]: row["occurrences"] for row in coverage.refused_signatures}
+    if (set(counts) != set(references) or refused != dict(missing)
+            or len(refused) != len(coverage.refused_signatures)
+            or sum(coverage.refused.values()) != sum(missing.values())
+            or inputs.get("loaded_inputs") != [item.as_dict() for item in base.loaded_inputs]
+            or not math.isfinite(remainder) or remainder < 0):
+        raise ValueError("native-body baseline inputs, qualified remainder or missing identities differ")
+    predicted = remainder + sum(counts[name] * points[name]["seconds"] for name in references)
+    values = [row["seconds"]["run_model"] for row in rows]
+    if any(type(value) not in (int, float) or not math.isfinite(value) or value <= 0 for value in values):
+        raise ValueError("native-body observations must all be finite positive measurements")
+    center = median(values)
+    error = abs(predicted - center) / center
+    if not math.isfinite(predicted) or predicted <= 0 or error > policy["native_body_relative_error_limit"]:
+        raise ValueError("frozen composed native-body error exceeds its independent accuracy limit")
+    return dict(reference_multiplicities=dict(counts), qualified_remainder_seconds=remainder,
+        frozen_body_seconds=predicted, native_seconds=values, native_median_seconds=center,
+        native_range_over_median=(max(values) - min(values)) / center, relative_error=error,
+        comparison="median of all six independent native source-body observations")
+
+
+def load_campaign(reference, deployment_scope_sha256, *, index, base=None):
     from atom.compass.core.cost.reached_primitives import INVALID_ALIAS, work_identity
 
     handoff_path = Path(reference["path"]).resolve()
@@ -410,6 +501,23 @@ def load_campaign(reference, deployment_scope_sha256, *, index):
     pins = handoff["evidence"]
     data = {name: reader.read(pin, name) for name, pin in pins.items()}
     plan, manifest, frozen, verdict = (data[name] for name in ("plan", "manifest", "freeze", "verdict"))
+    precision_policy = reference_precision_policy(plan)
+    body_validation = None
+    if any(reference_precision_policy(value) != precision_policy for value in (manifest, frozen, verdict, handoff)):
+        raise ValueError("reached primitive reference precision policies differ")
+    if precision_policy is not None:
+        source = plan.get("reference_source") or {}
+        failure = data["original_failure"]
+        if (plan.get("conditioning_policy") != Q3056_CONDITIONING
+                or not same_pin(source.get("plan"), pins["reference_plan"])
+                or not same_pin(source.get("phase"), pins["reference_phase"])
+                or not same_pin(source.get("failure"), pins["original_failure"])
+                or not same_pin(failure.get("science"), pins["reference_plan"])
+                or not same_pin(plan.get("independent_native_body_transfer"), data["reference_plan"].get("independent_native_body_transfer"))
+                or frozen.get("reference_values_admitted") is not True
+                or not same_pin(frozen.get("reused_reference_failure"), pins["original_failure"])
+                or plan.get("retained_references") or data["reference_plan"].get("retained_references")):
+            raise ValueError("reached primitive precision policy changes its unchanged reference source")
     if (plan.get("schema") != "compass.reached_primitive_executable/2"
             or manifest.get("schema") != "compass.reached_primitive_manifest/1"
             or not same_pin(plan.get("design"), pins["manifest"]) or plan["cases"] != manifest["cases"]
@@ -417,7 +525,8 @@ def load_campaign(reference, deployment_scope_sha256, *, index):
             or verdict.get("schema") != "compass.low_q_source_verdict/1"
             or not same_pin(frozen.get("plan"), pins["plan"]) or not same_pin(verdict.get("plan"), pins["plan"])
             or not same_pin(verdict.get("prediction_freeze"), pins["freeze"])
-            or frozen.get("source_qualified") is not True or frozen.get("heldout_timings_read") is not False
+            or (precision_policy is None and frozen.get("source_qualified") is not True)
+            or frozen.get("heldout_timings_read") is not False
             or frozen.get("target_timings_used") is not False or verdict.get("target_timings_used") is not False
             or frozen.get("candidate_activated") is not False or verdict.get("candidate_activated") is not False):
         raise ValueError("reached primitive plan, source freeze or heldout verdict differs")
@@ -469,6 +578,8 @@ def load_campaign(reference, deployment_scope_sha256, *, index):
     old_references = {case["cell_id"]: case for case in data["reference_plan"]["cases"] if case["phase"] == "reference"}
     if any(name not in old_references or not same_case(case, old_references[name]) for name, case in references.items()):
         raise ValueError("reached primitive reuse changes an original reference")
+    if precision_policy is not None and set(references) != set(old_references):
+        raise ValueError("reached primitive precision policy discards original references")
     if plan.get("retained_references", {}) != data["reference_plan"].get("retained_references", {}):
         raise ValueError("reached primitive retained source selections changed")
     points = {name: new[name] for name in references}
@@ -484,8 +595,12 @@ def load_campaign(reference, deployment_scope_sha256, *, index):
             or verdict["heldout_evidence"].get("raw_prices") != [row["raw"] for row in data["heldout_phase"]["records"]]
             or not same_pin(verdict["heldout_evidence"].get("dispatch"), pins["dispatch"])):
         raise ValueError("reached primitive freeze/verdict changes its recorded source evidence")
-    if set(frozen["reference_points"]) != set(points) or any(not point["source_qualified"] for point in points.values()):
+    if set(frozen["reference_points"]) != set(points) or any(not reference_values_admitted(point, precision_policy) for point in points.values()):
         raise ValueError("reached primitive freeze adds failed or unknown reference points")
+    if precision_policy is not None:
+        if (frozen.get("source_qualified") is not all(point["source_qualified"] for point in points.values())
+                or data["original_failure"].get("reference_evidence") != frozen["reference_evidence"]):
+            raise ValueError("reached primitive precision policy changes the original precision result or observations")
     for name, point in points.items():
         if any(frozen["reference_points"][name].get(key) != value for key, value in point.items()):
             raise ValueError("reached primitive freeze changes source observations or retained provenance")
@@ -509,7 +624,9 @@ def load_campaign(reference, deployment_scope_sha256, *, index):
         profiles = points[weights[0]["reference_cell_id"]]["kernel_profiles"] if case["family"] == "gemm" else []
         if (prediction.get("signature") != case["signature"] or prediction.get("family") != case["family"]
                 or prediction.get("sources") != weights or prediction.get("seconds") != seconds
-                or prediction.get("source_qualified") is not True or prediction.get("group") != case["score_group"]
+                or prediction.get("source_qualified") is not (all(points[item["reference_cell_id"]]["source_qualified"] for item in weights) if precision_policy is not None else True)
+                or (precision_policy is not None and prediction.get("reference_values_admitted") is not True)
+                or prediction.get("group") != case["score_group"]
                 or prediction.get("limit") != limit or prediction.get("kernel_profiles") != profiles):
             raise ValueError("reached primitive prediction refits heldouts or changes frozen weights")
         observed, check = heldout[name], checks[name]
@@ -544,6 +661,13 @@ def load_campaign(reference, deployment_scope_sha256, *, index):
     if (not isinstance(selected, list) or not selected or len(set(selected)) != len(selected)
             or not set(selected) <= qualified):
         raise ValueError("reached primitive export selects a failed or incomplete heldout group")
+    if precision_policy is not None:
+        if (qualified != set(groups) or set(selected) != set(groups)
+                or verdict.get("controls_qualified") is not True or verdict.get("ready_for_body_validation") is not True
+                or verdict.get("source_qualified") is not False or verdict.get("ready_for_source_review") is not False
+                or verdict.get("reference_precision_passed") is not frozen["source_qualified"]):
+            raise ValueError("reached primitive precision policy lacks complete independent control validation")
+        body_validation = _native_body_validation(reader, handoff, plan, frozen, references, points, precision_policy, base)
     domain_manifest = data["domain_manifest"]
     if domain_manifest.get("schema") != "compass.reached_primitive_manifest/1":
         raise ValueError("reached primitive domain manifest schema differs")
@@ -600,6 +724,11 @@ def load_campaign(reference, deployment_scope_sha256, *, index):
             validation_campaign_physical_uuid=runtime["physical_uuid"],
             retained_reference_origins={item["reference_cell_id"]: retained[item["reference_cell_id"]]["origin"]
                 for item in prediction["sources"] if item["reference_cell_id"] in retained})
+        if precision_policy is not None:
+            record.update(reference_precision_policy=precision_policy,
+                reference_precision_passed=prediction["source_qualified"],
+                native_body_validation=handoff["native_body_validation"],
+                native_body_relative_error=body_validation["relative_error"])
         if len(prediction["sources"]) != 1 or key != source_key:
             record[INTERPOLATED_FLAG] = True
         if key in records and any(records[key][field] != record[field] for field in
@@ -608,7 +737,9 @@ def load_campaign(reference, deployment_scope_sha256, *, index):
         records.setdefault(key, record)
     return dict(domain_sha256=pins["domain_manifest"]["sha256"], domain=domain, records=records,
         selected_groups=selected, loaded_inputs=tuple(reader.inputs), sources=sources,
-        provenance=dict(handoff=reference, plan=pins["plan"], reference_plan=pins["reference_plan"],
+        provenance=dict(**({"reference_precision_policy": precision_policy, "native_body_validation": body_validation}
+                           if precision_policy is not None else {}),
+            handoff=reference, plan=pins["plan"], reference_plan=pins["reference_plan"],
             physical_uuid=runtime["physical_uuid"], selected_groups=selected,
             validation=validation, historical_reference_physical_uuid=reference_runtime["physical_uuid"],
             original_failure=pins["original_failure"], terminal=pins["terminal"],

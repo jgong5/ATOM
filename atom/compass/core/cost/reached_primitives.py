@@ -70,7 +70,7 @@ class ReachedPrimitivePrices(PriceLibrary):
         loaded, sources, claimed_groups = [], [], set()
         domain_sha = None
         for index, reference in enumerate(handoffs):
-            campaign = load_campaign(reference, deployment_scope_sha256, index=index)
+            campaign = load_campaign(reference, deployment_scope_sha256, index=index, base=base)
             if domain_sha is not None and campaign["domain_sha256"] != domain_sha:
                 raise ValueError("reached source handoffs declare different operator domains")
             domain_sha = campaign["domain_sha256"]
