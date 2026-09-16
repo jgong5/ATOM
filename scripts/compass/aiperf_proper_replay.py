@@ -148,15 +148,15 @@ def native_record_admissions(raw_records, admissions, phase, purpose):
     cancelled = sum(row["metadata"].get("was_cancelled") is True for row in raw_records)
     remaining = phase["counts"]["final_requests_cancelled"] - cancelled
     if (remaining < 0 or len(missing) > remaining
-            or missing and (purpose != "diagnostic" or any(row.get("aborted") is not True for row in missing))):
+            or any(row.get("aborted") is not True for row in missing)):
         raise ValueError("missing native raw records do not reconcile with aborted admissions and cancelled credits")
     return [row for row in admissions if row["client_request_id"] in raw_ids], missing
 
 
 def check_native_summary(summary, raw_records, phase, purpose):
-    """A diagnostic may retain counted request cancellations, never a failed profile."""
+    """Both purposes retain counted request cancellations, never a failed profile."""
     errors = summary.get("error_summary") or []
-    if summary.get("was_cancelled") or errors and purpose != "diagnostic":
+    if summary.get("was_cancelled"):
         raise ValueError("ordinary native AIPerf reported profile cancellation or errors")
     def error_key(error):
         return tuple(error.get(key) for key in ("type", "code", "message"))
