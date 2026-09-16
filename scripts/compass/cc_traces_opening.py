@@ -663,12 +663,15 @@ def check_source_contract(modelled, registry, workload_sha, forbidden, label, *,
                  or str(row.get("role", "")).startswith(family_role + ".")
                  or str(row.get("role", "")).startswith(VALIDATION_PREFIX) for row in inputs):
             raise ValueError("unconfigured native A/P source evidence was loaded")
-        from atom.compass.core.cost.composition_qualification import ROLE_PREFIX as COMPOSITION_PREFIX, validate as qualify
+        from atom.compass.core.cost.composition_qualification import ROLE_PREFIX as COMPOSITION_PREFIX
 
         observed = [row for row in inputs if str(row.get("role", "")).startswith(COMPOSITION_PREFIX)]
         if composition:
-            verdict, qualification_inputs = qualify(options["composition_qualification"],
-                options["composition_qualification_sha256"], inputs=inputs, options=options, regions=selected)
+            # The factory reuses its actual initialized body/head oracle for
+            # the independent qualification, including all decode forwards.
+            qualified_oracle = wrapper.source_cost_oracle(**options)
+            qualification_inputs = [item for item in qualified_oracle.compass_loaded_inputs
+                                    if item.role.startswith(COMPOSITION_PREFIX)]
             if len(observed) != len(qualification_inputs) or any(
                     sum(row == item.as_dict() for row in observed) != 1 for item in qualification_inputs):
                 raise ValueError("composition qualification lacks its exact loaded validation evidence")

@@ -39,6 +39,7 @@ def code_identity():
 
 def source_selection(options):
     from atom.compass.runtime.cache_region_oracle import source_cost_oracle
+    from atom.compass.runtime.source_oracle import _rank_coords
 
     arguments = inspect.signature(source_cost_oracle).bind(**options)
     arguments.apply_defaults()
@@ -46,6 +47,7 @@ def source_selection(options):
     result.update(result.pop("options"))
     for name in ("diagnostic_only", "composition_qualification", "composition_qualification_sha256"):
         result.pop(name, None)
+    result["rank_coords"] = {"tp": 0, **_rank_coords(result.get("rank_coords"))}
     return json.loads(json.dumps({key: value for key, value in result.items() if value is not None}))
 
 
@@ -64,13 +66,14 @@ def predictor_identity(oracle, options, predictions):
 
 def geometry(descriptor):
     d = descriptor
-    return {**{k: d[k] for k in ("q", "history", "blocks", "prefill_continuation", "output_rows", "produces_output")},
+    return {**{k: d[k] for k in ("q", "history", "blocks", "prefill_continuation", "output_rows", "produces_output",
+                               "prefill_rows", "capture_bucket", "compiled", "topology", "rank_coords")},
             "state_alias_pattern": canonical_state_slots(d["state_slots"], d["state_fork_srcs"]),
             "kv_sharing_pairs": [list(v) for v in block_sharing_pairs(d["block_tables"])]}
 
 
-def observed_components(regions, row):
-    """Apply the actual composed A/P selector, including retained tiny cells."""
+def offer_observation(allocation, row):
+    """Offer the real prefill or decode geometry to the ordinary native binder."""
     d = row["descriptor"]
     context = dict(d["forward_context"]["scope"],
         prefill_continuations=tuple(d["prefill_continuation"]), output_rows=tuple(d["output_rows"]),
@@ -80,18 +83,23 @@ def observed_components(regions, row):
         prior_sampled_has_logprobs=False)
     for key in ("temperatures", "top_ks", "top_ps", "return_logprobs", "independent_noise"):
         context[key] = tuple(d[key])
-    regions._allocation.offer(NativeStepAllocation(
+    allocation.offer(NativeStepAllocation(
         rows=list(zip(d["q"], d["context"])), block_tables=d["block_tables"],
         state_slots=d["state_slots"], state_fork_srcs=d["state_fork_srcs"], state_rows=d["state_rows"],
         num_prefill_seqs=d["prefill_rows"], rank_coords=d["rank_coords"], region_context=context))
-    shape = StepShape(tuple(d["q"]), tuple(d["context"]), num_prefill_tokens=sum(d["q"]),
+    return StepShape(tuple(d["q"]), tuple(d["context"]), num_prefill_tokens=sum(d["q"][:d["prefill_rows"]]),
         produces_output=d["produces_output"], compiled=d["compiled"], capture_bucket=d["capture_bucket"],
         topology=d["topology"], rank_coords=d["rank_coords"])
+
+
+def observed_components(regions, row):
+    """Apply the actual composed A/P selector, including retained tiny cells."""
+    shape = offer_observation(regions._allocation, row)
     return regions.breakdown(shape)
 
 
-def validate(path, sha256, *, inputs, options, regions):
-    """Recompute every declared prefill heldout gate and verify frozen identity."""
+def validate(path, sha256, *, inputs, options, regions, oracle):
+    """Re-quote the actual oracle and recompute every independent forward gate."""
     data, receipt = load_json(path, role=ROLE_PREFIX + "receipt")
     loaded = [receipt]
 
@@ -145,13 +153,12 @@ def validate(path, sha256, *, inputs, options, regions):
     _source_scope(rows, regions.scope, {row["chain_id"] for row in sources})
     groups = {}
     for row in rows:
-        if eligible(row):
-            groups.setdefault((row["chain_id"], row["chain_step"]), []).append(row)
+        groups.setdefault((row["chain_id"], row["chain_step"]), []).append(row)
     predicted = {(row["chain_id"], row["chain_step"]): row for row in predictions["rows"]}
     if (predictions.get("complete") is not True or predictions.get("refused") != 0
             or len(predicted) != len(predictions["rows"]) or set(predicted) != set(groups)):
-        raise ValueError("composition predictions omit or repeat native prefill chain steps")
-    checks, selected = [], copy.deepcopy(regions)
+        raise ValueError("composition predictions omit or repeat native chain steps")
+    checks, selected, quotes = [], copy.deepcopy(regions), {}
     for key, observations in sorted(groups.items()):
         prediction = predicted[key]
         if any(geometry(row["descriptor"]) != prediction["geometry"] for row in observations):
@@ -162,10 +169,25 @@ def validate(path, sha256, *, inputs, options, regions):
                 or seconds["body"] < 0
                 or abs(seconds["forward"] - sum(seconds[k] for k in ("prepare", "postprocess", "body"))) > 1e-12):
             raise ValueError("composition predictions change their source-only component prices")
+        signature = json.dumps(prediction["geometry"], sort_keys=True)
+        if signature not in quotes:
+            shape = offer_observation(oracle.native_allocation, observations[0])
+            quote = oracle.estimate(shape)
+            if not oracle.require_complete or not oracle.last_coverage.complete:
+                raise ValueError("composition re-quote has incomplete body/head coverage")
+            quotes[signature] = quote
+        quote = quotes[signature]
+        body_and_head = quote.breakdown["<body>"] + quote.breakdown.get("<head>", 0.)
+        if (abs(seconds["body"] - body_and_head) > 1e-10
+                or abs(seconds["forward"] - quote.seconds) > 1e-10):
+            raise ValueError("frozen composition quote differs from the actual loaded body/head predictor")
         measured = median(row["seconds"]["forward"] for row in observations)
         error = abs(seconds["forward"] - measured) / measured if measured > 0 else float("inf")
         if not error < .10:
             raise ValueError("composition independent complete-forward error is not under 10%: " + str(key))
         checks.append(dict(chain_id=key[0], chain_step=key[1], relative_error=error))
-    return dict(passed=True, independent_prefill_steps=len(checks), checks=checks,
+    oracle.native_allocation.clear()
+    return dict(passed=True, independent_forward_steps=len(checks),
+                independent_prefill_steps=sum(eligible(v[0]) for v in groups.values()),
+                unique_geometries_requoted=len(quotes), checks=checks,
                 primitive_source_statuses_unchanged=True), tuple(loaded)

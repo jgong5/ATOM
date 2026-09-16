@@ -335,6 +335,6 @@ def source_cost_oracle(*, region_overlay, region_overlay_sha256, regions,
             raise ValueError("composition qualification requires the source-work A/P model and zero extra launch charge")
         result.compass_composition_qualification, loaded = validate(
             composition_qualification, composition_qualification_sha256,
-            inputs=result.compass_loaded_inputs, options=composition_options, regions=result.regions)
+            inputs=result.compass_loaded_inputs, options=composition_options, regions=result.regions, oracle=result)
         result.compass_loaded_inputs += loaded
     return result

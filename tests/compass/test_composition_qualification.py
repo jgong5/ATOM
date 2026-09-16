@@ -2,6 +2,7 @@
 import copy
 import hashlib
 import json
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -29,35 +30,49 @@ def bundle(candidate, tmp_path):
     row = dict(chain_id="native-chain", chain_step=0, repetition=0, role="source",
         normal_return=True, descriptor=descriptor,
         forward_context_after_return=dict(previous_sampled_ids=dict(shape=[1])))
+    decode = copy.deepcopy(row)
+    decode["chain_step"] = 1
+    decode["descriptor"] = fresh_descriptor([1], [33], [3], True)
+    decode["descriptor"].update(prefill_rows=0, capture_bucket=1)
     sources = []
     for repetition in range(6):
-        source = copy.deepcopy(row)
-        source["repetition"] = repetition
-        source["descriptor"]["req_ids"] = [1 + repetition]
-        sources.append(source)
+        for original in (row, decode):
+            source = copy.deepcopy(original)
+            source["repetition"] = repetition
+            source["descriptor"]["req_ids"] = [1 + len(sources)]
+            sources.append(source)
     write("source", dict(rows=sources))
     write("model", {})
     write("scope", {})
     inputs = [load_json(pins[name]["path"], role=role)[1] for name, role in (
         ("source", "oracle.native_ap_regions.work.source"),
         ("model", "oracle.native_ap_regions.work.model"), ("scope", "oracle.attention_scope"))]
-    terms = observed_components(regions, row)
-    forward = 1. + sum(terms.values())
-    write("predictions", dict(complete=True, refused=0, rows=[dict(chain_id=row["chain_id"],
-        chain_step=0, geometry=geometry(descriptor), seconds=dict(body=1., forward=forward,
-        prepare=terms["<prepare>"], postprocess=terms["<postprocess>"]))]))
+    predictions = []
+    for original in (row, decode):
+        terms = observed_components(regions, original)
+        predictions.append(dict(chain_id=original["chain_id"], chain_step=original["chain_step"],
+            geometry=geometry(original["descriptor"]), seconds=dict(body=1., forward=1. + sum(terms.values()),
+            prepare=terms["<prepare>"], postprocess=terms["<postprocess>"])))
+    write("predictions", dict(complete=True, refused=0, rows=predictions))
     options = dict(region_overlay="retained.json", region_overlay_sha256="retained", regions="existing")
-    oracle = SimpleNamespace(compass_loaded_inputs=inputs, seconds_per_launch=0)
+    def estimate(shape):
+        parts = regions.breakdown(shape)
+        return SimpleNamespace(seconds=1. + sum(parts.values()), breakdown={"<body>": 1., **parts})
+
+    oracle = SimpleNamespace(compass_loaded_inputs=inputs, seconds_per_launch=0,
+        native_allocation=regions._allocation, require_complete=True,
+        last_coverage=SimpleNamespace(complete=True), estimate=estimate)
     identity = predictor_identity(oracle, options, pins["predictions"])
     write("identity", identity)
     write("freeze", dict(frozen_before_heldout_warmups=True, source_refitted=False,
                          predictor_identity=pins["identity"], source_model=pins["model"]))
     heldouts = []
-    for repetition in range(6):
-        heldout = copy.deepcopy(row)
-        heldout.update(role="heldout", repetition=repetition,
-            seconds=dict(prepare=terms["<prepare>"], postprocess=terms["<postprocess>"], run_model=1., forward=forward))
-        heldout["descriptor"]["req_ids"] = [10 + repetition]
+    for source in sources:
+        heldout = copy.deepcopy(source)
+        terms = observed_components(regions, source)
+        heldout.update(role="heldout",
+            seconds=dict(prepare=terms["<prepare>"], postprocess=terms["<postprocess>"], run_model=1., forward=1. + sum(terms.values())))
+        heldout["descriptor"]["req_ids"] = [100 + len(heldouts)]
         heldouts.append(heldout)
     write("heldout", dict(rows=heldouts))
     write("complete", dict(success=True, engine_closed=True))
@@ -68,19 +83,21 @@ def bundle(candidate, tmp_path):
         predictor_identity=pins["identity"], predictor_freeze=pins["freeze"], heldout=pins["heldout"],
         native_complete=pins["complete"], copy_closeout=pins["closeout"])
     write("receipt", receipt)
-    return dict(regions=regions, inputs=inputs, options=options, pins=pins, write=write,
+    return dict(regions=regions, inputs=inputs, options=options, oracle=oracle, pins=pins, write=write,
                 receipt=receipt, identity=identity, heldouts=heldouts)
 
 
 def qualify(bundle):
     pin = bundle["pins"]["receipt"]
     return validate(pin["path"], pin["sha256"], regions=bundle["regions"],
-                    inputs=bundle["inputs"], options=bundle["options"])
+                    inputs=bundle["inputs"], options=bundle["options"], oracle=bundle["oracle"])
 
 
 def test_frozen_composition_passes_without_qualifying_raw_sources(bundle):
     verdict, inputs = qualify(bundle)
     assert verdict["passed"] and verdict["independent_prefill_steps"] == 1
+    assert verdict["independent_forward_steps"] == 2
+    assert verdict["unique_geometries_requoted"] == 2
     assert bundle["regions"].source_qualified is False
     assert all(item.role.startswith("validation.forward_composition.") for item in inputs)
 
@@ -129,3 +146,30 @@ def test_acceptance_preflight_requires_pinned_composition_then_full_reader(bundl
     options["composition_qualification_sha256"] = "0" * 64
     with pytest.raises(ValueError, match="changed"):
         _check_source_options({"purpose": "acceptance"}, options)
+
+
+def test_frozen_export_must_match_actual_body_and_head(bundle):
+    estimate = bundle["oracle"].estimate
+
+    def changed_body(shape):
+        quote = estimate(shape)
+        quote.breakdown["<head>"] = .0001
+        quote.seconds += .0001
+        return quote
+
+    bundle["oracle"].estimate = changed_body
+    with pytest.raises(ValueError, match="actual loaded body/head"):
+        qualify(bundle)
+
+
+def test_prediction_export_cannot_omit_decode_forwards(bundle):
+    prediction = json.loads(Path(bundle["pins"]["predictions"]["path"]).read_text())
+    prediction["rows"] = [row for row in prediction["rows"] if row["geometry"]["prefill_rows"]]
+    bundle["identity"]["validation_predictions"] = bundle["write"]("predictions", prediction)
+    bundle["receipt"]["predictor_identity"] = bundle["write"]("identity", bundle["identity"])
+    freeze = json.loads(Path(bundle["pins"]["freeze"]["path"]).read_text())
+    freeze["predictor_identity"] = bundle["pins"]["identity"]
+    bundle["receipt"]["predictor_freeze"] = bundle["write"]("freeze", freeze)
+    bundle["write"]("receipt", bundle["receipt"])
+    with pytest.raises(ValueError, match="omit or repeat native chain steps"):
+        qualify(bundle)
