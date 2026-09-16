@@ -4,6 +4,7 @@ import asyncio
 import hashlib
 import importlib.util
 import json
+import math
 import os
 import signal
 from pathlib import Path
@@ -34,6 +35,30 @@ def write(path, value):
         stream.flush()
         os.fsync(stream.fileno())
     temporary.replace(path)
+
+
+def incomplete_evidence(value):
+    """Preserve nonfinite control sentinels explicitly in failure evidence only."""
+    if isinstance(value, float) and not math.isfinite(value):
+        return {"nonfinite_float": repr(value)}
+    if isinstance(value, dict):
+        return {key: incomplete_evidence(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [incomplete_evidence(item) for item in value]
+    return value
+
+
+def export_phase_messages(messages):
+    """Encode only AIPerf's unbounded grace sentinel as the JSON string Infinity."""
+    exported = []
+    for message in messages:
+        value = dict(message)
+        config = value.get("config")
+        if (value.get("message_type") == "credit_phase_start" and isinstance(config, dict)
+                and config.get("grace_period_sec") == math.inf):
+            value["config"] = dict(config, grace_period_sec="Infinity")
+        exported.append(value)
+    return exported
 
 
 from atom.compass.replay.native_preparation import (
@@ -174,7 +199,7 @@ def main(argv=None):
             service_data = json.loads(json.dumps(plan["service_config"]).replace("{repeat}", str(args.repeat)))
             services = ServiceConfig.model_validate(service_data)
             services.comm_config.path.mkdir(parents=True, exist_ok=False)
-            messages = run_native_profile(native_config, services)
+            messages = export_phase_messages(run_native_profile(native_config, services))
             wall_finished = time.time()
             write(directory / "phase_messages.json", messages)
             execution_window = profiling_wall_window(messages)
@@ -233,15 +258,15 @@ def main(argv=None):
                     if time.monotonic() >= deadline:
                         raise TimeoutError("controlled profile startup was not acknowledged")
                     time.sleep(.01)
-                signal = json.loads(Path(args.start_signal).read_text())
-                if signal.get("plan_sha256") != args.plan_sha256 or signal.get("pid") != os.getpid():
+                acknowledgement = json.loads(Path(args.start_signal).read_text())
+                if acknowledgement.get("plan_sha256") != args.plan_sha256 or acknowledgement.get("pid") != os.getpid():
                     raise ValueError("controlled start signal names another plan/process")
             model_started = time.time()
             result = run_controlled_replay(
                 core=core, tokenizer=tokenizer, user_config=config, dataset_metadata=metadata,
                 dataset_client_metadata=store.get_client_metadata(), worker_count=1, server_options=options)
             wall_finished = time.time()
-            messages = [m.model_dump(mode="json") for m in result.messages]
+            messages = export_phase_messages([m.model_dump(mode="json") for m in result.messages])
             execution_window = profiling_wall_window(result.wall_phase_events)
             raw_records = export_controlled_records(result.records)
             consumed = {row["api_request_id"]: {"input_tokens": row["prompt_tokens"],
@@ -308,19 +333,25 @@ def main(argv=None):
         write(directory / "failure.json", failure)
         if closeout and not (directory / "native_closeout.json").exists():
             write(directory / "partial_native_closeout.json", closeout)
-        partial = getattr(exc, "replay_result", None)
-        if partial is not None:
-            write(directory / "controlled_failure.json", {
-                "events": partial.events, "dispatches": partial.dispatches,
-                "records": [r.model_dump(mode="json") for r in partial.records],
-                "messages": [m.model_dump(mode="json") for m in partial.messages],
-                "final_time": partial.final_time, "cleanup": partial.cleanup,
-                "serving": partial.serving, "accepted": False})
         if not output.exists():
             write(output, {"schema": "compass.aiperf_proper_run/1", "side": args.side,
               "purpose": plan["purpose"], "repeat": args.repeat,
                            "plan_sha256": args.plan_sha256, "complete": False,
                            "failure": failure, "accepted": False})
+        partial = getattr(exc, "replay_result", None)
+        if partial is not None:
+            try:
+                write(directory / "controlled_failure.json", incomplete_evidence({
+                    "nonfinite_encoding": "explicit nonfinite_float tags; incomplete evidence only",
+                    "events": partial.events, "dispatches": partial.dispatches,
+                    "records": [r.model_dump(mode="json") for r in partial.records],
+                    "messages": [m.model_dump(mode="json") for m in partial.messages],
+                    "final_time": partial.final_time, "cleanup": partial.cleanup,
+                    "serving": partial.serving, "accepted": False}))
+            except Exception as export_exc:
+                write(directory / "partial_export_failure.json", {
+                    "type": type(export_exc).__name__, "message": str(export_exc),
+                    "primary_failure_preserved": True})
     finally:
         signal.alarm(0)
         signal.signal(signal.SIGALRM, previous_alarm)
