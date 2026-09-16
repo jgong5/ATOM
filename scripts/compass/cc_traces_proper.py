@@ -37,6 +37,14 @@ def load_case(path, sha, case_id):
         raise ValueError("proper pair requires its purpose and repeat count frozen before execution")
     if purpose == lifecycle.ACCEPTANCE and repeats < lifecycle._load("cc_traces_validate").PROTOCOL_REPEATS:
         raise ValueError("acceptance requires the maintained protocol repeat count")
+    concurrency = plan.get("modelled_concurrency", 1)
+    if type(concurrency) is not int or not 1 <= concurrency <= min(3, repeats):
+        raise ValueError("modelled_concurrency must be between one and three, bounded by repeats")
+    if concurrency > 1:
+        for name in ("TMPDIR", "AIPERF_DATASET_MMAP_BASE_PATH"):
+            value = plan.get("modelled_environment", {}).get(name)
+            if not isinstance(value, str) or "{repeat}" not in value or not Path(value).is_absolute():
+                raise ValueError(f"concurrent modelled sessions require a distinct absolute {name} per repeat")
     if plan.get("record_export") != {"export_level": "raw", "export_http_trace": True}:
         raise ValueError("proper pair requires symmetric raw export settings frozen before execution")
     profile = core.profile_identity(core.read_pinned(plan["prepared"]))
@@ -45,15 +53,17 @@ def load_case(path, sha, case_id):
             raise ValueError("proper pair cannot install a fixed request calendar")
     return {"schema": CASE_SCHEMA, "case_id": case_id, "clients": 1,
             "purpose": purpose, "registered_acceptance_cell": purpose == lifecycle.ACCEPTANCE,
-            "repeats": repeats, "record_export": dict(plan["record_export"]),
+            "repeats": repeats, "modelled_concurrency": concurrency,
+            "record_export": dict(plan["record_export"]),
             "target_model": plan["model"], "workload": str(Path(path).resolve()),
             "workload_sha256": sha, "plan": {"path": str(Path(path).resolve()), "sha256": sha},
             "profile": profile, "cache_policy": plan["cache_policy"]}
 
 
 def identity(case):
-    return {k: case[k] for k in ("schema", "case_id", "clients", "purpose",
-            "registered_acceptance_cell", "repeats", "record_export", "target_model", "workload_sha256", "profile", "cache_policy")}
+    return {"modelled_concurrency": case.get("modelled_concurrency", 1),
+            **{k: case[k] for k in ("schema", "case_id", "clients", "purpose",
+            "registered_acceptance_cell", "repeats", "record_export", "target_model", "workload_sha256", "profile", "cache_policy")}}
 
 
 def recheck(case):
@@ -106,6 +116,12 @@ def build_steps(case, cell, *, port, engine_port, advisory):
                 "--side", "modelled", "--repeat", str(repeat),
                 "--out", str(cell / f"modelled.r{repeat}.json"),
                 "--start-signal", str(cell / f"modelled.r{repeat}.raw/start_profile.json")]})
+    concurrency = case.get("modelled_concurrency", 1)
+    if concurrency > 1:
+        modelled_steps = [{"id": f"proper-modelled-group-{start // concurrency + 1}",
+                           "role": "proper_sessions", "side": "modelled",
+                           "sessions": modelled_steps[start:start + concurrency]}
+                          for start in range(0, len(modelled_steps), concurrency)]
     return {"cell": str(cell), "tp": 1, "class": case["case_id"], "clients": 1,
             "repeats": case["repeats"], "purpose": case["purpose"],
             "workload": case["workload"], "diagnostic_case": case, "cache_policy": case["cache_policy"],
@@ -178,61 +194,87 @@ class ProperSideRun(lifecycle.SideRun):
             return False
 
     def _command(self, step):
-        if step["role"] != "proper_session":
+        if step["role"] not in ("proper_session", "proper_sessions"):
             return super()._command(step)
         if not self._check_diagnostic_case(step):
             return False
         plan = core.read_pinned(self.diagnostic_case["plan"])
-        started = self.wall()
-        env = self._serve_env(step)
-        proc = self.processes.start(step["command"], log=self._log(step), env=env)
-        execution = self._mint(step, proc, started)
-        execution["process"]["role"] = "controlled_session"
-        execution["config"]["provenance_transport"] = "owned local startup artifact"
-        held = {"proc": proc, "pid": proc.pid, "step": step, "execution": execution}
-        self.running[step["id"]] = held
-        ready_path = self.cell / f"modelled.r{step['repeat']}.raw/startup_ready.json"
-        signal_path = self.cell / f"modelled.r{step['repeat']}.raw/start_profile.json"
-        deadline = self.now() + plan.get("session_wall_timeout_seconds", 3600)
-        ready = None
+        sessions = step.get("sessions", [step])
+        limit = self.diagnostic_case.get("modelled_concurrency", 1)
+        if (not sessions or len(sessions) > limit
+                or any(item["role"] != "proper_session" or item["side"] != "modelled" for item in sessions)
+                or len({item["repeat"] for item in sessions}) != len(sessions)):
+            raise ValueError("proper session group differs from its frozen concurrency")
+        # Each command execs a fresh interpreter. The parent only polls owned
+        # processes; no simulation clock, runtime globals, or caches are shared.
+        active, started_sessions = {}, []
         try:
-            while self.processes.alive(proc):
-                if self.now() > deadline:
-                    raise TimeoutError("controlled proper session exceeded its wall bound")
-                if ready is None and ready_path.exists():
-                    ready = json.loads(ready_path.read_text())
-                    said = ready["server"]
-                    if not self._check_server_process(step, said, execution, proc):
-                        raise ValueError("controlled session startup identity is unverified")
-                    execution["config"]["provenance"] = said
-                    execution["process"]["healthy_at"] = ready["at"]
-                    execution["process"]["startup_s"] = ready["at"] - started
-                    self._record(dict(step, id=step["id"]+"-ready", role="serve"),
-                                 startup_s=ready["at"]-started, ok=True)
-                    signal = {"plan_sha256": self.diagnostic_case["workload_sha256"],
-                              "pid": proc.pid, "execution_id": execution["execution_id"]}
-                    temporary = signal_path.with_suffix(".writing")
-                    temporary.write_text(json.dumps(signal))
-                    temporary.replace(signal_path)
-                self.sleep(.05)
-            code = proc.returncode
-            execution["process"].update(ended_at=self.wall(), exit=code)
-            execution["replay"] = {"pid": proc.pid, "command": step["command"],
-                "started_at": started, "ended_at": self.wall(), "seconds": self.wall() - started, "exit": code}
-            entry = self._record(dict(step, role="replay"), pid=proc.pid, exit=code,
-                                 execution_id=execution["execution_id"], seconds=self.wall()-started, ok=code == 0)
-            if code != 0 or ready is None:
-                self.failures.append("controlled proper profile did not complete after a verified startup")
-                self._stamp_diagnostic_failure(step, execution)
-                return False
-            return self._check_artifact(step, entry, execution)
+            for item in sessions:
+                started = self.wall()
+                env = self._serve_env(item)
+                proc = self.processes.start(item["command"], log=self._log(item), env=env)
+                execution = self._mint(item, proc, started)
+                execution["process"]["role"] = "controlled_session"
+                execution["config"]["provenance_transport"] = "owned local startup artifact"
+                held = {"proc": proc, "pid": proc.pid, "step": item, "execution": execution,
+                        "started": started, "ready": None,
+                        "deadline": self.now() + plan.get("session_wall_timeout_seconds", 3600)}
+                self.running[item["id"]] = held
+                active[item["id"]] = held
+                started_sessions.append(held)
+            while active:
+                for name, held in list(active.items()):
+                    item, proc, execution = held["step"], held["proc"], held["execution"]
+                    if self.processes.alive(proc):
+                        if self.now() > held["deadline"]:
+                            raise TimeoutError("controlled proper session exceeded its wall bound")
+                        ready_path = self.cell / f"modelled.r{item['repeat']}.raw/startup_ready.json"
+                        if held["ready"] is None and ready_path.exists():
+                            ready = json.loads(ready_path.read_text())
+                            said = ready["server"]
+                            if not self._check_server_process(item, said, execution, proc):
+                                raise ValueError("controlled session startup identity is unverified")
+                            held["ready"] = ready
+                            execution["config"]["provenance"] = said
+                            execution["process"]["healthy_at"] = ready["at"]
+                            execution["process"]["startup_s"] = ready["at"] - held["started"]
+                            self._record(dict(item, id=item["id"]+"-ready", role="serve"),
+                                         startup_s=ready["at"]-held["started"], ok=True)
+                            signal = {"plan_sha256": self.diagnostic_case["workload_sha256"],
+                                      "pid": proc.pid, "execution_id": execution["execution_id"]}
+                            signal_path = ready_path.with_name("start_profile.json")
+                            temporary = signal_path.with_suffix(".writing")
+                            temporary.write_text(json.dumps(signal))
+                            temporary.replace(signal_path)
+                        continue
+                    code, ended = proc.returncode, self.wall()
+                    seconds = ended - held["started"]
+                    execution["process"].update(ended_at=ended, exit=code)
+                    execution["replay"] = {"pid": proc.pid, "command": item["command"],
+                        "started_at": held["started"], "ended_at": ended, "seconds": seconds, "exit": code}
+                    entry = self._record(dict(item, role="replay"), pid=proc.pid, exit=code,
+                                         execution_id=execution["execution_id"], seconds=seconds, ok=code == 0)
+                    if code != 0 or held["ready"] is None:
+                        self.failures.append("controlled proper profile did not complete after a verified startup")
+                        self._stamp_diagnostic_failure(item, execution)
+                        return False
+                    if not self._check_artifact(item, entry, execution):
+                        return False
+                    active.pop(name)
+                if active:
+                    self.sleep(.05)
+            return True
         except BaseException as exc:
             self.failures.append(f"controlled proper session: {exc}")
             return False
         finally:
-            self.processes.stop(proc)
-            self.running.pop(step["id"], None)
-            self._write_execution(execution)
+            for held in started_sessions:
+                code = self.processes.stop(held["proc"])
+                execution = held["execution"]
+                if "ended_at" not in execution["process"]:
+                    execution["process"].update(ended_at=self.wall(), exit=code)
+                self.running.pop(held["step"]["id"], None)
+                self._write_execution(execution)
 
 
 
