@@ -241,7 +241,9 @@ def prepare_native(base, config, conversations, replay, directory, *, step_journ
     reset = replay._reset_prefix_cache(base, 120)
     if reset_receipt_errors(reset, expected_worker_kind="device_synchronize"):
         raise ValueError("dispatch preparation did not acknowledge empty KV and state indexes")
-    journal_bytes = journal.read_bytes()
+    with journal.open("rb") as stream:
+        stream.seek(offset)
+        journal_bytes = stream.read()
     receipt = {"kind": "ordinary_marked_chat_preparation", "output_cap": 2,
                "outside_profile": True, "started_at": start, "ended_at": time.time(),
                "payload_sha256": [hashlib.sha256(p).hexdigest() for p in payloads],
@@ -251,8 +253,8 @@ def prepare_native(base, config, conversations, replay, directory, *, step_journ
                "dispatch_coverage_before": before, "dispatch_coverage": coverage,
                "dispatch_requests": dispatch_requests, "step_journal": str(journal),
                "step_journal_start_offset": offset, "compiled_caches_retained": True,
-               "step_journal_end_offset": len(journal_bytes),
-               "step_journal_region_sha256": hashlib.sha256(journal_bytes[offset:]).hexdigest(),
+               "step_journal_end_offset": offset + len(journal_bytes),
+               "step_journal_region_sha256": hashlib.sha256(journal_bytes).hexdigest(),
                "setup_elapsed_seconds": time.monotonic() - began, "first_use_latency_fitted": False}
     write(directory / "preparation.json", receipt)
     return receipt

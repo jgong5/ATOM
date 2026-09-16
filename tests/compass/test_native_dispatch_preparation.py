@@ -1,5 +1,6 @@
 """Native dispatch initialization needs observed classes and a final empty reset."""
 from copy import deepcopy
+import hashlib
 import json
 
 import pytest
@@ -184,6 +185,10 @@ def test_only_missing_classes_run_before_flush_drain_and_empty_reset(tmp_path, m
     assert result["setup_elapsed_seconds"] >= 0 and result["outside_profile"]
     assert result["first_use_latency_fitted"] is False
     assert cache.read_text() == "retained compiled bytes"
+    raw = replay.journal.read_bytes()
+    start = result["step_journal_start_offset"]
+    assert start > 0 and result["step_journal_end_offset"] == len(raw)
+    assert result["step_journal_region_sha256"] == hashlib.sha256(raw[start:]).hexdigest()
 
 
 def test_no_extra_requests_when_existing_native_preparation_covers_classes(tmp_path, monkeypatch):

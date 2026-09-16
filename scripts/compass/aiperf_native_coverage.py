@@ -26,7 +26,11 @@ ARM = "unprofiled_control"
 
 def pin(path):
     path = Path(path)
-    return {"path": str(path), "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        for block in iter(lambda: stream.read(1024 * 1024), b""):
+            digest.update(block)
+    return {"path": str(path), "sha256": digest.hexdigest()}
 
 
 def validate_plan(plan, output):
