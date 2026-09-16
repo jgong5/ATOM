@@ -267,3 +267,41 @@ def test_actual_native_outputless_path_never_reads_or_drains_previous_output():
         assert result.req_ids == batch.req_ids and result.token_ids == []
         assert calls == [("input_copy", 8288), "reset_context", "forward_end"]
         assert np.array_equal(runner.tokenID_processor.input_ids.np, tokens)
+
+
+@pytest.mark.parametrize("damage", [None, "missing", "mislabelled", "wrong_hash", "price_opt_in"])
+def test_actual_startup_manifest_validation_input_is_checked_but_not_calibration(damage):
+    """Use a real startup manifest when its external artifact tree is mounted."""
+    import importlib.util
+    import sys
+    from types import SimpleNamespace
+    from atom.compass.core.cost.native_ap_exact import VALIDATION_PREFIX
+
+    root = os.environ.get("ATOMCOMPASS_N3_ACTIVATION_RUN")
+    if not root:
+        pytest.skip("set ATOMCOMPASS_N3_ACTIVATION_RUN for the actual startup contract")
+    root = Path(root)
+    plan = json.loads((root / "PLAN.json").read_text())
+    server = json.loads((root / "c1/modelled.r1.raw/startup_ready.json").read_text())["server"]
+    registry = json.loads(Path(plan["calibration_registry"]["path"]).read_text())
+    rows = server["compass"]["loaded_inputs"]["ranks"][0]["inputs"]
+    validation = next(row for row in rows if row["role"].startswith(VALIDATION_PREFIX))
+    if damage == "missing":
+        rows.remove(validation)
+    elif damage == "mislabelled":
+        validation["role"] = "oracle.native_ap_regions.exact.0.ordinary_holdout"
+    elif damage == "wrong_hash":
+        validation["sha256"] = "0" * 64
+    elif damage == "price_opt_in":
+        next(row for row in rows if row["role"] == "oracle.price")["role"] = validation["role"]
+    path = Path(__file__).parents[2] / "scripts/compass/cc_traces_opening.py"
+    spec = importlib.util.spec_from_file_location("test_exact_startup_opening", path)
+    opening = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = opening
+    spec.loader.exec_module(opening)
+    errors, _ = opening.check_source_contract(SimpleNamespace(manifest={"server": server}), registry,
+        plan["source"]["sha256"], {}, "exact native startup test")
+    if damage:
+        assert any("native A/P" in error for error in errors), errors
+    else:
+        assert not errors
