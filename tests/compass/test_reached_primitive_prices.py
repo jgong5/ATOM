@@ -40,7 +40,26 @@ class Artifacts:
             self.pins[name]["sha256"] = hashlib.sha256(path.read_bytes()).hexdigest()
 
 
-def make_domain(store):
+def auxiliary_operators():
+    # Operator names/geometry from immutable rpa1 target_240 and target_262.
+    # Durations in the campaign fixture remain synthetic protocol test data.
+    embedding = dict(name="aten::embedding", input_shapes=[[248320, 5120], [23]],
+        dtypes=["bfloat16", "int32"], output_shapes=[[23, 5120]], output_dtypes=["bfloat16"],
+        layouts=[], scalars=[], context=[], group=None)
+    mrope = dict(name="triton::_mrope_qk_tiled_kernel",
+        input_shapes=[[1057, 6144], [1057, 1024], [1057, 6144], [1057, 1024],
+                      [3, 1057], [262144, 1, 1, 32], [262144, 1, 1, 32]],
+        dtypes=["bfloat16"] * 4 + ["int64", "bfloat16", "bfloat16"],
+        output_shapes=[], output_dtypes=[], layouts=[], context=[], group=None,
+        launch=[["grid", [67, 28]], ["origin", "atom.model_ops.triton_mrope:_mrope_qk_tiled_kernel"]],
+        scalars=[["#7", 6144], ["#8", 1024], ["#9", 6144], ["#10", 1024], ["#11", 1057],
+                 ["#12", 32], ["#13", 32], ["#14", 1057], ["#15", 24], ["#16", 4], ["#17", 256],
+                 ["#18", 64], ["#19", 32], ["#20", 11], ["#21", 10], ["#22", 16], ["#23", 256],
+                 ["num_stages", 1], ["num_warps", 8]])
+    return embedding, mrope
+
+
+def make_domain(store, *, include_auxiliary=False):
     gemm = {"name": GEMM, "input_shapes": [[32, 5120], [6144, 5120]],
             "dtypes": ["bfloat16", "bfloat16"], "layouts": [], "scalars": [],
             "output_shapes": [[32, 6144]], "output_dtypes": ["bfloat16"]}
@@ -57,6 +76,14 @@ def make_domain(store):
         ("gather_ref", "gather", "reference", gather(), 1., []),
         ("gather_failed", "gather", "heldout", gather(), 1.3, [("gather_ref", 1.)]),
     ]
+    if include_auxiliary:
+        embedding, mrope = auxiliary_operators()
+        specs.extend([
+            ("embedding_ref", "embedding", "reference", embedding, 1.25, []),
+            ("embedding_control", "embedding", "heldout", embedding, 1.2625, [("embedding_ref", 1.)]),
+            ("mrope_ref", "mrope", "reference", mrope, .25, []),
+            ("mrope_control", "mrope", "heldout", mrope, .2525, [("mrope_ref", 1.)]),
+        ])
     cases, ops, durations = [], {}, {}
     for name, family, phase, op, seconds, sources in specs:
         graph = store.add("graphs/" + name + ".json", {"ops": [op]})
@@ -226,6 +253,29 @@ def test_whole_groups_use_frozen_prices_and_preserve_original_failure(campaign):
     assert library.campaigns[0]["terminal_exit_code"] == 1
     assert library.campaigns[0]["whole_campaign_requalified"] is False
     assert library.lookup(mha(32768))[0] is None  # A reference alone is not active.
+
+
+@pytest.mark.parametrize("selected", [("gemm",), ("embedding", "mrope")])
+def test_full_domain_keeps_auxiliary_groups_distinct_from_selected_prices(tmp_path, selected):
+    store = Artifacts(tmp_path)
+    domain = make_domain(store, include_auxiliary=True)
+    pin = make_campaign(store, domain, groups=("gemm", "gdn", "mha", "gather", "embedding", "mrope"),
+                        selected=selected)
+    base = PriceLibrary()
+    embedding, mrope = auxiliary_operators()
+    add_book(base, tmp_path, "legacy_auxiliary", [embedding, mrope], [9., 9.])
+    library = load(pin, base)
+    assert library.selected_groups == tuple(sorted(selected))
+    if selected == ("gemm",):
+        assert library.lookup(domain.ops["gemm_control"])[0]["seconds"] == 2.
+        assert library.lookup(embedding)[0] is None
+        assert library.lookup(mrope)[0] is None
+    else:
+        assert library.lookup(embedding)[0]["seconds"] == 1.25
+        assert library.lookup(mrope)[0]["seconds"] == .25
+        assert library.lookup(domain.ops["gemm_control"])[0] is None
+        body, coverage, _ = library.body(prepared_graph([embedding, mrope]))
+        assert body == 1.5 and coverage.complete
 
 
 def test_two_disjoint_campaigns_keep_their_own_physical_uuid(tmp_path):

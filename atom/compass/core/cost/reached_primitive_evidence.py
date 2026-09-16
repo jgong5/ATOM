@@ -13,7 +13,8 @@ from atom.compass.core.cost.root_prefill import QK_NORM
 from atom.compass.core.loaded_input import LoadedInput, load_json
 
 SCHEMA = "compass.reached_primitive_reference_export/1"
-FAMILIES = {"gemm": GEMM, "gdn": GDN, "mha": MHA, "gather": GATHER, "qk_norm": QK_NORM}
+FAMILIES = {"gemm": GEMM, "gdn": GDN, "mha": MHA, "gather": GATHER, "qk_norm": QK_NORM,
+            "embedding": "aten::embedding", "mrope": "triton::_mrope_qk_tiled_kernel"}
 EVENTS = ("REFERENCE_CLOSED", "FREEZE_SEALED", "HELDOUT_RELEASED", "HELDOUT_STARTED", "HELDOUT_CLOSED", "VERDICT_WRITTEN")
 EVIDENCE = ("domain_manifest", "plan", "manifest", "freeze", "verdict", "reference_plan",
             "reference_phase", "reference_preflight", "heldout_phase", "heldout_preflight",
