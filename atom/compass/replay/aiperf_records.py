@@ -25,8 +25,23 @@ def export_controlled_records(records):
     return output
 
 
+def partition_raw_records(raw_records):
+    """Retain canonical priming records separately from profiling measurements."""
+    phases = {"warmup": [], "profiling": []}
+    seen = set()
+    for row in raw_records:
+        metadata = row["metadata"]
+        phase, request_id = metadata.get("benchmark_phase"), metadata.get("x_request_id")
+        if phase not in phases or not request_id or request_id in seen:
+            raise ValueError("proper raw records have an unknown phase or duplicate request identity")
+        seen.add(request_id)
+        phases[phase].append(row)
+    return phases
+
+
 def normalize_records(raw_records, *, user_config, tokenizer, model_path,
-                      default_chat_template_kwargs=None, consumed, expected_caps, admissions=()):
+                      default_chat_template_kwargs=None, consumed, expected_caps, admissions=(),
+                      benchmark_phase="profiling"):
     """Keep last packet, first visible content and transport completion separate."""
     from aiperf.common.models import ModelEndpointInfo, RawRecordInfo
     from aiperf.plugin import plugins
@@ -34,6 +49,8 @@ def normalize_records(raw_records, *, user_config, tokenizer, model_path,
     from atom.compass.prefix_workload import token_digest
     from atom.entrypoints.openai.chat_encoders import apply_chat_template, load_custom_message_encoder
 
+    if benchmark_phase not in ("profiling", "warmup"):
+        raise ValueError("unsupported proper record phase")
     endpoint_info = ModelEndpointInfo.from_user_config(user_config)
     endpoint = plugins.get_class(PluginType.ENDPOINT, endpoint_info.endpoint.type)(
         model_endpoint=endpoint_info)
@@ -48,8 +65,8 @@ def normalize_records(raw_records, *, user_config, tokenizer, model_path,
     for value in raw_records:
         raw = RawRecordInfo.model_validate(value)
         meta = raw.metadata
-        if str(meta.benchmark_phase) != "profiling":
-            raise ValueError("proper zero-warmup replay exported a non-profiling record")
+        if str(meta.benchmark_phase) != benchmark_phase:
+            raise ValueError("proper replay record belongs to a different benchmark phase")
         if raw.end_perf_ns is None:
             raise ValueError("raw export lacks its actual transport-completion timestamp")
         start, perf = meta.request_start_ns, raw.start_perf_ns
@@ -81,7 +98,9 @@ def normalize_records(raw_records, *, user_config, tokenizer, model_path,
                 or raw.payload.get("stop") or raw.payload.get("stop_token_ids")):
             raise ValueError("proper replay changed sampling or enabled content-dependent stopping")
         cap = raw.payload.get("max_completion_tokens", raw.payload.get("max_tokens"))
-        if cap != expected_caps.get((meta.conversation_id, meta.turn_index)):
+        source_cap = expected_caps.get((meta.conversation_id, meta.turn_index))
+        expected_cap = 1 if benchmark_phase == "warmup" and source_cap is not None else source_cap
+        if cap != expected_cap:
             raise ValueError("proper replay changed the source turn output cap")
         kwargs = dict(default_chat_template_kwargs or {})
         kwargs.update(raw.payload.get("chat_template_kwargs") or {})
@@ -107,12 +126,14 @@ def normalize_records(raw_records, *, user_config, tokenizer, model_path,
                 raise ValueError("marked rendered prompt differs from actual engine consumption")
             if usage.get("completion_tokens") != cap:
                 raise ValueError("successful native request did not produce its unchanged source cap")
-            if first is None or terminal is None or "completion_tokens" not in usage:
+            if ((benchmark_phase == "profiling" and first is None)
+                    or terminal is None or "completion_tokens" not in usage):
                 raise ValueError("successful raw record lacks visible content/terminal/usage evidence")
         marker = raw.cache_bust_marker
         if not marker:
             raise ValueError("proper replay record has no ordinary cache-bust marker")
         rows.append({
+            "benchmark_phase": benchmark_phase,
             "request_id": meta.x_request_id, "response_id": response_id,
             "engine_request_id": engine_request_id, "engine_seq_id": seq_id,
             "native_tokenized_observed": admission is not None,

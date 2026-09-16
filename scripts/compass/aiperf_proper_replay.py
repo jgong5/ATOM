@@ -73,19 +73,26 @@ def native_journal_path(plan, output):
     return Path(shared)
 
 
-def native_journal_segment(path, start, end, records, *, file_identity, cancelled_admissions=()):
-    """Attribute exactly this profile's append interval, without loading prior cases."""
+def native_journal_segment(path, start, end, records, *, file_identity, cancelled_admissions=(),
+                           warmup_records=()):
+    """Attribute priming and profiling separately within one append interval."""
     expected = {str(row["engine_seq_id"]) for row in records
                 if row.get("engine_seq_id") is not None}
     if any(row.get("aborted") is not True for row in cancelled_admissions):
         raise ValueError("unrecorded journal requests require native aborted admissions")
     expected.update(str(row["seq_id"]) for row in cancelled_admissions if row.get("seq_id") is not None)
+    warmup_ids = {str(row["engine_seq_id"]) for row in warmup_records
+                  if row.get("engine_seq_id") is not None}
+    warmup_completed = {str(row.get("engine_seq_id")) for row in warmup_records
+                        if not row.get("cancelled") and not row.get("error")}
     completed = {str(row["engine_seq_id"]) for row in records
                  if not row.get("cancelled") and not row.get("error")}
-    if (not expected or "None" in completed or type(start) is not int
-            or type(end) is not int or not 0 <= start < end):
+    if ("None" in completed or "None" in warmup_completed or expected & warmup_ids
+            or type(start) is not int or type(end) is not int or not 0 <= start <= end):
         raise ValueError("native journal segment lacks a valid request/byte interval")
     digest, observed, count = hashlib.sha256(), set(), 0
+    warmup_digest, warmup_observed, warmup_count = hashlib.sha256(), set(), 0
+    profile_start = None
     with Path(path).open("rb") as stream:
         stat = os.fstat(stream.fileno())
         if [stat.st_dev, stat.st_ino] != list(file_identity) or stat.st_size < end:
@@ -96,21 +103,40 @@ def native_journal_segment(path, start, end, records, *, file_identity, cancelle
                 raise ValueError("native journal start cuts through a row")
         stream.seek(start)
         while stream.tell() < end:
+            row_start = stream.tell()
             line = stream.readline(end - stream.tell())
             if not line.endswith(b"\n"):
                 raise ValueError("native journal end cuts through a row")
             row = json.loads(line)
             ids = {str(value) for value in row.get("req_ids") or []}
-            if not ids or not ids <= expected:
-                raise ValueError("native journal contains a request outside this profile")
-            digest.update(line)
-            observed.update(ids)
-            count += 1
+            if not ids or not ids <= expected | warmup_ids:
+                raise ValueError("native journal contains a request outside this run")
+            if ids <= warmup_ids:
+                if profile_start is not None:
+                    raise ValueError("native warmup steps occur after profiling steps")
+                warmup_digest.update(line)
+                warmup_observed.update(ids)
+                warmup_count += 1
+            elif ids <= expected:
+                if profile_start is None:
+                    profile_start = row_start
+                digest.update(line)
+                observed.update(ids)
+                count += 1
+            else:
+                raise ValueError("one native forward mixes warmup and profiling requests")
     if not completed <= observed:
         raise ValueError("completed native requests lack attributed journal steps")
-    return {"path": str(path), "profile_start_offset": start, "profile_end_offset": end,
+    if not warmup_completed <= warmup_observed:
+        raise ValueError("completed native warmup requests lack attributed journal steps")
+    if profile_start is None:
+        profile_start = end
+    return {"path": str(path), "profile_start_offset": profile_start, "profile_end_offset": end,
             "profile_region_sha256": digest.hexdigest(), "scheduled_steps": count,
-            "scheduled_request_ids": sorted(observed), "file_identity": list(file_identity)}
+            "scheduled_request_ids": sorted(observed), "file_identity": list(file_identity),
+            "warmup": {"start_offset": start, "end_offset": profile_start,
+                       "region_sha256": warmup_digest.hexdigest(), "scheduled_steps": warmup_count,
+                       "scheduled_request_ids": sorted(warmup_observed)}}
 
 
 def native_record_admissions(raw_records, admissions, phase, purpose):
@@ -236,7 +262,9 @@ def main(argv=None):
             load_profile, create_modelled_config, controlled_provenance,
             compare_native_metadata, verify_dependency,
         )
-        from atom.compass.replay.aiperf_records import export_controlled_records, normalize_records
+        from atom.compass.replay.aiperf_records import (
+            export_controlled_records, normalize_records, partition_raw_records,
+        )
         from atom.compass.replay.aiperf_runner import ChatServingOptions
         from atom.model_engine.llm_engine import _load_tokenizer
         from atom.compass.prefix_workload import tokenizer_identity
@@ -306,7 +334,6 @@ def main(argv=None):
             export_path = native_config.output.profile_export_raw_jsonl_file
             raw_records = [json.loads(line) for line in export_path.read_text().splitlines() if line]
             summary = json.loads(native_config.output.profile_export_json_file.read_text())
-            check_native_summary(summary, raw_records, phase_accounting(messages), plan["purpose"])
             closeout = {}
             flush, engine, after = native_helpers.collect_native_closeout(
                 args.url, replay, journal,
@@ -391,6 +418,13 @@ def main(argv=None):
             write(directory / "controlled_result.json", {"events": result.events,
                   "dispatches": result.dispatches, "serving": result.serving})
         phase = phase_accounting(messages)
+        all_raw_records = raw_records
+        by_phase = partition_raw_records(all_raw_records)
+        raw_records, warmup_raw_records = by_phase["profiling"], by_phase["warmup"]
+        write(directory / "raw_records.json", raw_records)
+        write(directory / "warmup_raw_records.json", warmup_raw_records)
+        if args.side == "real":
+            check_native_summary(summary, raw_records, phase, plan["purpose"])
         observed_dataset = [m["metadata"] for m in messages if m.get("message_type") == "dataset_configured_notification"]
         if len(observed_dataset) != 1:
             raise ValueError("actual AIPerf run lacks one dataset metadata observation")
@@ -398,23 +432,35 @@ def main(argv=None):
         record_admissions = admissions
         if args.side == "real":
             record_admissions, cancelled_admissions = native_record_admissions(
-                raw_records, admissions, phase, plan["purpose"])
+                all_raw_records, admissions, phase, plan["purpose"])
+        warmup_request_ids = {row["metadata"]["x_request_id"] for row in warmup_raw_records}
+        warmup_admissions = [row for row in record_admissions if row["client_request_id"] in warmup_request_ids]
+        record_admissions = [row for row in record_admissions if row["client_request_id"] not in warmup_request_ids]
         normalized = normalize_records(raw_records, user_config=config, tokenizer=tokenizer,
             model_path=plan["model"], default_chat_template_kwargs=options.default_chat_template_kwargs,
             consumed=consumed, expected_caps=caps, admissions=record_admissions)
         validate_records(normalized, phase)
+        warmup_normalized = normalize_records(warmup_raw_records, user_config=config, tokenizer=tokenizer,
+            model_path=plan["model"], default_chat_template_kwargs=options.default_chat_template_kwargs,
+            consumed=consumed, expected_caps=caps, admissions=warmup_admissions, benchmark_phase="warmup")
+        validate_records(warmup_normalized, phase["warmup"], benchmark_phase="warmup")
+        write(directory / "warmup_records.json", warmup_normalized)
         if args.side == "real" and plan.get("native_step_journal") is not None:
             journal_segment = native_journal_segment(journal, journal_start, journal_end,
-                normalized, file_identity=journal_identity, cancelled_admissions=cancelled_admissions)
+                normalized, file_identity=journal_identity, cancelled_admissions=cancelled_admissions,
+                warmup_records=warmup_normalized)
             journal_segment["preparation_start_offset"] = preparation["step_journal_start_offset"]
             journal_segment["preparation_end_offset"] = preparation["step_journal_end_offset"]
             write(directory / "native_journal.json", journal_segment)
-        write(directory / "raw_records.json", raw_records)
         artifact = {"schema": "compass.aiperf_proper_run/1", "side": args.side,
               "purpose": plan["purpose"], "repeat": args.repeat,
               "plan_sha256": args.plan_sha256, "profile": identity, "phase": phase,
               "records": normalized, "engine": engine, "server": provenance,
+              "records_phase": "profiling",
+              "initialization": {"kind": phase["warmup"]["kind"], "phase": phase["warmup"],
+                  "records": warmup_normalized, "native_admissions": warmup_admissions},
               "cache_before": before, "cache_after": after, "cache_boundary": cache_boundary,
+              "cache_before_scope": "before canonical AIPerf warmup",
               "preparation": preparation, "dataset_metadata_comparison": metadata_comparison,
               "source_notes": source_notes,
               "record_export": {"export_level": str(config.output.export_level),

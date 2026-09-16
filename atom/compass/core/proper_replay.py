@@ -74,8 +74,18 @@ def phase_accounting(messages, *, duration_seconds=900):
     warmup = ends["warmup"]["stats"]
     names = ("final_requests_sent", "final_requests_completed",
              "final_requests_cancelled", "final_request_errors")
-    if warmup.get("total_expected_requests") != 0 or any(warmup.get(k) != 0 for k in names):
-        raise ValueError("proper replay did not complete the derived empty warmup")
+    warmup_start = starts["warmup"]
+    declared = warmup_start["stats"].get("total_expected_requests")
+    warmup_counts = {key: warmup.get(key) for key in names}
+    if (type(declared) is not int or declared < 0
+            or warmup_start["config"].get("total_expected_requests", declared) != declared
+            or warmup.get("total_expected_requests") != declared
+            or any(type(value) is not int or value < 0 for value in warmup_counts.values())
+            or warmup_counts["final_requests_sent"] != declared
+            or warmup_counts["final_requests_completed"] != declared
+            or warmup_counts["final_requests_cancelled"] != 0
+            or warmup_counts["final_request_errors"] != 0 or warmup.get("was_cancelled")):
+        raise ValueError("proper replay did not complete its declared snapshot-priming warmup")
     start, end = starts["profiling"], ends["profiling"]["stats"]
     if start["config"]["expected_duration_sec"] != duration_seconds:
         raise ValueError("AIPerf profiling duration changed")
@@ -88,11 +98,20 @@ def phase_accounting(messages, *, duration_seconds=900):
         raise ValueError("AIPerf phase counts must be nonnegative integers")
     if counts["final_requests_sent"] != counts["final_requests_completed"] + counts["final_requests_cancelled"]:
         raise ValueError("AIPerf issued credits do not close as completed or cancelled")
+    warmup_origin, warmup_finish = warmup_start["stats"]["start_ns"], warmup["requests_end_ns"]
+    if (type(warmup_origin) is not int or type(warmup_finish) is not int
+            or not warmup_origin <= warmup_finish <= origin
+            or warmup["start_ns"] != warmup_origin):
+        raise ValueError("AIPerf warmup origin/completion is invalid")
     return {
         "origin_ns": origin, "completed_ns": finish,
         "requested_duration_seconds": duration_seconds,
         "observed_duration_seconds": (finish - origin) / 1e9,
-        "counts": counts, "warmup_counts": {key: warmup[key] for key in names},
+        "counts": counts, "warmup_counts": warmup_counts,
+        "warmup": {"origin_ns": warmup_origin, "completed_ns": warmup_finish,
+                   "observed_duration_seconds": (warmup_finish - warmup_origin) / 1e9,
+                   "declared_requests": declared, "counts": warmup_counts,
+                   "kind": "agentic_snapshot_priming" if declared else "empty"},
         "grace_period_timeout_triggered": end.get("grace_period_timeout_triggered", False),
         "branch_stats": ends["profiling"].get("branch_stats"),
         "count_basis": "actual phase counters; no historical request-count target",
@@ -104,9 +123,13 @@ def record_key(row):
     return (row["cache_bust_marker"], row["conversation_id"], row["turn_index"])
 
 
-def validate_records(rows, phase):
+def validate_records(rows, phase, *, benchmark_phase="profiling"):
+    if benchmark_phase not in ("profiling", "warmup"):
+        raise ValueError("unsupported proper record phase")
     ids, keys = set(), set()
     for row in rows:
+        if row.get("benchmark_phase", benchmark_phase) != benchmark_phase:
+            raise ValueError("normalized request belongs to a different benchmark phase")
         if row["request_id"] in ids:
             raise ValueError("duplicate actual request identity")
         ids.add(row["request_id"])
@@ -127,7 +150,8 @@ def validate_records(rows, phase):
             raise ValueError("request lacks marked payload and consumed-token identity")
         if type(row["output_tokens"]) is not int or row["output_tokens"] < 0:
             raise ValueError("request output-token count is invalid")
-        if not row.get("cancelled") and not row.get("error") and row["output_tokens"] and first is None:
+        if (benchmark_phase == "profiling" and not row.get("cancelled")
+                and not row.get("error") and row["output_tokens"] and first is None):
             raise ValueError("successful output has no visible first-token event")
     successful_or_error = sum(not r.get("cancelled") for r in rows)
     if successful_or_error != phase["counts"]["final_requests_completed"]:
