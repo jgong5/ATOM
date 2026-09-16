@@ -11,6 +11,7 @@ from atom.compass.core.loaded_input import load_json
 from atom.compass.runtime.templates import BindRefusal, block_sharing_pairs
 
 SCHEMA = "compass.native_ap_exact_forward_sources/1"
+VALIDATION_PREFIX = "validation.native_ap_regions.exact."
 POLICY = {"metric": "complete_forward_relative_error", "limit": .10,
           "source_only_components": True, "host_return_law_inferred": False}
 EVIDENCE = ("design", "acquisition_plan", "source", "freeze", "heldout", "verdict",
@@ -109,7 +110,8 @@ def _validate(data, loaded, scope, deployment_scope_sha256):
             or any(type(x) is not int for key in ("q", "history", "blocks") for x in geometry[key])
             or any(q <= 0 or h < 0 or b <= 0 or q + h > 16 * b
                    for q, h, b in zip(geometry["q"], geometry["history"], geometry["blocks"]))
-            or any(geometry["output_rows"])):
+            or any(geometry["output_rows"])
+            or scope.get("speculative_config_absent") is not True or scope.get("num_spec_step") != 0):
         raise ValueError("exact native A/P geometry differs or is outside the outputless policy")
     source_point = next(p for p in points if p["role"] == "source")
     heldout_point = next(p for p in points if p["role"] == "heldout")
@@ -183,6 +185,7 @@ def _validate(data, loaded, scope, deployment_scope_sha256):
         raise ValueError("exact native A/P qualification does not bind the explicit forward policy")
     return dict(geometry=geometry, components=components, prior_sampled_batch_rows=queue,
                 kv_sharing_pairs=pairs, policy=POLICY,
+                queue_invariance="prior sampler buffer is not read or drained by all-prefill P0 without speculation",
                 validation={"independent_relative_error": error,
                             "ordinary_relative_error": abs(predicted - ordinary_f) / ordinary_f})
 
@@ -199,8 +202,9 @@ def load_exact(base, handoff, identity, path, *, deployment_scope_sha256):
         data, loaded = {}, {}
         for role in EVIDENCE:
             reference = cell["evidence"][role]
-            data[role], loaded[role] = load_json(str(Path(path).parent / reference["path"]),
-                role=f"oracle.native_ap_regions.exact.{index}.{role}")
+            input_role = (f"{VALIDATION_PREFIX}{index}.ordinary_holdout" if role == "ordinary_holdout"
+                          else f"oracle.native_ap_regions.exact.{index}.{role}")
+            data[role], loaded[role] = load_json(str(Path(path).parent / reference["path"]), role=input_role)
             if loaded[role].sha256 != reference["sha256"]:
                 raise ValueError("exact native A/P evidence changed: " + role)
         result = _validate(data, loaded, base.scope, deployment_scope_sha256)
@@ -233,9 +237,14 @@ def exact_refusal(cell, shape, context, scope):
             or any(context.get(key) != value for key, value in scope.items())):
         return "exact native A/P deployment or compiled path differs"
     if (context.get("output_state_representation") != "predictive_deferred_batch"
-            or context.get("prior_sampled_batch_rows") != cell["prior_sampled_batch_rows"]
+            or type(context.get("prior_sampled_batch_rows")) is not int or context["prior_sampled_batch_rows"] < 0
             or context.get("prior_sampled_has_logprobs") is not False):
         return "exact native A/P deferred-output queue differs from its observed source"
+    # Native prepare_input_ids returns on prefill before reading prior sampled
+    # IDs; pure-middle forward returns before sampler/postprocess and drains no
+    # status queue. The native method poison test guards this source-backed
+    # invariance. The observed source count remains recorded, but is not work
+    # done by this all-prefill P0, non-speculative forward.
     if any(context.get(key) != (value,) * n for key, value in SAMPLING.items()):
         return "exact native A/P sampling path differs"
     if (list(context["allocation_blocks"]) != g["blocks"]

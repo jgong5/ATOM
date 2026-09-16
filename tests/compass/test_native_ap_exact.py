@@ -110,13 +110,22 @@ def test_real_frozen_source_and_both_forward_checks_load(observed_bundle):
 
 
 @pytest.mark.parametrize("change", [
-    {"prior_sampled_batch_rows": 0}, {"prior_sampled_batch_rows": 3},
+    {"prior_sampled_batch_rows": None}, {"prior_sampled_batch_rows": -1},
     {"prior_sampled_has_logprobs": True}, {"output_state_representation": "unknown"},
 ])
 def test_real_source_does_not_qualify_a_different_queue(observed_bundle, change):
     regions, allocation = load_bundle(observed_bundle)
     shape = offer(allocation, observed_descriptor(observed_bundle), change=change)
     assert "queue differs" in regions.refusal(shape)
+
+
+@pytest.mark.parametrize("prior_rows", [0, 1, 3])
+def test_outputless_source_does_not_consume_the_prior_sampler_buffer(observed_bundle, prior_rows):
+    regions, allocation = load_bundle(observed_bundle)
+    shape = offer(allocation, observed_descriptor(observed_bundle), change={"prior_sampled_batch_rows": prior_rows})
+    assert regions.seconds(shape) == 0.0010659179687504405
+    offer(allocation, observed_descriptor(observed_bundle), change={"prior_sampled_batch_rows": prior_rows, "num_spec_step": 1})
+    assert regions.refusal(shape) is not None
 
 
 @pytest.mark.parametrize("change", ["query", "blocks", "state_alias", "short_short_sharing", "nonprefix_sharing"])
@@ -193,3 +202,68 @@ def test_refusal_diagnostic_preserves_offered_queue(tmp_path, monkeypatch):
     evidence = json.loads(next(tmp_path.glob("*.json")).read_text())
     assert evidence["why"] == "unqualified geometry"
     assert evidence["native_region_context"] == context
+
+
+def test_actual_native_outputless_path_never_reads_or_drains_previous_output():
+    """Execute native methods with queue access forbidden, without GPU imports."""
+    import ast
+    import __future__
+    from types import MethodType, SimpleNamespace
+    import numpy as np
+    from atom.model_engine.scheduler import ScheduledBatchOutput, is_pure_middle_chunk
+
+    source = Path(__file__).parents[2] / "atom/model_engine/model_runner.py"
+    tree = ast.parse(source.read_text())
+
+    def method(class_name, name, namespace):
+        cls = next(node for node in tree.body if isinstance(node, ast.ClassDef) and node.name == class_name)
+        node = copy.deepcopy(next(node for node in cls.body if isinstance(node, ast.FunctionDef) and node.name == name))
+        node.decorator_list = []
+        exec(compile(ast.fix_missing_locations(ast.Module(body=[node], type_ignores=[])), str(source), "exec",
+                     flags=__future__.annotations.compiler_flag), namespace)
+        return namespace[name]
+
+    calls = []
+    namespace = dict(get_pp_group=lambda: SimpleNamespace(world_size=1, is_last_rank=True),
+        reset_forward_context=lambda: calls.append("reset_context"), ScheduledBatchOutput=ScheduledBatchOutput)
+    prepare_ids = method("tokenIDProcessor", "prepare_input_ids", namespace)
+    prepare_model = method("ModelRunner", "prepare_model", namespace)
+    forward = method("ModelRunner", "forward", namespace)
+
+    class Inputs:
+        def __init__(self):
+            self.np = np.zeros(8288, dtype=np.int64)
+            self.gpu = self.np
+
+        def copy_to_gpu(self, count):
+            calls.append(("input_copy", count))
+            return self.gpu[:count]
+
+    class Processor:
+        def __init__(self, prior_rows):
+            self.input_ids = Inputs()
+            self.prior_rows = prior_rows
+            self.prepare_input_ids = MethodType(prepare_ids, self)
+
+        def __getattr__(self, name):
+            raise AssertionError(f"outputless prefill accessed prior-output state: {name}")
+
+    tokens = np.arange(8288)
+    batch = SimpleNamespace(scheduled_tokens=tokens, total_tokens_num=8288,
+        total_tokens_num_prefill=8288, total_tokens_num_decode=0, total_seqs_num_prefill=3,
+        total_seqs_num=3, req_ids=[10, 11, 12], is_dummy_run=False, produces_output=lambda: False)
+    for prior_rows in (0, 1):
+        calls.clear()
+        runner = SimpleNamespace(tokenID_processor=Processor(prior_rows),
+            _advance_forward_vars=lambda: None, _gate_staging_reuse=lambda: None,
+            _dspark_apply_q_bucket=lambda b: None, _dspark_local_shape=lambda b: None,
+            prepare_sample=lambda b: (None, None, None, False, None), prepare_inputs=lambda *a, **k: None,
+            _mark_staging_h2d_enqueued=lambda: None, run_model=lambda ids, b: (None, None),
+            _dp_draft_lockstep_active=lambda: False, _is_pure_middle_chunk=is_pure_middle_chunk,
+            _record_forward_vars_event=lambda: calls.append("forward_end"),
+            postprocess=lambda *a, **k: pytest.fail("outputless forward reached sampler/postprocess"))
+        runner.prepare_model = MethodType(prepare_model, runner)
+        result = forward(runner, batch)
+        assert result.req_ids == batch.req_ids and result.token_ids == []
+        assert calls == [("input_copy", 8288), "reset_context", "forward_end"]
+        assert np.array_equal(runner.tokenID_processor.input_ids.np, tokens)

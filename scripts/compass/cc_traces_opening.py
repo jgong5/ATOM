@@ -568,6 +568,8 @@ def check_source_contract(modelled, registry, workload_sha, forbidden, label, *,
         if bool(options.get("native_ap_handoff")) != bool(options.get("native_ap_handoff_sha256")):
             raise ValueError("native A/P handoff and its SHA-256 are required together")
         family_role = "oracle.native_ap_regions"
+        from atom.compass.core.cost.native_ap_exact import VALIDATION_PREFIX
+
         if options.get("native_ap_handoff"):
             from atom.compass.core.cost.native_ap_regions import NativeAPFamilyRegions
 
@@ -579,13 +581,19 @@ def check_source_contract(modelled, registry, workload_sha, forbidden, label, *,
             if not selected.source_qualified:
                 raise ValueError("native A/P source is a review candidate; family qualification is required")
             observed = [row for row in inputs if row.get("role") == family_role
-                        or str(row.get("role", "")).startswith(family_role + ".")]
+                        or str(row.get("role", "")).startswith(family_role + ".")
+                        or str(row.get("role", "")).startswith(VALIDATION_PREFIX)]
             if len(observed) != len(selected.loaded_inputs):
                 raise ValueError("native A/P source input inventory differs")
             by_digest = {}
             for item in selected.loaded_inputs:
                 if sum(row == item.as_dict() for row in observed) != 1:
                     raise ValueError(f"native A/P input {item.path} lacks its exact loaded identity")
+                # Only the exact loader assigns this code-defined role, after
+                # recomputing the heldout check and source-only A/P medians.
+                # Keep it in the full manifest; it is not a fitting input.
+                if item.role.startswith(VALIDATION_PREFIX):
+                    continue
                 by_digest.setdefault(item.sha256, []).append(item)
             for sha, items in by_digest.items():
                 role = family_role + "." + sha[:16]
@@ -594,7 +602,8 @@ def check_source_contract(modelled, registry, workload_sha, forbidden, label, *,
                 bad.extend(validate._check_calibration_records(
                     {role: digest}, {role: contents},
                     registry, 1, workload_sha, forbidden))
-            files = file_digests(selected.loaded_inputs)
+            files = file_digests(item for item in selected.loaded_inputs
+                                if not item.role.startswith(VALIDATION_PREFIX))
             digest = validate._rolled_digest(files)
             if ((compass.get("oracle_option_files") or {}).get("native_ap_handoff") != files
                     or (compass.get("oracle_option_sha256") or {}).get("native_ap_handoff") != digest):
@@ -603,7 +612,8 @@ def check_source_contract(modelled, registry, workload_sha, forbidden, label, *,
                 {"native_ap_handoff": digest}, {"native_ap_handoff": files}, registry, 1, workload_sha, forbidden))
             selected_name = "native-ap-families"
         elif any(row.get("role") == family_role
-                 or str(row.get("role", "")).startswith(family_role + ".") for row in inputs):
+                 or str(row.get("role", "")).startswith(family_role + ".")
+                 or str(row.get("role", "")).startswith(VALIDATION_PREFIX) for row in inputs):
             raise ValueError("unconfigured native A/P source evidence was loaded")
         snapshot = region_snapshot(selected_name, selected)
         if ranks[0].get("regions") != snapshot:
