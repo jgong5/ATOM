@@ -658,6 +658,18 @@ FAMILY_CONTRACTS["aten::slice.Tensor"] = FamilyContract(
                "allocated is a copy and is refused"),
 )
 
+# These operators also perform only metadata work when their outputs alias
+# the inputs. Reshape can copy, so the same per-output alias proof is required;
+# its name alone never licenses a zero device cost.
+for _view_family in ("aten::view", "aten::reshape", "aten::detach",
+                     "aten::split_with_sizes"):
+    FAMILY_CONTRACTS[_view_family] = FamilyContract(
+        family=_view_family,
+        kind="view",
+        rationale=("zero device work only when every recorded output aliases "
+                   "an operand; copied or unknown outputs require a measurement"),
+    )
+
 FAMILY_CONTRACTS["aiter::unified_attention_with_output_base"] = FamilyContract(
     family="aiter::unified_attention_with_output_base",
     kind="ragged",

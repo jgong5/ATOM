@@ -1197,6 +1197,14 @@ class ParametricPriceLibrary(PriceLibrary):
 
     def lookup(self, op: dict, topology=None, registration=None, *,
                _modelled_memo=None):
+        contract = contract_for(op.get("name", ""))
+        if contract is not None and contract.kind == "view":
+            structural = self._view_price(op, _OPEN_QUESTION, contract)
+            if structural[0] is not None:
+                # Alias evidence proves no device work, independently of an
+                # older measurement's operand layout. A copying reshape still
+                # proceeds to exact lookup and must have its own measurement.
+                return structural
         exact = self._attention_exact.lookup(self, op, topology)
         if exact is not None:
             return exact

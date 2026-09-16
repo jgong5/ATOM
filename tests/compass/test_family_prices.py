@@ -1300,3 +1300,45 @@ def test_exact_only_books_keep_layout_checks_without_training_a_curve(tmp_path):
     strided["layouts"] = [[0, [[17409, 1], 0, 32 * 17409, 0]]]
     wrong_layout, _ = library.lookup(strided)
     assert wrong_layout is None
+
+
+@pytest.mark.parametrize("family", ["aten::view", "aten::reshape", "aten::detach",
+                                    "aten::split_with_sizes"])
+def test_alias_proof_covers_strided_metadata_without_dense_price_reuse(tmp_path, family):
+    from atom.compass.runtime.microbench import signature_of
+
+    dense = {"name": family, "input_shapes": [[4, 8]],
+             "output_shapes": [[4, 4], [4, 4]], "dtypes": ["float32"],
+             "output_aliases": [0, 0], "layouts": []}
+    graph_path, price_path = tmp_path / "graph.json", tmp_path / "prices.json"
+    graph_path.write_text(json.dumps({"ops": [dense]}))
+    price_path.write_text(json.dumps({"prices": {signature_of(dense): {
+        "name": family, "seconds": 1e-6, "kernels": {}}}}))
+    library = ParametricPriceLibrary(max_gap_ratio=2.0)
+    library.add(str(price_path), str(graph_path))
+    strided = dict(dense, layouts=[[0, [[16, 1], 8, 64, 0]]])
+
+    record, source = library.lookup(strided)
+    assert record["zero_work"] is True
+    assert record["seconds"] == 0.0
+    assert source == f"structural://{family}/alias"
+    for aliases in ([], [0, None]):
+        record, _ = library.lookup(dict(strided, output_aliases=aliases))
+        assert record is None
+
+
+def test_copying_reshape_can_still_use_its_exact_measurement(tmp_path):
+    from atom.compass.runtime.microbench import signature_of
+
+    op = {"name": "aten::reshape", "input_shapes": [[4, 8]],
+          "output_shapes": [[32]], "dtypes": ["float32"],
+          "output_aliases": [None], "layouts": [[0, [[1, 4], 0, 32, 0]]]}
+    graph_path, price_path = tmp_path / "graph.json", tmp_path / "prices.json"
+    graph_path.write_text(json.dumps({"ops": [op]}))
+    price_path.write_text(json.dumps({"prices": {signature_of(op): {
+        "name": op["name"], "seconds": 2e-6, "kernels": {"copy": 2e-6}}}}))
+    library = ParametricPriceLibrary(max_gap_ratio=2.0)
+    library.add(str(price_path), str(graph_path))
+    record, _ = library.lookup(op)
+    assert record["seconds"] == 2e-6
+    assert not record.get("zero_work")
