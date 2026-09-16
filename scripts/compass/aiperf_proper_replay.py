@@ -61,6 +61,54 @@ def export_phase_messages(messages):
     return exported
 
 
+def native_journal_path(plan, output):
+    """Diagnostic sweeps may share one server journal; ordinary runs keep their path."""
+    shared = plan.get("native_step_journal")
+    if shared is None:
+        return output.parent / (output.stem + "_steps.jsonl")
+    if (plan.get("purpose") != "diagnostic" or not isinstance(shared, str)
+            or not shared or not Path(shared).is_absolute()):
+        raise ValueError("shared native journal requires an absolute diagnostic plan path")
+    return Path(shared)
+
+
+def native_journal_segment(path, start, end, records, *, file_identity):
+    """Attribute exactly this profile's append interval, without loading prior cases."""
+    expected = {str(row["engine_seq_id"]) for row in records
+                if row.get("engine_seq_id") is not None}
+    completed = {str(row["engine_seq_id"]) for row in records
+                 if not row.get("cancelled") and not row.get("error")}
+    if (not expected or "None" in completed or type(start) is not int
+            or type(end) is not int or not 0 <= start < end):
+        raise ValueError("native journal segment lacks a valid request/byte interval")
+    digest, observed, count = hashlib.sha256(), set(), 0
+    with Path(path).open("rb") as stream:
+        stat = os.fstat(stream.fileno())
+        if [stat.st_dev, stat.st_ino] != list(file_identity) or stat.st_size < end:
+            raise ValueError("native journal was replaced or truncated during the profile")
+        if start:
+            stream.seek(start - 1)
+            if stream.read(1) != b"\n":
+                raise ValueError("native journal start cuts through a row")
+        stream.seek(start)
+        while stream.tell() < end:
+            line = stream.readline(end - stream.tell())
+            if not line.endswith(b"\n"):
+                raise ValueError("native journal end cuts through a row")
+            row = json.loads(line)
+            ids = {str(value) for value in row.get("req_ids") or []}
+            if not ids or not ids <= expected:
+                raise ValueError("native journal contains a request outside this profile")
+            digest.update(line)
+            observed.update(ids)
+            count += 1
+    if not completed <= observed:
+        raise ValueError("completed native requests lack attributed journal steps")
+    return {"path": str(path), "profile_start_offset": start, "profile_end_offset": end,
+            "profile_region_sha256": digest.hexdigest(), "scheduled_steps": count,
+            "scheduled_request_ids": sorted(observed), "file_identity": list(file_identity)}
+
+
 from atom.compass.replay.native_preparation import (
     check_runtime as _check_runtime, native_provenance, prepare_native,
 )
@@ -171,6 +219,7 @@ def main(argv=None):
         admissions = ()
         source_notes = []
         cache_boundary = None
+        journal_segment = None
         if args.side == "real":
             from aiperf.common.config import ServiceConfig
             from aiperf.common.enums import ExportLevel
@@ -182,8 +231,9 @@ def main(argv=None):
             provenance = native_provenance(args.url)
             check_runtime(plan, provenance, "real")
             native_scope = native_helpers.check_native_scope(scope_plan, provenance)
+            journal = native_journal_path(plan, output)
             preparation = prepare_native(args.url, config, conversations, replay, directory,
-                step_journal=output.parent / (output.stem + "_steps.jsonl"),
+                step_journal=journal,
                 native_scope=native_scope["native"], model=plan["model"])
             cache_boundary = preparation["cache_boundary"]
             before = replay._prefix_cache_snapshot(args.url, 120)
@@ -192,6 +242,10 @@ def main(argv=None):
             if (empty.get("requests") or empty.get("admissions")
                     or empty.get("active_streams") != 0 or empty.get("active_api_requests") != 0):
                 raise ValueError("native preparation admission/stream teardown is incomplete")
+            if plan.get("native_step_journal") is not None:
+                journal_stat = journal.stat()
+                journal_start = journal_stat.st_size
+                journal_identity = [journal_stat.st_dev, journal_stat.st_ino]
             endpoint = config.endpoint.model_copy(update={"urls": [args.url]})
             export = config.output.model_copy(update={"artifact_directory": directory / "aiperf",
                                                       "export_level": ExportLevel.RAW,
@@ -212,8 +266,10 @@ def main(argv=None):
                 raise ValueError("ordinary native AIPerf reported cancellation or errors")
             closeout = {}
             flush, engine, after = native_helpers.collect_native_closeout(
-                args.url, replay, output.parent / (output.stem + "_steps.jsonl"),
+                args.url, replay, journal,
                 evidence=closeout, reserve_seconds=120)
+            if plan.get("native_step_journal") is not None:
+                journal_end = journal.stat().st_size
             write(directory / "native_closeout.json", closeout)
             admissions = engine["admissions"]
             provenance = native_provenance(args.url)
@@ -300,6 +356,12 @@ def main(argv=None):
             model_path=plan["model"], default_chat_template_kwargs=options.default_chat_template_kwargs,
             consumed=consumed, expected_caps=caps, admissions=admissions)
         validate_records(normalized, phase)
+        if args.side == "real" and plan.get("native_step_journal") is not None:
+            journal_segment = native_journal_segment(journal, journal_start, journal_end,
+                normalized, file_identity=journal_identity)
+            journal_segment["preparation_start_offset"] = preparation["step_journal_start_offset"]
+            journal_segment["preparation_end_offset"] = preparation["step_journal_end_offset"]
+            write(directory / "native_journal.json", journal_segment)
         write(directory / "raw_records.json", raw_records)
         artifact = {"schema": "compass.aiperf_proper_run/1", "side": args.side,
               "purpose": plan["purpose"], "repeat": args.repeat,
@@ -316,6 +378,8 @@ def main(argv=None):
                   "frontend_cpu": "unmodelled" if args.side == "modelled" else "actual",
                   "validity_decided_by_workload_invariants_and_e2e_errors": True},
               "complete": True, "accepted": False}
+        if journal_segment is not None:
+            artifact["native_journal"] = journal_segment
         complete = [row for row in normalized if not row["cancelled"] and not row["error"]]
         artifact["run"] = {
             "server": provenance, "complete": True, "requests": len(complete),
