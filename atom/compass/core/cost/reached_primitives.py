@@ -52,7 +52,7 @@ def work_identity(operator):
 
 
 class ReachedPrimitivePrices(PriceLibrary):
-    """One or two disjoint, independently validated whole-group source exports."""
+    """Disjoint, independently validated whole-group source exports."""
 
     def __init__(self, base, handoffs, *, deployment_scope_sha256):
         super().__init__()
@@ -60,8 +60,8 @@ class ReachedPrimitivePrices(PriceLibrary):
 
         if isinstance(handoffs, str):
             handoffs = json.loads(handoffs)
-        if not isinstance(handoffs, list) or not 1 <= len(handoffs) <= 2:
-            raise ValueError("reached primitive sources require one or two explicit handoff pins")
+        if not isinstance(handoffs, list) or not handoffs:
+            raise ValueError("reached primitive sources require a nonempty list of explicit handoff pins")
         if getattr(base, "launch_charge_seconds", 0) != 0:
             raise ValueError("reached primitive sources do not qualify an extra launch charge")
         self.base = base

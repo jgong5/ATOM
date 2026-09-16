@@ -271,6 +271,55 @@ def _boundaries(reader, handoff, evidence):
             raise ValueError("reached subset relabels its original reference phase or whole campaign")
 
 
+def _validation_runtime(reader, handoff, data, reference_runtime, runtime):
+    """An explicit successor can validate immutable historical prices on a new GPU."""
+    pins, plan, frozen = handoff["evidence"], data["plan"], data["freeze"]
+    contract_pin = plan.get("continuation", {}).get("cross_device_validation")
+    exported_pin = handoff.get("cross_device_validation")
+    if contract_pin is None:
+        if exported_pin is not None or reference_runtime != runtime:
+            raise ValueError("reached primitive reference/heldout campaigns change physical UUID or runtime")
+        return {"mode": "same_device"}
+    if not same_pin(contract_pin, exported_pin) or not same_pin(contract_pin, frozen.get("cross_device_validation")):
+        raise ValueError("reached primitive cross-device validation contract is not exported")
+    contract = reader.read(contract_pin, "cross_device.contract")
+    if (contract.get("schema") != "compass.historical_reference_validation/1"
+            or contract.get("mode") != "historical_references_on_new_device"
+            or not same_pin(contract.get("original_reference_plan"), pins["reference_plan"])
+            or contract.get("reference_timing_calls") != 0
+            or contract.get("source_values_changed") is not False
+            or contract.get("device_correction_fitted") is not False
+            or contract.get("reference_runtime_identity") != reference_runtime
+            or contract.get("validation_runtime_identity") != runtime
+            or reference_runtime["physical_uuid"] == runtime["physical_uuid"]
+            or {k: v for k, v in reference_runtime.items() if k != "physical_uuid"}
+               != {k: v for k, v in runtime.items() if k != "physical_uuid"}
+            or not same_pin(plan.get("gpu_identity"), contract.get("validation_gpu_identity"))):
+        raise ValueError("reached primitive cross-device validation changes undeclared runtime or source facts")
+    reader.read(contract["validation_gpu_identity"], "cross_device.gpu_identity")
+    reader.read(contract["assessment"], "cross_device.assessment")
+    identity_evidence = reader.read(contract["validation_runtime_evidence"], "cross_device.runtime_identity")
+    if identity_evidence.get("runtime_identity") != runtime:
+        raise ValueError("reached primitive validation UUID differs from its pinned physical runtime evidence")
+    previous_plan = reader.read(contract["original_prepared_plan"], "cross_device.original_prepared_plan")
+    previous_freeze = reader.read(contract["original_prepared_freeze"], "cross_device.original_prepared_freeze")
+    if (not same_pin(previous_freeze.get("plan"), contract["original_prepared_plan"])
+            or not same_pin(previous_freeze.get("original_plan"), pins["reference_plan"])
+            or any(previous_freeze.get(key) != frozen.get(key) for key in
+                   ("reference_points", "predictions", "reference_evidence", "reuse", "original_failure"))
+            or any(previous_plan.get(key) != plan.get(key) for key in
+                   ("cases", "heldout_order_by_repeat", "reference_order_by_repeat", "heldout_order_sha256"))
+            or previous_plan["continuation"]["seed_ordinals"] != plan["continuation"]["seed_ordinals"]
+            or any(previous_plan["dispatch"][key] != plan["dispatch"][key] for key in ("probes", "case_to_probe"))
+            or contract.get("dispatch_calls") != len(plan["dispatch"]["probes"])
+            or contract.get("heldout_timing_calls") != sum(len(order) for order in plan["heldout_order_by_repeat"])
+            or same_pin(data["reference_phase"]["dispatch"], pins["dispatch"])):
+        raise ValueError("reached primitive cross-device validation refits or changes the historical frozen campaign")
+    return dict(mode=contract["mode"], contract=contract_pin,
+        historical_reference_physical_uuid=reference_runtime["physical_uuid"],
+        validation_physical_uuid=runtime["physical_uuid"])
+
+
 def load_campaign(reference, deployment_scope_sha256, *, index):
     from atom.compass.core.cost.reached_primitives import INVALID_ALIAS, work_identity
 
@@ -334,8 +383,9 @@ def load_campaign(reference, deployment_scope_sha256, *, index):
         reference_dispatch, data["reference_phase"]["dispatch"])
     heldout, _, current_dispatch, runtime = _phase(reader, "heldout", plan, pins["plan"],
         pins["heldout_phase"], pins["heldout_preflight"])
-    if runtime != reference_runtime or not same_pin(data["heldout_phase"]["dispatch"], pins["dispatch"]):
-        raise ValueError("reached primitive reference/heldout campaigns change physical UUID or runtime")
+    validation = _validation_runtime(reader, handoff, data, reference_runtime, runtime)
+    if not same_pin(data["heldout_phase"]["dispatch"], pins["dispatch"]):
+        raise ValueError("reached primitive heldout phase changes its current dispatch")
     if data["dispatch"] != current_dispatch:
         raise ValueError("reached primitive active dispatch evidence differs")
     references = {case["cell_id"]: case for case in plan["cases"] if case["phase"] == "reference"}
@@ -483,6 +533,7 @@ def load_campaign(reference, deployment_scope_sha256, *, index):
         selected_groups=selected, loaded_inputs=tuple(reader.inputs), sources=sources,
         provenance=dict(handoff=reference, plan=pins["plan"], reference_plan=pins["reference_plan"],
             physical_uuid=runtime["physical_uuid"], selected_groups=selected,
+            validation=validation, historical_reference_physical_uuid=reference_runtime["physical_uuid"],
             original_failure=pins["original_failure"], terminal=pins["terminal"],
             terminal_exit_code=data["terminal"].get("exit_code"), whole_campaign_requalified=False,
             retained_origins={name: point.get("origin") for name, point in retained.items()}))

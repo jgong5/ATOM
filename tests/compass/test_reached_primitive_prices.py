@@ -1,5 +1,6 @@
 """Whole-group primitive evidence composes without refitting heldout observations."""
 from collections import OrderedDict
+from copy import deepcopy
 import hashlib
 import json
 from types import SimpleNamespace
@@ -84,7 +85,8 @@ def make_campaign(store, domain, label="gpu3", groups=("gemm", "gdn", "mha", "ga
     plan_data = dict(schema="compass.reached_primitive_executable/2", design=manifest, cases=cases,
         code={"collector": collector}, engine_args=dict(model="Qwen/Qwen3.8-27B", tensor_parallel_size=1,
             pipeline_parallel_size=1, kv_cache_dtype="bf16"), backend_flags=flags, cache_policy=policy,
-        dispatch={"case_to_probe": {case["cell_id"]: case["cell_id"] for case in cases}},
+        dispatch={"case_to_probe": {case["cell_id"]: case["cell_id"] for case in cases},
+                  "probes": [{"cell_id": case["cell_id"]} for case in cases]},
         heldout_order_sha256=hashlib.sha256(json.dumps(orders["heldout_order_by_repeat"], sort_keys=True).encode()).hexdigest(),
         **orders)
     plan = add("PLAN.json", plan_data)
@@ -239,6 +241,16 @@ def test_two_disjoint_campaigns_keep_their_own_physical_uuid(tmp_path):
         ReachedPrimitivePrices(PriceLibrary(), [first, first], deployment_scope_sha256=SCOPE)
 
 
+def test_independent_partial_exports_have_no_fixed_campaign_count(tmp_path):
+    store = Artifacts(tmp_path)
+    domain = make_domain(store)
+    pins = [make_campaign(store, domain, label=group, groups=(group,)) for group in ("gemm", "gdn", "mha")]
+    library = ReachedPrimitivePrices(PriceLibrary(), pins, deployment_scope_sha256=SCOPE)
+    assert library.selected_groups == ("gdn", "gemm", "mha")
+    with pytest.raises(ValueError, match="nonempty"):
+        ReachedPrimitivePrices(PriceLibrary(), [], deployment_scope_sha256=SCOPE)
+
+
 def test_body_and_prepared_lookup_preserve_unrelated_legacy_prices(campaign, tmp_path):
     _, domain, pin = campaign
     ordinary = {"name": "ordinary", "input_shapes": [], "dtypes": [], "scalars": []}
@@ -362,7 +374,8 @@ def test_independent_failed_control_disqualifies_its_whole_group(campaign, damag
         load(pin)
 
 
-def test_continuation_reuses_original_reference_phase_and_original_seeds(tmp_path):
+@pytest.mark.parametrize("mode", ["same_device", "cross_device", "unexported", "software", "refit", "dispatch_count"])
+def test_continuation_reuses_original_reference_phase_and_original_seeds(tmp_path, mode):
     store = Artifacts(tmp_path)
     domain = make_domain(store)
     parent = make_campaign(store, domain)
@@ -395,12 +408,54 @@ def test_continuation_reuses_original_reference_phase_and_original_seeds(tmp_pat
     store.seal()
     data["subset/EXIT.json"]["plan_sha256"] = store.pins["subset/EXECUTION.json"]["sha256"]
     store.seal()
+    if mode != "same_device":
+        previous_plan = store.add("previous/PLAN.json", deepcopy(plan))
+        previous_freeze = store.add("previous/FREEZE.json", dict(deepcopy(freeze), plan=previous_plan))
+        validation_runtime = dict(runtime, physical_uuid="factual-gpu2")
+        physical = store.add("gpu2/IDENTITY.json", {"gpu_index": 2})
+        prior_process = store.add("gpu2/PRIOR_PROCESS.json", {"runtime_identity": dict(validation_runtime)})
+        assessment = store.add("gpu2/ASSESSMENT.json", {"assessment_only": True})
+        contract = dict(schema="compass.historical_reference_validation/1", mode="historical_references_on_new_device",
+            original_reference_plan=parent_evidence["plan"], original_prepared_plan=previous_plan,
+            original_prepared_freeze=previous_freeze, validation_gpu_identity=physical,
+            validation_runtime_evidence=prior_process, assessment=assessment,
+            reference_runtime_identity=runtime, validation_runtime_identity=validation_runtime,
+            reference_timing_calls=0, source_values_changed=False, device_correction_fitted=False,
+            dispatch_calls=len(plan["dispatch"]["probes"]),
+            heldout_timing_calls=sum(len(order) for order in plan["heldout_order_by_repeat"]))
+        contract_pin = store.add("gpu2/CONTRACT.json", contract)
+        plan["continuation"]["cross_device_validation"] = contract_pin
+        plan["gpu_identity"] = physical
+        freeze["cross_device_validation"] = contract_pin
+        handoff["cross_device_validation"] = contract_pin
+        data["subset/DISPATCH.json"]["runtime_identity"] = validation_runtime
+        data["subset/heldout/PREFLIGHT.json"]["runtime_identity"] = validation_runtime
+        if mode == "unexported":
+            del handoff["cross_device_validation"]
+        elif mode == "software":
+            validation_runtime["torch_version"] = "different-build"
+        elif mode == "refit":
+            data["previous/FREEZE.json"]["predictions"]["gdn_layer1"]["seconds"] = 1.01
+        elif mode == "dispatch_count":
+            contract["dispatch_calls"] += 1
+        store.seal()
+        store.seal()  # Forward pins to the immutable historical snapshots are now resolved.
+        data["subset/EXIT.json"]["plan_sha256"] = store.pins["subset/EXECUTION.json"]["sha256"]
+        store.seal()
+        if mode not in ("same_device", "cross_device"):
+            with pytest.raises(ValueError, match="cross-device"):
+                load(pin)
+            return
     library = load(pin)
     assert library.selected_groups == ("gdn", "mha")
     assert library.campaigns[0]["reference_plan"] == parent_evidence["plan"]
     assert library.campaigns[0]["handoff"] != parent
     assert library.lookup(gdn())[0]["seconds"] == 1.
     assert library.lookup(domain.ops["gemm_control"])[0] is None
+    if mode == "cross_device":
+        assert library.campaigns[0]["historical_reference_physical_uuid"] == "factual-gpu3"
+        assert library.campaigns[0]["validation"]["validation_physical_uuid"] == "factual-gpu2"
+        assert library.lookup(gdn())[0]["validation_campaign_physical_uuid"] == "factual-gpu2"
 
 
 @pytest.mark.parametrize("damage", [None, "missing_read", "unregistered", "aggregate", "unconfigured", "changed_scope"])
