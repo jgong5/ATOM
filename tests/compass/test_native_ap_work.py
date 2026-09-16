@@ -2,6 +2,7 @@
 import copy
 import json
 import os
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -101,6 +102,23 @@ def test_sampling_feature_is_native_tensor_shape_not_output_mask():
     del row["forward_context_after_return"]
     with pytest.raises(ValueError, match="tensor"):
         observation_vectors(row)
+
+
+def test_empty_prior_uses_separate_P_source_without_refitting_A(candidate):
+    regions, allocation = candidate
+    initial = dict(conditions={str(n): dict(postprocess_seconds=.00012 + n * .000001) for n in (1, 2, 3)})
+    added = replace(regions, allocation=allocation, initial_postprocess=initial)
+    d = fresh_descriptor([15, 8192, 7504], [195984, 8192, 688], [12250, 2191, 2191], True)
+    shape = offer(allocation, d, change={"prior_sampled_batch_rows": 0})
+    assert "sampler/queue bounds" in regions.refusal(shape)
+    assert added.breakdown(shape)["<postprocess>"] == pytest.approx(.000123)
+    assert added.model is regions.model
+    from atom.compass.core.cost.composition_qualification import offer_observation
+
+    decode = fresh_descriptor([1], [33], [3], True)
+    decode.update(prefill_rows=0, capture_bucket=1)
+    shape = offer_observation(allocation, dict(descriptor=decode))
+    assert added.breakdown(shape) == regions.breakdown(shape)
 
 
 def test_signed_negative_prepare_is_retained_and_short_cohort_refuses():

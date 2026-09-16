@@ -44,9 +44,11 @@ def bundle(candidate, tmp_path):
     write("source", dict(rows=sources))
     write("model", {})
     write("scope", {})
+    write("acquisition_plan", {})
     inputs = [load_json(pins[name]["path"], role=role)[1] for name, role in (
         ("source", "oracle.native_ap_regions.work.source"),
-        ("model", "oracle.native_ap_regions.work.model"), ("scope", "oracle.attention_scope"))]
+        ("model", "oracle.native_ap_regions.work.model"), ("scope", "oracle.attention_scope"),
+        ("acquisition_plan", "oracle.native_ap_regions.work.acquisition_plan"))]
     predictions = []
     for original in (row, decode):
         terms = observed_components(regions, original)
@@ -61,7 +63,7 @@ def bundle(candidate, tmp_path):
 
     oracle = SimpleNamespace(compass_loaded_inputs=inputs, seconds_per_launch=0,
         native_allocation=regions._allocation, require_complete=True,
-        last_coverage=SimpleNamespace(complete=True), estimate=estimate)
+        last_coverage=SimpleNamespace(complete=True), estimate=estimate, regions=regions)
     identity = predictor_identity(oracle, options, pins["predictions"])
     write("identity", identity)
     write("freeze", dict(frozen_before_heldout_warmups=True, source_refitted=False,
@@ -75,13 +77,19 @@ def bundle(candidate, tmp_path):
         heldout["descriptor"]["req_ids"] = [100 + len(heldouts)]
         heldouts.append(heldout)
     write("heldout", dict(rows=heldouts))
-    write("complete", dict(success=True, engine_closed=True))
-    write("closeout", dict(exit_code=0, cleanup=dict(verified=True, writers_released=True),
+    start = dict(execution_plan_sha256="e" * 64, plan_sha256=pins["acquisition_plan"]["sha256"],
+                 ownership_token_sha256="a" * 64, pid=77, started_at=1000.)
+    write("source_run", start)
+    write("heldout_run", start)
+    write("complete", dict(success=True, engine_closed=True, plan_sha256=start["plan_sha256"]))
+    write("closeout", dict(exit_code=0, plan_sha256=start["execution_plan_sha256"], cleanup=dict(verified=True, writers_released=True),
         collection=dict(copy_complete=True), terminal=dict(unprofiled_control={
+            "RUNNER_START.json": dict(sha256=pins["heldout_run"]["sha256"]),
             "native/NATIVE_COMPLETE.json": dict(sha256=pins["complete"]["sha256"])})))
     receipt = dict(schema=SCHEMA, passed=True, relative_limit=.10, source_refitted=False,
         predictor_identity=pins["identity"], predictor_freeze=pins["freeze"], heldout=pins["heldout"],
-        native_complete=pins["complete"], copy_closeout=pins["closeout"])
+        native_complete=pins["complete"], copy_closeout=pins["closeout"], source_closeout=pins["closeout"],
+        source_run=pins["source_run"], heldout_run=pins["heldout_run"])
     write("receipt", receipt)
     return dict(regions=regions, inputs=inputs, options=options, oracle=oracle, pins=pins, write=write,
                 receipt=receipt, identity=identity, heldouts=heldouts)
@@ -173,3 +181,18 @@ def test_prediction_export_cannot_omit_decode_forwards(bundle):
     bundle["write"]("receipt", bundle["receipt"])
     with pytest.raises(ValueError, match="omit or repeat native chain steps"):
         qualify(bundle)
+
+
+def test_fresh_worker_numeric_ids_are_namespaced(bundle):
+    for index, row in enumerate(bundle["heldouts"], 1):
+        row["descriptor"]["req_ids"] = [index]
+    bundle["receipt"]["heldout"] = bundle["write"]("heldout_fresh", dict(rows=bundle["heldouts"]))
+    start = json.loads(Path(bundle["pins"]["heldout_run"]["path"]).read_text())
+    start.update(pid=78, started_at=1001., execution_plan_sha256="f" * 64, ownership_token_sha256="b" * 64)
+    bundle["receipt"]["heldout_run"] = bundle["write"]("heldout_run_fresh", start)
+    closeout = json.loads(Path(bundle["pins"]["closeout"]["path"]).read_text())
+    closeout["plan_sha256"] = start["execution_plan_sha256"]
+    closeout["terminal"]["unprofiled_control"]["RUNNER_START.json"]["sha256"] = bundle["receipt"]["heldout_run"]["sha256"]
+    bundle["receipt"]["copy_closeout"] = bundle["write"]("closeout_fresh", closeout)
+    bundle["write"]("receipt", bundle["receipt"])
+    assert qualify(bundle)[0]["passed"]

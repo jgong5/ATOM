@@ -157,6 +157,7 @@ class NativeAPWorkRegions:
     source_handoff_sha256: str
     loaded_inputs: tuple
     allocation: InitVar[object]
+    initial_postprocess: dict | None = None
     source_qualified: bool = False
     version: str = "native-ap-work/1"
     provenance: str = "Source-only A/P work fit; full-forward composition qualification is separate"
@@ -207,9 +208,22 @@ class NativeAPWorkRegions:
             raise ValueError("native A/P source rows omit part of the CPU-proved chain inventory")
         _source_scope(rows, base.scope, {c["id"] for c in design["chains"]})
         validate_source_model(model, rows)
-        return cls(base, model, identity.sha256, (identity, *inputs.values()), allocation)
+        initial, extra = None, ()
+        if handoff.get("initial_postprocess"):
+            from atom.compass.core.cost.native_ap_initial import load_initial
+
+            initial, extra = load_initial(handoff["initial_postprocess"], scope=base.scope,
+                                         closed_model_sha256=inputs["model"].sha256)
+        return cls(base, model, identity.sha256, (identity, *inputs.values(), *extra), allocation,
+                   initial_postprocess=initial)
 
     def _retained(self, shape):
+        if (self.initial_postprocess is not None and shape.is_prefill
+                and shape.num_prefill_tokens == shape.total_tokens and shape.produces_output
+                and self._allocation.region_context_for(shape).get("prior_sampled_batch_rows") == 0):
+            # Empty-buffer P1 is a distinct measured branch. Retained tiny
+            # cells keep precedence on the nonempty queue path they cover.
+            return False
         if self.base._cell(shape) is not None:
             return True
         inherited = self.base.base
@@ -262,6 +276,8 @@ class NativeAPWorkRegions:
         if shape.produces_output:
             p_groups = self.model["models"]["postprocess"]["source_groups"]
             for i in (1, 2):
+                if i == 2 and vectors[1][i] == 0 and self.initial_postprocess is not None:
+                    continue
                 values = [g["features"][i] for g in p_groups]
                 if not min(values) <= vectors[1][i] <= max(values):
                     raise BindRefusal("native postprocess work exceeds its observed sampler/queue bounds")
@@ -287,6 +303,8 @@ class NativeAPWorkRegions:
             result["<" + part + ">"] = (0. if i and not shape.produces_output else
                 sum(x / scale * coefficient for x, scale, coefficient in
                     zip(vectors[i], model["scales"], model["coefficients"])))
+        if (shape.produces_output and vectors[1][2] == 0 and self.initial_postprocess is not None):
+            result["<postprocess>"] = self.initial_postprocess["conditions"][str(shape.batch_size)]["postprocess_seconds"]
         return result
 
     def seconds(self, shape):

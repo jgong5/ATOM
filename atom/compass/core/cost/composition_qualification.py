@@ -56,12 +56,15 @@ def predictor_identity(oracle, options, predictions):
     scopes = [x for x in oracle.compass_loaded_inputs if x.role == "oracle.attention_scope"]
     if len(scopes) != 1 or oracle.seconds_per_launch != 0:
         raise ValueError("complete predictor identity needs one scope and no extra launch charge")
-    return dict(schema="compass.complete_predictor_identity/1", complete_identity=True,
+    identity = dict(schema="compass.complete_predictor_identity/1", complete_identity=True,
         target_end_to_end_timings_used=False,
         body_book=dict(loaded_inputs=input_identity(oracle.compass_loaded_inputs),
                        source_selection=source_selection(options)),
         code=code_identity(), deployment_scope=dict(sha256=scopes[0].sha256),
         host_rule=HOST_RULE, validation_predictions=predictions)
+    if getattr(oracle.regions, "initial_postprocess", None) is not None:
+        identity["initial_postprocess_component"] = oracle.regions.initial_postprocess["component_identity"]
+    return identity
 
 
 def geometry(descriptor):
@@ -96,6 +99,16 @@ def observed_components(regions, row):
     """Apply the actual composed A/P selector, including retained tiny cells."""
     shape = offer_observation(regions._allocation, row)
     return regions.breakdown(shape)
+
+
+def request_namespace(start):
+    """Numeric Sequence IDs belong to one owned native process invocation."""
+    fields = ("execution_plan_sha256", "plan_sha256", "ownership_token_sha256")
+    if (any(not isinstance(start.get(key), str) or len(start[key]) != 64 for key in fields)
+            or type(start.get("pid")) is not int or start["pid"] <= 0
+            or not isinstance(start.get("started_at"), (int, float))):
+        raise ValueError("native request cohort lacks its owned process namespace")
+    return tuple(start[key] for key in fields) + (start["pid"], start["started_at"])
 
 
 def validate(path, sha256, *, inputs, options, regions, oracle):
@@ -139,11 +152,26 @@ def validate(path, sha256, *, inputs, options, regions, oracle):
     source_sha = source.sha256 if hasattr(source, "sha256") else source["sha256"]
     sources = read(dict(path=source_path, sha256=source_sha), "source_cohort")["rows"]
     rows = heldout["rows"]
-    source_ids = {str(i) for row in sources for i in row["descriptor"]["req_ids"]}
+    source_start = read(data["source_run"], "source_run")
+    heldout_start = read(data["heldout_run"], "heldout_run")
+    source_closeout = read(data["source_closeout"], "source_closeout")
+    source_namespace, heldout_namespace = request_namespace(source_start), request_namespace(heldout_start)
+    source_plans = [i for i in input_identity(inputs) if i["role"] == "oracle.native_ap_regions.work.acquisition_plan"]
+    if (len(source_plans) != 1 or source_start["plan_sha256"] != source_plans[0]["sha256"]
+            or heldout_start["plan_sha256"] != complete["plan_sha256"]
+            or source_start["started_at"] > heldout_start["started_at"]
+            or source_closeout["terminal"]["unprofiled_control"]["RUNNER_START.json"]["sha256"] != data["source_run"]["sha256"]
+            or closeout["terminal"]["unprofiled_control"]["RUNNER_START.json"]["sha256"] != data["heldout_run"]["sha256"]
+            or source_closeout["plan_sha256"] != source_start["execution_plan_sha256"]
+            or closeout["plan_sha256"] != heldout_start["execution_plan_sha256"]
+            or source_closeout["cleanup"].get("writers_released") is not True
+            or source_closeout["collection"].get("copy_complete") is not True):
+        raise ValueError("source/heldout process namespaces do not bind the actual acquisition plans")
+    source_ids = {(source_namespace, str(i)) for row in sources for i in row["descriptor"]["req_ids"]}
     if (len(rows) != len(sources)
             or {(r["chain_id"], r["chain_step"]) for r in rows} != {(r["chain_id"], r["chain_step"]) for r in sources}
             or any(row.get("role") != "heldout" for row in rows)
-            or source_ids.intersection(str(i) for row in rows for i in row["descriptor"]["req_ids"])
+            or source_ids.intersection((heldout_namespace, str(i)) for row in rows for i in row["descriptor"]["req_ids"])
             or complete.get("success") is not True or complete.get("engine_closed") is not True
             or closeout.get("exit_code") != 0 or closeout["cleanup"].get("verified") is not True
             or closeout["cleanup"].get("writers_released") is not True
@@ -187,7 +215,16 @@ def validate(path, sha256, *, inputs, options, regions, oracle):
             raise ValueError("composition independent complete-forward error is not under 10%: " + str(key))
         checks.append(dict(chain_id=key[0], chain_step=key[1], relative_error=error))
     oracle.native_allocation.clear()
+    initial_checks = []
+    if regions.initial_postprocess is not None:
+        from atom.compass.core.cost.native_ap_initial import validate_initial_heldouts
+
+        initial_checks = validate_initial_heldouts(regions.initial_postprocess,
+            data["initial_branch"], read, identity)
+    elif data.get("initial_branch"):
+        raise ValueError("unconfigured initial P qualification evidence")
     return dict(passed=True, independent_forward_steps=len(checks),
                 independent_prefill_steps=sum(eligible(v[0]) for v in groups.values()),
                 unique_geometries_requoted=len(quotes), checks=checks,
+                initial_postprocess_checks=initial_checks,
                 primitive_source_statuses_unchanged=True), tuple(loaded)
