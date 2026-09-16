@@ -68,15 +68,20 @@ def test_unobserved_runtime_or_queue_refuses(candidate, change):
     assert regions.refusal(shape)
 
 
-def test_large_allocation_and_shared_kv_refuse(candidate):
+def test_large_allocation_refuses_and_shared_kv_preserves_ap_work(candidate):
     regions, allocation = candidate
     d = fresh_descriptor([15], [222640], [17000], True)
     shape = offer(allocation, d)
     assert "bounds" in regions.refusal(shape)
     d = fresh_descriptor([15, 15], [32, 32], [3, 3], True)
+    shape = offer(allocation, d)
+    expected = regions.breakdown(shape)
     d["block_tables"][1][0] = d["block_tables"][0][0]
     shape = offer(allocation, d)
-    assert "alias" in regions.refusal(shape)
+    assert regions.breakdown(shape) == expected
+    d["state_fork_srcs"][0] = d["state_slots"][1]
+    shape = offer(allocation, d)
+    assert "state alias" in regions.refusal(shape)
 
 
 def test_retained_tiny_source_wins_without_work_context(candidate, monkeypatch):

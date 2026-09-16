@@ -15,7 +15,7 @@ import numpy as np
 from atom.compass.core.cost.cache_regions import CachedPrefillRegions
 from atom.compass.core.cost.native_ap_exact import SAMPLING
 from atom.compass.core.loaded_input import load_json
-from atom.compass.runtime.templates import BindRefusal, block_sharing_pairs
+from atom.compass.runtime.templates import BindRefusal
 
 SCHEMA = "compass.native_ap_work_sources/1"
 MODEL_SCHEMA = "compass.native_ap_work_model_candidate/1"
@@ -136,7 +136,6 @@ def _source_scope(rows, scope, chains):
         if (any(forward["scope"].get(k) != v for k, v in scope.items())
                 or d["blocks"] != [len(t) for t in d["block_tables"]]
                 or d["context"] != [q + h for q, h in zip(d["q"], d["history"])]
-                or any(prefix or nonprefix for _, _, prefix, nonprefix in block_sharing_pairs(d["block_tables"]))
                 or d["state_rows"] != list(range(n))
                 or len(set(d["state_slots"])) != n or any(s < 0 for s in d["state_slots"])
                 or any(d.get(k) != [v] * n for k, v in SAMPLING.items())
@@ -242,9 +241,12 @@ class NativeAPWorkRegions:
         if (slots is None or sources is None or len(slots) != n or len(sources) != n
                 or len(set(slots)) != n or any(s < 0 for s in slots)
                 or context.get("state_rows") != tuple(range(n))
-                or any(src >= 0 and src in slots and src != dst for dst, src in zip(slots, sources))
-                or any(prefix or nonprefix for _, _, prefix, nonprefix in context["kv_sharing_pairs"])):
-            raise BindRefusal("native A/P source does not cover cross-row state/KV aliasing")
+                or any(src >= 0 and src in slots and src != dst for dst, src in zip(slots, sources))):
+            raise BindRefusal("native A/P source does not cover cross-row state aliasing")
+        # In this TP1 Qwen/AITER prefill path, pack_rows and slot_mapping
+        # copy fixed extents; reused KV IDs change integer addresses only.
+        # State aliases remain guarded above. The body reader still receives
+        # the actual shared tables and must independently price that work.
         if (context.get("output_state_representation") != "predictive_deferred_batch"
                 or context.get("prior_sampled_has_logprobs") is not False
                 or any(context.get(k) != (v,) * n for k, v in SAMPLING.items())
