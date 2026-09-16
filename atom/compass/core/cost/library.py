@@ -1146,7 +1146,7 @@ def _dump_refusal(shape: StepShape, graph, head_graph, coverage) -> None:
             error)
 
 
-def _dump_region_refusal(shape: StepShape, why: str) -> None:
+def _dump_region_refusal(shape: StepShape, why: str, allocation=None) -> None:
     """Write down a step refused by the region model, before the raise.
 
     The sibling of `_dump_refusal`, for the refusal that happens too early to
@@ -1155,10 +1155,9 @@ def _dump_region_refusal(shape: StepShape, why: str) -> None:
     caller expects, so an unwritable directory must not replace the refusal
     with a different exception.
 
-    What it preserves is the shape and the sentence. That is enough to direct
-    a fix -- run 7's record would have said `(1, 9216, True)`, one request,
-    110144 tokens already done, which names both the cell to measure and the
-    reason it will recur.
+    Preserve the shape, reason and offered native region context when one is
+    available. Queue and allocation facts are needed to distinguish a missing
+    geometry from a source whose deferred-output path does not match.
     """
     global _DUMPS_WRITTEN
 
@@ -1176,9 +1175,14 @@ def _dump_region_refusal(shape: StepShape, why: str) -> None:
             target,
             "region_refusal_b%d_t%d_%d.json" % (
                 shape.batch_size, shape.total_tokens, _DUMPS_WRITTEN))
+        evidence = {"refused_by": "region model", "why": why, "shape": asdict(shape)}
+        if allocation is not None:
+            try:
+                evidence["native_region_context"] = allocation.region_context_for(shape)
+            except Exception as error:
+                evidence["native_region_context_unavailable"] = str(error)
         with open(path, "w") as handle:
-            json.dump({"refused_by": "region model", "why": why,
-                       "shape": asdict(shape)}, handle, default=str)
+            json.dump(evidence, handle, default=str)
         logger.warning(
             "ATOMCompass WARNING: region refusal evidence written to %s", path)
     except Exception as error:  # noqa: BLE001 - see docstring
@@ -1307,7 +1311,7 @@ class LibraryCostOracle:
                 # region gap is the one refusal that fires before any graph is
                 # derived, so `_dump_refusal` has nothing to write; this writes
                 # what there is instead of nothing.
-                _dump_region_refusal(shape, why)
+                _dump_region_refusal(shape, why, getattr(self, "native_allocation", None))
                 raise ValueError(f"no measured region for this shape: {why}")
         graph_for = getattr(self.graphs, "prepared_graph_for",
                             self.graphs.graph_for)

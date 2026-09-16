@@ -367,6 +367,15 @@ class NativeAPFamilyRegions:
     @classmethod
     def load(cls, base, path, sha256, allocation, *, deployment_scope_sha256):
         handoff, identity = load_json(path, role="oracle.native_ap_regions")
+        from atom.compass.core.cost.native_ap_exact import SCHEMA as EXACT_SCHEMA, load_exact
+
+        if identity.sha256 == sha256 and handoff.get("schema") == EXACT_SCHEMA:
+            cells, inputs = load_exact(base, handoff, identity, path,
+                deployment_scope_sha256=deployment_scope_sha256)
+            allocation.capture_region_context = True
+            return cls(base, {}, {"exact_cells": cells}, {}, identity.sha256, inputs, allocation,
+                source_qualified=True, version="native-ap-exact-forward/1",
+                provenance="Exact source A/P medians validated against independent complete forwards; no host-return law")
         if (identity.sha256 != sha256 or handoff.get("schema") != SCHEMA
                 or set(handoff["evidence"]) != set(EVIDENCE)
                 or handoff.get("retained_native_handoff_sha256") != base.source_handoff_sha256
@@ -403,7 +412,15 @@ class NativeAPFamilyRegions:
     def topologies(self):
         return self.base.topologies
 
+    @property
+    def exact_cells(self):
+        return self.domain.get("exact_cells", ())
+
     def _query(self, shape):
+        if self.exact_cells:
+            from atom.compass.core.cost.native_ap_exact import query_exact
+
+            return query_exact(self.exact_cells, self._allocation, shape)
         if (self.base._cell(shape) is not None or not shape.is_prefill
                 or shape.num_prefill_tokens != shape.total_tokens or shape.batch_size not in (1, 2)):
             return None
@@ -431,6 +448,10 @@ class NativeAPFamilyRegions:
         if selected is None:
             return self.base.refusal(shape)
         family, vector, q, history, blocks, context = selected
+        if family == "exact":
+            from atom.compass.core.cost.native_ap_exact import exact_refusal
+
+            return exact_refusal(vector, shape, context, self.base.scope)
         if not self.family_qualified[family]:
             return "native A/P family is unqualified or failed heldouts: " + family
         domain = self.domain["families"][family]
@@ -460,6 +481,8 @@ class NativeAPFamilyRegions:
         selected = self._query(shape)
         if selected is None:
             return self.base.breakdown(shape)
+        if selected[0] == "exact":
+            return {"<" + key + ">": value for key, value in selected[1]["components"].items()}
         return {"<" + key + ">": value for key, value in _components(self.rule, selected[0], selected[1]).items()}
 
     def seconds(self, shape):

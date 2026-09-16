@@ -196,6 +196,20 @@ class NativeStepAllocation:
         self.region_context = None if region_context is None else dict(region_context)
 
 
+def block_sharing_pairs(tables):
+    """Pairwise prefix and non-prefix aliases, independent of block IDs."""
+    pairs = []
+    for i, first in enumerate(tables):
+        for j in range(i + 1, len(tables)):
+            second, prefix = tables[j], 0
+            for left, right in zip(first, second):
+                if left != right:
+                    break
+                prefix += 1
+            pairs.append([i, j, prefix, len(set(first).intersection(second)) - prefix])
+    return pairs
+
+
 class NativeAllocation:
     """The scheduler's own assignment, encoded the way a capture records it.
 
@@ -280,7 +294,8 @@ class NativeAllocation:
                 "allocation_blocks": tuple(len(t) for t in record.block_tables),
                 "state_slots": record.state_slots, "state_rows": record.state_rows,
                 "state_fork_srcs": record.state_fork_srcs,
-                "shared_prefix_blocks": shared, "kv_sharing_is_prefix_only": prefix_only}
+                "shared_prefix_blocks": shared, "kv_sharing_is_prefix_only": prefix_only,
+                "kv_sharing_pairs": block_sharing_pairs(record.block_tables)}
 
     def allocation_for(self, shape: StepShape) -> dict:
         record = self._record
