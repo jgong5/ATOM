@@ -152,6 +152,7 @@ def inflate_heldouts(data):
     ("copy_closeout", lambda d: d["cleanup"].update(writers_released=False)),
     ("heldout", lambda d: d["rows"].pop()),
     ("heldout", inflate_heldouts),
+    ("heldout", lambda d: d["rows"][1]["descriptor"].update(req_ids=d["rows"][0]["descriptor"]["req_ids"])),
     ("verdict", lambda d: d.update(host_return_law_inferred=True)),
 ])
 def test_repinning_does_not_qualify_incomplete_or_changed_evidence(observed_bundle, role, damage):

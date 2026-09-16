@@ -50,7 +50,8 @@ def _rows(rows, point, role, scope):
 
     if (len(rows) != 6 or sorted(r["repetition"] for r in rows) != list(range(6))
             or any(r["point_id"] != point["id"] or r["role"] != role
-                   or r.get("normal_return") is not True for r in rows)):
+                   or r.get("normal_return") is not True for r in rows)
+            or len({tuple(r["descriptor"]["req_ids"]) for r in rows}) != 6):
         raise ValueError("exact native A/P requires six independent observations per role")
     contexts = []
     for row in rows:
@@ -113,6 +114,10 @@ def _validate(data, loaded, scope, deployment_scope_sha256):
     source_point = next(p for p in points if p["role"] == "source")
     heldout_point = next(p for p in points if p["role"] == "heldout")
     sources, heldouts = data["source"]["rows"], data["heldout"]["rows"]
+    source_ids = {str(value) for row in sources for value in row["descriptor"]["req_ids"]}
+    heldout_ids = {str(value) for row in heldouts for value in row["descriptor"]["req_ids"]}
+    if source_ids & heldout_ids:
+        raise ValueError("exact native A/P source and heldout requests are not independent")
     queue, pairs = _rows(sources, source_point, "source", scope)
     if _rows(heldouts, heldout_point, "heldout", scope) != (queue, pairs):
         raise ValueError("exact native A/P heldout queue differs from its source")
@@ -163,10 +168,13 @@ def _validate(data, loaded, scope, deployment_scope_sha256):
             or complete["plan_sha256"] != loaded["acquisition_plan"].sha256
             or initial.get("inherited_run_model") is not True or final.get("inherited_run_model") is not True
             or initial["attention_scope"] != final["attention_scope"]
+            or initial["attention_scope"]["native"]["body_flags"] != plan["backend_body_flags"]
             or closeout.get("exit_code") != 0 or closeout["cleanup"].get("verified") is not True
             or closeout["cleanup"].get("writers_released") is not True
             or closeout["collection"].get("copy_complete") is not True
-            or closeout["collection"].get("owned_writers_released_before_collection") is not True):
+            or closeout["collection"].get("owned_writers_released_before_collection") is not True
+            or closeout["terminal"]["unprofiled_control"]["native/NATIVE_COMPLETE.json"]["sha256"]
+               != loaded["native_complete"].sha256):
         raise ValueError("exact native A/P runtime or owned source closeout is incomplete")
     qualification = data["qualification"]
     if (qualification.get("schema") != "compass.native_ap_exact_forward_qualification/1"
