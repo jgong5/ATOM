@@ -1053,7 +1053,10 @@ def _time_in_graph(fn, sets: list, iters: int, warmup: int, before=None,
     stream = torch.cuda.Stream()
     stream.wait_stream(torch.cuda.current_stream())
     with torch.cuda.stream(stream):
-        for i in range(max(warmup, 3)):
+        # Exercise every argument/context position that capture will visit.
+        # A shorter warmup can leave a lazy kernel branch cold until capture,
+        # where its autotuner is not allowed to synchronize the stream.
+        for i in range(max(warmup, 3, GRAPH_BATCH)):
             if before is not None:
                 before(i)
             a, k = sets[i % n]

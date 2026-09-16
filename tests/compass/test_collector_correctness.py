@@ -256,3 +256,59 @@ def test_the_arithmetic_this_replaced_aliased_into_the_previous_region():
     assert aliased[-1] == 1023
     assert 0 <= aliased[-1] < offset, "inside the previous region"
     assert forward_ctx.shift_addresses(slots, offset)[-1] == -1
+@pytest.mark.parametrize("argument_sets,context_variants", [(32, 1), (2, 32)])
+def test_capture_only_visits_eagerly_warmed_argument_context_pairs(
+        monkeypatch, argument_sets, context_variants):
+    from contextlib import contextmanager, nullcontext
+    from types import SimpleNamespace
+    import torch
+    from atom.compass.runtime import microbench
+
+    state = dict(capturing=False, context=0, synchronized=False)
+    warmed, captured = set(), set()
+
+    class Stream:
+        def wait_stream(self, other):
+            pass
+
+    class Graph:
+        def replay(self):
+            pass
+
+    class Event:
+        def __init__(self, **kwargs):
+            pass
+
+        def record(self):
+            pass
+
+        def elapsed_time(self, other):
+            return 1.0
+
+    @contextmanager
+    def capture(graph):
+        assert state["synchronized"]
+        state["capturing"] = True
+        yield
+        state["capturing"] = False
+
+    monkeypatch.setattr(torch, "cuda", SimpleNamespace(
+        Stream=Stream, current_stream=Stream, stream=lambda stream: nullcontext(),
+        synchronize=lambda: state.update(synchronized=True),
+        CUDAGraph=Graph, graph=capture, Event=Event))
+    monkeypatch.setattr(microbench, "GRAPH_BATCH", 32)
+
+    def before(index):
+        state["context"] = index % context_variants
+
+    def call(argument):
+        pair = argument, state["context"]
+        if state["capturing"]:
+            assert pair in warmed, "a lazy branch first executes inside capture"
+            captured.add(pair)
+        else:
+            warmed.add(pair)
+
+    microbench._time_in_graph(call, [([i], {}) for i in range(argument_sets)],
+                             iters=64, warmup=20, before=before)
+    assert len(captured) == 32
