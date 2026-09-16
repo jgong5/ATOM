@@ -507,8 +507,11 @@ def check_source_contract(modelled, registry, workload_sha, forbidden, label, *,
                 contents = file_digests(items)
                 digest = sha if len(contents) == 1 else validate._rolled_digest(contents)
                 role = ROLE_PREFIX + sha[:16]
-                bad.extend(validate._check_calibration_records(
-                    {role: digest}, {role: contents}, registry, 1, workload_sha, forbidden))
+                if len(contents) == 1:
+                    bad.extend(_check_diagnostic_input_registration(items[0], registry, workload_sha, forbidden))
+                else:
+                    bad.extend(validate._check_calibration_records(
+                        {role: digest}, {role: contents}, registry, 1, workload_sha, forbidden))
             files = file_digests(source.loaded_inputs)
             digest = next(iter(files.values())) if len(files) == 1 else validate._rolled_digest(files)
             if ((compass.get("oracle_option_files") or {}).get("diagnostic_reference_handoff") != files
