@@ -147,7 +147,13 @@ def _case(reader, case, declaration):
                     name + ".current_code." + relative, json_data=False)
     expected = attention.scoped(op, declaration.for_op(op) or {}) if op["name"] in (GDN, MHA) else {}
     views = argument_views(op)
-    values, seeds, treatments = [], set(), set()
+    # The pinned graph collector explicitly falls back to its over-time event
+    # interval for uncapturable MHA. The handoff must disclose that observed
+    # mode; it is not a kernel-only measurement or an extra launch charge.
+    timer_mode = case.get("timer_mode", "graph")
+    if timer_mode not in (("graph", "over") if op["name"] == MHA else ("graph",)):
+        raise ValueError("exact source does not declare a supported operator-event timer mode")
+    values, host_values, seeds, treatments = [], [], set(), set()
     for repeat, reference in enumerate(case["references"], 1):
         raw = reader.read(reference["artifact"], name + f".raw{repeat}")
         closed = reader.read(reference["exit"], name + f".exit{repeat}")
@@ -195,9 +201,12 @@ def _case(reader, case, declaration):
             raise ValueError("exact reference changed its one complete operator inventory")
         record = raw["prices"][signature]
         seconds = record["seconds"]
+        host_seconds = record.get("host_seconds")
         if (type(seconds) not in (int, float) or not isfinite(seconds) or seconds <= 0
                 or record.get("kernels") != {} or record.get("composition_witness")
-                or seconds != reference["seconds"] or record.get("cache") != "graph"
+                or seconds != reference["seconds"] or record.get("cache") != timer_mode
+                or (timer_mode == "over" and raw["provenance"].get("cache") != "graph")
+                or type(host_seconds) not in (int, float) or not isfinite(host_seconds) or host_seconds < 0
                 or record.get("arg_sets") != len(setup["operand_sets"])
                 or record.get("arg_sets") != reference["arg_sets"]
                 or record.get("kv_regions") != reference["kv_regions"]
@@ -205,6 +214,7 @@ def _case(reader, case, declaration):
                 or case["timed_iterations"] != plan["timed_iterations"]):
             raise ValueError("exact operator event reference changed its duration, layout or unobserved dispatch")
         values.append(seconds)
+        host_values.append(host_seconds)
         seeds.add(acquisition["seed"])
         treatments.add((record["cache"], record["arg_sets"], record["kv_regions"], raw["provenance"]["iters"]))
     if len(values) != 3 or len(seeds) != 3 or len(treatments) != 1:
@@ -216,10 +226,13 @@ def _case(reader, case, declaration):
         raise ValueError("exact reference median/spread trims or changes its raw observations")
     result = OperatorEventRecord(seconds=center, kernels={}, source=case["references"][values.index(center)]["artifact"]["path"],
         source_references=case["references"], all_three=values, relative_spread=spread,
+        source_host_seconds=host_values,
+        timer_scope=("device event interval including host starvation, context installation and dispatch"
+                     if timer_mode == "over" else "captured graph event interval"),
         precision_warning=spread > .05, source_qualified=False, whole_forward_validation_required=True,
         kernel_dispatch_observed=False, kernel_count=None, launch_count=None,
         dispatch_status=case["dispatch_status"], source_layer=layer, work_identity_sha256=_digest(key),
-        source_conditioning=dict(cache="graph", arg_sets=record["arg_sets"], kv_regions=record["kv_regions"],
+        source_conditioning=dict(cache=timer_mode, requested_cache="graph", arg_sets=record["arg_sets"], kv_regions=record["kv_regions"],
             state_slots=setup.get("standup", {}).get("state_slots")),
         registered_body_flags={key: int(plan["environment"][key]) for key in
             ("FLA_GDN_FIX_BT", "USE_DEFAULT_FLA_NORM")} if op["name"] == GDN else {})

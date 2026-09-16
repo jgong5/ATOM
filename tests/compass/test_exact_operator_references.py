@@ -223,3 +223,79 @@ def test_mha_scope_and_each_shifted_kv_context_are_required():
     installs[0]["observed_context_sha256"] = "0" * 64
     with pytest.raises(ValueError, match="shifted KV context"):
         E._registered_scope(op, raw, expected, {})
+
+
+@pytest.fixture
+def actual_mha(tmp_path):
+    source_path = os.environ.get("ATOMCOMPASS_EXACT_MHA_SOURCE")
+    scope_path = os.environ.get("ATOMCOMPASS_EXACT_OPERATOR_SCOPE")
+    if not source_path or not scope_path:
+        pytest.skip("set actual MHA source and scope paths for the completed batch")
+    source = json.loads(Path(source_path).read_text())
+    local_source = tmp_path / "source.json"
+    local_source.write_text(json.dumps(source))
+    handoff = {"schema": E.SCHEMA, "source_handoff": pin(local_source), "deployment_scope": pin(scope_path),
+               "diagnostic_only": True, "cases": [case["name"] for case in source["cases"]]}
+    base = ParametricPriceLibrary()
+    base.launch_charge_seconds = 0.0
+    base.request_attention_scope = Declaration(scopes=json.loads(Path(scope_path).read_text())["attention_scope"])
+    base.request_attention_treatments = {}
+    return tmp_path, source, handoff, base
+
+
+def test_actual_154_mha_cases_retain_timer_modes_and_host_observations(actual_mha):
+    from atom.compass.core.cost.library import _signature_of
+
+    library = load(actual_mha)
+    cases = actual_mha[1]["cases"]
+    assert len(cases) == 154
+    assert {case["timer_mode"] for case in cases} == {"graph", "over"}
+    raw_sources = {}
+    for case in cases:
+        op = case["operator"]
+        record, why = library.lookup(op, {"tp": 1})
+        assert record is not None, why
+        expected_host = []
+        for reference in case["references"]:
+            path = reference["artifact"]["path"]
+            if path not in raw_sources:
+                raw_sources[path] = json.loads(Path(path).read_text())
+            expected_host.append(raw_sources[path]["prices"][_signature_of(op)]["host_seconds"])
+        assert record["seconds"] == case["reference_median_seconds"]
+        assert record["all_three"] == case["reference_values_seconds"]
+        assert record["source_host_seconds"] == expected_host
+        assert record["source_conditioning"]["cache"] == case["timer_mode"]
+        assert record["kernel_count"] is None and record["launch_count"] is None
+        assert not record["kernel_dispatch_observed"] and _record_launch_count(record) == 0
+        seconds, coverage, charges = library.body({"ops": [op], "key": {"topology": [["tp", 1]]}})
+        assert seconds == record["seconds"] and coverage.complete and charges == 0
+
+
+@pytest.mark.parametrize("damage", ["mixed_mode", "undisclosed_mode", "requested_mode", "host_missing", "host_negative", "host_boolean"])
+def test_actual_mha_repinning_cannot_mix_modes_or_erase_host_evidence(actual_mha, damage):
+    from atom.compass.core.cost.library import _signature_of
+
+    directory, source, handoff, _ = actual_mha
+    case = next(case for case in source["cases"] if case["timer_mode"] == "over")
+    handoff["cases"] = [case["name"]]
+    if damage == "undisclosed_mode":
+        case.pop("timer_mode")
+    else:
+        reference = case["references"][1]
+        raw = json.loads(Path(reference["artifact"]["path"]).read_text())
+        record = raw["prices"][_signature_of(case["operator"])]
+        if damage == "mixed_mode":
+            record["cache"] = "graph"
+        elif damage == "requested_mode":
+            raw["provenance"]["cache"] = "hot"
+        elif damage == "host_missing":
+            record.pop("host_seconds")
+        elif damage == "host_negative":
+            record["host_seconds"] = -1
+        else:
+            record["host_seconds"] = True
+        path = directory / "changed_raw.json"
+        path.write_text(json.dumps(raw))
+        reference["artifact"] = pin(path)
+    with pytest.raises(ValueError, match="event reference"):
+        load(actual_mha)
