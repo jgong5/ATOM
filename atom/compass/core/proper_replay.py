@@ -162,3 +162,28 @@ def pairing_observations(real, modelled):
         "identical_dynamic_request_counts_required": False,
         "markers_stripped": False,
     }
+
+
+def profiling_wall_window(events):
+    """The passively observed profiling phase on the physical wall clock."""
+    import math
+    edges = {}
+    for row in events:
+        if (row.get("stats") or {}).get("phase") != "profiling":
+            continue
+        kind = row.get("message_type")
+        if kind not in ("credit_phase_start", "credit_phase_complete"):
+            continue
+        if kind in edges:
+            raise ValueError("duplicate physical profiling-phase observation")
+        value = row.get("wall_observed_at")
+        if type(value) not in (int, float) or not math.isfinite(value):
+            raise ValueError("profiling phase lacks a finite physical wall observation")
+        edges[kind] = value
+    if set(edges) != {"credit_phase_start", "credit_phase_complete"}:
+        raise ValueError("profiling phase lacks both physical wall boundaries")
+    start, end = edges["credit_phase_start"], edges["credit_phase_complete"]
+    if end <= start:
+        raise ValueError("physical profiling wall interval is not positive")
+    return {"started_at": start, "ended_at": end, "seconds": end-start, "clock": "wall",
+            "scope": "passive phase start through phase complete; excludes setup/export and final drain"}

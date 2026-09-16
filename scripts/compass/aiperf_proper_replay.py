@@ -1,0 +1,337 @@
+"""One ordinary-native or actual controlled AIPerf profile, owned by the pair harness."""
+import argparse
+import asyncio
+import hashlib
+import importlib.util
+import json
+import os
+import signal
+from pathlib import Path
+import sys
+import time
+import traceback
+
+ROOT = Path(__file__).resolve().parents[2]
+sys.path.insert(0, str(ROOT))
+
+
+def script(name):
+    spec = importlib.util.spec_from_file_location("proper_" + name, Path(__file__).with_name(name + ".py"))
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[spec.name] = module
+    spec.loader.exec_module(module)
+    return module
+
+
+def write(path, value):
+    path = Path(path)
+    if path.exists():
+        raise FileExistsError(path)
+    temporary = path.with_suffix(path.suffix + ".writing")
+    with temporary.open("x") as stream:
+        json.dump(value, stream, indent=2, sort_keys=True, allow_nan=False)
+        stream.write("\n")
+        stream.flush()
+        os.fsync(stream.fileno())
+    temporary.replace(path)
+
+
+from atom.compass.replay.native_preparation import (
+    check_runtime as _check_runtime, native_provenance, prepare_native,
+)
+
+
+def check_runtime(plan, provenance, side):
+    return _check_runtime(plan, provenance, side, script("cc_traces_opening"))
+
+
+def check_modelled_sources(plan, provenance, cell):
+    from types import SimpleNamespace
+    from atom.compass.core.proper_replay import read_pinned
+    validate = script("cc_traces_validate")
+    run = SimpleNamespace(manifest={"server": provenance})
+    registry = read_pinned(plan["calibration_registry"])
+    source_sha = read_pinned(plan["prepared"])["source"]["sha256"]
+    forbidden = {str(path): hashlib.sha256(path.read_bytes()).hexdigest()
+                 for pattern in ("real.r*_steps*.jsonl", "real.r*_memory*.json")
+                 for path in Path(cell).glob(pattern)}
+    bad, notes = script("cc_traces_opening").check_source_contract(
+        run, registry, source_sha, forbidden, "proper profile startup")
+    for check in (validate.check_calibration, validate.check_capacity_provenance,
+                  validate.check_scalar_overheads):
+        bad += check(run, registry, 1, source_sha, forbidden)
+    bad += validate.check_predictor_device_freedom(run, "proper profile startup")
+    bad += validate.check_capacity_inputs(run, "proper profile startup")
+    if bad:
+        raise ValueError("; ".join(bad))
+    return notes
+
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--plan", required=True)
+    parser.add_argument("--plan-sha256", required=True)
+    parser.add_argument("--side", required=True, choices=("real", "modelled"))
+    parser.add_argument("--out", required=True)
+    parser.add_argument("--repeat", type=int, default=1)
+    parser.add_argument("--url")
+    parser.add_argument("--start-signal")
+    args = parser.parse_args(argv)
+    raw = Path(args.plan).read_bytes()
+    if hashlib.sha256(raw).hexdigest() != args.plan_sha256:
+        raise ValueError("proper replay plan changed")
+    plan = json.loads(raw)
+    if plan.get("schema") != "compass.aiperf_proper_pair/1":
+        raise ValueError("unsupported proper replay plan")
+    if plan.get("record_export") != {"export_level": "raw", "export_http_trace": True}:
+        raise ValueError("proper replay requires predeclared symmetric raw export settings")
+    if plan.get("purpose") not in ("acceptance", "diagnostic"):
+        raise ValueError("proper replay requires a purpose declared before execution")
+    if not 1 <= args.repeat <= plan["repeats"]:
+        raise ValueError("proper replay repeat is outside the frozen plan")
+    output = Path(args.out)
+    if output.name != f"{args.side}.r{args.repeat}.json":
+        raise ValueError("proper replay output does not name its declared side/repeat")
+    directory = output.with_suffix(".raw")
+    directory.mkdir(parents=True, exist_ok=False)
+    started = time.time()
+    core = store = None
+    result = None
+    failure = None
+    closeout = {}
+    def deadline_expired(signum, frame):
+        raise TimeoutError("proper profile exceeded its declared client wall bound")
+    previous_alarm = signal.signal(signal.SIGALRM, deadline_expired)
+    signal.alarm(int(plan.get("session_wall_timeout_seconds", 3600)))
+    try:
+        environment = {key: value.replace("{repeat}", str(args.repeat)) for key, value in
+                       plan["native_environment" if args.side == "real" else "modelled_environment"].items()}
+        if environment.get("AIPERF_DATASET_WEKA_LIVE_ASSISTANT_RESPONSES") != "false":
+            raise ValueError("proper replay requires the predeclared provided-history environment")
+        os.environ.update(environment)
+        sys.path.insert(0, str(Path(plan["aiperf_dependency"]["checkout"]) / "src"))
+        if args.side == "modelled":
+            if Path("/dev/kfd").exists() or Path("/dev/dri").exists():
+                raise ValueError("controlled proper replay requires a device-free container")
+            if os.environ.get("COMPASS_NATIVE_COVERAGE") == "1":
+                raise ValueError("native coverage instrumentation is not a modelled input")
+            for key in ("TMPDIR", "AIPERF_DATASET_MMAP_BASE_PATH"):
+                if key in environment:
+                    Path(environment[key]).mkdir(parents=True, exist_ok=False)
+            from atom.compass.replay.bootstrap import install_from_target
+            install_from_target(plan["replay_target"]["path"])
+        from atom.compass.core.proper_replay import phase_accounting, validate_records, profiling_wall_window
+        from atom.compass.replay.aiperf_profile import (
+            load_profile, create_modelled_config, controlled_provenance,
+            compare_native_metadata, verify_dependency,
+        )
+        from atom.compass.replay.aiperf_records import export_controlled_records, normalize_records
+        from atom.compass.replay.aiperf_runner import ChatServingOptions
+        from atom.model_engine.llm_engine import _load_tokenizer
+        from atom.compass.prefix_workload import tokenizer_identity
+
+        verify_dependency(plan)
+        config, conversations, metadata, identity, caps = load_profile(plan)
+        from aiperf.common.enums import ExportLevel
+        config = config.model_copy(update={"output": config.output.model_copy(update={
+            "artifact_directory": directory / "aiperf", "export_level": ExportLevel.RAW,
+            "export_http_trace": plan["record_export"]["export_http_trace"]})})
+        tokenizer = _load_tokenizer(plan["model"], False)
+        if tokenizer_identity(tokenizer, plan["model"]) != plan["tokenizer"]:
+            raise ValueError("proper replay tokenizer differs from the frozen identity")
+        if hashlib.sha256(tokenizer.chat_template.encode()).hexdigest() != plan["chat_template_sha256"]:
+            raise ValueError("proper replay chat template changed")
+        options = ChatServingOptions(**plan["server_options"])
+        replay = script("replay")
+        admissions = ()
+        source_notes = []
+        cache_boundary = None
+        if args.side == "real":
+            from aiperf.common.config import ServiceConfig
+            from aiperf.common.enums import ExportLevel
+            from atom.compass.replay.aiperf_native import run_native_profile
+            if not args.url:
+                raise ValueError("native proper replay requires its owned server URL")
+            native_helpers = script("aiperf_native_coverage")
+            scope_plan = dict(plan, environment=environment)
+            provenance = native_provenance(args.url)
+            check_runtime(plan, provenance, "real")
+            native_scope = native_helpers.check_native_scope(scope_plan, provenance)
+            preparation = prepare_native(args.url, config, conversations, replay, directory)
+            cache_boundary = preparation["cache_boundary"]
+            before = replay._prefix_cache_snapshot(args.url, 120)
+            native_helpers.check_empty_cache(before)
+            empty = replay._drain_records(args.url, 120)
+            if (empty.get("requests") or empty.get("admissions")
+                    or empty.get("active_streams") != 0 or empty.get("active_api_requests") != 0):
+                raise ValueError("native preparation admission/stream teardown is incomplete")
+            endpoint = config.endpoint.model_copy(update={"urls": [args.url]})
+            export = config.output.model_copy(update={"artifact_directory": directory / "aiperf",
+                                                      "export_level": ExportLevel.RAW,
+                                                      "export_http_trace": True})
+            native_config = config.model_copy(update={"endpoint": endpoint, "output": export})
+            native_started = time.time()
+            service_data = json.loads(json.dumps(plan["service_config"]).replace("{repeat}", str(args.repeat)))
+            services = ServiceConfig.model_validate(service_data)
+            services.comm_config.path.mkdir(parents=True, exist_ok=False)
+            messages = run_native_profile(native_config, services)
+            wall_finished = time.time()
+            write(directory / "phase_messages.json", messages)
+            execution_window = profiling_wall_window(messages)
+            export_path = native_config.output.profile_export_raw_jsonl_file
+            raw_records = [json.loads(line) for line in export_path.read_text().splitlines() if line]
+            summary = json.loads(native_config.output.profile_export_json_file.read_text())
+            if summary.get("was_cancelled") or summary.get("error_summary"):
+                raise ValueError("ordinary native AIPerf reported cancellation or errors")
+            closeout = {}
+            flush, engine, after = native_helpers.collect_native_closeout(
+                args.url, replay, output.parent / (output.stem + "_steps.jsonl"),
+                evidence=closeout, reserve_seconds=120)
+            write(directory / "native_closeout.json", closeout)
+            admissions = engine["admissions"]
+            provenance = native_provenance(args.url)
+            check_runtime(plan, provenance, "real")
+            if native_helpers.check_native_scope(scope_plan, provenance) != native_scope:
+                raise ValueError("native runtime scope changed during the profile")
+            consumed = {row["request_id"]: row.get("shared_preprocessing") or {}
+                        for row in engine.get("requests") or []}
+            cleanup = {"native_flush": flush, "final_cache": after}
+            wall_window = {"started_at": native_started, "ended_at": wall_finished,
+                           "seconds": wall_finished - native_started,
+                           "scope": "ordinary AIPerf process including setup/export"}
+        else:
+            from aiperf.dataset.memory_map_utils import MemoryMapDatasetBackingStore
+            from atom.compass.replay.aiperf_runner import create_controlled_core, run_controlled_replay
+            from atom.compass.core.cache_boundary import snapshot, reset, reset_receipt_errors, RESET_SCHEMA, SNAPSHOT_SCHEMA
+            model_config = create_modelled_config(plan, tokenizer, directory)
+            core = create_controlled_core(model_config)
+            boundary = reset(core)
+            cache_boundary = {"schema": RESET_SCHEMA, "acknowledged": boundary["acknowledged"], "ranks": [boundary]}
+            errors = reset_receipt_errors(cache_boundary, expected_worker_kind="modelled_no_device",
+                                          require_fresh_modelled=True)
+            if errors:
+                raise ValueError("; ".join(errors))
+            before = {"schema": SNAPSHOT_SCHEMA, "ranks": [snapshot(core)]}
+            if (before["ranks"][0]["indexes"] != {"kv": 0, "state": 0}
+                    or not before["ranks"][0]["quiescence"]["idle"]):
+                raise ValueError("controlled proper replay does not start fresh and empty")
+
+            async def materialize():
+                backing = MemoryMapDatasetBackingStore(benchmark_id=config.benchmark_id)
+                await backing.initialize()
+                await backing.add_conversations({c.session_id: c for c in conversations})
+                await backing.finalize()
+                return backing
+            store = asyncio.run(materialize())
+            provenance = controlled_provenance(core, tokenizer, options)
+            check_runtime(plan, provenance, "modelled")
+            source_notes = check_modelled_sources(plan, provenance, output.parent)
+            write(directory / "startup_ready.json", {"at": time.time(), "server": provenance})
+            if args.start_signal:
+                deadline = time.monotonic() + 120
+                while not Path(args.start_signal).exists():
+                    if time.monotonic() >= deadline:
+                        raise TimeoutError("controlled profile startup was not acknowledged")
+                    time.sleep(.01)
+                signal = json.loads(Path(args.start_signal).read_text())
+                if signal.get("plan_sha256") != args.plan_sha256 or signal.get("pid") != os.getpid():
+                    raise ValueError("controlled start signal names another plan/process")
+            model_started = time.time()
+            result = run_controlled_replay(
+                core=core, tokenizer=tokenizer, user_config=config, dataset_metadata=metadata,
+                dataset_client_metadata=store.get_client_metadata(), worker_count=1, server_options=options)
+            wall_finished = time.time()
+            messages = [m.model_dump(mode="json") for m in result.messages]
+            execution_window = profiling_wall_window(result.wall_phase_events)
+            raw_records = export_controlled_records(result.records)
+            consumed = {row["api_request_id"]: {"input_tokens": row["prompt_tokens"],
+                                               "prompt_token_sha256": row["prompt_token_sha256"]}
+                        for row in result.dispatches if "api_request_id" in row and "prompt_tokens" in row}
+            engine = {"clock": "virtual", "requests": [
+                {"request_id": row["api_request_id"], "arrive_time": row["io_processor_arrival"],
+                 "first_token_time": row["core_first_token_at"], "finish_time": row["core_completion_at"]}
+                for row in result.dispatches if "core_first_token_at" in row and "core_completion_at" in row]}
+            provenance = controlled_provenance(core, tokenizer, options)
+            check_runtime(plan, provenance, "modelled")
+            after = {"schema": SNAPSHOT_SCHEMA, "ranks": [snapshot(core)]}
+            if not after["ranks"][0]["quiescence"]["idle"]:
+                raise ValueError("controlled profile did not return a quiescent engine")
+            cleanup = dict(result.cleanup, final_cache=after)
+            preparation = None
+            wall_window = {"started_at": model_started, "ended_at": wall_finished,
+                           "seconds": wall_finished - model_started,
+                           "scope": "controlled AIPerf call including setup/teardown"}
+            write(directory / "phase_messages.json", messages)
+            write(directory / "controlled_result.json", {"events": result.events,
+                  "dispatches": result.dispatches, "serving": result.serving})
+        phase = phase_accounting(messages)
+        observed_dataset = [m["metadata"] for m in messages if m.get("message_type") == "dataset_configured_notification"]
+        if len(observed_dataset) != 1:
+            raise ValueError("actual AIPerf run lacks one dataset metadata observation")
+        metadata_comparison = compare_native_metadata(metadata, observed_dataset[0], conversations)
+        normalized = normalize_records(raw_records, user_config=config, tokenizer=tokenizer,
+            model_path=plan["model"], default_chat_template_kwargs=options.default_chat_template_kwargs,
+            consumed=consumed, expected_caps=caps, admissions=admissions)
+        validate_records(normalized, phase)
+        write(directory / "raw_records.json", raw_records)
+        artifact = {"schema": "compass.aiperf_proper_run/1", "side": args.side,
+              "purpose": plan["purpose"], "repeat": args.repeat,
+              "plan_sha256": args.plan_sha256, "profile": identity, "phase": phase,
+              "records": normalized, "engine": engine, "server": provenance,
+              "cache_before": before, "cache_after": after, "cache_boundary": cache_boundary,
+              "preparation": preparation, "dataset_metadata_comparison": metadata_comparison,
+              "source_notes": source_notes,
+              "record_export": {"export_level": str(config.output.export_level),
+                                "export_http_trace": config.output.export_http_trace},
+              "cleanup": cleanup, "wall_window": wall_window, "execution_wall_window": execution_window,
+              "approximations": {"generated_text": "displayable surrogate" if args.side == "modelled" else "native",
+                  "provided_history_excludes_generated_text": True,
+                  "frontend_cpu": "unmodelled" if args.side == "modelled" else "actual",
+                  "validity_decided_by_workload_invariants_and_e2e_errors": True},
+              "complete": True, "accepted": False}
+        complete = [row for row in normalized if not row["cancelled"] and not row["error"]]
+        artifact["run"] = {
+            "server": provenance, "complete": True, "requests": len(complete),
+            "prompt_lengths": "passed", "trace_sha256": args.plan_sha256,
+            "paced": args.side == "real", "prepare": preparation,
+            "cache_boundary": cache_boundary, "cache_state_after": after,
+            "prompt_encoding": {"kind": "chat_messages"}}
+        artifact["workload"] = [{"input_tokens": row["input_tokens"], "output_tokens": row["output_tokens"]}
+                                for row in complete]
+        artifact["results"] = [{"index": index, "ok": True, "response": {
+            "id": row["response_id"], "usage": {"prompt_tokens": row["input_tokens"],
+                                                "completion_tokens": row["output_tokens"]}}}
+            for index, row in enumerate(complete)]
+        write(output, artifact)
+    except BaseException as exc:
+        failure = {"type": type(exc).__name__, "message": str(exc), "traceback": traceback.format_exc()}
+        write(directory / "failure.json", failure)
+        if closeout and not (directory / "native_closeout.json").exists():
+            write(directory / "partial_native_closeout.json", closeout)
+        partial = getattr(exc, "replay_result", None)
+        if partial is not None:
+            write(directory / "controlled_failure.json", {
+                "events": partial.events, "dispatches": partial.dispatches,
+                "records": [r.model_dump(mode="json") for r in partial.records],
+                "messages": [m.model_dump(mode="json") for m in partial.messages],
+                "final_time": partial.final_time, "cleanup": partial.cleanup,
+                "serving": partial.serving, "accepted": False})
+        if not output.exists():
+            write(output, {"schema": "compass.aiperf_proper_run/1", "side": args.side,
+              "purpose": plan["purpose"], "repeat": args.repeat,
+                           "plan_sha256": args.plan_sha256, "complete": False,
+                           "failure": failure, "accepted": False})
+    finally:
+        signal.alarm(0)
+        signal.signal(signal.SIGALRM, previous_alarm)
+        if core is not None:
+            core.exit()
+        if store is not None:
+            asyncio.run(store.stop())
+        write(directory / "exit.json", {"success": failure is None, "started_at": started,
+              "ended_at": time.time(), "accepted": False})
+    return 1 if failure else 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

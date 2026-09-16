@@ -66,6 +66,7 @@ class ReplayWire:
         self.subscribers = defaultdict(list)
         self.records = []
         self.messages = []
+        self.wall_phase_events = []
         self.events = []
         self.dispatches = []
         self.dispatches_by_credit = {}
@@ -175,6 +176,11 @@ class ReplayWire:
 
     async def publish(self, message):
         self.messages.append(message)
+        if str(message.message_type) in ("credit_phase_start", "credit_phase_complete"):
+            import time
+            self.wall_phase_events.append({
+                "message_type": str(message.message_type), "stats": {"phase": str(message.stats.phase)},
+                "wall_observed_at": time.time()})
         if isinstance(message, ProfileCancelCommand):
             self.event("ProfileCancel", reason=str(message.reason))
             if message.reason.is_abort:

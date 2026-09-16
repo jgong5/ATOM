@@ -45,6 +45,7 @@ class ReplayResult:
     final_time: float
     cleanup: dict = field(default_factory=dict)
     serving: dict = field(default_factory=dict)
+    wall_phase_events: tuple = ()
     frontend_service: str = "unmodelled"
     source_qualified: bool = False
     accepted: bool = False
@@ -265,6 +266,7 @@ def run_controlled_replay(
             messages=tuple(wire.messages),
             dispatches=tuple(dict(d.evidence) for d in wire.dispatches),
             final_time=control.clock.time(), serving=serving_inputs,
+            wall_phase_events=tuple(wire.wall_phase_events),
             cleanup={
                 "io_requests": len(serving.io_processor.requests),
                 "stream_loops": len(api_server._stream_loops),

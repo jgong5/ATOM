@@ -6,7 +6,8 @@ import time
 
 
 @contextmanager
-def observe_native_phases(service_config, *, require_terminal=False, drain_seconds=2.0):
+def observe_native_phases(service_config, *, require_terminal=False, drain_seconds=2.0,
+                          record_wall_phases=False):
     """Listen to the native event bus without issuing credits or commands."""
     from aiperf.common.enums import CommAddress, MessageType
     from aiperf.zmq.sub_client import ZMQSubClient
@@ -29,7 +30,10 @@ def observe_native_phases(service_config, *, require_terminal=False, drain_secon
         async def record(message):
             if (str(message.message_type) != "command"
                     or str(getattr(message, "command", "")) == "profile_cancel"):
-                messages.append(message.model_dump(mode="json"))
+                value = message.model_dump(mode="json")
+                if record_wall_phases and str(message.message_type) in ("credit_phase_start", "credit_phase_complete"):
+                    value["wall_observed_at"] = time.time()
+                messages.append(value)
                 last_message[0] = time.monotonic()
                 if (str(message.message_type) == "credits_complete"
                         or (str(message.message_type) == "credit_phase_complete"
@@ -136,7 +140,7 @@ def run_native_profile(user_config, service_config):
     process = None
     began = time.time()
     with (directory / "native_aiperf_controller.log").open("x") as log:
-        with observe_native_phases(service_config, require_terminal=True) as messages:
+        with observe_native_phases(service_config, require_terminal=True, record_wall_phases=True) as messages:
             try:
                 process = subprocess.Popen(command, cwd=root, env=env, stdout=log, stderr=subprocess.STDOUT)
                 process.wait()
