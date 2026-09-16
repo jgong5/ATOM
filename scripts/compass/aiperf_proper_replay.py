@@ -182,7 +182,9 @@ def main(argv=None):
             provenance = native_provenance(args.url)
             check_runtime(plan, provenance, "real")
             native_scope = native_helpers.check_native_scope(scope_plan, provenance)
-            preparation = prepare_native(args.url, config, conversations, replay, directory)
+            preparation = prepare_native(args.url, config, conversations, replay, directory,
+                step_journal=output.parent / (output.stem + "_steps.jsonl"),
+                native_scope=native_scope["native"], model=plan["model"])
             cache_boundary = preparation["cache_boundary"]
             before = replay._prefix_cache_snapshot(args.url, 120)
             native_helpers.check_empty_cache(before)

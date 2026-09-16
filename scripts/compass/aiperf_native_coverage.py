@@ -354,7 +354,8 @@ def main(argv=None):
         scope = check_native_scope(plan, provenance)
         write(private / "startup_provenance.json", provenance)
         replay = lifecycle._load("replay")
-        preparation = prepare_native(plan["url"], config, conversations, replay, private)
+        preparation = prepare_native(plan["url"], config, conversations, replay, private,
+            step_journal=plan["step_journal"], native_scope=scope["native"], model=plan["model"])
         before = replay._prefix_cache_snapshot(plan["url"], 120)
         check_empty_cache(before)
         prepared_empty = replay._drain_records(plan["url"], 120)

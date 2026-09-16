@@ -51,7 +51,7 @@ def worker_snapshot(runner):
 def native_attention_snapshot(runner):
     """Read instantiated modules and bound views through the existing scope ABI."""
     from atom.compass.core.cost.families.attention_scope import read_resolved
-    from atom.model_ops.fla_ops import chunk_o, l2norm
+    from atom.model_ops.fla_ops import chunk, chunk_o, l2norm
     from atom.utils import envs, forward_context
 
     def qualname(value):
@@ -92,6 +92,7 @@ def native_attention_snapshot(runner):
                                  "pool_shapes": {"kv_cache": [
                                      list(runner.kv_cache.shape), str(runner.kv_cache.dtype)]}}}
     return {"record": record, "declaration": read_resolved(record).as_dict(),
+            "gdn_dispatch": {"is_amd": bool(chunk.is_amd)},
             "generated_cache_paths": {key: os.environ[key] for key in (
                 "TORCHINDUCTOR_CACHE_DIR", "TRITON_CACHE_DIR", "TORCH_EXTENSIONS_DIR")},
             "body_flags": {"FLA_GDN_FIX_BT": bool(chunk_o.FLA_GDN_FIX_BT),
@@ -102,6 +103,7 @@ def native_batch_allocation(batch):
     """Copy the scheduler's assignment before native forward consumes it."""
     ops = getattr(batch, "state_maintenance_ops", None)
     return {"source": "ScheduledBatch",
+            "is_dummy_run": getattr(batch, "is_dummy_run", None),
             "block_tables": [list(map(int, row)) for row in batch.block_tables],
             "cached_tokens": list(map(int, batch.num_cached_tokens)),
             "state_rows": list(batch.state_rows),
