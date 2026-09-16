@@ -255,6 +255,63 @@ def test_whole_groups_use_frozen_prices_and_preserve_original_failure(campaign):
     assert library.lookup(mha(32768))[0] is None  # A reference alone is not active.
 
 
+def conditioned_campaign(tmp_path, *, n=5120, k=6144, m=3056):
+    store = Artifacts(tmp_path)
+    domain = make_domain(store)
+    op = domain.ops["gemm_ref"]
+    op.update(input_shapes=[[m, k], [n, k]], output_shapes=[[m, n]])
+    for case in domain.cases:
+        if case["family"] == "gemm":
+            case.update(signature=signature_of(op), graph_batch=32, warmup=20, iters=256)
+    pin = make_campaign(store, domain, groups=("gemm",))
+    policy = dict(schema="compass.q3056_fixed_conditioning/1", eager_warmup_calls=20,
+        base_graph_calls=32, conditioning_base_replays=13, conditioning_operator_calls=416,
+        timed_base_replays=8, timed_operator_calls=256, fixed_idle_seconds=0, adaptive=False, clock_reads=0)
+    for name in ("gpu3/PLAN.json", "gpu3/MANIFEST.json"):
+        store.data[name]["conditioning_policy"] = dict(policy)
+    for phase in ("reference", "heldout"):
+        for row in store.data[f"gpu3/{phase}/PHASE_RESULT.json"]["records"]:
+            row["settings"]["GRAPH_BATCH"] = 32
+            row["treatment"]["conditioning_policy"] = dict(policy)
+            name = f"gpu3/{phase}/{row['cell_id']}.r{row['repeat']}.json"
+            store.data[name]["provenance"]["conditioning"] = dict(policy=dict(policy), timer_invocations=1, completed=True)
+    return store, domain, pin
+
+
+def reseal_conditioned_campaign(store):
+    store.seal()
+    store.data["gpu3/EXIT.json"]["plan_sha256"] = store.pins["gpu3/EXECUTION.json"]["sha256"]
+    store.seal()
+
+
+@pytest.mark.parametrize("n,k", [(5120,17408), (14336,5120), (16480,5120), (34816,5120), (5120,6144)])
+def test_declared_conditioning_uses_geometry_without_campaign_ids_or_counts(tmp_path, n, k):
+    store, domain, pin = conditioned_campaign(tmp_path, n=n, k=k)
+    reseal_conditioned_campaign(store)
+    library = load(pin)
+    assert library.selected_groups == ("gemm",)
+    assert library.lookup(domain.ops["gemm_control"])[0]["seconds"] == 2.
+
+
+@pytest.mark.parametrize("damage", ["missing", "wrong", "incomplete", "plan", "manifest", "row", "geometry"])
+def test_conditioning_requires_matching_declarations_geometry_and_completed_receipt(tmp_path, damage):
+    store, _, pin = conditioned_campaign(tmp_path, m=464 if damage == "geometry" else 3056)
+    raw = store.data["gpu3/heldout/gemm_control.r1.json"]
+    if damage == "missing":
+        del raw["provenance"]["conditioning"]
+    elif damage == "wrong":
+        raw["provenance"]["conditioning"]["policy"]["conditioning_base_replays"] = 1
+    elif damage == "incomplete":
+        raw["provenance"]["conditioning"]["completed"] = False
+    elif damage in ("plan", "manifest"):
+        del store.data[f"gpu3/{damage.upper()}.json"]["conditioning_policy"]
+    elif damage == "row":
+        del store.data["gpu3/heldout/PHASE_RESULT.json"]["records"][0]["treatment"]["conditioning_policy"]
+    reseal_conditioned_campaign(store)
+    with pytest.raises(ValueError, match="conditioning"):
+        load(pin)
+
+
 @pytest.mark.parametrize("selected", [("gemm",), ("embedding", "mrope")])
 def test_full_domain_keeps_auxiliary_groups_distinct_from_selected_prices(tmp_path, selected):
     store = Artifacts(tmp_path)

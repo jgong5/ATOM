@@ -19,6 +19,35 @@ EVENTS = ("REFERENCE_CLOSED", "FREEZE_SEALED", "HELDOUT_RELEASED", "HELDOUT_STAR
 EVIDENCE = ("domain_manifest", "plan", "manifest", "freeze", "verdict", "reference_plan",
             "reference_phase", "reference_preflight", "heldout_phase", "heldout_preflight",
             "dispatch", "execution_plan", "terminal", "owner_closeout", "copy_closeout", "original_failure")
+Q3056_CONDITIONING = dict(schema="compass.q3056_fixed_conditioning/1", eager_warmup_calls=20,
+    base_graph_calls=32, conditioning_base_replays=13, conditioning_operator_calls=416,
+    timed_base_replays=8, timed_operator_calls=256, fixed_idle_seconds=0, adaptive=False, clock_reads=0)
+
+
+def _conditioning_policy(plan, manifest):
+    if "conditioning_policy" not in plan and "conditioning_policy" not in manifest:
+        return None
+    policy = plan.get("conditioning_policy")
+    if (not isinstance(policy, dict) or policy != Q3056_CONDITIONING
+            or any(type(policy[key]) is not type(value) for key, value in Q3056_CONDITIONING.items())
+            or manifest.get("conditioning_policy") != policy):
+        raise ValueError("reached primitive conditioning policy is undeclared or inconsistent")
+    return policy
+
+
+def _conditioned_geometry(reader, case, role):
+    op = graph_for(reader, case, role + ".conditioning_graph")
+    shapes = op.get("input_shapes", [])
+    if (case["family"] != "gemm" or len(shapes) != 2 or any(len(shape) != 2 for shape in shapes)
+            or shapes[0][0] != 3056 or shapes[0][1] != shapes[1][1]
+            or (shapes[1][0], shapes[1][1]) not in
+                {(5120, 17408), (14336, 5120), (16480, 5120), (34816, 5120), (5120, 6144)}
+            or op.get("dtypes") != ["bfloat16", "bfloat16"]
+            or op.get("output_shapes") != [[3056, shapes[1][0]]]
+            or op.get("output_dtypes") != ["bfloat16"] or op.get("layouts") or op.get("context")
+            or (case["graph_batch"], case["warmup"], case["iters"], case["kv_regions"]) != (32, 20, 256, 1)
+            or case["only"] != GEMM or case["requested_cache"] != "graph" or case["observed_cache"] != "graph"):
+        raise ValueError("reached primitive conditioning geometry or timer contract differs")
 
 
 class Evidence:
@@ -80,7 +109,7 @@ def _point(values, case, profiles=None):
     return result
 
 
-def _raw(reader, case, row, role, *, retained=False):
+def _raw(reader, case, row, role, *, retained=False, conditioning_policy=None):
     raw = reader.read(row["raw"], role)
     settings = row.get("settings") or {}
     provenance = raw.get("provenance") or {}
@@ -97,9 +126,21 @@ def _raw(reader, case, row, role, *, retained=False):
     if any(price.get(field) != case[source] for field, source in
            (("cache", "observed_cache"), ("arg_sets", "arg_sets"), ("kv_regions", "kv_regions"))):
         raise ValueError("reached primitive raw working-set treatment differs")
-    if not retained:
+    declared = (row.get("treatment") or {}).get("conditioning_policy")
+    if conditioning_policy is not None:
+        _conditioned_geometry(reader, case, role)
+        receipt = provenance.get("conditioning") or {}
+        if (declared != conditioning_policy or receipt !=
+                dict(policy=conditioning_policy, timer_invocations=1, completed=True)
+                or receipt.get("completed") is not True or type(receipt.get("timer_invocations")) is not int):
+            raise ValueError("reached primitive actual conditioning receipt differs")
+    elif declared is not None or "conditioning" in provenance:
+        raise ValueError("reached primitive observation has undeclared conditioning")
+    if not retained or conditioning_policy is not None:
         treatment = {field: case[field] for field in
             ("graph_batch", "warmup", "iters", "requested_cache", "observed_cache", "arg_sets", "kv_regions")}
+        if conditioning_policy is not None:
+            treatment["conditioning_policy"] = conditioning_policy
         if (row.get("profiled") is not False or settings.get("PRICE_KERNELS") is not False
                 or settings.get("PROFILE_MATCH") != "" or price.get("kernels")
                 or row.get("treatment") != treatment):
@@ -189,7 +230,8 @@ def _phase(reader, phase, plan, plan_pin, phase_pin, preflight_pin):
         repeat, ordinal = index // len(cases) + 1, index % len(cases)
         if row.get("seed") != _seed(reader, plan, phase, repeat, ordinal, case["cell_id"]):
             raise ValueError("reached primitive timing seed differs")
-        _, price = _raw(reader, case, row, phase + ".raw." + case["cell_id"] + "." + str(repeat))
+        _, price = _raw(reader, case, row, phase + ".raw." + case["cell_id"] + "." + str(repeat),
+                        conditioning_policy=plan.get("conditioning_policy"))
         samples[case["cell_id"]].append(price["seconds"])
         raw_refs[case["cell_id"]].append(row["raw"])
     points = {name: _point(values, cases[name],
@@ -222,7 +264,13 @@ def _retained(reader, plan, dispatch, dispatch_pin):
         rows = [row for row in phase["records"] if row["cell_id"] == selected["original_name"]]
         if [row["repeat"] for row in rows] != [1, 2, 3] or [row["raw"] for row in rows] != entry["samples"]:
             raise ValueError("retained reached source sample inventory differs")
-        values = [_raw(reader, case, row, "retained.raw", retained=True)[1]["seconds"] for row in rows]
+        policy = prior.get("conditioning_policy")
+        if policy != plan.get("conditioning_policy"):
+            raise ValueError("retained reached source conditioning policy differs")
+        if policy is not None:
+            _conditioning_policy(prior, reader.read(prior["design"], "retained.manifest"))
+        values = [_raw(reader, case, row, "retained.raw", retained=True,
+                       conditioning_policy=policy)[1]["seconds"] for row in rows]
         point = dict(frozen["reference_points"][selected["original_name"]])
         measured = _point(values, case)
         if any(point.get(key) != value for key, value in measured.items()) or not measured["source_qualified"]:
@@ -351,6 +399,12 @@ def load_campaign(reference, deployment_scope_sha256, *, index):
             or frozen.get("target_timings_used") is not False or verdict.get("target_timings_used") is not False
             or frozen.get("candidate_activated") is not False or verdict.get("candidate_activated") is not False):
         raise ValueError("reached primitive plan, source freeze or heldout verdict differs")
+    policy = _conditioning_policy(plan, manifest)
+    reference_plan = data["reference_plan"]
+    if reference_plan.get("conditioning_policy") != policy:
+        raise ValueError("reached primitive reference and heldout conditioning policies differ")
+    if policy is not None:
+        _conditioning_policy(reference_plan, reader.read(reference_plan["design"], "reference.manifest"))
     from atom.compass.core.cache_policy import cache_on_policy, policy_errors
 
     for source in (plan, data["reference_plan"]):
