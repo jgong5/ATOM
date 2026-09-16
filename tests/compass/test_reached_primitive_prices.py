@@ -11,7 +11,7 @@ from atom.compass.core.cache_policy import cache_on_policy
 from atom.compass.core.cost.cached_q16 import CachedQ16Prices
 from atom.compass.core.cost.library import PriceLibrary
 from atom.compass.core.cost.low_query import GEMM
-from atom.compass.core.cost.reached_primitive_evidence import EVENTS
+from atom.compass.core.cost.reached_primitive_evidence import EVENTS, Evidence, _phase
 from atom.compass.core.cost.reached_primitives import ReachedPrimitivePrices, work_identity
 from atom.compass.runtime.microbench import signature_of
 from .test_cached_q16_prices import bundle as q16_bundle, gather, gdn, mha
@@ -226,6 +226,80 @@ def make_campaign(store, domain, label="gpu3", groups=("gemm", "gdn", "mha", "ga
     store.data[label + "/EXIT.json"]["plan_sha256"] = execution["sha256"]
     store.seal()
     return handoff
+
+
+def full_layer_labels(inventory):
+    # Label forms and 48 GDN / 16 MHA inventory from the actual Q3056
+    # reference PREFLIGHT. ABI payloads remain the protocol fixture values.
+    return {f"language_model.model.layers.{index}."
+            f"{'self_attn' if int(index) % 4 == 3 else 'linear_attn'}": value
+            for index, value in inventory.items()}
+
+
+@pytest.mark.parametrize("abi_full,native_full", [(True, True), (True, False), (False, True)])
+def test_actual_preflight_layer_label_forms_reach_reference_precision(tmp_path, abi_full, native_full):
+    store = Artifacts(tmp_path)
+    domain = make_domain(store)
+    make_campaign(store, domain)
+    preflight = store.data["gpu3/reference/PREFLIGHT.json"]
+    if abi_full:
+        preflight["family_abi"]["all_layers"] = full_layer_labels(preflight["family_abi"]["all_layers"])
+    if native_full:
+        preflight["native"]["layers"] = full_layer_labels(preflight["native"]["layers"])
+    # Preserve the observed target_096 triplet's precision outcome. No freeze
+    # is consumed here: this exercises the actual reference-phase reader.
+    values = [0.0031671087741851804, 0.002965928316116333, 0.0029762182235717775]
+    for repeat, value in enumerate(values, 1):
+        raw = store.data[f"gpu3/reference/gemm_ref.r{repeat}.json"]
+        next(iter(raw["prices"].values()))["seconds"] = value
+    store.seal()
+    pins = store.data["gpu3/HANDOFF.json"]["evidence"]
+    points, samples, _, _ = _phase(Evidence(tmp_path, 0), "reference", store.data["gpu3/PLAN.json"],
+        pins["plan"], pins["reference_phase"], pins["reference_preflight"])
+    assert points["gemm_ref"]["all_three"] == values
+    assert points["gemm_ref"]["range_over_median"] == pytest.approx(0.06759600370547081)
+    assert points["gemm_ref"]["source_qualified"] is False
+    assert len(samples["gemm_ref"]) == 3
+
+
+@pytest.mark.parametrize("inventory", ["abi", "native"])
+@pytest.mark.parametrize("damage", ["missing", "duplicate", "ambiguous", "out_of_range"])
+def test_layer_inventories_reject_missing_duplicate_or_ambiguous_indices(tmp_path, inventory, damage):
+    store = Artifacts(tmp_path)
+    domain = make_domain(store)
+    handoff = make_campaign(store, domain)
+    preflight = store.data["gpu3/reference/PREFLIGHT.json"]
+    entries = preflight["family_abi"]["all_layers"] if inventory == "abi" else preflight["native"]["layers"]
+    if damage == "missing":
+        del entries["63"]
+    elif damage == "duplicate":
+        del entries["63"]  # Keep 64 entries while duplicating layer zero.
+        entries["language_model.model.layers.0.linear_attn"] = deepcopy(entries["0"])
+    elif damage == "ambiguous":
+        entries["model.layers.0.sub.1.linear_attn"] = entries.pop("0")
+    else:
+        entries["64"] = entries.pop("63")
+    store.seal()
+    with pytest.raises(ValueError, match="layer"):
+        ReachedPrimitivePrices(PriceLibrary(), [handoff], deployment_scope_sha256=SCOPE)
+
+
+@pytest.mark.parametrize("damage", ["family", "abi"])
+def test_full_layer_labels_preserve_family_and_abi_checks(tmp_path, damage):
+    store = Artifacts(tmp_path)
+    domain = make_domain(store)
+    handoff = make_campaign(store, domain)
+    preflight = store.data["gpu3/reference/PREFLIGHT.json"]
+    preflight["family_abi"]["all_layers"] = full_layer_labels(preflight["family_abi"]["all_layers"])
+    preflight["native"]["layers"] = full_layer_labels(preflight["native"]["layers"])
+    label = "language_model.model.layers.0.linear_attn"
+    if damage == "family":
+        preflight["native"]["layers"][label]["family"] = "mha"
+    else:
+        preflight["family_abi"]["all_layers"][label] = {"abi": "changed"}
+    store.seal()
+    with pytest.raises(ValueError, match="not homogeneous"):
+        ReachedPrimitivePrices(PriceLibrary(), [handoff], deployment_scope_sha256=SCOPE)
 
 
 @pytest.fixture

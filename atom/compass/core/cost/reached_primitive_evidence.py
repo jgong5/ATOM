@@ -185,6 +185,27 @@ def _seed(reader, plan, phase, repeat, ordinal, name):
     return (314159 if phase == "reference" else 271828) + repeat * 1000 + ordinal
 
 
+def _layers_by_index(inventory):
+    from atom.models.utils import extract_layer_index
+
+    if not isinstance(inventory, dict):
+        raise ValueError("reached primitive layer inventory is incomplete")
+    normalized = {}
+    for label, value in inventory.items():
+        if not isinstance(label, str):
+            raise ValueError("reached primitive layer label is not a string")
+        try:
+            index = extract_layer_index(label)
+        except (AssertionError, ValueError) as exc:
+            raise ValueError("reached primitive layer label is ambiguous: " + label) from exc
+        if index not in range(64) or index in normalized:
+            raise ValueError("reached primitive layer index is duplicated or outside its scope: " + label)
+        normalized[index] = value
+    if set(normalized) != set(range(64)):
+        raise ValueError("reached primitive layer inventory is incomplete")
+    return normalized
+
+
 def _phase(reader, phase, plan, plan_pin, phase_pin, preflight_pin):
     value = reader.read(phase_pin, phase + ".phase")
     preflight = reader.read(preflight_pin, phase + ".preflight")
@@ -208,13 +229,14 @@ def _phase(reader, phase, plan, plan_pin, phase_pin, preflight_pin):
     if boundary.get("policy") != plan["cache_policy"] or (boundary.get("quiescence") or {}).get("idle") is not True:
         raise ValueError("reached primitive phase lacks its native idle cache boundary")
     abi = preflight.get("family_abi") or {}
-    families, layers = abi.get("families") or {}, abi.get("all_layers") or {}
-    if (abi.get("flags") != plan["backend_flags"] or set(families) != {"gdn", "mha"}
-            or set(layers) != {str(index) for index in range(64)}):
+    families = abi.get("families") or {}
+    if abi.get("flags") != plan["backend_flags"] or set(families) != {"gdn", "mha"}:
         raise ValueError("reached primitive homogeneous layer-family ABI is incomplete")
-    for label, observed in layers.items():
-        family = (preflight.get("native", {}).get("layers", {}).get(label) or {}).get("family")
-        expected_family = "mha" if int(label) % 4 == 3 else "gdn"
+    layers = _layers_by_index(abi.get("all_layers"))
+    native_layers = _layers_by_index(preflight.get("native", {}).get("layers"))
+    for index, observed in layers.items():
+        family = (native_layers[index] or {}).get("family")
+        expected_family = "mha" if index % 4 == 3 else "gdn"
         if family != expected_family or observed != families[family]:
             raise ValueError("reached primitive source layer ABI is not homogeneous")
     cases = {case["cell_id"]: case for case in plan["cases"] if case["phase"] == phase}
