@@ -102,6 +102,10 @@ def _check_source_options(plan, options):
             raise ValueError(f"proper replay refuses unqualified source opt-in: {key}")
     if options.get("root_prefill_diagnostic_handoff"):
         raise ValueError("proper replay cannot select fixed-workload diagnostic sources")
+    if options.get("diagnostic_reference_handoff") and (
+            plan.get("purpose") != "diagnostic"
+            or not _flag(options.get("diagnostic_only", False), "diagnostic_only")):
+        raise ValueError("proper diagnostic references require diagnostic purpose and explicit diagnostic_only")
 
 
 def create_modelled_config(plan, tokenizer, output_directory):

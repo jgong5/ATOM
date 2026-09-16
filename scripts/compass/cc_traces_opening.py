@@ -42,6 +42,7 @@ CACHE_REGION_OPTIONS = frozenset((
     "native_prefill_handoff", "native_prefill_handoff_sha256",
     "native_ap_handoff", "native_ap_handoff_sha256",
     "reached_primitive_handoffs",
+    "diagnostic_reference_handoff", "diagnostic_reference_handoff_sha256",
 ))
 
 
@@ -478,6 +479,48 @@ def check_source_contract(modelled, registry, workload_sha, forbidden, label, *,
                 registry, 1, workload_sha, forbidden))
         elif any(str(row.get("role", "")).startswith(reached_role) for row in inputs):
             raise ValueError("unconfigured reached primitive source evidence was loaded")
+        from atom.compass.core.cost.diagnostic_references import DiagnosticReferencePrices, ROLE_PREFIX
+
+        if bool(options.get("diagnostic_reference_handoff")) != bool(options.get("diagnostic_reference_handoff_sha256")):
+            raise ValueError("diagnostic reference handoff and its SHA-256 are required together")
+        if options.get("diagnostic_reference_handoff"):
+            from atom.compass.core.cost.library import PriceLibrary
+            from atom.compass.core.loaded_input import file_digests
+
+            if not diagnostic or not _flag(options.get("require_complete", True), "require_complete"):
+                raise ValueError("diagnostic references require diagnostic mode and complete coverage")
+            scopes = [row for row in inputs if row.get("role") == "oracle.attention_scope"]
+            if len(scopes) != 1 or scopes[0].get("requested") != options.get("attention_scope"):
+                raise ValueError("diagnostic references lack their loaded deployment scope")
+            source = DiagnosticReferencePrices(PriceLibrary(), options["diagnostic_reference_handoff"],
+                options["diagnostic_reference_handoff_sha256"], deployment_scope_sha256=scopes[0]["sha256"],
+                diagnostic_only=True)
+            observed = [row for row in inputs if str(row.get("role", "")).startswith(ROLE_PREFIX)]
+            if len(observed) != len(source.loaded_inputs):
+                raise ValueError("diagnostic reference input inventory differs")
+            by_digest = {}
+            for item in source.loaded_inputs:
+                if sum(row == item.as_dict() for row in observed) != 1:
+                    raise ValueError(f"diagnostic reference input {item.path} lacks its exact loaded identity")
+                by_digest.setdefault(item.sha256, []).append(item)
+            for sha, items in by_digest.items():
+                contents = file_digests(items)
+                digest = sha if len(contents) == 1 else validate._rolled_digest(contents)
+                role = ROLE_PREFIX + sha[:16]
+                bad.extend(validate._check_calibration_records(
+                    {role: digest}, {role: contents}, registry, 1, workload_sha, forbidden))
+            files = file_digests(source.loaded_inputs)
+            digest = next(iter(files.values())) if len(files) == 1 else validate._rolled_digest(files)
+            if ((compass.get("oracle_option_files") or {}).get("diagnostic_reference_handoff") != files
+                    or (compass.get("oracle_option_sha256") or {}).get("diagnostic_reference_handoff") != digest):
+                raise ValueError("diagnostic reference aggregate omits or changes loaded evidence")
+            bad.extend(validate._check_calibration_records(
+                {"diagnostic_reference_handoff": digest}, {"diagnostic_reference_handoff": files},
+                registry, 1, workload_sha, forbidden))
+            notes.append("Diagnostic reference medians and frozen bounded-prefix MHA predictions; "
+                         "all original qualification failures retained; no acceptance credit")
+        elif any(str(row.get("role", "")).startswith(ROLE_PREFIX) for row in inputs):
+            raise ValueError("unconfigured diagnostic reference evidence was loaded")
         if bool(options.get("native_prefill_handoff")) != bool(options.get("native_prefill_handoff_sha256")):
             raise ValueError("native prefill handoff and its SHA-256 are required together")
         native_role = "oracle.native_prefill_regions"

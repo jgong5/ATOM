@@ -93,6 +93,14 @@ def _mha_identity(op):
     return q, C, layer[0], _key(normalized)
 
 
+def mha_prefix_interpolation(low_seconds, high_seconds, prefix):
+    """The existing fixed-query interpolation over the measured prefix interval."""
+    if type(prefix) is not int or not PREFIXES[0] <= prefix <= PREFIXES[1]:
+        raise ValueError("MHA prefix interpolation cannot extrapolate")
+    weight = (prefix - PREFIXES[0]) / (PREFIXES[1] - PREFIXES[0])
+    return (1 - weight) * low_seconds + weight * high_seconds, [1 - weight, weight]
+
+
 class LowQueryPrices(PriceLibrary):
     """A separate source addition; baseline and q16 observations are untouched."""
 
@@ -294,12 +302,12 @@ class LowQueryPrices(PriceLibrary):
             if C in points:
                 record = points[C]
             else:
-                weight = (C - PREFIXES[0]) / (PREFIXES[1] - PREFIXES[0])
                 low, high = (points[c] for c in PREFIXES)
-                record = dict(low, seconds=(1 - weight) * low["seconds"] + weight * high["seconds"],
+                seconds, weights = mha_prefix_interpolation(low["seconds"], high["seconds"], C)
+                record = dict(low, seconds=seconds,
                               **{INTERPOLATED_FLAG: True})
                 record["interpolation"] = {"basis": "exact query, bounded cached prefix and layer transfer",
-                    "prefixes": list(PREFIXES), "weights": [1 - weight, weight],
+                    "prefixes": list(PREFIXES), "weights": weights,
                     "source_signatures": [low["signature"], high["signature"]],
                     "source_handoff_sha256": self.handoff_sha256}
         elif name == GATHER:

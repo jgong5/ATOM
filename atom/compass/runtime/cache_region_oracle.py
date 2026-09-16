@@ -113,6 +113,7 @@ def source_cost_oracle(*, region_overlay, region_overlay_sha256, regions,
                        native_prefill_handoff=None, native_prefill_handoff_sha256=None,
                        native_ap_handoff=None, native_ap_handoff_sha256=None,
                        reached_primitive_handoffs=None,
+                       diagnostic_reference_handoff=None, diagnostic_reference_handoff_sha256=None,
                        include_failed_outputless=False, include_failed_final=False, diagnostic_only=False,
                        q16_handoff=None, q16_handoff_sha256=None,
                        low_q_handoff=None, low_q_handoff_sha256=None,
@@ -148,6 +149,12 @@ def source_cost_oracle(*, region_overlay, region_overlay_sha256, regions,
         raise ValueError("native prefill source handoff and its explicit SHA-256 are required together")
     if bool(native_ap_handoff) != bool(native_ap_handoff_sha256):
         raise ValueError("native A/P handoff and its explicit SHA-256 are required together")
+    if bool(diagnostic_reference_handoff) != bool(diagnostic_reference_handoff_sha256):
+        raise ValueError("diagnostic reference handoff and its explicit SHA-256 are required together")
+    if diagnostic_reference_handoff and (
+            not _flag(diagnostic_only, "diagnostic_only")
+            or not _flag(options.get("require_complete", True), "require_complete")):
+        raise ValueError("diagnostic references require explicit diagnostic mode and complete coverage")
     if native_ap_handoff and not native_prefill_handoff:
         raise ValueError("native A/P families require their retained native-prefill source")
     if bool(q16_handoff) != bool(q16_handoff_sha256):
@@ -273,6 +280,17 @@ def source_cost_oracle(*, region_overlay, region_overlay_sha256, regions,
         result.regions = selected
         result.compass_region_snapshot = region_snapshot("native-prefill-sources", result.regions)
         result.compass_loaded_inputs += result.regions.loaded_inputs
+    if diagnostic_reference_handoff:
+        from atom.compass.core.cost.diagnostic_references import DiagnosticReferencePrices
+
+        scopes = [entry for entry in result.library.loaded_inputs if entry.role == "oracle.attention_scope"]
+        if len(scopes) != 1:
+            raise ValueError("diagnostic references require one loaded deployment attention scope")
+        previous = len(result.library.loaded_inputs)
+        result.library = DiagnosticReferencePrices(result.library, diagnostic_reference_handoff,
+            diagnostic_reference_handoff_sha256, deployment_scope_sha256=scopes[0].sha256,
+            diagnostic_only=True)
+        result.compass_loaded_inputs += result.library.loaded_inputs[previous:]
     if native_ap_handoff:
         from atom.compass.core.cost.native_ap_regions import NativeAPFamilyRegions
 

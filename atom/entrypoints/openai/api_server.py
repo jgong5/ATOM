@@ -2748,6 +2748,8 @@ def _loaded_option_files(ranks: list) -> dict:
                 key = "native_ap_handoff"
             if str(row.get("role", "")).startswith("oracle.reached_primitives."):
                 key = "reached_primitive_handoffs"
+            if str(row.get("role", "")).startswith("oracle.diagnostic_references."):
+                key = "diagnostic_reference_handoff"
             if not key or not row.get("sha256"):
                 continue
             by_option.setdefault(key, []).append(row)
