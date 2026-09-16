@@ -43,6 +43,7 @@ CACHE_REGION_OPTIONS = frozenset((
     "native_ap_handoff", "native_ap_handoff_sha256",
     "reached_primitive_handoffs",
     "diagnostic_reference_handoff", "diagnostic_reference_handoff_sha256",
+    "exact_operator_handoff", "exact_operator_handoff_sha256",
 ))
 
 
@@ -524,6 +525,45 @@ def check_source_contract(modelled, registry, workload_sha, forbidden, label, *,
                          "all original qualification failures retained; no acceptance credit")
         elif any(str(row.get("role", "")).startswith(ROLE_PREFIX) for row in inputs):
             raise ValueError("unconfigured diagnostic reference evidence was loaded")
+        if bool(options.get("exact_operator_handoff")) != bool(options.get("exact_operator_handoff_sha256")):
+            raise ValueError("exact operator handoff and SHA-256 are required together")
+        from atom.compass.core.cost.exact_operator_references import ExactOperatorReferences, ROLE_PREFIX as EXACT_PREFIX
+
+        if options.get("exact_operator_handoff"):
+            from atom.compass.core.cost.library import PriceLibrary
+            from atom.compass.core.loaded_input import file_digests
+
+            if not diagnostic or not _flag(options.get("require_complete", True), "require_complete"):
+                raise ValueError("exact operator references require diagnostic mode and complete coverage")
+            scopes = [row for row in inputs if row.get("role") == "oracle.attention_scope"]
+            if len(scopes) != 1:
+                raise ValueError("exact operator references lack their loaded deployment scope")
+            source = ExactOperatorReferences(PriceLibrary(), options["exact_operator_handoff"],
+                options["exact_operator_handoff_sha256"], deployment_scope_sha256=scopes[0]["sha256"], diagnostic_only=True)
+            observed = [row for row in inputs if str(row.get("role", "")).startswith(EXACT_PREFIX)]
+            if len(observed) != len(source.loaded_inputs):
+                raise ValueError("exact operator reference input inventory differs")
+            by_digest = {}
+            for item in source.loaded_inputs:
+                if sum(row == item.as_dict() for row in observed) != 1:
+                    raise ValueError("exact operator reference lacks its exact loaded identity: " + item.path)
+                by_digest.setdefault(item.sha256, []).append(item)
+            for sha, items in by_digest.items():
+                contents = file_digests(items)
+                digest = sha if len(contents) == 1 else validate._rolled_digest(contents)
+                role = EXACT_PREFIX + sha[:16]
+                bad.extend(validate._check_calibration_records({role: digest}, {role: contents},
+                    registry, 1, workload_sha, forbidden))
+            files = file_digests(source.loaded_inputs)
+            digest = validate._rolled_digest(files)
+            if ((compass.get("oracle_option_files") or {}).get("exact_operator_handoff") != files
+                    or (compass.get("oracle_option_sha256") or {}).get("exact_operator_handoff") != digest):
+                raise ValueError("exact operator aggregate omits or changes its evidence")
+            bad.extend(validate._check_calibration_records({"exact_operator_handoff": digest},
+                {"exact_operator_handoff": files}, registry, 1, workload_sha, forbidden))
+            notes.append("Exact operator-event references; kernel dispatch/count unobserved; precision warnings retained; no interpolation or acceptance credit")
+        elif any(str(row.get("role", "")).startswith(EXACT_PREFIX) for row in inputs):
+            raise ValueError("unconfigured exact operator reference evidence was loaded")
         if bool(options.get("native_prefill_handoff")) != bool(options.get("native_prefill_handoff_sha256")):
             raise ValueError("native prefill handoff and its SHA-256 are required together")
         native_role = "oracle.native_prefill_regions"

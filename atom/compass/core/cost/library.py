@@ -50,7 +50,7 @@ from atom.compass.core.cost.prepared import (
     PreparedOperator, immutable_content_key, materialize_graph,
 )
 from atom.compass.core.cost.prepared_plan import PreparedGraph, StaticSegment
-from atom.compass.core.cost.records import AttestedAttentionRecord
+from atom.compass.core.cost.records import AttestedAttentionRecord, OperatorEventRecord
 from atom.compass.core.loaded_input import load_json
 
 logger = logging.getLogger(__name__)
@@ -60,6 +60,11 @@ __all__ = ["Coverage", "PriceLibrary", "GraphSource", "StaticGraphs",
 
 
 def _record_launch_count(record):
+    if isinstance(record, OperatorEventRecord):
+        # This is an added-charge count, not a claim that zero kernels ran.
+        # The record explicitly retains kernel_count=None and is admitted only
+        # by an exact source adapter requiring zero additional launch charge.
+        return 0
     if isinstance(record, AttestedAttentionRecord):
         return record.attested_launch_count
     return max(1, len(record.get("kernels") or {}))

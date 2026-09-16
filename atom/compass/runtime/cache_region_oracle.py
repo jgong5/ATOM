@@ -114,6 +114,7 @@ def source_cost_oracle(*, region_overlay, region_overlay_sha256, regions,
                        native_ap_handoff=None, native_ap_handoff_sha256=None,
                        reached_primitive_handoffs=None,
                        diagnostic_reference_handoff=None, diagnostic_reference_handoff_sha256=None,
+                       exact_operator_handoff=None, exact_operator_handoff_sha256=None,
                        include_failed_outputless=False, include_failed_final=False, diagnostic_only=False,
                        q16_handoff=None, q16_handoff_sha256=None,
                        low_q_handoff=None, low_q_handoff_sha256=None,
@@ -151,6 +152,12 @@ def source_cost_oracle(*, region_overlay, region_overlay_sha256, regions,
         raise ValueError("native A/P handoff and its explicit SHA-256 are required together")
     if bool(diagnostic_reference_handoff) != bool(diagnostic_reference_handoff_sha256):
         raise ValueError("diagnostic reference handoff and its explicit SHA-256 are required together")
+    if bool(exact_operator_handoff) != bool(exact_operator_handoff_sha256):
+        raise ValueError("exact operator handoff and its SHA-256 are required together")
+    if exact_operator_handoff and (
+            not _flag(diagnostic_only, "diagnostic_only")
+            or not _flag(options.get("require_complete", True), "require_complete")):
+        raise ValueError("exact operator references require diagnostic mode and complete coverage")
     if diagnostic_reference_handoff and (
             not _flag(diagnostic_only, "diagnostic_only")
             or not _flag(options.get("require_complete", True), "require_complete")):
@@ -290,6 +297,18 @@ def source_cost_oracle(*, region_overlay, region_overlay_sha256, regions,
         result.library = DiagnosticReferencePrices(result.library, diagnostic_reference_handoff,
             diagnostic_reference_handoff_sha256, deployment_scope_sha256=scopes[0].sha256,
             diagnostic_only=True)
+        result.compass_loaded_inputs += result.library.loaded_inputs[previous:]
+    if exact_operator_handoff:
+        from atom.compass.core.cost.exact_operator_references import ExactOperatorReferences
+
+        scopes = [entry for entry in result.library.loaded_inputs if entry.role == "oracle.attention_scope"]
+        if len(scopes) != 1:
+            raise ValueError("exact operator sources require one loaded deployment attention scope")
+        if result.seconds_per_launch != 0:
+            raise ValueError("unobserved kernel dispatch requires zero added launch charge")
+        previous = len(result.library.loaded_inputs)
+        result.library = ExactOperatorReferences(result.library, exact_operator_handoff,
+            exact_operator_handoff_sha256, deployment_scope_sha256=scopes[0].sha256, diagnostic_only=True)
         result.compass_loaded_inputs += result.library.loaded_inputs[previous:]
     if native_ap_handoff:
         from atom.compass.core.cost.native_ap_regions import NativeAPFamilyRegions

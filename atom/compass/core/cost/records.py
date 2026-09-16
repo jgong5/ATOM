@@ -11,3 +11,7 @@ class AttestedAttentionRecord(dict):
         self.attested_launch_count = count
         self["attention_exact_override"] = True
         self["launch_count"] = count
+
+
+class OperatorEventRecord(dict):
+    """Whole-operator timing with unknown kernel count and no extra launch fee."""
