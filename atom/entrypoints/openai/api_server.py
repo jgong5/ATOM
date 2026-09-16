@@ -2752,6 +2752,8 @@ def _loaded_option_files(ranks: list) -> dict:
                 key = "diagnostic_reference_handoff"
             if str(row.get("role", "")).startswith("oracle.exact_operator_references."):
                 key = "exact_operator_handoff"
+            if str(row.get("role", "")).startswith("oracle.native_mha_decode_layout."):
+                key = "native_mha_decode_layout_handoff"
             if not key or not row.get("sha256"):
                 continue
             by_option.setdefault(key, []).append(row)

@@ -17,6 +17,7 @@ from atom.compass.core.cost.prepared import PreparedOperator
 from atom.compass.core.cost.reached_primitive_evidence import Evidence
 
 SCHEMA = "compass.native_mha_decode_layout_transfer/1"
+ROLE_PREFIX = "oracle.native_mha_decode_layout."
 REGIME = "unified.decode.paged_gluon_dispatch"
 DECODE_SCOPE = {"attention_backend": "paged_gluon", "compute_units": 80,
                 "decode_dispatch_topology": "gfx942-spx-4xcc-80cu",
@@ -64,7 +65,7 @@ class NativeMhaDecodeLayout(PriceLibrary):
     def __init__(self, base, handoff_path, handoff_sha256, *, deployment_scope_sha256):
         super().__init__()
         reader = Evidence(Path(handoff_path).parent, "native_mha_layout")
-        reader.prefix = "oracle.native_mha_decode_layout."
+        reader.prefix = ROLE_PREFIX
         handoff = reader.read(dict(path=str(handoff_path), sha256=handoff_sha256), "handoff")
         if (handoff.get("schema") != SCHEMA or handoff.get("modelled_transfer") is not True
                 or handoff.get("source_refitted") is not False

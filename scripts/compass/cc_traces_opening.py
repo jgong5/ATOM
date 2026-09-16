@@ -44,6 +44,7 @@ CACHE_REGION_OPTIONS = frozenset((
     "reached_primitive_handoffs",
     "diagnostic_reference_handoff", "diagnostic_reference_handoff_sha256",
     "exact_operator_handoff", "exact_operator_handoff_sha256",
+    "native_mha_decode_layout_handoff", "native_mha_decode_layout_handoff_sha256",
     "composition_qualification", "composition_qualification_sha256",
 ))
 
@@ -570,6 +571,46 @@ def check_source_contract(modelled, registry, workload_sha, forbidden, label, *,
                          ("composition qualification checked separately" if composition else "no interpolation or acceptance credit"))
         elif any(str(row.get("role", "")).startswith(EXACT_PREFIX) for row in inputs):
             raise ValueError("unconfigured exact operator reference evidence was loaded")
+        from atom.compass.core.cost.native_mha_layout import NativeMhaDecodeLayout, ROLE_PREFIX as MHA_LAYOUT_PREFIX
+
+        if bool(options.get("native_mha_decode_layout_handoff")) != bool(options.get("native_mha_decode_layout_handoff_sha256")):
+            raise ValueError("native MHA layout handoff and SHA-256 are required together")
+        if options.get("native_mha_decode_layout_handoff"):
+            from atom.compass.core.cost.families.adapter import ParametricPriceLibrary
+            from atom.compass.core.loaded_input import file_digests
+
+            if not (diagnostic or composition):
+                raise ValueError("native MHA layout transfer requires diagnostic mode or composition qualification")
+            scopes = [row for row in inputs if row.get("role") == "oracle.attention_scope"]
+            if len(scopes) != 1:
+                raise ValueError("native MHA layout transfer lacks its loaded deployment scope")
+            source = NativeMhaDecodeLayout(ParametricPriceLibrary(), options["native_mha_decode_layout_handoff"],
+                options["native_mha_decode_layout_handoff_sha256"], deployment_scope_sha256=scopes[0]["sha256"])
+            observed = [row for row in inputs if str(row.get("role", "")).startswith(MHA_LAYOUT_PREFIX)]
+            if len(observed) != len(source.loaded_inputs):
+                raise ValueError("native MHA layout transfer input inventory differs")
+            by_digest = {}
+            for item in source.loaded_inputs:
+                if sum(row == item.as_dict() for row in observed) != 1:
+                    raise ValueError("native MHA layout transfer lacks its exact loaded identity: " + item.path)
+                by_digest.setdefault(item.sha256, []).append(item)
+            for sha, items in by_digest.items():
+                contents = file_digests(items)
+                digest = sha if len(contents) == 1 else validate._rolled_digest(contents)
+                role = MHA_LAYOUT_PREFIX + sha[:16]
+                bad.extend(validate._check_calibration_records({role: digest}, {role: contents},
+                    registry, 1, workload_sha, forbidden))
+            files = file_digests(source.loaded_inputs)
+            digest = validate._rolled_digest(files)
+            if ((compass.get("oracle_option_files") or {}).get("native_mha_decode_layout_handoff") != files
+                    or (compass.get("oracle_option_sha256") or {}).get("native_mha_decode_layout_handoff") != digest):
+                raise ValueError("native MHA layout aggregate omits or changes its evidence")
+            bad.extend(validate._check_calibration_records({"native_mha_decode_layout_handoff": digest},
+                {"native_mha_decode_layout_handoff": files}, registry, 1, workload_sha, forbidden))
+            notes.append("Native V address transfer into the bounded decode model; actual layouts and source residuals retained; "
+                         "modelled coverage, not exact measured coverage")
+        elif any(str(row.get("role", "")).startswith(MHA_LAYOUT_PREFIX) for row in inputs):
+            raise ValueError("unconfigured native MHA layout transfer evidence was loaded")
         if bool(options.get("native_prefill_handoff")) != bool(options.get("native_prefill_handoff_sha256")):
             raise ValueError("native prefill handoff and its SHA-256 are required together")
         native_role = "oracle.native_prefill_regions"
