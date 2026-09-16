@@ -185,5 +185,6 @@ def profiling_wall_window(events):
     start, end = edges["credit_phase_start"], edges["credit_phase_complete"]
     if end <= start:
         raise ValueError("physical profiling wall interval is not positive")
-    return {"started_at": start, "ended_at": end, "seconds": end-start, "clock": "wall",
+    return {"schema": "compass.replay_wall_window/1",
+            "started_at": start, "ended_at": end, "seconds": end-start, "clock": "wall",
             "scope": "passive phase start through phase complete; excludes setup/export and final drain"}

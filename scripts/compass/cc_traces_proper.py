@@ -3,8 +3,9 @@
 The frozen plan declares purpose, repeats, symmetric record_export settings,
 native/modelled engine arguments and environments, profile/dependency pins, and
 the calibration registry. Environment paths may contain {repeat}. Acceptance
-uses the protocol repeat floor and existing source, memory, metric and measured
-cost checks. cost_args are forwarded unchanged to cc_traces_run costs.
+uses the protocol repeat floor and existing source, memory and metric checks.
+Supplied cost claims remain validated; unavailable speedup accounting is advisory.
+cost_args are forwarded unchanged to cc_traces_run costs.
 """
 import argparse
 import hashlib
@@ -283,6 +284,49 @@ def pair_input_observations(real, modelled):
     return observed
 
 
+
+def cost_claim_errors(costs, validate):
+    """Missing accounting is advisory; supplied numerical claims remain checked."""
+    if not costs:
+        return []
+    bad = []
+    if costs.get("cost_schema") != validate.COSTS_SCHEMA:
+        bad.append("supplied costs use an unsupported cost schema")
+    _, reasons = validate._timing(costs)
+    bad += reasons
+    for name in validate.MEASURED_COST_TERMS:
+        value = costs.get(name)
+        if value is not None and (type(value) not in (int, float) or not validate._finite(value) or value < 0):
+            bad.append(f"supplied cost {name} is not a finite nonnegative duration")
+    for side in ("real", "modelled"):
+        claimed = costs.get("execution_" + side) is not None or bool(
+            (costs.get("execution_by_repeat") or {}).get(side))
+        if claimed and (costs.get("execution_clocks") or {}).get(side) != "wall":
+            bad.append(f"supplied {side} execution cost is not labelled wall-clock")
+    for name in validate.SUPPLIED_COST_TERMS:
+        value = costs.get(name)
+        if value is None or value == {} or value == [] or validate._unknown_disclosure(value):
+            continue
+        parts = validate._parts(costs, name)
+        if not parts or (isinstance(value, list) and len(parts) != len(value)):
+            bad.append(f"supplied {name} cost lacks structured duration provenance")
+            continue
+        for part in parts:
+            if validate._unknown_disclosure(part):
+                continue
+            if (type(part.get("seconds")) not in (int, float)
+                    or not validate._finite(part.get("seconds")) or part["seconds"] < 0
+                    or not part.get("source") or "within" not in part
+                    or part["within"] not in (None,) + validate.MEASURED_COST_TERMS):
+                bad.append(f"supplied {name} cost has invalid duration/provenance/containment")
+        known = set(validate._by_repeat(costs, "execution_by_repeat", "modelled" if name == "derivation" else "real"))
+        if name in ("derivation", "load") and known:
+            if validate._foreign_repeats(costs, name, known):
+                bad.append(f"supplied {name} cost names a foreign repeat")
+            if name == "derivation" and validate._unplaced_repeats(costs, name) > 0:
+                bad.append("supplied derivation duration belongs to no repeat")
+    return bad
+
 def pair(args):
     case = load_case(args.plan, args.plan_sha256, args.case_id)
     plan = core.read_pinned(case["plan"])
@@ -296,10 +340,11 @@ def pair(args):
     paths = {side: [cell / f"{side}.r{repeat}.json" for repeat in range(1, case["repeats"]+1)]
              for side in journals}
     failures, notes, reports, memory, inputs, counts = [], [], [], [], [], []
+    execution_windows = []
     for side, journal in journals.items():
         if journal.get("ok") is not True or journal.get("purpose") != case["purpose"]:
             failures.append(f"{side} lifecycle did not complete its predeclared purpose")
-        if set(cell.glob(f"{side}.r*.json")) != set(paths[side]):
+        if set(validate._runs(cell, side)) != set(paths[side]):
             failures.append(f"{side} artifacts differ from the frozen repeat count")
     failures += validate.check_gpu_free(cell, paths["modelled"])
     isolation_path = cell / "isolation.json"
@@ -317,6 +362,7 @@ def pair(args):
         blobs = {side: json.loads(paths[side][repeat-1].read_text()) for side in journals}
         for side, blob in blobs.items():
             check_result(blob, case)
+            validate.replay_client.read_wall_window(blob.get("execution_wall_window"))
             if blob["repeat"] != repeat:
                 raise ValueError("proper artifact belongs to another repeat")
             execution = blob.get("execution") or {}
@@ -347,6 +393,7 @@ def pair(args):
         memory.append(observed_memory)
         reports.append(compare_dynamic(blobs["real"], blobs["modelled"]))
         counts.append({side: blob["phase"]["counts"] for side, blob in blobs.items()})
+        execution_windows.append({side: blob["execution_wall_window"] for side, blob in blobs.items()})
     for side in manifests:
         failures += validate.check_who_served(journals[side], manifests[side], side)
     scores = validate._across_repeats(reports)
@@ -356,10 +403,15 @@ def pair(args):
     if not costs_path.exists() and all((cell / f"costs.{side}.json").exists() for side in journals):
         lifecycle.main(["costs", str(cell), *plan.get("cost_args", [])])
     costs = json.loads(costs_path.read_text()) if costs_path.exists() else {}
+    failures += cost_claim_errors(costs, validate)
+    if costs:
+        for side in journals:
+            if costs.get("execution_" + side) is not None or (costs.get("execution_by_repeat") or {}).get(side):
+                failures += validate.check_costs_cover_runs(costs, side, paths[side], journals[side], case["repeats"])
     speedup = validate._speedup(costs, 1)
     if speedup.get("replay_ratio") is None:
         reason = "measured execution/derivation accounting unavailable: " + str(speedup.get("reason"))
-        (failures if case["purpose"] == lifecycle.ACCEPTANCE else notes).append(reason)
+        notes.append(reason + "; speedup accounting is advisory")
     passed = bool(reports) and not failures
     output = {"schema": "compass.aiperf_proper_pair_result/1", "case": identity(case),
               "purpose": case["purpose"], "passed": passed,
@@ -368,6 +420,7 @@ def pair(args):
               "metrics": scores, "detail": reports, "input_observations": inputs,
               "counts": counts, "memory": memory, "isolation": isolation,
               "speedup": speedup, "speedup_target_advisory": True,
+              "execution_wall_windows": execution_windows,
               "calibration_registry_sha256": plan["calibration_registry"]["sha256"]}
     path = Path(args.out) if args.out else cell / "proper_pair.json"
     path.write_text(json.dumps(output, indent=2) + "\n")
