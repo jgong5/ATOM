@@ -1,6 +1,7 @@
 """Load the pinned ordinary AIPerf profile and verify its exported dependency."""
 import hashlib
 import importlib.util
+import inspect
 from pathlib import Path
 
 from atom.compass.core.proper_replay import checked_path, profile_identity, read_pinned
@@ -45,7 +46,12 @@ def load_profile(plan):
     spec.loader.exec_module(builder)
     # Only a path alias may differ: the bytes above have already been checked.
     builder.SOURCE = Path(source["path"])
-    config = builder.config()
+    # Construct with the requested root-client count before dependency validators
+    # derive coupled settings. Old pinned C1 constructors remain usable unchanged.
+    if "clients" in inspect.signature(builder.config).parameters:
+        config = builder.config(clients=identity["clients"])
+    else:
+        config = builder.config()
     config.benchmark_id = prepared["config"]["benchmark_id"]
     current, expected = config.model_dump(mode="json"), dict(prepared["config"])
     for value in (current, expected):
@@ -84,6 +90,20 @@ def compare_native_metadata(frozen, observed, conversations):
             "basis": {"has_timing_data": "no consumers in pinned dependency",
                       "default_context_mode": "explicit Conversation.context_mode takes precedence"}}
 
+def _check_source_options(plan, options):
+    """Diagnostic execution may retain failed precision; missing work stays fatal."""
+    from atom.compass.runtime.source_oracle import _flag
+
+    if not _flag(options.get("require_complete", True), "require_complete"):
+        raise ValueError("proper replay requires complete cost coverage; unpriced work cannot be omitted")
+    for key in ("diagnostic_only", "include_failed_outputless", "include_failed_final", "low_q_allow_failed_spread",
+                "root_prefill_allow_failed_spread"):
+        if _flag(options.get(key, False), key) and plan.get("purpose") != "diagnostic":
+            raise ValueError(f"proper replay refuses unqualified source opt-in: {key}")
+    if options.get("root_prefill_diagnostic_handoff"):
+        raise ValueError("proper replay cannot select fixed-workload diagnostic sources")
+
+
 def create_modelled_config(plan, tokenizer, output_directory):
     """Use the normal EngineArgs/Config path; no release calendar is installed."""
     from dataclasses import fields
@@ -103,17 +123,11 @@ def create_modelled_config(plan, tokenizer, output_directory):
         raise ValueError("proper paired harness currently supports TP1/PP1")
     if config.enable_prefix_caching is not True:
         raise ValueError("proper paired harness requires prefix caching enabled")
-    from atom.compass.runtime.source_oracle import _flag
     if compass.oracle_qualname not in (
             "atom.compass.runtime.source_oracle.source_cost_oracle",
             "atom.compass.runtime.cache_region_oracle.source_cost_oracle"):
         raise ValueError("proper replay requires the maintained source oracle factory")
-    for key in ("diagnostic_only", "include_failed_outputless", "include_failed_final", "low_q_allow_failed_spread",
-                "root_prefill_allow_failed_spread"):
-        if _flag(compass.oracle_options.get(key, False), key):
-            raise ValueError(f"proper replay refuses unqualified source opt-in: {key}")
-    if compass.oracle_options.get("root_prefill_diagnostic_handoff"):
-        raise ValueError("proper replay cannot select fixed-workload diagnostic sources")
+    _check_source_options(plan, compass.oracle_options)
     compass.epoch = 100.0
     compass.measure_out = str(Path(output_directory).parent / (Path(output_directory).stem + "_steps.jsonl"))
     compass.filler_token_id = plan["surrogate_output"]["token_id"]

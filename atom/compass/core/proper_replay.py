@@ -28,8 +28,10 @@ def content_sha256(value):
 def profile_identity(prepared):
     config = prepared["config"]
     conversations = prepared["conversations"]
+    # Root clients may spawn sub-agents; this is not an in-flight request cap.
+    clients = config["loadgen"]["concurrency"]
     if (config.get("scenario") != "inferencex-agentx-mvp"
-            or config["loadgen"]["concurrency"] != 1
+            or type(clients) is not int or clients not in (1, 2, 4, 8)
             or config["loadgen"]["benchmark_duration"] != 900
             or config["input"]["random_seed"] != 42
             or config["endpoint"]["type"] != "chat"
@@ -37,13 +39,13 @@ def profile_identity(prepared):
             or config["endpoint"]["use_server_token_count"] is not True
             or not conversations
             or any(c["context_mode"] != "deltas_with_responses" for c in conversations)):
-        raise ValueError("proper replay requires the frozen C1/900s/seed42 provided-history profile")
+        raise ValueError("proper replay requires a C1/C2/C4/C8, 900s/seed42 provided-history profile")
     # The benchmark identifier is an input: ordinary cache-bust markers hash it.
     benchmark_id = config["benchmark_id"]
     if not isinstance(benchmark_id, str) or not benchmark_id:
         raise ValueError("proper replay requires its cache-bust benchmark identifier")
     return {
-        "scenario": config["scenario"], "clients": 1, "profile_seconds": 900,
+        "scenario": config["scenario"], "clients": clients, "profile_seconds": 900,
         "seed": 42, "benchmark_id": benchmark_id,
         "context_mode": "deltas_with_responses",
         "source_sha256": prepared["source"]["sha256"],
