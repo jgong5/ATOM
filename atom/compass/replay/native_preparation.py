@@ -80,7 +80,16 @@ def gdn_dispatch_prompt(tokens):
     return [1024 + tokens * 128 + i for i in range(tokens + 1)]
 
 
+def long_prefill_prompt(tokens):
+    """Independent bounded prompt whose checkpoint ends at the configured chunk."""
+    if type(tokens) is not int or not 64 < tokens <= 16384 or tokens % 16:
+        raise ValueError("long-prefill preparation requires a bounded block-aligned chunk")
+    return [1024 + i for i in range(tokens + 1)]
+
+
 def _observed_preparation_rows(journal, offset, records):
+    if not records:
+        return []
     ids = {str(row["seq_id"]) for row in records}
     if len(ids) != len(records):
         raise ValueError("preparation lacks distinct native request identities")
@@ -148,17 +157,22 @@ def check_runtime(plan, provenance, side, opening):
         raise ValueError("; ".join(bad))
 
 
-def prepare_native(base, config, conversations, replay, directory, *, step_journal, native_scope, model):
+def prepare_native(base, config, conversations, replay, directory, *, step_journal, native_scope, model,
+                   dispatch_only=False, max_prefill_tokens=None):
     """Warm declared dispatch classes, then acknowledge an empty request cache."""
     from atom.compass.core.cache_boundary import flush_receipt_errors, reset_receipt_errors
     from atom.compass.prefix_workload import token_digest
 
     start, began = time.time(), time.monotonic()
+    if type(dispatch_only) is not bool or max_prefill_tokens is not None and not dispatch_only:
+        raise ValueError("bounded long-prefill preparation requires dispatch-only mode")
+    if max_prefill_tokens is not None:
+        long_prefill_prompt(max_prefill_tokens)
     gdn_dispatch_coverage([], native_scope=native_scope, model=model)
     journal = Path(step_journal)
     offset = journal.stat().st_size if journal.exists() else 0
     payloads = []
-    for body in marked_payloads(config, conversations):
+    for body in (() if dispatch_only else marked_payloads(config, conversations)):
         body["max_completion_tokens"] = 2
         body.pop("max_tokens", None)
         payloads.append(json.dumps(body).encode())
@@ -195,15 +209,17 @@ def prepare_native(base, config, conversations, replay, directory, *, step_journ
                                     native_scope=native_scope, model=model)
     before = coverage
     dispatch_requests = []
-    for tokens in (16, 32, 64):
-        needed = {"output_bt" + str(tokens)}
+    representatives = (16, 32, 64) + ((max_prefill_tokens,) if max_prefill_tokens is not None else ())
+    for tokens in representatives:
+        long_prefill = tokens > 64
+        needed = {"output_bt" + str(min(tokens, 64))}
         if tokens < 64:
             needed.add("recompute_varlen_bt64")
         else:
             needed.add("amd_fused_ge64")
-        if not needed.intersection(coverage["missing"]):
+        if not long_prefill and not needed.intersection(coverage["missing"]):
             continue
-        prompt = gdn_dispatch_prompt(tokens)
+        prompt = long_prefill_prompt(tokens) if long_prefill else gdn_dispatch_prompt(tokens)
         token_sha = token_digest(prompt)
         body = {"model": model, "prompt": prompt, "max_tokens": 2, "temperature": 1.0,
                 "top_k": -1, "top_p": 1.0, "ignore_eos": True, "stream": True}
@@ -229,7 +245,16 @@ def prepare_native(base, config, conversations, replay, directory, *, step_journ
                                         native_scope=native_scope, model=model)
         if not needed <= set(coverage["observed"]):
             raise ValueError("submitted representative did not execute its declared GDN dispatch class")
+        if long_prefill:
+            current_ids = {str(row["seq_id"]) for row in current}
+            actual = _observed_preparation_rows(journal, offset, current)
+            if not any(row.get("num_scheduled_tokens") == [tokens]
+                       and row.get("context_lens") == [tokens]
+                       and row.get("produces_output") is False
+                       and set(map(str, row.get("req_ids") or [])) <= current_ids for row in actual):
+                raise ValueError("long-prefill preparation did not execute its declared cold outputless chunk")
         dispatch_requests.append({"representative_tokens": tokens, "input_tokens": len(prompt),
+            "long_prefill": long_prefill,
             "prompt_token_sha256": token_sha, "payload_sha256": hashlib.sha256(payload).hexdigest(),
             "result": results[0], "submission": submission})
     coverage = gdn_dispatch_coverage(_observed_preparation_rows(journal, offset, records),
@@ -244,7 +269,8 @@ def prepare_native(base, config, conversations, replay, directory, *, step_journ
     with journal.open("rb") as stream:
         stream.seek(offset)
         journal_bytes = stream.read()
-    receipt = {"kind": "ordinary_marked_chat_preparation", "output_cap": 2,
+    receipt = {"kind": "bounded_dispatch_preparation" if dispatch_only else "ordinary_marked_chat_preparation", "output_cap": 2,
+               "dispatch_only": dispatch_only, "max_prefill_tokens": max_prefill_tokens,
                "outside_profile": True, "started_at": start, "ended_at": time.time(),
                "payload_sha256": [hashlib.sha256(p).hexdigest() for p in payloads],
                "observations": observations, "flush": flushes[-1], "flushes": flushes,

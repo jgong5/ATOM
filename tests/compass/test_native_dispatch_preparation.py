@@ -26,6 +26,7 @@ def native_scope():
 def native_row(tokens, request="1", *, dummy=False):
     return dict(req_ids=[request], num_scheduled_tokens=[tokens], context_lens=[tokens],
         num_prefill_tokens=tokens, topology={"tp": 1}, rank_coords={"tp": 0}, compiled=True, capture_bucket=None,
+        produces_output=False,
         decision={"allocation": dict(source="ScheduledBatch", is_dummy_run=dummy, block_tables=[[1, 2, 3, 4, 5]],
             num_prefill_seqs=1, state_rows=[0], state_slots=[1], state_fork_srcs=[-1])})
 
@@ -213,3 +214,36 @@ def test_requested_prompts_and_unacknowledged_resets_are_not_coverage(tmp_path, 
     with pytest.raises(ValueError, match=match):
         run_preparation(tmp_path, monkeypatch, damage=damage)
     assert not (tmp_path / "preparation.json").exists()
+
+
+def test_dispatch_only_is_bounded_independently_of_corpus_size(tmp_path, monkeypatch):
+    def forbidden(*args):
+        raise AssertionError("full-corpus turns must not be materialized for preparation")
+    monkeypatch.setattr(preparation, "marked_payloads", forbidden)
+    journal = tmp_path / "steps.jsonl"
+    replay = Replay(journal)
+    result = preparation.prepare_native("http://owned", None, object(), replay, tmp_path,
+        step_journal=journal, native_scope=native_scope(), model=MODEL,
+        dispatch_only=True, max_prefill_tokens=16384)
+    assert [call for call in replay.calls if call[0] == "dispatch"] == [
+        ("dispatch", 16), ("dispatch", 32), ("dispatch", 64), ("dispatch", 16384)]
+    assert result["observations"] == [] and result["dispatch_only"] is True
+    assert result["dispatch_coverage"]["missing"] == []
+    assert result["dispatch_requests"][-1]["long_prefill"] is True
+    assert result["cache_boundary"]["acknowledged"] is True
+
+
+def test_long_prefill_prompt_reaches_actual_configured_outputless_chunk():
+    from conftest import MockConfig
+    from atom.model_engine.scheduler import Scheduler
+    from atom.model_engine.sequence import Sequence
+    from atom.model_engine.state_runtime import StateRuntime, StateTransfer
+    config = MockConfig(kv_cache_block_size=16, num_kvcache_blocks=16384,
+        enable_prefix_caching=True, max_num_seqs=32, max_num_batched_tokens=16384,
+        max_model_len=262144, pool_entries={"state":32}, state_checkpoint_interval_tokens=8192,
+        state_checkpoint_demand=True, compass_config=None, pipeline_parallel_size=1, tensor_parallel_size=1)
+    scheduler = Scheduler(config, state_runtime=StateRuntime(transfer=StateTransfer.fork(1)))
+    scheduler.add(Sequence(preparation.long_prefill_prompt(16384), 16, has_per_req_cache=True))
+    batch, _ = scheduler.schedule()
+    assert list(batch.num_scheduled_tokens) == [16384]
+    assert list(batch.num_cached_tokens) == [0] and not batch.produces_output()

@@ -271,9 +271,14 @@ def main(argv=None):
             check_runtime(plan, provenance, "real")
             native_scope = native_helpers.check_native_scope(scope_plan, provenance)
             journal = native_journal_path(plan, output)
+            preparation_mode = plan.get("native_preparation", {"mode": "marked_chat_and_dispatch"})
+            if preparation_mode.get("mode") not in ("marked_chat_and_dispatch", "dispatch_only"):
+                raise ValueError("unknown native preparation mode")
             preparation = prepare_native(args.url, config, conversations, replay, directory,
                 step_journal=journal,
-                native_scope=native_scope["native"], model=plan["model"])
+                native_scope=native_scope["native"], model=plan["model"],
+                dispatch_only=preparation_mode["mode"] == "dispatch_only",
+                max_prefill_tokens=preparation_mode.get("max_prefill_tokens"))
             cache_boundary = preparation["cache_boundary"]
             before = replay._prefix_cache_snapshot(args.url, 120)
             native_helpers.check_empty_cache(before)
