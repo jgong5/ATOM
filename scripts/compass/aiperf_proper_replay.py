@@ -115,6 +115,8 @@ def native_journal_segment(path, start, end, records, *, file_identity, cancelle
 
 def native_record_admissions(raw_records, admissions, phase, purpose):
     """Keep unsaved cancelled admissions factual, without inventing raw records."""
+    if len({row["client_request_id"] for row in admissions}) != len(admissions):
+        raise ValueError("native cancellation attribution has duplicate admissions")
     raw_ids = {row["metadata"]["x_request_id"] for row in raw_records}
     missing = [row for row in admissions if row["client_request_id"] not in raw_ids]
     cancelled = sum(row["metadata"].get("was_cancelled") is True for row in raw_records)
