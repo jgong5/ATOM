@@ -102,10 +102,23 @@ def _check_source_options(plan, options):
             raise ValueError(f"proper replay refuses unqualified source opt-in: {key}")
     if options.get("root_prefill_diagnostic_handoff"):
         raise ValueError("proper replay cannot select fixed-workload diagnostic sources")
-    if options.get("diagnostic_reference_handoff") and (
+    composition = options.get("composition_qualification")
+    if bool(composition) != bool(options.get("composition_qualification_sha256")):
+        raise ValueError("proper replay needs composition qualification and its SHA-256 together")
+    if composition:
+        from atom.compass.core.cost.composition_qualification import SCHEMA
+        from atom.compass.core.loaded_input import load_json
+
+        receipt, identity = load_json(composition, role="validation.forward_composition.preflight")
+        if (identity.sha256 != options["composition_qualification_sha256"]
+                or receipt.get("schema") != SCHEMA or receipt.get("passed") is not True):
+            raise ValueError("proper replay composition qualification is missing, changed or failed")
+        # The source factory and final source-contract reader independently
+        # recompute this receipt against actual loaded books, code and heldouts.
+    if any(options.get(key) for key in ("diagnostic_reference_handoff", "exact_operator_handoff")) and not composition and (
             plan.get("purpose") != "diagnostic"
             or not _flag(options.get("diagnostic_only", False), "diagnostic_only")):
-        raise ValueError("proper diagnostic references require diagnostic purpose and explicit diagnostic_only")
+        raise ValueError("proper reference sources require composition qualification or explicit diagnostic execution")
 
 
 def create_modelled_config(plan, tokenizer, output_directory):

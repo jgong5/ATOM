@@ -44,6 +44,7 @@ CACHE_REGION_OPTIONS = frozenset((
     "reached_primitive_handoffs",
     "diagnostic_reference_handoff", "diagnostic_reference_handoff_sha256",
     "exact_operator_handoff", "exact_operator_handoff_sha256",
+    "composition_qualification", "composition_qualification_sha256",
 ))
 
 
@@ -271,6 +272,9 @@ def check_source_contract(modelled, registry, workload_sha, forbidden, label, *,
         include_failed = _flag(options.get("include_failed_outputless", False), "include_failed_outputless")
         include_failed_final = _flag(options.get("include_failed_final", False), "include_failed_final")
         diagnostic = _flag(options.get("diagnostic_only", False), "diagnostic_only")
+        composition = bool(options.get("composition_qualification"))
+        if composition != bool(options.get("composition_qualification_sha256")):
+            raise ValueError("composition qualification and its SHA-256 are required together")
         if options.get("root_prefill_diagnostic_handoff") and (
                 not diagnostic or options.get("root_prefill_handoff") or options.get("region_supplement_handoff")):
             raise ValueError("root diagnostic source requires separate explicit diagnostic selection")
@@ -488,8 +492,8 @@ def check_source_contract(modelled, registry, workload_sha, forbidden, label, *,
             from atom.compass.core.cost.library import PriceLibrary
             from atom.compass.core.loaded_input import file_digests
 
-            if not diagnostic or not _flag(options.get("require_complete", True), "require_complete"):
-                raise ValueError("diagnostic references require diagnostic mode and complete coverage")
+            if not (diagnostic or composition) or not _flag(options.get("require_complete", True), "require_complete"):
+                raise ValueError("diagnostic references require diagnostic mode or composition qualification, and complete coverage")
             scopes = [row for row in inputs if row.get("role") == "oracle.attention_scope"]
             if len(scopes) != 1 or scopes[0].get("requested") != options.get("attention_scope"):
                 raise ValueError("diagnostic references lack their loaded deployment scope")
@@ -522,7 +526,8 @@ def check_source_contract(modelled, registry, workload_sha, forbidden, label, *,
                 {"diagnostic_reference_handoff": digest}, {"diagnostic_reference_handoff": files},
                 registry, 1, workload_sha, forbidden))
             notes.append("Diagnostic reference medians and frozen bounded-prefix MHA predictions; "
-                         "all original qualification failures retained; no acceptance credit")
+                         "all original qualification failures retained; " +
+                         ("composition qualification checked separately" if composition else "no acceptance credit"))
         elif any(str(row.get("role", "")).startswith(ROLE_PREFIX) for row in inputs):
             raise ValueError("unconfigured diagnostic reference evidence was loaded")
         if bool(options.get("exact_operator_handoff")) != bool(options.get("exact_operator_handoff_sha256")):
@@ -533,8 +538,8 @@ def check_source_contract(modelled, registry, workload_sha, forbidden, label, *,
             from atom.compass.core.cost.library import PriceLibrary
             from atom.compass.core.loaded_input import file_digests
 
-            if not diagnostic or not _flag(options.get("require_complete", True), "require_complete"):
-                raise ValueError("exact operator references require diagnostic mode and complete coverage")
+            if not (diagnostic or composition) or not _flag(options.get("require_complete", True), "require_complete"):
+                raise ValueError("exact operator references require diagnostic mode or composition qualification, and complete coverage")
             scopes = [row for row in inputs if row.get("role") == "oracle.attention_scope"]
             if len(scopes) != 1:
                 raise ValueError("exact operator references lack their loaded deployment scope")
@@ -561,7 +566,8 @@ def check_source_contract(modelled, registry, workload_sha, forbidden, label, *,
                 raise ValueError("exact operator aggregate omits or changes its evidence")
             bad.extend(validate._check_calibration_records({"exact_operator_handoff": digest},
                 {"exact_operator_handoff": files}, registry, 1, workload_sha, forbidden))
-            notes.append("Exact operator-event references; kernel dispatch/count unobserved; precision warnings retained; no interpolation or acceptance credit")
+            notes.append("Exact operator-event references; kernel dispatch/count unobserved; precision warnings retained; " +
+                         ("composition qualification checked separately" if composition else "no interpolation or acceptance credit"))
         elif any(str(row.get("role", "")).startswith(EXACT_PREFIX) for row in inputs):
             raise ValueError("unconfigured exact operator reference evidence was loaded")
         if bool(options.get("native_prefill_handoff")) != bool(options.get("native_prefill_handoff_sha256")):
@@ -618,8 +624,10 @@ def check_source_contract(modelled, registry, workload_sha, forbidden, label, *,
             pinned("native_ap_handoff", family_role)
             selected = NativeAPFamilyRegions.load(selected, options["native_ap_handoff"],
                 options["native_ap_handoff_sha256"], allocation, deployment_scope_sha256=scopes[0]["sha256"])
-            if not selected.source_qualified:
+            if not selected.source_qualified and not (selected.version == "native-ap-work/1" and (diagnostic or composition)):
                 raise ValueError("native A/P source is a review candidate; family qualification is required")
+            if selected.version == "native-ap-work/1":
+                notes.append("Native A/P work model from complete source chains; independent composition qualification required")
             observed = [row for row in inputs if row.get("role") == family_role
                         or str(row.get("role", "")).startswith(family_role + ".")
                         or str(row.get("role", "")).startswith(VALIDATION_PREFIX)]
@@ -655,6 +663,18 @@ def check_source_contract(modelled, registry, workload_sha, forbidden, label, *,
                  or str(row.get("role", "")).startswith(family_role + ".")
                  or str(row.get("role", "")).startswith(VALIDATION_PREFIX) for row in inputs):
             raise ValueError("unconfigured native A/P source evidence was loaded")
+        from atom.compass.core.cost.composition_qualification import ROLE_PREFIX as COMPOSITION_PREFIX, validate as qualify
+
+        observed = [row for row in inputs if str(row.get("role", "")).startswith(COMPOSITION_PREFIX)]
+        if composition:
+            verdict, qualification_inputs = qualify(options["composition_qualification"],
+                options["composition_qualification_sha256"], inputs=inputs, options=options, regions=selected)
+            if len(observed) != len(qualification_inputs) or any(
+                    sum(row == item.as_dict() for row in observed) != 1 for item in qualification_inputs):
+                raise ValueError("composition qualification lacks its exact loaded validation evidence")
+            notes.append("Frozen composition passed independent native complete-forward heldouts; original primitive warnings retained")
+        elif observed:
+            raise ValueError("unconfigured composition qualification evidence was loaded")
         snapshot = region_snapshot(selected_name, selected)
         if ranks[0].get("regions") != snapshot:
             raise ValueError("selected region snapshot differs from its loaded overlay and flags")

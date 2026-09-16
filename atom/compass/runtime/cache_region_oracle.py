@@ -115,6 +115,7 @@ def source_cost_oracle(*, region_overlay, region_overlay_sha256, regions,
                        reached_primitive_handoffs=None,
                        diagnostic_reference_handoff=None, diagnostic_reference_handoff_sha256=None,
                        exact_operator_handoff=None, exact_operator_handoff_sha256=None,
+                       composition_qualification=None, composition_qualification_sha256=None,
                        include_failed_outputless=False, include_failed_final=False, diagnostic_only=False,
                        q16_handoff=None, q16_handoff_sha256=None,
                        low_q_handoff=None, low_q_handoff_sha256=None,
@@ -133,6 +134,8 @@ def source_cost_oracle(*, region_overlay, region_overlay_sha256, regions,
     actual effective backend/environment equality. The pinned attention scope
     is a deployment declaration, not a fresh observation of the live worker.
     """
+    composition_options = dict(locals())
+    composition_options.update(composition_options.pop("options"))
     expected = {"model": "Qwen/Qwen3.8-27B", "tp": 1, "block_size": 16,
                 "max_model_len": 262144, "position_rows": 3,
                 "cudagraph_mode": "full", "allocation": "native"}
@@ -154,14 +157,16 @@ def source_cost_oracle(*, region_overlay, region_overlay_sha256, regions,
         raise ValueError("diagnostic reference handoff and its explicit SHA-256 are required together")
     if bool(exact_operator_handoff) != bool(exact_operator_handoff_sha256):
         raise ValueError("exact operator handoff and its SHA-256 are required together")
+    if bool(composition_qualification) != bool(composition_qualification_sha256):
+        raise ValueError("composition qualification and its SHA-256 are required together")
     if exact_operator_handoff and (
-            not _flag(diagnostic_only, "diagnostic_only")
+            not (_flag(diagnostic_only, "diagnostic_only") or composition_qualification)
             or not _flag(options.get("require_complete", True), "require_complete")):
-        raise ValueError("exact operator references require diagnostic mode and complete coverage")
+        raise ValueError("exact operator references require diagnostic mode or composition qualification, and complete coverage")
     if diagnostic_reference_handoff and (
-            not _flag(diagnostic_only, "diagnostic_only")
+            not (_flag(diagnostic_only, "diagnostic_only") or composition_qualification)
             or not _flag(options.get("require_complete", True), "require_complete")):
-        raise ValueError("diagnostic references require explicit diagnostic mode and complete coverage")
+        raise ValueError("diagnostic references require diagnostic mode or composition qualification, and complete coverage")
     if native_ap_handoff and not native_prefill_handoff:
         raise ValueError("native A/P families require their retained native-prefill source")
     if bool(q16_handoff) != bool(q16_handoff_sha256):
@@ -316,9 +321,20 @@ def source_cost_oracle(*, region_overlay, region_overlay_sha256, regions,
         selected = NativeAPFamilyRegions.load(result.regions, native_ap_handoff,
             native_ap_handoff_sha256, result.native_allocation,
             deployment_scope_sha256=scopes[0].sha256)
-        if not selected.source_qualified:
+        if not selected.source_qualified and not (
+                selected.version == "native-ap-work/1"
+                and (_flag(diagnostic_only, "diagnostic_only") or composition_qualification)):
             raise ValueError("native A/P source is a review candidate; family qualification is required for activation")
         result.regions = selected
         result.compass_region_snapshot = region_snapshot("native-ap-families", selected)
         result.compass_loaded_inputs += selected.loaded_inputs
+    if composition_qualification:
+        from atom.compass.core.cost.composition_qualification import validate
+
+        if result.seconds_per_launch != 0 or result.regions.version != "native-ap-work/1":
+            raise ValueError("composition qualification requires the source-work A/P model and zero extra launch charge")
+        result.compass_composition_qualification, loaded = validate(
+            composition_qualification, composition_qualification_sha256,
+            inputs=result.compass_loaded_inputs, options=composition_options, regions=result.regions)
+        result.compass_loaded_inputs += loaded
     return result

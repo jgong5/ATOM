@@ -368,7 +368,11 @@ class NativeAPFamilyRegions:
     def load(cls, base, path, sha256, allocation, *, deployment_scope_sha256):
         handoff, identity = load_json(path, role="oracle.native_ap_regions")
         from atom.compass.core.cost.native_ap_exact import SCHEMA as EXACT_SCHEMA, load_exact
+        from atom.compass.core.cost.native_ap_work import SCHEMA as WORK_SCHEMA, NativeAPWorkRegions
 
+        if identity.sha256 == sha256 and handoff.get("schema") == WORK_SCHEMA:
+            return NativeAPWorkRegions.load(base, path, sha256, allocation,
+                deployment_scope_sha256=deployment_scope_sha256)
         if identity.sha256 == sha256 and handoff.get("schema") == EXACT_SCHEMA:
             cells, inputs = load_exact(base, handoff, identity, path,
                 deployment_scope_sha256=deployment_scope_sha256)
