@@ -10,6 +10,7 @@ cost_args are forwarded unchanged to cc_traces_run costs.
 import argparse
 import hashlib
 import json
+import math
 import os
 from pathlib import Path
 import re
@@ -260,6 +261,18 @@ def as_metric_run(blob, *, client=True):
 def compare_dynamic(real, modelled):
     observed = {side: compare.metrics(as_metric_run(blob), range(len(as_metric_run(blob).joined)))
                 for side, blob in (("real", real), ("modelled", modelled))}
+    for side, blob in (("real", real), ("modelled", modelled)):
+        phase = blob.get("phase") or {}
+        origin, completed = phase.get("origin_ns"), phase.get("completed_ns")
+        if type(origin) is not int or type(completed) is not int or completed <= origin:
+            raise ValueError("proper throughput requires positive profiling-phase endpoints")
+        window = (completed - origin) / 1e9
+        if not math.isfinite(window) or window <= 0:
+            raise ValueError("proper profiling-phase duration must be finite and positive")
+        # Include idle and grace time in the serving clock. The simulator's
+        # physical execution window measures speedup, not serving throughput.
+        observed[side]["window_s"] = window
+        observed[side]["throughput_tok_s"] = observed[side]["output_tokens"] / window
     metrics = {}
     for name in ("ttft", "tpot", "latency"):
         r = compare._quantiles(list(observed["real"][name].values()))
@@ -270,7 +283,10 @@ def compare_dynamic(real, modelled):
         "error_pct": (m-r)/r*100 if r else None,
         "real_window_s": observed["real"]["window_s"], "modelled_window_s": observed["modelled"]["window_s"],
         "real_output_tokens": observed["real"]["output_tokens"],
-        "modelled_output_tokens": observed["modelled"]["output_tokens"]}
+        "modelled_output_tokens": observed["modelled"]["output_tokens"],
+        "window_basis": "profiling phase origin_ns through completed_ns",
+        "numerator_basis": "successful completed requests only",
+        "real_clock": "wall", "modelled_clock": "virtual"}
     return {"metrics": metrics, "metric_domain": "actual visible client SSE / transport completion",
             "quantile_convention": compare.QUANTILE_CONVENTION}
 

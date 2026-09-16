@@ -105,3 +105,42 @@ def test_declared_acceptance_requires_protocol_repeats_before_launch(tmp_path):
     modelled = [step for step in built["steps"] if step["role"] == "proper_session"]
     assert [step["repeat"] for step in modelled] == [1, 2, 3]
     assert len({step["command"][step["command"].index("--out")+1] for step in modelled}) == 3
+
+
+def test_throughput_uses_full_serving_phase_and_only_completed_outputs():
+    def artifact(side, origin, duration, tokens, request_duration):
+        start = int((origin + 10) * 1e9)
+        successful = {"start_ns": start, "first_visible_ns": start + 10**9,
+            "end_ns": start + int(request_duration * 1e9), "output_tokens": tokens,
+            "input_tokens": 20, "cancelled": False, "error": None}
+        cancelled = dict(successful, output_tokens=999, cancelled=True)
+        failed = dict(successful, output_tokens=777, error={"type": "RequestError"})
+        return {"side": side, "server": {}, "engine": {"requests": []},
+            "records": [successful, cancelled, failed],
+            "phase": {"origin_ns": int(origin * 1e9),
+                      "completed_ns": int((origin + duration) * 1e9)},
+            "execution_wall_window": {"seconds": .1}}
+
+    real = artifact("real", 100., 40., 10, 10.)
+    modelled = artifact("modelled", 200., 20., 12, 5.)
+    metrics = paired.compare_dynamic(real, modelled)["metrics"]
+    throughput = metrics["throughput_tok_s"]
+    assert throughput["real"] == .25
+    assert throughput["modelled"] == .6
+    assert throughput["real_window_s"] == 40.
+    assert throughput["modelled_window_s"] == 20.
+    assert throughput["real_output_tokens"] == 10
+    assert throughput["modelled_output_tokens"] == 12
+    assert throughput["error_pct"] == pytest.approx(140.)
+    assert metrics["ttft"]["real"]["n"] == metrics["ttft"]["modelled"]["n"] == 1
+
+
+@pytest.mark.parametrize("phase", [{}, {"origin_ns": 1, "completed_ns": 1}])
+def test_throughput_refuses_missing_or_empty_phase(phase):
+    row = {"start_ns": 10**9, "first_visible_ns": 2 * 10**9,
+           "end_ns": 3 * 10**9, "output_tokens": 2, "input_tokens": 1,
+           "cancelled": False, "error": None}
+    blob = {"side": "real", "server": {}, "engine": {"requests": []},
+            "records": [row], "phase": phase}
+    with pytest.raises(ValueError, match="profiling-phase endpoints"):
+        paired.compare_dynamic(blob, dict(blob, side="modelled"))
