@@ -294,6 +294,8 @@ class ExactOperatorReferences(PriceLibrary):
         self._prices, self.address_shifted = base._prices, base.address_shifted
 
     def _source_lookup(self, op, topology):
+        if op.get("name") not in CODE:
+            return None
         if isinstance(op, PreparedOperator):
             op = op.as_dict()
         key, layer = work_identity(op)

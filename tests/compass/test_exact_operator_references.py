@@ -19,6 +19,24 @@ def pin(path):
     return dict(path=str(path), sha256=hashlib.sha256(Path(path).read_bytes()).hexdigest())
 
 
+@pytest.mark.parametrize("prepared", [False, True])
+def test_unrelated_operator_skips_exact_identity_and_materialization(monkeypatch, prepared):
+    op = dict(name="aiter::gemm_a16w16", input_shapes=[[1, 8], [8, 8]],
+              output_shapes=[[1, 8]], dtypes=["bfloat16", "bfloat16"])
+    if prepared:
+        op = prepare_static_operator(op)
+        assert op is not None
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("unrelated work reached exact-source normalization")
+
+    monkeypatch.setattr(E, "work_identity", unexpected)
+    if prepared:
+        monkeypatch.setattr(E.PreparedOperator, "as_dict", unexpected)
+    reader = object.__new__(E.ExactOperatorReferences)
+    assert reader._source_lookup(op, {"tp": 1}) is None
+
+
 @pytest.fixture
 def actual(tmp_path, monkeypatch):
     source = os.environ.get("ATOMCOMPASS_EXACT_OPERATOR_SOURCE")
