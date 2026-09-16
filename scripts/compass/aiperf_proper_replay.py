@@ -11,6 +11,7 @@ from pathlib import Path
 import sys
 import time
 import traceback
+from collections import Counter
 
 ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
@@ -72,10 +73,13 @@ def native_journal_path(plan, output):
     return Path(shared)
 
 
-def native_journal_segment(path, start, end, records, *, file_identity):
+def native_journal_segment(path, start, end, records, *, file_identity, cancelled_admissions=()):
     """Attribute exactly this profile's append interval, without loading prior cases."""
     expected = {str(row["engine_seq_id"]) for row in records
                 if row.get("engine_seq_id") is not None}
+    if any(row.get("aborted") is not True for row in cancelled_admissions):
+        raise ValueError("unrecorded journal requests require native aborted admissions")
+    expected.update(str(row["seq_id"]) for row in cancelled_admissions if row.get("seq_id") is not None)
     completed = {str(row["engine_seq_id"]) for row in records
                  if not row.get("cancelled") and not row.get("error")}
     if (not expected or "None" in completed or type(start) is not int
@@ -107,6 +111,38 @@ def native_journal_segment(path, start, end, records, *, file_identity):
     return {"path": str(path), "profile_start_offset": start, "profile_end_offset": end,
             "profile_region_sha256": digest.hexdigest(), "scheduled_steps": count,
             "scheduled_request_ids": sorted(observed), "file_identity": list(file_identity)}
+
+
+def native_record_admissions(raw_records, admissions, phase, purpose):
+    """Keep unsaved cancelled admissions factual, without inventing raw records."""
+    raw_ids = {row["metadata"]["x_request_id"] for row in raw_records}
+    missing = [row for row in admissions if row["client_request_id"] not in raw_ids]
+    cancelled = sum(row["metadata"].get("was_cancelled") is True for row in raw_records)
+    remaining = phase["counts"]["final_requests_cancelled"] - cancelled
+    if (remaining < 0 or len(missing) > remaining
+            or missing and (purpose != "diagnostic" or any(row.get("aborted") is not True for row in missing))):
+        raise ValueError("missing native raw records do not reconcile with aborted admissions and cancelled credits")
+    return [row for row in admissions if row["client_request_id"] in raw_ids], missing
+
+
+def check_native_summary(summary, raw_records, phase, purpose):
+    """A diagnostic may retain counted request cancellations, never a failed profile."""
+    errors = summary.get("error_summary") or []
+    if summary.get("was_cancelled") or errors and purpose != "diagnostic":
+        raise ValueError("ordinary native AIPerf reported profile cancellation or errors")
+    def error_key(error):
+        return tuple(error.get(key) for key in ("type", "code", "message"))
+    cancelled = Counter(error_key(row["error"]) for row in raw_records
+        if row.get("error") and row["metadata"].get("was_cancelled") is True
+        and row["error"].get("type") == "RequestCancellationError" and row["error"].get("code") == 499)
+    if sum(cancelled.values()) > phase["counts"]["final_requests_cancelled"]:
+        raise ValueError("raw cancellation errors exceed cancelled credits")
+    for entry in errors:
+        count = entry.get("count")
+        key = error_key(entry.get("error_details") or {})
+        if type(count) is not int or count <= 0 or count > cancelled[key]:
+            raise ValueError("ordinary native AIPerf reported unrelated or unattributed errors")
+        cancelled[key] -= count
 
 
 from atom.compass.replay.native_preparation import (
@@ -220,6 +256,7 @@ def main(argv=None):
         source_notes = []
         cache_boundary = None
         journal_segment = None
+        cancelled_admissions = []
         if args.side == "real":
             from aiperf.common.config import ServiceConfig
             from aiperf.common.enums import ExportLevel
@@ -262,8 +299,7 @@ def main(argv=None):
             export_path = native_config.output.profile_export_raw_jsonl_file
             raw_records = [json.loads(line) for line in export_path.read_text().splitlines() if line]
             summary = json.loads(native_config.output.profile_export_json_file.read_text())
-            if summary.get("was_cancelled") or summary.get("error_summary"):
-                raise ValueError("ordinary native AIPerf reported cancellation or errors")
+            check_native_summary(summary, raw_records, phase_accounting(messages), plan["purpose"])
             closeout = {}
             flush, engine, after = native_helpers.collect_native_closeout(
                 args.url, replay, journal,
@@ -352,13 +388,17 @@ def main(argv=None):
         if len(observed_dataset) != 1:
             raise ValueError("actual AIPerf run lacks one dataset metadata observation")
         metadata_comparison = compare_native_metadata(metadata, observed_dataset[0], conversations)
+        record_admissions = admissions
+        if args.side == "real":
+            record_admissions, cancelled_admissions = native_record_admissions(
+                raw_records, admissions, phase, plan["purpose"])
         normalized = normalize_records(raw_records, user_config=config, tokenizer=tokenizer,
             model_path=plan["model"], default_chat_template_kwargs=options.default_chat_template_kwargs,
-            consumed=consumed, expected_caps=caps, admissions=admissions)
+            consumed=consumed, expected_caps=caps, admissions=record_admissions)
         validate_records(normalized, phase)
         if args.side == "real" and plan.get("native_step_journal") is not None:
             journal_segment = native_journal_segment(journal, journal_start, journal_end,
-                normalized, file_identity=journal_identity)
+                normalized, file_identity=journal_identity, cancelled_admissions=cancelled_admissions)
             journal_segment["preparation_start_offset"] = preparation["step_journal_start_offset"]
             journal_segment["preparation_end_offset"] = preparation["step_journal_end_offset"]
             write(directory / "native_journal.json", journal_segment)
@@ -380,6 +420,8 @@ def main(argv=None):
               "complete": True, "accepted": False}
         if journal_segment is not None:
             artifact["native_journal"] = journal_segment
+        if args.side == "real":
+            artifact["unrecorded_cancelled_admissions"] = cancelled_admissions
         complete = [row for row in normalized if not row["cancelled"] and not row["error"]]
         artifact["run"] = {
             "server": provenance, "complete": True, "requests": len(complete),

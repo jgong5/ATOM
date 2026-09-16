@@ -70,3 +70,38 @@ def test_segment_refuses_wrong_attribution_or_changed_file(tmp_path, failure):
         path.write_bytes(data[:-1])
     with pytest.raises(ValueError):
         m.native_journal_segment(path, start, end, records, file_identity=original)
+
+
+def test_admitted_scheduled_cancellation_without_raw_export_is_not_a_metric_row(tmp_path):
+    m = cli()
+    raw = [{"metadata": {"x_request_id": "completed", "was_cancelled": False}}]
+    admissions = [{"client_request_id": "completed", "seq_id": "1", "aborted": False},
+                  {"client_request_id": "cancelled", "seq_id": "2", "aborted": True}]
+    phase = {"counts": {"final_requests_cancelled": 1}}
+    kept, unrecorded = m.native_record_admissions(raw, admissions, phase, "diagnostic")
+    assert kept == admissions[:1] and unrecorded == admissions[1:]
+    path = tmp_path / "shared.jsonl"
+    path.write_bytes(line("1") + line("2"))
+    result = m.native_journal_segment(path, 0, path.stat().st_size,
+        [{"engine_seq_id": "1", "cancelled": False, "error": None}],
+        file_identity=identity(path), cancelled_admissions=unrecorded)
+    assert result["scheduled_request_ids"] == ["1", "2"]
+    assert len(raw) == 1 and "output_tokens" not in unrecorded[0]
+    for purpose, count, aborted in [("acceptance", 1, True), ("diagnostic", 0, True), ("diagnostic", 1, False)]:
+        admissions[1]["aborted"] = aborted
+        with pytest.raises(ValueError):
+            m.native_record_admissions(raw, admissions, {"counts": {"final_requests_cancelled": count}}, purpose)
+
+
+def test_summary_permits_only_counted_diagnostic_request_cancellations():
+    m = cli()
+    error = {"type": "RequestCancellationError", "code": 499, "message": "Request cancelled by external signal"}
+    raw = [{"metadata": {"x_request_id": "cancelled", "was_cancelled": True}, "error": error}]
+    phase = {"counts": {"final_requests_cancelled": 1}}
+    summary = {"was_cancelled": False, "error_summary": [{"error_details": error, "count": 1}]}
+    m.check_native_summary(summary, raw, phase, "diagnostic")
+    for purpose, altered in [("acceptance", summary), ("diagnostic", dict(summary, was_cancelled=True)),
+            ("diagnostic", dict(summary, error_summary=[{"error_details": {"type": "HTTPError"}, "count": 1}])),
+            ("diagnostic", dict(summary, error_summary=[{"error_details": error, "count": 2}]))]:
+        with pytest.raises(ValueError):
+            m.check_native_summary(altered, raw, phase, purpose)
