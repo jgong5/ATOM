@@ -293,6 +293,32 @@ def _mixed_library(tmp_path, order=("dense", "strided")):
     return library
 
 
+@pytest.mark.parametrize("collective", [False, True])
+@pytest.mark.parametrize("order", [("dense", "strided"), ("strided", "dense")])
+def test_same_scope_retains_and_selects_each_measured_layout(tmp_path, collective, order):
+    dense = all_reduce() if collective else gemm(32)
+    strided = all_reduce(layouts=STRIDED) if collective else strided_gemm(32)
+    files = {
+        "dense": _write(tmp_path, "dense", dense, 1e-4, topology=TP2,
+                        registration=REGISTERED),
+        "strided": _write(tmp_path, "strided", strided, 5e-4, topology=TP2,
+                          registration=REGISTERED),
+    }
+    library = PriceLibrary()
+    for name in order:
+        library.add(*files[name])
+    for op, seconds in [(dense, 1e-4), (strided, 5e-4)]:
+        record, reason = library.lookup(op, topology=TP2, registration=REGISTERED)
+        assert record is not None, reason
+        assert record["seconds"] == seconds
+    assert not library.conflicts, "different layouts are different measurements"
+    unknown = dict(strided, layouts=[[0, [9999, 1, 999999, "other"]]])
+    assert library.lookup(unknown, topology=TP2, registration=REGISTERED)[0] is None
+    if collective:
+        assert library.lookup(strided, topology=TP4, registration=REGISTERED)[0] is None
+        assert library.lookup(strided, topology=TP2, registration=UNREGISTERED)[0] is None
+
+
 @pytest.mark.parametrize("order", [("dense", "strided"), ("strided", "dense")])
 def test_a_dense_interpolation_is_not_contaminated_by_strided_prices(
         tmp_path, order):
@@ -511,9 +537,9 @@ def _collapsed_file(tmp_path, tag, graph_ops, priced_ops, seconds):
     return library
 
 
-def test_the_kept_price_carries_its_own_layout_not_the_graphs_first(tmp_path):
+def test_each_kept_price_carries_its_own_layout_not_the_graphs_first(tmp_path):
     """Graph lists the dense call first; the price list names the strided one
-    first, so the strided record is the one kept for this scope.
+    first. Both records survive, each with its own observed layout.
 
     Its layout has to be the strided one it was measured under. Taking the
     graph's first entry instead stamps it dense, and a dense request is then
@@ -528,12 +554,13 @@ def test_the_kept_price_carries_its_own_layout_not_the_graphs_first(tmp_path):
                                     topology=TP1, registration=REGISTERED)
     assert record is not None, detail
     assert record["seconds"] == pytest.approx(3e-4)
+    assert record["signature"] == signature_of(strided)
 
-    refused, why = library.lookup(attn(MEASURED_SLOTS),
-                                  topology=TP1, registration=REGISTERED)
-    assert refused is None, (
-        "a dense request was paid from a price measured on a strided read, "
-        f"because the layout came from the graph's first entry: {why}")
+    dense_record, why = library.lookup(attn(MEASURED_SLOTS),
+                                      topology=TP1, registration=REGISTERED)
+    assert dense_record is not None, why
+    assert dense_record["signature"] == signature_of(dense)
+    assert dense_record["layout"] != record["layout"]
 
 
 def test_an_unpriced_first_observation_does_not_lend_its_layout(tmp_path):

@@ -614,7 +614,9 @@ class PriceLibrary:
             # before this rule existed is found by it.
             key = cost_key(sig)
             kept = self._prices.setdefault(key, [])
-            same = [r for r in kept if _same_scope(r["scope"], scope)]
+            measured_layout = layouts.get(sig)
+            same = [r for r in kept if _same_scope(r["scope"], scope)
+                    and r.get("layout") == measured_layout]
             if same:
                 was = float(same[0]["seconds"])
                 now = float(record["seconds"])
@@ -665,6 +667,13 @@ class PriceLibrary:
             refusal = self._refusals.get(key)
             return None, (f"refused when priced: {refusal}" if refusal
                           else "no entry for this signature")
+        # One scope may contain several real operand layouts. Prefer an exact
+        # layout match within whichever scope the collective check selects;
+        # an older dense record must not hide a later strided measurement.
+        mine = _layout_fingerprint(op)
+        candidates = sorted(candidates, key=lambda record:
+                            0 if record.get("layout") == mine else
+                            1 if record.get("layout") is None else 2)
         collective = op.collective if prepared else _is_collective_op(op)
         if collective:
             record, why = self._collective(candidates, topology, registration)
@@ -686,7 +695,6 @@ class PriceLibrary:
         # it was measured under are one measurement and travel together.
         measured = record.get("layout")
         if measured is not None:
-            mine = _layout_fingerprint(op)
             if mine != measured:
                 # Same key, different memory. The price is real and it is a
                 # price of something else.
