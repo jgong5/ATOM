@@ -16,7 +16,18 @@ import pytest
 torch = pytest.importorskip("torch")
 
 from atom.compass.core.graph import OpGraph, OpSpec
-from atom.compass.runtime.meta import _layouts_of
+from atom.compass.runtime.meta import MetaOpTracer, _layouts_of
+
+
+@torch.library.custom_op("compass_layout_test::gdn", mutates_args=())
+def _registered_gdn(qkv: torch.Tensor, b: torch.Tensor,
+                    a: torch.Tensor, out: torch.Tensor) -> torch.Tensor:
+    return torch.empty_like(out)
+
+
+@_registered_gdn.register_fake
+def _registered_gdn_fake(qkv, b, a, out):
+    return torch.empty_like(out)
 
 
 def _qkv(tokens=4, dev="meta"):
@@ -58,6 +69,62 @@ class TestWhatALayoutRecords:
         _fused, q, _k = _qkv(dev="meta")
         assert q.device.type == "meta"
         assert _layouts_of([q])
+
+
+class TestRegisteredOperatorLayouts:
+    @pytest.mark.parametrize("device", ["cpu", "meta"])
+    def test_registered_gdn_keeps_shared_projection_views(self, device):
+        fused = torch.empty((4, 16480), dtype=torch.bfloat16, device=device)
+        qkv, _z, b, a = fused.split([10240, 6144, 48, 48], dim=-1)
+        out = torch.empty((4, 6144), dtype=torch.bfloat16, device=device)
+        tracer = MetaOpTracer()
+        with tracer:
+            _registered_gdn(qkv, b, a, out)
+        (op,) = tracer.graph.ops
+        assert op.layouts == (
+            (0, ((16480, 1), 0, 4 * 16480, 0)),
+            (1, ((16480, 1), 16384, 4 * 16480, 0)),
+            (2, ((16480, 1), 16432, 4 * 16480, 0)),
+        )
+        assert OpGraph.from_dict(tracer.graph.to_dict()).ops[0].layouts == op.layouts
+
+    @pytest.mark.parametrize("device", ["cpu", "meta"])
+    def test_dense_gemm_stays_without_layout_entries(self, device):
+        x = torch.empty((4, 8), device=device)
+        weight = torch.empty((8, 16), device=device)
+        tracer = MetaOpTracer()
+        with tracer:
+            torch.mm(x, weight)
+        assert tracer.graph.ops[0].layouts == ()
+
+    def test_layout_is_captured_before_metadata_mutation(self):
+        x = torch.empty((4, 8), device="meta")
+        tracer = MetaOpTracer()
+        with tracer:
+            x.transpose_(0, 1)
+        assert tracer.graph.ops[0].input_shapes == ((4, 8),)
+        assert tracer.graph.ops[0].layouts == ()
+        assert not x.is_contiguous()
+
+    def test_synthesized_collective_keeps_a_view_layout(self):
+        _fused, q, _k = _qkv()
+        tracer = MetaOpTracer()
+        tracer.note_operator(
+            OpSpec(name="aiter::all_reduce_", input_shapes=(tuple(q.shape),),
+                   output_shapes=(), dtypes=("bfloat16",), group="tp"),
+            inputs=(q,))
+        assert tracer.graph.ops[0].layouts == (
+            (0, ((14336, 256, 1), 0, 4 * 56 * 256, 0)),)
+
+    def test_synthesized_collective_preserves_explicit_native_layout(self):
+        x = torch.empty((4, 8), device="meta")
+        native = ((0, ((16, 1), 0, 64, 0)),)
+        tracer = MetaOpTracer()
+        tracer.note_operator(
+            OpSpec(name="aiter::all_reduce_", input_shapes=((4, 8),),
+                   output_shapes=(), dtypes=("float32",), group="tp",
+                   layouts=native), inputs=(x,))
+        assert tracer.graph.ops[0].layouts == native
 
 
 class TestALayoutSurvivesTheArtifact:

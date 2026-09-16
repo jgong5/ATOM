@@ -580,17 +580,20 @@ class MetaOpTracer(TorchDispatchMode):
         the tensor the collective was handed instead. Both are liveness, and a
         collective sits where the activation term is largest.
 
-        ``inputs_from`` is filled in from the producer map unless the caller
-        already supplied one. ``output_aliases`` is the caller's: whether a
+        ``inputs_from`` and ``layouts`` are filled in from the input tensors
+        unless the caller already supplied them. ``output_aliases`` is the
+        caller's: whether a
         collective allocates or writes in place is a fact about the native
         implementation, not something this can see through a passthrough.
         """
         import dataclasses
 
+        tensors = tuple(t for t in inputs if isinstance(t, torch.Tensor))
         if not spec.inputs_from:
             spec = dataclasses.replace(spec, inputs_from=tuple(
-                self._producers.get(_storage_of(t), -1) for t in inputs
-                if isinstance(t, torch.Tensor)))
+                self._producers.get(_storage_of(t), -1) for t in tensors))
+        if not spec.layouts:
+            spec = dataclasses.replace(spec, layouts=_layouts_of(tensors))
         self.graph.add(spec)
         index = len(self.graph.ops) - 1
         self.allocated[index] = _allocated()
@@ -624,6 +627,9 @@ class MetaOpTracer(TorchDispatchMode):
         tensors = _flat_tensors(args, kwargs)
         in_shapes = tuple(s for s in (_shape_of(t) for t in tensors) if s is not None)
         dtypes = tuple(str(t.dtype).replace("torch.", "") for t in tensors)
+        # Registered operators receive views too. Capture their input layout
+        # before dispatch, since an in-place operator can change the metadata.
+        in_layouts = _layouts_of(tensors)
 
         # A collective on meta has no group to talk to and no storage to send.
         # Standing in for the shape-preserving ones is what lets a single
@@ -744,6 +750,7 @@ class MetaOpTracer(TorchDispatchMode):
                     scalars=_scalars_of(args, kwargs),
                     int_values=_int_values_of(tensors),
                     int_ranges=_int_ranges_of(tensors),
+                    layouts=in_layouts,
                     # An operator that reads ambient state needs that state
                     # recorded with it; its arguments do not describe it, and
                     # cannot be made to. Empty for everything but attention.
