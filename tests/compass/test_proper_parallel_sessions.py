@@ -55,7 +55,7 @@ def runner(tmp_path, monkeypatch, *, fail=False):
     executions, journal, completed = {}, [], []
     def mint(step, proc, started):
         value = {"repeat": step["repeat"], "execution_id": f"repeat-{step['repeat']}-{proc.pid}",
-                 "process": {"pid": proc.pid, "launched_at": started}, "config": {}}
+                 "process": {"pid": proc.pid, "launched_at": started, "ended_at":None, "exit":None}, "config": {}}
         executions[step["repeat"]] = value
         return value
     run._mint = mint
@@ -107,9 +107,31 @@ def test_child_failure_fails_group_and_stops_owned_siblings(tmp_path, monkeypatc
     assert run.failures and not run.running and not completed
     assert executions[2]["process"]["exit"] == 7
     for execution in executions.values():
-        assert "ended_at" in execution["process"] and execution["process"]["exit"] is not None
+        assert execution["process"]["ended_at"] is not None and execution["process"]["exit"] is not None
         with pytest.raises(ProcessLookupError):
             os.kill(execution["process"]["pid"], 0)
+
+
+def test_launch_metadata_failure_also_stops_the_just_started_child(tmp_path, monkeypatch):
+    run, group, executions, _, _ = runner(tmp_path, monkeypatch)
+    processes = []
+    start = run.processes.start
+    def tracked_start(*args, **kwargs):
+        process = start(*args, **kwargs)
+        processes.append(process)
+        return process
+    run.processes.start = tracked_start
+    mint = run._mint
+    def failed_mint(step, proc, started):
+        if step["repeat"] == 2:
+            raise ValueError("source identity unavailable")
+        return mint(step, proc, started)
+    run._mint = failed_mint
+    assert not run._command(group)
+    assert len(processes) == 2 and not run.running
+    assert any("source identity unavailable" in failure for failure in run.failures)
+    assert all(process.poll() is not None for process in processes)
+    assert executions[1]["process"]["ended_at"] is not None
 
 
 @pytest.mark.parametrize("concurrency", [0, 4, True, 1.5])

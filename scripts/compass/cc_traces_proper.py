@@ -213,15 +213,16 @@ class ProperSideRun(lifecycle.SideRun):
                 started = self.wall()
                 env = self._serve_env(item)
                 proc = self.processes.start(item["command"], log=self._log(item), env=env)
-                execution = self._mint(item, proc, started)
-                execution["process"]["role"] = "controlled_session"
-                execution["config"]["provenance_transport"] = "owned local startup artifact"
-                held = {"proc": proc, "pid": proc.pid, "step": item, "execution": execution,
+                held = {"proc": proc, "pid": proc.pid, "step": item, "execution": None,
                         "started": started, "ready": None,
                         "deadline": self.now() + plan.get("session_wall_timeout_seconds", 3600)}
                 self.running[item["id"]] = held
-                active[item["id"]] = held
                 started_sessions.append(held)
+                execution = self._mint(item, proc, started)
+                execution["process"]["role"] = "controlled_session"
+                execution["config"]["provenance_transport"] = "owned local startup artifact"
+                held["execution"] = execution
+                active[item["id"]] = held
             while active:
                 for name, held in list(active.items()):
                     item, proc, execution = held["step"], held["proc"], held["execution"]
@@ -271,10 +272,11 @@ class ProperSideRun(lifecycle.SideRun):
             for held in started_sessions:
                 code = self.processes.stop(held["proc"])
                 execution = held["execution"]
-                if "ended_at" not in execution["process"]:
-                    execution["process"].update(ended_at=self.wall(), exit=code)
                 self.running.pop(held["step"]["id"], None)
-                self._write_execution(execution)
+                if execution is not None:
+                    if execution["process"].get("ended_at") is None:
+                        execution["process"].update(ended_at=self.wall(), exit=code)
+                    self._write_execution(execution)
 
 
 
