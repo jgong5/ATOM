@@ -115,6 +115,7 @@ def source_cost_oracle(*, region_overlay, region_overlay_sha256, regions,
                        reached_primitive_handoffs=None,
                        diagnostic_reference_handoff=None, diagnostic_reference_handoff_sha256=None,
                        exact_operator_handoff=None, exact_operator_handoff_sha256=None,
+                       native_mha_decode_layout_handoff=None, native_mha_decode_layout_handoff_sha256=None,
                        composition_qualification=None, composition_qualification_sha256=None,
                        include_failed_outputless=False, include_failed_final=False, diagnostic_only=False,
                        q16_handoff=None, q16_handoff_sha256=None,
@@ -157,6 +158,10 @@ def source_cost_oracle(*, region_overlay, region_overlay_sha256, regions,
         raise ValueError("diagnostic reference handoff and its explicit SHA-256 are required together")
     if bool(exact_operator_handoff) != bool(exact_operator_handoff_sha256):
         raise ValueError("exact operator handoff and its SHA-256 are required together")
+    if bool(native_mha_decode_layout_handoff) != bool(native_mha_decode_layout_handoff_sha256):
+        raise ValueError("native MHA layout handoff and its SHA-256 are required together")
+    if native_mha_decode_layout_handoff and not (_flag(diagnostic_only, "diagnostic_only") or composition_qualification):
+        raise ValueError("native MHA layout transfer requires diagnostic mode or composition qualification")
     if bool(composition_qualification) != bool(composition_qualification_sha256):
         raise ValueError("composition qualification and its SHA-256 are required together")
     if exact_operator_handoff and (
@@ -314,6 +319,16 @@ def source_cost_oracle(*, region_overlay, region_overlay_sha256, regions,
         previous = len(result.library.loaded_inputs)
         result.library = ExactOperatorReferences(result.library, exact_operator_handoff,
             exact_operator_handoff_sha256, deployment_scope_sha256=scopes[0].sha256, diagnostic_only=True)
+        result.compass_loaded_inputs += result.library.loaded_inputs[previous:]
+    if native_mha_decode_layout_handoff:
+        from atom.compass.core.cost.native_mha_layout import NativeMhaDecodeLayout
+
+        scopes = [entry for entry in result.library.loaded_inputs if entry.role == "oracle.attention_scope"]
+        if len(scopes) != 1:
+            raise ValueError("native MHA layout transfer requires one loaded deployment attention scope")
+        previous = len(result.library.loaded_inputs)
+        result.library = NativeMhaDecodeLayout(result.library, native_mha_decode_layout_handoff,
+            native_mha_decode_layout_handoff_sha256, deployment_scope_sha256=scopes[0].sha256)
         result.compass_loaded_inputs += result.library.loaded_inputs[previous:]
     if native_ap_handoff:
         from atom.compass.core.cost.native_ap_regions import NativeAPFamilyRegions
