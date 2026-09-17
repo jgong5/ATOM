@@ -86,3 +86,18 @@ def test_native_v_backing_capacity_and_void_writes_remain_guarded():
     assert model.quote(changed) is None
     next(entry for entry in op["context"] if entry[0] == "slot_mapping")[1][0] = -1
     assert model.quote(op) is None
+
+
+@pytest.mark.parametrize("change", ["duplicate_tail", "prefix_overlap", "wrong_slots"])
+def test_query_writes_must_match_distinct_non_prefix_tail_blocks(change):
+    op = operator()
+    model = model_for(op)
+    context = dict(op["context"])
+    width = len(context["block_tables"]) // 2
+    if change == "wrong_slots":
+        context["slot_mapping"][0] -= 16
+    else:
+        block = context["block_tables"][32] if change == "duplicate_tail" else 6
+        context["block_tables"][width + 64] = block
+        context["slot_mapping"][-1] = block * 16
+    assert model.quote(op) is None

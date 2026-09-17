@@ -76,9 +76,15 @@ def sharing_pattern(operator, row):
     if len(shape) != 2 or shape[0] != n or len(flat) % n:
         return None
     width = len(flat) // n
-    if any(h // 16 > min(width, shape[1]) for h in row["history"]):
+    if any(h // 16 + 1 > min(width, shape[1]) for h in row["history"]):
         return None
     tables = [flat[i * width:i * width + h // 16] for i, h in enumerate(row["history"])]
+    tails = [flat[i * width + h // 16] for i, h in enumerate(row["history"])]
+    cached = {block for table in tables for block in table}
+    if (len(set(tails)) != n or cached.intersection(tails)
+            or context.get("slot_mapping") != [block * 16 + offset
+                for block, q in zip(tails, row["q"]) for offset in range(q)]):
+        return None
     pattern = []
     for i, first in enumerate(tables):
         for second in tables[i + 1:]:
