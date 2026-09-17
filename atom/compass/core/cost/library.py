@@ -1285,6 +1285,7 @@ class LibraryCostOracle:
                 "ways; supplying both charges the runner's work twice. Pass "
                 "the region model alone.")
         self.regions = regions
+        self.execution_model = None
         self.last_coverage: Optional[Coverage] = None
         #: Priced body and head per shape, because summing a price over every
         #: operator is where a replayed step's CPU time actually goes: measured
@@ -1399,9 +1400,10 @@ class LibraryCostOracle:
             basis = dict(timing, placement="before the last synchronizing operator",
                          approximation="preceding complete operators plus preparation; "
                                        "opaque operator internal prefix unresolved")
-        return StepCost(seconds=total, breakdown=breakdown,
+        result = StepCost(seconds=total, breakdown=breakdown,
                         output_ready_seconds=ready, output_ready_basis=basis,
                         preparation_seconds=breakdown.get("<prepare>"))
+        return self.execution_model.apply(result, shape) if self.execution_model is not None else result
 
     def _check_body_rows(self, graph: dict, shape: StepShape) -> None:
         """Refuse a body graph traced over a different number of rows.

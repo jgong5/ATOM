@@ -145,6 +145,9 @@ def create_modelled_config(plan, tokenizer, output_directory):
             "atom.compass.runtime.cache_region_oracle.source_cost_oracle"):
         raise ValueError("proper replay requires the maintained source oracle factory")
     _check_source_options(plan, compass.oracle_options)
+    if (compass.oracle_options.get("compiled_prefill_execution_handoff")
+            and not compass.prefill_preparation_fence):
+        raise ValueError("compiled-prefill execution requires the source-proven prefill preparation fence")
     compass.epoch = 100.0
     compass.measure_out = str(Path(output_directory).parent / (Path(output_directory).stem + "_steps.jsonl"))
     compass.filler_token_id = plan["surrogate_output"]["token_id"]

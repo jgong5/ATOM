@@ -103,6 +103,9 @@ class StepCost:
     #: this oracle has no evidence for asynchronous scheduling. When present,
     #: the engine tracks queued device work separately from host-return time.
     preparation_seconds: float | None = None
+    #: Effective run_model interval, when a separately sourced execution
+    #: calibration transforms raw body/head prices. Raw prices stay visible.
+    model_seconds: float | None = None
 
     def __post_init__(self) -> None:
         if self.seconds < 0.0:
@@ -112,6 +115,8 @@ class StepCost:
         if (self.preparation_seconds is not None
                 and not 0.0 <= self.preparation_seconds <= self.seconds):
             raise ValueError("preparation offset must lie within the step cost")
+        if self.model_seconds is not None and not 0 <= self.model_seconds <= self.seconds:
+            raise ValueError("effective model interval must lie within the step cost")
 
 
 @runtime_checkable

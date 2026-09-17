@@ -22,6 +22,15 @@ HOST_RULE = {"kind": "existing_forward_timeline", "extra_host_seconds": 0,
              "target_end_to_end_timings_used": False}
 
 
+def host_rule(oracle):
+    model = getattr(oracle, "execution_model", None)
+    if model is None:
+        return HOST_RULE
+    return dict(HOST_RULE, compiled_prefill_execution_sha256=model.sha256,
+        mapping="M=max(alpha*B,floor); R=min(A+M,max(A+(R_raw-A)*M/B,A+floor))",
+        prefill_preparation_fence_required=True, pure_CPU_time_claim=False)
+
+
 def input_identity(inputs):
     values = [item.as_dict() if hasattr(item, "as_dict") else item for item in inputs]
     return sorted(({"role": v["role"], "sha256": v["sha256"]} for v in values
@@ -61,7 +70,7 @@ def predictor_identity(oracle, options, predictions):
         body_book=dict(loaded_inputs=input_identity(oracle.compass_loaded_inputs),
                        source_selection=source_selection(options)),
         code=code_identity(), deployment_scope=dict(sha256=scopes[0].sha256),
-        host_rule=HOST_RULE, validation_predictions=predictions)
+        host_rule=host_rule(oracle), validation_predictions=predictions)
     if getattr(oracle.regions, "initial_postprocess", None) is not None:
         identity["initial_postprocess_component"] = oracle.regions.initial_postprocess["component_identity"]
     return identity
@@ -133,7 +142,7 @@ def validate(path, sha256, *, inputs, options, regions, oracle):
             or identity.get("target_end_to_end_timings_used") is not False
             or identity["body_book"]["loaded_inputs"] != input_identity(inputs)
             or identity["body_book"]["source_selection"] != source_selection(options)
-            or identity.get("code") != code_identity() or identity.get("host_rule") != HOST_RULE
+            or identity.get("code") != code_identity() or identity.get("host_rule") != host_rule(oracle)
             or frozen.get("frozen_before_heldout_warmups") is not True
             or frozen.get("source_refitted") is not False
             or frozen["predictor_identity"]["sha256"] != data["predictor_identity"]["sha256"]):
@@ -193,9 +202,10 @@ def validate(path, sha256, *, inputs, options, regions, oracle):
             raise ValueError("composition heldout changes the frozen predicted geometry")
         all_terms = [observed_components(selected, row) for row in observations]
         seconds = prediction["seconds"]
+        effective_model = seconds.get("run_model", seconds["body"])
         if (any(seconds["prepare"] != terms["<prepare>"] or seconds["postprocess"] != terms["<postprocess>"] for terms in all_terms)
                 or seconds["body"] < 0
-                or abs(seconds["forward"] - sum(seconds[k] for k in ("prepare", "postprocess", "body"))) > 1e-12):
+                or abs(seconds["forward"] - (seconds["prepare"] + seconds["postprocess"] + effective_model)) > 1e-12):
             raise ValueError("composition predictions change their source-only component prices")
         signature = json.dumps(prediction["geometry"], sort_keys=True)
         if signature not in quotes:
@@ -206,7 +216,10 @@ def validate(path, sha256, *, inputs, options, regions, oracle):
             quotes[signature] = quote
         quote = quotes[signature]
         body_and_head = quote.breakdown["<body>"] + quote.breakdown.get("<head>", 0.)
+        actual_model = getattr(quote, "model_seconds", None)
+        actual_model = body_and_head if actual_model is None else actual_model
         if (abs(seconds["body"] - body_and_head) > 1e-10
+                or abs(effective_model - actual_model) > 1e-10
                 or abs(seconds["forward"] - quote.seconds) > 1e-10):
             raise ValueError("frozen composition quote differs from the actual loaded body/head predictor")
         measured = median(row["seconds"]["forward"] for row in observations)

@@ -389,11 +389,17 @@ class CompassPredictMixin:
         # simulated one on aggregate latency alone cannot tell a wrong step cost
         # from a different set of steps, which is where the serving diagnosis
         # ran out of evidence twice.
+        if ("compiled_prefill_execution" in cost.output_ready_basis
+                and not getattr(self._compass_config, "prefill_preparation_fence", False)):
+            raise ValueError("compiled-prefill execution requires the source-proven prefill preparation fence")
         self._record_measurement(shape, cost.seconds, None,
                                  req_ids=list(batch.req_ids),
                                  started_at=started_at,
                                  decision=getattr(batch, "compass_decision", None),
                                  ranks=ranks,
+                                 spans=({"run_model": getattr(cost, "model_seconds", None),
+                                         "postprocess": cost.breakdown.get("<postprocess>", 0.)}
+                                        if getattr(cost, "model_seconds", None) is not None else None),
                                  visibility={"seconds": cost.output_ready_seconds,
                                              "basis": dict(cost.output_ready_basis),
                                              "preparation_seconds": cost.preparation_seconds})

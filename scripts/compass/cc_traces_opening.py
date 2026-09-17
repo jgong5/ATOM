@@ -46,6 +46,7 @@ CACHE_REGION_OPTIONS = frozenset((
     "exact_operator_handoff", "exact_operator_handoff_sha256",
     "native_mha_decode_layout_handoff", "native_mha_decode_layout_handoff_sha256",
     "composition_qualification", "composition_qualification_sha256",
+    "compiled_prefill_execution_handoff", "compiled_prefill_execution_handoff_sha256",
 ))
 
 
@@ -706,11 +707,37 @@ def check_source_contract(modelled, registry, workload_sha, forbidden, label, *,
             raise ValueError("unconfigured native A/P source evidence was loaded")
         from atom.compass.core.cost.composition_qualification import ROLE_PREFIX as COMPOSITION_PREFIX
 
+        execution_oracle = None
+        execution_prefix = "oracle.compiled_prefill_execution."
+        execution_rows = [row for row in inputs if str(row.get("role", "")).startswith(execution_prefix)]
+        if bool(options.get("compiled_prefill_execution_handoff")) != bool(options.get("compiled_prefill_execution_handoff_sha256")):
+            raise ValueError("compiled-prefill execution source and SHA-256 are required together")
+        if options.get("compiled_prefill_execution_handoff"):
+            from atom.compass.core.loaded_input import file_digests
+
+            execution_oracle = wrapper.source_cost_oracle(**options)
+            execution_inputs = execution_oracle.execution_model.loaded_inputs
+            if len(execution_rows) != len(execution_inputs) or any(
+                    sum(row == item.as_dict() for row in execution_rows) != 1 for item in execution_inputs):
+                raise ValueError("compiled-prefill execution lacks its exact loaded source evidence")
+            for item in execution_inputs:
+                bad.extend(validate._check_calibration_records({item.role: item.sha256},
+                    {item.role: {Path(item.path).name: item.sha256}}, registry, 1, workload_sha, forbidden))
+            files = file_digests(execution_inputs)
+            digest = validate._rolled_digest(files)
+            key = "compiled_prefill_execution_handoff"
+            if ((compass.get("oracle_option_files") or {}).get(key) != files
+                    or (compass.get("oracle_option_sha256") or {}).get(key) != digest):
+                raise ValueError("compiled-prefill execution aggregate changes its source inputs")
+            bad.extend(validate._check_calibration_records({key: digest}, {key: files}, registry, 1, workload_sha, forbidden))
+            notes.append("Source-only effective compiled-prefill M calibration; raw B, A/P and captured decode retained")
+        elif execution_rows:
+            raise ValueError("unconfigured compiled-prefill execution source evidence")
         observed = [row for row in inputs if str(row.get("role", "")).startswith(COMPOSITION_PREFIX)]
         if composition:
             # The factory reuses its actual initialized body/head oracle for
             # the independent qualification, including all decode forwards.
-            qualified_oracle = wrapper.source_cost_oracle(**options)
+            qualified_oracle = execution_oracle or wrapper.source_cost_oracle(**options)
             qualification_inputs = [item for item in qualified_oracle.compass_loaded_inputs
                                     if item.role.startswith(COMPOSITION_PREFIX)]
             if len(observed) != len(qualification_inputs) or any(
