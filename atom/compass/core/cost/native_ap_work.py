@@ -159,6 +159,7 @@ class NativeAPWorkRegions:
     allocation: InitVar[object]
     initial_postprocess: dict | None = None
     scaffolding_decode: tuple = ()
+    width_extension: dict | None = None
     source_qualified: bool = False
     version: str = "native-ap-work/1"
     provenance: str = "Source-only A/P work fit; full-forward composition qualification is separate"
@@ -234,8 +235,14 @@ class NativeAPWorkRegions:
                     raise ValueError("short captured-decode source median is negative; signed observations retained")
                 scaffolding.append(dict(context=context, blocks=blocks, components=components,
                                         all_observations=raw, source_rows=len(selected)))
-        return cls(base, model, identity.sha256, (identity, *inputs.values(), *extra), allocation,
-                   initial_postprocess=initial, scaffolding_decode=tuple(scaffolding))
+        width, width_inputs = None, ()
+        if handoff.get("width_extension"):
+            from atom.compass.core.cost.native_ap_width import load_width
+
+            width, width_inputs = load_width(handoff["width_extension"], original_model=model,
+                original_model_sha256=inputs["model"].sha256, scope=base.scope)
+        return cls(base, model, identity.sha256, (identity, *inputs.values(), *extra, *width_inputs), allocation,
+                   initial_postprocess=initial, scaffolding_decode=tuple(scaffolding), width_extension=width)
 
     def _scaffold(self, shape):
         if (not self.scaffolding_decode or shape.is_prefill or tuple(shape.num_scheduled_tokens) != (1,)
@@ -286,7 +293,9 @@ class NativeAPWorkRegions:
         q = list(shape.num_scheduled_tokens)
         history = [c - t for c, t in zip(shape.context_lens, q)]
         n, blocks = len(q), context["allocation_blocks"]
-        if (not 1 <= n <= 3 or shape.compiled is not True or shape.capture_bucket is not None
+        max_rows = self.width_extension["max_rows"] if self.width_extension else 3
+        max_prior = self.width_extension["max_prior_rows"] if self.width_extension else 3
+        if (not 1 <= n <= max_rows or shape.compiled is not True or shape.capture_bucket is not None
                 or not shape.topology or any(v != 1 for v in shape.topology.values())
                 or any(v != 0 for v in shape.rank_coords.values())
                 or any(context.get(k) != v for k, v in self.scope.items())
@@ -307,12 +316,13 @@ class NativeAPWorkRegions:
                 or context.get("prior_sampled_has_logprobs") is not False
                 or any(context.get(k) != (v,) * n for k, v in SAMPLING.items())
                 or type(context.get("prior_sampled_batch_rows")) is not int
-                or not 0 <= context["prior_sampled_batch_rows"] <= 3):
+                or not 0 <= context["prior_sampled_batch_rows"] <= max_prior):
             raise BindRefusal("native A/P sampling/deferred-output work differs from its sources")
         vectors = work_vectors(q, history, blocks, slots, sources, shape.produces_output,
                                context["prior_sampled_batch_rows"], n)
+        bounds = self.width_extension["bounds"] if self.width_extension else self.model["observed_feature_bounds"]
         for key, value in zip(A_FEATURES[1:], vectors[0][1:]):
-            lo, hi = self.model["observed_feature_bounds"][key]
+            lo, hi = bounds[key]
             if not lo <= value <= hi:
                 raise BindRefusal("native A/P work exceeds its observed source feature bounds: " + key)
         if shape.produces_output:
@@ -321,7 +331,8 @@ class NativeAPWorkRegions:
                 if i == 2 and vectors[1][i] == 0 and self.initial_postprocess is not None:
                     continue
                 values = [g["features"][i] for g in p_groups]
-                if not min(values) <= vectors[1][i] <= max(values):
+                maximum = (max_rows if i == 1 else max_prior) if self.width_extension else max(values)
+                if not min(values) <= vectors[1][i] <= maximum:
                     raise BindRefusal("native postprocess work exceeds its observed sampler/queue bounds")
         return vectors
 
@@ -351,7 +362,10 @@ class NativeAPWorkRegions:
                 sum(x / scale * coefficient for x, scale, coefficient in
                     zip(vectors[i], model["scales"], model["coefficients"])))
         if (shape.produces_output and vectors[1][2] == 0 and self.initial_postprocess is not None):
-            result["<postprocess>"] = self.initial_postprocess["conditions"][str(shape.batch_size)]["postprocess_seconds"]
+            if shape.batch_size == 4 and self.width_extension:
+                result["<postprocess>"] = self.width_extension["initial_P4"]
+            else:
+                result["<postprocess>"] = self.initial_postprocess["conditions"][str(shape.batch_size)]["postprocess_seconds"]
         return result
 
     def seconds(self, shape):
