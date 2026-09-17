@@ -158,6 +158,7 @@ class NativeAPWorkRegions:
     loaded_inputs: tuple
     allocation: InitVar[object]
     initial_postprocess: dict | None = None
+    scaffolding_decode: tuple = ()
     source_qualified: bool = False
     version: str = "native-ap-work/1"
     provenance: str = "Source-only A/P work fit; full-forward composition qualification is separate"
@@ -214,8 +215,49 @@ class NativeAPWorkRegions:
 
             initial, extra = load_initial(handoff["initial_postprocess"], scope=base.scope,
                                          closed_model_sha256=inputs["model"].sha256)
+        scaffolding = []
+        if handoff.get("validation_scaffolding_decode"):
+            for context, blocks in ((34, 3), (66, 5)):
+                selected = [r for r in rows if r["descriptor"]["prefill_rows"] == 0
+                    and r["descriptor"]["q"] == [1] and r["descriptor"]["context"] == [context]]
+                if (len(selected) < 6 or {r["repetition"] for r in selected} != set(range(6))
+                        or any(r["descriptor"]["capture_bucket"] != 1
+                            or r["descriptor"]["compiled"] is not True
+                            or r["descriptor"]["blocks"] != [blocks]
+                            or r["descriptor"]["state_rows"] != [0]
+                            or r["descriptor"]["state_fork_srcs"] != [-1]
+                            or r["descriptor"]["forward_context"]["prior_sampled_batch_rows"] != 1 for r in selected)):
+                    raise ValueError("short captured-decode source scaffold is incomplete or changes work")
+                raw = {part: [r["seconds"][part] for r in selected] for part in ("prepare", "postprocess")}
+                components = {part: median(values) for part, values in raw.items()}
+                if min(components.values()) < 0:
+                    raise ValueError("short captured-decode source median is negative; signed observations retained")
+                scaffolding.append(dict(context=context, blocks=blocks, components=components,
+                                        all_observations=raw, source_rows=len(selected)))
         return cls(base, model, identity.sha256, (identity, *inputs.values(), *extra), allocation,
-                   initial_postprocess=initial)
+                   initial_postprocess=initial, scaffolding_decode=tuple(scaffolding))
+
+    def _scaffold(self, shape):
+        if (not self.scaffolding_decode or shape.is_prefill or tuple(shape.num_scheduled_tokens) != (1,)
+                or shape.capture_bucket != 1 or not shape.compiled or not shape.produces_output):
+            return None
+        cell = next((c for c in self.scaffolding_decode if tuple(shape.context_lens) == (c["context"],)), None)
+        if cell is None or self.base.refusal(shape) is None:
+            return None
+        self._allocation.allocation_for(shape)
+        record = self._allocation._record
+        context = {**(record.region_context or {}), "block_size": self._allocation.block_size,
+                   "max_model_len": self._allocation.max_model_len, "position_rows": self._allocation.position_rows}
+        if (dict(shape.topology or {}) != {"tp": 1} or any(v != 0 for v in (shape.rank_coords or {}).values())
+                or any(context.get(k) != v for k, v in self.scope.items())
+                or record.state_rows != (0,) or record.state_fork_srcs != (-1,)
+                or len(record.state_slots or ()) != 1 or len(record.block_tables[0]) != cell["blocks"]
+                or context.get("prior_sampled_batch_rows") != 1
+                or context.get("prior_sampled_has_logprobs") is not False
+                or context.get("output_state_representation") != "predictive_deferred_batch"
+                or any(context.get(k) != (v,) for k, v in SAMPLING.items())):
+            raise BindRefusal("short captured-decode scaffold changes its exact native source scope")
+        return cell
 
     def _retained(self, shape):
         if (self.initial_postprocess is not None and shape.is_prefill
@@ -285,6 +327,8 @@ class NativeAPWorkRegions:
 
     def refusal(self, shape):
         try:
+            if self._scaffold(shape) is not None:
+                return None
             vectors = self._vectors(shape)
         except (BindRefusal, ValueError) as exc:
             return str(exc)
@@ -294,6 +338,9 @@ class NativeAPWorkRegions:
         why = self.refusal(shape)
         if why is not None:
             raise ValueError("no native A/P source-work prediction: " + why)
+        scaffold = self._scaffold(shape)
+        if scaffold is not None:
+            return {"<" + part + ">": value for part, value in scaffold["components"].items()}
         vectors = self._vectors(shape)
         if vectors is None:
             return self.base.breakdown(shape)
@@ -311,6 +358,8 @@ class NativeAPWorkRegions:
         return sum(self.breakdown(shape).values())
 
     def band(self, shape):
+        if self._scaffold(shape) is not None:
+            raise ValueError("short captured-decode medians retain raw spread, not a calibrated uncertainty band")
         if self._vectors(shape) is None:
             return self.base.band(shape)
         raise ValueError("native A/P work sources provide no calibrated uncertainty band")

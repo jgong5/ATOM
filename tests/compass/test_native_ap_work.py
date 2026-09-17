@@ -121,6 +121,33 @@ def test_empty_prior_uses_separate_P_source_without_refitting_A(candidate):
     assert added.breakdown(shape) == regions.breakdown(shape)
 
 
+def test_short_decode_scaffold_is_exact_and_keeps_existing_base(candidate, monkeypatch):
+    from atom.compass.core.cost.composition_qualification import offer_observation
+
+    regions, allocation = candidate
+    cells = tuple(dict(context=c, blocks=b, components=dict(prepare=.001, postprocess=.0001),
+                       all_observations=dict(prepare=[-.000001, .002001], postprocess=[.0001, .0001]))
+                  for c, b in ((34, 3), (66, 5)))
+    added = replace(regions, allocation=allocation, scaffolding_decode=cells)
+    original_refusal = type(regions.base).refusal
+    monkeypatch.setattr(type(regions.base), "refusal", lambda self, shape:
+        "history below measured range" if shape.context_lens[0] < 128 else original_refusal(self, shape))
+    for context, blocks in ((34, 3), (66, 5)):
+        d = fresh_descriptor([1], [context - 1], [blocks], True)
+        d.update(prefill_rows=0, capture_bucket=1, state_fork_srcs=[-1])
+        shape = offer_observation(allocation, dict(descriptor=d))
+        assert added.breakdown(shape) == {"<prepare>": .001, "<postprocess>": .0001}
+        assert regions.refusal(shape)
+    d = fresh_descriptor([1], [34], [3], True)
+    d.update(prefill_rows=0, capture_bucket=1)
+    shape = offer_observation(allocation, dict(descriptor=d))
+    assert added.refusal(shape) == "history below measured range"
+    d = fresh_descriptor([1], [128], [9], True)
+    d.update(prefill_rows=0, capture_bucket=1)
+    shape = offer_observation(allocation, dict(descriptor=d))
+    assert added.breakdown(shape) == regions.breakdown(shape)
+
+
 def test_signed_negative_prepare_is_retained_and_short_cohort_refuses():
     d = fresh_descriptor([32], [0], [3], False)
     row = dict(chain_id="source_chain", chain_step=0, repetition=0, role="source", normal_return=True,
