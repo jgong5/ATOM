@@ -10,9 +10,10 @@ from atom.compass.core.cost.exact_operator_references import _case
 from atom.compass.core.cost.families import attention_scope
 from atom.compass.core.cost.library import _signature_of
 from atom.compass.core.cost.prepared import PreparedOperator
-from atom.compass.core.cost.reached_primitive_evidence import same_pin
+from atom.compass.core.cost.reached_primitive_evidence import Evidence, same_pin
 
 SCHEMA = "compass.native_mha_low_query/1"
+VALIDATION_PREFIX = "validation.native_mha_low_query."
 GROUPS = {"N1_causal", "N2_causal", "N3_causal", "N4_causal"}
 MHA = "aiter::unified_attention_with_output_base"
 
@@ -111,7 +112,11 @@ class NativeMhaLowQueryModel:
 
     def __init__(self, reader, handoff_pin, *, deployment_scope_sha256):
         read = lambda pin, role: reader.read(pin, "low_query." + role)
-        handoff = read(handoff_pin, "handoff")
+        validation_reader = Evidence(reader.directory, "native_mha_low_query")
+        validation_reader.prefix = VALIDATION_PREFIX
+        # This contract pins independent validation as well as its source
+        # model. Its admission dependency is not a fitting observation.
+        handoff = validation_reader.read(handoff_pin, "handoff")
         if (handoff.get("schema") != SCHEMA or set(handoff.get("active_groups", [])) != GROUPS
                 or handoff.get("old_lookup_first") is not True
                 or handoff.get("q1_model_activated") is not False
@@ -188,7 +193,8 @@ class NativeMhaLowQueryModel:
             raise ValueError("native low-query model lacks its prepared-prompt identity checks")
         self.allowed_rows = {(row["tail_query"], row["tail_history"]) for row in inventory["rows"]}
         self.sharing_audit = read(handoff["sharing_audit"], "sharing_audit")
-        self._validate_heldouts(read, handoff, source)
+        self._validate_heldouts(validation_reader.read, handoff, source)
+        reader.inputs.extend(validation_reader.inputs)
 
     def _validate_heldouts(self, read, handoff, source):
         report = read(handoff["heldout_validation"], "heldout_validation")

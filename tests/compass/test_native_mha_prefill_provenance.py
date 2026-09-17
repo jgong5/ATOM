@@ -12,17 +12,21 @@ from .test_native_prefill_provenance import grouped_inputs
 from .test_opening_harness import wrapper_evidence, opening, validate
 
 
-@pytest.mark.parametrize("damage",[None,"missing_read","unregistered","aggregate","unconfigured"])
+@pytest.mark.parametrize("damage",[None,"missing_read","missing_validation","unregistered","aggregate","unconfigured"])
 def test_prefill_source_manifest_and_contract(tmp_path,monkeypatch,damage):
     compass,registry=wrapper_evidence.__wrapped__(tmp_path)
     path=tmp_path/'prefill-handoff.json';path.write_text('{"source":"frozen"}')
     _,loaded=load_json(str(path),role=native_mha_prefill.ROLE_PREFIX+'handoff')
+    validation_path=tmp_path/'heldout.json';validation_path.write_text('{"seconds":123.0}')
+    _,validation=load_json(str(validation_path),role='validation.native_mha_low_query.heldout_raw')
     options=compass['oracle_options']
     options.update(native_mha_prefill_handoff=str(path),native_mha_prefill_handoff_sha256=loaded.sha256)
     rank=compass['loaded_inputs']['ranks'][0];rank['inputs'].append(loaded.as_dict())
+    rank['inputs'].append(validation.as_dict())
     monkeypatch.setattr(native_mha_prefill,'NativeMhaPrefillFallback',
-                        lambda *args,**kwargs:SimpleNamespace(loaded_inputs=(loaded,)))
+                        lambda *args,**kwargs:SimpleNamespace(loaded_inputs=(loaded,validation)))
     files=grouped_inputs(rank)['native_mha_prefill_handoff']
+    assert 'heldout.json' not in files  # Retained in rank provenance, never a fit input.
     digest=validate._rolled_digest(files)
     compass['oracle_option_files']['native_mha_prefill_handoff']=files
     compass['oracle_option_sha256']['native_mha_prefill_handoff']=digest
@@ -30,6 +34,7 @@ def test_prefill_source_manifest_and_contract(tmp_path,monkeypatch,damage):
     registry['artifacts'].extend([dict(provenance,sha256=loaded.sha256,contents=files),
                                   dict(provenance,sha256=digest,contents=files)])
     if damage=='missing_read':rank['inputs'].remove(loaded.as_dict())
+    elif damage=='missing_validation':rank['inputs'].remove(validation.as_dict())
     elif damage=='unregistered':registry['artifacts']=[a for a in registry['artifacts'] if a['sha256']!=loaded.sha256]
     elif damage=='aggregate':compass['oracle_option_files']['native_mha_prefill_handoff']={}
     elif damage=='unconfigured':

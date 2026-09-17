@@ -184,3 +184,18 @@ def test_invalid_native_allocation_cannot_fall_through_to_older_projection():
     op['context']=list(context.items())
     record,why=library.lookup(op,{'tp':1})
     assert record is None and 'invalid prefix/tail aliases' in why
+
+
+@pytest.mark.parametrize('damage',['negative_slot','short_slots','bad_starts'])
+def test_malformed_native_metadata_cannot_fall_through_to_old_projection(damage):
+    library,_=wrapper();library.low_query_model=SimpleNamespace(quote=lambda op:None)
+    op=complete_allocation(operator());context=dict(op['context'])
+    if damage=='negative_slot':context['slot_mapping'][0]=-1
+    elif damage=='short_slots':context['slot_mapping'].pop()
+    else:context['seq_starts']=[16]
+    op['context']=list(context.items())
+    record,why=library.lookup(op,{'tp':1})
+    assert record is None and 'native allocation metadata is invalid' in why
+    # Legitimate dense references remain available outside the native model.
+    dense=complete_allocation(operator(native=False))
+    assert library.lookup(dense,{'tp':1})[0]['seconds']>0

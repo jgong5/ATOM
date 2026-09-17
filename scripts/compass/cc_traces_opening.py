@@ -256,6 +256,40 @@ def _source_contract_oracle(options, observed_inputs, live_oracle=None):
     return oracle
 
 
+def _native_mha_prefill_input_contract(source, inputs, compass, registry, workload_sha, forbidden):
+    """Attest all source/validation reads; only source reads enter fit aggregates."""
+    from atom.compass.core.cost.native_mha_prefill import ROLE_PREFIX
+    from atom.compass.core.cost.native_mha_low_query import VALIDATION_PREFIX
+    from atom.compass.core.loaded_input import file_digests
+
+    validate = _script("cc_traces_validate")
+    observed = [row for row in inputs if str(row.get("role", "")).startswith((ROLE_PREFIX, VALIDATION_PREFIX))]
+    if len(observed) != len(source.loaded_inputs):
+        raise ValueError("native MHA prefill input inventory differs")
+    by_digest = {}
+    for item in source.loaded_inputs:
+        if sum(row == item.as_dict() for row in observed) != 1:
+            raise ValueError("native MHA prefill lacks its exact loaded identity: " + item.path)
+        if not item.role.startswith(VALIDATION_PREFIX):
+            by_digest.setdefault(item.sha256, []).append(item)
+    bad = []
+    for sha, items in by_digest.items():
+        contents = file_digests(items)
+        digest = sha if len(contents) == 1 else validate._rolled_digest(contents)
+        role = ROLE_PREFIX + sha[:16]
+        bad.extend(validate._check_calibration_records({role: digest}, {role: contents},
+            registry, 1, workload_sha, forbidden))
+    files = file_digests([item for item in source.loaded_inputs if not item.role.startswith(VALIDATION_PREFIX)])
+    digest = validate._rolled_digest(files)
+    key = "native_mha_prefill_handoff"
+    if ((compass.get("oracle_option_files") or {}).get(key) != files
+            or (compass.get("oracle_option_sha256") or {}).get(key) != digest):
+        raise ValueError("native MHA prefill aggregate omits or changes its evidence")
+    bad.extend(validate._check_calibration_records({key: digest}, {key: files},
+        registry, 1, workload_sha, forbidden))
+    return bad
+
+
 def check_source_contract(modelled, registry, workload_sha, forbidden, label, *,
                           diagnostic_status=None, live_oracle=None):
     """Check the exact diagnostic wrapper, retaining the base protocol checks.
@@ -661,6 +695,7 @@ def check_source_contract(modelled, registry, workload_sha, forbidden, label, *,
         elif any(str(row.get("role", "")).startswith(MHA_LAYOUT_PREFIX) for row in inputs):
             raise ValueError("unconfigured native MHA layout transfer evidence was loaded")
         from atom.compass.core.cost.native_mha_prefill import NativeMhaPrefillFallback, ROLE_PREFIX as MHA_PREFILL_PREFIX
+        from atom.compass.core.cost.native_mha_low_query import VALIDATION_PREFIX as MHA_PREFILL_VALIDATION_PREFIX
 
         if bool(options.get("native_mha_prefill_handoff")) != bool(options.get("native_mha_prefill_handoff_sha256")):
             raise ValueError("native MHA prefill handoff and SHA-256 are required together")
@@ -675,31 +710,11 @@ def check_source_contract(modelled, registry, workload_sha, forbidden, label, *,
                 raise ValueError("native MHA prefill fallback lacks its loaded deployment scope")
             source = NativeMhaPrefillFallback(ParametricPriceLibrary(), options["native_mha_prefill_handoff"],
                 options["native_mha_prefill_handoff_sha256"], deployment_scope_sha256=scopes[0]["sha256"])
-            observed = [row for row in inputs if str(row.get("role", "")).startswith(MHA_PREFILL_PREFIX)]
-            if len(observed) != len(source.loaded_inputs):
-                raise ValueError("native MHA prefill input inventory differs")
-            by_digest = {}
-            for item in source.loaded_inputs:
-                if sum(row == item.as_dict() for row in observed) != 1:
-                    raise ValueError("native MHA prefill lacks its exact loaded identity: " + item.path)
-                by_digest.setdefault(item.sha256, []).append(item)
-            for sha, items in by_digest.items():
-                contents = file_digests(items)
-                digest = sha if len(contents) == 1 else validate._rolled_digest(contents)
-                role = MHA_PREFILL_PREFIX + sha[:16]
-                bad.extend(validate._check_calibration_records({role: digest}, {role: contents},
-                    registry, 1, workload_sha, forbidden))
-            files = file_digests(source.loaded_inputs)
-            digest = validate._rolled_digest(files)
-            key = "native_mha_prefill_handoff"
-            if ((compass.get("oracle_option_files") or {}).get(key) != files
-                    or (compass.get("oracle_option_sha256") or {}).get(key) != digest):
-                raise ValueError("native MHA prefill aggregate omits or changes its evidence")
-            bad.extend(validate._check_calibration_records({key: digest}, {key: files},
-                registry, 1, workload_sha, forbidden))
+            bad.extend(_native_mha_prefill_input_contract(source, inputs, compass, registry, workload_sha, forbidden))
             notes.append("Refusal-only cached-prefill interpolation; exact prior prices retained; "
                          "native V transfer and all source/control residuals remain modelled")
-        elif any(str(row.get("role", "")).startswith(MHA_PREFILL_PREFIX) for row in inputs):
+        elif any(str(row.get("role", "")).startswith(
+                (MHA_PREFILL_PREFIX, MHA_PREFILL_VALIDATION_PREFIX)) for row in inputs):
             raise ValueError("unconfigured native MHA prefill evidence was loaded")
         if bool(options.get("native_prefill_handoff")) != bool(options.get("native_prefill_handoff_sha256")):
             raise ValueError("native prefill handoff and its SHA-256 are required together")

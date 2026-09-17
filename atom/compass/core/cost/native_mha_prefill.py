@@ -241,6 +241,7 @@ class NativeMhaPrefillFallback(PriceLibrary):
     def _fallback(self, op, topology, registration, original):
         if isinstance(op, PreparedOperator):
             op = op.as_dict()
+        identity = _identity(op)
         if getattr(self, "low_query_model", None) is not None:
             quote = self.low_query_model.quote(op)
             if quote is not None:
@@ -262,9 +263,12 @@ class NativeMhaPrefillFallback(PriceLibrary):
             from atom.compass.core.cost.native_mha_low_query import coordinates, sharing_pattern
 
             row = coordinates(op)
+            native_projection = (identity is not None
+                                 and argument_views(op)[2]["stride"] == [14336, 1])
+            if row is None and native_projection:
+                return None, "cached-prefill native allocation metadata is invalid"
             if row is not None and sharing_pattern(op, row) is None:
                 return None, "cached-prefill native allocation has invalid prefix/tail aliases"
-        identity = _identity(op)
         if (identity is None or not topology or topology.get("tp") != 1
                 or any(type(value) is not int or value != 1 for value in topology.values())):
             return original
