@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from functools import lru_cache
+from collections import Counter
 import hashlib
 import importlib.util
 import json
@@ -209,7 +210,52 @@ def _check_diagnostic_input_registration(item, registry, workload_sha, forbidden
         {item.role: item.sha256}, {item.role: contents}, registry, 1, workload_sha, forbidden)
 
 
-def check_source_contract(modelled, registry, workload_sha, forbidden, label, *, diagnostic_status=None):
+_SOURCE_CONTRACT_ORACLES = {}
+
+
+def _source_contract_oracle(options, observed_inputs, live_oracle=None):
+    """Reuse one initialized model, while reopening its source bytes each check.
+
+    Startup supplies the engine's actual oracle. Offline pairing constructs it
+    once for the pinned options and reuses it across repeats; neither route
+    resets ATOM's global attention registration or trusts stale source files.
+    """
+    from atom.compass.runtime.cache_region_oracle import source_cost_oracle
+
+    key = json.dumps(options, sort_keys=True, separators=(",", ":"))
+    oracle = live_oracle or _SOURCE_CONTRACT_ORACLES.get(key)
+    if oracle is None:
+        if _SOURCE_CONTRACT_ORACLES:
+            raise ValueError("source validation options changed; use a fresh process")
+        oracle = source_cost_oracle(**options)
+    expected = [item.as_dict() if hasattr(item, "as_dict") else dict(item)
+                for item in oracle.compass_loaded_inputs]
+    if not expected:
+        raise ValueError("initialized source oracle has no loaded input identity")
+    encode = lambda row: json.dumps(row, sort_keys=True, separators=(",", ":"))
+    wanted = Counter(map(encode, expected))
+    observed = Counter(map(encode, observed_inputs))
+    if any(observed[item] != count for item, count in wanted.items()):
+        raise ValueError("initialized source oracle differs from the worker's loaded input identity")
+    checked = set()
+    for item in expected:
+        identity = (item["path"], item["sha256"], item["size"])
+        if identity in checked:
+            continue
+        checked.add(identity)
+        digest, size = hashlib.sha256(), 0
+        with Path(item["path"]).open("rb") as stream:
+            for block in iter(lambda: stream.read(1024 * 1024), b""):
+                digest.update(block)
+                size += len(block)
+        if digest.hexdigest() != item["sha256"] or size != item["size"]:
+            raise ValueError("initialized source oracle input changed: " + item["path"])
+    _SOURCE_CONTRACT_ORACLES[key] = oracle
+    return oracle
+
+
+def check_source_contract(modelled, registry, workload_sha, forbidden, label, *,
+                          diagnostic_status=None, live_oracle=None):
     """Check the exact diagnostic wrapper, retaining the base protocol checks.
 
     Pair validation needs the pinned overlay and optional source bundles mounted
@@ -715,8 +761,18 @@ def check_source_contract(modelled, registry, workload_sha, forbidden, label, *,
         if options.get("compiled_prefill_execution_handoff"):
             from atom.compass.core.loaded_input import file_digests
 
-            execution_oracle = wrapper.source_cost_oracle(**options)
-            execution_inputs = execution_oracle.execution_model.loaded_inputs
+            from atom.compass.core.cost.compiled_prefill_execution import CompiledPrefillExecution
+
+            execution_oracle = _source_contract_oracle(options, inputs, live_oracle)
+            reopened = CompiledPrefillExecution.load(
+                options["compiled_prefill_execution_handoff"],
+                options["compiled_prefill_execution_handoff_sha256"],
+                oracle=execution_oracle, options=options)
+            active = getattr(execution_oracle, "execution_model", None)
+            if (active is None or active.sha256 != reopened.sha256
+                    or active.parameters != reopened.parameters or active.domain != reopened.domain):
+                raise ValueError("initialized compiled-prefill execution differs from its pinned source")
+            execution_inputs = reopened.loaded_inputs
             if len(execution_rows) != len(execution_inputs) or any(
                     sum(row == item.as_dict() for row in execution_rows) != 1 for item in execution_inputs):
                 raise ValueError("compiled-prefill execution lacks its exact loaded source evidence")
@@ -737,9 +793,15 @@ def check_source_contract(modelled, registry, workload_sha, forbidden, label, *,
         if composition:
             # The factory reuses its actual initialized body/head oracle for
             # the independent qualification, including all decode forwards.
-            qualified_oracle = execution_oracle or wrapper.source_cost_oracle(**options)
-            qualification_inputs = [item for item in qualified_oracle.compass_loaded_inputs
-                                    if item.role.startswith(COMPOSITION_PREFIX)]
+            from atom.compass.core.cost.composition_qualification import validate as validate_composition
+
+            qualified_oracle = execution_oracle or _source_contract_oracle(options, inputs, live_oracle)
+            qualification, qualification_inputs = validate_composition(
+                options["composition_qualification"], options["composition_qualification_sha256"],
+                inputs=qualified_oracle.compass_loaded_inputs, options=options,
+                regions=qualified_oracle.regions, oracle=qualified_oracle)
+            if qualification != qualified_oracle.compass_composition_qualification:
+                raise ValueError("initialized composition differs from its pinned qualification")
             if len(observed) != len(qualification_inputs) or any(
                     sum(row == item.as_dict() for row in observed) != 1 for item in qualification_inputs):
                 raise ValueError("composition qualification lacks its exact loaded validation evidence")

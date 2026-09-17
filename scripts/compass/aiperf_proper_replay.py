@@ -182,7 +182,7 @@ def check_runtime(plan, provenance, side):
     return _check_runtime(plan, provenance, side, script("cc_traces_opening"))
 
 
-def check_modelled_sources(plan, provenance, cell):
+def check_modelled_sources(plan, provenance, cell, *, live_oracle=None):
     from types import SimpleNamespace
     from atom.compass.core.proper_replay import read_pinned
     validate = script("cc_traces_validate")
@@ -193,7 +193,8 @@ def check_modelled_sources(plan, provenance, cell):
                  for pattern in ("real.r*_steps*.jsonl", "real.r*_memory*.json")
                  for path in Path(cell).glob(pattern)}
     bad, notes = script("cc_traces_opening").check_source_contract(
-        run, registry, source_sha, forbidden, "proper profile startup")
+        run, registry, source_sha, forbidden, "proper profile startup",
+        live_oracle=live_oracle)
     for check in (validate.check_calibration, validate.check_capacity_provenance,
                   validate.check_scalar_overheads):
         bad += check(run, registry, 1, source_sha, forbidden)
@@ -378,7 +379,8 @@ def main(argv=None):
             store = asyncio.run(materialize())
             provenance = controlled_provenance(core, tokenizer, options)
             check_runtime(plan, provenance, "modelled")
-            source_notes = check_modelled_sources(plan, provenance, output.parent)
+            source_notes = check_modelled_sources(
+                plan, provenance, output.parent, live_oracle=core.runner_mgr.runner._oracle)
             write(directory / "startup_ready.json", {"at": time.time(), "server": provenance})
             if args.start_signal:
                 deadline = time.monotonic() + 120
