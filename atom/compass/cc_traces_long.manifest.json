@@ -1,0 +1,319 @@
+{
+ "class": "long",
+ "rule": {
+  "kind": "long",
+  "window": 20,
+  "min_input": 64,
+  "max_input": 262144,
+  "volume_band": [
+   1000000,
+   2500000
+  ],
+  "max_window_span_s": 900.0
+ },
+ "corpus": {
+  "dataset": "semianalysisai/cc-traces-weka-062126-256k",
+  "file": "traces.jsonl",
+  "bytes": 568864747,
+  "sha256": "e39cd2ff3eba21d4a3664be51da743ac3d2149a1933898cafc7bfeac8147eeef",
+  "sessions": 393
+ },
+ "corpus_sha256_observed": "e39cd2ff3eba21d4a3664be51da743ac3d2149a1933898cafc7bfeac8147eeef",
+ "development_sessions_excluded": [
+  "002001296e8a8c38ad9d7cc436d691afc602"
+ ],
+ "context_tokens": 262144,
+ "servable_types": [
+  "s",
+  "n"
+ ],
+ "generator_sha256": "d0a1dc1be2ae777408266d8a18996bd55145cd688edddb1482a179a0ad8b09ff",
+ "arrivals": {
+  "model": "source_paced_open_loop",
+  "within_session": "raw source intervals, nothing clipped or compressed",
+  "across_sessions": "not applicable, one session",
+  "transform": "one common origin shift: the window's first turn at 0.0"
+ },
+ "sessions": [
+  {
+   "index": 6,
+   "id": "0470d446a4514dfe0c6ad0be92853bd13287",
+   "requests": 20,
+   "input_tokens": 1594624,
+   "turns_in_session": 414,
+   "turns_taken": 20,
+   "source_t_first_s": 0.0,
+   "source_t_last_s": 262.828,
+   "scope_end_s": 299.635,
+   "origin_shift_s": -0.0,
+   "starts_at_s": 0.0,
+   "subagent_wrappers_in_session": 7,
+   "nested_requests_in_session": 131,
+   "nested_requests_in_scope": 0
+  }
+ ],
+ "sessions_rejected": [
+  {
+   "index": 0,
+   "id": "002001296e8a8c38ad9d7cc436d691afc602",
+   "rejected": "development session"
+  },
+  {
+   "index": 1,
+   "id": "006c98de37d819e95b0840e25426bb7ca99d",
+   "rejected": "window spans 4346.2s, above 900s"
+  },
+  {
+   "index": 2,
+   "id": "00ca01c4aaeccee751ae6285beb54dea262f",
+   "rejected": "window spans 1165.9s, above 900s"
+  },
+  {
+   "index": 3,
+   "id": "0196085d85d2075a50b74cd8795ffbdcea9a",
+   "rejected": "window volume 3339904 outside the band"
+  },
+  {
+   "index": 4,
+   "id": "02bc0afb13f7a2d9efa86c28511261d85c0e",
+   "rejected": "window spans 2190.3s, above 900s"
+  },
+  {
+   "index": 5,
+   "id": "03e110ac6921c2fe9ac7772a9654314a2beb",
+   "rejected": "window spans 1564.0s, above 900s"
+  }
+ ],
+ "requests": 20,
+ "input_tokens": {
+  "min": 448,
+  "p10": 48960,
+  "median": 91008,
+  "p90": 105920,
+  "max": 107328,
+  "sum": 1594624
+ },
+ "output_tokens": {
+  "min": 24,
+  "p10": 123,
+  "median": 608,
+  "p90": 1661,
+  "max": 2413,
+  "sum": 15833
+ },
+ "arrival_span_s": 262.828,
+ "gaps_clipped": 0,
+ "outputs_altered": 0,
+ "selection_nested_requests_in_scope": 0,
+ "selection_nested_requests_in_selected_sessions": 131,
+ "scanned_sessions": 7,
+ "scanned_subagent_wrapper_rows": 31,
+ "scanned_nested_requests": 515,
+ "input_token_units": "tokens; corpus `in` is already a token count and is block-aligned (in == len(hash_ids) * block_size), never multiplied here",
+ "lengths_checked": "in == len(hash_ids) * block_size on every request",
+ "provenance": [
+  {
+   "session": "0470d446a4514dfe0c6ad0be92853bd13287",
+   "request_index": 0,
+   "source_t_s": 0.0,
+   "origin_shift_s": -0.0,
+   "arrival_s": 0.0,
+   "input_tokens": 448,
+   "input_blocks": 7,
+   "output_tokens": 24
+  },
+  {
+   "session": "0470d446a4514dfe0c6ad0be92853bd13287",
+   "request_index": 1,
+   "source_t_s": 0.125,
+   "origin_shift_s": -0.0,
+   "arrival_s": 0.125,
+   "input_tokens": 45440,
+   "input_blocks": 710,
+   "output_tokens": 366
+  },
+  {
+   "session": "0470d446a4514dfe0c6ad0be92853bd13287",
+   "request_index": 2,
+   "source_t_s": 9.833,
+   "origin_shift_s": -0.0,
+   "arrival_s": 9.833,
+   "input_tokens": 48960,
+   "input_blocks": 765,
+   "output_tokens": 380
+  },
+  {
+   "session": "0470d446a4514dfe0c6ad0be92853bd13287",
+   "request_index": 3,
+   "source_t_s": 19.287,
+   "origin_shift_s": -0.0,
+   "arrival_s": 19.287,
+   "input_tokens": 49088,
+   "input_blocks": 767,
+   "output_tokens": 122
+  },
+  {
+   "session": "0470d446a4514dfe0c6ad0be92853bd13287",
+   "request_index": 4,
+   "source_t_s": 23.819,
+   "origin_shift_s": -0.0,
+   "arrival_s": 23.819,
+   "input_tokens": 54400,
+   "input_blocks": 850,
+   "output_tokens": 785
+  },
+  {
+   "session": "0470d446a4514dfe0c6ad0be92853bd13287",
+   "request_index": 5,
+   "source_t_s": 38.577,
+   "origin_shift_s": -0.0,
+   "arrival_s": 38.577,
+   "input_tokens": 65344,
+   "input_blocks": 1021,
+   "output_tokens": 1482
+  },
+  {
+   "session": "0470d446a4514dfe0c6ad0be92853bd13287",
+   "request_index": 6,
+   "source_t_s": 64.005,
+   "origin_shift_s": -0.0,
+   "arrival_s": 64.005,
+   "input_tokens": 79680,
+   "input_blocks": 1245,
+   "output_tokens": 710
+  },
+  {
+   "session": "0470d446a4514dfe0c6ad0be92853bd13287",
+   "request_index": 7,
+   "source_t_s": 76.592,
+   "origin_shift_s": -0.0,
+   "arrival_s": 76.592,
+   "input_tokens": 80640,
+   "input_blocks": 1260,
+   "output_tokens": 446
+  },
+  {
+   "session": "0470d446a4514dfe0c6ad0be92853bd13287",
+   "request_index": 8,
+   "source_t_s": 86.45,
+   "origin_shift_s": -0.0,
+   "arrival_s": 86.45,
+   "input_tokens": 80768,
+   "input_blocks": 1262,
+   "output_tokens": 291
+  },
+  {
+   "session": "0470d446a4514dfe0c6ad0be92853bd13287",
+   "request_index": 9,
+   "source_t_s": 93.361,
+   "origin_shift_s": -0.0,
+   "arrival_s": 93.361,
+   "input_tokens": 83904,
+   "input_blocks": 1311,
+   "output_tokens": 608
+  },
+  {
+   "session": "0470d446a4514dfe0c6ad0be92853bd13287",
+   "request_index": 10,
+   "source_t_s": 106.559,
+   "origin_shift_s": -0.0,
+   "arrival_s": 106.559,
+   "input_tokens": 91008,
+   "input_blocks": 1422,
+   "output_tokens": 1140
+  },
+  {
+   "session": "0470d446a4514dfe0c6ad0be92853bd13287",
+   "request_index": 11,
+   "source_t_s": 129.315,
+   "origin_shift_s": -0.0,
+   "arrival_s": 129.315,
+   "input_tokens": 91520,
+   "input_blocks": 1430,
+   "output_tokens": 1240
+  },
+  {
+   "session": "0470d446a4514dfe0c6ad0be92853bd13287",
+   "request_index": 12,
+   "source_t_s": 152.561,
+   "origin_shift_s": -0.0,
+   "arrival_s": 152.561,
+   "input_tokens": 98048,
+   "input_blocks": 1532,
+   "output_tokens": 1511
+  },
+  {
+   "session": "0470d446a4514dfe0c6ad0be92853bd13287",
+   "request_index": 13,
+   "source_t_s": 178.812,
+   "origin_shift_s": -0.0,
+   "arrival_s": 178.812,
+   "input_tokens": 99264,
+   "input_blocks": 1551,
+   "output_tokens": 123
+  },
+  {
+   "session": "0470d446a4514dfe0c6ad0be92853bd13287",
+   "request_index": 14,
+   "source_t_s": 183.852,
+   "origin_shift_s": -0.0,
+   "arrival_s": 183.852,
+   "input_tokens": 101824,
+   "input_blocks": 1591,
+   "output_tokens": 1661
+  },
+  {
+   "session": "0470d446a4514dfe0c6ad0be92853bd13287",
+   "request_index": 15,
+   "source_t_s": 210.522,
+   "origin_shift_s": -0.0,
+   "arrival_s": 210.522,
+   "input_tokens": 102464,
+   "input_blocks": 1601,
+   "output_tokens": 301
+  },
+  {
+   "session": "0470d446a4514dfe0c6ad0be92853bd13287",
+   "request_index": 16,
+   "source_t_s": 217.807,
+   "origin_shift_s": -0.0,
+   "arrival_s": 217.807,
+   "input_tokens": 103808,
+   "input_blocks": 1622,
+   "output_tokens": 289
+  },
+  {
+   "session": "0470d446a4514dfe0c6ad0be92853bd13287",
+   "request_index": 17,
+   "source_t_s": 227.619,
+   "origin_shift_s": -0.0,
+   "arrival_s": 227.619,
+   "input_tokens": 104768,
+   "input_blocks": 1637,
+   "output_tokens": 1584
+  },
+  {
+   "session": "0470d446a4514dfe0c6ad0be92853bd13287",
+   "request_index": 18,
+   "source_t_s": 254.179,
+   "origin_shift_s": -0.0,
+   "arrival_s": 254.179,
+   "input_tokens": 105920,
+   "input_blocks": 1655,
+   "output_tokens": 357
+  },
+  {
+   "session": "0470d446a4514dfe0c6ad0be92853bd13287",
+   "request_index": 19,
+   "source_t_s": 262.828,
+   "origin_shift_s": -0.0,
+   "arrival_s": 262.828,
+   "input_tokens": 107328,
+   "input_blocks": 1677,
+   "output_tokens": 2413
+  }
+ ],
+ "sha256": "68326792ead8da5f52478ba111cfae84746c24a2f23a3cb394d026c99b018e8a",
+ "emitted_at": "2026-09-11T00:00:00Z",
+ "file": "cc_traces_long.jsonl"
+}

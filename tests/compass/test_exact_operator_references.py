@@ -1,0 +1,383 @@
+"""Exact event references retain real repetitions without claiming dispatch."""
+import copy
+import hashlib
+import json
+import os
+from pathlib import Path
+
+import pytest
+
+from atom.compass.core.cost import exact_operator_references as E
+from atom.compass.core.cost.families.adapter import ParametricPriceLibrary
+from atom.compass.core.cost.families.attention_scope import Declaration
+from atom.compass.core.cost.library import INTERPOLATED_FLAG, _record_launch_count
+from atom.compass.core.cost.prepared import prepare_static_operator
+from atom.compass.core.cost.records import OperatorEventRecord
+
+
+def pin(path):
+    return dict(path=str(path), sha256=hashlib.sha256(Path(path).read_bytes()).hexdigest())
+
+
+@pytest.mark.parametrize("prepared", [False, True])
+def test_unrelated_operator_skips_exact_identity_and_materialization(monkeypatch, prepared):
+    op = dict(name="aiter::gemm_a16w16", input_shapes=[[1, 8], [8, 8]],
+              output_shapes=[[1, 8]], dtypes=["bfloat16", "bfloat16"])
+    if prepared:
+        op = prepare_static_operator(op)
+        assert op is not None
+
+    def unexpected(*args, **kwargs):
+        raise AssertionError("unrelated work reached exact-source normalization")
+
+    monkeypatch.setattr(E, "work_identity", unexpected)
+    if prepared:
+        monkeypatch.setattr(E.PreparedOperator, "as_dict", unexpected)
+    reader = object.__new__(E.ExactOperatorReferences)
+    assert reader._source_lookup(op, {"tp": 1}) is None
+
+
+@pytest.fixture
+def actual(tmp_path, monkeypatch):
+    source = os.environ.get("ATOMCOMPASS_EXACT_OPERATOR_SOURCE")
+    scope = os.environ.get("ATOMCOMPASS_EXACT_OPERATOR_SCOPE")
+    if not source or not scope:
+        pytest.skip("set ATOMCOMPASS_EXACT_OPERATOR_SOURCE and ATOMCOMPASS_EXACT_OPERATOR_SCOPE for actual references")
+    source = json.loads(Path(source).read_text())
+    local_source = tmp_path / "source.json"
+    local_source.write_text(json.dumps(source))
+    scope_data = json.loads(Path(scope).read_text())
+    handoff = dict(schema=E.SCHEMA, source_handoff=pin(local_source), deployment_scope=pin(scope),
+        diagnostic_only=True, cases=[case["name"] for case in source["cases"]])
+    base = ParametricPriceLibrary()
+    base.launch_charge_seconds = 0.0
+    base.request_attention_scope = Declaration(scopes=scope_data["attention_scope"])
+    base.request_attention_treatments = {"gdn.prefill": {"kernels": ("old parametric treatment",)}}
+    monkeypatch.setattr(E, "live_body_flags", lambda: {"FLA_GDN_FIX_BT": 0, "USE_DEFAULT_FLA_NORM": 0})
+    return tmp_path, source, handoff, base
+
+
+def load(actual):
+    path, source, handoff, base = actual
+    source_path = path / "source.json"
+    source_path.write_text(json.dumps(source))
+    handoff["source_handoff"] = pin(source_path)
+    target = path / "handoff.json"
+    target.write_text(json.dumps(handoff))
+    return E.ExactOperatorReferences(base, str(target), pin(target)["sha256"],
+        deployment_scope_sha256=handoff["deployment_scope"]["sha256"], diagnostic_only=True)
+
+
+def test_actual_three_references_preempt_treatment_without_training_or_dispatch_claims(actual):
+    library = load(actual)
+    for case in actual[1]["cases"]:
+        record, _ = library.lookup(case["operator"], {"tp": 1})
+        assert isinstance(record, OperatorEventRecord)
+        assert record["seconds"] == case["reference_median_seconds"]
+        assert record["all_three"] == case["reference_values_seconds"]
+        assert record["relative_spread"] == case["relative_spread"]
+        assert record["precision_warning"] == (case["relative_spread"] > .05)
+        assert record["source_qualified"] is False and record["whole_forward_validation_required"]
+        assert record["kernel_count"] is None and record["launch_count"] is None
+        assert record["kernel_dispatch_observed"] is False
+        assert not record.get(INTERPOLATED_FLAG)
+        assert _record_launch_count(record) == 0
+        seconds, coverage, charges = library.body({"ops": [case["operator"]], "key": {"topology": [["tp", 1]]}})
+        assert seconds == record["seconds"] and coverage.complete and charges == 0
+    assert actual[3]._attention_obs == []
+
+
+def test_layer_label_and_joint_address_renaming_preserve_exact_work(actual):
+    library = load(actual)
+    op = copy.deepcopy(actual[1]["cases"][0]["operator"])
+    op["scalars"][0][1] = op["scalars"][0][1].replace("layers.0.", "layers.1.")
+    for name, value in op["context"]:
+        if name in ("non_spec_state_indices_tensor", "non_spec_state_indices_in_tensor"):
+            value[0][:] = [index + 5 if index >= 0 else index for index in value[0]]
+    record, _ = library.lookup(op, {"tp": 1})
+    assert record["seconds"] == actual[1]["cases"][0]["reference_median_seconds"]
+    assert record["layer_label_equivalence"]["source"] == 0
+    assert record["layer_label_equivalence"]["target"] == 1
+    assert not record.get(INTERPOLATED_FLAG) and _record_launch_count(record) == 0
+
+
+def test_prepared_mrope_uses_the_same_finite_record(actual):
+    library = load(actual)
+    case = next(case for case in actual[1]["cases"] if case["operator"]["name"] == E.MROPE)
+    prepared = prepare_static_operator(case["operator"])
+    assert prepared is not None
+    record, _ = library._body_lookup(prepared, {"tp": 1}, None, {})
+    assert record["seconds"] == case["reference_median_seconds"] and _record_launch_count(record) == 0
+
+
+@pytest.mark.parametrize("damage", ["stride", "offset", "backing", "alias", "missing_alias", "output_dtype", "topology"])
+def test_inexact_work_does_not_reach_finite_reference(actual, damage):
+    library = load(actual)
+    op = copy.deepcopy(actual[1]["cases"][0]["operator"])
+    topology = {"tp": 1}
+    if damage == "stride":
+        op["layouts"][0][1][0][0] += 1
+    elif damage == "offset":
+        op["layouts"][1][1][1] += 1
+    elif damage == "backing":
+        op["layouts"][0][1][2] += 1
+    elif damage == "alias":
+        context = dict(op["context"])
+        context["non_spec_state_indices_tensor"][0][0] = context["non_spec_state_indices_in_tensor"][0][0]
+    elif damage == "missing_alias":
+        op["context"] = [item for item in op["context"] if item[0] != "non_spec_state_indices_in_tensor"]
+    elif damage == "output_dtype":
+        op["output_dtypes"] = ["float32"]
+    else:
+        topology = {"tp": 2}
+    record, _ = library.lookup(op, topology)
+    assert record is None
+
+
+def test_extra_launch_charge_and_changed_backend_flags_refuse(actual, monkeypatch):
+    library = load(actual)
+    op = actual[1]["cases"][0]["operator"]
+    actual[3].launch_charge_seconds = .000001
+    assert library.lookup(op, {"tp": 1})[0] is None
+    actual[3].launch_charge_seconds = 0
+    monkeypatch.setattr(E, "live_body_flags", lambda: {"FLA_GDN_FIX_BT": 1, "USE_DEFAULT_FLA_NORM": 0})
+    assert library.lookup(op, {"tp": 1})[0] is None
+
+
+@pytest.mark.parametrize("damage", ["median", "spread", "drop_repeat", "invent_dispatch", "wrong_backend_code"])
+def test_repinning_cannot_trim_refit_or_invent_evidence(actual, damage):
+    case = actual[1]["cases"][0]
+    if damage == "median":
+        case["reference_median_seconds"] *= 1.1
+    elif damage == "spread":
+        case["relative_spread"] = 0
+    elif damage == "drop_repeat":
+        case["references"].pop()
+    elif damage == "invent_dispatch":
+        case["kernel_dispatch_observed"] = True
+    else:
+        plan = json.loads(Path(case["plan"]["path"]).read_text())
+        entry = next(p for p in plan["code_pins"] if p["path"].endswith("atom/model_ops/attention_gdn.py"))
+        entry["sha256"] = "0" * 64
+        target = actual[0] / "changed_plan.json"
+        target.write_text(json.dumps(plan))
+        case["plan"] = pin(target)
+    with pytest.raises(ValueError):
+        load(actual)
+
+
+def test_shared_projection_views_are_not_contiguous_defaults():
+    op = {"input_shapes": [[3, 4], [3, 2]], "dtypes": ["bfloat16"] * 2,
+          "layouts": [[0, [[8, 1], 0, 24, 0]], [1, [[8, 1], 6, 24, 0]]]}
+    views = E.argument_views(op)
+    assert views[0]["stride"] == [8, 1]
+    assert views[1]["offset"] == 6 and views[1]["elements"] == 24 and views[1]["owner"] == 0
+
+
+def test_synthetic_bulk_schema_selects_one_signature_and_retains_shared_pool(actual):
+    """Schema fixture only; this does not claim a new batched acquisition."""
+    from atom.compass.core.cost.library import _signature_of
+
+    directory, source, handoff, _ = actual
+    case = source["cases"][0]
+    handoff["cases"] = [case["name"]]
+    op = case["operator"]
+    other = source["cases"][1]["operator"]
+    batch = directory / "batch.json"
+    batch.write_text(json.dumps({"ops": [op, other]}))
+    plan = json.loads(Path(case["plan"]["path"]).read_text())
+    plan["graph"] = pin(batch)
+    plan["no_end_to_end_timing_inputs"] = True
+    plan.pop("fitting_end_to_end_timings")
+    for entry in plan["cases"]:
+        entry["case_id"] = entry.pop("name")
+    plan["input_pins"] = plan.pop("code_pins")
+    plan_path = directory / "batch_plan.json"
+    plan_path.write_text(json.dumps(plan))
+    case["plan"] = pin(plan_path)
+    case.pop("native_context")
+    signature = _signature_of(op)
+    for index, reference in enumerate(case["references"]):
+        raw = json.loads(Path(reference["artifact"]["path"]).read_text())
+        raw["acquisition"]["plan_sha256"] = case["plan"]["sha256"]
+        raw["acquisition"]["case_id"] = raw["acquisition"].pop("case")
+        raw["acquisition"].pop("source_only")
+        raw["acquisition"].pop("dispatch_seconds_used_as_prices")
+        raw["acquisition"]["by_signature"] = {signature: {"case_id": case["name"]}}
+        setup = raw["provenance"]["native_layout_context_setup"]
+        setup.pop("native_context")
+        setup["graph"] = pin(batch)
+        raw["provenance"]["native_layout_context_setup"] = {
+            "standup": setup["standup"], "by_signature": {signature: setup}}
+        raw["provenance"]["collector"]["hashes"]["graphs"] = {batch.name: pin(batch)["sha256"]}
+        raw["prices"][_signature_of(other)] = dict(raw["prices"][signature])
+        target = directory / f"batch_raw{index}.json"
+        target.write_text(json.dumps(raw))
+        reference["artifact"] = pin(target)
+    library = load(actual)
+    assert library.lookup(op, {"tp": 1})[0]["seconds"] == case["reference_median_seconds"]
+
+
+def test_mha_scope_and_each_shifted_kv_context_are_required():
+    from atom.compass.core.cost.families import attention as A, attention_scope
+    from atom.compass.core.cost.library import _signature_of
+    from atom.compass.runtime.forward_ctx import shift_addresses
+    from .test_attention_family import _resolved_record, _unified
+
+    op = _unified([8], [16], is_prefill=True, has_cached=True)
+    op["context"] += [["block_tables", [0]], ["slot_mapping", list(range(8, 16))]]
+    resolved = _resolved_record()
+    expected = A.scoped(op, attention_scope.read_resolved(resolved, where="fixture").for_op(op))
+    context = dict(op["context"])
+    installs = []
+    for region in range(2):
+        shifted = dict(context, block_tables=shift_addresses(context["block_tables"], region),
+                       slot_mapping=shift_addresses(context["slot_mapping"], region * expected["kv_cache_block_size"]))
+        installs.append(dict(region=region, block_stride=1, observed_context_sha256=E._digest(shifted),
+                             expected_context_sha256=E._digest(shifted)))
+    raw = dict(raw={"resolved_scope": resolved}, prices={_signature_of(op): {"kv_regions": 2}},
+        provenance={"native_layout_context_setup": {"context_sha256": E._digest(op["context"]), "context_installs": installs}})
+    E._registered_scope(op, raw, expected, {})
+    installs[0]["observed_context_sha256"] = "0" * 64
+    with pytest.raises(ValueError, match="shifted KV context"):
+        E._registered_scope(op, raw, expected, {})
+
+
+@pytest.fixture
+def actual_mha(tmp_path):
+    source_path = os.environ.get("ATOMCOMPASS_EXACT_MHA_SOURCE")
+    scope_path = os.environ.get("ATOMCOMPASS_EXACT_OPERATOR_SCOPE")
+    if not source_path or not scope_path:
+        pytest.skip("set actual MHA source and scope paths for the completed batch")
+    source = json.loads(Path(source_path).read_text())
+    local_source = tmp_path / "source.json"
+    local_source.write_text(json.dumps(source))
+    handoff = {"schema": E.SCHEMA, "source_handoff": pin(local_source), "deployment_scope": pin(scope_path),
+               "diagnostic_only": True, "cases": [case["name"] for case in source["cases"]]}
+    base = ParametricPriceLibrary()
+    base.launch_charge_seconds = 0.0
+    base.request_attention_scope = Declaration(scopes=json.loads(Path(scope_path).read_text())["attention_scope"])
+    base.request_attention_treatments = {}
+    return tmp_path, source, handoff, base
+
+
+def test_actual_154_mha_cases_retain_timer_modes_and_host_observations(actual_mha):
+    from atom.compass.core.cost.library import _signature_of
+
+    library = load(actual_mha)
+    cases = actual_mha[1]["cases"]
+    assert len(cases) == 154
+    assert {case["timer_mode"] for case in cases} == {"graph", "over"}
+    raw_sources = {}
+    for case in cases:
+        op = case["operator"]
+        record, why = library.lookup(op, {"tp": 1})
+        assert record is not None, why
+        expected_host = []
+        for reference in case["references"]:
+            path = reference["artifact"]["path"]
+            if path not in raw_sources:
+                raw_sources[path] = json.loads(Path(path).read_text())
+            expected_host.append(raw_sources[path]["prices"][_signature_of(op)]["host_seconds"])
+        assert record["seconds"] == case["reference_median_seconds"]
+        assert record["all_three"] == case["reference_values_seconds"]
+        assert record["source_host_seconds"] == expected_host
+        assert record["source_conditioning"]["cache"] == case["timer_mode"]
+        assert record["kernel_count"] is None and record["launch_count"] is None
+        assert not record["kernel_dispatch_observed"] and _record_launch_count(record) == 0
+        seconds, coverage, charges = library.body({"ops": [op], "key": {"topology": [["tp", 1]]}})
+        assert seconds == record["seconds"] and coverage.complete and charges == 0
+
+
+@pytest.mark.parametrize("damage", ["mixed_mode", "undisclosed_mode", "requested_mode", "host_missing", "host_negative", "host_boolean"])
+def test_actual_mha_repinning_cannot_mix_modes_or_erase_host_evidence(actual_mha, damage):
+    from atom.compass.core.cost.library import _signature_of
+
+    directory, source, handoff, _ = actual_mha
+    case = next(case for case in source["cases"] if case["timer_mode"] == "over")
+    handoff["cases"] = [case["name"]]
+    if damage == "undisclosed_mode":
+        case.pop("timer_mode")
+    else:
+        reference = case["references"][1]
+        raw = json.loads(Path(reference["artifact"]["path"]).read_text())
+        record = raw["prices"][_signature_of(case["operator"])]
+        if damage == "mixed_mode":
+            record["cache"] = "graph"
+        elif damage == "requested_mode":
+            raw["provenance"]["cache"] = "hot"
+        elif damage == "host_missing":
+            record.pop("host_seconds")
+        elif damage == "host_negative":
+            record["host_seconds"] = -1
+        else:
+            record["host_seconds"] = True
+        path = directory / "changed_raw.json"
+        path.write_text(json.dumps(raw))
+        reference["artifact"] = pin(path)
+    with pytest.raises(ValueError, match="event reference"):
+        load(actual_mha)
+
+
+@pytest.fixture
+def actual_decode(tmp_path):
+    source_path = os.environ.get("ATOMCOMPASS_EXACT_MHA_DECODE_SOURCE")
+    scope_path = os.environ.get("ATOMCOMPASS_EXACT_OPERATOR_SCOPE")
+    if not source_path or not scope_path:
+        pytest.skip("set actual decode MHA source and scope paths for the completed controls")
+    source = json.loads(Path(source_path).read_text())
+    local_source = tmp_path / "source.json"
+    local_source.write_text(json.dumps(source))
+    handoff = {"schema": E.SCHEMA, "source_handoff": pin(local_source), "deployment_scope": pin(scope_path),
+               "diagnostic_only": True, "cases": [case["name"] for case in source["cases"]]}
+    base = ParametricPriceLibrary()
+    base.launch_charge_seconds = 0.0
+    base.request_attention_scope = Declaration(scopes=json.loads(Path(scope_path).read_text())["attention_scope"])
+    base.request_attention_treatments = {}
+    return tmp_path, source, handoff, base
+
+
+def test_actual_decode_controls_match_physical_scope_without_inventing_dispatch(actual_decode):
+    library = load(actual_decode)
+    cases = actual_decode[1]["cases"]
+    assert len(cases) == 7
+    for case in cases:
+        op = case["operator"]
+        assert dict(op["context"])["is_prefill"] is False
+        record, why = library.lookup(op, {"tp": 1})
+        assert record is not None, why
+        assert record["seconds"] == case["reference_median_seconds"]
+        assert record["all_three"] == case["reference_values_seconds"]
+        assert record["registered_attention_scope"]["attention_backend"] != "paged_gluon"
+        assert record["kernel_dispatch_observed"] is False
+        assert record["kernel_count"] is None and _record_launch_count(record) == 0
+        seconds, coverage, charges = library.body({"ops": [op], "key": {"topology": [["tp", 1]]}})
+        assert seconds == record["seconds"] and coverage.complete and charges == 0
+
+
+@pytest.mark.parametrize("damage", ["backend", "kv_dtype", "missing_physical"])
+def test_decode_repinning_cannot_change_or_omit_physical_scope(actual_decode, damage):
+    directory, _, handoff, _ = actual_decode
+    scope = json.loads(Path(handoff["deployment_scope"]["path"]).read_text())
+    if damage == "backend":
+        scope["attention_scope"]["unified"]["attention_backend"] = "different backend"
+    elif damage == "kv_dtype":
+        scope["attention_scope"]["unified"]["kv_cache_dtype"] = "fp8"
+    else:
+        scope["attention_scope"].pop("unified")
+    target = directory / "changed_scope.json"
+    target.write_text(json.dumps(scope))
+    handoff["deployment_scope"] = pin(target)
+    with pytest.raises(ValueError, match="resolved backend/KV scope differs"):
+        load(actual_decode)
+
+
+@pytest.mark.parametrize("scope_name,field,value", [
+    ("unified", "kv_cache_dtype", "fp8"),
+    ("unified.decode", "compute_units", 160),
+])
+def test_decode_lookup_rechecks_physical_and_per_call_scopes(actual_decode, scope_name, field, value):
+    library = load(actual_decode)
+    actual_decode[3].request_attention_scope.scopes[scope_name][field] = value
+    record, why = library.lookup(actual_decode[1]["cases"][0]["operator"], {"tp": 1})
+    assert record is None and "scope differs" in why

@@ -7,6 +7,7 @@ import queue
 import threading
 import time
 from contextlib import ExitStack
+from dataclasses import dataclass
 
 import torch
 import zmq
@@ -14,7 +15,6 @@ import zmq
 from atom.config import Config, ParallelConfig
 from atom.kv_transfer.disaggregation import KVOutputAggregator
 from atom.kv_transfer.disaggregation.types import connector_metadata_has_work
-from atom.model_engine.async_proc import AsyncIOProcManager
 from atom.model_engine.engine_core_protocol import EngineCoreRequestType
 from atom.model_engine.engine_utility import EngineUtilityHandler
 from atom.model_engine.scheduler import DecodeScheduler, PrefillScheduler, Scheduler
@@ -30,6 +30,7 @@ from atom.utils import (
     envs,
     init_exit_handler,
     make_zmq_socket,
+    resolve_obj_by_qualname,
     set_process_title,
 )
 from atom.utils.distributed.utils import (
@@ -41,6 +42,7 @@ from atom.utils.gc_utils import (
     tune_gc,
     unfreeze_gc_heap,
 )
+from atom.utils.clock import get_clock
 
 logger = logging.getLogger("atom")
 
@@ -60,13 +62,202 @@ KV_IDLE_DRAIN_INTERVAL_S = 0.001
 KV_SHUTDOWN_DRAIN_TIMEOUT_S = 2.0
 
 
+
+
+def _install_compass_clock(config) -> None:
+    """Put this process on a virtual clock when running a simulated workload.
+
+    Only the scheduling process does this. Workers predict step durations and
+    report them back; they never hold a clock, which keeps time single-sourced
+    even when the model is sharded across processes.
+    """
+    compass = getattr(config, "compass_config", None)
+    if compass is None or not compass.enabled or not compass.virtual_clock:
+        return
+    from atom.utils.clock import VirtualClock, set_clock
+
+    set_clock(VirtualClock(epoch=compass.epoch))
+    logger.info("ATOMCompass: engine core running on a virtual clock")
+
+
+def _stamp_step_start(scheduled_batch) -> None:
+    """Tell the runner when this step begins, on this process's clock.
+
+    The runner records when each step started, so that queueing can be measured
+    against a request's arrival rather than reconstructed from durations. It
+    cannot read the time itself: arrivals and first tokens are stamped on the
+    clock this process owns, and the runner may sit in a worker that never had
+    a Compass clock installed. Measured, it was stamping the wall clock -- 69
+    seconds ahead of the first arrival, which is the server's startup, and
+    advancing in real time while this clock advanced by predicted steps. Every
+    step then landed after the first token it produced, which is impossible,
+    and is what the validity check caught.
+
+    Installing a virtual clock in the worker would not fix it: only this
+    process calls ``advance``, so the worker's copy would sit at the epoch.
+    """
+    try:
+        scheduled_batch.compass_started_at = get_clock().time()
+    except AttributeError:  # a batch type that does not take attributes
+        pass
+
+
+def _clock_delta_for(fwd_out, *, before_output: bool | None = None):
+    """Calculate one existing whole-step or split clock charge."""
+    seconds = getattr(fwd_out, "compass_step_seconds", None)
+    if seconds is None:
+        return
+    if before_output is not None:
+        ready = getattr(fwd_out, "compass_output_ready_seconds", None)
+        if ready is None:
+            ready = 0.0 if _defers_output(fwd_out) else seconds
+        if not 0.0 <= ready <= seconds:
+            raise ValueError("output-ready offset must lie within the step cost")
+        seconds = ready if before_output else seconds - ready
+    return seconds
+
+
+def _advance_clock_for(fwd_out, *, before_output: bool | None = None) -> None:
+    """Apply the existing clock charge; wall-clock execution remains a no-op."""
+    seconds = _clock_delta_for(fwd_out, before_output=before_output)
+    advance = getattr(get_clock(), "advance", None)
+    if seconds is not None and advance is not None:
+        advance(seconds)
+
+
+def _defers_output(fwd_out) -> bool:
+    """Whether this output carries the *previous* step's tokens.
+
+    This is token identity, not a statement of host visibility. Cold prefill
+    and decode can drain those tokens while the current forward runs. Cached
+    ASM prefill instead synchronizes inside its prefix gather, so draining
+    must wait for part of the current forward. The predicted output carries
+    that distinct offset as compass_output_ready_seconds. Component oracles
+    also supply a preparation boundary so the engine can keep device-queue
+    time separate from scheduling time. Total-only oracles retain the original
+    split charge around publication.
+    """
+    return bool(getattr(fwd_out, "is_deferred_out", False))
+
+
+def _native_pipeline_marks(core, fwd_out, scheduled_batch=None):
+    """Reserve the existing forward timeline once, without advancing host time."""
+    preparation = getattr(fwd_out, "compass_preparation_seconds", None)
+    clock = get_clock()
+    advance = getattr(clock, "advance", None)
+    if advance is None:
+        return None
+    config = getattr(getattr(core, "scheduler", None), "config", None)
+    compass = getattr(config, "compass_config", None)
+    fence = bool(getattr(compass, "enabled", False)
+                 and getattr(compass, "prefill_preparation_fence", False))
+    if fence:
+        if scheduled_batch is None:
+            raise ValueError("prefill preparation fence requires the selected batch")
+        fence = scheduled_batch.total_tokens_num_prefill > 0
+    if fence:
+        architectures = getattr(getattr(config, "hf_config", None), "architectures", ()) or ()
+        parallel = getattr(config, "parallel_config", None)
+        if ("Qwen3_5ForConditionalGeneration" not in architectures
+                or getattr(config, "tensor_parallel_size", 1) != 1
+                or getattr(config, "pipeline_parallel_size", 1) != 1
+                or getattr(parallel, "data_parallel_size", 1) != 1):
+            raise ValueError("preparation fence supports the source-proven TP1 dense Qwen3.5 GDN path")
+        if preparation is None:
+            raise ValueError("prefill preparation fence needs a priced preparation boundary")
+    if preparation is None:
+        return None
+    from atom.compass.runtime.timeline import ForwardTimeline
+
+    timeline = getattr(core, "_compass_forward_timeline", None)
+    if timeline is None:
+        timeline = core._compass_forward_timeline = ForwardTimeline()
+    produces = getattr(fwd_out, "compass_produces_output", None)
+    if produces is None:
+        raise ValueError("pipelined timing requires the current output predicate")
+    now = clock.time()
+    blocking_prefix = fwd_out.compass_output_ready_seconds or 0.0
+    if fence:
+        # GDN prefill copies GPU cu_seqlens_q.diff() back to CPU while building
+        # metadata, before model dispatch and before the output-less branch.
+        # The source-priced preparation+idle remainder approximates that fence;
+        # it is not an exact D2H timestamp. Reuse the existing prefix rule so
+        # preparation and GPU total are charged once. Dispatch stays unpriced.
+        blocking_prefix = max(blocking_prefix, preparation)
+    marks = timeline.submit(
+        now, fwd_out.compass_step_seconds, preparation,
+        blocking_prefix, produces)
+    if fence:
+        marks["prefill_preparation_fence"] = "priced_preparation_boundary_approximation"
+    return marks
+
+
+def _emit_native_pipeline(marks):
+    from atom.compass.runtime.lifecycle import trace
+    trace().emit("forward_timeline", **marks)
+
+
+def _advance_native_pipeline(core, fwd_out, scheduled_batch=None) -> bool:
+    """Legacy synchronous application of the same native pipeline calculation."""
+    marks = _native_pipeline_marks(core, fwd_out, scheduled_batch)
+    if marks is None:
+        return False
+    get_clock().advance(marks["host_returned_at"] - get_clock().time())
+    _emit_native_pipeline(marks)
+    return True
+
+
+@dataclass(frozen=True)
+class _ClockWait:
+    at: float
+    seconds: float
+
+
+@dataclass(frozen=True)
+class _OutputReady:
+    at: float
+    streams: tuple
+    finished: tuple
+    after_at: float | None = None
+
+
+def _clock_wait_for(fwd_out, *, before_output=None):
+    seconds = _clock_delta_for(fwd_out, before_output=before_output)
+    if seconds is None or getattr(get_clock(), "advance", None) is None:
+        return None
+    return _ClockWait(get_clock().time() + seconds, seconds)
+
+
 class EngineCore:
     # This process's name, for the title and every GC log line. A class
     # attribute because it is per-process state and each engine is spawned into
     # its own interpreter; `_setup_engine_process` is the only writer.
     _process_name = "EngineCore"
 
-    def __init__(self, config: Config, input_address: str, output_address: str):
+    def __init__(
+        self, config: Config, input_address: str | None, output_address: str | None,
+        *, in_process: bool = False,
+    ):
+        if in_process:
+            compass = getattr(config, "compass_config", None)
+            if (type(self) is not EngineCore or input_address is not None
+                    or output_address is not None
+                    or not getattr(compass, "enabled", False)
+                    or getattr(compass, "mode", None) != "predict"
+                    or not getattr(compass, "virtual_clock", False)
+                    or not getattr(compass, "replay_target", "")
+                    or any(getattr(config, name, 1) != 1 for name in (
+                        "tensor_parallel_size", "pipeline_parallel_size",
+                        "prefill_context_parallel_size", "decode_context_parallel_size"))
+                    or getattr(getattr(config, "parallel_config", None), "data_parallel_size",
+                               getattr(config, "data_parallel_size", 1)) != 1
+                    or getattr(config, "kv_transfer_config", None)
+                    or getattr(config, "speculative_config", None)
+                    or getattr(config, "disagg_is_decode", False)
+                    or config.runner_manager_qualname != "atom.compass.replay.local_proc.LocalProcManager"
+                    or config.runner_qualname != "atom.compass.replay.runner.ReplayModelRunner"):
+                raise ValueError("in-process EngineCore requires a local virtual prediction replay at TP1/PP1/DP1 without KV transfer, speculation or socket addresses")
+        _install_compass_clock(config)
         self.label = "Engine Core"
         self.input_queue = queue.Queue[Sequence]()
         self.output_queue = queue.Queue[list[Sequence]]()
@@ -86,28 +277,30 @@ class EngineCore:
         # Control traffic arrives on its own socket so CoreManager can keep the
         # request socket single-writer; see CoreManager._send_request.
         self.control_address = config.parallel_config.control_address
-        assert self.control_address, (
-            "parallel_config.control_address is unset -- an EngineCore must be "
-            "launched through CoreManager, which allocates the control channel"
-        )
-        self.output_thread = threading.Thread(
-            target=self.process_output_sockets, args=(self.output_address,), daemon=True
-        )
-        self.output_thread.start()
+        self.output_thread = self.input_thread = None
+        if not in_process:
+            assert self.control_address, (
+                "parallel_config.control_address is unset -- an EngineCore must be "
+                "launched through CoreManager, which allocates the control channel"
+            )
+            self.output_thread = threading.Thread(
+                target=self.process_output_sockets, args=(self.output_address,), daemon=True
+            )
+            self.output_thread.start()
 
-        # Start input thread BEFORE _init_data_parallel so that CoreManager
-        # can receive the input socket connection and proceed to start the
-        # remaining DP ranks.  Without this, _init_data_parallel blocks on
-        # rendezvous waiting for all DP ranks, but they haven't been spawned
-        # yet because CoreManager is still waiting for *this* rank's socket.
-        # The READY signal (sent at the end of __init__) gates actual request
-        # processing, so starting the input thread early is safe.
-        self.input_thread = threading.Thread(
-            target=self.process_input_sockets,
-            args=(self.input_address, self.control_address),
-            daemon=True,
-        )
-        self.input_thread.start()
+            # Start input thread BEFORE _init_data_parallel so that CoreManager
+            # can receive the input socket connection and proceed to start the
+            # remaining DP ranks.  Without this, _init_data_parallel blocks on
+            # rendezvous waiting for all DP ranks, but they haven't been spawned
+            # yet because CoreManager is still waiting for *this* rank's socket.
+            # The READY signal (sent at the end of __init__) gates actual request
+            # processing, so starting the input thread early is safe.
+            self.input_thread = threading.Thread(
+                target=self.process_input_sockets,
+                args=(self.input_address, self.control_address),
+                daemon=True,
+            )
+            self.input_thread.start()
 
         self.mark_trace = getattr(config, "mark_trace", False)
         init_exit_handler(self)
@@ -122,7 +315,8 @@ class EngineCore:
             # workers inside a single EngineCore — so pp does NOT multiply here.
             # tp_world_size, not tensor_parallel_size: under simulated TP only
             # the first tp_world_size shards get a process.
-            self.runner_mgr = AsyncIOProcManager(
+            manager_cls = resolve_obj_by_qualname(config.runner_manager_qualname)
+            self.runner_mgr = manager_cls(
                 self._finalizer,
                 config.tp_world_size * config.prefill_context_parallel_size,
                 config.runner_qualname,
@@ -183,6 +377,7 @@ class EngineCore:
             self.output_queue,
             label=self.label,
             scheduler=self.scheduler,
+            engine=self,
         )
 
         # KV cache allocated, graphs captured, BlockPool built: everything this
@@ -273,7 +468,8 @@ class EngineCore:
     def _send_engine_dead(self):
         logger.debug(f"{self.label}: send SHUTDOWN request")
         self.output_queue.put_nowait([get_exit_sequence()])
-        self.output_thread.join(timeout=0.5)
+        if self.output_thread is not None:
+            self.output_thread.join(timeout=0.5)
 
     @staticmethod
     def run_engine(config: Config, input_address: str, output_address: str):
@@ -338,19 +534,47 @@ class EngineCore:
                 logger.exception("KV event publish during shutdown failed")
             self.scheduler.shutdown_kv_events()
 
+    def _publish_step_kv_events(self):
+        try:
+            self.scheduler.publish_kv_events()
+        except Exception:
+            logger.exception("KV event publish in engine-step finally failed")
+
     def _process_engine_step(self):
         try:
             return self._process_engine_step_inner()
         finally:
-            # Swallow publisher errors so they cannot mask an exception from
-            # the engine step itself.
-            try:
-                self.scheduler.publish_kv_events()
-            except Exception:
-                logger.exception("KV event publish in engine-step finally failed")
+            self._publish_step_kv_events()
 
     def _process_engine_step_inner(self):
-        result = self.scheduler.schedule()
+        """Run the shared program synchronously for the existing engine loop."""
+        if getattr(self, "_controlled_owner", None) is not None:
+            raise RuntimeError("engine step is owned by a controlled driver")
+        program = self._process_engine_step_program()
+        reply = None
+        while True:
+            try:
+                event = program.send(reply)
+            except StopIteration as done:
+                return done.value
+            if isinstance(event, _ClockWait):
+                get_clock().advance(event.seconds)
+                reply = None
+            elif isinstance(event, _OutputReady):
+                reply = False  # Legacy publication remains at its original point.
+            else:
+                raise RuntimeError("unknown engine step checkpoint")
+
+    def _publish_step_output(self, output):
+        for streams in output.streams:
+            self.output_queue.put_nowait(("STREAM", streams))
+        if output.finished:
+            self.output_queue.put_nowait(list(output.finished))
+
+    def _process_engine_step_program(self, *, advance_idle=True):
+        """One forward/postprocess implementation, suspended only at explicit events."""
+        result = (self.scheduler.schedule() if advance_idle
+                  else self.scheduler.schedule(advance_idle=False))
 
         # Surface admit-rejected seqs (those `_unschedulable_reason` flags in
         # the scheduler) through the same finished-seq path as normal seqs.
@@ -358,7 +582,10 @@ class EngineCore:
         # the rejected seq will never produce.
         rejected = self.scheduler.take_rejected()
         if rejected:
-            self.output_queue.put_nowait(rejected)
+            output = _OutputReady(get_clock().time(), (), tuple(rejected))
+            published = yield output
+            if not published:
+                self._publish_step_output(output)
 
         if result is None:
             self._advance_idle_kv_transfer()
@@ -383,9 +610,22 @@ class EngineCore:
         has_seqs = len(scheduled_batch.req_ids) > 0
         if has_seqs:
             self.scheduler.compute_detailed_aggregates(scheduled_batch, seqs)
+            _stamp_step_start(scheduled_batch)
             fwd_out = self.runner_mgr.call_func(
                 "forward", scheduled_batch, wait_out=True
             )
+            marks = _native_pipeline_marks(self, fwd_out, scheduled_batch)
+            pipelined = marks is not None
+            if pipelined:
+                yield _ClockWait(marks["host_returned_at"], marks["host_returned_at"] - get_clock().time())
+                _emit_native_pipeline(marks)
+            else:
+                if not _defers_output(fwd_out):
+                    wait = _clock_wait_for(fwd_out)
+                else:
+                    wait = _clock_wait_for(fwd_out, before_output=True)
+                if wait is not None:
+                    yield wait
             if (
                 self.scheduler.prefill_delayer is not None
                 and scheduled_batch.total_seqs_num_prefill > 0
@@ -410,19 +650,23 @@ class EngineCore:
             stream_output_queue=self.stream_output_queue,
             batch=scheduled_batch,
         )
-
-        # Send stream outputs to main process via output_queue
+        trailing = None
+        if _defers_output(fwd_out):
+            if not pipelined:
+                trailing = _clock_wait_for(fwd_out, before_output=False)
+        streams = []
         try:
             while not self.stream_output_queue.empty():
-                stream_outputs = self.stream_output_queue.get_nowait()
-                # Send stream outputs as intermediate results
-                self.output_queue.put_nowait(("STREAM", stream_outputs))
+                streams.append(self.stream_output_queue.get_nowait())
         except queue.Empty:
             pass
-
-        if finished_seqs:
-            self.output_queue.put_nowait(finished_seqs)
-
+        output = _OutputReady(get_clock().time(), tuple(streams), tuple(finished_seqs),
+                              trailing.at if trailing is not None else get_clock().time())
+        published = (yield output) if output.streams or output.finished else False
+        if trailing is not None:
+            yield trailing
+        if not published:
+            self._publish_step_output(output)
         return True
 
     def has_pending_kv_work(self) -> bool:
@@ -988,11 +1232,11 @@ class PrefillEngineCore(EngineCore):
             return False
 
         # Run on the dedicated prefill stream; returns sampled token IDs (one per seq).
-        t0 = time.perf_counter()
+        t0 = get_clock().perf_counter()
         sampled_token_ids = self.runner_mgr.call_func(
             "prefill_forward", scheduled_batch, wait_out=True
         )
-        iter_ms = (time.perf_counter() - t0) * 1000
+        iter_ms = (get_clock().perf_counter() - t0) * 1000
         logger.info(
             f"prefill iter {iter_ms:.2f}ms | "
             f"reqs={scheduled_batch.total_seqs_num} | "
@@ -1260,9 +1504,16 @@ class DecodeEngineCore(EngineCore):
         scheduled_batch, seqs = result
         if scheduled_batch is None:
             return False
-        t0 = time.perf_counter()
+        t0 = get_clock().perf_counter()
+        _stamp_step_start(scheduled_batch)
         fwd_out = self.runner_mgr.call_func("forward", scheduled_batch, wait_out=True)
-        iter_ms = (time.perf_counter() - t0) * 1000
+        pipelined = _advance_native_pipeline(self, fwd_out, scheduled_batch)
+        if not pipelined:
+            if not _defers_output(fwd_out):
+                _advance_clock_for(fwd_out)
+            else:
+                _advance_clock_for(fwd_out, before_output=True)
+        iter_ms = (get_clock().perf_counter() - t0) * 1000
         logger.info(
             f"iter {iter_ms:.2f}ms | "
             f"reqs={scheduled_batch.total_seqs_num} "
@@ -1275,6 +1526,9 @@ class DecodeEngineCore(EngineCore):
         finished_seqs = self.scheduler.postprocess(
             seqs.values(), fwd_out, stream_output_queue=self.stream_output_queue
         )
+        if _defers_output(fwd_out):
+            if not pipelined:
+                _advance_clock_for(fwd_out, before_output=False)
         try:
             while not self.stream_output_queue.empty():
                 stream_outputs = self.stream_output_queue.get_nowait()

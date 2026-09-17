@@ -1,0 +1,41 @@
+--- a/src/aiperf/common/models/record_models.py
++++ b/src/aiperf/common/models/record_models.py
+@@ -1469,6 +1469,15 @@
+         default_factory=clock.perf_counter_ns,
+         description="The start reference time of the request in nanoseconds used for latency calculations (perf_counter_ns).",
+     )
++    end_perf_ns: int | None = Field(
++        default=None,
++        description="Original RequestRecord transport-completion timestamp in perf_counter_ns. "
++        "Distinct from the final SSE packet and metadata.request_end_ns; absent on older exports.",
++    )
++    recv_start_perf_ns: int | None = Field(
++        default=None,
++        description="Original RequestRecord response-receive start timestamp in perf_counter_ns.",
++    )
+     payload: dict[str, Any] | None = Field(
+         default=None,
+         description="The raw request payload sent to the server. Exactly one "
+--- a/src/aiperf/post_processors/raw_record_writer_processor.py
++++ b/src/aiperf/post_processors/raw_record_writer_processor.py
+@@ -93,6 +93,8 @@
+         return RawRecordInfo(
+             metadata=metadata,
+             start_perf_ns=record.request.start_perf_ns,
++            end_perf_ns=record.request.end_perf_ns,
++            recv_start_perf_ns=record.request.recv_start_perf_ns,
+             payload=None,
+             payload_bytes=payload_bytes,
+             request_headers=redact_headers(record.request.request_headers),
+--- a/docs/architecture.md
++++ b/docs/architecture.md
+@@ -317,3 +317,9 @@
+ The simulator must settle request registration and callback delivery before
+ advancing its timeline. A clock provider alone does not virtualize asyncio
+ timers or replace the replay state machine.
++
++Raw record exports preserve the original optional `RequestRecord.end_perf_ns`
++and `recv_start_perf_ns` values. Transport completion can occur after the
++last SSE packet; `metadata.request_end_ns` retains its existing last-packet
++meaning. An absent optional field on an older export means the corresponding
++transport boundary is unavailable, not equal to the last packet.

@@ -1,0 +1,275 @@
+"""Whether a configuration can serve a workload, and why not when it cannot.
+
+Feasibility has been treated as "the engine started", which is the weaker half
+of the question. A deployment that starts, sizes a non-zero pool and then can
+never admit the workload's longest request is not feasible; it is a deployment
+that answers every short request and drops the long one, and a ranking built
+over it is ranking a service nobody asked for.
+
+So there are two gates here, and a configuration has to pass both:
+
+* **Pool** -- the STATE floor has to leave something to page with. This is
+  `plan_pools`, called rather than reimplemented, so a rejection carries ATOM's
+  own `InsufficientPoolBudget` and the same byte counts the engine's start-up
+  error would print.
+* **Admission** -- the workload's longest request has to be schedulable. The
+  three static rules are `Scheduler._unschedulable_reason`'s, mirrored here
+  because reaching the original needs a `BlockManager`, a `Config` and a live
+  `Sequence`. `tests/compass/test_feasibility.py` wires the derived block count
+  into a real `Scheduler` and checks the two agree, which is what keeps the
+  mirror honest.
+
+**Prefill and decode are different lengths.** A prompt is `input` tokens when
+the batched-token budget sees it and `input + output` tokens by the time it
+finishes, and the rules divide on that: `max_num_batched_tokens` bounds the
+prefill, while `max_model_len` and the block count have to hold the sequence at
+its longest. Checking the prompt length against all three -- which is what the
+scheduler does, because at submit time that is all it has -- passes
+configurations that die part-way through the decode of the longest request.
+"""
+
+from __future__ import annotations
+
+import json
+from collections.abc import Mapping
+from dataclasses import dataclass
+from typing import Any
+
+from atom.compass.core.kv_geometry import InsufficientPoolBudget, blocks_from_readings
+
+__all__ = [
+    "Request",
+    "Verdict",
+    "admission_refusal",
+    "assess",
+    "blocks_for",
+    "longest_request",
+    "trace_requests",
+    "window_upper_bound",
+    "within_window",
+]
+
+
+@dataclass(frozen=True)
+class Request:
+    """One request's two lengths. Both matter, and for different rules."""
+
+    input_tokens: int
+    output_tokens: int = 0
+
+    @property
+    def total_tokens(self) -> int:
+        return self.input_tokens + self.output_tokens
+
+
+@dataclass(frozen=True)
+class Verdict:
+    """Feasible or not, which gate decided, and the numbers behind it."""
+
+    feasible: bool
+    #: ``"pool"``, ``"admission"`` or ``None`` when feasible.
+    gate: str | None = None
+    reason: str | None = None
+    blocks: int = 0
+    state_entries: int = 0
+    blocks_needed: int = 0
+
+    def __bool__(self) -> bool:
+        return self.feasible
+
+
+def trace_requests(path: str) -> list:
+    """Every request in a cc-traces JSONL, as lengths.
+
+    Lengths read here are a property of the workload and not of any deployment,
+    which is what makes them a legitimate feasibility input -- nothing measured
+    on the target is read. But a captured slice is not automatically the
+    workload: if the campaign manifest bounds prompt length, the slice may hold
+    requests that will never be sent, and the longest of those is a stress
+    figure rather than an acceptance figure. Pass the manifest's own trace here
+    once it exists; until then bound the slice with `within_window`.
+    """
+    requests = []
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            line = line.strip()
+            if not line:
+                continue
+            row = json.loads(line)
+            requests.append(
+                Request(
+                    int(row.get("input_tokens") or 0),
+                    int(row.get("output_tokens") or 0),
+                )
+            )
+    return requests
+
+
+def within_window(requests, *, max_input_tokens: int) -> list:
+    """The requests a workload window admits, by prompt length.
+
+    A trace slice and the workload a campaign accepts against are not the same
+    thing. The slice on disk is whatever was captured; the workload is what the
+    manifest says will be replayed, and a manifest that caps prompts at N makes
+    every longer request in the slice irrelevant to feasibility, because it will
+    never be sent.
+    """
+    return [r for r in requests if r.input_tokens <= int(max_input_tokens)]
+
+
+def window_upper_bound(requests, *, max_input_tokens: int) -> Request | None:
+    """The longest request a window *could* contain, not the longest it did.
+
+    The input cap paired with the longest output the admitted requests show.
+    That deliberately pairs two different requests' extremes: a feasibility
+    bound has to hold for the worst request the window can produce, and a slice
+    that happens not to contain a cap-length prompt answering at its longest is
+    evidence about the slice, not about the window.
+
+    This is a stand-in for a number nobody has yet. Once the workload manifest
+    is locked, take the lengths from it via `trace_requests` and
+    `longest_request` instead -- a bound that is never replaced quietly becomes
+    a claim about a workload that was never measured.
+    """
+    inside = within_window(requests, max_input_tokens=max_input_tokens)
+    if not inside:
+        return None
+    return Request(int(max_input_tokens), max(r.output_tokens for r in inside))
+
+
+def longest_request(requests) -> Request | None:
+    """The request that has to fit, which is the longest *in total*.
+
+    Not the longest prompt. A 240k-token prompt with a 20-token answer is
+    easier to serve than a 200k prompt answering for 60k, and picking by prompt
+    length silently checks the wrong one.
+    """
+    return max(requests, key=lambda r: r.total_tokens, default=None)
+
+
+def blocks_for(tokens: int, block_size: int, dcp_world_size: int = 1) -> int:
+    """Pool blocks one sequence of `tokens` occupies on one rank.
+
+    `BlockManager.num_pool_blocks`. Under DCP a rank holds only its shard, and
+    this is the only count that may be compared against the pool's size --
+    which is why the DCP case is named here rather than left to a reader who
+    might use `ceil(tokens / block_size)` and admit prompts that do not fit.
+    """
+    if dcp_world_size > 1:
+        raise NotImplementedError(
+            "dcp>1 shards a sequence across ranks by an interleave this does "
+            "not model; use BlockManager.num_pool_blocks"
+        )
+    return (int(tokens) + int(block_size) - 1) // int(block_size)
+
+
+def admission_refusal(
+    request: Request,
+    *,
+    blocks: int,
+    block_size: int,
+    max_model_len: int,
+    max_num_batched_tokens: int,
+    enable_chunked_prefill: bool = True,
+) -> str | None:
+    """Why this request can never be scheduled here, or None.
+
+    The three static rules of `Scheduler._unschedulable_reason`, in its order,
+    because the first one that fires is the one the engine would report.
+    """
+    total = request.total_tokens
+    if max_model_len and total > max_model_len:
+        return (
+            f"tokens={total} > max_model_len={max_model_len} at its longest "
+            f"(input {request.input_tokens} + output {request.output_tokens})"
+        )
+    if (
+        not enable_chunked_prefill
+        and max_num_batched_tokens
+        and request.input_tokens > max_num_batched_tokens
+    ):
+        return (
+            f"input tokens={request.input_tokens} > "
+            f"max_num_batched_tokens={max_num_batched_tokens} with chunked "
+            "prefill off"
+        )
+    needed = blocks_for(total, block_size)
+    if needed > blocks:
+        return (
+            f"needs {needed} KV blocks for {total} tokens > "
+            f"total pool blocks={blocks}"
+        )
+    return None
+
+
+def assess(
+    config: Mapping[str, Any],
+    readings,
+    *,
+    utilization: float,
+    max_num_seqs: int,
+    max_model_len: int,
+    max_num_batched_tokens: int = 0,
+    tensor_parallel: int = 1,
+    block_size: int = 16,
+    kv_dtype_bytes: int = 2,
+    state_dtype_bytes: int = 2,
+    num_spec: int = 0,
+    enable_chunked_prefill: bool = True,
+    request: Request | None = None,
+) -> Verdict:
+    """Both gates, in the order the engine would hit them.
+
+    `request` is the workload's longest; omit it and only the pool gate is
+    applied, which is the weaker question this module exists to stop being
+    mistaken for the whole one -- so a verdict reached without one says so by
+    leaving `blocks_needed` at zero.
+    """
+    try:
+        plan = blocks_from_readings(
+            config,
+            readings,
+            utilization=utilization,
+            max_num_seqs=max_num_seqs,
+            tensor_parallel=tensor_parallel,
+            block_size=block_size,
+            kv_dtype_bytes=kv_dtype_bytes,
+            state_dtype_bytes=state_dtype_bytes,
+            num_spec=num_spec,
+        )
+    except InsufficientPoolBudget as exc:
+        return Verdict(
+            False,
+            "pool",
+            f"state pool needs {exc.reserved_bytes / 2**30:.2f}GB of "
+            f"{exc.available_bytes / 2**30:.2f}GB available for {exc.entries} entries",
+            state_entries=exc.entries,
+        )
+
+    blocks = plan.paged_entries
+    state_entries = sum(
+        count for name, count in plan.entries.items() if name != plan.paged_class
+    )
+    if blocks <= 0:
+        return Verdict(
+            False,
+            "pool",
+            "the pool sized to zero blocks",
+            blocks=0,
+            state_entries=state_entries,
+        )
+    if request is None:
+        return Verdict(True, None, None, blocks, state_entries)
+
+    refusal = admission_refusal(
+        request,
+        blocks=blocks,
+        block_size=block_size,
+        max_model_len=max_model_len,
+        max_num_batched_tokens=max_num_batched_tokens,
+        enable_chunked_prefill=enable_chunked_prefill,
+    )
+    needed = blocks_for(request.total_tokens, block_size)
+    if refusal:
+        return Verdict(False, "admission", refusal, blocks, state_entries, needed)
+    return Verdict(True, None, None, blocks, state_entries, needed)

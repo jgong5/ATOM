@@ -24,6 +24,20 @@ import pytest
 from import_guard import skip_if_dependency_missing
 
 
+def test_cache_wrapper_option_files_use_original_worker_reads(tmp_path):
+    overlay, q16 = tmp_path / "overlay.json", tmp_path / "q16.json"
+    overlay.write_text("changed after the worker read")
+    q16.write_text("changed after the worker read")
+    ranks = [{"inputs": [
+        {"role": "oracle.region_overlay", "path": str(overlay), "sha256": "a" * 64},
+        {"role": "oracle.q16_sources", "path": str(q16), "sha256": "b" * 64},
+    ]}]
+    assert api_server._loaded_option_files(ranks) == {
+        "region_overlay": {"overlay.json": "a" * 64},
+        "q16_handoff": {"q16.json": "b" * 64},
+    }
+
+
 def _install_api_server_stubs() -> list[str]:
     """Ensure attribute access ``atom.SamplingParams`` works under the stubbed
     ``atom`` package that ``tests/conftest.py`` installs, and stub any heavy
@@ -298,6 +312,356 @@ class TestValidateContextLength:
             max_tokens=8,
             max_model_len=None,
         )
+
+
+class TestCompletionTokenPrompts:
+    class Tokenizer:
+        vocab_size = 8
+
+        def __init__(self):
+            self.encoded = []
+
+        def __len__(self):
+            return 12  # Four added tokens are valid input IDs as well.
+
+        def encode(self, text, **kwargs):
+            assert isinstance(text, str), "token IDs must never be re-tokenized"
+            self.encoded.append(text)
+            return [1, 2, 3]
+
+        def decode(self, tokens, **kwargs):
+            return "done"
+
+    def _engine(self, monkeypatch, *, model_vocab_size=10):
+        from atom.model_engine.llm_engine import InputOutputProcessor
+        from atom.model_engine.request import RequestOutput
+
+        tokenizer = self.Tokenizer()
+        config = SimpleNamespace(
+            hf_config=SimpleNamespace(model_type="test", vocab_size=model_vocab_size),
+            max_model_len=32)
+        processor = InputOutputProcessor(config, tokenizer, 16)
+        received, admitted = [], []
+        original = processor.preprocess_fanout
+
+        def preprocess(prompt, *args, **kwargs):
+            received.append(prompt)
+            return original(prompt, *args, **kwargs)
+
+        processor.preprocess_fanout = preprocess
+
+        def add_request(sequences):
+            admitted.extend(sequences)
+            for seq in sequences:
+                seq.stream_callback(RequestOutput(seq.id, [7], True, "length"))
+
+        engine = SimpleNamespace(config=config, io_processor=processor,
+                                 core_mgr=SimpleNamespace(add_request=add_request))
+        monkeypatch.setattr(api_server, "engine", engine)
+        monkeypatch.setattr(api_server, "tokenizer", tokenizer)
+        monkeypatch.setattr(api_server, "model_name", "test")
+        return tokenizer, processor, received, admitted
+
+    @pytest.mark.parametrize("n", [1, 2])
+    def test_token_ids_reach_real_preprocessing_without_tokenization(self, monkeypatch, n):
+        tokenizer, processor, received, admitted = self._engine(monkeypatch)
+        request = api_server.CompletionRequest(prompt=[1, 8, 9], max_tokens=1, n=n)
+        response = asyncio.run(api_server.completions(request, None))
+        assert received == [[1, 8, 9]]
+        assert received[0] is request.prompt
+        assert all(list(seq.token_ids) == [1, 8, 9] for seq in admitted)
+        assert len(admitted) == n
+        assert tokenizer.encoded == []
+        assert response.usage["prompt_tokens"] == 3
+        assert response.usage["completion_tokens"] == n
+        assert not processor.requests
+
+    def test_text_prompt_keeps_normal_tokenization(self, monkeypatch):
+        tokenizer, _, received, admitted = self._engine(monkeypatch)
+        request = api_server.CompletionRequest(prompt="ordinary text", max_tokens=1)
+        response = asyncio.run(api_server.completions(request, None))
+        assert received == ["ordinary text"]
+        assert tokenizer.encoded == ["ordinary text"]
+        assert list(admitted[0].token_ids) == [1, 2, 3]
+        assert response.usage["prompt_tokens"] == 3
+
+    def test_declared_order_reaches_the_scheduler_handoff(self, monkeypatch):
+        from atom.utils.clock import VirtualClock, get_clock, set_clock
+
+        _, _, _, admitted = self._engine(monkeypatch)
+        previous = get_clock()
+        set_clock(VirtualClock(epoch=1000.0))
+        try:
+            request = api_server.CompletionRequest(
+                prompt=[1, 8, 9], max_tokens=1,
+                compass_arrival=5.0, compass_workload_size=4,
+                compass_workload_index=2,
+            )
+            asyncio.run(api_server.completions(request, None))
+        finally:
+            set_clock(previous)
+        assert len(admitted) == 1
+        seq = admitted[0]
+        assert seq.arrive_time == 1005.0
+        assert seq.compass_workload_size == 4
+        assert seq.compass_workload_index == 2
+
+    @pytest.mark.parametrize("model_size,invalid_id", [(10, 10), (20, 12)])
+    @pytest.mark.parametrize("stream", [False, True])
+    def test_out_of_range_ids_refuse_before_preprocessing(
+            self, monkeypatch, model_size, invalid_id, stream):
+        _, _, received, admitted = self._engine(monkeypatch, model_vocab_size=model_size)
+        request = api_server.CompletionRequest(prompt=[invalid_id], max_tokens=1, stream=stream)
+        with pytest.raises(api_server.HTTPException) as exc:
+            asyncio.run(api_server.completions(request, None))
+        assert exc.value.status_code == 400
+        assert "Prompt token IDs" in str(exc.value.detail)
+        assert received == admitted == []
+
+    def test_token_ids_keep_context_length_validation(self, monkeypatch):
+        _, processor, received, admitted = self._engine(monkeypatch)
+        request = api_server.CompletionRequest(prompt=[1] * 32, max_tokens=1)
+        with pytest.raises(api_server.HTTPException) as exc:
+            asyncio.run(api_server.completions(request, None))
+        assert exc.value.status_code == 400
+        assert "maximum context length" in str(exc.value.detail)
+        assert received and not admitted
+        assert not processor.requests
+
+
+class TestOpeningChatPreprocessing:
+    @pytest.mark.parametrize("wrong_digest", [False, True])
+    def test_chat_metadata_and_consumed_tokens_cross_shared_preprocessing(self, monkeypatch, wrong_digest):
+        from collections import OrderedDict
+        from atom.compass.prefix_workload import token_digest
+        from atom.model_engine.llm_engine import InputOutputProcessor
+        from atom.model_engine.request import RequestOutput
+        from atom.utils.clock import VirtualClock, get_clock, set_clock
+
+        class Tokenizer:
+            def encode(self, text, **kwargs):
+                assert text == "rendered opening"
+                return [1, 2, 3]
+
+        config = SimpleNamespace(hf_config=SimpleNamespace(model_type="test"), max_model_len=32)
+        processor = InputOutputProcessor(config, Tokenizer(), 16)
+        admitted = []
+
+        def add(sequences):
+            admitted.extend(sequences)
+            for seq in sequences:
+                seq.stream_callback(RequestOutput(
+                    seq.id, [7], True, "length", arrive_time=seq.arrive_time,
+                    first_token_time=seq.arrive_time + .1, finish_time=seq.arrive_time + .2))
+
+        monkeypatch.setattr(api_server, "engine", SimpleNamespace(
+            config=config, io_processor=processor, core_mgr=SimpleNamespace(add_request=add)))
+        monkeypatch.setattr(api_server, "model_name", "test")
+        monkeypatch.setattr(api_server, "tokenizer", processor.tokenizer)
+        monkeypatch.setattr(api_server, "apply_chat_template", lambda *a, **kw: "rendered opening")
+        monkeypatch.setattr(api_server, "_stream_batch_dispatcher", SimpleNamespace(
+            new_state=lambda: object(), enqueue=lambda **kw: None))
+        monkeypatch.setattr(api_server, "_compass_records", OrderedDict())
+        monkeypatch.setattr(api_server, "_compass_prompt_evidence", {})
+        digest = token_digest([1, 2, 3])
+        request = api_server.ChatCompletionRequest(
+            model="test", messages=[{"role": "user", "content": "source message"}],
+            max_completion_tokens=1, temperature=0, ignore_eos=True, stream=True,
+            compass_arrival=21.437, compass_workload_size=2, compass_workload_index=1,
+            compass_prompt_token_sha256="0" * 64 if wrong_digest else digest)
+        previous = get_clock()
+        set_clock(VirtualClock(epoch=1000.))
+        try:
+            if wrong_digest:
+                with pytest.raises(api_server.HTTPException) as exc:
+                    asyncio.run(api_server.chat_completions(request, None))
+                assert exc.value.status_code == 400
+                assert "pinned token identity" in str(exc.value.detail)
+                assert not admitted and not processor.requests
+            else:
+                asyncio.run(api_server.chat_completions(request, None))
+                assert len(admitted) == 1
+                seq = admitted[0]
+                assert list(seq.token_ids) == [1, 2, 3]
+                assert seq.arrive_time == 1021.437
+                assert seq.compass_workload_size == 2 and seq.compass_workload_index == 1
+                assert not hasattr(seq, "prompt_token_sha256")  # No Sequence wire-layout change.
+                record, = api_server._compass_records.values()
+                assert record["shared_preprocessing"]["prompt_token_sha256"] == digest
+                assert record["shared_preprocessing"]["input_tokens"] == 3
+                assert record["shared_preprocessing"]["api_preprocess_returned_wall_time"] > 0
+                api_server.cleanup_stream(seq.id)
+                api_server.cleanup_request(record["request_id"])
+        finally:
+            set_clock(previous)
+
+
+    def test_ordinary_cancelled_chat_keeps_consumed_token_and_header_attribution(self, monkeypatch):
+        from collections import OrderedDict
+        from atom.compass.prefix_workload import token_digest
+        from atom.model_engine.llm_engine import InputOutputProcessor
+
+        config = SimpleNamespace(hf_config=SimpleNamespace(model_type="test"), max_model_len=32)
+        processor = InputOutputProcessor(config, SimpleNamespace(encode=lambda *a, **kw: [1, 2, 3]), 16)
+        admitted, aborted = [], []
+        monkeypatch.setenv("COMPASS_NATIVE_COVERAGE", "1")
+        monkeypatch.setattr(api_server, "engine", SimpleNamespace(
+            config=config, io_processor=processor,
+            core_mgr=SimpleNamespace(add_request=lambda rows: admitted.extend(rows),
+                                     abort_request=lambda seq_id: aborted.append(seq_id))))
+        monkeypatch.setattr(api_server, "model_name", "test")
+        monkeypatch.setattr(api_server, "tokenizer", processor.tokenizer)
+        monkeypatch.setattr(api_server, "apply_chat_template", lambda *a, **kw: "ordinary marked prompt")
+        monkeypatch.setattr(api_server, "_stream_batch_dispatcher", SimpleNamespace(
+            new_state=lambda: object(), enqueue=lambda **kw: None))
+        for name in ("_compass_records", "_compass_coverage_admissions"):
+            monkeypatch.setattr(api_server, name, OrderedDict())
+        for name in ("_compass_prompt_evidence", "_stream_loops", "_request_start_times", "_seq_id_to_request_id"):
+            monkeypatch.setattr(api_server, name, {})
+        request = api_server.ChatCompletionRequest(
+            model="test", messages=[{"role": "user", "content": "marked source"}],
+            max_completion_tokens=21, temperature=1, ignore_eos=True, stream=True)
+        asyncio.run(api_server.chat_completions(
+            request, SimpleNamespace(headers={"x-request-id": "actual-client-id"})))
+        assert len(admitted) == 1 and not api_server._compass_records
+        seq = admitted[0]
+        entry, = api_server._compass_coverage_admissions.values()
+        assert entry["client_request_id"] == "actual-client-id" and entry["seq_id"] == str(seq.id)
+        assert entry["tokenized"] is True and entry["engine_enqueued"] is True
+        assert entry["shared_preprocessing"] == {"input_tokens": 3, "prompt_token_sha256": token_digest([1, 2, 3])}
+        api_server.cleanup_stream(seq.id, aborted=True)
+        api_server.cleanup_request(entry["request_id"])
+        assert entry["aborted"] and aborted == [seq.id]
+        assert not api_server._stream_loops and not api_server._request_start_times
+        assert len(api_server._compass_coverage_admissions) == 1
+
+
+class TestResolvedCompassProvenance:
+    def test_native_alias_sort_and_filter_preserve_reported_rung_sets(self):
+        from atom.compass.core.resolved_runtime import worker_snapshot
+        declared = [1, 2, 4, 8, 16, 32, 48, 64, 128, 256]
+        config = SimpleNamespace(capture_sizes=list(declared))
+        native = SimpleNamespace(config=config, rank=0,
+                                 _compass_config=SimpleNamespace(mode="measure"))
+        # Reproduce the native mutation when Config exposes a mutable list:
+        # alias, descending capture order, then detach the filtered ladder.
+        native.capture_sizes = config.capture_sizes
+        native.capture_sizes.sort(reverse=True)
+        native.capture_sizes = [size for size in native.capture_sizes if size <= 32]
+        native.capture_sizes.sort()
+        native._compass_native_capture_sizes = list(native.capture_sizes)
+        assert config.capture_sizes == list(reversed(declared))
+        measured = worker_snapshot(native)
+        predictor = SimpleNamespace(config=SimpleNamespace(capture_sizes=list(declared)), rank=0,
+                                    _compass_config=SimpleNamespace(mode="predict"),
+                                    capture_sizes=[1, 2, 4, 8, 16, 32],
+                                    target=SimpleNamespace(graph={"capture_sizes": [1, 2, 4, 8, 16, 32]},
+                                                           loaded_input=None))
+        modelled = worker_snapshot(predictor)
+        assert measured["configuration"]["declared_capture_sizes"] == declared
+        assert measured["configuration"]["declared_capture_sizes"] == modelled["configuration"]["declared_capture_sizes"]
+        assert measured["configuration"]["declared_capture_order_as_read"] == list(reversed(declared))
+        assert measured["graphs"]["effective_decode_order"] == native.capture_sizes
+        assert config.capture_sizes == list(reversed(declared))
+
+    @pytest.mark.parametrize("side", ["real", "modelled"])
+    @pytest.mark.parametrize("missing_core", [False, True])
+    def test_producer_output_satisfies_cache_on_validator_without_api_policy_defaults(
+            self, monkeypatch, side, missing_core):
+        import importlib.util
+        import queue
+        from pathlib import Path
+        from conftest import MockConfig
+        from atom.compass.core import cache_boundary
+        from atom.compass.core.cache_policy import cache_on_policy
+        from atom.compass.runtime.predict import CompassPredictMixin
+        from atom.model_engine.scheduler import Scheduler
+        from atom.model_engine.state_runtime import StateRuntime, StateTransfer
+        from atom.utils.clock import VirtualClock, WallClock, get_clock, set_clock
+
+        spec = importlib.util.spec_from_file_location(
+            "cache_producer_validator", Path(__file__).resolve().parents[2] / "scripts/compass/cc_traces_validate.py")
+        validator = importlib.util.module_from_spec(spec)
+        sys.modules[spec.name] = validator
+        spec.loader.exec_module(validator)
+        mode = "measure" if side == "real" else "predict"
+        previous = get_clock()
+        set_clock(WallClock() if side == "real" else VirtualClock(epoch=1000.))
+        try:
+            state = StateRuntime(transfer=StateTransfer.fork(1))
+            config = MockConfig(
+                kv_cache_block_size=16, num_kvcache_blocks=200, max_model_len=262144,
+                max_num_batched_tokens=16384, max_num_seqs=32, enable_prefix_caching=True,
+                pool_entries={"state": 32}, state_checkpoint_interval_tokens=8192,
+                state_checkpoint_demand=True)
+            core = SimpleNamespace(
+                scheduler=Scheduler(config, state_runtime=state), state_runtime=state,
+                input_queue=queue.Queue(), stream_output_queue=queue.Queue(),
+                has_pending_kv_work=lambda: False,
+                runner_mgr=SimpleNamespace(proc_num=1, call_func=lambda *_a, **_k: {
+                    "acknowledged": True, "kind": "device_synchronize" if side == "real" else "modelled_no_device",
+                    "retained_output_requests": 0, "retained_outputs_preserved": True}))
+            reset = cache_boundary.reset(core)
+            compass = SimpleNamespace(enabled=True, mode=mode, virtual_clock=side == "modelled",
+                                      oracle_qualname="fixture", oracle_options={}, admission_seconds=0.)
+            api_config = SimpleNamespace(
+                model="fixture", revision="fixture-revision", compass_config=compass,
+                tensor_parallel_size=1, pipeline_parallel_size=1, max_model_len=262144,
+                max_num_seqs=32, gpu_memory_utilization=.9, enable_prefix_caching=True,
+                state_checkpoint_interval_tokens=1, state_checkpoint_demand=False)
+            worker_config = SimpleNamespace(
+                **{key: getattr(api_config, key) for key in (
+                    "model", "tensor_parallel_size", "pipeline_parallel_size", "max_model_len",
+                    "max_num_seqs", "gpu_memory_utilization", "enable_prefix_caching")},
+                max_num_batched_tokens=16384, kv_cache_block_size=16, kv_cache_dtype="bf16",
+                enforce_eager=False, compilation_config=SimpleNamespace(level=3, cudagraph_mode="FULL"),
+                capture_sizes=[1, 2, 4, 8, 16, 32, 48, 64, 128, 256])
+            buckets = [1, 2, 4, 8, 16, 32]
+            target = SimpleNamespace(graph={"capture_sizes": buckets}, loaded_input=SimpleNamespace(
+                as_dict=lambda: {"path": "/source/target.json", "sha256": "b" * 64}))
+            worker = SimpleNamespace(config=worker_config, rank=0, _compass_config=compass,
+                                     capture_sizes=buckets, _compass_native_capture_sizes=buckets,
+                                     target=target if side == "modelled" else None,
+                                     _compass_oracle_inputs=(), _rank_coords=lambda: {},
+                                     _oracle=SimpleNamespace(), _observe_device_freedom=lambda _: {})
+            worker_manifest = CompassPredictMixin.compass_input_manifest(worker)
+            def core_cache(**kwargs):
+                if missing_core:
+                    raise RuntimeError("core unavailable")
+                return {"schema": cache_boundary.SNAPSHOT_SCHEMA, "ranks": [cache_boundary.snapshot(core)]}
+            monkeypatch.setattr(api_server, "engine", SimpleNamespace(config=api_config, get_compass_cache=core_cache))
+            monkeypatch.setattr(api_server, "model_name", "fixture")
+            monkeypatch.setattr(api_server, "_compass_loaded_inputs", lambda: {"ranks": [worker_manifest]})
+            monkeypatch.setattr(api_server, "_server_revision", lambda: "fixture-revision")
+            monkeypatch.setattr(api_server, "_server_code_digest", lambda: "a" * 64)
+            monkeypatch.setattr(api_server, "_server_process_identity", lambda: {"pid": 123})
+            published = asyncio.run(api_server.compass_provenance())
+            manifest = {"server": published,
+                        "cache_boundary": {"schema": cache_boundary.RESET_SCHEMA,
+                                           "acknowledged": True, "ranks": [reset]},
+                        "cache_state_after": {"schema": cache_boundary.SNAPSHOT_SCHEMA,
+                                              "ranks": [cache_boundary.snapshot(core)]}}
+            errors = validator.check_cache_policy_evidence(manifest, cache_on_policy(), side)
+            assert bool(errors) is missing_core
+            if not missing_core:
+                assert published["cache_policy"] == cache_on_policy()
+                assert published["cache_policy"]["state_checkpoint_interval_tokens"] == 8192
+                assert published["core_cache"]["ranks"][0]["reader"]["component"] == "EngineCore.Scheduler"
+            runtime, = published["worker_runtime"]
+            assert runtime["configuration"]["declared_capture_sizes"] == worker_config.capture_sizes
+            assert runtime["graphs"]["effective_decode_buckets"] == buckets
+            if side == "modelled":
+                assert runtime["graphs"]["native_capture_sizes"] is None
+                assert runtime["graphs"]["origin"] == "borrowed_replay_target"
+            else:
+                assert runtime["graphs"]["native_capture_sizes"] == buckets
+                assert runtime["graphs"]["borrowed_source_capture_sizes"] is None
+                del worker._compass_native_capture_sizes
+                uncaptured = CompassPredictMixin.compass_input_manifest(worker)["runtime_configuration"]
+                assert uncaptured["graphs"]["native_capture_sizes"] is None
+                assert uncaptured["graphs"]["origin"] == "not_captured"
+        finally:
+            set_clock(previous)
 
 
 class TestARequestIsNotSerialisedForALogNobodyKeeps:

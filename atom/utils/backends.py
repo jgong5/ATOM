@@ -472,7 +472,7 @@ def set_model_tag(tag: str):
         model_tag = old_tag
 
 
-VLLM_CACHE_ROOT = os.path.expanduser("~/.cache/atom")
+VLLM_CACHE_ROOT = os.path.expanduser(os.environ.get("ATOM_COMPILE_CACHE_ROOT", "~/.cache/atom"))
 
 
 class VllmBackend:

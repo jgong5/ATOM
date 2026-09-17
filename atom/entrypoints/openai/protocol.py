@@ -5,7 +5,7 @@
 
 import json
 import time
-from typing import Any
+from typing import Annotated, Any
 
 from pydantic import BaseModel, ConfigDict, Field
 
@@ -211,6 +211,10 @@ class ChatCompletionRequest(BaseModel):
     # Optional KV-transfer metadata for P/D disaggregation.
     kv_transfer_params: dict[str, Any] | None = None
     data_parallel_rank: int | None = None
+    compass_arrival: float | None = None
+    compass_workload_size: int | None = None
+    compass_workload_index: int | None = Field(default=None, ge=0)
+    compass_prompt_token_sha256: str | None = Field(default=None, pattern=r"^[0-9a-f]{64}$")
 
     def get_max_tokens(self) -> int:
         """Return the effective generation cap for OpenAI chat requests."""
@@ -236,7 +240,12 @@ class CompletionRequest(BaseModel):
     model_config = {"extra": "ignore"}
 
     model: str | None = None
-    prompt: str
+    # OpenAI completions accepts either text or one pre-tokenized prompt.
+    # Strict integer validation prevents strings, floats and booleans from
+    # silently changing token identities before they reach the engine.
+    prompt: str | Annotated[
+        list[Annotated[int, Field(strict=True, ge=0)]], Field(min_length=1)
+    ]
     temperature: float | None = DEFAULT_TEMPERATURE
     top_k: int | None = DEFAULT_TOP_K
     top_p: float | None = DEFAULT_TOP_P
@@ -250,6 +259,23 @@ class CompletionRequest(BaseModel):
     # Optional DPA routing hint inserted by atomesh for DP-aware workers.
     data_parallel_rank: int | None = None
     n: int | None = 1
+    # Seconds after the engine's epoch at which this request should be treated
+    # as having arrived. Only meaningful against a Compass server: the engine's
+    # virtual clock is driven by predicted steps and does not track the wall
+    # clock a client sends on, so without a declared arrival every request lands
+    # at the same instant and TTFT is measured from the start of the run rather
+    # than from when the request turned up. Ignored by a normal server, where
+    # "now" is already the right answer.
+    compass_arrival: float | None = None
+    # How many requests the whole workload contains. A simulated engine may not
+    # advance virtual time past an arrival it has not been told about, and an
+    # HTTP client submits concurrently, so requests reach it out of declared
+    # order. Told the total, it holds until every one has arrived and then every
+    # jump is safe. Only useful for a closed workload; ignored without Compass.
+    compass_workload_size: int | None = None
+    # Stable row index within that declared workload. Equal arrival times use
+    # this order rather than HTTP delivery order; ignored on a real clock.
+    compass_workload_index: int | None = Field(default=None, ge=0)
 
     def get_max_tokens(self) -> int:
         """Return the effective generation cap for completion requests."""

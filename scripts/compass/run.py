@@ -1,0 +1,431 @@
+"""Serve a fixed set of prompts and record each request's latency.
+
+Used by `validate.py` for both halves of the comparison, so that the
+real run and the simulated one differ in exactly one thing: whether the forward
+pass happened. Anything else that differed would show up as model error.
+
+Prompts are synthetic and fixed-length. Real text would make prompt length vary
+with the tokenizer, and the point here is a controlled comparison, not a
+realistic workload.
+"""
+
+import argparse
+import json
+import sys
+import time
+
+from atom import SamplingParams
+from atom.compass.workload import prompt_of_tokens
+from atom.model_engine.arg_utils import EngineArgs
+from atom.utils.arg_parser import FlexibleArgumentParser
+
+
+def main() -> int:
+    parser = FlexibleArgumentParser(description="ATOMCompass fixed-workload run")
+    EngineArgs.add_cli_args(parser)
+    parser.add_argument("--num-prompts", type=int, default=8)
+    parser.add_argument("--max-tokens", type=int, default=32)
+    parser.add_argument(
+        "--prompt-tokens", type=int, default=64,
+        help="tokens per prompt, exactly. Was words until now, and a word is "
+             "five to eight tokens, so an invocation pinned to a value here "
+             "produces a different (smaller) shape than it used to -- 64 gave "
+             "314 tokens, 2400 gave 15694. Artifacts already on disk are keyed "
+             "to the shapes their steps recorded and are unaffected.")
+    parser.add_argument("--out", required=True)
+    parser.add_argument(
+        "--sweep-long-decode", type=int, default=64,
+        help="tokens to generate per long round. Decode is fitted per "
+             "CUDA-graph rung against total context, so a rung asked about "
+             "millions of tokens of history needs samples there; four tokens "
+             "a round leaves it fitted on short context and under-predicting "
+             "time per output token by 71%%.")
+    parser.add_argument(
+        "--sweep-long", action="store_true",
+        help="add long-context rounds to --sweep, out to a 262144-token "
+             "prompt. Needed before predicting a workload with long prompts: "
+             "the default ladder stops at 1024 tokens, so a model fitted to it "
+             "has no evidence about attention over a long history. Chunked "
+             "prefill keeps the steps themselves small, so this costs about "
+             "684k tokens of forward.")
+    parser.add_argument(
+        "--sweep-shard", default=None, metavar="I/N",
+        help="run only shard I of N of the sweep's rounds, so a long "
+             "calibration can be collected as several separately identified "
+             "fresh processes instead of one four-hour one. The rounds are "
+             "split contiguously after de-duplication; every shard still runs "
+             "its own rounds twice, because the warm/steady distinction is a "
+             "per-process property (Triton autotunes per shape per process) "
+             "and would be destroyed by splitting the two passes apart. "
+             "Sharding does not make the collection equivalent to a monolithic "
+             "sweep: each shard pays its own process warmup, and any effect "
+             "that depends on a long single process's history is not sampled.")
+    parser.add_argument(
+        "--sweep-rounds-out", default=None,
+        help="write one record per round -- shard, pass (warmup|steady), "
+             "shape and the wall-clock interval it occupied -- so each step "
+             "row in the measure file can be attributed to its round and pass "
+             "afterwards by its own `started_at`.")
+    parser.add_argument(
+        "--sweep", action="store_true",
+        help="Calibration workload: several rounds of varied prompt length and "
+             "batch size, so the table holds prefill steps across a range of "
+             "sizes rather than the one or two a fixed workload produces. "
+             "Fitting three coefficients needs more than two samples, and a "
+             "fixed workload prefills everything in a single step.",
+    )
+    args = parser.parse_args()
+
+    llm = EngineArgs.from_cli_args(args).create_engine()
+
+    # Distinct prefixes: identical prompts would share prefix-cache blocks and
+    # the second request onward would skip prefill entirely, which is a real
+    # ATOM behaviour but not the one being measured here.
+    prompts = [
+        prompt_of_tokens(args.prompt_tokens, i)
+        for i in range(args.num_prompts)
+    ]
+    params = SamplingParams(temperature=0.0, max_tokens=args.max_tokens)
+
+    if getattr(args, "compass_trace_prefill", 0) > 1:
+        # Triton autotunes a shape on its first launch, benchmarking every
+        # candidate configuration, so the first prefill of a workload records a
+        # tuning run rather than a serving one. Warm the shapes first.
+        #
+        # The *same* prompts, not merely same-length ones. Qwen3.8-27B is a
+        # hybrid: 48 of its layers are gated DeltaNet, whose Triton kernels
+        # autotune per shape, and prompts differing by a token or two are a
+        # different shape. Warming with `Warm {i}` text of the same word count
+        # left 50451 tuning launches in a prefill graph of 51179 operators, and
+        # the two ranks disagreed because they tuned for different times.
+        #
+        # Same prompts means prefix caching would let the second pass skip the
+        # prefill this exists to record, so a trace run wants
+        # `--no-enable_prefix_caching`. Said rather than forced: the flag
+        # belongs to the caller, and a cold prefill does the same work either
+        # way.
+        if getattr(args, "enable_prefix_caching", False):
+            print("warning: --compass-trace-prefill warms with the same prompts, "
+                  "which prefix caching will then serve from cache -- pass "
+                  "--no-enable_prefix_caching so the traced prefill is real",
+                  file=sys.stderr)
+        llm.generate(prompts, SamplingParams(temperature=0.0, max_tokens=1))
+
+    if args.sweep:
+        # Each round is its own generate, so each contributes at least one
+        # prefill step at a different size. Lengths and batch sizes vary
+        # together because that is how they vary in a deployment.
+        # Each round is one generate, so each contributes at least one prefill
+        # step. Sizes are chosen to bracket what an evaluation will ask about
+        # rather than to look thorough: ATOM batches several requests' prefill
+        # into one step, so what lands in the table is the *batched* token
+        # count, and a sweep of large prompts produces only large samples. A
+        # model fitted to 1.7k-16k tokens and then asked about 500 extrapolates
+        # below everything it has seen, where the intercept dominates and the
+        # slope is doing no work.
+        # Batch size matters as much as prompt length and is easier to forget:
+        # the first version of this sweep varied only length, so it produced
+        # decode steps at batch sizes 1-4 and the model was then asked about a
+        # workload running 8 concurrent requests -- extrapolating outside its
+        # evidence in a dimension nobody had thought to check. Coverage has to
+        # bracket the evaluation in *every* dimension the model uses.
+        # Concurrency is not a smooth dimension either. With CUDA graphs a
+        # decode step replays the smallest capture size no smaller than the
+        # batch, so cost steps at that ladder -- and the decode model is now
+        # fitted per rung, which means a rung with no samples has no model. The
+        # default ladder is [1,2,4,8,16,32,48,64,128,256], and stopping at 16
+        # concurrent requests is what left a serving run at batch 63 asking
+        # about a rung nothing had ever measured. Each rung appears at two
+        # prompt lengths, because a rung needs its own context slope and one
+        # length gives one band of history to fit it over.
+        rounds = [
+            (8, 1), (16, 2), (24, 4), (32, 1), (32, 8), (48, 2), (64, 1),
+            (64, 4), (64, 12), (96, 8), (128, 1), (128, 4), (128, 16),
+            (192, 2), (192, 8), (256, 1), (256, 6), (256, 12), (384, 2),
+            (384, 8), (512, 1), (512, 4), (768, 2), (768, 6), (1024, 1),
+            (1024, 3),
+            # Rungs 32, 48 and 64.
+            (64, 24), (256, 24), (64, 32), (256, 32),
+            (64, 48), (192, 48), (64, 64), (128, 64),
+        ]
+        # (prompt tokens, concurrent requests) so far; the long rounds below
+        # need a third field, because sampling decode is the point of them.
+        rounds = [(length, count, args.max_tokens) for length, count in rounds]
+        if args.sweep_long:
+            # Long context. Everything above is a prompt of at most 1024
+            # tokens, so the table it produces has no evidence past a context
+            # of a few thousand -- and an agentic trace runs to 256k, where
+            # attention over the history is most of the step. Asking the fitted
+            # model about that is extrapolating two orders of magnitude outside
+            # its evidence, in the one dimension where the cost is not linear.
+            #
+            # Prefill is chunked at `attn_prefill_chunk_size` (16384 by
+            # default), so these do not produce enormous *steps*: a 262144
+            # token prompt produces sixteen steps of 16384 tokens at contexts
+            # 0, 16k, 32k and so on. That is exactly the coverage wanted, and
+            # it is why this costs about 684k tokens in total rather than
+            # anything alarming -- roughly a minute of forward.
+            # Decode is fitted per CUDA-graph rung against *total* context --
+            # the sum across the batch, not the average -- so a rung needs
+            # samples spanning the total contexts it will be asked about. The
+            # first version of these rounds varied only prompt length at one
+            # request each, which covers prefill and leaves decode where it
+            # was: the cc-traces pilot ran twenty concurrent requests at 164k
+            # each, rung 32 at a total context of 3.3M, against rung-32 samples
+            # taken at 2k and 8k. Four hundred times outside its evidence, and
+            # it under-predicted time per output token by 71%.
+            #
+            # So each rung is sampled at two or three total contexts reaching
+            # into the millions. Long prompts are the cheap way to get there:
+            # 32 requests of 49152 tokens is a total context of 1.57M against a
+            # pool of about 8M.
+            long_decode = args.sweep_long_decode
+            # A round longer than the model's window is rejected or truncated,
+            # silently: the first version of these rounds asked for 262144
+            # against a 262144 window and the tokens it generates, and the
+            # coverage stopped 90k short with nothing in the log to say so.
+            # Clamped here so the ladder is the same shape on any model, which
+            # is what lets a small model stand in for a large one when the
+            # question is about scheduling rather than about kernels.
+            ceiling = max(1024, int(getattr(args, "max_model_len", 0) or 262144)
+                          - long_decode - 64)
+            rounds += [
+                # Rung 1, out to the model's context limit -- prefill coverage.
+                (2048, 1, long_decode), (4096, 1, long_decode),
+                (8192, 1, long_decode), (16384, 1, long_decode),
+                (65536, 1, long_decode), (131072, 1, long_decode),
+                (196608, 1, long_decode), (258048, 1, long_decode),
+                # Rungs 8, 16 and 32 across the context range, not only at
+                # its ends. Sampling a rung at a tiny context and an enormous
+                # one bounds it without covering it: the fit is then a line
+                # through two distant clusters, and a workload living between
+                # them is being interpolated across a region nothing measured.
+                # Measured, that is where every real decode step fell -- 117 of
+                # 117 at rung 8, 512 of 512 at rung 16, 1642 of 1642 at rung 32
+                # -- and the predictions came out 31 to 33% low. Rung 1 was the
+                # only rung whose samples surrounded its workload and the only
+                # one within a percent.
+                (1024, 8, long_decode), (4096, 8, long_decode),
+                (16384, 8, long_decode), (65536, 8, long_decode),
+                (131072, 8, long_decode),
+                (1024, 16, long_decode), (4096, 16, long_decode),
+                (16384, 16, long_decode), (65536, 16, long_decode),
+                (1024, 32, long_decode), (4096, 32, long_decode),
+                (16384, 32, long_decode), (49152, 32, long_decode),
+                # Rungs 2 and 4 at long context. They had ragged rounds and no
+                # uniform ones, so their only long samples came from `_skewed`,
+                # whose single long sequence tops out at 32768. That left rung 2
+                # calibrated to a total context of 33856 and rung 4 to 57209 --
+                # and a real 27B run asked them for 163676 and 299712, five
+                # times outside the evidence, with the extrapolation warning
+                # firing on every such step. Rung 8 reached 569320 against a
+                # calibrated 524544, so it gets one more sample too.
+                #
+                # A small batch only reaches a large total context when each of
+                # its few members is individually long, which is what a nearly
+                # drained queue of long requests looks like -- exactly how a
+                # long-prompt workload ends. It is a different gap from the
+                # raggedness one closed earlier: that was the spread within a
+                # batch, this is the product of a small batch and a long
+                # history, and no amount of raggedness reaches it.
+                (1024, 2, long_decode), (4096, 2, long_decode),
+                (16384, 2, long_decode), (65536, 2, long_decode),
+                (131072, 2, long_decode),
+                (1024, 4, long_decode), (4096, 4, long_decode),
+                (16384, 4, long_decode), (65536, 4, long_decode),
+                (131072, 4, long_decode),
+            ]
+            # Ragged batches, so raggedness varies and can be fitted. Lengths
+            # spread geometrically within one batch, which is what a real
+            # workload looks like: requests arrive at different times and are
+            # at different points in their generation, so a decode batch mixes
+            # short histories with long ones.
+            def _spread(rung, low, high):
+                step = (high / low) ** (1.0 / max(rung - 1, 1))
+                return tuple(int(low * step ** i) for i in range(rung))
+
+            def _skewed(rung, short, long_):
+                """One long sequence among short ones.
+
+                A geometric spread cannot get very ragged: its mean rises with
+                its maximum, so the ratio tops out near 3.5 whatever the range.
+                A batch is at its most ragged when one sequence dominates, and
+                then the ratio approaches the rung size. That is not a contrived
+                case -- it is one long-running request among freshly arrived
+                ones, and real steps reach 11.8 at rung 32, which nothing built
+                from a spread can reach.
+                """
+                return tuple([short] * (rung - 1) + [long_])
+
+            # Every rung, not just the large ones. Rung 4 is fully ragged in the
+            # workload and was the one rung that got *worse* when the others
+            # improved, because it had no ragged samples of its own.
+            # Three degrees of raggedness, because how ragged a real batch is
+            # depends on the workload and not on the engine. A 0.6B serving
+            # short prompts runs 2.8 to 3.9 times ragged, since generation adds
+            # a lot relative to a 2k context; a 27B serving 163k prompts runs
+            # 1.1 to 1.4, since it adds very little relative to those. Sampling
+            # only at 1.0 and at 7 to 21 -- which the first two patterns do --
+            # leaves a hole exactly where the second workload lives, and the
+            # padding coefficient is then fitted far from where it is used. On
+            # the 27B that made rung 2 worse with the feature than without it.
+            # Mildly ragged *at long context*. The rounds below are ragged
+            # but short, and the uniform long-context rounds above are long but
+            # perfectly uniform, so where a long-prompt workload actually lives
+            # -- long histories, mildly ragged -- there was nothing. Measured on
+            # the 27B: at the contexts its run uses, every one of the sweep's 64
+            # rung-16 samples sat at raggedness exactly 1.00 while the run ran
+            # at 1.18-1.32, and none of its rung-8 samples were in the run's
+            # band either.
+            #
+            # Padding is identically zero at raggedness 1.00, so the padding
+            # coefficient had no variance to be identified from in that region.
+            # That is the same rank deficiency the term was introduced to fix,
+            # surviving locally after being fixed globally -- a bounding box
+            # containing the workload is not evidence near it. Rung 16 was
+            # covered on context and on raggedness separately and still came out
+            # 22.58% low, five times any other rung's error.
+            # Two per rung, so the padding coefficient has a spread to be
+            # fitted from there and not a single point. The first sits at about
+            # 1.15 and the second above the run's band; the uniform rounds above
+            # supply raggedness 1.00, so together they bracket it.
+            for rung, low, high in ((2, 98304, 131072), (4, 98304, 131072),
+                                    (8, 65536, 98304), (16, 49152, 65536),
+                                    (2, 54026, 88064), (4, 53857, 77824),
+                                    (8, 40206, 65536), (16, 26757, 53248)):
+                rounds += [(_spread(rung, low, high), rung, long_decode)]
+
+            for rung in (2, 4, 8, 16, 32):
+                rounds += [
+                    # Barely ragged: a batch of similar long histories.
+                    (_spread(rung, 12288, 16384), rung, long_decode),
+                    (_spread(rung, 512, 8192), rung, long_decode),
+                    (_spread(rung, 1024, 32768), rung, long_decode),
+                    (_skewed(rung, 512, 32768), rung, long_decode),
+                ]
+            rounds = [((tuple(min(v, ceiling) for v in length)
+                        if isinstance(length, (list, tuple))
+                        else min(length, ceiling)), count, decode)
+                      for length, count, decode in rounds]
+            # Clamping collapses distinct rounds into duplicates on a small
+            # model; one of each is enough and the sweep runs every round twice
+            # anyway.
+            seen, unique = set(), []
+            for entry in rounds:
+                if entry not in seen:
+                    seen.add(entry)
+                    unique.append(entry)
+            rounds = unique
+        # A shard of the rounds, when asked for. Contiguous rather than
+        # strided, so a shard is a describable region of the ladder ("the long
+        # uniform rounds") and not an arbitrary sample of it; and taken here,
+        # after de-duplication, so the shards partition exactly the rounds a
+        # whole sweep would have run.
+        shard_label = None
+        if args.sweep_shard:
+            index, _, total = args.sweep_shard.partition("/")
+            index, total = int(index), int(total)
+            if not 0 <= index < total:
+                print(f"--sweep-shard {args.sweep_shard}: shard index out of "
+                      f"range")
+                return 2
+            size = -(-len(rounds) // total)
+            lo, hi = index * size, min((index + 1) * size, len(rounds))
+            shard_label = f"{index}/{total}"
+            print(f"sweep shard {shard_label}: rounds [{lo}, {hi}) of "
+                  f"{len(rounds)}")
+            rounds = rounds[lo:hi]
+            if not rounds:
+                print("sweep shard is empty")
+                return 2
+
+        # Twice through, because Triton autotunes per shape rather than once per
+        # process: the first visit to a shape pays a benchmarking cost that
+        # steady-state serving never pays again. The second visit is the one
+        # worth fitting, and having both lets the outlier rejection see the
+        # difference rather than guess at it.
+        #
+        # Both passes stay in one process for that reason. Splitting them into
+        # two fresh processes would give two warmup passes and no steady one.
+        passes = [("warmup", r) for r in rounds] + [("steady", r)
+                                                    for r in rounds]
+        round_log = []
+        for round_index, (which_pass, (length, count, decode)) in enumerate(
+                passes):
+            # A round is either `count` prompts of one length, or an explicit
+            # list of lengths. The second exists because every uniform round
+            # leaves the batch's *raggedness* at exactly one, and a fit cannot
+            # find a coefficient for a quantity that never varies. Measured:
+            # real decode batches run 2.8 to 3.9 times ragged (longest sequence
+            # over mean) while every sweep batch was 1.0, and the cost model,
+            # which sums context across the batch, came out 29 to 32% low at
+            # rungs 8 and 16 as a result. Widening the context range did not
+            # help, because context was not the missing dimension.
+            lengths = (list(length) if isinstance(length, (list, tuple))
+                       else [length] * count)
+            began_at = time.time()
+            llm.generate(
+                # Exactly `length` tokens each, and a distinct opening per
+                # prompt so no two share prefix-cache blocks. This built its
+                # own prompts by hand until the long rounds arrived, and a
+                # hand-built word-per-token prompt is five to eight times the
+                # length it claims -- which the short ladder survived and the
+                # long one did not, being silently truncated at max_model_len.
+                [prompt_of_tokens(n, round_index * 10007 + i)
+                 for i, n in enumerate(lengths)],
+                SamplingParams(temperature=0.0, max_tokens=decode),
+            )
+            # Wall clock, not `perf_counter`: step rows carry `started_at` on
+            # the same epoch, so a row can be attributed to the round and pass
+            # it belongs to without the engine having to know about either.
+            round_log.append({
+                "round": round_index, "pass": which_pass,
+                "shard": shard_label, "lengths": lengths, "decode": decode,
+                "t0": began_at, "t1": time.time(),
+            })
+        if args.sweep_rounds_out:
+            with open(args.sweep_rounds_out, "w", encoding="utf-8") as fh:
+                json.dump({"shard": shard_label, "rounds": round_log}, fh,
+                          indent=1)
+        print("sweep complete")
+        with open(args.out, "w", encoding="utf-8") as fh:
+            json.dump({"wall": 0.0, "requests": []}, fh)
+        return 0
+
+    # A profile of this same workload is what says whether a priced kernel costs
+    # what it costs in a step. The two have to be the same workload or the
+    # comparison is between different shapes -- so it is a flag here rather than
+    # a second script with its own prompts. One warm generate first, because the
+    # trace should hold steady-state work and not Triton autotuning its way
+    # through every shape.
+    profiling = bool(getattr(args, "torch_profiler_dir", None))
+    if profiling:
+        llm.generate(["warmup"], SamplingParams(temperature=0.0, max_tokens=4))
+        llm.start_profile()
+
+    start = time.perf_counter()
+    outputs = llm.generate(prompts, params)
+    wall = time.perf_counter() - start
+
+    if profiling:
+        llm.stop_profile()
+        print(f"profile written to {args.torch_profiler_dir}")
+
+    requests = [
+        {
+            "ttft": out.get("ttft", 0.0),
+            "tpot": out.get("tpot", 0.0),
+            "latency": out.get("latency", 0.0),
+            "num_tokens_input": out.get("num_tokens_input", 0),
+            "num_tokens_output": out.get("num_tokens_output", 0),
+        }
+        for out in outputs
+    ]
+    with open(args.out, "w", encoding="utf-8") as fh:
+        json.dump({"wall": wall, "requests": requests}, fh, indent=2)
+    print(f"wrote {len(requests)} requests to {args.out} (wall {wall:.2f}s)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

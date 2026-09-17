@@ -1,0 +1,161 @@
+"""Prepared templates own immutable identities; ordinary inputs remain live."""
+from dataclasses import FrozenInstanceError
+import json
+
+import pytest
+
+from atom.compass.core.cost.library import PriceLibrary
+from atom.compass.core.cost.prepared import (
+    PreparedOperator, materialize_graph, prepare_static_operator,
+)
+from atom.compass.runtime.microbench import signature_of
+from atom.compass.runtime.templates import TemplateGraphs
+
+from .test_templates import shape
+
+
+def operation():
+    return {"name": "custom::kernel", "input_shapes": [[2, 4]],
+            "dtypes": ["bf16"], "scalars": [["axes", [-1, 4]], ["scale", -0.0]]}
+
+
+def library_for(tmp_path, op):
+    graph = tmp_path / "graph.json"
+    price = tmp_path / "price.json"
+    graph.write_text(json.dumps({"ops": [op], "key": {"topology": [["tp", 2]]}}))
+    price.write_text(json.dumps({"provenance": {"topology": {"tp": 2}},
+                                "prices": {signature_of(op): {"seconds": .001,
+                                            "name": op["name"]}}}))
+    library = PriceLibrary()
+    library.add(str(price), str(graph), registration="unregistered")
+    return library
+
+
+def test_preparation_owns_a_snapshot_and_mutable_lookup_stays_live(tmp_path):
+    op = operation()
+    library = library_for(tmp_path, op)
+    prepared = prepare_static_operator(op)
+    assert isinstance(prepared, PreparedOperator)
+    first = library.lookup(prepared)
+    op["input_shapes"][0][0] = 3
+    op["scalars"][0][1][0] = 9
+    assert library.lookup(op)[0] is None
+    assert library.lookup(prepared) == first
+    exported = prepared.as_dict()
+    exported["input_shapes"][0][0] = 99
+    assert prepared.as_dict()["input_shapes"] == [[2, 4]]
+    with pytest.raises(FrozenInstanceError):
+        prepared.signature = "changed"
+
+
+def test_preparation_keeps_python_scalar_representation():
+    op = operation()
+    prepared = prepare_static_operator(op)
+    assert prepared.signature == signature_of(prepared.as_dict())
+    op["scalars"][0][1] = (-1, 4)
+    assert prepare_static_operator(op).signature != prepared.signature
+    op["scalars"][1][1] = 0.0
+    assert "scale=0.0" in prepare_static_operator(op).signature
+
+
+def test_dynamic_and_custom_values_remain_on_the_live_path():
+    class CustomInt(int):
+        pass
+
+    op = operation()
+    op["scalars"] = [["value", CustomInt(2)]]
+    assert prepare_static_operator(op) is None
+    op["scalars"] = [["value", bytearray(b"x")]]
+    assert prepare_static_operator(op) is None
+    op["scalars"] = []
+    op["context"] = [["slot_mapping", [1]]]
+    assert prepare_static_operator(op) is None
+    op["context"] = []
+    op["int_values"] = [[0, [1]]]
+    assert prepare_static_operator(op) is None
+
+
+def test_prepared_identity_still_checks_layout_topology_and_registration(tmp_path):
+    op = operation()
+    op["group"] = "tp"
+    library = library_for(tmp_path, op)
+    prepared = prepare_static_operator(op)
+    assert library.lookup(prepared, {"tp": 2}, "unregistered")[0] is not None
+    assert library.lookup(prepared, {"tp": 4}, "unregistered")[0] is None
+    assert library.lookup(prepared, {"tp": 2}, "registered")[0] is None
+    op["layouts"] = [[0, [[8, 1], 8, 16, 0]]]
+    other = prepare_static_operator(op)
+    assert library.lookup(other, {"tp": 2}, "unregistered")[0] is None
+
+
+def test_template_public_copies_and_replacement_cannot_poison_preparation():
+    original = {"ops": [operation()]}
+    source = TemplateGraphs()
+    point = shape([1], [128])
+    source.add(point, original)
+    original["ops"][0]["input_shapes"][0][0] = 8
+    public = source.graph_for(point)
+    public["ops"][0]["input_shapes"][0][0] = 9
+    prepared = source.prepared_graph_for(point)
+    assert prepared["ops"][0].as_dict()["input_shapes"] == [[2, 4]]
+    assert materialize_graph(prepared)["ops"][0]["input_shapes"] == [[2, 4]]
+    source.add(point, original)
+    assert source.prepared_graph_for(point)["ops"][0].as_dict()["input_shapes"] == [[8, 4]]
+
+
+def test_prepared_lookup_keeps_address_shift_counters(tmp_path):
+    measured = operation()
+    measured["scalars"] = [["slot_mapping", [1, 2]]]
+    library = library_for(tmp_path, measured)
+    current = dict(measured, scalars=[["slot_mapping", [11, 12]]])
+    prepared = prepare_static_operator(current)
+    for _ in range(3):
+        assert library.lookup(prepared)[0] is not None
+    assert sum(library.address_shifted.values()) == 3
+
+
+def test_prepared_static_calls_preserve_the_ordered_visibility_prefix():
+    from .test_attention_family import _unified
+    from .test_output_visibility import SCOPE, TimedLibrary
+
+    library = TimedLibrary()
+    library.request_attention_scope = SCOPE
+    attention = _unified([8], [16], is_prefill=True, has_cached=True)
+    def static(name, seconds):
+        return {"name": name, "input_shapes": [], "dtypes": [], "test_seconds": seconds}
+    ops = [static("prefix", 2.0), dict(attention, test_seconds=3.0),
+           static("between", 5.0), dict(attention, test_seconds=7.0), static("suffix", 11.0)]
+    ordinary = {"ops": ops}
+    prepared = {"ops": [prepare_static_operator(op) or op for op in ops]}
+    assert sum(isinstance(op, PreparedOperator) for op in prepared["ops"]) == 3
+    before, after = {}, {}
+    assert library.body(ordinary, timing=before) == library.body(prepared, timing=after)
+    assert before == after
+    assert after["seconds"] == 10.0
+    assert after["priced_operator_index"] == 3
+
+
+def test_repeated_prepared_body_entries_repay_address_shifts(tmp_path):
+    measured = operation()
+    measured["scalars"] = [["slot_mapping", [1, 2]]]
+    library = library_for(tmp_path, measured)
+    current = dict(measured, scalars=[["slot_mapping", [11, 12]]])
+    prepared = prepare_static_operator(current)
+    graph = {"ops": [prepared, prepared, prepared]}
+    for count in (3, 6):
+        seconds, coverage, launches = library.body(graph)
+        assert seconds == .003 and coverage.measured == launches == 3
+        assert sum(library.address_shifted.values()) == count
+
+
+def test_body_reuse_stays_within_current_layout_and_scope(tmp_path):
+    op = operation()
+    op["group"] = "tp"
+    library = library_for(tmp_path, op)
+    prepared = prepare_static_operator(op)
+    changed = prepare_static_operator(dict(op, layouts=[[0, [[8, 1], 8, 16, 0]]]))
+    graph = {"key": {"topology": [["tp", 2]]}, "ops": [prepared, prepared, changed]}
+    assert library.body(graph, "unregistered")[1].measured == 2
+    assert library.body(graph, "registered")[1].measured == 0
+    graph["key"]["topology"] = [["tp", 4]]
+    assert library.body(graph, "unregistered")[1].measured == 0

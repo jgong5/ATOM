@@ -43,7 +43,11 @@ from atom.kv_transfer.disaggregation import KVConnectorOutput
 from atom.model_engine.kv_block import STATE_SLOT_CLASS
 from atom.model_engine.page_unit_checkpoint import PagedStateCheckpointSpec
 from atom.model_engine.run_labels import build_run_label
-from atom.model_engine.scheduler import ScheduledBatch, ScheduledBatchOutput
+from atom.model_engine.scheduler import (
+    ScheduledBatch,
+    ScheduledBatchOutput,
+    is_pure_middle_chunk,
+)
 from atom.model_engine.sequence import (
     Sequence,
     SequenceStatus,
@@ -1648,6 +1652,23 @@ class ModelRunner:
         None` -- an RPC target returning None hangs its `wait_out=True` caller.
         """
         return freeze_gc_heap(worker_process_name(self.config, self.rank))
+
+    def compass_cache_barrier(self) -> dict:
+        """Complete this worker's GPU work before a native idle index reset.
+
+        The token pipeline can retain its final unused output after all
+        requests finish. Synchronize its D2H stream too, preserving the output
+        and prev_batch for the normal next-forward lifecycle.
+        """
+        torch.cuda.synchronize(self.device)
+        processor = self.tokenID_processor
+        previous = processor.prev_batch
+        return {
+            "acknowledged": True,
+            "kind": "device_synchronize",
+            "retained_output_requests": len(previous.req_ids) if previous else 0,
+            "retained_outputs_preserved": True,
+        }
 
     def get_num_blocks(self) -> dict[str, object]:
         torch.set_default_device(self.device)
@@ -3324,7 +3345,7 @@ class ModelRunner:
 
     @staticmethod
     def _is_pure_middle_chunk(batch) -> bool:
-        return batch is not None and not batch.produces_output()
+        return is_pure_middle_chunk(batch)
 
     def _dp_draft_lockstep_active(self) -> bool:
         """Are this rank's draft passes bound to what the DP peers run?
