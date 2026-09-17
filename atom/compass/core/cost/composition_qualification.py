@@ -17,6 +17,7 @@ from atom.compass.core.loaded_input import load_json
 from atom.compass.runtime.templates import NativeStepAllocation, block_sharing_pairs
 
 SCHEMA = "compass.forward_composition_qualification/1"
+WIDTH_SCHEMA = "compass.native_width_forward_qualification/1"
 ROLE_PREFIX = "validation.forward_composition."
 HOST_RULE = {"kind": "existing_forward_timeline", "extra_host_seconds": 0,
              "target_end_to_end_timings_used": False}
@@ -124,6 +125,13 @@ def request_namespace(start):
 def validate(path, sha256, *, inputs, options, regions, oracle, extension=None):
     """Re-quote the actual oracle and recompute every independent forward gate."""
     data, receipt = load_json(path, role=ROLE_PREFIX + "receipt")
+    if data.get("schema") == WIDTH_SCHEMA:
+        if extension is not None:
+            raise ValueError("fresh width qualification cannot reuse historical identity equivalence")
+        from atom.compass.core.cost.native_ap_width_qualification import validate as validate_width
+
+        return validate_width(data, receipt, path=path, sha256=sha256,
+            inputs=inputs, options=options, regions=regions, oracle=oracle)
     loaded = [receipt]
 
     def read(pin, role):

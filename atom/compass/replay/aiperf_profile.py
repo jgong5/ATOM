@@ -106,12 +106,12 @@ def _check_source_options(plan, options):
     if bool(composition) != bool(options.get("composition_qualification_sha256")):
         raise ValueError("proper replay needs composition qualification and its SHA-256 together")
     if composition:
-        from atom.compass.core.cost.composition_qualification import SCHEMA
+        from atom.compass.core.cost.composition_qualification import SCHEMA, WIDTH_SCHEMA
         from atom.compass.core.loaded_input import load_json
 
         receipt, identity = load_json(composition, role="validation.forward_composition.preflight")
         if (identity.sha256 != options["composition_qualification_sha256"]
-                or receipt.get("schema") != SCHEMA or receipt.get("passed") is not True):
+                or receipt.get("schema") not in (SCHEMA, WIDTH_SCHEMA) or receipt.get("passed") is not True):
             raise ValueError("proper replay composition qualification is missing, changed or failed")
         # The source factory and final source-contract reader independently
         # recompute this receipt against actual loaded books, code and heldouts.
