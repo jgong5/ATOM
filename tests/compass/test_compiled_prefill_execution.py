@@ -57,6 +57,25 @@ def test_captured_decode_is_unchanged(rule):
     assert rule.apply(original, shape(q=1, history=32, prefill=False, bucket=1)) is original
 
 
+def test_width_four_candidate_is_cached_only_and_preserves_parameters(rule):
+    added = CompiledPrefillExecution(dict(parameters=rule.parameters,
+        observed_domain=rule.domain, native_width_extension=dict(maximum_rows=4,cached_only=True)), "later-source", ())
+    cached = StepShape((1,)*4,(33,)*4,num_prefill_tokens=4,produces_output=True,
+                       compiled=True,topology={"tp":1})
+    with pytest.raises(ValueError, match="outside its source work scope"):
+        rule.apply(cost(.2),cached)
+    assert added.apply(cost(.2),cached).model_seconds == pytest.approx(.19)
+    assert added.parameters == rule.parameters
+    cold = StepShape((1,)*4,(1,)*4,num_prefill_tokens=4,produces_output=True,
+                     compiled=True,topology={"tp":1})
+    with pytest.raises(ValueError, match="cached prefill only"):
+        added.apply(cost(.2),cold)
+    too_wide = StepShape((1,)*5,(33,)*5,num_prefill_tokens=5,produces_output=True,
+                         compiled=True,topology={"tp":1})
+    with pytest.raises(ValueError, match="outside its source work scope"):
+        added.apply(cost(.2),too_wide)
+
+
 def test_actual_frozen_rule_source_integrity():
     value = os.environ.get("ATOMCOMPASS_EXECUTION_RULE")
     if not value:

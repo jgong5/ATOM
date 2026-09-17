@@ -34,6 +34,8 @@ class CompiledPrefillExecution:
     def __init__(self, data, sha256, inputs):
         self.parameters = data["parameters"]
         self.domain = data["observed_domain"]
+        self.maximum_rows = data.get("native_width_extension", {}).get("maximum_rows", self.domain["rows"][1])
+        self.width_cached_only = bool(data.get("native_width_extension"))
         self.sha256 = sha256
         self.loaded_inputs = tuple(inputs)
 
@@ -63,6 +65,19 @@ class CompiledPrefillExecution:
                        for v in (parameters["alpha"], *parameters["floor_seconds"].values()))):
             raise ValueError("compiled-prefill execution parameters are invalid")
         evidence = {role: read(pin, role) for role, pin in data["evidence"].items()}
+        width = data.get("native_width_extension")
+        if width:
+            active = getattr(oracle.regions, "width_extension", None)
+            candidate = read(width["candidate"], "width_source_candidate")
+            if (active is None or width.get("maximum_rows") != 4
+                    or width.get("cached_only") is not True
+                    or width.get("source_only") is not True
+                    or width.get("full_forward_qualification_required") is not True
+                    or width["candidate"] != active["candidate"]
+                    or candidate.get("schema") != "compass.native_width_four_ap_candidate/1"
+                    or candidate.get("heldout_started") is not False
+                    or candidate.get("source_refitted") is not False):
+                raise ValueError("compiled-prefill width extension lacks its independent native source candidate")
         quotes = evidence["body_quotes"]
         historical_inputs = read(quotes["loaded_inputs"], "body_loaded_inputs")
         historical_options = read(data["body_options"], "body_options")
@@ -113,14 +128,16 @@ class CompiledPrefillExecution:
     def apply(self, cost, shape):
         if not shape.is_prefill or not shape.compiled or shape.capture_bucket is not None:
             return cost
+        cached = any(c > q for c, q in zip(shape.context_lens, shape.num_scheduled_tokens))
+        if self.width_cached_only and shape.batch_size > self.domain["rows"][1] and not cached:
+            raise ValueError("compiled-prefill width-four source supports cached prefill only")
         if (dict(shape.topology) != {"tp": 1} or shape.num_prefill_tokens != shape.total_tokens
                 or not self.domain["query_tokens"][0] <= shape.total_tokens <= self.domain["query_tokens"][1]
-                or not self.domain["rows"][0] <= shape.batch_size <= self.domain["rows"][1]):
+                or not self.domain["rows"][0] <= shape.batch_size <= self.maximum_rows):
             raise ValueError("compiled-prefill execution is outside its source work scope")
         raw = cost.breakdown["<body>"] + cost.breakdown.get("<head>", 0.)
         if raw <= 0:
             raise ValueError("compiled-prefill execution needs a positive raw B quote")
-        cached = any(c > q for c, q in zip(shape.context_lens, shape.num_scheduled_tokens))
         floor = self.parameters["floor_seconds"]["cached" if cached else "cold"]
         model = max(self.parameters["alpha"] * raw, floor)
         adjustment = model - raw
