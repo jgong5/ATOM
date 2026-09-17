@@ -2754,6 +2754,10 @@ def _loaded_option_files(ranks: list) -> dict:
                 key = "exact_operator_handoff"
             if str(row.get("role", "")).startswith("oracle.native_mha_decode_layout."):
                 key = "native_mha_decode_layout_handoff"
+            if str(row.get("role", "")).startswith("oracle.native_mha_prefill."):
+                key = "native_mha_prefill_handoff"
+            if str(row.get("role", "")).startswith("validation.forward_extension."):
+                key = "composition_extension"
             if str(row.get("role", "")).startswith("oracle.compiled_prefill_execution."):
                 key = "compiled_prefill_execution_handoff"
             if not key or not row.get("sha256"):

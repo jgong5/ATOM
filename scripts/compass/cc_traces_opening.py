@@ -46,7 +46,9 @@ CACHE_REGION_OPTIONS = frozenset((
     "diagnostic_reference_handoff", "diagnostic_reference_handoff_sha256",
     "exact_operator_handoff", "exact_operator_handoff_sha256",
     "native_mha_decode_layout_handoff", "native_mha_decode_layout_handoff_sha256",
+    "native_mha_prefill_handoff", "native_mha_prefill_handoff_sha256",
     "composition_qualification", "composition_qualification_sha256",
+    "composition_extension", "composition_extension_sha256",
     "compiled_prefill_execution_handoff", "compiled_prefill_execution_handoff_sha256",
 ))
 
@@ -658,6 +660,47 @@ def check_source_contract(modelled, registry, workload_sha, forbidden, label, *,
                          "modelled coverage, not exact measured coverage")
         elif any(str(row.get("role", "")).startswith(MHA_LAYOUT_PREFIX) for row in inputs):
             raise ValueError("unconfigured native MHA layout transfer evidence was loaded")
+        from atom.compass.core.cost.native_mha_prefill import NativeMhaPrefillFallback, ROLE_PREFIX as MHA_PREFILL_PREFIX
+
+        if bool(options.get("native_mha_prefill_handoff")) != bool(options.get("native_mha_prefill_handoff_sha256")):
+            raise ValueError("native MHA prefill handoff and SHA-256 are required together")
+        if options.get("native_mha_prefill_handoff"):
+            from atom.compass.core.cost.families.adapter import ParametricPriceLibrary
+            from atom.compass.core.loaded_input import file_digests
+
+            if not (diagnostic or composition):
+                raise ValueError("native MHA prefill fallback requires diagnostic mode or composition qualification")
+            scopes = [row for row in inputs if row.get("role") == "oracle.attention_scope"]
+            if len(scopes) != 1:
+                raise ValueError("native MHA prefill fallback lacks its loaded deployment scope")
+            source = NativeMhaPrefillFallback(ParametricPriceLibrary(), options["native_mha_prefill_handoff"],
+                options["native_mha_prefill_handoff_sha256"], deployment_scope_sha256=scopes[0]["sha256"])
+            observed = [row for row in inputs if str(row.get("role", "")).startswith(MHA_PREFILL_PREFIX)]
+            if len(observed) != len(source.loaded_inputs):
+                raise ValueError("native MHA prefill input inventory differs")
+            by_digest = {}
+            for item in source.loaded_inputs:
+                if sum(row == item.as_dict() for row in observed) != 1:
+                    raise ValueError("native MHA prefill lacks its exact loaded identity: " + item.path)
+                by_digest.setdefault(item.sha256, []).append(item)
+            for sha, items in by_digest.items():
+                contents = file_digests(items)
+                digest = sha if len(contents) == 1 else validate._rolled_digest(contents)
+                role = MHA_PREFILL_PREFIX + sha[:16]
+                bad.extend(validate._check_calibration_records({role: digest}, {role: contents},
+                    registry, 1, workload_sha, forbidden))
+            files = file_digests(source.loaded_inputs)
+            digest = validate._rolled_digest(files)
+            key = "native_mha_prefill_handoff"
+            if ((compass.get("oracle_option_files") or {}).get(key) != files
+                    or (compass.get("oracle_option_sha256") or {}).get(key) != digest):
+                raise ValueError("native MHA prefill aggregate omits or changes its evidence")
+            bad.extend(validate._check_calibration_records({key: digest}, {key: files},
+                registry, 1, workload_sha, forbidden))
+            notes.append("Refusal-only cached-prefill interpolation; exact prior prices retained; "
+                         "native V transfer and all source/control residuals remain modelled")
+        elif any(str(row.get("role", "")).startswith(MHA_PREFILL_PREFIX) for row in inputs):
+            raise ValueError("unconfigured native MHA prefill evidence was loaded")
         if bool(options.get("native_prefill_handoff")) != bool(options.get("native_prefill_handoff_sha256")):
             raise ValueError("native prefill handoff and its SHA-256 are required together")
         native_role = "oracle.native_prefill_regions"
@@ -754,6 +797,32 @@ def check_source_contract(modelled, registry, workload_sha, forbidden, label, *,
         from atom.compass.core.cost.composition_qualification import ROLE_PREFIX as COMPOSITION_PREFIX
 
         execution_oracle = None
+        extension = None
+        extension_prefix = "validation.forward_extension."
+        extension_rows = [row for row in inputs if str(row.get("role", "")).startswith(extension_prefix)]
+        if bool(options.get("composition_extension")) != bool(options.get("composition_extension_sha256")):
+            raise ValueError("composition extension and SHA-256 are required together")
+        if options.get("composition_extension"):
+            from atom.compass.core.loaded_input import file_digests
+
+            if not composition:
+                raise ValueError("composition extension requires its unchanged original qualification")
+            execution_oracle = _source_contract_oracle(options, inputs, live_oracle)
+            extension = getattr(execution_oracle, "compass_composition_extension", None)
+            if extension is None:
+                raise ValueError("initialized oracle lacks its composition extension")
+            receipt = [item for item in extension.loaded_inputs if item.role == extension_prefix + "receipt"]
+            if (len(receipt) != 1 or receipt[0].requested != options["composition_extension"]
+                    or receipt[0].sha256 != options["composition_extension_sha256"]
+                    or len(extension_rows) != len(extension.loaded_inputs)
+                    or any(sum(row == item.as_dict() for row in extension_rows) != 1 for item in extension.loaded_inputs)):
+                raise ValueError("composition extension lacks its exact loaded validation evidence")
+            files = file_digests(extension.loaded_inputs)
+            if ((compass.get("oracle_option_files") or {}).get("composition_extension") != files
+                    or (compass.get("oracle_option_sha256") or {}).get("composition_extension") != validate._rolled_digest(files)):
+                raise ValueError("composition extension aggregate changes its validation inputs")
+        elif extension_rows:
+            raise ValueError("unconfigured composition extension evidence was loaded")
         execution_prefix = "oracle.compiled_prefill_execution."
         execution_rows = [row for row in inputs if str(row.get("role", "")).startswith(execution_prefix)]
         if bool(options.get("compiled_prefill_execution_handoff")) != bool(options.get("compiled_prefill_execution_handoff_sha256")):
@@ -767,7 +836,8 @@ def check_source_contract(modelled, registry, workload_sha, forbidden, label, *,
             reopened = CompiledPrefillExecution.load(
                 options["compiled_prefill_execution_handoff"],
                 options["compiled_prefill_execution_handoff_sha256"],
-                oracle=execution_oracle, options=options)
+                oracle=execution_oracle, options=options,
+                **({"extension": extension} if extension is not None else {}))
             active = getattr(execution_oracle, "execution_model", None)
             if (active is None or active.sha256 != reopened.sha256
                     or active.parameters != reopened.parameters or active.domain != reopened.domain):
@@ -789,7 +859,7 @@ def check_source_contract(modelled, registry, workload_sha, forbidden, label, *,
             notes.append("Source-only effective compiled-prefill M calibration; raw B, A/P and captured decode retained")
         elif execution_rows:
             raise ValueError("unconfigured compiled-prefill execution source evidence")
-        observed = [row for row in inputs if str(row.get("role", "")).startswith(COMPOSITION_PREFIX)]
+        observed = [row for row in inputs if str(row.get("role", "")).startswith(COMPOSITION_PREFIX)] + extension_rows
         if composition:
             # The factory reuses its actual initialized body/head oracle for
             # the independent qualification, including all decode forwards.
@@ -799,7 +869,8 @@ def check_source_contract(modelled, registry, workload_sha, forbidden, label, *,
             qualification, qualification_inputs = validate_composition(
                 options["composition_qualification"], options["composition_qualification_sha256"],
                 inputs=qualified_oracle.compass_loaded_inputs, options=options,
-                regions=qualified_oracle.regions, oracle=qualified_oracle)
+                regions=qualified_oracle.regions, oracle=qualified_oracle,
+                **({"extension": extension} if extension is not None else {}))
             if qualification != qualified_oracle.compass_composition_qualification:
                 raise ValueError("initialized composition differs from its pinned qualification")
             if len(observed) != len(qualification_inputs) or any(
