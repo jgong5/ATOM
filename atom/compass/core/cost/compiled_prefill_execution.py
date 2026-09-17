@@ -36,6 +36,7 @@ class CompiledPrefillExecution:
         self.domain = data["observed_domain"]
         self.maximum_rows = data.get("native_width_extension", {}).get("maximum_rows", self.domain["rows"][1])
         self.width_cached_only = bool(data.get("native_width_extension"))
+        self.width_parameters = data.get("native_width_extension", {}).get("parameters")
         self.sha256 = sha256
         self.loaded_inputs = tuple(inputs)
 
@@ -81,6 +82,9 @@ class CompiledPrefillExecution:
         quotes = evidence["body_quotes"]
         historical_inputs = read(quotes["loaded_inputs"], "body_loaded_inputs")
         historical_options = read(data["body_options"], "body_options")
+        if width and ("execution_fit" in width or "parameters" in width):
+            from atom.compass.core.cost.compiled_prefill_width import validate_width_fit
+            validate_width_fit(width, active, candidate, read, historical_inputs)
         if extension is None:
             if body_inputs(historical_inputs) != body_inputs(oracle.compass_loaded_inputs):
                 raise ValueError("compiled-prefill B sources changed; a new source fit is required")
@@ -139,7 +143,10 @@ class CompiledPrefillExecution:
         if raw <= 0:
             raise ValueError("compiled-prefill execution needs a positive raw B quote")
         floor = self.parameters["floor_seconds"]["cached" if cached else "cold"]
-        model = max(self.parameters["alpha"] * raw, floor)
+        alpha = self.parameters["alpha"]
+        if self.width_parameters is not None and shape.batch_size == 4:
+            alpha, floor = self.width_parameters["alpha"], self.width_parameters["floor_seconds"]
+        model = max(alpha * raw, floor)
         adjustment = model - raw
         prepare = cost.preparation_seconds
         if prepare is None:

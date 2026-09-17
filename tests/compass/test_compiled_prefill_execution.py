@@ -76,6 +76,20 @@ def test_width_four_candidate_is_cached_only_and_preserves_parameters(rule):
         added.apply(cost(.2),too_wide)
 
 
+def test_separate_width_fit_preserves_all_original_regimes(rule):
+    added = CompiledPrefillExecution(dict(parameters=rule.parameters,
+        observed_domain=rule.domain, native_width_extension=dict(maximum_rows=4, cached_only=True,
+            parameters=dict(alpha=1.07, floor_seconds=.107))), rule.sha256, ())
+    for history in (0, 32):
+        for body in (.02, 5.4):
+            original_shape = shape(history=history)
+            assert added.apply(cost(body), original_shape) == rule.apply(cost(body), original_shape)
+    cached = StepShape((4096,)*4, (4128,)*4, num_prefill_tokens=16384,
+                      produces_output=False, compiled=True, topology={'tp': 1})
+    assert added.apply(cost(5.4), cached).model_seconds == pytest.approx(5.778)
+    assert added.apply(cost(.02), cached).model_seconds == pytest.approx(.107)
+
+
 def test_actual_frozen_rule_source_integrity():
     value = os.environ.get("ATOMCOMPASS_EXECUTION_RULE")
     if not value:
