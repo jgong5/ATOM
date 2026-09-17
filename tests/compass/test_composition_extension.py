@@ -54,7 +54,8 @@ def extended(bundle, monkeypatch):
         old_predictor_identity=bundle["pins"]["identity"], old_quotes=write("old_quotes", snapshot),
         new_identity=dict(code=current_code, body_book=dict(loaded_inputs=input_identity(inputs),
                                                           source_selection=source_selection(options))),
-        code_changes={"compass/core/cost/native_mha_prefill.py": dict(before=None, after="f" * 64)},
+        code_changes={"compass/core/cost/native_mha_prefill.py": dict(
+            before=old_identity["code"].get("compass/core/cost/native_mha_prefill.py"), after="f" * 64)},
         added_inputs=input_identity([added]), fallback_handoff=fallback)
     pin = write("extension", data)
     # The adapter itself has separate real-source/selector tests. This fixture
@@ -69,6 +70,7 @@ def extended(bundle, monkeypatch):
     bundle.update(inputs=inputs, options=options, sources=sources,
                   extension_data=data, snapshot=snapshot, extension_pin=pin,
                   extension=extension.CompositionExtension(**dict(path=pin["path"], sha256=pin["sha256"]), options=options))
+    bundle["extension"].calibration_comparisons = []
     return bundle
 
 
@@ -147,9 +149,25 @@ def test_source_calibration_raw_B_is_requoted_exactly(extended):
     obj = extended["extension"]
     quotes = dict(observations=[dict(source_row_index=0, B=1.)])
     obj.check_calibration(extended["oracle"], extended["sources"], quotes)
-    quotes["observations"][0]["B"] += 1e-14
-    with pytest.raises(ValueError, match="source-calibration raw B"):
+    quotes["observations"][0]["B"] += 1e-8
+    with pytest.raises(ValueError, match="beyond the existing export policy"):
         obj.check_calibration(extended["oracle"], extended["sources"], quotes)
+
+
+def test_export_roundoff_is_disclosed_but_old_new_equality_stays_exact(extended):
+    obj, oracle = extended["extension"], extended["oracle"]
+    quotes = dict(observations=[dict(source_row_index=0, B=1. + 1e-14)])
+    obj.check_calibration(oracle, extended["sources"], quotes)
+    evidence = obj.calibration_comparisons[0]
+    assert evidence["old_actual_B"] == evidence["new_actual_B"] == 1.
+    assert evidence["absolute_export_difference"] > 0 and evidence["export_difference_ulps"] > 0
+    original = oracle.estimate
+    def changed(shape):
+        cost = original(shape)
+        return replace(cost, breakdown={**cost.breakdown, "<body>": 1. + 1e-14})
+    oracle.estimate = changed
+    with pytest.raises(ValueError, match="source-calibration raw B"):
+        obj.check_calibration(oracle, extended["sources"], quotes)
 
 
 def test_body_identity_only_accepts_the_exact_enumerated_addition(extended):

@@ -393,4 +393,6 @@ def source_cost_oracle(*, region_overlay, region_overlay_sha256, regions,
             inputs=result.compass_loaded_inputs, options=composition_options, regions=result.regions,
             oracle=result, extension=extension)
         result.compass_loaded_inputs += loaded
+        if extension is not None:
+            result.compass_composition_extension = extension
     return result

@@ -6,6 +6,7 @@ does not backdate new code or qualify the newly added domain.
 from dataclasses import asdict
 import hashlib
 import json
+from math import ulp
 from pathlib import Path
 
 from atom.compass.core.cost.composition_qualification import (
@@ -24,6 +25,7 @@ CODE_PATHS = {
     "compass/core/cost/compiled_prefill_execution.py",
     "compass/core/cost/native_mha_prefill.py",
     "compass/runtime/cache_region_oracle.py",
+    "entrypoints/openai/api_server.py",
 }
 
 
@@ -166,17 +168,34 @@ class CompositionExtension:
             raise ValueError("extension changes the inherited compiled-prefill B identity")
 
     def check_calibration(self, oracle, source, original_quotes):
-        cache = {}
+        cache, self.calibration_comparisons = {}, []
+        original_observations = {row["index"]: row["key"] for row in self.old_quotes["observations"]
+                                 if row["role"] == "source_calibration"}
         for observation in original_quotes["observations"]:
-            row = source[observation["source_row_index"]]
+            index = observation["source_row_index"]
+            row = source[index]
             key = observation_key(row)
+            if original_observations.get(index) != key:
+                raise ValueError("extension source-calibration geometry differs from the old predictor")
             if key not in cache:
                 cost = oracle.estimate(offer_observation(oracle.native_allocation, row))
                 if not oracle.last_coverage.complete:
                     raise ValueError("extension source-calibration coverage changed")
                 cache[key] = cost.breakdown["<body>"] + cost.breakdown.get("<head>", 0.)
-            if cache[key] != observation["B"]:
-                raise ValueError("extension changes an original source-calibration raw B quote")
+            old_parts = self.old_quotes["quotes"][key]["cost"]["breakdown"]
+            old = old_parts["<body>"] + old_parts.get("<head>", 0.)
+            new, historical = cache[key], observation["B"]
+            comparison = dict(source_row_index=index, geometry=geometry(row["descriptor"]),
+                old_actual_B=old, new_actual_B=new, historical_export_B=historical,
+                absolute_old_new_difference=abs(new-old), old_new_difference_ulps=abs(new-old)/ulp(old),
+                absolute_export_difference=abs(new-historical), export_difference_ulps=abs(new-historical)/ulp(old))
+            self.calibration_comparisons.append(comparison)
+            if new != old:
+                raise ValueError("extension changes an original source-calibration raw B quote: " + json.dumps(comparison))
+            # Existing complete-predictor export comparison policy. This applies
+            # only to historical summation roundoff; old/new equality above is exact.
+            if abs(new-historical) > 1e-10:
+                raise ValueError("extension historical source-calibration B differs beyond the existing export policy: " + json.dumps(comparison))
         oracle.native_allocation.clear()
 
     def check_quotes(self, oracle, sources, heldouts, source_pin):
@@ -192,4 +211,6 @@ class CompositionExtension:
                     added_domain_qualified_by_old_heldouts=False,
                     primitive_control_max_relative_error=self.primitive_control_max_error,
                     primitive_controls_all_under_ten_percent=self.primitive_control_max_error < .10,
+                    source_calibration=dict(old_new_exact=True, historical_export_absolute_limit_seconds=1e-10,
+                                            comparisons=self.calibration_comparisons),
                     final_e2e_proof_required=True)
