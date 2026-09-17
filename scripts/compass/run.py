@@ -15,7 +15,7 @@ import sys
 import time
 
 from atom import SamplingParams
-from atom.compass.workload import prompt_of_tokens
+from atom.compass.workload import prompt_of_tokens, shared_prefix_prompts
 from atom.model_engine.arg_utils import EngineArgs
 from atom.utils.arg_parser import FlexibleArgumentParser
 
@@ -298,12 +298,73 @@ def main() -> int:
                     seen.add(entry)
                     unique.append(entry)
             rounds = unique
+
+            # Every round above gives each prompt a distinct opening, so no two
+            # ever share a block. That is deliberate -- a sweep measuring
+            # prefill must perform it -- but it puts a hard ceiling on the one
+            # axis decode is fitted against. Decode is fitted per rung on
+            # *total* context, the sum across the batch, and without sharing
+            # that sum cannot exceed the KV pool, because every token in it is
+            # a token stored. Measured on the 27B at TP1: the pool is 76596
+            # blocks of 16, so 1225536 tokens, and the sweep's rung-16 samples
+            # already reach 1049600 of it (86%) and rung 32 reaches 1230400
+            # (100%). There is no room left to extend them.
+            #
+            # A real agentic workload is not bounded that way. It re-sends its
+            # conversation, 96.3% of its blocks are reusable, and a shared block
+            # is stored once but counted once *per request* in total context. So
+            # a cc-traces run reached 1.48M at rung 16, 2.85M at rung 32 and
+            # 3.58M at rung 48 -- 1.2x, 2.3x and 2.9x the entire pool -- against
+            # a table whose rung 48 stopped at 10752. The prediction there was an
+            # extrapolation by a factor of 333, and the run's time per output
+            # token came out 73.5% high.
+            #
+            # These rounds reach the same place the same way. Each is `count`
+            # prompts of `length` tokens sharing a `shared`-token prefix, so it
+            # costs `shared + count * (length - shared)` blocks and presents
+            # `count * length` of total context. They are also the only samples
+            # in the table that are cache *hits*: until now not one was, and the
+            # oracle sees a hit only as reduced num_scheduled_tokens against
+            # unchanged context_lens -- indistinguishable from a chunked-prefill
+            # middle chunk, which costs differently because it writes KV.
+            #
+            # Two or three per rung, spanning the range rather than bracketing
+            # it. A rung sampled only at its ends is a line through two distant
+            # clusters, which is how rung 16 came out 22.58% low once before.
+            shared_rounds = [
+                # (length, count, shared) -- physical cost in the comment.
+                (98304, 8, 65536),      # logical 786k, physical 327k
+                (131072, 8, 98304),     # logical 1.05M, physical 360k
+                (65536, 16, 32768),     # logical 1.05M, physical 557k
+                (92672, 16, 65536),     # logical 1.48M, physical 500k
+                (131072, 16, 114688),   # logical 2.10M, physical 377k
+                (49152, 32, 24576),     # logical 1.57M, physical 811k
+                (89088, 32, 81920),     # logical 2.85M, physical 311k
+                (131072, 32, 122880),   # logical 4.19M, physical 384k
+                (40960, 48, 24576),     # logical 1.97M, physical 810k
+                (74752, 48, 70656),     # logical 3.59M, physical 267k
+                (131072, 48, 126976),   # logical 6.29M, physical 324k
+                (32768, 64, 20480),     # logical 2.10M, physical 806k
+                (98304, 64, 94208),     # logical 6.29M, physical 356k
+            ]
+            # Same clamp as above, and the shared prefix with it: a prefix
+            # longer than the prompt would silently become no sharing at all.
+            rounds = [(length, count, decode, 0)
+                      for length, count, decode in rounds]
+            for length, count, shared in shared_rounds:
+                length = min(length, ceiling)
+                rounds.append((length, count, long_decode,
+                               min(shared, max(0, length - 64))))
         # Twice through, because Triton autotunes per shape rather than once per
         # process: the first visit to a shape pays a benchmarking cost that
         # steady-state serving never pays again. The second visit is the one
         # worth fitting, and having both lets the outlier rejection see the
         # difference rather than guess at it.
-        for round_index, (length, count, decode) in enumerate(rounds + rounds):
+        # `--sweep` without `--sweep-long` never reaches the block above, so
+        # normalise here rather than there. Idempotent on purpose.
+        rounds = [r if len(r) == 4 else (r[0], r[1], r[2], 0) for r in rounds]
+        for round_index, (length, count, decode, shared) in enumerate(
+                rounds + rounds):
             # A round is either `count` prompts of one length, or an explicit
             # list of lengths. The second exists because every uniform round
             # leaves the batch's *raggedness* at exactly one, and a fit cannot
@@ -315,15 +376,20 @@ def main() -> int:
             # help, because context was not the missing dimension.
             lengths = (list(length) if isinstance(length, (list, tuple))
                        else [length] * count)
-            llm.generate(
+            if shared:
+                prompts_here = shared_prefix_prompts(lengths, shared,
+                                                     round_index)
+            else:
                 # Exactly `length` tokens each, and a distinct opening per
                 # prompt so no two share prefix-cache blocks. This built its
                 # own prompts by hand until the long rounds arrived, and a
                 # hand-built word-per-token prompt is five to eight times the
                 # length it claims -- which the short ladder survived and the
                 # long one did not, being silently truncated at max_model_len.
-                [prompt_of_tokens(n, round_index * 10007 + i)
-                 for i, n in enumerate(lengths)],
+                prompts_here = [prompt_of_tokens(n, round_index * 10007 + i)
+                                for i, n in enumerate(lengths)]
+            llm.generate(
+                prompts_here,
                 SamplingParams(temperature=0.0, max_tokens=decode),
             )
         print("sweep complete")

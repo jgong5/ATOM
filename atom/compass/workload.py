@@ -138,3 +138,43 @@ def prompt_of_hash_ids(hash_ids, tokens: int, session: int = 0,
     words = (words + [WORDS[0]] * tokens)[:tokens]
     # A leading space so the first word tokenises the same way as the rest.
     return " " + " ".join(words)
+
+
+def shared_prefix_prompts(lengths, shared: int, session: int = 0) -> list[str]:
+    """Prompts of `lengths` tokens sharing a `shared`-token leading prefix.
+
+    What a calibration sweep needs that `prompt_of_hash_ids` alone does not
+    give it: a batch whose *total* context is far larger than the tokens it
+    stores. Decode is fitted per CUDA-graph rung against total context, the sum
+    across the batch, and with no sharing that sum can never exceed the KV pool,
+    because every token in it is a token stored. An agentic workload is not
+    bounded that way -- a shared block is stored once and counted once per
+    request -- so without these rounds the table stops short of exactly the
+    region a cc-traces replay spends its time in.
+
+    Built from block ids rather than text so the sharing is exact: the engine
+    hashes whole blocks chaining from position zero, so two prompts share cache
+    blocks precisely where they share leading ids and nowhere else. The head ids
+    are common to the batch; each prompt's tail ids are its own.
+
+    `session` namespaces the ids, so callers that visit the same round twice
+    must pass a different one each time. The sweep does visit twice, on purpose,
+    so its outlier pass can tell a Triton-tuning visit from a steady-state one;
+    served from the first visit's cache the second would record a batch of hits
+    where the sweep means to record work.
+    """
+    block = SOURCE_BLOCK_TOKENS
+    shared_blocks = max(0, int(shared)) // block
+    head = list(range(shared_blocks))
+    prompts, next_id = [], shared_blocks
+    for n in lengths:
+        n = int(n)
+        # Round up: `prompt_of_hash_ids` trims to exactly `n` tokens, so a
+        # partly-filled final block costs nothing, while rounding down would
+        # leave the prompt short of the length the round asked for.
+        total_blocks = -(-n // block)
+        tail_len = max(0, total_blocks - shared_blocks)
+        prompts.append(prompt_of_hash_ids(
+            head + list(range(next_id, next_id + tail_len)), n, session=session))
+        next_id += tail_len
+    return prompts
