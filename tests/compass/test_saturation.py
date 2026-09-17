@@ -65,6 +65,51 @@ class TestBothAxesComeOffTheEngineClock:
         assert abs(point["tokens_s_per_user"] - 101 / 11.0) > 0.5
 
 
+class TestAFrozenArrivalClockIsCaught:
+    """The failure this guard exists for did not look like a failure.
+
+    A simulated run keeps one virtual clock per process and only the engine
+    core's advances, so an arrival stamped in the API process lands on the
+    epoch every time. Every request then reports arriving at the start of the
+    run. Nothing errors: TTFT simply absorbs the queueing each request had
+    already passed, and the span collapses onto busy time. Measured on a
+    one-client rung, that read as +203% TTFT and +68% tokens/s per GPU -- both
+    of which look like a cost model being wrong.
+    """
+
+    def test_all_requests_at_one_instant_is_refused(self, tmp_path):
+        mod = _module()
+        d = tmp_path / "c1"
+        d.mkdir()
+        frozen = [(0.0, 0.03, 0.09, 24), (0.0, 0.13, 0.19, 24),
+                  (0.0, 0.23, 0.30, 24)]
+        for side in ("real", "modelled"):
+            (d / f"{side}.json").write_text(json.dumps(
+                _artifact(frozen, clients=1)))
+        rc = mod.main([str(d), "--out", str(tmp_path / "s.json")])
+        assert rc == 1
+        report = json.loads((tmp_path / "s.json").read_text())
+        assert any("one arrival instant" in r for r in report["blocking"])
+
+    def test_one_request_per_client_may_share_an_arrival(self, tmp_path):
+        """A rung whose clients each ran one request is not evidence of this.
+
+        Four clients starting together genuinely do arrive together, and
+        refusing that would withhold a correct curve.
+        """
+        mod = _module()
+        d = tmp_path / "c4"
+        d.mkdir()
+        together = [(0.0, 0.03, 0.09, 24)] * 4
+        for side in ("real", "modelled"):
+            (d / f"{side}.json").write_text(json.dumps(
+                _artifact(together, clients=4)))
+        rc = mod.main([str(d), "--out", str(tmp_path / "s.json")])
+        report = json.loads((tmp_path / "s.json").read_text())
+        assert not any("one arrival instant" in r for r in report["blocking"])
+        assert rc == 0
+
+
 class TestOnlyTheRequestsTheRunExecuted:
     def test_records_from_an_earlier_run_do_not_stretch_the_span(self):
         mod = _module()

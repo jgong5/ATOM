@@ -100,6 +100,8 @@ def rung(artifact, gpus):
 
     span, busy = _busy_span(records)
     produced = sum(r["output_tokens"] for r in readings.values())
+    arrivals = {round(float(r["arrive_time"]), 9) for r in records
+                if r.get("arrive_time") is not None}
     rates = [1.0 / r["tpot_s"] for r in readings.values()
              if r.get("tpot_s") and r["tpot_s"] > 0]
 
@@ -115,6 +117,7 @@ def rung(artifact, gpus):
         "tokens_s_per_gpu": (produced / span / gpus) if span else None,
         "tokens_s_per_user": _median(rates),
         "tokens_s_per_user_n": len(rates),
+        "distinct_arrivals": len(arrivals),
         "failed": int(manifest.get("failed") or 0),
     }
 
@@ -208,6 +211,19 @@ def main(argv=None) -> int:
             if pt["tokens_s_per_user"] is None:
                 blocking.append(f"{side} rung {pt['clients']} produced no TPOT "
                                 f"reading, so it has no per-user axis")
+            # More requests than clients means somebody's second request was
+            # sent after somebody's first came back, so they cannot all have
+            # arrived at one instant. When they do, arrival was stamped on a
+            # clock that never advanced -- which reads as a plausible curve:
+            # TTFT absorbs the queueing each request had already passed, and
+            # the span collapses onto busy time, overstating per-GPU
+            # throughput. Measured at +68% before this check existed.
+            if pt["requests"] > max(1, pt["clients"]) and \
+                    pt["distinct_arrivals"] <= 1:
+                blocking.append(
+                    f"{side} rung {pt['clients']} stamped all "
+                    f"{pt['requests']} requests at one arrival instant; "
+                    f"arrival is being read from a clock that does not advance")
     counts = {side: [pt["clients"] for pt in curves[side]] for side in curves}
     if counts["real"] != counts["modelled"]:
         blocking.append(f"the two sides swept different client counts: "
