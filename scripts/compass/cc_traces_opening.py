@@ -260,17 +260,19 @@ def _native_mha_prefill_input_contract(source, inputs, compass, registry, worklo
     """Attest all source/validation reads; only source reads enter fit aggregates."""
     from atom.compass.core.cost.native_mha_prefill import ROLE_PREFIX
     from atom.compass.core.cost.native_mha_low_query import VALIDATION_PREFIX
+    from atom.compass.core.cost.native_mha_large_query import VALIDATION_PREFIX as LARGE_VALIDATION_PREFIX
     from atom.compass.core.loaded_input import file_digests
 
     validate = _script("cc_traces_validate")
-    observed = [row for row in inputs if str(row.get("role", "")).startswith((ROLE_PREFIX, VALIDATION_PREFIX))]
+    validation_prefixes = (VALIDATION_PREFIX, LARGE_VALIDATION_PREFIX)
+    observed = [row for row in inputs if str(row.get("role", "")).startswith((ROLE_PREFIX,) + validation_prefixes)]
     if len(observed) != len(source.loaded_inputs):
         raise ValueError("native MHA prefill input inventory differs")
     by_digest = {}
     for item in source.loaded_inputs:
         if sum(row == item.as_dict() for row in observed) != 1:
             raise ValueError("native MHA prefill lacks its exact loaded identity: " + item.path)
-        if not item.role.startswith(VALIDATION_PREFIX):
+        if not item.role.startswith(validation_prefixes):
             by_digest.setdefault(item.sha256, []).append(item)
     bad = []
     for sha, items in by_digest.items():
@@ -279,7 +281,7 @@ def _native_mha_prefill_input_contract(source, inputs, compass, registry, worklo
         role = ROLE_PREFIX + sha[:16]
         bad.extend(validate._check_calibration_records({role: digest}, {role: contents},
             registry, 1, workload_sha, forbidden))
-    files = file_digests([item for item in source.loaded_inputs if not item.role.startswith(VALIDATION_PREFIX)])
+    files = file_digests([item for item in source.loaded_inputs if not item.role.startswith(validation_prefixes)])
     digest = validate._rolled_digest(files)
     key = "native_mha_prefill_handoff"
     if ((compass.get("oracle_option_files") or {}).get(key) != files
@@ -696,6 +698,7 @@ def check_source_contract(modelled, registry, workload_sha, forbidden, label, *,
             raise ValueError("unconfigured native MHA layout transfer evidence was loaded")
         from atom.compass.core.cost.native_mha_prefill import NativeMhaPrefillFallback, ROLE_PREFIX as MHA_PREFILL_PREFIX
         from atom.compass.core.cost.native_mha_low_query import VALIDATION_PREFIX as MHA_PREFILL_VALIDATION_PREFIX
+        from atom.compass.core.cost.native_mha_large_query import VALIDATION_PREFIX as MHA_LARGE_VALIDATION_PREFIX
 
         if bool(options.get("native_mha_prefill_handoff")) != bool(options.get("native_mha_prefill_handoff_sha256")):
             raise ValueError("native MHA prefill handoff and SHA-256 are required together")
@@ -714,7 +717,7 @@ def check_source_contract(modelled, registry, workload_sha, forbidden, label, *,
             notes.append("Refusal-only cached-prefill interpolation; exact prior prices retained; "
                          "native V transfer and all source/control residuals remain modelled")
         elif any(str(row.get("role", "")).startswith(
-                (MHA_PREFILL_PREFIX, MHA_PREFILL_VALIDATION_PREFIX)) for row in inputs):
+                (MHA_PREFILL_PREFIX, MHA_PREFILL_VALIDATION_PREFIX, MHA_LARGE_VALIDATION_PREFIX)) for row in inputs):
             raise ValueError("unconfigured native MHA prefill evidence was loaded")
         if bool(options.get("native_prefill_handoff")) != bool(options.get("native_prefill_handoff_sha256")):
             raise ValueError("native prefill handoff and its SHA-256 are required together")

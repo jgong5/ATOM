@@ -207,13 +207,24 @@ class NativeMhaPrefillFallback(PriceLibrary):
             raise ValueError("cached-prefill fallback requires the original scoped source library")
         self.family = provider
         self.low_query_model = None
+        self.large_query_model = None
         if handoff.get("low_query_model"):
             from atom.compass.core.cost.native_mha_low_query import NativeMhaLowQueryModel
 
-            if handoff.get("selection_order") != [
-                    "valid_base_prices", "validated_native_low_query", "bounded_dense_prefix_fallback"]:
+            order = ["valid_base_prices", "validated_native_low_query"]
+            if handoff.get("large_query_model"):
+                order.append("validated_native_large_query")
+            order.append("bounded_dense_prefix_fallback")
+            if handoff.get("selection_order") != order:
                 raise ValueError("native low-query addition must declare its source-based selection order")
             self.low_query_model = NativeMhaLowQueryModel(reader, handoff["low_query_model"],
+                deployment_scope_sha256=deployment_scope_sha256)
+        if handoff.get("large_query_model"):
+            from atom.compass.core.cost.native_mha_large_query import NativeMhaLargeQueryModel
+
+            if self.low_query_model is None:
+                raise ValueError("native larger-query addition requires the composed native source layer")
+            self.large_query_model = NativeMhaLargeQueryModel(reader, handoff["large_query_model"],
                 deployment_scope_sha256=deployment_scope_sha256)
         self.handoff_sha256 = handoff_sha256
         self.loaded_inputs = base.loaded_inputs + tuple(reader.inputs)
@@ -242,22 +253,26 @@ class NativeMhaPrefillFallback(PriceLibrary):
         if isinstance(op, PreparedOperator):
             op = op.as_dict()
         identity = _identity(op)
-        if getattr(self, "low_query_model", None) is not None:
-            quote = self.low_query_model.quote(op)
+        for name in ("low_query", "large_query"):
+            model = getattr(self, name + "_model", None)
+            if model is None:
+                continue
+            quote = model.quote(op)
             if quote is not None:
                 why = self._scope_error(op, topology)
                 if why is not None:
                     return None, why
-                source = "interpolated://native-mha-prefill/validated-low-query"
+                source = "interpolated://native-mha-prefill/validated-" + name.replace("_", "-")
                 return OperatorEventRecord(seconds=quote["seconds"], kernels={}, source=source,
                     **{INTERPOLATED_FLAG: True}, source_qualified=False,
                     whole_forward_validation_required=True, kernel_dispatch_observed=False,
                     kernel_count=None, launch_count=None,
-                    interpolation=dict(family=MHA, regime="unified.prefill.cached.native_low_query",
+                    interpolation=dict(family=MHA, regime="unified.prefill.cached.native_" + name,
                         basis="modelled", detail=quote["model_provenance"]),
-                    native_mha_low_query=quote["model_provenance"],
-                    independent_operator_validation=self.low_query_model.validation,
+                    **{"native_mha_" + name: quote["model_provenance"]},
+                    independent_operator_validation=model.validation,
                     source_selection="valid base first, validated native model before dense-prefix fallback"), source
+        if getattr(self, "low_query_model", None) is not None:
             # A malformed allocation is not permission to fall through to an
             # older model whose geometric key does not describe joint aliases.
             from atom.compass.core.cost.native_mha_low_query import coordinates, sharing_pattern
@@ -321,4 +336,6 @@ class NativeMhaPrefillFallback(PriceLibrary):
 
     def describe(self):
         native = "validated native low-query model; " if self.low_query_model is not None else ""
+        if getattr(self, "large_query_model", None) is not None:
+            native += "validated native larger-query model; "
         return f"NativeMhaPrefillFallback({native}bounded prefix fallback; base first; base={self.base.describe()})"

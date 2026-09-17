@@ -13,12 +13,13 @@ from .test_opening_harness import wrapper_evidence, opening, validate
 
 
 @pytest.mark.parametrize("damage",[None,"missing_read","missing_validation","unregistered","aggregate","unconfigured"])
-def test_prefill_source_manifest_and_contract(tmp_path,monkeypatch,damage):
+@pytest.mark.parametrize("validation_prefix",["validation.native_mha_low_query.","validation.native_mha_large_query."])
+def test_prefill_source_manifest_and_contract(tmp_path,monkeypatch,damage,validation_prefix):
     compass,registry=wrapper_evidence.__wrapped__(tmp_path)
     path=tmp_path/'prefill-handoff.json';path.write_text('{"source":"frozen"}')
     _,loaded=load_json(str(path),role=native_mha_prefill.ROLE_PREFIX+'handoff')
     validation_path=tmp_path/'heldout.json';validation_path.write_text('{"seconds":123.0}')
-    _,validation=load_json(str(validation_path),role='validation.native_mha_low_query.heldout_raw')
+    _,validation=load_json(str(validation_path),role=validation_prefix+'heldout_raw')
     options=compass['oracle_options']
     options.update(native_mha_prefill_handoff=str(path),native_mha_prefill_handoff_sha256=loaded.sha256)
     rank=compass['loaded_inputs']['ranks'][0];rank['inputs'].append(loaded.as_dict())
