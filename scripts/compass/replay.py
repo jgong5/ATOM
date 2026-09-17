@@ -35,6 +35,7 @@ import argparse
 import json
 import random
 import sys
+import threading
 import time as _time
 import urllib.error
 import urllib.request
@@ -60,10 +61,24 @@ def _workload(args) -> list[dict]:
         # arrival process into a half-second burst left no trace in the
         # artifact -- the run looked paced and was not.
         scale = max(1e-9, float(args.time_scale))
-        return [{"arrival_s": (float(r.get("arrival_s", 0.0)) - base) / scale,
-                 "input_tokens": int(r.get("input_tokens", args.input_tokens)),
-                 "output_tokens": int(r.get("output_tokens", args.output_tokens))}
-                for r in rows]
+        out = []
+        for r in rows:
+            row = {"arrival_s": (float(r.get("arrival_s", 0.0)) - base) / scale,
+                   "input_tokens": int(r.get("input_tokens", args.input_tokens)),
+                   "output_tokens": int(r.get("output_tokens", args.output_tokens))}
+            # Carried, not dropped. `hash_ids` decides what the prompt builder
+            # shares, so without it a cc-traces replay is the same lengths with
+            # none of the reuse; `session` namespaces those ids, which are
+            # session-local; and `api_time_s` is the recorded duration, which is
+            # the only ground truth that ever reaches the artifact. They were
+            # projected away here, so a trace could carry all three and the
+            # output file would show no sign they had existed.
+            for key in ("hash_ids", "session", "api_time_s", "source_ttft_s",
+                        "session_id"):
+                if key in r:
+                    row[key] = r[key]
+            out.append(row)
+        return out
 
     # Poisson arrivals at --rate, or all at zero when the rate is infinite.
     rng = random.Random(args.seed)
@@ -109,15 +124,131 @@ def _revision():
         return None
 
 
-def _prompt(tokens: int, index: int) -> str:
-    """Distinct text of exactly the requested token count.
+def _prompt(row: dict, index: int) -> str:
+    """Text of exactly the requested token count, sharing what the row shares.
 
-    See `atom.compass.workload`, which run.py's sweep shares: a sweep that
-    cannot target a token count cannot bracket a workload measured in tokens.
+    Two opposite constructions, picked by whether the trace says anything about
+    sharing. See `atom.compass.workload`, which run.py's sweep shares: a sweep
+    that cannot target a token count cannot bracket a workload measured in
+    tokens.
+
+    Without `hash_ids` the prompt is built to *defeat* the prefix cache, so
+    every request pays for its own prefill and a synthetic workload measures
+    what it says it measures.
+
+    With `hash_ids` -- which is every cc-traces row -- each id names a 64-token
+    block and consecutive turns of a session share their leading ids. On the
+    256k corpus 96.2% of all input tokens are a re-send of a block the session
+    already sent, so ignoring the ids would not be a small simplification: it
+    would be a workload with 26x the prefill work of the one recorded.
     """
-    from atom.compass.workload import prompt_of_tokens
+    from atom.compass.workload import prompt_of_hash_ids, prompt_of_tokens
 
+    tokens = int(row["input_tokens"])
+    ids = row.get("hash_ids")
+    if ids:
+        return prompt_of_hash_ids(ids, tokens, session=int(row.get("session", 0)))
     return prompt_of_tokens(tokens, index)
+
+
+def _sessions(workload: list[dict]) -> list[list[int]]:
+    """Indices of each session's rows, sessions in first-arrival order.
+
+    A cc-traces session is the unit a user holds: its turns re-send the whole
+    conversation, so they share prefix blocks with each other and with nothing
+    else. Splitting one across clients would replay the same token counts with
+    none of that sharing.
+    """
+    order: dict[int, list[int]] = {}
+    for i, row in enumerate(workload):
+        order.setdefault(int(row.get("session", 0)), []).append(i)
+    return [idxs for _, idxs in
+            sorted(order.items(), key=lambda kv: workload[kv[1][0]]["arrival_s"])]
+
+
+def _dependencies(rows: list[dict]) -> list[list[int]]:
+    """Which of a session's rows each row waited for, from the recorded timing.
+
+    A session is not a straight line of turns. 43.5% of the corpus's requests
+    overlap another request of their own session, because a turn can fan out
+    into sub-agents -- and peak in-session concurrency runs from 1 to 23.
+
+    But that concurrency is *recorded*, not structural. Only 8.4% of sub-agent
+    window pairs actually overlap, and 218 of 393 sessions never have two
+    sub-agent branches open at once, so treating every branch as parallel
+    because the corpus nests it under a `subagent` wrapper would invent load
+    the recording does not contain. The recorded windows say which requests
+    were really in the server together, so that is what is read here: a row
+    waits for exactly those rows that had already finished when it started, and
+    runs alongside the rest.
+
+    Time is used for ordering only; the gaps are dropped, which is what makes
+    this a closed loop rather than a replay of the trace's arrival rate.
+    """
+    starts = [float(r.get("arrival_s", 0.0)) for r in rows]
+    ends = [s + float(r.get("api_time_s") or 0.0) for s, r in zip(starts, rows)]
+    return [[j for j in range(len(rows)) if j != k and ends[j] <= starts[k]]
+            for k in range(len(rows))]
+
+
+def _run_session(idxs: list[int], deps: list[list[int]], send, out: list) -> None:
+    """Issue one session's requests, honouring the recorded happens-before."""
+    done = [threading.Event() for _ in idxs]
+    threads = []
+
+    def go(k: int) -> None:
+        try:
+            out[idxs[k]] = send(idxs[k])
+        finally:
+            done[k].set()
+
+    for k in range(len(idxs)):
+        # Waiting here, before *starting* k, cannot deadlock: every member of
+        # deps[k] is a row earlier in the session, and each was spawned before
+        # this loop reached k.
+        for j in deps[k]:
+            done[j].wait()
+        thread = threading.Thread(target=go, args=(k,), daemon=True)
+        thread.start()
+        threads.append(thread)
+    for thread in threads:
+        thread.join()
+
+
+def _closed_loop(workload: list[dict], clients: int, per_client: int, send):
+    """Run the workload as `clients` users, each holding a session to the end.
+
+    Open-loop replay pins throughput to the trace's own arrival rate, so every
+    client count lands on the same tokens/s and a saturation curve collapses to
+    a single point. A closed loop asks the other question -- given N users who
+    always have work outstanding, how much does the engine deliver in total and
+    how fast does each user see its own tokens -- which is the curve with
+    tokens/s/GPU against tokens/s/user.
+
+    Sessions are dealt round-robin from the trace's own order rather than
+    pulled from a shared queue as clients free up. A queue would hand
+    different sessions to different clients on the real and the modelled side,
+    because the two sides finish at different moments; dealing them up front
+    makes both sides execute the same sessions in the same order, so the
+    comparison stays paired per request instead of merely distributional.
+    """
+    groups = _sessions(workload)
+    if per_client:
+        groups = groups[: clients * per_client]
+    assignment = [groups[c::clients] for c in range(clients)]
+    out: list = [None] * len(workload)
+
+    def client(c: int) -> None:
+        for idxs in assignment[c]:
+            _run_session(idxs, _dependencies([workload[i] for i in idxs]),
+                         send, out)
+
+    threads = [threading.Thread(target=client, args=(c,)) for c in range(clients)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    return [r for r in out if r is not None], assignment
 
 
 def _send(url: str, body: dict, timeout: float) -> dict:
@@ -135,6 +266,24 @@ def _send(url: str, body: dict, timeout: float) -> dict:
         except Exception:  # noqa: BLE001
             detail = ""
         raise RuntimeError(f"HTTP {exc.code}: {detail}") from exc
+
+
+def _cache_stats(base: str, timeout: float) -> dict:
+    """Cumulative prefix-cache counters, or {} on a server without them.
+
+    Read either side of the run and differenced, this is the check that the
+    replay actually reproduced the trace's reuse. It matters because failing to
+    is silent: prompts that share no blocks still complete, still report 0
+    failed, and just do 26x the prefill the recorded workload did. The trace's
+    own `reusable_tokens` (see `cc_traces.py --out ...meta.json`) is what the
+    delta should be compared against.
+    """
+    try:
+        with urllib.request.urlopen(base + "/debug/cache_stats",
+                                    timeout=timeout) as resp:
+            return json.loads(resp.read())
+    except Exception:  # noqa: BLE001 - absent on a server built without it
+        return {}
 
 
 def _served_model(base: str, timeout: float) -> str | None:
@@ -178,9 +327,30 @@ def main() -> int:
                         "long trace in less time. 1.0 keeps the trace's own "
                         "timing; it changes how much requests batch, so it is "
                         "a property of the workload and not a free knob")
+    p.add_argument("--ignore-eos", action="store_true",
+                   help="generate exactly --output-tokens rather than at most. "
+                        "A trace records how many tokens a request produced, "
+                        "and max_tokens is only a ceiling: a row asking for 376 "
+                        "may stop at 3 on an EOS the recorded run never hit, "
+                        "and the replay quietly stops being the workload while "
+                        "still reporting 0 failed")
     p.add_argument("--check-lengths", action="store_true",
                    help="compare the server's reported prompt_tokens against "
                         "what was asked for, and warn if they differ")
+    p.add_argument("--clients", type=int, default=0,
+                   help="run closed-loop as this many users instead of "
+                        "replaying the trace's arrivals. Each user holds one "
+                        "session until every request in it -- sub-agents "
+                        "included -- has finished, then takes the next. The "
+                        "trace's inter-arrival gaps are dropped; its recorded "
+                        "in-session overlap is kept. This is the mode that "
+                        "produces a saturation curve: an open-loop replay "
+                        "delivers the trace's own rate whatever N is")
+    p.add_argument("--sessions-per-client", type=int, default=0,
+                   help="with --clients, how many sessions each user works "
+                        "through. 0 means every session in the trace. Fixing "
+                        "it is what makes a sweep over client counts run "
+                        "comparable amounts of work per user")
     args = p.parse_args()
 
     workload = _workload(args)
@@ -194,12 +364,20 @@ def main() -> int:
               file=sys.stderr)
         return 2
 
+    cache_before = _cache_stats(base, args.timeout)
     began = _time.monotonic()
+
+    # Closed loop has no arrival process at all: a request is sent because the
+    # one before it came back. So neither compass field is sent -- declaring an
+    # arrival would contradict the loop, and declaring a workload size would
+    # deadlock, since the barrier holds every request until all `size` of them
+    # are waiting and a closed loop never has more than `clients` in flight.
+    closed = args.clients > 0
 
     def one(i_row):
         i, row = i_row
         at = row["arrival_s"]  # already scaled when the workload was built
-        if args.pace:
+        if args.pace and not closed:
             # Hold the request until its moment really comes round. Against a
             # real engine this is what makes the arrival process real: the
             # queue is genuinely empty between arrivals, which declaring an
@@ -211,12 +389,15 @@ def main() -> int:
                 _time.sleep(delay)
         body = {
             "model": model,
-            "prompt": _prompt(row["input_tokens"], i),
+            "prompt": _prompt(row, i),
             "max_tokens": row["output_tokens"],
             "temperature": 0.0,
-            "compass_workload_size": len(workload),
         }
-        if not args.pace:
+        if not closed:
+            body["compass_workload_size"] = len(workload)
+        if args.ignore_eos:
+            body["ignore_eos"] = True
+        if not args.pace and not closed:
             # Declared rather than delivered: against a simulated engine the
             # wall clock and the virtual clock race, so the arrival is stated
             # and the engine honours it. Ignored by a server on a real clock,
@@ -245,17 +426,30 @@ def main() -> int:
     # which is not the declared arrival process. This happened, went unnoticed
     # because the client still reported "0 failed", and a day's conclusions
     # were drawn from the result.
-    workers = len(workload)
-    if workers > MAX_IN_FLIGHT:
-        raise SystemExit(
-            f"{workers} requests needs {workers} concurrent connections, over "
-            f"the {MAX_IN_FLIGHT} this client will open. A declared workload "
-            f"cannot be posted in batches -- the server waits for all of it "
-            f"before it starts -- so this needs a bulk submission endpoint "
-            f"rather than a larger pool. Use --num-requests to bound the "
-            f"workload meanwhile.")
-    with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
-        results = list(pool.map(one, enumerate(workload)))
+    assignment = None
+    if closed:
+        # No bound needed here: a closed loop holds at most one session per
+        # client, and a session's own recorded peak concurrency is at most 23.
+        results, assignment = _closed_loop(
+            workload, args.clients, args.sessions_per_client,
+            lambda i: one((i, workload[i])))
+        if not results:
+            print("closed loop executed no requests: the trace has fewer "
+                  "sessions than it has clients, so some clients were dealt "
+                  "nothing", file=sys.stderr)
+            return 2
+    else:
+        workers = len(workload)
+        if workers > MAX_IN_FLIGHT:
+            raise SystemExit(
+                f"{workers} requests needs {workers} concurrent connections, "
+                f"over the {MAX_IN_FLIGHT} this client will open. A declared "
+                f"workload cannot be posted in batches -- the server waits for "
+                f"all of it before it starts -- so this needs a bulk "
+                f"submission endpoint rather than a larger pool. Use "
+                f"--num-requests to bound the workload meanwhile.")
+        with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+            results = list(pool.map(one, enumerate(workload)))
 
     failed = [r for r in results if not r["ok"]]
 
@@ -283,6 +477,7 @@ def main() -> int:
             length_check = "passed"
             print(f"  prompt lengths verified against the server for "
                   f"{len(results) - len(failed)} requests")
+    cache_after = _cache_stats(base, args.timeout)
     engine = {}
     try:
         engine = _send(base + "/compass/requests", {}, args.timeout)
@@ -301,7 +496,17 @@ def main() -> int:
     # silently failed.
     manifest = {
         "revision": _revision(),
-        "paced": bool(args.pace),
+        "paced": bool(args.pace) and not closed,
+        # A closed-loop artifact must be able to say so on its own. Its
+        # `arrival_span_s` is the trace's, not the run's, and reading one as an
+        # open-loop replay would attribute the trace's arrival rate to a run
+        # that ignored it.
+        "closed_loop": closed,
+        "clients": int(args.clients) if closed else 0,
+        "sessions_run": (sum(len(a) for a in assignment) if assignment else 0),
+        "sessions_per_client": ([len(a) for a in assignment] if assignment
+                                else None),
+        "requests_executed": len(results),
         "time_scale": float(args.time_scale),
         "requests": len(workload),
         "arrival_span_s": (round(workload[-1]["arrival_s"], 6)
@@ -311,11 +516,21 @@ def main() -> int:
         "model": model,
         "failed": len(failed),
         "prompt_lengths": length_check,
+        "ignore_eos": bool(args.ignore_eos),
+        # How many rows carried sharing, so a run with no reuse can be told
+        # apart from a trace that never asked for any.
+        "rows_with_hash_ids": sum(1 for r in workload if r.get("hash_ids")),
     }
     with open(args.out, "w", encoding="utf-8") as fh:
         json.dump({"run": manifest, "workload": workload, "results": results,
-                   "engine": engine}, fh, indent=1)
-    print(f"sent {len(workload)} requests, {len(failed)} failed -> {args.out}")
+                   "engine": engine,
+                   "cache_stats": {"before": cache_before, "after": cache_after}},
+                  fh, indent=1)
+    if closed:
+        print(f"{args.clients} clients ran {manifest['sessions_run']} sessions, "
+              f"{len(results)} requests, {len(failed)} failed -> {args.out}")
+    else:
+        print(f"sent {len(workload)} requests, {len(failed)} failed -> {args.out}")
     if failed:
         print("  first failure:", failed[0]["error"], file=sys.stderr)
     return 0

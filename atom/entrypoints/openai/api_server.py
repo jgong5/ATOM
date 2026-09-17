@@ -181,6 +181,12 @@ def _record_engine_timings(request_id: str, out: "RequestOutput") -> None:
         "finish_time": finish,
         "ttft": (first - arrive) if first else None,
         "latency": finish - arrive,
+        # Prefix-cache tokens this request did not have to prefill. The
+        # completions endpoint drops it -- it reaches `final_output` and never
+        # the response body -- so without it here a replay has no per-request
+        # way to tell that its prompts shared anything, and a harness that
+        # silently stopped reproducing the trace's reuse still reports 0 failed.
+        "num_cached_tokens": int(getattr(out, "num_cached_tokens", 0) or 0),
     }
 # The tool-call format this model emits, resolved once at startup from its
 # chat template. `None` means none was recognised and tool calls, if any, are

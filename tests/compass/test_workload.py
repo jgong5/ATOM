@@ -8,7 +8,14 @@ a length-dependent distortion reshapes a distribution rather than shifting it.
 """
 import pytest
 
-from atom.compass.workload import WORDS, prompt_of_tokens
+from atom.compass.workload import (
+    ENCODE_WORDS,
+    SESSION_STRIDE,
+    SOURCE_BLOCK_TOKENS,
+    WORDS,
+    prompt_of_hash_ids,
+    prompt_of_tokens,
+)
 
 
 class TestExactLength:
@@ -108,3 +115,66 @@ class TestARunDescribesItself:
             assert module._digest(str(a)) == module._digest(str(a))
             assert module._digest(str(a)) != module._digest(str(b))
             assert module._digest(None) is None
+
+
+class TestRequestsShareExactlyTheBlocksTheTraceSays:
+    """The cc-traces replay needs the opposite guarantee to the one above.
+
+    A session re-sends its whole conversation each turn, and `hash_ids` records
+    which 64-token blocks each turn shares with the last. Replaying only the
+    lengths gives the right arrival process, the right length multiset and no
+    reuse at all, which is a test of step prediction rather than a replay of
+    this corpus. So these prompts must share leading blocks *exactly* where the
+    ids do -- no less, which would re-prefill work the source cached, and no
+    more, which would invent reuse and flatter the run.
+    """
+
+    NATIVE_BLOCK = 16  # the engine's --block-size default
+
+    def _tokens(self, ids, session=0):
+        n = len(ids) * SOURCE_BLOCK_TOKENS
+        return prompt_of_hash_ids(ids, n, session=session).split()
+
+    def test_shared_leading_ids_give_byte_identical_leading_tokens(self):
+        a = self._tokens([11, 22, 33, 44])
+        b = self._tokens([11, 22, 99, 77])
+        shared = 2 * SOURCE_BLOCK_TOKENS
+        assert a[:shared] == b[:shared]
+
+    def test_divergence_starts_inside_the_first_differing_native_block(self):
+        """Not merely somewhere after it.
+
+        A source block is 64 tokens and a native block is 16, so a difference
+        that only showed up at token 60 of the block would leave native blocks
+        128..175 identical and hand the engine three blocks of reuse the trace
+        never recorded.
+        """
+        a = self._tokens([11, 22, 33])
+        b = self._tokens([11, 22, 99])
+        shared = 2 * SOURCE_BLOCK_TOKENS
+        assert a[shared:shared + self.NATIVE_BLOCK] != \
+            b[shared:shared + self.NATIVE_BLOCK]
+
+    def test_the_identifier_fits_inside_one_native_block(self):
+        """Which is what makes the test above hold for any pair of ids."""
+        assert ENCODE_WORDS <= self.NATIVE_BLOCK
+
+    def test_two_sessions_reusing_an_id_do_not_share(self):
+        """`hash_id_scope` is "local", so the same number means different text
+        in a different session. Colliding them would invent reuse silently."""
+        assert self._tokens([7], session=0) != self._tokens([7], session=1)
+
+    def test_an_id_past_the_session_stride_is_refused(self):
+        with pytest.raises(ValueError, match="invent reuse"):
+            prompt_of_hash_ids([SESSION_STRIDE], 64)
+
+    def test_the_length_is_the_requested_one(self):
+        for ids, n in (([1], 64), ([1, 2], 128), ([1, 2, 3], 160), ([4], 1)):
+            assert len(prompt_of_hash_ids(ids, n).split()) == n
+
+    def test_zero_and_below_are_empty(self):
+        assert prompt_of_hash_ids([1, 2], 0) == ""
+        assert prompt_of_hash_ids([1, 2], -3) == ""
+
+    def test_it_starts_with_a_space(self):
+        assert prompt_of_hash_ids([1], 64).startswith(" ")
