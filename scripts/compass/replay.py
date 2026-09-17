@@ -42,8 +42,20 @@ import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 
 
+#: Requests to generate when there is no trace to replay. Not a default for the
+#: trace path: a trace is a workload someone chose, and quietly keeping its
+#: first N is a different workload wearing its name and sha256. This was that
+#: default for the trace path once, and a 809-request replay ran 64 of them --
+#: 55s of a 5726s timeline -- with the artifact naming the whole file.
+_SYNTHETIC_REQUESTS = 64
+
+
 def _workload(args) -> list[dict]:
-    """The requests to send, each with the instant it should count as arriving."""
+    """The requests to send, each with the instant it should count as arriving.
+
+    Sets ``args.trace_rows`` on the trace path, so the manifest can report what
+    was on disk beside what ran and truncation cannot be silent.
+    """
     if args.trace:
         rows = []
         with open(args.trace, encoding="utf-8") as fh:
@@ -52,6 +64,7 @@ def _workload(args) -> list[dict]:
                 if line:
                     rows.append(json.loads(line))
         rows.sort(key=lambda r: float(r.get("arrival_s", 0.0)))
+        args.trace_rows = len(rows)
         if args.num_requests:
             rows = rows[: args.num_requests]
         base = float(rows[0].get("arrival_s", 0.0)) if rows else 0.0
@@ -83,7 +96,7 @@ def _workload(args) -> list[dict]:
     # Poisson arrivals at --rate, or all at zero when the rate is infinite.
     rng = random.Random(args.seed)
     out, t = [], 0.0
-    for _ in range(args.num_requests):
+    for _ in range(args.num_requests or _SYNTHETIC_REQUESTS):
         out.append({"arrival_s": t,
                     "input_tokens": args.input_tokens,
                     "output_tokens": args.output_tokens})
@@ -308,7 +321,12 @@ def main() -> int:
     p.add_argument("--model", default=None,
                    help="defaults to whatever /v1/models reports")
     p.add_argument("--trace", help="JSONL of {arrival_s, input_tokens, output_tokens}")
-    p.add_argument("--num-requests", type=int, default=64)
+    p.add_argument("--num-requests", type=int, default=None,
+                   help="how many requests to send. With --trace the default "
+                        "is the whole trace; this only ever truncates it, and "
+                        "the artifact records that it did. Without a trace it "
+                        "is how many synthetic requests to generate "
+                        f"(default {_SYNTHETIC_REQUESTS})")
     p.add_argument("--rate", type=float, default=0.0,
                    help="Poisson arrivals per second; 0 means all arrive at once")
     p.add_argument("--input-tokens", type=int, default=128)
@@ -513,6 +531,13 @@ def main() -> int:
                            if workload else 0.0),
         "trace": args.trace,
         "trace_sha256": _digest(args.trace),
+        # What was on disk, beside what ran. The sha256 above names the whole
+        # file however few of its rows were sent, so without these two a
+        # truncated replay is indistinguishable from a complete one.
+        "trace_rows": getattr(args, "trace_rows", None),
+        "trace_truncated": (args.trace is not None
+                            and getattr(args, "trace_rows", None) is not None
+                            and len(workload) < args.trace_rows),
         "model": model,
         "failed": len(failed),
         "prompt_lengths": length_check,
