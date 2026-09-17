@@ -7,6 +7,7 @@ from pathlib import Path
 
 from atom.compass.core.cache_policy import cache_on_policy, policy_errors
 from atom.compass.core.cost.cached_q16 import GDN, MHA
+from atom.compass.core.cost.families import attention
 from atom.compass.core.cost.library import INTERPOLATED_FLAG, PriceLibrary, _layout_fingerprint
 from atom.compass.core.cost.low_query import PREFIXES, _mha_identity, mha_prefix_interpolation
 from atom.compass.core.cost.prepared import PreparedOperator
@@ -111,6 +112,8 @@ class DiagnosticReferencePrices(PriceLibrary):
             reader, handoff, deployment_scope_sha256)
         reference_phase = reader.read(handoff["evidence"]["reference_phase"], "reference_phase")
         self._selected = {}
+        self.excluded_references = []
+        self.exact_reference_count = 0
         records = {}
         for name, case in references.items():
             point, op = points[name], graphs[name]
@@ -131,9 +134,8 @@ class DiagnosticReferencePrices(PriceLibrary):
                 native_path_evidence=handoff["evidence"]["reference_preflight"],
                 scope={"topology": {"tp": 1}, "registration": None},
                 signature=case["signature"], layout=_layout_fingerprint(op))
-            self._insert(op, record)
+            self.exact_reference_count += self._insert(op, record)
             records[name] = record
-        self.exact_reference_count = len(records)
         self.bounded_prediction_count = 0
         for case in plan["cases"]:
             if case["phase"] != "heldout":
@@ -156,6 +158,14 @@ class DiagnosticReferencePrices(PriceLibrary):
         self._prices, self.address_shifted = base._prices, base.address_shifted
 
     def _insert(self, op, record):
+        if op.get("name") == MHA:
+            regime = attention.regime_of(op)
+            if (isinstance(regime, attention.Refusal)
+                    and regime.reason == attention.CACHED_ROW_STARTS_REFUSAL):
+                self.excluded_references.append(dict(
+                    reference_cell_id=record.get("reference_cell_id"),
+                    source_graph=record.get("source_graph"), reason=regime.reason))
+                return 0
         key, _ = work_identity(op)
         if key is None or key[1] == INVALID_ALIAS:
             raise ValueError("diagnostic reference has an unsupported layer or state-alias identity")
@@ -207,4 +217,5 @@ class DiagnosticReferencePrices(PriceLibrary):
     def describe(self):
         return (f"DiagnosticReferencePrices({self.exact_reference_count} exact references; "
                 f"{self.bounded_prediction_count} frozen MHA predictions; source_qualified=False; "
+                f"{len(self.excluded_references)} excluded invalid references; "
                 f"base={self.base.describe()})")

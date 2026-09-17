@@ -63,3 +63,17 @@ def test_invalid_observations_do_not_change_fit_treatment_or_launch_composition(
     assert sum(row['observations'] for row in exclusions if row['reason']==A.CACHED_ROW_STARTS_REFUSAL)==2
     assert (tmp_path/'bad_same_treatment.price.json').read_bytes()==raw
     assert len(library._attention_obs)==10  # Evidence retained, not erased.
+
+
+def test_diagnostic_exact_reference_cannot_admit_invalid_cached_metadata():
+    from atom.compass.core.cost.diagnostic_references import DiagnosticReferencePrices
+
+    overlay=DiagnosticReferencePrices.__new__(DiagnosticReferencePrices)
+    overlay._selected={}
+    overlay.excluded_references=[]
+    invalid=op([7,16],[42016,2992],[0,42016])
+    raw={'seconds':.123,'reference_cell_id':'invalid_reference','source_graph':{'sha256':'f'*64}}
+    assert overlay._insert(invalid,raw)==0 and not overlay._selected
+    assert overlay.excluded_references==[dict(reference_cell_id='invalid_reference',
+        source_graph={'sha256':'f'*64},reason=A.CACHED_ROW_STARTS_REFUSAL)]
+    assert raw['seconds']==.123
