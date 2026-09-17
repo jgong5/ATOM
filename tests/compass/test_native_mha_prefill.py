@@ -142,3 +142,45 @@ def test_graph_collective_registration_does_not_select_local_attention(registrat
     seconds,coverage,launches=library.body(graph)
     assert seconds>0 and coverage.complete and coverage.interpolated==1 and launches==0
     assert len(calls)==1 and calls[0][2]==registration
+
+
+def complete_allocation(op):
+    context=dict(op['context'])
+    context['block_tables']=list(range((context['context_lens'][0]+15)//16))
+    op['context']=list(context.items())
+    return op
+
+
+def test_validated_native_model_precedes_older_dense_projection_but_not_base():
+    calls=[]
+    model=SimpleNamespace(validation={'sha256':'a'*64},quote=lambda op:
+        calls.append(op) or {'seconds':.077,'model_provenance':{'group':'N1_causal'}})
+    library,_=wrapper();library.low_query_model=model
+    result,_=library.lookup(operator(),{'tp':1},'unregistered')
+    assert result['seconds']==.077 and result[INTERPOLATED_FLAG]
+    assert result['independent_operator_validation']==model.validation
+    assert result['kernel_count'] is None and _record_launch_count(result)==0
+    exact={'seconds':.456,'source':'valid native exact'}
+    library,_=wrapper(result=exact);library.low_query_model=model
+    before=len(calls)
+    assert library.lookup(operator(),{'tp':1})[0] is exact and len(calls)==before
+
+
+def test_native_model_out_of_scope_retains_old_bounded_fallback_and_scope_guards():
+    library,_=wrapper();library.low_query_model=SimpleNamespace(quote=lambda op:None)
+    result,_=library.lookup(complete_allocation(operator()),{'tp':1})
+    assert result['seconds']>0 and 'native_mha_prefill_transfer' in result
+    library.low_query_model=SimpleNamespace(validation={},quote=lambda op:
+        {'seconds':.077,'model_provenance':{}})
+    assert library.lookup(operator(),{'tp':2})[0] is None
+    library.family.request_attention_scope.scopes['unified']['kv_cache_dtype']='fp8'
+    assert 'scope differs' in library.lookup(operator(),{'tp':1})[1]
+
+
+def test_invalid_native_allocation_cannot_fall_through_to_older_projection():
+    library,_=wrapper();library.low_query_model=SimpleNamespace(quote=lambda op:None)
+    op=complete_allocation(operator());context=dict(op['context'])
+    context['block_tables'][-1]=0  # Tail aliases a cached prefix block.
+    op['context']=list(context.items())
+    record,why=library.lookup(op,{'tp':1})
+    assert record is None and 'invalid prefix/tail aliases' in why

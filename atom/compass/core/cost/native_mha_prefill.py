@@ -21,6 +21,7 @@ def _identity(op):
     """The dense or proved native-V class of one small cached-prefill query."""
     if (op.get("name") != MHA or op.get("group") is not None
             or op.get("int_values") or op.get("int_ranges")
+            or op.get("abi", "") or op.get("launch") or op.get("param_names")
             or op.get("output_aliases") != [None]):
         return None
     identity = _mha_identity(op)
@@ -205,30 +206,71 @@ class NativeMhaPrefillFallback(PriceLibrary):
         if provider is None:
             raise ValueError("cached-prefill fallback requires the original scoped source library")
         self.family = provider
+        self.low_query_model = None
+        if handoff.get("low_query_model"):
+            from atom.compass.core.cost.native_mha_low_query import NativeMhaLowQueryModel
+
+            if handoff.get("selection_order") != [
+                    "valid_base_prices", "validated_native_low_query", "bounded_dense_prefix_fallback"]:
+                raise ValueError("native low-query addition must declare its source-based selection order")
+            self.low_query_model = NativeMhaLowQueryModel(reader, handoff["low_query_model"],
+                deployment_scope_sha256=deployment_scope_sha256)
         self.handoff_sha256 = handoff_sha256
         self.loaded_inputs = base.loaded_inputs + tuple(reader.inputs)
         self.sources = base.sources + [str(handoff_path)]
         self._prices, self.address_shifted = base._prices, base.address_shifted
 
-    def _fallback(self, op, topology, registration, original):
-        if isinstance(op, PreparedOperator):
-            op = op.as_dict()
-        identity = _identity(op)
-        if (identity is None or not topology or topology.get("tp") != 1
+    def _scope_error(self, op, topology):
+        if (not topology or topology.get("tp") != 1
                 or any(type(value) is not int or value != 1 for value in topology.values())):
-            return original
+            return "cached-prefill fallback requires its TP1 scope"
         if getattr(self.family, "launch_charge_seconds", 0) != 0:
-            return None, "cached-prefill fallback requires zero added launch charge"
+            return "cached-prefill fallback requires zero added launch charge"
         declared = self.family.request_attention_scope
         if not isinstance(declared, attention_scope.Declaration):
             try:
                 declared = attention_scope.declaration_of(declared, where="cached-prefill fallback current scope")
             except ValueError:
-                return None, "cached-prefill fallback has no current deployment scope"
+                return "cached-prefill fallback has no current deployment scope"
         expected = _layout_without_capacity(attention.scoped(op, self.declaration.for_family("unified")))
         actual = _layout_without_capacity(attention.scoped(op, declared.for_family("unified")))
         if attention._scope_matches(expected, actual) is not None:
-            return None, "cached-prefill fallback current backend/KV scope differs"
+            return "cached-prefill fallback current backend/KV scope differs"
+        return None
+
+    def _fallback(self, op, topology, registration, original):
+        if isinstance(op, PreparedOperator):
+            op = op.as_dict()
+        if getattr(self, "low_query_model", None) is not None:
+            quote = self.low_query_model.quote(op)
+            if quote is not None:
+                why = self._scope_error(op, topology)
+                if why is not None:
+                    return None, why
+                source = "interpolated://native-mha-prefill/validated-low-query"
+                return OperatorEventRecord(seconds=quote["seconds"], kernels={}, source=source,
+                    **{INTERPOLATED_FLAG: True}, source_qualified=False,
+                    whole_forward_validation_required=True, kernel_dispatch_observed=False,
+                    kernel_count=None, launch_count=None,
+                    interpolation=dict(family=MHA, regime="unified.prefill.cached.native_low_query",
+                        basis="modelled", detail=quote["model_provenance"]),
+                    native_mha_low_query=quote["model_provenance"],
+                    independent_operator_validation=self.low_query_model.validation,
+                    source_selection="valid base first, validated native model before dense-prefix fallback"), source
+            # A malformed allocation is not permission to fall through to an
+            # older model whose geometric key does not describe joint aliases.
+            from atom.compass.core.cost.native_mha_low_query import coordinates, sharing_pattern
+
+            row = coordinates(op)
+            if row is not None and sharing_pattern(op, row) is None:
+                return None, "cached-prefill native allocation has invalid prefix/tail aliases"
+        identity = _identity(op)
+        if (identity is None or not topology or topology.get("tp") != 1
+                or any(type(value) is not int or value != 1 for value in topology.values())):
+            return original
+        why = self._scope_error(op, topology)
+        if why is not None:
+            return None, why
         q, prefix, layer, key = identity
         sources = [self.endpoints.get((key, bound)) for bound in PREFIXES]
         if any(source is None for source in sources):
@@ -274,4 +316,5 @@ class NativeMhaPrefillFallback(PriceLibrary):
         raise ValueError("build baseline prices before attaching cached-prefill fallback")
 
     def describe(self):
-        return f"NativeMhaPrefillFallback(Q1-15 bounded prefix; old lookup first; base={self.base.describe()})"
+        native = "validated native low-query model; " if self.low_query_model is not None else ""
+        return f"NativeMhaPrefillFallback({native}bounded prefix fallback; base first; base={self.base.describe()})"
