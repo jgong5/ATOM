@@ -79,6 +79,35 @@ def _install_compass_clock(config) -> None:
     logger.info("ATOMCompass: engine core running on a virtual clock")
 
 
+def _restamp_undeclared_arrivals(seqs) -> None:
+    """Stamp arrival here, on the only clock that knows simulated "now".
+
+    A simulated run holds two virtual clocks, one per process, and only this
+    one advances -- the API process stamps arrival before handing the sequence
+    over, and its clock sits at the epoch forever. A client that declared its
+    arrivals is unaffected: the declaration is an offset from a shared epoch
+    and needs no clock at all. A closed-loop client has nothing to declare,
+    because simulated time is only knowable once the previous response returns,
+    so without this every one of its requests arrives at t=0. Measured, that
+    put four sequential requests at the same instant, inflated TTFT by the
+    queueing that arrival had already passed, and collapsed the run's span onto
+    its busy time.
+
+    This runs on the input socket thread while the busy loop may be mid-step,
+    so the reading is accurate to one step. That is the same granularity the
+    scheduler makes every other decision at.
+
+    A real clock is left alone: there "now" in the API process is the truth,
+    and it is stamped closer to the wire than this is.
+    """
+    clock = get_clock()
+    if getattr(clock, "epoch", None) is None:
+        return
+    for seq in seqs:
+        if not getattr(seq, "compass_arrival_declared", False):
+            seq.arrive_time = clock.time()
+
+
 def _stamp_step_start(scheduled_batch) -> None:
     """Tell the runner when this step begins, on this process's clock.
 
@@ -622,6 +651,7 @@ class EngineCore:
                         logger.debug(
                             f"{self.label}: input get {request_type} {req_ids}"
                         )
+                        _restamp_undeclared_arrivals(reqs)
                         self.input_queue.put_nowait(reqs)
                     elif request_type == EngineCoreRequestType.UTILITY:
                         cmd = reqs.get("cmd") if isinstance(reqs, dict) else None

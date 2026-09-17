@@ -42,6 +42,15 @@ def _stamp_arrival(arrival_time: float | None) -> float:
     means anything on a clock that knows where the run began -- a virtual one.
     Against a real server there is no start-of-run to offset from, so a declared
     arrival is ignored and "now" is used, which is the right answer there.
+
+    With no declared arrival on a *virtual* clock this returns the epoch, which
+    is a placeholder and not an answer: this process's clock never advances --
+    the engine core owns progress and runs in another process -- so "now" here
+    reads as the start of the run for every request, however late it was sent.
+    A closed-loop client cannot declare an arrival, because it does not know
+    simulated time until the previous response comes back, so it lands here on
+    every request. The engine core restamps it on admission; the marker is
+    ``Sequence.compass_arrival_declared``.
     """
     clock = get_clock()
     if arrival_time is None:
@@ -792,6 +801,7 @@ class InputOutputProcessor:
                 dp_parent_session_id=dp_parent_session_id,
             )
             seq.arrive_time = _stamp_arrival(arrival_time)
+            seq.compass_arrival_declared = arrival_time is not None
             seq.compass_workload_size = workload_size
             self.requests[seq.id] = seq
             if seq.external_request_id is not None:

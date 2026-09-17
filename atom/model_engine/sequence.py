@@ -257,6 +257,13 @@ class Sequence:
 
         # statistics fields
         self.arrive_time = 0.0
+        # Whether arrive_time above is the caller's declared arrival or a
+        # placeholder to be restamped. A simulated run keeps two virtual
+        # clocks -- one per process -- and only the engine core's advances, so
+        # the API process cannot read simulated "now". When nothing was
+        # declared it stamps the frozen epoch and the engine core replaces it
+        # on admission. See _stamp_arrival and EngineCoreRequestType.ADD.
+        self.compass_arrival_declared = False
         self.first_token_time = 0.0
         self.leave_time = 0.0
         # Stamped by the engine core when the sequence finishes, on whichever
