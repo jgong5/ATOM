@@ -116,6 +116,7 @@ def source_cost_oracle(*, region_overlay, region_overlay_sha256, regions,
                        diagnostic_reference_handoff=None, diagnostic_reference_handoff_sha256=None,
                        exact_operator_handoff=None, exact_operator_handoff_sha256=None,
                        native_mha_decode_layout_handoff=None, native_mha_decode_layout_handoff_sha256=None,
+                       native_mha_prefill_handoff=None, native_mha_prefill_handoff_sha256=None,
                        composition_qualification=None, composition_qualification_sha256=None,
                        compiled_prefill_execution_handoff=None, compiled_prefill_execution_handoff_sha256=None,
                        include_failed_outputless=False, include_failed_final=False, diagnostic_only=False,
@@ -163,6 +164,10 @@ def source_cost_oracle(*, region_overlay, region_overlay_sha256, regions,
         raise ValueError("native MHA layout handoff and its SHA-256 are required together")
     if native_mha_decode_layout_handoff and not (_flag(diagnostic_only, "diagnostic_only") or composition_qualification):
         raise ValueError("native MHA layout transfer requires diagnostic mode or composition qualification")
+    if bool(native_mha_prefill_handoff) != bool(native_mha_prefill_handoff_sha256):
+        raise ValueError("native MHA prefill handoff and its SHA-256 are required together")
+    if native_mha_prefill_handoff and not (_flag(diagnostic_only, "diagnostic_only") or composition_qualification):
+        raise ValueError("native MHA prefill fallback requires diagnostic mode or composition qualification")
     if bool(composition_qualification) != bool(composition_qualification_sha256):
         raise ValueError("composition qualification and its SHA-256 are required together")
     if bool(compiled_prefill_execution_handoff) != bool(compiled_prefill_execution_handoff_sha256):
@@ -334,6 +339,16 @@ def source_cost_oracle(*, region_overlay, region_overlay_sha256, regions,
         previous = len(result.library.loaded_inputs)
         result.library = NativeMhaDecodeLayout(result.library, native_mha_decode_layout_handoff,
             native_mha_decode_layout_handoff_sha256, deployment_scope_sha256=scopes[0].sha256)
+        result.compass_loaded_inputs += result.library.loaded_inputs[previous:]
+    if native_mha_prefill_handoff:
+        from atom.compass.core.cost.native_mha_prefill import NativeMhaPrefillFallback
+
+        scopes = [entry for entry in result.library.loaded_inputs if entry.role == "oracle.attention_scope"]
+        if len(scopes) != 1 or result.seconds_per_launch != 0:
+            raise ValueError("native MHA prefill fallback requires one deployment scope and zero added launch charge")
+        previous = len(result.library.loaded_inputs)
+        result.library = NativeMhaPrefillFallback(result.library, native_mha_prefill_handoff,
+            native_mha_prefill_handoff_sha256, deployment_scope_sha256=scopes[0].sha256)
         result.compass_loaded_inputs += result.library.loaded_inputs[previous:]
     if native_ap_handoff:
         from atom.compass.core.cost.native_ap_regions import NativeAPFamilyRegions
