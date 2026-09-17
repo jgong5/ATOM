@@ -112,6 +112,8 @@ def runtime_readings(side):
              "borrowed_source_capture_sizes": opening.EFFECTIVE_DECODE_BUCKETS if side == "modelled" else None,
              "borrowed_target_input": {"sha256": "b" * 64} if side == "modelled" else None}
     return {"worker_runtime": [{"reader": {"component": "ModelRunner", "pid": 321},
+                                 "allocation_policy": {"torch_git_version": "3d3aa833db84eed6b7f5595cb5f162c2f78300a4",
+                                     "deterministic_algorithms": False, "fill_uninitialized_memory": True},
                                  "configuration": configuration, "graphs": graph}],
             "core_cache": {"ranks": [{"reader": {"component": "EngineCore.Scheduler", "pid": 322},
                                        "policy": cache_on_policy(),

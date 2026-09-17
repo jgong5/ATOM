@@ -4,6 +4,8 @@ import os
 
 
 def worker_snapshot(runner):
+    from atom.compass.core.cost.allocation_only import runtime_policy
+
     config = runner.config
     compilation = getattr(config, "compilation_config", None)
     mode = getattr(getattr(runner, "_compass_config", None), "mode", None)
@@ -31,6 +33,7 @@ def worker_snapshot(runner):
         "reader": {"component": "ModelRunner", "implementation": type(runner).__qualname__,
                    "pid": os.getpid(), "rank": getattr(runner, "rank", None)},
         "configuration": resolved,
+        "allocation_policy": runtime_policy(),
         "graphs": {
             "effective_decode_buckets": sorted(effective) if effective is not None else None,
             "effective_decode_order": effective,

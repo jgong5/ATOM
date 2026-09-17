@@ -276,6 +276,11 @@ class ExactOperatorReferences(PriceLibrary):
             self.acquisition_evidence[name] = [reader.read(pin, name + str(i)) for i, pin in enumerate(source.get(name, []))]
         for i, pin in enumerate(handoff.get("extra_evidence", [])):
             reader.read(pin, "extra_evidence" + str(i))
+        self.allocation_only = None
+        if handoff.get("allocation_only"):
+            from atom.compass.core.cost.allocation_only import AllocationOnly
+
+            self.allocation_only = AllocationOnly(reader, handoff["allocation_only"])
         cases = {case["name"]: case for case in source["cases"]}
         selected = handoff["cases"]
         if not selected or len(set(selected)) != len(selected) or any(name not in cases for name in selected):
@@ -342,11 +347,15 @@ class ExactOperatorReferences(PriceLibrary):
 
     def lookup(self, op, topology=None, registration=None):
         selected = self._source_lookup(op, topology)
-        return selected if selected is not None else self.base.lookup(op, topology, registration)
+        result = selected if selected is not None else self.base.lookup(op, topology, registration)
+        allocation = getattr(self, "allocation_only", None)
+        return allocation.finish(op, topology, result) if allocation is not None else result
 
     def _body_lookup(self, op, topology, registration, modelled_memo):
         selected = self._source_lookup(op, topology)
-        return selected if selected is not None else self.base._body_lookup(op, topology, registration, modelled_memo)
+        result = selected if selected is not None else self.base._body_lookup(op, topology, registration, modelled_memo)
+        allocation = getattr(self, "allocation_only", None)
+        return allocation.finish(op, topology, result) if allocation is not None else result
 
     def add(self, *args, **kwargs):
         raise ValueError("build baseline prices before attaching exact operator references")
@@ -359,7 +368,9 @@ class ExactOperatorReferences(PriceLibrary):
 
     def _prepared_config_key(self, topology, registration):
         key = self.base._prepared_config_key(topology, registration)
-        return None if key is None else (key, self.handoff_sha256)
+        allocation = getattr(self, "allocation_only", None)
+        policy = allocation.configuration_key() if allocation is not None else None
+        return None if key is None else (key, self.handoff_sha256, policy)
 
     def describe(self):
         return f"ExactOperatorReferences({len(self._selected)} finite event references; dispatch unobserved; no interpolation; base={self.base.describe()})"

@@ -116,6 +116,10 @@ def check_server_configuration(server, case, side):
     if len(workers) != 1 or len(cores) != 1:
         return ["opening requires one worker runtime and one core cache-policy record"]
     worker, core = workers[0], cores[0]
+    from atom.compass.core.cost.allocation_only import uninitialized
+
+    if not uninitialized(worker.get("allocation_policy") or {}):
+        bad.append("opening worker lacks pinned uninitialized-allocation semantics with deterministic filling disabled")
     for label, reading, component in (("worker", worker, "ModelRunner"),
                                       ("core", core, "EngineCore.Scheduler")):
         owner = reading.get("reader") or {}
