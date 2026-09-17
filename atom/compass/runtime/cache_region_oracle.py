@@ -118,6 +118,7 @@ def source_cost_oracle(*, region_overlay, region_overlay_sha256, regions,
                        native_mha_decode_layout_handoff=None, native_mha_decode_layout_handoff_sha256=None,
                        native_mha_prefill_handoff=None, native_mha_prefill_handoff_sha256=None,
                        composition_qualification=None, composition_qualification_sha256=None,
+                       composition_extension=None, composition_extension_sha256=None,
                        compiled_prefill_execution_handoff=None, compiled_prefill_execution_handoff_sha256=None,
                        include_failed_outputless=False, include_failed_final=False, diagnostic_only=False,
                        q16_handoff=None, q16_handoff_sha256=None,
@@ -170,6 +171,10 @@ def source_cost_oracle(*, region_overlay, region_overlay_sha256, regions,
         raise ValueError("native MHA prefill fallback requires diagnostic mode or composition qualification")
     if bool(composition_qualification) != bool(composition_qualification_sha256):
         raise ValueError("composition qualification and its SHA-256 are required together")
+    if bool(composition_extension) != bool(composition_extension_sha256):
+        raise ValueError("composition extension and its SHA-256 are required together")
+    if composition_extension and not (composition_qualification and compiled_prefill_execution_handoff):
+        raise ValueError("composition extension requires the original qualification and unchanged execution model")
     if bool(compiled_prefill_execution_handoff) != bool(compiled_prefill_execution_handoff_sha256):
         raise ValueError("compiled-prefill execution source and its SHA-256 are required together")
     if compiled_prefill_execution_handoff and not (_flag(diagnostic_only, "diagnostic_only") or composition_qualification):
@@ -363,13 +368,20 @@ def source_cost_oracle(*, region_overlay, region_overlay_sha256, regions,
         result.regions = selected
         result.compass_region_snapshot = region_snapshot("native-ap-families", selected)
         result.compass_loaded_inputs += selected.loaded_inputs
+    extension = None
+    if composition_extension:
+        from atom.compass.core.cost.composition_extension import CompositionExtension
+
+        extension = CompositionExtension(composition_extension, composition_extension_sha256,
+                                         options=composition_options)
     if compiled_prefill_execution_handoff:
         from atom.compass.core.cost.compiled_prefill_execution import CompiledPrefillExecution
 
         if not result.require_complete or result.seconds_per_launch != 0:
             raise ValueError("compiled-prefill execution requires complete raw coverage and zero extra launch charge")
         result.execution_model = CompiledPrefillExecution.load(compiled_prefill_execution_handoff,
-            compiled_prefill_execution_handoff_sha256, oracle=result, options=composition_options)
+            compiled_prefill_execution_handoff_sha256, oracle=result, options=composition_options,
+            extension=extension)
         result.compass_loaded_inputs += result.execution_model.loaded_inputs
     if composition_qualification:
         from atom.compass.core.cost.composition_qualification import validate
@@ -378,6 +390,7 @@ def source_cost_oracle(*, region_overlay, region_overlay_sha256, regions,
             raise ValueError("composition qualification requires the source-work A/P model and zero extra launch charge")
         result.compass_composition_qualification, loaded = validate(
             composition_qualification, composition_qualification_sha256,
-            inputs=result.compass_loaded_inputs, options=composition_options, regions=result.regions, oracle=result)
+            inputs=result.compass_loaded_inputs, options=composition_options, regions=result.regions,
+            oracle=result, extension=extension)
         result.compass_loaded_inputs += loaded
     return result

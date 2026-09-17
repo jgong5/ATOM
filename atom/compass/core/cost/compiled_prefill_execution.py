@@ -38,7 +38,7 @@ class CompiledPrefillExecution:
         self.loaded_inputs = tuple(inputs)
 
     @classmethod
-    def load(cls, path, sha256, *, oracle, options):
+    def load(cls, path, sha256, *, oracle, options, extension=None):
         inputs = []
         def read(pin, role):
             value, loaded = load_json(str(Path(path).parent / pin["path"]), role=PREFIX + role)
@@ -66,10 +66,13 @@ class CompiledPrefillExecution:
         quotes = evidence["body_quotes"]
         historical_inputs = read(quotes["loaded_inputs"], "body_loaded_inputs")
         historical_options = read(data["body_options"], "body_options")
-        if body_inputs(historical_inputs) != body_inputs(oracle.compass_loaded_inputs):
-            raise ValueError("compiled-prefill B sources changed; a new source fit is required")
-        if body_options(historical_options) != body_options(options):
-            raise ValueError("compiled-prefill B source selection changed")
+        if extension is None:
+            if body_inputs(historical_inputs) != body_inputs(oracle.compass_loaded_inputs):
+                raise ValueError("compiled-prefill B sources changed; a new source fit is required")
+            if body_options(historical_options) != body_options(options):
+                raise ValueError("compiled-prefill B source selection changed")
+        else:
+            extension.check_body_identity(historical_inputs, historical_options, oracle, options)
         if (quotes.get("source_only") is not True or quotes.get("heldout_rows_read") is not False
                 or quotes.get("e2e_timings_read") is not False
                 or quotes["source"]["sha256"] != data["evidence"]["source"]["sha256"]):
@@ -81,6 +84,8 @@ class CompiledPrefillExecution:
                 or len(observations) != len(expected)
                 or {row["source_row_index"] for row in observations} != expected):
             raise ValueError("compiled-prefill fit omits or duplicates source observations")
+        if extension is not None:
+            extension.check_calibration(oracle, source, quotes)
         groups = {}
         for observation in observations:
             row = source[observation["source_row_index"]]

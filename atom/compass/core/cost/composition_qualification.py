@@ -54,7 +54,8 @@ def source_selection(options):
     arguments.apply_defaults()
     result = dict(arguments.arguments)
     result.update(result.pop("options"))
-    for name in ("diagnostic_only", "composition_qualification", "composition_qualification_sha256"):
+    for name in ("diagnostic_only", "composition_qualification", "composition_qualification_sha256",
+                 "composition_extension", "composition_extension_sha256"):
         result.pop(name, None)
     result["rank_coords"] = {"tp": 0, **_rank_coords(result.get("rank_coords"))}
     return json.loads(json.dumps({key: value for key, value in result.items() if value is not None}))
@@ -120,7 +121,7 @@ def request_namespace(start):
     return tuple(start[key] for key in fields) + (start["pid"], start["started_at"])
 
 
-def validate(path, sha256, *, inputs, options, regions, oracle):
+def validate(path, sha256, *, inputs, options, regions, oracle, extension=None):
     """Re-quote the actual oracle and recompute every independent forward gate."""
     data, receipt = load_json(path, role=ROLE_PREFIX + "receipt")
     loaded = [receipt]
@@ -137,12 +138,18 @@ def validate(path, sha256, *, inputs, options, regions, oracle):
         raise ValueError("composition qualification lacks the unchanged whole-forward policy")
     identity = read(data["predictor_identity"], "predictor_identity")
     frozen = read(data["predictor_freeze"], "predictor_freeze")
+    if extension is None:
+        unchanged_identity = (
+            identity["body_book"]["loaded_inputs"] == input_identity(inputs)
+            and identity["body_book"]["source_selection"] == source_selection(options)
+            and identity.get("code") == code_identity())
+    else:
+        extension.check_identity(identity, inputs, options, oracle)
+        unchanged_identity = True
     if (identity.get("schema") != "compass.complete_predictor_identity/1"
             or identity.get("complete_identity") is not True
             or identity.get("target_end_to_end_timings_used") is not False
-            or identity["body_book"]["loaded_inputs"] != input_identity(inputs)
-            or identity["body_book"]["source_selection"] != source_selection(options)
-            or identity.get("code") != code_identity() or identity.get("host_rule") != host_rule(oracle)
+            or not unchanged_identity or identity.get("host_rule") != host_rule(oracle)
             or frozen.get("frozen_before_heldout_warmups") is not True
             or frozen.get("source_refitted") is not False
             or frozen["predictor_identity"]["sha256"] != data["predictor_identity"]["sha256"]):
@@ -236,8 +243,13 @@ def validate(path, sha256, *, inputs, options, regions, oracle):
             data["initial_branch"], read, identity)
     elif data.get("initial_branch"):
         raise ValueError("unconfigured initial P qualification evidence")
+    extension_check = {}
+    if extension is not None:
+        extension_check = dict(qualification_extension=extension.check_quotes(
+            oracle, sources, rows, dict(path=source_path, sha256=source_sha)))
+        loaded.extend(extension.loaded_inputs)
     return dict(passed=True, independent_forward_steps=len(checks),
                 independent_prefill_steps=sum(eligible(v[0]) for v in groups.values()),
                 unique_geometries_requoted=len(quotes), checks=checks,
                 initial_postprocess_checks=initial_checks,
-                primitive_source_statuses_unchanged=True), tuple(loaded)
+                primitive_source_statuses_unchanged=True, **extension_check), tuple(loaded)
