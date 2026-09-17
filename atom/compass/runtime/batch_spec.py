@@ -571,7 +571,10 @@ class BatchSpec:
         if self.has_cached:
             recorded += [
                 ("total_kv", sum(self.context_lens)),
-                ("seq_starts", list(_prefix_starts(self.cached_lens))),
+                # The gather indexes each request's own block-table row.
+                # Native CommonAttentionBuilder starts every prefix at zero;
+                # cu_seqlens_k already gives the offset in the packed output.
+                ("seq_starts", [0] * self.batch_size),
                 ("num_cached_tokens", list(self.cached_lens)),
             ]
 
@@ -707,14 +710,6 @@ class BatchSpec:
                 ("has_initial_state",
                  [[1 if c > 0 else 0 for c in self.cached_lens], "bool"]))
         return tuple(recorded)
-
-
-def _prefix_starts(lengths):
-    total = 0
-    for n in lengths:
-        yield total
-        total += n
-
 
 
 def install(spec: "BatchSpec", device: str = "cpu"):

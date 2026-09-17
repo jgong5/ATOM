@@ -761,15 +761,11 @@ def cached_prefill_op(rows):
     """A prefill that reads a cached prefix, with the three extra fields."""
     op = prefill_attention_op(rows)
     cached = [c - q for q, c in rows]
-    starts, run = [], 0
-    for n in cached:
-        starts.append(run)
-        run += n
     op["context"].extend([
         ["has_cached", True],
         ["state", "prefill_prefix"],
         ["total_kv", sum(c for _, c in rows)],
-        ["seq_starts", starts],
+        ["seq_starts", [0] * len(rows)],
         ["num_cached_tokens", cached],
     ])
     return op
@@ -799,7 +795,7 @@ def test_the_cached_fields_are_the_cohorts_own():
                               prefill=16384), carried())
     ctx = _ctx(bound)
     assert ctx["num_cached_tokens"] == [16384, 32768]
-    assert ctx["seq_starts"] == [0, 16384]
+    assert ctx["seq_starts"] == [0, 0]
     assert ctx["total_kv"] == 65536
     assert ctx["cu_seqlens_k"] == [0, 24576, 65536]
     assert ctx["cu_seqlens_q"] == [0, 8192, 16384]
@@ -817,7 +813,7 @@ def test_a_ragged_cached_cohort_binds_row_by_row():
                               bucket=None, prefill=12288), carried())
     ctx = _ctx(bound)
     assert ctx["num_cached_tokens"] == [128, 4096, 61440]
-    assert ctx["seq_starts"] == [0, 128, 4224]
+    assert ctx["seq_starts"] == [0, 0, 0]
     assert ctx["total_kv"] == 4224 + 8192 + 65536
 
 

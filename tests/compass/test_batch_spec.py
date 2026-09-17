@@ -176,6 +176,34 @@ class TestPrefillIsNotDecodeWithTheSameShapes:
         assert derived["num_cached_tokens"] == [66]
         assert derived["seq_starts"] == [0]
 
+    @pytest.mark.parametrize("queries,contexts", [
+        ((13, 12), (249965, 148268)),
+        ((15, 16, 1, 7), (195999, 58080, 104593, 102935)),
+    ])
+    def test_cached_gather_reads_each_requests_own_prefix(self, queries, contexts):
+        """Use the gather kernel's addressing rule, including the failed N2 extent."""
+        spec = BatchSpec(kind="prefill", query_lens=queries,
+                         context_lens=contexts, block_size=16,
+                         max_model_len=262144, block_policy="packed")
+        context = dict(spec.attention_context())
+        tables = spec.tables()
+        stored_columns = len(context["block_tables"]) // len(queries)
+        table_width = context["block_tables_shape"][1]
+        for row, count in enumerate(contexts):
+            packed_start = context["cu_seqlens_k"][row]
+            for local_token in (0, count - 1):
+                token_id = packed_start + local_token
+                # cp_mha_gather_cache_kernel uses a within-row seq_start;
+                # CommonAttentionBuilder initializes that buffer to zeros.
+                batch_offset = (token_id - packed_start
+                                + context["seq_starts"][row])
+                column = batch_offset // 16
+                assert 0 <= column < table_width
+                assert column < len(tables[row])
+                block = context["block_tables"][row * stored_columns + column]
+                assert block == tables[row][local_token // 16]
+                assert batch_offset % 16 == local_token % 16
+
     def test_four_tokens_one_sequence_is_not_four_decodes(self):
         """The claim the old token-count derivation could not distinguish."""
         body = self._prefill()

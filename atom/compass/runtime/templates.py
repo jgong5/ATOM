@@ -676,25 +676,22 @@ def _bind(key, template_value, rows, pad_rows: int = 0, pad_tokens: int = 0,
         # The cached-prefix branch of `BatchSpec.attention_context`, which
         # `template_key` now separates, so a template carrying these is bound
         # only to a cohort that also reads a cached prefix. Each is the
-        # recording rule verbatim: the total keys attention walks, the start of
-        # each request's cached prefix, and how many tokens of it were already
-        # there -- `cached_lens`, which is context minus query.
+        # recording rule verbatim: the total keys attention walks, the start
+        # within each request's own block-table row, and its cached length.
         cached = [c - q for q, c in rows]
         if key == "total_kv":
             return sum(contexts)
         if key == "num_cached_tokens":
             return cached
-        starts, run = [], 0
-        for n in cached:
-            starts.append(run)
-            run += n
         if len(template_value) != len(rows):
             raise BindRefusal(
                 f"seq_starts has {len(template_value)} entries and this batch "
                 f"has {len(rows)} requests; it is one start per prefill row, "
                 "and a batch whose prefill rows are not all of it is a "
                 "structure this function has not been shown")
-        return starts
+        # Native CommonAttentionBuilder starts every full-prefix gather at
+        # zero. Packed-output offsets are already carried by cu_seqlens_k.
+        return [0] * len(rows)
     if key in CARRIED_CONSTANTS:
         return template_value
     if key in ("num_prefills", "num_prefill_tokens", "num_decodes",
