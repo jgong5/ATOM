@@ -85,6 +85,9 @@ __all__ = ["REQUIRED_SCOPE", "UNIFIED_SCOPE", "GDN_SCOPE", "UNIFIED", "GDN",
 
 UNIFIED = "aiter::unified_attention_with_output_base"
 GDN = "aiter::linear_attention_with_output_base"
+CACHED_ROW_STARTS_REFUSAL = (
+    "cached-prefill seq_starts must be zero per request row; "
+    "nonzero row offsets do not measure the native full-context gather")
 
 #: The native chunk width the GDN scan is written against. Declared here so a
 #: chunk-count feature can be stated; it is not a fitted quantity, and a
@@ -1018,6 +1021,18 @@ def regime_of(op: dict, structure: Optional[Structure] = None, scope=None):
             return Refusal(
                 "the key does not say whether a cached prefix was read, and "
                 "the cold and cached prefill paths read different KV")
+        if structure.has_cached:
+            starts = _context(op).get("seq_starts")
+            if starts is not None and (
+                    not isinstance(starts, (list, tuple))
+                    or len(starts) != structure.sequences
+                    or any(type(value) is not int or value != 0 for value in starts)):
+                # Full-context cached prefill gathers each sequence from its
+                # own block-table column zero. Old derived graphs accumulated
+                # other sequences' histories here, reading unrelated columns
+                # (or beyond the table). Those measurements cannot fit the
+                # native cached law, even when their exact keys never match.
+                return Refusal(CACHED_ROW_STARTS_REFUSAL)
         return REGIMES["unified.prefill.cached" if structure.has_cached
                        else "unified.prefill.cold"]
     if name == GDN:

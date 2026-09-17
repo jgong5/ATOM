@@ -1034,6 +1034,14 @@ class ParametricPriceLibrary(PriceLibrary):
         coverage = dict(self.attention_model().coverage())
         coverage["observations"] = len(self._attention_obs)
         coverage["design_points"] = len(self.attention_design_points())
+        excluded = {}
+        for item in self._classified_evidence():
+            if item["refusal"] is not None:
+                key = item["source"], item["refusal"]
+                excluded[key] = excluded.get(key, 0) + 1
+        coverage["excluded_from_fits"] = [
+            dict(source=source, reason=reason, observations=count)
+            for (source, reason), count in sorted(excluded.items())]
         # How the numbers were acquired, reported beside what they cover. A
         # reader deciding whether to trust a modelled price needs to see that
         # two policies are present, or that one file recorded none -- neither
@@ -1465,6 +1473,8 @@ class ParametricPriceLibrary(PriceLibrary):
                 regime = attention.regime_of(op, None, full)
                 evidence.append({
                     "op": op,
+                    "source": _source,
+                    "refusal": regime.reason if isinstance(regime, attention.Refusal) else None,
                     "family": op.get("name"),
                     "geometry": attention.geometry_of(op),
                     # The scope as WRITTEN, for `_shown_to_match`, which
@@ -1669,6 +1679,8 @@ class ParametricPriceLibrary(PriceLibrary):
     def _find_treatment(self, family, geometry, wanted, requested, selector):
         treatments = set()
         for obs in self._classified_evidence():
+            if obs["refusal"] == attention.CACHED_ROW_STARTS_REFUSAL:
+                continue
             if obs["family"] != family:
                 continue
             if obs["geometry"] != geometry:
