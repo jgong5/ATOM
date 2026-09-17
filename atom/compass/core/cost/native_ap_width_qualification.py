@@ -7,6 +7,7 @@ from atom.compass.core.cost.composition_qualification import (
     offer_observation, request_namespace, source_selection,
 )
 from atom.compass.core.cost.native_ap_width import PRIMARY, primary_rows
+from atom.compass.core.cost.composition_extension import observation_key
 from atom.compass.core.loaded_input import load_json
 
 SCHEMA = "compass.native_width_forward_qualification/1"
@@ -82,10 +83,13 @@ def validate(data, receipt, *, path, sha256, inputs, options, regions, oracle):
         prediction = predicted[name]
         if (prediction["chain_step"] != PRIMARY[name]
                 or prediction["geometry"] != geometry(source_groups[name][0]["descriptor"])
+                or any(observation_key(r) != prediction["observation_key"]
+                       or r["descriptor"]["state_rows"] != prediction["state_rows"]
+                       for r in [*source_groups[name], *rows])
                 or any(geometry(r["descriptor"]) != prediction["geometry"]
                        or r["descriptor"].get("seq_starts") != [0] * len(r["descriptor"]["q"])
                        or r.get("normal_return") is not True for r in rows)):
-            raise ValueError("width heldout changes the frozen native control geometry")
+            raise ValueError("width heldout changes the frozen native control geometry or offered state")
         quote = oracle.estimate(offer_observation(oracle.native_allocation, rows[0]))
         expected = prediction["cost"]
         if not oracle.require_complete or not oracle.last_coverage.complete:

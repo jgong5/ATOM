@@ -40,6 +40,7 @@ def evidence(monkeypatch):
             sources.append(source)
             heldouts.append(dict(copy.deepcopy(source),role='heldout'))
         predictions.append(dict(chain_id=name,chain_step=step,geometry=geometry(d),
+                                observation_key=Q.observation_key(source),state_rows=d['state_rows'],
                                 cost=asdict(cost),coverage=asdict(coverage)))
     width=dict(source=pin('source',dict(rows=sources)),candidate=dict(sha256='candidate'),plan=dict(sha256='p'*64))
     regions=SimpleNamespace(width_extension=width)
@@ -100,4 +101,19 @@ def test_changed_predictor_and_unclosed_worker_refuse(evidence):
     evidence['documents']['/proof/identity']['code']=code_identity()
     evidence['documents']['/proof/closeout']['cleanup']['writers_released']=False
     with pytest.raises(ValueError,match='closed collection'):
+        qualify(evidence)
+
+
+@pytest.mark.parametrize('field,value', [
+    ('prior_sampled_batch_rows', 0), ('temperatures', [0.5] * 4),
+    ('prefix_cache_hit_tokens', [16] * 4), ('scope', {'changed': True}),
+    ('state_rows', 64),
+])
+def test_later_repeat_cannot_change_the_offered_state(evidence, field, value):
+    descriptor = evidence['documents']['/proof/heldouts']['rows'][4]['descriptor']
+    if field in ('scope', 'prior_sampled_batch_rows'):
+        descriptor['forward_context'][field] = value
+    else:
+        descriptor[field] = value
+    with pytest.raises(ValueError, match='offered state'):
         qualify(evidence)
