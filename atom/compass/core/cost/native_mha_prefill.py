@@ -215,8 +215,7 @@ class NativeMhaPrefillFallback(PriceLibrary):
             op = op.as_dict()
         identity = _identity(op)
         if (identity is None or not topology or topology.get("tp") != 1
-                or any(type(value) is not int or value != 1 for value in topology.values())
-                or registration is not None):
+                or any(type(value) is not int or value != 1 for value in topology.values())):
             return original
         if getattr(self.family, "launch_charge_seconds", 0) != 0:
             return None, "cached-prefill fallback requires zero added launch charge"

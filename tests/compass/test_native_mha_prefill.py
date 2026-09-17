@@ -42,7 +42,8 @@ def wrapper(result=None):
     def old(*args):
         calls.append(args)
         return result,"original result"
-    obj.base=SimpleNamespace(lookup=old,_body_lookup=old)
+    obj.base=SimpleNamespace(lookup=old,_body_lookup=old,
+                            _can_reuse_prepared_lookups=lambda:False, host_sync_reason=lambda op:None)
     return obj,calls
 
 
@@ -131,3 +132,13 @@ def test_missing_endpoint_keeps_refusal_and_body_lookup_uses_same_policy():
     library,calls=wrapper(); op=operator()
     record,_=library._body_lookup(op,{"tp":1},None,{})
     assert record[INTERPOLATED_FLAG] and len(calls)==1
+
+
+@pytest.mark.parametrize("registration",["registered","unregistered"])
+def test_graph_collective_registration_does_not_select_local_attention(registration):
+    library,calls=wrapper()
+    graph=dict(key={"topology":[["tp",1]]},
+               provenance={"collective_registration_required":registration},ops=[operator()])
+    seconds,coverage,launches=library.body(graph)
+    assert seconds>0 and coverage.complete and coverage.interpolated==1 and launches==0
+    assert len(calls)==1 and calls[0][2]==registration
