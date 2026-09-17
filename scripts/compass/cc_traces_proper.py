@@ -127,7 +127,7 @@ def build_steps(case, cell, *, port, engine_port, advisory):
             "workload": case["workload"], "diagnostic_case": case, "cache_policy": case["cache_policy"],
             "allow_advisory_isolation": advisory,
             "isolation_qualification": pm.ADVISORY_ISOLATION_QUALIFICATION if advisory else None,
-            "steps": before + real_steps + after + [pm._gpu_free_step(str(cell))] + modelled_steps}
+            "steps": before + real_steps + after + modelled_steps + [pm._gpu_free_step(str(cell))]}
 
 
 class ProperSideRun(lifecycle.SideRun):
