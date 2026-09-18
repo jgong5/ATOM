@@ -20,7 +20,7 @@ def _module():
 
 
 def _artifact(readings, *, clients=4, closed=True, failed=0, extra_records=(),
-              sessions=None):
+              sessions=None, dag="dag-0"):
     """One replay.py artifact from `[(arrive, ttft, latency, produced), ...]`."""
     results, records = [], []
     for i, (arrive, ttft, latency, produced) in enumerate(readings):
@@ -35,7 +35,7 @@ def _artifact(readings, *, clients=4, closed=True, failed=0, extra_records=(),
                         "num_cached_tokens": 0})
     records.extend(extra_records)
     return {"run": {"clients": clients, "closed_loop": closed, "failed": failed,
-                    "prompt_lengths": "passed"},
+                    "prompt_lengths": "passed", "dag_sha256": dag},
             "workload": [{"session": s} for s in
                          (sessions if sessions is not None
                           else range(len(readings)))],
@@ -148,20 +148,21 @@ class TestIdleTimeIsReportedNotAssumed:
 
 class TestACurveThatCannotBeDrawnIsNotDrawn:
     def _sweep(self, tmp_path, mod, *, real_clients=(1, 4), modelled_clients=(1, 4),
-               failed=0, closed=True):
+               failed=0, closed=True, real_dag="dag-0", modelled_dag="dag-0"):
         dirs = []
         for i, n in enumerate(real_clients):
             d = tmp_path / f"c{n}"
             d.mkdir(exist_ok=True)
             (d / "real.json").write_text(json.dumps(_artifact(
                 [(0.0, 1.0, 11.0, 101)], clients=n, failed=failed,
-                closed=closed)))
+                closed=closed, dag=real_dag)))
             dirs.append(str(d))
         for n in modelled_clients:
             d = tmp_path / f"c{n}"
             d.mkdir(exist_ok=True)
             (d / "modelled.json").write_text(json.dumps(_artifact(
-                [(0.0, 1.0, 11.0, 101)], clients=n, closed=closed)))
+                [(0.0, 1.0, 11.0, 101)], clients=n, closed=closed,
+                dag=modelled_dag)))
             if str(d) not in dirs:
                 dirs.append(str(d))
         return dirs
@@ -269,3 +270,47 @@ class TestARungIsLabelledWithTheSlotsItRan:
         point = mod.rung(artifact, gpus=1)
         assert point["sessions"] == 0
         assert point["realised_clients"] == 0.0
+
+
+class TestBothSidesMustHaveRunTheSameGraph:
+    """Two runs can both be closed-loop, both be c8, both be over the same
+    trace, and still be two workloads: the deal of sessions to slots is part of
+    the experiment. `dag_sha256` names the whole graph, so the check is an
+    equality, not a heuristic.
+    """
+
+    def _sweep(self, tmp_path, **kw):
+        return TestACurveThatCannotBeDrawnIsNotDrawn()._sweep(
+            tmp_path, None, **kw)
+
+    def test_two_sides_that_dealt_sessions_differently_are_refused(self, tmp_path):
+        mod = _module()
+        dirs = self._sweep(tmp_path, real_dag="dag-a", modelled_dag="dag-b")
+        plot = tmp_path / "curve.png"
+        rc = mod.main([*dirs, "--out", str(tmp_path / "s.json"),
+                       "--plot", str(plot)])
+        assert rc == 1
+        assert not plot.exists()
+        report = json.loads((tmp_path / "s.json").read_text())
+        assert any("different dependency graphs" in r
+                   for r in report["blocking"])
+
+    def test_a_rung_that_named_no_graph_is_refused(self, tmp_path):
+        mod = _module()
+        # An artifact from before the graph was recorded. Matching Nones are
+        # not evidence the two sides agreed.
+        dirs = self._sweep(tmp_path, real_dag=None, modelled_dag=None)
+        rc = mod.main([*dirs, "--out", str(tmp_path / "s.json")])
+        assert rc == 1
+        report = json.loads((tmp_path / "s.json").read_text())
+        assert any("nothing shows the two ran the same graph" in r
+                   for r in report["blocking"])
+
+    def test_matching_graphs_draw(self, tmp_path):
+        mod = _module()
+        dirs = self._sweep(tmp_path, real_dag="dag-x", modelled_dag="dag-x")
+        plot = tmp_path / "curve.png"
+        rc = mod.main([*dirs, "--out", str(tmp_path / "s.json"),
+                       "--plot", str(plot)])
+        assert rc == 0
+        assert plot.exists()

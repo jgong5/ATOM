@@ -147,6 +147,10 @@ def rung(artifact, gpus):
         "slot_utilisation": ((occupied / span / clients)
                              if span and clients else None),
         "failed": int(manifest.get("failed") or 0),
+        # A name for the whole dependency graph: the deal, the rows selected,
+        # the edges and the think times. Two sides can both run N clients over
+        # the same trace and still be two experiments.
+        "dag_sha256": manifest.get("dag_sha256"),
     }
 
 
@@ -260,6 +264,25 @@ def main(argv=None) -> int:
                     f"{side} rung {pt['clients']} stamped all "
                     f"{pt['requests']} requests at one arrival instant; "
                     f"arrival is being read from a clock that does not advance")
+    # The two sides of a rung must have walked the same graph. Without this the
+    # report pairs a real run against a modelled run that dealt its sessions
+    # differently -- both well-formed, both labelled c8, measuring different
+    # workloads, and the difference would be read as model error.
+    graphs: dict = {}
+    for side in ("real", "modelled"):
+        for pt in curves[side]:
+            graphs.setdefault(pt["dir"], {})[side] = pt["dag_sha256"]
+    for directory, sides in sorted(graphs.items()):
+        if len(sides) < 2:
+            continue
+        if sides["real"] != sides["modelled"]:
+            blocking.append(
+                f"{directory}: the two sides ran different dependency graphs "
+                f"(real {sides['real']}, modelled {sides['modelled']})")
+        elif sides["real"] is None:
+            blocking.append(
+                f"{directory}: neither side recorded a dag_sha256, so nothing "
+                f"shows the two ran the same graph")
     counts = {side: [pt["clients"] for pt in curves[side]] for side in curves}
     if counts["real"] != counts["modelled"]:
         blocking.append(f"the two sides swept different client counts: "
