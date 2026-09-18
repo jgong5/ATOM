@@ -249,10 +249,41 @@ class Sequence:
         # Next decode step sizes this seq's verification to dspark_next_ell+1.
         self.dspark_next_ell: int | None = None
 
+        # How many requests the whole workload contains, when a simulated run
+        # declared it. The engine may not advance virtual time past an arrival
+        # it has not been told about, so it holds until it has them all -- see
+        # Scheduler._arrival_barrier_unmet. None on any normal request.
+        self.compass_workload_size: int | None = None
+
+        # An arrival declared relative to other requests finishing, rather than
+        # as an offset into the run: this request arrives
+        # `compass_think_s` after the last of `compass_after` finished. The
+        # engine resolves it into `arrive_time` as those requests complete --
+        # see Scheduler._resolve_relative_arrivals -- and until it has,
+        # `compass_arrival_resolved` is False and the request is not
+        # schedulable. `compass_id` is the client's name for this request, the
+        # one its successors refer to. All None/False on a normal request.
+        self.compass_id: str | None = None
+        self.compass_after: tuple[str, ...] = ()
+        self.compass_think_s: float | None = None
+        self.compass_arrival_resolved = False
+
         # statistics fields
         self.arrive_time = 0.0
+        # Whether arrive_time above is the caller's declared arrival or a
+        # placeholder to be restamped. A simulated run keeps two virtual
+        # clocks -- one per process -- and only the engine core's advances, so
+        # the API process cannot read simulated "now". When nothing was
+        # declared it stamps the frozen epoch and the engine core replaces it
+        # on admission. See _stamp_arrival and EngineCoreRequestType.ADD.
+        self.compass_arrival_declared = False
         self.first_token_time = 0.0
         self.leave_time = 0.0
+        # Stamped by the engine core when the sequence finishes, on whichever
+        # clock the engine is running. The client stamps leave_time on its own
+        # clock, which under a simulated run does not advance — so latency and
+        # TPOT must be derived from this instead.
+        self.finish_time = 0.0
         self.leave_reason = ""
 
         # kv_transfer params

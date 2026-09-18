@@ -41,6 +41,7 @@ from atom.utils.gc_utils import (
     tune_gc,
     unfreeze_gc_heap,
 )
+from atom.utils.clock import get_clock
 
 logger = logging.getLogger("atom")
 
@@ -60,6 +61,90 @@ KV_IDLE_DRAIN_INTERVAL_S = 0.001
 KV_SHUTDOWN_DRAIN_TIMEOUT_S = 2.0
 
 
+
+
+def _install_compass_clock(config) -> None:
+    """Put this process on a virtual clock when running a simulated workload.
+
+    Only the scheduling process does this. Workers predict step durations and
+    report them back; they never hold a clock, which keeps time single-sourced
+    even when the model is sharded across processes.
+    """
+    compass = getattr(config, "compass_config", None)
+    if compass is None or not compass.enabled or not compass.virtual_clock:
+        return
+    from atom.utils.clock import VirtualClock, set_clock
+
+    set_clock(VirtualClock(epoch=compass.epoch))
+    logger.info("ATOMCompass: engine core running on a virtual clock")
+
+
+def _restamp_undeclared_arrivals(seqs) -> None:
+    """Stamp arrival here, on the only clock that knows simulated "now".
+
+    A simulated run holds two virtual clocks, one per process, and only this
+    one advances -- the API process stamps arrival before handing the sequence
+    over, and its clock sits at the epoch forever. A client that declared its
+    arrivals is unaffected: the declaration is an offset from a shared epoch
+    and needs no clock at all. A closed-loop client has nothing to declare,
+    because simulated time is only knowable once the previous response returns,
+    so without this every one of its requests arrives at t=0. Measured, that
+    put four sequential requests at the same instant, inflated TTFT by the
+    queueing that arrival had already passed, and collapsed the run's span onto
+    its busy time.
+
+    This runs on the input socket thread while the busy loop may be mid-step,
+    so the reading is accurate to one step. That is the same granularity the
+    scheduler makes every other decision at.
+
+    A real clock is left alone: there "now" in the API process is the truth,
+    and it is stamped closer to the wire than this is.
+    """
+    clock = get_clock()
+    if getattr(clock, "epoch", None) is None:
+        return
+    for seq in seqs:
+        if not getattr(seq, "compass_arrival_declared", False):
+            seq.arrive_time = clock.time()
+
+
+def _stamp_step_start(scheduled_batch) -> None:
+    """Tell the runner when this step begins, on this process's clock.
+
+    The runner records when each step started, so that queueing can be measured
+    against a request's arrival rather than reconstructed from durations. It
+    cannot read the time itself: arrivals and first tokens are stamped on the
+    clock this process owns, and the runner may sit in a worker that never had
+    a Compass clock installed. Measured, it was stamping the wall clock -- 69
+    seconds ahead of the first arrival, which is the server's startup, and
+    advancing in real time while this clock advanced by predicted steps. Every
+    step then landed after the first token it produced, which is impossible,
+    and is what the validity check caught.
+
+    Installing a virtual clock in the worker would not fix it: only this
+    process calls ``advance``, so the worker's copy would sit at the epoch.
+    """
+    try:
+        scheduled_batch.compass_started_at = get_clock().time()
+    except AttributeError:  # a batch type that does not take attributes
+        pass
+
+
+def _advance_clock_for(fwd_out) -> None:
+    """Advance a virtual clock by a simulated step's predicted duration.
+
+    A no-op during a normal run: the output carries no duration, and the wall
+    clock cannot be advanced anyway. Under Compass the runner has predicted the
+    step rather than performed it, so time only moves if we move it here — this
+    process owns scheduling, and therefore owns the clock.
+    """
+    seconds = getattr(fwd_out, "compass_step_seconds", None)
+    if seconds is None:
+        return
+    advance = getattr(get_clock(), "advance", None)
+    if advance is not None:
+        advance(seconds)
+
 class EngineCore:
     # This process's name, for the title and every GC log line. A class
     # attribute because it is per-process state and each engine is spawned into
@@ -67,6 +152,7 @@ class EngineCore:
     _process_name = "EngineCore"
 
     def __init__(self, config: Config, input_address: str, output_address: str):
+        _install_compass_clock(config)
         self.label = "Engine Core"
         self.input_queue = queue.Queue[Sequence]()
         self.output_queue = queue.Queue[list[Sequence]]()
@@ -383,9 +469,11 @@ class EngineCore:
         has_seqs = len(scheduled_batch.req_ids) > 0
         if has_seqs:
             self.scheduler.compute_detailed_aggregates(scheduled_batch, seqs)
+            _stamp_step_start(scheduled_batch)
             fwd_out = self.runner_mgr.call_func(
                 "forward", scheduled_batch, wait_out=True
             )
+            _advance_clock_for(fwd_out)
             if (
                 self.scheduler.prefill_delayer is not None
                 and scheduled_batch.total_seqs_num_prefill > 0
@@ -563,6 +651,7 @@ class EngineCore:
                         logger.debug(
                             f"{self.label}: input get {request_type} {req_ids}"
                         )
+                        _restamp_undeclared_arrivals(reqs)
                         self.input_queue.put_nowait(reqs)
                     elif request_type == EngineCoreRequestType.UTILITY:
                         cmd = reqs.get("cmd") if isinstance(reqs, dict) else None
@@ -988,11 +1077,11 @@ class PrefillEngineCore(EngineCore):
             return False
 
         # Run on the dedicated prefill stream; returns sampled token IDs (one per seq).
-        t0 = time.perf_counter()
+        t0 = get_clock().perf_counter()
         sampled_token_ids = self.runner_mgr.call_func(
             "prefill_forward", scheduled_batch, wait_out=True
         )
-        iter_ms = (time.perf_counter() - t0) * 1000
+        iter_ms = (get_clock().perf_counter() - t0) * 1000
         logger.info(
             f"prefill iter {iter_ms:.2f}ms | "
             f"reqs={scheduled_batch.total_seqs_num} | "
@@ -1260,9 +1349,11 @@ class DecodeEngineCore(EngineCore):
         scheduled_batch, seqs = result
         if scheduled_batch is None:
             return False
-        t0 = time.perf_counter()
+        t0 = get_clock().perf_counter()
+        _stamp_step_start(scheduled_batch)
         fwd_out = self.runner_mgr.call_func("forward", scheduled_batch, wait_out=True)
-        iter_ms = (time.perf_counter() - t0) * 1000
+        _advance_clock_for(fwd_out)
+        iter_ms = (get_clock().perf_counter() - t0) * 1000
         logger.info(
             f"iter {iter_ms:.2f}ms | "
             f"reqs={scheduled_batch.total_seqs_num} "

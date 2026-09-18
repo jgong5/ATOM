@@ -21,6 +21,7 @@ import logging
 import struct
 import threading
 import time
+import time as _time  # real seconds, for the arrival barrier's timeout
 from collections import deque
 from collections.abc import Callable, Iterable
 
@@ -42,6 +43,7 @@ from atom.model_engine.state_runtime import (
     StateRuntime,
 )
 from atom.utils import envs
+from atom.utils.clock import get_clock
 
 logger = logging.getLogger("atom")
 
@@ -860,9 +862,15 @@ class ScheduledBatchOutput:
         is_prev_prefill=False,
         logprobs=None,
         dspark_ell: np.ndarray | None = None,
+        compass_step_seconds: float | None = None,
     ):
         self.req_ids = req_ids
         self.token_ids = token_ids
+        # Set only by a simulated runner: how long this step was predicted to
+        # take. The scheduling process advances its clock by this rather than
+        # waiting, because the runner executes in a different process and has
+        # no clock of its own. None during a normal run.
+        self.compass_step_seconds = compass_step_seconds
         self.draft_token_ids = draft_token_ids
         self.num_rejected = num_rejected
         self.num_bonus = num_bonus
@@ -922,6 +930,20 @@ class Scheduler:
         self.waiting: deque[Sequence] = deque()
         self.running: deque[Sequence] = deque()
         self.config = config
+        # See _arrival_barrier_unmet: latched open once a declared workload has
+        # fully arrived, so a draining queue cannot re-close it.
+        self._arrival_barrier_open = False
+        self._arrival_barrier_since: float | None = None
+        self._arrival_barrier_seen = 0
+        # Client request id -> the instant it finished, for arrivals declared
+        # relative to other requests. Only ever written for requests that
+        # carry a `compass_id`, so a normal run never grows it. See
+        # _resolve_relative_arrivals.
+        self._compass_finished: dict[str, float] = {}
+        # Waiting requests whose arrival is not yet knowable, by seq id. Empty
+        # for every workload that declares nothing, and empties as the run
+        # proceeds. See _resolve_relative_arrivals.
+        self._compass_unresolved: dict[int, Sequence] = {}
 
         # Admit-rejected seqs (those `_unschedulable_reason` flags). Drained
         # by `take_rejected` each EngineCore step; routed through the same
@@ -1170,6 +1192,258 @@ class Scheduler:
                 break  # all partials summed; skip the rest of the decode tail
         return total
 
+    #: How long to wait, in real seconds, for a declared workload to finish
+    #: arriving before giving up on the barrier and running anyway. A client
+    #: that dies mid-submission must not hang the engine forever.
+    ARRIVAL_BARRIER_TIMEOUT_S = 120.0
+
+    def _arrival_barrier_unmet(self) -> bool:
+        """Is the engine still waiting to be told about every arrival?
+
+        Advancing virtual time is only safe when no earlier event can still turn
+        up. A client submitting over HTTP submits concurrently, so requests reach
+        the engine out of declared order: if the first one received is declared
+        for 0.9s, an idle engine jumps there, and a request declared for 0.0
+        arriving a moment later is retroactively late. That cost the first 13
+        requests of a 64-request run, which shared two first-token instants where
+        the real run had 64 distinct ones.
+
+        For a *closed* workload the fix is cheap: the client says how many
+        requests are coming, and the engine runs nothing until it has them all.
+        After that every arrival time is known, so every jump is safe. The wait
+        is bounded by how long submission takes -- a one-off startup cost, not a
+        per-step sleep, which is what makes real-time pacing unacceptable here.
+
+        Open-ended serving gets no help from this: there is no count to wait for,
+        and a simulator cannot know whether another request is about to arrive.
+        That case needs the schedule handed over up front.
+
+        Latched once open: a workload that has fully arrived cannot un-arrive,
+        and re-checking after requests start finishing would compare a shrinking
+        queue against the original total and stall the run.
+        """
+        if self._arrival_barrier_open:
+            return False
+        if not hasattr(self, "arrival_barrier_timed_out"):
+            self.arrival_barrier_timed_out = None
+        if getattr(get_clock(), "epoch", None) is None:
+            self._arrival_barrier_open = True  # real clock: nothing to wait for
+            return False
+
+        expected = None
+        for seq in self.waiting:
+            declared = getattr(seq, "compass_workload_size", None)
+            if declared:
+                expected = int(declared)
+                break
+        if not expected:
+            return False  # nobody declared a workload; nothing to hold for
+
+        if len(self.waiting) >= expected:
+            self._arrival_barrier_open = True
+            logger.info(
+                "ATOMCompass: all %d declared requests have arrived; "
+                "the virtual clock may now advance safely",
+                expected,
+            )
+            return False
+
+        # Real seconds deliberately: this measures the harness submitting, not
+        # the workload being simulated, and the virtual clock is frozen anyway.
+        #
+        # Restarted every time another request lands, so the deadline means
+        # "the client has gone quiet for this long" rather than "submission has
+        # taken this long in total". Those differ by orders of magnitude at
+        # scale: 3,094 declared requests averaging 127k tokens spend minutes
+        # being posted and tokenized, and a total-time deadline would give up
+        # on a perfectly healthy client and run anyway -- which is the exact
+        # failure this mechanism exists to prevent. A dead client still trips
+        # it, because a dead client stops the count.
+        arrived = len(self.waiting)
+        if (self._arrival_barrier_since is None
+                or arrived > self._arrival_barrier_seen):
+            self._arrival_barrier_since = _time.monotonic()
+            self._arrival_barrier_seen = arrived
+        elif (_time.monotonic() - self._arrival_barrier_since
+              > self.ARRIVAL_BARRIER_TIMEOUT_S):
+            self._arrival_barrier_open = True
+            # Recorded, not only logged. A warning in a server log is not a
+            # result: the run that this fired on was read as an accuracy
+            # measurement for a day, because the client reported "0 failed"
+            # and nothing downstream could see that the arrival protocol had
+            # not completed.
+            self.arrival_barrier_timed_out = {
+                "arrived": len(self.waiting),
+                "expected": int(expected),
+                "timeout_s": float(self.ARRIVAL_BARRIER_TIMEOUT_S),
+            }
+            logger.warning(
+                "ATOMCompass WARNING: only %d of %d declared requests have "
+                "arrived and none has for %.0fs; running anyway. Virtual time "
+                "may now advance "
+                "past an arrival still in flight, which makes that request "
+                "retroactively late -- treat this run's latencies as invalid.",
+                len(self.waiting), expected, self.ARRIVAL_BARRIER_TIMEOUT_S,
+            )
+        return not self._arrival_barrier_open
+
+    @property
+    def _admission_seconds(self) -> float:
+        """How long a request takes to become schedulable, simulated.
+
+        Measured at 8-18 ms on this deployment and unmodelled until now, which
+        was the entire TTFT error: a simulated run advances its clock by
+        predicted forward durations, so the two process hops between
+        ``preprocess`` and a worker cost nothing. Zero unless configured, and
+        configured only from a measurement.
+        """
+        compass = getattr(self.config, "compass_config", None)
+        return float(getattr(compass, "admission_seconds", 0.0) or 0.0)
+
+    def _compass_note_finished(self, seq) -> None:
+        """Record when a request with a client id finished.
+
+        Its successors' arrivals are stated relative to this instant, so it is
+        read back by ``_resolve_relative_arrivals``. Called from every path
+        that stamps ``finish_time`` -- including the rejection paths, because a
+        request that is never going to run must still release whatever was
+        waiting behind it, or the run deadlocks on a request that failed.
+        """
+        rid = getattr(seq, "compass_id", None)
+        if rid is not None:
+            self._compass_finished[rid] = seq.finish_time
+
+    def _resolve_relative_arrivals(self) -> None:
+        """Stamp the arrival of waiting requests whose predecessors have finished.
+
+        An agentic session's next turn begins some think time after the
+        previous turn came back, and when it came back is what the run is
+        measuring -- so the client cannot state the arrival and the engine
+        must. Each such request carries the ids it waits on and the recorded
+        gap; once all of them have finished, its arrival is the latest of those
+        finishes plus the gap.
+
+        Stamped into ``arrive_time`` rather than answered from
+        ``_schedulable_at`` every tick, because ``arrive_time`` is what TTFT,
+        the run's span and the queue-age SLA are all measured from. Answering
+        only the scheduling question would leave those three reading the
+        placeholder, and TTFT would then include the user's think time -- an
+        error the size of the gap, which on this corpus is minutes.
+
+        Once stamped a request is never restamped: its predecessors cannot
+        un-finish, and re-deriving it after the clock moved would make an
+        arrival drift forward under a request that had simply not been
+        scheduled yet.
+
+        Walks an index of the unresolved rather than the waiting queue, which
+        at this scale is the difference between a constant and 3,000 attribute
+        reads on every one of a run's millions of ticks. The index empties as
+        the run proceeds and is empty for every workload that declares nothing.
+        """
+        if not self._compass_unresolved:
+            return
+        epoch = getattr(get_clock(), "epoch", None) or 0.0
+        for sid, seq in list(self._compass_unresolved.items()):
+            ends = []
+            for rid in seq.compass_after:
+                end = self._compass_finished.get(rid)
+                if end is None:
+                    break
+                ends.append(end)
+            else:
+                seq.arrive_time = (max(ends) if ends else epoch) + seq.compass_think_s
+                seq.compass_arrival_resolved = True
+                del self._compass_unresolved[sid]
+
+    def _compass_track_unresolved(self, seq) -> None:
+        """Index a request whose arrival is declared relative to others."""
+        if (getattr(seq, "compass_think_s", None) is not None
+                and not seq.compass_arrival_resolved):
+            self._compass_unresolved[seq.id] = seq
+
+    def _schedulable_at(self, seq) -> float:
+        """The earliest simulated instant this request may be scheduled.
+
+        Its declared arrival plus the time the engine really takes to get it in
+        hand. Modelled as a delay on the request rather than as time consumed by
+        the engine, because it is per-request and concurrent: two requests
+        arriving together each wait once, not twice.
+
+        Infinite for a request whose arrival is declared relative to others and
+        whose predecessors have not all finished: it has no arrival instant
+        yet, and the honest answer is "not from anything known now" rather than
+        a number. Callers that jump the clock forward must skip those; the
+        graph always bottoms out in a request that does have an instant.
+        """
+        if (getattr(seq, "compass_think_s", None) is not None
+                and not seq.compass_arrival_resolved):
+            return float("inf")
+        return seq.arrive_time + self._admission_seconds
+
+    def _declared_arrival_pending(self, seq) -> bool:
+        """Is this request not yet schedulable -- either not arrived, or arrived
+        and still being admitted?
+
+        Only ever true on a virtual clock. A simulated engine advances time by
+        the steps it predicts, not with the wall clock a client sends on, so a
+        workload declares when each request should be treated as arriving. The
+        engine has to honour that or the declaration only changes what TTFT is
+        measured *from* while the work still happens immediately -- which
+        produced 62 of 64 requests finishing before they arrived.
+
+        A real clock has no start-of-run, so nothing declares against it and
+        this costs one attribute read per waiting seq per tick.
+        """
+        clock = get_clock()
+        if getattr(clock, "epoch", None) is None:
+            return False
+        return self._schedulable_at(seq) > clock.time()
+
+    def _advance_to_next_arrival(self) -> None:
+        """Jump the virtual clock forward when there is nothing else to do.
+
+        The discrete-event step. With no runnable work and every waiting request
+        declared for later, real time would spin and virtual time would never
+        move -- so the next thing that can possibly happen is the next arrival,
+        and time goes straight there. Skipping the idle gap is the whole reason
+        a simulation is faster than the thing it simulates.
+
+        Deliberately narrow: it fires only when nothing is running and nothing
+        is admittable, so it can never skip past work that was ready.
+        """
+        clock = get_clock()
+        advance = getattr(clock, "advance", None)
+        if advance is None or getattr(clock, "epoch", None) is None:
+            return
+        if self.running or not self.waiting:
+            return
+        if self._arrival_barrier_unmet():
+            return  # an earlier arrival may still be in flight
+        now = clock.time()
+        pending = [self._schedulable_at(seq) for seq in self.waiting
+                   if self._schedulable_at(seq) > now]
+        if len(pending) != len(self.waiting):
+            return  # something has already arrived; let it run
+        # Requests still waiting on a predecessor have no instant to jump to --
+        # `inf`, not a time. They are not skipped over: nothing is running, so
+        # whatever releases them must itself be released by an arrival that
+        # does have an instant, and the graph bottoms out there. If none does,
+        # the workload declared a cycle or named a request that was never sent,
+        # and jumping anywhere would invent an arrival.
+        knowable = [at for at in pending if at != float("inf")]
+        if not knowable:
+            if self._compass_unresolved:
+                logger.error(
+                    "ATOMCompass: %d waiting request(s) are declared after "
+                    "requests that have not finished, nothing is running, and "
+                    "no arrival has a knowable instant. The declared arrival "
+                    "graph has a cycle or names a request that was never "
+                    "submitted; this run is stalled.",
+                    len(self._compass_unresolved),
+                )
+            return
+        advance(min(knowable) - now)
+
     def _oldest_waiting_prefill_age_ms(self) -> float:
         """Age in ms (since arrival) of the oldest ADMITTABLE waiting prefill,
         or 0.0 if none.
@@ -1191,7 +1465,7 @@ class Scheduler:
                 oldest_arrive = seq.arrive_time
         if oldest_arrive is None:
             return 0.0
-        return max(0.0, (time.time() - oldest_arrive) * 1000.0)
+        return max(0.0, (get_clock().time() - oldest_arrive) * 1000.0)
 
     def publish_kv_events(self) -> None:
         """Drain BlockManager's event log and publish as one EventBatch. Called
@@ -1225,11 +1499,13 @@ class Scheduler:
 
     def add(self, seq: Sequence):
         self._warn_if_unschedulable(seq)
+        self._compass_track_unresolved(seq)
         self.waiting.append(seq)
 
     def extend(self, seqs: list[Sequence]):
         for seq in seqs:
             self._warn_if_unschedulable(seq)
+            self._compass_track_unresolved(seq)
         self.waiting.extend(seqs)
 
     def _deferred_sequence(self, req_id) -> Sequence | None:
@@ -1388,6 +1664,47 @@ class Scheduler:
         self._rejected = []
         return out
 
+    def _decision_record(self, kind: str, batched_tokens: int) -> dict:
+        """What the scheduler could see when it chose this step.
+
+        A step table records what ran. It cannot say why, and every comparison
+        between a real run and a simulated one has eventually needed that:
+        the two run the same steps at the same prices, in a different order,
+        and the order is a consequence of decisions whose inputs nothing keeps.
+
+        Cheap on purpose -- a handful of integers per step, and a 27B run has
+        about 4500 steps -- so it can stay on rather than being a debugging
+        mode somebody has to think to enable.
+        """
+        waiting = list(self.waiting)
+        outstanding = 0
+        for seq in waiting:
+            try:
+                if seq.num_prompt_tokens > seq.num_cached_tokens:
+                    outstanding += 1
+            except AttributeError:
+                outstanding += 1
+        held = 0
+        for seq in waiting:
+            try:
+                if self._declared_arrival_pending(seq):
+                    held += 1
+            except Exception:  # noqa: BLE001 - diagnostics never break a run
+                pass
+        return {
+            "kind": kind,
+            "tick": self._schedule_tick,
+            # Everything the prefill-first rule weighs: it decodes only when no
+            # prefill is ready, so what was waiting with prefill left to do is
+            # the reason a decode step did or did not happen.
+            "waiting": len(waiting),
+            "waiting_prefill_outstanding": outstanding,
+            "waiting_held_for_arrival": held,
+            "running": len(self.running),
+            "batched_tokens": int(batched_tokens),
+            "token_budget": int(getattr(self.config, "max_num_batched_tokens", 0) or 0),
+        }
+
     def schedule(self) -> tuple[ScheduledBatch, dict[int, Sequence]]:
         """Select the next batch of sequences for a forward pass.
 
@@ -1395,6 +1712,14 @@ class Scheduler:
         decoding already-running sequences.
         """
         self._schedule_tick += 1
+        # Arrivals declared relative to other requests become knowable only as
+        # those finish, so they are resolved before anything reads them --
+        # including the jump below, which would otherwise step over a request
+        # that had just become due. No-op unless a workload declared one.
+        self._resolve_relative_arrivals()
+        # Nothing runnable and every arrival still in the future: move virtual
+        # time to the next one rather than spinning. No-op off a virtual clock.
+        self._advance_to_next_arrival()
         # Sources borrowed by the previous batch: its forward has been issued,
         # so they can go back on the free list.
         self.block_manager.complete_previous_state_batch()
@@ -1437,6 +1762,12 @@ class Scheduler:
         if not self.running and not self.waiting:
             return None
 
+        # Hold the whole run until a declared workload has finished arriving.
+        # Placed after should_allow_prefill above, which must execute every tick
+        # on every rank for cross-DP lockstep.
+        if self._arrival_barrier_unmet():
+            return None
+
         # ---- Phase 1: resume partial prefills from running ----
         # Gated by `delayer_allows` so cross-DP alignment still holds when one
         # rank is mid-chunked-prefill: a delayer veto skips both Phase 1 and
@@ -1471,7 +1802,7 @@ class Scheduler:
         # ---- Phase 2: new requests from waiting ----
         while (
             delayer_allows
-            and (self.delay_factor <= 0 or self._passed_delay(time.time()))
+            and (self.delay_factor <= 0 or self._passed_delay(get_clock().time()))
             and self.waiting
             and num_seqs_prefill < self.max_num_seqs
             and num_batched_tokens < self.max_num_batched_tokens
@@ -1488,6 +1819,13 @@ class Scheduler:
                 self._reject_aborted_waiting(seq)
                 continue
 
+            # Declared to arrive later: put it back and look again next tick.
+            # Not `_unschedulable_reason`, which finishes a sequence -- this one
+            # is fine, it is simply not here yet.
+            if self._declared_arrival_pending(seq):
+                skipped_waiting_requests.append(seq)
+                continue
+
             # Drop seqs the static-capacity check at submit-time flagged as
             # permanently unschedulable (oversized prompt, exhausted pool,
             # etc.). They've already been warned; mark FINISHED + record the
@@ -1500,7 +1838,9 @@ class Scheduler:
             unschedulable = self._unschedulable_reason(seq)
             if unschedulable is not None:
                 seq.status = SequenceStatus.FINISHED
+                seq.finish_time = get_clock().time()
                 seq.leave_reason = f"unschedulable: {unschedulable}"
+                self._compass_note_finished(seq)
                 self._rejected.append(seq)
                 continue
 
@@ -1712,6 +2052,8 @@ class Scheduler:
                     seq, start, start + int(num_scheduled_tokens[i])
                 )
 
+            _decision = self._decision_record(
+                "prefill", total_tokens_num_prefill)
             prefill_batch = ScheduledBatch(
                 seqs=scheduled_seqs,
                 num_scheduled_tokens=num_scheduled_tokens,
@@ -1734,6 +2076,12 @@ class Scheduler:
                     scheduled_seqs, num_scheduled_tokens, is_final_chunk
                 )
 
+            # Carried on the batch, the way the step's start time is, because
+            # the runner writes the table and the scheduler owns the reason.
+            try:
+                prefill_batch.compass_decision = _decision
+            except AttributeError:
+                pass
             return (prefill_batch, scheduled_seqs)
 
         # --- Decode scheduling ---
@@ -1839,6 +2187,8 @@ class Scheduler:
         if self.kv_connector is not None:
             connector_meta_output = self.kv_connector.build_connector_meta()
 
+        _decision = self._decision_record(
+            "decode", total_tokens_num_decode)
         decode_batch = ScheduledBatch(
             seqs=scheduled_seqs,
             num_scheduled_tokens=num_scheduled_tokens,
@@ -1859,6 +2209,10 @@ class Scheduler:
                 else None
             ),
         )
+        try:
+            decode_batch.compass_decision = _decision
+        except AttributeError:
+            pass
         self._consume_state_forks(scheduled_seqs)
         return (decode_batch, scheduled_seqs)
 
@@ -1918,7 +2272,9 @@ class Scheduler:
     def _reject_aborted_waiting(self, seq: Sequence) -> None:
         has_inflight_load = bool(getattr(seq, "_counted_as_inflight_load", False))
         seq.status = SequenceStatus.FINISHED
+        seq.finish_time = get_clock().time()
         seq.leave_reason = "aborted"
+        self._compass_note_finished(seq)
         self._rejected.append(seq)
         if not has_inflight_load or not self._connector_flag("is_offload"):
             self._uncount_inflight_load(seq)
@@ -2590,6 +2946,9 @@ class Scheduler:
                     seq.num_tokens,
                     len(seq.block_table),
                 )
+            if seq.num_completion_tokens >= 1 and seq.first_token_time == 0.0:
+                seq.first_token_time = get_clock().time()
+
             num_tokens = seq.num_tokens - num_placeholder_width - num_rejected
             leave_reason = None
             # Client disconnected -> finish now via the normal stop path (frees
@@ -2685,7 +3044,10 @@ class Scheduler:
             # speculative tokens and cap/stop overflow have been removed. A
             # terminal response with no completion tokens must keep TTFT zero.
             if num_tokens - seq.num_prompt_tokens >= 1 and seq.first_token_time == 0.0:
-                seq.first_token_time = time.time()
+                # get_clock(), not time.time(): the other two stamp sites go
+                # through the clock, and mixing them makes TTFT a wall-clock
+                # instant minus a virtual one, which is not a duration.
+                seq.first_token_time = get_clock().time()
 
             # Hash generated blocks. Deferred output: all tokens forwarded;
             # undeferred: last token not yet forwarded, so exclude it.
@@ -2701,6 +3063,12 @@ class Scheduler:
             # A terminal event is required even when truncation leaves no
             # tokens (for example max_tokens <= 0). Async consumers wait for
             # this finished RequestOutput and would otherwise block forever.
+            if leave_reason is not None and seq.finish_time == 0.0:
+                # Stamped before the stream output is built rather than after,
+                # so the finishing output can carry it. The assignment further
+                # down is now conditional and leaves this value alone.
+                seq.finish_time = get_clock().time()
+
             if stream_output_queue is not None and (
                 new_tokens or leave_reason is not None
             ):
@@ -2720,6 +3088,9 @@ class Scheduler:
                         seq, "kv_transfer_params_output", None
                     ),
                     num_cached_tokens=getattr(seq, "prefix_cache_hit_tokens", 0),
+                    arrive_time=seq.arrive_time,
+                    first_token_time=seq.first_token_time,
+                    finish_time=seq.finish_time,
                 )
 
                 if request_output.kv_transfer_params_output is not None:
@@ -2738,6 +3109,11 @@ class Scheduler:
                 seq.num_tokens = num_tokens
                 seq.leave_reason = leave_reason
                 seq.status = SequenceStatus.FINISHED
+                if seq.finish_time == 0.0:
+                    seq.finish_time = get_clock().time()
+                # Before the successors' next chance to be scheduled: their
+                # arrivals are stated relative to this instant.
+                self._compass_note_finished(seq)
                 self.total_finished_requests += 1
                 self.total_prompt_tokens += int(seq.num_prompt_tokens)
                 self.total_generation_tokens += max(
@@ -3361,7 +3737,7 @@ class DecodeScheduler(Scheduler):
         if seq is not None:
             seq.num_cached_tokens = num_tokens_computed
             seq.append_token(sampled_token_id)
-            seq.first_token_time = time.time()
+            seq.first_token_time = get_clock().time()
             self.prefill_done.append(seq)
 
     def schedule(self):

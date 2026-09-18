@@ -230,6 +230,35 @@ class ChatCompletionRequest(BaseModel):
             raise ValueError("Either 'messages' or 'prompt' field is required")
 
 
+class CompassRelativeArrival(BaseModel):
+    """When a request arrives, stated relative to other requests finishing.
+
+    ``compass_arrival`` is an absolute offset into the run, which a client can
+    only state for a workload whose timing it has already decided. An agentic
+    replay has not: a session's next turn begins some *think time* after the
+    previous turn came back, and when the previous turn comes back is what the
+    run is measuring. Stating the turn's absolute arrival would replay the
+    recorded engine's speed rather than this engine's.
+
+    So the arrival is declared as a dependency instead: this request arrives
+    ``think_s`` seconds after the last of ``after`` finished. The engine
+    resolves it as those requests complete, on whichever clock it is running,
+    which is the only place the answer exists.
+
+    ``after`` empty means the request opens its chain and arrives ``think_s``
+    after the run's epoch -- a session slot's first turn.
+
+    The ids are the client's, not the server's: the whole workload is declared
+    before any of it has a server-side id.
+    """
+
+    model_config = {"extra": "ignore"}
+
+    id: str
+    after: list[str] = []
+    think_s: float = 0.0
+
+
 class CompletionRequest(BaseModel):
     """Request model for text completions (OpenAI-compatible)."""
 
@@ -250,6 +279,25 @@ class CompletionRequest(BaseModel):
     # Optional DPA routing hint inserted by atomesh for DP-aware workers.
     data_parallel_rank: int | None = None
     n: int | None = 1
+    # Seconds after the engine's epoch at which this request should be treated
+    # as having arrived. Only meaningful against a Compass server: the engine's
+    # virtual clock is driven by predicted steps and does not track the wall
+    # clock a client sends on, so without a declared arrival every request lands
+    # at the same instant and TTFT is measured from the start of the run rather
+    # than from when the request turned up. Ignored by a normal server, where
+    # "now" is already the right answer.
+    compass_arrival: float | None = None
+    # How many requests the whole workload contains. A simulated engine may not
+    # advance virtual time past an arrival it has not been told about, and an
+    # HTTP client submits concurrently, so requests reach it out of declared
+    # order. Told the total, it holds until every one has arrived and then every
+    # jump is safe. Only useful for a closed workload; ignored without Compass.
+    compass_workload_size: int | None = None
+    # This request's arrival, stated relative to other requests finishing
+    # instead of as an offset into the run. Mutually exclusive with
+    # compass_arrival in practice; if both are sent this one wins, because it
+    # is the one the engine can still be right about. See CompassRelativeArrival.
+    compass_relative_arrival: CompassRelativeArrival | None = None
 
     def get_max_tokens(self) -> int:
         """Return the effective generation cap for completion requests."""
