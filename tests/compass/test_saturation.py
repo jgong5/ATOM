@@ -19,7 +19,8 @@ def _module():
     return module
 
 
-def _artifact(readings, *, clients=4, closed=True, failed=0, extra_records=()):
+def _artifact(readings, *, clients=4, closed=True, failed=0, extra_records=(),
+              sessions=None):
     """One replay.py artifact from `[(arrive, ttft, latency, produced), ...]`."""
     results, records = [], []
     for i, (arrive, ttft, latency, produced) in enumerate(readings):
@@ -35,7 +36,10 @@ def _artifact(readings, *, clients=4, closed=True, failed=0, extra_records=()):
     records.extend(extra_records)
     return {"run": {"clients": clients, "closed_loop": closed, "failed": failed,
                     "prompt_lengths": "passed"},
-            "workload": [], "results": results,
+            "workload": [{"session": s} for s in
+                         (sessions if sessions is not None
+                          else range(len(readings)))],
+            "results": results,
             "engine": {"count": len(records), "clock": "virtual",
                        "requests": records},
             "cache_stats": {"before": {}, "after": {}}}
@@ -219,3 +223,49 @@ class TestACurveThatCannotBeDrawnIsNotDrawn:
         # why otherwise costs another two servers.
         report = json.loads((tmp_path / "s.json").read_text())
         assert report["curves"]["real"][0]["tokens_s_per_gpu"] is not None
+
+
+class TestARungIsLabelledWithTheSlotsItRan:
+    """A client count is what the rung was *asked* for. A slot holds one
+    session at a time, so when the pool does not divide evenly the last stretch
+    of the run is a few slots working alone -- and `tokens_s_per_gpu` divides
+    by the whole span, tail included. Reported, so the point is not read as
+    "N clients could not fill the GPU".
+    """
+
+    def test_slots_that_all_ran_throughout_realise_their_client_count(self):
+        mod = _module()
+        # Four sessions, one per slot, all spanning the same 10s.
+        point = mod.rung(_artifact([(0.0, 1.0, 10.0, 100)] * 4, clients=4),
+                         gpus=1)
+        assert point["sessions"] == 4
+        assert point["realised_clients"] == 4.0
+        assert point["slot_utilisation"] == 1.0
+
+    def test_a_slot_that_finished_early_is_not_counted_to_the_end(self):
+        mod = _module()
+        # Two slots: one runs the whole 10s, one is done at 2s.
+        point = mod.rung(_artifact([(0.0, 1.0, 10.0, 100),
+                                    (0.0, 1.0, 2.0, 20)], clients=2), gpus=1)
+        assert point["engine_span_s"] == 10.0
+        assert point["realised_clients"] == 1.2
+        assert point["slot_utilisation"] == 0.6
+
+    def test_a_slot_holds_its_session_across_the_gap_between_its_turns(self):
+        mod = _module()
+        # One session, two turns with 5s of think time between them. The slot
+        # is occupied for the gap -- the user is thinking, not gone.
+        point = mod.rung(_artifact([(0.0, 1.0, 2.0, 20),
+                                    (7.0, 1.0, 3.0, 30)],
+                                   clients=1, sessions=[9, 9]), gpus=1)
+        assert point["sessions"] == 1
+        assert point["engine_busy_s"] == 5.0    # the engine idled the gap
+        assert point["realised_clients"] == 1.0  # the slot did not
+
+    def test_a_rung_with_no_workload_rows_reports_no_slots_rather_than_lying(self):
+        mod = _module()
+        artifact = _artifact([(0.0, 1.0, 10.0, 100)], clients=1)
+        artifact["workload"] = []
+        point = mod.rung(artifact, gpus=1)
+        assert point["sessions"] == 0
+        assert point["realised_clients"] == 0.0

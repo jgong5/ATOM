@@ -98,6 +98,29 @@ def rung(artifact, gpus):
            for r in artifact.get("results", []) if r.get("ok")}
     records = [r for r in records if r.get("request_id") in ids]
 
+    # How many slots the rung *ran*, as opposed to how many it was given. A
+    # slot holds one session at a time and takes the next only when that one
+    # ends, so the time-average of live sessions is the time-average of busy
+    # slots. It matters whenever a pool does not divide evenly: a 16-session
+    # pool at 16 clients gives every slot exactly one session, session spans
+    # run 273s to 5802s, and the run's last hour is one slot working alone.
+    # `tokens_s_per_gpu` divides by the whole span, so that tail idle is
+    # charged to the rung -- reported here rather than left to be read as
+    # "16 clients could not fill the GPU".
+    index_of = {(r.get("response") or {}).get("id"): r["index"]
+                for r in artifact.get("results", []) if r.get("ok")}
+    rows = artifact.get("workload") or []
+    live: dict = {}
+    for r in records:
+        idx = index_of.get(r.get("request_id"))
+        arrive, finish = r.get("arrive_time"), r.get("finish_time")
+        if idx is None or idx >= len(rows) or arrive is None or finish is None:
+            continue
+        key = rows[idx].get("session")
+        lo, hi = live.get(key, (float(arrive), float(finish)))
+        live[key] = (min(lo, float(arrive)), max(hi, float(finish)))
+    occupied = sum(hi - lo for lo, hi in live.values())
+
     span, busy = _busy_span(records)
     produced = sum(r["output_tokens"] for r in readings.values())
     arrivals = {round(float(r["arrive_time"]), 9) for r in records
@@ -106,8 +129,9 @@ def rung(artifact, gpus):
              if r.get("tpot_s") and r["tpot_s"] > 0]
 
     manifest = artifact.get("run") or {}
+    clients = int(manifest.get("clients") or 0)
     return {
-        "clients": int(manifest.get("clients") or 0),
+        "clients": clients,
         "closed_loop": bool(manifest.get("closed_loop")),
         "requests": len(readings),
         "output_tokens": produced,
@@ -118,6 +142,10 @@ def rung(artifact, gpus):
         "tokens_s_per_user": _median(rates),
         "tokens_s_per_user_n": len(rates),
         "distinct_arrivals": len(arrivals),
+        "sessions": len(live),
+        "realised_clients": (occupied / span) if span else None,
+        "slot_utilisation": ((occupied / span / clients)
+                             if span and clients else None),
         "failed": int(manifest.get("failed") or 0),
     }
 
@@ -138,7 +166,15 @@ def _plot(curves, path):
         # without it a reader cannot tell which end of the curve is one user
         # and which is sixteen.
         for point, x, y in zip(points, xs, ys):
-            ax.annotate(f"{point['clients']}", (x, y), textcoords="offset points",
+            label = str(point["clients"])
+            util = point.get("slot_utilisation")
+            if util is not None and util < 0.9:
+                # The rung ran fewer slots than it was given -- the tail of the
+                # run is a few slots working alone. Labelling the point with
+                # the client count alone would place it on the curve at a
+                # concurrency it never held.
+                label += f" (~{point['realised_clients']:.1f})"
+            ax.annotate(label, (x, y), textcoords="offset points",
                         xytext=(5, 4), fontsize=8, color=colour)
     ax.set_xlabel("tokens/s per user  (1/TPOT, median)")
     ax.set_ylabel("tokens/s per GPU")
