@@ -537,3 +537,115 @@ class TestConcurrencyIsBoundedByTheLanes:
         workload = [_stream_row(s, k, 0.0, 5.0)
                     for s in range(2) for k in range(3)]
         assert _peak(mod, workload, clients=2, instances=1) == 6
+
+
+class TestTheWindowClosesOnALaneMidSession:
+    """A rung must end at its deadline, not at the end of a recorded session.
+
+    The lane loop used to consult the clock only *between* instances, so a
+    lane that had started a session ran it to the end whatever
+    `--benchmark-duration` said. On the corpus that is not a rounding error:
+    the recorded per-session span is 8,468 s at the median and 351,982 s at
+    the longest, so a 1,800 s rung would have run for one recorded session.
+    It showed up as a dry run sitting at 0.2% CPU for ten minutes -- asleep in
+    think time, not wedged.
+
+    The fix may not be to shorten the think time. The scenario the corpus ships
+    with sets `forbid_ignore_trace_delays` and `forbid_inter_turn_delay_cap`,
+    and the only compression it allows is the system-wide idle gap. So the turn
+    behind an unfinished think time is simply not sent, and the run ends with
+    its lanes mid-session -- which is what the same scenario's
+    `minimum_profile_metric_coverage_ratio` of 0.95 is there to tolerate.
+    """
+
+    @staticmethod
+    def _slow_session(turns, gap):
+        """One session whose turns are `gap` seconds apart."""
+        return [_row(0, i * gap, 0.0) for i in range(turns)]
+
+    def _recycled(self, mod, workload, *, clients=1, duration=0.4, send=None):
+        out, guard = {}, mod._IdleGuard(0.0)
+        groups = mod._sessions(workload)
+        began = time.monotonic()
+        plan, _, ended = mod._recycle(
+            workload, groups, clients=clients, duration=duration, instances=0,
+            sampler=mod._Sampler(len(groups), 0, "sequential"),
+            rng=random.Random(0), guard=guard, send=send or _ok, out=out,
+            startup=False)
+        return plan, out, guard, ended - began
+
+    def test_a_long_session_does_not_outlast_the_window(self):
+        mod = _module()
+        # Ten turns a second apart: the session is ten seconds long and the
+        # window is four tenths of one.
+        plan, _, _, wall = self._recycled(
+            mod, self._slow_session(10, 1.0), duration=0.4)
+        assert wall < 3.0, f"the rung ran {wall:.1f}s past a 0.4s window"
+        assert len(plan) < 10
+
+    def test_the_turns_it_did_not_reach_are_not_in_the_plan(self):
+        mod = _module()
+        plan, out, guard, _ = self._recycled(
+            mod, self._slow_session(10, 1.0), duration=0.4)
+        assert guard.cut > 0
+        # The plan is the schedule as executed: every entry left in it was
+        # sent, and none of them waits on one that was not. A dangling edge
+        # here is what would make the modelled side replay a request the real
+        # side never issued.
+        kept = {e["eid"] for e in plan}
+        assert all(d in kept for e in plan for d in e["deps"])
+        assert kept <= set(out)
+
+    def test_nothing_goes_on_the_wire_after_the_deadline(self):
+        mod = _module()
+        sent = []
+        lock = threading.Lock()
+
+        def send(e):
+            with lock:
+                sent.append(time.monotonic())
+            return _ok(e)
+
+        began = time.monotonic()
+        self._recycled(mod, self._slow_session(20, 0.2), duration=0.5,
+                       send=send)
+        assert sent, "nothing was sent at all"
+        assert max(sent) - began < 0.5 + 0.3
+
+    def test_an_unfinished_think_time_is_abandoned_not_shortened(self):
+        mod = _module()
+        # A turn 0.3s behind its predecessor, inside a window with room for
+        # it. Cutting the sleep short to fit would be the inter-turn cap the
+        # scenario forbids; the gap must still be paid in full.
+        gaps = []
+        last = [None]
+        lock = threading.Lock()
+
+        def send(e):
+            with lock:
+                now = time.monotonic()
+                if last[0] is not None:
+                    gaps.append(now - last[0])
+                last[0] = now
+            return _ok(e)
+
+        self._recycled(mod, self._slow_session(3, 0.3), duration=5.0,
+                       send=send)
+        # A lane recycles several times in five seconds, and the gap across an
+        # instance boundary is zero by design -- it belongs to two different
+        # users. So every gap is either that boundary or a recorded think time
+        # paid in full; a value in between is a shortened sleep.
+        assert gaps
+        assert not [g for g in gaps if 0.02 < g < 0.25]
+        assert max(gaps) >= 0.25
+
+    def test_an_unbounded_run_is_not_cut(self):
+        mod = _module()
+        # No duration and no deadline: the modelled side replays a recorded
+        # schedule in full, and a guard left armed from the real side would
+        # silently truncate it.
+        plan, _, guard, _ = self._recycled(
+            mod, self._slow_session(4, 0.01), duration=0.0)
+        assert guard.expires_at is None
+        assert guard.cut == 0
+        assert len(plan) == 4

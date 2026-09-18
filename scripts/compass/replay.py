@@ -443,6 +443,22 @@ class _IdleGuard:
         self._quiet = 0
         self._stop = False
         self._thread = None
+        #: When the profiling window closes, and how many executions it cut.
+        #: A lane has to be interruptible mid-session: this corpus's recorded
+        #: sessions span 2.4 hours at the median and 98 hours at the longest,
+        #: so a loop that only consults the clock between whole instances runs
+        #: for one recorded session rather than for --benchmark-duration.
+        self.expires_at = None
+        self.cut = 0
+
+    def expire_at(self, when: float) -> None:
+        with self.cv:
+            self.expires_at = when
+            self.cv.notify_all()
+
+    def expired(self) -> bool:
+        return (self.expires_at is not None
+                and _time.monotonic() >= self.expires_at)
 
     def start(self):
         if self.cap > 0:
@@ -460,22 +476,35 @@ class _IdleGuard:
     def sending(self):
         return _Sending(self)
 
-    def sleep(self, seconds: float) -> None:
+    def sleep(self, seconds: float) -> bool:
+        """Wait out a recorded think time. False if the window closed first.
+
+        A think time is never shortened to fit the window -- that would be the
+        inter-turn cap the scenario forbids. It is abandoned: the turn behind
+        it is simply not sent, and the run ends with that lane mid-session,
+        which is what a fixed-duration benchmark of a days-long recording is.
+        """
         if seconds <= 0:
-            return
+            return not self.expired()
         with self.cv:
             token = self._next
             self._next += 1
             self._deadlines[token] = _time.monotonic() + seconds
             try:
                 while not self._stop:
-                    left = self._deadlines[token] - _time.monotonic()
+                    now = _time.monotonic()
+                    if self.expires_at is not None and now >= self.expires_at:
+                        return False
+                    left = self._deadlines[token] - now
                     if left <= 0:
                         break
+                    if self.expires_at is not None:
+                        left = min(left, self.expires_at - now)
                     self.cv.wait(left)
             finally:
                 self._deadlines.pop(token, None)
                 self.cv.notify_all()
+        return not self.expired()
 
     def _watch(self) -> None:
         with self.cv:
@@ -586,7 +615,7 @@ def _plan_digest(plan) -> str:
     return hashlib.sha256(canonical.encode()).hexdigest()
 
 
-def _run_executions(execs, send, out, guard) -> None:
+def _run_executions(execs, send, out, guard) -> set:
     """Issue one instance's executions on a real clock, sleeping think time.
 
     A thread is started when a row's predecessors are done, not before, so the
@@ -598,6 +627,10 @@ def _run_executions(execs, send, out, guard) -> None:
     An edge pointing outside this batch is already satisfied: it is either the
     warmup turn, which the boundary waited for, or the previous instance on
     this lane, which this lane ran to completion before calling here.
+
+    Returns the executions the profiling window closed on before they were
+    sent. The DAG is still walked to the end so the lane drains, but nothing
+    past the deadline goes on the wire.
     """
     by_eid = {e["eid"]: e for e in execs}
     waiting = {e["eid"]: {d for d in e["deps"] if d in by_eid} for e in execs}
@@ -609,14 +642,17 @@ def _run_executions(execs, send, out, guard) -> None:
 
     lock = threading.Lock()
     live = [0]
+    cut = set()
     drained = threading.Event()
 
     def go(eid: int) -> None:
         e = by_eid[eid]
         try:
-            if e["think_s"] > 0:
-                guard.sleep(e["think_s"])
-            out[eid] = send(e)
+            if guard.sleep(e["think_s"]):
+                out[eid] = send(e)
+            else:
+                with lock:
+                    cut.add(eid)
         finally:
             ready = []
             with lock:
@@ -633,11 +669,12 @@ def _run_executions(execs, send, out, guard) -> None:
 
     roots = [e["eid"] for e in execs if not waiting[e["eid"]]]
     if not roots:
-        return
+        return cut
     live[0] = len(roots)
     for eid in roots:
         threading.Thread(target=go, args=(eid,), daemon=True).start()
     drained.wait()
+    return cut
 
 
 def _warmup(plan, send, out) -> list[dict]:
@@ -708,12 +745,17 @@ def _recycle(workload, groups, *, clients, duration, instances, sampler, rng,
             f"{(out.get(failures[0]['eid']) or {}).get('error')}")
 
     began = _time.monotonic()
+    if duration:
+        guard.expire_at(began + duration)
+    cut = set()
 
     def lane(c: int) -> None:
         execs = [e for e in initial[c] if e["phase"] == "profile"]
         instance = 0
         while True:
-            _run_executions(execs, send, out, guard)
+            dropped = _run_executions(execs, send, out, guard)
+            with lock:
+                cut.update(dropped)
             instance += 1
             if instances and instance >= instances:
                 return
@@ -729,7 +771,14 @@ def _recycle(workload, groups, *, clients, duration, instances, sampler, rng,
         thread.start()
     for thread in threads:
         thread.join()
-    return plan, began, _time.monotonic()
+    # The plan is the schedule as *executed*. An execution the window closed on
+    # was never sent, so leaving it in would hand the modelled side a request
+    # the real side does not have, and `_workloads_agree` would then refuse the
+    # pair on a difference that is nothing but where the clock ran out. Only
+    # successors can be cut -- a dependent waits for its predecessor -- so no
+    # surviving execution is left pointing at a dropped one.
+    guard.cut = len(cut)
+    return [e for e in plan if e["eid"] not in cut], began, _time.monotonic()
 
 
 def _replay_schedule(plan, send, out, guard) -> None:
@@ -1183,6 +1232,12 @@ def main() -> int:
         "idle_shifts": guard.shifts,
         "idle_shifted_s": round(guard.shifted_s, 3),
         "idle_gap_cap_s": guard.cap or None,
+        # Turns whose think time was still running when the window closed. A
+        # fixed-duration benchmark of a days-long recording ends with every
+        # lane mid-session, so this is expected to be nonzero and is reported
+        # rather than silently pruned: zero here on a long trace would mean the
+        # lanes were not cut but ran a whole recorded session each.
+        "executions_cut_at_deadline": guard.cut,
         "think_time_s": (round(sum(e["think_s"] for e in plan), 3)
                          if plan else None),
         "requests_executed": len(results),
@@ -1220,6 +1275,9 @@ def main() -> int:
         if guard.shifts:
             print(f"  idle guard shifted {guard.shifted_s:.0f}s of dead air in "
                   f"{guard.shifts} jumps")
+        if guard.cut:
+            print(f"  {guard.cut} turns were still thinking when the window "
+                  f"closed and were not sent")
     else:
         print(f"sent {len(workload)} requests, {len(failed)} failed -> {args.out}")
     if failed:
