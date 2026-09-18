@@ -56,9 +56,16 @@ def _per_request(artifact):
     """
     records = {r["request_id"]: r
                for r in (artifact.get("engine") or {}).get("requests", [])}
+    # The one turn before t* is sent to prime its session instance's cache and
+    # is not part of the measurement -- it is in the artifact so the run can be
+    # audited, and out of every statistic computed from it. Counting it would
+    # put one cold request per session instance into a distribution the run
+    # deliberately warmed.
+    warmup = {e["eid"] for e in (artifact.get("plan") or [])
+              if e.get("phase") == "warmup"}
     out = {}
     for result in artifact.get("results", []):
-        if not result.get("ok"):
+        if not result.get("ok") or result.get("index") in warmup:
             continue
         response = result.get("response") or {}
         record = records.get(response.get("id"))

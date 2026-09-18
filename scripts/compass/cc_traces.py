@@ -45,19 +45,30 @@ BLOCK_TOKENS = 64
 #: under 640 tokens. Pass --min-input-tokens 0 to keep them and read the warning.
 DEFAULT_MIN_INPUT_TOKENS = 640
 
-
-def _leaves(requests, depth=0):
-    """Every actual LLM request under `requests`, sub-agents included.
+def _leaves(requests, counter=None, stream=0):
+    """Every actual LLM request under `requests`, and which chain it belongs to.
 
     Nested leaves carry absolute session-clock timestamps, not offsets from
     their wrapper -- checked: no nested `t` is below its wrapper's on any of the
     1,697 wrappers -- so nothing needs rebasing here.
+
+    The chain id matters for ordering. Golden replays a session as a set of
+    concurrent *streams*: the root conversation is one, every `subagent`
+    wrapper is another, and within a stream turn k+1 waits for turn k to come
+    back whatever the recorded clocks say. Between streams the ordering is the
+    recorded one. Without the id the two cannot be told apart, and a session
+    whose root turns happen to overlap in the recording replays as a fan-out it
+    never had. Root is 0; wrappers are numbered in document order, so the id is
+    stable for a given session and means nothing across sessions.
     """
+    if counter is None:
+        counter = [0]
     for r in requests:
         if r.get("type") == "subagent":
-            yield from _leaves(r.get("requests", ()), depth + 1)
+            counter[0] += 1
+            yield from _leaves(r.get("requests", ()), counter, counter[0])
         else:
-            yield r, depth
+            yield r, stream
 
 
 def _sessions(path):
@@ -95,7 +106,7 @@ def extract(path, *, min_input_tokens=DEFAULT_MIN_INPUT_TOKENS,
     rows, kept_sessions = [], 0
     for index, session in _sessions(path):
         stats["sessions_in_corpus"] += 1
-        leaves = [r for r, _ in _leaves(session.get("requests", ()))]
+        leaves = list(_leaves(session.get("requests", ())))
         stats["leaves_in_corpus"] += len(leaves)
         if session.get("block_size") != BLOCK_TOKENS:
             raise ValueError(
@@ -108,8 +119,8 @@ def extract(path, *, min_input_tokens=DEFAULT_MIN_INPUT_TOKENS,
                 f"session {session.get('id')} has hash_id_scope "
                 f"{session.get('hash_id_scope')!r}; this namespaces ids per "
                 f"session, which is only correct for 'local'")
-        peak = max((int(r["in"]) for r in leaves), default=0)
-        ts = [float(r["t"]) for r in leaves] or [0.0]
+        peak = max((int(r["in"]) for r, _ in leaves), default=0)
+        ts = [float(r["t"]) for r, _ in leaves] or [0.0]
         span = max(ts) - min(ts)
         if (peak < session_min_peak_tokens
                 or (max_session_span_s is not None and span > max_session_span_s)
@@ -129,12 +140,12 @@ def extract(path, *, min_input_tokens=DEFAULT_MIN_INPUT_TOKENS,
             # 96.2% of input tokens are a re-send at full length and 85.1% at a
             # cap of 16. `summarise` reports what survived, so the run's own
             # artifact states the reuse it should see.
-            leaves = sorted(leaves, key=lambda r: float(r["t"]))
+            leaves = sorted(leaves, key=lambda rs: float(rs[0]["t"]))
             if len(leaves) > max_requests_per_session:
                 stats["dropped_past_session_cap"] += (
                     len(leaves) - max_requests_per_session)
                 leaves = leaves[:max_requests_per_session]
-        for r in leaves:
+        for r, stream in leaves:
             n_in, n_out = int(r["in"]), int(r["out"])
             if n_in < min_input_tokens:
                 stats["dropped_short"] += 1
@@ -156,6 +167,9 @@ def extract(path, *, min_input_tokens=DEFAULT_MIN_INPUT_TOKENS,
                    "output_tokens": n_out,
                    "hash_ids": [int(h) for h in r["hash_ids"]],
                    "session": index,
+                   # Which chain of the session tree this turn belongs to.
+                   # 0 is the root conversation; the rest are sub-agents.
+                   "stream": int(stream),
                    "session_id": session.get("id"),
                    "api_time_s": float(r["api_time"])}
             if r.get("ttft") is not None:

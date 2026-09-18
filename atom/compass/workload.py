@@ -89,6 +89,37 @@ SESSION_STRIDE = 1 << 24
 SOURCE_BLOCK_TOKENS = 64
 
 
+#: Tokens in the cache-busting marker prepended to a session instance's first
+#: turn. Exactly one native KV block (`--block-size 16`), so every source block
+#: boundary after it still lands on a native boundary: a 64-token source block
+#: shifted by 16 tokens is still four whole native blocks. Sharing *inside* the
+#: session tree -- which is where 96.2% of this corpus's input tokens come
+#: from -- survives untouched; only the leading block differs between
+#: instances, and that is enough to break the hit.
+#:
+#: The marker exists because a duration-bounded run replays the same recorded
+#: session many times. Without it the second instance finds the first
+#: instance's blocks still resident and prefills almost nothing, so the run
+#: reports reuse the recording never had and a throughput figure to match.
+MARKER_TOKENS = 16
+
+
+def marker_words(rid: str) -> list[str]:
+    """`MARKER_TOKENS` words naming one session instance.
+
+    `rid` is hex. Its low bits are carried in the first eight words in base 52;
+    52**8 is 5.3e13 against the 2**48 a 12-hex-digit id holds, so the encoding
+    is not what limits distinctness.
+    """
+    base = len(WORDS)
+    n = int(rid, 16)
+    head = []
+    for _ in range(8):
+        head.append(WORDS[n % base])
+        n //= base
+    return (head + [WORDS[1]] * MARKER_TOKENS)[:MARKER_TOKENS]
+
+
 def _block_words(ordinal: int, block_size: int) -> list[str]:
     """One source block's worth of words, identified by `ordinal`."""
     base = len(WORDS)
@@ -100,6 +131,7 @@ def _block_words(ordinal: int, block_size: int) -> list[str]:
 
 
 def prompt_of_hash_ids(hash_ids, tokens: int, session: int = 0,
+                       marker: str | None = None,
                        block_size: int = SOURCE_BLOCK_TOKENS) -> str:
     """Text whose blocks are shared exactly where `hash_ids` says they are.
 
@@ -125,7 +157,11 @@ def prompt_of_hash_ids(hash_ids, tokens: int, session: int = 0,
     if tokens <= 0:
         return ""
     stride = max(1, int(block_size))
-    words: list[str] = []
+    # The marker goes in front and the whole thing is truncated back to
+    # `tokens`, so the request stays exactly the length the trace recorded.
+    # What falls off the end is filler, not content: every row of this corpus
+    # is a whole number of source blocks, and `tokens` is that count times 64.
+    words: list[str] = list(marker_words(marker)) if marker else []
     for h in hash_ids:
         if len(words) >= tokens:
             break

@@ -91,32 +91,40 @@ def rung(artifact, gpus):
     readings = mod._per_request(artifact)
     records = (artifact.get("engine") or {}).get("requests", [])
 
-    # Only the requests this run actually executed. A closed-loop rung runs a
-    # subset of the trace, and dividing its tokens by the whole trace's span
-    # would report a throughput no run achieved.
-    ids = {(r.get("response") or {}).get("id")
-           for r in artifact.get("results", []) if r.get("ok")}
-    records = [r for r in records if r.get("request_id") in ids]
+    # Only the requests this run actually *measured*. A rung replays a subset
+    # of the trace, and it sends one unmeasured turn per session instance to
+    # prime that instance's cache; `_per_request` has already dropped the
+    # warm-up, and dividing the rest by a span that included it would report a
+    # throughput no measured request achieved.
+    eid_of = {(r.get("response") or {}).get("id"): r["index"]
+              for r in artifact.get("results", []) if r.get("ok")}
+    records = [r for r in records if eid_of.get(r.get("request_id")) in readings]
 
-    # How many slots the rung *ran*, as opposed to how many it was given. A
-    # slot holds one session at a time and takes the next only when that one
-    # ends, so the time-average of live sessions is the time-average of busy
-    # slots. It matters whenever a pool does not divide evenly: a 16-session
-    # pool at 16 clients gives every slot exactly one session, session spans
-    # run 273s to 5802s, and the run's last hour is one slot working alone.
-    # `tokens_s_per_gpu` divides by the whole span, so that tail idle is
-    # charged to the rung -- reported here rather than left to be read as
-    # "16 clients could not fill the GPU".
-    index_of = {(r.get("response") or {}).get("id"): r["index"]
-                for r in artifact.get("results", []) if r.get("ok")}
+    # How many lanes the rung *ran*, as opposed to how many it was given. A
+    # lane holds one session instance at a time and takes the next the moment
+    # that one ends, so the time-average of live instances is the time-average
+    # of busy lanes. Under a duration-bounded run this should sit at `clients`
+    # until the final instances drain, and a number well under it means lanes
+    # went hungry -- which is a fact about the run, not about the GPU.
+    plan = {e.get("eid"): e for e in (artifact.get("plan") or [])}
     rows = artifact.get("workload") or []
     live: dict = {}
     for r in records:
-        idx = index_of.get(r.get("request_id"))
+        eid = eid_of.get(r.get("request_id"))
+        entry = plan.get(eid)
         arrive, finish = r.get("arrive_time"), r.get("finish_time")
-        if idx is None or idx >= len(rows) or arrive is None or finish is None:
+        if arrive is None or finish is None:
             continue
-        key = rows[idx].get("session")
+        if entry is not None:
+            # One session *instance*: the same recorded session replayed twice
+            # is two, because each is its own occupancy of a lane.
+            key = (entry.get("lane"), entry.get("instance"))
+        elif eid is not None and eid < len(rows):
+            # An artifact from before plans were recorded, where the result
+            # index was a row index and a session ran at most once.
+            key = rows[eid].get("session")
+        else:
+            continue
         lo, hi = live.get(key, (float(arrive), float(finish)))
         live[key] = (min(lo, float(arrive)), max(hi, float(finish)))
     occupied = sum(hi - lo for lo, hi in live.values())
@@ -142,10 +150,19 @@ def rung(artifact, gpus):
         "tokens_s_per_user": _median(rates),
         "tokens_s_per_user_n": len(rates),
         "distinct_arrivals": len(arrivals),
-        "sessions": len(live),
+        "session_instances": len(live),
         "realised_clients": (occupied / span) if span else None,
         "slot_utilisation": ((occupied / span / clients)
                              if span and clients else None),
+        # The clock the run was bounded by, beside the span its measured
+        # requests actually occupied on the engine. On the modelled side the
+        # two are different clocks and are meant to differ; on the real side a
+        # large gap means the rung spent wall time not measuring anything.
+        "benchmark_duration_s": manifest.get("benchmark_duration_s"),
+        "profile_window_s": manifest.get("profile_window_s"),
+        "warmup_requests": manifest.get("warmup_requests"),
+        "idle_shifts": manifest.get("idle_shifts"),
+        "idle_shifted_s": manifest.get("idle_shifted_s"),
         "failed": int(manifest.get("failed") or 0),
         # A name for the whole dependency graph: the deal, the rows selected,
         # the edges and the think times. Two sides can both run N clients over

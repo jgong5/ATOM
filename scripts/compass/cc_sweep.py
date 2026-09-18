@@ -46,7 +46,14 @@ def main(argv=None) -> int:
                         "compare points measured against different models")
     p.add_argument("--out-dir", required=True)
     p.add_argument("--clients", type=int, nargs="+", default=[1, 4, 8, 16])
-    p.add_argument("--sessions-per-client", type=int, default=1)
+    p.add_argument("--sessions-per-client", type=int, default=0,
+                   help="a cap on the session instances one lane may get "
+                        "through. 0 -- the default -- lets the clock decide")
+    p.add_argument("--benchmark-duration", type=float, default=1800.0,
+                   help="seconds each rung's lanes keep recycling. Every rung "
+                        "gets the same wall clock, and that is what makes the "
+                        "points comparable: a rung bounded by a session count "
+                        "would end at a different place in every session's arc")
     p.add_argument("--gpus", type=int, default=1)
     p.add_argument("--keep-going", action="store_true",
                    help="run the remaining rungs after one fails. The curve is "
@@ -71,6 +78,7 @@ def main(argv=None) -> int:
             "--table", args.table, "--out-dir", str(work),
             "--clients", str(n),
             "--sessions-per-client", str(args.sessions_per_client),
+            "--benchmark-duration", str(args.benchmark_duration),
             *args.rest])
         rungs.append(str(work))
         if rc != 0:
@@ -89,6 +97,7 @@ def main(argv=None) -> int:
                           "--plot", str(root / "saturation.png")])
     (root / "sweep.json").write_text(json.dumps(
         {"clients": args.clients, "sessions_per_client": args.sessions_per_client,
+         "benchmark_duration_s": args.benchmark_duration,
          "table": args.table, "trace": args.trace, "rungs": rungs,
          "rung_failures": failures}, indent=1))
     if failures:

@@ -239,7 +239,7 @@ class TestARungIsLabelledWithTheSlotsItRan:
         # Four sessions, one per slot, all spanning the same 10s.
         point = mod.rung(_artifact([(0.0, 1.0, 10.0, 100)] * 4, clients=4),
                          gpus=1)
-        assert point["sessions"] == 4
+        assert point["session_instances"] == 4
         assert point["realised_clients"] == 4.0
         assert point["slot_utilisation"] == 1.0
 
@@ -259,7 +259,7 @@ class TestARungIsLabelledWithTheSlotsItRan:
         point = mod.rung(_artifact([(0.0, 1.0, 2.0, 20),
                                     (7.0, 1.0, 3.0, 30)],
                                    clients=1, sessions=[9, 9]), gpus=1)
-        assert point["sessions"] == 1
+        assert point["session_instances"] == 1
         assert point["engine_busy_s"] == 5.0    # the engine idled the gap
         assert point["realised_clients"] == 1.0  # the slot did not
 
@@ -268,7 +268,7 @@ class TestARungIsLabelledWithTheSlotsItRan:
         artifact = _artifact([(0.0, 1.0, 10.0, 100)], clients=1)
         artifact["workload"] = []
         point = mod.rung(artifact, gpus=1)
-        assert point["sessions"] == 0
+        assert point["session_instances"] == 0
         assert point["realised_clients"] == 0.0
 
 

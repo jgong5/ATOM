@@ -286,3 +286,71 @@ class _NullServer:
 
     def __exit__(self, *_):
         return False
+
+
+class TestTheTwoSidesAreHandedTheirWorkDifferently:
+    """A duration-bounded rung discovers its own graph. Lanes recycle until the
+    clock says stop, so how many session instances each got through is not
+    knowable before the run. The modelled side cannot discover the same one --
+    the engine's arrival barrier holds every declared request until all
+    `compass_workload_size` of them have arrived, so it has to be handed a
+    graph that is already complete. Hence the asymmetry: the real side
+    recycles and records what it executed, and the modelled side replays that.
+    Both still carry `--clients`, because that is the rung's name and
+    `saturation.py` reads it off each manifest.
+    """
+
+    def _commands(self, tmp_path, monkeypatch, *extra):
+        work = tmp_path / "out"
+        work.mkdir()
+        (work / "compare.json").write_text(json.dumps({"blocking": []}))
+        (work / "real_steps.jsonl").write_text("{}\n")
+        calls = []
+        monkeypatch.setattr(
+            rv.subprocess, "run",
+            lambda cmd, *a, **kw: subprocess.CompletedProcess(cmd, 0, "", ""))
+        monkeypatch.setattr(rv, "_run",
+                            lambda cmd, label: calls.append((label, cmd)))
+        monkeypatch.setattr(rv, "Served", lambda *a, **kw: _NullServer())
+        monkeypatch.setattr(rv, "_free_port", lambda: 8000)
+        rv.main(["--model", "M", "--trace", str(tmp_path / "t.jsonl"),
+                 "--out-dir", str(work), "--table", str(tmp_path / "s"),
+                 *extra])
+        return work, {label: cmd for label, cmd in calls}
+
+    def test_the_real_side_recycles_against_a_clock(self, tmp_path, monkeypatch):
+        _, cmds = self._commands(tmp_path, monkeypatch,
+                                 "--clients", "4",
+                                 "--benchmark-duration", "1800")
+        real = cmds["real replay"]
+        assert "--pace" in real
+        assert real[real.index("--benchmark-duration") + 1] == "1800.0"
+        assert "--schedule" not in real
+
+    def test_the_modelled_side_replays_the_schedule_the_real_one_executed(
+            self, tmp_path, monkeypatch):
+        work, cmds = self._commands(tmp_path, monkeypatch,
+                                    "--clients", "4",
+                                    "--benchmark-duration", "1800")
+        modelled = cmds["modelled replay"]
+        assert modelled[modelled.index("--schedule") + 1] == str(
+            work / "real.json")
+        # A declared run on a virtual clock: pacing it would time the
+        # simulator, and a duration would ask it to recycle, which it cannot.
+        assert "--pace" not in modelled
+        assert "--benchmark-duration" not in modelled
+
+    def test_both_sides_carry_the_rungs_client_count(self, tmp_path, monkeypatch):
+        _, cmds = self._commands(tmp_path, monkeypatch, "--clients", "8")
+        for cmd in cmds.values():
+            if Path(cmd[1]).name == "replay.py":
+                assert cmd[cmd.index("--clients") + 1] == "8"
+
+    def test_an_open_loop_run_has_no_schedule_to_hand_over(self, tmp_path,
+                                                           monkeypatch):
+        # Without --clients both sides replay the trace's own arrivals, which
+        # both already have. There is nothing for one side to discover.
+        _, cmds = self._commands(tmp_path, monkeypatch)
+        for cmd in cmds.values():
+            assert "--schedule" not in cmd
+            assert "--benchmark-duration" not in cmd

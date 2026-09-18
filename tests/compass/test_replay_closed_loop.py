@@ -21,6 +21,7 @@ finishes: which requests wait for which, how long they then wait, and which
 slot runs them.
 """
 import importlib.util
+import random
 import threading
 import time
 from pathlib import Path
@@ -43,8 +44,47 @@ def _row(session, arrival_s, api_time_s, tokens=640):
             "output_tokens": 16}
 
 
-def _ok(i):
-    return {"index": i, "ok": True, "response": {}}
+def _stream_row(session, stream, arrival_s, api_time_s, tokens=640):
+    row = _row(session, arrival_s, api_time_s, tokens)
+    row["stream"] = stream
+    return row
+
+
+def _ok(e):
+    return {"index": e["eid"], "row": e["row"], "ok": True, "response": {}}
+
+
+def _run(mod, workload, *, clients, duration=0.0, instances=0, send=None,
+         startup=False, seed=0):
+    """A recycling run with no server behind it. Returns `(plan, results)`."""
+    out: dict = {}
+    groups = mod._sessions(workload)
+    plan, _, _ = mod._recycle(
+        workload, groups, clients=clients, duration=duration,
+        instances=instances or (0 if duration else 1),
+        sampler=mod._Sampler(len(groups), seed, "sequential"),
+        rng=random.Random(seed), guard=mod._IdleGuard(0.0),
+        send=send or _ok, out=out, startup=startup)
+    return plan, out
+
+
+def _peak(mod, workload, *, clients, instances):
+    """Highest number of requests on the wire at once."""
+    live = peak = 0
+    lock = threading.Lock()
+
+    def send(e):
+        nonlocal live, peak
+        with lock:
+            live += 1
+            peak = max(peak, live)
+        time.sleep(0.05)
+        with lock:
+            live -= 1
+        return _ok(e)
+
+    _run(mod, workload, clients=clients, instances=instances, send=send)
+    return peak
 
 
 class TestTheRecordedOverlapIsWhatIsReproduced:
@@ -52,7 +92,11 @@ class TestTheRecordedOverlapIsWhatIsReproduced:
         mod = _module()
         rows = [_row(0, 0.0, 1.0), _row(0, 1.0, 1.0), _row(0, 2.0, 1.0)]
         deps, _ = mod._session_plan(rows)
-        assert deps == [[], [0], [0, 1]]
+        # Row 2 waits on row 1 only: row 1 already waits on row 0, so the
+        # second edge states nothing the first does not. The release instant is
+        # `max(ends)` either way -- pruning changes the declared payload and
+        # not the schedule.
+        assert deps == [[], [0], [1]]
 
     def test_requests_that_did_overlap_are_concurrent(self):
         mod = _module()
@@ -71,14 +115,18 @@ class TestTheRecordedOverlapIsWhatIsReproduced:
 
     def test_a_row_with_no_recorded_duration_is_treated_as_instantaneous(self):
         mod = _module()
-        # api_time_s absent -> zero-length window, ending where it starts. The
-        # conservative reading: it blocks what starts after it and overlaps
-        # nothing. The alternative -- an unbounded window -- would make one
-        # missing field serialise the rest of the session.
+        # api_time_s absent -> zero-length window, ending where it starts, so
+        # one missing field cannot serialise the rest of the session by
+        # implying an unbounded window.
+        #
+        # It does not block a row starting at that same instant. Golden wants
+        # the predecessor to have started strictly before, not merely to have
+        # finished by then, and a zero-width interval at t never satisfies that
+        # for a row at t.
         rows = [{"session": 0, "arrival_s": 0.0}, _row(0, 0.0, 1.0),
                 _row(0, -1.0, 3.0)]
         deps, _ = mod._session_plan(rows)
-        assert deps[1] == [0]      # starts at its end, so waits for it
+        assert deps[1] == []
         assert deps[0] == []       # the row still running at t=0 does not block it
 
 
@@ -120,6 +168,7 @@ class TestTheThinkTimeIsKept:
         assert think == [0.0, 0.999]   # measured from the session opening
 
 
+
 class TestSessionsAreNotSplitAcrossClients:
     def test_rows_group_by_session_in_first_arrival_order(self):
         mod = _module()
@@ -127,155 +176,348 @@ class TestSessionsAreNotSplitAcrossClients:
                     _row(3, 2.0, 1.0)]
         assert mod._sessions(workload) == [[1, 3], [0, 2]]
 
-    def test_every_request_of_a_session_runs_on_one_client(self):
+    def test_every_request_of_an_instance_comes_from_one_session(self):
         mod = _module()
         workload = [_row(s, i, 1.0) for s in range(4) for i in range(3)]
-        groups, assignment, _, deps, think, selected = mod._dag(workload, 2, 0)
-        results = mod._closed_loop(workload, groups, assignment, deps, think, _ok)
-        assert len(results) == len(workload)
-
-        # Each client's work is whole sessions, no session is dealt twice, and
-        # between them they cover the trace.
-        by_client = {}
-        for c, slot in enumerate(assignment):
-            for g in slot:
-                sessions = {workload[i]["session"] for i in groups[g]}
-                assert len(sessions) == 1
-                by_client.setdefault(sessions.pop(), []).append(c)
-        assert sorted(by_client) == [0, 1, 2, 3]
-        assert all(len(v) == 1 for v in by_client.values())
-        assert selected == list(range(len(workload)))
+        plan, out = _run(mod, workload, clients=2, instances=2)
+        assert len(out) == len(plan)
+        for key in {(e["lane"], e["instance"]) for e in plan}:
+            rows = [e for e in plan if (e["lane"], e["instance"]) == key]
+            assert len({workload[e["row"]]["session"] for e in rows}) == 1
 
 
-class TestTheDealIsTheSameOnBothSides:
-    """The two sides run the same pool; if they deal it differently they are
-    two experiments, and the paired report cannot tell that from model error."""
+class TestALaneRecyclesUntilTheClockSaysStop:
+    """The pool's size must not decide the run's length.
 
-    def test_the_longest_session_is_dealt_first(self):
+    Dealing a fixed slice of sessions to slots made a small trace produce a
+    short run with idle lanes -- c16 on a 16-session trace realised 9.1 lanes
+    of 16, which was then reported as a fact about the workload rather than as
+    an artifact of the deal. Bounded by the clock, a small pool is simply
+    replayed more times.
+    """
+
+    def test_one_session_is_replayed_many_times(self):
         mod = _module()
-        # One long session and three short ones over two slots. Round-robin
-        # would put the long one with a short one and leave the other slot
-        # idle for most of the run; longest-first does not.
-        workload = ([_row(0, 0.0, 10.0)]
-                    + [_row(s, s, 1.0) for s in range(1, 4)])
-        groups = mod._sessions(workload)
-        assignment, spans = mod._balanced_deal(groups, workload, 2)
-        assert spans == [10.0, 1.0, 1.0, 1.0]
-        assert assignment == [[0], [1, 2, 3]]
+        workload = [_row(0, 0.0, 0.0), _row(0, 0.0, 0.0)]
+        plan, _ = _run(mod, workload, clients=1, duration=0.3)
+        assert len({e["instance"] for e in plan}) > 1
 
-    def test_the_deal_does_not_depend_on_anything_but_the_trace(self):
+    def test_the_pool_does_not_bound_the_run(self):
         mod = _module()
-        workload = [_row(s, s, 1.0 + s) for s in range(9)]
-        first = mod._dag(workload, 3, 0)[1]
-        assert first == mod._dag(workload, 3, 0)[1]
+        workload = [_row(s, 0.0, 0.0) for s in range(2)]
+        short, _ = _run(mod, workload, clients=1, duration=0.15)
+        long, _ = _run(mod, workload, clients=1, duration=0.6)
+        assert len(long) > len(short)
 
-    def test_assignment_does_not_depend_on_how_fast_requests_return(self):
+    def test_every_lane_keeps_working_for_the_whole_window(self):
         mod = _module()
-        workload = [_row(s, s, 1.0) for s in range(9)]
+        # Four lanes, one session in the pool. A fixed deal would leave three
+        # of them with nothing.
+        workload = [_row(0, 0.0, 0.0)]
+        plan, _ = _run(mod, workload, clients=4, duration=0.3)
+        assert {e["lane"] for e in plan} == {0, 1, 2, 3}
+        assert all(len({e["instance"] for e in plan if e["lane"] == c}) > 1
+                   for c in range(4))
 
-        def run(delay_of):
-            def send(i):
-                time.sleep(delay_of(i))
-                return _ok(i)
-            groups, assignment, _, deps, think = mod._dag(workload, 3, 0)[:5]
-            got = mod._closed_loop(workload, groups, assignment, deps, think,
-                                   send)
-            return assignment, sorted(r["index"] for r in got)
-
-        # Slow sessions on one side, fast on the other. A shared work queue
-        # would deal different sessions to different clients; dealing up front
-        # must not.
-        assert run(lambda i: 0.0) == run(lambda i: 0.02 if i % 3 else 0.0)
-
-    def test_sessions_per_client_bounds_the_work_evenly(self):
+    def test_the_sampler_is_seeded(self):
         mod = _module()
-        workload = [_row(s, s, 1.0) for s in range(20)]
-        assignment = mod._dag(workload, 4, 2)[1]
-        assert [len(a) for a in assignment] == [2, 2, 2, 2]
+        workload = [_row(s, 0.0, 0.0) for s in range(6)]
 
-    def test_the_digest_separates_two_different_deals(self):
+        def drawn():
+            sampler = mod._Sampler(6, 7, "shuffle")
+            return [sampler.draw() for _ in range(12)]
+
+        assert drawn() == drawn()
+        assert sorted(drawn()[:6]) == list(range(6))
+
+
+class TestStartupSamplingAndWarmup:
+    """A lane's first session is already in progress, and its prefix is warm.
+
+    Starting every session at turn 0 measures a server whose every session is
+    cold -- maximum prefill, minimum reuse -- which is not the steady state the
+    throughput number is supposed to describe.
+    """
+
+    def test_a_session_joined_midway_skips_the_turns_before_it(self):
         mod = _module()
-        workload = [_row(s, s, 1.0 + s) for s in range(6)]
+        rows = [_row(0, float(i), 0.1) for i in range(10)]
+        warm, profiled = mod._tstar_split(rows, 0.5)
+        assert profiled == [5, 6, 7, 8, 9]
+        assert warm == 4
 
-        def digest(clients):
-            _, assignment, _, deps, think, selected = mod._dag(
-                workload, clients, 0)
-            return mod._dag_digest(assignment, deps, think, selected)
-
-        assert digest(2) == digest(2)
-        assert digest(2) != digest(3)
-
-
-class TestASlotTakesTheNextSessionWhenItIsDone:
-    def test_the_next_sessions_opening_requests_wait_for_the_whole_previous_one(self):
+    def test_the_turn_before_it_is_sent_unmeasured(self):
         mod = _module()
-        workload = [_row(0, 0.0, 1.0), _row(0, 2.0, 1.0), _row(1, 10.0, 1.0)]
-        _, assignment, _, deps, think, _ = mod._dag(workload, 1, 0)
-        assert assignment == [[0, 1]]
-        # Not just the last row of session 0 -- all of them. A sub-agent that
-        # started late can still be running when the main turn has returned,
-        # and the slot is not free until it is not.
+        workload = [_row(0, float(i), 0.0) for i in range(10)]
+        plan = mod._instance(workload, list(range(10)), eid0=0, lane=0,
+                             instance=0, session=0, marker="abc", ratio=0.5)
+        warm = [e for e in plan if e["phase"] == "warmup"]
+        assert len(warm) == 1 and warm[0]["row"] == 4
+        assert [e["row"] for e in plan if e["phase"] == "profile"] == [5, 6, 7, 8, 9]
+
+    def test_the_first_profiled_turn_starts_at_the_boundary(self):
+        mod = _module()
+        # A 30s gap between the warmup turn and the first profiled one. Sleeping
+        # it would put the lane's t* 30s past every other lane's, and the
+        # boundary would stop being a boundary.
+        workload = [_row(0, 0.0, 1.0), _row(0, 30.0, 1.0)]
+        plan = mod._instance(workload, [0, 1], eid0=0, lane=0, instance=0,
+                             session=0, marker="abc", ratio=1.0)
+        first = [e for e in plan if e["phase"] == "profile"][0]
+        assert first["think_s"] == 0.0
+        assert first["think_recorded_s"] == 29.0
+
+    def test_a_recycled_session_replays_from_turn_zero(self):
+        mod = _module()
+        workload = [_row(0, float(i), 0.0) for i in range(6)]
+        plan = mod._instance(workload, list(range(6)), eid0=0, lane=0,
+                             instance=3, session=0, marker="abc", ratio=0.0)
+        assert not [e for e in plan if e["phase"] == "warmup"]
+        assert [e["row"] for e in plan] == [0, 1, 2, 3, 4, 5]
+
+    def test_a_failed_root_warmup_refuses_the_run(self):
+        mod = _module()
+        workload = [_row(0, float(i), 0.0) for i in range(6)]
+
+        def send(e):
+            if e["phase"] == "warmup":
+                return {"index": e["eid"], "row": e["row"], "ok": False,
+                        "error": "TimeoutError: timed out"}
+            return _ok(e)
+
+        with pytest.raises(SystemExit) as exc:
+            mod._recycle(workload, mod._sessions(workload), clients=1,
+                         duration=0.0, instances=1,
+                         sampler=mod._Sampler(1, 0, "sequential"),
+                         rng=random.Random(0), guard=mod._IdleGuard(0.0),
+                         send=send, out={}, startup=True)
+        assert "warmup" in str(exc.value)
+
+
+class TestTheCacheBustMarker:
+    """A recycled session must not find the previous instance's blocks warm.
+
+    Without a marker the second instance of a trace prefills almost nothing, so
+    the run reports reuse the recording never had and a throughput figure to
+    match.
+    """
+
+    def test_two_instances_do_not_share_a_leading_block(self):
+        from atom.compass.workload import MARKER_TOKENS, prompt_of_hash_ids
+
+        one = prompt_of_hash_ids([1, 2], 128, marker="00000000000a").split()
+        two = prompt_of_hash_ids([1, 2], 128, marker="00000000000b").split()
+        assert one[:MARKER_TOKENS] != two[:MARKER_TOKENS]
+
+    def test_the_marker_is_one_native_block(self):
+        from atom.compass.workload import MARKER_TOKENS
+        # 64-token source blocks stay aligned to the engine's 16-token blocks
+        # only if the shift is a multiple of 16.
+        assert MARKER_TOKENS == 16 and 64 % MARKER_TOKENS == 0
+
+    def test_the_marker_does_not_change_the_length(self):
+        from atom.compass.workload import prompt_of_hash_ids
+
+        for tokens in (64, 128, 1024):
+            ids = list(range(1, tokens // 64 + 1))
+            plain = prompt_of_hash_ids(ids, tokens)
+            marked = prompt_of_hash_ids(ids, tokens, marker="0123456789ab")
+            assert len(plain.split()) == len(marked.split()) == tokens
+
+    def test_turns_of_one_instance_still_share(self):
+        from atom.compass.workload import prompt_of_hash_ids
+
+        first = prompt_of_hash_ids([1, 2], 128, marker="0123456789ab").split()
+        second = prompt_of_hash_ids([1, 2, 3], 192, marker="0123456789ab").split()
+        assert second[:128] == first
+
+    def test_every_turn_of_an_instance_carries_the_same_marker(self):
+        mod = _module()
+        workload = [_row(0, float(i), 0.0) for i in range(4)]
+        plan, _ = _run(mod, workload, clients=1, instances=2)
+        for key in {(e["lane"], e["instance"]) for e in plan}:
+            markers = {e["marker"] for e in plan
+                       if (e["lane"], e["instance"]) == key}
+            assert len(markers) == 1
+        assert len({e["marker"] for e in plan}) == len(
+            {(e["lane"], e["instance"]) for e in plan})
+
+
+class TestThePerStreamSpine:
+    """Within a chain, turn k+1 is a reply to turn k.
+
+    The earlier rule read only the recorded windows, session-wide. On a
+    recording where two consecutive root turns overlap by a hair -- different
+    clocks, or a retry -- it replayed a conversation as a fan-out, putting two
+    turns of the same chain in the server at once. The token counts are
+    unchanged, so nothing in the aggregate shows it.
+    """
+
+    def test_a_chain_is_sequential_even_where_the_recording_overlaps(self):
+        mod = _module()
+        rows = [_stream_row(0, 0, 0.0, 1.0), _stream_row(0, 0, 0.999, 1.0)]
+        deps, think = mod._session_plan(rows)
+        assert deps[1] == [0]
+        assert think[1] == 0.0      # it never actually waited, so it does not
+
+    def test_two_chains_that_overlap_are_concurrent(self):
+        mod = _module()
+        rows = [_stream_row(0, 0, 0.0, 10.0), _stream_row(0, 1, 1.0, 2.0),
+                _stream_row(0, 2, 1.5, 2.0)]
+        deps, _ = mod._session_plan(rows)
+        assert deps[1] == [] and deps[2] == []
+
+    def test_a_chain_waits_for_another_chains_completed_request(self):
+        mod = _module()
+        rows = [_stream_row(0, 0, 0.0, 1.0), _stream_row(0, 1, 0.2, 0.3),
+                _stream_row(0, 0, 2.0, 1.0)]
+        deps, think = mod._session_plan(rows)
         assert deps[2] == [0, 1]
+        assert think[2] == pytest.approx(1.0)
+
+    def test_only_the_latest_of_a_chain_is_kept(self):
+        mod = _module()
+        # Three finished turns of one other chain. Waiting on all three says
+        # the same thing as waiting on the last, and the declared payload
+        # carries the edges.
+        rows = [_stream_row(0, 1, 0.0, 0.1), _stream_row(0, 1, 0.5, 0.1),
+                _stream_row(0, 1, 1.0, 0.1), _stream_row(0, 0, 5.0, 1.0)]
+        deps, _ = mod._session_plan(rows)
+        assert deps[3] == [2]
+
+    def test_a_zero_width_predecessor_at_the_same_instant_is_not_one(self):
+        mod = _module()
+        # Golden requires the predecessor to have started strictly before, not
+        # merely to have finished by then.
+        rows = [_stream_row(0, 1, 5.0, 0.0), _stream_row(0, 0, 5.0, 1.0)]
+        deps, _ = mod._session_plan(rows)
+        assert deps[1] == []
+
+    def test_a_trace_without_chain_ids_keeps_the_old_rule(self):
+        mod = _module()
+        rows = [_row(0, 0.0, 1.0), _row(0, 0.2, 0.3), _row(0, 2.0, 1.0)]
+        assert mod._session_plan(rows)[0][2] == [0, 1]
+
+
+class TestTheIdleGuard:
+    """Dead air is skipped; a gap with work behind it is not.
+
+    This corpus's think times are most of its wall clock -- 32 sessions with a
+    few hours of engine work span 98,944 seconds -- so a faithful replay spends
+    nearly all of a fixed window asleep.
+    """
+
+    def test_dead_air_is_shifted_forward(self):
+        mod = _module()
+        guard = mod._IdleGuard(0.2, period=0.02).start()
+        began = time.monotonic()
+        guard.sleep(5.0)
+        elapsed = time.monotonic() - began
+        guard.stop()
+        assert elapsed < 1.5
+        assert guard.shifts >= 1
+        assert guard.shifted_s > 4.0
+
+    def test_a_gap_with_a_request_in_flight_is_not_touched(self):
+        mod = _module()
+        guard = mod._IdleGuard(0.05, period=0.02).start()
+        threading.Thread(target=guard.sleep, args=(5.0,), daemon=True).start()
+        with guard.sending():
+            time.sleep(0.25)
+            shifts = guard.shifts
+        guard.stop()
+        assert shifts == 0
+
+    def test_one_shift_moves_every_pending_timer_by_the_same_amount(self):
+        mod = _module()
+        # Shifting each timer to the cap independently would close the gaps
+        # between lanes, which is the arrival process between sessions.
+        guard = mod._IdleGuard(0.2, period=0.02)
+        for seconds in (5.0, 6.0, 9.0):
+            threading.Thread(target=guard.sleep, args=(seconds,),
+                             daemon=True).start()
+        time.sleep(0.1)
+        with guard.cv:
+            before = sorted(guard._deadlines.values())
+        guard.start()
+        time.sleep(0.15)
+        with guard.cv:
+            after = sorted(guard._deadlines.values())
+        guard.stop()
+        assert len(before) == len(after) == 3
+        moved = [b - a for a, b in zip(after, before)]
+        assert max(moved) - min(moved) < 1e-6
+        assert min(moved) > 4.0
+
+    def test_a_cap_of_zero_leaves_the_clock_alone(self):
+        mod = _module()
+        guard = mod._IdleGuard(0.0).start()
+        began = time.monotonic()
+        guard.sleep(0.3)
+        elapsed = time.monotonic() - began
+        guard.stop()
+        assert elapsed >= 0.28
+        assert guard.shifts == 0
+
+
+class TestTheScheduleIsWhatPairsTheTwoSides:
+    def test_the_digest_separates_two_schedules(self):
+        mod = _module()
+        workload = [_row(s, float(s), 1.0) for s in range(6)]
+        one, _ = _run(mod, workload, clients=2, instances=1)
+        two, _ = _run(mod, workload, clients=3, instances=1)
+        assert mod._plan_digest(one) == mod._plan_digest(one)
+        assert mod._plan_digest(one) != mod._plan_digest(two)
+
+    def test_a_recorded_schedule_replays_the_same_executions(self):
+        mod = _module()
+        workload = [_row(s, float(s), 0.0) for s in range(4)]
+        plan, first = _run(mod, workload, clients=2, instances=2)
+        again: dict = {}
+        mod._replay_schedule(plan, _ok, again, mod._IdleGuard(0.0))
+        assert sorted(again) == sorted(first)
+        assert [again[k]["row"] for k in sorted(again)] == \
+               [first[k]["row"] for k in sorted(first)]
+
+    def test_an_instance_waits_for_the_previous_one_on_its_lane(self):
+        mod = _module()
+        workload = [_row(0, 0.0, 1.0), _row(0, 2.0, 1.0)]
+        plan, _ = _run(mod, workload, clients=1, instances=2)
+        second = [e for e in plan if e["instance"] == 1]
+        first = [e for e in plan if e["instance"] == 0]
+        # Not just the last row of the previous session -- all of its open
+        # ends. A sub-agent that started late can still be running when the
+        # main turn has returned, and the lane is not free until it is not.
+        assert second[0]["deps"] == mod._terminals(first)
         # And no think time on that edge: the gap between two sessions in the
         # trace is a gap between two different users.
-        assert think[2] == 0.0
-
-    def test_the_first_session_of_a_slot_waits_for_nothing(self):
-        mod = _module()
-        workload = [_row(0, 0.0, 1.0), _row(1, 10.0, 1.0)]
-        _, _, _, deps, think, _ = mod._dag(workload, 2, 0)
-        assert deps[0] == [] and deps[1] == []
-        assert think[0] == 0.0 and think[1] == 0.0
-
-    def test_the_between_session_gap_is_not_slept(self):
-        mod = _module()
-        # Two sessions 100s apart in the recording, one slot. The recorded gap
-        # belongs to a different user, so a slot must pick the next session up
-        # immediately -- otherwise a sweep over client counts measures the
-        # trace's own idle time instead of the engine's throughput.
-        workload = [_row(0, 0.0, 0.0), _row(1, 100.0, 0.0)]
-        groups, assignment, _, deps, think, _ = mod._dag(workload, 1, 0)
-        began = time.monotonic()
-        mod._closed_loop(workload, groups, assignment, deps, think, _ok)
-        assert time.monotonic() - began < 1.0
+        assert second[0]["think_s"] == 0.0
 
 
 class TestTheThinkTimeIsReallySlept:
     def test_the_paced_executor_waits_the_recorded_gap(self):
         mod = _module()
         workload = [_row(0, 0.0, 0.0), _row(0, 0.05, 0.0)]
-        groups, assignment, _, deps, think, _ = mod._dag(workload, 1, 0)
-        assert think[1] == 0.05
         began = time.monotonic()
-        mod._closed_loop(workload, groups, assignment, deps, think, _ok)
+        plan, _ = _run(mod, workload, clients=1, instances=1)
         # An executor that declared the gap and then did not sleep it would
         # come back instantly, and the real side would be a burst.
         assert time.monotonic() - began >= 0.045
+        assert [e["think_s"] for e in plan] == [0.0, 0.05]
 
-
-class TestConcurrencyIsBoundedByTheClients:
-    def test_one_client_never_has_two_sessions_open(self):
+    def test_the_between_session_gap_is_not_slept(self):
         mod = _module()
-        # Three sessions, each a single long request. With one client they
-        # must not overlap; a bug that spawns per session rather than per
-        # client would let them.
+        workload = [_row(0, 0.0, 0.0), _row(1, 100.0, 0.0)]
+        began = time.monotonic()
+        _run(mod, workload, clients=1, instances=2)
+        assert time.monotonic() - began < 1.0
+
+
+class TestConcurrencyIsBoundedByTheLanes:
+    def test_one_lane_never_has_two_sessions_open(self):
+        mod = _module()
         workload = [_row(s, 0.0, 1.0) for s in range(3)]
-        live = 0
-        peak = 0
-        lock = threading.Lock()
-
-        def send(i):
-            nonlocal live, peak
-            with lock:
-                live += 1
-                peak = max(peak, live)
-            time.sleep(0.02)
-            with lock:
-                live -= 1
-            return _ok(i)
-
-        groups, assignment, _, deps, think, _ = mod._dag(workload, 1, 0)
-        mod._closed_loop(workload, groups, assignment, deps, think, send)
+        peak = _peak(mod, workload, clients=1, instances=3)
         assert peak == 1
 
     def test_in_session_overlap_really_happens_at_the_socket(self):
@@ -283,22 +525,15 @@ class TestConcurrencyIsBoundedByTheClients:
         # One turn overlapped by two sub-agents, fired a millisecond apart. If
         # the loop serialises the session, peak is 1 and the run measures a
         # workload the corpus does not contain.
-        workload = [_row(0, 0.0, 10.0), _row(0, 0.001, 2.0),
-                    _row(0, 0.002, 2.0)]
-        live = 0
-        peak = 0
-        lock = threading.Lock()
+        workload = [_stream_row(0, 0, 0.0, 10.0), _stream_row(0, 1, 0.001, 2.0),
+                    _stream_row(0, 2, 0.002, 2.0)]
+        assert _peak(mod, workload, clients=1, instances=1) == 3
 
-        def send(i):
-            nonlocal live, peak
-            with lock:
-                live += 1
-                peak = max(peak, live)
-            time.sleep(0.05)
-            with lock:
-                live -= 1
-            return _ok(i)
-
-        groups, assignment, _, deps, think, _ = mod._dag(workload, 1, 0)
-        mod._closed_loop(workload, groups, assignment, deps, think, send)
-        assert peak == 3
+    def test_sub_agents_do_not_take_a_lane_of_their_own(self):
+        mod = _module()
+        # Two lanes, each holding a session that fans out three ways. In-flight
+        # requests reach six, which is the workload and not an error: golden
+        # counts lanes, not requests.
+        workload = [_stream_row(s, k, 0.0, 5.0)
+                    for s in range(2) for k in range(3)]
+        assert _peak(mod, workload, clients=2, instances=1) == 6

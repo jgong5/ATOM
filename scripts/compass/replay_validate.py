@@ -206,7 +206,23 @@ def build_parser():
                         "the trace's own arrivals. One point on a saturation "
                         "curve; see replay.py --clients")
     p.add_argument("--sessions-per-client", type=int, default=0,
-                   help="with --clients, sessions each user works through")
+                   help="with --clients, a cap on the instances one lane may "
+                        "get through. 0 -- the default -- means the clock "
+                        "decides, which is what --benchmark-duration is for")
+    p.add_argument("--benchmark-duration", type=float, default=0.0,
+                   help="seconds the real side keeps its lanes recycling. A "
+                        "lane finishes a session instance and immediately "
+                        "starts another until the clock says stop, so the "
+                        "rung is bounded by time rather than by how many "
+                        "sessions happened to be extracted. The modelled side "
+                        "does not recycle -- it replays the schedule the real "
+                        "side executed")
+    p.add_argument("--startup-sampling", choices=("uniform", "none"),
+                   default="uniform",
+                   help="where in its recording a lane's *first* session "
+                        "joins. Uniform picks an instant t* and sends the one "
+                        "turn before it unmeasured, so the rung does not open "
+                        "with every lane cold at turn 0")
     p.add_argument("--python", default=sys.executable)
     return p
 
@@ -238,12 +254,21 @@ def main(argv=None) -> int:
     replay = [args.python, "scripts/compass/replay.py", "--trace", args.trace,
               "--model", args.model, "--ignore-eos", "--check-lengths",
               "--timeout", str(args.request_timeout)]
-    # Giving both sides the same client flags is what keeps the two runs the
-    # same experiment: same session pool, same deal, same dependency graph.
+    # The client count goes to both sides -- it is the rung's name, and
+    # `saturation.py` reads it off each manifest. What differs is how the two
+    # sides get their work: the real side recycles lanes against a clock, and
+    # the modelled side replays the schedule that produced, because the
+    # engine's arrival barrier holds every declared request until all of them
+    # have arrived and so cannot be handed a graph that grows as it runs.
+    real_only, modelled_only = [], []
     if args.clients:
         replay += ["--clients", str(args.clients)]
         if args.sessions_per_client:
             replay += ["--sessions-per-client", str(args.sessions_per_client)]
+        real_only += ["--startup-sampling", args.startup_sampling]
+        if args.benchmark_duration:
+            real_only += ["--benchmark-duration", str(args.benchmark_duration)]
+        modelled_only += ["--schedule", str(work / "real.json")]
     # --pace on the real side in *both* modes. Open loop it sleeps until each
     # recorded arrival; closed loop it sleeps each session's think time and
     # drives the next turn from the previous response. Without it the real side
@@ -270,7 +295,7 @@ def main(argv=None) -> int:
             # the real side answers a burst while the modelled side answers the
             # trace, and the difference comes out reported as model error.
             _run(replay + ["--port", str(port), "--out", str(real_out),
-                           *real_arrivals], "real replay")
+                           *real_arrivals, *real_only], "real replay")
 
     print("phase 3/5  replaying it modelled ...", flush=True)
     port = _free_port()
@@ -286,9 +311,12 @@ def main(argv=None) -> int:
     with Served(args.python, args.model, port, work / "modelled_server.log",
                 modelled_flags, args.startup_timeout):
         # No --pace: arrivals are declared, so delivery order and socket
-        # latency stop mattering against a virtual clock.
-        _run(replay + ["--port", str(port), "--out", str(modelled_out)],
-             "modelled replay")
+        # latency stop mattering against a virtual clock. `--schedule` hands
+        # this side the lanes, instances and edges the real side executed, so
+        # the two runs are the same graph even though only one of them could
+        # have discovered it.
+        _run(replay + ["--port", str(port), "--out", str(modelled_out),
+                       *modelled_only], "modelled replay")
 
     print("phase 4/5  coverage ...", flush=True)
     covered = True
