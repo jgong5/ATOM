@@ -238,15 +238,20 @@ def main(argv=None) -> int:
     replay = [args.python, "scripts/compass/replay.py", "--trace", args.trace,
               "--model", args.model, "--ignore-eos", "--check-lengths",
               "--timeout", str(args.request_timeout)]
-    # Closed loop replaces the arrival process on *both* sides, so pacing and
-    # declared arrivals both fall away: there is nothing to pace to and nothing
-    # to declare. Giving both sides the same client flags is what keeps the two
-    # runs the same experiment.
+    # Giving both sides the same client flags is what keeps the two runs the
+    # same experiment: same session pool, same deal, same dependency graph.
     if args.clients:
         replay += ["--clients", str(args.clients)]
         if args.sessions_per_client:
             replay += ["--sessions-per-client", str(args.sessions_per_client)]
-    real_arrivals = [] if args.clients else ["--pace"]
+    # --pace on the real side in *both* modes. Open loop it sleeps until each
+    # recorded arrival; closed loop it sleeps each session's think time and
+    # drives the next turn from the previous response. Without it the real side
+    # would post a *declared* graph to an engine on a real clock, which cannot
+    # honour it -- the whole trace would land as one burst while the modelled
+    # side answered the recorded timeline, and the gap would be reported as
+    # model error.
+    real_arrivals = ["--pace"]
 
     if args.skip_real and real_out.exists():
         print(f"phase 2/5  skipped; reusing {real_out}", flush=True)

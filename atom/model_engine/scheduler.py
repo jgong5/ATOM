@@ -940,6 +940,16 @@ class Scheduler:
         # fully arrived, so a draining queue cannot re-close it.
         self._arrival_barrier_open = False
         self._arrival_barrier_since: float | None = None
+        self._arrival_barrier_seen = 0
+        # Client request id -> the instant it finished, for arrivals declared
+        # relative to other requests. Only ever written for requests that
+        # carry a `compass_id`, so a normal run never grows it. See
+        # _resolve_relative_arrivals.
+        self._compass_finished: dict[str, float] = {}
+        # Waiting requests whose arrival is not yet knowable, by seq id. Empty
+        # for every workload that declares nothing, and empties as the run
+        # proceeds. See _resolve_relative_arrivals.
+        self._compass_unresolved: dict[int, Sequence] = {}
 
         # Admit-rejected seqs (those `_unschedulable_reason` flags). Drained
         # by `take_rejected` each EngineCore step; routed through the same
@@ -1246,8 +1256,20 @@ class Scheduler:
 
         # Real seconds deliberately: this measures the harness submitting, not
         # the workload being simulated, and the virtual clock is frozen anyway.
-        if self._arrival_barrier_since is None:
+        #
+        # Restarted every time another request lands, so the deadline means
+        # "the client has gone quiet for this long" rather than "submission has
+        # taken this long in total". Those differ by orders of magnitude at
+        # scale: 3,094 declared requests averaging 127k tokens spend minutes
+        # being posted and tokenized, and a total-time deadline would give up
+        # on a perfectly healthy client and run anyway -- which is the exact
+        # failure this mechanism exists to prevent. A dead client still trips
+        # it, because a dead client stops the count.
+        arrived = len(self.waiting)
+        if (self._arrival_barrier_since is None
+                or arrived > self._arrival_barrier_seen):
             self._arrival_barrier_since = _time.monotonic()
+            self._arrival_barrier_seen = arrived
         elif (_time.monotonic() - self._arrival_barrier_since
               > self.ARRIVAL_BARRIER_TIMEOUT_S):
             self._arrival_barrier_open = True
@@ -1262,8 +1284,9 @@ class Scheduler:
                 "timeout_s": float(self.ARRIVAL_BARRIER_TIMEOUT_S),
             }
             logger.warning(
-                "ATOMCompass WARNING: only %d of %d declared requests arrived "
-                "within %.0fs; running anyway. Virtual time may now advance "
+                "ATOMCompass WARNING: only %d of %d declared requests have "
+                "arrived and none has for %.0fs; running anyway. Virtual time "
+                "may now advance "
                 "past an arrival still in flight, which makes that request "
                 "retroactively late -- treat this run's latencies as invalid.",
                 len(self.waiting), expected, self.ARRIVAL_BARRIER_TIMEOUT_S,
@@ -1283,6 +1306,67 @@ class Scheduler:
         compass = getattr(self.config, "compass_config", None)
         return float(getattr(compass, "admission_seconds", 0.0) or 0.0)
 
+    def _compass_note_finished(self, seq) -> None:
+        """Record when a request with a client id finished.
+
+        Its successors' arrivals are stated relative to this instant, so it is
+        read back by ``_resolve_relative_arrivals``. Called from every path
+        that stamps ``finish_time`` -- including the rejection paths, because a
+        request that is never going to run must still release whatever was
+        waiting behind it, or the run deadlocks on a request that failed.
+        """
+        rid = getattr(seq, "compass_id", None)
+        if rid is not None:
+            self._compass_finished[rid] = seq.finish_time
+
+    def _resolve_relative_arrivals(self) -> None:
+        """Stamp the arrival of waiting requests whose predecessors have finished.
+
+        An agentic session's next turn begins some think time after the
+        previous turn came back, and when it came back is what the run is
+        measuring -- so the client cannot state the arrival and the engine
+        must. Each such request carries the ids it waits on and the recorded
+        gap; once all of them have finished, its arrival is the latest of those
+        finishes plus the gap.
+
+        Stamped into ``arrive_time`` rather than answered from
+        ``_schedulable_at`` every tick, because ``arrive_time`` is what TTFT,
+        the run's span and the queue-age SLA are all measured from. Answering
+        only the scheduling question would leave those three reading the
+        placeholder, and TTFT would then include the user's think time -- an
+        error the size of the gap, which on this corpus is minutes.
+
+        Once stamped a request is never restamped: its predecessors cannot
+        un-finish, and re-deriving it after the clock moved would make an
+        arrival drift forward under a request that had simply not been
+        scheduled yet.
+
+        Walks an index of the unresolved rather than the waiting queue, which
+        at this scale is the difference between a constant and 3,000 attribute
+        reads on every one of a run's millions of ticks. The index empties as
+        the run proceeds and is empty for every workload that declares nothing.
+        """
+        if not self._compass_unresolved:
+            return
+        epoch = getattr(get_clock(), "epoch", None) or 0.0
+        for sid, seq in list(self._compass_unresolved.items()):
+            ends = []
+            for rid in seq.compass_after:
+                end = self._compass_finished.get(rid)
+                if end is None:
+                    break
+                ends.append(end)
+            else:
+                seq.arrive_time = (max(ends) if ends else epoch) + seq.compass_think_s
+                seq.compass_arrival_resolved = True
+                del self._compass_unresolved[sid]
+
+    def _compass_track_unresolved(self, seq) -> None:
+        """Index a request whose arrival is declared relative to others."""
+        if (getattr(seq, "compass_think_s", None) is not None
+                and not seq.compass_arrival_resolved):
+            self._compass_unresolved[seq.id] = seq
+
     def _schedulable_at(self, seq) -> float:
         """The earliest simulated instant this request may be scheduled.
 
@@ -1290,7 +1374,16 @@ class Scheduler:
         hand. Modelled as a delay on the request rather than as time consumed by
         the engine, because it is per-request and concurrent: two requests
         arriving together each wait once, not twice.
+
+        Infinite for a request whose arrival is declared relative to others and
+        whose predecessors have not all finished: it has no arrival instant
+        yet, and the honest answer is "not from anything known now" rather than
+        a number. Callers that jump the clock forward must skip those; the
+        graph always bottoms out in a request that does have an instant.
         """
+        if (getattr(seq, "compass_think_s", None) is not None
+                and not seq.compass_arrival_resolved):
+            return float("inf")
         return seq.arrive_time + self._admission_seconds
 
     def _declared_arrival_pending(self, seq) -> bool:
@@ -1337,7 +1430,25 @@ class Scheduler:
                    if self._schedulable_at(seq) > now]
         if len(pending) != len(self.waiting):
             return  # something has already arrived; let it run
-        advance(min(pending) - now)
+        # Requests still waiting on a predecessor have no instant to jump to --
+        # `inf`, not a time. They are not skipped over: nothing is running, so
+        # whatever releases them must itself be released by an arrival that
+        # does have an instant, and the graph bottoms out there. If none does,
+        # the workload declared a cycle or named a request that was never sent,
+        # and jumping anywhere would invent an arrival.
+        knowable = [at for at in pending if at != float("inf")]
+        if not knowable:
+            if self._compass_unresolved:
+                logger.error(
+                    "ATOMCompass: %d waiting request(s) are declared after "
+                    "requests that have not finished, nothing is running, and "
+                    "no arrival has a knowable instant. The declared arrival "
+                    "graph has a cycle or names a request that was never "
+                    "submitted; this run is stalled.",
+                    len(self._compass_unresolved),
+                )
+            return
+        advance(min(knowable) - now)
 
     def _oldest_waiting_prefill_age_ms(self) -> float:
         """Age in ms (since arrival) of the oldest ADMITTABLE waiting prefill,
@@ -1394,11 +1505,13 @@ class Scheduler:
 
     def add(self, seq: Sequence):
         self._warn_if_unschedulable(seq)
+        self._compass_track_unresolved(seq)
         self.waiting.append(seq)
 
     def extend(self, seqs: list[Sequence]):
         for seq in seqs:
             self._warn_if_unschedulable(seq)
+            self._compass_track_unresolved(seq)
         self.waiting.extend(seqs)
 
     def _deferred_sequence(self, req_id) -> Sequence | None:
@@ -1605,6 +1718,11 @@ class Scheduler:
         decoding already-running sequences.
         """
         self._schedule_tick += 1
+        # Arrivals declared relative to other requests become knowable only as
+        # those finish, so they are resolved before anything reads them --
+        # including the jump below, which would otherwise step over a request
+        # that had just become due. No-op unless a workload declared one.
+        self._resolve_relative_arrivals()
         # Nothing runnable and every arrival still in the future: move virtual
         # time to the next one rather than spinning. No-op off a virtual clock.
         self._advance_to_next_arrival()
@@ -1728,6 +1846,7 @@ class Scheduler:
                 seq.status = SequenceStatus.FINISHED
                 seq.finish_time = get_clock().time()
                 seq.leave_reason = f"unschedulable: {unschedulable}"
+                self._compass_note_finished(seq)
                 self._rejected.append(seq)
                 continue
 
@@ -2161,6 +2280,7 @@ class Scheduler:
         seq.status = SequenceStatus.FINISHED
         seq.finish_time = get_clock().time()
         seq.leave_reason = "aborted"
+        self._compass_note_finished(seq)
         self._rejected.append(seq)
         if not has_inflight_load or not self._connector_flag("is_offload"):
             self._uncount_inflight_load(seq)
@@ -2997,6 +3117,9 @@ class Scheduler:
                 seq.status = SequenceStatus.FINISHED
                 if seq.finish_time == 0.0:
                     seq.finish_time = get_clock().time()
+                # Before the successors' next chance to be scheduled: their
+                # arrivals are stated relative to this instant.
+                self._compass_note_finished(seq)
                 self.total_finished_requests += 1
                 self.total_prompt_tokens += int(seq.num_prompt_tokens)
                 self.total_generation_tokens += max(

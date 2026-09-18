@@ -255,6 +255,19 @@ class Sequence:
         # Scheduler._arrival_barrier_unmet. None on any normal request.
         self.compass_workload_size: int | None = None
 
+        # An arrival declared relative to other requests finishing, rather than
+        # as an offset into the run: this request arrives
+        # `compass_think_s` after the last of `compass_after` finished. The
+        # engine resolves it into `arrive_time` as those requests complete --
+        # see Scheduler._resolve_relative_arrivals -- and until it has,
+        # `compass_arrival_resolved` is False and the request is not
+        # schedulable. `compass_id` is the client's name for this request, the
+        # one its successors refer to. All None/False on a normal request.
+        self.compass_id: str | None = None
+        self.compass_after: tuple[str, ...] = ()
+        self.compass_think_s: float | None = None
+        self.compass_arrival_resolved = False
+
         # statistics fields
         self.arrive_time = 0.0
         # Whether arrive_time above is the caller's declared arrival or a

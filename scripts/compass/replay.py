@@ -106,10 +106,23 @@ def _workload(args) -> list[dict]:
 
 
 #: Most requests this client will hold open at once. One thread each, so this
-#: is a thread count as much as a connection count. Not a tuning knob: past it
-#: the declared-arrival protocol needs a bulk submission the server does not
-#: have, and quietly posting fewer would reintroduce the deadlock this bounds.
-MAX_IN_FLIGHT = 1024
+#: is a thread count as much as a connection count. Not a tuning knob: quietly
+#: posting fewer would reintroduce the deadlock this bounds -- a declared
+#: workload is held by the server until all of it has arrived, so a pool
+#: smaller than the workload is threads waiting on responses the server will
+#: not produce until the threads post more.
+#:
+#: Raised from 1024 because that refused the workload this harness exists for:
+#: 32 sessions at 256k is 3,094 requests, and truncating it to 1,024 would drop
+#: 2,070 of them while the artifact still named the whole trace. The cost is
+#: one OS thread and one socket per request; at 3,094 that is real but well
+#: inside a default `ulimit -n` of 65536, and the stack size is pinned below so
+#: the address space cost stays bounded.
+MAX_IN_FLIGHT = 8192
+
+#: Bytes of stack per request thread. The default 8 MiB times 3,094 threads is
+#: 24 GiB of address space reserved to hold a socket and a dict.
+_THREAD_STACK_BYTES = 512 * 1024
 
 
 def _digest(path):
@@ -179,8 +192,8 @@ def _sessions(workload: list[dict]) -> list[list[int]]:
             sorted(order.items(), key=lambda kv: workload[kv[1][0]]["arrival_s"])]
 
 
-def _dependencies(rows: list[dict]) -> list[list[int]]:
-    """Which of a session's rows each row waited for, from the recorded timing.
+def _session_plan(rows: list[dict]) -> tuple[list[list[int]], list[float]]:
+    """Which of a session's rows each row waited for, and how long it then waited.
 
     A session is not a straight line of turns. 43.5% of the corpus's requests
     overlap another request of their own session, because a turn can fan out
@@ -195,73 +208,181 @@ def _dependencies(rows: list[dict]) -> list[list[int]]:
     waits for exactly those rows that had already finished when it started, and
     runs alongside the rest.
 
-    Time is used for ordering only; the gaps are dropped, which is what makes
-    this a closed loop rather than a replay of the trace's arrival rate.
+    The gap is kept, not dropped. Between a turn coming back and the next one
+    going out sits a user reading the answer and typing, and on this corpus
+    that think time is most of the session: 32 sessions whose requests total
+    a few hours of engine work span 98,944 seconds end to end. Dropping it
+    replaces an agentic workload with a benchmark that hammers -- which is a
+    real workload, but not this one, and it cannot answer how many concurrent
+    sessions a GPU carries.
+
+    So each row gets `think[k]`: the recorded seconds between the last of its
+    predecessors finishing and it starting. A row that waits for nothing
+    measures from when its session opened, which is zero for the first row and
+    the branch's own offset for a sub-agent that was already running.
     """
     starts = [float(r.get("arrival_s", 0.0)) for r in rows]
     ends = [s + float(r.get("api_time_s") or 0.0) for s, r in zip(starts, rows)]
-    return [[j for j in range(len(rows)) if j != k and ends[j] <= starts[k]]
-            for k in range(len(rows))]
+    opened = min(starts) if starts else 0.0
+    deps: list[list[int]] = []
+    think: list[float] = []
+    for k in range(len(rows)):
+        before = [j for j in range(len(rows)) if j != k and ends[j] <= starts[k]]
+        base = max((ends[j] for j in before), default=opened)
+        deps.append(before)
+        # Floored: a recorded end can sit a hair past a recorded start when the
+        # two came from different clocks, and a negative think time would mean
+        # a request arriving before the answer it is a reply to.
+        think.append(max(0.0, starts[k] - base))
+    return deps, think
 
 
-def _run_session(idxs: list[int], deps: list[list[int]], send, out: list) -> None:
-    """Issue one session's requests, honouring the recorded happens-before."""
-    done = [threading.Event() for _ in idxs]
-    threads = []
-
-    def go(k: int) -> None:
-        try:
-            out[idxs[k]] = send(idxs[k])
-        finally:
-            done[k].set()
-
-    for k in range(len(idxs)):
-        # Waiting here, before *starting* k, cannot deadlock: every member of
-        # deps[k] is a row earlier in the session, and each was spawned before
-        # this loop reached k.
-        for j in deps[k]:
-            done[j].wait()
-        thread = threading.Thread(target=go, args=(k,), daemon=True)
-        thread.start()
-        threads.append(thread)
-    for thread in threads:
-        thread.join()
+def _session_span(workload: list[dict], idxs: list[int]) -> float:
+    """Recorded seconds from a session's first request starting to its last
+    finishing -- think time included, because that is what a slot is occupied
+    for."""
+    starts = [float(workload[i].get("arrival_s", 0.0)) for i in idxs]
+    ends = [s + float(workload[i].get("api_time_s") or 0.0)
+            for s, i in zip(starts, idxs)]
+    return (max(ends) - min(starts)) if idxs else 0.0
 
 
-def _closed_loop(workload: list[dict], clients: int, per_client: int, send):
-    """Run the workload as `clients` users, each holding a session to the end.
+def _balanced_deal(groups, workload, clients):
+    """Sessions to slots: longest first, each to the slot holding least so far.
 
-    Open-loop replay pins throughput to the trace's own arrival rate, so every
-    client count lands on the same tokens/s and a saturation curve collapses to
-    a single point. A closed loop asks the other question -- given N users who
-    always have work outstanding, how much does the engine deliver in total and
-    how fast does each user see its own tokens -- which is the curve with
-    tokens/s/GPU against tokens/s/user.
+    A slot is a client. It runs one session to the end, then takes another, so
+    a sweep over client counts has to deal the *same* pool of sessions to 1, 4,
+    8 and 16 slots -- otherwise the rungs are four different workloads and the
+    curve joins points that measure different things.
 
-    Sessions are dealt round-robin from the trace's own order rather than
-    pulled from a shared queue as clients free up. A queue would hand
-    different sessions to different clients on the real and the modelled side,
-    because the two sides finish at different moments; dealing them up front
-    makes both sides execute the same sessions in the same order, so the
-    comparison stays paired per request instead of merely distributional.
+    Dealt up front rather than pulled from a queue as slots free up, for two
+    reasons. The modelled side must declare its arrival graph before it runs,
+    so a runtime queue is not expressible there at all. And a queue would hand
+    different sessions to different slots on the two sides, because they finish
+    at different moments -- the comparison would stop being paired per request
+    and become merely distributional, with no way to tell a scheduling
+    divergence from a cost-model error.
+
+    Longest-processing-time-first is the standard greedy for this and leaves
+    far less tail idle than dealing round-robin, which hands one slot the short
+    sessions and lets it sit out the rest of the run. It is computed from the
+    trace alone, so neither side is handed a decision the other made.
+    """
+    spans = [_session_span(workload, idxs) for idxs in groups]
+    order = sorted(range(len(groups)), key=lambda g: (-spans[g], g))
+    assignment: list[list[int]] = [[] for _ in range(clients)]
+    load = [0.0] * clients
+    for g in order:
+        slot = min(range(clients), key=lambda c: (load[c], c))
+        assignment[slot].append(g)
+        load[slot] += spans[g]
+    return assignment, spans
+
+
+def _dag(workload: list[dict], clients: int, per_client: int):
+    """The whole run as one happens-before graph over the workload's rows.
+
+    Built once and used by both executors, so the real side and the modelled
+    side cannot drift into running different experiments: the paced executor
+    walks it with threads and sleeps, the declared executor hands it to the
+    engine, and there is one definition of what the run is.
+
+    Two kinds of edge. Inside a session, the recorded overlap (see
+    `_session_plan`). Between sessions, the slot: a session's opening requests
+    wait for every request of the session that slot ran before, which is what
+    "finish one, then take the next" means. That edge carries no think time --
+    the gap between two sessions in the trace is a gap between two different
+    users, and says nothing about how soon a slot takes new work.
     """
     groups = _sessions(workload)
     if per_client:
         groups = groups[: clients * per_client]
-    assignment = [groups[c::clients] for c in range(clients)]
-    out: list = [None] * len(workload)
+    assignment, spans = _balanced_deal(groups, workload, clients)
 
-    def client(c: int) -> None:
-        for idxs in assignment[c]:
-            _run_session(idxs, _dependencies([workload[i] for i in idxs]),
-                         send, out)
+    deps: list[list[int]] = [[] for _ in workload]
+    think: list[float] = [0.0] * len(workload)
+    selected: list[int] = []
+    for slot in assignment:
+        previous: list[int] = []
+        for g in slot:
+            idxs = groups[g]
+            sdeps, sthink = _session_plan([workload[i] for i in idxs])
+            for k, i in enumerate(idxs):
+                think[i] = sthink[k]
+                deps[i] = ([idxs[j] for j in sdeps[k]] if sdeps[k]
+                           else list(previous))
+            selected.extend(idxs)
+            previous = list(idxs)
+    return groups, assignment, spans, deps, think, sorted(selected)
 
-    threads = [threading.Thread(target=client, args=(c,)) for c in range(clients)]
+
+def _dag_digest(assignment, deps, think, selected) -> str:
+    """A name for the graph, so two artifacts can be shown to have run the same
+    one. Two sides that dealt sessions differently would still produce a
+    well-formed paired report, and it would be comparing different runs."""
+    import hashlib
+
+    canonical = json.dumps(
+        {"assignment": assignment, "selected": selected,
+         "deps": [deps[i] for i in selected],
+         "think": [round(think[i], 6) for i in selected]},
+        sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(canonical.encode()).hexdigest()
+
+
+def _run_session(idxs: list[int], deps, think, send, out: list) -> None:
+    """Issue one session's requests on a real clock, sleeping its think time.
+
+    One thread per row, all started before any of them blocks, so a row whose
+    predecessors are already done starts at its own offset rather than behind
+    the sum of its siblings' waits. Sleeping in the loop that spawns them
+    instead would serialise two concurrent sub-agents into one after the other.
+
+    Cannot deadlock: an edge only ever points at a row that finished earlier in
+    the recording, and every row's thread exists before any wait begins.
+    """
+    local = {i: k for k, i in enumerate(idxs)}
+    done = [threading.Event() for _ in idxs]
+
+    def go(k: int, i: int) -> None:
+        try:
+            for j in deps[i]:
+                if j in local:
+                    done[local[j]].wait()
+            if think[i] > 0:
+                _time.sleep(think[i])
+            out[i] = send(i)
+        finally:
+            done[k].set()
+
+    threads = [threading.Thread(target=go, args=(k, i), daemon=True)
+               for k, i in enumerate(idxs)]
     for thread in threads:
         thread.start()
     for thread in threads:
         thread.join()
-    return [r for r in out if r is not None], assignment
+
+
+def _closed_loop(workload, groups, assignment, deps, think, send):
+    """Run the graph as `len(assignment)` slots on a real clock.
+
+    Each slot walks its sessions in order; the slot's join between them is the
+    between-session edge `_dag` declared, so the two executors agree without
+    either re-deriving it.
+    """
+    out: list = [None] * len(workload)
+
+    def slot(c: int) -> None:
+        for g in assignment[c]:
+            _run_session(groups[g], deps, think, send, out)
+
+    threads = [threading.Thread(target=slot, args=(c,), daemon=True)
+               for c in range(len(assignment))]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    return [r for r in out if r is not None]
 
 
 def _send(url: str, body: dict, timeout: float) -> dict:
@@ -335,11 +456,13 @@ def main() -> int:
     p.add_argument("--timeout", type=float, default=600.0)
     p.add_argument("--out", required=True)
     p.add_argument("--pace", action="store_true",
-                   help="deliver each request when its arrival really comes "
-                        "round, instead of declaring it. Use against a real "
-                        "engine: a real clock discards a declared arrival, so "
-                        "without this the real side answers a burst while the "
-                        "simulated side answers the trace")
+                   help="drive the timeline from this client's own clock "
+                        "instead of declaring it to the engine. Use against a "
+                        "real engine, in either mode: a real clock discards a "
+                        "declared arrival, so without this the real side "
+                        "answers a burst while the simulated side answers the "
+                        "trace. Open loop it sleeps until each arrival; with "
+                        "--clients it sleeps each session's think time")
     p.add_argument("--time-scale", type=float, default=1.0,
                    help="divide every arrival offset by this, to replay a "
                         "long trace in less time. 1.0 keeps the trace's own "
@@ -360,10 +483,13 @@ def main() -> int:
                         "replaying the trace's arrivals. Each user holds one "
                         "session until every request in it -- sub-agents "
                         "included -- has finished, then takes the next. The "
-                        "trace's inter-arrival gaps are dropped; its recorded "
-                        "in-session overlap is kept. This is the mode that "
-                        "produces a saturation curve: an open-loop replay "
-                        "delivers the trace's own rate whatever N is")
+                        "recorded in-session overlap is kept, and so is the "
+                        "think time between a turn coming back and the next "
+                        "going out; what is dropped is the gap between "
+                        "sessions, which belongs to a different user. This is "
+                        "the mode that produces a saturation curve: an "
+                        "open-loop replay delivers the trace's own rate "
+                        "whatever N is. Add --pace against a real engine")
     p.add_argument("--sessions-per-client", type=int, default=0,
                    help="with --clients, how many sessions each user works "
                         "through. 0 means every session in the trace. Fixing "
@@ -385,12 +511,36 @@ def main() -> int:
     cache_before = _cache_stats(base, args.timeout)
     began = _time.monotonic()
 
-    # Closed loop has no arrival process at all: a request is sent because the
-    # one before it came back. So neither compass field is sent -- declaring an
-    # arrival would contradict the loop, and declaring a workload size would
-    # deadlock, since the barrier holds every request until all `size` of them
-    # are waiting and a closed loop never has more than `clients` in flight.
+    # A closed loop has no arrival process to declare up front: a request goes
+    # out because the one before it came back, and how long that took is what
+    # the run is measuring. The two sides answer that differently.
+    #
+    # Real (--pace): the client owns the loop. It holds each request until its
+    # predecessors' responses are in hand, sleeps the recorded think time, and
+    # sends. A real clock needs nothing from the server.
+    #
+    # Modelled (no --pace): the client cannot own the loop, because the wall
+    # clock it would sleep on and the virtual clock the engine advances race --
+    # a millisecond of round trip can be seconds of simulated time, and the
+    # request lands after work the loop meant it to precede. So the whole graph
+    # is declared instead and the engine resolves each arrival as the requests
+    # it waits on finish. That needs every request posted up front, which is
+    # what `compass_workload_size` and the arrival barrier are for.
     closed = args.clients > 0
+    declared_loop = closed and not args.pace
+
+    groups = assignment = None
+    deps: list[list[int]] = []
+    think: list[float] = []
+    selected: list[int] = list(range(len(workload)))
+    if closed:
+        groups, assignment, _spans, deps, think, selected = _dag(
+            workload, args.clients, args.sessions_per_client)
+        if not selected:
+            print("closed loop executed no requests: the trace has fewer "
+                  "sessions than it has clients, so some clients were dealt "
+                  "nothing", file=sys.stderr)
+            return 2
 
     def one(i_row):
         i, row = i_row
@@ -421,6 +571,16 @@ def main() -> int:
             # and the engine honours it. Ignored by a server on a real clock,
             # which is why --pace exists for that side.
             body["compass_arrival"] = at
+        if declared_loop:
+            # The same graph the paced side walks with threads, stated so the
+            # engine can walk it on its own clock. The ids are row indices into
+            # the workload, which is the only naming both sides already share.
+            body["compass_workload_size"] = len(selected)
+            body["compass_relative_arrival"] = {
+                "id": str(i),
+                "after": [str(j) for j in deps[i]],
+                "think_s": round(think[i], 6),
+            }
         try:
             return {"index": i, "ok": True, "response": _send(base + "/v1/completions",
                                                               body, args.timeout)}
@@ -444,20 +604,7 @@ def main() -> int:
     # which is not the declared arrival process. This happened, went unnoticed
     # because the client still reported "0 failed", and a day's conclusions
     # were drawn from the result.
-    assignment = None
-    if closed:
-        # No bound needed here: a closed loop holds at most one session per
-        # client, and a session's own recorded peak concurrency is at most 23.
-        results, assignment = _closed_loop(
-            workload, args.clients, args.sessions_per_client,
-            lambda i: one((i, workload[i])))
-        if not results:
-            print("closed loop executed no requests: the trace has fewer "
-                  "sessions than it has clients, so some clients were dealt "
-                  "nothing", file=sys.stderr)
-            return 2
-    else:
-        workers = len(workload)
+    def _refuse_oversized(workers: int) -> None:
         if workers > MAX_IN_FLIGHT:
             raise SystemExit(
                 f"{workers} requests needs {workers} concurrent connections, "
@@ -466,8 +613,30 @@ def main() -> int:
                 f"all of it before it starts -- so this needs a bulk "
                 f"submission endpoint rather than a larger pool. Use "
                 f"--num-requests to bound the workload meanwhile.")
-        with ThreadPoolExecutor(max_workers=max(1, workers)) as pool:
+
+    threading.stack_size(_THREAD_STACK_BYTES)
+    if closed and not declared_loop:
+        # Paced: one thread per row of the session being run, not per row of
+        # the trace. A slot holds one session at a time, and a session's own
+        # recorded peak concurrency is at most 23.
+        results = _closed_loop(workload, groups, assignment, deps, think,
+                               lambda i: one((i, workload[i])))
+    elif closed:
+        # Declared: the whole graph has to be in flight at once, for the same
+        # reason an open declared workload does -- the server holds all of it
+        # until all of it has arrived.
+        _refuse_oversized(len(selected))
+        with ThreadPoolExecutor(max_workers=max(1, len(selected))) as pool:
+            results = list(pool.map(lambda i: one((i, workload[i])), selected))
+    else:
+        _refuse_oversized(len(workload))
+        with ThreadPoolExecutor(max_workers=max(1, len(workload))) as pool:
             results = list(pool.map(one, enumerate(workload)))
+    if not results:
+        print("closed loop executed no requests: the trace has fewer "
+              "sessions than it has clients, so some clients were dealt "
+              "nothing", file=sys.stderr)
+        return 2
 
     failed = [r for r in results if not r["ok"]]
 
@@ -520,10 +689,24 @@ def main() -> int:
         # open-loop replay would attribute the trace's arrival rate to a run
         # that ignored it.
         "closed_loop": closed,
+        # Which executor ran the graph. The paced side sleeps the think time on
+        # a real clock; the declared side hands the graph to the engine. An
+        # artifact that cannot say which is not interpretable.
+        "closed_loop_mode": ("paced" if closed and not declared_loop
+                             else "declared" if closed else None),
         "clients": int(args.clients) if closed else 0,
         "sessions_run": (sum(len(a) for a in assignment) if assignment else 0),
         "sessions_per_client": ([len(a) for a in assignment] if assignment
                                 else None),
+        # The deal itself, and a name for the whole graph. Two sides that dealt
+        # sessions to slots differently still produce a well-formed paired
+        # report -- of two different experiments. Comparing these two fields is
+        # how that is caught.
+        "session_assignment": assignment,
+        "dag_sha256": (_dag_digest(assignment, deps, think, selected)
+                       if closed else None),
+        "think_time_s": (round(sum(think[i] for i in selected), 3)
+                         if closed else None),
         "requests_executed": len(results),
         "time_scale": float(args.time_scale),
         "requests": len(workload),

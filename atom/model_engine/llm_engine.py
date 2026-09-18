@@ -682,6 +682,7 @@ class InputOutputProcessor:
         dp_parent_session_id: str | None = None,
         arrival_time: float | None = None,
         workload_size: int | None = None,
+        relative_arrival=None,
     ):
         """responsible for:
         1) Tokenize
@@ -708,6 +709,7 @@ class InputOutputProcessor:
             dp_parent_session_id=dp_parent_session_id,
             arrival_time=arrival_time,
             workload_size=workload_size,
+            relative_arrival=relative_arrival,
         )
         return seqs[0]
 
@@ -725,6 +727,7 @@ class InputOutputProcessor:
         dp_parent_session_id: str | None = None,
         arrival_time: float | None = None,
         workload_size: int | None = None,
+        relative_arrival=None,
     ) -> list[Sequence]:
         """Tokenize once and materialize ``sampling_params.n`` Sequences.
 
@@ -803,6 +806,20 @@ class InputOutputProcessor:
             seq.arrive_time = _stamp_arrival(arrival_time)
             seq.compass_arrival_declared = arrival_time is not None
             seq.compass_workload_size = workload_size
+            if relative_arrival is not None:
+                # Deliberately not stamped here. `arrive_time` above is a
+                # placeholder: the instant this request arrives is
+                # `think_s` after its predecessors finish, and when they
+                # finish is simulated time this process cannot read -- only
+                # the engine core advances the clock. The scheduler resolves
+                # it as they complete; until then the request is not
+                # schedulable. See Scheduler._resolve_relative_arrivals.
+                seq.compass_id = str(relative_arrival.id)
+                seq.compass_after = tuple(str(r) for r in
+                                          (relative_arrival.after or ()))
+                seq.compass_think_s = float(relative_arrival.think_s or 0.0)
+                seq.compass_arrival_declared = True
+                seq.compass_arrival_resolved = False
             self.requests[seq.id] = seq
             if seq.external_request_id is not None:
                 self._external_to_internal[seq.external_request_id] = seq.id
