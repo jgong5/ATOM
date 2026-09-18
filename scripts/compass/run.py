@@ -328,9 +328,23 @@ def main() -> int:
             # unchanged context_lens -- indistinguishable from a chunked-prefill
             # middle chunk, which costs differently because it writes KV.
             #
-            # Two or three per rung, spanning the range rather than bracketing
-            # it. A rung sampled only at its ends is a line through two distant
+            # Several per rung, spanning the range rather than bracketing it. A
+            # rung sampled only at its ends is a line through two distant
             # clusters, which is how rung 16 came out 22.58% low once before.
+            #
+            # Three heights per rung, not one. The table stopped at 131072 --
+            # half the 262144 window -- so every rung's total context topped out
+            # at `count * 131136` and a cc-traces rung at 250k sat outside it by
+            # construction. #78 measured that: rung 16 EXTRAPOLATED on 415 of
+            # 1479 steps and the coverage gate failed. Extending it is not a
+            # memory question. These rounds are cache hits, so a round costs
+            # `shared + count * (length - shared)` and a full-window one costs
+            # what a half-window one does -- 376k-400k tokens against a
+            # 1,225,536-token pool, the same size as the 131072 rows below.
+            #
+            # 196608 is in the list because 131072 and the ceiling alone are two
+            # distant clusters, and a rung fitted through two clusters is the
+            # 22.58% error this sweep already made once.
             shared_rounds = [
                 # (length, count, shared) -- physical cost in the comment.
                 (98304, 8, 65536),      # logical 786k, physical 327k
@@ -346,6 +360,32 @@ def main() -> int:
                 (131072, 48, 126976),   # logical 6.29M, physical 324k
                 (32768, 64, 20480),     # logical 2.10M, physical 806k
                 (98304, 64, 94208),     # logical 6.29M, physical 356k
+                # Three quarters of the window.
+                (196608, 2, 131072),    # logical 393k, physical 262k
+                (196608, 4, 163840),    # logical 786k, physical 295k
+                (196608, 8, 180224),    # logical 1.57M, physical 311k
+                (196608, 16, 188416),   # logical 3.15M, physical 319k
+                (196608, 32, 192512),   # logical 6.29M, physical 324k
+                (196608, 48, 194560),   # logical 9.44M, physical 293k
+                (196608, 64, 195584),   # logical 12.6M, physical 261k
+                # The window itself. Clamped to `ceiling` below, which is
+                # max_model_len less the decode length and a block -- ask for
+                # the full 262144 and the generated tokens run past the window,
+                # which is how the first version of these rounds stopped 90k
+                # short with nothing in the log to say so.
+                #
+                # Rungs 2 and 4 appear here and not above because they had no
+                # shared rounds at all: their whole column came from the
+                # distinct-prefix ladder, which cannot exceed the pool, so they
+                # stopped at 131136 per sequence. A c1 or c4 cc-traces rung runs
+                # exactly there.
+                (262144, 2, 245760),    # logical 524k, physical 278k
+                (262144, 4, 253952),    # logical 1.05M, physical 286k
+                (262144, 8, 245760),    # logical 2.10M, physical 376k
+                (262144, 16, 253952),   # logical 4.19M, physical 383k
+                (262144, 32, 258048),   # logical 8.38M, physical 385k
+                (262144, 48, 259072),   # logical 12.6M, physical 400k
+                (262144, 64, 260096),   # logical 16.8M, physical 383k
             ]
             # Same clamp as above, and the shared prefix with it: a prefix
             # longer than the prompt would silently become no sharing at all.
@@ -355,6 +395,16 @@ def main() -> int:
                 length = min(length, ceiling)
                 rounds.append((length, count, long_decode,
                                min(shared, max(0, length - 64))))
+            # Deduped after clamping, not before. On a model whose window is
+            # smaller than these lengths the three heights collapse onto the
+            # ceiling and become the same round three times -- which is exactly
+            # the case a small model standing in for a large one runs.
+            seen, unique = set(), []
+            for entry in rounds:
+                if entry not in seen:
+                    seen.add(entry)
+                    unique.append(entry)
+            rounds = unique
         # Twice through, because Triton autotunes per shape rather than once per
         # process: the first visit to a shape pays a benchmarking cost that
         # steady-state serving never pays again. The second visit is the one
