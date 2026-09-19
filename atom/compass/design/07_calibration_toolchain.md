@@ -642,8 +642,8 @@ prefill steps of 16 / 256 / 16,128 tokens costing 38.6 / 151.0 / 177.6 ms, all a
 ### Two refusals that belong with `--measure`
 
 1. **A `--measure` run can never be an acceptance run.** The instrument changes what it
-   measures: measure mode cost ~**11 ms of TTFT on the 27B (4%)**, and an earlier version
-   that synchronised around each forward made the run **33% slower** (TPOT 3.26 -> 4.33 ms;
+   measures: measure mode cost ~**11 ms of TTFT on the 27B (4%)**, and a variant that
+   synchronised around each forward made the run **33% slower** (TPOT 3.26 -> 4.33 ms;
    fixed by recording CUDA events on the stream and draining with `query()` rather than
    `synchronize()`, which took perturbation from 1.33x to 0.97x). The standing rule
    generalises: *"admission must come from a run instrumented like the one the prediction

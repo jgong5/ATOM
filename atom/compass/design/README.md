@@ -359,15 +359,12 @@ One thing that **is** in scope and is worth stating as a limit rather than a non
   result is conditional on that input and the artifact says which tier it came from
   (`14` D83, D87).
 
-### In scope, and previously mis-filed here
-
-Three items were listed as non-goals in an earlier draft and should not have been:
+### In scope, and worth naming because they are easily assumed otherwise
 
 - **Speculative decoding and MTP.** Now topic `14`. Three of the four things it changes are
   routine — more structures, a `K+1`-token query per sequence, two extra memory terms — and
   the fourth, acceptance, is handled by ATOM's existing `--spec-decode-acceptance-*`
   mechanism rather than by anything Compass builds.
-
 - **Closed-loop arrivals.** These *are* reproduced (`06` D35) and the clock contract makes
   them work: the harness holds a clock client and its pacing is a Clock Authority call, so
   a closed-loop replay runs against the global virtual timeline. What is genuinely
@@ -469,8 +466,8 @@ The documents use these precisely; a reader will bounce off without them.
 
 - Every document opens with a **status header**. None has been reviewed.
 - Each file is a **design topic**; the numbered `D*` items inside it are **design points**.
-  A topic owns several points. Sub-numbered points (`D3.1`, `D25.1`) were added after the
-  first draft and extend the point they hang off rather than renumbering everything.
+  A topic owns several points. Sub-numbered points (`D3.1`, `D25.1`) extend the
+  point they hang off, rather than renumbering everything downstream.
 - Decisions are numbered **`D*`**, continuous across documents, with a decision log at the
   end of each. TODOs are **`T*`**, likewise continuous.
 - Documents cite each other by number and decision — *"`07` D41"*.

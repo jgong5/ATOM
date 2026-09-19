@@ -63,10 +63,6 @@ sequentially, and force-accepting accordingly.
 
 ### The sampler is a cost and a value, and only one of them can be traced
 
-An earlier draft of this decision said *"the real rejection sampler runs."* That was
-wrong, and the way it was wrong is worth recording because it is the exact class of error
-this design keeps warning about — a claim that reads as reassuring and is not true.
-
 `rejection_synthetic_sample_kernel` is a **Triton kernel**
 (`rejection_sampler.py:334`). Under Compass no kernel runs. So the sampler has to be
 split into two halves that are handled differently:
@@ -140,9 +136,7 @@ This is the same failure mode as the design's central finding, in a new place: m
 aggregate does not match the schedule. A prior run was within 1.0% on prefill seconds and
 90% wrong on median TTFT.
 
-### What a distribution can and cannot buy — the honest limit
-
-Before the decision, the limit, because an earlier draft of D87 overclaimed here.
+### What a distribution can and cannot buy
 
 Feeding measured *rates* and re-drawing from them reproduces the acceptance
 **distribution**, in expectation. It does **not** reproduce:
@@ -195,13 +189,12 @@ For contract 2, the flow:
 `SpecStats` already tracks exactly the histogram this needs — `distribution` is keyed
 `0..mtp_k` — so the conversion is a cumulative sum and nothing more.
 
-### The transport does not exist yet, and an earlier draft claimed it did
+### The transport for a list does not exist yet
 
 `synthetic_acceptance_rates` is a `list[float]` on `SpeculativeConfig`
-(`config.py:1077`), which is what the earlier draft pointed at when it said this "needs no
-new mechanism". That was wrong: the field is **internal and derived**, filled by
-`__post_init__` from `acceptance_length_to_rates(length, n)` (`config.py:1184`). The CLI
-exposes only the two **scalars** — `--spec-decode-acceptance-length` and
+(`config.py:1077`), but it is **internal and derived** — filled by `__post_init__` from
+`acceptance_length_to_rates(length, n)` (`config.py:1184`). The CLI exposes only the two
+**scalars** — `--spec-decode-acceptance-length` and
 `--spec-decode-acceptance-rate` (`arg_utils.py:359,373`). There is no input path for a
 list, so contract 2 has nowhere to put its measurement.
 
@@ -309,8 +302,8 @@ Concretely, for acceptance cells:
 1. Run the real side. Record `SpecStats.distribution`.
 2. Feed the measured per-position rates to the simulated side (D84 tier 1).
 3. Report the three results of `08` D44 as usual — **plus** an acceptance-agreement check
-   between the two sides, at the right strength. An earlier draft called it "near-exact";
-   that was an overclaim and D84's trade explains why. What is actually checkable:
+   between the two sides, at the right strength — which is weaker than exact agreement,
+   for the reason D84 gives. What is checkable:
 
    | Quantity | Expectation | Status |
    |---|---|---|

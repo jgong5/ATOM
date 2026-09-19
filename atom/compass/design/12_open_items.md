@@ -26,21 +26,20 @@ in the execution plan rather than caveats in a document.
 |---|---|---|---|---|
 | **T21** | The in-situ calibration transfers across TP width | the recipe's "calibrate at TP1, predict TP2/4/8" collapses and the campaign multiplies by the number of widths | **Doc `07` Phase 1c's one extra run.** Calibrate at TP1, predict a TP2 full-engine run, compare. Already a designed step of the recommended flow — it is step 6 — so the check is not extra work, it is the reason that step exists. | one TP2 engine run, ~1 h GPU |
 | **T25** | The real-vs-real noise floor stays narrow under closed-loop replay at high client count | those cells become ungradeable — not failed, *ungradeable*, which is worse because nothing is proven either way | **Doc `08` D45's step 1, run before any simulated comparison.** N≥3 spaced real repeats at the 64- and 256-client cells; report the pairwise spread. If it swamps 10%, say so and re-scope the acceptance cells. | 3 real cc-traces runs per cell, ~3 h GPU |
-| **T5** | ATOM's model classes trace cleanly under `FakeTensorMode` at TP>1 | tier b has no IR, and docs `04`, `07` and `09` rest on it | **Trace the 27B at TP2 under the doc `04` D18 mechanism and diff the captured structure against TP1.** Run this FIRST and cheaply - it is not blocked on T52. A fake-tensor trace should be GPU- and collective-free, so the known mode hang should not be reachable from it; T5 is the experiment that settles whether that reasoning holds. Needs a non-wedged node (`rocminfo` under `timeout` before starting). | half a day, one node |
+| **T5** | ATOM's model classes trace cleanly under `FakeTensorMode` at TP>1 | tier b has no IR, and docs `04`, `07` and `09` rest on it | **Trace the 27B at TP2 under the doc `04` D18 mechanism and diff the captured structure against TP1.** Run this first and cheaply. A fake-tensor trace should be GPU- and collective-free, so the known mode hang should not be reachable from it; T5 is the experiment that settles whether that reasoning holds. Needs a non-wedged node (`rocminfo` under `timeout` before starting). | half a day, one node |
 | **T10** | `AgenticReplayStrategy` can be subclassed rather than vendored | the harness adapter grows by ~2,000 lines to keep in sync with upstream | **Read the class and attempt a minimal subclass that redirects pacing to the clock client.** No hardware, no ATOM. This is an hour of work that swings the adapter estimate by an order of magnitude. | 1 h, laptop |
-| **T52** | `TorchDispatchMode` instrumentation does not hang ATOM at width | `--measure` runs and any mode-based instrumentation of a REAL execution are unusable. **Narrowed after review: probably does not gate Phase 1a tracing** - the hazard is a `__torch_function__` guard on a real device, not a fake-tensor trace. | **Root-cause the known hang** at `atom/spec_decode/dspark_scheduler.py:264`. `rocgdb` attach, `info dispatches` per rank, identify which rank diverges. | <1 day, quiet node |
+| **T52** | `TorchDispatchMode` instrumentation does not hang ATOM at width | `--measure` runs and any mode-based instrumentation of a REAL execution are unusable. **Probably does not gate Phase 1a tracing** - the hazard is a `__torch_function__` guard on a real device, not a fake-tensor trace. | **Root-cause the known hang** at `atom/spec_decode/dspark_scheduler.py:264`. `rocgdb` attach, `info dispatches` per rank, identify which rank diverges. | <1 day, quiet node |
 
-**Ordering, revised 2026-09-19.** T10 first (no hardware, largest swing per hour). Then
-**T5** — previously placed behind T52, and that was wrong. A `FakeTensorMode` trace should
-be GPU-free and collective-free, so the known mode hang should not be reachable from it;
-T5 is both the cheaper experiment and the one that tells us whether T52 gates anything on
-the critical path. **T52** follows, at ordinary priority unless T5 actually hits the hang.
-T21 and T25 need the calibration and harness to exist, so they land later — but both are
-*designed-in steps*, not add-ons, and neither should slip to the end.
+**Ordering.** T10 first: no hardware, largest swing per hour. Then **T5** — a
+`FakeTensorMode` trace should be GPU-free and collective-free, so it is both the cheaper
+experiment and the one that tells us whether T52 gates anything on the critical path.
+**T52** follows, at ordinary priority unless T5 actually hits the hang. T21 and T25 need
+the calibration and harness to exist, so they land later — but both are *designed-in
+steps*, not add-ons, and neither should slip to the end.
 
-**The honest framing:** T21 and T25 can each invalidate a whole acceptance claim. T5 can
-invalidate a whole tier. T52 invalidates `--measure` and mode-based instrumentation of a
-real run, which is narrower than the earlier draft claimed. Finding out late is the
+**What each one costs if it fails.** T21 and T25 can each invalidate a whole acceptance
+claim. T5 can invalidate a whole tier. T52 invalidates `--measure` and mode-based
+instrumentation of a real run — narrower, but a designed path. Finding out late is the
 expensive outcome in every case, which is the argument for putting them early rather than
 where they naturally fall.
 
@@ -61,9 +60,8 @@ silently carried as gaps.
 | ~~M-f~~ | ~~Speculative decoding / MTP~~ | Acceptance is a *behaviour* Compass cannot compute - the first quantity in the design that is neither derivable nor measurable. | **IN SCOPE** by decision 2026-09-19; topic `14_speculative_decoding.md`, D82-D87. Placed as **M3.5** (mechanism on Qwen3.8-27B), real claim at M5/M6. |
 | **M-g** | **Simulated-run observability** | Doc `01` D3.1's open issue says the CA should own the global timeline log and the deadlock dump, and that "its output format is part of the acceptance evidence and should be designed, not improvised". Doc `11` covers Prometheus metrics, which is a different thing. Still improvised. | **Fold into `01`** alongside M-e. |
 
-**Status, 2026-09-19.** M-a written (`13`). M-b settled (`08` D50.1). M-f decided **in
-scope** and written (`14`). Still open: fold **M-c**, **M-e** and **M-g** into their own
-topics as sections; **M-d** waits for a doc `16`, before M7 starts.
+**Still open:** fold **M-c**, **M-e** and **M-g** into their own topics as sections;
+**M-d** waits for a doc `16`, written before M7 starts.
 
 ---
 

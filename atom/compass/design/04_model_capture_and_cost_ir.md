@@ -392,10 +392,10 @@ domain is detected rather than mispriced.
 
 ### `Repeat` must nest, and must tolerate a non-contiguous pattern
 
-The first sketch of `Repeat` assumed the thing every dense decoder looks like: one layer
-class, N identical instances, contiguous. Real models are not that, in two distinct ways,
-and the IR has to carry both or it silently flattens back to a linear `Seq` and loses the
-compression that makes symbolic pricing cheap.
+The obvious form of `Repeat` — one layer class, N identical instances, contiguous — is
+what a dense decoder looks like and not what real models are. They break it in two
+distinct ways, and the IR has to carry both or it silently flattens back to a linear `Seq`
+and loses the compression that makes symbolic pricing cheap.
 
 **Way 1 — prologue and epilogue.** The first and last layer routinely differ: a dense
 first layer in an otherwise-MoE stack, a different attention variant on layer 0, a final
@@ -795,9 +795,8 @@ against 330 captured (compiled)**. Inductor accounted for **exactly one** operat
 `split_with_sizes` and `empty` that inductor resolves into offsets and a buffer plan.
 **Compute totals are 283 operators either way.**
 
-An earlier note claimed compilation dropped 57 operators and argued for capturing at
-`--level 0`, *"which nobody deploys"*. That was wrong and is recorded here so it is not
-re-derived.
+So compilation does not thin the graph in a way that would justify capturing at
+`--level 0`, which nobody deploys.
 
 ### The launch regime belongs to the step, not the trace
 
@@ -852,10 +851,9 @@ Deferred to future work by decision on 2026-09-18.
   guard **hangs all 8 ranks on ROCm**. Mode-based instrumentation has already caused one
   production hang in this codebase.
 
-  **How much this actually gates T5 — narrowed after review.** The earlier draft placed
-  this ahead of all tracing work. That was too strong, and the argument against it is
-  sound: a `FakeTensorMode` trace should be **GPU-free and collective-free**, so a hang
-  whose mechanism is a desynchronised collective should not be reachable from it.
+  **How much this gates T5.** A `FakeTensorMode` trace should be **GPU-free and
+  collective-free**, so a hang whose mechanism is a desynchronised collective should not
+  be reachable from it.
 
   Two things have to hold for that, and both look true:
 
@@ -874,13 +872,12 @@ Deferred to future work by decision on 2026-09-18.
   the cheap way to convert them into evidence is T5 itself, which will either trace
   cleanly at TP>1 or produce the hang and settle the question.
 
-  **It still gets root-caused rather than worked around**, for a reason independent of
-  T5: mode-based instrumentation has caused one production hang in this codebase, and
+  **It gets root-caused rather than worked around**, for a reason independent of T5: mode-based instrumentation has caused one production hang in this codebase, and
   `--measure` is a designed path. A workaround that avoids the one known call site leaves
   the mechanism unexplained and the next call site undiscovered.
 
-  **Revised ordering:** run T5 *first* and cheaply. If it traces clean at TP>1, T52 drops
-  to ordinary priority and stops being a gate on anything in the critical path.
+  **Ordering:** run T5 *first* and cheaply. If it traces clean at TP>1, T52 drops to
+  ordinary priority and gates nothing on the critical path.
 
   What root-causing means concretely, and why it is tractable: the failure is a
   *collective* hang, so the question is which rank diverges. `torch.tensor(N,

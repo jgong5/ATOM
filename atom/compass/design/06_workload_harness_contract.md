@@ -68,10 +68,9 @@ stopwatch. A harness that cannot do the third is still usable for throughput-onl
 
 ### Warmup is not a protocol feature
 
-Settled: **warmup requests are ordinary requests sent early.** They carry `compass.arrival_s`
-like any other, go through the same endpoint, and the contract gains nothing. The
-earlier draft treated warmup as an open contract question; it is not one, because
-nothing about a warmup *request* differs from a normal one.
+**Warmup requests are ordinary requests sent early.** They carry `compass.arrival_s` like
+any other, go through the same endpoint, and the contract gains nothing from special-casing
+them — nothing about a warmup *request* differs from a normal one.
 
 What does differ is the **engine's state when it serves them**, and that is where the
 actual hazard lives. A prior sweep's first three prefill steps cost 47.5 / 19.5 / 6.1 s
@@ -138,12 +137,11 @@ dedicated one.
 The requirement is that these are the minimum — nothing more, nothing less. Audited in
 both directions.
 
-**One nested object per direction, not four flat keys.** The earlier draft used four
-top-level names (`sim_arrival` in; `sim_arrive`/`sim_first_token`/`sim_finish` out).
-Two problems: `sim_arrival` and `sim_arrive` differ by two characters and mean different
-things, which is a bug waiting to happen; and four new top-level keys is four collisions
-with a schema ATOM does not own. One `compass` object is **one** additive key each way,
-namespaced, and trivially ignorable by a server that does not know it.
+**One nested object per direction, not four flat keys.** Four top-level names would mean
+four collisions with a schema ATOM does not own, and near-identical names for the declared
+arrival and the engine's own reading — two things that differ by a clamp and must never be
+confused. One `compass` object is **one** additive key each way, namespaced, and trivially
+ignorable by a server that does not know it.
 
 **What is deliberately NOT a Compass field, because the OpenAI schema already has it:**
 

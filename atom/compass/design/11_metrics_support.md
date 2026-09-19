@@ -266,13 +266,15 @@ waiting-queue depth before the next step samples it. But nothing *consumes* that
 until the next step — the scheduler only acts at steps — so the step-resolution series is
 the decision-relevant one. Stated here rather than left implicit.
 
-### A subtlety this dissolves
+### A subtlety per-step sampling dissolves
 
-An earlier draft of this design used a virtual timer and needed a rule: the timer must be
-**re-armed, not back-filled**, across an idle jump, or a 100 ms timer would owe 550 firings
-of identical state when the clock jumps from t=5 s to t=60 s. **With per-step sampling that
-case does not arise** — the jump is one event, it produces one sample, and Prometheus's own
-staleness handling draws the gap. The rule is unnecessary rather than merely satisfied.
+A cadence-driven sampler has to decide what an idle jump owes it: a 100 ms timer spanning
+a clock jump from t=5 s to t=60 s is 550 firings of identical state, which must be either
+re-armed or back-filled, and the choice is load-bearing.
+
+**Per-step sampling never faces the question.** The jump is one event, it produces one
+sample, and Prometheus's own staleness handling draws the gap. The question is dissolved
+rather than answered.
 
 ### Backfill constraints, and how ATOM lands against them
 
@@ -313,8 +315,8 @@ exporter**.
 | metric emission that **advances the virtual clock** | emission is simulator overhead, not modelled work. Under `01` D4 virtual time advances only for durations the cost model produced, so this is satisfied by construction — but it must be **asserted**, because a hook that accidentally sat inside a Category-A path would be invisible |
 
 The standing reminder behind the last row: the instrument changes what it measures. Measure
-mode cost ~**11 ms of TTFT on the 27B (4%)**, and an earlier version that synchronised
-around each forward made the run **33% slower** (TPOT 3.26 → 4.33 ms).
+mode cost ~**11 ms of TTFT on the 27B (4%)**, and a variant that synchronised around each
+forward made the run **33% slower** (TPOT 3.26 → 4.33 ms).
 
 ---
 

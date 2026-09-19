@@ -99,9 +99,9 @@ forces a chosen acceptance curve instead of computing one.
 
 ### Problem
 
-An earlier design gave the runner three modes (`trace`, `measure`, `predict`), which put
-a mode check in front of every override and made "which mode was this artifact produced
-under" a question that had to be tracked out-of-band.
+A runner with modes — `trace`, `measure`, `predict` — puts a mode check in front of every
+override, and makes "which mode produced this artifact" a question that has to be tracked
+out-of-band.
 
 ### Decision
 
