@@ -736,6 +736,31 @@ def _recycle(workload, groups, *, clients, duration, instances, sampler, rng,
     initial = [instantiate(c, 0,
                            rng.random() if startup else 0.0, [])
                for c in range(clients)]
+    # Warmup is a *global* barrier, and until now only this side knew it.
+    # `_warmup` below dispatches every lane's turn and joins before any lane
+    # profiles -- that is the whole point of the phase, that profiling starts
+    # from one instant with every session's prefix already resident. The
+    # recorded graph did not say so: `_instance` chains a lane's first profiled
+    # turn to its own warmup and to nothing else. Walking that graph with
+    # threads hides the omission, because `_warmup`'s join supplies the barrier
+    # the edges leave out. Walking it as declared does not: lane 0 starts
+    # profiling while lanes 1-7 are still prefilling 250k tokens apiece.
+    #
+    # At c8 that put 1157.1s of warmup work -- 41% of the modelled span, 644.9s
+    # of it in batches shared with measured requests -- inside the window
+    # `saturation.py` measures over measured requests only, against 0.0s on the
+    # paced side. The rung read as a 24% throughput shortfall that was neither a
+    # cost error (the same oracle prices that schedule at 0.974) nor a
+    # scheduling one (the modelled side used 2.7% *less* engine time).
+    #
+    # Stating the barrier in the graph costs the paced side nothing:
+    # `_run_executions` already drops edges pointing outside the batch it was
+    # given, and a profile batch never contains a warmup execution.
+    warm = {e["eid"] for ex in initial for e in ex if e["phase"] == "warmup"}
+    if warm:
+        for e in (e for ex in initial for e in ex):
+            if e["phase"] == "profile" and warm.intersection(e["deps"]):
+                e["deps"] = sorted(set(e["deps"]) | warm)
     failures = _warmup([e for ex in initial for e in ex], send, out)
     if failures:
         raise SystemExit(
