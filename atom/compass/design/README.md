@@ -1,8 +1,8 @@
 # ATOM Compass — Design
 
 **Status: design only.** Nothing here has been implemented, and every document carries a
-header marking it as an unreviewed draft. **89 decisions (D0–D77 plus sub-decisions)** are
-indexed at the end of this file; **56 open TODOs (T1–T56)**, the load-bearing assumptions,
+header marking it as an unreviewed draft. **100 decisions (D0–D87 plus sub-decisions)** are
+indexed at the end of this file; **61 open TODOs (T1–T61)**, the load-bearing assumptions,
 the missing topics and the cross-cutting issues live in **`12_open_items.md`**.
 
 ---
@@ -155,7 +155,8 @@ document that owns it. Nothing in `01`–`11` is outside this diagram.
   |                       measure {ops,collectives,steps,memory} |      |
   |                       validate | explain                            |
   |                       spec probes . merge . validate . explain      |
-  |                                                    docs 07, 05      |
+  |                       flags, precedence, the `compass` executable   |
+  |                                                docs 07, 05, 13      |
   +=====================================================================+
   |  L4  WORKLOAD         clock client  |  wire fields (compass.*)      |
   |                       per-harness adapter (out of tree)             |
@@ -167,7 +168,9 @@ document that owns it. Nothing in `01`–`11` is outside this diagram.
   |                       +- tier 0 analytic   +- activations           |
   |                       Cost IR: Seq/Repeat/Par, opaque leaves        |
   |                       fitting, law selection, hull guard            |
-  |                                             docs 02,03,04,09,10     |
+  |                       spec-decode: draft/verify structures,         |
+  |                       declared acceptance, draft KV                 |
+  |                                          docs 02,03,04,09,10,14     |
   +=====================================================================+
   |  L2  EXECUTION        CompassModelRunner (the seam)                 |
   |                       simulated KV connector                        |
@@ -214,6 +217,8 @@ document that owns it. Nothing in `01`–`11` is outside this diagram.
 | L5 | Machine spec schema and probes | [`05_machine_spec_and_probes.md`](05_machine_spec_and_probes.md) | D24–D26 |
 | L0 | Artifact store, keys, invalidation | [`07`](07_calibration_toolchain.md) | D41, D43 |
 | — | Validation protocol (judges all of it) | [`08_validation_protocol.md`](08_validation_protocol.md) | D43.1, D44–D52 |
+| L5 | Configuration surface: flags, precedence, the `compass` CLI | [`13_configuration_surface.md`](13_configuration_surface.md) | D78–D81 |
+| L2/L3 | Speculative decoding and MTP | [`14_speculative_decoding.md`](14_speculative_decoding.md) | D82–D87 |
 | — | Open items, assumptions, gaps | [`12_open_items.md`](12_open_items.md) | — |
 
 ### B. A simulated step, end to end
@@ -322,6 +327,7 @@ Final proof is **paired simulated and real execution of cc-traces proper**.
 | **M1** | Fake models covering prefill, decode, KV need and TP/DP/PP/EP; the discrete-event foundation; the test harness; PD aggregation and disaggregation driven by the cc-traces harness |
 | **M2** | Qwen3.8-27B on MI308X-class hardware, PD aggregation, **TP1** |
 | **M3** | Qwen3.8-27B, same hardware, **TP2 and TP4** |
+| **M3.5** | **Speculative decoding / MTP** mechanism on Qwen3.8-27B: structures, shapes, draft KV, declared acceptance (`14`) |
 | **M4** | Qwen3.8-27B, same hardware and TP configs, **PD disaggregation across two nodes** |
 | **M5** | Kimi-K3, same hardware, **TP8**, PD aggregation |
 | **M6** | Kimi-K3, **TP8, PD disaggregation** |
@@ -343,12 +349,24 @@ Stated here so they are not discovered at review.
 | Neighbour contention. Compass models a **dedicated** device, so it will not predict an OOM a shared box produces | `03` D14 |
 | Memory fragmentation — not modelled, not planned, and nobody models it | `03` D16 |
 | **Cancellation** — `status` is `"completed"` on all 1,697 subagent wrappers in both corpora. There is nothing to replay. | `06` D35 |
-| Speculative decoding / MTP step shapes — no milestone names them | `12` M-f |
 | Serving *decisions* as a simulated subsystem — a simple serving simulation is planned for a later phase of Compass, not this one | — |
+
+One thing that **is** in scope and is worth stating as a limit rather than a non-goal:
+
+- **Predicting what acceptance rate a speculative draft head will achieve.** Speculative
+  decoding and MTP *are* in scope (`14`), but acceptance is a behaviour Compass cannot
+  compute — it is a **declared input**, like device bandwidth. A speculative throughput
+  result is conditional on that input and the artifact says which tier it came from
+  (`14` D83, D87).
 
 ### In scope, and previously mis-filed here
 
-Two items were listed as non-goals in an earlier draft and should not have been:
+Three items were listed as non-goals in an earlier draft and should not have been:
+
+- **Speculative decoding and MTP.** Now topic `14`. Three of the four things it changes are
+  routine — more structures, a `K+1`-token query per sequence, two extra memory terms — and
+  the fourth, acceptance, is handled by ATOM's existing `--spec-decode-acceptance-*`
+  mechanism rather than by anything Compass builds.
 
 - **Closed-loop arrivals.** These *are* reproduced (`06` D35) and the clock contract makes
   them work: the harness holds a clock client and its pacing is a Clock Authority call, so
@@ -507,18 +525,25 @@ The documents use these precisely; a reader will bounce off without them.
 | [`08`](08_validation_protocol.md) | Validation Protocol | ATOM's own 187-file CPU-only test suite as the first validation layer. Three separable results, never one number. **The real-vs-real spread is the tolerance.** A metric is admissible only if stable *and* sensitive. |
 | [`11`](11_metrics_support.md) | Engine Metrics under Virtual Time | ATOM's Prometheus exporter under a virtual clock. Metrics are classified by the **provenance of their value**, not their type. Sample once per engine step — virtual time is discrete-event. Both metrics clock reads stay real. |
 
-### Part V — What is not settled
+### Part V — Cross-cutting
+
+| Doc | Title | What it settles |
+|---|---|---|
+| [`13`](13_configuration_surface.md) | The Configuration Surface | Three homes for a setting, and the test that assigns them. Precedence is CLI > env > artifact > **refuse**. Eight engine-side flags, one `compass` executable, and an audit of what is deliberately *not* a flag. |
+| [`14`](14_speculative_decoding.md) | Speculative Decoding and MTP | Three of the four changes are routine. Acceptance is a **declared input** through ATOM's existing flags, fed the *measured per-position distribution* rather than a mean. No new cost form — decode becomes the `N_Q = 1` case of the general one. |
+
+### Part VI — What is not settled
 
 | Doc | Title | What it holds |
 |---|---|---|
-| [`12`](12_open_items.md) | Open Items | The five load-bearing assumptions and their check plans; seven missing topics with recommendations; T1–T56; cross-cutting issues; pending amendments. |
+| [`12`](12_open_items.md) | Open Items | The five load-bearing assumptions and their check plans; the missing-topic register; T1–T61; cross-cutting issues; pending amendments. |
 
 ### Not yet written
 
 | Doc | Title | Status |
 |---|---|---|
-| `13` | Execution Plan | next, and last. Will own the milestone table and the sequencing of `12`'s assumption checks. |
-| — | DP / PP / EP design (`12` M-d) | deliberately deferred to before M7 |
+| `15` | Execution Plan | next, and last. Will own the milestone table and the sequencing of `12`'s assumption checks. |
+| `16` | DP / PP / EP design (`12` M-d) | deliberately deferred to before M7 starts |
 
 ---
 
@@ -537,6 +562,8 @@ The documents use these precisely; a reader will bounce off without them.
 | D53 – D62 | `09` Fitting and Law Selection |
 | D63 – D70 (+ D67.1) | `10` Analytic Laws (Tier 0) |
 | D71 – D77 | `11` Engine Metrics under Virtual Time |
+| D78 – D81 | `13` The Configuration Surface |
+| D82 – D87 | `14` Speculative Decoding and MTP |
 
 ### Headline decisions
 

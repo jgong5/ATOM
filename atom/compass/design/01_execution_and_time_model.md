@@ -1073,6 +1073,7 @@ Ordered by how much they could cost.
 | D6 | KV transfer is simulated through a connector registered in the existing factory | 2026-09-18 |
 | D7 | Atomesh gets no virtual clock: mesh-only mode, detectors disabled, relay latency declared | 2026-09-18 |
 | D8 | Arrivals via the CA as a next-arrival lower bound; the take2 arrival barrier is replaced | 2026-09-18 |
+| D9 | The ATOM diff is enumerated and completeness enforced by test rather than by review; ATOM's own suite is the gate (`08` D43.1) | 2026-09-18 |
 
 ---
 

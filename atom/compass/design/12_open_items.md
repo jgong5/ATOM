@@ -11,7 +11,7 @@ backlog. Nothing here is a decision; every decision lives in its topic's decisio
 
 1. **Load-bearing assumptions** — hold up large parts of the design; each has a check plan
 2. **Missing topics** — design points nobody has written yet, with a recommendation
-3. **TODO register** — T1–T56, per topic
+3. **TODO register** — T1–T61, per topic
 4. **Cross-cutting issues and pending amendments**
 
 ---
@@ -47,17 +47,17 @@ silently carried as gaps.
 
 | # | Topic | Why it is missing, and why it matters | Recommendation |
 |---|---|---|---|
-| **M-a** | **Configuration surface and CLI** | 关键技术点 1.5 asks "which key parameters must be specified". Flags are currently scattered across five docs (`--runner-qualname`, `--compass-spec`, `--compass-clock-endpoint`, `--measure`, `--compass-no-lazy-trace`, `compass plan/discover/trace/measure/validate`) with no single owner and no agreed precedence between CLI, env and artifact. | **Write it** — short doc, mostly collation. Cheap now, painful to retrofit once code exists. |
-| **M-b** | **Refusal semantics end to end** | Five documents emit refusals; none says what a refusal *does to the run*. Abort? Mark the step `provenance=refused` and continue? Continue and exclude from grading? This is **T48** and it is load-bearing for doc `08`: a run with 12% refused steps is a different kind of evidence from one with none. | **Settle it as a decision in `08`**, since validation owns what counts as evidence. Needs a decision from you, not research. |
+| ~~M-a~~ | ~~Configuration surface and CLI~~ | Flags were scattered across five topics with no owner and no precedence rule. | **DONE** - topic `13_configuration_surface.md`, D78-D81. |
+| ~~M-b~~ | ~~Refusal semantics end to end~~ | Seven documents emitted refusals and none said what one *does to the run*. | **DONE** - `08` D50.1: mark and continue, priced by the next answerable rung, with a >5%-of-predicted-seconds admissibility gate. |
 | **M-c** | **Model loading without a GPU** | 关键技术点 1.4.2. Doc `03` covers memory *sizing*; nothing covers how the module tree comes into existence to be traced. ATOM has the pieces — `--load_dummy {empty,zero,xavier}`, `RapidServeModelRunner._init_weight_params_on_meta` — but no doc names the path or says whether weights are read at all. | **Fold into `02`** as a section. Small, and the in-tree precedents do most of the work. |
-| **M-d** | **DP / PP / EP specifics (M7)** | The non-goal that excluded "asymmetric parallelism" is removed, so M7 is in scope with no design behind it. Each is genuinely different: PP adds LPs with microsecond lookahead (doc `01` D3.1 already says they must stay under one node-local CA); EP adds MORI all-to-all with the `exclusive` occupancy property (doc `07` D40 class c); DP adds independent engines sharing one CA plus a Gloo barrier. | **Defer to a doc `13`, written before M7 starts, not now.** M1–M6 do not need it and the shape will be clearer after M4. Recorded so it is not discovered as a surprise. |
+| **M-d** | **DP / PP / EP specifics (M7)** | The non-goal that excluded "asymmetric parallelism" is removed, so M7 is in scope with no design behind it. Each is genuinely different: PP adds LPs with microsecond lookahead (doc `01` D3.1 already says they must stay under one node-local CA); EP adds MORI all-to-all with the `exclusive` occupancy property (doc `07` D40 class c); DP adds independent engines sharing one CA plus a Gloo barrier. | **Defer to a doc `16`, written before M7 starts, not now.** M1–M6 do not need it and the shape will be clearer after M4. Recorded so it is not discovered as a surprise. |
 | **M-e** | **Determinism and reproducibility** | Doc `08` **T26** asks for bit-reproducibility as a test, but nothing designs for it. Under a distributed CA, grant ordering is a function of real-time message arrival unless something pins it. Two runs of one configuration disagreeing would undermine every paired comparison. | **Fold into `01`** as a section under D3. It is a property of the clock protocol. |
-| **M-f** | **Speculative decoding / MTP step shapes** | ATOM has `spec_decode`, Eagle3, DSpark. A draft+verify step has a shape no dense-decode feature describes, and doc `03` already notes Eagle3 draft KV merging onto the target's block ids. In scope or not is currently unstated. | **Declare it out of scope for M1–M7 in `README.md`**, unless you want it — none of the milestones name it. One line, not a document. |
+| ~~M-f~~ | ~~Speculative decoding / MTP~~ | Acceptance is a *behaviour* Compass cannot compute - the first quantity in the design that is neither derivable nor measurable. | **IN SCOPE** by decision 2026-09-19; topic `14_speculative_decoding.md`, D82-D87. Placed as **M3.5** (mechanism on Qwen3.8-27B), real claim at M5/M6. |
 | **M-g** | **Simulated-run observability** | Doc `01` D3.1's open issue says the CA should own the global timeline log and the deadlock dump, and that "its output format is part of the acceptance evidence and should be designed, not improvised". Doc `11` covers Prometheus metrics, which is a different thing. Still improvised. | **Fold into `01`** alongside M-e. |
 
-**Recommendation in one line:** write **M-a** now; settle **M-b** now as a decision; fold
-**M-c**, **M-e**, **M-g** into existing docs as sections; defer **M-d** to a doc `13`
-before M7; **M-f** is a one-line scope statement.
+**Status, 2026-09-19.** M-a written (`13`). M-b settled (`08` D50.1). M-f decided **in
+scope** and written (`14`). Still open: fold **M-c**, **M-e** and **M-g** into their own
+topics as sections; **M-d** waits for a doc `16`, before M7 starts.
 
 ---
 
@@ -114,7 +114,7 @@ before M7; **M-f** is a one-line scope statement.
 | T26 | Assert simulator bit-reproducibility as a test — see **M-e** above |
 | T27 | Decide the 256-client cell's construction |
 | T28 | Establish whether ranking/regret becomes an explicit acceptance gate |
-| **T48** | Decide what a refusal does to a run: abort, mark-and-continue, or exclude-from-grading — see **M-b** above |
+| ~~T48~~ | ~~What a refusal does to a run~~ - **DONE**: `08` D50.1, mark-and-continue with a 5%-of-seconds admissibility gate |
 
 ### Topic 09 — fitting and law selection
 
@@ -149,6 +149,21 @@ before M7; **M-f** is a one-line scope statement.
 | T44 | Sanity-check histogram bucket ranges against simulated latencies |
 | T45 | Tag ATOM's existing twenty metrics with their D77 class |
 | T46 | Decide the DP-aggregation rule per class; refuse summaries there |
+
+### Topic 13 — configuration surface
+
+| # | Item |
+|---|---|
+| T57 | Generate the `ATOM_COMPASS_*` environment twins from the flag table rather than hand-writing them |
+| T58 | Decide whether a per-leaf tier override is worth the reproducibility cost |
+
+### Topic 14 — speculative decoding and MTP
+
+| # | Item |
+|---|---|
+| T59 | Capture `ATOM_ENABLE_RELAXED_MTP` in the run fingerprint - it changes acceptance *semantics* (`RELAXED_TOP_N` 1 to 10, `RELAXED_DELTA` 0 to 0.6) and is invisible to every artifact key today |
+| T60 | Test whether a draft forward's cost is linear in `K` - serial MTP should be, a real draft stack need not be |
+| T61 | Decide how chunked prefill and drafting interact, and what structure that produces |
 
 ### Topics 01, 03, 05 — newly opened
 

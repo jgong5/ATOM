@@ -332,6 +332,59 @@ Each of these voided real percentages before.
    Named here because both are *refusals a validation run applies*: a step outside the
    hull is reported as refused rather than predicted, and a law whose family was chosen
    by LOO alone is not admissible evidence.
+7. **A speculative acceptance cell run at declared acceptance is not acceptance
+   evidence.** It is exploration. Acceptance cells use the *measured* per-position
+   distribution from the paired real run (`14` D84 tier 1); the artifact names the tier.
+
+---
+
+## D50.1. What a refusal does to a run
+
+### Problem
+
+Seven documents emit refusals — an unpriced leaf, a step outside the hull, a missing
+runtime constant, an unmatched tokenizer, a guard domain no binding satisfies — and until
+now none of them said what happens next. Abort the run? Continue and mark the step? The
+answer changes what a result *is*, so it belongs here rather than in any of the seven.
+
+### Options
+
+| | abort on first refusal | mark and continue | continue, exclude from grading |
+|---|---|---|---|
+| Bring-up usability | **poor** — one unforeseen shape kills a 300 s run | good | good |
+| Diagnostic value | names one refusal | **names all of them, with counts** | names all of them |
+| Risk of a partial result being read as complete | none | **real** | real |
+| Schedule fidelity | n/a | a refused step still has to consume *some* time, or the schedule diverges from that point on | same |
+
+### Decision
+
+**Mark and continue, with the refused fraction as a reported result and a declared
+admissibility threshold.** Concretely:
+
+1. **A refused step is priced by the next rung of the resolver ladder that can answer**,
+   down to tier 0, and tagged `provenance=refused(<reason>)` naming the rung that actually
+   answered. It is never priced at zero and never skipped — a skipped step changes the
+   schedule from that point forward, which would corrupt every number after it, not just
+   the refused one.
+2. **The run artifact carries the refused count, the refused fraction of steps, the
+   refused fraction of predicted *seconds*, and the distinct reasons with counts.** The
+   seconds fraction matters more than the step fraction: 2% of steps can be 40% of the
+   time.
+3. **Admissibility gate: a run with more than 5% of predicted seconds refused is not
+   acceptance evidence.** It is a coverage report, and it names exactly what to measure
+   next. The number is declared, not derived, and should be revisited after one campaign.
+4. **`--compass-on-refusal abort` exists** (`13` D80) for the case where a refusal is a
+   bug being chased. It is not the default and is not valid in an acceptance run.
+
+**Why not abort by default.** Refusals are the design's main *diagnostic* output — the
+whole point of `compass plan` is that a refusal tells you what to measure. Aborting makes
+that one refusal per run instead of a complete list, which turns a single coverage gap
+into as many iterations as there are gaps.
+
+**Why the fraction is a gate rather than a note.** Without one, "mark and continue"
+degrades into a run that is 30% tier-0 fallback and reports a tidy latency number. The
+gate is what keeps the refusal from becoming a silent fallback — which is the exact
+failure the *refuse rather than fall back* principle exists to prevent.
 
 ---
 
@@ -448,6 +501,7 @@ claims there are not.
 | D47 | Cost accuracy on the real run's own step sequence; report totals, held-out-worst, and median per step together. | 2026-09-18 |
 | D48 | Memory per term, never as a sum. The gate is whether the top-1 configuration choice survives, not the byte error. | 2026-09-18 |
 | D49 | Seven hygiene refusals, each with a prior incident behind it. | 2026-09-18 |
+| D50.1 | A refusal marks and continues: priced by the next answerable rung, tagged `refused(reason)`, never zero and never skipped. Refused fraction of **seconds** is a reported result; **>5% refused seconds is not acceptance evidence**. | 2026-09-19 |
 | D50 | Everything registered and hashed before evaluation; the case set never shrinks. One simulated run plus a reproducibility assertion; N≥3 spaced real runs. | 2026-09-18 |
 | D51 | Measure a saturated cell early. Account cold costs once; report the simulator's own per-step CPU cost alongside the ratio. | 2026-09-18 |
 | D52 | Eight fail-closed invalidation conditions. Scheduling claims require slack; throughput claims at saturation are fine. | 2026-09-18 |
