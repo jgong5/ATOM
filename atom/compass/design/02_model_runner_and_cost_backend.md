@@ -1,4 +1,4 @@
-# ATOM Compass — Design Point 2: Model Runner Seam and Cost Backend
+# ATOM Compass — Design Topic 2: Model Runner Seam and Cost Backend
 
 **Status:** draft for review. Drafted by an AI assistant during a design interview; not
 yet reviewed or approved. No code has been written against it.
@@ -9,7 +9,7 @@ yet reviewed or approved. No code has been written against it.
 **Scope.** Where Compass attaches to ATOM, what replaces the forward pass, and the
 interface between that replacement and whatever predicts a duration. It does **not**
 cover how a *real* cost is derived (operator capture, pricing, analytical models) — that
-is design point 3 — nor memory sizing, which is design point 4.
+is topic `04` — nor memory sizing, which is topic `03`.
 
 ---
 
@@ -114,6 +114,49 @@ Two orthogonal flags sit beside it, neither a mode of the runner:
   later simulation.
 - **`trace`** — performed on demand on first use and cached; not something a user selects.
 
+#### Why these two are asymmetric, and how they line up with `compass plan`
+
+The asymmetry is not stylistic. It follows from one property:
+
+> **Tracing is device-free; measuring is not.**
+
+Capture runs under `FakeTensorMode` (doc `04` D18) and allocates nothing on a GPU, so it
+can happen *inside a simulated run* at the moment a structure is first asked for.
+Measuring runs kernels, so it can never happen inside a simulated run — a simulated run
+is defined by not touching a device.
+
+That gives each flag exactly one legitimate place, and the two must agree with doc `07`'s
+phases rather than describe a second workflow:
+
+| | `trace` | `measure` |
+|---|---|---|
+| Needs a device | no | **yes** |
+| Offline home | doc `07` **Phase 1a** — trace the structures Phase 0 discovered | doc `07` **Phase 1b/1c/2** — op pricing, in-situ steps, memory constants |
+| Allowed during a simulated run | **yes**, lazily, on a structure miss | **never** |
+| Who triggers it | the runner, automatically | the operator, via `compass plan`'s emitted commands |
+| Artifact written | the IR graph for that structure key | a price / region / memory-constant entry |
+
+**Recommended path is offline for both.** `compass plan` (doc `07` D37) emits the whole
+campaign, Phase 1a included; a run that finds every structure already traced does no
+lazy work at all, which is also the only way a run is reproducible from its artifacts.
+
+**The lazy path is a fallback with a declared cost, not a convenience.** It exists
+because a structure set is discovered, not enumerated (doc `07` Phase 0 is a
+best-effort over-cover), and refusing a whole run because one unforeseen shape appeared
+is worse than tracing it. Its costs, stated so nobody is surprised:
+
+1. It consumes **wall-clock inside a simulated run** — real seconds that do not
+   correspond to virtual time. Harmless to the predicted numbers (the clock does not
+   advance during it) but it degrades the ≥5x speed result, so the run artifact records
+   lazy-trace count and seconds separately.
+2. A newly traced structure has **no price**. The graph exists; the leaves in it may
+   not. The backend then refuses that step (per the rule below) rather than guessing.
+   So a lazy trace converts "unknown shape" into a *named* refusal with a graph
+   attached — which is exactly the input `compass plan` needs to extend the campaign.
+
+**Consequence worth stating plainly:** a lazy trace never rescues a run on its own. It
+makes the gap diagnosable. `measure` closes it, offline, on a machine with a card.
+
 ### The backend interface
 
 ```
@@ -151,10 +194,17 @@ from a file is still `measured`** — what changes is whether the key matched ex
 
 ### Open issues
 
-- Whether `measure` and `trace` are CLI flags, env vars, or both.
+- Whether `measure` and `trace` are CLI flags, env vars, or both. Settled in part by the
+  table above: `measure` is an operator-facing switch and belongs on the command line;
+  `trace` needs at most a *disable* (`--compass-no-lazy-trace`) for runs that want a
+  refusal instead of a stall. The full flag surface is a gap — see `12_open_items.md`,
+  "Missing topics".
 - A backend asked about a step kind it has no samples of must **raise**, not fall back.
   The prior fallback was the mean of an empty list, i.e. zero — "a confident, precise,
   entirely fictional answer", a TTFT of 0 ms against a real 7.6 s.
+- What a refusal *does to the run* is not settled here and is not local to this document:
+  abort the run, or mark the step and continue with `provenance=refused`? Five documents
+  emit refusals and none of them says. Recorded as **T48**.
 
 ---
 
@@ -188,7 +238,7 @@ divides by what:
 |---|---|
 | TP | KV heads shard (GQA-bounded) so KV bytes/token divides; weights shard; collectives appear as a cost term |
 | DP | N independent engines, each holding full KV |
-| PP | layers split per stage, so KV per stage; and it creates the LP structure of design point 1 |
+| PP | layers split per stage, so KV per stage; and it creates the LP structure of topic `01` |
 | EP | experts shard; KV unaffected; all-to-all appears as a cost term |
 
 This is on the order of thirty lines, and the point is that **the rest of the system then
@@ -267,7 +317,7 @@ scheduler at shapes no real model has.
 
 - **A single global quadratic coefficient is wrong for a hybrid.** The 27B target is 48
   gated-DeltaNet layers plus 16 full-attention layers; a DeltaNet decode does not grow
-  with history at all. Harmless for a stub; **must not be carried into design point 3
+  with history at all. Harmless for a stub; **must not be carried into topic `04`
   unexamined.**
 - The stub's coefficients are declared, so every M1 number is a plumbing result and must
   be labelled as such. Nothing from M1 may be presented as accuracy evidence.

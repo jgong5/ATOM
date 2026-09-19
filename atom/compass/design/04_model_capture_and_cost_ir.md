@@ -1,4 +1,4 @@
-# ATOM Compass — Design Point 4: Model Capture and the Cost IR
+# ATOM Compass — Design Topic 4: Model Capture and the Cost IR
 
 **Status:** draft for review. Drafted by an AI assistant during a design interview; not
 yet reviewed or approved. No code has been written against it.
@@ -390,10 +390,87 @@ This is strictly better than modelling branches in-IR: the predicates are produc
 than authored, so they cannot drift from ATOM's control flow, and a step outside every
 domain is detected rather than mispriced.
 
+### `Repeat` must nest, and must tolerate a non-contiguous pattern
+
+The first sketch of `Repeat` assumed the thing every dense decoder looks like: one layer
+class, N identical instances, contiguous. Real models are not that, in two distinct ways,
+and the IR has to carry both or it silently flattens back to a linear `Seq` and loses the
+compression that makes symbolic pricing cheap.
+
+**Way 1 — prologue and epilogue.** The first and last layer routinely differ: a dense
+first layer in an otherwise-MoE stack, a different attention variant on layer 0, a final
+norm fused into the last block. These break a naive run-length scan over the whole body.
+
+**Way 2 — hierarchical and non-contiguous repetition.** A model may interleave layer
+classes on a period, and repeat *that period*. Concretely:
+
+```
+sub-pattern P  =  LayerClassA x3  then  LayerClassB
+global pattern =  P x20
+```
+
+Nothing about this is exotic — it is how hybrid attention/SSM stacks, MoE-every-k-layers
+schedules and shared-expert variants are laid out. A flat run-length encoder sees
+`AAABAAAB...` and produces either 80 singleton groups or 20 groups of 4, never the
+nested form, and in both cases the `Repeat` body it emits is no longer a single
+priceable structure.
+
+**The IR change is small; the detection is the work.** `Repeat` already takes a *body*,
+so the representation is sufficient the moment the body is allowed to be a composite and
+`Repeat` is allowed to nest:
+
+```
+Seq[
+  Block(embed),
+  Block(layer_0_dense),                    <- prologue, a plain sibling
+  Repeat( n=20, body = Seq[                <- outer period
+            Repeat( n=3, body=Block(A) ),  <- inner run
+            Block(B),
+          ] ),
+  Block(layer_last),                       <- epilogue
+  Block(norm), Block(lm_head),
+]
+```
+
+Three rules make this well-formed rather than merely expressible:
+
+1. **A `Repeat` body is any node**, including a `Seq` and including another `Repeat`.
+   No arity or depth limit; in practice depth 2 covers everything seen.
+2. **`Repeat` carries the index binding it varies over**, so a body whose cost depends on
+   layer index (KV cache offsets, per-layer expert counts, a sliding-window pattern that
+   changes period) prices per instance rather than being assumed uniform. Without this,
+   nesting is a lie: `Repeat(20, P)` claims 20 identical `P`s.
+3. **Grouping is an optimisation and must be provably free.** `Repeat` is only emitted
+   where the flattened price and the grouped price agree exactly; otherwise the node
+   stays a `Seq`. This is already **T6**, and the nested form makes it load-bearing
+   rather than a nicety — a wrong nesting is a systematic error multiplied by the repeat
+   count.
+
+**Detection algorithm.** Bottom-up run-length encoding over a *canonical block
+signature*, not over the module name:
+
+1. Give every top-level block a signature = the hash of its leaf op sequence with
+   symbolic shapes, layer index excluded. Two blocks with the same signature are
+   interchangeable for pricing.
+2. Run-length-encode the signature string. This finds Way 1 for free (the prologue and
+   epilogue are runs of length 1 and simply stay as siblings) and finds contiguous runs.
+3. Re-encode the *resulting* symbol string. `AAAB AAAB ...` becomes `(A³B)` at step 2
+   and `(A³B)²⁰` at step 3. Iterate until a pass changes nothing — bounded by the depth
+   of real nesting, which is small.
+4. Emit `Repeat` only where step 3 of the rules above holds.
+
+This is standard run-length composition, it is device-free, it runs on the traced
+signature string rather than on tensors, and it costs microseconds on an 80-layer model.
+The risk is not cost, it is a *near*-miss: two blocks whose signatures differ only in a
+constant the pricing ignores will fail to group, costing compression but never
+correctness. That is the right way round.
+
+**Recorded as T51:** enumerate the actual layer-pattern shapes for the two target models
+(Qwen3.8-27B, Kimi-K3) and confirm the detector reaches the nested form on both. Kimi-K3
+is the one that matters — a dense-then-MoE schedule with shared experts is exactly Way 2.
+
 ### Open issues
 
-- How many `Repeat` groups a hybrid actually collapses to, and whether the first and last
-  layer break the grouping.
 - Whether `resource_bound`'s `peak` should come from the device spec's derated compute or
   be fitted.
 - Nothing yet validates that a `Par` reconstructed from stream ids matches the real
@@ -775,6 +852,25 @@ Deferred to future work by decision on 2026-09-18.
   guard **hangs all 8 ranks on ROCm**. Mode-based instrumentation has already caused one
   production hang in this codebase.
 
+  **This gets root-caused, not worked around.** The whole capture design (D18) rests on
+  entering a mode over ATOM's real model code, so an unexplained mode-induced hang is not
+  a footnote — it is an unbounded risk sitting under the load-bearing assumption T5. A
+  workaround that avoids the one known call site leaves the mechanism unexplained and the
+  next call site undiscovered.
+
+  What root-causing means concretely, and why it is tractable: the failure is a
+  *collective* hang, so the question is which rank diverges. `torch.tensor(N,
+  device=...)` under a `__torch_function__` guard either (a) triggers a H2D copy on a
+  stream the other ranks are not on, (b) takes a different branch on one rank because the
+  guard intercepts a `.item()` and turns a device value into a host one, or (c) causes a
+  lazy-init ordering difference. All three are distinguishable from a single `rocgdb`
+  attach reading `info dispatches` per rank, which the in-tree
+  `debug-agent-locate-kernel` procedure already automates. Estimated at well under a day
+  on a quiet node, and it gates T5.
+
+  Recorded as **T52**, and placed *before* the first tracing work in the execution plan
+  rather than beside it.
+
 ---
 
 ## Decision log
@@ -793,6 +889,9 @@ Deferred to future work by decision on 2026-09-18.
 ---
 
 ## TODO register
+
+This topic's items only. The consolidated register across all topics, with the
+load-bearing assumptions and their check plans, is [`12_open_items.md`](12_open_items.md).
 
 | # | Item | Why deferred |
 |---|---|---|

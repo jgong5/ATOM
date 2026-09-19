@@ -1,8 +1,9 @@
 # ATOM Compass — Design
 
 **Status: design only.** Nothing here has been implemented, and every document carries a
-header marking it as an unreviewed draft. 78 decisions (D0–D77) and 46 open TODOs (T1–T46)
-are tracked at the end of this file.
+header marking it as an unreviewed draft. **89 decisions (D0–D77 plus sub-decisions)** are
+indexed at the end of this file; **56 open TODOs (T1–T56)**, the load-bearing assumptions,
+the missing topics and the cross-cutting issues live in **`12_open_items.md`**.
 
 ---
 
@@ -25,62 +26,195 @@ ATOM's real scheduler, real block manager, real admission logic and real prefix 
 run unchanged. A simulated run therefore makes **the same scheduling decisions** as a real
 one; it only substitutes a predicted duration for the work.
 
-Almost every decision in these documents follows from taking that literally. Compass does
-not model serving *decisions* — only the time they consume.
+Almost every decision in these documents follows from taking that literally.
 
-### What is modelled
+---
 
-| | |
-|---|---|
-| **time** | what a step costs, and what serving adds around it |
-| **memory** | what a configuration consumes, so whether it fits and how many KV blocks it gets |
-| **KV cache pool** | not simulated — ATOM's real one runs, because it is pure arithmetic over integers |
+## Design principles
 
-### What is not
+Inherited from the task, and every decision in these documents is traceable to one of them.
+Where a decision looks odd, it is usually principle 1 or 2 being applied literally.
 
-Serving decisions. Fragmentation. Neighbour contention. A device that has never been
-measured (except at analytic fidelity). See **Scope and non-goals** below.
+| # | Principle | Where it bites |
+|---|---|---|
+| **1** | **Reuse ATOM's API server and scheduling modules.** Replace only the model layer and the modules it depends on (KV cache management, communication). Modify or refactor the reused parts where discrete time requires it — but do not reimplement them. | `01` D1 keeps ATOM's whole multi-process topology rather than collapsing it. `03` D13 refuses to simulate the KV pool. `07` Phase 0 forbids re-deriving admission to get shapes. |
+| **2** | **Simulated execution touches no GPU.** No compute, no device allocation. Compute capability, memory size, bandwidth and interconnect are **configured**, never read from a device runtime. | `05` exists at all. `03` D14 substitutes the five device readings. `04` D18 captures under `FakeTensorMode`. |
+| **3** | **Prioritise simplicity.** Add only what is necessary, and nothing more. | `02` D11: the runner has no modes. `01` D4: ~20 of ~55 synchronization sites are deliberately left alone. |
+| **4** | **Prefer clean abstractions and refactoring over ad-hoc changes.** | `02`'s `CostBackend` boundary, which forbids ATOM imports. `05` D24 pushes thread-pool width into ATOM's config rather than Compass's. |
+| **5** | **Start small; cut work into stages that are individually verifiable.** | M1's fake model exists to validate the clock, the KV path and the harness *before* any real cost model. |
+| **6** | **Refuse rather than fall back.** A declined answer with a named reason is a result. A guessed one is a defect. | Everywhere. The archetypal failure is in *Conventions* below. |
+
+Two more that the evidence added, and that are not in the original brief:
+
+| # | Principle | Why it was added |
+|---|---|---|
+| **7** | **Never report an aggregate without its decomposition.** | Aggregates have hidden compensating errors here at least six times. See finding 2. |
+| **8** | **Every claim carries its measurement.** A number without a source is a defect. | Several "known" constants turned out to be one data point. |
+
+---
+
+## Scope: what is simulated, what is reused, what is stubbed
+
+The single most important table here, and the one most easily got wrong. "Compass replaces
+only the forward pass" is a statement about *decisions*, not about tensors — several things
+ATOM's real code owns still never touch a device.
+
+| Component | Status | What that means concretely |
+|---|---|---|
+| **Forward pass** | **SIMULATED** | No kernels run. `CompassModelRunner.forward` evaluates a cost model and returns a predicted duration plus a correctly-shaped `ScheduledBatchOutput`. `02` D10 |
+| **Model weights** | **STUBBED** | Constructed on meta/fake tensors for geometry; no checkpoint bytes are read and nothing is resident on a device. `02`, and see `12_open_items.md` M-c |
+| **KV cache *tensors*** | **STUBBED** | `allocate_kv_cache` is a no-op. No device bytes are allocated. `03` D13 |
+| **KV block accounting** | **REUSED, unmodified** | `BlockManager`, `BlockPool`, the prefix index, `plan_pools`, ref counting, eviction, preemption. It is pure arithmetic over integers, so running the real thing is *more* faithful than simulating it, and free. `03` D13 |
+| **KV *transfer* (PD disagg)** | **SIMULATED** | No RDMA, no real bytes on a fabric. A simulated connector registered in ATOM's existing factory charges `latency + bytes/bandwidth` from the machine spec. `01` D6 |
+| **Prefix caching** | **REUSED, unmodified** | The hit *is* ATOM's hit, at ATOM's 64-token block granularity. Its effect on prefill cost is a cost-model term, not an inference. `03` |
+| **Scheduler / admission / chunking** | **REUSED, unmodified** | The whole point. Same decisions as a real run. `01`, `03` |
+| **API server, tokenizer** | **REUSED, real** | Real HTTP, real uvicorn, real tokenizer — run for its *effect*, with a modelled duration charged for its *time*. `06` D33 |
+| **Device memory readings** | **SUBSTITUTED** | Five readings come from the machine spec instead of the runtime, so an MI308X host can model an MI355X. The budget *arithmetic* around them is ATOM's. `03` D14, `05` |
+| **Wall-clock time** | **SUBSTITUTED** | Business-logic clock reads come from the Clock Authority. Failure detectors and metrics-push cadence deliberately stay real. `01` D5, `11` D72 |
+| **Collectives / comms** | **SIMULATED** (cost only) | Priced from measurements or the spec; no collective actually runs on a device. `07` D40 |
+| **Atomesh router** | **REUSED, untouched** | Zero changes. The simulated timeline rides `kv_transfer_params`, which the router already relays verbatim. `06` D30 |
+| **Serving *decisions*** | **NOT MODELLED** | Compass predicts the time decisions consume, not the decisions themselves — because it reuses the code that makes them. *(A simple serving simulation is planned as a future part of Compass; explicitly out of scope for this work.)* |
+
+**The rule underneath the table:** anything that is *arithmetic* is reused; anything that is
+*a device* is substituted or stubbed. The KV pool is the clearest case of the first and the
+one most often assumed to be the second.
+
+### Not modelled at all
+
+Fragmentation. Neighbour contention. A device that has never been measured (except at
+tier-0 fidelity). See **Scope and non-goals** below for where each is recorded.
 
 ---
 
 ## Architecture
 
+Four views. **A** shows where Compass sits inside ATOM; **A2** is Compass alone, layered;
+**B** follows one step; **C** splits offline from online; **D** is the cost-tier stack.
+
 ### A. Where Compass sits
 
-Everything above the dashed line is ATOM's own code, running unmodified.
+```
+   Dotted (:) borders are Compass. Solid borders are ATOM's own code, or a
+   third-party harness, running unmodified.
 
+   harness (any vendor)              ATOM, unmodified
+   +----------------+       +-----------------------------+
+   |  agentx-harness|  HTTP |  api_server                 |
+   |  / aiperf      |------>|  LLMEngine / CoreManager    |
+   |                |<------|  Scheduler                  |
+   | +............+ |       |  BlockManager / BlockPool   |
+   | :  adapter   : |       |  prefix cache, admission    |
+   | : clock cli  : |       |  tokenizer (real)           |
+   | +............+ |       +--------------+--------------+
+   +----------------+                      |
+           :                 ScheduledBatch |  ScheduledBatchOutput
+           :                                v
+           :  +...........................................................+
+           :  :                        C O M P A S S                      :
+           :  :   +-----------------------------------------------+       :
+           :  :   |  CompassModelRunner          <-- THE SEAM     |       :
+           :  :   |  --runner-qualname; no ATOM change needed     |       :
+           :  :   |  no weights, no KV tensors, no GPU            |       :
+           :  :   +-----------------------+-----------------------+       :
+           :  :                           |                               :
+           :  :   +-----------------------v-----------------------+       :
+           :  :   |  CostBackend (tier 0 / a / b)                 |       :
+           :  :   |  MemoryModel . Cost IR . ArtifactStore        |       :
+           :  :   +-----------------------+-----------------------+       :
+           :  :                           |                               :
+           :  :   +-----------------------v-----------------------+       :
+           :..:   |  Clock Authority                              |       :
+   grants,    :   |  grants virtual time to every logical process |       :
+   blocked/   :   |  co-hosted by default; standalone for M4/M6   |       :
+   running    :   +-----------------------------------------------+       :
+              :                                                           :
+              :   +-----------------------------------------------+       :
+              :   |  simulated KV connector                       |       :
+              :   |  latency + bytes/bandwidth, from the spec     |       :
+              :   |  (registered into ATOM's connector factory)   |       :
+              :   +-----------------------------------------------+       :
+              +...........................................................+
 ```
-   harness (any vendor)            ATOM, unmodified
-   +--------------+         +-----------------------------+
-   |  agentx /    |  HTTP   |  api_server                 |
-   |  aiperf +    |-------->|  LLMEngine / CoreManager    |
-   |  adapter     |<--------|  Scheduler                  |
-   +--------------+         |  BlockManager / BlockPool   |
-          ^                 |  prefix cache, admission    |
-          |                 +--------------+--------------+
-          |                                |
-          |                    ScheduledBatch |  ScheduledBatchOutput
-   - - - -|- - - - - - - - - - - - - - - - -|- - - - - - - - - - - - -
-          |                                v
-          |                 +-----------------------------+
-          |                 |  CompassModelRunner         |   <-- THE SEAM
-          |                 |  (--runner-qualname)        |
-          |                 |                             |
-          |                 |  no weights, no KV tensors, |
-          |                 |  no GPU. Returns a PREDICTED|
-          |                 |  duration + shaped output.  |
-          |                 +--------------+--------------+
-          |                                |
-          |                                v
-          |                 +-----------------------------+
-          +---------------- |  Clock Authority            |
-            grants,         |  grants virtual time to     |
-            blocked/running |  each logical process       |
-                            +-----------------------------+
-```
+
+**Yes, the Clock Authority is a Compass component.** It ships in Compass, it is started by
+Compass, and it has no meaning in a real ATOM run. It deploys two ways from one
+implementation — co-hosted in the API-server process by default, standalone for the
+multi-container M4/M6 cases (`01` D3.3).
 
 The seam needs **no ATOM change**: `Config.runner_qualname` already exists and already has
 two in-tree users.
+
+### A2. Compass alone, layered
+
+Every component in the detailed design documents appears here exactly once, with the
+document that owns it. Nothing in `01`–`11` is outside this diagram.
+
+```
+  +=====================================================================+
+  |  L5  TOOLING          compass plan | discover | trace |             |
+  |                       measure {ops,collectives,steps,memory} |      |
+  |                       validate | explain                            |
+  |                       spec probes . merge . validate . explain      |
+  |                                                    docs 07, 05      |
+  +=====================================================================+
+  |  L4  WORKLOAD         clock client  |  wire fields (compass.*)      |
+  |                       per-harness adapter (out of tree)             |
+  |                                                    doc 06           |
+  +=====================================================================+
+  |  L3  MODELLING        CostBackend          MemoryModel              |
+  |                       +- tier b op-level   +- weights               |
+  |                       +- tier a coarse     +- KV (ATOM's arithmetic)|
+  |                       +- tier 0 analytic   +- activations           |
+  |                       Cost IR: Seq/Repeat/Par, opaque leaves        |
+  |                       fitting, law selection, hull guard            |
+  |                                             docs 02,03,04,09,10     |
+  +=====================================================================+
+  |  L2  EXECUTION        CompassModelRunner (the seam)                 |
+  |                       simulated KV connector                        |
+  |                       metrics under virtual time                    |
+  |                                             docs 02, 01 D6, 11      |
+  +=====================================================================+
+  |  L1  TIME             Clock Authority: grant rule, lookahead matrix |
+  |                       LP registry . blocked/running protocol        |
+  |                       causality detectors (straggler, watchdog,     |
+  |                       CI clock lint)                                |
+  |                                                    doc 01           |
+  +=====================================================================+
+  |  L0  ARTIFACTS        machine_spec   op_graph      price_list       |
+  |                       region_terms   memory_readings coverage_hull  |
+  |                       keys . digests . fingerprints . invalidation  |
+  |                                                    docs 05, 07      |
+  +=====================================================================+
+
+  Dependencies point downward. L0 is written offline and read by everything;
+  L1 is the only layer every other layer talks to at run time.
+```
+
+### Component map — where each piece is designed
+
+| Layer | Component | Document | Decisions |
+|---|---|---|---|
+| L1 | Clock Authority, grant rule, LP collapse | [`01_execution_and_time_model.md`](01_execution_and_time_model.md) | D3, D3.1 |
+| L1 | Causality detectors | [`01`](01_execution_and_time_model.md) | D3.2 |
+| L1 | CA deployment (co-hosted / standalone) | [`01`](01_execution_and_time_model.md) | D3.3 |
+| L1 | Wait interception contract (4 categories) | [`01`](01_execution_and_time_model.md) | D4, D5 |
+| L1 | Arrival gate | [`01`](01_execution_and_time_model.md) | D8 |
+| L2 | `CompassModelRunner`, the seam | [`02_model_runner_and_cost_backend.md`](02_model_runner_and_cost_backend.md) | D10, D11 |
+| L2 | M1 fake model | [`02`](02_model_runner_and_cost_backend.md) | D12 |
+| L2 | Simulated KV connector | [`01`](01_execution_and_time_model.md) | D6 |
+| L2 | Atomesh handling | [`01`](01_execution_and_time_model.md), [`06`](06_workload_harness_contract.md) | D7, D30 |
+| L2 | Prometheus metrics under virtual time | [`11_metrics_support.md`](11_metrics_support.md) | D71–D77 |
+| L3 | `CostBackend` interface, provenance vocabulary | [`02`](02_model_runner_and_cost_backend.md) | D11 |
+| L3 | Memory model, KV pool reuse | [`03_memory_and_kv_model.md`](03_memory_and_kv_model.md) | D13–D16 |
+| L3 | Model capture, Cost IR | [`04_model_capture_and_cost_ir.md`](04_model_capture_and_cost_ir.md) | D17–D23 |
+| L3 | Fitting, law selection, hull guard | [`09_fitting_and_law_selection.md`](09_fitting_and_law_selection.md) | D53–D62 |
+| L3 | Analytic laws (tier 0) | [`10_analytic_laws.md`](10_analytic_laws.md) | D63–D70 |
+| L4 | Harness contract, wire fields, adapter | [`06_workload_harness_contract.md`](06_workload_harness_contract.md) | D27–D35 |
+| L5 | `compass plan` and the calibration phases | [`07_calibration_toolchain.md`](07_calibration_toolchain.md) | D36–D43 |
+| L5 | Machine spec schema and probes | [`05_machine_spec_and_probes.md`](05_machine_spec_and_probes.md) | D24–D26 |
+| L0 | Artifact store, keys, invalidation | [`07`](07_calibration_toolchain.md) | D41, D43 |
+| — | Validation protocol (judges all of it) | [`08_validation_protocol.md`](08_validation_protocol.md) | D43.1, D44–D52 |
+| — | Open items, assumptions, gaps | [`12_open_items.md`](12_open_items.md) | — |
 
 ### B. A simulated step, end to end
 
@@ -104,9 +238,10 @@ two in-tree users.
      |                       |                 |                     |
      |                       |<-- postprocess -|                     |
      |<-- SSE chunk ---------|                 |                     |
-     |    + sim_arrive       |                 |                     |
-     |      sim_first_token  |                 |                     |
-     |      sim_finish       |                 |                     |
+     |    + compass.{        |                 |                     |
+     |        arrival_s,     |                 |                     |
+     |        first_token_s, |                 |                     |
+     |        finish_s }      |                 |                     |
 ```
 
 Wall-clock time passes while that HTTP round trip happens. **Virtual time does not** — it
@@ -175,8 +310,26 @@ fitted, interpolated, extrapolated or analytical — and a step reports the mixt
 | Generalization | predict beyond the configurations used for calibration |
 | Simulation speed | aim ≥ 5×; negotiable, but **faster than a real run** is the floor |
 
-Final proof is **paired simulated and real execution of cc-traces proper**. Milestones M1–M7
-are in `00_initial_prompt.md`.
+Tier 0 has its own, looser, separately-declared goals, with **configuration ranking** as
+its primary gate rather than latency error (`10` D67.1).
+
+Final proof is **paired simulated and real execution of cc-traces proper**.
+
+### Milestones
+
+| # | Milestone |
+|---|---|
+| **M1** | Fake models covering prefill, decode, KV need and TP/DP/PP/EP; the discrete-event foundation; the test harness; PD aggregation and disaggregation driven by the cc-traces harness |
+| **M2** | Qwen3.8-27B on MI308X-class hardware, PD aggregation, **TP1** |
+| **M3** | Qwen3.8-27B, same hardware, **TP2 and TP4** |
+| **M4** | Qwen3.8-27B, same hardware and TP configs, **PD disaggregation across two nodes** |
+| **M5** | Kimi-K3, same hardware, **TP8**, PD aggregation |
+| **M6** | Kimi-K3, **TP8, PD disaggregation** |
+| **M7** | Kimi-K3 with **DP, PP and EP** |
+
+Sequencing, dependencies and parallelisable work belong to the execution plan (`13`, to be
+added), which will own this table. `00_initial_prompt.md` is the original seed and is
+**not** a design document — see *Development history*.
 
 ---
 
@@ -190,21 +343,66 @@ Stated here so they are not discovered at review.
 | Neighbour contention. Compass models a **dedicated** device, so it will not predict an OOM a shared box produces | `03` D14 |
 | Memory fragmentation — not modelled, not planned, and nobody models it | `03` D16 |
 | **Cancellation** — `status` is `"completed"` on all 1,697 subagent wrappers in both corpora. There is nothing to replay. | `06` D35 |
-| Closed-loop *arrival generation*. The corpus records no parent/child completion dependency; the harness reconstructs joins. | `06` D35 |
-| Asymmetric parallelism beyond what the milestones name | `01` D2 |
+| Speculative decoding / MTP step shapes — no milestone names them | `12` M-f |
+| Serving *decisions* as a simulated subsystem — a simple serving simulation is planned for a later phase of Compass, not this one | — |
+
+### In scope, and previously mis-filed here
+
+Two items were listed as non-goals in an earlier draft and should not have been:
+
+- **Closed-loop arrivals.** These *are* reproduced (`06` D35) and the clock contract makes
+  them work: the harness holds a clock client and its pacing is a Clock Authority call, so
+  a closed-loop replay runs against the global virtual timeline. What is genuinely
+  *reconstructed rather than recorded* is the **join**: no field in the corpus says a parent
+  resumed because a child finished, so the harness imposes SPAWN/JOIN linkage. That is a
+  fidelity caveat on the workload, not a scope exclusion.
+- **Asymmetric parallelism (EP, PP, DP).** M7 names all three, so they are in scope. There
+  is no design for them yet; that is a **gap**, recorded as `12` M-d, to be written before
+  M7 starts rather than deferred indefinitely.
 
 ---
 
-## Load-bearing assumptions — what would change our mind
+## Load-bearing assumptions
 
-Four assumptions hold up large parts of the design. Each is cheap to test and none has been.
+Five assumptions hold up large parts of the design and **none has been tested.** Each now
+carries a named check, a place it runs, and a cost — in **`12_open_items.md` §1**, so they
+are schedulable work rather than caveats.
 
 | # | Assumption | If false |
 |---|---|---|
-| **T21** | The in-situ calibration transfers across TP width | the recipe's "calibrate at TP1, predict TP2/4/8" collapses and the campaign multiplies. The overhead constants have **already** been measured moving 12% and 7% *in opposite directions* between TP1 and TP2 on the same GPUs. |
+| **T21** | The in-situ calibration transfers across TP width | the "calibrate at TP1, predict TP2/4/8" recipe collapses. Overhead constants have **already** been measured moving 12% and 7% in *opposite directions* between TP1 and TP2 on the same GPUs. |
 | **T25** | The real-vs-real noise floor stays narrow under closed-loop replay at high client count | those cells become ungradeable. All prior data is 20 requests, one session, declared arrivals. |
-| **T5** | ATOM's model classes trace cleanly under `FakeTensorMode` at TP>1 | tier b has no IR, and docs `04`, `07` and `09` rest on it |
+| **T5** | ATOM's model classes trace cleanly under `FakeTensorMode` at TP>1 | tier b has no IR, and docs `04`, `07`, `09` rest on it |
+| **T52** | `TorchDispatchMode` instrumentation does not hang ATOM at width | capture is unusable at TP>1; gates T5. A mode-induced 8-rank hang already exists in-tree and is being root-caused, not worked around. |
 | **T10** | `AgenticReplayStrategy` can be subclassed rather than vendored | the harness adapter grows by ~2,000 lines to keep in sync with upstream |
+
+**Order to settle them:** T10 (an hour, no hardware, largest swing per hour) → T52 → T5 →
+T21, T25. The last two are designed-in steps of the calibration and validation flows, not
+extra work — but they can each invalidate an acceptance claim, so they should not drift to
+the end.
+
+---
+
+## Development history
+
+Two prior attempts exist on this repository, and the measurements quoted throughout these
+documents come from them.
+
+| Branch | Relationship | What it contributed |
+|---|---|---|
+| `feature/atomcompass_take2` | the pruned PoC baseline; equals PR jgong5/ATOM#2 | the seam, the arrival field, the provenance vocabulary, the first cc-traces pilots |
+| `feature/atomcompass` | **not** an earlier abandoned attempt — it is take2 plus ~350 commits | the calibration campaign, the memory evidence, the op-pricing method, and every failure mode listed in *Five findings* |
+| `feature/atomcompass_new` | this branch, a clean fork of upstream `main` | design only, so far |
+
+**This is a fresh design.** The prior work is referred to at the level of *design*, never as
+a code-port plan: where a prior mechanism is the right answer it is re-derived on its
+merits; where it is not, it is not carried. What *is* inherited wholesale is the evidence —
+roughly forty measurements, most of which were got wrong once before they were got right,
+and which is why several decisions here look more defensive than a first design would.
+
+`00_initial_prompt.md` is preserved as the **original seed**: the task as first written,
+sketchy and partly superseded. It is not a design document and is not normative. Where it
+disagrees with a design topic, the design topic wins.
 
 ---
 
@@ -252,6 +450,9 @@ The documents use these precisely; a reader will bounce off without them.
 ## Conventions
 
 - Every document opens with a **status header**. None has been reviewed.
+- Each file is a **design topic**; the numbered `D*` items inside it are **design points**.
+  A topic owns several points. Sub-numbered points (`D3.1`, `D25.1`) were added after the
+  first draft and extend the point they hang off rather than renumbering everything.
 - Decisions are numbered **`D*`**, continuous across documents, with a decision log at the
   end of each. TODOs are **`T*`**, likewise continuous.
 - Documents cite each other by number and decision — *"`07` D41"*.
@@ -265,10 +466,11 @@ The documents use these precisely; a reader will bounce off without them.
 
 | If you are… | Read |
 |---|---|
-| new to the project | the top of this file, then `00_initial_prompt.md` for the original task, then Part I below |
+| new to the project | the top of this file through *Architecture*, then Part I below |
 | reviewing a specific decision | the decision map below, then straight to that document |
-| about to implement | Part I, then the document owning your area, then the TODO register |
-| wondering what is *not* settled | **Load-bearing assumptions** above, then the TODO register and cross-cutting issues below |
+| about to implement | Part I, then the document owning your area, then `12_open_items.md` |
+| wondering what is *not* settled | **`12_open_items.md`** — assumptions, missing topics, TODOs, cross-cutting issues, all in one place |
+| looking for the original task | `00_initial_prompt.md` — a seed, not a design doc |
 
 ---
 
@@ -278,40 +480,45 @@ The documents use these precisely; a reader will bounce off without them.
 
 | Doc | Title | What it settles |
 |---|---|---|
-| `01` | Execution and Time Model | Keep ATOM's multi-process topology. A central **Clock Authority** grants virtual time; logical processes collapse onto ATOM's existing hardware barriers. Which waits are rewritten, annotated, disabled or ignored. KV transfer simulated; Atomesh untouched; arrivals via a next-arrival bound. |
-| `02` | Model Runner Seam and Cost Backend | Attach at `ModelRunner.forward`, delivered by a `--runner-qualname` subclass — **no ATOM change for the injection**. The runner has no modes; the algorithm comes from a pluggable backend. The milestone-1 fake model. |
+| [`01`](01_execution_and_time_model.md) | Execution and Time Model | Keep ATOM's multi-process topology. A central **Clock Authority** grants virtual time; logical processes collapse onto ATOM's existing hardware barriers. Which waits are rewritten, annotated, disabled or ignored. Three always-on causality detectors. KV transfer simulated; Atomesh untouched; arrivals via a next-arrival bound. |
+| [`02`](02_model_runner_and_cost_backend.md) | Model Runner Seam and Cost Backend | Attach at `ModelRunner.forward`, delivered by a `--runner-qualname` subclass — **no ATOM change for the injection**. The runner has no modes; the algorithm comes from a pluggable backend. Trace is device-free and may be lazy; measure needs a device and never is. The milestone-1 fake model. |
 
 ### Part II — What is modelled
 
 | Doc | Title | What it settles |
 |---|---|---|
-| `05` | Machine Specification and its Probes | The one input artifact describing device, host, interconnect and the software stack it is pinned to. Read this before `03` and `04`, both of which consume it. Probe tools and their contamination refusals. |
-| `03` | Memory Model and the KV Pool | **Do not simulate the KV pool** — ATOM's real one is pure arithmetic. Substitute the five device readings, never the arithmetic. Validate per term, never as a sum. |
-| `04` | Model Capture and the Cost IR | Three tiers of cost model. Capture with `TorchDispatchMode` + `FakeTensorMode` + `ShapeEnv`. A hierarchical, symbolic, stream-annotated IR. **Opaque leaves** are priced, not decomposed. |
-| `10` | Analytic Laws (Tier 0) | Cost and memory from device parameters and model geometry, with no measurement of the subject. Three classes: exact from geometry, device-parameterised, policy-determined. **The most speculative document here.** |
+| [`05`](05_machine_spec_and_probes.md) | Machine Specification and its Probes | The one input artifact describing device, host, interconnect and the software stack it is pinned to. Read this before `03` and `04`, both of which consume it. Probe tools and their contamination refusals. |
+| [`03`](03_memory_and_kv_model.md) | Memory Model and the KV Pool | **Do not simulate the KV pool** — ATOM's real one is pure arithmetic. Substitute the five device readings, never the arithmetic. How a prefix-cache hit reaches the cost model. Validate per term, never as a sum. |
+| [`04`](04_model_capture_and_cost_ir.md) | Model Capture and the Cost IR | Capture with `TorchDispatchMode` + `FakeTensorMode` + `ShapeEnv`. A hierarchical, symbolic, stream-annotated IR whose `Repeat` nests and tolerates non-contiguous layer patterns. **Opaque leaves** are priced, not decomposed. |
+| [`10`](10_analytic_laws.md) | Analytic Laws (Tier 0) | Cost and memory from device parameters and model geometry, with no measurement of the subject. Three classes: exact from geometry, device-parameterised, policy-determined. Declared accuracy goals with **ranking** as the primary gate. **The most speculative document here.** |
 
 ### Part III — How the data is made
 
 | Doc | Title | What it settles |
 |---|---|---|
-| `07` | Calibration and Benchmarking Toolchain | `compass plan` as the single entry point. The minimal calibration recipe: one full-engine run at TP1, plus one TP2 transfer test, plus a startup per width. The artifact store, its keys and its invalidation matrix. |
-| `09` | Fitting and Law Selection | How measurements become a model: fit relative error, per-rung decode, hull guards not bounding boxes, and why leave-one-out cannot choose a family. |
+| [`07`](07_calibration_toolchain.md) | Calibration and Benchmarking Toolchain | `compass plan` as the single entry point, and one recommended flow it emits. The minimal recipe: one full-engine run at TP1, plus one TP2 transfer test, plus a startup per width. Four classes of communication pricing. The artifact store, its keys and its invalidation matrix. |
+| [`09`](09_fitting_and_law_selection.md) | Fitting and Law Selection | How measurements become a model: fit relative error, per-rung decode, hull guards not bounding boxes, and why leave-one-out cannot choose a family. Owns coverage geometry for every other document. |
 
 ### Part IV — How it is driven and judged
 
 | Doc | Title | What it settles |
 |---|---|---|
-| `06` | Workload Harness Contract | A three-part contract, not a bespoke client. agentx-harness reused with **zero edits** via an out-of-tree plugin. Timeline piggybacked on `kv_transfer_params` so Atomesh needs no change. Tokenizer cost is a queue, not a constant. |
-| `08` | Validation Protocol | Three separable results, never one number. **The real-vs-real spread is the tolerance.** A metric is admissible only if stable *and* sensitive. Three metric families ordered by robustness. |
-| `11` | Engine Metrics under Virtual Time | ATOM's Prometheus exporter under a virtual clock. Metrics are classified by the **provenance of their value**, not their type. Sample once per engine step &mdash; virtual time is discrete-event. Both metrics clock reads stay real. |
+| [`06`](06_workload_harness_contract.md) | Workload Harness Contract | A three-part contract, not a bespoke client. agentx-harness reused with **zero edits** via an out-of-tree plugin. One namespaced additive field each direction, audited for minimality. Timeline piggybacked on `kv_transfer_params` so Atomesh needs no change. Tokenizer cost is a queue, not a constant. |
+| [`08`](08_validation_protocol.md) | Validation Protocol | ATOM's own 187-file CPU-only test suite as the first validation layer. Three separable results, never one number. **The real-vs-real spread is the tolerance.** A metric is admissible only if stable *and* sensitive. |
+| [`11`](11_metrics_support.md) | Engine Metrics under Virtual Time | ATOM's Prometheus exporter under a virtual clock. Metrics are classified by the **provenance of their value**, not their type. Sample once per engine step — virtual time is discrete-event. Both metrics clock reads stay real. |
+
+### Part V — What is not settled
+
+| Doc | Title | What it holds |
+|---|---|---|
+| [`12`](12_open_items.md) | Open Items | The five load-bearing assumptions and their check plans; seven missing topics with recommendations; T1–T56; cross-cutting issues; pending amendments. |
 
 ### Not yet written
 
 | Doc | Title | Status |
 |---|---|---|
-| — | Execution Plan | next, and last |
-
-This file replaces the earlier `INDEX.md`.
+| `13` | Execution Plan | next, and last. Will own the milestone table and the sequencing of `12`'s assumption checks. |
+| — | DP / PP / EP design (`12` M-d) | deliberately deferred to before M7 |
 
 ---
 
@@ -319,16 +526,16 @@ This file replaces the earlier `INDEX.md`.
 
 | Decisions | Document |
 |---|---|
-| D0 – D9 | `01` Execution and Time Model |
+| D0 – D9 (+ D3.1–D3.3) | `01` Execution and Time Model |
 | D10 – D12 | `02` Model Runner Seam and Cost Backend |
 | D13 – D16 | `03` Memory Model and the KV Pool |
 | D17 – D23 | `04` Model Capture and the Cost IR |
-| D24 – D26 | `05` Machine Specification and its Probes |
+| D24 – D26 (+ D25.1) | `05` Machine Specification and its Probes |
 | D27 – D35 | `06` Workload Harness Contract |
-| D36 – D43 | `07` Calibration and Benchmarking Toolchain |
-| D44 – D52 | `08` Validation Protocol |
+| D36 – D43 (+ D38.1, D40.1) | `07` Calibration and Benchmarking Toolchain |
+| D43.1, D44 – D52 | `08` Validation Protocol |
 | D53 – D62 | `09` Fitting and Law Selection |
-| D63 – D70 | `10` Analytic Laws (Tier 0) |
+| D63 – D70 (+ D67.1) | `10` Analytic Laws (Tier 0) |
 | D71 – D77 | `11` Engine Metrics under Virtual Time |
 
 ### Headline decisions
@@ -349,98 +556,7 @@ This file replaces the earlier `INDEX.md`.
 | D36 | Three tiers: analytic, coarse empirical, op-level empirical. Compass models a device it has been measured on |
 | D37 | `compass plan` — the tool tells the user what to measure |
 | D45 | The real-vs-real spread is the tolerance; a metric must be stable **and** sensitive |
-
----
-
-## Open TODO register
-
-| # | Item | Doc |
-|---|---|---|
-| T1 | Inductor fusion correction (~4.8% of a decode step) | `04` |
-| T2 | Enumerate the structure set for Qwen3.8-27B | `04` |
-| T3 | Build the per-leaf parameter-extractor table (~20 entries) | `04` |
-| T4 | Establish scratch constants per leaf for the 27B | `04` |
-| T5 | Verify ATOM's model classes trace cleanly under FakeTensorMode at TP>1 | `04` |
-| T6 | Validate that `Repeat` grouping reproduces the flat cost | `04` |
-| T7 | Validate `Par` reconstruction from stream ids | `04` |
-| T8 | Decide whether tier (a) is fitted independently or derived from tier (b) | `04` |
-| T9 | Declare a row-ordering treatment for decode attention | `04` |
-| T10 | Verify `AgenticReplayStrategy` can be subclassed rather than vendored | `06` |
-| T11 | Build the per-tokenizer vetted filler-token set | `06` |
-| T12 | Chase the 32 `asyncio.wait_for` sites under virtual time | `06` |
-| T13 | Decide the simulated KV connector's completion semantic | `06` |
-| T14 | Build the client-count matrix given only 144 fan-out-capable sessions | `06` |
-| T15 | Warmup handling in the harness contract | `06` |
-| T16 | Calibrate `compass plan`'s GPU-time estimates | `07` |
-| T17 | Draw the boundary of the standalone `ModelRunner` bench | `07` |
-| T18 | Verify a replayed step table reproduces the forward context faithfully | `07` |
-| T19 | Decide the artifact store's physical form | `07` |
-| T20 | Declared node + standalone benchmark for invisible collectives | `07` |
-| T21 | Establish whether Phase 1c transfers across width (the TP2 test run) | `07` |
-| ~~T22~~ | ~~Analytic laws as their own design point~~ — **done**, now `10` | `07` |
-| T23 | Choose the family-2 distance function | `08` |
-| T24 | Define "structural event" for family 3 beyond prefill streaks | `08` |
-| T25 | Measure the real-vs-real noise floor under closed-loop replay at high client count | `08` |
-| T26 | Assert simulator bit-reproducibility as a test | `08` |
-| T27 | Decide the 256-client cell's construction | `08` |
-| T28 | Establish whether ranking/regret becomes an explicit acceptance gate | `08` |
-| T29 | Choose the hull implementation and its threshold | `09` |
-| T30 | Enumerate candidate laws per leaf family, with held-out validation shapes | `09` |
-| T31 | Test raggedness, cached fraction and chunk-position for treatment status | `09` |
-| T32 | Decide whether tier (a) is derived from tier (b) or fitted independently | `09` |
-| T33 | Establish `warmup_seconds` for Qwen3.8-27B under the current stack | `09` |
-| T34 | Test whether the activation coefficient is derivable from geometry | `10` |
-| T35 | Derive FLOPs and bytes-moved expressions for the ~20 opaque leaves | `10` |
-| T36 | Name the collective algorithm per code path in the machine spec schema | `10` |
-| T37 | Decide whether the host floor is derivable or stays a per-model constant | `10` |
-| T38 | Build the analytic-vs-measured ratio report as part of the empirical campaign | `10` |
-| T39 | Establish a dispatch-band table from geometry where no measured bands exist | `10` |
-| T40 | Confirm the new histograms are **classic**, not native | `11` |
-| T41 | Audit every `observe()` site; extend the AST test to observation arguments | `11` |
-| T42 | Measure `collect_metrics()` per-step cost on the real side; decide decimation | `11` |
-| T43 | Verify the backfill end to end &mdash; one block, loaded, visible in Grafana | `11` |
-| T44 | Sanity-check histogram bucket ranges against simulated latencies | `11` |
-| T45 | Tag ATOM's existing twenty metrics with their D77 class | `11` |
-| T46 | Decide the DP-aggregation rule per class; refuse summaries there | `11` |
-
-### The four I would settle first
-
-- **T21** — the calibration recipe's one unproven assumption. Overhead constants have
-  already been measured moving **12% and 7% in opposite directions** between TP1 and TP2 on
-  the same GPUs.
-- **T25** — the noise floor under closed-loop replay. All prior data is 20 requests, one
-  session, declared arrivals. If the floor is wide at 256 clients, those cells are
-  ungradeable.
-- **T10** — an hour of work that swings the adapter estimate by 2,000 lines.
-- **T5** — everything in `04` rests on it, and it needs a non-wedged node.
-
----
-
-## Pending amendments
-
-Corrections identified while writing later documents, not yet applied to earlier ones.
-
-| Document | Amendment |
-|---|---|
-| `02`, `04` | "Two tiers" becomes **three** — analytic/roofline is a tier in its own right (`07` D36), not merely rung 4 of the resolver ladder |
-| `02` | Extend `CostBackend` with the resolver ladder and compositional `provenance_mix` |
-| `05` | D26's `transfer` probe is **deferred**: no cross-hardware transfer of empirical data (`07` D36) |
-
----
-
-## Cross-cutting issues
-
-Beyond the per-document TODOs, from `01`'s register.
-
-1. **Silent failure is the dominant risk mode.** The always-on assertions, loud deadlock
-   aborts and the AST clock-site test are the design, not decoration.
-2. **Simulation speed is unmeasured under this architecture.** The prior design ran
-   **0.30×** under saturation — slower than the system it simulates. Measure a saturated
-   cell early.
-3. **Per-step replay CPU cost** was 4.3 ms against a 32.7 ms modelled step, and only with
-   the bound allocation in the cache key; a shape-only key is unsound.
-4. **Schedule agreement must be reported separately from latency**, and it was established
-   two changes *before* the latency numbers were right.
-5. **Scheduling fidelity is unobservable at saturation.** Some cell needs deliberate slack.
-6. **Multi-node DP is implemented but not hardware-validated** — `docs/distributed_guide.md`
-   §9 carries the banner. If paired evidence is needed there, the real side may not exist.
+| D3.2 | Three always-on causality detectors; a straggler fails the run rather than warning |
+| D3.3 | The Clock Authority ships two deployment forms from one implementation: co-hosted by default, standalone for multi-container runs |
+| D43.1 | ATOM's own 187-file, GPU-free test suite is a merge gate on every Compass change, unmodified |
+| D67.1 | Tier 0 is graded on **configuration ranking** first; its latency goals are diagnostics for that, not the result |

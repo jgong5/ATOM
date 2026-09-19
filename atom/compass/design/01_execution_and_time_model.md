@@ -1,4 +1,4 @@
-# ATOM Compass — Design Point 1: Execution and Time Model
+# ATOM Compass — Design Topic 1: Execution and Time Model
 
 **Status:** draft for review. Drafted by an AI assistant during a design interview; not
 yet reviewed or approved. No code has been written against it.
@@ -8,7 +8,7 @@ yet reviewed or approved. No code has been written against it.
 **Scope of this document.** The execution architecture: what a simulated run *is*,
 which processes exist, how virtual time advances, and what contract the rest of the
 system must honour. It does **not** cover the cost model, the memory model, model
-capture, or the workload harness. Those are separate design points.
+capture, or the workload harness. Those are separate design topics.
 
 ---
 
@@ -26,35 +26,19 @@ capture, or the workload harness. Those are separate design points.
 
 ---
 
-## D0. Relationship to the two prior branches
+## Relationship to the prior PoC branches
 
-### Problem
+Not a design point — a one-paragraph statement of provenance, recorded here so the
+evidence cited throughout this document has an origin. The fuller account is
+**Development history** in `README.md`.
 
-Two prior attempts exist in the repository. Restarting on a clean branch raises the
-question of what, if anything, is inherited.
-
-Verified facts:
-
-| Branch | Commits over `fork/main` | Diff | Note |
-|---|---|---|---|
-| `feature/atomcompass_take2` | 177 | 75 files, +23,878 / -13 | The PoC baseline. Head `66ae9d87`. Equals GitHub PR jgong5/ATOM#2. |
-| `feature/atomcompass` | 527 | 263 files, +118,921 / -37 | **Not** an abandoned earlier attempt — `git merge-base --is-ancestor take2 atomcompass` is true. It is take2 **plus 350 more commits**. |
-
-So the history is linear: take2 is a deliberately pruned baseline, `feature/atomcompass`
-is its continuation.
-
-### Options
-
-1. **Rebase on take2.** Fastest to a running thing. Carries a wall-clock-shaped
-   architecture into a virtual-clock design.
-2. **Parts bin.** Design fresh; port only what the new design names.
-3. **Pure from-scratch.** Reuse nothing.
-
-### Decision
-
-**Fresh design, referring to the prior work at the level of *design* only.** No
-code-port plan is defined up front. Where a prior mechanism is the right answer it is
-described here on its merits and re-derived; where it is not, it is not carried.
+Two prior attempts exist (`feature/atomcompass_take2`, `feature/atomcompass`; the
+history is linear, the second is the first plus ~350 commits). This design is **fresh,
+referring to the prior work at the level of *design* only**. No code-port plan is
+defined up front. Where a prior mechanism is the right answer it is described here on
+its merits and re-derived; where it is not, it is not carried. Every quantitative claim
+below that is attributed to "the prior work" or "a prior run" is a measurement taken on
+one of those branches, on this hardware.
 
 ### What the prior work established that this design relies on
 
@@ -68,10 +52,18 @@ These are measurements, not opinions, and they are load-bearing below:
   steps: per-step rank difference median 0.03%, worst 0.82%, rank 1 slower on 51% of
   steps. TP=4 over 2295 steps: rank totals within ±0.02%; charging every step to its
   **slowest** rank adds **0.06%** to the total.
-- **The idle jump is where the speedup comes from.** 64 requests Poisson 8/s: 9,426 ms
-  real vs 639 ms simulated (14.8x). cc-traces 20 requests 27B TP=4: 309 s vs 3 s
-  (~103x). Under saturation, where there is no idle to skip: **122 s vs 36 s, i.e.
-  0.30x — slower than the system it simulates.**
+- **Speedup has two independent sources, and only one of them survives saturation.**
+  (i) *Not doing the compute* — the forward pass evaluates a cost model instead of
+  running kernels, so every step is cheaper by construction, at every load. (ii) *The
+  idle jump* — when every LP is blocked, the clock leaps to the next event instead of
+  sleeping through real seconds. Measured: 64 requests Poisson 8/s, 9,426 ms real vs
+  639 ms simulated (14.8x); cc-traces 20 requests 27B TP=4, 309 s vs 3 s (~103x). Under
+  saturation, where there is no idle to skip, only (i) is left — and it was not enough:
+  **122 s vs 36 s, i.e. 0.30x, slower than the system it simulates.** That is the
+  measurement behind the "cost of a simulated step" work in doc `08`: source (i) is
+  worth less than it sounds because the replaced kernel time was overlapped with host
+  work that is *not* replaced. The ≥5x target is therefore a statement about the
+  arrival process, not only about the cost backend.
 - **Aggregate cost accuracy does not bound schedule accuracy when the scheduler has a
   discontinuity.** The prior run was within 1.0% on prefill seconds, 1.1% on decode,
   1.0% on run length — and **90% wrong on median TTFT**, because TTFT was decided by two
@@ -82,18 +74,6 @@ These are measurements, not opinions, and they are load-bearing below:
 - **The real machine is not on the knife edge; only the simulator is.** All four real
   repeats produced the identical streak structure (36, 6, 42, 7, 15) breaking at the
   same two places, margins varying by at most 0.1 s.
-
-### Open issues
-
-- The two handed-off artifacts (`atom/compass/DESIGN_NOTES.html`, `POC_SUMMARY.html`)
-  disagree about which is newer. Content settles it: DESIGN_NOTES is newer;
-  POC_SUMMARY's cc-traces and HTTP-serving rows are stale by roughly five successive
-  states. Anyone reading POC_SUMMARY alone inherits an out-of-date picture.
-- Nine further design documents referenced by those two (`RETROSPECTIVE.md`,
-  `PROTOCOL.md`, `CC_TRACES_PROTOCOL.md`, `POC_STATUS.md`, `G4_TRANSFER.md`,
-  `MEMORY_EVIDENCE.md`, `DECODE_CALIBRATION_SCOPE.md`, `SOURCE_ONLY_SERVING.md`,
-  `PREFIX_CACHE_REPLAY.md`) exist only on `feature/atomcompass`. They are readable via
-  `git show`, and several are load-bearing.
 
 ---
 
@@ -171,6 +151,65 @@ replaces the process layer, which is neither the model layer nor a dependency of
 Option B's stated cost — a coordination protocol — is addressed in D3 and turns out to
 be small **because ATOM's own structure supplies most of the synchronization already**
 (see D3's logical-process collapse).
+
+### Mitigating option B's real cost: causality violations are silent
+
+Option A's safety is structural — one thread cannot race itself. Option B has to *earn*
+the same property, and a violation under option B produces a plausible number rather
+than a crash. Accepting option B without a detector would mean accepting that class of
+error into the acceptance evidence. So three always-on detectors, sized to be cheap
+enough that none of them is a mode anyone can forget to enable.
+
+**Where violations actually come from.** The grant rule of D3 is conservative: it cannot
+produce a violation *given correct inputs*. There are exactly three ways the inputs go
+wrong, and each maps to one detector.
+
+| Failure | What it looks like | Detector |
+|---|---|---|
+| **Declared lookahead is larger than reality** — an LP claims it cannot affect another for 50 µs and then does it in 10 | Receiver has already advanced past the send time. Silent; the message lands "in the past" | **(1) Straggler check** |
+| **A wait is not annotated** — an LP blocks for real while the CA believes it is running | Either a deadlock (loud) or, if a timeout rescues it, an LP that consumed no virtual time while real time passed. Silent | **(2) Annotation-coverage audit** |
+| **A clock read was missed** — business logic still calls `time.monotonic()` | Two timestamps on one timeline disagree; durations mix scales. Silent | **(3) Clock-source audit** |
+
+**(1) Straggler check — receive side, always on, one comparison.** Every cross-LP
+message already passes through a small number of send/recv wrappers (the ZMQ hops of
+D4 category B). Each carries the sender's virtual send time `t_s`. On receipt the LP
+asserts `t_s >= now_self`. A violation means this LP has already simulated past the
+moment the message was sent, i.e. the local-causality constraint is broken. The check
+costs one float comparison per message and is the direct test of the property the whole
+protocol exists to provide. On failure: record `(sender, receiver, t_s, now_self,
+declared lookahead)` and **fail the run** — not a warning, because a straggler
+invalidates every number downstream of it.
+
+This is also what makes a wrong lookahead *findable*: the report names the pair, so
+raising `L[j→i]` to the observed violation plus margin is a mechanical fix.
+
+**(2) Annotation-coverage audit — a watchdog on "running" LPs.** A background thread
+per LP samples its own state. If an LP has been `declare_running()` for more than a
+wall-clock threshold (~200 ms is far above any real simulated step and far below any
+real blocking wait) *without* its virtual clock advancing, it is blocked on something
+nobody annotated. Log the LP, the stack, and continue — this one is a warning rather
+than a failure, because it costs correctness only when it also produces a straggler,
+and detector (1) catches that. Its value is that it names the missing annotation
+**during development**, when D4's ~55-site audit is still being worked through, rather
+than leaving a category-B site to be discovered by a wrong result.
+
+**(3) Clock-source audit — static, run in CI.** D4's categorisation rests on a
+by-hand audit of clock-read sites. A grep-level lint over the simulated-path modules
+that flags `time.time`, `time.monotonic`, `time.perf_counter`, `datetime.now` and
+`asyncio.sleep` outside an allow-list keeps that audit from rotting as ATOM's main
+branch moves. The allow-list is the set doc `11` D72 establishes as deliberately real
+(metrics push cadence, transport). Anything new lands as a CI failure on the day it is
+added, not at validation time.
+
+**What this costs.** One comparison per cross-LP message, one sampling thread per LP,
+one CI lint. None of it is on the per-step path. **What it buys:** the statement "no
+causality violation occurred" becomes a reported result of every run rather than an
+assumption, which is what doc `08` needs in order to treat a simulated number as
+evidence at all.
+
+**What it does not cover.** A lookahead that is wrong but *never exercised* by the
+workload is not detected — the run is correct, and a different workload may not be.
+Recorded as **T47**.
 
 ### Open issues
 
@@ -506,13 +545,38 @@ Requirements that follow, and they are cheap only if honoured from the start:
    node-local CA; PD role boundaries have millisecond lookahead and are the cheap links
    to cross a node.** The hardware already lays out that way.
 
+### Where the CA runs: both, selected by one flag
+
+Settled: **two deployment forms of one implementation, not two implementations.**
+
+| Form | When | How it is reached |
+|---|---|---|
+| **Co-hosted in the API-server process** (default) | single-container runs — M1 through M3, M5, and every calibration or debug run | the LP's endpoint resolves to an in-process transport; no socket, no extra process to start or reap |
+| **Standalone CA server** | multi-container and multi-node runs — M4, M6, and anything with an Atomesh router between roles | `--compass-clock-endpoint tcp://host:port`; the CA is its own process, started before the engines |
+
+This is cheap precisely because requirement 1 above already forbids the LP-facing
+interface from naming the CA's location. The two forms differ only in which transport
+the endpoint resolves to. The in-process form is *not* a shortcut that skips the
+protocol — the same grant rule, the same lookahead matrix, the same straggler stamps —
+so a bug found in one form is a bug in the other, and the cheap single-container runs
+are a real test of the expensive multi-container path.
+
+Default co-hosted rather than always-standalone because the overwhelming majority of
+runs are single-container, and a standalone CA there is one more process to start,
+supervise and leak. Standalone for M4/M6 because neither container is obviously the
+right host and making one of them the clock owner would give the two roles asymmetric
+failure behaviour that the real deployment does not have.
+
+**What must be true for this to stay one implementation:** the co-hosted form must not
+acquire an in-process fast path that bypasses the message stamps detector (1) above
+depends on. If grant traffic ever stops carrying virtual send times in-process, the
+single-container runs stop testing the property they are supposed to be testing.
+
 ### Open issues
 
 - Grant RPC latency has not been measured on this hardware. The 50 us figure is an
-  estimate and should be measured before it is quoted.
-- Whether the CA lives in the API-server process or standalone for the M4 two-container
-  case is unresolved. Standalone is probably cleaner there, since neither container is
-  obviously the right host.
+  estimate and should be measured before it is quoted. Note this matters only for the
+  standalone form; co-hosted grants are function calls.
 - The CA is the only component that knows every LP's virtual time. It should therefore
   own the global timeline log and the deadlock dump. That makes it an observability
   component as well as a coordination one, which is a benefit but also means its output
@@ -890,7 +954,7 @@ completion-driven recycling, cancellation". Verified against the corpus:
   keeps them so.
 
 **This must be declared in the acceptance scope rather than claimed.** It belongs to the
-workload design point, but it is recorded here because it is what licenses the
+workload design topic, but it is recorded here because it is what licenses the
 declared-arrival model.
 
 ### Open issues
@@ -1002,6 +1066,8 @@ Ordered by how much they could cost.
 | D2 | "Two nodes" means true PD disaggregation, realised as two containers on one physical node | 2026-09-17 |
 | D3 | Central Clock Authority, grant rule `min_j(now[j] + L[j->i])`, LPs collapsed on existing hardware barriers | 2026-09-18 |
 | D3.1 | Single CA with a hierarchy-ready interface; LP count scales with replicas and PP stages, not with GPUs | 2026-09-18 |
+| D3.2 | Three always-on causality detectors: receive-side straggler check (fails the run), annotation-coverage watchdog (warns), clock-source CI lint | 2026-09-19 |
+| D3.3 | CA deploys two ways from one implementation: co-hosted in the API-server process by default, standalone server via `--compass-clock-endpoint` for M4/M6 multi-container runs | 2026-09-19 |
 | D4 | Four-category interception contract; annotate rather than intercept cross-LP blocking waits | 2026-09-18 |
 | D5 | Disable failure detectors, virtualize business logic; sorting rule is "does it change which batch gets scheduled" | 2026-09-18 |
 | D6 | KV transfer is simulated through a connector registered in the existing factory | 2026-09-18 |

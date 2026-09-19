@@ -1,4 +1,4 @@
-# ATOM Compass — Design Point 9: Fitting and Law Selection
+# ATOM Compass — Design Topic 9: Fitting and Law Selection
 
 **Status:** draft for review. Drafted by an AI assistant during a design interview; not
 yet reviewed or approved. No code has been written against it.
@@ -356,6 +356,9 @@ choice that must be visible.
 ---
 
 ## TODO register
+
+This topic's items only. The consolidated register across all topics, with the
+load-bearing assumptions and their check plans, is [`12_open_items.md`](12_open_items.md).
 
 | # | Item | Why deferred |
 |---|---|---|

@@ -1,4 +1,4 @@
-# ATOM Compass — Design Point 8: The Validation Protocol
+# ATOM Compass — Design Topic 8: The Validation Protocol
 
 **Status:** draft for review. Drafted by an AI assistant during a design interview; not
 yet reviewed or approved. No code has been written against it.
@@ -10,6 +10,58 @@ yet reviewed or approved. No code has been written against it.
 tolerance applies and where that tolerance comes from, and what invalidates a run.
 Acceptance is paired simulated and real execution of cc-traces proper, so every rule here
 applies symmetrically to both sides.
+
+---
+
+## D43.1. ATOM's own test suite is the first validation layer, and it is free
+
+Asked directly: can Compass reuse existing ATOM unit tests? **Yes, and it is the cheapest
+correctness evidence in this document — but it validates a different property than
+everything else here.**
+
+Verified on `feature/atomcompass_new`: **187 test files** under `tests/`, and ATOM's own
+`CLAUDE.md` states they need **no GPU** — AITER and `torch.cuda` are mocked. Among them,
+directly relevant to the components Compass keeps:
+
+| Test | Covers |
+|---|---|
+| `test_scheduler.py` | `Scheduler` public API — admission, `ScheduledBatch`, `ScheduledBatchOutput`, spec stats |
+| `test_prefill_scheduler.py`, `test_scheduler_partial_prefill_tail.py` | chunked prefill boundaries |
+| `test_block_manager.py`, `test_block_pool.py` | the block accounting D13 relies on running unmodified |
+| `test_prefix_cache_accuracy.py`, `test_prefill_prefix_vs_native.py` | the prefix-cache behaviour doc `03` declares correct-by-construction |
+| `test_scheduled_batch_marshal.py`, `test_block_table_marshal.py` | the IPC payloads the clock protocol annotates around |
+| `test_kv_connector_scheduler.py` | the connector factory doc `01` D6 registers a simulated connector into |
+| `test_disagg_modes.py`, `test_disagg_types.py` | the PD paths of M4/M6 |
+| `test_dp_load_balance.py`, `test_dp_metadata.py`, `test_dp_sync_layout.py` | the DP paths of M7 |
+
+### What this does and does not prove
+
+**What it proves, and it is exactly the claim Compass's central design choice rests on:**
+that the scheduler, block manager and admission logic still behave identically after
+Compass's changes. Every one of doc `01` D4's edits — clock-read substitution, blocked/
+running annotation, disabled failure detectors — lands in code these tests cover. A
+simulated run "makes the same scheduling decisions as a real one" is not a hope if this
+suite passes unchanged; it is the definition of what the suite checks.
+
+**What it does not prove:** nothing about accuracy. No ATOM test knows what a step should
+*cost*. The three results of D44 below are untouched by it.
+
+### How it is used, as three rules
+
+1. **The suite is a merge gate, run on every Compass change, unmodified.** Not adapted,
+   not subsetted. The moment a Compass change requires editing an ATOM test to keep it
+   green, that change has altered ATOM's behaviour and needs justifying on its own terms.
+2. **A red test is never "expected under simulation".** If a clock substitution breaks
+   `test_scheduler.py`, the substitution is at a business-logic site that changes a
+   decision — which is precisely the sorting rule doc `01` D5 exists to apply, and the
+   test found a misclassification.
+3. **New Compass components get tests in the same suite**, in the same style, so they run
+   in the same CI on the same CPU-only box. The clock protocol, the straggler detector
+   and the cost-backend interface are all testable without a device.
+
+**Baseline caveat.** Take the suite's *current* pass/fail state as the baseline before the
+first Compass commit, and record it. A pre-existing failure attributed to Compass costs a
+day; this has already happened once on this codebase with a lint baseline.
 
 ---
 
@@ -274,14 +326,12 @@ Each of these voided real percentages before.
    pilot attempts were lost or degraded by other tenants — two refused to start with a
    negative KV budget at 141 GB of neighbour, one ran **64% slow**. A check that only runs
    first cannot see a tenant that arrived mid-run.
-6. **Coverage is a hull, not a bounding box.** Rung 16 was covered on both axes
-   *separately* and still came out **22.6% low**, because it held 64 samples at raggedness
-   exactly 1.00 against a run at 1.18–1.32. And the axes are workload-dependent: 0.6B
-   batches ran at raggedness 2.82–3.85, 27B at 1.11–1.42.
-7. **Leave-one-out is not cross-validation of a *family*.** An attention power law scored
-   LOO median **0.75%** and then missed two independently traced graphs by **−6.2% and
-   −6.7%, in the same direction**. *"Where a sample is small and geometrically spaced, LOO
-   reports how stable the fit is, not whether the family is right."*
+6. **Coverage is a hull, not a bounding box**, and **leave-one-out does not validate a
+   family**. Both are doc `09` D58/D59 — the geometry of coverage and the choice of a
+   functional form are fitting questions and are argued there, with the measurements.
+   Named here because both are *refusals a validation run applies*: a step outside the
+   hull is reported as refused rather than predicted, and a law whose family was chosen
+   by LOO alone is not admissible evidence.
 
 ---
 
@@ -405,6 +455,9 @@ claims there are not.
 ---
 
 ## TODO register
+
+This topic's items only. The consolidated register across all topics, with the
+load-bearing assumptions and their check plans, is [`12_open_items.md`](12_open_items.md).
 
 | # | Item | Why deferred |
 |---|---|---|

@@ -1,4 +1,4 @@
-# ATOM Compass — Design Point 6: The Workload Harness Contract
+# ATOM Compass — Design Topic 6: The Workload Harness Contract
 
 **Status:** draft for review. Drafted by an AI assistant during a design interview; not
 yet reviewed or approved. No code has been written against it.
@@ -38,10 +38,10 @@ Three parts:
    |   harness    |<----------------------------------+
    | (any vendor) |                                   |
    +------+-------+                            +------+------+
-          |  2. wire: sim_arrival -->          |    Clock    |
-          |           <-- sim_arrive,          |  Authority  |
-          |               sim_first_token,     +------+------+
-          |               sim_finish                  |
+          |  2. wire:  compass.arrival_s  -->  |    Clock    |
+          |            <-- compass.{arrival_s,|  Authority  |
+          |                 first_token_s,    +------+------+
+          |                 finish_s}                |
           v                                           |
    +--------------+                                   |
    | ATOM api_srv |-----------------------------------+
@@ -66,11 +66,43 @@ Exactly three things: replace its inter-request sleep with a clock call; attach 
 to an outgoing request; take its latency numbers from response fields rather than its own
 stopwatch. A harness that cannot do the third is still usable for throughput-only studies.
 
+### Warmup is not a protocol feature
+
+Settled: **warmup requests are ordinary requests sent early.** They carry `compass.arrival_s`
+like any other, go through the same endpoint, and the contract gains nothing. The
+earlier draft treated warmup as an open contract question; it is not one, because
+nothing about a warmup *request* differs from a normal one.
+
+What does differ is the **engine's state when it serves them**, and that is where the
+actual hazard lives. A prior sweep's first three prefill steps cost 47.5 / 19.5 / 6.1 s
+at 8 / 32 / 96 tokens, where the same shapes later cost **0.11 s** — 430x on the first
+one. That is JIT compilation, autotuning and allocator growth, not a property of the
+request.
+
+So one guardrail, and it is a measurement rule rather than a protocol one:
+
+> **The cost model does not model warmth, so the validation window must exclude it on
+> both sides, by request id, agreed before the run.**
+
+Three consequences worth being explicit about:
+
+1. **Both sides exclude the same requests.** Excluding the first N on the real side and
+   the first N on the simulated side is not the same thing if the two runs admit in a
+   different order. The harness declares the warmup request ids; both sides honour that
+   list. This is the same rule doc `08` applies to every paired comparison.
+2. **Simulated warmup is cheap and real warmup is not.** A simulated run will serve
+   those requests at steady-state prices, so the two runs' *wall* behaviour during
+   warmup diverges wildly. That is expected and harmless as long as rule 1 holds — and
+   it is the reason warmup cannot simply be left in and averaged over.
+3. **Warmth is measured, never charged** (doc `09` D62). If a future model wants to
+   predict the cold steps, that is a separate term with its own evidence, not a fudge on
+   the steady-state price.
+
 ### Open issues
 
-- The contract says nothing about *warmup*, which every harness does differently and which
-  matters here: a prior sweep's first three prefill steps cost 47.5 / 19.5 / 6.1 s at
-  8 / 32 / 96 tokens where the same shapes later cost 0.11 s.
+- Nothing here handles a workload where warmth *recurs* mid-run — a new shape reaching
+  autotune for the first time at minute 10. Doc `09` D62 measures leading warmth; it
+  does not detect a late one. Recorded as **T54**.
 
 ---
 
@@ -78,7 +110,7 @@ stopwatch. A harness that cannot do the third is still usable for throughput-onl
 
 ### Problem
 
-Simulation needs two fields in and three out. They can ride the production endpoint or a
+Simulation needs one declared value in and three readings out. They can ride the production endpoint or a
 dedicated one.
 
 ### Options
@@ -98,8 +130,54 @@ dedicated one.
 
 | Direction | Field | Meaning |
 |---|---|---|
-| request -> | `sim_arrival` | when this request counts as arriving, on the run's simulated timeline |
-| <- response | `sim_arrive`, `sim_first_token`, `sim_finish` | the engine's own readings |
+| request -> | `compass.arrival_s` | when this request counts as arriving, on the run's simulated timeline |
+| <- response | `compass.{arrival_s, first_token_s, finish_s}` | the engine's own readings |
+
+#### Minimality audit: why four values, and why not three or five
+
+The requirement is that these are the minimum — nothing more, nothing less. Audited in
+both directions.
+
+**One nested object per direction, not four flat keys.** The earlier draft used four
+top-level names (`sim_arrival` in; `sim_arrive`/`sim_first_token`/`sim_finish` out).
+Two problems: `sim_arrival` and `sim_arrive` differ by two characters and mean different
+things, which is a bug waiting to happen; and four new top-level keys is four collisions
+with a schema ATOM does not own. One `compass` object is **one** additive key each way,
+namespaced, and trivially ignorable by a server that does not know it.
+
+**What is deliberately NOT a Compass field, because the OpenAI schema already has it:**
+
+| Need | Existing field | Note |
+|---|---|---|
+| declared output length | `max_tokens` / `max_completion_tokens` | the harness must always set it |
+| never stop early | `ignore_eos` | always true under simulation; the output is garbage, so an EOS would be an artifact of the filler, not the model |
+| request identity | `id` on the response | the join key for the exclusion list and the step table |
+| streaming first-token timing | SSE first chunk | the harness's *wall* reading — kept, but not the graded one |
+
+Adding a Compass field for any of these would duplicate state that can disagree.
+
+**Why each of the four is irreducible:**
+
+- `compass.arrival_s` **(in)** — the only field with no existing home. The server cannot
+  infer it: under simulation the harness sends requests as fast as the socket allows and
+  the *declared* arrival is the whole point. Without it there is no simulated timeline.
+- `compass.arrival_s` **(out)** — not an echo. The engine may clamp a declared arrival
+  (it cannot be earlier than the run's epoch, and the arrival gate of doc `01` D8 may
+  defer it). Returning what the engine *used* is how the harness detects that its
+  timeline was not honoured. Dropping this makes a clamped run silently misreport TTFT.
+- `compass.first_token_s` **(out)** — TTFT is a graded acceptance metric at ≤10%. The
+  harness's own stopwatch measures HTTP and wall time, which under simulation is
+  unrelated to simulated time. There is no other source.
+- `compass.finish_s` **(out)** — same argument for TPOT and throughput; and
+  `finish − first_token` over the generated count is TPOT, so this is not derivable from
+  the other three.
+
+**What was considered and rejected as a fifth field:** a per-step or per-token timeline.
+It would make TPOT *distribution* gradeable rather than just its mean. Rejected because
+the same information is already in the engine's own step table (doc `08`), which both
+sides emit, and putting it on the wire would grow every response by the output length.
+If a later result needs per-token simulated stamps, it comes from the step table join,
+not from the endpoint.
 
 take2 built the request half: `CompletionRequest.compass_arrival` as an offset into the
 run, `llm_engine._stamp_arrival` turning it into `epoch + offset` and warning plus falling
@@ -166,7 +244,7 @@ The ATOM relay is strictly sequential (`http_pd_router.rs:969-1192`), unlike the
 path (`tokio::join!` on both, `:1463`) and the vLLM path (detached `spawn`, `:732`):
 
 ```
-client --sim_arrival--> router --inject_prefill_fields--> PREFILL
+client --compass.arrival_s--> router --inject_prefill_fields--> PREFILL
                                   (sets kv_transfer_params, stream=false,
                                    max_tokens=1; other fields pass through)
                         router <-- prefill response
@@ -184,8 +262,8 @@ itself is produced by `MoRIIOConnectorScheduler.request_finished`
 
 ### Decision
 
-**Prefill writes `sim_arrive` and `sim_first_token` into `kv_transfer_params`. Decode reads
-them, adds `sim_finish`, and emits the merged timeline in its response.**
+**Prefill writes `arrival_s` and `first_token_s` into `kv_transfer_params`. Decode reads
+them, adds `finish_s`, and emits the merged timeline in its response.**
 
 Consequences:
 
@@ -351,7 +429,7 @@ rule as the forward pass.
 | encode | default `ThreadPoolExecutor` | width from ATOM config | `encode_fixed_s + tokens / encode_tokens_per_s` |
 | decode | engine output thread, per stream per step | **1** | `2 x (decode_fixed_s + window / decode_tokens_per_s)` |
 
-Terms come from `host.tokenizer.*` in the machine spec (doc 05 D25), populated by the
+Terms come from `host.tokenizers[]` in the machine spec (doc 05 D25), populated by the
 `compass spec probe tokenizer` Tier-0 probe.
 
 **This is a queue, not a constant.** At the corpus p50 and a plausible 2 M tokens/s,
@@ -520,6 +598,9 @@ requires genuine fan-out in every root is not constructible without reusing sess
 ---
 
 ## TODO register
+
+This topic's items only. The consolidated register across all topics, with the
+load-bearing assumptions and their check plans, is [`12_open_items.md`](12_open_items.md).
 
 | # | Item | Why deferred |
 |---|---|---|

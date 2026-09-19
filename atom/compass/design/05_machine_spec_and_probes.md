@@ -1,4 +1,4 @@
-# ATOM Compass — Design Point 5: The Machine Specification and its Probes
+# ATOM Compass — Design Topic 5: The Machine Specification and its Probes
 
 **Status:** draft for review. Drafted by an AI assistant during a design interview; not
 yet reviewed or approved. No code has been written against it.
@@ -78,12 +78,17 @@ host:
   cpu:
     cores_physical: 96
     cores_logical: 192
-  tokenizer:                     # per (tokenizer, host) PAIR - re-probe if either changes
-    encode_fixed_s:            3.0e-4
-    encode_tokens_per_s:       2.0e6
-    decode_fixed_s:            1.5e-4
-    decode_tokens_per_s:       3.0e6
-    derate:                    0.85
+  tokenizers:                    # keyed by tokenizer identity, not by model - see below
+    - id: qwen3-151k-bpe
+      backend: fast              # fast (Rust) vs slow (Python) differ by >10x
+      vocab_size: 151936
+      fingerprint: sha256:<tokenizer.json>
+      applies_to: [Qwen3ForCausalLM, Qwen3MoeForCausalLM]
+      encode_fixed_s:          3.0e-4
+      encode_tokens_per_s:     2.0e6
+      decode_fixed_s:          1.5e-4
+      decode_tokens_per_s:     3.0e6
+      derate:                  0.85
   ipc:
     zmq_roundtrip_s:           5.0e-5
     shm_broadcast_s:           2.0e-5
@@ -102,13 +107,20 @@ device:
     fp8_flops:                 5.0e15
     derate:                    0.70
   runtime_constants:           # the "table, not a law" terms, keyed by TP width
-    non_torch_bytes:     {1: 970.0e6, 2: 7.2e9, 4: 7.6e9, 8: 11.2e9}
-    load_residue_bytes:  {1: 1.1e6,   2: 2.17e9, 4: 2.17e9, 8: 2.17e9}
-    persistent_bytes:    124.0e6
-    graph_pool:
-      w1_floor_bytes:                  95.5e6
-      w1_per_captured_token_bytes:     0.318e6
-      w_gt1_bytes:                     109.0e6
+    # Device memory held OUTSIDE the torch allocator: HIP context, loaded code
+    # objects, RCCL/AITER collective staging buffers. Device-wide, not per-process.
+    driver_and_collective_reserve_bytes: {1: 970.0e6, 2: 7.2e9, 4: 7.6e9, 8: 11.2e9}
+    # Torch-allocator bytes still resident after weight loading finishes, i.e. not
+    # weights and not freed: AITER CustomAllreduce pool + its two-stage kernel.
+    allocator_retained_after_load_bytes: {1: 1.1e6, 2: 2.17e9, 4: 2.17e9, 8: 2.17e9}
+    # Buffers allocated once and alive for the whole run: allocate_forward_vars,
+    # attention metadata. Flat in TP width; differs only by model.
+    persistent_forward_buffer_bytes: 124.0e6
+    # Memory the CUDA-graph private pool holds, on top of the captured activations.
+    cudagraph_pool:
+      w1_base_bytes:                   95.5e6
+      w1_bytes_per_captured_token:     0.318e6
+      w_gt1_flat_bytes:                109.0e6
   software_pinned_to:          # these constants belong to the stack as much as the silicon
     rocm:  "7.2.4"
     aiter: "<commit>"
@@ -129,16 +141,27 @@ interconnect:
 
 ### Why each term exists
 
-| Term | Consumer | Evidence it is needed |
+Names are chosen to say what the quantity *is*, not where it was first observed. Several
+of these feed ATOM variables whose own names are terser; the third column records that
+mapping so a reader can follow the term into ATOM's code without guessing.
+
+| Term | Feeds (ATOM name) | Evidence it is needed |
 |---|---|---|
-| `memory.capacity_bytes` | `get_num_blocks` `total` | the one reading that cannot be derived |
-| `runtime_constants.non_torch_bytes` | `get_num_blocks` `non_torch` | 926 / 6906 / 7266 / 10704 MiB at widths 1/2/4/8. **No fixed-plus-per-peer form fits** 5980 / 6340 / 9138. A table, not a law. |
-| `runtime_constants.load_residue_bytes` | `peak_torch` | AITER `CustomAllreduce` 1 GiB pool plus the two-stage kernel's: 1.1 MiB at TP1, **2069 MiB flat** at TP2/4/8 |
-| `runtime_constants.persistent_bytes` | `peak_torch` | `allocate_forward_vars` + attention metadata; ~118 MiB, flat in width, differs only by model |
-| `runtime_constants.graph_pool` | `cudagraph_overhead` | measured `91.1 MiB + 0.3033 MiB per captured token` at W=1; flat **104 MiB** above W=1, where the allocated delta was byte-identical (79,692,800) across three widths and three ladders |
-| `tokenizer.*` | admission queue | cc-traces p50 input is **88,768 tokens**; at 2 M tok/s that is ~44 ms, **3x take2's entire admission constant**, and it scales with prompt length while a constant does not |
+| `memory.capacity_bytes` | `get_num_blocks` → `total` | the one reading that cannot be derived |
+| `runtime_constants.driver_and_collective_reserve_bytes` | `get_num_blocks` → `non_torch` | 926 / 6906 / 7266 / 10704 MiB at widths 1/2/4/8. **No fixed-plus-per-peer form fits** 5980 / 6340 / 9138. A table, not a law. Note ATOM's `non_torch` is a **device-wide** reading, so on a shared box it includes neighbours — see D14's dedicated-device scope boundary. |
+| `runtime_constants.allocator_retained_after_load_bytes` | `peak_torch` | AITER `CustomAllreduce` 1 GiB pool plus the two-stage kernel's: 1.1 MiB at TP1, **2069 MiB flat** at TP2/4/8 |
+| `runtime_constants.persistent_forward_buffer_bytes` | `peak_torch` | `allocate_forward_vars` + attention metadata; ~118 MiB, flat in width, differs only by model |
+| `runtime_constants.cudagraph_pool` | `cudagraph_overhead` | measured `91.1 MiB + 0.3033 MiB per captured token` at W=1; flat **104 MiB** above W=1, where the allocated delta was byte-identical (79,692,800) across three widths and three ladders |
+| `tokenizers[].*` | admission queue | cc-traces p50 input is **88,768 tokens**; at 2 M tok/s that is ~44 ms, **3x take2's entire admission constant**, and it scales with prompt length while a constant does not |
 | `ipc.*`, `interconnect.*_latency_s` | **Clock Authority lookahead floors** (doc 01 D3) | a zero lookahead serializes the whole simulation |
 | every `derate` | cost model | no kernel reaches spec peak; the gap between datasheet and achievable is the user's to declare |
+
+**On `derate`.** The name was kept deliberately after considering `achievable_fraction`
+and `efficiency`. It is a fraction in `(0, 1]` multiplying a spec-peak number, it appears
+in five places with identical meaning, and it is the term the schema rules make
+*mandatory* so that nobody quietly uses a datasheet FLOP as an achievable one. A name
+that reads like a neutral measurement would undercut that; `derate` reads like what it is
+— a declared haircut the author is responsible for.
 
 ### Schema rules
 
@@ -154,16 +177,48 @@ interconnect:
 4. **The whole resolved spec is echoed into every run artifact.** The KV gate is **≤5%**;
    a number whose spec cannot be recovered from the artifact is unattributable.
 
+### `host.tokenizer` is keyed by tokenizer identity, not by model
+
+The problem was real: as first written, two models with different tokenizers compared on
+one spec would silently share one set of terms.
+
+The obvious fix is to key by model type. Rejected, for one reason: **models share
+tokenizers, routinely.** Every size in a family ships the same tokenizer, and
+distillations and fine-tunes inherit it. Keying by model means measuring the same
+tokenizer once per model, storing N copies of one number, and letting them drift — and
+drift here is invisible, because nothing ever compares the copies.
+
+So the key is the **tokenizer**, with model names as an index into it — the
+`host.tokenizers` list in the schema above. Four fields carry the identity:
+
+| Field | Why it is in the key |
+|---|---|
+| `id` | author-chosen, stable, human-readable; what `merge` conflicts on |
+| `backend` | `fast` (Rust) and `slow` (Python) run an order of magnitude apart on the same `tokenizer.json`, and which one loads depends on the environment, not the model |
+| `fingerprint` | sha256 of the `tokenizer.json` actually measured — the check that the numbers belong to this tokenizer |
+| `applies_to` | the model architectures that resolve to it; one entry, many models |
+
+Resolution at run time: match the model architecture against `applies_to`; if the loaded
+tokenizer's `tokenizer.json` hash does not equal `fingerprint`, **warn and name both**.
+No match at all is a **refusal**, not a default — an unmeasured tokenizer on an 88,768-token
+p50 prompt is a ~44 ms per-request error that would land entirely inside TTFT.
+
+**What this does not solve:** one spec still describes one *host*. Two tokenizers
+measured on different CPUs must not be merged into one spec — that is what
+`provenance` and `merge`'s conflict check are for.
+
 ### Open issues
 
-- **Whether the runtime constants transfer across devices is untested.** If the reading
-  above is right they transfer across cards of one software generation and **not** across
-  software upgrades. That is a testable claim and nobody has tested it.
-- Three topologies of one model is interpolation, not a law. The graph-pool width scaling
-  rests on **one** point above W=1.
-- `host.tokenizer` is keyed by neither model nor tokenizer in this schema. If two models
-  with different tokenizers are compared on one spec, the terms silently apply to both.
-  Either key them, or require one spec per model.
+- **Runtime-constant transfer across dies is untested** (**T50**). The working assumption
+  — transfers within a software generation, not across one — is now recorded in doc `03`
+  and enforced by `software_pinned_to`, but it has not been measured on a second card
+  type. One engine startup settles it.
+- Three topologies of one model is interpolation, not a law. The cudagraph-pool width
+  scaling rests on **one** point above W=1: the shape "flat above W=1" is well supported
+  (byte-identical 79,692,800 deltas across three widths and three capture ladders), but
+  the claim that the transition happens *at* W=2 rather than being a slowly-varying
+  function that merely looks flat over 2/4/8 rests on the single W=1→W=2 step. A fourth
+  width would not help; a second **model** would.
 
 ---
 
@@ -194,21 +249,21 @@ compass spec explain machine.yaml --term kv_blocks
 
 | Probe | Fills | Method |
 |---|---|---|
-| `tokenizer --model M` | `host.tokenizer.*` | encode and decode a length sweep with **ATOM's own loaded tokenizer** (`_load_tokenizer`, `llm_engine.py:23`), fit `a + b*n`. Must sweep past 200k tokens: the workload's p90 input is 204,288. |
+| `tokenizer --model M` | `host.tokenizers[].*` | encode and decode a length sweep with **ATOM's own loaded tokenizer** (`_load_tokenizer`, `llm_engine.py:23`), fit `a + b*n`. Must sweep past 200k tokens: the workload's p90 input is 204,288. |
 | `ipc` | `host.ipc.*` | round-trip over ATOM's own `make_zmq_socket` and `aiter.dist.shm_broadcast.MessageQueue`, so it measures the transports ATOM actually uses |
 
 **Tier 1 — one GPU of the target type.**
 
 | Probe | Fills | Notes |
 |---|---|---|
-| `device-memory --tp 1` | `capacity_bytes`, `non_torch_bytes[1]`, `persistent_bytes`, `graph_pool.w1_*` | start an engine, read the five readings. Sweep >=5 capture ladders for the graph-pool fit; the prior fit predicted a held-out sixth at **+6.4%** |
+| `device-memory --tp 1` | `capacity_bytes`, `driver_and_collective_reserve_bytes[1]`, `persistent_forward_buffer_bytes`, `cudagraph_pool.w1_*` | start an engine, read the five readings. Sweep >=5 capture ladders for the graph-pool fit; the prior fit predicted a held-out sixth at **+6.4%** |
 | `device-compute` | `bandwidth_bytes_per_s`, `*_flops`, their `derate`s | GEMM and bandwidth sweeps; derate is achieved/datasheet |
 
 **Tier 2 — N GPUs of the target type.**
 
 | Probe | Fills | Notes |
 |---|---|---|
-| `device-runtime-constants --tp 2,4,8` | `non_torch_bytes`, `load_residue_bytes`, `graph_pool.w_gt1_bytes` | one engine start per width |
+| `device-runtime-constants --tp 2,4,8` | `driver_and_collective_reserve_bytes`, `allocator_retained_after_load_bytes`, `cudagraph_pool.w_gt1_flat_bytes` | one engine start per width |
 | `interconnect-intra` | `intra_node.*` | collectives in **real groups**, several sizes |
 
 **Tier 3 — two nodes.**
@@ -261,9 +316,14 @@ which cancelled — the largest being 25% of a single term.
 
 ### Open issues
 
-- The tokenizer probe measures *this* host; if the simulated host differs from the probing
-  host, a derate or a transfer is needed and there is no evidence yet on whether tokenizer
-  throughput transfers across CPUs.
+- The tokenizer probe measures *this* host. **Working assumption: tokenizer throughput
+  transfers across CPUs of comparable class, adjusted by the declared `derate`.** Adopted
+  rather than left open, because the alternative is refusing every spec authored on a
+  machine other than the target, which is most of them. It is weaker than it sounds —
+  tokenization is single-threaded, cache-resident, integer work, so it tracks per-core
+  clock far more than core count, and the schema records `cpu.cores_physical` so a gross
+  mismatch is visible. Untested; recorded as **T53**, settled by one probe on a second
+  host class.
 - Tier 2 and 3 probes need a quiet machine. Three of the last five prior pilot attempts
   were lost or degraded by other tenants — two refused to start with a negative KV budget
   at 141 GB of neighbour, one ran 64% slow. **Any probe run needs the machine checked
@@ -281,3 +341,4 @@ which cancelled — the largest being 25% of a single term.
 | D24 | The spec describes the machine; ATOM's config describes the deployment. Thread-pool width becomes an ATOM config option, not a Compass one. | 2026-09-18 |
 | D25 | Four-section schema: `provenance`, `host`, `device`, `interconnect`. Mandatory derates, no defaults for `runtime_constants`, `software_pinned_to` checked, whole spec echoed into every artifact. | 2026-09-18 |
 | D26 | Probes emit fragments; `merge` / `validate` / `explain` combine and check them. Four hardware tiers plus datasheet and transfer paths. Every hardware probe implements the contamination refusals. | 2026-09-18 |
+| D25.1 | Runtime-constant fields renamed to say what they are; ATOM's own term recorded as a mapping column. `host.tokenizer` becomes `host.tokenizers[]`, keyed by tokenizer identity (id + backend + fingerprint) with `applies_to` model architectures. | 2026-09-19 |

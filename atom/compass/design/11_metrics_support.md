@@ -1,4 +1,4 @@
-# ATOM Compass — Design Point 11: Engine Metrics under Virtual Time
+# ATOM Compass — Design Topic 11: Engine Metrics under Virtual Time
 
 **Status:** draft for review. Drafted by an AI assistant during a design interview; not
 yet reviewed or approved. No code has been written against it.
@@ -447,6 +447,9 @@ infrastructure and add nothing" should mean in practice.
 ---
 
 ## TODO register
+
+This topic's items only. The consolidated register across all topics, with the
+load-bearing assumptions and their check plans, is [`12_open_items.md`](12_open_items.md).
 
 | # | Item | Why deferred |
 |---|---|---|

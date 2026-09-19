@@ -1,4 +1,4 @@
-# ATOM Compass — Design Point 3: Memory Model and the KV Pool
+# ATOM Compass — Design Topic 3: Memory Model and the KV Pool
 
 **Status:** draft for review. Drafted by an AI assistant during a design interview; not
 yet reviewed or approved. No code has been written against it.
@@ -64,7 +64,61 @@ KV merged onto the target's block ids by name — runs unmodified and is therefo
   presented to it actually share prefixes. That is a workload-harness problem, not a
   simulator problem, and it is not free: the corpus carries no prompt text, only
   per-64-token-block hash ids, so a prompt generator must reproduce the sharing topology.
-  Deferred to the workload design point.
+  Deferred to topic `06`.
+
+#### A cache hit changes the cost of the prefill, and this is where that is handled
+
+A hit is not free and a longer hit is not the same as a shorter one. Three separate
+things have to be true for that to come out right, and they live in three places.
+
+**1. The batch already carries the hit — nothing needs to infer it.** ATOM resolves the
+prefix match in the scheduler, *before* the forward. It sets `num_computed_tokens` from
+the matched block count, and the `ScheduledBatch` that reaches the runner contains only
+the **uncached** tokens as query. So for a request of 100k tokens with a 90k-token hit,
+the runner is handed `N_Q = 10k` with `N_KV_cached = 90k` — which is what a real run
+hands its kernels too. Compass reads the hit off the batch; it never re-derives it.
+This is a direct consequence of D13: the real `BlockManager` and prefix index run, so
+the hit *is* ATOM's hit, at ATOM's 64-token block granularity, including partial-block
+truncation.
+
+**2. The cost model must have a term that separates the two.** A model of the form
+`a + b·tokens` cannot express this: it sees 10k tokens and prices them as if there were
+no 90k of context behind them, when in fact every one of those 10k queries attends over
+100k keys. That is why the prefill form in doc `02` D12 is
+
+```
+a + b·tokens + c·Σ_req N_Q²  + d·Σ_req (N_Q · N_KV_cached)
+                ^^^^^^^^^^^     ^^^^^^^^^^^^^^^^^^^^^^^^^^
+                self-attention  attention against cached context
+                within the      — this is the cache-hit term
+                new tokens
+```
+
+`d` is the cache-hit term. A 90k hit and a 10k hit on the same `N_Q` differ in `d ·
+N_Q · ΔN_KV`, linearly, which is the right shape: the query block is fixed, the KV it
+scans is not. ATOM already computes these sums itself — `detailed_sqsq`, `detailed_sqsk`
+and `detailed_sk` at `scheduler.py:790-792` are exactly `Σ N_Q²`, `Σ N_Q·N_KV` and
+`Σ N_KV`, so the features are read from the batch rather than recomputed.
+
+**3. The calibration must have *seen* high-hit steps, or the hull refuses.** This is
+the consequence with teeth, and it belongs here because it is easy to miss. A
+cache-hit step has a shape that a prefix-cache-disabled sweep **never produces**: small
+`N_Q`, very large `N_KV_cached`, a ratio far off the `N_Q ≈ N_KV` diagonal that an
+uncached chunked prefill walks. Calibrating with prefix caching off and predicting with
+it on puts every hit step outside the convex hull of doc `09` D58, and the honest
+outcome is a refusal on most of the workload.
+
+So: **doc `07`'s Phase 0 discovery must run with prefix caching enabled**, matching the
+cc-traces default, and the discovered shape set must be checked for coverage of the
+high-`N_KV`/low-`N_Q` corner specifically — not just for coverage of `tokens` and
+`batch` separately, which is precisely the per-feature bounding-box failure doc `09`
+D58 spent three iterations abandoning.
+
+**What is still not modelled:** the *lookup* cost. Matching a 100k-token prompt against
+the prefix index is host work proportional to block count, and it is charged to nobody
+— it currently falls inside the host floor of doc `07` Phase 1c as an unattributed
+constant. At cc-traces' p50 input of 88,768 tokens that is ~1,387 blocks hashed and
+probed per request. Whether that is 0.1 ms or 10 ms is unmeasured. Recorded as **T49**.
 - `hash_blocks` is deliberately called from `Scheduler.postprocess` (`scheduler.py:2404,
   2420`) *after* the forward, because the real engine only publishes a prefix once the KV
   behind it exists. The simulated forward must not disturb that ordering.
@@ -191,7 +245,7 @@ not own cannot measure any of them.
 | `total` | — | the card. A spec number. |
 | weights | exact via a meta build, −0.00/+0.00/−0.02/+0.01% at TP1/2/4/8 | model geometry + TP |
 | buffers (rotary tables) | recorded exactly; a formula matched the 0.6B and was **4x wrong on the 27B** (partial rotary) | model config |
-| activations | liveness walk; held out at the warmup shape to **+0.0% at TP=1/2/4** | model + shape + TP. **Requires an op graph — see design point 4.** |
+| activations | liveness walk; held out at the warmup shape to **+0.0% at TP=1/2/4** | model + shape + TP. **Requires an op graph — see topic `04`.** |
 | invisible scratch | 0.1 KB/token on the 0.6B, **39.6 KB/token on the 27B** | model. One fitted number, deliberately not per-operator. |
 | persistent | 118 MiB, flat in width | model |
 | load residue | 1.1 MiB at TP1, **2069 MiB flat at TP2/4/8** | AITER `CustomAllreduce` 1 GiB pool + the two-stage kernel's. A *software* constant. |
@@ -237,16 +291,27 @@ KV gate, a spec that cannot be recovered from the artifact makes an error unattr
   is the accepted cost of option 4. The mitigation is the echo above plus, eventually, a
   per-term comparison against a real run on any card that is available — which costs no
   GPU time, because every hardware run already prints the real breakdown.
-- **Whether the runtime constants transfer across devices is untested.** A plausible
-  reading of the data is that they depend on the ROCm/RCCL/AITER build more than on the
-  die — the +5980 MiB at width > 1 is collective buffer sizing, and the 926 MiB at TP1 is
-  HIP context plus libraries. If so they transfer across cards of one software generation
-  and **not** across software upgrades. That is a testable claim and nobody has tested it.
+- **The runtime constants are assumed to transfer across devices of one software
+  generation, and not across software upgrades.** The reading behind the assumption: they
+  depend on the ROCm/RCCL/AITER build more than on the die — the +5980 MiB at width > 1 is
+  collective buffer sizing, and the 926 MiB at TP1 is HIP context plus libraries. Adopted
+  as a working assumption rather than left open, and made *enforceable* by
+  `software_pinned_to` (doc `05` D25 rule 3), which refuses silently reusing a spec across
+  a stack change. Still untested across dies; recorded as **T50** and cheap to settle with
+  one startup on a second card type.
 - Three topologies of one model is interpolation, not a law. The prior work said so
   explicitly and could not get a third model because the box was offline.
-- The graph-pool width scaling rests on **one** point above W=1.
-- Who writes the spec-authoring tool, and whether it probes a real card or is hand-written
-  from a datasheet, is unresolved.
+- **The graph-pool width scaling rests on one point above W=1.** Context, since the line
+  alone does not carry it: the measured form is `91.1 MiB + 0.3033 MiB per captured token`
+  at W=1, and a **flat 104 MiB** at W=2, W=4 and W=8 — where the allocated delta was
+  byte-identical (79,692,800) across three widths *and* three capture ladders. So "flat
+  above W=1" is well supported as a *shape*; what rests on one point is the claim that the
+  transition happens at W=2 rather than being a function that merely looks flat over the
+  widths measured. A fourth width would not help; a second *model* would.
+- The spec-authoring tool is specified in doc `05` D26 (probe tiers emitting fragments,
+  `merge`/`validate`/`explain`) and scheduled as doc `07`'s Phase 2. It probes a real card
+  where one is available and falls back to declared datasheet values plus a mandatory
+  derate where one is not.
 
 ---
 
@@ -280,7 +345,7 @@ breakdown.
 - **Buffers** — recorded, not formula'd. The formula that matched the 0.6B exactly was 4x
   wrong on the 27B. Tested on a second model, failed, did not ship.
 - **Activations** — a def-use liveness walk over a traced op graph, **not** a footprint
-  sum. This term has a hard dependency on design point 4 (model capture). Four faults had
+  sum. This term has a hard dependency on topic `04` (model capture). Four faults had
   to be fixed before it worked, and they are worth restating because each is a trap:
   deaths inferred from the last read are the wrong event (a residual held across a block
   outlives every read of it — use `weakref.finalize` on the allocator); an operator's
@@ -305,14 +370,22 @@ breakdown.
 
 ### The gate that actually matters
 
-Stated by the prior work and adopted here: **the gate is not the byte error, it is
-whether the top-1 configuration choice survives.** A byte error of a few percent that
-never changes which configuration wins is a better outcome than a tighter one that does.
+Owned by doc `08` D48, not restated here: the gate is not the byte error but whether the
+top-1 configuration choice survives. What belongs in *this* document is the consequence
+for the model — which is the per-term rule above, not the aggregate.
 
 ### Open issues
 
-- Activations are blocked on design point 4 until an op graph exists. For M1 with fake
-  models a declared formula suffices, and must be labelled as such.
+- Activations are blocked on topic `04` until an op graph exists. For M1 with fake
+  models a declared formula suffices, and must be labelled as such. **Cross-check against
+  `04`:** the liveness walk this term needs is `04` D22, which resolves observationally
+  under fake tensors and treats an opaque leaf's internal scratch as a *declared per-leaf
+  constant* rather than a walked one. So this term is not simply "blocked on a graph" —
+  it is blocked on a graph **plus** the scratch constants of `04` T4, and the second is
+  the one with no law behind it. The measured spread that makes it load-bearing:
+  invisible scratch is **0.1 KB/token on the 0.6B and 39.6 KB/token on the 27B** (doc
+  `10` D67), i.e. the difference between −35.0% and +3.4% held out. A graph without the
+  scratch table does not discharge the ≤10% gate on this term.
 - The model generalises to a shape the trace was not taken at, but **not to a model that
   was never traced** — a hybrid needs a real graph. So "size a configuration nobody has
   run" holds for shape and width, not for architecture.

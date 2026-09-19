@@ -1,3 +1,12 @@
+> **This is the original seed, not a design document.** It is the task as first written:
+> sketchy, partly superseded, and non-normative. Several statements in it were revised
+> during the design interview and a few were withdrawn. Where it disagrees with a design
+> topic (`01`-`12`), **the design topic wins**. Kept verbatim for provenance.
+>
+> Milestones and sequencing will be owned by the execution plan (`13`), not by this file.
+
+---
+
 Please brainstorm the design according to the following development task. Your goal is to come up with a design and an execution plan for implementation. You should not to follow the instructions as is but should explore design options, bring suggestions, verify assumptions, identify potential issues, close open issues, clarify anything unclear and make a plan for efficient implementation (e.g. multi-agents working on parallel sub-tasks). When explore design options for key design points, try your best to survey/study/prove them before giving options and suggestions.
 
 Start with high-level architecture, control/data flow design, then to the component/module details. Use multi-agents where applicable to speed up the brainstorming and design processes.

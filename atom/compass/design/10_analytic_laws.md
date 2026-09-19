@@ -1,4 +1,4 @@
-# ATOM Compass — Design Point 10: Analytic Laws (Tier 0)
+# ATOM Compass — Design Topic 10: Analytic Laws (Tier 0)
 
 **Status:** draft for review, and **more speculative than every other document here.**
 Docs 01–09 are grounded in measurements, most of which were got wrong once before they
@@ -198,6 +198,75 @@ width) — cheap, but not zero.
 
 ---
 
+## D67.1. The accuracy goal for tier 0
+
+### Problem
+
+The empirical tiers carry declared gates (≤10% on throughput/TPOT/TTFT and each non-KV
+memory term, ≤5% on KV block count). Tier 0 has had none, which makes "tier 0 is
+available on day zero" an unfalsifiable claim. A number with no gate cannot be reported
+as a result.
+
+### Why tier 0's gate cannot be the empirical gate
+
+Not a matter of ambition. Three structural reasons the same 10% is the wrong target:
+
+1. **The derate absorbs everything tier 0 does not model.** A single scalar stands in for
+   occupancy, tail effects, launch gaps, cache behaviour and kernel quality. Its own
+   authoring error is comparable to the accuracy being demanded.
+2. **Roofline is measurably wrong in four named places** (D66 below), and the corrections
+   are exactly what the empirical campaign supplies. A tier 0 that hit 10% would mean the
+   empirical campaign was unnecessary.
+3. **Tier 0's job is different.** It is asked *which configuration wins* and *does this
+   fit*, on a device nobody has measured. Ranking and feasibility are its outputs.
+   Latency to 10% is not.
+
+### The goal
+
+Declared in advance, per quantity, because they are not equally hard:
+
+| Quantity | Tier-0 goal | Why this number |
+|---|---|---|
+| **Memory: weights, KV capacity, block count** | **≤5%**, same as empirical | Class A — exact from geometry. There is no modelling here to be wrong about; a miss is a bug. |
+| **Memory: each non-KV term** | **≤25%** | activations are approximate (`k_model` derived rather than walked) and invisible scratch is Class C. The spread that sets the number: scratch is 0.1 KB/token on the 0.6B and **39.6 KB/token** on the 27B. |
+| **Step time (prefill and decode, separately)** | **≤30%** | roofline plus a declared derate, against the four known wrongnesses of D66. Anything tighter would be claiming the corrections are unnecessary. |
+| **End-to-end TTFT / TPOT / throughput** | **≤40%** | step error compounds through a scheduler with discontinuities (doc `08` D44). Reported, not gated on tighter. |
+| **Configuration ranking** | **top-1 must survive; top-3 set must survive** | **this is the primary gate.** The others are diagnostics for it. |
+| **Feasibility (does it fit)** | **no false "fits"** | a configuration tier 0 says fits and then OOMs is a hard failure regardless of byte error. One-sided on purpose. |
+
+### Why ranking is the primary gate and the others are not
+
+Tier 0 exists for the day-zero and never-measured-this-device cases. In both, the
+decision being made is *choose a configuration*, and a model that is uniformly 25% slow
+ranks identically to a perfect one. A model that is 10% fast on one configuration and
+10% slow on another can invert the ranking while looking better by every latency
+statistic. So the gate that matters is ordinal, and the percentage goals above exist to
+make a ranking failure diagnosable rather than to be reported on their own.
+
+This is the same argument doc `08` D48 makes for memory and it is adopted here
+deliberately — one gate philosophy across both, not two.
+
+### How it is measured, at no extra cost
+
+By D68 below: every leaf with both a measured price and an analytic law yields the ratio
+for free. The tier-0 goals above are checked against the empirical campaign's own data,
+on the devices where both exist. **No additional GPU time is requested for this.**
+
+What that cannot check is tier 0 on a device where no campaign ran — which is tier 0's
+whole purpose. That gap is irreducible: the honest statement is that the goals above are
+validated *where both tiers exist* and **assumed to transfer**, with the derate carrying
+the assumption. Recorded as **T56**: state the tier-0 error observed on each measured
+device in the artifact, so a user on an unmeasured device sees the range rather than a
+promise.
+
+### Open issue
+
+- These numbers are **declared, not derived**. 30% for step time is a judgement informed
+  by D66's four measured wrongnesses; one campaign will say whether it was generous or
+  harsh, and it should be revised then rather than defended.
+
+---
+
 ## D68. Validation: the empirical campaign *is* the analytic model's validation set
 
 ### The structural argument
@@ -253,16 +322,17 @@ Two honest mitigations, neither of which removes the caveat:
 
 ## D70. Expected accuracy, stated in advance
 
-So the result cannot be graded against an expectation invented afterwards:
+**D67.1 sets the goals — what tier 0 is graded against.** This decision is the separate
+and weaker statement: what we *expect* to observe, per use, so that a result cannot be
+graded against an expectation invented after seeing it. Where a use has a goal in D67.1,
+that goal governs; the rows below cover the uses D67.1 does not gate.
 
 | Use | Expected error | Why |
 |---|---|---|
-| tier 0, measured device, ranking configurations | **plausible** | derates are measured; discontinuities affect configurations similarly |
-| tier 0, measured device, absolute latency | **tens of percent** | tile cliffs, plateaus, the decode sign, non-monotone prefill |
-| tier 0, unmeasured device | **unbounded, derate-dominated** | D69 |
-| rung 4 gap-filling, promoted leaf | **~2%** | the promotion rule requires it |
+| tier 0, unmeasured device | **unbounded, derate-dominated** | D69. This is why D67.1's goals are validated only where both tiers exist. |
+| rung 4 gap-filling, promoted leaf | **~2%** | the promotion rule (D68) requires it |
 | rung 4 gap-filling, unpromoted leaf | **unknown** — that is why the fraction is capped | |
-| analytic memory: weights, KV | **exact** | Class A |
+| analytic memory: weights, KV | **exact** | Class A; D67.1 gates this at ≤5% purely to catch bugs |
 | analytic memory: block count end to end | **unknown** | depends on activations and the Class-C constants |
 
 Single digits on latency are not a target for tier 0 and should not be claimed. That is
@@ -278,6 +348,7 @@ what tier b exists for.
 | D64 | Roofline leaf `max(F/flops, M/bandwidth)` with derates, plus the host floor as a step-level `max`, not an addend. | 2026-09-19 |
 | D65 | Tier 0 is a smooth model and says so: it reports a band where a known discontinuity lies in range, and is not promoted for such leaves without a measured band table. | 2026-09-19 |
 | D66 | Two-regime collective model with the algorithm named in the spec. Textbook ring/log models are refuted on this fabric. | 2026-09-19 |
+| D67.1 | Tier-0 accuracy goals declared per quantity: ≤5% weights/KV/block count, ≤25% each non-KV memory term, ≤30% step time, ≤40% end-to-end. **Configuration ranking (top-1 and top-3 set) is the primary gate**; no false "fits". Checked against the empirical campaign at no extra GPU cost. | 2026-09-19 |
 | D67 | Analytic memory is the existing memory model with the activation coefficient derived rather than walked. Weights and KV exact; scratch, `non_torch` and load residue stay declared constants. | 2026-09-19 |
 | D68 | Tier 0's laws are authored **during** the empirical campaign, because that campaign is their only validation set. Promotion to rung 4 is per leaf, requires tracking the measured price within ~2%, and is revocable. | 2026-09-19 |
 | D69 | On an unmeasured device, tier 0 is derate-dominated. Report the derate and a ±20% sensitivity band; prefer ranking claims to absolute ones. | 2026-09-19 |
@@ -286,6 +357,9 @@ what tier b exists for.
 ---
 
 ## TODO register
+
+This topic's items only. The consolidated register across all topics, with the
+load-bearing assumptions and their check plans, is [`12_open_items.md`](12_open_items.md).
 
 | # | Item | Why deferred |
 |---|---|---|
