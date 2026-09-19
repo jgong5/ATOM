@@ -59,11 +59,22 @@ These are measurements, not opinions, and they are load-bearing below:
   sleeping through real seconds. Measured: 64 requests Poisson 8/s, 9,426 ms real vs
   639 ms simulated (14.8x); cc-traces 20 requests 27B TP=4, 309 s vs 3 s (~103x). Under
   saturation, where there is no idle to skip, only (i) is left — and it was not enough:
-  **122 s vs 36 s, i.e. 0.30x, slower than the system it simulates.** That is the
-  measurement behind the "cost of a simulated step" work in doc `08`: source (i) is
-  worth less than it sounds because the replaced kernel time was overlapped with host
-  work that is *not* replaced. The ≥5x target is therefore a statement about the
-  arrival process, not only about the cost backend.
+  **122 s vs 36 s, i.e. 0.30x, slower than the system it simulates.**
+
+  **Why source (i) is worth so much less than it sounds, which is the whole explanation
+  of that 0.30x.** Removing the kernels does not remove the step. A real decode step runs
+  its kernels on the device *while the host is busy* with `prepare_inputs`, block-table
+  marshalling, sampling setup and the scheduler's own bookkeeping — the two overlap, and
+  on small shapes the host side is the longer of the two. Doc `10` D64 measures exactly
+  this from the other direction: at 794 tokens the device window is 36.745 ms of which
+  **23.360 ms (63.6%) is idle**, waiting on the host. So deleting the kernel time deletes
+  the *shorter* of two overlapped costs on precisely the steps a decode-heavy workload is
+  made of, and the host work that remains is not replaced — Compass still runs all of it,
+  plus the cost model on top.
+
+  Two consequences: the ≥5x target is a statement about **the arrival process**, not only
+  about the cost backend; and the thing worth optimising for speed is the per-step host
+  path, which is what doc `08`'s "cost of a simulated step" work measures.
 - **Aggregate cost accuracy does not bound schedule accuracy when the scheduler has a
   discontinuity.** The prior run was within 1.0% on prefill seconds, 1.1% on decode,
   1.0% on run length — and **90% wrong on median TTFT**, because TTFT was decided by two
@@ -160,8 +171,24 @@ than a crash. Accepting option B without a detector would mean accepting that cl
 error into the acceptance evidence. So three always-on detectors, sized to be cheap
 enough that none of them is a mode anyone can forget to enable.
 
-**Where violations actually come from.** The grant rule of D3 is conservative: it cannot
-produce a violation *given correct inputs*. There are exactly three ways the inputs go
+**What class of error these detect — and it matters which.** All three catch
+**implementation defects, not holes in the PDES algorithm.** The grant rule
+`T_grant(i) = min over j≠i of (now[j] + L[j→i])` is conservative by construction: given
+correct inputs it *cannot* produce a violation, which is the standard Chandy–Misra–Bryant
+guarantee and is not in question here. What the detectors watch for is the inputs being
+wrong — a lookahead constant declared too large, a call site nobody annotated, a clock
+read nobody substituted. Those are bugs in *our* code and configuration.
+
+This distinction is worth stating plainly because the two cases warrant opposite
+responses. If a detector fires, the fix is local: correct the constant, add the
+annotation, substitute the clock read. **If one fired and none of those explained it, the
+mechanism itself would be in question** — and that would be a much larger problem than a
+detector, because it would mean the conservative rule is not conservative on this
+topology. Nothing observed so far suggests that, and the grant rule is standard rather
+than invented here. But the detectors are also the only thing that would *tell us*, which
+is a second reason to have them.
+
+**Where violations actually come from.** There are exactly three ways the inputs go
 wrong, and each maps to one detector.
 
 | Failure | What it looks like | Detector |

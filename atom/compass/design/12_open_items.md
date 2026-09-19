@@ -3,7 +3,7 @@
 **Status:** draft for review. Drafted by an AI assistant during a design interview; not
 yet reviewed or approved. No code has been written against it.
 
-**What this is.** Everything across the eleven design topics that is *not settled*, in one
+**What this is.** Everything across the fourteen design topics that is *not settled*, in one
 place. Split out of `README.md` so the front page stays a bird's-eye view rather than a
 backlog. Nothing here is a decision; every decision lives in its topic's decision log.
 
@@ -11,7 +11,7 @@ backlog. Nothing here is a decision; every decision lives in its topic's decisio
 
 1. **Load-bearing assumptions** — hold up large parts of the design; each has a check plan
 2. **Missing topics** — design points nobody has written yet, with a recommendation
-3. **TODO register** — T1–T61, per topic
+3. **TODO register** — T1–T63, per topic
 4. **Cross-cutting issues and pending amendments**
 
 ---
@@ -26,17 +26,23 @@ in the execution plan rather than caveats in a document.
 |---|---|---|---|---|
 | **T21** | The in-situ calibration transfers across TP width | the recipe's "calibrate at TP1, predict TP2/4/8" collapses and the campaign multiplies by the number of widths | **Doc `07` Phase 1c's one extra run.** Calibrate at TP1, predict a TP2 full-engine run, compare. Already a designed step of the recommended flow — it is step 6 — so the check is not extra work, it is the reason that step exists. | one TP2 engine run, ~1 h GPU |
 | **T25** | The real-vs-real noise floor stays narrow under closed-loop replay at high client count | those cells become ungradeable — not failed, *ungradeable*, which is worse because nothing is proven either way | **Doc `08` D45's step 1, run before any simulated comparison.** N≥3 spaced real repeats at the 64- and 256-client cells; report the pairwise spread. If it swamps 10%, say so and re-scope the acceptance cells. | 3 real cc-traces runs per cell, ~3 h GPU |
-| **T5** | ATOM's model classes trace cleanly under `FakeTensorMode` at TP>1 | tier b has no IR, and docs `04`, `07` and `09` rest on it | **Trace the 27B at TP2 under the doc `04` D18 mechanism and diff the captured structure against TP1.** Blocked on **T52** — a known mode-induced 8-rank hang must be root-caused first. Needs a non-wedged node (`rocminfo` under `timeout` before starting). | half a day, one node |
+| **T5** | ATOM's model classes trace cleanly under `FakeTensorMode` at TP>1 | tier b has no IR, and docs `04`, `07` and `09` rest on it | **Trace the 27B at TP2 under the doc `04` D18 mechanism and diff the captured structure against TP1.** Run this FIRST and cheaply - it is not blocked on T52. A fake-tensor trace should be GPU- and collective-free, so the known mode hang should not be reachable from it; T5 is the experiment that settles whether that reasoning holds. Needs a non-wedged node (`rocminfo` under `timeout` before starting). | half a day, one node |
 | **T10** | `AgenticReplayStrategy` can be subclassed rather than vendored | the harness adapter grows by ~2,000 lines to keep in sync with upstream | **Read the class and attempt a minimal subclass that redirects pacing to the clock client.** No hardware, no ATOM. This is an hour of work that swings the adapter estimate by an order of magnitude. | 1 h, laptop |
-| **T52** | `TorchDispatchMode` instrumentation does not hang ATOM at width | capture is unusable at TP>1 and T5 cannot be answered | **Root-cause the known hang** at `atom/spec_decode/dspark_scheduler.py:264`. `rocgdb` attach, `info dispatches` per rank, identify which rank diverges. | <1 day, quiet node |
+| **T52** | `TorchDispatchMode` instrumentation does not hang ATOM at width | `--measure` runs and any mode-based instrumentation of a REAL execution are unusable. **Narrowed after review: probably does not gate Phase 1a tracing** - the hazard is a `__torch_function__` guard on a real device, not a fake-tensor trace. | **Root-cause the known hang** at `atom/spec_decode/dspark_scheduler.py:264`. `rocgdb` attach, `info dispatches` per rank, identify which rank diverges. | <1 day, quiet node |
 
-**Ordering.** T10 first (no hardware, largest swing per hour). Then T52 → T5 (one gates the
-other). T21 and T25 need the calibration and harness to exist, so they land later — but
-both are *designed-in steps*, not add-ons, and neither should slip to the end.
+**Ordering, revised 2026-09-19.** T10 first (no hardware, largest swing per hour). Then
+**T5** — previously placed behind T52, and that was wrong. A `FakeTensorMode` trace should
+be GPU-free and collective-free, so the known mode hang should not be reachable from it;
+T5 is both the cheaper experiment and the one that tells us whether T52 gates anything on
+the critical path. **T52** follows, at ordinary priority unless T5 actually hits the hang.
+T21 and T25 need the calibration and harness to exist, so they land later — but both are
+*designed-in steps*, not add-ons, and neither should slip to the end.
 
-**The honest framing:** T21 and T25 can each invalidate a whole acceptance claim. T5 and
-T52 can each invalidate a whole tier. Finding out late is the expensive outcome in every
-case, which is the argument for putting them early rather than where they naturally fall.
+**The honest framing:** T21 and T25 can each invalidate a whole acceptance claim. T5 can
+invalidate a whole tier. T52 invalidates `--measure` and mode-based instrumentation of a
+real run, which is narrower than the earlier draft claimed. Finding out late is the
+expensive outcome in every case, which is the argument for putting them early rather than
+where they naturally fall.
 
 ---
 
@@ -164,6 +170,8 @@ topics as sections; **M-d** waits for a doc `16`, before M7 starts.
 | T59 | Capture `ATOM_ENABLE_RELAXED_MTP` in the run fingerprint - it changes acceptance *semantics* (`RELAXED_TOP_N` 1 to 10, `RELAXED_DELTA` 0 to 0.6) and is invisible to every artifact key today |
 | T60 | Test whether a draft forward's cost is linear in `K` - serial MTP should be, a real draft stack need not be |
 | T61 | Decide how chunked prefill and drafting interact, and what structure that produces |
+| T62 | Assert the host acceptance draw and the Triton kernel agree: same declared rates, same seed, same accepted-count distribution over a few thousand draws |
+| T63 | Add ATOM flag `--spec-decode-acceptance-rates` (list) - contract 2 has no transport today; the CLI exposes only the two scalars |
 
 ### Topics 01, 03, 05 — newly opened
 
@@ -193,7 +201,12 @@ Beyond the per-topic TODOs.
 5. **Scheduling fidelity is unobservable at saturation.** Some cell needs deliberate slack.
 6. **Multi-node DP is implemented but not hardware-validated** — `docs/distributed_guide.md`
    §9 carries the banner. If paired evidence is needed there, the real side may not exist.
-7. **ATOM's `main` moves while Compass is built.** The seam (`Config.runner_qualname`) has
+7. **A user guide is a deliverable, not documentation debt.** `compass plan` is designed
+   so the tool tells the user what to measure, which only works if the flows, the
+   recommended calibration sequence and the flag surface are written down for a reader
+   who was not in these design conversations. Requested during review; belongs in the
+   execution plan as its own task, not as a trailing chore.
+8. 7. **ATOM's `main` moves while Compass is built.** The seam (`Config.runner_qualname`) has
    two in-tree users so it is unlikely to vanish, but the ~55 synchronization sites of
    `01` D4 and the clock-read sites of `11` D72 are ordinary code that upstream will
    touch. The CI clock-source lint is the detector; a rebase cadence is an execution-plan

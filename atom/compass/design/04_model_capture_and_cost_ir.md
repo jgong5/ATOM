@@ -852,11 +852,35 @@ Deferred to future work by decision on 2026-09-18.
   guard **hangs all 8 ranks on ROCm**. Mode-based instrumentation has already caused one
   production hang in this codebase.
 
-  **This gets root-caused, not worked around.** The whole capture design (D18) rests on
-  entering a mode over ATOM's real model code, so an unexplained mode-induced hang is not
-  a footnote — it is an unbounded risk sitting under the load-bearing assumption T5. A
-  workaround that avoids the one known call site leaves the mechanism unexplained and the
-  next call site undiscovered.
+  **How much this actually gates T5 — narrowed after review.** The earlier draft placed
+  this ahead of all tracing work. That was too strong, and the argument against it is
+  sound: a `FakeTensorMode` trace should be **GPU-free and collective-free**, so a hang
+  whose mechanism is a desynchronised collective should not be reachable from it.
+
+  Two things have to hold for that, and both look true:
+
+  1. **No real collective executes under the mode.** ATOM's collectives are either
+     dispatcher-visible ops (which have `register_fake` impls — every ATOM opaque op
+     does) or invisible ones reached through declared nodes, which the tracer records
+     rather than calls. Nothing should reach RCCL.
+  2. **The specific hazard is not the same mode.** `dspark_scheduler.py:264` hangs under
+     an active `DeviceContext` **`__torch_function__`** guard doing
+     `torch.tensor(N, device=...)` — a *real* run with a real device, not a fake-tensor
+     trace.
+
+  So the honest status is: **the hang gates `--measure` runs and any mode-based
+  instrumentation of a real execution. It probably does not gate Phase 1a.** "Probably"
+  is doing work there — both points above are reasoned from the code, not observed — and
+  the cheap way to convert them into evidence is T5 itself, which will either trace
+  cleanly at TP>1 or produce the hang and settle the question.
+
+  **It still gets root-caused rather than worked around**, for a reason independent of
+  T5: mode-based instrumentation has caused one production hang in this codebase, and
+  `--measure` is a designed path. A workaround that avoids the one known call site leaves
+  the mechanism unexplained and the next call site undiscovered.
+
+  **Revised ordering:** run T5 *first* and cheaply. If it traces clean at TP>1, T52 drops
+  to ordinary priority and stops being a gate on anything in the critical path.
 
   What root-causing means concretely, and why it is tractable: the failure is a
   *collective* hang, so the question is which rank diverges. `torch.tensor(N,

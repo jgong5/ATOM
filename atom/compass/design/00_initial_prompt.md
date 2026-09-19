@@ -3,7 +3,7 @@
 > during the design interview and a few were withdrawn. Where it disagrees with a design
 > topic (`01`-`12`), **the design topic wins**. Kept verbatim for provenance.
 >
-> Milestones and sequencing will be owned by the execution plan (`13`), not by this file.
+> Milestones and sequencing will be owned by the execution plan (`15`), not by this file.
 
 ---
 

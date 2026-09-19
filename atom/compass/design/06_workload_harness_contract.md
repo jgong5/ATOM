@@ -609,4 +609,4 @@ load-bearing assumptions and their check plans, is [`12_open_items.md`](12_open_
 | T12 | Chase the 32 `asyncio.wait_for` sites under virtual time | only reachable once the adapter runs |
 | T13 | Decide the simulated KV connector's completion semantic (MoRI-IO's last-status vs Mooncake's all-ranks) | doc 01 D6 open issue, surfaces here |
 | T14 | Build the client-count matrix given only 144 fan-out-capable sessions | affects the 256-client cell |
-| T15 | Warmup handling in the contract | every harness differs |
+| ~~T15~~ | ~~Warmup handling in the contract~~ — **done**, D27: warmup requests are ordinary requests; the rule is an exclusion window agreed by request id |

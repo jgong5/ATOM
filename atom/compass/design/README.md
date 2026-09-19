@@ -1,8 +1,8 @@
 # ATOM Compass — Design
 
 **Status: design only.** Nothing here has been implemented, and every document carries a
-header marking it as an unreviewed draft. **100 decisions (D0–D87 plus sub-decisions)** are
-indexed at the end of this file; **61 open TODOs (T1–T61)**, the load-bearing assumptions,
+header marking it as an unreviewed draft. **98 decisions — D0–D87 with no gaps, plus 10 sub-decisions** — are
+indexed at the end of this file; **63 open TODOs (T1–T63)**, the load-bearing assumptions,
 the missing topics and the cross-cutting issues live in **`12_open_items.md`**.
 
 ---
@@ -333,7 +333,7 @@ Final proof is **paired simulated and real execution of cc-traces proper**.
 | **M6** | Kimi-K3, **TP8, PD disaggregation** |
 | **M7** | Kimi-K3 with **DP, PP and EP** |
 
-Sequencing, dependencies and parallelisable work belong to the execution plan (`13`, to be
+Sequencing, dependencies and parallelisable work belong to the execution plan (`15`, to be
 added), which will own this table. `00_initial_prompt.md` is the original seed and is
 **not** a design document — see *Development history*.
 
