@@ -3,7 +3,7 @@
 **Status:** draft for review. Drafted by an AI assistant during a design interview; not
 yet reviewed or approved. No code has been written against it.
 
-**What this is.** Everything across the fourteen design topics that is *not settled*, in one
+**What this is.** Everything across the fifteen design topics that is *not settled*, in one
 place. Split out of `README.md` so the front page stays a bird's-eye view rather than a
 backlog. Nothing here is a decision; every decision lives in its topic's decision log.
 
@@ -11,7 +11,7 @@ backlog. Nothing here is a decision; every decision lives in its topic's decisio
 
 1. **Load-bearing assumptions** — hold up large parts of the design; each has a check plan
 2. **Missing topics** — design points nobody has written yet, with a recommendation
-3. **TODO register** — T1–T63, per topic
+3. **TODO register** — T1–T67, per topic
 4. **Cross-cutting issues and pending amendments**
 
 ---
@@ -55,13 +55,12 @@ silently carried as gaps.
 | ~~M-a~~ | ~~Configuration surface and CLI~~ | Flags were scattered across five topics with no owner and no precedence rule. | **DONE** - topic `13_configuration_surface.md`, D78-D81. |
 | ~~M-b~~ | ~~Refusal semantics end to end~~ | Seven documents emitted refusals and none said what one *does to the run*. | **DONE** - `08` D50.1: mark and continue, priced by the next answerable rung, with a >5%-of-predicted-seconds admissibility gate. |
 | **M-c** | **Model loading without a GPU** | 关键技术点 1.4.2. Doc `03` covers memory *sizing*; nothing covers how the module tree comes into existence to be traced. ATOM has the pieces — `--load_dummy {empty,zero,xavier}`, `RapidServeModelRunner._init_weight_params_on_meta` — but no doc names the path or says whether weights are read at all. | **Fold into `02`** as a section. Small, and the in-tree precedents do most of the work. |
-| **M-d** | **DP / PP / EP specifics (M7)** | The non-goal that excluded "asymmetric parallelism" is removed, so M7 is in scope with no design behind it. Each is genuinely different: PP adds LPs with microsecond lookahead (doc `01` D3.1 already says they must stay under one node-local CA); EP adds MORI all-to-all with the `exclusive` occupancy property (doc `07` D40 class c); DP adds independent engines sharing one CA plus a Gloo barrier. | **Defer to a doc `16`, written before M7 starts, not now.** M1–M6 do not need it and the shape will be clearer after M4. Recorded so it is not discovered as a surprise. |
+| ~~M-d~~ | ~~TP / DP / PP / EP specifics~~ | M1 names all four, and DP couples *scheduling decisions* across ranks through a per-forward collective that rewrites the batch - so the LP structure is an M1 deliverable, not an M7 one. | **DONE** - topic `15_parallelism_support.md`, D88-D94, with an explicit M1/M7 split. |
 | **M-e** | **Determinism and reproducibility** | Doc `08` **T26** asks for bit-reproducibility as a test, but nothing designs for it. Under a distributed CA, grant ordering is a function of real-time message arrival unless something pins it. Two runs of one configuration disagreeing would undermine every paired comparison. | **Fold into `01`** as a section under D3. It is a property of the clock protocol. |
 | ~~M-f~~ | ~~Speculative decoding / MTP~~ | Acceptance is a *behaviour* Compass cannot compute - the first quantity in the design that is neither derivable nor measurable. | **IN SCOPE** by decision 2026-09-19; topic `14_speculative_decoding.md`, D82-D87. Placed as **M3.5** (mechanism on Qwen3.8-27B), real claim at M5/M6. |
 | **M-g** | **Simulated-run observability** | Doc `01` D3.1's open issue says the CA should own the global timeline log and the deadlock dump, and that "its output format is part of the acceptance evidence and should be designed, not improvised". Doc `11` covers Prometheus metrics, which is a different thing. Still improvised. | **Fold into `01`** alongside M-e. |
 
-**Still open:** fold **M-c**, **M-e** and **M-g** into their own topics as sections;
-**M-d** waits for a doc `16`, written before M7 starts.
+**Still open:** fold **M-c**, **M-e** and **M-g** into their own topics as sections.
 
 ---
 
@@ -170,6 +169,15 @@ silently carried as gaps.
 | T61 | Decide how chunked prefill and drafting interact, and what structure that produces |
 | T62 | Assert the host acceptance draw and the Triton kernel agree: same declared rates, same seed, same accepted-count distribution over a few thousand draws |
 | T63 | Add ATOM flag `--spec-decode-acceptance-rates` (list) - contract 2 has no transport today; the CLI exposes only the two scalars |
+
+### Topic 15 — parallelism support
+
+| # | Item |
+|---|---|
+| T64 | Establish whether ATOM microbatches PP - changes the LP event rate and the bubble model |
+| T65 | Establish EP's group membership per supported configuration; if EP spans DP, the LP collapse does not hold |
+| T66 | Measure whether the Class-C runtime constants move with PP degree |
+| T67 | Measure the step-duration spread across DP ranks, and what padding to `unified_bs` costs |
 
 ### Topics 01, 03, 05 — newly opened
 

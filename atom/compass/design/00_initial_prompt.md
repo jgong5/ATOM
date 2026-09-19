@@ -1,9 +1,9 @@
 > **This is the original seed, not a design document.** It is the task as first written:
 > sketchy, partly superseded, and non-normative. Several statements in it were revised
 > during the design interview and a few were withdrawn. Where it disagrees with a design
-> topic (`01`-`12`), **the design topic wins**. Kept verbatim for provenance.
+> topic (`01`-`15`), **the design topic wins**. Kept verbatim for provenance.
 >
-> Milestones and sequencing will be owned by the execution plan (`15`), not by this file.
+> Milestones and sequencing will be owned by the execution plan (`16`), not by this file.
 
 ---
 

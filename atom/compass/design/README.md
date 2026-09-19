@@ -1,8 +1,8 @@
 # ATOM Compass — Design
 
 **Status: design only.** Nothing here has been implemented, and every document carries a
-header marking it as an unreviewed draft. **98 decisions — D0–D87 with no gaps, plus 10 sub-decisions** — are
-indexed at the end of this file; **63 open TODOs (T1–T63)**, the load-bearing assumptions,
+header marking it as an unreviewed draft. **105 decisions — D0–D94 with no gaps, plus 10 sub-decisions** — are
+indexed at the end of this file; **67 open TODOs (T1–T67)**, the load-bearing assumptions,
 the missing topics and the cross-cutting issues live in **`12_open_items.md`**.
 
 ---
@@ -181,7 +181,9 @@ document that owns it. Nothing in `01`–`11` is outside this diagram.
   |                       LP registry . blocked/running protocol        |
   |                       causality detectors (straggler, watchdog,     |
   |                       CI clock lint)                                |
-  |                                                    doc 01           |
+  |                       LP topology per strategy: TP/DP/EP collapse,  |
+  |                       PP adds one LP per stage                      |
+  |                                                docs 01, 15          |
   +=====================================================================+
   |  L0  ARTIFACTS        machine_spec   op_graph      price_list       |
   |                       region_terms   memory_readings coverage_hull  |
@@ -219,6 +221,7 @@ document that owns it. Nothing in `01`–`11` is outside this diagram.
 | — | Validation protocol (judges all of it) | [`08_validation_protocol.md`](08_validation_protocol.md) | D43.1, D44–D52 |
 | L5 | Configuration surface: flags, precedence, the `compass` CLI | [`13_configuration_surface.md`](13_configuration_surface.md) | D78–D81 |
 | L2/L3 | Speculative decoding and MTP | [`14_speculative_decoding.md`](14_speculative_decoding.md) | D82–D87 |
+| L1/L3 | Parallelism: TP, DP, PP, EP | [`15_parallelism_support.md`](15_parallelism_support.md) | D88–D94 |
 | — | Open items, assumptions, gaps | [`12_open_items.md`](12_open_items.md) | — |
 
 ### B. A simulated step, end to end
@@ -333,7 +336,7 @@ Final proof is **paired simulated and real execution of cc-traces proper**.
 | **M6** | Kimi-K3, **TP8, PD disaggregation** |
 | **M7** | Kimi-K3 with **DP, PP and EP** |
 
-Sequencing, dependencies and parallelisable work belong to the execution plan (`15`, to be
+Sequencing, dependencies and parallelisable work belong to the execution plan (`16`, to be
 added), which will own this table. `00_initial_prompt.md` is the original seed and is
 **not** a design document — see *Development history*.
 
@@ -528,19 +531,19 @@ The documents use these precisely; a reader will bounce off without them.
 |---|---|---|
 | [`13`](13_configuration_surface.md) | The Configuration Surface | Three homes for a setting, and the test that assigns them. Precedence is CLI > env > artifact > **refuse**. Eight engine-side flags, one `compass` executable, and an audit of what is deliberately *not* a flag. |
 | [`14`](14_speculative_decoding.md) | Speculative Decoding and MTP | Three of the four changes are routine. Acceptance is a **declared input** through ATOM's existing flags, fed the *measured per-position distribution* rather than a mean. No new cost form — decode becomes the `N_Q = 1` case of the general one. |
+| [`15`](15_parallelism_support.md) | Parallelism Support | One frame of four questions per strategy. **Only PP adds logical processes** - TP, DP and EP each sit behind a barrier ATOM already has. DP is the one that couples *scheduling decisions*, through a per-forward collective that rewrites the batch; both its collectives run for real, because both reduce over scheduling metadata rather than model outputs. Explicit M1/M7 split. |
 
 ### Part VI — What is not settled
 
 | Doc | Title | What it holds |
 |---|---|---|
-| [`12`](12_open_items.md) | Open Items | The five load-bearing assumptions and their check plans; the missing-topic register; T1–T61; cross-cutting issues; pending amendments. |
+| [`12`](12_open_items.md) | Open Items | The five load-bearing assumptions and their check plans; the missing-topic register; T1–T67; cross-cutting issues; pending amendments. |
 
 ### Not yet written
 
 | Doc | Title | Status |
 |---|---|---|
-| `15` | Execution Plan | next, and last. Will own the milestone table and the sequencing of `12`'s assumption checks. |
-| `16` | DP / PP / EP design (`12` M-d) | deliberately deferred to before M7 starts |
+| `16` | Execution Plan | next, and last. Will own the milestone table and the sequencing of `12`'s assumption checks. |
 
 ---
 
@@ -561,6 +564,7 @@ The documents use these precisely; a reader will bounce off without them.
 | D71 – D77 | `11` Engine Metrics under Virtual Time |
 | D78 – D81 | `13` The Configuration Surface |
 | D82 – D87 | `14` Speculative Decoding and MTP |
+| D88 – D94 | `15` Parallelism Support (TP, DP, PP, EP) |
 
 ### Headline decisions
 
