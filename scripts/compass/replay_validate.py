@@ -46,10 +46,28 @@ import urllib.error
 import urllib.request
 from pathlib import Path
 
+from atom.compass.core.artifacts import rank_path
+
 #: Prefix every Compass warning carries. Matched on the message because ATOM's
 #: log format never names the level, so filtering on "WARNING" as a field
 #: matches nothing.
 MARKER = "ATOMCompass WARNING:"
+
+
+def _gate_path(path: Path) -> Path:
+    """The file the coverage gate should read, given the name the run asked for.
+
+    Under TP>1 every rank writes its own shard, so the unsuffixed name never
+    appears on disk and the gate reported coverage as unknown -- which withholds
+    the verdict on every rung of a TP2 or TP4 sweep while the step table sits
+    beside it under another name. Rank 0 answers the question the gate asks: the
+    ranks of a symmetric TP group run the same batches, and it is batch shapes,
+    not per-rank timings, that decide whether a run left the table.
+    """
+    if path.exists():
+        return path
+    shard = Path(rank_path(str(path), {"tp": 0}))
+    return shard if shard.exists() else path
 
 
 def _free_port() -> int:
@@ -351,10 +369,11 @@ def main(argv=None) -> int:
 
     print("phase 4/5  coverage ...", flush=True)
     covered = True
-    if real_steps.exists():
+    gate_table, gate_steps = _gate_path(table), _gate_path(real_steps)
+    if gate_steps.exists():
         coverage = subprocess.run(
             [args.python, "scripts/compass/coverage.py",
-             str(table), str(real_steps)],
+             str(gate_table), str(gate_steps)],
             capture_output=True, text=True)
         (work / "coverage.txt").write_text(coverage.stdout + coverage.stderr)
         print(coverage.stdout.rstrip() or "  (no output)", flush=True)
@@ -366,7 +385,7 @@ def main(argv=None) -> int:
         # Says so rather than passing quietly: a skipped real phase leaves no
         # step table, and "no gate ran" must not read as "the gate passed".
         covered = False
-        print(f"  no run step table at {real_steps}, so coverage is unknown; "
+        print(f"  no run step table at {gate_steps}, so coverage is unknown; "
               f"re-run phase 2 to gate on it", file=sys.stderr)
 
     print("phase 5/5  comparing ...", flush=True)
