@@ -18,7 +18,7 @@ Four things in here are not in `04` D18 and were found by running it:
   anything went wrong. `02` D10.1 has a name for the result: *"The T5 fallback
   is the meta context plus concrete traces."* `capture()` below now refuses a
   trace with no free symbol unless the caller says `concrete_ok=True`, so the
-  fallback has to be asked for rather than arrived at (T73).
+  fallback has to be asked for rather than arrived at (T81).
 
 * D18's five `torch.cuda` stubs are not enough to import ATOM. `get_device_properties`
   is read at *import* time by aiter's Triton attention kernels
@@ -355,7 +355,7 @@ def capture(shape_env: ShapeEnv, recorder: Recorder, concrete_ok: bool = False):
             "carry free symbols; an empty `shape_env.replacements` on a trace "
             "that created no symbol means NOTHING WAS CHECKED. This is the "
             "concrete capture `02` D10.1 names the T5 fallback. Ask for it "
-            "explicitly (concrete_ok=True) or fix the trace (T73)."
+            "explicitly (concrete_ok=True) or fix the trace (T81)."
         )
     shape_env.freeze()
 
