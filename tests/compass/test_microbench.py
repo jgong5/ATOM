@@ -495,3 +495,62 @@ class TestArgumentLayout:
             "a dense layout keys the same as a graph that recorded none, so "
             "prices measured before layout was recorded still answer")
         assert signature_of({**op, "input_strides": [[16480, 128, 1]]}) != dense
+
+
+class TestHowManyRepetitionsAPriceIsWorth:
+    """A fixed iteration count prices a microsecond kernel well and a
+    multi-second one absurdly. Attention at 16384 queries over 229376 of KV
+    runs about 0.7s a launch, so the old fixed 2000 was 23 minutes for one
+    number, and a graph holding 16 such signatures took six hours.
+    """
+
+    def _probed(self, monkeypatch, seconds):
+        from atom.compass.runtime import microbench as mb
+
+        monkeypatch.setattr(mb, "_time_over",
+                            lambda *a, **k: (seconds, seconds))
+        return mb._iters_for(None, [], 2000, 20)
+
+    def test_a_microsecond_kernel_keeps_the_ceiling(self, monkeypatch):
+        assert self._probed(monkeypatch, 5e-6) == 2000
+
+    def test_a_slow_kernel_is_cut_to_the_budget(self, monkeypatch):
+        from atom.compass.runtime.microbench import ITER_BUDGET_SECONDS
+
+        assert self._probed(monkeypatch, 0.01) == int(ITER_BUDGET_SECONDS / 0.01)
+
+    def test_the_floor_wins_over_the_budget(self, monkeypatch):
+        """The 27B's worst attention shape: 16384 queries over 229376 of KV at
+        about 0.7s a launch. The budget alone would ask for 4 repetitions; the
+        floor holds it at MIN_ITERS, so the signature costs ~14s instead of the
+        23 minutes a fixed 2000 cost."""
+        from atom.compass.runtime.microbench import MIN_ITERS
+
+        assert self._probed(monkeypatch, 0.7) == MIN_ITERS
+
+    def test_a_very_slow_kernel_still_gets_a_usable_mean(self, monkeypatch):
+        from atom.compass.runtime.microbench import MIN_ITERS
+
+        assert self._probed(monkeypatch, 60.0) == MIN_ITERS
+
+    def test_the_probe_never_asks_for_more_than_it_was_given(self, monkeypatch):
+        """The caller's count is a ceiling, so a cheap kernel is timed exactly
+        as it was before the probe existed."""
+        from atom.compass.runtime import microbench as mb
+
+        monkeypatch.setattr(mb, "_time_over", lambda *a, **k: (1e-9, 1e-9))
+        assert mb._iters_for(None, [], 50, 20) == 50
+
+    def test_a_failed_probe_leaves_the_count_alone(self, monkeypatch):
+        """Not a guess. The timing call that follows raises the same way and is
+        reported against the signature."""
+        from atom.compass.runtime import microbench as mb
+
+        def boom(*a, **k):
+            raise RuntimeError("no")
+
+        monkeypatch.setattr(mb, "_time_over", boom)
+        assert mb._iters_for(None, [], 2000, 20) == 2000
+
+    def test_a_zero_reading_is_not_divided_by(self, monkeypatch):
+        assert self._probed(monkeypatch, 0.0) == 2000

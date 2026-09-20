@@ -453,6 +453,32 @@ def _time(callable_, iters: int, warmup: int) -> float:
 #: last-level cache comfortably or the rotation is pointless; capped so a large
 #: weight does not exhaust the device building copies of itself.
 COLD_WORKING_SET_BYTES = 1 << 30
+#: Seconds a single signature's timing loop is allowed to take, and the fewest
+#: repetitions that still gives a usable mean. A fixed iteration count is right
+#: for a microsecond kernel and absurd for a multi-second one: attention at
+#: 16384 queries over 229376 of KV runs about 0.7s a launch, so 2000 of them is
+#: 23 minutes for one number, and a graph holding 16 such signatures takes six
+#: hours. Probing first costs a handful of launches and buys back the rest.
+ITER_BUDGET_SECONDS = 3.0
+MIN_ITERS = 20
+
+
+def _iters_for(fn, sets: list, iters: int, warmup: int) -> int:
+    """How many repetitions this operator can afford inside the budget.
+
+    Probes with a few launches and scales down from ``iters``, never up: the
+    caller's count stays the ceiling, so a cheap kernel is timed exactly as it
+    was before this existed. A probe that fails for any reason leaves the count
+    alone rather than guessing -- the timing call that follows will raise the
+    same way and be reported against the signature.
+    """
+    try:
+        seconds, _ = _time_over(fn, sets, 3, min(warmup, 3))
+    except Exception:  # noqa: BLE001 - a probe must not decide a price
+        return iters
+    if seconds <= 0:
+        return iters
+    return max(MIN_ITERS, min(iters, int(ITER_BUDGET_SECONDS / seconds)))
 
 
 def _build_arg_sets(op: dict, cache: str, fn) -> Optional[list]:
@@ -1019,11 +1045,15 @@ def price_graph(graph_path: str, iters: int = 2000, warmup: int = 20,
             unpriced[sig] = "unknown dtype"
             continue
         used, kernels = cache, {}
+        # What this signature can afford, not what the caller asked for. See
+        # _iters_for: the ceiling is still `iters`, so a cheap kernel is
+        # unchanged and only a slow one is cut short.
+        n_iters = _iters_for(fn, sets, iters, warmup)
         try:
             if cache == "graph":
                 try:
                     seconds, host_seconds, kernels = _time_in_graph(
-                        fn, sets, iters, warmup, before=rotate,
+                        fn, sets, n_iters, warmup, before=rotate,
                         breakdown=PRICE_KERNELS, occurrences=counts[sig],
                         family=op["name"], covered=covered)
                 except Exception as exc:  # noqa: BLE001
@@ -1045,10 +1075,10 @@ def price_graph(graph_path: str, iters: int = 2000, warmup: int = 20,
                     torch.cuda.synchronize()
                     if variants:
                         variants[0]()
-                    seconds, host_seconds = _time_over(fn, sets, iters, warmup)
+                    seconds, host_seconds = _time_over(fn, sets, n_iters, warmup)
             else:
                 timer = _time_isolated if cache == "isolated" else _time_over
-                seconds, host_seconds = timer(fn, sets, iters, warmup)
+                seconds, host_seconds = timer(fn, sets, n_iters, warmup)
         except Exception as exc:  # noqa: BLE001 - a call can fail many ways
             # Where it failed, not just what it said. An operator rebuilt from
             # a graph fails inside the engine's own code, and the message alone
@@ -1062,6 +1092,10 @@ def price_graph(graph_path: str, iters: int = 2000, warmup: int = 20,
             "occurrences": counts[sig],
             "cache": used,
             "arg_sets": len(sets),
+            # Repetitions this price is a mean over. A price taken over 20 and
+            # one taken over 2000 carry different confidence, and without this
+            # the reader cannot tell them apart.
+            "iters": n_iters,
             "kv_regions": len(variants) or 1,
             # Host enqueue cost per call. Where this matches `seconds`, the
             # device was idle waiting and the price is the host's, not the
@@ -1075,7 +1109,7 @@ def price_graph(graph_path: str, iters: int = 2000, warmup: int = 20,
         }
         if PROFILE_MATCH and PROFILE_MATCH in sig:
             try:
-                _profile_signature(fn, sets, sig, iters, warmup,
+                _profile_signature(fn, sets, sig, n_iters, warmup,
                                    before=rotate)
             except Exception as exc:  # noqa: BLE001 - a probe must not stop a run
                 print(f"### PROBE FAILED {type(exc).__name__}: {exc}", flush=True)
@@ -1086,7 +1120,8 @@ def price_graph(graph_path: str, iters: int = 2000, warmup: int = 20,
         "provenance": {
             "graph": graph_path,
             "graphs": paths,
-            "iters": iters,
+            "iters_ceiling": iters,
+            "iter_budget_seconds": ITER_BUDGET_SECONDS,
             "cache": cache,
             "note": "steady state, one event pair per signature",
         },
