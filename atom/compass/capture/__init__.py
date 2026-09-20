@@ -1,4 +1,4 @@
 # SPDX-License-Identifier: MIT
-"""Device-free model capture (`04` D18). P0.4 spike scope: enough of route A to
-settle T5 -- whether ATOM's model classes trace under `FakeTensorMode` at TP>1.
+"""Device-free model capture: build ATOM's real model classes without a GPU,
+run one forward under `FakeTensorMode`, and record the operators it dispatches.
 """

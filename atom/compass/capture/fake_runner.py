@@ -1,16 +1,15 @@
 # SPDX-License-Identifier: MIT
-"""Drive ATOM's own `ModelRunner` under the `04` D18 capture mechanism.
+"""Drive ATOM's own `ModelRunner` under the fake-tensor capture.
 
-Why the runner and not the model object: the operators a forward dispatches
-depend on the *metadata* (`ForwardContext.attn_metadata`, `kv_cache_data`,
-`Context`), and every branch that reads it lives in ATOM. Hand-building that
-metadata would be a reimplementation of `ModelRunner.prepare_inputs` and the
-attention builders -- ~1.5k lines whose agreement with ATOM nothing would
-check. Principle 1 says reuse; so the capture subclasses `ModelRunner` and
-substitutes the smallest set of behaviours that genuinely need hardware.
+Which operators a forward dispatches depends on the metadata ATOM builds around
+it -- `ForwardContext.attn_metadata`, `kv_cache_data`, `Context` -- and every
+branch that reads that metadata lives in ATOM. Hand-building it would duplicate
+`ModelRunner.prepare_inputs` and the attention metadata builders, roughly 1.5k
+lines whose agreement with ATOM nothing would check. So the capture subclasses
+`ModelRunner` and replaces only the behaviours that genuinely need hardware.
 
-Every substitution is named in `SUBSTITUTIONS` and copied into the run record,
-because a substitution is the part of the inventory that is *not* ATOM's.
+Each replacement is named in `SUBSTITUTIONS` and copied into the run record: a
+substitution is the part of a captured inventory that is not ATOM's.
 """
 
 from __future__ import annotations
@@ -27,10 +26,10 @@ SUBSTITUTIONS = {
         "ATOM ships for running a logical TP width on fewer ranks."
     ),
     "_build_and_load_model": (
-        "the base method calls `load_model(...)` which opens the checkpoint. "
-        "`02` D10.1: construction only, no checkpoint bytes. `load_dummy` is "
-        "not enough on its own because the loader still walks the safetensors "
-        "index to decide what to skip."
+        "the base method calls `load_model(...)`, which opens the checkpoint. "
+        "A capture constructs the module tree and reads no checkpoint bytes. "
+        "`load_dummy` is not enough on its own because the loader still walks "
+        "the safetensors index to decide what to skip."
     ),
     "_maybe_warmup": (
         "warmup IS the traced forward here, so it must run inside the "
