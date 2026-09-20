@@ -1,8 +1,8 @@
 # ATOM Compass — Design
 
 **Status: design only.** Nothing here has been implemented, and every document carries a
-header marking it as an unreviewed draft. **108 decisions — D0–D94 with no gaps, plus 13 sub-decisions** — are
-indexed at the end of this file; **70 open TODOs (T1–T70)**, the load-bearing assumptions,
+header marking it as an unreviewed draft. **116 decisions — D0–D102 with no gaps, plus 13 sub-decisions** — are
+indexed at the end of this file; **72 open TODOs (T1–T72)**, the load-bearing assumptions,
 the missing topics and the cross-cutting issues live in **`12_open_items.md`**.
 
 ---
@@ -223,6 +223,7 @@ document that owns it. Nothing in `01`–`11` is outside this diagram.
 | L2/L3 | Speculative decoding and MTP | [`14_speculative_decoding.md`](14_speculative_decoding.md) | D82–D87 |
 | L1/L3 | Parallelism: TP, DP, PP, EP | [`15_parallelism_support.md`](15_parallelism_support.md) | D88–D94 |
 | — | Open items, assumptions, gaps | [`12_open_items.md`](12_open_items.md) | — |
+| — | How it gets built: tasks, waves, gates, GPU queue | [`16_execution_plan.md`](16_execution_plan.md) | D95–D102 |
 
 ### B. A simulated step, end to end
 
@@ -336,8 +337,7 @@ Final proof is **paired simulated and real execution of cc-traces proper**.
 | **M6** | Kimi-K3, **TP8, PD disaggregation** |
 | **M7** | Kimi-K3 with **DP, PP and EP** |
 
-Sequencing, dependencies and parallelisable work belong to the execution plan (`16`, to be
-added), which will own this table. `00_initial_prompt.md` is the original seed and is
+Sequencing, dependencies and parallelisable work are in the execution plan (`16`). `00_initial_prompt.md` is the original seed and is
 **not** a design document — see *Development history*.
 
 ---
@@ -537,13 +537,13 @@ The documents use these precisely; a reader will bounce off without them.
 
 | Doc | Title | What it holds |
 |---|---|---|
-| [`12`](12_open_items.md) | Open Items | The five load-bearing assumptions and their check plans; the missing-topic register; T1–T70; cross-cutting issues; pending amendments. |
+| [`12`](12_open_items.md) | Open Items | The five load-bearing assumptions and their check plans; the missing-topic register; T1–T72; cross-cutting issues; pending amendments. |
 
-### Not yet written
+### Part VII — How it gets built
 
-| Doc | Title | Status |
+| Doc | Title | What it settles |
 |---|---|---|
-| `16` | Execution Plan | next, and last. Will own the milestone table and the sequencing of `12`'s assumption checks. |
+| [`16`](16_execution_plan.md) | The Execution Plan | Tasks are a **pool**, capped at 5 in flight, with context durable in the task record rather than in an agent. Phase 0 de-risks five assumptions before any build work. Effort in lines of code, not dates. Detailed through Wave 3, deliberately coarse beyond. |
 
 ---
 
@@ -565,6 +565,7 @@ The documents use these precisely; a reader will bounce off without them.
 | D78 – D81 | `13` The Configuration Surface |
 | D82 – D87 | `14` Speculative Decoding and MTP |
 | D88 – D94 | `15` Parallelism Support (TP, DP, PP, EP) |
+| D95 – D102 | `16` The Execution Plan |
 
 ### Headline decisions
 

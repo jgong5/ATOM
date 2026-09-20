@@ -3,7 +3,7 @@
 **Status:** draft for review. Drafted by an AI assistant during a design interview; not
 yet reviewed or approved. No code has been written against it.
 
-**What this is.** Everything across the fifteen design topics that is *not settled*, in one
+**What this is.** Everything across the sixteen design topics that is *not settled*, in one
 place. Split out of `README.md` so the front page stays a bird's-eye view rather than a
 backlog. Nothing here is a decision; every decision lives in its topic's decision log.
 
@@ -11,7 +11,7 @@ backlog. Nothing here is a decision; every decision lives in its topic's decisio
 
 1. **Load-bearing assumptions** — hold up large parts of the design; each has a check plan
 2. **Missing topics** — design points nobody has written yet, with a recommendation
-3. **TODO register** — T1–T70, per topic
+3. **TODO register** — T1–T72, per topic
 4. **Cross-cutting issues and pending amendments**
 
 ---
@@ -170,6 +170,13 @@ M-f `14`; M-g `01` D3.5.
 | T61 | Decide how chunked prefill and drafting interact, and what structure that produces |
 | T62 | Assert the host acceptance draw and the Triton kernel agree: same declared rates, same seed, same accepted-count distribution over a few thousand draws |
 | T63 | Add ATOM flag `--spec-decode-acceptance-rates` (list) - contract 2 has no transport today; the CLI exposes only the two scalars |
+
+### Topic 16 — execution plan
+
+| # | Item |
+|---|---|
+| T71 | Add Wave 4+ detail as Phase 0 and T21 answers arrive |
+| T72 | Decide whether reviewer agents use ATOM's `review-pr` skill or a Compass-specific checklist |
 
 ### Topics 02, 01 — gaps now closed
 
