@@ -164,7 +164,10 @@ def _fake(tmp_path, body, name="fake"):
 
 
 def _served(tmp_path, body, name="fake", timeout=30.0):
-    return rv.Served(_fake(tmp_path, body, name), "M", rv._free_port(),
+    # No port here: Served picks one per attempt in `__enter__`, so passing one
+    # at the call site puts an int in the `log` slot and every test reaching
+    # this helper dies inside `Path()`.
+    return rv.Served(_fake(tmp_path, body, name), "M",
                      tmp_path / f"{name}.log", [], timeout)
 
 
@@ -282,6 +285,9 @@ class TestAGateThatDidNotRunIsNotAGateThatPassed:
 
 class _NullServer:
     def __enter__(self):
+        # Served binds its port inside `__enter__` and main reads it back off
+        # the object, so a stub that never serves still has to carry one.
+        self.port = 65535
         return self
 
     def __exit__(self, *_):
