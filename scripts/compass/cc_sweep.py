@@ -73,13 +73,22 @@ def main(argv=None) -> int:
     for n in sorted(args.clients):
         work = root / f"c{n}"
         print(f"\n=== rung: {n} client(s) -> {work} ===", flush=True)
-        rc = validate.main([
-            "--model", args.model, "--trace", args.trace,
-            "--table", args.table, "--out-dir", str(work),
-            "--clients", str(n),
-            "--sessions-per-client", str(args.sessions_per_client),
-            "--benchmark-duration", str(args.benchmark_duration),
-            *args.rest])
+        rung = ["--model", args.model, "--trace", args.trace,
+                "--table", args.table, "--out-dir", str(work),
+                "--clients", str(n),
+                "--sessions-per-client", str(args.sessions_per_client),
+                "--benchmark-duration", str(args.benchmark_duration),
+                *args.rest]
+        try:
+            rc = validate.main(rung)
+        except SystemExit as exc:
+            # A rung that dies mid-phase raises rather than returns -- a dead
+            # server, a missing report. `--keep-going` has to survive that too,
+            # or a fault local to one rung costs the other three their night.
+            # sweep81_v2 died this way: one lost port race at c1, and c4, c8
+            # and c16 never ran.
+            rc = exc.code if isinstance(exc.code, int) else 1
+            print(f"rung {n} raised: {exc}", file=sys.stderr)
         rungs.append(str(work))
         if rc != 0:
             # Recorded and carried, not raised. A rung can fail its accuracy

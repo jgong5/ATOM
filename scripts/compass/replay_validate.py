@@ -101,10 +101,13 @@ class Served:
     allocate for a reason that looks nothing like the real one.
     """
 
-    def __init__(self, python, model, port, log, extra, startup_timeout):
-        self.python, self.model, self.port = python, model, port
+    def __init__(self, python, model, log, extra, startup_timeout, attempts=3):
+        self.python, self.model = python, model
         self.log, self.extra = Path(log), list(extra)
-        self.startup_timeout = startup_timeout
+        self.startup_timeout, self.attempts = startup_timeout, attempts
+        # Picked per attempt in `__enter__`, so read `.port` off the instance
+        # rather than picking one at the call site.
+        self.port = None
         self.proc = self.handle = None
 
     def _healthy(self) -> bool:
@@ -119,27 +122,49 @@ class Served:
         return "\n".join(
             self.log.read_text(errors="replace").splitlines()[-n:])
 
-    def __enter__(self):
+    def _spawn(self, append):
         cmd = [self.python, "-m", "atom.entrypoints.openai_server",
                "--model", self.model, "--server-port", str(self.port),
                *self.extra]
-        self.handle = self.log.open("w", encoding="utf-8")
+        self.handle = self.log.open("a" if append else "w", encoding="utf-8")
         self.proc = subprocess.Popen(cmd, stdout=self.handle,
                                      stderr=subprocess.STDOUT)
+
+    def _await_health(self):
+        """None once it answers /health, else why it never did."""
         deadline = time.monotonic() + self.startup_timeout
         while time.monotonic() < deadline:
             if self.proc.poll() is not None:
-                self.__exit__(None, None, None)
-                raise SystemExit(f"server died during startup; see {self.log}\n"
-                                 + self._tail())
+                return "server died during startup"
             if self._healthy():
+                return None
+            time.sleep(1.0)
+        return (f"server never became healthy in "
+                f"{self.startup_timeout:.0f}s")
+
+    def __enter__(self):
+        # `_free_port` picks a port, closes it, and the child binds it only
+        # after loading the model -- about twenty containers share this host's
+        # network, and that window is wide enough to lose the port to one of
+        # them. sweep81_v2 lost it: the modelled c1 server loaded the 27B,
+        # reached uvicorn, found its port taken, and took the whole sweep down
+        # with it 34 minutes in. Losing that race says nothing about the run,
+        # so pick another port and load again.
+        for attempt in range(1, self.attempts + 1):
+            self.port = _free_port()
+            self._spawn(append=attempt > 1)
+            why = self._await_health()
+            if why is None:
                 print(f"  server up on port {self.port}", flush=True)
                 return self
-            time.sleep(1.0)
-        self.__exit__(None, None, None)
-        raise SystemExit(f"server never became healthy in "
-                         f"{self.startup_timeout:.0f}s; see {self.log}\n"
-                         + self._tail())
+            taken = "address already in use" in self._tail(60).lower()
+            self.__exit__(None, None, None)
+            if taken and attempt < self.attempts:
+                print(f"  port {self.port} was taken between pick and bind; "
+                      f"retrying on a new one "
+                      f"({attempt}/{self.attempts - 1})", flush=True)
+                continue
+            raise SystemExit(f"{why}; see {self.log}\n" + self._tail())
 
     def __exit__(self, *_):
         if self.proc and self.proc.poll() is None:
@@ -234,6 +259,7 @@ def main(argv=None) -> int:
     work.mkdir(parents=True, exist_ok=True)
     table = Path(args.table) if args.table else work / "steps.jsonl"
     real_steps = work / "real_steps.jsonl"
+    modelled_steps = work / "modelled_steps.jsonl"
     real_out, modelled_out = work / "real.json", work / "modelled.json"
     report = work / "compare.json"
 
@@ -283,39 +309,44 @@ def main(argv=None) -> int:
     else:
         print("phase 2/5  replaying the trace against the real engine ...",
               flush=True)
-        port = _free_port()
         real_flags = _engine_flags(args) + [
             # Real forward, real clock, steps recorded for the coverage gate.
             "--compass", "--compass-mode", "measure",
             "--compass-measure-out", str(real_steps),
         ]
-        with Served(args.python, args.model, port, work / "real_server.log",
-                    real_flags, args.startup_timeout):
+        with Served(args.python, args.model, work / "real_server.log",
+                    real_flags, args.startup_timeout) as srv:
             # --pace: a real clock discards a declared arrival, so without this
             # the real side answers a burst while the modelled side answers the
             # trace, and the difference comes out reported as model error.
-            _run(replay + ["--port", str(port), "--out", str(real_out),
+            _run(replay + ["--port", str(srv.port), "--out", str(real_out),
                            *real_arrivals, *real_only], "real replay")
 
     print("phase 3/5  replaying it modelled ...", flush=True)
-    port = _free_port()
     modelled_flags = _engine_flags(args) + [
         "--compass",
         "--compass-oracle",
         "atom.compass.core.cost.calibrated.CalibratedCostOracle",
         "--compass-oracle-option", f"table={table}",
+        # The predict path already records every step it ran, in the format
+        # the measure path records every step it timed -- runner.py
+        # `_record_measurement` is called from both. It just never got a path.
+        # Without one a simulated run leaves no evidence of *which* steps it
+        # chose, so a throughput gap cannot be told apart from a wrong step
+        # cost, which is where the c8 diagnosis ran out of evidence.
+        "--compass-measure-out", str(modelled_steps),
     ]
     if args.admission_seconds:
         modelled_flags += ["--compass-admission-seconds",
                            str(args.admission_seconds)]
-    with Served(args.python, args.model, port, work / "modelled_server.log",
-                modelled_flags, args.startup_timeout):
+    with Served(args.python, args.model, work / "modelled_server.log",
+                modelled_flags, args.startup_timeout) as srv:
         # No --pace: arrivals are declared, so delivery order and socket
         # latency stop mattering against a virtual clock. `--schedule` hands
         # this side the lanes, instances and edges the real side executed, so
         # the two runs are the same graph even though only one of them could
         # have discovered it.
-        _run(replay + ["--port", str(port), "--out", str(modelled_out),
+        _run(replay + ["--port", str(srv.port), "--out", str(modelled_out),
                        *modelled_only], "modelled replay")
 
     print("phase 4/5  coverage ...", flush=True)
