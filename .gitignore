@@ -58,3 +58,10 @@ online_quant_info_*.json
 # CI: Docker / BuildKit state under workspace (self-hosted CI)
 .atom-docker-client/
 .buildkit-tmp/
+
+# Agent scratch space: temporary scripts and throwaway experiments.
+# Documented as git-ignored in CLAUDE.md, but the pattern was missing.
+agent_scratch/
+
+# editor backups
+*~

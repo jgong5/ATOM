@@ -1,0 +1,370 @@
+# ATOM Compass — Design Topic 9: Fitting and Law Selection
+
+**Status:** reviewed and approved, 2026-09-20. Drafted by an AI assistant during a design
+interview and reviewed by jgong5 across two review rounds on PR #3. No code has been
+written against it yet; implementation follows the execution plan in `16`.
+
+**Depends on:** `07_calibration_toolchain.md` (the measurements being fitted),
+`04_model_capture_and_cost_ir.md` (the leaves a law prices).
+
+**Scope.** How measurements become a model: objective, feature construction, outlier
+handling, guards, and how a functional form is chosen and shown to be right. This is a
+separate concern from the toolchain that produces the data and from the protocol that
+judges the result.
+
+**Why it needs its own document.** Nearly every wrong number in the prior effort came from
+a fitting decision, not a measurement error — the measurement was usually fine. Four
+distinct failures: an objective that weighted by magnitude, a feature computed against the
+wrong rectangle, a guard that could not see a hole, and a family validated by a method that
+cannot validate families.
+
+---
+
+## D53. Fit relative error, not absolute seconds
+
+### The failure
+
+Ordinary least squares on squared seconds makes a 250 ms sample count roughly **60×** a
+32 ms one. The symptom was diagnostic and almost invisible: widening the sweep to cover
+decode rungs 32–64 added large prefill samples, dropped the share of sub-1024-token prefill
+steps from **17% to 9%**, doubled the median token count to **13,008** — and moved the
+512-token prediction from **−13% to −17%**, *against a measurement that did not move*
+(32.51 → 32.53 ms).
+
+> **An unweighted fit is a weighted average whose weights are the sample values.** Adding
+> evidence in one region degraded prediction in another, which is not something a coverage
+> check can catch.
+
+### Decision
+
+**Every equation is divided by its own target before fitting, and the MAD outlier test runs
+on the same relative residuals.**
+
+| prefill prediction | absolute fit | relative fit | measured |
+|---|---|---|---|
+| at 512 tokens | −11.8% | **−5.3%** | 32.53 ms |
+| at 2512 tokens | +18.3% | **+3.9%** | 43.78 ms |
+| median over 121 rows | 9.51% | **9.03%** | |
+
+---
+
+## D54. What is fitted separately
+
+**Prefill and decode are separate fits.** Prefill is compute-bound in new tokens; decode is
+bandwidth-bound in KV history. Total context is **summed** across the batch, never
+averaged.
+
+**Decode is fitted per CUDA-graph rung, with *both* coefficients per rung:**
+
+| decode model | median \|err\| | RMSE | worst region |
+|---|---|---|---|
+| `[1, batch, total_context]` | 5.04% | 0.4216 ms | −3.7% |
+| per-rung intercept, shared slope | 8.09% | 0.3952 ms | −12.6% |
+| **per-rung intercept and slope** | **0.93%** | **0.1259 ms** | **−1.3%** |
+
+In place over 2,174 measured decode steps: **0.73% median**, per rung 0.46 / 0.45 / 0.69 /
+1.67 / 2.11 / 1.57 / 0.25 / 0.37% for rungs 1 → 64.
+
+### A sign that was wrong, not merely a curve that was
+
+**Decode cost *falls* as batch grows.** At matched total context over 1,662 decode steps:
+
+| batch | 1 | 2 | 4 | 8 | 12 |
+|---|---|---|---|---|---|
+| TP=1 | 3.640 | 3.564 | 3.393 | 3.317 | 3.532 ms |
+| TP=2 | 3.636 | 3.563 | 3.403 | 3.351 | 3.310 ms |
+
+Twelve sequences cost *less* per step than one. A model assuming monotone growth in batch
+is wrong in direction, not just in magnitude.
+
+---
+
+## D55. Feature construction
+
+```
+prefill:  [ 1,  tokens,  Σ_req N_Q²,  Σ_req N_Q·(ctx − N_Q) ]
+decode:   [ 1,  batch,   Σ ctx ]
+per rung: [ 1,  Σ ctx,   rung·max(ctx) − Σ ctx ]
+```
+
+Two constructions are load-bearing and both were originally wrong.
+
+**1. Attention terms are summed per request**, not computed from batch-collapsed scalars.
+Collapsing the batch to `tokens × history` and multiplying was a rank deficiency. ATOM
+already computes the correct form: `ScheduledBatch.detailed_sqsq / detailed_sqsk /
+detailed_sk` are **Σ N_Q², Σ N_Q·N_KV, Σ N_KV**, produced by `compute_detailed_aggregates`
+(`scheduler.py:2788-2842`).
+
+**2. The padding term is the *rung's* rectangle, not the batch's.** `rung·max(ctx) − Σctx`,
+**not** `len(ctx)·max(ctx) − Σctx`. Error tracked the ratio between them exactly:
+
+| rung | ratio | error with the wrong rectangle |
+|---|---|---|
+| 2 | 1.00 | −0.34% |
+| 8 | 1.40 | −2.41% |
+| 4 | 2.26 | −3.91% |
+| **16** | **5.59** | **−22.64%** |
+
+---
+
+## D56. A rank deficiency is not a coverage gap
+
+### The failure, and how it hid
+
+Decode error at rungs 8 and 16 was diagnosed as missing evidence. It was not — it was **a
+column of zeros where a feature should be**. Every calibration round ran sequences of one
+length, so raggedness was exactly **1.00 in all 2,997 samples**. Filling the *context* gap
+moved rung 8 from **−32.6% to −32.1%**. Adding ragged rounds plus the padding feature took
+it to **−7.4%**.
+
+### And the second-order trap
+
+> **A wrongly-computed feature reads as an unconstrained one.**
+
+Two rounds of sweep changes were spent on the theory that the padding coefficient was
+unconstrained. It was constrained — it was fitted to the wrong number (D55). The symptom
+worth remembering: **widening the evidence twice moved rung 16 by 0.07 points.**
+
+### Decision
+
+Before concluding "we need more samples", check the design matrix:
+
+1. **Any feature with no variance in the samples is dropped and its coefficient returned as
+   zero**, explicitly, in the fit's description — never silently absorbed into the
+   intercept.
+2. **Report the condition number and the per-feature variance** with every fit.
+3. **If widening the evidence does not move the error, the feature is not unconstrained —
+   it is wrong.** That is a diagnostic rule, not a heuristic.
+
+---
+
+## D57. Outliers, and what a fit must report
+
+- **MAD rejection on relative residuals, then refit.** The number dropped is reported in
+  the fit's description, never silently.
+- **A fit's description names its provenance** (`07` terminology), its sample count, the
+  dropped count, the condition number, and the hull it is valid over.
+- **Report an interval or report nothing.** A difference smaller than ~5% needs repeats
+  before it means anything, and repeats must be spaced (`08` D45).
+
+---
+
+## D58. Guards: refuse, and use a hull
+
+### Refuse rather than fall back
+
+An oracle asked about a step kind it has no samples of **raises**. The prior fallback was
+the mean of an empty list — zero — producing *"a confident, precise, entirely fictional
+answer"*: a TTFT of **0 ms against a real 7.6 s**.
+
+### The extrapolation guard must see the joint distribution
+
+A per-feature guard **cannot see a hole**. The concrete case: batch 8 was covered (1–16
+seen), context ~2,650 was covered (57–41,052 seen), and nothing warned — but the sweep's
+batch-8 steps run 1,776–2,288 and then jump to 5,360. *"The query sits in a hole, and the
+guard reported it as interpolation."*
+
+This cost **three** iterations to abandon:
+
+1. context bounds hid a gap — rung 8's bounds `[264, 327168]`, a step at 33,045 inside them
+   *and* inside a gap; 117/117, 512/512 and 1,642/1,642 real steps fell in the hole
+2. raggedness bounds hid a gap
+3. rung 16 was covered on both axes **separately** and still came out **22.6% low**, holding
+   64 samples at raggedness exactly 1.00 against a run at 1.18–1.32
+
+**Decision: a convex hull or k-NN distance with a threshold, never a per-feature bounding
+box.** The k-NN oracle already computes the distance.
+
+And the dimensions are **workload-dependent** — 0.6B batches ran at raggedness 2.82–3.85,
+27B at 1.11–1.42 — so:
+
+> **"The sweep covers this" is a statement about a pair, never about a sweep alone.**
+
+---
+
+## D59. Law selection, and why leave-one-out cannot do it
+
+### The failure
+
+Attention cost was fitted as a power law `a·L^p` on three geometrically spaced lengths:
+LOO median **0.75%**, worst 1.08%. Two independently traced graphs at 3,194 and 6,594 then
+came in at **−6.2% and −6.7% — the same direction**. Cross-run repeatability is 0.2%, so
+this was model bias, not noise.
+
+> **LOO perturbs the sample; it does not test the family.** Where a sample is small and
+> geometrically spaced, LOO reports how stable the fit is, not whether the family is right.
+
+### What the data actually looked like
+
+A dense 13-point ladder (2,294 → 10,094 in steps of 600) shows cost per token sitting on
+**flat plateaus**: 3.67, 6.28, 6.10, 5.90, 6.01, 8.31, 8.45, 8.17, 8.22, 10.58, 10.41,
+10.47, 10.50 µs/token. Four plateaus, steps of ~2.27 µs/token, plateau index
+`ceil(L / 2530)`.
+
+**The quadratic term is computed in whole chunks of keys** — attention is quantised in
+sequence length. `f(L) = L·(a + b·ceil(L/S))` with a = 1.461 µs, b = 2.272 µs, S = 2530
+gives LOO median **1.59%** against 7.78% for the power law, and predicts the independently
+traced graphs to **0.13%, 0.62%, 1.21%**.
+
+### And it still does not survive batching
+
+`2×3194` is **+23.9%**. Tracing 3,194 at one and two sequences: **19.967 ms/seq at one,
+15.470 ms/seq at two** — a 22.5% drop per sequence from adding a neighbour, while the same
+comparison moves 2.8% at 2,294 and 0.9% at 4,694.
+
+> The chunking is a property of the **batch**, not the sequence.
+
+### Decision
+
+1. **A family is validated on independently obtained data, never by LOO.** LOO ranks
+   candidates within a family; a held-out measurement decides the family.
+2. **Rank at least three candidate laws** and report all of them with their held-out error,
+   not only the winner. The prior tool ranked five.
+3. **A law that fits one axis must be tested on a second** before it ships — the batching
+   test above is the pattern, and so is the rotary-buffer formula that matched the 0.6B
+   exactly and was **4× wrong** on the 27B. *Tested on a second model, failed, did not
+   ship.*
+
+---
+
+## D60. Cost is piecewise; interpolation is not sound-but-imprecise
+
+### The cliffs are real and reproducible
+
+**GEMM tile cliff.** One gemm at 20 values of M: flat at ~9.2 µs to M=12, then climbing,
+then **jumping 58.07 µs at M=768 → 137.45 µs at M=1024 where the trend says ~77**. Each
+signature already records which kernels it launched: M=256/384 → `MT128x1…`; 512/768 →
+`MT256x1…`; 1024 → `MT256x2…`. **The price list already knows the band.**
+
+**Prefill is non-monotone in token count, reproducibly** (five repeats each, tight to a
+tenth of a percent):
+
+| shape | tokens | step |
+|---|---|---|
+| 8×100 | 3,952 | 55.32 ± 0.07 ms |
+| 4×200 | 4,376 | 63.16 ± 0.02 ms |
+| 2×400 | 4,588 | **52.14 ± 0.03 ms** |
+| 1×800 | 4,694 | 65.13 ± 0.05 ms |
+
+Two independent causes: a gemm tile cliff (M=4,376 at 536.80 µs `MT256x224x64` against
+M=4,500 at 259.68 µs `MT256x192x64`) and attention's quadratic. And the extreme case: at
+~9–10k tokens, **one long sequence costs 174.5 ms where four shorter ones totalling 9,176
+tokens cost 100.3 ms — 74% more time for 10% more tokens.**
+
+### What interpolation measures
+
+| measured shapes | n | median | worst |
+|---|---|---|---|
+| every other shape | 10 | 5.5% | **57.8%** |
+| powers of two | 11 | 2.8% | **60.1%** |
+| 1, 8, 64, 512 | 4 | 3.7% | **64.7%** |
+| 1, 32, 1024 | 3 | 8.6% | **80.1%** |
+
+And the obvious guard — interpolate only between same-kernel neighbours — **refuses almost
+everything**: twelve distinct tile configurations across twenty M values, so 8 of 10
+held-out shapes have no same-kernel bracket. The two that do come out at 0.4%.
+
+> **Interpolation is not sound-but-imprecise; it is accurate most of the time with no way to
+> tell when it is not. For a tool whose output is a ranking of configurations, an occasional
+> silent 60% is worse than a uniform 10%.**
+
+Prefill steps do not interpolate either, even averaged over hundreds of kernels: median
+**12.2%**, worst **32.1%**, against 2.1% for a measured ladder.
+
+### Decision
+
+**Laws are piecewise over declared dispatch bands.** A band boundary is read from the
+recorded kernel identity, not inferred from a residual. A query between bands with no
+bracket **refuses** rather than interpolating.
+
+---
+
+## D61. Declared treatments
+
+A treatment is a factor that moves cost and is **invisible to every feature in the model**.
+It must be declared and the calibration population matched to the target, or the fit is
+silently averaging over it.
+
+**Known treatment: decode row order.** At one fixed 32-row context multiset, row order
+alone moves measured decode attention across **1.77×** — grouped-descending 276.1 µs,
+grouped-ascending 292.2 µs, alternating 376.5 µs, ladder-interleaved 489.5 µs. Refuted as
+causes: KV pool footprint (2.42× pool maximum moves the price −0.5%), co-residency, shape,
+and launch-wave packing.
+
+> Every feature in every candidate law — `crit_waves`, `work_waves`, `launch_waves` — is a
+> function of the context multiset, so all four orders are the same vector. **No
+> coefficient over that basis can separate them, and a corpus that mixes orderings is
+> fitting an undeclared treatment.**
+
+Consequence, already in `07` D39: calibration batches are **replayed** from the real
+scheduler's step table, with explicit `block_tables`. Hand-built ladders are grouped by
+construction.
+
+**Suspected treatments to check before fitting:** raggedness (workload-dependent, and it
+was a zero column for 2,997 samples), cached fraction, and the prefill chunk's position in
+its streak.
+
+---
+
+## D62. Two biases that must be modelled or excluded, not left to cancel
+
+**1. Leading warmth does not transfer, and charging it is wrong.** The 27B sweep's first
+three prefill steps cost **47.5 / 19.5 / 6.1 s** at 8 / 32 / 96 tokens where the same shapes
+later cost **0.11 s**. Replaying that onto a simulated run's first step gives **+31.03%** on
+the prefill total against a real cold start of 6.87 s. *"A server does a profile run and
+captures graphs before its first measured step, so most of the process-level warmth is
+spent by then; a sweep meets it head-on."*
+
+**Decision:** the fit **measures and reports** its leading warmth and charges nothing
+(`leading warmup in table = 3 steps totalling 72.80 s, not charged`). A per-deployment
+`warmup_seconds` constant defaults to 0 — measured at 6.68 s on 27B TP=4 (steady to 1.3%
+over four repeats), 0.01 s on the 0.6B.
+
+**2. The prefill bias is shape-dependent, so scaling cannot fix it.** Split by the history
+each chunk attends over:
+
+| history band | chunks | error |
+|---|---|---|
+| 16k–50k | 44 | −1.16% |
+| 50k–100k | 50 | +3.74% |
+| 100k–150k | 11 | **+13.36%** |
+
+Not extrapolation — the sweep has 16 samples in that band and reaches 258k. *"It is a
+balance problem: 77% of the sweep sits in 16k–50k, the workload never goes past 131k, and
+one linear coefficient is fitted across the whole range."*
+
+**Decision:** report error **stratified by the axes the law is linear in**, not only in
+aggregate. A single coefficient across a range the workload samples unevenly is a design
+choice that must be visible.
+
+---
+
+## Decision log
+
+| # | Decision | Date |
+|---|---|---|
+| D53 | Fit relative error, not absolute seconds. MAD outlier test on the same relative residuals. | 2026-09-18 |
+| D54 | Prefill and decode fitted separately; decode per CUDA-graph rung with both coefficients per rung. | 2026-09-18 |
+| D55 | Attention terms summed per request; the padding term is the rung's rectangle, not the batch's. | 2026-09-18 |
+| D56 | Distinguish rank deficiency from coverage gap: drop zero-variance features explicitly, report the condition number, and treat "widening the evidence does not move the error" as evidence the feature is wrong. | 2026-09-18 |
+| D57 | Every fit reports provenance, sample count, dropped count, condition number and validity hull. Report an interval or report nothing. | 2026-09-18 |
+| D58 | Refuse rather than fall back. The extrapolation guard is a convex hull or k-NN distance, never a per-feature bounding box. | 2026-09-18 |
+| D59 | A family is validated on independently obtained data, never by LOO. Rank at least three candidates and report all held-out errors. A law that fits one axis is tested on a second before it ships. | 2026-09-18 |
+| D60 | Laws are piecewise over declared dispatch bands read from recorded kernel identity. A query with no same-band bracket refuses. | 2026-09-18 |
+| D61 | Treatments are declared and the calibration population matched. Decode row order is a known treatment worth 1.77×. | 2026-09-18 |
+| D62 | Leading warmth is measured and reported, never charged. Error is reported stratified by the axes the law is linear in. | 2026-09-18 |
+
+---
+
+## TODO register
+
+This topic's items only. The consolidated register across all topics, with the
+load-bearing assumptions and their check plans, is [`12_open_items.md`](12_open_items.md).
+
+| # | Item | Why deferred |
+|---|---|---|
+| T29 | Choose the hull implementation (convex hull vs k-NN distance threshold) and its threshold | needs one calibration corpus to tune against |
+| T30 | Enumerate candidate laws per leaf family, with their held-out validation shapes | needs the leaf list frozen (`04` T3) |
+| T31 | Test raggedness, cached fraction and chunk-position for treatment status | each needs a controlled experiment like the row-order one |
+| T32 | Decide whether tier (a)'s coarse fit is derived from tier (b)'s symbolic expression or fitted independently | `04` T8; if derived, most of this document applies only to leaves |
+| T33 | Establish `warmup_seconds` for Qwen3.8-27B under the current stack | per-deployment constant, currently defaulting to 0 |
