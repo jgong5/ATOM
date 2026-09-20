@@ -7,7 +7,18 @@ run one forward through it, record the operator list, and *refuse loudly* rather
 than record a plausible-looking partial one. Nothing here fits a cost model; the
 artifact is an inventory.
 
-Three things in here are not in `04` D18 and were found by running it:
+Four things in here are not in `04` D18 and were found by running it:
+
+* **What this mechanism produced at P0.4 is a CONCRETE trace, not a symbolic
+  one**, and the difference is the whole of D18's argument against route D.
+  Measured over the four committed forward records: **0 non-numeric shape
+  entries out of 12,425 / 12,455 / 12,490 / 12,520**. The cause is D18's own
+  trap 1 -- every tensor is allocated inside `with fake_mode:`, which yields an
+  already-fake *static* tensor with plain `int` shapes and no indication
+  anything went wrong. `02` D10.1 has a name for the result: *"The T5 fallback
+  is the meta context plus concrete traces."* `capture()` below now refuses a
+  trace with no free symbol unless the caller says `concrete_ok=True`, so the
+  fallback has to be asked for rather than arrived at (T73).
 
 * D18's five `torch.cuda` stubs are not enough to import ATOM. `get_device_properties`
   is read at *import* time by aiter's Triton attention kernels
@@ -29,17 +40,44 @@ Three things in here are not in `04` D18 and were found by running it:
   `apply_simulated_tp` (`atom/distributed/simulated_tp.py`), reused rather than
   reimplemented (principle 1). Its documented caveat is usually read as "the
   values are meaningless, the shapes are right", which would cost a capture
-  nothing. It costs a capture something else: at one physical rank
-  `_patch_group` replaces `all_reduce` with the IDENTITY, so a TP2 capture
-  taken this way contains NO COLLECTIVE OPERATORS AT ALL. Measured: the TP2
-  decode capture of the 27B has zero `c10d.*` dispatches inside the model. Any
-  cost model fed from it would price TP2 as collective-free.
+  nothing. It costs a capture something in BOTH directions, and the second one
+  is the easier to miss:
+
+  - **Erased.** At one physical rank `_patch_group` replaces `all_reduce` with
+    the IDENTITY, so a TP2 capture taken this way contains no collective
+    operator at all. Measured on this forward, by counting calls into the
+    patched group rather than by reading the inventory: **129 `all_reduce`
+    calls per forward at TP2** -- 128 from
+    `model_ops/communication_op.py:58 tensor_model_parallel_all_reduce` (the
+    row-parallel linears: 64 `mlp.down_proj` + 48 `linear_attn.out_proj` + 16
+    `self_attn.o_proj`, zero in the vision tower) and 1 from
+    `model_ops/embed_head.py:175` (the vocab-parallel embedding reduce).
+    Identical at warmup and at decode. The inventory records **0** `c10d.*`
+    dispatches against that 129, plus one erased sampler `broadcast`.
+  - **Fabricated.** `_all_gather`, `_gather` and `_reduce_scatter_tensor` are
+    NOT identities at one physical rank -- they build the absent ranks out of
+    zeros, and every op they use is dispatched and recorded. The single
+    `all_gather` this forward makes (`model_ops/embed_head.py:257`, the
+    vocab-parallel lm_head) arrives in the TP2 inventory as six ops a real TP2
+    forward never issues: `aten.zeros` -> `aten.slice` -> `aten.copy_` ->
+    `aten.view` -> `aten.movedim` -> `aten.reshape`, at indices 2458-2466 of
+    `real_tp2.json`, and half of the `[2,248320]` logits tensor it produces is
+    zeros.
+
+  So the TP2 inventory both omits 129 collectives and contains six ops that do
+  not exist in the configuration it claims to describe. A cost model fed from
+  it would price TP2 as collective-free AND pay for a gather that is an
+  artefact of the substitution. `simulated_tp.py`'s own docstring is explicit
+  that THE MODEL OUTPUT IS MEANINGLESS and that `--fake-eplb` "already means
+  'this run's output is garbage, I am measuring kernels'"; that caveat has to
+  travel with any structural reading of this inventory.
 """
 
 from __future__ import annotations
 
 import contextlib
 import os
+import re
 import socket
 from collections.abc import Callable
 from dataclasses import dataclass, field
@@ -254,8 +292,30 @@ def _shape_of(t) -> list:
     return [str(s) for s in t.shape]
 
 
+_NUMERIC = re.compile(r"^-?\d+$")
+
+
+def shape_entry_census(recorder: Recorder) -> tuple[int, int]:
+    """`(shape entries recorded, entries that are not a plain integer)`.
+
+    The second number is `04` D18 discipline 2's third clause -- *"assert the
+    output shapes still carry free symbols"* -- made countable. It is the one
+    measurement that separates a symbolic capture from the concrete one `02`
+    D10.1 calls the T5 fallback, and principle 8 says every claim about this
+    capture has to carry it.
+    """
+    total = non_numeric = 0
+    for rec in recorder.ops:
+        for shape in (*rec.in_shapes, *rec.out_shapes):
+            for entry in shape:
+                total += 1
+                if not _NUMERIC.match(str(entry)):
+                    non_numeric += 1
+    return total, non_numeric
+
+
 @contextlib.contextmanager
-def capture(shape_env: ShapeEnv, recorder: Recorder):
+def capture(shape_env: ShapeEnv, recorder: Recorder, concrete_ok: bool = False):
     """The three disciplines of `04` D18, with the post-trace assertions.
 
     Discipline 1 is the `_EnablePythonDispatcher` below. Without it
@@ -264,6 +324,18 @@ def capture(shape_env: ShapeEnv, recorder: Recorder):
     `RuntimeError: Cannot call numel() on tensor with symbolic sizes/strides`
     rather than specialising silently, which is the louder of the two
     documented failures but still a failure.
+
+    Discipline 2 has two halves and the second one is the load-bearing one.
+    `shape_env.replacements` catches a symbol that was *created and then
+    specialised*. It says nothing at all about a trace where no symbol was ever
+    created -- there, an empty `replacements` means "nothing was checked", not
+    "clean", which is the README's archetypal failure wearing its checking
+    disguise. So the free-symbol census runs too, and a trace with no free
+    symbol is refused unless the caller declares it wanted the concrete one.
+
+    `concrete_ok=True` does not soften the refusal into a fallback: it changes
+    what is being asked for, and the answer is recorded as a concrete trace
+    rather than reported as a symbolic one.
     """
     with torch._C._EnablePythonDispatcher(), recorder:
         yield recorder
@@ -273,6 +345,17 @@ def capture(shape_env: ShapeEnv, recorder: Recorder):
             f"{dict(shape_env.replacements)}. A specialised graph prices as a "
             "constant where the model is not one (`04` D18 records 8.44x at "
             "T=512, 46x at T=4096)."
+        )
+    entries, free = shape_entry_census(recorder)
+    if free == 0 and not concrete_ok:
+        raise CaptureRefusal(
+            f"the trace carries no free symbol: 0 of {entries} recorded shape "
+            "entries are non-numeric, so every shape in this inventory is a "
+            "constant. `04` D18 discipline 2 requires the output shapes still "
+            "carry free symbols; an empty `shape_env.replacements` on a trace "
+            "that created no symbol means NOTHING WAS CHECKED. This is the "
+            "concrete capture `02` D10.1 names the T5 fallback. Ask for it "
+            "explicitly (concrete_ok=True) or fix the trace (T73)."
         )
     shape_env.freeze()
 
@@ -295,7 +378,17 @@ class _NullEvent:
         return True
 
     def elapsed_time(self, *a, **k):
-        return 0.0
+        # NOT 0.0. `model_runner.py:4144` does
+        # `times_ms.append(start.elapsed_time(end))`, so a zero here is a
+        # confident, precise, entirely fictional duration -- the README's
+        # archetypal failure verbatim. A capture measures no time; say so
+        # (principle 6). Nothing on the P0.4 path reaches this.
+        raise CaptureRefusal(
+            "torch.cuda.Event.elapsed_time was read under a fake capture. A "
+            "capture runs no kernel, so it has no elapsed time to report and "
+            "will not invent one. Timing belongs to the cost model, not to "
+            "the trace."
+        )
 
 
 class _NullStream:
@@ -318,7 +411,7 @@ class _NullStream:
         return True
 
 
-def install_runner_stubs() -> list:
+def install_runner_stubs(readings: DeviceReadings | None = None) -> list:
     """`ModelRunner.__init__` reads more of `torch.cuda` than construction does.
 
     All BEYOND-D18. Streams and events are the interesting entry: they are not
@@ -327,7 +420,15 @@ def install_runner_stubs() -> list:
     their content here. `memory_stats` IS a reading, and returning zeros is a
     declaration that the capture measures no memory; `03`'s memory terms are
     modelled elsewhere and must not be back-filled from a fake trace.
+
+    `mem_get_info` is a reading too, and it is the one that must not be zero.
+    ATOM sizes the KV budget from it at `model_runner.py:1590`
+    (`budget = gpu_memory_utilization * torch.cuda.mem_get_info()[1]`), so a
+    `(0, 0)` there is a KV budget of exactly zero -- precise, confident and
+    fictional. It comes from `DeviceReadings` like every other declared fact
+    (`03` D14), and free == total because a capture has allocated nothing.
     """
+    readings = readings or DeviceReadings()
     installed = []
 
     def put(name, value):
@@ -353,7 +454,10 @@ def install_runner_stubs() -> list:
             "reserved_bytes.all.current": 0,
         },
     )
-    put("mem_get_info", lambda *a, **k: (0, 0))
+    put(
+        "mem_get_info",
+        lambda *a, **k: (readings.total_memory_bytes, readings.total_memory_bytes),
+    )
     put("max_memory_allocated", lambda *a, **k: 0)
     put("memory_allocated", lambda *a, **k: 0)
     put("memory_reserved", lambda *a, **k: 0)

@@ -51,6 +51,8 @@ def main(argv=None) -> int:
         if fw and not fw.get("ok"):
             print(f"     REFUSED {fw['error_type']}: {fw['error']}")
             print(f"     at {fw['at']}")
+            if fw.get("raised_at"):
+                print(f"     raised at {fw['raised_at']}")
 
     print("\n=== parameter geometry ===")
     ga, gb = a["geometry"], b["geometry"]
@@ -103,11 +105,41 @@ def main(argv=None) -> int:
         f"(factor {(ea - same) / max(eb - same, 1):.4f})"
     )
 
+    # T68: buffers are not parameters, so `--load_dummy` and the meta wrapper
+    # never touch them; a buffer is the likeliest thing to escape the mode.
+    # Collecting them and then diffing only params is how that would go unseen.
+    print("  buffers:")
+    ba, bb = ga.get("buffers", {}), gb.get("buffers", {})
+    print(
+        f"    {la}: {len(ba)} on {ga.get('buffer_devices')}   "
+        f"{lb}: {len(bb)} on {gb.get('buffer_devices')}"
+    )
+    for n in sorted(set(ba) | set(bb)):
+        sa_, sb_ = ba.get(n), bb.get(n)
+        if sa_ != sb_:
+            print(f"    DIFFERS {n}: {la}={sa_} {lb}={sb_}")
+    if ba == bb:
+        print("    identical at both widths")
+
     print("\n=== operator inventory ===")
     ia, ib = _fwd(a), _fwd(b)
     if not ia or not ib:
         print("one side has no inventory; nothing to diff")
         return 1
+    for lbl, r, i in ((la, a, ia), (lb, b, ib)):
+        if r.get("diagnostic_inventory"):
+            print(
+                f"{lbl}: DIAGNOSTIC (--skip-triton). Raw @triton.jit launches "
+                "were recorded and not run; this inventory is an enumeration, "
+                "NOT a cost model input (TritonLaunchRecorder's own rule)."
+            )
+        entries = i.get("shape_entries")
+        free = i.get("non_numeric_shape_entries")
+        if entries is not None:
+            print(
+                f"{lbl}: {free} of {entries} shape entries are non-numeric -> "
+                f"{'symbolic' if free else 'CONCRETE (`02` D10.1 T5 fallback)'}"
+            )
     print(f"{la}: {ia['n_ops']} dispatches, {ia['n_distinct_ops']} distinct ops")
     print(f"{lb}: {ib['n_ops']} dispatches, {ib['n_distinct_ops']} distinct ops")
     ca, cb = ia["op_counts"], ib["op_counts"]

@@ -16,12 +16,16 @@ Three stages, separately reportable, because they fail for different reasons:
 A stage that cannot complete records the refusal with its frame and exits
 non-zero rather than writing a shorter inventory (principle 6).
 
-    t5_trace.py --model <path> --tp 2 --stage real --out tp2.json
+    t5_trace.py --model <path> --tp 2 --stage real --concrete --out tp2.json
+
+The capture refuses a symbol-free trace unless `--concrete` says that is what
+was wanted: see `04` D18 discipline 2 and `02` D10.1.
 """
 
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import sys
 import time
@@ -38,6 +42,7 @@ from atom.compass.capture.fake_trace import (
     init_single_rank_group,
     install_device_stubs,
     install_runner_stubs,
+    shape_entry_census,
 )
 
 
@@ -55,6 +60,10 @@ def geometry(model) -> dict:
         "n_param_elements": sum(p.numel() for p in model.parameters()),
         "n_buffers": len(buffers),
         "param_devices": sorted({str(p.device) for p in model.parameters()}),
+        # T68 asks the same question of buffers that param_devices asks of
+        # parameters -- `--load_dummy` and the meta wrapper act on parameters
+        # only, so a buffer is the thing most likely to escape the mode.
+        "buffer_devices": sorted({str(b.device) for b in model.buffers()}),
         "module_types": sorted({type(m).__name__ for m in model.modules()}),
         "params": params,
         "buffers": buffers,
@@ -66,9 +75,15 @@ def inventory(recorder: Recorder) -> dict:
     counts: dict = {}
     for rec in recorder.ops:
         counts[rec.op] = counts.get(rec.op, 0) + 1
+    entries, free = shape_entry_census(recorder)
     return {
         "n_ops": len(recorder.ops),
         "n_distinct_ops": len(counts),
+        # Principle 8: the one measurement that says whether this inventory is
+        # a symbolic capture or the concrete T5 fallback of `02` D10.1.
+        "shape_entries": entries,
+        "non_numeric_shape_entries": free,
+        "capture_is_symbolic": free > 0,
         "op_counts": dict(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))),
         "ops": [
             {"op": r.op, "in": r.in_shapes, "out": r.out_shapes, "dtypes": r.dtypes}
@@ -82,13 +97,6 @@ def main(argv=None) -> int:
     ap.add_argument("--model", required=True)
     ap.add_argument("--tp", type=int, default=1)
     ap.add_argument("--stage", choices=("build", "warmup", "real"), default="build")
-    ap.add_argument(
-        "--tokens",
-        type=int,
-        default=8,
-        help="trace-time hint for the token dimension; `04` D18 discipline 3 "
-        "requires >= 2",
-    )
     ap.add_argument("--bs", type=int, default=2, help="decode rows for --stage real")
     ap.add_argument("--blocks", type=int, default=64, help="KV blocks for --stage real")
     ap.add_argument("--cu-count", type=int, default=80)
@@ -100,15 +108,18 @@ def main(argv=None) -> int:
         "inventory it yields is an enumeration, not a cost "
         "model input.",
     )
+    ap.add_argument(
+        "--concrete",
+        action="store_true",
+        help="record a CONCRETE trace. Without this the capture refuses when "
+        "no recorded shape carries a free symbol (`04` D18 discipline 2), "
+        "because an empty shape_env.replacements on a symbol-free trace means "
+        "nothing was checked. `02` D10.1 names the concrete result the T5 "
+        "fallback; this flag is how a run asks for it on purpose.",
+    )
     ap.add_argument("--out", default="")
     args = ap.parse_args(argv)
 
-    if args.tokens < 2:
-        raise CaptureRefusal(
-            f"--tokens {args.tokens}: a dimension whose trace-time hint is 1 is "
-            "silently specialised to a constant (`04` D18 discipline 3). Trace "
-            "at >= 2 and substitute afterwards."
-        )
     if args.bs < 2:
         raise CaptureRefusal(
             f"--bs {args.bs}: same discipline, applied to the batch dimension."
@@ -118,12 +129,18 @@ def main(argv=None) -> int:
         "argv": sys.argv[1:],
         "tp": args.tp,
         "stage": args.stage,
-        "tokens_hint": args.tokens,
         "skip_triton": args.skip_triton,
+        # B5: every headline number in this PR came from a --skip-triton run.
+        # `TritonLaunchRecorder` requires runs that use it to say so, so the
+        # record says it in its own field rather than only in an argv string.
+        "diagnostic_inventory": args.skip_triton,
+        "concrete_capture_requested": args.concrete,
     }
-    record["cuda_stubs"] = install_device_stubs(DeviceReadings(cu_count=args.cu_count))
+    readings = DeviceReadings(cu_count=args.cu_count)
+    record["device_readings"] = dataclasses.asdict(readings)
+    record["cuda_stubs"] = install_device_stubs(readings)
     if args.stage != "build":
-        record["cuda_stubs"] += install_runner_stubs()
+        record["cuda_stubs"] += install_runner_stubs(readings)
 
     t0 = time.perf_counter()
     init_single_rank_group()
@@ -206,6 +223,7 @@ def main(argv=None) -> int:
                 Recorder,
                 inventory,
                 skip_triton=args.skip_triton,
+                concrete=args.concrete,
             )
         else:
             record["forward"] = run_real(
@@ -218,6 +236,7 @@ def main(argv=None) -> int:
                 bs=args.bs,
                 num_blocks=args.blocks,
                 skip_triton=args.skip_triton,
+                concrete=args.concrete,
             )
 
     _emit(record, args)
@@ -241,7 +260,8 @@ def _emit(record: dict, args) -> None:
         print(
             f"geometry: {g['n_modules']} modules, {g['n_params']} params, "
             f"{g['n_param_elements']} elements, {g['n_buffers']} buffers, "
-            f"devices={g['param_devices']}"
+            f"param_devices={g['param_devices']} "
+            f"buffer_devices={g.get('buffer_devices')}"
         )
     err = record.get("runner_error")
     if err:
@@ -249,17 +269,33 @@ def _emit(record: dict, args) -> None:
         print(err["traceback"])
     f = record.get("forward")
     if f:
+        if record.get("diagnostic_inventory"):
+            print(
+                "DIAGNOSTIC INVENTORY (--skip-triton): raw @triton.jit launches "
+                "were recorded and NOT run, so anything downstream of a skipped "
+                "kernel read uninitialised fake memory. TritonLaunchRecorder "
+                "requires runs that use it to say so; this is that statement. "
+                "NOT a cost model input."
+            )
         if f.get("ok"):
+            entries = f.get("shape_entries", 0)
+            free = f.get("non_numeric_shape_entries", 0)
             print(
                 f"forward[{f['stage']}]: {f['n_ops']} ops, "
                 f"{f['n_distinct_ops']} distinct, "
                 f"attention_elided={f['attention_elided']}"
+            )
+            print(
+                f"  shape entries: {entries}, non-numeric (free symbols): "
+                f"{free} -> capture is "
+                f"{'SYMBOLIC' if free else 'CONCRETE (`02` D10.1 T5 fallback)'}"
             )
         else:
             print(
                 f"forward[{f['stage']}] REFUSED {f['error_type']} at {f['at']}: "
                 f"{f['error']}"
             )
+            print(f"  raised at: {f.get('raised_at')}")
             print(f"  ops recorded before the refusal: {f.get('ops_before_failure')}")
             print(f["traceback"])
         t = f.get("triton")

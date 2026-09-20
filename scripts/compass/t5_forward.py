@@ -28,22 +28,79 @@ raw-Triton call sites a forward reaches, not a capture.
 from __future__ import annotations
 
 import contextlib
+import os
 import traceback
 
 import numpy as np
 import torch
 
 
+def _atom_root() -> str:
+    """The tree under test, from the package that was actually imported."""
+    import atom
+
+    return os.path.dirname(os.path.dirname(os.path.abspath(atom.__file__)))
+
+
+# The recorder sits between ATOM and torch on *every* dispatched op, so it is
+# in the traceback of every refusal and never the answer to "where".
+_RECORDER_FRAME = ("fake_trace.py", "__torch_dispatch__")
+
+
 def _fail(stage: str, exc: BaseException) -> dict:
-    """A refusal is a result: name it, keep the frame, do not widen the try."""
+    """A refusal is a result: name it, keep the frame, do not widen the try.
+
+    Two frames, because neither alone is usable. `raised_at` is `tb[-1]`,
+    which for a missing fake impl is always
+    `torch/_subclasses/fake_tensor.py in maybe_run_unsafe_fallback` --
+    identical for every such refusal and therefore useless for telling two of
+    them apart. `at` is the last frame *inside the tree under test*, which is
+    the one a reader can act on: for `c10d.broadcast_` that is
+    `model_runner.py:3138 in postprocess`, the `get_tp_group().broadcast()`
+    call in `ModelRunner.postprocess`.
+
+    Picking "the last non-torch frame" instead is not enough and was measured
+    wrong: the dispatch path ends
+    `.../torch/_library/utils.py:313 in handle_dispatch_mode`, which is torch
+    but lives outside the three `torch/_subclasses|_ops|utils/_` prefixes, and
+    the frame below it is aiter's `parallel_state.py:1141` -- a third-party
+    call site, not an ATOM one. So the search is anchored to the ATOM tree,
+    with the non-torch frame kept as a fallback for a refusal raised entirely
+    outside it.
+    """
     tb = traceback.extract_tb(exc.__traceback__)
     frame = tb[-1] if tb else None
+    root = _atom_root()
+
+    def _usable(f) -> bool:
+        return (os.path.basename(f.filename), f.name) != _RECORDER_FRAME
+
+    caller = next(
+        (
+            f
+            for f in reversed(tb)
+            if f.filename.startswith(root + os.sep) and _usable(f)
+        ),
+        None,
+    )
+    if caller is None:
+        caller = next(
+            (
+                f
+                for f in reversed(tb)
+                if "/site-packages/torch/" not in f.filename and _usable(f)
+            ),
+            frame,
+        )
     return {
         "ok": False,
         "stage": stage,
         "error_type": type(exc).__name__,
         "error": str(exc)[:2000],
-        "at": f"{frame.filename}:{frame.lineno} in {frame.name}" if frame else "?",
+        "at": f"{caller.filename}:{caller.lineno} in {caller.name}" if caller else "?",
+        "raised_at": (
+            f"{frame.filename}:{frame.lineno} in {frame.name}" if frame else "?"
+        ),
         "traceback": "".join(traceback.format_tb(exc.__traceback__))[-6000:],
     }
 
@@ -69,13 +126,14 @@ def _traced(
     inventory,
     skip_triton,
     extra,
+    concrete,
 ):
     rec = recorder_factory()
     tlr_report = None
     try:
         with _triton(skip_triton) as tlr:
             try:
-                with fake_mode, capture_ctx(shape_env, rec):
+                with fake_mode, capture_ctx(shape_env, rec, concrete_ok=concrete):
                     thunk()
             finally:
                 tlr_report = tlr.report() if tlr is not None else None
@@ -84,6 +142,8 @@ def _traced(
         out["ops_before_failure"] = len(rec.ops)
         out["inventory_partial"] = inventory(rec)
         out["triton"] = tlr_report
+        out["diagnostic_inventory"] = bool(skip_triton)
+        out["concrete_capture_requested"] = bool(concrete)
         out.update(extra)
         return out
     out = {
@@ -91,6 +151,8 @@ def _traced(
         "stage": stage,
         "triton": tlr_report,
         "triton_skipped": bool(skip_triton),
+        "diagnostic_inventory": bool(skip_triton),
+        "concrete_capture_requested": bool(concrete),
     }
     out.update(extra)
     out.update(inventory(rec))
@@ -105,8 +167,14 @@ def run_warmup(
     recorder_factory,
     inventory,
     skip_triton=False,
+    concrete=False,
 ):
-    """ATOM's `warmup_model()`, traced. Attention is elided by construction."""
+    """ATOM's `warmup_model()`, traced.
+
+    Attention is NOT elided here, despite `is_dummy_run=True` -- see
+    `attention_note` below, which is the measured correction to the obvious
+    reading of `attention_mha.py:178`.
+    """
     return _traced(
         "warmup",
         runner.warmup_model,
@@ -118,6 +186,9 @@ def run_warmup(
         skip_triton,
         extra={
             "attention_elided": False,
+            "traced_tokens": runner.config.max_num_batched_tokens,
+            "traced_tokens_source": "config.max_num_batched_tokens, via ATOM's "
+            "own warmup_model(); nothing on the command line sets it",
             "attention_note": "attention IS in this inventory despite is_dummy_run=True: "
             "aiter.unified_attention_with_output_base and "
             "aiter.linear_attention_with_output_base are registered custom "
@@ -126,6 +197,7 @@ def run_warmup(
             "(attention_mha.py:178) never runs. Each is one opaque leaf; "
             "nothing below it is in the inventory.",
         },
+        concrete=concrete,
     )
 
 
@@ -171,6 +243,7 @@ def run_real(
     bs: int,
     num_blocks: int,
     skip_triton=False,
+    concrete=False,
 ):
     """KV cache through ATOM's allocator, then one non-dummy decode step."""
     alloc = {}
@@ -197,6 +270,9 @@ def run_real(
         extra={
             "attention_elided": False,
             "alloc": alloc,
+            "traced_tokens": bs,
+            "traced_tokens_source": "--bs; a decode step is one token per row",
             "batch": {"bs": bs, "tokens": bs, "kind": "decode"},
         },
+        concrete=concrete,
     )
