@@ -56,6 +56,22 @@ def main() -> int:
              "Fitting three coefficients needs more than two samples, and a "
              "fixed workload prefills everything in a single step.",
     )
+    parser.add_argument(
+        "--sweep-rounds", default="",
+        help="which rounds to run, as `start:stop` over the executed sequence "
+             "-- the round list twice. Default: all of them. The full sweep "
+             "is six hours on a 27B, and a GPU fault partway through loses "
+             "every round behind it, so the remainder has to be runnable on "
+             "its own. Indices are stable: a round seeds its prompts from its "
+             "index, so round 111 builds the same prompts whether it runs "
+             "first or last, and segments concatenate into one table.")
+    parser.add_argument(
+        "--sweep-round", action="append", default=[], metavar="L,C,S[,D[,SEED]]",
+        help="run one explicit round instead of the built-in list: length, "
+             "count, shared-prefix tokens, optionally decode tokens and the "
+             "prompt seed. Repeatable. For reproducing one round without the "
+             "six hours in front of it -- which is what finding the batch "
+             "size a round faults at needs.")
     args = parser.parse_args()
 
     llm = EngineArgs.from_cli_args(args).create_engine()
@@ -413,8 +429,27 @@ def main() -> int:
         # `--sweep` without `--sweep-long` never reaches the block above, so
         # normalise here rather than there. Idempotent on purpose.
         rounds = [r if len(r) == 4 else (r[0], r[1], r[2], 0) for r in rounds]
-        for round_index, (length, count, decode, shared) in enumerate(
-                rounds + rounds):
+        # Indexed before any slicing, because the index is the prompt seed: a
+        # segment run on its own has to build the same prompts the whole sweep
+        # would have built at that position, or two halves of one table would
+        # disagree about what they measured.
+        sequence = list(enumerate(rounds + rounds))
+        if args.sweep_round:
+            sequence = []
+            for spec in args.sweep_round:
+                parts = [int(v) for v in spec.split(",")]
+                length, count, shared = parts[0], parts[1], parts[2]
+                decode = parts[3] if len(parts) > 3 else args.sweep_long_decode
+                seed = parts[4] if len(parts) > 4 else 0
+                sequence.append((seed, (length, count, decode, shared)))
+        elif args.sweep_rounds:
+            start, _, stop = args.sweep_rounds.partition(":")
+            sequence = sequence[int(start or 0):
+                                int(stop) if stop else len(sequence)]
+        print(f"sweep: {len(sequence)} of {2 * len(rounds)} rounds, "
+              f"indices {[i for i, _ in sequence][:4]}"
+              f"{'...' if len(sequence) > 4 else ''}", flush=True)
+        for round_index, (length, count, decode, shared) in sequence:
             # A round is either `count` prompts of one length, or an explicit
             # list of lengths. The second exists because every uniform round
             # leaves the batch's *raggedness* at exactly one, and a fit cannot
