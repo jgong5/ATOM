@@ -100,10 +100,10 @@ forces a chosen acceptance curve instead of computing one.
 
 ### Problem
 
-Compass needs a **module tree** for two things: weight geometry (the memory model's
-Class-A term) and tracing (`04` D18 walks ATOM's real model code). Neither may read
-checkpoint bytes onto a device or allocate weights there. ATOM already has most of the
-pieces; what is missing is a statement of which combination Compass uses, and when.
+Compass needs a **module tree** for weight geometry (the memory model's Class-A term) and
+for tracing (`04` D18 walks ATOM's real model code). Neither may read checkpoint bytes
+onto a device or allocate weights there. ATOM already has every piece required; what is
+missing is a statement of which combination Compass uses, and when.
 
 ### What ATOM already provides
 
@@ -111,6 +111,7 @@ pieces; what is missing is a statement of which combination Compass uses, and wh
 |---|---|---|
 | `--load_dummy {empty,zero,xavier}` | `config.py:1556`, `arg_utils.py:69,260`, `loader.py:126,234,289-307` | skips the checkpoint read; `empty` leaves params uninitialised, the others fill them with finite values in place |
 | `_init_weight_params_on_meta` | `model_runner.py:4188-4211` | wraps `Module.register_parameter` so every `nn.Parameter` is replaced by a meta tensor as it is registered |
+| `no_init_weights` | `models/utils.py:457-496` | uses `torch.device("meta")` as a **context manager**, so construction itself lands on meta - no transient, no GPU, and it covers buffers. **Currently unused in ATOM.** |
 | `RapidServeModelRunner._build_and_load_model` | `model_runner.py:4218` | the override point where a runner declines to load |
 
 #### Why `_init_weight_params_on_meta` allocates on the real device, despite its name
@@ -144,24 +145,86 @@ zero GPU bytes"* while the helper says one parameter is transiently real. Both a
 different quantities — zero **persistent**, one parameter **transient**. The docstring is
 the precise one.
 
-#### Why Compass prefers `FakeTensorMode` anyway, and where the helper is still reused
+#### The transient is avoidable, and ATOM already ships the mechanism
+
+There is a second way, and it is strictly better than the `register_parameter` hook on
+both counts. **ATOM already has it**, at `atom/models/utils.py:457-496`:
+
+```python
+with register_module_module_registration_hook(hook), torch.device("meta"):
+    yield
+```
+
+`torch.device("meta")` as a **context manager** (torch ≥ 2.0) sets the default device, so
+it intercepts **construction** rather than registration. Verified on this stack (torch
+2.10.0+rocm7.2.4): `with torch.device("meta"): nn.Linear(4, 4)` yields
+`weight.device == meta`. Two consequences:
+
+| | `_init_weight_params_on_meta` | `torch.device("meta")` context |
+|---|---|---|
+| Transient real allocation | one parameter | **none** |
+| Requires a GPU to exist | **yes** | **no** |
+| Covers buffers | no — the hook only sees parameters | **yes**, everything a constructor makes |
+
+The buffer row is the one that matters for Compass. A model that allocates a rotary table
+or an attention mask in `__init__` allocates it for real under the hook and on meta under
+the context.
+
+**Provenance, since this came up as "Transformers does this":** the mechanism is the same
+one `accelerate.init_empty_weights` provides — accelerate reaches it by patching
+`torch.empty` / `zeros` / `ones` / `full` on older torch, and by this same device context
+on torch ≥ 2.0. Checked here: **accelerate is not installed and is not an ATOM dependency**
+(`pyproject.toml` lists `transformers==5.12.1` and no accelerate), and transformers 5.12
+does not export `no_init_weights` / `init_empty_weights` from `modeling_utils`. So the
+in-tree `atom/models/utils.py` version *is* ATOM's own form of it, and reusing it needs no
+new dependency.
+
+**It is currently unused** — grep finds no caller. Compass would be its first consumer.
+
+One caveat on reusing the function rather than the mechanism: `no_init_weights` is shaped
+for a different job — it takes a `placeholder` callable and swaps submodules out. The part
+Compass wants is the `torch.device("meta")` context, which is one line. Calling ATOM's
+function would mean supplying a placeholder we do not want.
+
+#### Why Compass prefers `FakeTensorMode` anyway, and where the meta path is still used
 
 Design principle 1 says reuse ATOM's mechanisms, so the bar for not reusing this one has
 to be more than a few hundred megabytes of transient.
 
-It is: **the helper requires a GPU to exist at all.** Capture under `FakeTensorMode`
-requires none, and `07` Phase 1a depends on that — it is what makes tracing schedulable on
-a CPU-only container rather than queued behind the GPU booking queue (`16` D101). A path
-that needs a device is a path that competes for the scarce resource.
+The meta context solves the transient and the GPU requirement, so the remaining reason is
+neither of those. It is the one `04` D18 already gives:
 
-**What is reused, in both paths:** `--load_dummy empty`, which is how the checkpoint read
-is skipped. That is the mechanism doing the real work, and Compass does not replace it.
+> **Meta has no symbolic shapes, and `device.type` is `'meta'`.**
 
-**Where the helper is reused:** as the **fallback** if `FakeTensorMode` construction turns
-out not to work on ATOM's model classes — which is exactly what **T5** tests. If T5 fails,
-`--load_dummy empty` plus `_init_weight_params_on_meta` gives a device-resident but
-weight-free construction, at the cost of requiring a GPU for capture. That is a real
-degradation and an escalation (`16` D102), not a silent substitution.
+Both matter, and both are measured:
+
+- **No `ShapeEnv`.** `ShapeEnv` attaches to `FakeTensorMode`, not to a device context. Without
+  it there are no symbolic shapes, which puts capture back on the shape-synthesis route
+  that mispredicted **3 of 11 dimensions** at a held-out point — including a ceil-division
+  **9.5x off**, which two sample points straddling a block boundary hide entirely.
+- **Wrong device branch.** ATOM registers its ops at `dispatch_key="CUDA"`
+  (`atom/utils/custom_register.py:40`) and the model and runner branch on device
+  throughout. Under meta that code takes paths nobody runs — and *"meta accepts kernels
+  real devices reject"*: AITER's fused qk-rmsnorm takes fp16/bf16 only, and meta traced it
+  happily at fp32.
+
+So the split is by **what the caller needs**, not by which mechanism is cheapest:
+
+| Need | Path |
+|---|---|
+| geometry only | HF config, no module tree |
+| **a module tree, no tracing** — parameter enumeration, a structural walk | **`torch.device("meta")` context**, no GPU, no transient |
+| **a module tree for tracing** | **`FakeTensorMode`** — the only one with symbolic shapes and the right device branch |
+
+**What is reused in all three:** `--load_dummy empty`, which is how the checkpoint read is
+skipped. That is the mechanism doing the real work, and Compass does not replace it.
+
+**The T5 fallback is the meta context, not the hook.** If `FakeTensorMode` construction
+turns out not to work on ATOM's model classes, `--load_dummy empty` plus
+`torch.device("meta")` gives a weight-free, GPU-free module tree — losing symbolic shapes,
+so capture would fall back to concrete traces at the shapes that actually occur (`04`
+option C), not to shape synthesis. That is a real degradation and an escalation
+(`16` D102), not a silent substitution.
 
 ### Decision
 
@@ -170,7 +233,8 @@ degradation and an escalation (`16` D102), not a silent substitution.
 | Need | Path | Device touched |
 |---|---|---|
 | **geometry only** — M1's fake model, the weight-bytes term, configuration sweeps | **HF config, no module tree at all.** Weight bytes are Class A, exact from declared geometry: measured **-0.00 / +0.00 / -0.02 / +0.01%** at TP 1/2/4/8 (`10` D63). | none |
-| **a real module tree** — tracing for tier b, the liveness walk, structure discovery | **Construct the model inside `FakeTensorMode`**, with `--load_dummy empty` so no checkpoint is read. | none |
+| **a module tree, no tracing** - parameter enumeration, a structural walk | **`torch.device("meta")` context** with `--load_dummy empty`. ATOM already has this shape at `models/utils.py:457-496`. | none |
+| **a module tree for tracing** - tier b, the liveness walk, structure discovery | **Construct the model inside `FakeTensorMode`**, with `--load_dummy empty` so no checkpoint is read. | none |
 
 The second is not an addition to `04` D18 — it *is* D18, stated from the construction side.
 Building under the mode means every parameter is a `FakeTensor` at creation, so there is no
@@ -445,6 +509,6 @@ scheduler at shapes no real model has.
 | # | Decision | Date |
 |---|---|---|
 | D10 | Attach at `ModelRunner.forward`, delivered by a `--runner-qualname` subclass; no ATOM change for the injection | 2026-09-18 |
-| D10.1 | A model comes into existence two ways, neither reading weights: HF-config geometry alone where only geometry is needed, and construction **inside `FakeTensorMode`** with `--load_dummy empty` where a real module tree is. `--load_dummy` is reused in both. `_init_weight_params_on_meta` is not a bug - it trades a one-parameter transient for real buffers and unchanged init branches - but it requires a GPU to exist, which would put capture behind the GPU queue. It is the **fallback if T5 fails**. | 2026-09-20 |
+| D10.1 | A model comes into existence three ways, none reading weights: HF-config geometry where only geometry is needed; a `torch.device("meta")` context where a module tree is needed without tracing (no transient, no GPU, covers buffers - ATOM already has this shape at `models/utils.py:457-496`, unused); and `FakeTensorMode` for tracing, the only one with symbolic shapes and the right device branch. `--load_dummy` is reused in all three. `_init_weight_params_on_meta` is not a bug but is superseded by the meta context. The T5 fallback is the meta context plus concrete traces. | 2026-09-20 |
 | D11 | No modes on the runner. Every run simulates; the algorithm comes from a pluggable cost backend. `measure` and `trace` are orthogonal flags. | 2026-09-18 |
 | D12 | M1 fake model = KV/weight geometry from the HF config + a shape-analytic cost stub including the quadratic query term; constant mode retained for bring-up | 2026-09-18 |
