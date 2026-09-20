@@ -1,7 +1,8 @@
 # ATOM Compass — Design Topic 9: Fitting and Law Selection
 
-**Status:** draft for review. Drafted by an AI assistant during a design interview; not
-yet reviewed or approved. No code has been written against it.
+**Status:** reviewed and approved, 2026-09-20. Drafted by an AI assistant during a design
+interview and reviewed by jgong5 across two review rounds on PR #3. No code has been
+written against it yet; implementation follows the execution plan in `16`.
 
 **Depends on:** `07_calibration_toolchain.md` (the measurements being fitted),
 `04_model_capture_and_cost_ir.md` (the leaves a law prices).

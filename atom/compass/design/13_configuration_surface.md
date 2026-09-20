@@ -1,7 +1,8 @@
 # ATOM Compass — Design Topic 13: The Configuration Surface
 
-**Status:** draft for review. Drafted by an AI assistant during a design interview; not
-yet reviewed or approved. No code has been written against it.
+**Status:** reviewed and approved, 2026-09-20. Drafted by an AI assistant during a design
+interview and reviewed by jgong5 across two review rounds on PR #3. No code has been
+written against it yet; implementation follows the execution plan in `16`.
 
 **Depends on:** `05_machine_spec_and_probes.md` D24 (the separation rule this extends),
 and every other topic, each of which contributed a flag.

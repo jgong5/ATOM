@@ -1,9 +1,10 @@
 # ATOM Compass — Design
 
-**Status: design only.** Nothing here has been implemented, and every document carries a
-header marking it as an unreviewed draft. **116 decisions — D0–D102 with no gaps, plus 13 sub-decisions** — are
-indexed at the end of this file; **72 open TODOs (T1–T72)**, the load-bearing assumptions,
-the missing topics and the cross-cutting issues live in **`12_open_items.md`**.
+**Status: reviewed and approved, 2026-09-20. Design only — no code has been written
+against it yet.** Every document carries a matching header. **116 decisions — D0–D102
+with no gaps, plus 13 sub-decisions** — are indexed at the end of this file; **72 open
+TODOs (T1–T72)**, the load-bearing assumptions and the cross-cutting issues live in
+**`12_open_items.md`**. Implementation follows the execution plan in `16`.
 
 ---
 
@@ -467,7 +468,7 @@ The documents use these precisely; a reader will bounce off without them.
 
 ## Conventions
 
-- Every document opens with a **status header**. None has been reviewed.
+- Every document opens with a **status header** recording its review state.
 - Each file is a **design topic**; the numbered `D*` items inside it are **design points**.
   A topic owns several points. Sub-numbered points (`D3.1`, `D25.1`) extend the
   point they hang off, rather than renumbering everything downstream.

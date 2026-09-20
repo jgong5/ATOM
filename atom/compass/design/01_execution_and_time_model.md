@@ -1,7 +1,8 @@
 # ATOM Compass — Design Topic 1: Execution and Time Model
 
-**Status:** draft for review. Drafted by an AI assistant during a design interview; not
-yet reviewed or approved. No code has been written against it.
+**Status:** reviewed and approved, 2026-09-20. Drafted by an AI assistant during a design
+interview and reviewed by jgong5 across two review rounds on PR #3. No code has been
+written against it yet; implementation follows the execution plan in `16`.
 
 **Branch:** `feature/atomcompass_new` (clean fork of upstream `main` at `0b4f1ddb`).
 
@@ -642,15 +643,41 @@ runs.
 | **Grant order at the CA** when two LPs are eligible at the same virtual time | **not by default** — real arrival order decides | **Tie-break by LP identity, never by arrival order.** The CA holds a total order over LP ids and grants in it. This is the single most important rule here, and it costs one comparison. |
 | **Cost model output** | yes, if the backend is pure | no iteration over a `dict` or `set` whose order depends on insertion or on object identity; a fixed summation order over IR nodes, since float addition is not associative |
 | **Speculative acceptance draw** | already handled | `14` D83: one host draw seeded from the step counter, not `world_size` draws that must agree |
-| **Python `set` / `dict` iteration** over request or block ids | yes, if keys are ids | ids are strings and ints from ATOM, and insertion order is the schedule's order, which is itself deterministic — but any set of *objects* breaks it |
+| **`dict` iteration** over request or block ids | **yes** | insertion-ordered since Python 3.7, and insertion order is the schedule's order, which is itself deterministic |
+| **`set` iteration** | **NO — and this is the trap** | see below |
 | **Thread scheduling inside an LP** | irrelevant | by D4, waits inside one LP are invisible to modelled time |
 | **Deliberately-real clock reads** (metrics push cadence, transport) | irrelevant | `11` D72 — they affect when a scrape lands, not what it says |
+
+### `set` is the trap, and it is worse than "unordered"
+
+`dict` preserves insertion order; **`set` does not, and its order is not even stable
+between processes.** Iteration order follows hash values and the insertion history that
+produced the table's layout. For the ids Compass actually holds:
+
+- **string ids** — request ids, block hashes, LP names — are hashed with
+  **`PYTHONHASHSEED` randomisation**, on by default. So a `set` of request ids iterates
+  in a *different order in every process*, and two runs of one configuration diverge with
+  no code change at all.
+- **integer ids** hash to themselves, so a small-int set looks stable — which is worse,
+  because it works in testing and then reorders the moment the values spread out or the
+  table resizes.
+
+This is the one source in the table that produces a divergence with nothing to point at:
+no error, no warning, and a diff between two runs of identical code.
+
+**Rule: no `set` iteration on the simulated path.** Where set *semantics* are wanted, use
+a `dict` with `None` values as an ordered set, or sort explicitly at the point of
+iteration. Membership tests against a `set` are fine — it is only iteration that leaks
+order.
+
+This is mechanically checkable, so it joins the CI clock-source lint of D3.2 as a second
+rule in the same check rather than a convention anyone has to remember.
 
 ### The rule, and the test
 
 **Rule:** the CA's grant order is a total order over LP identity; the cost backend is a
-pure function of its `batch_view`; and no simulated-path code iterates a container whose
-order depends on object identity.
+pure function of its `batch_view`; and no simulated-path code iterates a `set` or any
+container whose order depends on object identity.
 
 **Test** (this is `08` T26, now with a mechanism): run the same configuration twice and
 diff the step tables byte for byte. It is CPU-only, it needs no GPU, and it belongs in CI
@@ -1203,7 +1230,7 @@ Ordered by how much they could cost.
 | D3.1 | Single CA with a hierarchy-ready interface; LP count scales with replicas and PP stages, not with GPUs | 2026-09-18 |
 | D3.2 | Three always-on causality detectors: receive-side straggler check (fails the run), annotation-coverage watchdog (warns), clock-source CI lint | 2026-09-19 |
 | D3.3 | CA deploys two ways from one implementation: co-hosted in the API-server process by default, standalone server via `--compass-clock-endpoint` for M4/M6 multi-container runs | 2026-09-19 |
-| D3.4 | Wall-clock interleaving may vary between runs; the `(LP, virtual time, event)` sequence may not. CA grants tie-break by **LP identity, never arrival order**; the cost backend is a pure function of its batch view. Test is a byte-diff of two step tables, CPU-only, in CI from the first stage that produces one. | 2026-09-20 |
+| D3.4 | Wall-clock interleaving may vary between runs; the `(LP, virtual time, event)` sequence may not. CA grants tie-break by **LP identity, never arrival order**; the cost backend is a pure function of its batch view; **no `set` iteration on the simulated path** - string ids are hashed under `PYTHONHASHSEED` randomisation, so a set of request ids iterates differently in every process. Test is a byte-diff of two step tables, CPU-only, in CI. | 2026-09-20 |
 | D3.5 | The CA owns three outputs: an opt-in timeline log, a deadlock dump naming every LP's state and lookahead row, and an always-written run summary carrying grants, speed ratio, lazy-trace cost, detector state and the refusal fractions `08` D50.1 gates on. | 2026-09-20 |
 | D4 | Four-category interception contract; annotate rather than intercept cross-LP blocking waits | 2026-09-18 |
 | D5 | Disable failure detectors, virtualize business logic; sorting rule is "does it change which batch gets scheduled" | 2026-09-18 |

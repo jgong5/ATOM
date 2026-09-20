@@ -1,7 +1,9 @@
 # ATOM Compass — Design Topic 10: Analytic Laws (Tier 0)
 
-**Status:** draft for review, and **more speculative than every other document here.**
-Docs 01–09 are grounded in measurements, most of which were got wrong once before they
+**Status:** reviewed and approved, 2026-09-20 — but **more speculative than every other
+document here.**
+
+Docs 01-09 are grounded in measurements, most of which were got wrong once before they
 were got right. This one has a single existence proof and four recorded failures. Treat
 its numbers as targets, not findings.
 

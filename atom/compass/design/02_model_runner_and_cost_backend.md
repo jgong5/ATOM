@@ -1,7 +1,8 @@
 # ATOM Compass — Design Topic 2: Model Runner Seam and Cost Backend
 
-**Status:** draft for review. Drafted by an AI assistant during a design interview; not
-yet reviewed or approved. No code has been written against it.
+**Status:** reviewed and approved, 2026-09-20. Drafted by an AI assistant during a design
+interview and reviewed by jgong5 across two review rounds on PR #3. No code has been
+written against it yet; implementation follows the execution plan in `16`.
 
 **Depends on:** `01_execution_and_time_model.md` (the clock protocol supplies the
 `advance_to` that consumes this document's output).
@@ -95,9 +96,6 @@ forces a chosen acceptance curve instead of computing one.
 
 ---
 
-
----
-
 ## D10.1. Bringing a model into existence without a device
 
 ### Problem
@@ -115,11 +113,55 @@ pieces; what is missing is a statement of which combination Compass uses, and wh
 | `_init_weight_params_on_meta` | `model_runner.py:4188-4211` | wraps `Module.register_parameter` so every `nn.Parameter` is replaced by a meta tensor as it is registered |
 | `RapidServeModelRunner._build_and_load_model` | `model_runner.py:4218` | the override point where a runner declines to load |
 
-`_init_weight_params_on_meta` is a working precedent and **not directly reusable**, for a
-reason its own docstring states: *"Each parameter is briefly created on the real device
-then replaced with a meta tensor, so the transient peak is one parameter, not the whole
-model."* A transient of one parameter is an excellent trade for disaggregated decode. For
-Compass it is still a device allocation, and design principle 2 admits none.
+#### Why `_init_weight_params_on_meta` allocates on the real device, despite its name
+
+The name describes the **end state** — every `nn.Parameter` ends up on meta — not the
+mechanism. The mechanism is a hook on `Module.register_parameter`, and by the time that
+hook runs the parameter **already exists**: `Module.__setattr__` constructs
+`nn.Parameter(torch.empty(...))` first and registers it second. The hook can only replace
+what it is handed.
+
+So construction allocates each parameter on the current default device, and the hook
+immediately swaps in a meta tensor and drops the original. Its own docstring is precise
+about this: *"Each parameter is briefly created on the real device then replaced with a
+meta tensor, so the transient peak is one parameter, not the whole model."*
+
+**It has to be that way, and the docstring says why:** the helper deliberately leaves the
+default device unchanged *"so init code that explicitly targets CUDA (e.g. aiter RoPE) and
+buffers work normally."* Setting the default device to meta would put **buffers** on meta
+too — and buffers are not parameters, so the hook never sees them — and would change the
+branch taken by init code that targets CUDA explicitly. For its actual use case,
+disaggregated decode, both of those must stay real: it fills parameters from prefill over
+CUDA IPC and recomputes RoPE caches locally.
+
+**So it is not a bug.** It is a deliberate trade — a one-parameter transient bought in
+exchange for real buffers and unchanged init branches — and for its use case the trade is
+clearly right. It avoids what the call site calls *"the transient 2x-weights peak that
+OOMs at TP=4"* (`model_runner.py:4222-4226`), which is the thing that mattered there.
+
+Worth noting for anyone reading that code: the call site says construction *"allocates
+zero GPU bytes"* while the helper says one parameter is transiently real. Both are true of
+different quantities — zero **persistent**, one parameter **transient**. The docstring is
+the precise one.
+
+#### Why Compass prefers `FakeTensorMode` anyway, and where the helper is still reused
+
+Design principle 1 says reuse ATOM's mechanisms, so the bar for not reusing this one has
+to be more than a few hundred megabytes of transient.
+
+It is: **the helper requires a GPU to exist at all.** Capture under `FakeTensorMode`
+requires none, and `07` Phase 1a depends on that — it is what makes tracing schedulable on
+a CPU-only container rather than queued behind the GPU booking queue (`16` D101). A path
+that needs a device is a path that competes for the scarce resource.
+
+**What is reused, in both paths:** `--load_dummy empty`, which is how the checkpoint read
+is skipped. That is the mechanism doing the real work, and Compass does not replace it.
+
+**Where the helper is reused:** as the **fallback** if `FakeTensorMode` construction turns
+out not to work on ATOM's model classes — which is exactly what **T5** tests. If T5 fails,
+`--load_dummy empty` plus `_init_weight_params_on_meta` gives a device-resident but
+weight-free construction, at the cost of requiring a GPU for capture. That is a real
+degradation and an escalation (`16` D102), not a silent substitution.
 
 ### Decision
 
@@ -403,6 +445,6 @@ scheduler at shapes no real model has.
 | # | Decision | Date |
 |---|---|---|
 | D10 | Attach at `ModelRunner.forward`, delivered by a `--runner-qualname` subclass; no ATOM change for the injection | 2026-09-18 |
-| D10.1 | A model comes into existence two ways, neither reading weights: HF-config geometry alone where only geometry is needed, and construction **inside `FakeTensorMode`** with `--load_dummy empty` where a real module tree is. `_init_weight_params_on_meta` is a precedent, not reusable - it briefly allocates each parameter on the real device. | 2026-09-20 |
+| D10.1 | A model comes into existence two ways, neither reading weights: HF-config geometry alone where only geometry is needed, and construction **inside `FakeTensorMode`** with `--load_dummy empty` where a real module tree is. `--load_dummy` is reused in both. `_init_weight_params_on_meta` is not a bug - it trades a one-parameter transient for real buffers and unchanged init branches - but it requires a GPU to exist, which would put capture behind the GPU queue. It is the **fallback if T5 fails**. | 2026-09-20 |
 | D11 | No modes on the runner. Every run simulates; the algorithm comes from a pluggable cost backend. `measure` and `trace` are orthogonal flags. | 2026-09-18 |
 | D12 | M1 fake model = KV/weight geometry from the HF config + a shape-analytic cost stub including the quadratic query term; constant mode retained for bring-up | 2026-09-18 |

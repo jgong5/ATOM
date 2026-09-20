@@ -1,7 +1,8 @@
 # ATOM Compass — Design Topic 6: The Workload Harness Contract
 
-**Status:** draft for review. Drafted by an AI assistant during a design interview; not
-yet reviewed or approved. No code has been written against it.
+**Status:** reviewed and approved, 2026-09-20. Drafted by an AI assistant during a design
+interview and reviewed by jgong5 across two review rounds on PR #3. No code has been
+written against it yet; implementation follows the execution plan in `16`.
 
 **Depends on:** `01_execution_and_time_model.md` (the Clock Authority and the Category-A/B
 wait contract), `05_machine_spec_and_probes.md` (the host terms the tokenizer model needs).

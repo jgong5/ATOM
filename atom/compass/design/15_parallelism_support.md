@@ -1,7 +1,8 @@
 # ATOM Compass — Design Topic 15: Parallelism Support (TP, DP, PP, EP)
 
-**Status:** draft for review. Drafted by an AI assistant during a design interview; not
-yet reviewed or approved. No code has been written against it.
+**Status:** reviewed and approved, 2026-09-20. Drafted by an AI assistant during a design
+interview and reviewed by jgong5 across two review rounds on PR #3. No code has been
+written against it yet; implementation follows the execution plan in `16`.
 
 **Depends on:** `01` (the LP structure and the wait contract this applies per strategy),
 `03` / `05` (width-keyed memory), `07` D40 (communication pricing), `04` (structures that
