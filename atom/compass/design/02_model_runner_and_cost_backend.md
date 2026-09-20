@@ -95,6 +95,69 @@ forces a chosen acceptance curve instead of computing one.
 
 ---
 
+
+---
+
+## D10.1. Bringing a model into existence without a device
+
+### Problem
+
+Compass needs a **module tree** for two things: weight geometry (the memory model's
+Class-A term) and tracing (`04` D18 walks ATOM's real model code). Neither may read
+checkpoint bytes onto a device or allocate weights there. ATOM already has most of the
+pieces; what is missing is a statement of which combination Compass uses, and when.
+
+### What ATOM already provides
+
+| Piece | Where | What it does |
+|---|---|---|
+| `--load_dummy {empty,zero,xavier}` | `config.py:1556`, `arg_utils.py:69,260`, `loader.py:126,234,289-307` | skips the checkpoint read; `empty` leaves params uninitialised, the others fill them with finite values in place |
+| `_init_weight_params_on_meta` | `model_runner.py:4188-4211` | wraps `Module.register_parameter` so every `nn.Parameter` is replaced by a meta tensor as it is registered |
+| `RapidServeModelRunner._build_and_load_model` | `model_runner.py:4218` | the override point where a runner declines to load |
+
+`_init_weight_params_on_meta` is a working precedent and **not directly reusable**, for a
+reason its own docstring states: *"Each parameter is briefly created on the real device
+then replaced with a meta tensor, so the transient peak is one parameter, not the whole
+model."* A transient of one parameter is an excellent trade for disaggregated decode. For
+Compass it is still a device allocation, and design principle 2 admits none.
+
+### Decision
+
+**Two paths, chosen by what the caller needs. Neither reads weights.**
+
+| Need | Path | Device touched |
+|---|---|---|
+| **geometry only** — M1's fake model, the weight-bytes term, configuration sweeps | **HF config, no module tree at all.** Weight bytes are Class A, exact from declared geometry: measured **-0.00 / +0.00 / -0.02 / +0.01%** at TP 1/2/4/8 (`10` D63). | none |
+| **a real module tree** — tracing for tier b, the liveness walk, structure discovery | **Construct the model inside `FakeTensorMode`**, with `--load_dummy empty` so no checkpoint is read. | none |
+
+The second is not an addition to `04` D18 — it *is* D18, stated from the construction side.
+Building under the mode means every parameter is a `FakeTensor` at creation, so there is no
+transient at all and the `register_parameter` wrapper is unnecessary.
+
+**Why `FakeTensorMode` and not a meta default device**, restating `04` D18's reason in this
+context: ATOM's init code explicitly targets CUDA — the docstring above names aiter RoPE —
+and buffers are constructed rather than registered as parameters. Under a meta default
+those paths take branches nobody runs; under `FakeTensorMode` they produce `FakeTensor`s
+carrying a `cuda` device tag and take the real branch.
+
+### Two hazards this inherits
+
+1. **`FakeTensorMode.__enter__` probes the driver** to choose the fake device, so model
+   construction can hang on a wedged node despite touching no GPU. Same caveat as `07`
+   Phase 1a: portable, not hermetic. The 30-second `rocminfo` check comes first.
+2. **Buffers are not parameters.** `--load_dummy` and the meta wrapper both act on
+   parameters; a model that allocates a large buffer in `__init__` — a rotary table, an
+   attention mask — allocates it for real unless the whole construction happens inside the
+   mode. That is the concrete argument for constructing *under* the mode rather than
+   wrapping `register_parameter`. Recorded as **T68**: enumerate buffer allocations in the
+   two target models and confirm none escapes the mode.
+
+### What this does not decide
+
+Whether a **quantized** checkpoint's geometry is derivable without reading it. Quantized
+weight bytes depend on the on-disk layout, and `10` D63 records that checkpoint-header
+derivation came out **3.3% low at TP=4** on the hybrid 27B. Out of scope for M1-M3;
+recorded as **T69**.
 ## D11. No modes on the runner; the algorithm comes from a backend
 
 ### Problem
@@ -340,5 +403,6 @@ scheduler at shapes no real model has.
 | # | Decision | Date |
 |---|---|---|
 | D10 | Attach at `ModelRunner.forward`, delivered by a `--runner-qualname` subclass; no ATOM change for the injection | 2026-09-18 |
+| D10.1 | A model comes into existence two ways, neither reading weights: HF-config geometry alone where only geometry is needed, and construction **inside `FakeTensorMode`** with `--load_dummy empty` where a real module tree is. `_init_weight_params_on_meta` is a precedent, not reusable - it briefly allocates each parameter on the real device. | 2026-09-20 |
 | D11 | No modes on the runner. Every run simulates; the algorithm comes from a pluggable cost backend. `measure` and `trace` are orthogonal flags. | 2026-09-18 |
 | D12 | M1 fake model = KV/weight geometry from the HF config + a shape-analytic cost stub including the quadratic query term; constant mode retained for bring-up | 2026-09-18 |

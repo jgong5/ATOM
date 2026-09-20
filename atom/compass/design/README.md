@@ -1,8 +1,8 @@
 # ATOM Compass — Design
 
 **Status: design only.** Nothing here has been implemented, and every document carries a
-header marking it as an unreviewed draft. **105 decisions — D0–D94 with no gaps, plus 10 sub-decisions** — are
-indexed at the end of this file; **67 open TODOs (T1–T67)**, the load-bearing assumptions,
+header marking it as an unreviewed draft. **108 decisions — D0–D94 with no gaps, plus 13 sub-decisions** — are
+indexed at the end of this file; **70 open TODOs (T1–T70)**, the load-bearing assumptions,
 the missing topics and the cross-cutting issues live in **`12_open_items.md`**.
 
 ---
@@ -537,7 +537,7 @@ The documents use these precisely; a reader will bounce off without them.
 
 | Doc | Title | What it holds |
 |---|---|---|
-| [`12`](12_open_items.md) | Open Items | The five load-bearing assumptions and their check plans; the missing-topic register; T1–T67; cross-cutting issues; pending amendments. |
+| [`12`](12_open_items.md) | Open Items | The five load-bearing assumptions and their check plans; the missing-topic register; T1–T70; cross-cutting issues; pending amendments. |
 
 ### Not yet written
 
@@ -551,8 +551,8 @@ The documents use these precisely; a reader will bounce off without them.
 
 | Decisions | Document |
 |---|---|
-| D0 – D9 (+ D3.1–D3.3) | `01` Execution and Time Model |
-| D10 – D12 | `02` Model Runner Seam and Cost Backend |
+| D0 – D9 (+ D3.1–D3.5) | `01` Execution and Time Model |
+| D10 – D12 (+ D10.1) | `02` Model Runner Seam and Cost Backend |
 | D13 – D16 | `03` Memory Model and the KV Pool |
 | D17 – D23 | `04` Model Capture and the Cost IR |
 | D24 – D26 (+ D25.1) | `05` Machine Specification and its Probes |

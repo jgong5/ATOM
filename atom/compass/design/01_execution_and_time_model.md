@@ -611,6 +611,114 @@ single-container runs stop testing the property they are supposed to be testing.
 
 ---
 
+
+---
+
+## D3.4. Determinism: what a simulated run must reproduce, and what it need not
+
+### Problem
+
+`08` T26 asks for bit-reproducibility as a test, and the whole paired-comparison protocol
+leans on it: a simulated side that disagrees with *itself* between runs cannot be compared
+with a real side at all. But a multi-process simulator has several genuine sources of
+non-determinism, and demanding that all of them vanish would mean rebuilding the process
+model that D1 deliberately kept.
+
+### The distinction that makes this tractable
+
+> **Wall-clock interleaving may vary between runs. The sequence of
+> `(LP, virtual time, event)` may not.**
+
+Nothing downstream reads wall time. Every graded number, every step-table row and every
+artifact is a function of virtual time, so reproducibility is a property of the *virtual*
+schedule and of nothing else. Two runs may take different real durations, issue grants in
+different real orders, and schedule their threads differently, and still be identical
+runs.
+
+### The sources, and what each needs
+
+| Source | Deterministic? | What makes it so |
+|---|---|---|
+| **Grant order at the CA** when two LPs are eligible at the same virtual time | **not by default** — real arrival order decides | **Tie-break by LP identity, never by arrival order.** The CA holds a total order over LP ids and grants in it. This is the single most important rule here, and it costs one comparison. |
+| **Cost model output** | yes, if the backend is pure | no iteration over a `dict` or `set` whose order depends on insertion or on object identity; a fixed summation order over IR nodes, since float addition is not associative |
+| **Speculative acceptance draw** | already handled | `14` D83: one host draw seeded from the step counter, not `world_size` draws that must agree |
+| **Python `set` / `dict` iteration** over request or block ids | yes, if keys are ids | ids are strings and ints from ATOM, and insertion order is the schedule's order, which is itself deterministic — but any set of *objects* breaks it |
+| **Thread scheduling inside an LP** | irrelevant | by D4, waits inside one LP are invisible to modelled time |
+| **Deliberately-real clock reads** (metrics push cadence, transport) | irrelevant | `11` D72 — they affect when a scrape lands, not what it says |
+
+### The rule, and the test
+
+**Rule:** the CA's grant order is a total order over LP identity; the cost backend is a
+pure function of its `batch_view`; and no simulated-path code iterates a container whose
+order depends on object identity.
+
+**Test** (this is `08` T26, now with a mechanism): run the same configuration twice and
+diff the step tables byte for byte. It is CPU-only, it needs no GPU, and it belongs in CI
+from the first stage that produces a step table — because the failure it catches is one
+that gets *much* harder to localise once several tracks are contributing.
+
+**What the test does not cover:** a run that is reproducible and wrong in the same way
+twice. Determinism is a precondition for comparison, not evidence of fidelity.
+
+---
+
+## D3.5. Observability: the Clock Authority owns the timeline
+
+### Problem
+
+D3.1 records that the CA is the only component that knows every LP's virtual time, and
+that it should therefore own the global timeline log and the deadlock dump — and that
+*"its output format is part of the acceptance evidence and should be designed, not
+improvised."* This is that design. It is deliberately small.
+
+Note the boundary with `11`: that topic covers ATOM's **Prometheus engine metrics**, which
+describe the *simulated system*. This covers the **simulator itself** — whether the run was
+valid, not what the modelled engine did. Different consumers, different lifetimes, no
+overlap.
+
+### Three outputs, and nothing else
+
+**1. The timeline log.** One append-only record per granted advance:
+
+```
+  lp_id . virtual_time_from . virtual_time_to . event . detail
+```
+
+Written by the CA because it is the only place with a consistent global view, and the
+only place where the ordering is authoritative. It is what makes a causality report
+actionable: when the straggler check (D3.2) fails, the log already contains both LPs'
+histories up to the violation.
+
+**2. The deadlock dump.** When no LP can be granted, the CA dumps, for every LP: its
+current virtual time, its declared state (`running` / `blocked`), what it declared itself
+blocked on, and the lookahead row that produced its grant bound. A deadlock is the *loud*
+failure D4 deliberately engineered for — this is what makes it diagnosable rather than
+merely noisy.
+
+**3. The run summary**, written once at the end and carried in the run artifact:
+
+| Field | Why |
+|---|---|
+| grants issued, per LP | the protocol's own cost; the number that says whether PP degree is affordable |
+| wall seconds vs simulated seconds | the speed result (`08`), and the only place the ≥5x target is measured |
+| lazy traces: count and wall seconds | `02` — they consume real time inside a simulated run and must not silently degrade the speed result |
+| causality detector state | straggler count (must be 0), watchdog warnings, clock-lint status |
+| refusals: count, fraction of steps, **fraction of predicted seconds**, distinct reasons | `08` D50.1's admissibility gate reads this |
+
+### Two rules
+
+1. **The timeline log is off by default and costs nothing when off.** It is a debugging
+   and evidence artifact, not a per-step tax; at millions of grants it would dominate a
+   fast run. The *summary* is always written — it is small and it is what the acceptance
+   gate reads.
+2. **The summary is part of the run artifact, not a log line.** `13` D81's rule applies:
+   recorded by value, so a result can be audited without the machine that produced it.
+
+### Open issue
+
+- The timeline log's volume at PP degree > 1 is unestimated. Grants scale with PP stages
+  and with the microsecond lookahead between them, so the log could be very large exactly
+  where it is most wanted. Recorded as **T70**.
 ## D4. The interception contract: which waits must be touched
 
 ### Problem
@@ -1095,6 +1203,8 @@ Ordered by how much they could cost.
 | D3.1 | Single CA with a hierarchy-ready interface; LP count scales with replicas and PP stages, not with GPUs | 2026-09-18 |
 | D3.2 | Three always-on causality detectors: receive-side straggler check (fails the run), annotation-coverage watchdog (warns), clock-source CI lint | 2026-09-19 |
 | D3.3 | CA deploys two ways from one implementation: co-hosted in the API-server process by default, standalone server via `--compass-clock-endpoint` for M4/M6 multi-container runs | 2026-09-19 |
+| D3.4 | Wall-clock interleaving may vary between runs; the `(LP, virtual time, event)` sequence may not. CA grants tie-break by **LP identity, never arrival order**; the cost backend is a pure function of its batch view. Test is a byte-diff of two step tables, CPU-only, in CI from the first stage that produces one. | 2026-09-20 |
+| D3.5 | The CA owns three outputs: an opt-in timeline log, a deadlock dump naming every LP's state and lookahead row, and an always-written run summary carrying grants, speed ratio, lazy-trace cost, detector state and the refusal fractions `08` D50.1 gates on. | 2026-09-20 |
 | D4 | Four-category interception contract; annotate rather than intercept cross-LP blocking waits | 2026-09-18 |
 | D5 | Disable failure detectors, virtualize business logic; sorting rule is "does it change which batch gets scheduled" | 2026-09-18 |
 | D6 | KV transfer is simulated through a connector registered in the existing factory | 2026-09-18 |

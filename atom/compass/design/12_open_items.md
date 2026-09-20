@@ -11,7 +11,7 @@ backlog. Nothing here is a decision; every decision lives in its topic's decisio
 
 1. **Load-bearing assumptions** — hold up large parts of the design; each has a check plan
 2. **Missing topics** — design points nobody has written yet, with a recommendation
-3. **TODO register** — T1–T67, per topic
+3. **TODO register** — T1–T70, per topic
 4. **Cross-cutting issues and pending amendments**
 
 ---
@@ -54,13 +54,14 @@ silently carried as gaps.
 |---|---|---|---|
 | ~~M-a~~ | ~~Configuration surface and CLI~~ | Flags were scattered across five topics with no owner and no precedence rule. | **DONE** - topic `13_configuration_surface.md`, D78-D81. |
 | ~~M-b~~ | ~~Refusal semantics end to end~~ | Seven documents emitted refusals and none said what one *does to the run*. | **DONE** - `08` D50.1: mark and continue, priced by the next answerable rung, with a >5%-of-predicted-seconds admissibility gate. |
-| **M-c** | **Model loading without a GPU** | 关键技术点 1.4.2. Doc `03` covers memory *sizing*; nothing covers how the module tree comes into existence to be traced. ATOM has the pieces — `--load_dummy {empty,zero,xavier}`, `RapidServeModelRunner._init_weight_params_on_meta` — but no doc names the path or says whether weights are read at all. | **Fold into `02`** as a section. Small, and the in-tree precedents do most of the work. |
+| ~~M-c~~ | ~~Model loading without a GPU~~ | 关键技术点 1.4.2. Doc `03` covers memory *sizing*; nothing covers how the module tree comes into existence to be traced. ATOM has the pieces — `--load_dummy {empty,zero,xavier}`, `RapidServeModelRunner._init_weight_params_on_meta` — but no doc names the path or says whether weights are read at all. | **DONE** - `02` D10.1: HF-config geometry where only geometry is needed, construction inside `FakeTensorMode` with `--load_dummy empty` where a module tree is. |
 | ~~M-d~~ | ~~TP / DP / PP / EP specifics~~ | M1 names all four, and DP couples *scheduling decisions* across ranks through a per-forward collective that rewrites the batch - so the LP structure is an M1 deliverable, not an M7 one. | **DONE** - topic `15_parallelism_support.md`, D88-D94, with an explicit M1/M7 split. |
-| **M-e** | **Determinism and reproducibility** | Doc `08` **T26** asks for bit-reproducibility as a test, but nothing designs for it. Under a distributed CA, grant ordering is a function of real-time message arrival unless something pins it. Two runs of one configuration disagreeing would undermine every paired comparison. | **Fold into `01`** as a section under D3. It is a property of the clock protocol. |
+| ~~M-e~~ | ~~Determinism and reproducibility~~ | Doc `08` **T26** asks for bit-reproducibility as a test, but nothing designs for it. Under a distributed CA, grant ordering is a function of real-time message arrival unless something pins it. Two runs of one configuration disagreeing would undermine every paired comparison. | **DONE** - `01` D3.4: the `(LP, virtual time, event)` sequence is what must reproduce; CA grants tie-break by LP identity. |
 | ~~M-f~~ | ~~Speculative decoding / MTP~~ | Acceptance is a *behaviour* Compass cannot compute - the first quantity in the design that is neither derivable nor measurable. | **IN SCOPE** by decision 2026-09-19; topic `14_speculative_decoding.md`, D82-D87. Placed as **M3.5** (mechanism on Qwen3.8-27B), real claim at M5/M6. |
-| **M-g** | **Simulated-run observability** | Doc `01` D3.1's open issue says the CA should own the global timeline log and the deadlock dump, and that "its output format is part of the acceptance evidence and should be designed, not improvised". Doc `11` covers Prometheus metrics, which is a different thing. Still improvised. | **Fold into `01`** alongside M-e. |
+| ~~M-g~~ | ~~Simulated-run observability~~ | Doc `01` D3.1's open issue says the CA should own the global timeline log and the deadlock dump, and that "its output format is part of the acceptance evidence and should be designed, not improvised". Doc `11` covers Prometheus metrics, which is a different thing. Still improvised. | **DONE** - `01` D3.5: timeline log, deadlock dump, and an always-written run summary. |
 
-**Still open:** fold **M-c**, **M-e** and **M-g** into their own topics as sections.
+**All seven are now closed.** M-a `13`; M-b `08` D50.1; M-c `02` D10.1; M-d `15`; M-e `01` D3.4;
+M-f `14`; M-g `01` D3.5.
 
 ---
 
@@ -114,7 +115,7 @@ silently carried as gaps.
 | T23 | Choose the family-2 distance function |
 | T24 | Define "structural event" for family 3 beyond prefill streaks |
 | T25 | Measure the real-vs-real noise floor under closed-loop replay at high client count |
-| T26 | Assert simulator bit-reproducibility as a test — see **M-e** above |
+| T26 | Assert simulator bit-reproducibility as a test — mechanism now `01` D3.4; this item is the CI wiring |
 | T27 | Decide the 256-client cell's construction |
 | T28 | Establish whether ranking/regret becomes an explicit acceptance gate |
 | ~~T48~~ | ~~What a refusal does to a run~~ - **DONE**: `08` D50.1, mark-and-continue with a 5%-of-seconds admissibility gate |
@@ -169,6 +170,14 @@ silently carried as gaps.
 | T61 | Decide how chunked prefill and drafting interact, and what structure that produces |
 | T62 | Assert the host acceptance draw and the Triton kernel agree: same declared rates, same seed, same accepted-count distribution over a few thousand draws |
 | T63 | Add ATOM flag `--spec-decode-acceptance-rates` (list) - contract 2 has no transport today; the CLI exposes only the two scalars |
+
+### Topics 02, 01 — gaps now closed
+
+| # | Item |
+|---|---|
+| T68 | Enumerate buffer allocations in the two target models and confirm none escapes `FakeTensorMode` - `--load_dummy` and the meta wrapper act on parameters only |
+| T69 | Whether a quantized checkpoint's geometry is derivable without reading it; header derivation was 3.3% low at TP=4 on the 27B |
+| T70 | Estimate the timeline log's volume at PP degree > 1 - grants scale with stages and microsecond lookahead, so it is largest exactly where it is most wanted |
 
 ### Topic 15 — parallelism support
 
