@@ -119,17 +119,40 @@ resolved against.
 
 Four things, all required:
 
-1. **ATOM's test suite passes unmodified.** 187 files, no GPU needed (`08` D43.1). Needing
-   to edit an ATOM test means the change altered ATOM's behaviour and must be justified on
-   its own terms, not absorbed.
+1. **ATOM's tests pass unmodified, in two tiers.** Revised 2026-09-20 by P0.2, which
+   measured what this gate, `08` D43.1 and ATOM's own `CLAUDE.md` all assert — that the
+   187-file suite runs GPU-free and green — and found both halves false. 32 files reach the
+   driver (28 of them at *collection* time, via `rocminfo`), and `tests/plugin/` needs
+   sglang and vllm, which are in neither image.
+
+   - **Per task — the CPU gate.** `tests/` minus `tests/plugin/` (30 files) minus the 32
+     driver-dependent files: **125 files, 3925 passed, 0 failed, rc=0, 33 s** in the CPU
+     container. Green is the bar, because it *is* green. The exclusion list is
+     `scripts/compass/cpu_gate_exclude.txt`, derived by iterating collection to a fixed
+     point rather than by hand, and it is regenerated — never edited — when it drifts.
+   - **Per wave — the GPU superset.** `tests/ --ignore=tests/plugin` in the GPU container,
+     judged as a **delta** against the P0.2 baseline of **4730 passed / 5 failed** at
+     `83daf636d`. The five are one bf16 ULP each and pre-existing. A review record that
+     claims "green" instead of citing the delta has not read the baseline.
+
+   **The CPU gate's blind spot is not random.** The 32 excluded files include all five
+   `test_eplb_module_*`, plus `test_dp_metadata`, `test_dp_sync_layout`,
+   `test_cudagraph_capture_bounds` and `test_block_table_marshal` — the areas Compass
+   models most closely. **A task touching EPLB, DP metadata, CUDA-graph capture bounds or
+   block tables runs the GPU superset as part of its own gate, not at wave end.**
+
+   Needing to edit an ATOM test still means the change altered ATOM's behaviour and must be
+   justified on its own terms, not absorbed.
 2. **New CPU-only tests** for what the task added, in `tests/compass/`, in ATOM's style.
 3. **One named result**, stated in the brief and not chosen afterwards — what this task
    now makes possible that was not possible before.
 4. **Review by the task's reviewer agent**, against its brief and the cited decisions.
 
-**Baseline first.** P0.2 records the suite's and ruff's current pass/fail state before the
-first Compass commit. A pre-existing failure attributed to Compass costs a day, and the
-lint baseline on this repository is already known to be dirty.
+**Baseline first — done.** P0.2 measured it at `83daf636d` on node 18: CPU gate green;
+GPU superset 4730 passed / 5 failed; `ruff check .` **1003 errors, 640 fixable**;
+`black --check .` clean over 660 files. So the lint gate is "**no new** ruff error, and
+black stays clean" — never "ruff is clean", which it has never been. Record and raw output:
+`agent_scratch/compass_dev/tasks/P0.2.md`.
 
 ---
 
@@ -377,7 +400,7 @@ Stated so it is not mistaken for an omission.
 | D95 | Tasks are a **pool**, not a track assignment; 5 dev + 5 reviewer agents cap concurrency at 5 in flight. Conflicts are tolerated and are a **decomposition signal**. Developer and reviewer are separate agents with opposed objectives. **Halt and discuss on any surprise.** | 2026-09-20 |
 | D96 | Context is durable **in the task record** — brief, dev record, review record, handoff — with each brief linking to its predecessors'. A brief that cannot name its file set is not claimable. | 2026-09-20 |
 | D97 | `feature/atomcompass_new` is the integration branch; one worktree and one PR per task. Four setup rules from recorded failures: no shared mutable source root, containers mount the worktree parent, `PYTHONPATH` verified before trusting a result, `git archive` never `rsync`. | 2026-09-20 |
-| D98 | Four gates per task: ATOM's suite green **unmodified**, new CPU-only tests, one named result stated in advance, and review by a separate agent. Baselines recorded first. | 2026-09-20 |
+| D98 | Four gates per task: ATOM's tests pass **unmodified** — a green 125-file CPU gate per task, the GPU superset per wave as a delta against 4730/5 — plus new CPU-only tests, one named result stated in advance, and review by a separate agent. Amended 2026-09-20 after P0.2 disproved "187 files, no GPU needed". | 2026-09-20 |
 | D99 | Effort in **lines of code**. Wall-clock only for machine time with a measured basis. A 2x overrun is a halt-and-discuss event. | 2026-09-20 |
 | D100 | Twelve modules under `atom/compass/`; tasks are cut so each touches one plus its tests. ATOM edits outside that tree are enumerated per task. | 2026-09-20 |
 | D101 | One GPU queue; tasks declare their measurement before becoming claimable. Pre-flight is **three** checks — wedge, compute, **VRAM** — run before *and* after. | 2026-09-20 |
