@@ -32,6 +32,14 @@ import sys
 #: model.
 MIN_DENOMINATOR_S = 0.010
 
+#: Output-token count below which a request's TPOT is kept out of the TPOT
+#: aggregates. TPOT divides by `output_tokens - 1`, so at two tokens it is a
+#: single inter-token gap rather than a rate, and it enters the mean with the
+#: same weight as a nine-hundred-token request's average. On one rung five such
+#: requests took the mean from +18% to +229% and the worst ratio to 365x while
+#: the median stayed at -1.3%. The per-request value is still written out.
+TPOT_MIN_OUTPUT_TOKENS = 4
+
 
 def _load(path):
     with open(path, encoding="utf-8") as fh:
@@ -85,6 +93,11 @@ def _per_request(artifact):
         out[result["index"]] = {
             "ttft_s": ttft,
             "tpot_s": decode,
+            # The same number, present only when the denominator is large
+            # enough for it to be a rate. Aggregates read this; per-request
+            # readers read tpot_s, so a short request stays inspectable.
+            "tpot_rate_s": (decode if produced >= TPOT_MIN_OUTPUT_TOKENS
+                            else None),
             "latency_s": latency,
             "output_tokens": produced,
             "prompt_tokens": int(usage.get("prompt_tokens", 0) or 0),
@@ -195,12 +208,24 @@ def compare(real, modelled):
     if not paired:
         blocking.append("no request could be joined between the two artifacts")
 
+    tpot = _summary(*_errors(r, m, "tpot_rate_s"))
+    # Counted and reported rather than silently dropped: a rung where five
+    # requests left the TPOT aggregate is a different fact from one where none
+    # did, and the reader cannot tell from the mean.
+    tpot["below_output_token_floor"] = sum(
+        1 for index, real_row in r.items()
+        if index in m and real_row.get("tpot_s") is not None
+        and m[index].get("tpot_s") is not None
+        and (real_row.get("tpot_rate_s") is None
+             or m[index].get("tpot_rate_s") is None))
+    tpot["output_token_floor"] = TPOT_MIN_OUTPUT_TOKENS
+
     report = {
         "requests_paired": len(paired),
         "requests_real": len(r),
         "requests_modelled": len(m),
         "ttft": _summary(*_errors(r, m, "ttft_s")),
-        "tpot": _summary(*_errors(r, m, "tpot_s")),
+        "tpot": tpot,
         # Reported because it is what a reader expects to see, and listed last
         # with this note because on this workload it is the number that has
         # concealed the error four separate times.
@@ -251,6 +276,10 @@ def main(argv=None) -> int:
         print(f"  {field:<8} mean {s['mean_signed']:+.1%}  p50 "
               f"{s['p50_signed']:+.1%}  p90|err| {s['p90_abs']:.1%}  "
               f"max|err| {s['max_abs']:.1%}  (n={s['relative_n']})")
+        if field == "tpot" and s.get("below_output_token_floor"):
+            print(f"           {s['below_output_token_floor']} held out under "
+                  f"{TPOT_MIN_OUTPUT_TOKENS} output tokens, where TPOT is one "
+                  f"inter-token gap and not a rate")
     print(f"  {report['latency_note']}")
     for side in ("real", "modelled"):
         reuse = report["reuse"][side]
