@@ -228,9 +228,13 @@ Phase 0's environment. All CPU-only.
 component, and the one whose failures are silent — gets exercised without ATOM and without
 a GPU, so it runs in CI on every change thereafter.
 
-**W1.9's estimate is conditional on P0.3.** If `AgenticReplayStrategy` cannot be
-subclassed, this becomes ~2,000 lines of vendored code that must track upstream, and that
-is an escalation rather than a bigger task.
+**W1.9's estimate is no longer conditional. P0.3 resolved T10 on 2026-09-20:** subclassing
+works and nothing is vendored, so the row stands at 450–650 lines. The spike also found
+that a strategy subclass alone is **not sufficient** — three further pacing sites live in
+`BranchOrchestrator` and `ReplayBarrierCoordinator`, which a subclass never sees. W1.9
+therefore rebinds the shared `LoopScheduler` module global from the plugin bootstrap,
+covering all seven sites in about five lines (`06` D34). W1.9's acceptance must assert
+that **none** of the seven advances on the real clock, not merely that the strategy's does.
 
 ---
 

@@ -464,7 +464,7 @@ agentx-harness is a fork of **NVIDIA AIPerf v0.12.0**, Apache-2.0, ~203,654 line
    communication backend, timing strategy, dataset loader, metric or exporter with **zero
    edits to their repo**. Highest priority wins.
 2. **All arrival pacing funnels through one abstraction** — `common/loop_scheduler.py`,
-   37 call sites, all but 3 inside `timing/`. The single line that matters is
+   37 call sites, all but 3 inside `timing/`. The busiest is
    `timing/strategies/agentic_replay.py:1559`:
 
 ```python
@@ -474,6 +474,26 @@ if next_meta.delay_ms is not None and next_meta.delay_ms > 0:
 else:
     await coro
 ```
+
+   **P0.3 correction (2026-09-20): that line is not the only seam.** For
+   `AGENTIC_REPLAY`, `PhaseRunner.__init__` hands the *same* `LoopScheduler`
+   instance to `BranchOrchestrator` — always built for this timing mode — and to
+   `ReplayBarrierCoordinator`. Three of their calls are real arrivals that a
+   strategy subclass never sees: `branch_orchestrator.py:1265` (a spawned
+   child's turn-0 dispatch at its recorded offset), `:1467` (the join replay
+   deadline that releases a blocked parent), and `replay_dependencies.py:319`
+   (`cap_pending_delay_for_group`). Under virtual time those would advance on
+   the **real** clock — a silent divergence, not a crash, which is the worst
+   failure mode this design has.
+
+   What saves the estimate is the funnel claim above, not the line number. All
+   seven pacing sites obtain `LoopScheduler` as a **module global**
+   (`timing/phase/runner.py:191` constructs the one instance they share), so
+   **rebinding that single name from our plugin bootstrap reaches every site**
+   in about five lines — still with zero edits to their repo. That is the seam
+   we take (T10, resolved; `16` W1.9). A strategy subclass remains the fallback
+   if upstream ever stops sharing the instance, and it is the mechanism by which
+   the rebound class is installed.
 
 3. **Metrics are stamped in the transport**, so our transport controls them.
    `ttft_metric.py:49-56` is `content_responses[0].perf_ns - request.start_perf_ns`;
@@ -489,7 +509,7 @@ else:
 | Component | Lines |
 |---|---|
 | Transport plugin — real HTTP, re-stamp anchors from `sim_*` | 150-250 |
-| Timing-strategy override — redirect `schedule_later` to the clock client | 80-150 **if subclassing works** |
+| `LoopScheduler` rebind + clock-paced scheduler — covers all seven pacing sites | 80-150 |
 | Clock client library | 100-150 |
 | Plugin manifest, bootstrap, config glue | ~100 |
 | Tests | 200-400 |
