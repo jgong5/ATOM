@@ -457,7 +457,11 @@ request appearing in `scheduler.waiting`, **excluding** tokenize.
 ### What it plugs into
 
 agentx-harness is a fork of **NVIDIA AIPerf v0.12.0**, Apache-2.0, ~203,654 lines under
-`src/aiperf/`. Two facts make the adapter small:
+`src/aiperf/`. **Every file:line citation in this decision is against the checkout at
+`llm_infer_deploy_study/repos/agentx-harness`, commit
+`56a0cf70f4c0359454ee4bd15a17770b541a3e3e` (2026-08-18)** — a version string is not a
+revision, and W1.9's acceptance iterates these line numbers. Two facts make the adapter
+small:
 
 1. **34 plugin categories**, discovered via an `aiperf.plugins` setuptools entry point
    (`pyproject.toml:84`). An out-of-tree package can register a transport, service manager,
@@ -492,6 +496,13 @@ else:
    from a Compass bootstrap reaches every one of them** — still with zero edits to
    their repo.
 
+   The target is **the runner's scheduler**, not "the `LoopScheduler`". `LoopScheduler()`
+   is constructed in three places in `src/`: `common/loop_scheduler.py:18` (a docstring
+   example), `timing/phase/runner.py:191` (the one in scope), and
+   `zmq/zmq_base_client.py:96`, which uses its scheduler only for `execute_async` and
+   `cancel_all` (`:77`, `:167-168`) — transport plumbing, not arrival pacing. The rebind
+   does not reach that third one, and should not: it stays on the real clock.
+
    **The seam is the rebind; a subclass asserts it took effect** (T10 resolved,
    owner decision 2026-09-20, option C; `16` W1.9). Rebinding alone fails
    *silently*, so the plugin also registers a subclass whose only job is to refuse
@@ -500,7 +511,7 @@ else:
 ```python
 class CompassAgenticReplay(AgenticReplayStrategy):
     def __init__(self, *, scheduler, **kw):
-        if not isinstance(scheduler, ClockPacedScheduler):
+        if not isinstance(scheduler, ClockPacedLoopScheduler):
             raise RuntimeError(
                 f"Compass clock not installed: scheduler is {type(scheduler).__name__}. "
                 "The bootstrap did not run before PhaseRunner was constructed."
@@ -513,25 +524,62 @@ class CompassAgenticReplay(AgenticReplayStrategy):
    plugin factory, so this object is guaranteed to be constructed on the
    `AGENTIC_REPLAY` path, which makes it the one place an assert reliably fires.
 
-   **The tripwire is load-bearing, not belt-and-braces. Review of P0.3
-   (2026-09-20) found the rebind does not work with any bootstrap that exists
-   today**, and the failure is partial rather than total:
+   **The tripwire is load-bearing, not belt-and-braces.** The bootstrap has to run
+   before the first `PhaseRunner.__init__`, and the obvious way to ship it does
+   not. If the rebind is an import-time side effect of the Compass *strategy
+   module*, it runs too late, and the failure is partial rather than total:
 
    - `discover_plugins()` reads `plugins.yaml` manifests and imports **no** plugin
-     module — `loaded_class` is `None` for every entry until `get_class`. So the
-     Compass module is first imported inside `PhaseRunner._build_strategy`
+     module — `loaded_class` is `None` for every entry until `get_class`. The
+     strategy module would first be imported inside `PhaseRunner._build_strategy`
      (`runner.py:488`), *after* `__init__` built the real `LoopScheduler` at
      `runner.py:191` and handed it to the orchestrator and the barrier.
-   - Phase 0 (warmup) therefore paces on the **real** clock; phase 1 (profiling)
-     gets the rebound class. **A smoke test passes.** Executed probe, 7/7.
+   - Phase 0 (warmup) would then pace on the **real** clock while phase 1
+     (profiling) got the rebound class. **A smoke test passes.**
 
-   So **T73 — name a bootstrap that provably precedes the first `PhaseRunner` — is
-   a precondition of the seam working at all, not a tidy-up.** Candidates: a
-   Compass plugin in a category resolved earlier (`system_controller.py:144/156`
-   resolve `SERVICE_MANAGER` and `UI` before the timing manager starts), or an
-   explicit CLI/config hook. Until one is named and proven, the tripwire fires on
-   phase 0 of every run — which is the correct behaviour, and why it ships with
-   the rebind rather than after it.
+   Executed, 7/7 — `probe_order.py`, P0.3 review round 1, re-run 2026-09-20. The
+   seven, because a score is not a decomposition: (0) the Compass module is not
+   imported by discovery or by manifest registration; (1) the phase-0 runner is
+   built before any plugin class import; (2) its scheduler is the real
+   `LoopScheduler`; (3) `get_class` is what imports the Compass module, so a
+   side-effect bootstrap runs *there*; (4) phase-0's live scheduler is still the
+   real one; (5) its orchestrator and barrier share that same real-clock object;
+   (6) the *next* phase's runner does get the rebound class — half-working, and
+   silent.
+
+   **A bootstrap that provably precedes the first `PhaseRunner` does exist, and it
+   is one line of packaging — T73.** Entry-point *resolution* is itself the hook.
+   `plugins.py:210` calls `importlib.util.find_spec(module_name)` on the entry
+   point's value, and `find_spec` on a **dotted** name imports the parent package.
+   Declaring the entry point as `compass_harness.plugin:plugins.yaml` rather than
+   `compass_harness:plugins.yaml` therefore executes `compass_harness/__init__.py`
+   inside `discover_plugins()`, and that is where the rebind goes.
+   `submodule_search_locations` stays truthy in the dotted case, so upstream's
+   guard at `plugins.py:211` passes and the manifest still resolves normally: the
+   bootstrap is free, not a trade, and still zero edits to agentx-harness.
+
+   The ordering is structural, not incidental. `_registry = _PluginRegistry()` is
+   module-level (`plugins.py:1115`), `_PluginRegistry.__init__` calls
+   `discover_plugins()` (`plugins.py:89`), and `runner.py:24` is
+   `from aiperf.plugin import plugins` — so discovery, and the bootstrap with it,
+   completes while the module that *defines* `PhaseRunner` is still importing.
+
+   Executed, 13/13 — `probe_bootstrap.py`, 2026-09-20, against `56a0cf70f` with a
+   stand-in `compass_harness` distribution registering a real `aiperf.plugins`
+   entry point. The thirteen: (A1) the undotted entry-point value executes nothing;
+   (A2) it still resolves its manifest, so it is a genuine alternative and not a
+   straw man; (A3) the dotted value executes `compass_harness/__init__.py`; (A4)
+   `submodule_search_locations` stays truthy; (A5) the manifest still resolves;
+   (B0) the dotted entry point is visible to `importlib.metadata`; (B1) `aiperf` is
+   not yet imported and (B2) the bootstrap has not yet run; (B3) importing
+   `aiperf.timing.phase.runner` runs the bootstrap; (B4) `compass_harness` is in
+   `sys.modules`; (B5) the plugin is registered, so discovery was not damaged;
+   (B6) discovery still imported no plugin *module* — `get_class` stays lazy;
+   (B7) no `PhaseRunner` has been constructed at that point.
+
+   **So T73 is a packaging decision, not a precondition of the seam.** The tripwire
+   ships regardless: it is what turns a bootstrap that silently failed to run into
+   a loud failure.
 
 ### What the seam covers, precisely
 
@@ -543,6 +591,12 @@ scheduler-mediated pacing calls reachable on `AGENTIC_REPLAY` are **nine**:
 | `timing/strategies/agentic_replay.py` | 390, 552, 763, 810, 1560, 1797 |
 | `timing/branch_orchestrator.py` | 1265, 1467 |
 | `timing/replay_dependencies.py` | 319 |
+
+Those line numbers are pinned to `56a0cf70f` (above). W1.9's acceptance iterates this
+table, so it re-verifies the list against that revision — or re-derives it from the
+whole-tree grep for the seven `LoopScheduler` pacing methods, which returns 19 hits: 2
+in the `loop_scheduler.py` docstring, 8 in `fixed_schedule.py`, `request_rate.py` and
+`user_centric_rate.py` (other timing modes), and these nine.
 
 (An earlier count of "seven" added four *methods* the strategy touches to three
 *call sites* outside it — two different units. `set_drain_observer` and
@@ -564,12 +618,16 @@ or declare the idle-cap feature unsupported under virtual time and assert both
 
 ### Two constraints on the rebound class
 
-1. **It must be no-arg constructible.** `runner.py:191` calls `LoopScheduler()`
-   with no arguments. The P0.3 spike's `ClockPacedScheduler(inner)` is a *wrapper*
-   and cannot be the rebound class — that shape validated option A, not option B.
-   The rebound class is most safely a `LoopScheduler` **subclass**, which also
-   inherits `schedule_at`, `cancel_all` and `execute_async` for free. The "about
-   five lines" figure was costed against the wrong shape.
+1. **It must be no-arg constructible, and it is not the spike's class.**
+   `runner.py:191` calls `LoopScheduler()` with no arguments. The P0.3 spike's
+   `ClockPacedScheduler(inner)` is a *wrapper* and cannot be the rebound class —
+   that shape validated option A, not option B. The rebound class is
+   **`ClockPacedLoopScheduler(LoopScheduler)`**, a subclass, which also inherits
+   `schedule_at`, `cancel_all` and `execute_async` for free. It carries its own
+   name because the two objects are not interchangeable and the tripwire above
+   asserts against it; one name for both would be the naming collision that makes
+   the guard look right and fail closed only by luck. The "about five lines"
+   figure was costed against the wrong shape.
 2. **There is one scheduler per `PhaseRunner`, not one per run.**
    `phase_orchestrator.py:267` builds a fresh `PhaseRunner` per phase and tracks
    `_active_runners: list[PhaseRunner]` — "multiple possible with seamless mode".
@@ -591,16 +649,22 @@ sites below, which do not go through `LoopScheduler` either (T74).
 
 ### Contents and size
 
-| Component | Lines |
-|---|---|
-| Transport plugin — real HTTP, re-stamp anchors from `sim_*` | 150-250 |
-| `LoopScheduler` rebind + clock-paced scheduler — covers all seven pacing sites | 80-150 |
-| Clock client library | 100-150 |
-| Plugin manifest, bootstrap, config glue | ~100 |
-| Tests | 200-400 |
+| Component | Lines | Status |
+|---|---|---|
+| Transport plugin — real HTTP, re-stamp anchors from `sim_*` | 150-250 | stands |
+| `ClockPacedLoopScheduler` — the `LoopScheduler` subclass, covering the nine pacing calls | 80-150 | **open** — costed against the option-A wrapper, which constraint 1 rules out |
+| Clock client library | 100-150 | stands |
+| Plugin manifest, bootstrap, config glue | ~100 | stands — T73's dotted entry point and the package `__init__` rebind sit inside this row and add no line to it |
+| T75 — the two idle-cap timers: two `_arm_*` overrides, or assert both caps are `None` | **not costed** | new scope, added by the P0.3 review |
+| T76 — `seamless` reconciliation, or assert `seamless=False` | **not costed** | new scope, added by the P0.3 review |
+| Tests | 200-400 | stands |
 
-**~450-650 lines of production code**, plus tests. For scale, aiperf's own
-`fake_transport.py` is 478 lines and does *more* — it simulates a whole server.
+**The ~450-650 total does not stand as written.** It is the sum of the rows marked
+*stands*, plus one row that is open and two that are not costed — so it is a lower
+bound, not an estimate, until W1.9 re-costs them. Principle 7: the aggregate is not
+reportable apart from its decomposition, and the decomposition moved. For scale,
+aiperf's own `fake_transport.py` is 478 lines and does *more* — it simulates a whole
+server.
 
 ### What we do NOT need
 
@@ -699,6 +763,7 @@ requires genuine fan-out in every root is not constructible without reusing sess
 | D32 | The decode->prefill cache chain is already broken by the harness for real servers too; guard only against false hits. `theoretical_prefix_cache_hit` is the oracle. | 2026-09-18 |
 | D33 | Run the real tokenizer for its effect, charge a modelled duration for its time. Encode is a bounded-width queue; decode is a single-threaded per-step stage. | 2026-09-18 |
 | D34 | The aiperf adapter is an out-of-tree plugin package, ~450-650 lines, with zero edits to agentx-harness. | 2026-09-18 |
+| D34.1 | The pacing seam is the **scheduler**, not the strategy (option C): the adapter rebinds the runner's `LoopScheduler` to a `ClockPacedLoopScheduler` subclass **and** registers a strategy subclass whose only job is to refuse a scheduler that is not clock-paced. The bootstrap is the dotted plugin entry point, which `discover_plugins()` executes before any `PhaseRunner` exists (T73). The seam covers **nine** pacing calls, not seven, and does not reach the two `loop.call_later` idle-cap timers (T75) or a second live runner under `seamless` (T76). The ~450-650 total is reopened pending those. | 2026-09-20 |
 | D35 | Declare what the harness reproduces and what it cannot; cancellation is not available from this corpus. | 2026-09-18 |
 
 ---

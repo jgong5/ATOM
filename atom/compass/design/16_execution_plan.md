@@ -136,7 +136,8 @@ lint baseline on this repository is already known to be dirty.
 ## D99. Effort is estimated in lines of code
 
 Not in time. Agents do not have hours; they have output volume, and LOC is estimable from
-the design — `06` D34 already sizes the harness adapter at 450–650 lines.
+the design — `06` D34 sizes the harness adapter from a component table rather than a guess.
+(That table's total is currently reopened; see W1.9.)
 
 **Wall-clock appears only for machine time with a measured basis**: a TP2 engine run is
 ~1 h because engine runs take that long, and the long sweep is six hours because it was
@@ -221,7 +222,7 @@ Phase 0's environment. All CPU-only.
 | **W1.6** | M1 fake model: HF-config geometry plus the shape-analytic cost stub of `02` D12, including the quadratic query term | `backends/` | 300–450 | consumes W1.5 |
 | **W1.7** | Machine-spec schema, `merge` / `validate` / `explain`. No probes yet | `spec/` | 400–600 | implements the spec artifact |
 | **W1.8** | Wire-contract fields on ATOM's real endpoint: one `compass` object each direction (`06` D28) | ATOM entrypoints | 100–200 | implements the wire contract |
-| **W1.9** | aiperf adapter package, out of tree: clock client, pacing redirect, latency anchors from response fields | out-of-tree | 450–650 | consumes W1.8 |
+| **W1.9** | aiperf adapter package, out of tree: clock client, pacing redirect, latency anchors from response fields | out-of-tree | 450–650, reopened | consumes W1.8 |
 | **W1.10** | Cost IR: `Seq` / `Repeat` / `Par`, the **nested** Repeat detector with its index binding, and the provably-free grouping rule (`04` D19) | `ir/` | 500–700 | implements the IR |
 
 **W1.2 is the one that earns its keep.** It is where the distributed CA — the riskiest
@@ -244,15 +245,18 @@ the 450–650 range needs re-costing before W1.9 starts:
 
 | Correction | Effect on W1.9 |
 |---|---|
-| No bootstrap exists today that precedes the first `PhaseRunner`. Phase 0 paces on the real clock; phase 1 gets the rebound class; a smoke test passes | **T73 is W1.9's first deliverable and a precondition of the seam.** Not a tidy-up |
-| `runner.py:191` calls `LoopScheduler()` with no arguments, so the rebound class must be no-arg constructible — a `LoopScheduler` subclass, not the spike's `ClockPacedScheduler(inner)` wrapper | The spike validated option A's shape. "About five lines" was costed against the wrong object |
+| A bootstrap that precedes the first `PhaseRunner` **does** exist. `discover_plugins()` resolves each entry point with `importlib.util.find_spec`, which on a *dotted* value imports the parent package, so `compass_harness.plugin:plugins.yaml` executes `compass_harness/__init__.py` during discovery — executed 13/13 (`06` D34, T73) | **T73 is a packaging choice inside the existing "plugin manifest, bootstrap, config glue" row — not a precondition of the seam and not W1.9's first deliverable.** The bootstrap shape that *would* be too late is a side effect of the strategy module: phase 0 on the real clock, phase 1 rebound, smoke test passes. That is why the tripwire ships regardless |
+| `runner.py:191` calls `LoopScheduler()` with no arguments, so the rebound class must be no-arg constructible — `ClockPacedLoopScheduler(LoopScheduler)`, a subclass, not the spike's `ClockPacedScheduler(inner)` wrapper | The spike validated option A's shape. "About five lines" was costed against the wrong object, so that component row is **open** |
 | One scheduler per `PhaseRunner`, and `seamless=True` keeps two live | T76 — reconcile, or assert `seamless=False` |
 | Two `loop.call_later` idle-cap timers the rebind cannot reach, one of which upstream deliberately keeps outside the scheduler | T75 — override the two `_arm_*` methods, or declare the feature unsupported and assert both caps are `None` |
 
 **W1.9's acceptance is a list, not a count:** every one of the nine enumerated pacing calls
 in `06` D34 is observed to advance on the virtual clock — plus a stated disposition for the
-two timers in T75. "None of the seven advances on the real clock" was unimplementable as
-written; the seven added four *methods* to three *call sites*.
+two timers in T75. Those line numbers are pinned to agentx-harness
+`56a0cf70f4c0359454ee4bd15a17770b541a3e3e`; re-verify them against that revision, or
+re-derive them from the whole-tree grep in `06` D34, before building the test to them.
+"None of the seven advances on the real clock" was unimplementable as written; the seven
+added four *methods* to three *call sites*.
 
 It does **not** cover the 32 `asyncio.wait_for` timeout sites, which bypass `LoopScheduler`
 entirely (T74).
