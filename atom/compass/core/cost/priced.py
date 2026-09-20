@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import json
 import logging
+import math
 from dataclasses import dataclass
 from typing import Optional
 
@@ -62,6 +63,10 @@ class _Costed:
     is_prefill: bool
     batch: int
     context: float
+    #: Tokens the step scheduled. On a decode graph this is the batch; on a
+    #: prefill graph it is the chunk, and together with `context` it is what
+    #: distinguishes one prefill graph from another.
+    tokens: int = 0
 
 
 
@@ -303,12 +308,29 @@ class PricedGraphCostOracle:
         # not what dominates, and the machinery was not worth its complexity.
         # Two graphs of two kinds is a different proposition: it is the
         # difference between predicting TTFT and not predicting it at all.
+        #
+        # A prefill shape is two numbers, not one rung, and the second one
+        # moves the answer: at a 16384-token chunk the attention term grows
+        # with the context it attends to, so one graph taken at ctx 16384
+        # cannot answer for the same chunk at ctx 229376. So this takes a glob
+        # the same way the decode side does, and `_for_prefill` picks among
+        # what was measured. One path still works and still behaves exactly as
+        # before.
         self.prefill = None
+        self.by_prefill: list = []
         if prefill_graph:
-            self.prefill_path, _ = resolve_rank_path(prefill_graph, rank_coords)
-            with open(self.prefill_path, encoding="utf-8") as fh:
-                self.prefill = self._cost(json.load(fh), price_list,
-                                          self.prefill_path)
+            resolved, _ = resolve_rank_path(prefill_graph, rank_coords)
+            for path in sorted(_glob.glob(resolved)) or [resolved]:
+                with open(path, encoding="utf-8") as fh:
+                    self.by_prefill.append(
+                        self._cost(json.load(fh), price_list, path))
+            # The widest chunk measured is the one a step is most likely to
+            # run -- the scheduler fills to max-num-batched-tokens and only
+            # the last chunk of a request is a remainder -- so it is both the
+            # default and what `describe` reports.
+            self.prefill = max(self.by_prefill,
+                               key=lambda p: (p.tokens, p.context))
+            self.prefill_path = self.prefill.path
 
         self.fallback = None
         if fallback:
@@ -319,6 +341,7 @@ class PricedGraphCostOracle:
                                                  rank_coords=rank_coords)
         self._warned = False
         self._warned_rung = False
+        self._warned_prefill = False
 
         if self.unpriced:
             logger.warning(
@@ -366,6 +389,7 @@ class PricedGraphCostOracle:
             is_prefill=bool(recorded.get("num_prefill_tokens", 0)),
             batch=len(recorded.get("num_scheduled_tokens") or []),
             context=(sum(contexts) / len(contexts)) if contexts else 0.0,
+            tokens=int(sum(recorded.get("num_scheduled_tokens") or [])),
         )
 
     def _for_rung(self, shape: StepShape) -> "_Costed":
@@ -393,8 +417,46 @@ class PricedGraphCostOracle:
                 rung, sorted(self.by_rung))
         return self.decode
 
+    def _for_prefill(self, shape: StepShape) -> Optional["_Costed"]:
+        """The prefill graph closest to the shape this step is prefilling.
+
+        Unlike the decode rungs there is no enumerable set to match against: a
+        chunk is whatever the scheduler had budget for, at whatever context the
+        request had reached. So this picks the nearest measured shape rather
+        than requiring an exact one, and the distance is relative in both
+        coordinates -- 16384 tokens against 16 is a different operator regime,
+        while 229376 of context against 245760 is the same one, and an absolute
+        metric would let context, an order of magnitude the larger number,
+        decide which chunk size answers.
+
+        It still does not interpolate. The nearest graph's price is returned
+        whole; when the nearest is more than a factor of two away in either
+        coordinate this says so once, because that is the case where the answer
+        is a guess rather than a substitution.
+        """
+        if len(self.by_prefill) <= 1:
+            return self.prefill
+        tokens = shape.num_prefill_tokens or sum(shape.num_scheduled_tokens)
+        ctx = (sum(shape.context_lens) / len(shape.context_lens)
+               if shape.context_lens else 0.0)
+
+        def offsets(point: "_Costed") -> tuple:
+            return (abs(math.log((tokens + 1) / (point.tokens + 1))),
+                    abs(math.log((ctx + 1) / (point.context + 1))))
+
+        point = min(self.by_prefill, key=lambda p: sum(offsets(p)))
+        if max(offsets(point)) > math.log(2) and not self._warned_prefill:
+            self._warned_prefill = True
+            logger.warning(
+                "ATOMCompass WARNING: no prefill graph within 2x of %d tokens "
+                "at context %.0f; using %s (%d tokens at context %.0f). "
+                "Capture that shape to fix it -- prices are not interpolated "
+                "across shapes on purpose.",
+                tokens, ctx, point.path, point.tokens, point.context)
+        return point
+
     def estimate(self, shape: StepShape) -> StepCost:
-        point = self.prefill if shape.is_prefill else self._for_rung(shape)
+        point = self._for_prefill(shape) if shape.is_prefill else self._for_rung(shape)
         if point is None:
             if self.fallback is not None:
                 return self.fallback.estimate(shape)
@@ -454,6 +516,10 @@ class PricedGraphCostOracle:
     def describe(self) -> str:
         prefill = (f"{self.prefill.seconds*1e3:.3f}ms prefill kernels"
                    if self.prefill else "no prefill graph")
+        if len(self.by_prefill) > 1:
+            prefill += (" over " + str(len(self.by_prefill)) + " shapes "
+                        + str(sorted((p.tokens, int(p.context))
+                                     for p in self.by_prefill)))
         rungs = (f", {len(self.by_rung)} decode rungs {sorted(self.by_rung)}"
                  if len(self.by_rung) > 1 else "")
         return (f"PricedGraphCostOracle("

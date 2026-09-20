@@ -439,3 +439,107 @@ class TestOperatorsThatOnlyMakeTheHostWait:
         assert "aten::item" in HOST_SYNC
         assert "aten::is_nonzero" in HOST_SYNC
         assert "aten::mm" not in HOST_SYNC
+
+
+class TestPrefillShapes:
+    """A prefill step is two numbers, and the second one moves the answer.
+
+    At a fixed 16384-token chunk the attention term grows with the context
+    attended to, so one graph taken at context 16384 cannot answer for the same
+    chunk at 229376. Unlike the decode rungs there is nothing enumerable to
+    match against -- a chunk is whatever budget the scheduler had, at whatever
+    context the request reached -- so the nearest measured shape answers, and
+    says so when the nearest is far.
+    """
+
+    def _shapes(self, tmp_path, points):
+        """One prefill graph per (tokens, context) pair, priced as tokens*ctx."""
+        prices = {"prices": {}}
+        for tokens, ctx in points:
+            op = _op(f"p{tokens}_{ctx}")
+            graph = {"version": 2, "key": None, "ops": [op],
+                     "provenance": {"shape": {
+                         "num_scheduled_tokens": [tokens],
+                         "context_lens": [ctx],
+                         "num_prefill_tokens": tokens}}}
+            (tmp_path / f"g.prefill.t{tokens}c{ctx}.json").write_text(
+                json.dumps(graph))
+            prices["prices"][signature_of(op)] = {
+                "name": op["name"], "seconds": 1e-9 * tokens * max(ctx, 1),
+                "occurrences": 1, "kernels": {"k": 1.0}}
+        decode_op = _op("d")
+        (tmp_path / "g.json").write_text(json.dumps(
+            {"version": 2, "key": None, "provenance": {}, "ops": [decode_op]}))
+        prices["prices"][signature_of(decode_op)] = {
+            "name": "d", "seconds": 1e-5, "occurrences": 1, "kernels": {"k": 1e-5}}
+        (tmp_path / "p.json").write_text(json.dumps(prices))
+        return (str(tmp_path / "p.json"), str(tmp_path / "g.json"),
+                str(tmp_path / "g.prefill.*.json"))
+
+    def _shape(self, tokens, ctx):
+        return StepShape(num_scheduled_tokens=(tokens,), context_lens=(ctx,),
+                         num_prefill_tokens=tokens)
+
+    def _oracle(self, tmp_path, points):
+        prices, decode, prefill = self._shapes(tmp_path, points)
+        return PricedGraphCostOracle(prices, decode, prefill_graph=prefill,
+                                     boundary_seconds=0.0,
+                                     eager_seconds_per_op=0.0)
+
+    def test_each_measured_shape_answers_for_itself(self, tmp_path):
+        points = [(16384, 16384), (16384, 229376), (16, 245760)]
+        oracle = self._oracle(tmp_path, points)
+        assert len(oracle.by_prefill) == 3
+        for tokens, ctx in points:
+            assert oracle.estimate(self._shape(tokens, ctx)).seconds == (
+                pytest.approx(1e-9 * tokens * ctx))
+
+    def test_context_decides_between_two_graphs_of_the_same_chunk(self, tmp_path):
+        # The case the single-graph oracle could not express: same chunk, and
+        # a 14x difference in what it attends to.
+        oracle = self._oracle(tmp_path, [(16384, 16384), (16384, 229376)])
+        near = oracle.estimate(self._shape(16384, 20000)).seconds
+        far = oracle.estimate(self._shape(16384, 200000)).seconds
+        assert near == pytest.approx(1e-9 * 16384 * 16384)
+        assert far == pytest.approx(1e-9 * 16384 * 229376)
+
+    def test_chunk_size_is_not_outvoted_by_context(self, tmp_path):
+        # Context is the order-of-magnitude-larger number, so an absolute
+        # metric would hand a 16-token chunk the 16384-token graph purely
+        # because their contexts happen to be closer.
+        oracle = self._oracle(tmp_path, [(16384, 16384), (16, 245760)])
+        got = oracle.estimate(self._shape(16, 229376)).seconds
+        assert got == pytest.approx(1e-9 * 16 * 245760)
+
+    def test_a_far_shape_warns_rather_than_interpolating(self, tmp_path, caplog):
+        oracle = self._oracle(tmp_path, [(16384, 16384), (16384, 229376)])
+        with caplog.at_level("WARNING"):
+            got = oracle.estimate(self._shape(512, 1024)).seconds
+        # A measured price returned whole, not something fitted between two.
+        assert got == pytest.approx(1e-9 * 16384 * 16384)
+        assert "no prefill graph within 2x" in caplog.text
+
+    def test_and_warns_only_once(self, tmp_path, caplog):
+        oracle = self._oracle(tmp_path, [(16384, 16384), (16384, 229376)])
+        with caplog.at_level("WARNING"):
+            for _ in range(4):
+                oracle.estimate(self._shape(512, 1024))
+        assert caplog.text.count("no prefill graph within 2x") == 1
+
+    def test_a_near_shape_does_not_warn(self, tmp_path, caplog):
+        oracle = self._oracle(tmp_path, [(16384, 16384), (16384, 229376)])
+        with caplog.at_level("WARNING"):
+            oracle.estimate(self._shape(16000, 200000))
+        assert "no prefill graph within 2x" not in caplog.text
+
+    def test_one_prefill_graph_behaves_as_before(self, tmp_path):
+        prices, decode, _ = self._shapes(tmp_path, [(16384, 229376)])
+        oracle = PricedGraphCostOracle(
+            prices, decode,
+            prefill_graph=str(tmp_path / "g.prefill.t16384c229376.json"),
+            boundary_seconds=0.0, eager_seconds_per_op=0.0)
+        assert len(oracle.by_prefill) == 1
+        # Answers every prefill shape, near or far, with no warning: one graph
+        # is the caller saying that is the graph to use.
+        assert oracle.estimate(self._shape(8, 0)).seconds == pytest.approx(
+            1e-9 * 16384 * 229376)
