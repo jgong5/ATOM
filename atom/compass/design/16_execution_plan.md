@@ -237,7 +237,7 @@ Four things, all required:
    **Three files are covered by neither tier**, measured in `xiaobizh_n18` at `83daf636d`:
    `test_prefix_cache_accuracy.py` (`no tests ran`), `test_kv_connector_scheduler.py` and
    `test_transfer_engine.py` (`1 skipped`, ATOM #690). The first and the second are cited by
-   `08` D43.1 as coverage Compass keeps. See T73.
+   `08` D43.1 as coverage Compass keeps. See T80.
 
    Needing to edit an ATOM test still means the change altered ATOM's behaviour and must be
    justified on its own terms, not absorbed.
@@ -521,4 +521,4 @@ This topic's items only. The consolidated register is [`12_open_items.md`](12_op
 |---|---|---|
 | T71 | Add Wave 4+ detail as Phase 0 and T21 answers arrive | by design — see the Wave 4 note |
 | T72 | Decide whether reviewer agents use ATOM's existing `review-pr` skill or a Compass-specific checklist | needs one review cycle to tell |
-| T73 | Raise with ATOM's owners: `tests/test_prefix_cache_accuracy.py` has no test function — it is an `argparse` script driving a live server — and `test_kv_connector_scheduler.py` / `test_transfer_engine.py` have been dead since #690. Measured: all three run nothing in **either** tier | not a Compass change; needs the disaggregation and prefix-cache owners |
+| T80 | Raise with ATOM's owners: `tests/test_prefix_cache_accuracy.py` has no test function — it is an `argparse` script driving a live server — and `test_kv_connector_scheduler.py` / `test_transfer_engine.py` have been dead since #690. Measured: all three run nothing in **either** tier | not a Compass change; needs the disaggregation and prefix-cache owners |
