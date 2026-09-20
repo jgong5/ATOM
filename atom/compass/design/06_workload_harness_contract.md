@@ -490,10 +490,40 @@ else:
    seven pacing sites obtain `LoopScheduler` as a **module global**
    (`timing/phase/runner.py:191` constructs the one instance they share), so
    **rebinding that single name from our plugin bootstrap reaches every site**
-   in about five lines — still with zero edits to their repo. That is the seam
-   we take (T10, resolved; `16` W1.9). A strategy subclass remains the fallback
-   if upstream ever stops sharing the instance, and it is the mechanism by which
-   the rebound class is installed.
+   in about five lines — still with zero edits to their repo.
+
+   **The seam is the rebind; a subclass asserts it took effect.** (T10 resolved,
+   owner decision 2026-09-20; `16` W1.9.) Rebinding alone fails *silently*: if it
+   does not take, every site quietly runs on the wall clock, the run still
+   completes, and the result is plausible and wrong — the worst failure mode this
+   design has. So the plugin also registers a subclass whose only job is to refuse
+   that outcome:
+
+```python
+class CompassAgenticReplay(AgenticReplayStrategy):
+    def __init__(self, *, scheduler, **kw):
+        if not isinstance(scheduler, ClockPacedScheduler):
+            raise RuntimeError(
+                f"Compass clock not installed: scheduler is {type(scheduler).__name__}. "
+                "The bootstrap did not run before PhaseRunner was constructed."
+            )
+        super().__init__(scheduler=scheduler, **kw)
+```
+
+   It **does not wrap** — the rebind already did, and wrapping here would
+   double-wrap. It is a tripwire, and the cheapest one available:
+   `PhaseRunner._build_strategy` resolves the strategy through the plugin factory,
+   so this object is guaranteed to be constructed on the `AGENTIC_REPLAY` path.
+
+   A cheaper check — asserting after the rebind that
+   `runner.LoopScheduler is ClockPacedScheduler` — is **not** sufficient. It passes
+   in exactly the case that matters, where the bootstrap ran *after* the first
+   `PhaseRunner` was built. That ordering is currently unproven, and the tripwire is
+   decorative until it is settled: **naming a bootstrap that provably precedes the
+   first `PhaseRunner` is W1.9's first deliverable** (`16` W1.9; T73).
+
+   This reaches every *arrival*. It does not address the 32 `asyncio.wait_for`
+   timeout sites below, which do not go through `LoopScheduler` at all (T74).
 
 3. **Metrics are stamped in the transport**, so our transport controls them.
    `ttft_metric.py:49-56` is `content_responses[0].perf_ns - request.start_perf_ns`;
@@ -538,6 +568,8 @@ with upstream. **Testable in about an hour, and worth testing before committing.
 
 Second risk, shared by any route: **32 `asyncio.wait_for(..., timeout=T)` sites across 21
 files.** Under virtual time these can fire instantly. This is where the debugging will go.
+They do **not** go through `LoopScheduler`, so the rebind above does nothing for them —
+P0.3 verified the seam for arrivals only and did not examine these. Tracked as **T74**.
 
 ### Open issues
 

@@ -231,10 +231,22 @@ a GPU, so it runs in CI on every change thereafter.
 **W1.9's estimate is no longer conditional. P0.3 resolved T10 on 2026-09-20:** subclassing
 works and nothing is vendored, so the row stands at 450–650 lines. The spike also found
 that a strategy subclass alone is **not sufficient** — three further pacing sites live in
-`BranchOrchestrator` and `ReplayBarrierCoordinator`, which a subclass never sees. W1.9
-therefore rebinds the shared `LoopScheduler` module global from the plugin bootstrap,
-covering all seven sites in about five lines (`06` D34). W1.9's acceptance must assert
-that **none** of the seven advances on the real clock, not merely that the strategy's does.
+`BranchOrchestrator` and `ReplayBarrierCoordinator`, which a subclass never sees.
+
+**Owner decision, 2026-09-20 — rebind *and* assert.** W1.9 rebinds the shared
+`LoopScheduler` module global from the plugin bootstrap, covering all seven sites in about
+five lines, **and** registers a strategy subclass that raises unless the scheduler it
+receives is already clock-paced (`06` D34). The subclass does no wrapping; it exists
+because the rebind's failure mode is silent, and a silently wall-clocked run is the worst
+result this design can produce. Roughly thirteen lines for both.
+
+**W1.9's first deliverable is T73**, not the rebind: name a bootstrap that provably runs
+before the first `PhaseRunner` is constructed. Until that ordering is settled the tripwire
+is decorative — a late bootstrap misses the rebind *and* never builds the subclass.
+
+W1.9's acceptance must assert that **none** of the seven advances on the real clock, not
+merely that the strategy's does. It does **not** cover the 32 `asyncio.wait_for` timeout
+sites, which bypass `LoopScheduler` entirely (T74).
 
 ---
 

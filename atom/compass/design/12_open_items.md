@@ -178,6 +178,8 @@ M-f `14`; M-g `01` D3.5.
 |---|---|
 | T71 | Add Wave 4+ detail as Phase 0 and T21 answers arrive |
 | T72 | Decide whether reviewer agents use ATOM's `review-pr` skill or a Compass-specific checklist |
+| T73 | **Name a bootstrap that provably runs before the first `PhaseRunner` is constructed.** Successor to T10, opened 2026-09-20. The `LoopScheduler` rebind and the tripwire that guards it are both conditional on this ordering; if the bootstrap runs late, the rebind misses *and* the tripwire is never built, so the failure is silent again. W1.9's first deliverable (`06` D34, `16` W1.9) |
+| T74 | **Whether the 32 `asyncio.wait_for(..., timeout=T)` sites need virtual time.** Successor to T10, opened 2026-09-20. They bypass `LoopScheduler`, so the rebind does not reach them; under virtual time they may fire instantly. P0.3 did not examine them (`06` D34, second risk) |
 
 ### Topics 02, 01 — gaps now closed
 
