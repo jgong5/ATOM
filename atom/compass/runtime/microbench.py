@@ -80,6 +80,17 @@ def signature_of(op: dict) -> str:
     for key, value in (tuple(x) for x in op.get("launch") or ()):
         if key == "grid":
             sig += "|grid=" + ",".join(str(x) for x in value)
+    # A strided view and a dense tensor of the same shape are not the same read,
+    # and on a bandwidth-bound kernel they do not cost the same. Appended only
+    # where a layout is actually non-dense, so a price keyed before layout was
+    # recorded still answers for the dense call it was measured on.
+    strided = ";".join(
+        f"{i}:" + ",".join(str(int(d)) for d in st)
+        for i, (st, sh) in enumerate(
+            zip(op.get("input_strides") or (), op["input_shapes"]))
+        if _base_extent(tuple(int(d) for d in sh), st) is not None)
+    if strided:
+        sig += f"|strides={strided}"
     return sig
 
 
@@ -217,7 +228,55 @@ def _resolve_generated(origin: str):
     return call
 
 
-def _make_tensor(shape, dtype_name: str, values=None, span=None):
+def _base_extent(size, stride, offset=0):
+    """Elements the buffer behind a tensor argument must hold, or None if dense.
+
+    A view's elements sit on the base tensor's strides, so the kernel indexes
+    further than the view's own element count. A fused norm taking a
+    ``[16, 48, 128]`` view with a row stride of 16480 reads element 253,343 of
+    what a dense stand-in makes a 98,304-element buffer, which faults the
+    device. Returns how far it reaches so the stand-in can be built to match.
+
+    ``None`` means the argument is plain dense at offset zero and needs none of
+    this -- and is also the answer when the layout cannot be rebuilt (no
+    recorded stride, or a negative one reaching before the start), where a dense
+    tensor is what pricing used before and no worse than refusing.
+    """
+    if not stride or len(stride) != len(size):
+        return None
+    dense, step = [], 1
+    for extent in reversed(size):
+        dense.append(step)
+        step *= int(extent)
+    dense.reverse()
+    stride = tuple(int(s) for s in stride)
+    if stride == tuple(dense) and not offset:
+        return None
+    low = high = int(offset)
+    for extent, step in zip(size, stride):
+        reach = max(0, int(extent) - 1) * step
+        if reach >= 0:
+            high += reach
+        else:
+            low += reach
+    if low < 0:
+        return None
+    return high + 1
+
+
+def _buffer(count: int, dtype, span=None):
+    """A flat buffer of ``count`` elements, filled the way a stand-in is."""
+    import torch
+
+    if dtype.is_floating_point:
+        return torch.randn(count, dtype=dtype, device="cuda")
+    if span is not None and SYNTH_INT_RANGES:
+        return _spread((count,), dtype, span)
+    return torch.zeros(count, dtype=dtype, device="cuda")
+
+
+def _make_tensor(shape, dtype_name: str, values=None, span=None,
+                 stride=None, offset=0):
     """A stand-in for one tensor argument, from its shape and its contents.
 
     ``values`` are the recorded contents of a small integer tensor, and where
@@ -262,6 +321,14 @@ def _make_tensor(shape, dtype_name: str, values=None, span=None):
     if dtype is None:
         return None
     size = tuple(int(d) for d in shape)
+    # A recorded layout is rebuilt before anything else: a view's contents are
+    # not addressable as a dense tensor of its shape, so none of the paths below
+    # can produce one.
+    extent = _base_extent(size, stride, offset)
+    if extent is not None:
+        return torch.as_strided(
+            _buffer(extent, dtype, span), size,
+            tuple(int(s) for s in stride), int(offset))
     if values is not None and REPLAY_INT_VALUES and not dtype.is_floating_point:
         flat = torch.tensor(list(values), dtype=dtype, device="cuda")
         if flat.numel() == int(torch.Size(size).numel()):
@@ -421,9 +488,13 @@ def _build_arg_sets(op: dict, cache: str, fn) -> Optional[list]:
 
     recorded = {int(i): v for i, v in (op.get("int_values") or ())}
     spans = {int(i): v for i, v in (op.get("int_ranges") or ())}
+    strides = op.get("input_strides") or ()
+    offsets = op.get("input_offsets") or ()
 
     def one():
-        tensors = [_make_tensor(s, d, recorded.get(i), spans.get(i))
+        tensors = [_make_tensor(s, d, recorded.get(i), spans.get(i),
+                                strides[i] if i < len(strides) else None,
+                                offsets[i] if i < len(offsets) else 0)
                    for i, (s, d) in enumerate(
                        zip(op["input_shapes"], op["dtypes"]))]
         if any(t is None for t in tensors):
@@ -436,10 +507,17 @@ def _build_arg_sets(op: dict, cache: str, fn) -> Optional[list]:
     if cache == "hot":
         return [first]
 
+    # What one set costs to hold, which for a view is the base behind it and not
+    # the view's own element count -- a stride-16480 row over 6144 of them is
+    # 2.7x what its shape says, and undercounting it rotates over too many sets
+    # to fit in the working set the rotation is sized against.
     per_set = sum(
         int(torch.empty(0, dtype=getattr(torch, d)).element_size())
-        * max(1, int(torch.Size(tuple(sh)).numel()))
-        for sh, d in zip(op["input_shapes"], op["dtypes"])
+        * max(1, _base_extent(tuple(int(x) for x in sh),
+                              strides[i] if i < len(strides) else None,
+                              offsets[i] if i < len(offsets) else 0)
+              or int(torch.Size(tuple(sh)).numel()))
+        for i, (sh, d) in enumerate(zip(op["input_shapes"], op["dtypes"]))
         if getattr(torch, d, None) is not None
     ) or 1
     n = max(2, min(64, COLD_WORKING_SET_BYTES // per_set))

@@ -436,3 +436,62 @@ class TestOneBreakdownPerOperator:
         monkeypatch.setattr(microbench, "under_parallelism", lambda: True)
         assert not microbench._wants_breakdown(23.2e-6, 4, None, None)
         assert microbench._wants_breakdown(42e-6, 256, None, None)
+
+
+class TestArgumentLayout:
+    """A view argument is not addressable as a dense tensor of its shape.
+
+    The case that forced this: a fused norm in the 27B prefill graph takes
+    `in_ptr2` as a `[16, 48, 128]` view whose row stride is 16480, not
+    48 * 128 = 6144. The kernel indexes `r0_1 + 128*x2 + 16480*x3` over
+    x3 < 16 and x2 < 48, so it reads element 253,343 -- while a stand-in built
+    from the shape alone holds 98,304. That read is 310 KB past the end of the
+    buffer, and it kills the process with
+
+        Memory access fault by GPU node-2 ... Reason: Unknown.
+
+    which no per-signature try/except can catch. It took a five-round bisect to
+    name, because nothing in the recorded operator looks wrong: arity, dtypes
+    and both scalars are correct.
+    """
+
+    def test_a_view_reaches_past_its_own_element_count(self):
+        from atom.compass.runtime.microbench import _base_extent
+
+        assert _base_extent((16, 48, 128), (16480, 128, 1)) == 253344
+        assert 16 * 48 * 128 == 98304, "which is what a dense stand-in holds"
+
+    def test_a_dense_argument_needs_none_of_this(self):
+        from atom.compass.runtime.microbench import _base_extent
+
+        assert _base_extent((16, 48, 128), (6144, 128, 1)) is None
+        assert _base_extent((128,), (1,)) is None
+
+    def test_an_offset_is_part_of_the_extent(self):
+        from atom.compass.runtime.microbench import _base_extent
+
+        assert _base_extent((16, 48, 128), (6144, 128, 1), 100) == 98404
+
+    def test_an_unrecorded_layout_falls_back_to_dense(self):
+        """A graph captured before layout was recorded prices as it did."""
+        from atom.compass.runtime.microbench import _base_extent
+
+        assert _base_extent((16, 48, 128), None) is None
+        assert _base_extent((16, 48, 128), ()) is None
+        assert _base_extent((16, 48, 128), (128, 1)) is None
+
+    def test_a_layout_reaching_before_the_start_is_refused(self):
+        """Rather than allocating a buffer the offset cannot sit inside."""
+        from atom.compass.runtime.microbench import _base_extent
+
+        assert _base_extent((4,), (-1,), 0) is None
+        assert _base_extent((4,), (-1,), 3) == 4
+
+    def test_a_strided_call_does_not_inherit_a_dense_price(self):
+        op = {"name": "inductor::fused", "input_shapes": [[16, 48, 128]],
+              "dtypes": ["bfloat16"]}
+        dense = signature_of(op)
+        assert signature_of({**op, "input_strides": [[6144, 128, 1]]}) == dense, (
+            "a dense layout keys the same as a graph that recorded none, so "
+            "prices measured before layout was recorded still answer")
+        assert signature_of({**op, "input_strides": [[16480, 128, 1]]}) != dense

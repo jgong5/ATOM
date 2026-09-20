@@ -152,6 +152,17 @@ class OpSpec:
             decides how much work runs. Without both, a recorded Triton launch
             describes a kernel nobody can call back -- which left the KV gather
             of every chunked prefill unpriced. Empty for everything else.
+        input_strides: Stride of each tensor argument, in elements, in order.
+        input_offsets: Storage offset of each tensor argument, in elements.
+            Shape alone does not say where an argument's elements are. An
+            argument that is a view of a wider tensor is indexed on the base's
+            strides, so a dense stand-in built from its shape is too small and
+            the kernel reads past the end of it: a fused norm taking a
+            ``[16, 48, 128]`` view with a row stride of 16480 reaches element
+            253,343 of a 98,304-element buffer and faults the device. Recorded
+            so the stand-in can be rebuilt with ``as_strided`` instead. Empty on
+            graphs captured before this was recorded, which is why pricing falls
+            back to a dense tensor rather than refusing.
     """
 
     name: str
@@ -167,6 +178,8 @@ class OpSpec:
     inputs_from: tuple[int, ...] = ()
     output_aliases: tuple = ()
     dies_at: tuple = ()
+    input_strides: tuple[tuple[int, ...], ...] = ()
+    input_offsets: tuple[int, ...] = ()
 
     @property
     def is_collective(self) -> bool:
@@ -238,6 +251,8 @@ class OpGraph:
                     "inputs_from": list(op.inputs_from),
                     "output_aliases": list(op.output_aliases),
                     "dies_at": list(op.dies_at),
+                    "input_strides": [list(s) for s in op.input_strides],
+                    "input_offsets": list(op.input_offsets),
                 }
                 for op in self.ops
             ],
@@ -284,6 +299,14 @@ class OpGraph:
                         None if a is None else int(a)
                         for a in op.get("output_aliases") or ()),
                     dies_at=_deaths_of(op.get("dies_at")),
+                    # Absent from graphs captured before layout was recorded.
+                    # Those price their arguments as dense, which is what they
+                    # did before, and which faults on a strided view.
+                    input_strides=tuple(
+                        tuple(int(d) for d in s)
+                        for s in op.get("input_strides") or ()),
+                    input_offsets=tuple(
+                        int(i) for i in op.get("input_offsets") or ()),
                 )
             )
         return graph

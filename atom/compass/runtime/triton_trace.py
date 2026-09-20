@@ -49,6 +49,10 @@ class TritonLaunch:
         arg_dtypes: Dtype of each tensor argument, in order.
         constexprs: Compile-time constants — tile sizes, warp and stage counts.
             These change the kernel that runs, so a cost model needs them.
+        arg_strides: Stride of each tensor argument, in elements, in order.
+        arg_offsets: Storage offset of each tensor argument, in elements.
+            A kernel indexes a view on the base tensor's strides, so shape alone
+            does not say how far it reaches. See ``OpSpec.input_strides``.
     """
 
     kernel: str
@@ -56,6 +60,8 @@ class TritonLaunch:
     arg_shapes: tuple = ()
     arg_dtypes: tuple = ()
     constexprs: tuple = ()
+    arg_strides: tuple = ()
+    arg_offsets: tuple = ()
 
 
 def _jsonable(v: Any) -> bool:
@@ -283,6 +289,9 @@ class TritonLaunchTracer:
             arg_shapes=tuple(tuple(int(d) for d in t.shape) for t in tensors),
             arg_dtypes=tuple(str(t.dtype).replace("torch.", "") for t in tensors),
             constexprs=constexprs,
+            arg_strides=tuple(
+                tuple(int(s) for s in t.stride()) for t in tensors),
+            arg_offsets=tuple(int(t.storage_offset()) for t in tensors),
         )
         self.launches.append(launch)
         # `origin` is where the kernel can be imported from again. A torch
@@ -294,6 +303,8 @@ class TritonLaunchTracer:
             OpSpec(
                 name=f"{prefix}::{name}",
                 input_shapes=launch.arg_shapes,
+                input_strides=launch.arg_strides,
+                input_offsets=launch.arg_offsets,
                 output_shapes=(),
                 dtypes=launch.arg_dtypes,
                 scalars=scalars + constexprs,
