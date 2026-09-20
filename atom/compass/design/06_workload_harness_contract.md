@@ -487,16 +487,14 @@ else:
    failure mode this design has.
 
    What saves the estimate is the funnel claim above, not the line number. All
-   seven pacing sites obtain `LoopScheduler` as a **module global**
-   (`timing/phase/runner.py:191` constructs the one instance they share), so
-   **rebinding that single name from our plugin bootstrap reaches every site**
-   in about five lines — still with zero edits to their repo.
+   scheduler-mediated pacing obtains `LoopScheduler` as a **module global**
+   (`timing/phase/runner.py:191` constructs it), so **rebinding that single name
+   from a Compass bootstrap reaches every one of them** — still with zero edits to
+   their repo.
 
-   **The seam is the rebind; a subclass asserts it took effect.** (T10 resolved,
-   owner decision 2026-09-20; `16` W1.9.) Rebinding alone fails *silently*: if it
-   does not take, every site quietly runs on the wall clock, the run still
-   completes, and the result is plausible and wrong — the worst failure mode this
-   design has. So the plugin also registers a subclass whose only job is to refuse
+   **The seam is the rebind; a subclass asserts it took effect** (T10 resolved,
+   owner decision 2026-09-20, option C; `16` W1.9). Rebinding alone fails
+   *silently*, so the plugin also registers a subclass whose only job is to refuse
    that outcome:
 
 ```python
@@ -511,19 +509,76 @@ class CompassAgenticReplay(AgenticReplayStrategy):
 ```
 
    It **does not wrap** — the rebind already did, and wrapping here would
-   double-wrap. It is a tripwire, and the cheapest one available:
-   `PhaseRunner._build_strategy` resolves the strategy through the plugin factory,
-   so this object is guaranteed to be constructed on the `AGENTIC_REPLAY` path.
+   double-wrap. `PhaseRunner._build_strategy` resolves the strategy through the
+   plugin factory, so this object is guaranteed to be constructed on the
+   `AGENTIC_REPLAY` path, which makes it the one place an assert reliably fires.
 
-   A cheaper check — asserting after the rebind that
-   `runner.LoopScheduler is ClockPacedScheduler` — is **not** sufficient. It passes
-   in exactly the case that matters, where the bootstrap ran *after* the first
-   `PhaseRunner` was built. That ordering is currently unproven, and the tripwire is
-   decorative until it is settled: **naming a bootstrap that provably precedes the
-   first `PhaseRunner` is W1.9's first deliverable** (`16` W1.9; T73).
+   **The tripwire is load-bearing, not belt-and-braces. Review of P0.3
+   (2026-09-20) found the rebind does not work with any bootstrap that exists
+   today**, and the failure is partial rather than total:
 
-   This reaches every *arrival*. It does not address the 32 `asyncio.wait_for`
-   timeout sites below, which do not go through `LoopScheduler` at all (T74).
+   - `discover_plugins()` reads `plugins.yaml` manifests and imports **no** plugin
+     module — `loaded_class` is `None` for every entry until `get_class`. So the
+     Compass module is first imported inside `PhaseRunner._build_strategy`
+     (`runner.py:488`), *after* `__init__` built the real `LoopScheduler` at
+     `runner.py:191` and handed it to the orchestrator and the barrier.
+   - Phase 0 (warmup) therefore paces on the **real** clock; phase 1 (profiling)
+     gets the rebound class. **A smoke test passes.** Executed probe, 7/7.
+
+   So **T73 — name a bootstrap that provably precedes the first `PhaseRunner` — is
+   a precondition of the seam working at all, not a tidy-up.** Candidates: a
+   Compass plugin in a category resolved earlier (`system_controller.py:144/156`
+   resolve `SERVICE_MANAGER` and `UI` before the timing manager starts), or an
+   explicit CLI/config hook. Until one is named and proven, the tripwire fires on
+   phase 0 of every run — which is the correct behaviour, and why it ships with
+   the rebind rather than after it.
+
+### What the seam covers, precisely
+
+W1.9's acceptance needs a list a test can iterate, not a count. The
+scheduler-mediated pacing calls reachable on `AGENTIC_REPLAY` are **nine**:
+
+| File | Lines |
+|---|---|
+| `timing/strategies/agentic_replay.py` | 390, 552, 763, 810, 1560, 1797 |
+| `timing/branch_orchestrator.py` | 1265, 1467 |
+| `timing/replay_dependencies.py` | 319 |
+
+(An earlier count of "seven" added four *methods* the strategy touches to three
+*call sites* outside it — two different units. `set_drain_observer` and
+`running_count` are not pacing.)
+
+**Two real-clock timers the seam does not reach at all**, and cannot:
+
+| Site | What it arms | Why the rebind misses it |
+|---|---|---|
+| `replay_dependencies.py:307` | `loop.call_later(cap, self._enforce_root_idle_cap, ...)` | It is the *trigger* for `:319`; the rebind catches the effect, not the cause |
+| `agentic_replay.py:592` | `loop.call_later(...)` arming `_system_idle_watchdog` | Upstream's docstring at `:581` says it "deliberately lives outside the replay scheduler so `cap_pending_delay` cannot advance its own guard" |
+
+Related: `agentic_replay.py:531` reads `time.monotonic()` to compute
+`remaining_idle_budget`, so the *amount* of virtual time `cap_pending_delay` skips
+is itself derived from a real-clock measurement. Decide per site in W1.9: override
+`_arm_root_idle_watchdog` / `_arm_system_idle_watchdog` from the Compass subclass,
+or declare the idle-cap feature unsupported under virtual time and assert both
+`trace_idle_gap_cap_seconds` and the system idle cap are `None`.
+
+### Two constraints on the rebound class
+
+1. **It must be no-arg constructible.** `runner.py:191` calls `LoopScheduler()`
+   with no arguments. The P0.3 spike's `ClockPacedScheduler(inner)` is a *wrapper*
+   and cannot be the rebound class — that shape validated option A, not option B.
+   The rebound class is most safely a `LoopScheduler` **subclass**, which also
+   inherits `schedule_at`, `cancel_all` and `execute_async` for free. The "about
+   five lines" figure was costed against the wrong shape.
+2. **There is one scheduler per `PhaseRunner`, not one per run.**
+   `phase_orchestrator.py:267` builds a fresh `PhaseRunner` per phase and tracks
+   `_active_runners: list[PhaseRunner]` — "multiple possible with seamless mode".
+   Each live runner owns its scheduler, its `BranchOrchestrator` and its
+   `ReplayBarrierCoordinator`. W1.9 must either reconcile two concurrently live
+   schedulers against one virtual clock, or assert `seamless=False`.
+
+This all reaches *arrivals*. It does not address the 32 `asyncio.wait_for` timeout
+sites below, which do not go through `LoopScheduler` either (T74).
 
 3. **Metrics are stamped in the transport**, so our transport controls them.
    `ttft_metric.py:49-56` is `content_responses[0].perf_ns - request.start_perf_ns`;

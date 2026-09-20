@@ -228,25 +228,34 @@ Phase 0's environment. All CPU-only.
 component, and the one whose failures are silent — gets exercised without ATOM and without
 a GPU, so it runs in CI on every change thereafter.
 
-**W1.9's estimate is no longer conditional. P0.3 resolved T10 on 2026-09-20:** subclassing
-works and nothing is vendored, so the row stands at 450–650 lines. The spike also found
-that a strategy subclass alone is **not sufficient** — three further pacing sites live in
+**W1.9's estimate is no longer conditional on vendoring. P0.3 resolved T10 on
+2026-09-20:** subclassing works and nothing is vendored. The spike also found that a
+strategy subclass alone is **not sufficient** — further pacing sites live in
 `BranchOrchestrator` and `ReplayBarrierCoordinator`, which a subclass never sees.
 
-**Owner decision, 2026-09-20 — rebind *and* assert.** W1.9 rebinds the shared
-`LoopScheduler` module global from the plugin bootstrap, covering all seven sites in about
-five lines, **and** registers a strategy subclass that raises unless the scheduler it
-receives is already clock-paced (`06` D34). The subclass does no wrapping; it exists
-because the rebind's failure mode is silent, and a silently wall-clocked run is the worst
-result this design can produce. Roughly thirteen lines for both.
+**Owner decision, 2026-09-20 — rebind *and* assert (option C).** W1.9 rebinds the shared
+`LoopScheduler` module global from a Compass bootstrap, **and** registers a strategy
+subclass that raises unless the scheduler it receives is already clock-paced (`06` D34).
+The subclass does no wrapping; it exists because the rebind's failure mode is silent, and
+a silently wall-clocked run is the worst result this design can produce.
 
-**W1.9's first deliverable is T73**, not the rebind: name a bootstrap that provably runs
-before the first `PhaseRunner` is constructed. Until that ordering is settled the tripwire
-is decorative — a late bootstrap misses the rebind *and* never builds the subclass.
+**Review of P0.3 then showed the tripwire is load-bearing, not belt-and-braces**, and that
+the 450–650 range needs re-costing before W1.9 starts:
 
-W1.9's acceptance must assert that **none** of the seven advances on the real clock, not
-merely that the strategy's does. It does **not** cover the 32 `asyncio.wait_for` timeout
-sites, which bypass `LoopScheduler` entirely (T74).
+| Correction | Effect on W1.9 |
+|---|---|
+| No bootstrap exists today that precedes the first `PhaseRunner`. Phase 0 paces on the real clock; phase 1 gets the rebound class; a smoke test passes | **T73 is W1.9's first deliverable and a precondition of the seam.** Not a tidy-up |
+| `runner.py:191` calls `LoopScheduler()` with no arguments, so the rebound class must be no-arg constructible — a `LoopScheduler` subclass, not the spike's `ClockPacedScheduler(inner)` wrapper | The spike validated option A's shape. "About five lines" was costed against the wrong object |
+| One scheduler per `PhaseRunner`, and `seamless=True` keeps two live | T76 — reconcile, or assert `seamless=False` |
+| Two `loop.call_later` idle-cap timers the rebind cannot reach, one of which upstream deliberately keeps outside the scheduler | T75 — override the two `_arm_*` methods, or declare the feature unsupported and assert both caps are `None` |
+
+**W1.9's acceptance is a list, not a count:** every one of the nine enumerated pacing calls
+in `06` D34 is observed to advance on the virtual clock — plus a stated disposition for the
+two timers in T75. "None of the seven advances on the real clock" was unimplementable as
+written; the seven added four *methods* to three *call sites*.
+
+It does **not** cover the 32 `asyncio.wait_for` timeout sites, which bypass `LoopScheduler`
+entirely (T74).
 
 ---
 
