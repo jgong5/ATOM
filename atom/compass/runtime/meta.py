@@ -98,6 +98,27 @@ def _shape_of(x: Any):
     return tuple(int(d) for d in x.shape) if isinstance(x, torch.Tensor) else None
 
 
+def _layout_of(x: Any):
+    """Stride and storage offset, in elements, or None for a non-tensor.
+
+    A shape says how much of a tensor there is; only the stride says how far it
+    reaches into the buffer behind it. A benchmark stand-in built from the shape
+    alone is dense, and a dense stand-in for a view reads a different amount of
+    memory in a different order than the operator really does -- which for
+    attention at long context is the difference between a bandwidth cost and a
+    smaller one. Cheap enough to take on every tensor: it is two attribute
+    reads, and it is meaningful on the meta device as well as on a real one.
+    """
+    if not isinstance(x, torch.Tensor):
+        return None
+    try:
+        return (tuple(int(s) for s in x.stride()), int(x.storage_offset()))
+    except (RuntimeError, NotImplementedError):
+        # Sparse and nested layouts have no stride to give. Recording nothing
+        # leaves them exactly where they were before this existed.
+        return ((), 0)
+
+
 def _flat_tensors(args, kwargs):
     out = []
     for value in list(args) + list((kwargs or {}).values()):
@@ -398,6 +419,14 @@ class MetaOpTracer(TorchDispatchMode):
         tensors = _flat_tensors(args, kwargs)
         in_shapes = tuple(s for s in (_shape_of(t) for t in tensors) if s is not None)
         dtypes = tuple(str(t.dtype).replace("torch.", "") for t in tensors)
+        # Positionally aligned with in_shapes: same source, same filter, so
+        # index i of one describes the same argument as index i of the other.
+        # The microbenchmark pairs them by index to decide how large a buffer
+        # an argument needs.
+        layouts = tuple(_layout_of(t) for t in tensors
+                        if _shape_of(t) is not None)
+        in_strides = tuple(lay[0] for lay in layouts)
+        in_offsets = tuple(lay[1] for lay in layouts)
 
         # A collective on meta has no group to talk to and no storage to send.
         # Standing in for the shape-preserving ones is what lets a single
@@ -500,6 +529,8 @@ class MetaOpTracer(TorchDispatchMode):
                 OpSpec(
                     name=name,
                     input_shapes=in_shapes,
+                    input_strides=in_strides,
+                    input_offsets=in_offsets,
                     output_shapes=out_shapes,
                     dtypes=dtypes,
                     group=_resolve_group(name, self.topology),

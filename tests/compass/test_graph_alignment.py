@@ -389,3 +389,52 @@ class TestKernelsLaunchedInsideOperators:
 class _FakeKernel:
     __name__ = "a_kernel"
     __module__ = "some.module"
+
+
+class TestALayoutIsRecordedBesideAShape:
+    """A shape says how much of a tensor there is, not how far it reaches.
+
+    A benchmark stand-in built from the shape alone is dense. For a view of a
+    wider base that is the wrong buffer: fewer bytes touched, a different
+    access order, and at long context the difference between a bandwidth cost
+    and a much smaller one. The stride is what says which of the two it is.
+    """
+
+    @staticmethod
+    def _traced(tensor):
+        import torch
+
+        from atom.compass.core.graph import OpGraph
+        from atom.compass.runtime.meta import MetaOpTracer
+
+        graph = OpGraph()
+        with MetaOpTracer(graph=graph):
+            torch.add(tensor, 1.0)
+        return next(op for op in graph.ops if "add" in op.name)
+
+    def test_a_view_keeps_the_stride_of_the_base_it_indexes(self):
+        import torch
+
+        op = self._traced(torch.zeros(4, 16)[:, :4])
+        assert op.input_shapes[0] == (4, 4)
+        assert op.input_strides[0] == (16, 1), "a view is not dense"
+
+    def test_a_dense_tensor_records_the_dense_stride(self):
+        import torch
+
+        op = self._traced(torch.zeros(4, 4))
+        assert op.input_strides[0] == (4, 1)
+        assert op.input_offsets[0] == 0
+
+    def test_an_offset_view_records_where_it_starts(self):
+        import torch
+
+        op = self._traced(torch.zeros(4, 16)[2:])
+        assert op.input_offsets[0] == 32
+
+    def test_every_recorded_shape_has_a_layout_beside_it(self):
+        import torch
+
+        op = self._traced(torch.zeros(4, 16)[:, :4])
+        assert len(op.input_strides) == len(op.input_shapes)
+        assert len(op.input_offsets) == len(op.input_shapes)
