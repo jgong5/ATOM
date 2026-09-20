@@ -1,61 +1,56 @@
 # SPDX-License-Identifier: MIT
 """Device-free operator capture for ATOM's real model classes.
 
-`TorchDispatchMode` + `FakeTensorMode(ShapeEnv)` + the Python dispatcher. Builds
-the module tree at a logical TP width, runs one forward through it, and records
-every dispatched operator with its shapes. The artifact is an inventory of what
-a step executes -- not a cost model -- and anything the mechanism cannot record
-faithfully is refused rather than recorded partially.
+`TorchDispatchMode` + `FakeTensorMode(ShapeEnv)` + the Python dispatcher: build
+the module tree at a logical TP width, run one forward, record every dispatched
+operator with its shapes. The artifact is an inventory of what a step executes,
+not a cost model, and anything the mechanism cannot record faithfully is refused
+rather than recorded partially.
 
-Four properties of the inventories this has produced, each found by running it,
-each of which a reader of one needs:
+Four properties of the inventories this produces, each found by running it:
 
 * **The traces are CONCRETE, not symbolic.** Across the four committed forward
   records, 0 shape entries out of 12,425 / 12,455 / 12,490 / 12,520 are
-  non-numeric. The cause is that every tensor is allocated inside
-  `with fake_mode:`, which yields an already-fake *static* tensor with plain
-  `int` shapes and no indication anything went wrong. A concrete inventory is
-  only valid at the shapes it was taken at, so `capture()` below refuses one
-  unless the caller passes `concrete_ok=True`.
+  non-numeric. Cause: a tensor allocated inside `with fake_mode:` is already
+  fake and *static*, with plain `int` shapes and no sign anything went wrong. A
+  concrete inventory is valid only at the shapes it was taken at, so `capture()`
+  refuses one unless the caller passes `concrete_ok=True`.
 
 * **Importing ATOM needs more `torch.cuda` stubs than construction does.**
   `get_device_properties` is read at *import* time by aiter's Triton attention
   kernels (`aiter/ops/triton/_triton_kernels/flash_attn_triton_amd/utils.py:111`,
-  via `bwd.py:224 get_bwd_configs`); the failure without it is a `NameError`
+  via `bwd.py:224 get_bwd_configs`); without it the failure is a `NameError`
   from torch's own `get_device_properties` once `_lazy_init` is stubbed out.
 
 * **Attention arrives as ONE opaque leaf with nothing below it.**
   `aiter.unified_attention_with_output_base` and
-  `aiter.linear_attention_with_output_base` are registered custom ops, so under
-  FakeTensorMode the registered fake impl answers and the Python body never
-  runs. One consequence is the opposite of what it looks like:
-  `attention_mha.py:178` short-circuits attention when `context.is_dummy_run` is
-  set, and that branch is never reached under a fake trace -- so a dummy-batch
-  capture is not missing attention. Measured: the warmup capture of the 27B
-  records 16 unified + 48 linear attention dispatches, identical to the
-  non-dummy decode capture.
+  `aiter.linear_attention_with_output_base` are registered custom ops, so the
+  registered fake impl answers and the Python body never runs. One consequence
+  is the opposite of what it looks like: `attention_mha.py:178` short-circuits
+  attention when `context.is_dummy_run` is set, and that branch is never reached
+  under a fake trace, so a dummy-batch capture is not missing attention.
+  Measured: the warmup capture of the 27B records 16 unified + 48 linear
+  attention dispatches, identical to the non-dummy decode capture.
 
-* **A TP>1 capture at one physical rank both erases and fabricates
-  collectives.** The logical width comes from ATOM's `apply_simulated_tp`
-  (`atom/distributed/simulated_tp.py`), whose `_patch_group` replaces
-  `all_reduce` with the identity at one rank, so no collective operator reaches
-  the inventory. Counted by instrumenting the patched group rather than by
-  reading the inventory: **129 `all_reduce` calls per forward at TP2** -- 128
-  from `model_ops/communication_op.py:58 tensor_model_parallel_all_reduce` (the
+* **A TP>1 capture at one physical rank erases and fabricates collectives.**
+  Logical width comes from ATOM's `apply_simulated_tp`
+  (`atom/distributed/simulated_tp.py`), whose `_patch_group` makes `all_reduce`
+  the identity at one rank. Counted by instrumenting that group rather than by
+  reading the inventory: **129 `all_reduce` per forward at TP2** -- 128 from
+  `model_ops/communication_op.py:58 tensor_model_parallel_all_reduce` (the
   row-parallel linears: 64 `mlp.down_proj` + 48 `linear_attn.out_proj` + 16
   `self_attn.o_proj`, zero in the vision tower) and 1 from
   `model_ops/embed_head.py:175` (the vocab-parallel embedding reduce), identical
-  at warmup and at decode. Against that 129 the inventory records **0** `c10d.*`
-  dispatches, plus one erased sampler `broadcast`. In the other direction
-  `_all_gather`, `_gather` and `_reduce_scatter_tensor` are NOT identities at
-  one rank -- they build the absent ranks out of zeros, and every op they use is
-  dispatched and recorded. The single `all_gather` this forward makes
-  (`model_ops/embed_head.py:257`, the vocab-parallel lm_head) arrives as six ops
-  a real TP2 forward never issues -- `aten.zeros` -> `aten.slice` ->
-  `aten.copy_` -> `aten.view` -> `aten.movedim` -> `aten.reshape`, at indices
-  2458-2466 of `real_tp2.json` -- and half of the `[2,248320]` logits tensor
-  they produce is zeros. So a cost model fed from a TP2 inventory would price
-  TP2 as collective-free and also pay for a gather that exists only because of
+  at warmup and at decode. Against that 129 the inventory holds **0** `c10d.*`
+  dispatches, plus one erased sampler `broadcast`. The gathers go the other way:
+  `_all_gather`, `_gather` and `_reduce_scatter_tensor` build the absent ranks
+  out of zeros, and every op they use is dispatched and recorded, so the one
+  `all_gather` this forward makes (`model_ops/embed_head.py:257`, the
+  vocab-parallel lm_head) shows up as six ops a real TP2 forward never issues --
+  `aten.zeros` -> `aten.slice` -> `aten.copy_` -> `aten.view` -> `aten.movedim`
+  -> `aten.reshape`, at indices 2458-2466 of `real_tp2.json` -- over a
+  `[2,248320]` logits tensor that is half zeros. A cost model fed this would
+  price TP2 as collective-free and pay for a gather that exists only because of
   the substitution. `simulated_tp.py`'s own docstring says the model output is
   meaningless under `--fake-eplb`; that caveat travels with any structural
   reading of this inventory.
