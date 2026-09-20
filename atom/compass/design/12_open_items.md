@@ -12,7 +12,7 @@ backlog. Nothing here is a decision; every decision lives in its topic's decisio
 
 1. **Load-bearing assumptions** — hold up large parts of the design; each has a check plan
 2. **Missing topics** — design points nobody has written yet, with a recommendation
-3. **TODO register** — T1–T72, per topic
+3. **TODO register** — T1–T79, per topic
 4. **Cross-cutting issues and pending amendments**
 
 ---
@@ -195,6 +195,8 @@ M-f `14`; M-g `01` D3.5.
 | T65 | Establish EP's group membership per supported configuration; if EP spans DP, the LP collapse does not hold |
 | T66 | Measure whether the Class-C runtime constants move with PP degree |
 | T67 | Measure the step-duration spread across DP ranks, and what padding to `unified_bs` costs |
+| T78 | **`atom/models/qwen3_5.py:427` blocks PP above compilation level 0 for the M2/M3 target model.** Opened 2026-09-20 by P0.5. The model declares `"intermediate_tensors": 0` in `dynamic_arg_dims`. `atom/utils/decorators.py:525` raises `ValueError("Unsupported dynamic dimensions ...")` for any non-Tensor argument, and that raise sits **before** the decorator's own `IntermediateTensors` handling at `:534-538`, which marks the token dim of each contained tensor. A PP non-first stage receives its activations inside an `IntermediateTensors` container, so the declaration can never be satisfied and the model is unreachable at `--level > 0` under PP. Other PP-capable models use a bare `@support_torch_compile` and reach the working path. **Not on M1's path**: `15` D94's PP2 test runs a fake model — `tests/test_pp.py` mocks `aiter.dist.parallel_state` (`:126-128`) and builds a `MockConfig` (`:463-468`), loads no model file, and is in the CPU tier. It blocks any **real-model** PP measurement, so it is a prerequisite for M7 cost accuracy and for T66. Upstream ATOM fix, not Compass; owner unassigned. |
+| T79 | **`atom/model_ops/attentions/gdn_attn.py:1329-1331` mixes a PP-local layer count with a global one.** Opened 2026-09-20 by P0.5. `total = runner._get_total_num_layers()` returns the **PP-local** slice under PP>1 (`atom/model_engine/model_runner.py:1509-1515`, via `get_pp_indices`), but line 1330's `num_draft = total - hf_config.num_hidden_layers` subtracts the **global** count, and `runner.num_full_attn` (`gdn_attn.py:159-161`) is global as well. Measured on Qwen3.8-27B (64 layers, `full_attention_interval` 4, `num_full_attn` 16): PP1 gives `num_draft=0`, `n_full=16`, KV sizing `+1,056,768`; PP2 gives `num_draft=-32`, `n_full=-16`, `-1,056,768`. A PP1 control differing only in `-pp` returned `entries=80746, EXIT=0` — an exact sign flip with exact magnitude match, so the mechanism is determined rather than inferred. Same M1/M7 split as T78: the fake-model path never reaches this code. Upstream ATOM fix. |
 
 ### Topics 01, 03, 05 — newly opened
 

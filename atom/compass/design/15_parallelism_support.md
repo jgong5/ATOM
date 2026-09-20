@@ -374,3 +374,5 @@ load-bearing assumptions and their check plans, is [`12_open_items.md`](12_open_
 | T65 | Establish EP's group membership per supported configuration; if EP spans DP, D92's collapse does not hold | needs a deployed EP configuration to inspect |
 | T66 | Measure whether the Class-C runtime constants move with PP degree | one engine startup per PP degree |
 | T67 | Measure the step-duration spread across DP ranks, and what padding to `unified_bs` costs | needs a DP2 run with per-rank step timing |
+| T78 | `qwen3_5.py:427` declares `"intermediate_tensors": 0`, so the M2/M3 target model cannot run PP above compilation level 0 | upstream ATOM fix; `15` D94's PP2 test is fake-model and CPU-only, so this is not on M1's path |
+| T79 | `gdn_attn.py:1329-1331` mixes a PP-local layer count with a global one; KV sizing sign-flips at PP2 | upstream ATOM fix; blocks real-model PP measurement, not M1 |
