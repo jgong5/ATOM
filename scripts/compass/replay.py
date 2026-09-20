@@ -648,7 +648,21 @@ def _run_executions(execs, send, out, guard) -> set:
     def go(eid: int) -> None:
         e = by_eid[eid]
         try:
-            if guard.sleep(e["think_s"]):
+            began = _time.monotonic()
+            ok = guard.sleep(e["think_s"])
+            if e["think_s"] > 0:
+                # What this lane really waited, not what the corpus asked for.
+                # The guard shortens a wait whenever the whole system is quiet,
+                # and those shifts reach the artifact only as two totals in the
+                # run block -- `idle_shifts`, `idle_shifted_s` -- with nothing
+                # saying which edges gave the seconds up. The plan is the
+                # schedule as *executed*, so the modelled side, which resolves
+                # an arrival as `max(finish of deps) + think_s` and honours it
+                # exactly, replays the timeline this side really ran rather than
+                # the one it set out to. At c1 the two differed by 409.264s of a
+                # 1800s window, and the whole 17% throughput gap was that.
+                e["think_s"] = round(_time.monotonic() - began, 6)
+            if ok:
                 out[eid] = send(e)
             else:
                 with lock:
@@ -756,10 +770,19 @@ def _recycle(workload, groups, *, clients, duration, instances, sampler, rng,
     # Stating the barrier in the graph costs the paced side nothing:
     # `_run_executions` already drops edges pointing outside the batch it was
     # given, and a profile batch never contains a warmup execution.
+    #
+    # It goes on *every* initial profiled execution, not only the ones that
+    # already name a warmup. Requiring a direct warmup dep looked equivalent
+    # and is not: a branch whose recorded parent fell before t* keeps the empty
+    # dep list `_instance` gives an instance's opening request, matches
+    # nothing, and arrives at virtual zero beside the warmups. sweep81_v3's c8
+    # had six such executions on one lane of eight, and they pulled the
+    # measured span's start back 876.2s, to the instant warmup began. Deps
+    # resolve as a max, so the redundant edges on the other 96 cost nothing.
     warm = {e["eid"] for ex in initial for e in ex if e["phase"] == "warmup"}
     if warm:
         for e in (e for ex in initial for e in ex):
-            if e["phase"] == "profile" and warm.intersection(e["deps"]):
+            if e["phase"] == "profile":
                 e["deps"] = sorted(set(e["deps"]) | warm)
     failures = _warmup([e for ex in initial for e in ex], send, out)
     if failures:
