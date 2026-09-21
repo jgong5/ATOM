@@ -1,8 +1,8 @@
 # ATOM Compass — Design
 
 **Status: reviewed and approved, 2026-09-20. Design only — no code has been written
-against it yet.** Every document carries a matching header. **117 decisions — D0–D102
-with no gaps, plus 14 sub-decisions** — are indexed at the end of this file; **72 open
+against it yet.** Every document carries a matching header. **108 decisions — D0–D94
+with no gaps, plus 13 sub-decisions** — are indexed at the end of this file; **72 open
 TODOs (T1–T72)**, the load-bearing assumptions and the cross-cutting issues live in
 **`12_open_items.md`**. Implementation follows the execution plan in `16`.
 
@@ -224,7 +224,7 @@ document that owns it. Nothing in `01`–`11` is outside this diagram.
 | L2/L3 | Speculative decoding and MTP | [`14_speculative_decoding.md`](14_speculative_decoding.md) | D82–D87 |
 | L1/L3 | Parallelism: TP, DP, PP, EP | [`15_parallelism_support.md`](15_parallelism_support.md) | D88–D94 |
 | — | Open items, assumptions, gaps | [`12_open_items.md`](12_open_items.md) | — |
-| — | How it gets built: tasks, waves, gates, GPU queue | [`16_execution_plan.md`](16_execution_plan.md) | D95–D102 (+ D97.1) |
+| — | How it gets built: tasks, waves, gates, GPU queue | [`16_execution_plan.md`](16_execution_plan.md) | — |
 
 ### B. A simulated step, end to end
 
@@ -566,7 +566,6 @@ The documents use these precisely; a reader will bounce off without them.
 | D78 – D81 | `13` The Configuration Surface |
 | D82 – D87 | `14` Speculative Decoding and MTP |
 | D88 – D94 | `15` Parallelism Support (TP, DP, PP, EP) |
-| D95 – D102 (+ D97.1) | `16` The Execution Plan |
 
 ### Headline decisions
 
