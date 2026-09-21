@@ -55,6 +55,7 @@ import math
 
 from .identity import LpId
 from .lookahead import LookaheadMatrix
+from .observability import TimelineLog, deadlock_dump
 from .registry import LpRegistry
 from .state import Grant, LpState, LpStatus
 
@@ -104,6 +105,7 @@ class ClockAuthority:
         registry: LpRegistry,
         lookahead: LookaheadMatrix,
         start_time: float = 0.0,
+        timeline: TimelineLog | None = None,
     ) -> None:
         if not len(registry):
             raise ValueError("a clock needs at least one participant")
@@ -112,6 +114,11 @@ class ClockAuthority:
             raise ValueError(f"start_time must be a finite number, got {start_time!r}")
         self._registry = registry
         self._lookahead = lookahead
+        self._start = start
+        # Off unless a run asks for it. A run that hands out millions of grants
+        # would spend more time writing them down than simulating, so what the
+        # default costs is one comparison per resolve and nothing else.
+        self._timeline = timeline
         self._ids = registry.ids()
         self._now = {lp_id: start for lp_id in self._ids}
         # Two records, and the horizon is the smaller of them. `_declared` is
@@ -156,6 +163,16 @@ class ClockAuthority:
     def lookahead(self) -> LookaheadMatrix:
         """The declared floors the bound is walked over."""
         return self._lookahead
+
+    @property
+    def start_time(self) -> float:
+        """Where every clock stood before any time was handed out."""
+        return self._start
+
+    @property
+    def timeline(self) -> TimelineLog | None:
+        """The log every granted advance is written to, or `None` when off."""
+        return self._timeline
 
     def peers(self, lp_id: LpId) -> tuple[LpId, ...]:
         """Every other participant, in the total order.
@@ -447,6 +464,9 @@ class ClockAuthority:
             self._held[lp_id] = grant
             self._grants[lp_id] += 1
             issued.append(grant)
+        if self._timeline is not None:
+            for grant in issued:
+                self._timeline.record(grant, self._next[grant.lp_id])
         if not issued:
             self._refuse_to_stall()
         return tuple(issued)
@@ -480,7 +500,7 @@ class ClockAuthority:
             raise ClockDeadlock(
                 "every participant is waiting and none knows of a future event, "
                 "so no event exists anywhere that could release any of them",
-                self.lp_table(),
+                deadlock_dump(self),
             )
         pending = ", ".join(
             f"{lp_id} knows of an event at {self._seconds(self._next[lp_id])}"
@@ -490,7 +510,7 @@ class ClockAuthority:
             "every participant is waiting and none can be granted time, though "
             f"{pending}. The rule is supposed to make this impossible, so the "
             "state below is the evidence that it did not",
-            self.lp_table(),
+            deadlock_dump(self),
         )
 
     # --- small shared helpers ------------------------------------------------
