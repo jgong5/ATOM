@@ -5,7 +5,7 @@
 - Output shaping (`/i-have-adhd`): lead with the next action, number multi-step
   tasks, end with one concrete next action, restate state every turn, specific time
   estimates, matter-of-fact error tone, cap lists at 5, no preamble or closing
-  pleasantries.`
+  pleasantries.
 
 ## Execution rules
 - Don't modify the main worktree. Develop with linked worktrees.
@@ -17,9 +17,11 @@
   a citation in the output record.
 - Merge conflicts are the agent's call, not the owner's ("don't bother me on merge
   conflict, it's on you").
-- Working logs and scratch go in `agent_scratch/`, never `atom/compass/tasks`. The
-  durable task record — brief, dev record, review record, handoff (D96) — is not a
-  working log: it stays tracked, so a later brief can still link to it.
+- Working logs and scratch go in `agent_scratch/`. Nothing durable lives in the
+  tree: the task record is the GitHub issue and its PR.
+- Task management is GitHub. One issue per task holds the brief and the handoff;
+  its PR holds the dev and review records; the PR closes the issue. Agents open,
+  assign, comment on and close issues, including issues they did not open.
 - Design and implement solutions while keeping the solution as simple as possible.
 - Concurrency: 5 tasks in flight, up to 10 agents (`16_execution_plan.md:29`).
 - Both developer and reviewer agents must be told to read `atom/compass/design/README.md`'s
@@ -27,4 +29,5 @@
 - Reviewer agents must post its review to the PR. GitHub refuses
   APPROVE/REQUEST_CHANGES on self-authored PRs, so **the verdict goes in the
   comment body text**.
-- Except for the main branch, free updates to `jgong5/ATOM` repo. Never touch `ROCm/ATOM`.
+- Except for the main branch, free updates to `jgong5/ATOM` — branches, PRs and
+  issues alike. Never touch `ROCm/ATOM`.
