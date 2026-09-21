@@ -115,7 +115,7 @@ joined two real numbers wrongly: the 28 counts `rocminfo` across the *whole* sui
   `tests/` minus `tests/plugin/` (30 files) minus the 29 driver-dependent files in
   `scripts/compass/cpu_gate_exclude.txt`, driven by `scripts/compass/gate_cpu.sh`:
   **130 of this tree's 189 test files, 4030 passed, 0 failed, 149 skipped, 3 xfailed,
-  rc=0** — identical in all ten runs taken on 2026-09-21 in `xiaobizh_n18_cpu` on
+  rc=0** — identical in every run taken on 2026-09-21 in `xiaobizh_n18_cpu` on
   hjbog-srdc-18, where the clock read **25.4-31.7 s of pytest inside 31.1-37.8 s of
   wall (`time` real)**, which is a measured spread rather than a bound: it tracks
   what else is on the node. Run against a `git archive` snapshot of the tree, with
