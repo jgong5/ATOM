@@ -640,8 +640,17 @@ class CompassAgenticReplay(AgenticReplayStrategy):
    **So T73 is a packaging decision plus a small deferred rebind, not a precondition of
    the seam.** The claim this section used to carry — that the rebind does not work with
    any bootstrap that exists today — was an asserted negative with no probe behind it,
-   and is false. The tripwire ships regardless: it is what turns a bootstrap that
-   silently failed to run into a loud failure.
+   and is false.
+
+   **The tripwire ships regardless, and its coverage is partial — say which half.** It
+   catches the case where the bootstrap *did not run* or ran too late: the strategy is
+   constructed, receives a scheduler that is not clock-paced, and refuses. It does **not**
+   catch the de-registration case measured above, because the tripwire is a class inside the
+   very plugin that fails to register — no strategy subclass is resolved, upstream's own
+   `AgenticReplayStrategy` is used, and nothing raises. That failure's only surface is the
+   one `WARNING` line, which is a reason to have the deferred hook rather than a reason to
+   drop the guard. W1.9 should add a positive check that the Compass plugin is registered at
+   all, since the tripwire structurally cannot be it.
 
 ### What the seam covers, precisely
 
@@ -753,11 +762,19 @@ If pacing goes through the clock client and metrics come from the transport, **t
 harness's own `time.*` reads stop mattering**, and the edit count goes to zero. That is the
 design.
 
-### The risk that could blow the estimate up
+### The risk that could have blown the estimate up — tested, and it did not fire
 
-If `AgenticReplayStrategy` (1,952 lines) cannot be subclassed cleanly and must be vendored
-into the adapter package. Still zero edits to their repo, but 2,000 lines to keep in sync
-with upstream. **Testable in about an hour, and worth testing before committing.**
+The risk was that `AgenticReplayStrategy` (1,952 lines) could not be subclassed cleanly and
+would have to be **vendored** into the adapter package: still zero edits to their repo, but
+2,000 lines to keep in sync with upstream. It was testable in about an hour, and
+**P0.3 tested it on 2026-09-20. It does not happen.** The class subclasses cleanly, the
+plugin factory resolves the subclass, and nothing is vendored — so the 2,000-line
+consequence is retracted, here and wherever else this document used to state it.
+
+What the spike found in its place is a different shape of problem, and a much smaller one: a
+strategy subclass is not *sufficient*. It reaches four of the nine pacing calls; the other
+five are reached by rebinding the runner's `LoopScheduler` instead (D34.1, and `~~T10~~` in
+this topic's register below).
 
 Second risk, shared by any route: **32 `asyncio.wait_for(..., timeout=T)` sites across 21
 files.** Under virtual time these can fire instantly. This is where the debugging will go.

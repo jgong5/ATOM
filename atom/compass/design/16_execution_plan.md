@@ -59,10 +59,10 @@ five-slot cap.
 | **P0.7** | **T52** — root-cause the dispatch-mode 8-rank hang. **Only if P0.4 hits it.** | spike | — | quiet node |
 
 **Why these seven.** Each can invalidate work that would otherwise be built on top of it.
-P0.3 swings an estimate by ~2,000 lines for one hour's work. P0.4 decides whether tier b
-has an IR at all, and **it is the task most likely to reshape Waves 2–4** — if tracing
-does not work at TP>1, `capture/` and `ir/` change shape. The plan marks that edge rather
-than pretending the DAG is stable across it.
+P0.3 swung an estimate by ~2,000 lines for one hour's work; it has since run and the swing
+did not happen. P0.4 decides whether tier b has an IR at all, and **it is the task most
+likely to reshape Waves 2–4** — if tracing does not work at TP>1, `capture/` and `ir/`
+change shape. The plan marks that edge rather than pretending the DAG is stable across it.
 
 **P0.7 is conditional.** `15` and `04` both argue a fake-tensor trace should be GPU-free
 and collective-free, so the known hang should not be reachable from P0.4. If P0.4 confirms
