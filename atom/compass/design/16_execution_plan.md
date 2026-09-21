@@ -15,140 +15,7 @@ the answers arrive.
 
 ---
 
-## D95. The operating model
-
-### Tasks are a pool, not a track assignment
-
-Work is a **DAG of tasks**. A task becomes claimable when its dependencies land; any free
-agent claims it. There are no permanent per-track ownerships.
-
-The cold-start problem this creates — an agent picking up a task without the accumulated
-context of the ones before it — is solved by making context **durable in the task** rather
-than resident in an agent. See D96.
-
-**Concurrency is capped at 5 tasks in flight**: five developer agents and five reviewer
-agents. The cap is review throughput, not the DAG — Wave 1 holds about ten independent
-tasks and will run in two batches rather than all at once.
-
-### Conflicts are tolerated, and are a signal
-
-Tasks are cut so that each touches one module plus its tests, which makes most of them
-disjoint. They are **not** guaranteed disjoint, and no allocation-time file locking is
-imposed — a merge conflict is cheaper than the machinery to prevent it.
-
-> **Frequent conflicts mean the task decomposition is wrong, not that coordination
-> failed.** The response is to re-cut the tasks, not to add a scheduler.
-
-### Developer and reviewer are separate agents
-
-Both are per-task. They share the project context and the task record; their **briefs
-differ in what they optimise for**:
-
-| | Optimises for |
-|---|---|
-| **developer** | does this work, and does it match the design decision it cites |
-| **reviewer** | what does this break, what does the design actually say, and what here is untested |
-
-Same context, opposed objectives. The reviewer is a separate agent specifically so the
-review is not performed by the context that produced the code.
-
-### The halt rule
-
-> **When something does not work as expected, stop and discuss. Do not work around it.**
-
-This is the agent-facing form of the design's own standing principle — *refuse rather than
-fall back* (`README` principle 6). A workaround improvised under build pressure is exactly
-the class of decision that never gets written down, and the prior effort has recorded
-instances of well-formed, wrong artifacts surviving review.
-
-"Not as expected" includes: a design document that contradicts the code; a test that fails
-for a reason the task did not predict; a measurement outside its stated range; an
-interface that cannot be implemented as specified.
-
----
-
-## D96. The task record, and why context lives in it
-
-A task carries four sections. The first is written before the task is claimable; the rest
-are written as it runs.
-
-| Section | Written by | Contains |
-|---|---|---|
-| **Brief** | the planner | what to build; the governing decisions by number; the interfaces it **implements** and **consumes**; its file set; its exit criteria; its effort estimate |
-| **Dev record** | the developer | what was found, what was decided that the design did not cover, what surprised it, what was left undone |
-| **Review record** | the reviewer | what was checked, what was accepted with reservation, what the next task in this area should watch |
-| **Handoff** | both | what a successor needs to know that is not in the code |
-
-**Every task's brief links to its predecessors' records.** That is what makes continuity
-survive agent turnover: the context is in the graph, not in a context window.
-
-**A brief that cannot name its file set is under-specified** and is not claimable. This is
-the same discipline as `04` D21's declared nodes — the declaration is the contract.
-
----
-
-## D97. Where work lands
-
-| | |
-|---|---|
-| **Integration branch** | `feature/atomcompass_new` — already the PR #3 branch |
-| **Per-task isolation** | a git worktree per in-flight task, under `atomcompass-worktrees/<task-id>` |
-| **Landing** | one PR per task into the integration branch, reviewed by that task's reviewer agent |
-| **ATOM's `main`** | untouched until the milestone the project agrees to upstream |
-
-**Four setup rules, from failures already recorded on this hardware.** None was caused by
-worktrees; all were caused by a shared mutable non-git source tree that things silently
-resolved against.
-
-1. **No shared mutable source root exists.** Every tree is a worktree or a `git archive`
-   snapshot.
-2. **Containers mount the worktree parent**, so every task's tree is reachable at a stable
-   path. The CPU container previously mounted only one tree, which made `pytest` on
-   worktree code fail with a path error rather than a test failure.
-3. **Every command sets `PYTHONPATH` to its own worktree and verifies it** —
-   `python -c "import atom; print(atom.__file__)"` **before** trusting a result. A prior
-   run resolved `atom` to a non-git snapshot of a different branch, 72 files divergent,
-   and failed silently wherever both trees had the symbol.
-4. **Snapshots use `git archive`, never `rsync`** — so a snapshot names a commit and
-   cannot be a mixture of generations. One shared tree held two files from two different
-   generations, producing a `TypeError` that named the callee and read as a code bug.
-
----
-
-## D98. What gates a task
-
-Four things, all required:
-
-1. **ATOM's test suite passes unmodified.** 187 files, no GPU needed (`08` D43.1). Needing
-   to edit an ATOM test means the change altered ATOM's behaviour and must be justified on
-   its own terms, not absorbed.
-2. **New CPU-only tests** for what the task added, in `tests/compass/`, in ATOM's style.
-3. **One named result**, stated in the brief and not chosen afterwards — what this task
-   now makes possible that was not possible before.
-4. **Review by the task's reviewer agent**, against its brief and the cited decisions.
-
-**Baseline first.** P0.2 records the suite's and ruff's current pass/fail state before the
-first Compass commit. A pre-existing failure attributed to Compass costs a day, and the
-lint baseline on this repository is already known to be dirty.
-
----
-
-## D99. Effort is estimated in lines of code
-
-Not in time. Agents do not have hours; they have output volume, and LOC is estimable from
-the design — `06` D34 already sizes the harness adapter at 450–650 lines.
-
-**Wall-clock appears only for machine time with a measured basis**: a TP2 engine run is
-~1 h because engine runs take that long, and the long sweep is six hours because it was
-measured at six hours. Those are hardware constraints, not effort.
-
-Estimates are ranges and are expected to be wrong. A task that overruns its estimate by
-more than ~2x is a **halt-and-discuss** event, not a reason to keep going — the usual
-cause is that the task was mis-cut.
-
----
-
-## D100. The module layout, which is also the task boundary
+## The module layout, which is also the task boundary
 
 Tasks are cut so each touches one module plus its tests.
 
@@ -202,7 +69,7 @@ and collective-free, so the known hang should not be reachable from P0.4. If P0.
 that, T52 drops to ordinary priority and gates nothing on the critical path.
 
 **Each of P0.3–P0.7 ends in an escalation, not a decision.** The result plus its options
-and their costs go to the project owner; the scope call is theirs (D103).
+and their costs go to the project owner; the scope call is theirs (see Escalation points below).
 
 ---
 
@@ -291,15 +158,21 @@ knowing while the fake model is still the only thing in play.
 
 ---
 
-## D101. The GPU booking queue
+## The GPU booking queue
 
 GPU is the scarce resource; almost everything else is CPU-only by design principle 2.
 Only calibration Phases 1b/1c/2, `--measure` runs, the real side of pairings, and the
 T52 root-cause need one.
 
-**One queue.** A GPU task declares, before it is claimable: what it measures, which width,
-how long it needs, and which artifact it writes. A quiet window is never spent deciding
-what to run in it.
+**One queue.** A GPU task declares in its issue body, before it is claimable: what it
+measures, which width, how long it needs, and which artifact it writes. A quiet window is
+never spent deciding what to run in it.
+
+**Wall-clock is quoted only where it was actually measured.** A TP2 engine run is priced
+at ~1 h (`12` T21) because that is what engine runs take, and the long calibration sweep
+is priced at six hours because it was measured at six hours — not estimated from
+throughput. Effort elsewhere is sized in lines of code, not wall-clock, precisely because
+most tasks have no such measurement to quote (`AI_DEV_RULES.md`).
 
 ### The pre-flight gate — three checks, not one
 
@@ -334,7 +207,7 @@ pre-flight script, not this table.
 
 ---
 
-## D102. Escalation points
+## Escalation points
 
 Five checks can each reshape the plan. Each ends in a decision that belongs to the project
 owner, not to the agent that ran it.
@@ -351,7 +224,11 @@ owner, not to the agent that ran it.
 arrives with the options and their costs already worked out, so the decision is one round
 trip rather than a fresh analysis under time pressure.
 
-The halt rule (D95) is the general case: any surprise stops and is discussed.
+The halt rule (`AI_DEV_RULES.md`) is the general case: any surprise stops and is discussed.
+
+Reaching any of these five, like the loop's halt above, is an escalation — so it applies
+`need human` too (`AI_DEV_RULES.md`), for the same reason: the stop should be visible on
+GitHub, not only inside an agent's report.
 
 ---
 
@@ -360,28 +237,13 @@ The halt rule (D95) is the general case: any surprise stops and is discussed.
 Stated so it is not mistaken for an omission.
 
 - **Dates.** Effort is LOC; wall-clock appears only where it is machine time with a
-  measured basis (D99).
+  measured basis (`AI_DEV_RULES.md`).
 - **Detailed Wave 4+.** Deliberate — see above.
 - **Agent prompts.** Task briefs are written to be close to a prompt and generated from at
   launch, because embedded prompts go stale as tasks move.
 - **A test plan separate from `08`.** Validation is `08`; this document schedules it.
 - **Upstreaming to ATOM's `main`.** Out of scope until the project agrees a milestone is
   ready; the integration branch is the destination until then.
-
----
-
-## Decision log
-
-| # | Decision | Date |
-|---|---|---|
-| D95 | Tasks are a **pool**, not a track assignment; 5 dev + 5 reviewer agents cap concurrency at 5 in flight. Conflicts are tolerated and are a **decomposition signal**. Developer and reviewer are separate agents with opposed objectives. **Halt and discuss on any surprise.** | 2026-09-20 |
-| D96 | Context is durable **in the task record** — brief, dev record, review record, handoff — with each brief linking to its predecessors'. A brief that cannot name its file set is not claimable. | 2026-09-20 |
-| D97 | `feature/atomcompass_new` is the integration branch; one worktree and one PR per task. Four setup rules from recorded failures: no shared mutable source root, containers mount the worktree parent, `PYTHONPATH` verified before trusting a result, `git archive` never `rsync`. | 2026-09-20 |
-| D98 | Four gates per task: ATOM's suite green **unmodified**, new CPU-only tests, one named result stated in advance, and review by a separate agent. Baselines recorded first. | 2026-09-20 |
-| D99 | Effort in **lines of code**. Wall-clock only for machine time with a measured basis. A 2x overrun is a halt-and-discuss event. | 2026-09-20 |
-| D100 | Twelve modules under `atom/compass/`; tasks are cut so each touches one plus its tests. ATOM edits outside that tree are enumerated per task. | 2026-09-20 |
-| D101 | One GPU queue; tasks declare their measurement before becoming claimable. Pre-flight is **three** checks — wedge, compute, **VRAM** — run before *and* after. | 2026-09-20 |
-| D102 | Five named escalation points, each prepared in advance so the decision is one round trip. | 2026-09-20 |
 
 ---
 
