@@ -19,7 +19,8 @@
 # Five ways a green verdict was previously reachable on an unmeasured run, all
 # of them measured, all of them now refusals:
 #   - a summary carrying `N errors` was parsed for passed/failed only, so a run
-#     with 12 collection errors read as PASS (reviewer, replayed at :102-163);
+#     with 12 collection errors read as PASS (reviewer, replayed against this
+#     script);
 #   - pytest's own exit status was captured and never consulted, so rc=2
 #     (interrupted) or rc=4 (usage error) read as a measurement;
 #   - a caller's `-rE` overrode this script's `-rf` -- pytest's `-r` is
@@ -34,8 +35,9 @@
 #
 # One way is NOT a refusal, and this header claimed otherwise until 2026-09-20
 # ("EVERY question this gate cannot answer is a refusal"). A toolchain differing
-# from the baseline's -- including an AITER version that reads UNKNOWN, which
-# :162-163 explicitly calls a mismatch -- warns on stderr and can still end
+# from the baseline's -- including an AITER version that reads UNKNOWN, which the
+# toolchain comparison below explicitly calls a mismatch -- warns on stderr and
+# can still end
 # GATE_GPU_RC=0. All five known failures are AITER-kernel numerics, so on an
 # AITER bump the delta compares two different things and exits 0 anyway. Making
 # it a refusal is a behaviour change with its own cost -- a `git describe` that
@@ -81,19 +83,18 @@ BASE_ROCM=7.2.53211
 # them -- a bump used to pass the drift check in silence because only torch and
 # HIP were compared.
 BASE_AITER=v0.1.21.dev0-49-gf4e7c7509
-# How many of BASE_PASSED came from tests/compass/ at BASE_COMMIT. The pass
-# count is checked for EQUALITY against BASE_PASSED adjusted by the tests this
-# tree adds under tests/compass/, so a surplus is accounted for rather than
-# absorbed. Every Compass task adds tests there; a task that adds tests
-# anywhere else makes this an explicit mismatch, which is the point.
+# How many of BASE_PASSED came from tests/compass/ at BASE_COMMIT. The pass count
+# is checked for EQUALITY against BASE_PASSED adjusted by what tests/compass/
+# contributes on this tree, so a surplus is accounted for rather than absorbed.
+# Every Compass task adds tests there; a task that adds tests anywhere else makes
+# this an explicit mismatch, which is the point.
 #
-# LIMITATION, stated rather than papered over: this is a PASS count, and
-# COMPASS_N at :173 is a COLLECTED count. They are the same number only while
-# tests/compass/ contains no skip and no xfail -- true on this tree (checked:
-# one file, neither marker). The first Compass test that skips on a GPU host
-# would make a legitimately green tree read `unaccounted -1`, so that cause is
-# named in the mismatch text below rather than left to be rediscovered. Keeping
-# them equal is a condition on tests/compass/, not an accident.
+# Both sides are PASS counts. This one was a pass count all along; the tree side
+# used to be a COLLECTED count, so the first Compass test to skip or xfail on a
+# GPU host would have made a legitimately green tree read `unaccounted -1` and
+# blamed tests outside tests/compass/. compass_compass_pass_count in _lib.sh now
+# counts passes on both sides, so the two are the same quantity by construction
+# rather than while a condition happens to hold.
 BASE_COMPASS_TESTS=49
 
 # The baseline's failures by name. The count above and the list here are two
@@ -169,16 +170,13 @@ if [ "$TORCH" != "$BASE_TORCH" ] || [ "$ROCM" != "$BASE_ROCM" ] || [ "$AITER" !=
 fi
 
 # The surplus this tree is allowed, derived from this tree rather than declared.
-COLLECT=$(python -m pytest tests/compass --collect-only -q -p no:cacheprovider 2>&1)
-COMPASS_N=$(printf '%s' "$COLLECT" | grep -oE '[0-9]+ tests? collected' | grep -oE '^[0-9]+')
-case "$COMPASS_N" in
-'' | *[!0-9]*)
-    printf 'FATAL: could not count tests/compass -- the pass surplus this tree is\n' >&2
-    printf '  allowed has no source, so the delta cannot be judged. Last lines:\n' >&2
-    printf '%s\n' "$COLLECT" | tail -5 >&2
-    finish 93
-    ;;
-esac
+# An absent tests/compass/ counts zero and the gate still produces a verdict --
+# on the integration branch that is 4779 + 0 - 49 = 4730, which is what a tree
+# without this phase's tests measures. See compass_compass_pass_count in _lib.sh
+# for why that is a count and not a refusal.
+COMPASS_N=$(compass_compass_pass_count "$ROOT") || finish $?
+[ -d "$ROOT/tests/compass" ] ||
+    printf 'tests/compass: absent on this tree, so it contributes no tests.\n'
 EXPECT_PASSED=$((BASE_PASSED + COMPASS_N - BASE_COMPASS_TESTS))
 printf 'expected: %s passed = %s baseline + (%s - %s) tests/compass\n' \
     "$EXPECT_PASSED" "$BASE_PASSED" "$COMPASS_N" "$BASE_COMPASS_TESTS"
@@ -293,11 +291,10 @@ rm -f "$OBS_IDS" "$ERR_IDS" "$KNOWN_IDS"
     expected        %s
     observed        %s
     unaccounted     %s
-  A surplus is not slack: it absorbs a file that stopped being collected. If
-  this tree adds tests outside tests/compass/, account for them here. If the
-  difference is NEGATIVE, the other cause is tests/compass/ itself: the figure
-  above is a collected count and the baseline figure is a pass count, so a skip
-  or an xfail there reads as a missing pass.' \
+  A surplus is not slack: it absorbs a file that stopped being collected. Both
+  tests/compass figures are pass counts, so a skip or an xfail there is already
+  accounted for; if this tree adds tests outside tests/compass/, account for
+  them here.' \
         "$PASSED" "$EXPECT_PASSED" "$BASE_PASSED" "$BASE_COMMIT" \
         "$COMPASS_N" "$BASE_COMPASS_TESTS" "$((COMPASS_N - BASE_COMPASS_TESTS))" \
         "$EXPECT_PASSED" "$PASSED" "$((PASSED - EXPECT_PASSED))")"

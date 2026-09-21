@@ -8,9 +8,11 @@
 # THE RULE, in one sentence: an atom module named by an excluded test is a blind
 # spot unless a CPU-tier test that actually runs names it too.
 #
-# Three decisions make that sentence operational. Each was forced by a measured
-# counter-example in this tree, named here so the next reader does not have to
-# rediscover it.
+# Three decisions make that sentence operational. Decisions 1 and 3 were each
+# forced by a measured counter-example in this tree, named below so the next
+# reader does not have to rediscover it; decision 2 removes no path from this
+# tree and is kept as a forward guard, which is also said below rather than left
+# to be inferred from this sentence.
 #
 #   1. Imports are read at ANY indentation, not just column 0. The previous
 #      version anchored on `^`, and 190 `import atom.*` lines in non-plugin test

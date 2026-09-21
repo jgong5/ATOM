@@ -93,7 +93,9 @@ still allowed — there nothing contradicts the caller, and it is how
 > an `atom` module named by an excluded test is a blind spot **unless a CPU-tier
 > test that actually runs names it too**.
 
-Four things in that sentence were wrong before, each found by measurement:
+Four decisions make that sentence operational. Three were forced by a defect or a
+counter-example this tree measured; the fourth, collection, currently changes no
+path and is kept as a forward guard:
 
 1. **Indentation.** The parser anchored on `^`, and **190** of this tree's
    `import atom.*` lines in non-plugin test files are indented — function-local and

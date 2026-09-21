@@ -126,3 +126,52 @@ compass_describe() {
     printf 'commit: %s (%s)%s\n' "${sha:0:9}" "$src" \
         "$([ "$dirty" -gt 0 ] && echo " +${dirty} uncommitted")"
 }
+
+# How many tests under tests/compass/ pass on this tree. The GPU gate adds this
+# to its baseline, so a tree that carries Compass tests is judged by an equality
+# rather than by "no worse than".
+#
+# An ABSENT tests/compass/ is a count of zero, not a refusal. Every tree except a
+# Compass task's own has no such directory -- the integration branch included --
+# and a gate that produces no verdict there cannot be used to show that a branch
+# is gate-neutral. REPRODUCED 2026-09-21 on 4da2f3a2d and on the branch of PR #9:
+# `pytest tests/compass --collect-only` exits 4 with `file or directory not
+# found`, the count came back empty, and the gate refused with GATE_GPU_RC=93
+# before running a single test. The two cases are told apart by asking the
+# filesystem, not by parsing pytest's error text.
+#
+# A PASS count, not a collected count. The figure it is compared against is a
+# pass count, and the two diverge the moment tests/compass/ holds a skip or an
+# xfail -- which would read as a missing pass and fail a legitimately green tree.
+# Counting passes costs one extra pytest invocation over a CPU-only directory
+# (~1 s beside the superset's 72 s) and removes the condition entirely instead of
+# documenting it. What it assumes instead is narrower: that these tests give the
+# same result alone as inside the superset run.
+#
+# Anything else -- a failure, an error, an unparsable summary -- is a refusal.
+# The surplus would have no source, and a delta judged against a surplus that
+# has no source is not a measurement.
+compass_compass_pass_count() {
+    local root=$1 out rc n
+    if [ ! -d "$root/tests/compass" ]; then
+        printf '0'
+        return 0
+    fi
+    out=$(cd "$root" && python -m pytest tests/compass -q --no-header -p no:cacheprovider 2>&1)
+    rc=$?
+    # rc 5 is pytest's "no tests collected": a directory that exists and holds
+    # nothing runnable is a real zero, not an unreadable answer.
+    if [ "$rc" -eq 5 ]; then
+        printf '0'
+        return 0
+    fi
+    n=$(printf '%s' "$out" | grep -oE '[0-9]+ passed' | tail -1 | grep -oE '^[0-9]+')
+    if [ "$rc" -ne 0 ] || [ -z "$n" ]; then
+        printf 'FATAL: could not count the tests that pass under %s/tests/compass.\n' "$root" >&2
+        printf '       The pass surplus this tree is allowed would have no source, so\n' >&2
+        printf '       the delta cannot be judged. pytest rc=%s, last lines:\n' "$rc" >&2
+        printf '%s\n' "$out" | tail -5 >&2
+        return 93
+    fi
+    printf '%s' "$n"
+}
