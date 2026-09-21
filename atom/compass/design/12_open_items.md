@@ -12,7 +12,10 @@ backlog. Nothing here is a decision; every decision lives in its topic's decisio
 
 1. **Load-bearing assumptions** — hold up large parts of the design; each has a check plan
 2. **Missing topics** — design points nobody has written yet, with a recommendation
-3. **TODO register** — T1–T72, per topic
+3. **TODO register** — 77 items, **T1–T76 and T80**, per topic. The register is not
+   contiguous on this branch: T-numbers are allocated across parallel task branches, and
+   T73–T76 arrive with P0.3, here. T77 arrives with P0.1. T80 arrived with P0.2. 73 are
+   open; T10, T15, T22 and T48 are struck through as done
 4. **Cross-cutting issues and pending amendments**
 
 ---
@@ -179,9 +182,10 @@ M-f `14`; M-g `01` D3.5.
 | T71 | Add Wave 4+ detail as Phase 0 and T21 answers arrive |
 | T72 | Decide whether reviewer agents use ATOM's `review-pr` skill or a Compass-specific checklist |
 | T73 | **Declare the plugin entry point with a dotted module path and put the rebind in that package's `__init__.py`.** Successor to T10, opened 2026-09-20; re-scoped 2026-09-20 after review refuted its premise by execution. `plugins.py:210` calls `importlib.util.find_spec` on the entry-point value, and on a **dotted** value that imports the parent package — so `compass_harness.plugin:plugins.yaml` executes `compass_harness/__init__.py` inside `discover_plugins()`, which runs at import of `aiperf.plugin.plugins` and therefore before any `PhaseRunner` is constructed. `submodule_search_locations` stays truthy, so upstream's guard passes and the manifest resolves normally; zero edits to agentx-harness. Executed 13/13, `probe_bootstrap.py` against `56a0cf70f`, decomposed in `06` D34. **A packaging decision, not a precondition of the seam** — the earlier "no such bootstrap exists today" was an asserted negative and is false. It costs no lines beyond `06` D34's existing manifest/bootstrap row. The tripwire ships regardless, because a bootstrap that silently fails to run has no other detector (`06` D34, `16` W1.9) |
+| T74 | **Whether the 32 `asyncio.wait_for(..., timeout=T)` sites need virtual time.** Successor to T10, opened 2026-09-20. They bypass `LoopScheduler`, so the rebind does not reach them; under virtual time they may fire instantly. P0.3 did not examine them (`06` D34, second risk) |
 | T75 | **Decide the two `loop.call_later` idle-cap timers.** Opened 2026-09-20. `replay_dependencies.py:307` and `agentic_replay.py:592` arm real-clock timers the `LoopScheduler` rebind cannot reach; upstream's own docstring says the second deliberately lives outside the scheduler. Either override the two `_arm_*_idle_watchdog` methods from the Compass subclass, or declare the idle-cap feature unsupported under virtual time and assert both caps are `None`. Related: `agentic_replay.py:531` derives the virtual-time skip from `time.monotonic()` (`06` D34) |
 | T76 | **Reconcile `seamless=True`, which keeps two `PhaseRunner`s and two schedulers live at once.** Opened 2026-09-20. `phase_orchestrator.py:267` builds one runner per phase and tracks `_active_runners`. W1.9 either reconciles two concurrent schedulers against one virtual clock or asserts `seamless=False` (`06` D34) |
-| T74 | **Whether the 32 `asyncio.wait_for(..., timeout=T)` sites need virtual time.** Successor to T10, opened 2026-09-20. They bypass `LoopScheduler`, so the rebind does not reach them; under virtual time they may fire instantly. P0.3 did not examine them (`06` D34, second risk) |
+| T80 | Raise with ATOM's owners: `tests/test_prefix_cache_accuracy.py` has no test function — it is an `argparse` script driving a live server — and `test_kv_connector_scheduler.py` / `test_transfer_engine.py` have been dead since #690. Measured: all three run nothing in **either** tier |
 
 ### Topics 02, 01 — gaps now closed
 

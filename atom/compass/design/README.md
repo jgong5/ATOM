@@ -1,9 +1,10 @@
 # ATOM Compass — Design
 
 **Status: reviewed and approved, 2026-09-20. Design only — no code has been written
-against it yet.** Every document carries a matching header. **116 decisions — D0–D102
-with no gaps, plus 14 sub-decisions** — are indexed at the end of this file; **72 open
-TODOs (T1–T72)**, the load-bearing assumptions and the cross-cutting issues live in
+against it yet.** Every document carries a matching header. **108 decisions — D0–D94
+with no gaps, plus 14 sub-decisions** — are indexed at the end of this file; **77 registered
+TODOs — T1–T76 and T80, of which 73 are open** (T10, T15, T22 and T48 are struck through as
+done); they, the load-bearing assumptions and the cross-cutting issues live in
 **`12_open_items.md`**. Implementation follows the execution plan in `16`.
 
 ---
@@ -212,19 +213,19 @@ document that owns it. Nothing in `01`–`11` is outside this diagram.
 | L2 | Prometheus metrics under virtual time | [`11_metrics_support.md`](11_metrics_support.md) | D71–D77 |
 | L3 | `CostBackend` interface, provenance vocabulary | [`02`](02_model_runner_and_cost_backend.md) | D11 |
 | L3 | Memory model, KV pool reuse | [`03_memory_and_kv_model.md`](03_memory_and_kv_model.md) | D13–D16 |
-| L3 | Model capture, Cost IR | [`04_model_capture_and_cost_ir.md`](04_model_capture_and_cost_ir.md) | D17–D23 |
+| L3 | Model capture, Cost IR | [`04_model_capture_and_cost_ir.md`](04_model_capture_and_cost_ir.md) | D17–D23 (+ D18.1) |
 | L3 | Fitting, law selection, hull guard | [`09_fitting_and_law_selection.md`](09_fitting_and_law_selection.md) | D53–D62 |
 | L3 | Analytic laws (tier 0) | [`10_analytic_laws.md`](10_analytic_laws.md) | D63–D70 |
 | L4 | Harness contract, wire fields, adapter | [`06_workload_harness_contract.md`](06_workload_harness_contract.md) | D27–D35 |
 | L5 | `compass plan` and the calibration phases | [`07_calibration_toolchain.md`](07_calibration_toolchain.md) | D36–D43 |
 | L5 | Machine spec schema and probes | [`05_machine_spec_and_probes.md`](05_machine_spec_and_probes.md) | D24–D26 |
 | L0 | Artifact store, keys, invalidation | [`07`](07_calibration_toolchain.md) | D41, D43 |
-| — | Validation protocol (judges all of it) | [`08_validation_protocol.md`](08_validation_protocol.md) | D43.1, D44–D52 |
+| — | Validation protocol (judges all of it) | [`08_validation_protocol.md`](08_validation_protocol.md) | D43.1, D44–D52 (+ D50.1) |
 | L5 | Configuration surface: flags, precedence, the `compass` CLI | [`13_configuration_surface.md`](13_configuration_surface.md) | D78–D81 |
 | L2/L3 | Speculative decoding and MTP | [`14_speculative_decoding.md`](14_speculative_decoding.md) | D82–D87 |
 | L1/L3 | Parallelism: TP, DP, PP, EP | [`15_parallelism_support.md`](15_parallelism_support.md) | D88–D94 |
 | — | Open items, assumptions, gaps | [`12_open_items.md`](12_open_items.md) | — |
-| — | How it gets built: tasks, waves, gates, GPU queue | [`16_execution_plan.md`](16_execution_plan.md) | D95–D102 |
+| — | How it gets built: tasks, waves, gates, GPU queue | [`16_execution_plan.md`](16_execution_plan.md) | — |
 
 ### B. A simulated step, end to end
 
@@ -538,13 +539,13 @@ The documents use these precisely; a reader will bounce off without them.
 
 | Doc | Title | What it holds |
 |---|---|---|
-| [`12`](12_open_items.md) | Open Items | The five load-bearing assumptions and their check plans; the missing-topic register; T1–T72; cross-cutting issues; pending amendments. |
+| [`12`](12_open_items.md) | Open Items | The five load-bearing assumptions and their check plans; the missing-topic register; T1–T72 and T80; cross-cutting issues; pending amendments. |
 
 ### Part VII — How it gets built
 
 | Doc | Title | What it settles |
 |---|---|---|
-| [`16`](16_execution_plan.md) | The Execution Plan | Tasks are a **pool**, capped at 5 in flight, with context durable in the task record rather than in an agent. Phase 0 de-risks five assumptions before any build work. Effort in lines of code, not dates. Detailed through Wave 3, deliberately coarse beyond. |
+| [`16`](16_execution_plan.md) | The Execution Plan | Tasks are a **pool**, capped at 5 in flight, with context durable in the task's GitHub issue and PR rather than in an agent. Phase 0 de-risks five assumptions before any build work. Effort in lines of code, not dates. Detailed through Wave 3, deliberately coarse beyond. |
 
 ---
 
@@ -555,18 +556,17 @@ The documents use these precisely; a reader will bounce off without them.
 | D0 – D9 (+ D3.1–D3.5) | `01` Execution and Time Model |
 | D10 – D12 (+ D10.1) | `02` Model Runner Seam and Cost Backend |
 | D13 – D16 | `03` Memory Model and the KV Pool |
-| D17 – D23 | `04` Model Capture and the Cost IR |
+| D17 – D23 (+ D18.1) | `04` Model Capture and the Cost IR |
 | D24 – D26 (+ D25.1) | `05` Machine Specification and its Probes |
 | D27 – D35 | `06` Workload Harness Contract |
 | D36 – D43 (+ D38.1, D40.1) | `07` Calibration and Benchmarking Toolchain |
-| D43.1, D44 – D52 | `08` Validation Protocol |
+| D43.1, D44 – D52 (+ D50.1) | `08` Validation Protocol |
 | D53 – D62 | `09` Fitting and Law Selection |
 | D63 – D70 (+ D67.1) | `10` Analytic Laws (Tier 0) |
 | D71 – D77 | `11` Engine Metrics under Virtual Time |
 | D78 – D81 | `13` The Configuration Surface |
 | D82 – D87 | `14` Speculative Decoding and MTP |
 | D88 – D94 | `15` Parallelism Support (TP, DP, PP, EP) |
-| D95 – D102 | `16` The Execution Plan |
 
 ### Headline decisions
 

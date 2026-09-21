@@ -20,9 +20,36 @@ Asked directly: can Compass reuse existing ATOM unit tests? **Yes, and it is the
 correctness evidence in this document — but it validates a different property than
 everything else here.**
 
-Verified on `feature/atomcompass_new`: **187 test files** under `tests/`, and ATOM's own
-`CLAUDE.md` states they need **no GPU** — AITER and `torch.cuda` are mocked. Among them,
-directly relevant to the components Compass keeps:
+> **Corrected 2026-09-20 by P0.2 — measured, not argued. The full rewrite of this decision
+> belongs to P0.1; `16`'s measured test and lint baselines carry the derivation and the
+> numbers.**
+
+There are **187 test files** under `tests/` on `feature/atomcompass_new`, but the rest of the
+claim that stood here — that ATOM's own `CLAUDE.md` is right that they need **no GPU** because
+AITER and `torch.cuda` are mocked — is false, measured at `83daf636d` and at `b963c9411` in
+container `xiaobizh_n18_cpu` on node 18. Of those 187, **30 are under `tests/plugin/`** and are
+dropped whole for needing sglang and vllm — though 3 of the 7 that fail collection there fail
+on `rocminfo`, not on a missing package. Of the **157 that remain, 29 reach the driver** (28 at
+collection time via `rocminfo`, 1 at run time via `hipHostMalloc`), and of the **128 left after
+those, 22 collect no test at all**. Every count in this paragraph is stated against the set it
+was measured over: a numerator taken over the non-plugin files and divided by 187 is the defect
+this correction exists to remove. What is GPU-free is a *tier*, and that tier is genuinely
+green: 3956 passed, 0 failed, rc=0.
+
+Several rows of the table below are affected, and the correction matters most where that
+table is load-bearing:
+
+- `test_prefix_cache_accuracy.py` contains **no test function**. It is an `argparse` script
+  that drives a live server on `localhost:8000`; `pytest` reports `no tests ran` for it in
+  both containers. It is coverage of nothing.
+- `test_prefill_prefix_vs_native.py` module-skips on the CPU tier ("needs a real GPU") and
+  gives 4 passed in the GPU container — so the prefix-cache row is **GPU-tier only**.
+- `test_kv_connector_scheduler.py` likewise runs nothing in either tier: `1 skipped`, because
+  ATOM #690 split `kv_transfer_engine` into `moriio` and the test's imports were never updated.
+- `test_block_table_marshal.py`, `test_dp_metadata.py` and `test_dp_sync_layout.py`: the first
+  is in the 29-file exclusion list; the other two were too, wrongly, and are CPU-green.
+
+With those caveats, the tests directly relevant to the components Compass keeps:
 
 | Test | Covers |
 |---|---|
