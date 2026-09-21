@@ -113,9 +113,10 @@ if [ -n "${COMPASS_CHANGED_FILES:-}" ]; then
     CHANGED=$(cat "$COMPASS_CHANGED_FILES")
     SRC="COMPASS_CHANGED_FILES"
 elif git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1 &&
-     BASE=$(git -C "$ROOT" merge-base HEAD "$INTEGRATION" 2>/dev/null); then
+     REF=$(compass_resolve_ref "$ROOT" "$INTEGRATION") &&
+     BASE=$(git -C "$ROOT" merge-base HEAD "$REF" 2>/dev/null); then
     CHANGED=$(git -C "$ROOT" diff --name-only "$BASE")
-    SRC="diff vs $INTEGRATION (${BASE:0:9})"
+    SRC="diff vs $REF (${BASE:0:9})"
 elif [ -r "$ROOT/.compass-changed" ]; then
     # A snapshot built by snapshot.sh, which is how this gate normally runs.
     # The stamp was written from the same rev-parse that selected the archived
@@ -145,7 +146,7 @@ if [ -z "$GPU_SRC_UNKNOWN" ]; then
 fi
 
 if [ -n "$GPU_SRC_UNKNOWN" ]; then
-    printf 'gpu:    UNKNOWN -- no git, no COMPASS_CHANGED_FILES, no .compass-changed\n'
+    printf 'gpu:    UNKNOWN -- no git, no COMPASS_CHANGED_FILES, no .compass-changed stamp\n'
 elif [ -n "$GPU_NEEDED" ]; then
     printf 'gpu:    REQUIRED (%s)\n' "$SRC"
     printf '%s' "$GPU_NEEDED" | sed 's/^/          /'
@@ -173,12 +174,14 @@ if [ "$RC" -ne 0 ]; then
 fi
 
 if [ -n "$GPU_SRC_UNKNOWN" ]; then
-    printf 'The CPU tier is green, but the test gate is not passed: this run\n' >&2
-    printf 'cannot tell whether the diff needs the GPU tier, and an unanswered\n' >&2
-    printf 'question is not a "no".\n' >&2
-    printf '  Fix by any one of: run in a tree with %s reachable;\n' "$INTEGRATION" >&2
-    printf '  set COMPASS_CHANGED_FILES=<file listing the diff>; or rebuild the\n' >&2
-    printf '  snapshot with scripts/compass/snapshot.sh, which stamps .compass-changed.\n' >&2
+    printf 'The CPU tier is green, but the test gate is not passed: this tree was\n' >&2
+    printf 'never stamped -- it carries no .compass-changed, which a bare `git\n' >&2
+    printf 'archive` does not write and snapshot.sh does. So this run cannot tell\n' >&2
+    printf 'whether the diff needs the GPU tier, and an unanswered question is not a\n' >&2
+    printf '"no". That is a staging omission, not a finding about the tree.\n' >&2
+    printf '  Fix by any one of: stage with scripts/compass/snapshot.sh, which stamps\n' >&2
+    printf '  .compass-changed; set COMPASS_CHANGED_FILES=<file listing the diff>; or\n' >&2
+    printf '  run in a tree where %s resolves.\n' "$INTEGRATION" >&2
     finish 98
 fi
 
