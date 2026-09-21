@@ -9,7 +9,15 @@ AI agents are given full autonomy under standing rules at `atom/compass/AI_DEV_R
 
 ```bash
 pip install -e .                          # editable install
-python -m pytest tests/                   # all tests (no GPU needed — mocks AITER and torch.cuda)
+python -m pytest tests/                   # NOT GPU-free: AITER and torch.cuda are mocked, but
+                                          # 29 of the 157 files outside tests/plugin/ still
+                                          # reach the driver — 28 at collection time via
+                                          # rocminfo — and the 30 under tests/plugin/ need
+                                          # sglang and vllm. The driver-free subset, 128 files,
+                                          # is green; it and its exclusion list are in
+                                          # atom/compass/design/16_execution_plan.md, under
+                                          # "The measured test and lint baselines". Measured
+                                          # 2026-09-20 at 83daf636d.
 black . && ruff check .                   # format + lint (CI enforced)
 ```
 
