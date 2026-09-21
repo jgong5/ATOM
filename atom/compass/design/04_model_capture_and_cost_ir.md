@@ -331,7 +331,15 @@ Node    := Op(name, kind, in_shapes: [SymExpr], out_shapes: [SymExpr],
 ### `Repeat` — the efficiency property
 
 An LLM forward is a prologue, N layer bodies, and an epilogue. `Repeat` prices the body
-once and multiplies. For Qwen3.8-27B that is 64 layers collapsing to roughly two bodies —
+once and **reuses that price** for every instance — the same prices, in the same order,
+added the same way. It does not multiply the body price by the count. Float addition is
+not associative, so multiplying re-associates, and it reproduces the recorded price in
+**none of the three shapes measured**: eight identical layers, 3.2e-05 s multiplied
+against 3.200000000000001e-05 s recorded; a four-block pattern repeated twenty times,
+0.00036 against 0.0003600000000000009; six instances of 0.1 s, 0.6000000000000001
+against 0.6. Reuse reproduces all three exactly.
+
+For Qwen3.8-27B that is 64 layers collapsing to roughly two bodies —
 **48 `linear_attention` and 16 `full_attention`**, `full_attention_interval: 4` — plus
 embedding and the head.
 
@@ -348,8 +356,13 @@ unsound**, see below); 4.3 ms once the key carried the bound allocation.
 > shape-only cache answers the first number, with a complete-coverage claim, for a step
 > that is neither.
 
-**`Repeat` must be validated, not assumed.** Derive flat, group, and assert the grouped
-form reproduces the flat cost. Layer 0 often differs structurally; per-layer quantization
+**`Repeat` must be validated, not assumed.** Derive flat, group, and compare the two forms
+**term by term, in order** — not total against total. A step cost is reported as a
+breakdown, one row per term, so individual prices are read downstream and not only their
+sum; two forms agreeing on the sum while disagreeing on a term disagree in what gets
+reported. Measured: one instance priced one bit above the others left the two forms
+bit-identical in total, so the elementwise comparison refuses that grouping and a
+total-only one accepts it. Layer 0 often differs structurally; per-layer quantization
 scales differ without differing in cost; a hybrid's layer types interleave rather than
 block.
 
@@ -504,8 +517,8 @@ Three rules make this well-formed rather than merely expressible:
    changes period) prices per instance rather than being assumed uniform. Without this,
    nesting is a lie: `Repeat(20, P)` claims 20 identical `P`s.
 3. **Grouping is an optimisation and must be provably free.** `Repeat` is only emitted
-   where the flattened price and the grouped price agree exactly; otherwise the node
-   stays a `Seq`. This is already **T6**, and the nested form makes it load-bearing
+   where the flattened and grouped forms price identically, term by term; otherwise the
+   node stays a `Seq`. This is already **T6**, and the nested form makes it load-bearing
    rather than a nicety — a wrong nesting is a systematic error multiplied by the repeat
    count.
 
@@ -984,7 +997,7 @@ load-bearing assumptions and their check plans, is [`12_open_items.md`](12_open_
 | T3 | Build the per-leaf parameter-extractor table (~20 entries) | the main hand-written asset; needs the leaf list frozen first |
 | T4 | Establish scratch constants per leaf for the 27B | unobservable device-free; needs a source or one measurement |
 | T5 | Verify ATOM's model classes trace cleanly under FakeTensorMode at TP>1 | needs a non-wedged node |
-| T6 | Validate that `Repeat` grouping reproduces the flat cost | needs a first trace |
+| T6 | Validate that `Repeat` grouping reproduces the flat prices term by term | needs a first trace |
 | T7 | Validate `Par` reconstruction from stream ids | not exercised until M5 (Kimi-K3) |
 | T8 | Decide whether tier (a) is fitted independently or derived from tier (b) | tier (b) does not exist yet |
 | T9 | Declare a row-ordering treatment for decode attention | 1.77x effect, invisible to every current feature |
