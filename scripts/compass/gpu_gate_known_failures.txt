@@ -1,0 +1,25 @@
+# SPDX-License-Identifier: MIT
+# The GPU superset's known-failing node-ids at BASE_COMMIT, verbatim. Read by
+# gate_gpu.sh, which judges failures by NAME and not only by count: a
+# same-sized set of *different* failures is a regression the counts cannot see.
+#
+# Measured 2026-09-20 on hjbog-srdc-18 in xiaobizh_n18, at fe9ea043c, with
+# torch 2.10.0+rocm7.2.4.git3d3aa833 / hip 7.2.53211 / ROCm 7.2.4 /
+# aiter v0.1.21.dev0-49-gf4e7c7509. Two runs, byte-identical failing sets.
+#
+# Four are one bf16 ULP -- max|diff| = 0.001953125 = 2^-9 -- against
+# atol=rtol=1e-3. The fifth is a bitwise torch.equal with no tolerance at all,
+# so "five bf16 ULP failures" is wrong; it is four, plus one bitwise check.
+# All five are pre-existing and unrelated to Compass: no importable atom module
+# differs between fe9ea043c and the integration base 83daf636d. The only delta
+# under atom/ is 30 inserted lines of markdown documentation, which no test
+# imports.
+#
+# Blank lines and # comments are ignored. One node-id per line. The count here
+# and BASE_FAILED in gate_gpu.sh are two statements of one fact; the script
+# refuses to run if they disagree.
+tests/test_dcp_merge_ops.py::test_row_view_matches_output_slicing_bitwise
+tests/test_fused_compress_ragged.py::test_kernel_matches_reference_on_ragged_batches[extend0-context0-cut+whole]
+tests/test_fused_compress_ragged.py::test_kernel_matches_reference_on_ragged_batches[extend1-context1-whole+cut]
+tests/test_fused_compress_ragged.py::test_kernel_matches_reference_on_ragged_batches[extend2-context2-resume+fresh]
+tests/test_fused_compress_ragged.py::test_kernel_matches_reference_on_ragged_batches[extend4-context4-tiny-then-long]

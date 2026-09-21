@@ -1,0 +1,52 @@
+# Test files excluded from the CPU tier run by gate_cpu.sh.
+#
+# Two sections. They have different provenance and different rules, and the
+# difference is the whole point of the file: one section is reproducible from
+# the tree, the other cannot be, and each says which it is.
+#
+# GENERATED -- produced by regen_cpu_gate_exclude.sh. Never hand-edit. These
+# files raise a *collection*-time error in a driverless container: importing
+# them reaches rocminfo before any test body runs, so pytest cannot even build
+# the node list. Regenerating rewrites this section wholesale.
+#
+# MANUAL -- files that collect cleanly and so are invisible to the regenerator
+# (it greps `^ERROR ` from --collect-only), but fail at run time on a driver
+# call. The regenerator preserves this section verbatim. Every entry must carry
+# the observed failure above it: an entry without one is indistinguishable from
+# a test somebody found inconvenient.
+# BEGIN GENERATED
+tests/model_ops/test_balance_router_logits.py
+tests/model_ops/test_shared_expert_dispatch.py
+tests/test_block_table_marshal.py
+tests/test_cudagraph_capture_bounds.py
+tests/test_dcp_merge_ops.py
+tests/test_dcp_sparse_filter.py
+tests/test_dcp_topk.py
+tests/test_decode_input_ids.py
+tests/test_deepseek_v4_wo_a_dequant.py
+tests/test_dspark.py
+tests/test_dspark_swa_fp8_2buff.py
+tests/test_dummy_weight_init.py
+tests/test_eplb_metadata.py
+tests/test_eplb_module_a.py
+tests/test_eplb_module_b.py
+tests/test_eplb_module_c.py
+tests/test_eplb_module_d.py
+tests/test_eplb_module_e.py
+tests/test_gdn_state_relocation.py
+tests/test_kda_checkpoint_slot_copy.py
+tests/test_kda_layout_id.py
+tests/test_lm_head_argmax.py
+tests/test_mega_mxfp4_method.py
+tests/test_merge_attn_states.py
+tests/test_moe_online_quant_batch.py
+tests/test_mori_dispatch_trim_bound.py
+tests/test_mtp_deferred_status_queue.py
+tests/test_mxfp4_moe_has_bias.py
+# END GENERATED
+# BEGIN MANUAL
+# collects cleanly, then fails at run time with `hipHostMalloc failed: 100`
+# -- a pinned-host-memory allocation, which needs the driver. Measured in the
+# CPU container at 83daf636d.
+tests/test_lmcache_offload_disk_integration.py
+# END MANUAL

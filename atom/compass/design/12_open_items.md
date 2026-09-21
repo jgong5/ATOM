@@ -12,11 +12,15 @@ backlog. Nothing here is a decision; every decision lives in its topic's decisio
 
 1. **Load-bearing assumptions** — hold up large parts of the design; each has a check plan
 2. **Missing topics** — design points nobody has written yet, with a recommendation
-3. **TODO register** — 80 items, **T1–T76, T78–T80 and T82**, per topic. The register is
-   not contiguous on this branch: T-numbers are allocated across parallel task branches,
-   and T73–T76 arrive with P0.3, here. T77 arrives with P0.1, T81 with P0.4. T80 arrived
-   with P0.2; T78, T79 and T82 with P0.5. 76 are open; T10, T15, T22 and T48 are struck
-   through as done
+3. **TODO register** — 81 rows, **T1–T80 and T82**, per topic, of which **76 are open**:
+   T10, T15, T22 and T48 are struck through as done, and T77 was opened and closed by P0.1.
+   Both figures are the rows of section 3 below, counted as
+   `grep -oE '^\| *~*\**T[0-9]+'` over that section and nothing else — prose elsewhere in
+   this file names T-numbers that belong to other branches, and counting those tokens is
+   what made two earlier counts disagree. The register is **not contiguous and is not a
+   range**: T-numbers are allocated across parallel task branches and arrive when those
+   branches land. T73–T76 arrive here, with P0.3; at the time of writing T81 is still open
+   on P0.4's branch
 4. **Cross-cutting issues and pending amendments**
 
 ---
@@ -194,6 +198,7 @@ M-f `14`; M-g `01` D3.5.
 
 | # | Item |
 |---|---|
+| **T77** — closed 2026-09-20 by P0.1 | Re-measure the GPU-tier baseline and record it in full. As stated it was unverifiable: `gate_gpu.sh` judged the superset against `BASE_PASSED=4730 / BASE_FAILED=5` measured by P0.2 at `83daf636d`, with `BASE_TORCH=UNRECORDED`, `BASE_ROCM=UNRECORDED`, no AITER version, a toolchain-drift warning guarded on `BASE_TORCH != UNRECORDED` so the one check that would catch drift could not fire, and — sharper — no failing node-ids on file, so "5 failed" could not be checked against "the *same* 5 failed". **Closed by** a re-measurement on node 18 in `xiaobizh_n18`, `HIP_VISIBLE_DEVICES=1`, 2026-09-20, at `fe9ea043c`: **4779 passed / 5 failed**, 0 errors, 105 skipped, 3 xfailed, 72.6 s, two runs with byte-identical failing sets, under torch **2.10.0+rocm7.2.4.git3d3aa833**, `torch.version.hip` **7.2.53211**, ROCm **7.2.4**, AITER **v0.1.21.dev0-49-gf4e7c7509**. All five node-ids are written out verbatim in `scripts/compass/gpu_gate_known_failures.txt` and compared by name, and the drift guard now fires because every version field is recorded. The five are pre-existing and unrelated to Compass, and are **four ULP comparisons plus one bitwise check**, not five ULP failures: four `allclose` cases in `tests/test_fused_compress_ragged.py` off by one bf16 ULP (`max\|diff\| = 0.001953125`, exactly 2^-9, against `atol=rtol=1e-3`), plus `tests/test_dcp_merge_ops.py::test_row_view_matches_output_slicing_bitwise`, a `torch.equal` with no tolerance at all. What remains open is not T77: the baseline is a *pass count*, so it moves whenever `tests/compass/` grows, and `gate_gpu.sh` handles that by re-deriving the expectation per tree (`4779 + (this tree's tests/compass count - 49)`) rather than by re-measuring. |
 | T68 | Enumerate buffer allocations in the two target models and confirm none escapes `FakeTensorMode` - `--load_dummy` and the meta wrapper act on parameters only |
 | T69 | Whether a quantized checkpoint's geometry is derivable without reading it; header derivation was 3.3% low at TP=4 on the 27B |
 | T70 | Estimate the timeline log's volume at PP degree > 1 - grants scale with stages and microsecond lookahead, so it is largest exactly where it is most wanted |

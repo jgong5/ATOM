@@ -2,10 +2,11 @@
 
 **Status: reviewed and approved, 2026-09-20. Design only — no code has been written
 against it yet.** Every document carries a matching header. **109 decisions — D0–D94
-with no gaps, plus 14 sub-decisions** — are indexed at the end of this file; **80 registered
-TODOs — T1–T76, T78–T80 and T82, of which 76 are open** (T10, T15, T22 and T48 are struck
-through as done); they, the load-bearing assumptions and the cross-cutting issues live in
-**`12_open_items.md`**. Implementation follows the execution plan in `16`.
+with no gaps, plus 14 sub-decisions** — are indexed at the end of this file; **81 registered
+TODOs — T1–T80 and T82, of which 76 are open** (T10, T15, T22 and T48 are struck through as
+done, and T77 was opened and closed by P0.1); they, the load-bearing assumptions and the
+cross-cutting issues live in **`12_open_items.md`**. Implementation follows the execution
+plan in `16`.
 
 ---
 
@@ -525,7 +526,7 @@ The documents use these precisely; a reader will bounce off without them.
 | Doc | Title | What it settles |
 |---|---|---|
 | [`06`](06_workload_harness_contract.md) | Workload Harness Contract | A three-part contract, not a bespoke client. agentx-harness reused with **zero edits** via an out-of-tree plugin. One namespaced additive field each direction, audited for minimality. Timeline piggybacked on `kv_transfer_params` so Atomesh needs no change. Tokenizer cost is a queue, not a constant. |
-| [`08`](08_validation_protocol.md) | Validation Protocol | ATOM's own 187-file CPU-only test suite as the first validation layer. Three separable results, never one number. **The real-vs-real spread is the tolerance.** A metric is admissible only if stable *and* sensitive. |
+| [`08`](08_validation_protocol.md) | Validation Protocol | ATOM's own test suite as the first validation layer, in two tiers: a driver-free CPU tier over 130 of 189 files, green at **4030 passed / 0 failed** (3956 ATOM + 74 `tests/compass`; node 18 CPU container), and a GPU superset judged as a **delta** against **4779 / 5** (`fe9ea043c`, torch 2.10.0+rocm7.2.4, ROCm 7.2.4, AITER v0.1.21.dev0-49-gf4e7c7509, all five failing node-ids on file). Three separable results, never one number. **The real-vs-real spread is the tolerance.** A metric is admissible only if stable *and* sensitive. |
 | [`11`](11_metrics_support.md) | Engine Metrics under Virtual Time | ATOM's Prometheus exporter under a virtual clock. Metrics are classified by the **provenance of their value**, not their type. Sample once per engine step — virtual time is discrete-event. Both metrics clock reads stay real. |
 
 ### Part V — Cross-cutting
@@ -540,7 +541,7 @@ The documents use these precisely; a reader will bounce off without them.
 
 | Doc | Title | What it holds |
 |---|---|---|
-| [`12`](12_open_items.md) | Open Items | The five load-bearing assumptions and their check plans; the missing-topic register; T1–T72, T78–T80 and T82; cross-cutting issues; pending amendments. |
+| [`12`](12_open_items.md) | Open Items | The five load-bearing assumptions and their check plans; the missing-topic register; T1–T72, T77–T80 and T82; cross-cutting issues; pending amendments. |
 
 ### Part VII — How it gets built
 
@@ -589,5 +590,5 @@ The documents use these precisely; a reader will bounce off without them.
 | D45 | The real-vs-real spread is the tolerance; a metric must be stable **and** sensitive |
 | D3.2 | Three always-on causality detectors; a straggler fails the run rather than warning |
 | D3.3 | The Clock Authority ships two deployment forms from one implementation: co-hosted by default, standalone for multi-container runs |
-| D43.1 | ATOM's own 187-file, GPU-free test suite is a merge gate on every Compass change, unmodified |
+| D43.1 | ATOM's suite is a merge gate on every Compass change, unmodified, in two tiers: a driver-free CPU tier (130 of 189 files, green at 4030 passed) per change, a GPU superset judged as a delta per wave against 4779 / 5, by an equality on a per-tree expectation rather than "no worse than". The CPU tier **exits 98** rather than reporting "GPU not required" when it cannot tell |
 | D67.1 | Tier 0 is graded on **configuration ranking** first; its latency goals are diagnostics for that, not the result |

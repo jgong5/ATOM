@@ -4,8 +4,12 @@
 interview and reviewed by jgong5 across two review rounds on PR #3. No code has been
 written against it yet; implementation follows the execution plan in `16`.
 
-**Depends on:** all of `01`–`15`. This document turns 109 decisions and 76 open items into
-work that can be allocated.
+**Depends on:** all of `01`–`15`. This document turns those topics' decisions, and the
+register of open items in [`12_open_items.md`](12_open_items.md), into work that can be
+allocated. Neither is counted here. The register is owned by `12`, restated once on
+`README.md`'s front page, and it moves as tasks land; a third copy in a document that does
+not own it has been stale before, and "open items" and "registered items" are two different
+numbers that a single figure here cannot distinguish.
 
 **Scope.** How the work is organised, allocated and gated; what happens first; and what
 each stage must produce. It is **detailed for Phase 0 through Wave 3 and deliberately
@@ -107,91 +111,145 @@ both carried, "32 files reach the driver, 28 of them at collection time via `roc
 joined two real numbers wrongly: the 28 counts `rocminfo` across the *whole* suite,
 `tests/plugin/` included (25 + 3), and was attached to a non-plugin set of 32.
 
-- **Per task — the CPU tier.** `tests/` minus `tests/plugin/` (30 files) minus the 29
-  driver-dependent files below: **128 files handed, 3956 passed, 0 failed, 149 skipped,
-  3 xfailed, rc=0, 26.1 s**, measured 2026-09-20 at `b963c9411` in `xiaobizh_n18_cpu`,
-  pytest's own exit status captured before any pipe. The identical run at the base commit
-  `83daf636d` gives the same four counts — which is what makes a change gate-neutral by
-  measurement rather than by assertion. `tests/plugin/` is dropped whole because it needs
-  sglang and vllm, in neither image — but that is not the measured reason for all of it:
-  7 of its 30 files fail collection in the CPU container and **3 of those 7 are `rocminfo`**,
-  not a missing package.
-- **Green is the bar, but green is not "exercised".** Of the 128 files handed, **106 collect
-  at least one test and 22 collect none**: 16 declare a device dependency, 3 need PyAV, 2 are
-  dead since ATOM #690 split `kv_transfer_engine` into `moriio`
-  (`test_kv_connector_scheduler.py`, `test_transfer_engine.py`), and
-  `test_prefix_cache_accuracy.py` has **no test function at all** — it is an `argparse` script
-  that drives a live server on `localhost:8000`. The 149 skips are 68 distinct reasons: 66
-  skipped tests name a device, 83 do not.
-- **Per wave — the GPU superset.** `tests/ --ignore=tests/plugin` in the GPU container,
-  judged as a **delta** against the P0.2 baseline at `83daf636d`:
-  `5 failed, 4730 passed, 105 skipped, 3 xfailed, 18 warnings in 137.76s`. A bare count
-  cannot be checked — a regression that swaps one failure for another passes it — so the five
-  are named:
+- **Per task — the CPU tier, re-measured by P0.1 and superseding the counts above.**
+  `tests/` minus `tests/plugin/` (30 files) minus the 29 driver-dependent files in
+  `scripts/compass/cpu_gate_exclude.txt`, driven by `scripts/compass/gate_cpu.sh`:
+  **130 of this tree's 189 test files, 4030 passed, 0 failed, 149 skipped, 3 xfailed,
+  rc=0** — identical in every run taken on 2026-09-21 in `xiaobizh_n18_cpu` on
+  hjbog-srdc-18, where the clock read **25.4-31.7 s of pytest inside 31.1-37.8 s of
+  wall (`time` real)**, which is a measured spread rather than a bound: it tracks
+  what else is on the node. Run against a `git archive` snapshot of the tree, with
+  `PYTHONPATH` asserted to resolve `atom` under that root and pytest's own exit status
+  captured before any pipe. The 4030 is **3956 ATOM tests + 74 `tests/compass/` tests**,
+  stated as its parts because a single total cannot show which half moved (principle 7). The
+  file count moves 128 → 130 and the test count 3956 → 4030 because this tree adds
+  `tests/compass/test_cpu_gate_exclude.py` and `tests/compass/test_gate_gpu_surplus.py`; the
+  P0.2 readings above are the same suite without them. The other totals in circulation are
+  the same suite under a different exclusion list or a different `tests/compass`, not
+  discrepancies: **3925** was 32 exclusions with
+  `tests/compass` at 35 tests, **3956** is the ATOM-only half at 29 exclusions, and **4005**
+  was this gate at `3afcb4880` with `tests/compass` at 49, and **4022** was it at 66. The
+  49 → 66 step is mechanical: `tests/compass/test_cpu_gate_exclude.py` parametrises one case
+  per entry of `gpu_gate_triggers.txt`, and correcting that file's derivation took it from 13
+  entries to 30. The 66 → 74 step is `tests/compass/test_gate_gpu_surplus.py`, added here.
+- **Green is the bar, but green is not "exercised".** Of the 130 files handed, **22 collect
+  no test at all**: 16 declare a device dependency, 3 need PyAV, 2 are dead since ATOM #690
+  split `kv_transfer_engine` into `moriio` (`test_kv_connector_scheduler.py`,
+  `test_transfer_engine.py`), and `test_prefix_cache_accuracy.py` has **no test function at
+  all** — it is an `argparse` script that drives a live server on `localhost:8000`. The 149
+  skips are 68 distinct reasons: 66 skipped tests name a device, 83 do not. That
+  decomposition was measured per file by P0.2 against an earlier tree, where the same 22 sat
+  inside a 128-file gate; the gate's own counts above supersede that file count, and the
+  split of the 22 stands because nothing since has changed which files hold runnable tests.
+- **Per wave — the GPU superset, re-measured by P0.1.** `tests/ --ignore=tests/plugin` in the
+  GPU container, driven by `scripts/compass/gate_gpu.sh`, judged as a **delta**, never as
+  "green". The baseline is **4779 passed / 5 failed**, 0 errors, 105 skipped, 3 xfailed,
+  72.6 s, measured 2026-09-20 at `fe9ea043c` on node 18 in `xiaobizh_n18` with
+  `HIP_VISIBLE_DEVICES=1` — torch **2.10.0+rocm7.2.4.git3d3aa833**, `torch.version.hip`
+  **7.2.53211**, ROCm **7.2.4**, AITER **v0.1.21.dev0-49-gf4e7c7509** — over two runs with
+  byte-identical failing sets. It supersedes P0.2's **4730 / 5** at `83daf636d`, whose torch,
+  AITER and ROCm versions were unrecorded and which therefore could not be reproduced as
+  recorded; **T77**, which tracked that gap, is closed by this measurement. The five are
+  pre-existing and unrelated to Compass, and they are **four ULP comparisons plus one bitwise
+  check**, not "five bf16 ULP failures": four `allclose` cases in
+  `tests/test_fused_compress_ragged.py` off by one bf16 ULP
+  (`max|diff| = 0.001953125`, exactly 2⁻⁹, against `atol=rtol=1e-3`), plus
+  `tests/test_dcp_merge_ops.py::test_row_view_matches_output_slicing_bitwise`, a
+  `torch.equal` with **no tolerance at all** — a tolerance bump would not move it. All five
+  node-ids are on file verbatim in `scripts/compass/gpu_gate_known_failures.txt` and compared
+  by name, so "5 failed" is checked against "the *same* 5 failed". A review record that
+  claims "green" instead of citing the delta has not read the baseline. The pass count moves
+  by construction — the superset includes `tests/compass/`, so every test this phase adds
+  raises it above 4779, and `gate_gpu.sh` therefore expects
+  `4779 + (this tree's tests/compass count - 49)` and refuses a bare "no worse than".
 
-  ```
-  tests/test_dcp_merge_ops.py::test_row_view_matches_output_slicing_bitwise
-  tests/test_fused_compress_ragged.py::test_kernel_matches_reference_on_ragged_batches[extend0-context0-cut+whole]
-  tests/test_fused_compress_ragged.py::test_kernel_matches_reference_on_ragged_batches[extend1-context1-whole+cut]
-  tests/test_fused_compress_ragged.py::test_kernel_matches_reference_on_ragged_batches[extend2-context2-resume+fresh]
-  tests/test_fused_compress_ragged.py::test_kernel_matches_reference_on_ragged_batches[extend4-context4-tiny-then-long]
-  ```
-
-  Each is one bf16 ULP (`max|diff| = 0.001953125`, exactly 2⁻⁹, against `atol=rtol=1e-3`) and
-  pre-existing. Stack, so the delta is comparable: `xiaobizh_n18` on hjbog-srdc-18 (MI308X),
-  torch `2.10.0+rocm7.2.4.git3d3aa833`, HIP `7.2.53211`, ROCm `7.2.4`, `aiter` at `f4e7c7509`,
-  Python 3.12.3, pytest 9.0.3 — read from that same container on 2026-09-20, because the run
-  itself did not record them. A review record that claims "green" instead of citing the delta
-  has not read the baseline.
-
-**The exclusion list, and where it lives.** At this commit, here: `scripts/compass/` is empty
-on this branch and on its base, and a gate may not name a file its own tree does not contain.
-28 files fail collection when `tests/` is collected as one batch — the configuration the CPU
-tier runs — iterated until the set stops growing; `test_decode_input_ids.py` appears only in
-the second iteration, which is why the derivation must be iterated and not read off one pass:
-
-```
-tests/model_ops/test_balance_router_logits.py   tests/test_eplb_metadata.py
-tests/model_ops/test_shared_expert_dispatch.py  tests/test_eplb_module_{a,b,c,d,e}.py
-tests/test_block_table_marshal.py               tests/test_gdn_state_relocation.py
-tests/test_cudagraph_capture_bounds.py          tests/test_kda_checkpoint_slot_copy.py
-tests/test_dcp_merge_ops.py                     tests/test_kda_layout_id.py
-tests/test_dcp_sparse_filter.py                 tests/test_lm_head_argmax.py
-tests/test_dcp_topk.py                          tests/test_mega_mxfp4_method.py
-tests/test_decode_input_ids.py                  tests/test_merge_attn_states.py
-tests/test_deepseek_v4_wo_a_dequant.py          tests/test_moe_online_quant_batch.py
-tests/test_dspark.py                            tests/test_mori_dispatch_trim_bound.py
-tests/test_dspark_swa_fp8_2buff.py              tests/test_mtp_deferred_status_queue.py
-tests/test_dummy_weight_init.py                 tests/test_mxfp4_moe_has_bias.py
-```
-
-— plus `test_lmcache_offload_disk_integration.py`, which collects and then fails at run time:
-**29**. P0.1 (PR #6, based on this branch) mechanises this same list as
-`scripts/compass/cpu_gate_exclude.txt`, with `gate_cpu.sh` to run it and
-`regen_cpu_gate_exclude.sh` to rewrite the generated half; from that commit the file is the
-source of truth, is regenerated rather than edited, and this paragraph is superseded.
+**The exclusion list lives in the tree.** P0.2 derived it here, in prose, because
+`scripts/compass/` did not yet exist on this branch and a gate may not name a file its own
+tree does not contain. P0.1 mechanises it: `scripts/compass/cpu_gate_exclude.txt`, with
+`gate_cpu.sh` to run it and `regen_cpu_gate_exclude.sh` to rewrite the generated half. From
+this commit that file is the source of truth and is regenerated rather than edited, and the
+prose derivation above is superseded. Its 29 entries are **28 GENERATED + 1 MANUAL**: the
+generator iterates batch collection to a fixed point and produces 28, and the single manual
+entry — `test_lmcache_offload_disk_integration.py`, which collects cleanly and then fails on
+`hipHostMalloc failed: 100` — carries the observed failure text above it, which is the only
+evidence such an entry can have. Both reviewers found that the earlier 32-entry list could
+not be reproduced by its own generator: four entries had been hand-added to a file whose
+header read "never hand-edit", and three of those four — `test_dp_metadata.py`,
+`test_dp_sync_layout.py` and `test_forward_mode.py` — collect *and pass* in a driverless
+container. Prose saying the list is 32, or that those three need the driver, is stale.
 
 The list is regenerated under the *batch* the tier runs, because that is the configuration
 whose green is claimed — and the per-file census above is a separate question, not a
 replacement for it. Both are needed: `test_postprocess_width.py` and
 `test_v4_checkpoint_slot_copy.py` sit inside the tier, module-skip in the batch
 ("model_runner imports aiter at module load", "the V4 builder's module imports aiter at
-load"), and fail collection with `rocminfo` when run alone; the three files above go the
-other way. That pair is also the whole difference between the two counts of silent files —
-20 per file, 22 in the tier. Recording only the batch is how three CPU-green files stayed
-excluded and how one attributed cause replaced four.
+load"), and fail collection with `rocminfo` when run alone; the three CPU-green files above
+go the other way. That pair is also the whole difference between the two counts of silent
+files — 20 per file, 22 in the tier. Recording only the batch is how three CPU-green files
+stayed excluded and how one attributed cause replaced four.
 
-**The blind spot is bigger than the exclusion list, and it is not random.** 51 of the 157
-non-plugin files run nothing here: 29 excluded and 22 exercising nothing. The excluded 29
-include all five `test_eplb_module_*`, `test_cudagraph_capture_bounds` and
-`test_block_table_marshal`; the silent 22 include `test_pool_index.py`,
+**The CPU tier's blind spot is a file, not a sentence.** P0.2 stated it as prose naming four
+areas — EPLB, DP metadata, cudagraph bounds, block tables — which nothing read, and which
+named two files (`test_dp_metadata`, `test_dp_sync_layout`) the CPU tier does in fact cover.
+It is now `scripts/compass/gpu_gate_triggers.txt`, **30 paths** in the tree committed here,
+generated by `regen_gpu_gate_triggers.sh` and never hand-edited — the counts in its own
+header included (189 test files, 130 CPU tier, 108 of them collecting, 47 candidates, 99
+covered). The rule it applies: an `atom` module named by an excluded test is a blind spot
+**unless a CPU-tier test that actually runs names it too**. A module both tiers import is
+covered when the CPU gate runs, so triggering on it would make the gate cry wolf. A trailing
+`/` matches a subtree. `gate_cpu.sh` matches the diff against that file and **exits 98 unless
+`COMPASS_GPU_GATE_DONE` names this tree's own HEAD**; where it can compute neither a diff nor
+a supplied file list — a `git archive` snapshot with no `.git` — it refuses rather than
+reporting "not required", per principle 6.
+
+The rule has three parts. One was forced by a counter-example measured in this tree, one is
+what keeps the headline example, and one currently changes no path:
+
+- *Imports are read at any indentation on the excluded side.* 190 of this tree's
+  `import atom.*` lines are indented — inside a function, a `try`, or a
+  `skipif(not torch.cuda.is_available())` guard. An earlier draft anchored the match at
+  column 0 on both sides and silently dropped `atom/model_ops/topK.py`, whose only
+  excluded-side reference is `test_moe_dp_token_capacity.py:39`, indented under exactly such
+  a guard.
+- *Coverage is credited only for a module-level import.* An indented import in a CPU-tier
+  file is not proof that the CPU tier executes it, and crediting it would let a never-taken
+  branch suppress a trigger. **This is the part that keeps
+  `atom/model_engine/model_runner.py`** — the module Compass's runner seam replaces.
+  `tests/test_mla_index_cache.py` imports `ModelRunner` at
+  `tests/test_mla_index_cache.py:99`, indented four spaces inside a test function, so that
+  import is never credited whatever the file collects. Measured at `236abfd9a` in
+  `xiaobizh_n18_cpu`: crediting coverage at any indentation drops the set 30 → 29, losing
+  `topK.py`; doing that *and* crediting non-collecting files drops it 30 → 27, losing
+  `model_runner.py`, `aiter_mla.py` and `topK.py`.
+- *Coverage is credited only from a CPU-tier file that collects at least one test.* 22 of the
+  130 CPU-tier files collect none. On this tree that probe **removes no path**: 30 triggers
+  with it, 30 without, difference empty — measured at `236abfd9a` in `xiaobizh_n18_cpu`,
+  where it withholds 15 coverage paths, and the only one of those that is also a candidate,
+  `atom/model_ops/v4_kernels/state_writes.py`, is absorbed either way by the candidate
+  subtree entry above it. It is kept as a forward guard for trees this one does not
+  represent, and it is not free: a full `pytest --collect-only` over the CPU tier and one
+  more refusal path (exit 97). Whether that guard earns its cost is an open call
+  (principle 3), not a settled one.
+
+**That file errs in both directions, so do not cite it as a floor.** Toward *firing*: an
+indented import in a CPU-tier test that does run is not credited, so a module can be listed
+although the CPU tier reaches it, and coverage is subtracted by exact string, so a candidate
+subtree entry is never cancelled by coverage of a file under it. Toward *silence*: imports
+are read as text, not resolved as a graph, so a transitive import, an `importlib` call or a
+re-export is invisible. A path *absent* from `gpu_gate_triggers.txt` is not a claim that the
+CPU tier covers it, and a path *present* is not proof that it does not. Of the two mistakes
+this gate prefers the first, because running the GPU tier when in doubt is never the wrong
+one. Judging that a change sits outside the blind spot remains the task's own call.
+
+**A task touching EPLB, CUDA-graph capture bounds, block tables, the paged index builders or
+the prefix-cache kernels runs the GPU superset as part of its own gate, not at wave end.**
+That is where the files running nothing here concentrate — 29 excluded plus 22 exercising
+nothing, 51 in all; the silent 22 include `test_pool_index.py`,
 `test_prefill_indices_paged.py`, `test_decode_indices_paged.py`, `test_postprocess_width.py`
-and `test_prefill_prefix_vs_native.py` — the paged-index and prefix-cache areas `03` D13 and
-`01` D6 lean on. **A task touching EPLB, CUDA-graph capture bounds, block tables, the paged
-index builders or the prefix-cache kernels runs the GPU superset as part of its own gate, not
-at wave end.** `test_dp_metadata` and `test_dp_sync_layout` are **not** on that list: they are
-CPU-green, measured above, and booking a GPU for them spends the resource the booking queue
-below exists to ration.
+and `test_prefill_prefix_vs_native.py`, the paged-index and prefix-cache areas `03` D13 and
+`01` D6 lean on. `test_dp_metadata` and `test_dp_sync_layout` are **not** among them: they
+are CPU-green, measured above, and booking a GPU for them spends the resource the booking
+queue below exists to ration.
 
 **Three files are covered by neither tier**, measured in `xiaobizh_n18` at `83daf636d`:
 `test_prefix_cache_accuracy.py` (`no tests ran`), `test_kv_connector_scheduler.py` and
@@ -205,10 +263,15 @@ reproduce at `83daf636d` on 2026-09-20. So the lint bar is "**no new** ruff erro
 stays clean" — never "ruff is clean", which it has never been.
 
 Every number above is stated here rather than cited. The task record lives outside the tree
-(`AI_DEV_RULES.md`), and the raw pytest output lives only in the containers that produced it;
-a citation to either is not resolvable from a checkout, which is the same defect as naming a
-script that is not in the tree. The commits carrying these measurements are `9c8df1328`,
-`b963c9411` and the two that follow them, on PR #4.
+and the raw pytest output lives only in the containers that produced it; a citation to either
+is not resolvable from a checkout, which is the same defect as naming a script that is not in
+the tree. The commits carrying P0.2's measurements are `9c8df1328` and `b963c9411`, landed as
+`947d5b282`; the ones that supersede them are on this branch. P0.1's GPU re-measurement has
+an **in-tree** record, because a plan of record cannot cite one that is not: the five failing
+node-ids verbatim in `scripts/compass/gpu_gate_known_failures.txt`, and the pair, the tree and
+the toolchain as the `BASE_*` constants in `scripts/compass/gate_gpu.sh`. P0.2's own task
+record predates that measurement and contains neither `4779` nor `fe9ea043c`; it is a source
+for the superseded 4730 / 5 above and for nothing else.
 
 ---
 
@@ -300,7 +363,9 @@ Depends on Wave 1. The first three are the vertical slice.
 **M1's exit criterion**, per `15` D94, needs no cost model: **does a fake-model run at
 TP2 / DP2 / PP2 / EP2 reach the same scheduling decisions as the real engine at the same
 configuration?** ATOM's own `test_dp_load_balance.py`, `test_dp_metadata.py`,
-`test_dp_sync_layout.py` and `test_forward_mode.py` already cover the pieces, CPU-only.
+`test_dp_sync_layout.py` and `test_forward_mode.py` already cover the pieces, CPU-only —
+all four are in the CPU tier at `3afcb4880`, which was not true when this was written: the
+last three sat in a 32-entry exclusion list until they were re-measured and found green.
 
 ---
 
@@ -341,17 +406,34 @@ is priced at six hours because it was measured at six hours — not estimated fr
 throughput. Effort elsewhere is sized in lines of code, not wall-clock, precisely because
 most tasks have no such measurement to quote (`AI_DEV_RULES.md`).
 
-### The pre-flight gate — three checks, not one
+### The pre-flight gate — four checks, not one
 
 ```
-  1.  timeout 25 rocminfo            -> hangs?  node is WEDGED. Do not use.
-  2.  rocm-smi --showuse             -> compute busy?
-  3.  rocm-smi --showmemuse          -> VRAM held?     <- the one that gets missed
+  0.  D-state census               -> thousands in D state? node is WEDGED.
+  1.  timeout 25 rocminfo          -> hangs?  node is WEDGED. Do not use.
+  2.  rocm-smi --showuse           -> compute busy?
+  3.  rocm-smi --showmemuse        -> VRAM held?     <- the one that gets missed
 ```
 
 **Check 3 is not optional.** A node can show 0% utilisation and ~99% VRAM — a loaded,
 idle model. A pre-flight testing only utilisation calls that node free, and `non_torch` is
 a **device-wide** reading, so a neighbour's allocation is indistinguishable from ours.
+
+**Check 0 states its own scope, because in a container it cannot answer the question.** It
+was added by P0.2 on the reasoning that `timeout` cannot kill a probe already in D state.
+But a container's PID namespace is private, so the census counts the container, not the
+node. Measured 2026-09-20T08:45Z on hjbog-srdc-39, the same second from both sides: the host
+had **10840 processes of which 2236 were in D state**, while the `jgong5_vllm` container on
+it saw **3171 and 103** — 4.6% of the D-state processes that were actually there, against a
+threshold of 20 calibrated on host-wide readings. `docker inspect
+-f '{{.HostConfig.PidMode}}'` is empty and no host procfs is bind-mounted, so there is
+nothing to look through. `preflight.sh` therefore reads a host procfs when one *is* mounted
+(`/host/proc`, `/hostfs/proc`, `/rootfs/proc`), detects the container positively
+(`/.dockerenv` or `/proc/1/cgroup`) rather than inferring it from a low count, prints
+`scope:` on every run, and when the scope is container-local and under threshold reports
+**PARTIAL** — "nothing is wedged inside this container, the node was not examined" — instead
+of a clear (principle 6: an unanswered question is not a "no"). Check 1 is what still sees a
+host wedge from inside a container, because `rocminfo` goes through the driver.
 
 **Check before *and* after.** Three of the last five prior pilot attempts were lost or
 degraded by other tenants; a check that only runs first cannot see a tenant that arrived
