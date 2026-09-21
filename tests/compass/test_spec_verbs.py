@@ -196,6 +196,19 @@ def test_two_hosts_in_one_spec_are_refused_and_both_provenances_are_named():
         assert named in message, f"{named} is not named in: {message}"
 
 
+def test_the_refusal_says_the_fragments_are_authored_for_different_machines():
+    # `Fragment.machine` is the `name` field, which is the machine the spec is
+    # being authored for. No field records where a probe ran, so the refusal
+    # says what the fragments claim and not where their numbers came from.
+    with pytest.raises(SpecRefusal) as refused:
+        merge(
+            [fragment("a", TIER0, machine="node-18"), fragment("b", machine="node-22")]
+        )
+    message = str(refused.value)
+    assert "are authored for different machines" in message
+    assert "measured on" not in message
+
+
 def test_the_same_two_tokenizers_merge_when_the_machine_agrees():
     # The control for the result above: the same two measurements, the same two
     # authors and dates, differing only in the machine they name.
@@ -464,6 +477,24 @@ def test_a_stack_that_has_moved_is_refused_under_the_strict_flag():
 
 def test_a_stack_that_matches_is_silent():
     assert validate(merged(), observed_stack=STACK, strict=True).ok
+
+
+def test_a_stack_difference_is_rendered_by_the_run_that_refused_nothing():
+    # Without the strict flag nothing is refused, so the difference is the only
+    # thing this check found. It is on the dataclass either way; the string is
+    # where a reader of the summary looks for what the check did.
+    with pytest.warns(StackMismatch):
+        checked = validate(
+            merged(),
+            tp_widths=(1, 2, 4, 8),
+            observed_stack=dict(STACK, rocm="7.3.0"),
+        )
+    assert checked.ok
+    assert str(checked) == (
+        "ok: 0 refusal(s)\n"
+        "  stack moved: the constants were measured against rocm '7.2.4' "
+        "(now '7.3.0')"
+    )
 
 
 def test_a_transfer_keeps_the_source_stack_out_of_this_machines_pin():
