@@ -12,7 +12,10 @@ Two modules, split by what each is allowed to import:
   with no driver, so anything reachable from that import cannot be exercised by
   a test that runs without one.
 - `model_runner` binds those overrides onto `ModelRunner`, and is therefore the
-  only module here that needs a driver to import.
+  only module here that needs a driver to import. It is also where the composed
+  class is checked against `overrides.RPC_SURFACE`, the table of names a worker
+  dispatches: the worker skips a name the runner lacks without raising, so a
+  hole in that surface is a caller that waits forever rather than an error.
 
 This package stays empty at import time for the same reason, so naming it costs
 nothing.
