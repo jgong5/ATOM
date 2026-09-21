@@ -168,6 +168,12 @@ T52 root-cause need one.
 measures, which width, how long it needs, and which artifact it writes. A quiet window is
 never spent deciding what to run in it.
 
+**Wall-clock is quoted only where it was actually measured.** A TP2 engine run is priced
+at ~1 h (`12` T21) because that is what engine runs take, and the long calibration sweep
+is priced at six hours because it was measured at six hours — not estimated from
+throughput. Effort elsewhere is sized in lines of code, not wall-clock, precisely because
+most tasks have no such measurement to quote (`AI_DEV_RULES.md`).
+
 ### The pre-flight gate — three checks, not one
 
 ```

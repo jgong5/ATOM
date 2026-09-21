@@ -10,8 +10,9 @@
 ## Execution rules
 - Don't modify the main worktree. Develop with linked worktrees, one per in-flight
   task, under `compass-worktrees/<task-id>`, beside the repo.
-- **On every landing, the main agent fast-forwards the main worktree** to the
-  integration branch promptly. This doesn't contradict the rule above: that rule
+- **On every landing, the main agent fast-forwards the main worktree** to
+  `feature/atomcompass_new` (the integration branch) promptly. This doesn't
+  contradict the rule above: that rule
   forbids developing there, not updating it. The pull runs through the container
   as root and leaves the tree root-owned, which fails host-side edits silently;
   chowning it to the host user fixes that but then makes container git refuse
@@ -128,9 +129,11 @@
   machine time with a measured basis. **A task that overruns its estimate by more
   than ~2x is a halt-and-discuss event, not a reason to keep going** — the usual
   cause is that the task was mis-cut.
-- **PRs land squashed onto the integration branch**, one commit per task.
-  GitHub enforces this structurally (`allow_merge_commit=false`,
-  `allow_rebase_merge=false`).
+- **PRs land squashed onto `feature/atomcompass_new`, the integration branch**,
+  one commit per task. GitHub enforces this structurally
+  (`allow_merge_commit=false`, `allow_rebase_merge=false`). Base branch is always
+  `feature/atomcompass_new` — never `main`, never `master`, never a branch on
+  upstream `ROCm/ATOM`.
 - **Recommended, not required: stack a dependent task's PR on its unlanded
   parent** with `gh stack` rather than waiting for it to land. Independent
   tasks do not stack. `gh stack` is GitHub's own extension
