@@ -76,6 +76,14 @@ instances of well-formed, wrong artifacts surviving review.
 for a reason the task did not predict; a measurement outside its stated range; an
 interface that cannot be implemented as specified.
 
+### The halt's visible form
+
+A halt reported only to the owner is invisible to any other agent that might pick the
+task back up before the owner acts on it. The `need human` label is what makes the stop
+**repository state** instead of just a message: while it is on an issue or PR, that stop
+is visible to every agent, not only to whichever one hit it. Procedure — who applies it,
+who removes it, what it blocks — is in `AI_DEV_RULES.md`.
+
 ---
 
 ## D96. The task record, and why context lives in it
@@ -384,6 +392,10 @@ trip rather than a fresh analysis under time pressure.
 
 The halt rule (D95) is the general case: any surprise stops and is discussed.
 
+Reaching any of these five, like the loop's halt above, is an escalation — so it applies
+`need human` too (`AI_DEV_RULES.md`), for the same reason: the stop should be visible on
+GitHub, not only inside an agent's report.
+
 ---
 
 ## What this plan does not contain
@@ -405,14 +417,14 @@ Stated so it is not mistaken for an omission.
 
 | # | Decision | Date |
 |---|---|---|
-| D95 | Tasks are a **pool**, not a track assignment; 5 dev + 5 reviewer agents cap concurrency at 5 in flight. Conflicts are tolerated and are a **decomposition signal**. Developer and reviewer are separate agents with opposed objectives; the developer owns development and PR updates, looping with the reviewer until APPROVE, escalating only critical blocking issues and scope calls. **The loop halts to the owner if the same finding survives two cycles, or after three cycles.** **Halt and discuss on any surprise.** | 2026-09-21 |
+| D95 | Tasks are a **pool**, not a track assignment; 5 dev + 5 reviewer agents cap concurrency at 5 in flight. Conflicts are tolerated and are a **decomposition signal**. Developer and reviewer are separate agents with opposed objectives; the developer owns development and PR updates, looping with the reviewer until APPROVE, escalating only critical blocking issues and scope calls. **The loop halts to the owner if the same finding survives two cycles, or after three cycles, applying `need human` to the PR.** **Halt and discuss on any surprise.** | 2026-09-21 |
 | D96 | The task record is the **GitHub issue and its PR** — brief in the issue body, dev record in the PR body, review record in the review comment, handoff in the closing comment — with each brief linking to its predecessors' issues. A brief that cannot name its file set is not claimable. | 2026-09-21 |
 | D97 | `feature/atomcompass_new` is the integration branch; one issue, one worktree and one PR per task, **squash-merged** (the repo permits squash merges only). Four setup rules from recorded failures: no shared mutable source root, containers mount the worktree parent, `PYTHONPATH` verified before trusting a result, `git archive` never `rsync`. On landing, the main agent fast-forwards the main worktree and restores file ownership. | 2026-09-21 |
 | D98 | Four gates per task: ATOM's suite green **unmodified**, new CPU-only tests, one named result stated in advance, and review by a separate agent, looping to APPROVE per D95. Baselines recorded first. | 2026-09-21 |
 | D99 | Effort in **lines of code**. Wall-clock only for machine time with a measured basis. A 2x overrun is a halt-and-discuss event. | 2026-09-20 |
 | D100 | Twelve modules under `atom/compass/`; tasks are cut so each touches one plus its tests. ATOM edits outside that tree are enumerated per task. | 2026-09-20 |
 | D101 | One GPU queue; tasks declare their measurement before becoming claimable. Pre-flight is **three** checks — wedge, compute, **VRAM** — run before *and* after. | 2026-09-20 |
-| D102 | Five named escalation points, each prepared in advance so the decision is one round trip. | 2026-09-20 |
+| D102 | Five named escalation points, each prepared in advance so the decision is one round trip. Reaching one applies `need human` (`AI_DEV_RULES.md`), so the stop is visible on GitHub rather than only in a report. | 2026-09-21 |
 
 ---
 

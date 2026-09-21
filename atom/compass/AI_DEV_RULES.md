@@ -42,10 +42,18 @@
   and does not write the change itself.** After each push a reviewer agent
   reviews, the developer amends, and that repeats until the verdict is APPROVE.
   The owner is asked only for a critical blocking issue or a scope call — an
-  actionable review finding is not an escalation.
+  actionable review finding is not an escalation, and is not labelled.
+- **Automation is on by default.** An agent acts on any issue or PR that does
+  not carry the `need human` label — no opt-in, no waiting to be told.
+- **`need human` stops all agent action on that issue or PR** — no agent
+  commits to it, reviews it, amends it, or merges it, not even a labelled PR
+  whose review already passed. An agent applies the label the moment it
+  escalates, so it can stop itself; only the owner removes it, and removal is
+  what restarts the work.
 - **The review loop has its own stop.** If the same finding survives two cycles,
-  or the loop passes three cycles, it halts and goes to the owner (`16_execution_plan.md`,
-  D95): a task that cannot converge is mis-cut, not under-worked.
+  or the loop passes three cycles, it halts and goes to the owner and applies
+  `need human` to the PR (`16_execution_plan.md`, D95): a task that cannot
+  converge is mis-cut, not under-worked.
 - Reviewer agents must post their review to the PR. GitHub refuses
   APPROVE/REQUEST_CHANGES on self-authored PRs, so **the verdict goes in the
   comment body text**.
