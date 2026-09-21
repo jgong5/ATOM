@@ -558,7 +558,7 @@ The documents use these precisely; a reader will bounce off without them.
 | D13 – D16 | `03` Memory Model and the KV Pool |
 | D17 – D23 (+ D18.1) | `04` Model Capture and the Cost IR |
 | D24 – D26 (+ D25.1) | `05` Machine Specification and its Probes |
-| D27 – D35 | `06` Workload Harness Contract |
+| D27 – D35 (+ D34.1) | `06` Workload Harness Contract |
 | D36 – D43 (+ D38.1, D40.1) | `07` Calibration and Benchmarking Toolchain |
 | D43.1, D44 – D52 (+ D50.1) | `08` Validation Protocol |
 | D53 – D62 | `09` Fitting and Law Selection |

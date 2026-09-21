@@ -547,16 +547,16 @@ class CompassAgenticReplay(AgenticReplayStrategy):
    (6) the *next* phase's runner does get the rebound class — half-working, and
    silent.
 
-   **A bootstrap that provably precedes the first `PhaseRunner` does exist, and it
-   is one line of packaging — T73.** Entry-point *resolution* is itself the hook.
-   `plugins.py:210` calls `importlib.util.find_spec(module_name)` on the entry
-   point's value, and `find_spec` on a **dotted** name imports the parent package.
-   Declaring the entry point as `compass_harness.plugin:plugins.yaml` rather than
-   `compass_harness:plugins.yaml` therefore executes `compass_harness/__init__.py`
-   inside `discover_plugins()`, and that is where the rebind goes.
-   `submodule_search_locations` stays truthy in the dotted case, so upstream's
-   guard at `plugins.py:211` passes and the manifest still resolves normally: the
-   bootstrap is free, not a trade, and still zero edits to agentx-harness.
+   **A bootstrap that provably precedes the first `PhaseRunner` does exist — T73.**
+   Entry-point *resolution* is itself the hook. `plugins.py:210` calls
+   `importlib.util.find_spec(module_name)` on the entry point's value, and `find_spec`
+   on a **dotted** name imports the parent package. Declaring the entry point as
+   `compass_harness.plugin:plugins.yaml` rather than `compass_harness:plugins.yaml`
+   therefore executes `compass_harness/__init__.py` inside `discover_plugins()`.
+   `submodule_search_locations` stays truthy in the dotted case, so upstream's guard at
+   `plugins.py:211` passes, the manifest still resolves and the plugin is still
+   registered: the bootstrap is free, not a trade, and still zero edits to
+   agentx-harness.
 
    The ordering is structural, not incidental. `_registry = _PluginRegistry()` is
    module-level (`plugins.py:1115`), `_PluginRegistry.__init__` calls
@@ -564,22 +564,60 @@ class CompassAgenticReplay(AgenticReplayStrategy):
    `from aiperf.plugin import plugins` — so discovery, and the bootstrap with it,
    completes while the module that *defines* `PhaseRunner` is still importing.
 
-   Executed, 13/13 — `probe_bootstrap.py`, 2026-09-20, against `56a0cf70f` with a
-   stand-in `compass_harness` distribution registering a real `aiperf.plugins`
-   entry point. The thirteen: (A1) the undotted entry-point value executes nothing;
-   (A2) it still resolves its manifest, so it is a genuine alternative and not a
-   straw man; (A3) the dotted value executes `compass_harness/__init__.py`; (A4)
-   `submodule_search_locations` stays truthy; (A5) the manifest still resolves;
-   (B0) the dotted entry point is visible to `importlib.metadata`; (B1) `aiperf` is
-   not yet imported and (B2) the bootstrap has not yet run; (B3) importing
-   `aiperf.timing.phase.runner` runs the bootstrap; (B4) `compass_harness` is in
-   `sys.modules`; (B5) the plugin is registered, so discovery was not damaged;
-   (B6) discovery still imported no plugin *module* — `get_class` stays lazy;
-   (B7) no `PhaseRunner` has been constructed at that point.
+   **The rebind cannot be done inline in that bootstrap.** That is measured, and it is
+   the same structural fact read the other way: the bootstrap runs at `plugins.py:1115`,
+   *inside* the module body of `aiperf.plugin.plugins`, before the module-level API
+   names at `plugins.py:1120-1148` are bound. Any `import aiperf.…` from the bootstrap
+   re-enters `aiperf/plugin/enums.py:21`, whose module body calls
+   `plugins.list_categories()`, and raises
 
-   **So T73 is a packaging decision, not a precondition of the seam.** The tripwire
-   ships regardless: it is what turns a bootstrap that silently failed to run into
-   a loud failure.
+   ```
+   AttributeError: partially initialized module 'aiperf.plugin.plugins'
+   has no attribute 'list_categories' (most likely due to a circular import)
+   ```
+
+   This holds for **both** rebind targets — the runner module, and the leaf
+   `aiperf/common/loop_scheduler.py`, which reaches the same place via
+   `common/constants.py:6` → `common/enums/enums.py`. If the bootstrap lets that
+   exception escape, `find_spec` raises inside `discover_plugins()`'s per-entry `try`,
+   the entry lands in `failed_plugins`, and the Compass plugin is not registered at all.
+
+   **So the bootstrap defers the rebind.** It installs a `sys.meta_path` finder —
+   stdlib only, no `aiperf` import — that intercepts `aiperf.timing.phase.runner`,
+   delegates to the remaining finders for the real spec, wraps `spec.loader.exec_module`
+   and rebinds `LoopScheduler` on that module once it has executed, before any caller
+   can reach `runner.py:191`. It removes itself after firing. That is the whole of T73:
+   a dotted entry-point value, plus roughly twenty lines of import hook in the adapter
+   package's `__init__.py`.
+
+   Executed against `56a0cf70f`, with a stand-in distribution registering a real
+   `aiperf.plugins` entry point and upstream's own `discover_plugins()` as the thing
+   under test — no upstream code reproduced in the probe. Five combinations were run,
+   because the failing ones are what make the working one a measurement rather than an
+   assertion:
+
+   | entry-point value | what the bootstrap does | outcome |
+   |---|---|---|
+   | `…probe:plugins.yaml` | — | package **not** executed; manifest resolves |
+   | `…probe.plugin:plugins.yaml` | — | package executed; manifest resolves |
+   | `…probe.plugin:plugins.yaml` | rebind the runner module inline | `AttributeError`, partially initialized module |
+   | `…probe.plugin:plugins.yaml` | rebind `common.loop_scheduler` inline | same `AttributeError` |
+   | `…probe.plugin:plugins.yaml` | deferred `sys.meta_path` hook | **7/7** — `runner.LoopScheduler` is the subclass |
+
+   The seven in that last row, because a score is not a decomposition: (0) nothing
+   `aiperf` or adapter-side is imported when the probe starts; (1) importing
+   `aiperf.plugin.plugins` executes the adapter package's `__init__.py`; (2) upstream's
+   guard passed and the plugin is registered, so discovery was not damaged; (3)
+   discovery still imported no plugin *module* — `get_class` stays lazy; (4) the
+   deferred hook fired when the runner module executed; (5) the name `LoopScheduler`
+   that `runner.py:191` resolves is the subclass; (6) the bootstrap ran strictly before
+   the runner module existed.
+
+   **So T73 is a packaging decision plus a small deferred rebind, not a precondition of
+   the seam.** The claim this section used to carry — that the rebind does not work with
+   any bootstrap that exists today — was an asserted negative with no probe behind it,
+   and is false. The tripwire ships regardless: it is what turns a bootstrap that
+   silently failed to run into a loud failure.
 
 ### What the seam covers, precisely
 
@@ -654,7 +692,7 @@ sites below, which do not go through `LoopScheduler` either (T74).
 | Transport plugin — real HTTP, re-stamp anchors from `sim_*` | 150-250 | stands |
 | `ClockPacedLoopScheduler` — the `LoopScheduler` subclass, covering the nine pacing calls | 80-150 | **open** — costed against the option-A wrapper, which constraint 1 rules out |
 | Clock client library | 100-150 | stands |
-| Plugin manifest, bootstrap, config glue | ~100 | stands — T73's dotted entry point and the package `__init__` rebind sit inside this row and add no line to it |
+| Plugin manifest, bootstrap, config glue | ~100 | stands — T73's dotted entry-point value costs nothing; the ~20-line deferred rebind hook sits inside this row's ~100 |
 | T75 — the two idle-cap timers: two `_arm_*` overrides, or assert both caps are `None` | **not costed** | new scope, added by the P0.3 review |
 | T76 — `seamless` reconciliation, or assert `seamless=False` | **not costed** | new scope, added by the P0.3 review |
 | Tests | 200-400 | stands |
@@ -763,7 +801,7 @@ requires genuine fan-out in every root is not constructible without reusing sess
 | D32 | The decode->prefill cache chain is already broken by the harness for real servers too; guard only against false hits. `theoretical_prefix_cache_hit` is the oracle. | 2026-09-18 |
 | D33 | Run the real tokenizer for its effect, charge a modelled duration for its time. Encode is a bounded-width queue; decode is a single-threaded per-step stage. | 2026-09-18 |
 | D34 | The aiperf adapter is an out-of-tree plugin package, ~450-650 lines, with zero edits to agentx-harness. | 2026-09-18 |
-| D34.1 | The pacing seam is the **scheduler**, not the strategy (option C): the adapter rebinds the runner's `LoopScheduler` to a `ClockPacedLoopScheduler` subclass **and** registers a strategy subclass whose only job is to refuse a scheduler that is not clock-paced. The bootstrap is the dotted plugin entry point, which `discover_plugins()` executes before any `PhaseRunner` exists (T73). The seam covers **nine** pacing calls, not seven, and does not reach the two `loop.call_later` idle-cap timers (T75) or a second live runner under `seamless` (T76). The ~450-650 total is reopened pending those. | 2026-09-20 |
+| D34.1 | The pacing seam is the **scheduler**, not the strategy (option C): the adapter rebinds the runner's `LoopScheduler` to a `ClockPacedLoopScheduler` subclass **and** registers a strategy subclass whose only job is to refuse a scheduler that is not clock-paced. The bootstrap is the dotted plugin entry point, which `discover_plugins()` executes before any `PhaseRunner` exists; the rebind itself is deferred by a `sys.meta_path` hook, because the bootstrap runs while `aiperf.plugin.plugins` is still importing and cannot import `aiperf` (T73). The seam covers **nine** pacing calls, not seven, and does not reach the two `loop.call_later` idle-cap timers (T75) or a second live runner under `seamless` (T76). The ~450-650 total is reopened pending those. | 2026-09-20 |
 | D35 | Declare what the harness reproduces and what it cannot; cancellation is not available from this corpus. | 2026-09-18 |
 
 ---
