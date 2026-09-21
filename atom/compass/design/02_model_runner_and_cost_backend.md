@@ -431,9 +431,17 @@ about 40 lines.
 carries.
 
 - *Pros:* about twenty lines more than A, and it buys a **testable integration property**:
-  double the chunk size, the step time doubles, the prefill streak breaks at a predicted
-  place. That closed loop — step cost to queueing to a different batch — is what the whole
-  design rests on, and constants cannot exercise it.
+  double the chunk size and every term of the form moves by its own power of the chunk,
+  so the step time rises and the prefill streak breaks at a predicted place. That closed
+  loop — step cost to queueing to a different batch — is what the whole design rests on,
+  and constants cannot exercise it.
+  - *Not* "the step time doubles". Measured against the form this section mandates, at
+    `b`=5e-7, `c`=2e-8 and a 256→512 single-request chunk: the intercept is 1.00x, the
+    token term exactly 2.00x, the quadratic exactly 4.00x, and the total **1.8836x**.
+    The total doubles only when `a = c = d = 0`, which is the degenerate linear case —
+    i.e. only by deleting the quadratic term this same section requires. The property
+    that holds for the mandated form is term by term, and the exit criterion of any task
+    building this option must be written that way.
 - *Cons:* its coefficients mean nothing physically, so it must never be quoted as
   accuracy.
 
@@ -456,9 +464,9 @@ decode:   a' + b'·batch  + c'·Sum ctx       + e'·( rung * max(ctx) - Sum ctx 
 ```
 
 **ATOM already computes the attention terms.** `ScheduledBatch.detailed_sqsq`,
-`detailed_sqsk`, `detailed_sk` (`scheduler.py:790-792`) are Sum N_Q^2, Sum N_Q*N_KV and
-Sum N_KV, produced by `Scheduler.compute_detailed_aggregates` (`:2788-2842`), currently
-gated on `self.profile_active and ATOM_ENABLE_DETAILED_ANNOTATION` (`:2820-2821`).
+`detailed_sqsk`, `detailed_sk` (`scheduler.py:801-803`) are Sum N_Q^2, Sum N_Q*N_KV and
+Sum N_KV, produced by `Scheduler.compute_detailed_aggregates` (`:2788-2841`), currently
+gated on `self.profile_active and ATOM_ENABLE_DETAILED_ANNOTATION` (`:2819-2820`).
 Ungating them is a flag, not code.
 
 Two properties of this form are free here and cost the prior effort real time to

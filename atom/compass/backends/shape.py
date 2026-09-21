@@ -44,14 +44,30 @@ its own provenance, so a charge that may not correspond to a collective cannot
 be read back as one that did.
 
 **Every sum runs over requests, one at a time.** `BatchView` holds one row per
-request and derives the sums from those rows. It has no field and no
-constructor that accepts a batch-level scalar, so the collapsed form cannot be
-handed in even by accident, and that is the point rather than fastidiousness:
-collapsing a batch to `tokens x history` and multiplying makes the quadratic
-term and the cross term fixed multiples of each other over every batch a
-scheduler can build. A fit cannot then separate them, and a feature computed
-wrongly is indistinguishable from one that is merely unconstrained. Summing
-per request was the repair, and here it is the only shape the type permits.
+request and every shape sum is a function of those rows: no constructor takes
+a sum in place of the rows, and no supplied sum can disagree with the rows it
+was computed from. That is the point rather than fastidiousness: collapsing a
+batch to `tokens x history` and multiplying makes the quadratic term and the
+cross term fixed multiples of each other over every batch a scheduler can
+build. A fit cannot then separate them, and a feature computed wrongly is
+indistinguishable from one that is merely unconstrained. Summing per request
+was the repair.
+
+State the property precisely, because a stronger claim was made here and it
+was measured false. The type does not make the collapsed form unreachable.
+A one-row `BatchView` *is* `tokens x history` -- `RequestShape(512, 2048)`
+alone sums to 1048576 where the two 256-token rows it collapses sum to
+524288 -- and nothing in the type ties the row count to the number of
+requests a scheduler scheduled. `capture_rung` is a batch-level scalar field,
+correctly so, because a rung is a property of the replayed graph rather than
+of the rows; it is checked against the decode rows in both directions but is
+unbounded above and enters the price linearly, so a rung nobody would pass
+prices a single decode row at any duration one likes. Subclassing is refused
+outright (see `_refuse_shadowing`), which closes the two routes that fabricate
+a reading from a field a subclass added; the row count is not closed here and
+cannot be. What closes it is the projection -- one row per scheduled request,
+built by whoever holds the scheduled batch -- and that builder does not live
+in this package yet.
 
 The decode padding feature is the *rung's* rectangle, `rung.max - Sum`, and
 not the batch's `len.max - Sum`. A replayed graph runs its rung's worth of
@@ -85,6 +101,41 @@ DECLARED = "declared, not measured -- a plumbing figure, not an accuracy claim"
 CANDIDATE = "a collective these widths admit, not one observed to run"
 
 
+def _refuse_shadowing(owner: type, cls: type) -> None:
+    """Refuse a subclass of `owner` that redefines anything `owner` reports.
+
+    The shape features are functions of the rows, which is the property the
+    whole form rests on -- but a subclass is accepted by the `isinstance`
+    check the backend makes, and a subclass that redefines a reader can hand
+    back a number that came from a field it added rather than from the rows.
+    `cached_tokens` fabricates the cross term directly; `prefill` synthesises
+    a single row holding a whole batch's tokens against a whole batch's
+    history, which is the collapsed form the summing exists to keep out.
+    Refusing that is the same call `StepCost` in this package already makes,
+    for the same reason.
+
+    The protected set is read off `owner` rather than listed, so a reader
+    added later is covered the day it is added. `__post_init__` is added to
+    it by name because it is the only non-public member whose replacement
+    also changes what the object reports: it is where a row's integers and a
+    rung's width are checked, and a subclass that drops it admits shapes the
+    sums are not defined over.
+    """
+    protected = {
+        name
+        for name in (*vars(owner), *owner.__annotations__)
+        if not name.startswith("_")
+    } | {"__post_init__"}
+    shadowed = sorted(protected & set(cls.__dict__))
+    if shadowed:
+        raise TypeError(
+            f"{cls.__name__} redefines {', '.join(shadowed)} of "
+            f"{owner.__name__}; the shape sums are functions of the rows, and "
+            "a reader that answers from anything else is what summing per "
+            "request exists to prevent"
+        )
+
+
 @dataclass(frozen=True)
 class RequestShape:
     """One request's share of one step, as the scheduler sized it.
@@ -100,6 +151,10 @@ class RequestShape:
     query_tokens: int
     context_tokens: int
     decode: bool
+
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        super().__init_subclass__(**kwargs)
+        _refuse_shadowing(RequestShape, cls)
 
     def __post_init__(self) -> None:
         if self.query_tokens < 1:
@@ -173,14 +228,24 @@ class BatchView:
     class. Whoever holds a scheduled batch reads the integers off it and
     builds these rows.
 
-    There is no field and no constructor argument for a batch-level sum. The
-    sums are functions of the rows, so a caller cannot supply a collapsed pair
-    of scalars instead, and cannot supply a sum that disagrees with the rows
-    it was supposedly computed from.
+    Every shape sum is a function of the rows: no constructor argument takes a
+    sum in place of them, so a caller cannot supply a collapsed pair of
+    scalars instead, and cannot supply a sum that disagrees with the rows it
+    was supposedly computed from. `capture_rung` is the one batch-level
+    scalar, and it is one because a rung is a property of the replayed graph
+    and not of any row.
+
+    What this does not do is make the collapsed form unreachable: one row is
+    a legal batch, and a one-row batch is `tokens x history` by construction.
+    The row count is the projection's guarantee, not the type's.
     """
 
     requests: tuple[RequestShape, ...]
     capture_rung: int | None = None
+
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        super().__init_subclass__(**kwargs)
+        _refuse_shadowing(BatchView, cls)
 
     def __post_init__(self) -> None:
         rows = tuple(self.requests)
@@ -346,6 +411,13 @@ class ShapeStubBackend(CostBackend):
         No seconds are added here. Each term is one product, and the total is
         whatever `StepCost` folds from them, so there is no second summation
         to disagree with the first.
+
+        The two refusals below and in `BatchView.__post_init__` are `TypeError`
+        and `ValueError` rather than the `CostRefused` the seam names, because
+        a batch that is not a batch is a caller defect and not a step this
+        backend declines to price; the asymmetry is worth stating because a
+        resolver that wraps this backend catches `CostRefused` and falls
+        through to the next rung, and will not catch these.
         """
         if not isinstance(batch_view, BatchView):
             raise TypeError(

@@ -7,8 +7,8 @@ having.
 The first kind checks the form: that a step's price is the declared
 coefficients multiplied into the shapes of that step, that the breakdown names
 every part, that the attention sums are the ones ATOM itself publishes, and
-that the projection cannot be handed a batch-level scalar in place of the rows
-it is meant to sum over.
+that every shape sum is a function of the rows rather than something a caller
+can supply -- including what that does *not* close, which is the row count.
 
 The second kind drives ATOM's real `Scheduler` -- chunked prefill, real
 admission, real block manager -- with a virtual clock advanced by nothing but
@@ -24,7 +24,7 @@ guessed well.
 """
 
 import math
-from dataclasses import fields, replace
+from dataclasses import dataclass, fields, replace
 from itertools import count
 from types import SimpleNamespace
 
@@ -145,15 +145,85 @@ class TestTheForm:
 class TestPerRequestSums:
     """Summed per request, made structural rather than asked for in prose."""
 
-    def test_the_projection_has_no_field_for_a_batch_level_sum(self):
-        """The collapsed form is not expressible, so it cannot be passed by
-        mistake and cannot disagree with the rows it came from."""
+    def test_no_constructor_takes_a_sum_in_place_of_the_rows(self):
+        """Every sum is a function of the rows, so none can be supplied and
+        none can disagree with the rows it came from.
+
+        `capture_rung` is the one batch-level scalar and is one deliberately:
+        a rung is a property of the replayed graph, not of any row.
+        """
         assert [f.name for f in fields(BatchView)] == ["requests", "capture_rung"]
         assert [f.name for f in fields(RequestShape)] == [
             "query_tokens",
             "context_tokens",
             "decode",
         ]
+
+    def test_one_row_is_a_legal_batch_and_is_the_collapsed_form(self):
+        """What the type does not close, said here rather than claimed away.
+
+        A single row carrying a whole batch's tokens against a whole batch's
+        history is `tokens x history` exactly. Nothing in the type ties the
+        row count to the number of requests a scheduler scheduled; the
+        projection does, and the projection is not in this package yet.
+        """
+        collapsed = BatchView((prefill(512, cached=1536),))
+        honest = BatchView((prefill(256, cached=768), prefill(256, cached=768)))
+        assert sum_query_context(collapsed.requests) == 512 * 2048
+        assert sum_query_context(honest.requests) == 2 * 256 * 1024
+        backend = ShapeStubBackend()
+        assert backend.estimate(collapsed).seconds != backend.estimate(honest).seconds
+
+    def test_a_projection_subclass_that_redefines_a_reader_is_refused(self):
+        """Route two of the collapsed form, closed at the type.
+
+        A frozen subclass adding a batch-level field and overriding `prefill`
+        passes the backend's `isinstance` check and prices the collapsed form
+        exactly. `StepCost` in this package already refuses the same shape.
+        """
+        with pytest.raises(TypeError, match="functions of the rows"):
+
+            @dataclass(frozen=True)
+            class Collapsed(BatchView):
+                tokens: int = 0
+                history: int = 0
+
+                @property
+                def prefill(self):
+                    return (RequestShape(self.tokens, self.history, False),)
+
+    def test_a_row_subclass_that_redefines_a_reader_is_refused(self):
+        """Route three: `cached_tokens` fabricates the cross term directly."""
+        with pytest.raises(TypeError, match="functions of the rows"):
+
+            @dataclass(frozen=True)
+            class Fabricated(RequestShape):
+                @property
+                def cached_tokens(self) -> int:
+                    return 10**9
+
+    def test_the_guard_names_what_the_subclass_redefined(self):
+        """A refusal that does not name the member leaves a reader guessing."""
+        with pytest.raises(TypeError) as refused:
+
+            @dataclass(frozen=True)
+            class Silent(BatchView):
+                @property
+                def graph_padding(self) -> int:
+                    return 0
+
+        assert "graph_padding" in str(refused.value)
+
+    def test_dropping_the_row_checks_is_refused_too(self):
+        """`__post_init__` is where a row's integers and a rung's width are
+        checked; a subclass that drops it admits shapes the sums are not
+        defined over."""
+        with pytest.raises(TypeError, match="__post_init__"):
+
+            @dataclass(frozen=True)
+            class Unchecked(RequestShape):
+                def __post_init__(self) -> None:
+                    return None
 
     def test_two_batches_that_collapse_alike_are_priced_apart(self):
         """The rank deficiency, shown rather than described.
