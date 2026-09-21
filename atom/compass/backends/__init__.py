@@ -14,6 +14,9 @@ The pieces, and the rule each exists to make structural rather than customary:
   and what produced it, with no default that would let one avoid saying.
 - `Resolver` / `CostSource` -- sources consulted in a fixed order, with every
   refusal on the way down recorded on the answer rather than inferred from it.
+- `KvGeometry` / `Parallelism` -- what a KV block costs and how each parallel
+  width divides it, so ATOM's own pool sizing and block manager run for real
+  against a stand-in model.
 - `ProvenanceMix` -- the run-level mixture, and refusals counted by number, by
   fraction of steps and by fraction of predicted seconds. A run with nothing in
   it has no fractions and says so, rather than reporting a reassuring zero.
@@ -27,6 +30,7 @@ from atom.compass.backends.cost import (
     fold_seconds,
     fold_step,
 )
+from atom.compass.backends.geometry import KvGeometry, Parallelism
 from atom.compass.backends.ladder import (
     CostRefused,
     CostSource,
@@ -40,6 +44,8 @@ __all__ = [
     "CostRefused",
     "CostSource",
     "CostTerm",
+    "KvGeometry",
+    "Parallelism",
     "Provenance",
     "ProvenanceMix",
     "Refusal",
