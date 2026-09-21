@@ -478,10 +478,12 @@ class IndexBinding:
 class GroupingEvidence(abc.ABC):
     """What was compared before a repeat was allowed to replace a sequence.
 
-    Collapsing *n* instances into one body is only free if pricing the body once
-    and *reusing* that price for every instance gives what pricing the instances
-    separately would give -- the same prices, in the same order, added the same
-    way. Multiplying is a different sum, because it re-associates. Reuse
+    Collapsing *n* instances into one body is only free if pricing the body's
+    operators once and *reusing* those prices for every instance gives what
+    pricing the instances separately would give -- the same prices, in the same
+    order, added the same way. What is reused is the body's sequence of
+    per-operator prices, re-emitted in order once per instance, and not a body
+    total. Multiplying is a different sum, because it re-associates. Reuse
     reproduces the recorded price exactly in all three shapes measured and
     multiplying in none of them: eight identical layers, 3.2e-05 s multiplied
     against 3.200000000000001e-05 s recorded; a four-block pattern repeated
