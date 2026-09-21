@@ -6,8 +6,8 @@
 These are the memory-owning methods of ATOM's `ModelRunner`: the ones that read
 a checkpoint, warm the model, size the KV pool, allocate it, capture graphs, and
 run a step. They live here rather than beside the subclass because this module
-imports nothing from the engine, and so can be executed on a machine with no
-driver.
+imports nothing from the engine at module scope, and so can be executed on a
+machine with no driver.
 
 Two of them run during construction (`_build_and_load_model`, `_maybe_warmup`)
 and decline to do their work. The rest run afterwards, over the worker's RPC
@@ -319,10 +319,11 @@ class NonAllocatingRunner:
         observe how a real forward routed tokens across experts and commits a
         load window from what it saw; a predicted step routes nothing, so the
         window would be fabricated, and acting on one can move experts on a
-        device this runner owns none of. It would also have to be imported from
-        the engine, which this module does not do. `RapidServeModelRunner`, the
-        other runner in this tree that declines to own its memory, carries the
-        same one of the two.
+        device this runner owns none of. A decorator is applied while the
+        class body runs, so it would also have to be imported from the engine
+        at module scope, which this module does not do.
+        `RapidServeModelRunner`, the other runner in this tree that declines
+        to own its memory, carries the same one of the two.
 
         No duration is reported. The reply has nowhere to put one: the engine
         times the call itself, and the batch output it reads carries tokens.

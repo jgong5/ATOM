@@ -227,22 +227,38 @@ def test_the_worker_process_instantiates_whatever_that_field_names():
 
 
 def _import_time_imports(source):
-    """Every module *source* imports when it is imported, and none it imports later.
+    """The imports module *source* takes at module scope.
 
-    Neither of the two obvious predicates states that. Top-level statements
-    alone miss an import nested in a module-scope `try:`/`except ImportError:`,
-    in a module-scope `if`, or in a class body, all of which run at import;
-    walking every node counts one inside a function body, which does not. So
-    this walks and prunes at `def`/`lambda`, and the six forms below are
-    checked against what the interpreter actually runs, rather than against
-    the rule of thumb stated here.
+    That approximates what a module imports when it is imported, which is the
+    property the guard below states, and neither of the two obvious predicates
+    states even the approximation. Top-level statements alone miss an import
+    nested in a module-scope `try:`/`except ImportError:`, in a module-scope
+    `if`, or in a class body, all of which run at import; walking every node
+    counts one inside a function body, which does not. So this walks and prunes
+    at `def`/`lambda`, and the six forms below are checked against what the
+    interpreter actually runs, rather than against the rule of thumb stated
+    here.
+
+    Module scope is the approximation, and it is loose in both directions. It
+    over-catches a module-scope branch the interpreter never takes --
+    `if TYPE_CHECKING:`, which is how someone annotating a signature with an
+    engine type will write it, and `if False:` and `if __name__ ==
+    "__main__":` with it -- and there top-level statements alone are what
+    agrees with the interpreter. It under-catches a module-scope call of a
+    function defined in the same module, whose body does import at import
+    time, and there walking every node is what agrees. Neither is a defect a
+    stricter predicate could remove: whether a call runs is not decidable from
+    the source. The trade is taken deliberately, because the import that would
+    strand this package is the one written at module scope.
 
     Both halves are load-bearing. `overrides.forward` takes its single engine
     import at call time, on a worker that has imported the engine already, so
     counting it would forbid the reply this package exists to build. And the
     `try:`/`except ImportError:` form is the one case where this assertion is
     the only guard there is: collecting the package without a driver would not
-    fail on it, because the `except` swallows the failure.
+    fail on it, because the `except` swallows the failure. The under-catch is
+    blind in the same place: the same `except` inside a function body hides
+    that import from driverless collection too.
     """
     imported = set()
     stack = list(ast.parse(source).body)

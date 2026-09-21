@@ -27,10 +27,21 @@ follow. A replacement that carries its tokens forward by one *step* surfaces
 them early, by the number of middle chunks in between.
 
 **A step that produces nothing still reports its request ids.** The early
-return names the batch's requests with an empty token list, and on the two
-paths that exist today nothing reads it. A single-stage scheduler skips every
-request in such a batch before it reads a token, because they are all still
-mid-prompt; a pipeline head drops the entry without waiting for a reply at all.
+return names the batch's requests with an empty token list, and nothing reads
+it on any path that exists today. A single-stage scheduler skips every
+request in such a batch at `scheduler.py:2467-2468` before it reads a token,
+because they are all still mid-prompt; a pipeline head drops the entry
+without waiting for a reply at all. The third path is the deferred flag, and
+it has two readers above that per-seq loop: `:2444`, which folds it into
+`need_placeholder`, and `:2449`, which widens the placeholder count by one.
+`need_placeholder` in turn has two uses, `:2502` and `:2751`, and both sit
+behind a gate -- `:2502` is inside the loop, below the same skip, and the
+placeholder loop at `:2751` touches only a sequence that is RUNNING and not
+mid-prefill (`:2754`) -- while `:2430-2433` flags every member of a batch of
+middle chunks partial before either gate reads it. The sequences that loop
+walks are the batch's own, since `schedule()` returns the dict it built the
+batch from (`:1716`/`:1737` and `:1843`/`:1863`), so this holds for any batch
+rather than for the ones that have been tried.
 So this one is mirrored from ATOM's own early return rather than derived from
 what a caller needs -- there is no caller to derive it from, and a reply that
 differs from the original differs in silence until one appears.
