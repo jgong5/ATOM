@@ -15,6 +15,7 @@ This module provides:
 
 import logging
 import multiprocessing
+import os
 import pickle
 import queue
 import threading
@@ -490,6 +491,22 @@ class AsyncIOProcManager:
                 f"(exitcode={dead_proc.exitcode}), shutting down.",
             )
             _self.exit()
+            # Leaving the process alive after this point makes a failure look
+            # like a slow run. A rank is gone, so no further step can be
+            # produced, and every caller is blocked -- or about to block -- on
+            # a queue nothing will ever fill again. Observed: a capture whose
+            # child raised in prepare_decode sat at 0.3% CPU for 1h49m holding
+            # its GPU, and the wrapping script's `rc=$?` never ran, so the
+            # queue behind it never advanced.
+            #
+            # Raising here would not reach them: this is a daemon thread, and
+            # the main thread is inside a `queue.get` with no timeout. So the
+            # exit is the process's, taken after `exit()` above has closed the
+            # shared memory and joined the io threads. Logging is flushed by
+            # hand because `os._exit` runs no atexit handler, and the child's
+            # traceback is the only account of what went wrong.
+            logging.shutdown()
+            os._exit(1)
 
         Thread(
             target=monitor_engine_cores, daemon=True, name=f"{self.runner_label}Monitor"
