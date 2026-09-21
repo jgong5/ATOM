@@ -1,8 +1,8 @@
 # ATOM Compass — Design
 
 **Status: reviewed and approved, 2026-09-20. Design only — no code has been written
-against it yet.** Every document carries a matching header. **116 decisions — D0–D102
-with no gaps, plus 13 sub-decisions** — are indexed at the end of this file; **72 open
+against it yet.** Every document carries a matching header. **117 decisions — D0–D102
+with no gaps, plus 14 sub-decisions** — are indexed at the end of this file; **72 open
 TODOs (T1–T72)**, the load-bearing assumptions and the cross-cutting issues live in
 **`12_open_items.md`**. Implementation follows the execution plan in `16`.
 
