@@ -35,14 +35,16 @@ Four properties of the inventories this produces, each found by running it:
 * **A TP>1 capture at one physical rank erases and fabricates collectives.**
   Logical width comes from ATOM's `apply_simulated_tp`
   (`atom/distributed/simulated_tp.py`), whose `_patch_group` makes `all_reduce`
-  the identity at one rank. Counted by instrumenting that group rather than by
-  reading the inventory: **129 `all_reduce` per forward at TP2** -- 128 from
-  `model_ops/communication_op.py:58 tensor_model_parallel_all_reduce` (the
-  row-parallel linears: 64 `mlp.down_proj` + 48 `linear_attn.out_proj` + 16
-  `self_attn.o_proj`, zero in the vision tower) and 1 from
-  `model_ops/embed_head.py:175` (the vocab-parallel embedding reduce), identical
-  at warmup and at decode. Against that 129 the inventory holds **0** `c10d.*`
-  dispatches, plus one erased sampler `broadcast`. The gathers go the other way:
+  the identity at one rank. **128 row-parallel `all_reduce` per forward at
+  TP2**, derived from the parameter geometry rather than from the inventory:
+  128 weights shard on dim 1 -- 64 `mlp.down_proj` + 48 `linear_attn.out_proj`
+  + 16 `self_attn.o_proj`, zero in the vision tower -- and each one reduces
+  through `model_ops/communication_op.py:58 tensor_model_parallel_all_reduce`.
+  The vocab-parallel embedding reduces through the same patched group at
+  `model_ops/embed_head.py:175`; that is a call site read from the source, not
+  a count derived from any shape, so it is stated separately rather than added
+  in. Against all of them the inventory holds **0** `c10d.*` dispatches, plus
+  one erased sampler `broadcast`. The gathers go the other way:
   `_all_gather`, `_gather` and `_reduce_scatter_tensor` build the absent ranks
   out of zeros, and every op they use is dispatched and recorded, so the one
   `all_gather` this forward makes (`model_ops/embed_head.py:257`, the
@@ -516,9 +518,16 @@ class TritonLaunchRecorder:
         return self
 
     def __exit__(self, *exc) -> None:
+        if self._orig is None:
+            # An __exit__ with no matching __enter__, or a second __exit__.
+            # `JITFunction.run` is process-wide: writing None over it here
+            # would break every Triton launch in the process, including the
+            # ones this object never saw.
+            return
         from triton.runtime.jit import JITFunction
 
         JITFunction.run = self._orig
+        self._orig = None
 
     def report(self) -> dict:
         items = sorted(self.launches.items(), key=lambda kv: (-kv[1].n, kv[0]))

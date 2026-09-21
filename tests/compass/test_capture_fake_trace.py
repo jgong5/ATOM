@@ -10,6 +10,8 @@ those and a trace that created no symbol at all.
 
 from __future__ import annotations
 
+import contextlib
+
 import pytest
 import torch
 
@@ -17,6 +19,7 @@ from atom.compass.capture.fake_trace import (
     CaptureRefusal,
     DeviceReadings,
     Recorder,
+    TritonLaunchRecorder,
     capture,
     install_device_stubs,
     install_runner_stubs,
@@ -55,14 +58,55 @@ MODEL_RUNNER_STUBS = (
 )
 
 
+_MISSING = object()
+
+
+@contextlib.contextmanager
+def _cuda_namespace_restored():
+    """Put `torch.cuda` back as it was, including names that were not there.
+
+    Snapshotting `dir(torch.cuda)` and writing the old values back restores
+    only what a stub *overwrote*. A stub for a name that did not exist is not
+    in the snapshot, so it survives the restore and leaks into every later test
+    in the process -- and the whole point of enumerating the stub sets below is
+    that those sets grow. Names that appeared are deleted; names whose real
+    value is legitimately `None` are restored like any other.
+    """
+    before = {name: getattr(torch.cuda, name, _MISSING) for name in dir(torch.cuda)}
+    try:
+        yield
+    finally:
+        for name in set(dir(torch.cuda)) - set(before):
+            delattr(torch.cuda, name)
+        for name, value in before.items():
+            if value is not _MISSING:
+                setattr(torch.cuda, name, value)
+
+
 @pytest.fixture
 def restore_cuda():
     """Both installers mutate `torch.cuda` in place; put it back."""
-    saved = {k: getattr(torch.cuda, k, None) for k in dir(torch.cuda)}
-    yield
-    for k, v in saved.items():
-        if v is not None:
-            setattr(torch.cuda, k, v)
+    with _cuda_namespace_restored():
+        yield
+
+
+def test_the_cuda_restore_removes_a_stub_that_added_a_new_name():
+    """The leak the restore has to close, exercised on the restore itself.
+
+    A fixture cannot check its own teardown from inside the test it wraps, so
+    the teardown lives in a context manager and this test runs it directly.
+    """
+    assert not hasattr(torch.cuda, "_compass_probe_stub")
+    real_is_available = torch.cuda.is_available
+    with _cuda_namespace_restored():
+        torch.cuda._compass_probe_stub = lambda: "a name that was never there"
+        torch.cuda.is_available = lambda: "a name that was"
+        assert hasattr(torch.cuda, "_compass_probe_stub")
+    assert not hasattr(torch.cuda, "_compass_probe_stub"), (
+        "a stub for a new name is not in the snapshot and cannot be restored "
+        "by writing the old value back; it has to be deleted"
+    )
+    assert torch.cuda.is_available is real_is_available
 
 
 def test_import_stubs_are_pinned_by_name(restore_cuda):
@@ -244,3 +288,76 @@ def test_capture_freezes_the_shape_env_on_a_clean_trace():
         "an unfrozen ShapeEnv keeps accepting guards after the trace, so a "
         "later specialisation would not be visible in it"
     )
+
+
+def _probe_kernels():
+    """Two trivial `@triton.jit` kernels that would write if they ever ran."""
+    import triton
+    import triton.language as tl
+
+    @triton.jit
+    def probe_store(out_ptr, n: tl.constexpr):
+        tl.store(out_ptr + tl.arange(0, n), 1.0)
+
+    @triton.jit
+    def probe_other(out_ptr, n: tl.constexpr):
+        tl.store(out_ptr + tl.arange(0, n), 2.0)
+
+    return probe_store, probe_other
+
+
+def test_triton_recorder_counts_launches_it_did_not_run():
+    """The property the diagnostic label rests on: a recorded launch is one
+    that did not happen.
+
+    Nothing downstream may read a `--skip-triton` inventory as a cost-model
+    input, and the reason is here: the kernel is counted, the memory it would
+    have written is untouched, and `JITFunction.run` is the real one again
+    afterwards.
+    """
+    from triton.runtime.jit import JITFunction
+
+    probe_store, probe_other = _probe_kernels()
+    out = torch.zeros(8)
+    before = JITFunction.run
+    with TritonLaunchRecorder() as recorder:
+        probe_store[(1,)](out, 8)
+        probe_store[(1,)](out, 8)
+        probe_other[(1,)](out, 8)
+        report = recorder.report()
+
+    assert JITFunction.run is before, "the launcher is process-wide; put it back"
+    assert bool((out == 0).all()), (
+        "the kernels would have stored 1.0 and 2.0. A skipped kernel writes "
+        "nothing, which is why anything downstream of one reads uninitialised "
+        "memory."
+    )
+    assert report["n_distinct_triton_kernels"] == 2
+    assert report["n_triton_launches"] == 3
+    assert [k["kernel"].rsplit(".", 1)[-1] for k in report["triton_kernels"]] == [
+        "probe_store",
+        "probe_other",
+    ]
+    assert [k["launches"] for k in report["triton_kernels"]] == [2, 1]
+    assert all(k["defined_at"] != "?" for k in report["triton_kernels"])
+
+
+def test_triton_recorder_exit_without_enter_leaves_the_launcher_alone():
+    """An unmatched `__exit__` used to write `None` over `JITFunction.run`.
+
+    `JITFunction.run` is a class attribute, so that breaks every Triton launch
+    in the process -- including kernels this recorder never saw -- and it
+    breaks them at the next launch, far from the bookkeeping slip that caused
+    it. A second `__exit__` after a real one has the same shape.
+    """
+    from triton.runtime.jit import JITFunction
+
+    before = JITFunction.run
+    TritonLaunchRecorder().__exit__(None, None, None)
+    assert JITFunction.run is before
+
+    recorder = TritonLaunchRecorder()
+    with recorder:
+        pass
+    recorder.__exit__(None, None, None)
+    assert JITFunction.run is before
