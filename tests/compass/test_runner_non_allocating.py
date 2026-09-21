@@ -47,6 +47,7 @@ OVERRIDDEN = {
     "_maybe_warmup",
     "get_num_blocks",
     "allocate_kv_cache",
+    "capture_cudagraph",
     "forward",
 }
 
@@ -108,7 +109,7 @@ def test_every_replaced_method_exists_on_the_class_being_replaced():
     assert OVERRIDDEN <= _methods(_classes(ATOM_RUNNER)["ModelRunner"])
 
 
-def test_the_difference_from_the_in_tree_non_allocating_runner_is_two_methods():
+def test_the_difference_from_the_in_tree_non_allocating_runner_is_three_methods():
     """`RapidServeModelRunner` is the working non-allocating runner in the tree.
 
     It overrides two things this one does not. `__init__`: it has to bind a
@@ -117,13 +118,19 @@ def test_the_difference_from_the_in_tree_non_allocating_runner_is_two_methods():
     it holds bytes back because a second process shares its GPU, and a runner
     that allocates nothing has no tenant to hold anything back from.
 
+    This one overrides one thing it does not: `capture_cudagraph`. RapidServe
+    allocates no weights of its own but imports real ones over CUDA IPC, so it
+    has a model to trace and keeps ATOM's capture. This runner has none, and
+    ATOM's capture zeroes device buffers and opens a graph pool before it finds
+    that out.
+
     Its `_init_weight_params_on_meta` is not in the difference because it is not
     an override -- it is a helper the base does not have.
     """
     base = _methods(_classes(ATOM_RUNNER)["ModelRunner"])
     template = _methods(_classes(ATOM_RUNNER)["RapidServeModelRunner"]) & base
     assert template - OVERRIDDEN == {"__init__", "_kv_budget_extra_reserve"}
-    assert OVERRIDDEN - template == set()
+    assert OVERRIDDEN - template == {"capture_cudagraph"}
 
 
 # --- construction allocates nothing -----------------------------------------
