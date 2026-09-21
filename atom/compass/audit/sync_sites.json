@@ -2,7 +2,7 @@
  "schema": 1,
  "what": "Every call on ATOM's serving path that can stop a thread, and what a simulated run has to do about it. Rows under 'sites' are produced by the scanner in sync_scan.py and classified by hand; rows under 'anchors' are points that are not a call -- a loop gate, a stamp, a compiled-in bound -- and are pinned to a line of text instead.",
  "categories": {
-  "A": "simulated time decides this, not the real clock: a duration that is predicted rather than elapsed, or a reading the result reports",
+  "A": "simulated time decides this, not the real clock: a duration that is predicted rather than elapsed, a reading the result reports, or an idle loop that must jump to the next event",
   "B": "parks until another process sends something, with no bound; the call stays as it is and the process says when it is idle",
   "C1": "a bound that exists to declare something broken; raise it or switch it off",
   "C2": "a bound that sets a cadence; keep the cadence on simulated time and poll briefly for real so the thread stays responsive",
@@ -1025,7 +1025,7 @@
    "shape": "queue_get",
    "category": "B",
    "peer": "process",
-   "why": "the engine's step loop parks for the workers' reply; the duration was charged by the reply's sender"
+   "why": "the engine's step loop parks for rank 0's reply, the only rank given a primary output address; the duration was charged by the reply's sender"
   },
   {
    "id": "atom/model_engine/async_proc.py::AsyncIOProcManager.call_func_with_aggregation::self.rpc_broadcast_mq.enqueue(msg)::task_wait#0",
@@ -1865,7 +1865,7 @@
    "shape": "worker_rpc",
    "category": "B",
    "peer": "process",
-   "why": "an out-of-band control command parks the engine's step loop until every worker answers; it is unbounded and can arrive at any point in a run"
+   "why": "an out-of-band control command parks the engine's step loop until rank 0 answers, which is the only rank wired to the primary output queue; it is unbounded and can arrive at any point in a run"
   },
   {
    "id": "atom/model_engine/engine_utility.py::EngineUtilityHandler._handle_update_weights_shm::self.runner_mgr.call_func( \"update_weights_from_shm\", shm_name, bucket_meta, is_last, wait_out=True )::worker_rpc#0",
@@ -1877,7 +1877,7 @@
    "shape": "worker_rpc",
    "category": "B",
    "peer": "process",
-   "why": "an out-of-band control command parks the engine's step loop until every worker answers; it is unbounded and can arrive at any point in a run"
+   "why": "an out-of-band control command parks the engine's step loop until rank 0 answers, which is the only rank wired to the primary output queue; it is unbounded and can arrive at any point in a run"
   },
   {
    "id": "atom/model_engine/engine_utility.py::EngineUtilityHandler._handle_update_weights_ipc::self.runner_mgr.call_func( \"update_weights_from_ipc\", ipc_handle, bucket_meta, is_last, ipc_handles, wait_out=True, )::worker_rpc#0",
@@ -1889,7 +1889,7 @@
    "shape": "worker_rpc",
    "category": "B",
    "peer": "process",
-   "why": "an out-of-band control command parks the engine's step loop until every worker answers; it is unbounded and can arrive at any point in a run"
+   "why": "an out-of-band control command parks the engine's step loop until rank 0 answers, which is the only rank wired to the primary output queue; it is unbounded and can arrive at any point in a run"
   },
   {
    "id": "atom/model_engine/engine_utility.py::EngineUtilityHandler._handle_release_memory::self.runner_mgr.call_func(\"release_memory\", tags, wait_out=True)::worker_rpc#0",
@@ -1901,7 +1901,7 @@
    "shape": "worker_rpc",
    "category": "B",
    "peer": "process",
-   "why": "an out-of-band control command parks the engine's step loop until every worker answers; it is unbounded and can arrive at any point in a run"
+   "why": "an out-of-band control command parks the engine's step loop until rank 0 answers, which is the only rank wired to the primary output queue; it is unbounded and can arrive at any point in a run"
   },
   {
    "id": "atom/model_engine/engine_utility.py::EngineUtilityHandler._handle_resume_memory::self.runner_mgr.call_func(\"resume_memory\", tags, wait_out=True)::worker_rpc#0",
@@ -1913,7 +1913,7 @@
    "shape": "worker_rpc",
    "category": "B",
    "peer": "process",
-   "why": "an out-of-band control command parks the engine's step loop until every worker answers; it is unbounded and can arrive at any point in a run"
+   "why": "an out-of-band control command parks the engine's step loop until rank 0 answers, which is the only rank wired to the primary output queue; it is unbounded and can arrive at any point in a run"
   },
   {
    "id": "atom/model_engine/engine_utility.py::EngineUtilityHandler._handle_clear_kv_cache::self.runner_mgr.call_func(\"clear_kv_cache\", wait_out=True)::worker_rpc#0",
@@ -1925,7 +1925,7 @@
    "shape": "worker_rpc",
    "category": "B",
    "peer": "process",
-   "why": "an out-of-band control command parks the engine's step loop until every worker answers; it is unbounded and can arrive at any point in a run"
+   "why": "an out-of-band control command parks the engine's step loop until rank 0 answers, which is the only rank wired to the primary output queue; it is unbounded and can arrive at any point in a run"
   },
   {
    "id": "atom/model_engine/engine_utility.py::EngineUtilityHandler._handle_configure_hidden_states::self.runner_mgr.call_func( \"configure_hidden_states\", aux_layer_ids, mooncake_config, wait_out=True )::worker_rpc#0",
@@ -1937,7 +1937,7 @@
    "shape": "worker_rpc",
    "category": "B",
    "peer": "process",
-   "why": "an out-of-band control command parks the engine's step loop until every worker answers; it is unbounded and can arrive at any point in a run"
+   "why": "an out-of-band control command parks the engine's step loop until rank 0 answers, which is the only rank wired to the primary output queue; it is unbounded and can arrive at any point in a run"
   },
   {
    "id": "atom/model_engine/engine_utility.py::EngineUtilityHandler._handle_start_profile::self.runner_mgr.call_func(\"start_profiler\", wait_out=True)::worker_rpc#0",
@@ -1949,7 +1949,7 @@
    "shape": "worker_rpc",
    "category": "B",
    "peer": "process",
-   "why": "an out-of-band control command parks the engine's step loop until every worker answers; it is unbounded and can arrive at any point in a run"
+   "why": "an out-of-band control command parks the engine's step loop until rank 0 answers, which is the only rank wired to the primary output queue; it is unbounded and can arrive at any point in a run"
   },
   {
    "id": "atom/model_engine/engine_utility.py::EngineUtilityHandler._handle_stop_profile::self.runner_mgr.call_func(\"stop_profiler\", wait_out=True)::worker_rpc#0",
@@ -1961,7 +1961,7 @@
    "shape": "worker_rpc",
    "category": "B",
    "peer": "process",
-   "why": "an out-of-band control command parks the engine's step loop until every worker answers; it is unbounded and can arrive at any point in a run"
+   "why": "an out-of-band control command parks the engine's step loop until rank 0 answers, which is the only rank wired to the primary output queue; it is unbounded and can arrive at any point in a run"
   },
   {
    "id": "atom/model_engine/model_runner.py::tokenIDProcessor.send_to_cpu_async::data_ready.wait(stream=self.async_copy_stream)::event_wait#0",

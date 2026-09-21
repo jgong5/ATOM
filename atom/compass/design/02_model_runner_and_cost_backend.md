@@ -408,7 +408,7 @@ divides by what:
 | TP | KV heads shard (GQA-bounded) so KV bytes/token divides; weights shard; collectives appear as a cost term |
 | DP | N independent engines, each holding full KV |
 | PP | layers split per stage, so KV per stage; and it creates the LP structure of topic `01` |
-| EP | experts shard; KV unaffected; all-to-all appears as a cost term |
+| EP | experts shard; KV unaffected; an all-to-all appears as a cost term **only at `dp_size > 1`** — at DP 1 ATOM builds no all-to-all at all and the MoE is masked local compute plus the TP all-reduce (`15` D92) |
 
 This is on the order of thirty lines, and the point is that **the rest of the system then
 does genuine work**: the real `BlockManager` gets a genuinely different block count per

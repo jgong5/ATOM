@@ -764,7 +764,7 @@ A wait matters to virtual time **only if its duration is observable in the simul
 result.** That yields four categories.
 
 **The counts below are measured, not estimated.** The classified list is
-`atom/compass/clock/sync_sites.json`, produced by the scanner beside it and held to the
+`atom/compass/audit/sync_sites.json`, produced by the scanner beside it and held to the
 tree by `tests/compass/test_sync_inventory.py` — which parses **this table too**, so it
 cannot drift from the rows. The estimates this table carried until 2026-09-21 are kept
 in the last column so the diff stays visible.
@@ -857,8 +857,11 @@ directories rather than a list of files:
   Anthropic endpoint and was listed; these two are the endpoints a replay drives.
 - the nine out-of-band control commands in `engine_utility.py` (`:126`, `:147`, `:174`,
   `:194`, `:203`, `:213`, `:236`, `:252`, `:264`). Each parks the engine's **step loop**
-  until every worker answers, with no bound, and unlike the startup calls they can
-  arrive at any point in a run.
+  with no bound, and unlike the startup calls they can arrive at any point in a run.
+  They wait for **rank 0 only**: `async_proc.py:310` gives the primary output address to
+  rank 0 and `None` to every other rank, and `:332` builds one `outputs_queue` for it,
+  so no other worker has a thread on that channel. The form that does wait for all of
+  them is `call_func_with_aggregation`, which has a queue per rank.
 
 **On the send side, "it cannot park" is true of most of them and has to be said per
 socket, not once.** Of the 25 sends, the ones built by `make_zmq_socket`
@@ -927,7 +930,7 @@ that assumes the enqueue is the only thing in that function will be surprised.
 
 - ~~The counts above are estimates from a synchronization inventory, not from a completed
   pass over the code. The first implementation task should be to produce the exact
-  classified list and check it in.~~ **Done, 2026-09-21.** `atom/compass/clock/`.
+  classified list and check it in.~~ **Done, 2026-09-21.** `atom/compass/audit/`.
 - ~~`engine_core.py:1156` is a literal `time.sleep(2)` ... it must be *checked*, not
   assumed.~~ **Checked, 2026-09-21, and both halves hold.** It is reached only from
   `DecodeEngineCore._post_model_load_hook`, and `DecodeEngineCore` is constructed only by
@@ -1030,7 +1033,7 @@ shutdown disagree.
   sites "deleted for free by D6", the two Rust constants, and the three clock reads in
   `streaming_dispatch.py`. The drifted cites are elsewhere: three distinct ones, one of
   which appears twice more in D3, for five occurrences in all. The rows this section
-  owns are carried in `atom/compass/clock/sync_sites.json` as pinned lines of text
+  owns are carried in `atom/compass/audit/sync_sites.json` as pinned lines of text
   rather than as call sites, so a rename or a move fails the inventory test instead of
   rotting quietly.
 - Disabling a failure detector removes a safety net from a long unattended run. The
