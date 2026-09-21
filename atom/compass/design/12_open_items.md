@@ -12,7 +12,10 @@ backlog. Nothing here is a decision; every decision lives in its topic's decisio
 
 1. **Load-bearing assumptions** — hold up large parts of the design; each has a check plan
 2. **Missing topics** — design points nobody has written yet, with a recommendation
-3. **TODO register** — T1–T72, per topic
+3. **TODO register** — 73 items, **T1–T72 and T80**, per topic. The register is not
+   contiguous on this branch: T-numbers are allocated across parallel task branches, and
+   T73–T76 arrive with P0.3, T77 with P0.1. T80 arrives with P0.2, here. 70 are open; T15,
+   T22 and T48 are struck through as done
 4. **Cross-cutting issues and pending amendments**
 
 ---
@@ -178,6 +181,7 @@ M-f `14`; M-g `01` D3.5.
 |---|---|
 | T71 | Add Wave 4+ detail as Phase 0 and T21 answers arrive |
 | T72 | Decide whether reviewer agents use ATOM's `review-pr` skill or a Compass-specific checklist |
+| T80 | Raise with ATOM's owners: `tests/test_prefix_cache_accuracy.py` has no test function — it is an `argparse` script driving a live server — and `test_kv_connector_scheduler.py` / `test_transfer_engine.py` have been dead since #690. Measured: all three run nothing in **either** tier |
 
 ### Topics 02, 01 — gaps now closed
 
