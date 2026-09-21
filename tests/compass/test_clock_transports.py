@@ -20,10 +20,14 @@ What each test is defending:
   Then the frames themselves are compared, which is the stronger statement: the
   co-hosted carriage does not merely carry equivalent stamps, it carries the
   same bytes.
-* **There is nowhere to put a shortcut.** A carrier takes bytes and returns
-  bytes, and the rule is reachable through exactly one method that takes a
-  frame. Handing the in-process carrier a message object is refused, which is
-  what makes the first property structural rather than a matter of care.
+* **A carriage cannot reach the rule without a frame, and that is the whole of
+  what is structural here.** A carrier takes bytes and returns bytes; the
+  service has one public method and it takes a frame; handing the in-process
+  carrier a message object is refused. What is *not* guaranteed, and is
+  measured rather than claimed: whatever co-hosts a clock built it before it
+  served it, so it holds a reference and can drive the rule with no frames at
+  all. That is wiring -- a participant is handed a session, not a clock -- and
+  no arrangement of these classes can make it otherwise.
 * **A refusal is carried, not flattened.** An abort crosses either carriage as
   the same type, with its reason and its participant table, so a run that must
   stop stops the same way in both arrangements.
@@ -34,10 +38,14 @@ What each test is defending:
   own timestamp, never the clock's horizon -- but the arrangement where a
   collapse would be invisible is the standalone one, so the case is driven over
   both, with a single-event control beside it.
+* **The wire format is JSON a stranger can read.** Bare `Infinity` is what
+  Python's encoder writes for the commonest value in this protocol and is not
+  JSON; a frame that needs `parse_constant` to be read is a frame only Python
+  can read, which would make the standalone arrangement Python-to-Python only.
 * **Nothing a participant touches says where the clock is.** That claim is
   mechanical and lives with the package's other source guards, in
-  `test_clock_lp_identity.py`, because it is a statement about the whole package
-  rather than about the transport alone.
+  `test_clock_package_boundary.py`, because it is a statement about the whole
+  package rather than about the transport alone.
 
 A socket is tested without a second container and without a GPU: the standalone
 clock binds `127.0.0.1` on a port the kernel picks, runs its accept loop in a
@@ -48,6 +56,7 @@ cannot make it.
 """
 
 import hashlib
+import json
 import math
 import os
 import subprocess
@@ -58,6 +67,7 @@ import pytest
 
 from atom.compass.clock import (
     BackdatedEvent,
+    ClockAbort,
     ClockAuthority,
     ClockDeadlock,
     LinkClass,
@@ -147,6 +157,24 @@ class _Recorded:
 
     def close(self):
         self._carrier.close()
+
+
+class _Replying:
+    """A carriage that answers every frame with one prepared reply.
+
+    For the cases a real clock cannot produce: a refusal naming something this
+    side has never heard of, which is what an older participant meets after the
+    clock grows a new one.
+    """
+
+    def __init__(self, reply):
+        self._reply = encode(reply)
+
+    def exchange(self, frame):
+        return self._reply
+
+    def close(self):
+        pass
 
 
 def _row(lp_id, when, event):
@@ -439,16 +467,86 @@ def test_a_co_hosted_carrier_moves_bytes_and_not_a_message(clocks):
         carrier.exchange(Message(MessageKind.ATTACH, DECODE, 0.0))
 
 
-def test_the_only_way_into_the_rule_is_a_frame():
-    authority = _clock()
+def test_a_carriage_can_reach_the_rule_only_through_a_frame():
+    # The half of the prohibition that is structural, stated as the surface it
+    # rests on. A carriage is handed a service and nothing else, so if the
+    # service exposes one method and that method takes a frame, there is no way
+    # from a carriage to the rule that does not carry a stamp. A public reader
+    # returning the clock would be exactly such a way, and would leave this
+    # test passing while the property it names was gone.
     public = sorted(name for name in vars(ClockService) if not name.startswith("_"))
-    assert public == ["authority", "handle"], (
-        f"the rule is reachable through {public}; a second entry point taking a "
-        "request object is how the two arrangements stop being one"
+    assert public == ["handle"], (
+        f"the rule is reachable through {public}; anything here that hands back "
+        "the clock, or takes a request object, is a way past the stamps"
     )
-    # The one public reader is a reader: it hands back the clock, and the clock
-    # is not a way to send it a request from a carriage.
-    assert ClockService(authority).authority is authority
+    service = ClockService(_clock())
+    assert isinstance(
+        service.handle(encode(Message(MessageKind.ATTACH, DECODE, 0.0))), bytes
+    )
+    with pytest.raises(MalformedMessage):
+        service.handle(Message(MessageKind.ATTACH, DECODE, 0.0))
+
+
+def test_no_public_attribute_of_the_transport_hands_back_the_clock():
+    # The one hole this closes was a single public property. A service that
+    # returned the clock it served let a participant assembled from nothing but
+    # public exports run the whole protocol with no frames at all -- while the
+    # surface test above passed throughout, because the surface it asserted was
+    # exactly where the hole was. Stated over every public attribute of every
+    # object a participant can hold, so it cannot come back as a different name.
+    authority = _clock()
+    service = ClockService(authority)
+    server = serve(service, "inproc:no-way-back")
+    try:
+        session = ClockSession(DECODE, carrier_for(server.endpoint))
+        session.attach()
+        holders = (service, server, carrier_for(server.endpoint), session)
+        leaks = [
+            f"{type(holder).__name__}.{name}"
+            for holder in holders
+            for name in dir(holder)
+            if not name.startswith("_")
+            and isinstance(getattr(holder, name, None), ClockAuthority)
+        ]
+        assert not leaks, (
+            f"{leaks} hands back the clock, whose own surface is the whole "
+            "protocol; a participant holding one needs no frames and no stamps"
+        )
+        session.close()
+    finally:
+        server.close()
+
+
+def test_the_process_that_hosts_a_clock_still_holds_it_directly(clocks):
+    # The half that is not structural, measured rather than claimed, because a
+    # test that implied otherwise would be worse than no test.
+    #
+    # Whatever co-hosts a clock has to build it before it can serve it, so it
+    # holds a reference by construction and no arrangement of these classes can
+    # take that away. Something in that process can therefore drive the rule
+    # directly and produce a run with no frames in it at all. What stops that
+    # is wiring -- a participant is handed a session, not a clock -- and wiring
+    # is a rule, not an impossibility.
+    #
+    # So the claim this file makes is the narrow one: a request that travels by
+    # carriage carries a stamp, and both carriages carry the same stamps. It is
+    # not that the stamps cannot be avoided by a process that never uses a
+    # carriage.
+    authority = _clock()
+    endpoint = clocks(IN_PROCESS, authority)
+    frames = []
+    session = ClockSession(DECODE, _Recorded(carrier_for(endpoint), frames))
+    session.attach()
+    assert len(frames) == 1
+    # The same participant, driven straight at the clock it was served from.
+    authority.request_advance(DECODE, 5.0)
+    authority.take_up_grant(DECODE)
+    assert len(frames) == 1, (
+        "a request reached the rule and left a frame behind, which would make "
+        "the bypass below impossible -- and it is not"
+    )
+    assert authority.now(DECODE) > 0.0
+    session.close()
 
 
 # --- a refusal is carried, not flattened -------------------------------------
@@ -612,7 +710,53 @@ def test_a_message_encodes_the_same_bytes_every_time():
     message = Message(MessageKind.ADVANCE, DECODE, 1.0, when=math.inf)
     assert encode(message) == encode(message)
     assert b'"sent_at":1.0' in encode(message)
-    assert b'"when":Infinity' in encode(message)
+    assert b'"when":"+inf"' in encode(message)
+
+
+def test_a_frame_is_json_a_stranger_can_read():
+    # Not a nicety. A participant that knows of no future event declares an
+    # unbounded horizon, so most advance frames carry one, and Python's encoder
+    # would write it as a bare `Infinity` -- which this interpreter reads back
+    # and a conforming parser rejects. That would quietly make the standalone
+    # arrangement Python-to-Python only. `parse_constant` is the hook a strict
+    # reader would use, so a frame that needs it is a frame that is not JSON.
+    frames = []
+    for when in (math.inf, -math.inf, 0.0, 1.5):
+        frames.append(encode(Message(MessageKind.ADVANCE, DECODE, when, when=when)))
+    for frame in frames:
+        json.loads(
+            frame.decode("utf-8"),
+            parse_constant=lambda name: pytest.fail(f"bare {name} on the wire"),
+        )
+    # And both spellings survive the round trip they exist for.
+    assert decode(frames[0]).when == math.inf
+    assert decode(frames[1]).when == -math.inf
+
+
+def test_a_duration_that_is_not_one_is_refused_where_it_would_be_written():
+    # The other half of dropping Python's non-standard constants: a NaN has no
+    # spelling here, and encoding it as one more bare word would put a quantity
+    # nothing downstream can order onto the wire.
+    with pytest.raises(MalformedMessage, match="neither"):
+        encode(Message(MessageKind.ADVANCE, DECODE, 0.0, when=float("nan")))
+
+
+def test_a_refusal_this_side_does_not_recognise_keeps_its_table():
+    # The participant table is the only thing that makes an abort actionable,
+    # and a refusal the clock grew after this module was written is exactly the
+    # case where somebody needs to read one. The type degrades; the evidence
+    # does not.
+    unknown = Message(
+        MessageKind.REFUSAL,
+        DECODE,
+        0.0,
+        detail=("SomethingNewer", "a reason", "the whole table"),
+    )
+    session = ClockSession(DECODE, _Replying(unknown))
+    with pytest.raises(ClockAbort) as excinfo:
+        session.request_advance(1.0)
+    assert "SomethingNewer" in excinfo.value.reason
+    assert excinfo.value.table == "the whole table"
 
 
 @pytest.mark.parametrize(

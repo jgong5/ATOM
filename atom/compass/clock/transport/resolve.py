@@ -76,7 +76,14 @@ class InProcessServer:
         return self._service.handle(frame)
 
     def close(self) -> None:
-        _SERVED_HERE.pop(self._endpoint, None)
+        """Give up the name, unless somebody else has taken it since.
+
+        A second close of a clock already taken down would otherwise unregister
+        whichever clock is serving that name now -- and a run set up twice in
+        one process, which is what a test session is, reuses names.
+        """
+        if _SERVED_HERE.get(self._endpoint) is self:
+            del _SERVED_HERE[self._endpoint]
 
     def __repr__(self) -> str:
         return f"InProcessServer({self._endpoint})"

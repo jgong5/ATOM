@@ -27,6 +27,16 @@ stands. It has no clock to quote and stamps itself minus infinity.
 The encoding is JSON with sorted keys and no spacing, so the same message
 encodes to the same bytes on every run and in every process -- which is what
 lets two arrangements be compared by comparing their traffic.
+
+It is JSON a stranger can read, not merely JSON this interpreter accepts.
+Python's encoder will happily write a bare `Infinity`, and most of this
+protocol's numbers are simulated seconds whose ordinary value is exactly that:
+a participant that knows of no future event declares one. A frame carrying a
+bare `Infinity` parses here and is rejected by a conforming parser anywhere
+else, which would quietly make the standalone arrangement Python-to-Python
+only. Every simulated duration therefore travels as a number or as one of two
+spelled-out strings, and a quantity that is not a number at all is refused at
+the point it would have been written rather than encoded as one more bare word.
 """
 
 import enum
@@ -120,13 +130,15 @@ def encode(message: Message) -> bytes:
     body = {
         "kind": message.kind.value,
         "participant": message.participant.name,
-        "sent_at": message.sent_at,
+        "sent_at": _encode_seconds(message.sent_at),
         "target": None if message.target is None else message.target.name,
-        "when": message.when,
+        "when": _encode_seconds(message.when),
         "grants": [_encode_grant(grant) for grant in message.grants],
         "detail": list(message.detail),
     }
-    return json.dumps(body, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    return json.dumps(
+        body, sort_keys=True, separators=(",", ":"), allow_nan=False
+    ).encode("utf-8")
 
 
 def decode(frame: bytes) -> Message:
@@ -142,15 +154,17 @@ def decode(frame: bytes) -> Message:
             "encoded messages, never message objects"
         )
     try:
-        body = json.loads(bytes(frame).decode("utf-8"))
+        body = json.loads(
+            bytes(frame).decode("utf-8"), parse_constant=_refuse_bare_constant
+        )
         kind = MessageKind(body["kind"])
         target = body["target"]
         return Message(
             kind,
             LpId(body["participant"]),
-            float(body["sent_at"]),
+            _decode_seconds(body["sent_at"]),
             None if target is None else LpId(target),
-            float(body["when"]),
+            _decode_seconds(body["when"]),
             tuple(_decode_grant(row) for row in body["grants"]),
             tuple(str(item) for item in body["detail"]),
         )
@@ -158,13 +172,48 @@ def decode(frame: bytes) -> Message:
         raise MalformedMessage(f"{frame!r} is not a message: {fault}") from fault
 
 
+#: How the two unbounded durations are spelled on a frame. A participant that
+#: knows of no future event declares `+inf`, so this is the ordinary case and
+#: not an edge one.
+UNBOUNDED = {math.inf: "+inf", -math.inf: "-inf"}
+BOUNDS = {name: value for value, name in UNBOUNDED.items()}
+
+
+def _encode_seconds(value: float):
+    """A duration as a number, or as one of two words. Refuses anything else."""
+    seconds = float(value)
+    if seconds in UNBOUNDED:
+        return UNBOUNDED[seconds]
+    if math.isnan(seconds):
+        raise MalformedMessage(
+            "a simulated duration must be a number of seconds or unbounded, "
+            "and this one is neither; nothing downstream can order it"
+        )
+    return seconds
+
+
+def _decode_seconds(value) -> float:
+    if isinstance(value, str):
+        if value not in BOUNDS:
+            raise ValueError(f"{value!r} is not a duration")
+        return BOUNDS[value]
+    return float(value)
+
+
+def _refuse_bare_constant(name: str):
+    raise ValueError(
+        f"{name} is not valid JSON; a duration travels as a number or as "
+        f"{sorted(BOUNDS)}"
+    )
+
+
 def _encode_grant(grant: Grant) -> list:
     pinned = grant.bound_from
     return [
         grant.lp_id.name,
-        grant.advance_from,
-        grant.advance_to,
-        grant.bound,
+        _encode_seconds(grant.advance_from),
+        _encode_seconds(grant.advance_to),
+        _encode_seconds(grant.bound),
         None if pinned is None else pinned.name,
     ]
 
@@ -173,8 +222,8 @@ def _decode_grant(row: list) -> Grant:
     name, advance_from, advance_to, bound, pinned = row
     return Grant(
         LpId(name),
-        float(advance_from),
-        float(advance_to),
-        float(bound),
+        _decode_seconds(advance_from),
+        _decode_seconds(advance_to),
+        _decode_seconds(bound),
         None if pinned is None else LpId(pinned),
     )

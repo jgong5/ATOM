@@ -142,9 +142,22 @@ def _refuse(reply: Message) -> None:
     A run that has to stop stops the same way whichever carrier brought the
     news, which is the point: the abort's reason and its participant table
     travel on the frame rather than being reduced to a status code.
+
+    A refusal this side does not recognise keeps both anyway. A participant
+    table is the only thing that makes an abort actionable, and a refusal the
+    clock grew after this module was written is exactly the case where somebody
+    needs to see one. So an unrecognised name that arrived with a table is
+    raised as an abort carrying it, with the original name in front of the
+    reason; one that arrived without a table keeps the name in the message. The
+    type is degraded, never the evidence.
     """
     named, reason, table = reply.detail
     abort = ABORTED.get(named)
     if abort is not None:
         raise abort(reason, table)
-    raise DECLINED.get(named, RuntimeError)(reason)
+    declined = DECLINED.get(named)
+    if declined is not None:
+        raise declined(reason)
+    if table:
+        raise ClockAbort(f"{named}: {reason}", table)
+    raise RuntimeError(f"{named}: {reason}")

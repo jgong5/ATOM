@@ -18,6 +18,17 @@ to whatever is above it through exactly the surface a participant uses.
 A refusal is carried, not swallowed. Whatever the rule raises is encoded with
 its type, its reason and the participant table, and the far side raises the same
 type again -- so a run that must stop stops the same way through either carrier.
+
+**What this can and cannot guarantee.** It holds the clock and hands nothing
+back, so there is no way *through a carriage* to reach the rule without a
+frame, and therefore no way to reach it without a stamp. That is the property
+the two arrangements' equivalence rests on and it is structural. It is not a
+guarantee that nothing in the hosting process can reach the clock directly:
+whatever co-hosts a clock has to build it before it can serve it, so it holds a
+reference by construction, and no arrangement of this class can take that away.
+The rule there is about wiring -- a participant is given a session and not a
+clock -- and it is a rule rather than an impossibility. Saying so is worth more
+than a check that looks like it covers it and does not.
 """
 
 import math
@@ -31,11 +42,6 @@ class ClockService:
 
     def __init__(self, authority: ClockAuthority) -> None:
         self._authority = authority
-
-    @property
-    def authority(self) -> ClockAuthority:
-        """The clock being served. Reading it is not a way to send it a request."""
-        return self._authority
 
     def handle(self, frame: bytes) -> bytes:
         """Answer one encoded request with one encoded reply.

@@ -37,6 +37,12 @@ STREAM_SCHEME = "tcp"
 #: the sender or a stream that is not carrying this protocol at all.
 LARGEST_FRAME_BYTES = 1 << 22
 
+#: How long taking a clock down waits for each of its threads. They are woken
+#: by the close that precedes the wait, so this is the bound on a thread that
+#: is wedged rather than the time a shutdown ordinarily takes. Bounded because
+#: a clock that will not come down must not stop the run reporting.
+SHUTDOWN_SECONDS = 5.0
+
 
 class _Frames:
     """Length-prefixed frames over one open connection."""
@@ -70,12 +76,21 @@ class _Frames:
         return frame
 
     def close(self) -> None:
-        try:
-            self._connection.shutdown(socket.SHUT_RDWR)
-        except OSError:
-            pass
-        self._stream.close()
-        self._connection.close()
+        """Wake whoever is reading this connection, then let it go.
+
+        The shutdown is what does the waking: closing the file alone leaves a
+        thread parked in a read that never returns. Called from more than one
+        thread on the same connection, so every step tolerates having already
+        happened.
+        """
+        for step in (self._shutdown, self._stream.close, self._connection.close):
+            try:
+                step()
+            except OSError:
+                pass
+
+    def _shutdown(self) -> None:
+        self._connection.shutdown(socket.SHUT_RDWR)
 
 
 class StreamCarrier:
@@ -108,7 +123,14 @@ class StreamServer:
     def __init__(self, service, host: str, port: int) -> None:
         self._service = service
         self._lock = threading.Lock()
+        # The roster of live connections and the threads serving them, under
+        # their own lock. Separate from the one above, which is held for the
+        # whole of a request: a connection arriving or ending must not wait on
+        # a grant being computed, and a shutdown must not read the roster while
+        # it is being added to.
+        self._roster = threading.Lock()
         self._open = []
+        self._serving = []
         self._running = True
         self._listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         self._listener.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -128,10 +150,33 @@ class StreamServer:
         return f"{STREAM_SCHEME}://{self._bound[0]}:{self._bound[1]}"
 
     def close(self) -> None:
+        """Stop listening, end every live connection, and wait for the threads.
+
+        Waiting is the part worth doing rather than assuming. Closing the
+        listener wakes the thread that accepts; shutting a connection down
+        wakes the thread reading it. Both then end on their own, but a caller
+        that does not wait leaves a run's worth of threads alive behind a clock
+        it believes it has taken down -- which is invisible until something
+        counts them, and by then it is a hundred.
+        """
         self._running = False
+        # Shut down before closing. Closing a listening socket does not
+        # reliably wake a thread already parked in `accept`, so a close that
+        # only closes leaves that thread there until something else disturbs
+        # it -- and the wait below then costs its whole timeout, every time.
+        try:
+            self._listener.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
         self._listener.close()
-        while self._open:
-            self._open.pop().close()
+        with self._roster:
+            live, threads = list(self._open), list(self._serving)
+            self._open.clear()
+            self._serving.clear()
+        for frames in live:
+            frames.close()
+        for thread in [self._door] + threads:
+            thread.join(timeout=SHUTDOWN_SECONDS)
 
     def _admit(self) -> None:
         while self._running:
@@ -139,25 +184,37 @@ class StreamServer:
                 connection, _ = self._listener.accept()
             except OSError:
                 return
-            self._open.append(_Frames(connection))
-            threading.Thread(
-                target=self._serve, args=(self._open[-1],), daemon=True
-            ).start()
+            frames = _Frames(connection)
+            worker = threading.Thread(target=self._serve, args=(frames,), daemon=True)
+            with self._roster:
+                # Both appended before the thread starts, and the connection
+                # handed over by value rather than read back off the end of the
+                # list -- a second connection arriving in between would
+                # otherwise hand this thread the wrong one.
+                self._open.append(frames)
+                self._serving.append(worker)
+            worker.start()
 
     def _serve(self, frames: _Frames) -> None:
-        while True:
-            try:
-                frame = frames.receive()
-            except (ConnectionError, OSError, ValueError):
-                return
-            if frame is None:
-                return
-            with self._lock:
-                reply = self._service.handle(frame)
-            try:
-                frames.send(reply)
-            except OSError:
-                return
+        try:
+            while True:
+                try:
+                    frame = frames.receive()
+                except (ConnectionError, OSError, ValueError):
+                    return
+                if frame is None:
+                    return
+                with self._lock:
+                    reply = self._service.handle(frame)
+                try:
+                    frames.send(reply)
+                except OSError:
+                    return
+        finally:
+            with self._roster:
+                if frames in self._open:
+                    self._open.remove(frames)
+            frames.close()
 
     def __repr__(self) -> str:
         return f"StreamServer({self.endpoint})"
