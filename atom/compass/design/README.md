@@ -1,11 +1,12 @@
 # ATOM Compass — Design
 
 **Status: reviewed and approved, 2026-09-20. Design only — no code has been written
-against it yet.** Every document carries a matching header. **108 decisions — D0–D94
-with no gaps, plus 13 sub-decisions** — are indexed at the end of this file; **73 registered
-TODOs — T1–T72 and T80, of which 70 are open** (T15, T22 and T48 are struck through as done);
-they, the load-bearing assumptions and the cross-cutting issues live in
-**`12_open_items.md`**. Implementation follows the execution plan in `16`.
+against it yet.** Every document carries a matching header. **109 decisions — D0–D94
+with no gaps, plus 14 sub-decisions** — are indexed at the end of this file; **86 registered
+TODOs — T1–T80 and T82–T87, of which 80 are open** (T10, T15, T22, T48 and T65 are struck
+through as done, and T77 was opened and closed by P0.1); they, the load-bearing assumptions and the
+cross-cutting issues live in **`12_open_items.md`**. Implementation follows the execution
+plan in `16`.
 
 ---
 
@@ -384,9 +385,10 @@ One thing that **is** in scope and is worth stating as a limit rather than a non
 
 ## Load-bearing assumptions
 
-Five assumptions hold up large parts of the design and **none has been tested.** Each now
-carries a named check, a place it runs, and a cost — in **`12_open_items.md` §1**, so they
-are schedulable work rather than caveats.
+Five assumptions hold up large parts of the design. **One has been tested** — T10, resolved
+by P0.3 on 2026-09-20; the other four have not. Each now carries a named check, a place it
+runs, and a cost — in **`12_open_items.md` §1**, so they are schedulable work rather than
+caveats.
 
 | # | Assumption | If false |
 |---|---|---|
@@ -394,12 +396,12 @@ are schedulable work rather than caveats.
 | **T25** | The real-vs-real noise floor stays narrow under closed-loop replay at high client count | those cells become ungradeable. All prior data is 20 requests, one session, declared arrivals. |
 | **T5** | ATOM's model classes trace cleanly under `FakeTensorMode` at TP>1 | tier b has no IR, and docs `04`, `07`, `09` rest on it |
 | **T52** | `TorchDispatchMode` instrumentation does not hang ATOM at width | capture is unusable at TP>1; gates T5. A mode-induced 8-rank hang already exists in-tree and is being root-caused, not worked around. |
-| **T10** | `AgenticReplayStrategy` can be subclassed rather than vendored | the harness adapter grows by ~2,000 lines to keep in sync with upstream |
+| ~~**T10**~~ | ~~`AgenticReplayStrategy` can be subclassed rather than vendored~~ — **resolved 2026-09-20 by P0.3: yes, and nothing is vendored** | the ~2,000-line consequence does not occur. What the spike found instead is that a subclass reaches only four of the nine pacing calls, so the adapter rebinds the runner's `LoopScheduler` (`06` D34.1) |
 
-**Order to settle them:** T10 (an hour, no hardware, largest swing per hour) → T52 → T5 →
-T21, T25. The last two are designed-in steps of the calibration and validation flows, not
-extra work — but they can each invalidate an acceptance claim, so they should not drift to
-the end.
+**Order to settle the four that remain:** T52 → T5 → T21, T25. T10 came first — an hour, no
+hardware, largest swing per hour — and is done. The last two are designed-in steps of the
+calibration and validation flows, not extra work — but they can each invalidate an
+acceptance claim, so they should not drift to the end.
 
 ---
 
@@ -524,7 +526,7 @@ The documents use these precisely; a reader will bounce off without them.
 | Doc | Title | What it settles |
 |---|---|---|
 | [`06`](06_workload_harness_contract.md) | Workload Harness Contract | A three-part contract, not a bespoke client. agentx-harness reused with **zero edits** via an out-of-tree plugin. One namespaced additive field each direction, audited for minimality. Timeline piggybacked on `kv_transfer_params` so Atomesh needs no change. Tokenizer cost is a queue, not a constant. |
-| [`08`](08_validation_protocol.md) | Validation Protocol | ATOM's own 187-file CPU-only test suite as the first validation layer. Three separable results, never one number. **The real-vs-real spread is the tolerance.** A metric is admissible only if stable *and* sensitive. |
+| [`08`](08_validation_protocol.md) | Validation Protocol | ATOM's own test suite as the first validation layer, in two tiers: a driver-free CPU tier over 130 of 189 files, green at **4030 passed / 0 failed** (3956 ATOM + 74 `tests/compass`; node 18 CPU container), and a GPU superset judged as a **delta** against **4779 / 5** (`fe9ea043c`, torch 2.10.0+rocm7.2.4, ROCm 7.2.4, AITER v0.1.21.dev0-49-gf4e7c7509, all five failing node-ids on file). Three separable results, never one number. **The real-vs-real spread is the tolerance.** A metric is admissible only if stable *and* sensitive. |
 | [`11`](11_metrics_support.md) | Engine Metrics under Virtual Time | ATOM's Prometheus exporter under a virtual clock. Metrics are classified by the **provenance of their value**, not their type. Sample once per engine step — virtual time is discrete-event. Both metrics clock reads stay real. |
 
 ### Part V — Cross-cutting
@@ -539,7 +541,7 @@ The documents use these precisely; a reader will bounce off without them.
 
 | Doc | Title | What it holds |
 |---|---|---|
-| [`12`](12_open_items.md) | Open Items | The five load-bearing assumptions and their check plans; the missing-topic register; T1–T72 and T80; cross-cutting issues; pending amendments. |
+| [`12`](12_open_items.md) | Open Items | The five load-bearing assumptions and their check plans; the missing-topic register; T1–T80 and T82–T87; cross-cutting issues; pending amendments. |
 
 ### Part VII — How it gets built
 
@@ -558,7 +560,7 @@ The documents use these precisely; a reader will bounce off without them.
 | D13 – D16 | `03` Memory Model and the KV Pool |
 | D17 – D23 (+ D18.1) | `04` Model Capture and the Cost IR |
 | D24 – D26 (+ D25.1) | `05` Machine Specification and its Probes |
-| D27 – D35 | `06` Workload Harness Contract |
+| D27 – D35 (+ D34.1) | `06` Workload Harness Contract |
 | D36 – D43 (+ D38.1, D40.1) | `07` Calibration and Benchmarking Toolchain |
 | D43.1, D44 – D52 (+ D50.1) | `08` Validation Protocol |
 | D53 – D62 | `09` Fitting and Law Selection |
@@ -588,5 +590,5 @@ The documents use these precisely; a reader will bounce off without them.
 | D45 | The real-vs-real spread is the tolerance; a metric must be stable **and** sensitive |
 | D3.2 | Three always-on causality detectors; a straggler fails the run rather than warning |
 | D3.3 | The Clock Authority ships two deployment forms from one implementation: co-hosted by default, standalone for multi-container runs |
-| D43.1 | ATOM's own 187-file, GPU-free test suite is a merge gate on every Compass change, unmodified |
+| D43.1 | ATOM's suite is a merge gate on every Compass change, unmodified, in two tiers: a driver-free CPU tier (130 of 189 files, green at 4030 passed) per change, a GPU superset judged as a delta per wave against 4779 / 5, by an equality on a per-tree expectation rather than "no worse than". The CPU tier **exits 98** rather than reporting "GPU not required" when it cannot tell |
 | D67.1 | Tier 0 is graded on **configuration ranking** first; its latency goals are diagnostics for that, not the result |
