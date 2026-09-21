@@ -111,7 +111,8 @@ joined two real numbers wrongly: the 28 counts `rocminfo` across the *whole* sui
   `tests/` minus `tests/plugin/` (30 files) minus the 29 driver-dependent files in
   `scripts/compass/cpu_gate_exclude.txt`, driven by `scripts/compass/gate_cpu.sh`:
   **130 of this tree's 189 test files, 4030 passed, 0 failed, 149 skipped, 3 xfailed, rc=0,
-  25.6-30.8 s of pytest inside 31.8-36.9 s of wall (`time` real), over three runs**, measured
+  25.6-30.8 s of pytest inside 31.6-36.9 s of wall (`time` real), over six runs at
+`d737f15e7` and `7ff80cc4b`**, measured
   2026-09-21 in `xiaobizh_n18_cpu`
   on hjbog-srdc-18 against a `git archive` snapshot of the tree committed here, with
   `PYTHONPATH` asserted to resolve `atom` under that root and pytest's own exit status
