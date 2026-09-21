@@ -124,8 +124,8 @@ records before this decision named where the brief goes.
 | **Integration branch** | `feature/atomcompass_new` — already the PR #3 branch |
 | **Per-task isolation** | a git worktree per in-flight task, under `compass-worktrees/<task-id>`, beside the repo |
 | **The task** | one GitHub issue per task, holding its brief and its handoff (D96) |
-| **Landing** | one PR per task, **squash-merged** into the integration branch, naming its task's issue, reviewed by that task's reviewer agent. The repo permits squash merges only (`allow_merge_commit=false`, `allow_rebase_merge=false`) |
-| **Post-landing** | the main agent fast-forwards the main worktree to the integration branch promptly. The pull leaves it root-owned; chowning it to the host user restores host edits but makes container git refuse it (`dubious ownership`) until `/root/.gitconfig` carries a `safe.directory` entry for that path — which a full `teardown.sh` discards, so re-add it after a rebuild |
+| **Landing** | one PR per task, **squash-merged** into the integration branch, naming its task's issue, reviewed by that task's reviewer agent. The repo permits squash merges only; the enforcing settings are in `AI_DEV_RULES.md` |
+| **Post-landing** | the main agent fast-forwards the main worktree to the integration branch promptly. The pull runs as root, which traps every landing in a file-ownership fix; procedure is in `AI_DEV_RULES.md` |
 | **ATOM's `main`** | untouched until the milestone the project agrees to upstream |
 
 **Closing the issue is deliberate, not automatic.** GitHub auto-closes a linked issue
@@ -162,9 +162,9 @@ Four things, all required:
 3. **One named result**, stated in the issue body before the task is claimed and not
    chosen afterwards — what this task now makes possible that was not possible before.
 4. **Review by the task's reviewer agent**, against its brief and the cited decisions,
-   repeating until the verdict is APPROVE. GitHub refuses APPROVE and REQUEST_CHANGES on a
-   self-authored PR, so the verdict is stated in the body of the review comment. A loop
-   that does not converge halts to the owner per D95's stop condition.
+   repeating until the verdict is APPROVE (procedure for posting the verdict is in
+   `AI_DEV_RULES.md`). A loop that does not converge halts to the owner per D95's
+   stop condition.
 
 **Baseline first.** P0.2 records the suite's and ruff's current pass/fail state before the
 first Compass commit. A pre-existing failure attributed to Compass costs a day, and the
@@ -417,7 +417,7 @@ Stated so it is not mistaken for an omission.
 
 | # | Decision | Date |
 |---|---|---|
-| D95 | Tasks are a **pool**, not a track assignment; 5 dev + 5 reviewer agents cap concurrency at 5 in flight. Conflicts are tolerated and are a **decomposition signal**. Developer and reviewer are separate agents with opposed objectives; the developer owns development and PR updates, looping with the reviewer until APPROVE, escalating only critical blocking issues and scope calls. **The loop halts to the owner if the same finding survives two cycles, or after three cycles, applying `need human` to the PR.** **Halt and discuss on any surprise.** | 2026-09-21 |
+| D95 | Tasks are a **pool**, not a track assignment; 5 dev + 5 reviewer agents cap concurrency at 5 in flight. Conflicts are tolerated and are a **decomposition signal**. Developer and reviewer are separate agents with opposed objectives. **The loop halts to the owner if the same finding survives two cycles, or after three cycles, applying `need human` to the PR.** **Halt and discuss on any surprise.** | 2026-09-21 |
 | D96 | The task record is the **GitHub issue and its PR** — brief in the issue body, dev record in the PR body, review record in the review comment, handoff in the closing comment — with each brief linking to its predecessors' issues. A brief that cannot name its file set is not claimable. | 2026-09-21 |
 | D97 | `feature/atomcompass_new` is the integration branch; one issue, one worktree and one PR per task, **squash-merged** (the repo permits squash merges only). Four setup rules from recorded failures: no shared mutable source root, containers mount the worktree parent, `PYTHONPATH` verified before trusting a result, `git archive` never `rsync`. On landing, the main agent fast-forwards the main worktree and restores file ownership. | 2026-09-21 |
 | D98 | Four gates per task: ATOM's suite green **unmodified**, new CPU-only tests, one named result stated in advance, and review by a separate agent, looping to APPROVE per D95. Baselines recorded first. | 2026-09-21 |
