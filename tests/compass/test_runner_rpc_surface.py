@@ -61,6 +61,11 @@ def _methods(node):
     return {n.name for n in node.body if isinstance(n, ast.FunctionDef)}
 
 
+def _raised_name(node):
+    """The name of the exception a call constructs, if it constructs one."""
+    return getattr(getattr(node, "func", None), "id", None)
+
+
 def _call_sites():
     """Every name ATOM broadcasts to a worker, found by walking its source.
 
@@ -202,9 +207,55 @@ def test_the_aggregating_form_is_the_one_bounded_wait():
 
 
 def test_a_refusal_reaches_the_caller_instead_of_stranding_it():
-    """The chain that makes raising the loud option, and skipping the quiet one."""
-    assert "died unexpectedly" in ASYNC_PROC and "_self.exit()" in ASYNC_PROC
-    assert "self.outputs_queue.put_nowait(SystemExit())" in ASYNC_PROC
+    """Why raising is the loud option although `busy_loop` catches nothing.
+
+    `out = func(*args)` sits under no `try`, so an exception unwinds out of
+    `busy_loop`, out of `AsyncIOProc.__init__` -- which is the process target --
+    and the worker exits. That alone would strand the caller. What does not
+    strand it is the manager: a monitor thread, started from `__init__` before
+    any RPC can be sent, waits on the process sentinels and calls `exit()`,
+    which puts a `SystemExit` on the output queue **before** it finalizes
+    anything, and `call_func` re-raises it. Every wait on that path is bounded.
+
+    The ordering is the load-bearing part, so it is asserted rather than read:
+    a finalizer that ran first would tear the manager down with the caller
+    still parked.
+    """
+    tree = ast.parse(ASYNC_PROC)
+    manager = next(
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.ClassDef) and n.name == "AsyncIOProcManager"
+    )
+    bodies = {n.name: n for n in manager.body if isinstance(n, ast.FunctionDef)}
+
+    # The monitor exists before the first RPC can be broadcast.
+    init = bodies["__init__"]
+    assert "monitor_procs" in {
+        n.func.attr
+        for n in ast.walk(init)
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute)
+    }
+    assert "_self.exit()" in ASYNC_PROC
+
+    # The worker's own dispatch catches nothing, which is what kills it.
+    busy = next(
+        n
+        for n in ast.walk(tree)
+        if isinstance(n, ast.FunctionDef) and n.name == "busy_loop"
+    )
+    assert not [n for n in ast.walk(busy) if isinstance(n, ast.Try)]
+
+    # SystemExit is queued before the manager finalizes its parent.
+    lines = {}
+    for n in ast.walk(bodies["exit"]):
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Attribute):
+            queued = n.func.attr == "put_nowait" and n.args
+            if queued and _raised_name(n.args[0]) == "SystemExit":
+                lines["queued"] = n.lineno
+            if n.func.attr == "parent_finalizer":
+                lines["finalized"] = n.lineno
+    assert lines["queued"] < lines["finalized"]
     assert "if isinstance(ret, SystemExit):\n                raise ret" in ASYNC_PROC
 
 
@@ -239,8 +290,11 @@ def test_capture_cudagraph_answers_the_arity_its_call_sites_unpack():
     assert arities == {3}
     assert len(SITES["capture_cudagraph"]) == 2
     cap_cost, bs, pool_bytes = Runner().capture_cudagraph()
-    # Exactly what the two call sites then do with them.
-    assert f"{cap_cost:.2f}" and f"capture{bs}" and pool_bytes / (1 << 30) == 0.0
+    # Exactly what the two call sites then do with the three, none of which
+    # may raise on the value this runner sends.
+    assert f"{cap_cost:.2f}" == "0.00"
+    assert f"cudagraph capture{bs}" == "cudagraph capture[]"
+    assert pool_bytes / (1 << 30) == 0.0
 
 
 def test_capture_cudagraph_says_that_nothing_was_captured():
@@ -370,3 +424,29 @@ def test_the_two_names_no_caller_waits_for_and_what_replying_costs():
     assert not [n for n in ast.walk(silent) if isinstance(n, ast.Return) and n.value]
     assert bodies["exit"].body[-1].value.value is True
     assert 'if func_name == "exit":\n                break' in ASYNC_PROC
+
+
+def test_the_zero_block_form_in_the_tree_answers_two_of_the_four_keys():
+    """A trap for whoever ends the `get_num_blocks` refusal above.
+
+    `RapidServeModelRunner.get_num_blocks` is the obvious thing to copy -- a
+    non-allocating runner answering without a device -- and it returns
+    `num_kvcache_blocks` and `state_runtime` only. That is not a breach: the
+    caller takes the two pool-entry keys with a default. It is short, and the
+    shortfall is invisible at zero blocks and not invisible above them, so the
+    count is asserted here rather than left to be noticed.
+    """
+    short = next(
+        n
+        for n in ast.walk(_classes(ATOM_RUNNER)["RapidServeModelRunner"])
+        if isinstance(n, ast.FunctionDef) and n.name == "get_num_blocks"
+    )
+    keys = next(
+        {k.value for k in n.value.keys}
+        for n in ast.walk(short)
+        if isinstance(n, ast.Return) and isinstance(n.value, ast.Dict)
+    )
+    assert keys == {"num_kvcache_blocks", "state_runtime"}
+    engine = (ENGINE / "engine_core.py").read_text()
+    assert 'block_info.get("pool_entries", {})' in engine
+    assert 'block_info.get("pool_entries_per_req", {})' in engine

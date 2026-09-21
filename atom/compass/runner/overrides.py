@@ -27,7 +27,7 @@ come from `self.config`, which the base sets first.
 
 A worker runs `AsyncIOProc.busy_loop`, which takes a name off a shared-memory
 ring, resolves it with `getattr(runner, name, None)`, calls it, and forwards the
-result **only when it is not None** (`async_proc.py:231-250`). The caller's side
+result **only when it is not None** (`async_proc.py:231-252`). The caller's side
 is `AsyncIOProcManager.call_func`, whose `wait_out=True` form blocks on
 `self.outputs_queue.get()` with no timeout. Three consequences, none of which a
 single-process test can show:
