@@ -11,10 +11,14 @@
 - Don't modify the main worktree. Develop with linked worktrees.
 - **On every landing, the main agent fast-forwards the main worktree** to the
   integration branch promptly. This doesn't contradict the rule above: that rule
-  forbids developing there, not updating it. Git run through the container writes
-  as **root**, so file ownership must be restored after the pull, or later
-  host-side edits fail silently. This happened on #11's landing and needed a
-  manual repair.
+  forbids developing there, not updating it. The pull runs through the container
+  as root and leaves the tree root-owned, which fails host-side edits silently;
+  chowning it to the host user fixes that but then makes container git refuse
+  the same tree with `dubious ownership` until a `safe.directory` entry for that
+  path exists in the container's git config. That entry lives under `/root`,
+  which does not survive a full `teardown.sh`, so expect to re-add it after a
+  container rebuild — script it under `/workspace` rather than doing it by hand
+  each time. This happened on #11's landing and needed a manual repair.
 - **No design-doc references in code.** No `D18`, `P0.4`, `T5`, `W2.5`, backticked
   doc numbers, "principle N", or numbered labels like "Gate 1". No quoting design
   principles as justification. Say what the code does, its functions, how it works.

@@ -53,19 +53,15 @@ differ in what they optimise for**:
 Same context, opposed objectives. The reviewer is a separate agent specifically so the
 review is not performed by the context that produced the code.
 
-### The developer owns development and PR updates, and the loop has a stop
+### The review loop needs its own stop
 
-The main agent orchestrates; it does not write the change or update the PR. The developer
-agent owns both. After each push the reviewer reviews, the developer amends, and that
-repeats until the reviewer's verdict is APPROVE.
+Procedure is in `AI_DEV_RULES.md`. What belongs here is why: a finding that keeps
+recurring, or a loop that keeps running past a few cycles, is the developer and reviewer
+agents doing their jobs correctly against a task that cannot be done correctly — it is not
+a sign either agent is underperforming.
 
-The owner is asked only for a **critical blocking issue** — one where proceeding under any
-reading would be wrong — or a scope call (D102). A review finding the developer can act on
-is not an escalation.
-
-> **If the same finding survives two cycles, or the loop passes three cycles, it halts and
-> goes to the owner.** A task that cannot converge is mis-cut, not under-worked — the same
-> decomposition signal as the conflicts above.
+> **A task whose review loop does not converge is mis-cut, not under-worked** — the same
+> decomposition signal as the conflicts above, arriving late instead of at allocation time.
 
 ### The halt rule
 
@@ -121,7 +117,7 @@ records before this decision named where the brief goes.
 | **Per-task isolation** | a git worktree per in-flight task, under `compass-worktrees/<task-id>`, beside the repo |
 | **The task** | one GitHub issue per task, holding its brief and its handoff (D96) |
 | **Landing** | one PR per task, **squash-merged** into the integration branch, naming its task's issue, reviewed by that task's reviewer agent. The repo permits squash merges only (`allow_merge_commit=false`, `allow_rebase_merge=false`) |
-| **Post-landing** | the main agent fast-forwards the main worktree to the integration branch promptly. Git run through the container writes as root, so file ownership must be restored after the pull |
+| **Post-landing** | the main agent fast-forwards the main worktree to the integration branch promptly. The pull leaves it root-owned; chowning it to the host user restores host edits but makes container git refuse it (`dubious ownership`) until `/root/.gitconfig` carries a `safe.directory` entry for that path — which a full `teardown.sh` discards, so re-add it after a rebuild |
 | **ATOM's `main`** | untouched until the milestone the project agrees to upstream |
 
 **Closing the issue is deliberate, not automatic.** GitHub auto-closes a linked issue
