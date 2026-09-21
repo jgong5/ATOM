@@ -19,7 +19,10 @@ That is not asserted here in a comment; the wrong idiom is executed and the
 guard it installs is counted, beside the right idiom that installs none.
 """
 
+import numpy
 import pytest
+import sympy
+import torch
 from torch._dynamo.source import ConstantSource
 from torch.fx.experimental.symbolic_shapes import DimDynamic, ShapeEnv
 
@@ -163,7 +166,7 @@ def test_a_size_that_is_still_symbolic_is_refused():
 
 def test_the_refusal_of_a_symbolic_size_names_how_to_resolve_it():
     _, name, tokens, recorded = _recorded(17)
-    with pytest.raises(TypeError, match="Ask the tracing run for the hint"):
+    with pytest.raises(TypeError, match="ask the tracing run for its hint"):
         recorded.decide(key=DECODE_KEY, sizes={name: tokens})
 
 
@@ -250,8 +253,8 @@ def test_a_key_that_states_no_condition_is_refused():
         GuardedApplicability(key={})
 
 
-def test_a_key_value_that_cannot_be_held_in_a_value_is_refused():
-    with pytest.raises(TypeError, match="hashable"):
+def test_a_key_value_outside_the_stated_types_is_refused():
+    with pytest.raises(TypeError, match="enum member or None"):
         GuardedApplicability(key={"ctx": [1, 2, 3]})
 
 
@@ -274,3 +277,117 @@ def test_a_recorded_predicate_is_what_a_graph_is_built_with():
     _, _, _, decode = _recorded(17)
     assert isinstance(decode, Applicability)
     assert Graph(applicability=decode, region=_op()).applicability is decode
+
+
+# --- the key half: asking a value anything is itself an operation ------------
+
+
+def _symbolic_bool():
+    """A live symbolic boolean, of the kind a branch on a flag would produce."""
+    shape_env = ShapeEnv()
+    source = ConstantSource("cached")
+    symbol = shape_env.create_symbol(17, source=source, dynamic_dim=DimDynamic.DYNAMIC)
+    size = shape_env.create_symintnode(symbol, hint=17, source=source)
+    return shape_env, str(symbol), size <= 4096
+
+
+def test_hashing_a_symbolic_boolean_installs_a_guard():
+    """Why the key's gate cannot be a question put to the value.
+
+    A symbolic size refuses to be hashed at all, so a gate that hashed was
+    safe there by accident. A symbolic boolean answers instead, by forcing
+    itself concrete first -- and that is a guard, installed by the act of
+    checking whether the value was safe to keep.
+    """
+    shape_env, name, flag = _symbolic_bool()
+    assert type(flag).__name__ == "SymBool"
+    before = len(shape_env.guards)
+    assert isinstance(hash(flag), int)
+    assert len(shape_env.guards) == before + 1
+    assert f"{name} <= 4096" in [str(guard.expr) for guard in shape_env.guards]
+
+
+def test_a_symbolic_boolean_in_a_key_is_refused_and_installs_no_guard():
+    shape_env, _, flag = _symbolic_bool()
+    before = len(shape_env.guards)
+    with pytest.raises(TypeError, match="symbolic boolean"):
+        GuardedApplicability(key={**DECODE_KEY, "has_cached": flag})
+    assert len(shape_env.guards) == before
+
+
+def test_a_key_value_whose_equality_is_not_a_verdict_is_refused():
+    """A tensor answers `==` with a tensor, and its truth test raises.
+
+    Kept out at the door rather than met in the middle of a comparison: a
+    mismatch has to be a refusal that names itself, not an exception from
+    somewhere inside the check.
+    """
+    with pytest.raises(TypeError, match="Tensor"):
+        GuardedApplicability(key={**DECODE_KEY, "ctx": torch.tensor([1, 2, 3])})
+
+
+@pytest.mark.parametrize(
+    "value",
+    [
+        pytest.param(17.0, id="float"),
+        pytest.param(numpy.int64(17), id="numpy-int64"),
+        pytest.param(sympy.Integer(17), id="sympy-Integer"),
+    ],
+)
+def test_a_size_that_only_stands_in_for_an_int_is_refused(value):
+    _, name, _, decode = _recorded(17)
+    with pytest.raises(TypeError, match="a size is a concrete int"):
+        decode.decide(key=DECODE_KEY, sizes={name: value})
+
+
+# --- a size the trace never branched on --------------------------------------
+
+
+def test_a_size_the_trace_never_branched_on_is_not_a_condition():
+    """A data-dependent count is bookkeeping in the run, not a recorded bound.
+
+    It arrives bounded by nothing, with no guard naming it, because nothing
+    branched on it -- branching on one raises at trace time rather than
+    installing a guard. Recorded as a condition it would be unanswerable.
+    """
+    shape_env, name, _, key = _traced(17)
+    experts = shape_env.create_unbacked_symint()
+    unbacked = str(experts.node.expr)
+    assert unbacked in {str(symbol) for symbol in shape_env.var_to_range}
+    assert unbacked not in str(shape_env.guards)
+
+    recorded = GuardedApplicability.from_shape_env(shape_env, key)
+    assert unbacked not in dict(recorded.ranges)
+    assert name in dict(recorded.ranges)
+    assert recorded.decide(key=DECODE_KEY, sizes={name: 17}).applies
+    assert not recorded.decide(key=DECODE_KEY, sizes={name: 1}).applies
+
+
+def test_a_hand_built_range_still_has_to_be_bound():
+    """Dropping a range at record time is not the same as ignoring one.
+
+    Where a range is in the record, the step has to answer it; what changed is
+    which ranges get in.
+    """
+    predicate = GuardedApplicability(key=DECODE_KEY, ranges={"experts": (2, 8)})
+    verdict = predicate.decide(key=DECODE_KEY, sizes={"tokens": 17})
+    assert not verdict.applies
+    assert "experts" in verdict.reason
+
+
+# --- the statement a graph holds ---------------------------------------------
+
+
+def test_a_recorded_predicate_says_where_it_applies_in_one_line():
+    _, name, _, decode = _recorded(17)
+    described = decode.describe()
+    assert "\n" not in described
+    assert "mode='decode'" in described
+    assert f"{name} <= 128" in described
+    assert f"{name} in [2, 128]" in described
+
+
+def test_the_marker_alone_cannot_stand_in_for_a_predicate():
+    """A graph claiming to apply everywhere cannot be built by omission."""
+    with pytest.raises(TypeError, match="abstract"):
+        Applicability()
