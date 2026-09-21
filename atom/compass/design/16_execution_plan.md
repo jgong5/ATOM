@@ -19,8 +19,9 @@ the answers arrive.
 
 ### Tasks are a pool, not a track assignment
 
-Work is a **DAG of tasks**. A task becomes claimable when its dependencies land; any free
-agent claims it. There are no permanent per-track ownerships.
+Work is a **DAG of tasks**, and each task is a GitHub issue. A task becomes claimable when
+its dependencies land; any free agent assigns itself the issue. There are no permanent
+per-track ownerships.
 
 The cold-start problem this creates — an agent picking up a task without the accumulated
 context of the ones before it — is solved by making context **durable in the task** rather
@@ -69,21 +70,32 @@ interface that cannot be implemented as specified.
 
 ## D96. The task record, and why context lives in it
 
+The task record is **the GitHub issue and its PR**. Nothing durable lives in the tree.
+
 A task carries four sections. The first is written before the task is claimable; the rest
 are written as it runs.
 
-| Section | Written by | Contains |
-|---|---|---|
-| **Brief** | the planner | what to build; the governing decisions by number; the interfaces it **implements** and **consumes**; its file set; its exit criteria; its effort estimate |
-| **Dev record** | the developer | what was found, what was decided that the design did not cover, what surprised it, what was left undone |
-| **Review record** | the reviewer | what was checked, what was accepted with reservation, what the next task in this area should watch |
-| **Handoff** | both | what a successor needs to know that is not in the code |
+| Section | Written by | Lives in | Contains |
+|---|---|---|---|
+| **Brief** | the planner | the **issue body** | what to build; the governing decisions by number; the interfaces it **implements** and **consumes**; its file set; its exit criteria; its effort estimate |
+| **Dev record** | the developer | the **PR body** | what was found, what was decided that the design did not cover, what surprised it, what was left undone |
+| **Review record** | the reviewer | the **PR review comment** | what was checked, what was accepted with reservation, what the next task in this area should watch |
+| **Handoff** | both | a **closing comment on the issue** | what a successor needs to know that is not in the code |
 
-**Every task's brief links to its predecessors' records.** That is what makes continuity
-survive agent turnover: the context is in the graph, not in a context window.
+**The issue exists before the branch does.** That is why the brief lives there rather than
+in the PR: a PR needs a commit, and the brief is written before there is anything to
+commit. Claiming a task is assigning yourself its issue.
+
+**Every task's brief links to its predecessors' issues.** That is what makes continuity
+survive agent turnover: the context is in the graph, not in a context window. The PR
+closes its issue, so an implementation and the brief that asked for it stay joined.
 
 **A brief that cannot name its file set is under-specified** and is not claimable. This is
 the same discipline as `04` D21's declared nodes — the declaration is the contract.
+
+**What this costs.** A `git archive` snapshot carries the code and not the reasoning, and
+the record is only as reachable as GitHub is. Both were already true of the dev and review
+records before this decision named where the brief goes.
 
 ---
 
@@ -93,7 +105,8 @@ the same discipline as `04` D21's declared nodes — the declaration is the cont
 |---|---|
 | **Integration branch** | `feature/atomcompass_new` — already the PR #3 branch |
 | **Per-task isolation** | a git worktree per in-flight task, under `atomcompass-worktrees/<task-id>` |
-| **Landing** | one PR per task into the integration branch, reviewed by that task's reviewer agent |
+| **The task** | one GitHub issue per task, holding its brief and its handoff (D96) |
+| **Landing** | one PR per task into the integration branch, closing that task's issue, reviewed by that task's reviewer agent |
 | **ATOM's `main`** | untouched until the milestone the project agrees to upstream |
 
 **Four setup rules, from failures already recorded on this hardware.** None was caused by
@@ -123,9 +136,11 @@ Four things, all required:
    to edit an ATOM test means the change altered ATOM's behaviour and must be justified on
    its own terms, not absorbed.
 2. **New CPU-only tests** for what the task added, in `tests/compass/`, in ATOM's style.
-3. **One named result**, stated in the brief and not chosen afterwards — what this task
-   now makes possible that was not possible before.
+3. **One named result**, stated in the issue body before the task is claimed and not
+   chosen afterwards — what this task now makes possible that was not possible before.
 4. **Review by the task's reviewer agent**, against its brief and the cited decisions.
+   GitHub refuses APPROVE and REQUEST_CHANGES on a self-authored PR, so the verdict is
+   stated in the body of the review comment.
 
 **Baseline first.** P0.2 records the suite's and ruff's current pass/fail state before the
 first Compass commit. A pre-existing failure attributed to Compass costs a day, and the
@@ -297,9 +312,9 @@ GPU is the scarce resource; almost everything else is CPU-only by design princip
 Only calibration Phases 1b/1c/2, `--measure` runs, the real side of pairings, and the
 T52 root-cause need one.
 
-**One queue.** A GPU task declares, before it is claimable: what it measures, which width,
-how long it needs, and which artifact it writes. A quiet window is never spent deciding
-what to run in it.
+**One queue.** A GPU task declares in its issue body, before it is claimable: what it
+measures, which width, how long it needs, and which artifact it writes. A quiet window is
+never spent deciding what to run in it.
 
 ### The pre-flight gate — three checks, not one
 
@@ -375,8 +390,8 @@ Stated so it is not mistaken for an omission.
 | # | Decision | Date |
 |---|---|---|
 | D95 | Tasks are a **pool**, not a track assignment; 5 dev + 5 reviewer agents cap concurrency at 5 in flight. Conflicts are tolerated and are a **decomposition signal**. Developer and reviewer are separate agents with opposed objectives. **Halt and discuss on any surprise.** | 2026-09-20 |
-| D96 | Context is durable **in the task record** — brief, dev record, review record, handoff — with each brief linking to its predecessors'. A brief that cannot name its file set is not claimable. | 2026-09-20 |
-| D97 | `feature/atomcompass_new` is the integration branch; one worktree and one PR per task. Four setup rules from recorded failures: no shared mutable source root, containers mount the worktree parent, `PYTHONPATH` verified before trusting a result, `git archive` never `rsync`. | 2026-09-20 |
+| D96 | The task record is the **GitHub issue and its PR** — brief in the issue body, dev record in the PR body, review record in the review comment, handoff in the closing comment — with each brief linking to its predecessors' issues. A brief that cannot name its file set is not claimable. | 2026-09-21 |
+| D97 | `feature/atomcompass_new` is the integration branch; one issue, one worktree and one PR per task. Four setup rules from recorded failures: no shared mutable source root, containers mount the worktree parent, `PYTHONPATH` verified before trusting a result, `git archive` never `rsync`. | 2026-09-20 |
 | D98 | Four gates per task: ATOM's suite green **unmodified**, new CPU-only tests, one named result stated in advance, and review by a separate agent. Baselines recorded first. | 2026-09-20 |
 | D99 | Effort in **lines of code**. Wall-clock only for machine time with a measured basis. A 2x overrun is a halt-and-discuss event. | 2026-09-20 |
 | D100 | Twelve modules under `atom/compass/`; tasks are cut so each touches one plus its tests. ATOM edits outside that tree are enumerated per task. | 2026-09-20 |
