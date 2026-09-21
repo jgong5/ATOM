@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 from atom.compass.runner.overrides import (
+    RPC_SURFACE,
     NonAllocatingRunner,
     RunnerRefusal,
     unanswered_rpc_names,
@@ -40,12 +41,36 @@ if _UNANSWERED:
     # Checked here rather than left to a deployment. The worker resolves each
     # RPC with `getattr(runner, name, None)` and skips what comes back None, so
     # a name this class stops answering -- because ATOM renamed or dropped it --
-    # produces no error anywhere: the worker stays healthy and the caller that
-    # asked for the reply blocks until the process is killed. Failing the import
-    # turns that into a worker that dies at construction, with a traceback.
+    # produces no error anywhere: the worker stays healthy and nothing logs.
+    # Failing the import turns that into a worker that dies at construction,
+    # with a traceback.
+    #
+    # The two halves below fail differently, which is why the message
+    # partitions them instead of asserting one story for all twelve. A waited
+    # name parks its caller on an unbounded queue read for the life of the
+    # process. An unwaited one parks nobody: `busy_loop` skips it and carries
+    # on -- which for `exit` means the loop never breaks, and for
+    # `process_kvconnector_output` means a KV load is silently never started.
+    # Both are real failures; neither is a park.
+    #
+    # Two things about this raise itself. No CPU test tier can execute it:
+    # importing this module imports `ModelRunner`, which runs aiter's
+    # architecture probe and needs a driver, so a green CPU gate is not
+    # evidence that the composed class answers the surface -- only an import on
+    # a machine with a GPU is. And when it does fire inside a worker,
+    # `AsyncIOProc.__init__` resolves the runner class (`async_proc.py:166`)
+    # before assigning `self.runners = []` (`:167`), so the atexit finalizer
+    # then fails on the half-built object and the worker log *ends* with
+    # `AttributeError: 'AsyncIOProc' object has no attribute 'runners'`. The
+    # refusal is the traceback above that one.
+    _WAITED = [name for name in _UNANSWERED if RPC_SURFACE[name]]
+    _UNREAD = [name for name in _UNANSWERED if not RPC_SURFACE[name]]
     raise RunnerRefusal(
         "the worker dispatches "
         + ", ".join(_UNANSWERED)
-        + " by name and this runner answers none of them; each one would park "
-        "its caller rather than raise."
+        + " by name and this runner answers none of them. Waited on, so a hole "
+        "parks its caller for the life of the process: "
+        + (", ".join(_WAITED) or "none")
+        + ". Dispatched with no reader, so a hole is skipped and the worker "
+        "carries on without it: " + (", ".join(_UNREAD) or "none") + "."
     )
