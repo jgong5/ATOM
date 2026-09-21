@@ -34,7 +34,7 @@ it now costs four failures on **every** side of a comparison:
 
 | tree | its own `scripts/compass` | with the `ddb69e7aa` overlay |
 |---|---|---|
-| `b1dca15da` — integration head, tree `00386e887` | **4594 passed, 0 failed**, rc=0 | **4590 passed, 4 failed**, `GATE_CPU_RC=1` |
+| `b1dca15da`, tree `00386e887` (the integration head's tree at 2026-09-21T21:00Z) | **4594 passed, 0 failed**, rc=0 | **4590 passed, 4 failed**, `GATE_CPU_RC=1` |
 | `83ef2a094` — an earlier head, tree `9091c1dc8` | **4570 passed, 0 failed**, rc=0 | **4566 passed, 4 failed**, `GATE_CPU_RC=1` |
 | `cf6429387` — a branch, tree `95cb8358d` | **4501 passed, 0 failed**, rc=0 | **4497 passed, 4 failed**, `GATE_CPU_RC=1` |
 
@@ -79,7 +79,7 @@ property. Read 2026-09-21T20:58:34Z over `refs/remotes/fork/compass/**` after
 `git fetch fork --prune`: **45** `compass/*` branches, **35** carrying this
 directory, **six** distinct tree objects between them, **26** of those branches
 still on the pre-`186d12829` `ddb69e7aa` the overlay recipe copies from. Read the
-first three as a floor on the spread rather than as a current count — three reads
+first three as readings with their times rather than as a current count — three reads
 over the preceding hour gave 41 / 31 / four, 43 / 33 / six and 45 / 35 / seven, and
 they move in both directions as branches are pushed and rebased. The `26` is the
 exposed population and is the figure that justifies this section. "Every tree is
