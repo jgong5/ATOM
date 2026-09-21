@@ -229,9 +229,11 @@ def test_every_stated_extent_names_exactly_the_rows(path, rows):
 # `> 2` or `> 3` left every test in this file passing. The two cases below pin
 # it at exactly two by running that test over documents written here -- a single
 # free mention and a pair -- rather than over a second copy of its rule, which
-# would pin the copy and let the rule move.
-FREE_MENTION = "The register runs T1–T2. {} allocated on a branch that has not landed."
-LANDED = [(1, False), (2, False)]
+# would pin the copy and let the rule move. The stated extent below is three ids
+# wide on purpose: at `> 2` a two-id extent is dropped by the same filter, and
+# both cases would then die on the precondition instead of on the hatch.
+FREE_MENTION = "The register runs T1–T3. {} allocated on a branch that has not landed."
+LANDED = [(1, False), (2, False), (3, False)]
 
 
 def test_one_unlanded_id_may_be_named_in_prose(tmp_path):
