@@ -193,6 +193,63 @@ def main() -> int:
                 (8192, 1, long_decode), (16384, 1, long_decode),
                 (65536, 1, long_decode), (131072, 1, long_decode),
                 (196608, 1, long_decode), (258048, 1, long_decode),
+                # Every length above is a multiple of the 16384-token prefill
+                # chunk, or near enough that only 258048 leaves a remainder.
+                # So the table has full chunks at every context and almost no
+                # SHORT chunk at a deep one -- and a short chunk at a deep
+                # context is a request's last chunk, which every request has.
+                #
+                # Counted: at 512 tokens the table holds three rows, all at a
+                # context under 8192, while a one-client cc-traces rung puts
+                # thirty past 131072. Per-feature coverage calls that covered,
+                # because the table has short chunks and it has deep contexts;
+                # it does not have the two together. The fit there is
+                # unconstrained, and it shows -- the same rung's 512..4096
+                # token steps came out 17% to 25% low, and they are 30% of its
+                # prefill seconds against 1% of a sixteen-client rung's, which
+                # is the whole of the -8%-to--1% spread across the rungs.
+                #
+                # A prompt of `chunks * 16384 + r` ends in a chunk of exactly
+                # `r` at a context of `chunks * 16384`, so the remainder is
+                # chosen by choosing the length. The scheduler then splits that
+                # remainder again: `_finalize_prefill_chunk` shortens a chunk
+                # to the previous state-checkpoint rung, so 512 goes out as
+                # 496 and then 16. Both shapes are wanted -- every ragged
+                # request ends that way -- and the 16-token tail is not cheap,
+                # 543ms against 979ms for the 496 beside it, because it is
+                # almost entirely KV read.
+                #
+                # Four depths. Measured: these twenty rungs take 72 minutes and
+                # move held-out per-step MAPE over the four cc-traces rungs from
+                # 10.2% to 8.6%, and the bias spread across them from 7.1 to
+                # 5.9 points, by raising the history coefficient 24% -- without
+                # short chunks at deep context the fit cannot separate reading
+                # the KV from computing the attention pairs. Twenty more rungs
+                # at the four depths in between were measured too and reached
+                # 8.2% and 5.5 points for another 58 minutes, which is not
+                # worth a fifth of the sweep. What is left is not this defect:
+                # at the same step shape the one-client rung is 5.9% low and
+                # the sixteen-client rung 0.6% low, so it is occupancy.
+                (66048, 1, long_decode),    # 512 at 65536
+                (66560, 1, long_decode),    # 1024 at 65536
+                (67584, 1, long_decode),    # 2048 at 65536
+                (69632, 1, long_decode),    # 4096 at 65536
+                (73728, 1, long_decode),    # 8192 at 65536
+                (131584, 1, long_decode),   # 512 at 131072
+                (132096, 1, long_decode),   # 1024 at 131072
+                (133120, 1, long_decode),   # 2048 at 131072
+                (135168, 1, long_decode),   # 4096 at 131072
+                (139264, 1, long_decode),   # 8192 at 131072
+                (197120, 1, long_decode),   # 512 at 196608
+                (197632, 1, long_decode),   # 1024 at 196608
+                (198656, 1, long_decode),   # 2048 at 196608
+                (200704, 1, long_decode),   # 4096 at 196608
+                (204800, 1, long_decode),   # 8192 at 196608
+                (246272, 1, long_decode),   # 512 at 245760
+                (246784, 1, long_decode),   # 1024 at 245760
+                (247808, 1, long_decode),   # 2048 at 245760
+                (249856, 1, long_decode),   # 4096 at 245760
+                (253952, 1, long_decode),   # 8192 at 245760
                 # Rungs 8, 16 and 32 across the context range, not only at
                 # its ends. Sampling a rung at a tiny context and an enormous
                 # one bounds it without covering it: the fit is then a line
