@@ -18,7 +18,9 @@
   a citation in the output record.
 - Merge conflicts are the agent's call, not the owner's ("don't bother me on merge
   conflict, it's on you").
-- Task logs go in `agent_scratch/`, never `atom/compass/tasks`.
+- Working logs and scratch go in `agent_scratch/`, never `atom/compass/tasks`. The
+  durable task record — brief, dev record, review record, handoff (D96) — is not a
+  working log: it stays tracked, so a later brief can still link to it.
 - "Complete solutions while keeping the solution as simple as possible."
 - Concurrency: 5 tasks in flight, up to 10 agents (`16_execution_plan.md:29`).
 - Both developer and reviewer agents must be told to read `atom/compass/design/README.md`'s
