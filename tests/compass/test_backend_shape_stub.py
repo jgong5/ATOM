@@ -1,0 +1,561 @@
+# SPDX-License-Identifier: MIT
+"""The shape-reading stand-in backend, and the loop it exists to close.
+
+Two kinds of test here, and the second is the reason the first is worth
+having.
+
+The first kind checks the form: that a step's price is the declared
+coefficients multiplied into the shapes of that step, that the breakdown names
+every part, that the attention sums are the ones ATOM itself publishes, and
+that the projection cannot be handed a batch-level scalar in place of the rows
+it is meant to sum over.
+
+The second kind drives ATOM's real `Scheduler` -- chunked prefill, real
+admission, real block manager -- with a virtual clock advanced by nothing but
+this backend's predictions, and watches the batch it builds change. That is
+the property constants cannot exercise: a fixed price per kind makes every
+step the same length, so the clock reaches an arrival at a time that has
+nothing to do with the work, and a run cannot show whether the schedule
+depends on the model at all.
+
+Nothing below is an accuracy check. The coefficients were declared, and a test
+that compared them to a measured duration would be asserting that somebody
+guessed well.
+"""
+
+import math
+from dataclasses import fields, replace
+from itertools import count
+from types import SimpleNamespace
+
+import pytest
+from conftest import MockConfig
+
+from atom.compass.backends import (
+    BatchView,
+    Coefficients,
+    CostBackend,
+    KvGeometry,
+    Parallelism,
+    RequestShape,
+    ShapeStubBackend,
+    Species,
+    Tier,
+    fold_step,
+)
+from atom.compass.backends.shape import (
+    CANDIDATE,
+    DECLARED,
+    sum_context,
+    sum_query_cached,
+    sum_query_context,
+    sum_query_square,
+)
+from atom.model_engine.scheduler import ScheduledBatchOutput, Scheduler
+from atom.model_engine.sequence import Sequence, SequenceType
+from atom.sampling_params import SamplingParams
+
+# The two switches that publish ATOM's attention aggregates. Both are settable
+# from outside the scheduler -- one an env flag read once into
+# `_detailed_annotation_enabled`, the other the public `profile_active` the
+# profiler RPC flips -- so a stand-in for them is a stand-in for two
+# assignments and not for any code that would have to be written.
+PUBLISHING = SimpleNamespace(profile_active=True, _detailed_annotation_enabled=True)
+
+
+def prefill(query_tokens, cached=0):
+    return RequestShape(query_tokens, cached + query_tokens, False)
+
+
+def decode(context, query_tokens=1):
+    return RequestShape(query_tokens, context, True)
+
+
+def named(step):
+    return {name: seconds for name, seconds, _ in step.rows()}
+
+
+# ── the form ────────────────────────────────────────────────────────────────
+
+
+class TestTheForm:
+    def test_a_prefill_step_is_its_four_named_parts(self):
+        c = Coefficients()
+        step = ShapeStubBackend().estimate(
+            BatchView((prefill(256), prefill(64, cached=128)))
+        )
+        assert named(step) == {
+            "prefill.step": c.prefill_step,
+            "prefill.tokens": (256 + 64) * c.prefill_token,
+            "prefill.query_square": (256**2 + 64**2) * c.prefill_query_square,
+            "prefill.query_cached": (64 * 128) * c.prefill_query_cached,
+        }
+        assert step.seconds == pytest.approx(sum(named(step).values()))
+
+    def test_a_decode_step_is_its_four_named_parts(self):
+        c = Coefficients()
+        view = BatchView((decode(1000), decode(600)), capture_rung=4)
+        step = ShapeStubBackend().estimate(view)
+        assert named(step) == {
+            "decode.step": c.decode_step,
+            "decode.requests": 2 * c.decode_request,
+            "decode.context": 1600 * c.decode_context,
+            "decode.graph_padding": (4 * 1000 - 1600) * c.decode_padding,
+        }
+
+    def test_a_mixed_step_pays_both_groups(self):
+        step = ShapeStubBackend().estimate(BatchView((prefill(128), decode(900))))
+        groups = {name.split(".")[0] for name in named(step)}
+        assert groups == {"prefill", "decode"}
+
+    def test_a_step_names_only_the_groups_it_ran(self):
+        step = ShapeStubBackend().estimate(BatchView((prefill(128),)))
+        assert not [name for name in named(step) if name.startswith("decode")]
+
+    def test_the_total_is_folded_from_the_parts_and_not_stored(self):
+        step = ShapeStubBackend().estimate(BatchView((prefill(300), decode(50))))
+        refolded = 0.0
+        for _, seconds, _ in step.rows():
+            refolded = fold_step(refolded, seconds)
+        assert refolded == step.seconds
+
+    def test_a_step_with_no_requests_is_refused(self):
+        with pytest.raises(ValueError, match="no shape to price"):
+            BatchView(())
+
+    def test_the_backend_answers_at_step_granularity(self):
+        backend = ShapeStubBackend()
+        assert isinstance(backend, CostBackend)
+        assert backend.tier is Tier.COARSE
+
+    def test_something_that_is_not_a_projection_is_refused(self):
+        with pytest.raises(TypeError, match="prices a BatchView"):
+            ShapeStubBackend().estimate({"tokens": 512})
+
+    def test_a_coefficient_that_is_not_a_duration_is_refused(self):
+        with pytest.raises(ValueError, match="prefill_token"):
+            Coefficients(prefill_token=-1.0)
+        with pytest.raises(ValueError, match="decode_context"):
+            Coefficients(decode_context=math.inf)
+
+
+# ── the sums are over requests ──────────────────────────────────────────────
+
+
+class TestPerRequestSums:
+    """Summed per request, made structural rather than asked for in prose."""
+
+    def test_the_projection_has_no_field_for_a_batch_level_sum(self):
+        """The collapsed form is not expressible, so it cannot be passed by
+        mistake and cannot disagree with the rows it came from."""
+        assert [f.name for f in fields(BatchView)] == ["requests", "capture_rung"]
+        assert [f.name for f in fields(RequestShape)] == [
+            "query_tokens",
+            "context_tokens",
+            "decode",
+        ]
+
+    def test_two_batches_that_collapse_alike_are_priced_apart(self):
+        """The rank deficiency, shown rather than described.
+
+        Both batches compute 512 tokens against 2048 of context, so a form
+        built from `tokens x history` prices them identically. They are not
+        the same work: one request attending over 1024 is not two attending
+        over 512 each.
+        """
+        one_big = BatchView((prefill(256, cached=768), prefill(256, cached=768)))
+        lopsided = BatchView((prefill(448, cached=576), prefill(64, cached=960)))
+        assert sum_context(one_big.requests) == sum_context(lopsided.requests)
+        assert sum(r.query_tokens for r in one_big.requests) == sum(
+            r.query_tokens for r in lopsided.requests
+        )
+        backend = ShapeStubBackend()
+        assert backend.estimate(one_big).seconds != backend.estimate(lopsided).seconds
+
+    def test_the_sums_are_the_ones_the_scheduler_publishes(self):
+        """Checked against ATOM's own method, not against a re-derivation."""
+        rows = (prefill(4, cached=2), prefill(3), decode(10))
+        batch = SimpleNamespace(
+            num_scheduled_tokens=[4, 3, 1],
+            detailed_sqsq=None,
+            detailed_sqsk=None,
+            detailed_sk=None,
+        )
+        seqs = {
+            0: SimpleNamespace(
+                type=SequenceType.PREFILL, num_tokens=6, num_cached_tokens=2
+            ),
+            1: SimpleNamespace(
+                type=SequenceType.PREFILL, num_tokens=3, num_cached_tokens=0
+            ),
+            2: SimpleNamespace(
+                type=SequenceType.DECODE, num_tokens=10, num_cached_tokens=9
+            ),
+        }
+
+        Scheduler.compute_detailed_aggregates(PUBLISHING, batch, seqs)
+
+        assert sum_query_square(rows) == batch.detailed_sqsq
+        assert sum_query_context(rows) == batch.detailed_sqsk
+        assert sum_context(rows) == batch.detailed_sk
+
+    def test_the_cached_cross_term_is_a_difference_of_two_published_sums(self):
+        """`Sum N_Q.N_KV_cached` is `sqsk - sqsq`, so it needs no new reading."""
+        rows = (prefill(128, cached=896), decode(2000), prefill(7))
+        assert sum_query_cached(rows) == sum_query_context(rows) - sum_query_square(
+            rows
+        )
+
+
+# ── the graph rung ──────────────────────────────────────────────────────────
+
+
+class TestTheRung:
+    def test_the_padding_is_the_rungs_rectangle_not_the_batchs(self):
+        rows = (decode(1000), decode(200), decode(200))
+        view = BatchView(rows, capture_rung=16)
+        batchs_own = len(rows) * 1000 - 1400
+        assert view.graph_padding == 16 * 1000 - 1400
+        assert view.graph_padding > batchs_own
+
+    def test_a_step_that_replayed_nothing_has_no_rung(self):
+        with pytest.raises(ValueError, match="no decode requests"):
+            BatchView((prefill(256),), capture_rung=8)
+
+    def test_a_rung_narrower_than_the_batch_is_refused(self):
+        with pytest.raises(ValueError, match="smaller than the 3 decode"):
+            BatchView((decode(10), decode(10), decode(10)), capture_rung=2)
+
+    def test_without_a_rung_the_padding_term_is_zero_and_still_named(self):
+        step = ShapeStubBackend().estimate(BatchView((decode(10), decode(10))))
+        assert named(step)["decode.graph_padding"] == 0.0
+
+
+# ── constant mode ───────────────────────────────────────────────────────────
+
+
+class TestConstantMode:
+    def test_constant_pricing_is_a_coefficient_set_not_a_mode(self):
+        flat = Coefficients.constant(prefill_seconds=0.05, decode_seconds=0.002)
+        backend = ShapeStubBackend(coefficients=flat)
+        short = backend.estimate(BatchView((prefill(16),)))
+        long = backend.estimate(BatchView((prefill(16128),)))
+        assert short.seconds == long.seconds == 0.05
+        assert set(named(short)) == set(named(long))
+        assert flat.shape_blind
+
+    def test_constant_pricing_still_names_every_part(self):
+        flat = Coefficients.constant(prefill_seconds=0.05, decode_seconds=0.002)
+        step = ShapeStubBackend(coefficients=flat).estimate(
+            BatchView((prefill(16128),))
+        )
+        assert named(step) == {
+            "prefill.step": 0.05,
+            "prefill.tokens": 0.0,
+            "prefill.query_square": 0.0,
+            "prefill.query_cached": 0.0,
+        }
+
+    def test_the_default_reads_the_shape(self):
+        assert not Coefficients().shape_blind
+        backend = ShapeStubBackend()
+        assert (
+            backend.estimate(BatchView((prefill(16),))).seconds
+            != backend.estimate(BatchView((prefill(256),))).seconds
+        )
+
+
+# ── what a reader of the output is told ─────────────────────────────────────
+
+
+class TestWhatTheOutputSays:
+    """The disclaimer has to survive the trip into an artifact."""
+
+    def test_every_term_says_the_coefficient_was_declared(self):
+        step = ShapeStubBackend().estimate(BatchView((prefill(128), decode(500))))
+        for name, _, provenance in step.rows():
+            assert DECLARED in provenance, name
+            assert "not an accuracy claim" in provenance
+
+    def test_every_term_says_which_count_and_which_coefficient(self):
+        step = ShapeStubBackend().estimate(BatchView((prefill(128),)))
+        rows = {name: provenance for name, _, provenance in step.rows()}
+        assert "5e-07 s x 128" in rows["prefill.tokens"]
+        assert "x 16384" in rows["prefill.query_square"]
+
+    def test_the_species_is_not_analytical(self):
+        """Reserved for something computed without measuring the subject, and
+        a declared coefficient has not computed anything."""
+        step = ShapeStubBackend().estimate(BatchView((prefill(128),)))
+        for _, _, provenance in step.rows():
+            assert str(Species.ANALYTICAL) not in provenance
+
+    def test_the_description_says_it_and_which_pricing_produced_it(self):
+        assert DECLARED in ShapeStubBackend().describe()
+        assert "shape-read" in ShapeStubBackend().describe()
+        flat = Coefficients.constant(prefill_seconds=0.05, decode_seconds=0.002)
+        assert "constant bring-up" in ShapeStubBackend(coefficients=flat).describe()
+
+
+# ── collectives ─────────────────────────────────────────────────────────────
+
+
+class TestCollectives:
+    GEOMETRY = KvGeometry(
+        layers=16, kv_heads=4, head_dim=256, element_bytes=2, block_size=64
+    )
+
+    def test_a_single_rank_deployment_is_charged_for_no_collective(self):
+        step = ShapeStubBackend(
+            parallelism=Parallelism(expert_parallel=True), geometry=self.GEOMETRY
+        ).estimate(BatchView((prefill(128),)))
+        assert not [name for name in named(step) if name.startswith("collective")]
+
+    def test_the_charged_collectives_are_the_ones_the_widths_produce(self):
+        widths = Parallelism(tp_size=2, dp_size=2, expert_parallel=True)
+        step = ShapeStubBackend(parallelism=widths, geometry=self.GEOMETRY).estimate(
+            BatchView((prefill(128),))
+        )
+        charged = [name for name in named(step) if name.startswith("collective")]
+        assert charged == [f"collective.{n}" for n in widths.collectives()]
+        assert named(step)["collective.tp-all-reduce"] == pytest.approx(
+            128 * 16 * Coefficients().collective_token_layer
+        )
+
+    def test_a_collective_with_no_geometry_to_price_it_is_refused(self):
+        with pytest.raises(ValueError, match="how many layers"):
+            ShapeStubBackend(parallelism=Parallelism(tp_size=2))
+
+    def test_a_charged_collective_says_it_is_a_candidate(self):
+        """The widths rule one out conclusively and rule it in conditionally.
+
+        Two of the four conditions that gate the peer-to-peer path are not
+        deployment widths, so a presence in the list is what the widths admit
+        rather than what a step ran. A term charged for one says which of the
+        two it is where the charge is read, since the seconds are indis-
+        tinguishable from a confirmed collective's once they are in a total.
+        """
+        step = ShapeStubBackend(
+            parallelism=Parallelism(tp_size=2, dp_size=2, expert_parallel=True),
+            geometry=self.GEOMETRY,
+        ).estimate(BatchView((prefill(128),)))
+        for name, _, provenance in step.rows():
+            assert (CANDIDATE in provenance) is name.startswith("collective.")
+
+
+# ── chunk size ──────────────────────────────────────────────────────────────
+
+
+class TestChunkSize:
+    """Doubling the chunk, term by term, because the total is not one number's
+    story: the token term doubles, the quadratic term quadruples, and the
+    launch intercept does not move. Reporting only the ratio of the totals
+    would hide all three."""
+
+    @staticmethod
+    def _terms(n):
+        return named(ShapeStubBackend().estimate(BatchView((prefill(n),))))
+
+    def test_the_token_term_doubles_exactly(self):
+        assert (
+            self._terms(512)["prefill.tokens"] == 2 * self._terms(256)["prefill.tokens"]
+        )
+
+    def test_the_quadratic_term_quadruples_exactly(self):
+        assert (
+            self._terms(512)["prefill.query_square"]
+            == 4 * self._terms(256)["prefill.query_square"]
+        )
+
+    def test_the_launch_term_does_not_move(self):
+        assert self._terms(512)["prefill.step"] == self._terms(256)["prefill.step"]
+
+    def test_the_step_doubles_exactly_where_the_form_is_linear(self):
+        """The literal property, in the regime where it can hold: with the
+        quadratic and cross coefficients at zero and no launch intercept, the
+        form is `b.tokens` and doubling the chunk doubles the step."""
+        linear = Coefficients(
+            prefill_step=0.0,
+            prefill_query_square=0.0,
+            prefill_query_cached=0.0,
+        )
+        backend = ShapeStubBackend(coefficients=linear)
+        short = backend.estimate(BatchView((prefill(256),))).seconds
+        long = backend.estimate(BatchView((prefill(512),))).seconds
+        assert long == 2 * short
+
+
+# ── the closed loop ─────────────────────────────────────────────────────────
+
+CHUNK = 256
+PROMPT_A = 2048
+PROMPT_B = 512
+ARRIVAL = 7.48e-4
+
+
+def _project(batch, seqs):
+    """Read one batch's shapes off the engine, as the caller of a backend does.
+
+    This lives in the test rather than in the package because the package
+    names no engine type: the two branches below -- a prefill chunk's context
+    is what was cached plus the chunk, a decode's is the whole sequence -- are
+    exactly the ones `compute_detailed_aggregates` takes, and the tests above
+    check that the sums come out equal to what it publishes.
+    """
+    rows = []
+    for seq, scheduled in zip(seqs.values(), batch.num_scheduled_tokens):
+        query = int(scheduled)
+        is_decode = seq.type == SequenceType.DECODE
+        context = (
+            int(seq.num_tokens) if is_decode else int(seq.num_cached_tokens) + query
+        )
+        rows.append(RequestShape(query, context, is_decode))
+    return BatchView(tuple(rows))
+
+
+def _drive(coefficients, steps=10, arrival=ARRIVAL, chunk=CHUNK):
+    """Run the real scheduler with a clock that only this backend advances.
+
+    The token budget is two chunks wide, so a second request that has become
+    admittable can share the step rather than having to wait for the first to
+    finish. That is what makes the streak of single-request prefills break
+    where the clock says and not where the prompt runs out.
+    """
+    Sequence.counter = count()
+    scheduler = Scheduler(
+        MockConfig(
+            kv_cache_block_size=16,
+            num_kvcache_blocks=1024,
+            enable_chunked_prefill=True,
+            max_num_seqs=8,
+            max_num_batched_tokens=2 * chunk,
+            long_prefill_token_threshold=chunk,
+            max_model_len=4096,
+        )
+    )
+    backend = ShapeStubBackend(coefficients=coefficients)
+    params = SamplingParams(max_tokens=200)
+    scheduler.add(Sequence(list(range(1, PROMPT_A + 1)), 16, sampling_params=params))
+    waiting = [
+        (arrival, Sequence(list(range(1, PROMPT_B + 1)), 16, sampling_params=params))
+    ]
+    clock = 0.0
+    trace = []
+    for _ in range(steps):
+        while waiting and waiting[0][0] <= clock:
+            scheduler.add(waiting.pop(0)[1])
+        batch, seqs = scheduler.schedule()
+        Scheduler.compute_detailed_aggregates(PUBLISHING, batch, seqs)
+        view = _project(batch, seqs)
+        assert sum_query_square(view.requests) == batch.detailed_sqsq
+        assert sum_query_context(view.requests) == batch.detailed_sqsk
+        assert sum_context(view.requests) == batch.detailed_sk
+        trace.append((tuple(batch.req_ids), view, clock))
+        clock = fold_step(clock, backend.estimate(view).seconds)
+        scheduler.postprocess(
+            list(seqs.values()),
+            ScheduledBatchOutput(
+                req_ids=list(batch.req_ids),
+                token_ids=[(7,) for _ in batch.req_ids],
+                num_rejected=None,
+                num_bonus=None,
+                draft_token_ids=None,
+            ),
+            batch=batch,
+        )
+    return trace
+
+
+def _predicted_break(coefficients, arrival=ARRIVAL, chunk=CHUNK):
+    """Which step the second request first appears in, from the form alone.
+
+    Nothing here consults the scheduler. Every step until the arrival is one
+    chunk of the first prompt against the context it has accumulated, so the
+    clock is a closed sum over the declared coefficients, and the step whose
+    batch is assembled after the clock has passed the arrival is the one the
+    second request can be in.
+    """
+    clock = 0.0
+    step = 1
+    while clock < arrival:
+        cached = (step - 1) * chunk
+        clock = fold_step(
+            clock,
+            coefficients.prefill_step
+            + coefficients.prefill_token * chunk
+            + coefficients.prefill_query_square * chunk * chunk
+            + coefficients.prefill_query_cached * chunk * cached,
+        )
+        step += 1
+    return step
+
+
+def _observed_break(trace):
+    for index, (req_ids, _, _) in enumerate(trace, start=1):
+        if len(req_ids) > 1:
+            return index
+    raise AssertionError("the streak never broke")
+
+
+class TestClosedLoop:
+    """Step cost, to a clock, to admission, to a different batch.
+
+    The scheduler is ATOM's own and is not told anything about the cost model.
+    The only channel between them is the clock: a step that this backend
+    prices as longer is a step during which more of the arrival schedule
+    elapses, so a request becomes admittable earlier or later in the streak,
+    and the batch the scheduler then builds is a different batch.
+    """
+
+    def test_the_streak_of_single_request_prefills_breaks_where_predicted(self):
+        coefficients = Coefficients()
+        trace = _drive(coefficients)
+        assert _observed_break(trace) == _predicted_break(coefficients) == 6
+        assert all(len(req_ids) == 1 for req_ids, _, _ in trace[:5])
+        assert all(not row.decode for _, view, _ in trace[:6] for row in view.requests)
+
+    def test_dropping_one_term_moves_the_break_by_a_predicted_step(self):
+        """The loop is real rather than decorative.
+
+        Over the five steps before the arrival the cross term is worth 2.62 us
+        against 749.18 us elapsed -- 0.35% -- and 0.35% is the whole
+        difference between the second request making the sixth batch and
+        missing it: without the term the clock stands at 746.55 us there,
+        1.45 us short of the arrival, and with it at 749.18 us, 1.18 us past.
+        """
+        without = replace(Coefficients(), prefill_query_cached=0.0)
+        assert _predicted_break(without) == 7
+        assert _observed_break(_drive(without)) == 7
+
+    def test_the_break_moves_when_each_step_does_twice_the_work(self):
+        """Doubling the chunk halves the streak and raises the step by 1.88x
+        -- the token term doubles, the quadratic quadruples and the intercept
+        does not move -- so the same arrival lands two batches earlier."""
+        coefficients = Coefficients()
+        assert (
+            _observed_break(_drive(coefficients, chunk=512))
+            == _predicted_break(coefficients, chunk=512)
+            == 4
+        )
+
+    def test_constant_pricing_is_blind_to_that(self):
+        """Not a defect in constant mode -- the reason it is not the default.
+
+        The same two runs under a constant price break at the same step,
+        because the time a step takes is the constant and the work in it does
+        not enter. The schedule is then a property of the number somebody
+        typed, and a run cannot show that anything reacted to the model.
+        """
+        flat = Coefficients.constant(prefill_seconds=2.5e-4, decode_seconds=2.5e-4)
+        narrow = _observed_break(_drive(flat, chunk=CHUNK))
+        wide = _observed_break(_drive(flat, chunk=512))
+        assert narrow == wide == _predicted_break(flat) == 4
+
+    def test_a_longer_chunk_costs_longer_in_the_real_streak(self):
+        trace = _drive(Coefficients())
+        backend = ShapeStubBackend()
+        first, joined = trace[0][1], trace[5][1]
+        assert sum(r.query_tokens for r in joined.requests) == 2 * sum(
+            r.query_tokens for r in first.requests
+        )
+        assert backend.estimate(joined).seconds > backend.estimate(first).seconds
