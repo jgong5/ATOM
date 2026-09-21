@@ -27,32 +27,30 @@ defending:
   around it.
 * **A zero floor is accepted.** It costs overlap, not correctness, and a module
   that rejected it would be asserting the opposite.
-* **The package reaches nothing, and names nothing.** No device runtime, no
-  clock, no socket -- an allowlist over the package's own imports. That is a
-  different claim from naming no location and no level, which a module taking
-  `host`, `port` and `level` would satisfy while breaking; the signature scan
-  is what covers the second.
+* **An identity carries a name and nothing that would locate it.** An
+  exhaustive equality on a closed set of fields, so it fails on any field added
+  for any reason.
+
+What is no longer here: the scans over what the whole package may *name* and
+may *reach*. They were package-wide from the start -- an allowlist over every
+module's imports, and a check that no module writes down a location or a level
+-- and they grew a transport subpackage to cover, so they are no longer about
+identity, the order or the matrix. They live in
+`test_clock_package_boundary.py`, which is where a subpackage added later will
+look for them.
 """
 
-import ast
 import dataclasses
-import enum
-import inspect
-from pathlib import Path
 
 import pytest
 
-from atom.compass import clock
 from atom.compass.clock import (
     TRAFFIC_TO_ENGINE_FLOOR_SECONDS,
-    InterLpLink,
     LinkClass,
     LookaheadMatrix,
     LpId,
     LpRegistry,
 )
-
-CLOCK_PACKAGE = Path(__file__).resolve().parents[2] / "atom" / "compass" / "clock"
 
 TRAFFIC = LpId("traffic-source")
 PREFILL = LpId("prefill")
@@ -364,126 +362,12 @@ def test_the_admission_delay_is_kept_per_path():
     }
 
 
-# --- what the package is allowed to name -------------------------------------
-
-# A participant knows a peer by name. Where that peer runs, how it is reached,
-# and how deep it sits in an arrangement of authorities are all things it must
-# not be able to write down, because an authority inserted between two others
-# has to be invisible to both sides.
-LOCATING_WORDS = (
-    "address",
-    "depth",
-    "endpoint",
-    "host",
-    "level",
-    "node",
-    "parent",
-    "port",
-    "rank",
-    "socket",
-    "url",
-)
-
-
-def _public_signatures():
-    """(name, signature) for every exported callable and its public methods."""
-    found = []
-    for exported in sorted(clock.__all__):
-        obj = getattr(clock, exported)
-        if not inspect.isclass(obj):
-            if callable(obj):
-                found.append((exported, inspect.signature(obj)))
-            continue
-        if not issubclass(obj, enum.Enum):
-            # An Enum's call is a value lookup, not a constructor.
-            found.append((exported, inspect.signature(obj)))
-        for attr_name, attr in sorted(vars(obj).items()):
-            if attr_name.startswith("_") or not inspect.isfunction(attr):
-                continue
-            found.append((f"{exported}.{attr_name}", inspect.signature(attr)))
-    return found
+# --- what an identity may carry ----------------------------------------------
 
 
 def test_an_identity_carries_a_name_and_nothing_that_would_locate_it():
+    # An exhaustive equality rather than a scan for forbidden words: it fails on
+    # any field added for any reason, which is a proof where a word list is a
+    # vocabulary check. The vocabulary checks over the rest of the package are
+    # in `test_clock_package_boundary.py`.
     assert [field.name for field in dataclasses.fields(LpId)] == ["name"]
-
-
-def test_no_public_call_takes_a_location_or_a_level():
-    # The import allowlist below proves the package reaches no device, clock or
-    # socket. It does not prove this: a module taking host, port and level and
-    # storing them would pass it unchanged. Stated here so the requirement is
-    # mechanical rather than upheld by inspection, because the pressure to hang
-    # an endpoint somewhere convenient arrives with the transport.
-    offenders = []
-    for name, signature in _public_signatures():
-        for parameter in signature.parameters:
-            if parameter.lower() in LOCATING_WORDS:
-                offenders.append(f"{name}({parameter})")
-    for cls in (LpId, InterLpLink):
-        for field in dataclasses.fields(cls):
-            if field.name.lower() in LOCATING_WORDS:
-                offenders.append(f"{cls.__name__}.{field.name}")
-    assert not offenders, (
-        f"the interface names where a peer is or how deep it sits: {offenders}. "
-        "A participant knows a name; an endpoint belongs to whatever resolves it."
-    )
-
-
-# --- what the package is allowed to reach ------------------------------------
-
-
-def _clock_modules():
-    # rglob, not glob: a transport or any other subpackage added later would sit
-    # below the top level, and a guard that stopped there would go quiet on
-    # exactly the code it exists for. Each module is one parametrised case, so a
-    # new one shows up in the gate arithmetic rather than silently.
-    return sorted(CLOCK_PACKAGE.rglob("*.py"))
-
-
-def test_the_package_was_found():
-    assert _clock_modules(), f"no modules under {CLOCK_PACKAGE}"
-
-
-@pytest.mark.parametrize("module", _clock_modules(), ids=lambda p: p.name)
-def test_the_package_imports_only_the_standard_library_it_names(module):
-    # Stated as an allowlist rather than a denylist. The claim being kept is
-    # that these structures can be built and read on any machine: no device
-    # runtime, no wall-clock read, no socket. A denylist would have to predict
-    # the name of the next thing that breaks it. It lists only what the package
-    # actually imports: an allowlist naming something unused is a permission
-    # granted for no reason, and it weakens the statement.
-    allowed = {"dataclasses", "enum", "math"}
-    tree = ast.parse(module.read_text())
-    roots = []
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            roots += [alias.name.split(".")[0] for alias in node.names]
-        elif isinstance(node, ast.ImportFrom) and not node.level:
-            roots.append((node.module or "").split(".")[0])
-    strays = sorted({root for root in roots if root not in allowed})
-    assert not strays, f"{module.name} imports {strays}; allowed: {sorted(allowed)}"
-
-
-@pytest.mark.parametrize("module", _clock_modules(), ids=lambda p: p.name)
-def test_the_package_builds_no_set_at_all(module):
-    # A `set` of names iterates in hash order, and string hashing is randomised
-    # per process, so iterating one makes two runs of one configuration diverge
-    # with no error and no warning. Membership against a set would be fine, but
-    # "built here and only ever tested against" is not a property this check can
-    # see -- and the package has no use for one -- so the rule it enforces is the
-    # one it can prove: none is constructed, so none can be iterated.
-    tree = ast.parse(module.read_text())
-    offenders = []
-    for node in ast.walk(tree):
-        if isinstance(node, (ast.Set, ast.SetComp)):
-            offenders.append(f"{type(node).__name__} at line {node.lineno}")
-        elif (
-            isinstance(node, ast.Call)
-            and isinstance(node.func, ast.Name)
-            and node.func.id in ("set", "frozenset")
-        ):
-            offenders.append(f"{node.func.id}() at line {node.lineno}")
-    assert not offenders, (
-        f"{module.name} builds {offenders}; use a dict with None values as an "
-        "ordered set, or sort at the point of iteration"
-    )
