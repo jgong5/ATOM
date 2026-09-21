@@ -245,29 +245,15 @@ class SyntheticRun:
         )
 
 
-def measure(workload=DESIGN_WORKLOAD, deployments=DEPLOYMENTS, grant_cap=None):
-    """Run every deployment once under the contract, smallest first."""
-    return tuple(
-        SyntheticRun(deployment, workload, grant_cap=grant_cap).run()
-        for deployment in deployments
-    )
-
-
-def disciplines(deployment, workload, grant_cap):
-    """The same deployment under all three disciplines, so the gap is measured.
-
-    The two that are not the contract are capped, because neither finishes on a
-    deployment whose tightest floor is a microsecond.
-    """
-    return tuple(
-        SyntheticRun(deployment, workload, discipline, grant_cap).run()
-        for discipline in Discipline
-    )
-
-
 def main():
-    """Print the grant table the design's sizing is compared against."""
-    for report in measure():
+    """Print the grant table the design's sizing is compared against.
+
+    A row at a time, because the largest deployment is an hour of arithmetic on
+    its own and a run that prints nothing until the last of them reads exactly
+    like a run that has hung.
+    """
+    for deployment in DEPLOYMENTS:
+        report = SyntheticRun(deployment, DESIGN_WORKLOAD).run()
         print(report, flush=True)
         print(f"    stopped by: {report.stopped_by}")
         print(
@@ -276,7 +262,9 @@ def main():
             f"participant {report.events_in_flight}"
         )
     print()
-    for report in disciplines(DEPLOYMENTS[3], scaled(DESIGN_WORKLOAD, 4), 2_000_000):
+    trace = scaled(DESIGN_WORKLOAD, 4)
+    for discipline in Discipline:
+        report = SyntheticRun(DEPLOYMENTS[3], trace, discipline, 2_000_000).run()
         print(
             f"{report.discipline:<20} {report.grants:>9} grants "
             f"{report.steps:>6} of 660 steps "
