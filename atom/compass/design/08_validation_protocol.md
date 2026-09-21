@@ -14,53 +14,77 @@ applies symmetrically to both sides.
 
 ---
 
-## D43.1. ATOM's own test suite is the first validation layer, and it is free
+## D43.1. ATOM's own test suite is the first validation layer, in two tiers — one of them free
 
-Asked directly: can Compass reuse existing ATOM unit tests? **Yes, and it is the cheapest
-correctness evidence in this document — but it validates a different property than
-everything else here.**
+Asked directly: can Compass reuse existing ATOM unit tests? **Yes, and the CPU tier of that
+suite is the cheapest correctness evidence in this document — but it validates a different
+property than everything else here.**
 
-> **Corrected 2026-09-20 by P0.2 — measured, not argued. The full rewrite of this decision
-> belongs to P0.1; `16`'s measured test and lint baselines carry the derivation and the
-> numbers.**
+**Revised 2026-09-20; the original claim was measured false.** This decision used to read
+*"187 test files under `tests/`, and ATOM's own `CLAUDE.md` states they need **no GPU** —
+AITER and `torch.cuda` are mocked"*. Neither half survived measurement. There are **188**
+test files under `tests/`, and **29 of the 158 outside `tests/plugin/` reach the driver**: 28
+at *collection* time, via `rocminfo` reached on import, so pytest cannot even build the node
+list, plus 1 that collects cleanly and then fails at run time on a pinned-host allocation
+(`hipHostMalloc failed: 100`). That numerator is non-plugin, so its denominator must be too —
+quoting 29 against 188 is the defect `16` L4 fixes and it is not repeated here. **At the
+whole-suite denominator the figure is at least 32 of 188**, because `tests/plugin/` is not
+purely a packaging problem: collecting it alone at `236abfd9a` in `xiaobizh_n18_cpu` gives
+`153 tests collected, 7 errors in 1.45s`, rc=2, and those 7 decompose as **3 `rocminfo`**
+(`test_gdn_target_verify_batched_equiv.py`, `test_rtpllm_forward_context_semantics.py`,
+`test_vllm_deepseek_v4_proxy_state_arena_layout.py`), **1 `ModuleNotFoundError: No module
+named 'sglang'`**, and **3 `ImportError: cannot import name 'fused_gdn_gating' from
+'atom.model_ops.attention_gdn' (unknown location)`** — a module left half-initialised by the
+first three, not a fourth cause. 29 + 3 = 32 is a floor: the other 23 plugin files collect
+here and are never run, so nothing is measured about what they would touch.
+`tests/plugin/`'s 30 files are dropped whole because the tier targets ATOM and sglang
+and vllm are in neither image — the measured reason for 27 of them, not for all 30. The
+suite as a whole is **not** GPU-free and never was. What is GPU-free is a *tier* of it, and
+that tier is genuinely green.
 
-There are **187 test files** under `tests/` on `feature/atomcompass_new`, but the rest of the
-claim that stood here — that ATOM's own `CLAUDE.md` is right that they need **no GPU** because
-AITER and `torch.cuda` are mocked — is false, measured at `83daf636d` and at `b963c9411` in
-container `xiaobizh_n18_cpu` on node 18. Of those 187, **30 are under `tests/plugin/`** and are
-dropped whole for needing sglang and vllm — though 3 of the 7 that fail collection there fail
-on `rocminfo`, not on a missing package. Of the **157 that remain, 29 reach the driver** (28 at
-collection time via `rocminfo`, 1 at run time via `hipHostMalloc`), and of the **128 left after
-those, 22 collect no test at all**. Every count in this paragraph is stated against the set it
-was measured over: a numerator taken over the non-plugin files and divided by 187 is the defect
-this correction exists to remove. What is GPU-free is a *tier*, and that tier is genuinely
-green: 3956 passed, 0 failed, rc=0.
+### The two tiers
 
-Several rows of the table below are affected, and the correction matters most where that
-table is load-bearing:
+| Tier | What runs | Measured result |
+|---|---|---|
+| **CPU tier** — per task, and green is the bar | `tests/` minus `tests/plugin/` (30 files) minus the 29 driver-dependent files in `scripts/compass/cpu_gate_exclude.txt` = **129 of 188 files**. Driven by `scripts/compass/gate_cpu.sh`; no driver is touched **as a batch**. That is the weaker and correct claim: `test_postprocess_width.py` and `test_v4_checkpoint_slot_copy.py` are among the 129 handed, and each reaches `rocminfo` when run *alone* (`no tests collected, 1 error in 0.78s`, rc=2, each, measured at `236abfd9a` in `xiaobizh_n18_cpu`); inside the gate they module-skip on the mock an earlier file installs. Driver-freedom here is a property of the batch, not of every file in it. | **4022 passed, 0 failed**, 149 skipped, 3 xfailed, rc=0, **27.4-40.9 s wall (`time` real) over three runs**. Decomposition (principle 7): **3956 ATOM + 66 `tests/compass` = 4022**. Measured 2026-09-20 in container `xiaobizh_n18_cpu` on hjbog-srdc-18, against a `git archive` snapshot with `PYTHONPATH` asserted to resolve `atom` under that root and pytest's own exit status captured before any pipe. |
+| **GPU superset** — per wave, judged as a **delta**, never as "green" | `tests/ --ignore=tests/plugin` in the GPU container, driven by `scripts/compass/gate_gpu.sh`. | **4779 passed / 5 failed**, 0 errors, 105 skipped, 3 xfailed, 72.6 s, at `fe9ea043c` on node 18 in `xiaobizh_n18`, `HIP_VISIBLE_DEVICES=1`, 2026-09-20 — torch **2.10.0+rocm7.2.4.git3d3aa833**, `torch.version.hip` **7.2.53211**, ROCm **7.2.4**, AITER **v0.1.21.dev0-49-gf4e7c7509**; two runs, byte-identical failing sets. The five are pre-existing and unrelated to Compass, and they are **four ULP comparisons plus one bitwise check**, not "five bf16 ULP failures": four `allclose` cases in `tests/test_fused_compress_ragged.py` off by one bf16 ULP (`max\|diff\| = 0.001953125`, exactly 2⁻⁹, against `atol=rtol=1e-3`), plus `tests/test_dcp_merge_ops.py::test_row_view_matches_output_slicing_bitwise`, a `torch.equal` with **no tolerance at all** — a tolerance bump would not move it. All five node-ids are on file verbatim in `scripts/compass/gpu_gate_known_failures.txt` and compared by name, so "5 failed" can now be checked against "the *same* 5 failed". |
 
-- `test_prefix_cache_accuracy.py` contains **no test function**. It is an `argparse` script
-  that drives a live server on `localhost:8000`; `pytest` reports `no tests ran` for it in
-  both containers. It is coverage of nothing.
-- `test_prefill_prefix_vs_native.py` module-skips on the CPU tier ("needs a real GPU") and
-  gives 4 passed in the GPU container — so the prefix-cache row is **GPU-tier only**.
-- `test_kv_connector_scheduler.py` likewise runs nothing in either tier: `1 skipped`, because
-  ATOM #690 split `kv_transfer_engine` into `moriio` and the test's imports were never updated.
-- `test_block_table_marshal.py`, `test_dp_metadata.py` and `test_dp_sync_layout.py`: the first
-  is in the 29-file exclusion list; the other two were too, wrongly, and are CPU-green.
+**Five different totals for this suite are in circulation and all five are consistent** —
+each is a different exclusion count and a different `tests/compass`, not a discrepancy:
+3925 (32 exclusions, `tests/compass` at 35 tests), 3956 (29 exclusions, **ATOM tests only**,
+no `tests/compass` — the P0.2 reviewer's figure), 3988 (29 exclusions, `tests/compass` at
+32), 4005 (29 exclusions, `tests/compass` at 49), and **4022** (29 exclusions,
+`tests/compass` at 66). The last step is mechanical: `tests/compass/test_cpu_gate_exclude.py`
+parametrises one case per entry of `gpu_gate_triggers.txt`, and correcting that file's
+derivation took it from 13 entries to 30. The exclusion list went 32 → 29
+because `test_dp_metadata.py`, `test_dp_sync_layout.py` and `test_forward_mode.py` were
+re-measured and are CPU-green. Prose saying the list is 32, or that those three need the
+driver, is stale.
 
-With those caveats, the tests directly relevant to the components Compass keeps:
+### The tests that matter to Compass, and which tier each is in
 
-| Test | Covers |
-|---|---|
-| `test_scheduler.py` | `Scheduler` public API — admission, `ScheduledBatch`, `ScheduledBatchOutput`, spec stats |
-| `test_prefill_scheduler.py`, `test_scheduler_partial_prefill_tail.py` | chunked prefill boundaries |
-| `test_block_manager.py`, `test_block_pool.py` | the block accounting D13 relies on running unmodified |
-| `test_prefix_cache_accuracy.py`, `test_prefill_prefix_vs_native.py` | the prefix-cache behaviour doc `03` declares correct-by-construction |
-| `test_scheduled_batch_marshal.py`, `test_block_table_marshal.py` | the IPC payloads the clock protocol annotates around |
-| `test_kv_connector_scheduler.py` | the connector factory doc `01` D6 registers a simulated connector into |
-| `test_disagg_modes.py`, `test_disagg_types.py` | the PD paths of M4/M6 |
-| `test_dp_load_balance.py`, `test_dp_metadata.py`, `test_dp_sync_layout.py` | the DP paths of M7 |
+| Test | Tier | Covers |
+|---|---|---|
+| `test_scheduler.py` | CPU | `Scheduler` public API — admission, `ScheduledBatch`, `ScheduledBatchOutput`, spec stats |
+| `test_prefill_scheduler.py`, `test_scheduler_partial_prefill_tail.py` | CPU | chunked prefill boundaries |
+| `test_block_manager.py`, `test_block_pool.py` | CPU | the block accounting D13 relies on running unmodified |
+| `test_prefix_cache_accuracy.py` | **neither** | nothing. It holds **no test function at all** — it is an `argparse` script that drives a live server on `localhost:8000`, and `pytest` reports `no tests ran` for it in both containers. The prefix-cache behaviour doc `03` declares correct-by-construction is not covered by this file. |
+| `test_prefill_prefix_vs_native.py` | **GPU only** | the prefix-cache behaviour doc `03` declares correct-by-construction. It module-skips on the CPU tier ("needs a real GPU") and gives 4 passed in the GPU container, so the prefix-cache row is GPU-tier evidence and nothing else. |
+| `test_scheduled_batch_marshal.py` | CPU | the IPC payloads the clock protocol annotates around |
+| `test_block_table_marshal.py` | **GPU only** | the block-table half of those same payloads — excluded at collection time, so the CPU tier does not see it |
+| `test_kv_connector_scheduler.py` | **neither** | the connector factory doc `01` D6 registers a simulated connector into — except that it runs nothing in either tier: `1 skipped`, because ATOM #690 split `kv_transfer_engine` into `moriio` and the test's imports were never updated. |
+| `test_disagg_modes.py`, `test_disagg_types.py` | CPU | the PD paths of M4/M6 |
+| `test_dp_load_balance.py`, `test_dp_metadata.py`, `test_dp_sync_layout.py` | CPU | the DP paths of M7 |
+
+**The two "neither" rows above are a finding, not a gap in the table**, and there is a
+third file in the same position that was never listed here at all.
+`test_prefix_cache_accuracy.py`, `test_kv_connector_scheduler.py` and
+`test_transfer_engine.py` run nothing in *either* tier — measured per file by P0.2 in both
+containers, `no tests ran` for the first and `1 skipped` for the other two. That
+measurement was taken at `83daf636d`, a tree superseded for every pass count in this
+document; it is retained because it is a statement about whether these files contain
+runnable tests, which no later re-measurement has changed. Two of the three were cited here
+as coverage Compass keeps, and are not. Raised with ATOM's owners as **T80** in `16`.
 
 ### What this does and does not prove
 
@@ -68,28 +92,64 @@ With those caveats, the tests directly relevant to the components Compass keeps:
 that the scheduler, block manager and admission logic still behave identically after
 Compass's changes. Every one of doc `01` D4's edits — clock-read substitution, blocked/
 running annotation, disabled failure detectors — lands in code these tests cover. A
-simulated run "makes the same scheduling decisions as a real one" is not a hope if this
-suite passes unchanged; it is the definition of what the suite checks.
+simulated run "makes the same scheduling decisions as a real one" is not a hope if the CPU
+tier passes unchanged and the GPU superset's delta is zero; it is the definition of what the
+suite checks.
 
 **What it does not prove:** nothing about accuracy. No ATOM test knows what a step should
 *cost*. The three results of D44 below are untouched by it.
 
-### How it is used, as three rules
+### How it is used, as four rules
 
-1. **The suite is a merge gate, run on every Compass change, unmodified.** Not adapted,
-   not subsetted. The moment a Compass change requires editing an ATOM test to keep it
+1. **The suite is a merge gate, run on every Compass change, unmodified.** Not adapted, not
+   subsetted by hand. The CPU tier's exclusion list is not an exception to that: it is
+   *generated* — `regen_cpu_gate_exclude.sh` iterates collection to a fixed point — and every
+   hand-kept entry carries its observed failure above it, so an inconvenient test cannot be
+   quietly removed. The moment a Compass change requires editing an ATOM test to keep it
    green, that change has altered ATOM's behaviour and needs justifying on its own terms.
 2. **A red test is never "expected under simulation".** If a clock substitution breaks
    `test_scheduler.py`, the substitution is at a business-logic site that changes a
-   decision — which is precisely the sorting rule doc `01` D5 exists to apply, and the
-   test found a misclassification.
-3. **New Compass components get tests in the same suite**, in the same style, so they run
-   in the same CI on the same CPU-only box. The clock protocol, the straggler detector
-   and the cost-backend interface are all testable without a device.
+   decision — which is precisely the sorting rule doc `01` D5 exists to apply, and the test
+   found a misclassification.
+3. **New Compass components get tests in the same suite**, in `tests/compass/`, in ATOM's
+   style, so they run in the CPU tier on the same driverless box. The clock protocol, the
+   straggler detector and the cost-backend interface are all testable without a device.
+   Those tests are the 66 in the decomposition above.
+4. **The CPU tier refuses rather than reporting "not required" (principle 6).** Green at the
+   CPU tier is not green for the task when the diff lands in what the CPU tier cannot see. That
+   blind spot is a file, not a sentence: `scripts/compass/gpu_gate_triggers.txt`, **30 paths**,
+   generated rather than hand-written — the counts in its own header included. The rule:
+   an `atom` module named by an excluded test is a blind spot unless a CPU-tier test that
+   **actually runs** names it too. Imports are read at any indentation on the excluded side
+   (190 of this tree's `import atom.*` lines are indented), but coverage is credited only for
+   a module-level import in a CPU-tier file that collects at least one test — the only
+   imports that provably execute. `regen_gpu_gate_triggers.sh` reproduces it, and a trailing
+   `/` matches a subtree.
+   `gate_cpu.sh` exits **98** when a changed path matches a trigger and
+   `COMPASS_GPU_GATE_DONE=<sha>` is absent or names a different tree — and also when it
+   cannot determine the diff at all (no git, no `COMPASS_CHANGED_FILES`) or cannot name the
+   tree the attestation would apply to. An unanswerable question is refused, not answered
+   "no". The previous form of this rule was a prose list of areas — "EPLB, DP metadata,
+   cudagraph bounds, block tables" — which both missed modules and named two the CPU tier
+   does cover.
 
-**Baseline caveat.** Take the suite's *current* pass/fail state as the baseline before the
-first Compass commit, and record it. A pre-existing failure attributed to Compass costs a
-day; this has already happened once on this codebase with a lint baseline.
+   **The trigger file errs in both directions, so do not cite it as a floor.** Toward
+   *firing*: an indented import in a CPU-tier test that does run is not credited, so its
+   module can be listed although the CPU tier reaches it. Toward *silence*: imports are read
+   as text and not resolved as a graph, so a module reached only transitively is invisible.
+   A path **absent** from the file is not a claim that the CPU tier covers it, and a path
+   **present** is not proof that it does not. `16`'s measured test and lint baselines say
+   which of the two mistakes to prefer — running the GPU tier when in doubt is never the wrong one — and the asymmetry
+   above is that preference written down. Cite it that way wherever it is cited.
+
+`16` states the same rule as the per-task gate, under its measured test and lint
+baselines; the two must be amended together.
+
+**Baseline caveat.** Take each tier's *current* pass/fail state as the baseline before the
+first Compass commit, and record it with the tree, container and versions it was measured on
+— the GPU baseline above is a standing example of what an unrecorded torch/ROCm version
+costs. A pre-existing failure attributed to Compass costs a day; this has already happened
+once on this codebase with a lint baseline.
 
 ---
 

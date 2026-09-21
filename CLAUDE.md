@@ -2,22 +2,19 @@
 
 ATOM is a lightweight LLM inference engine built on AITER GPU kernels for the AMD ROCm platform.
 
-This is a development branch for ATOM Compass. Check its design doc under `atom/compass/design`.
-AI agents are given full autonomy under standing rules at `atom/compass/AI_DEV_RULES.md`.
-
 ## Build & Test & Lint
 
 ```bash
 pip install -e .                          # editable install
-python -m pytest tests/                   # NOT GPU-free: AITER and torch.cuda are mocked, but
-                                          # 29 of the 157 files outside tests/plugin/ still
-                                          # reach the driver — 28 at collection time via
-                                          # rocminfo — and the 30 under tests/plugin/ need
-                                          # sglang and vllm. The driver-free subset, 128 files,
-                                          # is green; it and its exclusion list are in
-                                          # atom/compass/design/16_execution_plan.md, under
-                                          # "The measured test and lint baselines". Measured
-                                          # 2026-09-20 at 83daf636d.
+python -m pytest tests/                   # needs a GPU: AITER and torch.cuda are mocked, but
+                                          # 29 of the 158 files outside tests/plugin/ reach
+                                          # the driver, and 3 of the 30 inside it do too, so
+                                          # at least 32 of 188 -- not 29 of 188
+scripts/compass/gate_cpu.sh               # driver-free AS A BATCH: 129 files, 4022 passed,
+                                          # 0 failed, 27-41 s, green. Two of the 129 reach
+                                          # rocminfo run alone; in the gate they module-skip.
+                                          # Measured 2026-09-20 in xiaobizh_n18_cpu; an
+                                          # earlier 128-file/3956 reading is superseded
 black . && ruff check .                   # format + lint (CI enforced)
 ```
 
