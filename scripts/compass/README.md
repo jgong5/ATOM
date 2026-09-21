@@ -189,6 +189,29 @@ a `ref:` line and names it beside the base, `gate_cpu.sh` names it in the `gpu:`
 source. Before that, the default resolved nowhere and `snapshot.sh` exited **92**
 in every worktree with nothing set.
 
+A second `ref:` shape appears when the bare name **did** resolve — to a local
+branch that has drifted from the remote branch of the same name. Both scripts
+print it, in the same position as the one above:
+
+```
+ref:    feature/atomcompass_new (1b473e5af) is 2 commit(s) behind fork/feature/atomcompass_new (cae322c86)
+        the base is the local branch; COMPASS_INTEGRATION_REF=fork/feature/atomcompass_new uses the remote
+```
+
+It reports and does not redirect — the base stays the ref that resolved, in all
+three directions (`N commit(s) behind`, `N commit(s) ahead of`, `diverged from
+(N ahead, M behind)`), and a local branch level with its remote prints nothing,
+which is what makes the line mean something when it appears. Two things to read
+it with. `diverged from` is also what **unrelated** histories print, because
+`rev-list --left-right --count` returns the whole of each side when there is no
+merge-base; it is the merge-base refusal below, not this line, that reports a
+pair with no common history at all. And the counterpart is found by **same name** under each remote —
+what `compass_resolve_ref` would have picked had the local branch been absent —
+so a branch whose configured upstream is a *differently* named remote branch is
+either silent or compared against a ref it does not track. Ten local branches
+on this box were in that state on 2026-09-21; the announcement is not a
+substitute for keeping the local integration branch fast-forwarded.
+
 The two ways that can still fail are separate refusals, because one is a
 statement about the *ref* and the other about the *history*, and a reader who
 confuses them inspects the wrong thing:

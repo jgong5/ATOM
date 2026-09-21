@@ -128,6 +128,14 @@ elif [ -r "$ROOT/.compass-changed" ]; then
     # The stamp was written from the same rev-parse that selected the archived
     # tree, so it describes this tree and not whichever one the archiver
     # happened to be sitting in.
+    #
+    # The drift line above does not reach here, and this is the path the gate
+    # normally runs on. .compass-changed records the file list and
+    # .compass-commit the sha; neither records the *base*, so a stamp built on
+    # a stale local branch cannot be told from one built on the remote, and the
+    # announcement lives only in the staging log while this is the log that
+    # gets pasted. Closing it means recording the base in a stamp, which
+    # changes the stamp format and is not #102.
     CHANGED=$(cat "$ROOT/.compass-changed")
     SRC=".compass-changed stamp"
 else

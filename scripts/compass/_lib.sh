@@ -104,6 +104,20 @@ compass_resolve_ref() {
 # chosen had the local branch been absent -- so the comparison is against the
 # ref that was passed over, which is the one the caller might have wanted.
 #
+# What that rule costs, measured rather than assumed. A local branch whose
+# configured upstream is a *differently* named remote branch is not compared
+# against what it tracks. Over both ATOM clones on this box, 2026-09-21 21:00
+# UTC, ten local branches are in that state. Two have no same-name remote ref
+# at all, so no counterpart is found and this function prints nothing:
+# compass/runner-2-merged is 5 ahead, 8 behind fork/feature/atomcompass_new,
+# which is the ref it tracks, and compass_ref_drift against it is silent. The
+# other eight do have a same-name remote ref, so a line is printed -- about a
+# ref the branch does not track. Both halves are deliberate: the counterpart
+# has to be the ref compass_resolve_ref would have picked, so announcing
+# against branch.<name>.merge would name a ref the resolver would never use.
+# The silent half is the case a future reader most needs, because it is where
+# the tool goes back to being quiet.
+#
 # Announced, not refused, and the choice is not close. The caller named a ref
 # that exists here and got that ref; nothing was guessed and no fallback was
 # taken, so there is no declined answer to give. Refusing would also change
@@ -118,6 +132,15 @@ compass_resolve_ref() {
 # descends from those unlanded commits the base moves forward with them and the
 # changed set shrinks -- and a changed set that is too small is how the GPU
 # blind-spot question gets answered "no" without being asked.
+#
+# "diverged from (N ahead, M behind)" is also what *unrelated* histories print:
+# rev-list --left-right --count returns the whole of each side when there is no
+# merge-base, so an orphan counterpart reads as diverged. The counts are true
+# either way and this line only reports them; the refusal that has to tell the
+# two apart is snapshot.sh's merge-base one, whose message is "shares no commit
+# with HEAD" and not "diverged". Not split here because the orphan fixture is the only test that
+# reaches this branch of the ladder, so a separate wording would leave the
+# genuine diverged case with no test at all.
 compass_ref_drift() {
     local root=$1 ref=$2 remote up= counts ahead behind how lsha rsha
     git -C "$root" show-ref --verify --quiet "refs/heads/$ref" || return 0
