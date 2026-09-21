@@ -46,14 +46,15 @@ Four properties of the inventories this produces, each found by running it:
   `_all_gather`, `_gather` and `_reduce_scatter_tensor` build the absent ranks
   out of zeros, and every op they use is dispatched and recorded, so the one
   `all_gather` this forward makes (`model_ops/embed_head.py:257`, the
-  vocab-parallel lm_head) shows up as six ops a real TP2 forward never issues --
-  `aten.zeros` -> `aten.slice` -> `aten.copy_` -> `aten.view` -> `aten.movedim`
-  -> `aten.reshape`, at indices 2458-2466 of `real_tp2.json` -- over a
-  `[2,248320]` logits tensor that is half zeros. A cost model fed this would
-  price TP2 as collective-free and pay for a gather that exists only because of
-  the substitution. `simulated_tp.py`'s own docstring says the model output is
-  meaningless under `--fake-eplb`; that caveat travels with any structural
-  reading of this inventory.
+  vocab-parallel lm_head) shows up as six dispatched ops a real TP2 forward
+  never issues -- `aten.zeros` -> `aten.slice` -> `aten.copy_` -> `aten.view`
+  -> `aten.movedim` -> `aten.reshape` -- plus three `prim.device` queries, at
+  indices 2458-2466 of `real_tp2.json`, over a `[2,248320]` logits tensor that
+  is half zeros. A cost model fed this would price TP2 as collective-free and
+  pay for a gather that exists only because of the substitution.
+  `simulated_tp.py`'s own docstring says the model output is meaningless under
+  `--fake-eplb`; that caveat travels with any structural reading of this
+  inventory.
 """
 
 from __future__ import annotations
@@ -489,7 +490,7 @@ class TritonLaunchRecorder:
         self.launches: dict = {}
         self._orig = None
 
-    def __enter__(self) -> Self:  # noqa: F821
+    def __enter__(self) -> TritonLaunchRecorder:
         import inspect
 
         from triton.runtime.jit import JITFunction
