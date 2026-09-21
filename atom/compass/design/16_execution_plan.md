@@ -4,7 +4,7 @@
 interview and reviewed by jgong5 across two review rounds on PR #3. No code has been
 written against it yet; implementation follows the execution plan in `16`.
 
-**Depends on:** all of `01`–`15`. This document turns 108 decisions and 70 open items into
+**Depends on:** all of `01`–`15`. This document turns 109 decisions and 76 open items into
 work that can be allocated.
 
 **Scope.** How the work is organised, allocated and gated; what happens first; and what
@@ -376,12 +376,12 @@ pre-flight script, not this table.
 
 ## Escalation points
 
-Five checks can each reshape the plan. Each ends in a decision that belongs to the project
-owner, not to the agent that ran it.
+Five checks can each reshape the plan; T10 has been run and did not fire. Each ends in a
+decision that belongs to the project owner, not to the agent that ran it.
 
 | Trigger | What the escalation carries |
 |---|---|
-| **T10** fails | adapter cost rises to ~2,000 vendored lines — vendor, fork, or restrict the harness |
+| ~~**T10** fails~~ | ~~adapter cost rises to ~2,000 vendored lines — vendor, fork, or restrict the harness~~ — **did not fire.** P0.3, 2026-09-20: the subclass works and nothing is vendored. The escalation this row prepared for never arose |
 | **T5** fails | tier b has no IR at TP>1 — options and their effect on M2 onward |
 | **T21** fails | calibration does not transfer across width — per-width campaign, a reduced acceptance set, or generalisation reported as within-width only |
 | **T25** fails | the noise floor swamps 10% at high client count — those cells are **ungradeable**, and the acceptance set needs re-scoping |

@@ -578,9 +578,33 @@ class CompassAgenticReplay(AgenticReplayStrategy):
 
    This holds for **both** rebind targets — the runner module, and the leaf
    `aiperf/common/loop_scheduler.py`, which reaches the same place via
-   `common/constants.py:6` → `common/enums/enums.py`. If the bootstrap lets that
-   exception escape, `find_spec` raises inside `discover_plugins()`'s per-entry `try`,
-   the entry lands in `failed_plugins`, and the Compass plugin is not registered at all.
+   `common/constants.py:6` → `common/enums/enums.py`.
+
+   **And an escaping exception does not fail loudly — it deletes the plugin.** This is the
+   part worth stating precisely, because it is the outcome that would ship unnoticed. If
+   the bootstrap lets the `AttributeError` out, `find_spec` raises inside
+   `discover_plugins()`'s per-entry `try`, the entry lands in `failed_plugins`, and the run
+   continues. Measured with a second stand-in distribution carrying **no** `try/except`, at
+   `56a0cf70f`:
+
+   ```
+   WARNING:aiperf.plugin.plugins:Plugin discovery: 1 loaded, 1 failed:
+     • compassprobe: partially initialized module 'aiperf.plugin.plugins'
+       has no attribute 'list_categories' (most likely due to a circular import)
+   BOOT marker         : ran
+   compassprobe pkg    : False
+   entry registered    : False
+   packages registered : ['aiperf']
+   runner.LoopScheduler: LoopScheduler
+   ```
+
+   Read the distinction: the bootstrap *ran*, and then the Compass plugin **was not
+   registered at all** — not the strategy, not the transport, nothing. The rebind did not
+   happen, `runner.LoopScheduler` is untouched, the package is not even left in
+   `sys.modules` for anything downstream to notice, and the process exits 0. The whole
+   surface is one `WARNING` line among the `INFO` lines discovery already emits. So the
+   choice is not between a working inline rebind and a crash; it is between the deferred
+   hook and a run that quietly has no Compass in it.
 
    **So the bootstrap defers the rebind.** It installs a `sys.meta_path` finder —
    stdlib only, no `aiperf` import — that intercepts `aiperf.timing.phase.runner`,
@@ -654,7 +678,7 @@ is itself derived from a real-clock measurement. Decide per site in W1.9: overri
 or declare the idle-cap feature unsupported under virtual time and assert both
 `trace_idle_gap_cap_seconds` and the system idle cap are `None`.
 
-### Two constraints on the rebound class
+### Three constraints on the rebound class
 
 1. **It must be no-arg constructible, and it is not the spike's class.**
    `runner.py:191` calls `LoopScheduler()` with no arguments. The P0.3 spike's
@@ -672,6 +696,18 @@ or declare the idle-cap feature unsupported under virtual time and assert both
    Each live runner owns its scheduler, its `BranchOrchestrator` and its
    `ReplayBarrierCoordinator`. W1.9 must either reconcile two concurrently live
    schedulers against one virtual clock, or assert `seamless=False`.
+3. **The hook has to publish the class; it cannot be defined at bootstrap time.**
+   The tripwire above imports `ClockPacedLoopScheduler` by name, and the same
+   measurement that forces the deferred hook forbids defining it in the adapter
+   package's `__init__.py`: `class ClockPacedLoopScheduler(LoopScheduler)` needs
+   `LoopScheduler` imported, and that import from the bootstrap is exactly what
+   raises. The class can therefore only come into being **inside** the hook, after
+   `aiperf.timing.phase.runner` has executed. W1.9 either has the hook publish it
+   back onto the adapter package, or has the strategy module read
+   `aiperf.timing.phase.runner.LoopScheduler` after the hook has fired. The
+   `isinstance` itself is sound — the rebound class is a real subclass of the real
+   one, and an instance of the real one is not an instance of it — so this is a
+   wiring constraint, not a hole in option C.
 
 This all reaches *arrivals*. It does not address the 32 `asyncio.wait_for` timeout
 sites below, which do not go through `LoopScheduler` either (T74).
@@ -801,7 +837,7 @@ requires genuine fan-out in every root is not constructible without reusing sess
 | D32 | The decode->prefill cache chain is already broken by the harness for real servers too; guard only against false hits. `theoretical_prefix_cache_hit` is the oracle. | 2026-09-18 |
 | D33 | Run the real tokenizer for its effect, charge a modelled duration for its time. Encode is a bounded-width queue; decode is a single-threaded per-step stage. | 2026-09-18 |
 | D34 | The aiperf adapter is an out-of-tree plugin package, ~450-650 lines, with zero edits to agentx-harness. | 2026-09-18 |
-| D34.1 | The pacing seam is the **scheduler**, not the strategy (option C): the adapter rebinds the runner's `LoopScheduler` to a `ClockPacedLoopScheduler` subclass **and** registers a strategy subclass whose only job is to refuse a scheduler that is not clock-paced. The bootstrap is the dotted plugin entry point, which `discover_plugins()` executes before any `PhaseRunner` exists; the rebind itself is deferred by a `sys.meta_path` hook, because the bootstrap runs while `aiperf.plugin.plugins` is still importing and cannot import `aiperf` (T73). The seam covers **nine** pacing calls, not seven, and does not reach the two `loop.call_later` idle-cap timers (T75) or a second live runner under `seamless` (T76). The ~450-650 total is reopened pending those. | 2026-09-20 |
+| D34.1 | The pacing seam is the **scheduler**, not the strategy (option C): the adapter rebinds the runner's `LoopScheduler` to a `ClockPacedLoopScheduler` subclass **and** registers a strategy subclass whose only job is to refuse a scheduler that is not clock-paced. The bootstrap is the dotted plugin entry point, which `discover_plugins()` executes before any `PhaseRunner` exists; the rebind itself is deferred by a `sys.meta_path` hook, because the bootstrap runs while `aiperf.plugin.plugins` is still importing and cannot import `aiperf`; an inline attempt does not raise to the operator, it de-registers the whole plugin and logs one `WARNING` (T73). The seam covers **nine** pacing calls, not seven, and does not reach the two `loop.call_later` idle-cap timers (T75) or a second live runner under `seamless` (T76). The ~450-650 total is reopened pending those. | 2026-09-20 |
 | D35 | Declare what the harness reproduces and what it cannot; cancellation is not available from this corpus. | 2026-09-18 |
 
 ---
@@ -813,7 +849,7 @@ load-bearing assumptions and their check plans, is [`12_open_items.md`](12_open_
 
 | # | Item | Why deferred |
 |---|---|---|
-| T10 | Verify `AgenticReplayStrategy` can be subclassed rather than vendored | ~1 hour to test; changes the adapter estimate by 2,000 lines |
+| ~~T10~~ | ~~Verify `AgenticReplayStrategy` can be subclassed rather than vendored~~ — **done**, P0.3: yes, but a subclass reaches only four of the nine pacing calls, so the adapter rebinds the runner's `LoopScheduler` instead (D34.1) | ~~changes the adapter estimate by 2,000 lines~~ — it does not; nothing is vendored |
 | T11 | Build the per-tokenizer vetted filler-token set | needs a tokenizer in hand |
 | T12 | Chase the 32 `asyncio.wait_for` sites under virtual time | only reachable once the adapter runs |
 | T13 | Decide the simulated KV connector's completion semantic (MoRI-IO's last-status vs Mooncake's all-ranks) | doc 01 D6 open issue, surfaces here |

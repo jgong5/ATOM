@@ -23,9 +23,10 @@ backlog. Nothing here is a decision; every decision lives in its topic's decisio
 
 ## 1. Load-bearing assumptions, and how each gets checked
 
-Five assumptions hold up large parts of the design. **None has been tested.** Each row
-names the check, where it runs, and roughly what it costs — so these are schedulable work
-in the execution plan rather than caveats in a document.
+Five assumptions hold up large parts of the design. **One has been tested** — T10, resolved
+by P0.3 on 2026-09-20; the other four have not. Each row names the check, where it runs,
+and roughly what it costs — so these are schedulable work in the execution plan rather than
+caveats in a document.
 
 | # | Assumption | If false | The check | Cost |
 |---|---|---|---|---|
@@ -35,9 +36,10 @@ in the execution plan rather than caveats in a document.
 | ~~**T10**~~ | ~~`AgenticReplayStrategy` can be subclassed rather than vendored~~ — **resolved 2026-09-20 by P0.3.** Yes, and it is not needed on its own: the strategy is built by the plugin factory, so an out-of-tree subclass displaces it with no upstream edit — but a subclass reaches only four of the nine pacing sites. All nine share one `LoopScheduler` resolved as a module global, so the adapter **rebinds that global** instead (`06` D34). No vendoring. **W1.9's 450–650 total is reopened, not settled** — see `06` D34's component table: one row was costed against the option-A wrapper, and T75 and T76 are new, uncosted scope. Evidence: six executed claims, `agent_scratch/compass_dev/p0_3/spike_t10.py`, zero edits to agentx-harness. | done |
 | **T52** | `TorchDispatchMode` instrumentation does not hang ATOM at width | `--measure` runs and any mode-based instrumentation of a REAL execution are unusable. **Probably does not gate Phase 1a tracing** - the hazard is a `__torch_function__` guard on a real device, not a fake-tensor trace. | **Root-cause the known hang** at `atom/spec_decode/dspark_scheduler.py:264`. `rocgdb` attach, `info dispatches` per rank, identify which rank diverges. | <1 day, quiet node |
 
-**Ordering.** T10 first: no hardware, largest swing per hour. Then **T5** — a
-`FakeTensorMode` trace should be GPU-free and collective-free, so it is both the cheaper
-experiment and the one that tells us whether T52 gates anything on the critical path.
+**Ordering.** T10 came first — no hardware, largest swing per hour — and is done. Then
+**T5** — a `FakeTensorMode` trace should be GPU-free and collective-free, so it is both the
+cheaper experiment and the one that tells us whether T52 gates anything on the critical
+path.
 **T52** follows, at ordinary priority unless T5 actually hits the hang. T21 and T25 need
 the calibration and harness to exist, so they land later — but both are *designed-in
 steps*, not add-ons, and neither should slip to the end.
