@@ -25,7 +25,9 @@ backlog. Nothing here is a decision; every decision lives in its topic's decisio
    last two. Every figure and range here, and on `README.md`'s front page and index row,
    is checked against these rows by `tests/compass/test_open_items_register.py`; a
    superseded extent must not be restated in prose in either file, because that test reads
-   any range starting at T1 as a claim about the register as it stands
+   any range starting at T1 as a claim about the register as it stands, and refuses any
+   other range or list that names two or more ids the register does not yet hold — so an
+   unlanded allocation may be named here only one id at a time
 4. **Cross-cutting issues and pending amendments**
 
 ---
