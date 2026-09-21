@@ -21,6 +21,12 @@ whole of what it decides. It never buys safety, and code that treats a small
 floor as a hazard has the relationship backwards. `LookaheadMatrix.serializing`
 exists to report the zero links, not to reject them.
 
+**An undeclared pair is not a zero, and it is not skippable either.** A caller
+takes a minimum over one participant's whole row, quantified over every
+registered peer, so a peer missing from that row leaves the minimum higher
+rather than lower -- more time granted, not less. `inbound` therefore refuses an
+incomplete row and `require_complete` refuses an incomplete matrix at set-up.
+
 The matrix is addressed by identity throughout. There is no row index and no
 position anywhere in the interface, so an arrangement that later inserts a
 participant between two existing ones renumbers nothing.
@@ -28,6 +34,7 @@ participant between two existing ones renumbers nothing.
 
 import enum
 import math
+from dataclasses import dataclass
 
 from .identity import LpId
 from .registry import LpRegistry
@@ -74,22 +81,20 @@ TRAFFIC_TO_ENGINE_FLOOR_SECONDS = {
 }
 
 
+@dataclass(frozen=True, slots=True, repr=False)
 class InterLpLink:
-    """One declared link: its ends, what kind of path it is, and its floor."""
+    """One declared link: its ends, what kind of path it is, and its floor.
 
-    __slots__ = ("floor_seconds", "link_class", "source", "target")
+    Frozen, because the accessors below hand the object itself to a caller. A
+    writable `floor_seconds` would let a holder rewrite a declared floor and
+    reach around every check `declare` performs -- the refusals on a negative,
+    NaN or infinite floor, and on a pair declared twice.
+    """
 
-    def __init__(
-        self,
-        source: LpId,
-        target: LpId,
-        link_class: LinkClass,
-        floor_seconds: float,
-    ) -> None:
-        self.source = source
-        self.target = target
-        self.link_class = link_class
-        self.floor_seconds = floor_seconds
+    source: LpId
+    target: LpId
+    link_class: LinkClass
+    floor_seconds: float
 
     def __repr__(self) -> str:
         return (
@@ -162,13 +167,56 @@ class LookaheadMatrix:
         return link.floor_seconds
 
     def inbound(self, target: LpId) -> tuple[InterLpLink, ...]:
-        """Every declared link into `target`, in the registry's total order."""
+        """Every link into `target`, one per registered peer, in the total order.
+
+        This is the row a caller takes a minimum over, and the minimum is
+        quantified over every registered peer rather than over the links that
+        happen to exist. So a peer with no declared floor is refused here, not
+        skipped: a skipped term drops out of a minimum entirely, which reads as
+        an unbounded lookahead and hands out *more* time than the peer allows,
+        not less. Zero would at least have been the conservative mistake.
+        """
         self._registry.require(target)
+        missing = self._missing_into(target)
+        if missing:
+            raise KeyError(
+                f"{len(missing)} registered peer(s) have no declared floor into "
+                f"{target}: "
+                + ", ".join(f"{source} -> {target}" for source in missing)
+                + ". Leaving one out of this row would raise the minimum taken "
+                "over it rather than lower it. Declare a floor for each, at zero "
+                "where the two are meant to run in lockstep."
+            )
         return tuple(
             self._links[(source, target)]
             for source in self._registry.ids()
-            if (source, target) in self._links
+            if source != target
         )
+
+    def _missing_into(self, target: LpId) -> tuple[LpId, ...]:
+        return tuple(
+            source
+            for source in self._registry.ids()
+            if source != target and (source, target) not in self._links
+        )
+
+    def require_complete(self) -> None:
+        """Refuse unless every ordered pair of registered participants has a floor.
+
+        Called once when set-up finishes, so an incomplete matrix is a loud
+        failure before anything runs rather than a number computed from too few
+        terms one step later. It names every missing pair at once; `inbound`
+        names only the ones that would have spoiled the row it was asked for.
+        """
+        missing = self.undeclared()
+        if missing:
+            raise KeyError(
+                f"{len(missing)} ordered pair(s) have no declared lookahead "
+                "floor: "
+                + ", ".join(f"{source} -> {target}" for source, target in missing)
+                + ". Declare each one, at zero where the two are meant to run in "
+                "lockstep."
+            )
 
     def links(self) -> tuple[InterLpLink, ...]:
         """Every declared link, ordered by source then target."""
@@ -197,7 +245,12 @@ class LookaheadMatrix:
         return tuple(link for link in self.links() if link.floor_seconds == 0.0)
 
     def tightest(self) -> InterLpLink | None:
-        """The link with the smallest floor: the one that bounds how far anything may run ahead."""
+        """The declared link with the smallest floor: what bounds how far anything runs ahead.
+
+        Reporting, not protocol: it walks the links that exist, so on an
+        incomplete matrix it answers about the part that was declared. Check
+        `require_complete` before quoting it as the bound on a run.
+        """
         links = self.links()
         if not links:
             return None

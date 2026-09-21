@@ -55,8 +55,14 @@ class LpRegistry:
         """Return `lp_id`, or refuse with the names that are registered.
 
         Used wherever an unregistered identity would otherwise be accepted and
-        turn into a missing row later, far from the call that introduced it.
+        turn into a missing row later, far from the call that introduced it. It
+        is the entry point the matrix funnels every identity through, so it
+        type-checks for the same reason `register` does -- and because a bare
+        `str` that reached the check below would be reported as not registered
+        alongside the identically-spelled name that is.
         """
+        if not isinstance(lp_id, LpId):
+            raise TypeError(f"require expects an LpId, got {type(lp_id).__name__}")
         if lp_id not in self._members:
             known = ", ".join(str(known_id) for known_id in self.ids()) or "<none>"
             raise KeyError(f"{lp_id} is not registered; registered: {known}")

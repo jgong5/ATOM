@@ -8,16 +8,20 @@ a `set` of names would produce the same order twice and a same-process test
 would pass against precisely the defect it exists to catch. The interpreters
 below are given different `PYTHONHASHSEED` values, so the seed is the variable.
 
-Each child also builds a plain `set` of the same names and prints the order it
-iterates in. That is the control, and it is the reason the result reads as a
-demonstration rather than an assertion: the same names, in the same children,
-come out in a different order per seed through a `set` and in one order through
-the registry. The `set` here is deliberate and belongs to the control; the
-package under test builds none, which its own source check covers.
+Each child also builds a plain `set` of the same names, in the same order in
+every child, and prints the order it iterates in. That is the control, and it is
+the reason the result reads as a demonstration rather than an assertion: the
+same names, in the same children, come out in a different order per seed through
+a `set` and in one order through the registry. The seed is the only thing that
+differs between those `set` lines -- they are built from the unrotated list on
+purpose, because insertion order moves set order a little by itself and a
+control varying two things at once attributes nothing. The `set` here is
+deliberate and belongs to the control; the package under test builds none, which
+its own source check covers.
 
-Arrival order is varied too -- each child registers the names rotated by a
-different amount -- so an implementation that simply preserved insertion order
-would fail this as well.
+Arrival order is varied separately -- each child registers the names rotated by
+a different amount -- so an implementation that simply preserved insertion order
+fails this too.
 """
 
 import os
@@ -52,6 +56,7 @@ SEEDS = ("1", "2", "3")
 
 CHILD = """
 import os, sys
+import atom
 from atom.compass.clock import LpId, LpRegistry
 
 names = sys.argv[2].split(",")
@@ -64,9 +69,14 @@ for name in arrival:
 
 print("seed", os.environ.get("PYTHONHASHSEED", "<unset>"))
 print("hash", hash(names[0]))
+print("module", atom.__file__)
 print("arrival", " ".join(arrival))
 print("registry", " ".join(str(lp_id) for lp_id in registry.ids()))
-print("set", " ".join(set(arrival)))
+# Built from `names`, not from `arrival`: the seed is then the only thing that
+# differs between children, so a difference in this line is attributable to it
+# and to nothing else. Insertion order does move set order a little on its own,
+# which is exactly the confound worth not having in the control.
+print("set", " ".join(set(names)))
 """
 
 
@@ -106,6 +116,18 @@ def test_the_children_really_did_get_different_hash_seeds(runs):
         "hash randomisation is disabled in this interpreter or the seed did "
         "not reach the child, and nothing below is evidence of anything."
     )
+
+
+def test_every_child_ran_against_the_tree_under_test(runs):
+    # A demonstration whose value is that its output can be read should say
+    # which tree produced it. PYTHONPATH wins over site-packages, but an
+    # installed `atom` on the path is the kind of thing that turns a green run
+    # into evidence about someone else's code.
+    for run in runs:
+        assert run["module"].startswith(str(REPO)), (
+            f"seed {run['seed']} resolved atom at {run['module']}, "
+            f"which is not under {REPO}"
+        )
 
 
 def test_the_children_really_did_register_in_different_orders(runs):
