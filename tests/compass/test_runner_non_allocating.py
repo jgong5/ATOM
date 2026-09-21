@@ -22,7 +22,9 @@ The two facts worth naming, because both were surprises:
 
 import ast
 import dataclasses
+import importlib
 import pathlib
+import sys
 from types import SimpleNamespace
 
 import pytest
@@ -224,6 +226,74 @@ def test_the_worker_process_instantiates_whatever_that_field_names():
     )
 
 
+def _import_time_imports(source):
+    """Every module *source* imports when it is imported, and none it imports later.
+
+    Neither of the two obvious predicates states that. Top-level statements
+    alone miss an import nested in a module-scope `try:`/`except ImportError:`,
+    in a module-scope `if`, or in a class body, all of which run at import;
+    walking every node counts one inside a function body, which does not. So
+    this walks and prunes at `def`/`lambda`, and the six forms below are
+    checked against what the interpreter actually runs, rather than against
+    the rule of thumb stated here.
+
+    Both halves are load-bearing. `overrides.forward` takes its single engine
+    import at call time, on a worker that has imported the engine already, so
+    counting it would forbid the reply this package exists to build. And the
+    `try:`/`except ImportError:` form is the one case where this assertion is
+    the only guard there is: collecting the package without a driver would not
+    fail on it, because the `except` swallows the failure.
+    """
+    imported = set()
+    stack = list(ast.parse(source).body)
+    while stack:
+        node = stack.pop()
+        if isinstance(node, ast.Import):
+            imported |= {a.name for a in node.names}
+        elif isinstance(node, ast.ImportFrom):
+            imported.add("." * node.level + (node.module or ""))
+        elif not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+            stack.extend(ast.iter_child_nodes(node))
+    return imported
+
+
+# One sample per form an import can take, each importing a probe module of its
+# own. Which of them run at import is not asserted here: the test writes the
+# sample out, imports it, and reads the answer off `sys.modules`.
+IMPORT_FORMS = {
+    "module_scope": "import {probe}\n",
+    "module_scope_try": (
+        "try:\n    import {probe}\nexcept ImportError:\n    {probe} = None\n"
+    ),
+    "module_scope_if": "if True:\n    import {probe}\n",
+    "class_body": "class C:\n    import {probe}\n",
+    "method_body": "class C:\n    def m(self):\n        import {probe}\n",
+    "function_body": "def f():\n    import {probe}\n",
+}
+
+
+@pytest.mark.parametrize("form", sorted(IMPORT_FORMS))
+def test_the_guard_reads_the_imports_that_run_at_import(form, tmp_path, monkeypatch):
+    """The predicate is checked against the interpreter, both ways.
+
+    The probe module is named after the form and imported nowhere else, so it
+    reaches `sys.modules` only if importing the sample ran that import -- which
+    is the property the guard is trying to state, rather than a rule of thumb
+    about where imports are allowed to sit.
+    """
+    probe, sample = f"probe_{form}", f"sample_{form}"
+    (tmp_path / f"{probe}.py").write_text("")
+    source = IMPORT_FORMS[form].format(probe=probe)
+    (tmp_path / f"{sample}.py").write_text(source)
+    monkeypatch.syspath_prepend(str(tmp_path))
+    monkeypatch.delitem(sys.modules, probe, raising=False)
+    monkeypatch.delitem(sys.modules, sample, raising=False)
+    importlib.import_module(sample)
+    assert (probe in _import_time_imports(source)) == (probe in sys.modules)
+    sys.modules.pop(sample, None)
+    sys.modules.pop(probe, None)
+
+
 @pytest.mark.parametrize(
     "path",
     sorted(PACKAGE.rglob("*.py")),
@@ -231,13 +301,7 @@ def test_the_worker_process_instantiates_whatever_that_field_names():
 )
 def test_only_the_binding_module_reaches_the_engine(path):
     """Everything else stays runnable where the engine cannot be imported."""
-    tree = ast.parse(path.read_text())
-    imported = set()
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Import):
-            imported |= {a.name for a in node.names}
-        elif isinstance(node, ast.ImportFrom):
-            imported.add("." * node.level + (node.module or ""))
+    imported = _import_time_imports(path.read_text())
     engine = {m for m in imported if m.split(".")[0] == "atom"} - {
         m for m in imported if m.startswith("atom.compass.runner")
     }
