@@ -1,0 +1,509 @@
+# SPDX-License-Identifier: MIT
+"""The machine spec: what it may carry, and what it refuses to answer.
+
+The document below is a complete, valid spec and every test starts from a copy
+of it, so a test that constructs a violation constructs exactly one and the
+refusal it gets can only be about that.
+
+Two of the checks read ATOM's own sources rather than the spec package. The
+separation rule says the spec carries nothing ATOM could configure, and that is
+a claim about ATOM's argument surface, not about a list somebody wrote once. So
+the surface is parsed out of the engine's arguments dataclass and compared both
+ways: every knob the refusal message names has to be a real one, and no field of
+the spec's machine sections may collide with it. Parsed rather than imported --
+reading the source needs no driver, and this tier has none.
+"""
+
+import ast
+import copy
+import pathlib
+import warnings
+
+import pytest
+
+from atom.compass import spec as spec_package
+from atom.compass.spec import (
+    DECLARED,
+    DEPLOYMENT_OWNED,
+    SCHEMA,
+    Backend,
+    FingerprintMismatch,
+    Kind,
+    MachineSpec,
+    Rule,
+    SpecRefusal,
+    StackMismatch,
+)
+
+REPO = pathlib.Path(__file__).resolve().parents[2]
+PACKAGE = REPO / "atom" / "compass" / "spec"
+ENGINE_ARGS = REPO / "atom" / "model_engine" / "arg_utils.py"
+
+#: The stack the constants below were measured against.
+STACK = {"rocm": "7.2.4", "aiter": "f4e7c7509", "rccl": "2.22.3"}
+
+TOKENIZER = {
+    "id": "qwen3-151k-bpe",
+    "backend": "fast",
+    "vocab_size": 151936,
+    "fingerprint": "sha256:" + "a" * 64,
+    "applies_to": ["Qwen3ForCausalLM", "Qwen3MoeForCausalLM"],
+    "encode_fixed_s": 3.0e-4,
+    "encode_tokens_per_s": 2.0e6,
+    "decode_fixed_s": 1.5e-4,
+    "decode_tokens_per_s": 3.0e6,
+    "derate": 0.85,
+}
+
+DOCUMENT = {
+    "schema_version": 1,
+    "name": "mi355x-8gpu-2node",
+    "provenance": {
+        "authored_by": "a person",
+        "date": "2026-09-18",
+        "method": "probed",
+    },
+    "host": {
+        "cpu": {"cores_physical": 96, "cores_logical": 192},
+        "tokenizers": [TOKENIZER],
+        "ipc": {"zmq_roundtrip_s": 5.0e-5, "shm_broadcast_s": 2.0e-5},
+        "admission_fixed_s": 9.0e-3,
+    },
+    "device": {
+        "name": "MI355X",
+        "arch": "gfx950",
+        "count_per_node": 8,
+        "memory": {
+            "capacity_bytes": 288.0e9,
+            "bandwidth_bytes_per_s": 8.0e12,
+            "derate": 0.85,
+        },
+        "compute": {"bf16_flops": 2.5e15, "fp8_flops": 5.0e15, "derate": 0.70},
+        "runtime_constants": {
+            "driver_and_collective_reserve_bytes": {
+                1: 970.0e6,
+                2: 7.2e9,
+                4: 7.6e9,
+                8: 11.2e9,
+            },
+            "allocator_retained_after_load_bytes": {
+                1: 1.1e6,
+                2: 2.17e9,
+                4: 2.17e9,
+                8: 2.17e9,
+            },
+            "persistent_forward_buffer_bytes": 124.0e6,
+            "cudagraph_pool": {
+                "w1_base_bytes": 95.5e6,
+                "w1_bytes_per_captured_token": 0.318e6,
+                "w_gt1_flat_bytes": 109.0e6,
+            },
+        },
+        "software_pinned_to": dict(STACK),
+    },
+    "interconnect": {
+        "intra_node": {
+            "topology": "fully_connected",
+            "link_bandwidth_bytes_per_s": 1.0e12,
+            "link_latency_s": 2.0e-6,
+            "derate": 0.80,
+        },
+        "inter_node": {
+            "link_bandwidth_bytes_per_s": 5.0e10,
+            "link_latency_s": 5.0e-6,
+            "derate": 0.80,
+        },
+        "router_relay_s": 1.5e-3,
+    },
+}
+
+
+def document(**edits):
+    """A fresh copy of the reference spec, with one block replaced per edit."""
+    fresh = copy.deepcopy(DOCUMENT)
+    for section, value in edits.items():
+        fresh[section] = value
+    return fresh
+
+
+def read(**edits):
+    return MachineSpec.from_mapping(document(**edits))
+
+
+def drop(mapping, *path):
+    """The document with one dotted field removed, for a missing-term test."""
+    node = mapping
+    for key in path[:-1]:
+        node = node[key]
+    del node[path[-1]]
+    return mapping
+
+
+# --- the document goes in and comes back out ---------------------------------
+
+
+def test_a_spec_round_trips():
+    assert read().echo() == DOCUMENT
+
+
+def test_the_echo_carries_every_field_that_was_read():
+    # Rule: a number whose spec cannot be recovered from the run artifact is
+    # unattributable, so the echo is built from the field table and is total by
+    # construction rather than being whatever the reader kept.
+    machine = read()
+    echoed = machine.echo()
+    for path in machine.values:
+        node = echoed
+        for key in path.split("."):
+            assert key in node, path
+            node = node[key]
+
+
+def test_the_digest_moves_when_any_number_does():
+    before = read().digest()
+    shifted = document()
+    shifted["device"]["memory"]["capacity_bytes"] = 287.0e9
+    assert MachineSpec.from_mapping(shifted).digest() != before
+    assert read().digest() == before
+
+
+# --- the separation rule -----------------------------------------------------
+
+
+def _engine_argument_names():
+    """The engine's configurable surface, read out of its arguments dataclass."""
+    tree = ast.parse(ENGINE_ARGS.read_text())
+    for node in ast.walk(tree):
+        if isinstance(node, ast.ClassDef) and node.name == "EngineArgs":
+            return frozenset(
+                statement.target.id
+                for statement in node.body
+                if isinstance(statement, ast.AnnAssign)
+                and isinstance(statement.target, ast.Name)
+            )
+    return frozenset()
+
+
+ENGINE_SURFACE = _engine_argument_names()
+
+
+def test_the_engine_argument_surface_was_found():
+    assert len(ENGINE_SURFACE) > 20
+
+
+@pytest.mark.parametrize("knob", sorted(DEPLOYMENT_OWNED))
+def test_every_knob_the_refusal_names_is_one_the_engine_really_has(knob):
+    assert knob in ENGINE_SURFACE, (
+        f"{knob} is named as ATOM's, and is not on ATOM's argument surface; "
+        "the message would send a reader somewhere that does not exist"
+    )
+
+
+@pytest.mark.parametrize(
+    "field", [f for f in SCHEMA if f.path.split(".")[0] != "provenance"]
+)
+def test_no_field_describing_the_machine_is_one_the_engine_configures(field):
+    # Only the sections that describe the machine. `provenance` describes how
+    # the document was authored, which is not something a deployment can set,
+    # and the rule is about the machine.
+    assert field.path.rsplit(".", 1)[-1] not in ENGINE_SURFACE, field.path
+
+
+@pytest.mark.parametrize("knob", sorted(DEPLOYMENT_OWNED))
+def test_a_deployment_knob_is_refused_and_told_where_it_lives(knob):
+    edited = document()
+    edited["device"][knob] = 4
+    with pytest.raises(SpecRefusal) as refusal:
+        MachineSpec.from_mapping(edited)
+    assert refusal.value.rule is Rule.SEPARATION
+    assert knob in refusal.value.what
+    assert DEPLOYMENT_OWNED[knob] in refusal.value.remedy
+
+
+def test_the_closed_schema_refuses_a_key_no_rule_names():
+    # The mechanism is the closed schema, not the list: a knob nobody has
+    # thought of is refused the same way, just without the forwarding address.
+    edited = document()
+    edited["device"]["some_future_engine_knob"] = 1
+    with pytest.raises(SpecRefusal) as refusal:
+        MachineSpec.from_mapping(edited)
+    assert refusal.value.rule is Rule.SEPARATION
+    assert "some_future_engine_knob" in refusal.value.what
+
+
+# --- no defaults for the runtime constants -----------------------------------
+
+
+def test_a_missing_runtime_constant_refuses_and_names_itself():
+    edited = drop(
+        document(), "device", "runtime_constants", "persistent_forward_buffer_bytes"
+    )
+    with pytest.raises(SpecRefusal) as refusal:
+        MachineSpec.from_mapping(edited)
+    assert refusal.value.rule is Rule.NO_DEFAULTS
+    assert "persistent_forward_buffer_bytes" in refusal.value.what
+
+
+def test_an_unmeasured_width_refuses_and_names_the_measured_ones():
+    with pytest.raises(SpecRefusal) as refusal:
+        read().runtime_constant("driver_and_collective_reserve_bytes", tp_width=3)
+    assert refusal.value.rule is Rule.NO_DEFAULTS
+    assert "width 3" in refusal.value.what
+    assert "[1, 2, 4, 8]" in refusal.value.what
+
+
+def test_a_width_keyed_constant_will_not_answer_without_a_width():
+    with pytest.raises(SpecRefusal) as refusal:
+        read().runtime_constant("driver_and_collective_reserve_bytes")
+    assert refusal.value.rule is Rule.NO_DEFAULTS
+
+
+def test_a_measured_width_answers():
+    machine = read()
+    assert machine.runtime_constant("driver_and_collective_reserve_bytes", 2) == 7.2e9
+    assert machine.runtime_constant("persistent_forward_buffer_bytes") == 124.0e6
+    assert machine.runtime_constant("cudagraph_pool.w_gt1_flat_bytes") == 109.0e6
+
+
+# --- a derate wherever a spec peak appears -----------------------------------
+
+
+def test_no_derate_is_declared_by_hand():
+    # Each one is derived from a field marked as a spec peak, so a peak number
+    # added later cannot arrive without one.
+    assert not [f for f in DECLARED if f.kind is Kind.DERATE]
+    derated = {f.block for f in SCHEMA if f.kind is Kind.DERATE}
+    assert derated == {f.block for f in SCHEMA if f.peak}
+    assert len(derated) == 4
+
+
+@pytest.mark.parametrize("block", ["memory", "compute"])
+def test_a_spec_peak_without_its_derate_is_refused(block):
+    edited = drop(document(), "device", block, "derate")
+    with pytest.raises(SpecRefusal) as refusal:
+        MachineSpec.from_mapping(edited)
+    assert refusal.value.rule is Rule.DERATE
+    assert f"device.{block}.derate" in refusal.value.what
+
+
+@pytest.mark.parametrize("value", [1.2, 0.0, -0.5])
+def test_a_derate_may_shrink_a_peak_and_never_grow_it(value):
+    edited = document()
+    edited["device"]["compute"]["derate"] = value
+    with pytest.raises(SpecRefusal) as refusal:
+        MachineSpec.from_mapping(edited)
+    assert refusal.value.rule is Rule.DERATE
+
+
+def test_a_tokenizer_entry_owes_a_derate_too():
+    entry = dict(TOKENIZER)
+    del entry["derate"]
+    edited = document()
+    edited["host"]["tokenizers"] = [entry]
+    with pytest.raises(SpecRefusal) as refusal:
+        MachineSpec.from_mapping(edited)
+    assert refusal.value.rule is Rule.DERATE
+
+
+# --- the stack pin is checked ------------------------------------------------
+
+
+def test_a_matching_stack_is_silent():
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        assert read().check_stack(dict(STACK)) == ()
+
+
+def test_a_stack_mismatch_warns_and_names_both_versions():
+    running = dict(STACK, rocm="7.3.0")
+    with pytest.warns(StackMismatch) as caught:
+        differences = read().check_stack(running)
+    assert differences == (("rocm", "7.2.4", "7.3.0"),)
+    message = str(caught[0].message)
+    assert "7.2.4" in message and "7.3.0" in message
+
+
+def test_a_stack_component_nobody_reported_is_a_mismatch_not_a_pass():
+    with pytest.warns(StackMismatch):
+        differences = read().check_stack({"rocm": "7.2.4", "aiter": "f4e7c7509"})
+    assert differences == (("rccl", "2.22.3", None),)
+
+
+def test_a_missing_stack_pin_is_refused():
+    edited = drop(document(), "device", "software_pinned_to", "rccl")
+    with pytest.raises(SpecRefusal):
+        MachineSpec.from_mapping(edited)
+
+
+# --- the tokenizer is keyed by the tokenizer ---------------------------------
+
+
+def test_two_models_sharing_one_tokenizer_resolve_to_one_entry():
+    # The named result. Two architectures, one measured entry: four rates and a
+    # derate stored once. Keyed by model the same spec would hold one copy per
+    # architecture -- two here, more in a real family -- with nothing in the
+    # document ever comparing them, so they would drift silently.
+    machine = read()
+    qwen = machine.tokenizer_for("Qwen3ForCausalLM", Backend.FAST)
+    qwen_moe = machine.tokenizer_for("Qwen3MoeForCausalLM", Backend.FAST)
+    assert qwen is qwen_moe
+    assert len(machine.tokenizers.entries) == 1
+    copies_if_keyed_by_model = sum(
+        len(entry.key.applies_to) for entry in machine.tokenizers.entries
+    )
+    assert copies_if_keyed_by_model == 2
+    assert qwen.encode_tokens_per_s == 2.0e6
+
+
+def test_an_unmeasured_architecture_is_refused_not_defaulted():
+    with pytest.raises(SpecRefusal) as refusal:
+        read().tokenizer_for("LlamaForCausalLM", Backend.FAST)
+    assert refusal.value.rule is Rule.TOKENIZER_IDENTITY
+    assert "LlamaForCausalLM" in refusal.value.what
+    assert "qwen3-151k-bpe" in refusal.value.what
+
+
+def test_the_other_backend_is_a_different_measurement():
+    # The two implementations run an order of magnitude apart on the same file,
+    # so an entry measured on one says nothing about the other.
+    with pytest.raises(SpecRefusal) as refusal:
+        read().tokenizer_for("Qwen3ForCausalLM", Backend.SLOW)
+    assert refusal.value.rule is Rule.TOKENIZER_IDENTITY
+    assert "slow" in refusal.value.what
+
+
+def test_a_fingerprint_mismatch_warns_and_names_both():
+    loaded = "sha256:" + "b" * 64
+    with pytest.warns(FingerprintMismatch) as caught:
+        entry = read().tokenizer_for("Qwen3ForCausalLM", Backend.FAST, loaded)
+    assert entry.key.id == "qwen3-151k-bpe"
+    message = str(caught[0].message)
+    assert TOKENIZER["fingerprint"] in message and loaded in message
+
+
+def test_the_measured_fingerprint_is_silent():
+    with warnings.catch_warnings():
+        warnings.simplefilter("error")
+        read().tokenizer_for("Qwen3ForCausalLM", Backend.FAST, TOKENIZER["fingerprint"])
+
+
+def test_two_entries_claiming_one_architecture_are_refused():
+    other = dict(TOKENIZER, id="qwen3-151k-bpe-again")
+    edited = document()
+    edited["host"]["tokenizers"] = [TOKENIZER, other]
+    with pytest.raises(SpecRefusal) as refusal:
+        MachineSpec.from_mapping(edited)
+    assert refusal.value.rule is Rule.TOKENIZER_IDENTITY
+    assert "qwen3-151k-bpe-again" in refusal.value.what
+
+
+def test_an_unknown_backend_names_the_two_that_exist():
+    edited = document()
+    edited["host"]["tokenizers"] = [dict(TOKENIZER, backend="rust")]
+    with pytest.raises(SpecRefusal) as refusal:
+        MachineSpec.from_mapping(edited)
+    assert refusal.value.rule is Rule.TOKENIZER_IDENTITY
+    assert "fast" in refusal.value.remedy and "slow" in refusal.value.remedy
+
+
+def test_a_tokenizer_entry_is_closed_like_the_rest_of_the_schema():
+    edited = document()
+    edited["host"]["tokenizers"] = [dict(TOKENIZER, max_model_len=4096)]
+    with pytest.raises(SpecRefusal) as refusal:
+        MachineSpec.from_mapping(edited)
+    assert refusal.value.rule is Rule.SEPARATION
+
+
+# --- shapes ------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "path, value",
+    [
+        (("host", "cpu", "cores_physical"), True),
+        (("host", "cpu", "cores_physical"), 0),
+        (("host", "admission_fixed_s"), -1.0),
+        (("device", "name"), ""),
+        (("device", "arch"), 950),
+        (("schema_version",), 2),
+    ],
+)
+def test_a_value_the_schema_cannot_hold_is_refused(path, value):
+    edited = document()
+    node = edited
+    for key in path[:-1]:
+        node = node[key]
+    node[path[-1]] = value
+    with pytest.raises(SpecRefusal):
+        MachineSpec.from_mapping(edited)
+
+
+def test_a_width_table_is_keyed_by_a_width():
+    edited = document()
+    edited["device"]["runtime_constants"]["driver_and_collective_reserve_bytes"] = {
+        "one": 1.0
+    }
+    with pytest.raises(SpecRefusal):
+        MachineSpec.from_mapping(edited)
+
+
+def test_a_block_written_as_a_scalar_is_refused():
+    edited = document()
+    edited["device"]["memory"] = 288.0e9
+    with pytest.raises(SpecRefusal) as refusal:
+        MachineSpec.from_mapping(edited)
+    assert refusal.value.rule is Rule.SHAPE
+
+
+def test_a_spec_is_a_mapping():
+    with pytest.raises(SpecRefusal):
+        MachineSpec.from_mapping([("schema_version", 1)])
+
+
+def test_asking_for_a_field_that_is_not_one_is_refused():
+    with pytest.raises(SpecRefusal):
+        read().value("device.tensor_parallel_size")
+
+
+# --- what the package reaches ------------------------------------------------
+
+
+def _spec_modules():
+    # rglob, so a module added under the package is covered the day it lands.
+    return sorted(PACKAGE.rglob("*.py"))
+
+
+def test_the_package_was_found():
+    assert _spec_modules(), f"no modules under {PACKAGE}"
+
+
+@pytest.mark.parametrize("module", _spec_modules(), ids=lambda p: p.name)
+def test_the_package_imports_only_the_standard_library_it_names(module):
+    # An allowlist of what the package actually imports. The claim kept is that
+    # a spec can be authored and checked on any machine: no device runtime, no
+    # engine, and no document parser either -- turning a file into a mapping is
+    # the caller's, which keeps a dependency the engine does not declare out of
+    # the path that reads a spec.
+    allowed = {
+        "collections",
+        "dataclasses",
+        "enum",
+        "hashlib",
+        "json",
+        "typing",
+        "warnings",
+    }
+    tree = ast.parse(module.read_text())
+    roots = []
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Import):
+            roots += [alias.name.split(".")[0] for alias in node.names]
+        elif isinstance(node, ast.ImportFrom) and not node.level:
+            roots.append((node.module or "").split(".")[0])
+    strays = sorted({root for root in roots if root not in allowed})
+    assert not strays, f"{module.name} imports {strays}; allowed: {sorted(allowed)}"
+
+
+def test_everything_the_package_exports_is_reachable_by_name():
+    for name in spec_package.__all__:
+        assert getattr(spec_package, name, None) is not None, name
