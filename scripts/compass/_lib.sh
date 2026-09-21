@@ -57,6 +57,33 @@ compass_tree_root() {
     printf '%s' "$src"
 }
 
+# The integration ref, resolved against this tree: the bare name first, then the
+# same name qualified by each configured remote. A linked worktree and a fresh
+# clone both carry fork/feature/atomcompass_new and no local branch of that
+# name, so the bare default resolves nowhere and the comparison the caller
+# wanted never happens. Prints the ref that resolved -- the caller compares that
+# against what it asked for to report the fallback. When nothing resolves it
+# prints git's own message for the bare form instead, so a refusal can quote git
+# rather than paraphrase it into a claim about the history. That message cannot
+# travel in a global: the caller reads this through a command substitution,
+# which is a subshell, and an assignment made in there never reaches the caller.
+compass_resolve_ref() {
+    local root=$1 ref=$2 remote err
+    err=$(git -C "$root" rev-parse --verify "$ref^{commit}" 2>&1 >/dev/null) &&
+        { printf '%s' "$ref"; return 0; }
+    # `git remote` prints alphabetically, which is an order and not a
+    # preference: with two remotes both carrying the ref at different commits
+    # the first by name wins, and that picks a base and hence a diff, not just a
+    # name. The chosen remote is printed on the ref: and base: lines, which is
+    # what makes the choice checkable rather than silent.
+    for remote in $(git -C "$root" remote); do
+        git -C "$root" rev-parse --verify --quiet "$remote/$ref^{commit}" >/dev/null 2>&1 &&
+            { printf '%s' "$remote/$ref"; return 0; }
+    done
+    printf '%s' "$err"
+    return 1
+}
+
 # PYTHONPATH is set to the tree and nothing else. Inherited entries are not
 # merged: an inherited entry ahead of ours is exactly how a take2 script silently
 # ran another branch's engine, and an entry behind ours can still satisfy an

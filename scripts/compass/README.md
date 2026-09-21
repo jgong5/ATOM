@@ -27,9 +27,20 @@ on, because until 2026-09-20 it was not — see "Which tree a script acts on" be
 Not one baseline. The rows below were measured at different commits by different
 tasks, so each row names its own commit and the tier it was measured in.
 
+**Read them as history, not as a current expectation — the CPU total above all.**
+It moves whenever `tests/compass/` grows, which is most tasks, so the recorded
+figure is stale by construction between one task and the next, and it has twice
+been taken as a control by a task that then read the intervening tasks' tests as a
+surplus of its own. **A control is measured, not read**: run `gate_cpu.sh` on the
+integration head your branch forked from, in the same container, and state both
+figures beside their commits. The CPU row below does not name the commit it ran
+on, which is the omission that let it pass for current; the same gate on
+`68ef4f329` measured **4380 passed, 149 skipped, 3 xfailed, rc=0** — node 18,
+container `xiaobizh_n18_cpu`, 2026-09-22, 36.2 s of pytest inside 43.0 s of wall.
+
 | Tier | Result | Measured |
 |---|---|---|
-| CPU gate (130 files) | **4030 passed, 0 failed**, 149 skipped, 3 xfailed, rc=0, **identical in every run on 2026-09-21, the clock 25.4-31.7 s of pytest inside 31.1-37.8 s of wall (`time` real) — a measured spread, not a bound** — decomposing as **3956 ATOM + 74 `tests/compass`** | node 18, container `xiaobizh_n18_cpu`, 2026-09-21, against a `git archive` snapshot with `PYTHONPATH` asserted and pytest's own rc captured before any pipe |
+| CPU gate (130 files) | **4030 passed, 0 failed**, 149 skipped, 3 xfailed, rc=0, **identical in every run on 2026-09-21, the clock 25.4-31.7 s of pytest inside 31.1-37.8 s of wall (`time` real) — a measured spread, not a bound** — decomposing as **3956 ATOM + 74 `tests/compass`** | node 18, container `xiaobizh_n18_cpu`, 2026-09-21, **commit not recorded**, against a `git archive` snapshot with `PYTHONPATH` asserted and pytest's own rc captured before any pipe |
 | GPU superset (`--ignore=tests/plugin`) | **4779 passed, 5 failed**, 0 errors, 105 skipped, 3 xfailed, **72.6 s**; two runs, byte-identical failing sets | `fe9ea043c`, node 18, container `xiaobizh_n18`, `HIP_VISIBLE_DEVICES=1`, 2026-09-20, torch **2.10.0+rocm7.2.4.git3d3aa833**, `torch.version.hip` **7.2.53211**, ROCm release **7.2.4**, AITER **v0.1.21.dev0-49-gf4e7c7509** (`git describe`) |
 | `ruff check .` | 1003 errors, 640 fixable — the gate is *no new* error, not zero | `83daf636d` |
 | `black --check .` | clean, 660 files | `83daf636d` |
@@ -151,8 +162,9 @@ wrong one, and the asymmetry above is that preference written down.
 
 `gate_cpu.sh` **enforces** that preference rather than restating it. It takes the
 changed-file list from `COMPASS_CHANGED_FILES`, else from `git diff` against the
-merge-base with `feature/atomcompass_new` (`COMPASS_INTEGRATION_REF`); with neither
-it exits **98** rather than answering "no". When a changed file matches a trigger,
+merge-base with `feature/atomcompass_new` (`COMPASS_INTEGRATION_REF`, resolved as
+below); with neither it exits **98**, naming the missing stamp, rather than
+answering "no". When a changed file matches a trigger,
 the run ends 98 unless `COMPASS_GPU_GATE_DONE` discharges it:
 
 | `COMPASS_GPU_GATE_DONE` | Outcome |
@@ -165,6 +177,36 @@ the run ends 98 unless `COMPASS_GPU_GATE_DONE` discharges it:
 The trigger match is *reported* before pytest and *enforced* after it, so one run
 yields both answers instead of trading one for the other. Green at the CPU tier is
 not green at the test gate when the diff is in the blind spot.
+
+## Which integration ref resolves, and which step refused
+
+`COMPASS_INTEGRATION_REF` defaults to `feature/atomcompass_new`, which is the
+branch's name on the remote and **not** a local branch in a linked worktree or a
+fresh clone — there only `fork/feature/atomcompass_new` exists. `_lib.sh`'s
+`compass_resolve_ref` therefore tries the bare name first, then the same name
+under each configured remote, and reports which one it used: `snapshot.sh` prints
+a `ref:` line and names it beside the base, `gate_cpu.sh` names it in the `gpu:`
+source. Before that, the default resolved nowhere and `snapshot.sh` exited **92**
+in every worktree with nothing set.
+
+The two ways that can still fail are separate refusals, because one is a
+statement about the *ref* and the other about the *history*, and a reader who
+confuses them inspects the wrong thing:
+
+| Step | Message | Means |
+|---|---|---|
+| ref resolution | `REFUSED: ref resolution failed -- <ref> names nothing here…` plus git's own line, verbatim | nothing was compared; set `COMPASS_INTEGRATION_REF` |
+| merge-base | `REFUSED: merge-base failed -- <ref> resolved, but shares no commit with HEAD.` | the ref is fine; the histories are unrelated |
+
+Both exit **92**: the exit code is what other scripts key on and did not change,
+and the two are told apart by the message. `tests/compass/test_snapshot_ref.py`
+covers each path separately so they cannot merge back into one.
+
+A bare `git archive` tree — one extracted without `snapshot.sh`'s stamps — is the
+adjacent case, and `gate_cpu.sh` still exits **98** there. The stamps are not
+written retroactively: `.compass-changed` is a diff against a base the stamped
+tree no longer has any way to compute, so writing one would be a guess in the
+shape of a measurement. The refusal names the omission instead.
 
 ## What the GPU gate expects, and on a tree that carries no Compass tests
 
