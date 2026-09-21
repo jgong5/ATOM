@@ -149,6 +149,34 @@ resolved against.
    cannot be a mixture of generations. One shared tree held two files from two different
    generations, producing a `TypeError` that named the callee and read as a code bug.
 
+### D97.1 Stacked PRs: the force-push scope and the squash-restack cost
+
+A task that depends on one that has not landed need not wait for it: it may stack its
+PR on the dependency's branch instead, so both are reviewed in parallel. This is a
+**recommendation, not a requirement** — independent tasks do not stack — and procedure
+(the `gh stack` extension, its install command, its ephemerality) is in
+`AI_DEV_RULES.md`.
+
+**Stacking forces a choice about force-push that this repository had never written
+down.** `gh stack rebase`/`gh stack sync` rebase and force-push every branch above the
+one that changed — that is inherent to a stack, not an optional mode — and it collides
+with practice already in force but never recorded here: developer agents have been
+told "never force-push, never rebase a pushed branch" out of band. The owner scoped
+that instruction on 2026-09-21:
+
+- **Forbidden** on a branch **under review** — a force-push there destroys the
+  review's anchor to what was actually reviewed.
+- **Permitted** to **restack after its parent has landed** — mechanical and expected,
+  since the branch's own history is not what changed; its base was cut out from
+  under it.
+
+**The restack is also forced by D97 itself, independent of stacking.** Squash is the
+*only* merge this repository permits, and squashing the bottom PR of a stack rewrites
+its commits into one new commit on the integration branch. Every branch stacked above
+it now shares no history with that base and cannot land as-is. Landing a stack
+therefore costs **one restack of the remainder per landing** — every time the bottom
+of a stack merges, whatever is left above it restacks once before its own turn.
+
 ---
 
 ## D98. What gates a task
@@ -420,6 +448,7 @@ Stated so it is not mistaken for an omission.
 | D95 | Tasks are a **pool**, not a track assignment; 5 dev + 5 reviewer agents cap concurrency at 5 in flight. Conflicts are tolerated and are a **decomposition signal**. Developer and reviewer are separate agents with opposed objectives. **The loop halts to the owner if the same finding survives two cycles, or after three cycles, applying `need human` to the PR.** **Halt and discuss on any surprise.** | 2026-09-21 |
 | D96 | The task record is the **GitHub issue and its PR** — brief in the issue body, dev record in the PR body, review record in the review comment, handoff in the closing comment — with each brief linking to its predecessors' issues. A brief that cannot name its file set is not claimable. | 2026-09-21 |
 | D97 | `feature/atomcompass_new` is the integration branch; one issue, one worktree and one PR per task, **squash-merged** (the repo permits squash merges only). Four setup rules from recorded failures: no shared mutable source root, containers mount the worktree parent, `PYTHONPATH` verified before trusting a result, `git archive` never `rsync`. On landing, the main agent fast-forwards the main worktree and restores file ownership. | 2026-09-21 |
+| D97.1 | Stacking a dependent task's PR on an unlanded parent is **recommended, not required** (independent tasks do not stack). Force-push is **forbidden on a branch under review** and **permitted only to restack after its parent lands**. Squash-only merging (D97) rewrites the bottom PR's commits on landing, so everything stacked above it must restack — **one restack of the remainder per stack landing**. | 2026-09-21 |
 | D98 | Four gates per task: ATOM's suite green **unmodified**, new CPU-only tests, one named result stated in advance, and review by a separate agent, looping to APPROVE per D95. Baselines recorded first. | 2026-09-21 |
 | D99 | Effort in **lines of code**. Wall-clock only for machine time with a measured basis. A 2x overrun is a halt-and-discuss event. | 2026-09-20 |
 | D100 | Twelve modules under `atom/compass/`; tasks are cut so each touches one plus its tests. ATOM edits outside that tree are enumerated per task. | 2026-09-20 |
