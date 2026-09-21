@@ -152,8 +152,20 @@ class TestEveryDeploymentRuns:
         """One event in flight cannot see a horizon record losing the second."""
         assert report.events_in_flight >= 2
 
-    def test_the_protocol_cost_is_reported_per_participant(self, report):
-        assert report.grants_per_participant > 0
+    def test_the_protocol_cost_stays_near_one_grant_per_step_per_participant(
+        self, report
+    ):
+        """Where a lost driver discipline shows up before it shows up anywhere else.
+
+        The design prices a run at one grant per participant per event. Measured
+        here it is between 1.7 and 3.6, and the extra is the grant an idle
+        participant has to take up before it is allowed to ask again. A driver
+        that stopped serving the furthest-behind participant last would not be
+        slightly outside this band; on the pipelined deployments it would be
+        outside it by three orders of magnitude.
+        """
+        per_step = report.grants / (report.steps * report.participants)
+        assert 1.0 < per_step < 8.0
 
 
 class TestEveryInventoryCategoryIsDriven:
