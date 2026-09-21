@@ -7,11 +7,11 @@ ATOM is a lightweight LLM inference engine built on AITER GPU kernels for the AM
 ```bash
 pip install -e .                          # editable install
 python -m pytest tests/                   # needs a GPU: AITER and torch.cuda are mocked, but
-                                          # 29 of the 158 files outside tests/plugin/ reach
+                                          # 29 of the 159 files outside tests/plugin/ reach
                                           # the driver, and 3 of the 30 inside it do too, so
-                                          # at least 32 of 188 -- not 29 of 188
-scripts/compass/gate_cpu.sh               # driver-free AS A BATCH: 129 files, 4022 passed,
-                                          # 0 failed, 27-41 s, green. Two of the 129 reach
+                                          # at least 32 of 189 -- not 29 of 189
+scripts/compass/gate_cpu.sh               # driver-free AS A BATCH: 130 files, 4030 passed,
+                                          # 0 failed, 31.2 s, green. Two of the 130 reach
                                           # rocminfo run alone; in the gate they module-skip.
                                           # Measured 2026-09-20 in xiaobizh_n18_cpu; an
                                           # earlier 128-file/3956 reading is superseded

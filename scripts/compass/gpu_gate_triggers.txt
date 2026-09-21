@@ -37,12 +37,12 @@
 #
 # A trailing / matches the whole subtree.
 #
-# Measured at ec60583b31903970aa8bf5bbdb61a8a417ca3964 over this tree:
-#   tests/        188 files  = 30 in tests/plugin/ + 29 excluded + 129 CPU tier
-#   CPU tier      107 files collect >=1 test, 22 collect none
+# Measured at 2f2e9ea2912a923e31efbb05297fe5d8c8bf765f over this tree:
+#   tests/        189 files  = 30 in tests/plugin/ + 29 excluded + 130 CPU tier
+#   CPU tier      108 files collect >=1 test, 22 collect none
 #   imports       190 indented `import atom.*` lines in non-plugin test files
-#   collected   4153 tests by --collect-only. A run of the same set reports
-#              the same 4153 outcomes. Its "skipped" total is LARGER than any
+#   collected   4161 tests by --collect-only. A run of the same set reports
+#              the same 4161 outcomes. Its "skipped" total is LARGER than any
 #              skip count here, because a module-level skip in one of the 22
 #              files that collect nothing is counted as skipped without ever
 #              becoming a collected test. This file states the set; gate_cpu.sh

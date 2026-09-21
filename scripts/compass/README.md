@@ -11,7 +11,7 @@ on, because until 2026-09-20 it was not — see "Which tree a script acts on" be
 
 | Script | Where | What |
 |---|---|---|
-| `gate_cpu.sh` | CPU container | The CPU test tier, run per task. 129 of 188 test files, no driver, ~30 s. **Must be green.** Also exits 98 when the diff is in the blind spot below and the GPU tier has not run on *this* tree. Refuses a caller-supplied `-r`. |
+| `gate_cpu.sh` | CPU container | The CPU test tier, run per task. 130 of 189 test files, no driver, ~31 s. **Must be green.** Also exits 98 when the diff is in the blind spot below and the GPU tier has not run on *this* tree. Refuses a caller-supplied `-r`. |
 | `gate_gpu.sh` | GPU container | The GPU test tier, run per wave — and per task for a blind-spot diff. Superset (`--ignore=tests/plugin`), judged as a **delta** against **4779 passed / 5 failed** at `fe9ea043c`, with torch, HIP, ROCm and AITER recorded and compared. The five failing node-ids are on file in `gpu_gate_known_failures.txt` and compared **by name**. Calls `preflight.sh` itself, before and after. |
 | `preflight.sh` | GPU container | `rocminfo` reachability, compute use and VRAM use (checks 1–3), plus a D-state census (check 0), and a list of bookable devices. Run **before and after**. The census states its own scope: in a container it can only see this PID namespace, and says so rather than reporting a clear node. Also worth running for a CPU-only task: on a wedged node ATOM's *import* hangs, because aiter shells out to `rocminfo`. |
 | `regen_cpu_gate_exclude.sh` | CPU container | Regenerate the **GENERATED** section of the exclusion list by iterating `--collect-only` to a fixed point (three passes at `83daf636d`: 37 errors, 1, clean). Preserves the MANUAL section verbatim. |
@@ -20,7 +20,7 @@ on, because until 2026-09-20 it was not — see "Which tree a script acts on" be
 | `cpu_gate_exclude.txt` | — | **29** excluded test files in two marked sections: **28 GENERATED** (`# BEGIN GENERATED`, driver-dependent at *collection* time; never hand-edit — `regen_cpu_gate_exclude.sh` rewrites it wholesale) + **1 MANUAL** (`# BEGIN MANUAL`, collects cleanly then fails on a driver call, so the regenerator cannot see it). The MANUAL section **is** hand-edited; every entry must carry its observed failure above it. |
 | `gpu_gate_triggers.txt` | — | **30** source paths that no *running* CPU-tier test names. Generated, not hand-written; matched by `gate_cpu.sh`. A trailing `/` matches a subtree. |
 | `gpu_gate_known_failures.txt` | — | The five known-failing GPU node-ids at `fe9ea043c`, verbatim. Its line count and `BASE_FAILED` are two statements of one fact; `gate_gpu.sh` refuses to run if they disagree. |
-| `_lib.sh` | — | Tree resolution, `PYTHONPATH`, the `import atom` assertion, commit stamp. |
+| `_lib.sh` | — | Tree resolution, `PYTHONPATH`, the `import atom` assertion, commit stamp, and the `tests/compass` pass count the GPU gate derives its allowed surplus from. |
 
 ## Baselines — two tiers, two commits, two provenances
 
@@ -29,7 +29,7 @@ tasks, so each row names its own commit and the tier it was measured in.
 
 | Tier | Result | Measured |
 |---|---|---|
-| CPU gate (129 files) | **4022 passed, 0 failed**, 149 skipped, 3 xfailed, rc=0, **27.4-40.9 s wall (`time` real) over three runs** — decomposing as **3956 ATOM + 66 `tests/compass`** | node 18, container `xiaobizh_n18_cpu`, 2026-09-20, against a `git archive` snapshot with `PYTHONPATH` asserted and pytest's own rc captured before any pipe |
+| CPU gate (130 files) | **4030 passed, 0 failed**, 149 skipped, 3 xfailed, rc=0, **25.4-25.5 s of pytest inside 31.1-31.2 s of wall (`time` real), over three runs** — decomposing as **3956 ATOM + 74 `tests/compass`** | node 18, container `xiaobizh_n18_cpu`, 2026-09-21, against a `git archive` snapshot with `PYTHONPATH` asserted and pytest's own rc captured before any pipe |
 | GPU superset (`--ignore=tests/plugin`) | **4779 passed, 5 failed**, 0 errors, 105 skipped, 3 xfailed, **72.6 s**; two runs, byte-identical failing sets | `fe9ea043c`, node 18, container `xiaobizh_n18`, `HIP_VISIBLE_DEVICES=1`, 2026-09-20, torch **2.10.0+rocm7.2.4.git3d3aa833**, `torch.version.hip` **7.2.53211**, ROCm release **7.2.4**, AITER **v0.1.21.dev0-49-gf4e7c7509** (`git describe`) |
 | `ruff check .` | 1003 errors, 640 fixable — the gate is *no new* error, not zero | `83daf636d` |
 | `black --check .` | clean, 660 files | `83daf636d` |
@@ -41,8 +41,9 @@ one case each, so regenerating that file changes the pass count by exactly the
 change in the number of entries. The readings in circulation are the same gate
 under different exclusion lists and a different `tests/compass`, not discrepancies:
 **3925** at 32 exclusions; **3956** is the ATOM-only half; **3988** with
-`tests/compass` at 32; **4005** with it at 49; **4022** with it at 66, which is 49
-plus the 17 extra trigger paths the corrected derivation below produces. The
+`tests/compass` at 32; **4005** with it at 49; **4022** with it at 66 — 49 plus the 17
+extra trigger paths the corrected derivation below produces — and **4030** with it at 74,
+the 8 cases `test_gate_gpu_surplus.py` adds. The
 exclusion list went 32 → 29 because `test_dp_metadata.py`, `test_dp_sync_layout.py`
 and `test_forward_mode.py` were re-measured **CPU-green**.
 
@@ -164,6 +165,37 @@ the run ends 98 unless `COMPASS_GPU_GATE_DONE` discharges it:
 The trigger match is *reported* before pytest and *enforced* after it, so one run
 yields both answers instead of trading one for the other. Green at the CPU tier is
 not green at the test gate when the diff is in the blind spot.
+
+## What the GPU gate expects, and on a tree that carries no Compass tests
+
+`gate_gpu.sh` judges an **equality**, not a floor: `BASE_PASSED` plus whatever
+`tests/compass/` contributes on the tree in front of it, minus what it contributed
+at the baseline (`BASE_COMPASS_TESTS=49`). A floor would be loosened by exactly the
+tests each task adds, so a task adding 30 tests while silently losing a 20-test file
+would still clear it.
+
+| this tree's `tests/compass/` | expected passes |
+|---|---|
+| absent | `4779 + 0 - 49` = **4730** — the figure a tree without this phase's tests measures |
+| present, N passing | `4779 + N - 49` |
+| present, unreadable | **93** — a surplus with no source is not a measurement |
+
+The absent case is the common one: every tree except a Compass task's own has no
+such directory, the integration branch included. Deriving the surplus with
+`pytest tests/compass --collect-only` made that case exit 4 (`file or directory not
+found`), left the count empty and refused with `GATE_GPU_RC=93` before running a
+test — reproduced on `4da2f3a2d` and on PR #9's branch, so it was a property of the
+script and not of any change. An absent directory and an unreadable one are told
+apart by asking the filesystem, not by parsing pytest's error text.
+
+Both sides of the arithmetic are **pass** counts. The tree side used to be a
+*collected* count, which is the same number only while `tests/compass/` holds no
+skip and no xfail; the first Compass test to skip on a GPU host would have made a
+green tree read `unaccounted -1` and blamed tests outside `tests/compass/`. Counting
+passes costs one pytest run over a CPU-only directory and removes the condition.
+`compass_compass_pass_count` in `_lib.sh` holds the derivation, and
+`tests/compass/test_gate_gpu_surplus.py` covers each of its branches with a stubbed
+`python`, so the absent-directory path is tested without a driver.
 
 ## Why the gates refuse a caller-supplied `-r`
 

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: MIT
 #
-# Per-task test gate: the 129 of 188 test files that run without a GPU driver,
+# Per-task test gate: the 130 of 189 test files that run without a GPU driver,
 # ~30 s. Green is the bar: this subset really is green.
 #
 # Excluded, and why neither is a judgement call:
@@ -166,8 +166,8 @@ RC=$?
 printf '\npytest: rc=%s\n' "$RC"
 
 if [ "$RC" -ne 0 ]; then
-    printf 'CPU tier of the test gate FAILED. Baseline is 4022 passed, 0 failed at 29\n' >&2
-    printf 'exclusions (3956 ATOM + 66 tests/compass) -- see scripts/compass/README.md\n' >&2
+    printf 'CPU tier of the test gate FAILED. Baseline is 4030 passed, 0 failed at 29\n' >&2
+    printf 'exclusions (3956 ATOM + 74 tests/compass) -- see scripts/compass/README.md\n' >&2
     printf 'for how that number moves.\n' >&2
     finish "$RC"
 fi
