@@ -22,6 +22,69 @@ on, because until 2026-09-20 it was not — see "Which tree a script acts on" be
 | `gpu_gate_known_failures.txt` | — | The five known-failing GPU node-ids at `fe9ea043c`, verbatim. Its line count and `BASE_FAILED` are two statements of one fact; `gate_gpu.sh` refuses to run if they disagree. |
 | `_lib.sh` | — | Tree resolution, `PYTHONPATH`, the `import atom` assertion, commit stamp, and the `tests/compass` pass count the GPU gate derives its allowed surplus from. |
 
+## Gate a tree with its own `scripts/compass/` — four `test_snapshot_ref.py` failures mean you overlaid
+
+Stage a tree with the copy of these scripts **that tree itself carries**, and run
+that copy. Do not copy `scripts/compass/` from another branch over it. An older
+staging recipe did exactly that — overlaying this directory from
+`compass/p0.1-env-and-gates` (`105ca4197`, whose `scripts/compass` is tree
+`ddb69e7aa`) so that every tree was gated from one known copy. It predates these
+scripts being on the integration branch, and on any tree at or after `186d12829`
+it now costs four failures on **every** side of a comparison:
+
+| tree | its own `scripts/compass` | with the `ddb69e7aa` overlay |
+|---|---|---|
+| `b1dca15da` — integration head, tree `00386e887` | **4594 passed, 0 failed**, rc=0 | **4590 passed, 4 failed**, `GATE_CPU_RC=1` |
+| `83ef2a094` — an earlier head, tree `9091c1dc8` | **4570 passed, 0 failed**, rc=0 | **4566 passed, 4 failed**, `GATE_CPU_RC=1` |
+| `cf6429387` — a branch, tree `95cb8358d` | **4501 passed, 0 failed**, rc=0 | **4497 passed, 4 failed**, `GATE_CPU_RC=1` |
+
+149 skipped, 3 xfailed on all six runs, and the total is conserved on every tree
+— the four are moved out of passed, not added. Measured node 18, container
+`xiaobizh_n18_cpu`, 2026-09-21T20:06-20:09Z and 21:00-21:03Z, staged by
+`git archive` + `docker cp`, run sequentially and unpiped, `import atom` asserted
+under each root from `/` first.
+
+The four are in `tests/compass/test_snapshot_ref.py`, and they are **correct
+failures** — each asserts on *that tree's own* `snapshot.sh` messages, which the
+tree has and the overlaid older script does not:
+
+| Failing test | What the overlaid `snapshot.sh` does instead |
+|---|---|
+| `test_unresolvable_ref_refuses_at_ref_resolution` | prints the one merged `REFUSED: no merge-base with <ref>` for both refusals |
+| `test_unrelated_history_refuses_at_merge_base` | same message, so neither test can tell which step refused |
+| `test_remote_qualified_ref_resolves_and_names_itself` | has no remote-prefix fallback, so it exits 92 where the tree's own script resolves `fork/feature/atomcompass_new` |
+| `test_snapshot_carries_both_stamps` | same: it exits 92 before writing a tarball to inspect |
+
+The fifth test in that file passes either way: a local branch of that name
+resolves in both scripts and neither announces a fallback it did not take. **Do
+not exclude any of them.** A red gate here is the tests working, and it is the
+only signal that says the instrument was swapped.
+
+The overlay costs a second thing on the same path: the older `gate_cpu.sh` it
+brings with it prints `Baseline is 4030 passed, 0 failed` when the tier fails, a
+figure removed at `186d12829` because a script line cannot name its own commit —
+**564** behind the 4594 `b1dca15da` reads with its own scripts, **540** behind
+`83ef2a094`'s 4570 and **471** behind `cf6429387`'s 4501. It is stale by a
+different amount on every tree, because it was never a statement about the tree it
+prints on. So the reader of the false red is handed a stale control as well.
+
+**If two trees being compared carry different copies, say so and name both tree
+objects** — `git rev-parse <ref>:scripts/compass`. The gate is then a different
+instrument on each side, and the delta is not a measurement of the diff. That
+question is live, not settled. Any branch that edits this directory carries its own
+tree by construction (`cf6429387` carries `95cb8358d`), and so does the integration
+head the moment such a branch lands: it carried `9091c1dc8` at 2026-09-21T20:05Z and
+`00386e887` at 20:58Z, when #99 landed. A tree census is therefore a reading, not a
+property. Read 2026-09-21T20:58:34Z over `refs/remotes/fork/compass/**` after
+`git fetch fork --prune`: **45** `compass/*` branches, **35** carrying this
+directory, **six** distinct tree objects between them, **26** of those branches
+still on the pre-`186d12829` `ddb69e7aa` the overlay recipe copies from. Read the
+first three as a floor on the spread rather than as a current count — three reads
+over the preceding hour gave 41 / 31 / four, 43 / 33 / six and 45 / 35 / seven, and
+they move in both directions as branches are pushed and rebased. The `26` is the
+exposed population and is the figure that justifies this section. "Every tree is
+identical now" is what made the overlay look free.
+
 ## Baselines — two tiers, two commits, two provenances
 
 Not one baseline. The rows below were measured at different commits by different
