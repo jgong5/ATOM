@@ -122,6 +122,7 @@ elif git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1 &&
     # announced, so a caller who set nothing sees a prefix it never asked for.
     [ "$REF" = "$INTEGRATION" ] ||
         printf 'ref:    %s is not a ref here; resolved it as %s\n' "$INTEGRATION" "$REF"
+    compass_ref_drift "$ROOT" "$REF"
 elif [ -r "$ROOT/.compass-changed" ]; then
     # A snapshot built by snapshot.sh, which is how this gate normally runs.
     # The stamp was written from the same rev-parse that selected the archived
