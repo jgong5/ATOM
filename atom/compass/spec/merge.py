@@ -1,0 +1,295 @@
+# SPDX-License-Identifier: MIT
+"""Fragments combined into one spec, and the check that is the point of it.
+
+A probe measures part of a machine and emits a **fragment**: a partial document
+plus the stanza that says which machine it was taken on, by whom, when and how.
+Combining fragments is arithmetic over dotted paths and would need very little
+said about it. The conflict check is why this module exists.
+
+**One spec describes one host, and nothing about a fragment's shape says which
+host it came from.** Two tokenizers measured on two different CPUs contradict
+nothing: they have different identities, they occupy different entries, no field
+of one overlaps a field of the other, and a merge that only compared values
+would combine them into a single document that describes no machine at all. The
+error is then invisible for as long as the spec lives, and every number derived
+from it is wrong by however far the two hosts differ. So a fragment states the
+machine it was measured on, the merge refuses two fragments that name different
+machines, and the refusal prints both stanzas rather than the bare names -- what
+a reader needs is which two measurements are being combined, not that a string
+comparison failed.
+
+The second arm catches the same hazard from the other side. Two fragments that
+name one machine and disagree about one of its fields cannot both be true of it,
+whatever their stanzas say, so a differing value is refused with both readings
+and both stanzas. Between them the arms cover the mislabelled fragment and the
+unlabelled contradiction, which are the two ways a multi-host spec is authored.
+
+Three kinds of field are combined rather than compared, because contributing
+part of one is what a probe does:
+
+* a **runtime constant keyed by width** is combined per width, since the widths
+  come from different probe runs -- one rank's engine start fills width 1, and
+  the multi-rank run fills the rest. Two fragments measuring the same width
+  differently are still a conflict.
+* the **tokenizer table** is combined per entry, keyed by the identity and the
+  implementation the rates were measured on. Two entries sharing an identity
+  must agree about the file they measured; one name over two files is the drift
+  that keying by tokenizer exists to prevent.
+* the **provenance** block is rebuilt rather than merged. It names every
+  fragment that went in, carries the latest date, and states one method only
+  when the fragments agree on one -- a spec built from a datasheet and an engine
+  run is honestly `mixed` and not either of them.
+
+Constants that were transferred from another spec are the exception to combining
+values. Such a fragment carries the stack the *source* spec was pinned to, which
+is provenance about the constants and not a claim about this machine's stack, so
+it is kept aside for checking rather than contributed. Merging it as though it
+described this host would install the source's ROCm version as this one's and
+silence the check that exists to catch exactly that.
+
+The result is a document, not a spec. A merge produces what the fragments
+happened to cover, and whether that is a complete and consistent machine is a
+separate question with its own answer.
+"""
+
+from collections.abc import Mapping, Sequence
+from dataclasses import dataclass
+from typing import Any
+
+from .fields import BY_PATH, SCHEMA, Kind, check
+from .machine import _walk
+from .rules import Rule, SpecRefusal
+
+#: The block holding the stack the device constants were measured against.
+PINNED_BLOCK = "device.software_pinned_to"
+#: The tokenizer table, combined per entry rather than compared as a value.
+TOKENIZERS = "host.tokenizers"
+#: The method prefix that marks constants carried over from another spec.
+TRANSFERRED = "transferred-from:"
+#: What every fragment states, whatever else it measured.
+STATED = (
+    "schema_version",
+    "name",
+    "provenance.authored_by",
+    "provenance.date",
+    "provenance.method",
+)
+
+
+@dataclass(frozen=True, slots=True)
+class Fragment:
+    """What one probe measured, and the stanza saying where it was measured."""
+
+    source: str
+    values: Mapping[str, Any]
+
+    @classmethod
+    def from_mapping(cls, document: object, source: str) -> "Fragment":
+        """Read a partial document, checking every field it does carry."""
+        if not isinstance(document, Mapping):
+            raise SpecRefusal(
+                Rule.SHAPE,
+                f"fragment {source!r} is {type(document).__name__}, not a mapping",
+                "a fragment is a partial spec document, shaped like the spec it "
+                "contributes to",
+            )
+        found: dict[str, Any] = {}
+        _walk(document, "", found)
+        values = {
+            field.path: check(field, found[field.path], field.path)
+            for field in SCHEMA
+            if field.path in found
+        }
+        for path in STATED:
+            if path not in values:
+                raise SpecRefusal(
+                    Rule.ONE_MACHINE,
+                    f"fragment {source!r} does not state `{path}`",
+                    "a fragment names the machine it was measured on and how, "
+                    "because nothing in the numbers themselves says which host "
+                    "produced them",
+                )
+        return cls(source, values)
+
+    @property
+    def machine(self) -> str:
+        """The machine this fragment claims to have been measured on."""
+        return self.values["name"]
+
+    @property
+    def method(self) -> str:
+        """How it was obtained: a datasheet, a probe, or another spec."""
+        return self.values["provenance.method"]
+
+    @property
+    def transferred_from(self) -> str | None:
+        """The spec these constants were carried over from, if they were."""
+        if self.method.startswith(TRANSFERRED):
+            return self.method[len(TRANSFERRED) :]
+        return None
+
+    def stanza(self) -> str:
+        """Who measured what, where and when, as a refusal names it."""
+        return (
+            f"{self.source!r} (machine {self.machine!r}, {self.method}, "
+            f"by {self.values['provenance.authored_by']} "
+            f"on {self.values['provenance.date']})"
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class Merge:
+    """The document the fragments make, and which fragment supplied each field."""
+
+    document: Mapping[str, Any]
+    sources: Mapping[str, tuple[str, ...]]
+    fragments: tuple[Fragment, ...]
+
+    @property
+    def transfers(self) -> tuple[Fragment, ...]:
+        """The fragments whose constants came from another spec."""
+        return tuple(f for f in self.fragments if f.transferred_from is not None)
+
+
+def _one_machine(fragments: tuple[Fragment, ...]) -> None:
+    claimed: dict[str, Fragment] = {}
+    for fragment in fragments:
+        claimed.setdefault(fragment.machine, fragment)
+    if len(claimed) > 1:
+        first, second = list(claimed.values())[:2]
+        raise SpecRefusal(
+            Rule.ONE_MACHINE,
+            f"{first.stanza()} and {second.stanza()} were measured on "
+            f"different machines, {first.machine!r} and {second.machine!r}",
+            "one spec describes one host; numbers from two hosts in one "
+            "document describe neither, and nothing in their shape would ever "
+            "say so. Author a spec per machine",
+        )
+
+
+def _conflict(
+    where: str, held: Any, first: Fragment, value: Any, second: Fragment
+) -> None:
+    stack = where.startswith(PINNED_BLOCK)
+    raise SpecRefusal(
+        Rule.PINNED_STACK if stack else Rule.ONE_MACHINE,
+        f"`{where}` is {held!r} in {first.stanza()} and {value!r} in "
+        f"{second.stanza()}",
+        (
+            "these constants track the compute stack as much as the die, so "
+            "fragments pinned to different stacks are not measurements of one "
+            "machine"
+            if stack
+            else "two fragments that name one machine cannot disagree about it; "
+            "settle which reading belongs to this host before combining them"
+        ),
+    )
+
+
+def entry_label(identity: str, backend: object) -> str:
+    """How one tokenizer entry is named, by the two fields that select it."""
+    return f"{TOKENIZERS}[{identity} {backend}]"
+
+
+def _identity(raw: object, fragment: Fragment, index: int) -> tuple:
+    if not isinstance(raw, Mapping) or not isinstance(raw.get("id"), str):
+        raise SpecRefusal(
+            Rule.TOKENIZER_IDENTITY,
+            f"`{TOKENIZERS}[{index}]` in {fragment.source!r} states no id",
+            "a tokenizer entry carries an author-chosen id; it is what two "
+            "fragments conflict on, so an entry without one combines with "
+            "nothing",
+        )
+    return raw["id"], raw.get("backend")
+
+
+def _provenance(fragments: tuple[Fragment, ...]) -> dict:
+    methods = dict.fromkeys(fragment.method for fragment in fragments)
+    authors = dict.fromkeys(
+        fragment.values["provenance.authored_by"] for fragment in fragments
+    )
+    notes = [
+        fragment.values["provenance.notes"]
+        for fragment in fragments
+        if "provenance.notes" in fragment.values
+    ]
+    block = {
+        "authored_by": ", ".join(authors),
+        "date": max(fragment.values["provenance.date"] for fragment in fragments),
+        "method": next(iter(methods)) if len(methods) == 1 else "mixed",
+        "fragments": [fragment.source for fragment in fragments],
+    }
+    if notes:
+        block["notes"] = " | ".join(notes)
+    return block
+
+
+def merge(fragments: Sequence[Fragment]) -> Merge:
+    """Combine fragments into one document, refusing what one host cannot be."""
+    fragments = tuple(fragments)
+    if not fragments:
+        raise SpecRefusal(
+            Rule.ONE_MACHINE,
+            "there are no fragments to merge",
+            "a spec is built from what was measured; with nothing measured "
+            "there is nothing to build it from",
+        )
+    _one_machine(fragments)
+    values: dict[str, Any] = {}
+    supplied: dict[str, Fragment] = {}
+    sources: dict[str, tuple[str, ...]] = {}
+
+    def claim(where: str, holder: dict, key: Any, value: Any, by: Fragment) -> None:
+        if key in holder:
+            if holder[key] != value:
+                _conflict(where, holder[key], supplied[where], value, by)
+            sources[where] += (by.source,)
+            return
+        holder[key] = value
+        supplied[where] = by
+        sources[where] = (by.source,)
+
+    for fragment in fragments:
+        for path, value in fragment.values.items():
+            if path == "name" or path == TOKENIZERS or path.startswith("provenance."):
+                continue
+            if path.startswith(PINNED_BLOCK) and fragment.transferred_from:
+                continue
+            if BY_PATH[path].kind is Kind.WIDTH_TABLE:
+                table = values.setdefault(path, {})
+                for width, measured in value.items():
+                    claim(f"{path}[{width}]", table, width, measured, fragment)
+                continue
+            claim(path, values, path, value, fragment)
+
+    entries: dict[tuple, Any] = {}
+    files: dict[str, tuple[Any, Fragment]] = {}
+    for fragment in fragments:
+        for index, raw in enumerate(fragment.values.get(TOKENIZERS, ())):
+            identity = _identity(raw, fragment, index)
+            named = files.setdefault(identity[0], (raw.get("fingerprint"), fragment))
+            if named[0] != raw.get("fingerprint"):
+                raise SpecRefusal(
+                    Rule.TOKENIZER_IDENTITY,
+                    f"{identity[0]!r} is {named[0]!r} in {named[1].stanza()} and "
+                    f"{raw.get('fingerprint')!r} in {fragment.stanza()}",
+                    "one identity names one measured file; two fingerprints "
+                    "under one id are two revisions nothing will ever compare",
+                )
+            claim(entry_label(*identity), entries, identity, raw, fragment)
+    if entries:
+        values[TOKENIZERS] = list(entries.values())
+
+    values["name"] = fragments[0].machine
+    for leaf, stated in _provenance(fragments).items():
+        values[f"provenance.{leaf}"] = stated
+    document: dict[str, Any] = {}
+    for field in SCHEMA:
+        if field.path not in values:
+            continue
+        *blocks, leaf = field.path.split(".")
+        node = document
+        for block in blocks:
+            node = node.setdefault(block, {})
+        node[leaf] = values[field.path]
+    return Merge(document, sources, fragments)
