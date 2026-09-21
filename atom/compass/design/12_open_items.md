@@ -12,11 +12,14 @@ backlog. Nothing here is a decision; every decision lives in its topic's decisio
 
 1. **Load-bearing assumptions** — hold up large parts of the design; each has a check plan
 2. **Missing topics** — design points nobody has written yet, with a recommendation
-3. **TODO register** — 77 items, **T1–T72, T77–T80 and T82**, per topic. The register is
-   not contiguous: T-numbers are allocated across parallel task branches and arrive when
-   those branches land — T73–T76 with P0.3 and T81 with P0.4 are open elsewhere at the time
-   of writing. 73 are open here; T15, T22 and T48 are struck through as done, and T77 was
-   opened and closed by P0.1
+3. **TODO register** — 77 rows, **T1–T72, T77–T80 and T82**, per topic, of which **73 are
+   open**: T15, T22 and T48 are struck through as done, and T77 was opened and closed by
+   P0.1. Both figures are the rows of section 3 below, counted as
+   `grep -oE '^\| *~*\**T[0-9]+'` over that section and nothing else — prose elsewhere in
+   this file names T-numbers that belong to other branches, and counting those tokens is
+   what made two earlier counts disagree. The register is **not contiguous and is not a
+   range**: T-numbers are allocated across parallel task branches and arrive when those
+   branches land. At the time of writing T73–T76 are open on P0.3's branch and T81 on P0.4's
 4. **Cross-cutting issues and pending amendments**
 
 ---
