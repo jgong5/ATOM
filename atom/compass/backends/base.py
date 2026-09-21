@@ -14,6 +14,15 @@ visible in the projection rather than reachable by attribute from anywhere in
 the scheduler. The projection's shape belongs to the caller that builds it, so
 it is not named here.
 
+Whoever defines that shape inherits an obligation with it, because the
+no-engine-imports property belongs to a package and not to a type. The test
+that enforces it reads the files under this package and nothing else: a
+projection defined here is covered automatically, and one defined anywhere
+else is covered by nobody until its own package's tests assert the same thing
+over its own sources. A projection that reaches an engine type for one field
+is a projection that can only be built where the engine imports, which defeats
+the reason it exists.
+
 `tier` says which cost model was asked, which is a different axis from where
 each answer inside it came from. A run can ask for the op-level model and still
 receive analytically-computed seconds for a term the campaign never covered;

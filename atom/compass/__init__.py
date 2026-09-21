@@ -1,8 +1,6 @@
 # SPDX-License-Identifier: MIT
-# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+"""Compass: a performance simulator for ATOM.
 
-"""Compass: simulated execution for ATOM.
-
-Empty at import time. Every subpackage is imported by name, so pulling one in
-costs only what that subpackage needs.
+The package is deliberately empty at import time. Every subpackage is imported
+by name, so that pulling in one of them costs only what it needs.
 """

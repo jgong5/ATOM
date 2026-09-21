@@ -77,6 +77,7 @@ class Layered(CostSource):
 
 PRICED = Answers("price_list", 0.004, Species.MEASURED)
 LAW = Answers("analytic_law", 0.005, Species.ANALYTICAL)
+ROOFLINE = Answers("roofline", 0.006, Species.ANALYTICAL)
 UNPRICED = Declines("price_list", "no entry for this leaf")
 OUTSIDE = Declines("nearest_key", "outside the measured range")
 
@@ -138,6 +139,53 @@ def test_a_resolver_backed_rung_keeps_both_halves_of_the_chain():
     assert got.term.provenance.source == "layered/analytic_law"
 
 
+def test_an_exhausted_inner_ladder_does_not_escape_the_outer_one():
+    """It declined; the rungs below it have not been asked yet."""
+    inner = Resolver([Declines("inner_price_list", "no entry"), OUTSIDE])
+    got = Resolver([UNPRICED, Layered("layered", inner), ROOFLINE]).resolve("attention")
+
+    assert got.source == "roofline"
+    assert [r.source for r in got.declined] == [
+        "price_list",
+        "inner_price_list",
+        "nearest_key",
+    ]
+    assert [r.source for r in got.term.provenance.refusals] == [
+        "price_list",
+        "inner_price_list",
+        "nearest_key",
+    ]
+
+
+def test_an_exhausted_inner_ladder_keeps_its_reasons_countable():
+    """Flattening them onto the wrapper would name something unmeasurable."""
+    inner = Resolver([Declines("inner_price_list", "no entry"), OUTSIDE])
+    got = Resolver([UNPRICED, Layered("layered", inner), ROOFLINE]).resolve("attention")
+
+    mix = ProvenanceMix()
+    mix.record(StepCost([got.term]))
+    assert mix.reasons() == {
+        ("price_list", "no entry for this leaf"): 1,
+        ("inner_price_list", "no entry"): 1,
+        ("nearest_key", "outside the measured range"): 1,
+    }
+
+
+def test_an_inner_exhaustion_that_names_nobody_still_names_the_rung():
+    """A hand-rolled source can raise with an empty list; silence is not allowed."""
+
+    class Silent(CostSource):
+        @property
+        def name(self):
+            return "silent_layer"
+
+        def price(self, request):
+            raise CostRefused(request, ())
+
+    got = Resolver([Silent(), ROOFLINE]).resolve("attention")
+    assert [r.source for r in got.declined] == ["silent_layer"]
+
+
 def test_an_exhausted_ladder_refuses_with_the_whole_list():
     """One refusal per run turns one coverage gap into one iteration each."""
     with pytest.raises(CostRefused) as raised:
@@ -145,6 +193,18 @@ def test_an_exhausted_ladder_refuses_with_the_whole_list():
     assert [r.source for r in raised.value.declined] == ["price_list", "nearest_key"]
     assert raised.value.request == "attention"
     assert "outside the measured range" in str(raised.value)
+
+
+def test_an_exhausted_ladder_lists_the_inner_rungs_too():
+    """The whole list means the whole list, however deeply it was nested."""
+    inner = Resolver([Declines("inner_price_list", "no entry"), OUTSIDE])
+    with pytest.raises(CostRefused) as raised:
+        Resolver([UNPRICED, Layered("layered", inner)]).resolve("attention")
+    assert [r.source for r in raised.value.declined] == [
+        "price_list",
+        "inner_price_list",
+        "nearest_key",
+    ]
 
 
 def test_a_resolver_needs_sources():

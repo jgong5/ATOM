@@ -7,6 +7,12 @@ real if the package stays free of engine imports. So it is asserted by reading
 the sources rather than trusted: a package that imports the engine is testable
 only where the engine imports, which on this project means a machine with a
 driver, which is where a cheap test stops being run.
+
+The scan walks this package recursively, so a module added under it is covered
+the day it is added. It reads nothing outside it, which is the limit worth
+stating: the property is a property of a *package*, not something a type
+inherits by being passed across the seam. Whoever defines the projection type
+somewhere else owns the same assertion over the package that defines it.
 """
 
 import ast
@@ -82,7 +88,11 @@ def _imported_modules(path):
             yield node, "." * node.level + (node.module or "")
 
 
-@pytest.mark.parametrize("path", sorted(PACKAGE.glob("*.py")), ids=lambda p: p.name)
+@pytest.mark.parametrize(
+    "path",
+    sorted(PACKAGE.rglob("*.py")),
+    ids=lambda p: str(p.relative_to(PACKAGE)),
+)
 def test_the_package_imports_nothing_from_the_engine(path):
     """Only its own modules, so it runs anywhere Python does."""
     for node, module in _imported_modules(path):

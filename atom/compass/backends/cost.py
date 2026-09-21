@@ -126,18 +126,29 @@ class StepCost:
         object.__setattr__(self, "terms", _checked(terms))
 
     def __init_subclass__(cls, **kwargs: object) -> None:
-        """Refuse a subclass that shadows the total or its decomposition.
+        """Refuse a subclass that shadows anything this class reports.
 
-        Overriding `seconds` needs no bypass and defeats every check here: the
-        object is valid, the breakdown is real, and the number returned has
-        nothing to do with it. There is no legitimate reason to redefine these
-        three, so the class is refused at definition rather than at use.
+        Overriding a reader needs no bypass and defeats every check here: the
+        object is valid, the breakdown is real, and the answer returned has
+        nothing to do with it. `seconds` is the obvious one; `is_refused` is
+        the dangerous one, because hiding it makes a run report no refused
+        steps over steps that refused, at the layer that reads that fraction
+        to decide whether the run is evidence.
+
+        The protected set is read off this class rather than listed, so a
+        reader added later is covered the day it is added and not the day
+        somebody remembers to extend a tuple.
         """
         super().__init_subclass__(**kwargs)
-        shadowed = sorted({"seconds", "terms", "rows"} & set(cls.__dict__))
+        owned = {
+            name
+            for name in (*vars(StepCost), *StepCost.__annotations__)
+            if not name.startswith("_")
+        }
+        shadowed = sorted(owned & set(cls.__dict__))
         if shadowed:
             raise TypeError(
-                f"{cls.__name__} redefines {', '.join(shadowed)}; a total that does "
+                f"{cls.__name__} redefines {', '.join(shadowed)}; an answer that does "
                 "not come from the terms is the thing this class exists to prevent"
             )
 
@@ -165,7 +176,16 @@ class StepCost:
         return fold_seconds(t.seconds for t in self.terms if t.provenance.is_refused)
 
     def seconds_by_species(self) -> Mapping[Species, float]:
-        """Seconds grouped by how they were obtained, terms in stored order."""
+        """Seconds grouped by how they were obtained, terms in stored order.
+
+        Each group is the fold of its own terms, in the order they appear in
+        the breakdown. Grouping re-associates, so folding these group totals
+        is a *different* sum from `seconds` and is not bit-equal to it: three
+        terms of 0.1, 0.2 and 0.15 whose first and third share a species fold
+        flat to 0.45000000000000007 and grouped to 0.45. The mixture is for
+        reporting which species the time went to. `rows()` is the view that
+        re-folds to the total, and is what a reader checks a total against.
+        """
         grouped: dict[Species, list[float]] = {}
         for term in self.terms:
             grouped.setdefault(term.provenance.species, []).append(term.seconds)

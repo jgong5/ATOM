@@ -50,6 +50,21 @@ def test_the_total_is_the_fold_of_the_parts():
     assert step.seconds == pytest.approx(0.011)
 
 
+def test_grouping_re_associates_so_the_mixture_is_not_a_second_total():
+    """The rows re-fold to the total; the species totals are a different sum."""
+    step = StepCost(
+        [
+            term("a", 0.1),
+            CostTerm("b", 0.2, ANALYTIC),
+            term("c", 0.15),
+        ]
+    )
+    assert step.seconds == 0.45000000000000007
+    assert fold_seconds(step.seconds_by_species().values()) == 0.45
+    assert fold_seconds(step.seconds_by_species().values()) != step.seconds
+    assert fold_seconds(seconds for _, seconds, _ in step.rows()) == step.seconds
+
+
 def test_a_reader_can_check_the_total_against_the_rows():
     """The artifact's rows re-fold to the artifact's total, bit for bit."""
     step = StepCost([term("a", 0.1), term("b", 0.2), term("c", 0.3)])
@@ -96,6 +111,46 @@ def test_a_subclass_cannot_shadow_the_total_or_its_parts():
             @property
             def seconds(self):
                 return 99.0
+
+
+PUBLIC_READERS = sorted(
+    name
+    for name in (*vars(StepCost), *StepCost.__annotations__)
+    if not name.startswith("_")
+)
+
+
+def test_every_reader_is_covered_not_just_the_obvious_one():
+    """`is_refused` is the dangerous one: hiding it empties the refused count."""
+    assert set(PUBLIC_READERS) >= {
+        "is_refused",
+        "refusals",
+        "refused_seconds",
+        "rows",
+        "seconds",
+        "seconds_by_species",
+        "terms",
+    }
+
+
+@pytest.mark.parametrize("reader", PUBLIC_READERS)
+def test_no_reader_can_be_shadowed_by_a_subclass(reader):
+    """Derived from the class, so a reader added later is covered on arrival."""
+    with pytest.raises(TypeError, match=f"redefines {reader}"):
+        type("Drifting", (StepCost,), {reader: property(lambda self: None)})
+
+
+def test_hiding_the_refusal_flag_would_empty_the_refused_count():
+    """The defect the derived set exists to stop, stated as the thing it breaks."""
+    mix = ProvenanceMix()
+    mix.record(StepCost([CostTerm("step", 0.096, STOOD_IN)]))
+    assert mix.refused_step_fraction == 1.0
+    with pytest.raises(TypeError, match="redefines is_refused"):
+
+        class Quiet(StepCost):
+            @property
+            def is_refused(self):
+                return False
 
 
 def test_terms_are_read_by_name_so_names_are_unique():
