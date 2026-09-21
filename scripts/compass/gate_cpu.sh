@@ -175,6 +175,12 @@ if [ "$RC" -ne 0 ]; then
     printf 'CPU tier of the test gate FAILED. The baseline is measured, not read:\n' >&2
     printf 'run this script on the integration head this branch forked from and\n' >&2
     printf 'compare -- see scripts/compass/README.md.\n' >&2
+    printf 'Before you read it as your diff, check the FAILED line above. One test in\n' >&2
+    printf 'ATOM'"'"'s own suite -- TestTheRegionIsNotCopiedPerChunk in\n' >&2
+    printf 'tests/entrypoints/test_stream_marker_properties.py -- asserts a wall-clock\n' >&2
+    printf 'timing property and fails intermittently on a loaded box. That README\n' >&2
+    printf 'section names it, what it was measured to do, and to run gates one at a\n' >&2
+    printf 'time. It is not a Compass defect and is not excluded.\n' >&2
     finish "$RC"
 fi
 
