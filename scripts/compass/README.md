@@ -208,9 +208,13 @@ merge-base; it is the merge-base refusal below, not this line, that reports a
 pair with no common history at all. And the counterpart is found by **same name** under each remote —
 what `compass_resolve_ref` would have picked had the local branch been absent —
 so a branch whose configured upstream is a *differently* named remote branch is
-either silent or compared against a ref it does not track. Ten local branches
-on this box were in that state on 2026-09-21; the announcement is not a
-substitute for keeping the local integration branch fast-forwarded.
+either silent or compared against a ref it does not track. That class is the
+branches whose `git config --get branch.<name>.merge` names something other
+than `refs/heads/<name>`; enumerate it rather than trusting a number, because
+`git push -u` moves a branch out of the class the moment it is published — it
+creates the same-name ref and rewrites the config in one step — so any count
+is stale as soon as anyone pushes. The announcement is not a substitute for
+keeping the local integration branch fast-forwarded.
 
 The two ways that can still fail are separate refusals, because one is a
 statement about the *ref* and the other about the *history*, and a reader who

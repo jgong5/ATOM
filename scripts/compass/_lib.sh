@@ -104,19 +104,29 @@ compass_resolve_ref() {
 # chosen had the local branch been absent -- so the comparison is against the
 # ref that was passed over, which is the one the caller might have wanted.
 #
-# What that rule costs, measured rather than assumed. A local branch whose
-# configured upstream is a *differently* named remote branch is not compared
-# against what it tracks. Over both ATOM clones on this box, 2026-09-21 21:00
-# UTC, ten local branches are in that state. Two have no same-name remote ref
-# at all, so no counterpart is found and this function prints nothing:
-# compass/runner-2-merged is 5 ahead, 8 behind fork/feature/atomcompass_new,
-# which is the ref it tracks, and compass_ref_drift against it is silent. The
-# other eight do have a same-name remote ref, so a line is printed -- about a
-# ref the branch does not track. Both halves are deliberate: the counterpart
-# has to be the ref compass_resolve_ref would have picked, so announcing
-# against branch.<name>.merge would name a ref the resolver would never use.
-# The silent half is the case a future reader most needs, because it is where
-# the tool goes back to being quiet.
+# What that rule costs. A local branch whose configured upstream is a
+# *differently* named remote branch is not compared against what it tracks.
+# The class is exactly: branches for which `git config --get
+# branch.<name>.merge` names something other than refs/heads/<name>. To
+# enumerate it, walk `git for-each-ref --format='%(refname:short)' refs/heads`
+# and compare that config value against each branch's own name. A member with
+# no refs/remotes/*/<name> gets no counterpart, so this function returns 0 and
+# prints nothing; a member that has one gets a line about a ref it does not
+# track. Both halves are deliberate: the counterpart has to be the ref
+# compass_resolve_ref would have picked, so announcing against
+# branch.<name>.merge would name a ref the resolver would never use. The
+# silent half is the case a future reader most needs, because it is where the
+# tool goes back to being quiet.
+#
+# How many such branches exist is deliberately not recorded here. Membership
+# turns over by ordinary development in minutes: `git push -u` creates the
+# same-name remote ref *and* rewrites branch.<name>.merge to it, so publishing
+# a branch moves it out of the class and into the level-and-silent early return
+# below, while a landing on the integration branch changes the arithmetic of
+# the ones that stay. A count in a comment is read without the timestamp that
+# would make it checkable, and a reading taken here was already wrong within
+# the hour. A dated census belongs in a change record, where it is met as a
+# record; run the enumeration above for the reading that is true now.
 #
 # Announced, not refused, and the choice is not close. The caller named a ref
 # that exists here and got that ref; nothing was guessed and no fallback was
@@ -137,9 +147,14 @@ compass_resolve_ref() {
 # rev-list --left-right --count returns the whole of each side when there is no
 # merge-base, so an orphan counterpart reads as diverged. The counts are true
 # either way and this line only reports them; the refusal that has to tell the
-# two apart is snapshot.sh's merge-base one, whose message is "shares no commit
-# with HEAD" and not "diverged". Not split here because the orphan fixture is the only test that
-# reaches this branch of the ladder, so a separate wording would leave the
+# two apart is snapshot.sh's merge-base one, which says "shares no commit with
+# HEAD" on its first line and "these two histories are unrelated" on its
+# second, and never says "diverged". That vocabulary is the refusal's own text
+# on stderr, not a gloss on it, and tests/compass/test_snapshot_ref.py pins the
+# word. So the distinction already exists one file over, in the place that has
+# to make it, under a test -- which is the reason not to state it a second time
+# here. It is also not split here because the orphan fixture is the only test
+# that reaches this branch of the ladder, so a separate wording would leave the
 # genuine diverged case with no test at all.
 compass_ref_drift() {
     local root=$1 ref=$2 remote up= counts ahead behind how lsha rsha
