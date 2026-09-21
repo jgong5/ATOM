@@ -188,3 +188,80 @@ def test_the_staging_source_being_a_real_tensor_is_not_the_cause():
         staged = dst[:FILLED_ROWS].copy_(src[:FILLED_ROWS])
 
     assert list(staged.shape) == [FILLED_ROWS, 8], staged.shape
+
+
+# --------------------------------------------------------------------------
+# whether the symbol can reach the staging copy at all on ATOM's decode path
+
+
+def test_a_symbolic_bound_used_as_a_numpy_index_is_specialised_silently():
+    """The reason the repair cannot be made at the caller.
+
+    Staging fills the CPU side through the buffer's numpy view before the
+    device copy happens. numpy takes `__index__` of whatever bound it is
+    given, and on a `SymInt` that resolves to the hint -- so the symbol is
+    replaced by a constant, with no error and no warning, before
+    `copy_to_gpu` is ever reached.
+    """
+    import numpy as np
+
+    shape_env, fake_mode = _mode()
+    sym = _dynamic_leading_dim(
+        fake_mode, torch.empty(BUFFER_ROWS, 8, dtype=torch.int32)
+    )
+    bound = sym.shape[0]
+    assert _is_symbolic(bound), bound
+    assert not shape_env.replacements
+
+    staging = np.zeros((BUFFER_ROWS, 8), dtype=np.int32)
+    staging[:bound] = -1
+
+    # It did not raise, and it did not write the batch: it wrote the hint.
+    assert int((staging == -1).all(axis=1).sum()) == BUFFER_ROWS
+    # And the symbol is now a constant, which `capture()` refuses outright.
+    assert shape_env.replacements, "the numpy bound left the symbol free"
+    assert str(BUFFER_ROWS) in str(dict(shape_env.replacements))
+
+
+def test_the_same_bound_stays_symbolic_when_numpy_does_not_see_it():
+    """The control for the test above: the slice itself is not the problem."""
+    shape_env, fake_mode = _mode()
+    sym = _dynamic_leading_dim(
+        fake_mode, torch.empty(BUFFER_ROWS, 8, dtype=torch.int32)
+    )
+    bound = sym.shape[0]
+
+    with fake_mode, torch._C._EnablePythonDispatcher():
+        staged = sym[:bound]
+
+    assert _is_symbolic(staged.shape[0]), staged.shape
+    assert not shape_env.replacements, dict(shape_env.replacements)
+
+
+def test_the_decode_path_shares_one_bound_between_numpy_and_the_device_copy():
+    """The precondition the finding above rests on, checked against ATOM.
+
+    `prepare_decode` derives one count per staged buffer and uses it twice:
+    to fill the numpy view, and as the device copy's bound. Only the second
+    may be symbolic, and the first runs first. Separating them is a change to
+    this file, which is why a symbolic capture is not reachable from the
+    caller alone.
+
+    If ATOM ever does separate them, this fails, and the conclusion drawn
+    from it has to be retaken rather than inherited.
+    """
+    import pathlib
+
+    import atom
+
+    source = (
+        pathlib.Path(atom.__file__).parent
+        / "model_ops"
+        / "attentions"
+        / "aiter_attention.py"
+    ).read_text()
+
+    # the numpy fill, the shared count, and the device copy that follows it
+    assert 'var["slot_mapping"].np[:running_tokens]' in source
+    assert '("slot_mapping", running_tokens),' in source
+    assert "copy_to_gpu(num) for el, num in vars_used" in source
