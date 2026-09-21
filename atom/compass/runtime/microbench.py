@@ -94,6 +94,43 @@ def signature_of(op: dict) -> str:
     return sig
 
 
+def _is_module_path(value: object) -> bool:
+    """Whether a scalar is a dotted module path like `model.layers.3.self_attn`.
+
+    Recognised structurally, not by key name, and deliberately narrow: the
+    string must carry a purely numeric segment. That is the segment that
+    differs between two layers, so requiring it is what makes the test say
+    "layer index" rather than "anything with a dot in it". A dtype spelled
+    `torch.bfloat16` has no numeric segment and is not matched -- and is
+    identical across layers anyway, so it would not have grouped anything.
+    """
+    if not isinstance(value, str) or "." not in value:
+        return False
+    segments = value.split(".")
+    if not any(seg.isdigit() for seg in segments):
+        return False
+    return all(seg.isidentifier() or seg.isdigit() for seg in segments)
+
+
+def _layer_class(op: dict) -> str:
+    """The signature this operator would have with its module path dropped.
+
+    Two attention calls from layer 3 and layer 7 differ in exactly one field --
+    a string scalar naming the module they were called from. Everything a price
+    depends on, shapes through strides, is byte identical. Grouping on this and
+    measuring one member is the same reading either way.
+
+    Done beside `signature_of` rather than inside it so that the keys written to
+    a price list do not change. An existing list keeps answering; only the
+    number of GPU measurements drops.
+    """
+    scalars = tuple(tuple(x) for x in op.get("scalars") or ())
+    kept = tuple((k, v) for k, v in scalars if not _is_module_path(v))
+    if len(kept) == len(scalars):
+        return signature_of(op)
+    return signature_of({**op, "scalars": kept})
+
+
 def _resolve(name: str):
     """Find the callable behind a recorded operator name.
 
@@ -978,6 +1015,31 @@ def price_graph(graph_path: str, iters: int = 2000, warmup: int = 20,
         counts[sig] = counts.get(sig, 0) + 1
         example.setdefault(sig, op)
 
+    # Sixteen full-attention layers and forty-eight GDN layers each produce a
+    # distinct signature, and the only field that differs between them is a
+    # string scalar holding the module path --
+    # `language_model.model.layers.3.self_attn` against `...layers.7...`.
+    # Shapes, dtypes, context, slot_mapping, grid and strides are byte
+    # identical. A module path says where the kernel was called from, not what
+    # it costs, so those layers are one measurement repeated: 64 of a prefill
+    # graph's 151 signatures, about 42% of pricing wall-clock.
+    #
+    # Deduped here and not in signature_of, deliberately. Removing the field
+    # from the key would change every key and silently retire every price list
+    # already measured. Here the keys are untouched -- each class is measured
+    # once and the reading copied to its members -- so an existing list still
+    # answers and only the number of measurements drops.
+    #
+    # The evidence that layers really do cost the same is #110: across three
+    # graphs the 16 and 48 per-layer readings agree to 1.003x-1.040x, and the
+    # GDN layers read 5.588 / 5.591 / 5.602 ms across a 3.7x context span.
+    # Note what the dedup gives up: it also removes the ability to notice a
+    # case where a layer did NOT cost the same.
+    classes: dict[str, list[str]] = {}
+    for sig, op in example.items():
+        classes.setdefault(_layer_class(op), []).append(sig)
+    example = {sigs[0]: example[sigs[0]] for sigs in classes.values()}
+
     # Nothing priced here is inside a live forward, and an operator that reads
     # ambient state must not silently inherit the last one. Capture leaves a
     # forward context installed -- the final rung of the ladder, one sequence at
@@ -1114,6 +1176,29 @@ def price_graph(graph_path: str, iters: int = 2000, warmup: int = 20,
             except Exception as exc:  # noqa: BLE001 - a probe must not stop a run
                 print(f"### PROBE FAILED {type(exc).__name__}: {exc}", flush=True)
 
+
+    # Fan the measured classes back out over their members, so the list has an
+    # entry per signature exactly as it did before the dedup above. `measured`
+    # records which signature was actually put on the GPU, because a reader
+    # otherwise cannot tell a reading from a copy of one, and `occurrences`
+    # stays each member's own count -- the copy is of the per-call price, not
+    # of how often that member ran.
+    for sigs in classes.values():
+        src = next((s for s in sigs if s in priced), None)
+        if src is None:
+            reason = next((unpriced[s] for s in sigs if s in unpriced), None)
+            if reason is not None:
+                for sig in sigs:
+                    unpriced.setdefault(sig, reason)
+            continue
+        for sig in sigs:
+            if sig == src:
+                continue
+            entry = dict(priced[src])
+            entry["occurrences"] = counts[sig]
+            entry["measured"] = src
+            priced[sig] = entry
+            unpriced.pop(sig, None)
     ops_priced = sum(counts[s] for s in priced)
     return {
         "version": 1,

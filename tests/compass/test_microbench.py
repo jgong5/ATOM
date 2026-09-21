@@ -554,3 +554,49 @@ class TestHowManyRepetitionsAPriceIsWorth:
 
     def test_a_zero_reading_is_not_divided_by(self, monkeypatch):
         assert self._probed(monkeypatch, 0.0) == 2000
+
+
+class TestLayersAreOneMeasurement:
+    """Sixteen full-attention and forty-eight GDN layers each produced a
+    distinct signature, and the only field that differed was a string scalar
+    naming the module the kernel was called from. That is 64 of a prefill
+    graph's 151 signatures measured to learn the same number 64 times.
+
+    The grouping is done beside the key, not in it. These tests pin both
+    halves: that layers group, and that `signature_of` is untouched -- because
+    changing it would retire every price list already measured.
+    """
+
+    def test_two_layers_are_one_class(self):
+        from atom.compass.runtime.microbench import _layer_class
+        a = _op(scalars=[("#5", "language_model.model.layers.3.self_attn")])
+        b = _op(scalars=[("#5", "language_model.model.layers.7.self_attn")])
+        assert _layer_class(a) == _layer_class(b)
+
+    def test_but_they_are_still_two_signatures(self):
+        a = _op(scalars=[("#5", "language_model.model.layers.3.self_attn")])
+        b = _op(scalars=[("#5", "language_model.model.layers.7.self_attn")])
+        assert signature_of(a) != signature_of(b), (
+            "the key must not change, or every existing price list stops "
+            "answering")
+
+    def test_a_cost_bearing_scalar_is_not_dropped(self):
+        """The grouping is by layer index, not by "has a dot in it"."""
+        from atom.compass.runtime.microbench import _layer_class
+        a = _op(scalars=[("#2", 1), ("dtype", "torch.bfloat16")])
+        b = _op(scalars=[("#2", 16384), ("dtype", "torch.bfloat16")])
+        assert _layer_class(a) != _layer_class(b)
+
+    def test_a_dotted_string_without_a_layer_index_stays(self):
+        from atom.compass.runtime.microbench import _is_module_path
+        assert not _is_module_path("torch.bfloat16")
+        assert not _is_module_path("causal")
+        assert _is_module_path("language_model.model.layers.0.linear_attn")
+
+    def test_operators_that_differ_elsewhere_do_not_group(self):
+        from atom.compass.runtime.microbench import _layer_class
+        a = _op(shapes=[(16, 10240)],
+                scalars=[("#5", "model.layers.3.self_attn")])
+        b = _op(shapes=[(32, 10240)],
+                scalars=[("#5", "model.layers.7.self_attn")])
+        assert _layer_class(a) != _layer_class(b)
