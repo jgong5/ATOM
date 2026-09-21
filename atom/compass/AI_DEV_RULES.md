@@ -55,7 +55,8 @@
 - Reviewer agents must post their review to the PR; **the verdict goes in the
   comment body text**, since GitHub refuses APPROVE/REQUEST_CHANGES on
   self-authored PRs (D98).
-- **PRs land squashed onto the integration branch**, one commit per task —
-  enforced structurally by the repo's merge settings (D97).
+- **PRs land squashed onto the integration branch**, one commit per task.
+  GitHub enforces this structurally (`allow_merge_commit=false`,
+  `allow_rebase_merge=false`) (D97).
 - Except for the main branch, free updates to `jgong5/ATOM` — branches, PRs and
   issues alike. Never touch `ROCm/ATOM`.
