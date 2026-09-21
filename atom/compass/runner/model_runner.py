@@ -18,14 +18,11 @@ class CompassModelRunner(NonAllocatingRunner, ModelRunner):
     overriding the five methods that own them; see `overrides`, which holds the
     bodies and says why each one does what it does.
 
-    Construction is not free of device memory, and what remains is the base's
-    forward-vars ring. Measured at TP1 on Qwen3-0.6B with `enforce_eager`, the
-    whole of `__init__` leaves 2,168,320 bytes allocated at a 1024-token,
-    4-sequence budget and 17,668,096 at 8192 / 256; `allocate_forward_vars`
-    accounts for 99.1% and 99.4% of those, and named tensors on the runner for
-    0 bytes both times. That remainder is sized by the batch budget and not by
-    the model: 16.9 MiB against the 1.40 GiB of weights the base makes resident
-    for Qwen3-0.6B, and against 51.7 GiB for Qwen3.8-27B.
+    Construction is not free of device memory. What remains is the base's
+    forward-vars ring from `allocate_forward_vars`, whose dominant term is a
+    `max_num_batched_tokens` by `hidden_size` output buffer. It is sized by the
+    batch budget and the model's hidden size, not by the model's weights, and
+    no named tensor on the runner holds any of it.
 
     `NonAllocatingRunner` comes first so its methods win over the base's. There
     is deliberately no `__init__`: the base runs all of its own before a
