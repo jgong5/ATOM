@@ -495,7 +495,7 @@ class TestTheScheduleIsWhatPairsTheTwoSides:
 
 
 class TestTheThinkTimeIsReallySlept:
-    def test_the_paced_executor_waits_the_recorded_gap(self):
+    def test_the_paced_executor_waits_and_records_what_it_waited(self):
         mod = _module()
         workload = [_row(0, 0.0, 0.0), _row(0, 0.05, 0.0)]
         began = time.monotonic()
@@ -503,7 +503,14 @@ class TestTheThinkTimeIsReallySlept:
         # An executor that declared the gap and then did not sleep it would
         # come back instantly, and the real side would be a burst.
         assert time.monotonic() - began >= 0.045
-        assert [e["think_s"] for e in plan] == [0.0, 0.05]
+        # think_s is the gap this lane ACTUALLY waited (replay.py:664), not
+        # the one the corpus asked for, so a real 50 ms sleep records as
+        # 50.08 ms and exact equality cannot hold. The idle guard can also
+        # shorten a wait, so the tolerance is two-sided. The first edge is
+        # still exactly zero: nothing is slept there at all.
+        think = [e["think_s"] for e in plan]
+        assert think[0] == 0.0
+        assert think[1] == pytest.approx(0.05, abs=5e-3)
 
     def test_the_between_session_gap_is_not_slept(self):
         mod = _module()
