@@ -104,7 +104,7 @@ records before this decision named where the brief goes.
 | | |
 |---|---|
 | **Integration branch** | `feature/atomcompass_new` — already the PR #3 branch |
-| **Per-task isolation** | a git worktree per in-flight task, under `atomcompass-worktrees/<task-id>` |
+| **Per-task isolation** | a git worktree per in-flight task, under `compass-worktrees/<task-id>`, beside the repo |
 | **The task** | one GitHub issue per task, holding its brief and its handoff (D96) |
 | **Landing** | one PR per task into the integration branch, naming its task's issue, reviewed by that task's reviewer agent |
 | **ATOM's `main`** | untouched until the milestone the project agrees to upstream |
