@@ -8,7 +8,6 @@
   pleasantries.`
 
 ## Execution rules
-
 - Don't modify the main worktree. Develop with linked worktrees.
 - **No design-doc references in code.** No `D18`, `P0.4`, `T5`, `W2.5`, backticked
   doc numbers, "principle N", or numbered labels like "Gate 1". No quoting design
@@ -21,7 +20,7 @@
 - Working logs and scratch go in `agent_scratch/`, never `atom/compass/tasks`. The
   durable task record — brief, dev record, review record, handoff (D96) — is not a
   working log: it stays tracked, so a later brief can still link to it.
-- "Complete solutions while keeping the solution as simple as possible."
+- Design and implement solutions while keeping the solution as simple as possible.
 - Concurrency: 5 tasks in flight, up to 10 agents (`16_execution_plan.md:29`).
 - Both developer and reviewer agents must be told to read `atom/compass/design/README.md`'s
   eight principles first.
