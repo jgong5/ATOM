@@ -54,7 +54,17 @@
   converge is mis-cut, not under-worked.
 - Reviewer agents must post their review to the PR; **the verdict goes in the
   comment body text**, since GitHub refuses APPROVE/REQUEST_CHANGES on
-  self-authored PRs (D98).
+  self-authored PRs (D98). That limitation is about the verdict only — it says
+  nothing about where findings go.
+- **Prefer inline comments.** A finding that points at specific lines is posted as
+  an inline review comment on those lines, via
+  `gh api repos/<owner>/<repo>/pulls/<n>/comments` with `body`, `commit_id`,
+  `path` and `line` — `commit_id` is required alongside the other three;
+  omitting it fails the call rather than silently defaulting. A reviewer does not
+  fold a line-anchorable finding into one standalone comment.
+- **The standalone comment carries the verdict and the summary**, plus any
+  finding that genuinely has no line to sit on — a missing file, a count wrong
+  across a whole document, a claim in the PR body rather than the diff.
 - **PRs land squashed onto the integration branch**, one commit per task.
   GitHub enforces this structurally (`allow_merge_commit=false`,
   `allow_rebase_merge=false`) (D97).
