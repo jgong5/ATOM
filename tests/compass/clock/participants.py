@@ -72,21 +72,29 @@ class Workload:
     the clock that holds more than one.
 
     `tokenise_seconds` is why two requests that arrive together are not offered
-    together. They are tokenised one after another on one executor, so the
-    second is offered a tokenisation later than the first, and the engine they
-    both go to can then hold two events at **two** timestamps rather than two
-    at one -- which is the shape a horizon with a single record cannot carry.
+    together: each is charged its own slice, so the second is offered a
+    tokenisation later than the first, and the engine they both go to can then
+    hold two events at **two** timestamps rather than two at one -- which is
+    the shape a horizon with a single record cannot carry. That staggering is
+    an assumption this harness makes, not something the server does:
+    preprocessing is handed to the interpreter's implicit default thread pool,
+    whose width is a config option and several tens of workers by default, and
+    nothing in the server narrows it, so a pair arriving together is
+    preprocessed concurrently and offered at one timestamp. What is modelled
+    here is the narrow end of that same option -- a preprocess pool serving one
+    request at a time.
 
-    Whether it actually does is decided by this field against the admission
-    delay, and the threshold is not the obvious one. While the engine is parked
-    on the first request the source is bounded at that request's timestamp plus
-    the floor back out again, which is one tokenisation plus *two* admission
-    delays -- so the second request is offered onto an engine that still holds
-    the first exactly while the slice is at most twice the admission delay.
-    Measured on the two-role deployment at a 9 ms admission delay: 18 ms holds
-    two events at two timestamps, 20 ms holds one at a time, and so does a
-    slice of zero. A trace of long prompts therefore exercises *less* of the
-    clock than a trace of short ones, which is the opposite way round from most
+    Whether the pair then lands at two timestamps is decided by this field
+    against the admission delay, and the threshold is not the obvious one.
+    While the engine is parked on the first request the source is bounded at
+    that request's timestamp plus the floor back out again, which is one
+    tokenisation plus *two* admission delays -- so the second request is
+    offered onto an engine that still holds the first exactly while the slice
+    is at most twice the admission delay. Measured on the two-role deployment
+    at a 9 ms admission delay: 18 ms holds two events at two timestamps, 20 ms
+    holds one at a time, and so does a slice of zero. Under the same width-one
+    assumption a trace of long prompts therefore exercises *less* of the clock
+    than a trace of short ones, which is the opposite way round from most
     sizing knobs and is why the value is stated here rather than buried.
     """
 
@@ -108,7 +116,11 @@ class Workload:
 #: rather than folded into the 9 ms admission delay because it is charged per
 #: request while the admission delay is charged per hop, and because the two
 #: together decide whether a pair of requests is resident on one engine at two
-#: timestamps or at one.
+#: timestamps or at one. It is also far below the slice a median prompt would
+#: take: at the same few million tokens a second an 89k-token prompt is around
+#: 44 ms, some forty times larger and on the far side of the 18 ms threshold
+#: above -- so the two-timestamp shape this suite covers is reached by a
+#: deliberately short slice rather than by a representative one.
 DESIGN_WORKLOAD = Workload(
     requests=106,
     requests_per_arrival=2,
@@ -177,9 +189,12 @@ class TrafficSource(_Participant):
     """Offers requests at modelled arrival times and waits for their responses.
 
     Requests arrive in groups and are **offered one at a time**, a tokenisation
-    apart, because that is what tokenising them one after another on a single
-    executor does to their offer times. It is the reason an engine here holds
-    two accepted events at two distinct timestamps rather than two at one.
+    apart, because each is charged its own preprocessing slice. That models a
+    preprocess pool serving one request at a time; the server's own pool is
+    tens of workers wide by default, and on a pool that wide a pair arriving
+    together is preprocessed concurrently and offered at one timestamp. The
+    narrow reading is the reason an engine here holds two accepted events at
+    two distinct timestamps rather than two at one.
     """
 
     def __init__(self, workload, targets):
@@ -201,11 +216,14 @@ class TrafficSource(_Participant):
 
         `atom/entrypoints/openai/api_server.py::generate_async::
         loop.run_in_executor(None, do_preprocess)::executor_handoff#0` hands a
-        request's prompt to one executor and awaits it, so tokenisation is a
-        duration the run has to charge and requests that arrived together come
-        out of it one after another. The duration comes from the trace rather
-        than from however long this machine's tokeniser takes, which is what
-        makes the offer times a property of the workload and not of the host.
+        request's prompt to the interpreter's default executor and awaits it,
+        so tokenisation is a duration the run has to charge. That executor is
+        tens of workers wide by default and nothing narrows it, so bringing the
+        requests of one arrival out of it one after another is this harness's
+        width-one reading of that pool rather than the server's behaviour. The
+        duration comes from the trace rather than from however long this
+        machine's tokeniser takes, which is what makes the offer times a
+        property of the workload and not of the host.
 
         Past it, `atom/model_engine/llm_engine.py:745` stamps the request's
         arrival from the clock and every queueing age and reported latency is
