@@ -13,9 +13,9 @@ Two of them run during construction (`_build_and_load_model`, `_maybe_warmup`)
 and decline to do their work. The rest run afterwards, over the worker's RPC
 channel; `allocate_kv_cache` does the arithmetic and none of the allocation,
 `capture_cudagraph` captures nothing and says so in the shape its caller
-unpacks, and the other two refuse by name because their answers are not this
-module's to invent -- a wrong duration or a wrong block count would be
-indistinguishable from a measured one.
+unpacks, `forward` reports what a step produced without running one, and
+`get_num_blocks` refuses by name because its answer is not this module's to
+invent -- a wrong block count would be indistinguishable from a measured one.
 
 Order matters when mixing this in: `NonAllocatingRunner` must precede
 `ModelRunner` in the bases so these definitions win. The class deliberately
@@ -78,6 +78,12 @@ import logging
 from typing import Any
 
 import torch
+
+from atom.compass.runner.step_output import (
+    DeferredTokenStream,
+    reported_token_id,
+    reports_previous_step,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -268,12 +274,17 @@ class NonAllocatingRunner:
         logger.info("no cudagraph captured: there are no weights to trace.")
         return 0.0, [], 0
 
+    @torch.inference_mode()
     def forward(self, batch: Any) -> Any:
-        """Refuse to run a step.
+        """Report what a step produced, without running one.
 
-        This class is the attachment point and not the replacement for a step. A
-        step's output has to reproduce what the scheduler reads back from a real
-        one, and a plausible-looking stub that does not is worse than no answer.
+        The reply is the whole of what the scheduler learns from a step, and
+        `step_output` holds the three rules that decide it: the tokens belong
+        to the previous output-producing batch, the lag is counted in
+        output-producing steps rather than in steps, and a batch that samples
+        nothing reports its requests with no tokens. Each is wrong in a way the
+        scheduler accepts without complaining, so they are stated in one place
+        with their reasons rather than inlined here.
 
         What a replacement owes its callers. Four sites broadcast this name --
         `engine_core.py:386` and `:1264`, and `pp_engine_core.py:118` (which
@@ -299,8 +310,73 @@ class NonAllocatingRunner:
         `atom/distributed/pp_transport.py:141` and `:114`. ATOM's own answer is
         a `ScheduledBatchOutput`; the contract a replacement has to meet is the
         nine reads and the pickle, not that class.
+
+        One decorator, not the base's two. ATOM's own carries
+        `torch.inference_mode`, which is kept: the body no longer raises, and
+        whatever a cost model eventually evaluates here should build in the
+        same context as the step it stands for. It also carries
+        `with_eplb_forward_monitor`, which is not. That monitor exists to
+        observe how a real forward routed tokens across experts and commits a
+        load window from what it saw; a predicted step routes nothing, so the
+        window would be fabricated, and acting on one can move experts on a
+        device this runner owns none of. It would also have to be imported from
+        the engine, which this module does not do. `RapidServeModelRunner`, the
+        other runner in this tree that declines to own its memory, carries the
+        same one of the two.
+
+        No duration is reported. The reply has nowhere to put one: the engine
+        times the call itself, and the batch output it reads carries tokens.
+
+        A speculative config is refused rather than reported. The reply's
+        `draft_token_ids` is None and its `num_rejected`/`num_bonus` are zero,
+        which is a well-formed description of a step that drafted nothing:
+        `scheduler.py:2579` then never fills `seq.spec_token_ids` and
+        `:2521-2522` reads zeros out of correctly sized arrays. Nothing raises,
+        and a caller that asked for a speculative configuration gets a
+        prediction of that configuration with speculation off. That silence is
+        the failure this module exists to avoid, so the configuration it cannot
+        model is named instead.
         """
-        raise RunnerRefusal(
-            "this runner has no cost model and no step semantics yet, so it "
-            "cannot say what a step produced or how long it took."
-        )
+        if not hasattr(batch, "produces_output"):
+            # Not reachable from the engine, which only ever passes a scheduled
+            # batch. Kept because it is the one shape this method cannot report
+            # from, and because a refusal that did cross the worker boundary
+            # would reach the parent as a bare SystemExit -- so the loud
+            # failure has to happen on this side of it.
+            raise RunnerRefusal(
+                "a step is reported from what the scheduler scheduled, and "
+                f"{type(batch).__name__} cannot say whether its batch produces "
+                "output; there is nothing here to report from."
+            )
+        if getattr(self.config, "speculative_config", None) is not None:
+            # Refused on the config rather than on the batch: the reply this
+            # method builds drafts nothing, and a run that drafts nothing is a
+            # different run from the one a speculative config describes. The
+            # shapes are right -- it is the semantics that are not modelled.
+            raise RunnerRefusal(
+                "a predicted step drafts no tokens, so reporting one under a "
+                "speculative config would model speculation as off and say "
+                "nothing about it; speculative decoding has no step semantics "
+                "here yet."
+            )
+        # Imported at call time, not at module scope, so this module stays
+        # importable where there is no driver. By the time a step is reported
+        # the worker has imported the engine anyway.
+        from atom.model_engine.scheduler import ScheduledBatchOutput
+
+        stream = getattr(self, "_token_stream", None)
+        if stream is None:
+            # Built on first use rather than in an `__init__`: the base class
+            # runs the whole of its own before a subclass body would get
+            # control, and `self.config` is what this reads.
+            stream = DeferredTokenStream(
+                reported_token_id(
+                    getattr(self.config, "eos_token_id", None),
+                    getattr(self.config, "stop_token_ids", None),
+                ),
+                deferred=reports_previous_step(
+                    getattr(self.config, "pipeline_parallel_size", 1)
+                ),
+            )
+            self._token_stream = stream
+        return ScheduledBatchOutput(**stream.step(batch))
