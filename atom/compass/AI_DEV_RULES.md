@@ -59,20 +59,16 @@
   GitHub enforces this structurally (`allow_merge_commit=false`,
   `allow_rebase_merge=false`) (D97).
 - **Recommended, not required: stack a dependent task's PR on its unlanded
-  parent** with `gh stack`, rather than waiting for the parent to land, so both
-  can be reviewed in parallel (D97.1). Independent tasks do not stack.
-  `gh stack` is GitHub's own extension (`github/gh-stack`), already installed at
-  v0.1.1 against `gh` 2.45.0. It installs under `/root`, which `teardown.sh`
-  discards, so it does not survive a container rebuild; reinstall with
-  `./shell.sh /workspace/gpu_docker/install-gh-stack.sh`, idempotent. Its stack
-  metadata lives in `.git/gh-stack` and is not committed.
-- **Never force-push a branch under review** — it destroys the review's anchor
-  to what was reviewed. **A restack after the parent has landed is permitted** —
-  it is mechanical and expected, and is how a stacked branch keeps landing once
-  its base has been squash-merged away (D97.1).
-- **Squashing the bottom of a stack rewrites its commits**, so every branch stacked
-  on top of it no longer shares history with the integration branch and must be
-  restacked before it can land — one restack of the remainder per stack landing
-  (D97.1).
+  parent** with `gh stack` rather than waiting for it to land (D97.1).
+  Independent tasks do not stack. `gh stack` is GitHub's own extension
+  (`github/gh-stack`), already installed at v0.1.1 against `gh` 2.45.0. It
+  installs under `/root`, which `teardown.sh` discards, so it does not
+  survive a container rebuild; reinstall with
+  `./shell.sh /workspace/gpu_docker/install-gh-stack.sh`, idempotent. Its
+  stack metadata lives in `.git/gh-stack` and is not committed.
+- **Never force-push a branch under review. A restack after its parent has
+  landed is permitted** (D97.1).
+- **Landing the bottom of a stack forces one restack of everything stacked
+  above it** (D97.1).
 - Except for the main branch, free updates to `jgong5/ATOM` — branches, PRs and
   issues alike. Never touch `ROCm/ATOM`.
