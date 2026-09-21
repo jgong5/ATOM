@@ -65,7 +65,7 @@ import re
 import socket
 from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Self
 
 import torch
 from torch._subclasses.fake_tensor import FakeTensorMode
@@ -490,7 +490,7 @@ class TritonLaunchRecorder:
         self.launches: dict = {}
         self._orig = None
 
-    def __enter__(self) -> TritonLaunchRecorder:
+    def __enter__(self) -> Self:
         import inspect
 
         from triton.runtime.jit import JITFunction
