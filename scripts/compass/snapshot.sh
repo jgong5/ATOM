@@ -59,6 +59,9 @@ REF=$(compass_resolve_ref "$ROOT" "$INTEGRATION") || {
 }
 [ "$REF" = "$INTEGRATION" ] ||
     printf 'ref:    %s is not a ref here; resolved it as %s\n' "$INTEGRATION" "$REF"
+# A resolved local branch left behind the remote of the same name is named on
+# the same line, in the same place. It stays the base; it stops being silent.
+compass_ref_drift "$ROOT" "$REF"
 
 BASE=$(git -C "$ROOT" merge-base HEAD "$REF") || {
     printf 'REFUSED: merge-base failed -- %s resolved, but shares no commit with HEAD.\n' "$REF" >&2

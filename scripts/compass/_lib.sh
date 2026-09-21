@@ -84,6 +84,104 @@ compass_resolve_ref() {
     return 1
 }
 
+# Whether the ref that resolved is a local branch that has drifted from the
+# remote branch of the same name. This reports; it does not redirect. The
+# resolution order above is untouched and the base stays the ref that resolved.
+#
+# Bare-name-first is right when the local branch is what the caller means, and
+# nothing told that apart from a local branch that is simply old. MEASURED
+# 2026-09-22, in a worktree of /workspace/ATOM checked out at 83ef2a094 --
+# which *is* fork/feature/atomcompass_new: with nothing set, the local
+# feature/atomcompass_new at 1b473e5af won and .compass-changed listed the 5
+# files of the landing in between; with COMPASS_INTEGRATION_REF naming the
+# remote, 0 files. Both runs exited 0 and printed no ref: line, so the output
+# of the wrong one was indistinguishable from the output of the right one.
+#
+# The counterpart is found by scanning the remotes for the same name rather
+# than by reading branch.<name>.merge: that branch has no upstream configured
+# (measured, same tree, `rev-parse feature/atomcompass_new@{upstream}` exits
+# 128), and the same-name scan is exactly what the resolver above would have
+# chosen had the local branch been absent -- so the comparison is against the
+# ref that was passed over, which is the one the caller might have wanted.
+#
+# What that rule costs. A local branch whose configured upstream is a
+# *differently* named remote branch is not compared against what it tracks.
+# The class is exactly: branches for which `git config --get
+# branch.<name>.merge` names something other than refs/heads/<name>. To
+# enumerate it, walk `git for-each-ref --format='%(refname:short)' refs/heads`
+# and compare that config value against each branch's own name. A member with
+# no refs/remotes/*/<name> gets no counterpart, so this function returns 0 and
+# prints nothing; a member that has one gets a line about a ref it does not
+# track. Both halves are deliberate: the counterpart has to be the ref
+# compass_resolve_ref would have picked, so announcing against
+# branch.<name>.merge would name a ref the resolver would never use. The
+# silent half is the case a future reader most needs, because it is where the
+# tool goes back to being quiet.
+#
+# How many such branches exist is deliberately not recorded here. Membership
+# turns over by ordinary development in minutes: `git push -u` creates the
+# same-name remote ref *and* rewrites branch.<name>.merge to it, so publishing
+# a branch moves it out of the class and into the level-and-silent early return
+# below, while a landing on the integration branch changes the arithmetic of
+# the ones that stay. A count in a comment is read without the timestamp that
+# would make it checkable, and a reading taken here was already wrong within
+# the hour. A dated census belongs in a change record, where it is met as a
+# record; run the enumeration above for the reading that is true now.
+#
+# Announced, not refused, and the choice is not close. The caller named a ref
+# that exists here and got that ref; nothing was guessed and no fallback was
+# taken, so there is no declined answer to give. Refusing would also change
+# what exit 92 means -- today it says "this ref names nothing here", which
+# other agents key on and #82 was careful not to move -- and it would refuse
+# the legitimate case of a deliberately older base, with no way back except an
+# environment variable the caller would have to already suspect.
+#
+# Behind is the only direction that can corrupt the base: merge-base ignores
+# commits the local branch has and HEAD does not, so a local branch that is
+# *ahead* leaves the base where it was. It is still named, because when HEAD
+# descends from those unlanded commits the base moves forward with them and the
+# changed set shrinks -- and a changed set that is too small is how the GPU
+# blind-spot question gets answered "no" without being asked.
+#
+# "diverged from (N ahead, M behind)" is also what *unrelated* histories print:
+# rev-list --left-right --count returns the whole of each side when there is no
+# merge-base, so an orphan counterpart reads as diverged. The counts are true
+# either way and this line only reports them; the refusal that has to tell the
+# two apart is snapshot.sh's merge-base one, which says "shares no commit with
+# HEAD" on its first line and "these two histories are unrelated" on its
+# second, and never says "diverged". That vocabulary is the refusal's own text
+# on stderr, not a gloss on it, and tests/compass/test_snapshot_ref.py pins the
+# word. So the distinction already exists one file over, in the place that has
+# to make it, under a test -- which is the reason not to state it a second time
+# here. It is also not split here because the orphan fixture is the only test
+# that reaches this branch of the ladder, so a separate wording would leave the
+# genuine diverged case with no test at all.
+compass_ref_drift() {
+    local root=$1 ref=$2 remote up= counts ahead behind how lsha rsha
+    git -C "$root" show-ref --verify --quiet "refs/heads/$ref" || return 0
+    for remote in $(git -C "$root" remote); do
+        git -C "$root" show-ref --verify --quiet "refs/remotes/$remote/$ref" &&
+            { up=$remote/$ref; break; }
+    done
+    [ -n "$up" ] || return 0
+    counts=$(git -C "$root" rev-list --left-right --count "$ref...$up") || return 0
+    ahead=${counts%%[!0-9]*}
+    behind=${counts##*[!0-9]}
+    if [ "$ahead" -eq 0 ] && [ "$behind" -eq 0 ]; then return 0; fi
+    if [ "$behind" -eq 0 ]; then
+        how="$ahead commit(s) ahead of"
+    elif [ "$ahead" -eq 0 ]; then
+        how="$behind commit(s) behind"
+    else
+        how="diverged from ($ahead ahead, $behind behind)"
+    fi
+    lsha=$(git -C "$root" rev-parse "$ref")
+    rsha=$(git -C "$root" rev-parse "$up")
+    printf 'ref:    %s (%s) is %s %s (%s)\n' \
+        "$ref" "${lsha:0:9}" "$how" "$up" "${rsha:0:9}"
+    printf '        the base is the local branch; COMPASS_INTEGRATION_REF=%s uses the remote\n' "$up"
+}
+
 # PYTHONPATH is set to the tree and nothing else. Inherited entries are not
 # merged: an inherited entry ahead of ours is exactly how a take2 script silently
 # ran another branch's engine, and an entry behind ours can still satisfy an

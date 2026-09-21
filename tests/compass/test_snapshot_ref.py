@@ -167,4 +167,83 @@ def test_bare_ref_is_preferred_and_the_fallback_is_not_claimed(tree, outdir):
     r = _snapshot(tree, outdir)
     assert r.returncode == 0, r.stderr
     assert "is not a ref here" not in r.stdout
+    # The remote counterpart here is an unrelated commit, so this fixture is
+    # also the diverged case, and the drift line names it. It reports; the base
+    # asserted below is still the local branch's.
+    assert (
+        "is diverged from (1 ahead, 1 behind) fork/feature/atomcompass_new" in r.stdout
+    )
     assert f"base:    {head[:9]} (feature/atomcompass_new)" in r.stdout
+
+
+def test_stale_local_branch_is_named_with_both_shas(tree, outdir):
+    """A local branch left behind the remote of the same name still wins, and
+    now says so -- both commits and the distance between them.
+
+    This is the case that cost the measurement. In a worktree checked out at
+    the integration head itself, with nothing set, the stale local branch was
+    the base and `.compass-changed` listed the five files of the landing in
+    between; the run exited 0 and read exactly like a correct one.
+
+    The assertion is the whole line, not a substring of it. Both shas appear
+    elsewhere in this output -- the local one on the `base:` line -- so pinning
+    either alone passes with the announcement deleted, which is the guard #82
+    found was not a guard.
+    """
+    stale = _git(tree, "rev-parse", "HEAD")
+    _git(tree, "branch", "feature/atomcompass_new")
+    (tree / "landed.txt").write_text("landed after the branch stopped\n")
+    _git(tree, "add", "-A")
+    _git(tree, "commit", "-qm", "the landing in between")
+    remote = _git(tree, "rev-parse", "HEAD")
+    (tree / "mine.txt").write_text("this branch's own work\n")
+    _git(tree, "add", "-A")
+    _git(tree, "commit", "-qm", "this branch")
+    _git(tree, "remote", "add", "fork", "https://example.invalid/ATOM.git")
+    _git(tree, "update-ref", "refs/remotes/fork/feature/atomcompass_new", remote)
+    r = _snapshot(tree, outdir)
+    assert r.returncode == 0, r.stderr
+    assert (
+        f"ref:    feature/atomcompass_new ({stale[:9]}) is 1 commit(s) behind "
+        f"fork/feature/atomcompass_new ({remote[:9]})"
+    ) in r.stdout
+    assert "COMPASS_INTEGRATION_REF=fork/feature/atomcompass_new" in r.stdout
+    # Reported, not redirected: precedence is unchanged and the base is still
+    # the local branch's commit.
+    assert f"base:    {stale[:9]} (feature/atomcompass_new)" in r.stdout
+
+
+def test_current_local_branch_is_not_announced(tree, outdir):
+    """The other half of the pair: a local branch level with its remote prints
+    no `ref:` line at all, so the line above means something when it appears."""
+    head = _git(tree, "rev-parse", "HEAD")
+    _git(tree, "branch", "feature/atomcompass_new")
+    _git(tree, "remote", "add", "fork", "https://example.invalid/ATOM.git")
+    _git(tree, "update-ref", "refs/remotes/fork/feature/atomcompass_new", head)
+    r = _snapshot(tree, outdir)
+    assert r.returncode == 0, r.stderr
+    assert "ref:" not in r.stdout
+    assert f"base:    {head[:9]} (feature/atomcompass_new)" in r.stdout
+
+
+def test_local_branch_ahead_of_its_remote_is_named_as_ahead(tree, outdir):
+    """Ahead cannot corrupt the base -- merge-base ignores commits the branch
+    has and HEAD does not -- but it is still named, because when HEAD descends
+    from those unlanded commits the base moves forward with them and the
+    changed set shrinks. A changed set that is too small is how the GPU
+    blind-spot question gets answered "no" without being asked."""
+    remote = _git(tree, "rev-parse", "HEAD")
+    (tree / "unlanded.txt").write_text("not on the remote yet\n")
+    _git(tree, "add", "-A")
+    _git(tree, "commit", "-qm", "not landed yet")
+    local = _git(tree, "rev-parse", "HEAD")
+    _git(tree, "branch", "feature/atomcompass_new")
+    _git(tree, "remote", "add", "fork", "https://example.invalid/ATOM.git")
+    _git(tree, "update-ref", "refs/remotes/fork/feature/atomcompass_new", remote)
+    r = _snapshot(tree, outdir)
+    assert r.returncode == 0, r.stderr
+    assert (
+        f"ref:    feature/atomcompass_new ({local[:9]}) is 1 commit(s) ahead of "
+        f"fork/feature/atomcompass_new ({remote[:9]})"
+    ) in r.stdout
+    assert f"base:    {local[:9]} (feature/atomcompass_new)" in r.stdout
