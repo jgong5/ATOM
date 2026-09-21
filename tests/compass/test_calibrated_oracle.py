@@ -141,6 +141,10 @@ class TestPrefillAttentionIsPerRequest:
     attended, 8.8 times too much. Fourteen such steps in one serving run came out
     +27.28% against -4.01% for the single-request ones, and the two nearly
     cancelled in the total.
+
+    It also pins what the per-request terms ARE: the history each chunk reads,
+    which does not scale with the chunk, and the causal pairs it evaluates,
+    which include the triangle inside the chunk itself.
     """
 
     @staticmethod
@@ -153,18 +157,27 @@ class TestPrefillAttentionIsPerRequest:
             num_prefill_tokens=sum(n for n, _ in pairs),
         )
 
-    def test_one_request_is_unchanged(self):
-        """The old features were right for a batch of one, and a sweep is mostly
-        batches of one -- which is why this survived so long."""
+    def test_one_request_is_read_plus_causal_pairs(self):
+        """A 16384-token chunk on a 65536 context reads 49152 tokens of history
+        and evaluates every pair below the diagonal, its own chunk included."""
         f = _prefill_features(self._shape([(16384, 65536)]))
-        assert f == [1.0, 16384.0, 16384.0 ** 2, 16384.0 * (65536.0 - 16384.0)]
+        hist = 65536.0 - 16384.0
+        assert f == [1.0, 16384.0, hist,
+                     16384.0 * hist + 16384.0 * 16385.0 / 2.0]
+
+    def test_a_first_chunk_still_costs_something(self):
+        """Its history is zero, so the old `across` term made it free. The
+        triangle inside the chunk is the whole of a first chunk's attention."""
+        f = _prefill_features(self._shape([(16384, 16384)]))
+        assert f[2] == 0.0
+        assert f[3] == pytest.approx(16384.0 * 16385.0 / 2.0)
 
     def test_two_requests_are_not_cross_multiplied(self):
         f = _prefill_features(self._shape([(1856, 67968), (14528, 14528)]))
         # 14528 is a first chunk: its context is its own tokens, so no history.
-        assert f[3] == pytest.approx(1856.0 * (67968.0 - 1856.0))
+        assert f[2] == pytest.approx(67968.0 - 1856.0)
         collapsed = 16384.0 * ((67968.0 + 14528.0) - 16384.0)
-        assert f[3] < collapsed / 8
+        assert f[3] < collapsed / 2
 
     def test_a_decode_riding_along_is_not_charged_here(self):
         """Its attention is what the decode model is for."""
@@ -173,12 +186,22 @@ class TestPrefillAttentionIsPerRequest:
             self._shape([(16384, 65536)], decodes=(120000,)))
         assert alone == with_decode
 
-    def test_within_chunk_attention_is_also_per_request(self):
+    def test_the_history_read_does_not_scale_with_the_chunk(self):
+        """A short final chunk re-reads the whole history, the same as a full
+        one does. That is the region the serving rungs spend their time in and
+        the region a `new * history` term gets wrong."""
+        short = _prefill_features(self._shape([(512, 200192)]))
+        full = _prefill_features(self._shape([(16384, 216064)]))
+        assert short[2] == pytest.approx(full[2])
+        assert short[3] < full[3] / 20
+
+    def test_within_chunk_attention_is_still_per_request(self):
         """Two 1000-token chunks are not one 2000-token chunk: attention within
-        a chunk is quadratic, so the sum of squares is not the square of sums."""
+        a chunk is quadratic, so the sum of triangles is not the triangle of
+        sums."""
         f = _prefill_features(self._shape([(1000, 1000), (1000, 1000)]))
-        assert f[2] == pytest.approx(2 * 1000.0 ** 2)
-        assert f[2] < (2000.0 ** 2)
+        assert f[3] == pytest.approx(2 * 1000.0 * 1001.0 / 2.0)
+        assert f[3] < 2000.0 * 2001.0 / 2.0
 
 
 class TestLeadingWarmupIsReportedNotCharged:

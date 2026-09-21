@@ -14,9 +14,10 @@ model that is wrong about both.
 
 Features, per step:
 
-* prefill — new tokens, plus attention within each chunk and over each chunk's
-  own history. Both attention terms are summed per request: a step prefilling
-  two requests at once must not charge one's tokens against the other's history
+* prefill — new tokens, plus the KV history each chunk reads and the causal
+  attention pairs it evaluates. Every term is summed per request: a step
+  prefilling two requests at once must not charge one's tokens against the
+  other's history
 * decode — batch size (one row of GEMM work each) and total context across the
   batch (the KV bytes that must be read)
 
@@ -41,7 +42,8 @@ __all__ = ["CalibratedCostOracle"]
 
 
 def _prefill_features(shape: StepShape) -> list[float]:
-    """What a prefill step costs: its own tokens, and the history it reads.
+    """What a prefill step costs: its own tokens, the history it reads, and the
+    attention pairs it evaluates.
 
     `tokens` and `tokens**2` alone describe a prefill that starts from nothing --
     linear GEMM work plus self-attention within the chunk. Chunked prefill does
@@ -55,14 +57,9 @@ def _prefill_features(shape: StepShape) -> list[float]:
     one number for them, 23% under the mean, because the feature it needed was
     not there to fit.
 
-    Attention is the chunk reading over what came before -- each of its queries
-    reads its own request's history. Keeping that separate from attention
-    *within* the chunk, because the two grow differently: the second is fixed
-    once the chunk size is, and the first climbs with every chunk.
-
-    **Both are summed per request, not taken on the batch totals.** A step can
-    prefill two requests at once, and collapsing it into `tokens * history` with
-    both sides summed cross-multiplies them -- request A's new tokens get
+    **Everything is summed per request, not taken on the batch totals.** A step
+    can prefill two requests at once, and collapsing it into `tokens * history`
+    with both sides summed cross-multiplies them -- request A's new tokens get
     charged against request B's history, which A never reads. The error is not
     small. On one real step, ``[1856 new on 67968 ctx] + [14528 new on 14528]``:
 
@@ -81,13 +78,47 @@ def _prefill_features(shape: StepShape) -> list[float]:
     Collapsing them is the standard shortcut in this field and it is the
     standard source of error." The lengths were there; this function summed them.
 
-    Reduces to the previous features exactly for a single-request step, which is
-    all a calibration sweep mostly contains and is why a sweep-fitted model
-    looked healthy while serving runs did not.
+    The attention terms are the read and the compute, charged separately.
+
+    The features were once `within = new**2` and `across = new * history`,
+    splitting attention by where the keys came from. That split is not what the
+    hardware distinguishes. Reading the KV history costs bytes and is linear in
+    the history alone -- a 512-token chunk re-reads a 200k history in full, the
+    same as a 16384-token chunk does. Evaluating attention costs flops and is
+    the count of causal (query, key) pairs: `new * history` for the history plus
+    `new * (new + 1) / 2` for the lower triangle inside the chunk itself. The
+    old `across` dropped that triangle, which is the entire cost of a first
+    chunk, where the history is zero.
+
+    Fitted on the calibration table of each tensor-parallel width and scored on
+    four held-out serving rungs of that width, mean per-step error over the
+    twelve rungs falls from 21.9% to 12.9% -- TP1 20.0 to 10.2, TP2 23.3 to
+    13.2, TP4 22.5 to 15.4.
+
+    A roofline, `max(a * history, pairs)`, scores the same (12.7%) but needs `a`
+    as a source constant rather than a fitted one, and the best `a` is 450 at
+    TP1, 675 at TP2 and 1250 at TP4 -- so it would ship a table of magic numbers
+    keyed on width, and guess for any width nobody swept. Two columns let the
+    calibration find the crossover itself.
+
+    What this does NOT fix is a total bias of -8% at one concurrent client,
+    falling to -1% at sixteen. That is not the basis: no coefficients fit all
+    four rungs at once, and fitting on the one-client rung lands the sixteen-
+    client rung +11%. It is a hole in the table. A short final chunk taken
+    against a deep history is 30% of the one-client run's prefill seconds and 1%
+    of the sixteen-client run's, and the sweep has no such sample -- at 512
+    tokens it holds three rows, all at a context under 8192, while the run puts
+    thirty past 131072. The fit is unconstrained exactly where the short-chunk
+    rungs spend their time.
+
+    Reduces to the previous features exactly for a single-request step in the
+    sense that matters -- one request's numbers, not the batch's -- which is all
+    a calibration sweep mostly contains and is why a sweep-fitted model looked
+    healthy while serving runs did not.
     """
     tokens = float(shape.num_prefill_tokens)
-    within = 0.0    # attention inside each chunk, quadratic in that chunk
-    across = 0.0    # attention over each chunk's own history
+    history = 0.0   # KV bytes read: every chunk re-reads its request's history
+    pairs = 0.0     # attention flops: causal (query, key) pairs evaluated
     for scheduled, context in zip(shape.num_scheduled_tokens,
                                   shape.context_lens or ()):
         if scheduled <= 1:
@@ -95,11 +126,12 @@ def _prefill_features(shape: StepShape) -> list[float]:
             # the decode model is for; charging it here would double-count.
             continue
         new = float(scheduled)
-        within += new * new
         # The history is what this request's context holds *before* its own new
         # tokens, which the reading already counts.
-        across += new * max(0.0, float(context) - new)
-    return [1.0, tokens, within, across]
+        hist = max(0.0, float(context) - new)
+        history += hist
+        pairs += new * hist + new * (new + 1.0) / 2.0
+    return [1.0, tokens, history, pairs]
 
 
 def _decode_features(shape: StepShape) -> list[float]:
