@@ -54,7 +54,7 @@ HEADING = re.compile(r"^## (\d+)\.")
 ROW = re.compile(r"^\| *(~*)\**T(\d+)")
 SPAN = re.compile(r"T\d+(?:[-–]T\d+)?(?:(?:,| and ) ?T\d+(?:[-–]T\d+)?)*")
 TOTAL = re.compile(r"(\d+) (?:registered TODOs|rows)")
-OPEN = re.compile(r"(?<![T\d])(\d+) are open")
+OPEN = re.compile(r"(?<![T\d.])(\d+) are open")
 STRUCK = re.compile(r"((?:T\d+(?:, | and ))*T\d+) are struck through as done")
 CLOSED = re.compile(r"T(\d+) was opened and closed")
 
