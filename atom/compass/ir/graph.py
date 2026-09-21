@@ -15,8 +15,16 @@ graph is detected rather than mispriced.
 `Applicability` is the slot for that statement and not the statement itself:
 deciding a step against recorded guards is the job of the module that evaluates
 them, and it chooses how it is asked. What is fixed here is that a graph cannot
-be built without one. `None` is not an empty predicate; it is a graph claiming
-to apply everywhere, which is the failure this field exists to prevent.
+be built without one, and that one cannot be conjured -- `Applicability` is
+abstract, so an instance of it by itself, which is a graph claiming to apply
+everywhere, cannot be made. `None` is not an empty predicate either; it is the
+same claim spelled differently.
+
+A graph is also where an unresolved index is caught. A context key written in
+terms of `{layer}` is priced per instance only if some enclosing repeat binds
+`layer`; if none does, the key names something that will never be supplied. The
+region reports those as `free_indices`, composed from each region's immediate
+children, and a graph refuses to hold a region with any.
 """
 
 import abc
@@ -34,9 +42,17 @@ class Applicability(abc.ABC):
     -- and a symbolic domain evaluated from the guards the tracing run
     installed. Guards only capture branches taken on a shape, so a branch on a
     non-shape leaves no guard behind and the key is what covers it.
+
+    Abstract on one method only, and that method is not the deciding one: how a
+    step is offered and how a refusal names its guard belong to whatever
+    evaluates the guards, and are deliberately not fixed here.
     """
 
     __slots__ = ()
+
+    @abc.abstractmethod
+    def describe(self) -> str:
+        """Where this graph is valid, in one line, for a record or a refusal."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -61,4 +77,11 @@ class Graph:
         if not isinstance(self.region, Region):
             raise TypeError(
                 f"a graph holds one region, got {type(self.region).__name__}"
+            )
+        unresolved = self.region.free_indices
+        if unresolved:
+            raise ValueError(
+                f"nothing binds {sorted(unresolved)}, named by a context key in "
+                "this graph. An index no enclosing repeat supplies cannot be "
+                "given a value when a price is asked for."
             )
