@@ -53,6 +53,20 @@ differ in what they optimise for**:
 Same context, opposed objectives. The reviewer is a separate agent specifically so the
 review is not performed by the context that produced the code.
 
+### The developer owns development and PR updates, and the loop has a stop
+
+The main agent orchestrates; it does not write the change or update the PR. The developer
+agent owns both. After each push the reviewer reviews, the developer amends, and that
+repeats until the reviewer's verdict is APPROVE.
+
+The owner is asked only for a **critical blocking issue** — one where proceeding under any
+reading would be wrong — or a scope call (D102). A review finding the developer can act on
+is not an escalation.
+
+> **If the same finding survives two cycles, or the loop passes three cycles, it halts and
+> goes to the owner.** A task that cannot converge is mis-cut, not under-worked — the same
+> decomposition signal as the conflicts above.
+
 ### The halt rule
 
 > **When something does not work as expected, stop and discuss. Do not work around it.**
@@ -106,7 +120,8 @@ records before this decision named where the brief goes.
 | **Integration branch** | `feature/atomcompass_new` — already the PR #3 branch |
 | **Per-task isolation** | a git worktree per in-flight task, under `compass-worktrees/<task-id>`, beside the repo |
 | **The task** | one GitHub issue per task, holding its brief and its handoff (D96) |
-| **Landing** | one PR per task into the integration branch, naming its task's issue, reviewed by that task's reviewer agent |
+| **Landing** | one PR per task, **squash-merged** into the integration branch, naming its task's issue, reviewed by that task's reviewer agent. The repo permits squash merges only (`allow_merge_commit=false`, `allow_rebase_merge=false`) |
+| **Post-landing** | the main agent fast-forwards the main worktree to the integration branch promptly. Git run through the container writes as root, so file ownership must be restored after the pull |
 | **ATOM's `main`** | untouched until the milestone the project agrees to upstream |
 
 **Closing the issue is deliberate, not automatic.** GitHub auto-closes a linked issue
@@ -142,9 +157,10 @@ Four things, all required:
 2. **New CPU-only tests** for what the task added, in `tests/compass/`, in ATOM's style.
 3. **One named result**, stated in the issue body before the task is claimed and not
    chosen afterwards — what this task now makes possible that was not possible before.
-4. **Review by the task's reviewer agent**, against its brief and the cited decisions.
-   GitHub refuses APPROVE and REQUEST_CHANGES on a self-authored PR, so the verdict is
-   stated in the body of the review comment.
+4. **Review by the task's reviewer agent**, against its brief and the cited decisions,
+   repeating until the verdict is APPROVE. GitHub refuses APPROVE and REQUEST_CHANGES on a
+   self-authored PR, so the verdict is stated in the body of the review comment. A loop
+   that does not converge halts to the owner per D95's stop condition.
 
 **Baseline first.** P0.2 records the suite's and ruff's current pass/fail state before the
 first Compass commit. A pre-existing failure attributed to Compass costs a day, and the
@@ -393,10 +409,10 @@ Stated so it is not mistaken for an omission.
 
 | # | Decision | Date |
 |---|---|---|
-| D95 | Tasks are a **pool**, not a track assignment; 5 dev + 5 reviewer agents cap concurrency at 5 in flight. Conflicts are tolerated and are a **decomposition signal**. Developer and reviewer are separate agents with opposed objectives. **Halt and discuss on any surprise.** | 2026-09-20 |
+| D95 | Tasks are a **pool**, not a track assignment; 5 dev + 5 reviewer agents cap concurrency at 5 in flight. Conflicts are tolerated and are a **decomposition signal**. Developer and reviewer are separate agents with opposed objectives; the developer owns development and PR updates, looping with the reviewer until APPROVE, escalating only critical blocking issues and scope calls. **The loop halts to the owner if the same finding survives two cycles, or after three cycles.** **Halt and discuss on any surprise.** | 2026-09-21 |
 | D96 | The task record is the **GitHub issue and its PR** — brief in the issue body, dev record in the PR body, review record in the review comment, handoff in the closing comment — with each brief linking to its predecessors' issues. A brief that cannot name its file set is not claimable. | 2026-09-21 |
-| D97 | `feature/atomcompass_new` is the integration branch; one issue, one worktree and one PR per task. Four setup rules from recorded failures: no shared mutable source root, containers mount the worktree parent, `PYTHONPATH` verified before trusting a result, `git archive` never `rsync`. | 2026-09-21 |
-| D98 | Four gates per task: ATOM's suite green **unmodified**, new CPU-only tests, one named result stated in advance, and review by a separate agent. Baselines recorded first. | 2026-09-20 |
+| D97 | `feature/atomcompass_new` is the integration branch; one issue, one worktree and one PR per task, **squash-merged** (the repo permits squash merges only). Four setup rules from recorded failures: no shared mutable source root, containers mount the worktree parent, `PYTHONPATH` verified before trusting a result, `git archive` never `rsync`. On landing, the main agent fast-forwards the main worktree and restores file ownership. | 2026-09-21 |
+| D98 | Four gates per task: ATOM's suite green **unmodified**, new CPU-only tests, one named result stated in advance, and review by a separate agent, looping to APPROVE per D95. Baselines recorded first. | 2026-09-21 |
 | D99 | Effort in **lines of code**. Wall-clock only for machine time with a measured basis. A 2x overrun is a halt-and-discuss event. | 2026-09-20 |
 | D100 | Twelve modules under `atom/compass/`; tasks are cut so each touches one plus its tests. ATOM edits outside that tree are enumerated per task. | 2026-09-20 |
 | D101 | One GPU queue; tasks declare their measurement before becoming claimable. Pre-flight is **three** checks — wedge, compute, **VRAM** — run before *and* after. | 2026-09-20 |

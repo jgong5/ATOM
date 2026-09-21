@@ -9,6 +9,12 @@
 
 ## Execution rules
 - Don't modify the main worktree. Develop with linked worktrees.
+- **On every landing, the main agent fast-forwards the main worktree** to the
+  integration branch promptly. This doesn't contradict the rule above: that rule
+  forbids developing there, not updating it. Git run through the container writes
+  as **root**, so file ownership must be restored after the pull, or later
+  host-side edits fail silently. This happened on #11's landing and needed a
+  manual repair.
 - **No design-doc references in code.** No `D18`, `P0.4`, `T5`, `W2.5`, backticked
   doc numbers, "principle N", or numbered labels like "Gate 1". No quoting design
   principles as justification. Say what the code does, its functions, how it works.
@@ -28,8 +34,19 @@
 - Concurrency: 5 tasks in flight, up to 10 agents (`16_execution_plan.md`, D95).
 - Both developer and reviewer agents must be told to read `atom/compass/design/README.md`'s
   eight principles first.
+- **A developer agent owns development and PR updates; the main agent orchestrates
+  and does not write the change itself.** After each push a reviewer agent
+  reviews, the developer amends, and that repeats until the verdict is APPROVE.
+  The owner is asked only for a critical blocking issue or a scope call — an
+  actionable review finding is not an escalation.
+- **The review loop has its own stop.** If the same finding survives two cycles,
+  or the loop passes three cycles, it halts and goes to the owner (`16_execution_plan.md`,
+  D95): a task that cannot converge is mis-cut, not under-worked.
 - Reviewer agents must post their review to the PR. GitHub refuses
   APPROVE/REQUEST_CHANGES on self-authored PRs, so **the verdict goes in the
   comment body text**.
+- **PRs land squashed onto the integration branch**, one commit per task. GitHub
+  enforces this structurally (`allow_merge_commit=false`, `allow_rebase_merge=false`);
+  this rule records the constraint, not creates it.
 - Except for the main branch, free updates to `jgong5/ATOM` — branches, PRs and
   issues alike. Never touch `ROCm/ATOM`.
