@@ -1,0 +1,2095 @@
+{
+ "schema": 1,
+ "what": "Every call on ATOM's serving path that can stop a thread, and what a simulated run has to do about it. Rows under 'sites' are produced by the scanner in sync_scan.py and classified by hand; rows under 'anchors' are points that are not a call -- a loop gate, a stamp, a compiled-in bound -- and are pinned to a line of text instead.",
+ "categories": {
+  "A": "simulated time decides this, not the real clock: a duration that is predicted rather than elapsed, or a reading the result reports",
+  "B": "parks until another process sends something, with no bound; the call stays as it is and the process says when it is idle",
+  "C1": "a bound that exists to declare something broken; raise it or switch it off",
+  "C2": "a bound that sets a cadence; keep the cadence on simulated time and poll briefly for real so the thread stays responsive",
+  "ignore": "invisible to the simulated result: inside one process, at startup, at shutdown, below the replaced forward pass, or in a backend the simulator substitutes",
+  "undecided": "the reading depends on a decision that has not been made"
+ },
+ "boundary": "A bounded wait for another process is C1 or C2 by what the bound is for; the same wait without a bound is B. A wait whose peer is a thread of the same process is ignored, because the process is not idle while one of its own threads is parked.",
+ "scanned_roots": [
+  {
+   "path": "atom/model_engine/engine_core.py",
+   "why": "the engine step loop, its IPC threads, and the two disaggregated cores"
+  },
+  {
+   "path": "atom/model_engine/engine_core_mgr.py",
+   "why": "the front-end side of the engine IPC, startup handshake and shutdown"
+  },
+  {
+   "path": "atom/model_engine/pp_engine_core.py",
+   "why": "the pipeline-parallel head and downstream step loops"
+  },
+  {
+   "path": "atom/model_engine/async_proc.py",
+   "why": "the worker RPC transport: shared-memory broadcast out, ZMQ back"
+  },
+  {
+   "path": "atom/model_engine/scheduler.py",
+   "why": "admission and batching, including the disaggregated schedulers"
+  },
+  {
+   "path": "atom/model_engine/llm_engine.py",
+   "why": "request entry, arrival stamping, egress"
+  },
+  {
+   "path": "atom/model_engine/prefill_delayer.py",
+   "why": "the cross-rank prefill coalescer, which reduces every tick"
+  },
+  {
+   "path": "atom/model_engine/model_runner.py",
+   "why": "the class the simulated runner replaces; scanned so the replacement's obligations stay visible"
+  },
+  {
+   "path": "atom/entrypoints/openai/api_server.py",
+   "why": "HTTP entry, streaming egress, metrics"
+  },
+  {
+   "path": "atom/entrypoints/openai/streaming_dispatch.py",
+   "why": "the hand-off from the engine output threads to each stream"
+  },
+  {
+   "path": "atom/distributed/pp_comm.py",
+   "why": "pipeline-stage tensor send and its completion"
+  },
+  {
+   "path": "atom/distributed/pp_transport.py",
+   "why": "pipeline-stage metadata and token sockets"
+  },
+  {
+   "path": "atom/distributed/kv_events.py",
+   "why": "the KV event publisher thread"
+  },
+  {
+   "path": "atom/kv_transfer/disaggregation/",
+   "why": "the prefill/decode transfer connectors and their handshake threads"
+  }
+ ],
+ "unscanned_roots": [
+  {
+   "path": "atom/kv_transfer/offload/",
+   "why": "CPU and NVMe offload backends, selected by their own transfer config and not by the prefill/decode path the simulator substitutes"
+  },
+  {
+   "path": "atom/entrypoints/atomesh/",
+   "why": "the standalone router's Python adapter, an alternative front end; a simulated run posts to the OpenAI server above"
+  },
+  {
+   "path": "atom/model_ops/",
+   "why": "kernels and layers below the forward pass, which the simulator replaces whole rather than entering"
+  }
+ ],
+ "sites": [
+  {
+   "id": "atom/distributed/kv_events.py::ZmqEventPublisher.shutdown::self._sender.join::join#0",
+   "file": "atom/distributed/kv_events.py",
+   "line": 236,
+   "symbol": "ZmqEventPublisher.shutdown",
+   "call": "self._sender.join",
+   "shape": "join",
+   "category": "ignore",
+   "peer": "thread",
+   "why": "shutdown join of the event publisher thread, after the last step has been charged"
+  },
+  {
+   "id": "atom/distributed/kv_events.py::ZmqEventPublisher._run::self._queue.get::queue_get#0",
+   "file": "atom/distributed/kv_events.py",
+   "line": 246,
+   "symbol": "ZmqEventPublisher._run",
+   "call": "self._queue.get",
+   "shape": "queue_get",
+   "category": "ignore",
+   "peer": "thread",
+   "why": "the publisher thread parks on a queue its own process fills, and no step waits for it"
+  },
+  {
+   "id": "atom/distributed/kv_events.py::ZmqEventPublisher._run::self._socket.send::p2p#0",
+   "file": "atom/distributed/kv_events.py",
+   "line": 253,
+   "symbol": "ZmqEventPublisher._run",
+   "call": "self._socket.send",
+   "shape": "p2p",
+   "category": "ignore",
+   "peer": "process",
+   "why": "fire-and-forget publish to an outside subscriber; nothing in the step loop waits for it"
+  },
+  {
+   "id": "atom/distributed/pp_comm.py::_async_send_object::torch.distributed.isend::p2p#0",
+   "file": "atom/distributed/pp_comm.py",
+   "line": 120,
+   "symbol": "_async_send_object",
+   "call": "torch.distributed.isend",
+   "shape": "p2p",
+   "category": "ignore",
+   "peer": "process",
+   "why": "inside the real forward pass, which the simulated runner replaces, so no tensor is sent"
+  },
+  {
+   "id": "atom/distributed/pp_comm.py::_async_send_object::torch.distributed.isend::p2p#1",
+   "file": "atom/distributed/pp_comm.py",
+   "line": 122,
+   "symbol": "_async_send_object",
+   "call": "torch.distributed.isend",
+   "shape": "p2p",
+   "category": "ignore",
+   "peer": "process",
+   "why": "inside the real forward pass, which the simulated runner replaces, so no tensor is sent"
+  },
+  {
+   "id": "atom/distributed/pp_comm.py::async_send_intermediate_tensors::torch.distributed.isend::p2p#0",
+   "file": "atom/distributed/pp_comm.py",
+   "line": 151,
+   "symbol": "async_send_intermediate_tensors",
+   "call": "torch.distributed.isend",
+   "shape": "p2p",
+   "category": "ignore",
+   "peer": "process",
+   "why": "inside the real forward pass, which the simulated runner replaces, so no tensor is sent"
+  },
+  {
+   "id": "atom/distributed/pp_comm.py::async_send_intermediate_tensors::torch.distributed.isend::p2p#1",
+   "file": "atom/distributed/pp_comm.py",
+   "line": 153,
+   "symbol": "async_send_intermediate_tensors",
+   "call": "torch.distributed.isend",
+   "shape": "p2p",
+   "category": "ignore",
+   "peer": "process",
+   "why": "inside the real forward pass, which the simulated runner replaces, so no tensor is sent"
+  },
+  {
+   "id": "atom/distributed/pp_comm.py::commit_pp_send_work::p2p.work.wait::event_wait#0",
+   "file": "atom/distributed/pp_comm.py",
+   "line": 163,
+   "symbol": "commit_pp_send_work",
+   "call": "p2p.work.wait",
+   "shape": "event_wait",
+   "category": "undecided",
+   "peer": "process",
+   "why": "reached through the flush the stage loop still asks the runner for; whether the replacement runner has any send to commit is not settled"
+  },
+  {
+   "id": "atom/distributed/pp_transport.py::PPStageTransport.send_metadata::sock.send::p2p#0",
+   "file": "atom/distributed/pp_transport.py",
+   "line": 105,
+   "symbol": "PPStageTransport.send_metadata",
+   "call": "sock.send",
+   "shape": "p2p",
+   "category": "ignore",
+   "peer": "process",
+   "why": "the head broadcasts the batch and does not park; this is where a message's send time would be stamped"
+  },
+  {
+   "id": "atom/distributed/pp_transport.py::PPStageTransport.recv_tokens::self._token_recv.poll::poll#0",
+   "file": "atom/distributed/pp_transport.py",
+   "line": 112,
+   "symbol": "PPStageTransport.recv_tokens",
+   "call": "self._token_recv.poll",
+   "shape": "poll",
+   "category": "C2",
+   "peer": "process",
+   "why": "bounded poll whose bound the head varies between zero and its idle interval, so it paces the head loop"
+  },
+  {
+   "id": "atom/distributed/pp_transport.py::PPStageTransport.recv_tokens::self._token_recv.recv::socket_recv#0",
+   "file": "atom/distributed/pp_transport.py",
+   "line": 114,
+   "symbol": "PPStageTransport.recv_tokens",
+   "call": "self._token_recv.recv",
+   "shape": "socket_recv",
+   "category": "B",
+   "peer": "process",
+   "why": "the head parks for the last stage's sampled output"
+  },
+  {
+   "id": "atom/distributed/pp_transport.py::PPStageTransport.recv_kv_status::self._kv_status_recv.poll::poll#0",
+   "file": "atom/distributed/pp_transport.py",
+   "line": 125,
+   "symbol": "PPStageTransport.recv_kv_status",
+   "call": "self._kv_status_recv.poll",
+   "shape": "poll",
+   "category": "ignore",
+   "peer": "process",
+   "why": "every caller passes a zero bound, so this drains what has already arrived and never parks"
+  },
+  {
+   "id": "atom/distributed/pp_transport.py::PPStageTransport.recv_kv_status::self._kv_status_recv.recv::socket_recv#0",
+   "file": "atom/distributed/pp_transport.py",
+   "line": 126,
+   "symbol": "PPStageTransport.recv_kv_status",
+   "call": "self._kv_status_recv.recv",
+   "shape": "socket_recv",
+   "category": "ignore",
+   "peer": "process",
+   "why": "only reached after a zero-bound poll reports a frame, so it returns at once"
+  },
+  {
+   "id": "atom/distributed/pp_transport.py::PPStageTransport.recv_metadata::self._meta_recv.poll::poll#0",
+   "file": "atom/distributed/pp_transport.py",
+   "line": 134,
+   "symbol": "PPStageTransport.recv_metadata",
+   "call": "self._meta_recv.poll",
+   "shape": "poll",
+   "category": "C2",
+   "peer": "process",
+   "why": "bounded poll that paces the downstream stage loop between batches"
+  },
+  {
+   "id": "atom/distributed/pp_transport.py::PPStageTransport.recv_metadata::self._meta_recv.recv::socket_recv#0",
+   "file": "atom/distributed/pp_transport.py",
+   "line": 136,
+   "symbol": "PPStageTransport.recv_metadata",
+   "call": "self._meta_recv.recv",
+   "shape": "socket_recv",
+   "category": "B",
+   "peer": "process",
+   "why": "a downstream stage parks for the head's scheduled batch"
+  },
+  {
+   "id": "atom/distributed/pp_transport.py::PPStageTransport.send_tokens::self._token_send.send::p2p#0",
+   "file": "atom/distributed/pp_transport.py",
+   "line": 141,
+   "symbol": "PPStageTransport.send_tokens",
+   "call": "self._token_send.send",
+   "shape": "p2p",
+   "category": "ignore",
+   "peer": "process",
+   "why": "the last stage returns its sampled output and does not park"
+  },
+  {
+   "id": "atom/distributed/pp_transport.py::PPStageTransport.send_kv_status::self._kv_status_send.send::p2p#0",
+   "file": "atom/distributed/pp_transport.py",
+   "line": 147,
+   "symbol": "PPStageTransport.send_kv_status",
+   "call": "self._kv_status_send.send",
+   "shape": "p2p",
+   "category": "ignore",
+   "peer": "process",
+   "why": "a downstream stage reports transfer status and does not park"
+  },
+  {
+   "id": "atom/entrypoints/openai/api_server.py::_send_stream_chunk_direct::_stream_batch_dispatcher.enqueue::task_wait#0",
+   "file": "atom/entrypoints/openai/api_server.py",
+   "line": 790,
+   "symbol": "_send_stream_chunk_direct",
+   "call": "_stream_batch_dispatcher.enqueue",
+   "shape": "task_wait",
+   "category": "ignore",
+   "peer": "none",
+   "why": "appends to a thread-local buffer flushed at the end of the engine step; it never parks"
+  },
+  {
+   "id": "atom/entrypoints/openai/api_server.py::_send_stream_chunk_tagged::_stream_batch_dispatcher.enqueue::task_wait#0",
+   "file": "atom/entrypoints/openai/api_server.py",
+   "line": 823,
+   "symbol": "_send_stream_chunk_tagged",
+   "call": "_stream_batch_dispatcher.enqueue",
+   "shape": "task_wait",
+   "category": "ignore",
+   "peer": "none",
+   "why": "appends to a thread-local buffer flushed at the end of the engine step; it never parks"
+  },
+  {
+   "id": "atom/entrypoints/openai/api_server.py::generate_async::loop.run_in_executor::executor_handoff#0",
+   "file": "atom/entrypoints/openai/api_server.py",
+   "line": 890,
+   "symbol": "generate_async",
+   "call": "loop.run_in_executor",
+   "shape": "executor_handoff",
+   "category": "A",
+   "peer": "thread",
+   "why": "tokenization on the default thread pool, whose service time is charged from the machine spec instead of taken from the wall clock"
+  },
+  {
+   "id": "atom/entrypoints/openai/api_server.py::generate_async::token_queue.get::queue_get#0",
+   "file": "atom/entrypoints/openai/api_server.py",
+   "line": 901,
+   "symbol": "generate_async",
+   "call": "token_queue.get",
+   "shape": "queue_get",
+   "category": "B",
+   "peer": "process",
+   "why": "the request's coroutine parks until the engine produces its next chunk"
+  },
+  {
+   "id": "atom/entrypoints/openai/api_server.py::generate_async_multimodal::loop.run_in_executor::executor_handoff#0",
+   "file": "atom/entrypoints/openai/api_server.py",
+   "line": 1004,
+   "symbol": "generate_async_multimodal",
+   "call": "loop.run_in_executor",
+   "shape": "executor_handoff",
+   "category": "A",
+   "peer": "thread",
+   "why": "tokenization on the default thread pool, whose service time is charged from the machine spec instead of taken from the wall clock"
+  },
+  {
+   "id": "atom/entrypoints/openai/api_server.py::generate_async_multimodal::token_queue.get::queue_get#0",
+   "file": "atom/entrypoints/openai/api_server.py",
+   "line": 1015,
+   "symbol": "generate_async_multimodal",
+   "call": "token_queue.get",
+   "shape": "queue_get",
+   "category": "B",
+   "peer": "process",
+   "why": "the request's coroutine parks until the engine produces its next chunk"
+  },
+  {
+   "id": "atom/entrypoints/openai/api_server.py::generate_async_fanout::loop.run_in_executor::executor_handoff#0",
+   "file": "atom/entrypoints/openai/api_server.py",
+   "line": 1126,
+   "symbol": "generate_async_fanout",
+   "call": "loop.run_in_executor",
+   "shape": "executor_handoff",
+   "category": "A",
+   "peer": "thread",
+   "why": "tokenization on the default thread pool, whose service time is charged from the machine spec instead of taken from the wall clock"
+  },
+  {
+   "id": "atom/entrypoints/openai/api_server.py::generate_async_fanout::shared_queue.get::queue_get#0",
+   "file": "atom/entrypoints/openai/api_server.py",
+   "line": 1139,
+   "symbol": "generate_async_fanout",
+   "call": "shared_queue.get",
+   "shape": "queue_get",
+   "category": "B",
+   "peer": "process",
+   "why": "the fan-out coroutine parks until the engine produces a chunk for any of its branches"
+  },
+  {
+   "id": "atom/entrypoints/openai/api_server.py::setup_streaming_request::executor_loop.run_in_executor::executor_handoff#0",
+   "file": "atom/entrypoints/openai/api_server.py",
+   "line": 1258,
+   "symbol": "setup_streaming_request",
+   "call": "executor_loop.run_in_executor",
+   "shape": "executor_handoff",
+   "category": "A",
+   "peer": "thread",
+   "why": "tokenization on the default thread pool, whose service time is charged from the machine spec instead of taken from the wall clock"
+  },
+  {
+   "id": "atom/entrypoints/openai/api_server.py::_race_disconnect::asyncio.wait::event_wait#0",
+   "file": "atom/entrypoints/openai/api_server.py",
+   "line": 1365,
+   "symbol": "_race_disconnect",
+   "call": "asyncio.wait",
+   "shape": "event_wait",
+   "category": "ignore",
+   "peer": "none",
+   "why": "races two tasks of the same request against each other; the wait for the engine sits inside the handler task and is listed there"
+  },
+  {
+   "id": "atom/entrypoints/openai/api_server.py::_race_disconnect::handler_task.result::event_wait#0",
+   "file": "atom/entrypoints/openai/api_server.py",
+   "line": 1388,
+   "symbol": "_race_disconnect",
+   "call": "handler_task.result",
+   "shape": "event_wait",
+   "category": "ignore",
+   "peer": "none",
+   "why": "reads a task that has already completed"
+  },
+  {
+   "id": "atom/entrypoints/openai/api_server.py::setup_streaming_request_fanout::executor_loop.run_in_executor::executor_handoff#0",
+   "file": "atom/entrypoints/openai/api_server.py",
+   "line": 1480,
+   "symbol": "setup_streaming_request_fanout",
+   "call": "executor_loop.run_in_executor",
+   "shape": "executor_handoff",
+   "category": "A",
+   "peer": "thread",
+   "why": "tokenization on the default thread pool, whose service time is charged from the machine spec instead of taken from the wall clock"
+  },
+  {
+   "id": "atom/entrypoints/openai/api_server.py::_metrics_refresh_loop::asyncio.sleep::sleep#0",
+   "file": "atom/entrypoints/openai/api_server.py",
+   "line": 1522,
+   "symbol": "_metrics_refresh_loop",
+   "call": "asyncio.sleep",
+   "shape": "sleep",
+   "category": "ignore",
+   "peer": "none",
+   "why": "the metrics scrape cadence is deliberately left on the real clock"
+  },
+  {
+   "id": "atom/entrypoints/openai/api_server.py::chat_completions::loop.run_in_executor::executor_handoff#0",
+   "file": "atom/entrypoints/openai/api_server.py",
+   "line": 1660,
+   "symbol": "chat_completions",
+   "call": "loop.run_in_executor",
+   "shape": "executor_handoff",
+   "category": "undecided",
+   "peer": "thread",
+   "why": "multimodal input preparation shares the pool with tokenization, but no service time is defined for it and the corpus carries no images"
+  },
+  {
+   "id": "atom/entrypoints/openai/api_server.py::anthropic_messages.generate_anthropic_stream::stream_collector.get::queue_get#0",
+   "file": "atom/entrypoints/openai/api_server.py",
+   "line": 2147,
+   "symbol": "anthropic_messages.generate_anthropic_stream",
+   "call": "stream_collector.get",
+   "shape": "queue_get",
+   "category": "B",
+   "peer": "process",
+   "why": "the stream generator parks until the engine produces its next chunk"
+  },
+  {
+   "id": "atom/entrypoints/openai/streaming_dispatch.py::StreamOutputCollector.get::self._ready.wait::event_wait#0",
+   "file": "atom/entrypoints/openai/streaming_dispatch.py",
+   "line": 136,
+   "symbol": "StreamOutputCollector.get",
+   "call": "self._ready.wait",
+   "shape": "event_wait",
+   "category": "B",
+   "peer": "process",
+   "why": "the stream's response generator parks until an engine step delivers its chunk"
+  },
+  {
+   "id": "atom/kv_transfer/disaggregation/mooncake/mooncake_connector.py::MooncakeConnector._acquire_staging_slot::time.sleep::sleep#0",
+   "file": "atom/kv_transfer/disaggregation/mooncake/mooncake_connector.py",
+   "line": 1084,
+   "symbol": "MooncakeConnector._acquire_staging_slot",
+   "call": "time.sleep",
+   "shape": "sleep",
+   "category": "ignore",
+   "peer": "none",
+   "why": "spins for a staging slot in a transfer backend the simulator replaces with a priced one"
+  },
+  {
+   "id": "atom/kv_transfer/disaggregation/mooncake/mooncake_connector.py::MooncakeConnector._write_listener::sock.recv_multipart::socket_recv#0",
+   "file": "atom/kv_transfer/disaggregation/mooncake/mooncake_connector.py",
+   "line": 1131,
+   "symbol": "MooncakeConnector._write_listener",
+   "call": "sock.recv_multipart",
+   "shape": "socket_recv",
+   "category": "ignore",
+   "peer": "process",
+   "why": "listener thread of a transfer backend the simulator replaces with a priced one"
+  },
+  {
+   "id": "atom/kv_transfer/disaggregation/mooncake/mooncake_connector.py::MooncakeConnector._write_listener::self._send_executor.submit::executor_handoff#0",
+   "file": "atom/kv_transfer/disaggregation/mooncake/mooncake_connector.py",
+   "line": 1149,
+   "symbol": "MooncakeConnector._write_listener",
+   "call": "self._send_executor.submit",
+   "shape": "executor_handoff",
+   "category": "ignore",
+   "peer": "thread",
+   "why": "transfer backend the simulator replaces with a priced one"
+  },
+  {
+   "id": "atom/kv_transfer/disaggregation/mooncake/mooncake_connector.py::MooncakeConnector._execute_block_slot_transfer::torch.cuda.current_stream().synchronize::device_sync#0",
+   "file": "atom/kv_transfer/disaggregation/mooncake/mooncake_connector.py",
+   "line": 1569,
+   "symbol": "MooncakeConnector._execute_block_slot_transfer",
+   "call": "torch.cuda.current_stream().synchronize",
+   "shape": "device_sync",
+   "category": "ignore",
+   "peer": "none",
+   "why": "device-stream synchronization in a transfer backend the simulator replaces with a priced one"
+  },
+  {
+   "id": "atom/kv_transfer/disaggregation/mooncake/mooncake_connector.py::MooncakeConnector._wait_for_prefill_data::self._completed_prefills_cv.wait_for::event_wait#0",
+   "file": "atom/kv_transfer/disaggregation/mooncake/mooncake_connector.py",
+   "line": 1602,
+   "symbol": "MooncakeConnector._wait_for_prefill_data",
+   "call": "self._completed_prefills_cv.wait_for",
+   "shape": "event_wait",
+   "category": "ignore",
+   "peer": "process",
+   "why": "a sixty-second lookup bound in a transfer backend the simulator replaces with a priced one"
+  },
+  {
+   "id": "atom/kv_transfer/disaggregation/mooncake/mooncake_connector.py::MooncakeConnector._rdma_write_with_retry::time.sleep::sleep#0",
+   "file": "atom/kv_transfer/disaggregation/mooncake/mooncake_connector.py",
+   "line": 1667,
+   "symbol": "MooncakeConnector._rdma_write_with_retry",
+   "call": "time.sleep",
+   "shape": "sleep",
+   "category": "ignore",
+   "peer": "process",
+   "why": "a doubling retry pause in a transfer backend the simulator replaces with a priced one"
+  },
+  {
+   "id": "atom/kv_transfer/disaggregation/mooncake/mooncake_connector.py::MooncakeConnector._notification_listener::sock.recv_multipart::socket_recv#0",
+   "file": "atom/kv_transfer/disaggregation/mooncake/mooncake_connector.py",
+   "line": 1731,
+   "symbol": "MooncakeConnector._notification_listener",
+   "call": "sock.recv_multipart",
+   "shape": "socket_recv",
+   "category": "ignore",
+   "peer": "process",
+   "why": "listener thread of a transfer backend the simulator replaces with a priced one"
+  },
+  {
+   "id": "atom/kv_transfer/disaggregation/moriio/moriio_connector.py::MoRIIOConnector.start_load_kv::while need_handshake::spin_loop#0",
+   "file": "atom/kv_transfer/disaggregation/moriio/moriio_connector.py",
+   "line": 331,
+   "symbol": "MoRIIOConnector.start_load_kv",
+   "call": "while need_handshake",
+   "shape": "spin_loop",
+   "category": "ignore",
+   "peer": "process",
+   "why": "a handshake spin with no pause and no deadline, in a transfer backend the simulator replaces with a priced one"
+  },
+  {
+   "id": "atom/kv_transfer/disaggregation/moriio/moriio_connector.py::MoRIIOConnector._handshake_listener::sock.recv_multipart::socket_recv#0",
+   "file": "atom/kv_transfer/disaggregation/moriio/moriio_connector.py",
+   "line": 656,
+   "symbol": "MoRIIOConnector._handshake_listener",
+   "call": "sock.recv_multipart",
+   "shape": "socket_recv",
+   "category": "ignore",
+   "peer": "process",
+   "why": "handshake listener of a transfer backend the simulator replaces with a priced one"
+  },
+  {
+   "id": "atom/kv_transfer/disaggregation/moriio/moriio_connector.py::MoRIIOConnector._execute_handshake::sock.send::p2p#0",
+   "file": "atom/kv_transfer/disaggregation/moriio/moriio_connector.py",
+   "line": 704,
+   "symbol": "MoRIIOConnector._execute_handshake",
+   "call": "sock.send",
+   "shape": "p2p",
+   "category": "ignore",
+   "peer": "process",
+   "why": "handshake exchange of a transfer backend the simulator replaces with a priced one"
+  },
+  {
+   "id": "atom/kv_transfer/disaggregation/moriio/moriio_connector.py::MoRIIOConnector._execute_handshake::sock.recv_multipart::socket_recv#0",
+   "file": "atom/kv_transfer/disaggregation/moriio/moriio_connector.py",
+   "line": 705,
+   "symbol": "MoRIIOConnector._execute_handshake",
+   "call": "sock.recv_multipart",
+   "shape": "socket_recv",
+   "category": "ignore",
+   "peer": "process",
+   "why": "handshake exchange of a transfer backend the simulator replaces with a priced one"
+  },
+  {
+   "id": "atom/kv_transfer/disaggregation/moriio/moriio_connector.py::MoRIIOConnector._execute_handshake::sock.recv_multipart::socket_recv#1",
+   "file": "atom/kv_transfer/disaggregation/moriio/moriio_connector.py",
+   "line": 746,
+   "symbol": "MoRIIOConnector._execute_handshake",
+   "call": "sock.recv_multipart",
+   "shape": "socket_recv",
+   "category": "ignore",
+   "peer": "process",
+   "why": "handshake exchange of a transfer backend the simulator replaces with a priced one"
+  },
+  {
+   "id": "atom/kv_transfer/disaggregation/moriio/moriio_connector.py::MoRIIOConnector._initiate_background_handshake::self._handshake_executor.submit::executor_handoff#0",
+   "file": "atom/kv_transfer/disaggregation/moriio/moriio_connector.py",
+   "line": 794,
+   "symbol": "MoRIIOConnector._initiate_background_handshake",
+   "call": "self._handshake_executor.submit",
+   "shape": "executor_handoff",
+   "category": "ignore",
+   "peer": "thread",
+   "why": "background handshake of a transfer backend the simulator replaces with a priced one"
+  },
+  {
+   "id": "atom/kv_transfer/disaggregation/moriio/moriio_connector.py::MoRIIOConnector._initiate_background_handshake._on_single_done::f.result::event_wait#0",
+   "file": "atom/kv_transfer/disaggregation/moriio/moriio_connector.py",
+   "line": 803,
+   "symbol": "MoRIIOConnector._initiate_background_handshake._on_single_done",
+   "call": "f.result",
+   "shape": "event_wait",
+   "category": "ignore",
+   "peer": "thread",
+   "why": "background handshake of a transfer backend the simulator replaces with a priced one"
+  },
+  {
+   "id": "atom/kv_transfer/disaggregation/moriio/moriio_connector.py::MoRIIOConnector._initiate_background_handshake._wait_all::f.result::event_wait#0",
+   "file": "atom/kv_transfer/disaggregation/moriio/moriio_connector.py",
+   "line": 812,
+   "symbol": "MoRIIOConnector._initiate_background_handshake._wait_all",
+   "call": "f.result",
+   "shape": "event_wait",
+   "category": "ignore",
+   "peer": "thread",
+   "why": "background handshake of a transfer backend the simulator replaces with a priced one"
+  },
+  {
+   "id": "atom/kv_transfer/disaggregation/moriio/moriio_connector.py::MoRIIOConnector._initiate_background_handshake::self._handshake_executor.submit::executor_handoff#1",
+   "file": "atom/kv_transfer/disaggregation/moriio/moriio_connector.py",
+   "line": 815,
+   "symbol": "MoRIIOConnector._initiate_background_handshake",
+   "call": "self._handshake_executor.submit",
+   "shape": "executor_handoff",
+   "category": "ignore",
+   "peer": "thread",
+   "why": "background handshake of a transfer backend the simulator replaces with a priced one"
+  },
+  {
+   "id": "atom/kv_transfer/disaggregation/moriio/moriio_engine.py::MoRIIOWrapper.async_wait_reqid._async_wait::sock.recv_multipart::socket_recv#0",
+   "file": "atom/kv_transfer/disaggregation/moriio/moriio_engine.py",
+   "line": 237,
+   "symbol": "MoRIIOWrapper.async_wait_reqid._async_wait",
+   "call": "sock.recv_multipart",
+   "shape": "socket_recv",
+   "category": "ignore",
+   "peer": "process",
+   "why": "completion listener of a transfer backend the simulator replaces with a priced one"
+  },
+  {
+   "id": "atom/model_engine/async_proc.py::AsyncIOProc.exit::t.join::join#0",
+   "file": "atom/model_engine/async_proc.py",
+   "line": 181,
+   "symbol": "AsyncIOProc.exit",
+   "call": "t.join",
+   "shape": "join",
+   "category": "ignore",
+   "peer": "thread",
+   "why": "shutdown join of a worker's own IO threads"
+  },
+  {
+   "id": "atom/model_engine/async_proc.py::AsyncIOProc.recv_input_from_socket::socket.send::p2p#0",
+   "file": "atom/model_engine/async_proc.py",
+   "line": 202,
+   "symbol": "AsyncIOProc.recv_input_from_socket",
+   "call": "socket.send",
+   "shape": "p2p",
+   "category": "ignore",
+   "peer": "process",
+   "why": "the manager passes no input address for this thread, so it is never started"
+  },
+  {
+   "id": "atom/model_engine/async_proc.py::AsyncIOProc.recv_input_from_socket::poller.poll::poll#0",
+   "file": "atom/model_engine/async_proc.py",
+   "line": 207,
+   "symbol": "AsyncIOProc.recv_input_from_socket",
+   "call": "poller.poll",
+   "shape": "poll",
+   "category": "ignore",
+   "peer": "process",
+   "why": "the manager passes no input address for this thread, so it is never started"
+  },
+  {
+   "id": "atom/model_engine/async_proc.py::AsyncIOProc.recv_input_from_socket::socket.recv::socket_recv#0",
+   "file": "atom/model_engine/async_proc.py",
+   "line": 208,
+   "symbol": "AsyncIOProc.recv_input_from_socket",
+   "call": "socket.recv",
+   "shape": "socket_recv",
+   "category": "ignore",
+   "peer": "process",
+   "why": "the manager passes no input address for this thread, so it is never started"
+  },
+  {
+   "id": "atom/model_engine/async_proc.py::AsyncIOProc.send_output_to_socket::output_queue.get::queue_get#0",
+   "file": "atom/model_engine/async_proc.py",
+   "line": 220,
+   "symbol": "AsyncIOProc.send_output_to_socket",
+   "call": "output_queue.get",
+   "shape": "queue_get",
+   "category": "ignore",
+   "peer": "thread",
+   "why": "a worker's output thread parks on a queue the same process fills; the step loop does not wait for it"
+  },
+  {
+   "id": "atom/model_engine/async_proc.py::AsyncIOProc.send_output_to_socket::socket.send::p2p#0",
+   "file": "atom/model_engine/async_proc.py",
+   "line": 222,
+   "symbol": "AsyncIOProc.send_output_to_socket",
+   "call": "socket.send",
+   "shape": "p2p",
+   "category": "ignore",
+   "peer": "process",
+   "why": "a worker returns its result; the send does not park, and it is where a message's send time would be stamped"
+  },
+  {
+   "id": "atom/model_engine/async_proc.py::AsyncIOProc.busy_loop::self.all_ranks_barrier.wait::event_wait#0",
+   "file": "atom/model_engine/async_proc.py",
+   "line": 242,
+   "symbol": "AsyncIOProc.busy_loop",
+   "call": "self.all_ranks_barrier.wait",
+   "shape": "event_wait",
+   "category": "ignore",
+   "peer": "process",
+   "why": "a barrier across the worker processes of one tensor-parallel group, which hold no clock of their own and advance together"
+  },
+  {
+   "id": "atom/model_engine/async_proc.py::AsyncIOProc.get_func::self.rpc_broadcast_mq.dequeue::task_wait#0",
+   "file": "atom/model_engine/async_proc.py",
+   "line": 256,
+   "symbol": "AsyncIOProc.get_func",
+   "call": "self.rpc_broadcast_mq.dequeue",
+   "shape": "task_wait",
+   "category": "B",
+   "peer": "process",
+   "why": "a worker's main loop parks here for the engine's next call, and this is where it is idle"
+  },
+  {
+   "id": "atom/model_engine/async_proc.py::AsyncIOProcManager.exit::proc.join::join#0",
+   "file": "atom/model_engine/async_proc.py",
+   "line": 363,
+   "symbol": "AsyncIOProcManager.exit",
+   "call": "proc.join",
+   "shape": "join",
+   "category": "ignore",
+   "peer": "process",
+   "why": "shutdown joins of the worker processes and their IO threads"
+  },
+  {
+   "id": "atom/model_engine/async_proc.py::AsyncIOProcManager.exit::self.output_thread.join::join#0",
+   "file": "atom/model_engine/async_proc.py",
+   "line": 366,
+   "symbol": "AsyncIOProcManager.exit",
+   "call": "self.output_thread.join",
+   "shape": "join",
+   "category": "ignore",
+   "peer": "process",
+   "why": "shutdown joins of the worker processes and their IO threads"
+  },
+  {
+   "id": "atom/model_engine/async_proc.py::AsyncIOProcManager.exit::thread.join::join#0",
+   "file": "atom/model_engine/async_proc.py",
+   "line": 368,
+   "symbol": "AsyncIOProcManager.exit",
+   "call": "thread.join",
+   "shape": "join",
+   "category": "ignore",
+   "peer": "process",
+   "why": "shutdown joins of the worker processes and their IO threads"
+  },
+  {
+   "id": "atom/model_engine/async_proc.py::AsyncIOProcManager.process_output_sockets::poller.poll::poll#0",
+   "file": "atom/model_engine/async_proc.py",
+   "line": 398,
+   "symbol": "AsyncIOProcManager.process_output_sockets",
+   "call": "poller.poll",
+   "shape": "poll",
+   "category": "C1",
+   "peer": "process",
+   "why": "a one-second bound so the thread can notice shutdown; raising it changes nothing the run reports"
+  },
+  {
+   "id": "atom/model_engine/async_proc.py::AsyncIOProcManager.process_output_sockets::output_socket.recv::socket_recv#0",
+   "file": "atom/model_engine/async_proc.py",
+   "line": 401,
+   "symbol": "AsyncIOProcManager.process_output_sockets",
+   "call": "output_socket.recv",
+   "shape": "socket_recv",
+   "category": "B",
+   "peer": "process",
+   "why": "the engine's output thread parks for a worker's reply frame"
+  },
+  {
+   "id": "atom/model_engine/async_proc.py::AsyncIOProcManager.process_kv_output_sockets::poller.poll::poll#0",
+   "file": "atom/model_engine/async_proc.py",
+   "line": 415,
+   "symbol": "AsyncIOProcManager.process_kv_output_sockets",
+   "call": "poller.poll",
+   "shape": "poll",
+   "category": "C1",
+   "peer": "process",
+   "why": "a one-second bound so the thread can notice shutdown; raising it changes nothing the run reports"
+  },
+  {
+   "id": "atom/model_engine/async_proc.py::AsyncIOProcManager.process_kv_output_sockets::output_socket.recv::socket_recv#0",
+   "file": "atom/model_engine/async_proc.py",
+   "line": 418,
+   "symbol": "AsyncIOProcManager.process_kv_output_sockets",
+   "call": "output_socket.recv",
+   "shape": "socket_recv",
+   "category": "B",
+   "peer": "process",
+   "why": "the engine's transfer-status thread parks for a worker's reply frame"
+  },
+  {
+   "id": "atom/model_engine/async_proc.py::AsyncIOProcManager.call_func::self.rpc_broadcast_mq.enqueue::task_wait#0",
+   "file": "atom/model_engine/async_proc.py",
+   "line": 429,
+   "symbol": "AsyncIOProcManager.call_func",
+   "call": "self.rpc_broadcast_mq.enqueue",
+   "shape": "task_wait",
+   "category": "B",
+   "peer": "process",
+   "why": "the engine hands a call to the workers and parks if the shared-memory ring has no free slot"
+  },
+  {
+   "id": "atom/model_engine/async_proc.py::AsyncIOProcManager.call_func::self.outputs_queue.get::queue_get#0",
+   "file": "atom/model_engine/async_proc.py",
+   "line": 431,
+   "symbol": "AsyncIOProcManager.call_func",
+   "call": "self.outputs_queue.get",
+   "shape": "queue_get",
+   "category": "B",
+   "peer": "process",
+   "why": "the engine's step loop parks for the workers' reply; the duration was charged by the reply's sender"
+  },
+  {
+   "id": "atom/model_engine/async_proc.py::AsyncIOProcManager.call_func_with_aggregation::self.rpc_broadcast_mq.enqueue::task_wait#0",
+   "file": "atom/model_engine/async_proc.py",
+   "line": 454,
+   "symbol": "AsyncIOProcManager.call_func_with_aggregation",
+   "call": "self.rpc_broadcast_mq.enqueue",
+   "shape": "task_wait",
+   "category": "B",
+   "peer": "process",
+   "why": "the engine hands a call to the workers and parks if the shared-memory ring has no free slot"
+  },
+  {
+   "id": "atom/model_engine/async_proc.py::AsyncIOProcManager.call_func_with_aggregation::output_queue.get::queue_get#0",
+   "file": "atom/model_engine/async_proc.py",
+   "line": 460,
+   "symbol": "AsyncIOProcManager.call_func_with_aggregation",
+   "call": "output_queue.get",
+   "shape": "queue_get",
+   "category": "C1",
+   "peer": "process",
+   "why": "a ten-second bound per worker that returns None and logs an error; it detects a dead worker rather than pacing anything"
+  },
+  {
+   "id": "atom/model_engine/async_proc.py::AsyncIOProcManager.monitor_procs.monitor_engine_cores::multiprocessing.connection.wait::event_wait#0",
+   "file": "atom/model_engine/async_proc.py",
+   "line": 482,
+   "symbol": "AsyncIOProcManager.monitor_procs.monitor_engine_cores",
+   "call": "multiprocessing.connection.wait",
+   "shape": "event_wait",
+   "category": "ignore",
+   "peer": "process",
+   "why": "waits on process sentinels at the OS level; a death detector, not a timeout, and it stays on the real clock"
+  },
+  {
+   "id": "atom/model_engine/async_proc.py::AsyncIOProcManager.monitor_procs.monitor_engine_cores::dead_proc.join::join#0",
+   "file": "atom/model_engine/async_proc.py",
+   "line": 487,
+   "symbol": "AsyncIOProcManager.monitor_procs.monitor_engine_cores",
+   "call": "dead_proc.join",
+   "shape": "join",
+   "category": "ignore",
+   "peer": "process",
+   "why": "reaps a worker that has already died"
+  },
+  {
+   "id": "atom/model_engine/engine_core.py::EngineCore.__init__::self.runner_mgr.call_func::worker_rpc#0",
+   "file": "atom/model_engine/engine_core.py",
+   "line": 132,
+   "symbol": "EngineCore.__init__",
+   "call": "self.runner_mgr.call_func",
+   "shape": "worker_rpc",
+   "category": "ignore",
+   "peer": "process",
+   "why": "startup sizing and allocation calls to the workers, before any request exists"
+  },
+  {
+   "id": "atom/model_engine/engine_core.py::EngineCore.__init__::self.runner_mgr.call_func::worker_rpc#1",
+   "file": "atom/model_engine/engine_core.py",
+   "line": 142,
+   "symbol": "EngineCore.__init__",
+   "call": "self.runner_mgr.call_func",
+   "shape": "worker_rpc",
+   "category": "ignore",
+   "peer": "process",
+   "why": "startup sizing and allocation calls to the workers, before any request exists"
+  },
+  {
+   "id": "atom/model_engine/engine_core.py::EngineCore.__init__::self.runner_mgr.call_func::worker_rpc#2",
+   "file": "atom/model_engine/engine_core.py",
+   "line": 149,
+   "symbol": "EngineCore.__init__",
+   "call": "self.runner_mgr.call_func",
+   "shape": "worker_rpc",
+   "category": "ignore",
+   "peer": "process",
+   "why": "startup sizing and allocation calls to the workers, before any request exists"
+  },
+  {
+   "id": "atom/model_engine/engine_core.py::EngineCore._freeze_after_startup::self.runner_mgr.call_func::worker_rpc#0",
+   "file": "atom/model_engine/engine_core.py",
+   "line": 204,
+   "symbol": "EngineCore._freeze_after_startup",
+   "call": "self.runner_mgr.call_func",
+   "shape": "worker_rpc",
+   "category": "ignore",
+   "peer": "process",
+   "why": "a startup call to the workers, before any request exists"
+  },
+  {
+   "id": "atom/model_engine/engine_core.py::EngineCore.exit::proc.join::join#0",
+   "file": "atom/model_engine/engine_core.py",
+   "line": 269,
+   "symbol": "EngineCore.exit",
+   "call": "proc.join",
+   "shape": "join",
+   "category": "ignore",
+   "peer": "process",
+   "why": "shutdown join of the worker processes"
+  },
+  {
+   "id": "atom/model_engine/engine_core.py::EngineCore._send_engine_dead::self.output_thread.join::join#0",
+   "file": "atom/model_engine/engine_core.py",
+   "line": 276,
+   "symbol": "EngineCore._send_engine_dead",
+   "call": "self.output_thread.join",
+   "shape": "join",
+   "category": "ignore",
+   "peer": "thread",
+   "why": "shutdown join of this process's output thread"
+  },
+  {
+   "id": "atom/model_engine/engine_core.py::EngineCore._is_idle_rl_weights_offloaded::time.sleep::sleep#0",
+   "file": "atom/model_engine/engine_core.py",
+   "line": 307,
+   "symbol": "EngineCore._is_idle_rl_weights_offloaded",
+   "call": "time.sleep",
+   "shape": "sleep",
+   "category": "ignore",
+   "peer": "none",
+   "why": "reached only while weights are offloaded for reinforcement-learning training, which a simulated run never does"
+  },
+  {
+   "id": "atom/model_engine/engine_core.py::EngineCore.busy_loop::while True::spin_loop#0",
+   "file": "atom/model_engine/engine_core.py",
+   "line": 315,
+   "symbol": "EngineCore.busy_loop",
+   "call": "while True",
+   "shape": "spin_loop",
+   "category": "ignore",
+   "peer": "none",
+   "why": "the step loop; everything that parks in it parks inside the calls it makes, which are listed separately"
+  },
+  {
+   "id": "atom/model_engine/engine_core.py::EngineCore._process_engine_step_inner::self.runner_mgr.call_func::worker_rpc#0",
+   "file": "atom/model_engine/engine_core.py",
+   "line": 386,
+   "symbol": "EngineCore._process_engine_step_inner",
+   "call": "self.runner_mgr.call_func",
+   "shape": "worker_rpc",
+   "category": "A",
+   "peer": "process",
+   "why": "the forward pass: the predicted duration replaces the elapsed time of this call"
+  },
+  {
+   "id": "atom/model_engine/engine_core.py::EngineCore._drain_kv_work_at_exit::time.sleep::sleep#0",
+   "file": "atom/model_engine/engine_core.py",
+   "line": 481,
+   "symbol": "EngineCore._drain_kv_work_at_exit",
+   "call": "time.sleep",
+   "shape": "sleep",
+   "category": "ignore",
+   "peer": "none",
+   "why": "a bounded shutdown drain, after the last step has been charged"
+  },
+  {
+   "id": "atom/model_engine/engine_core.py::EngineCore._poll_kv_transfer_progress::self.runner_mgr.call_func_with_aggregation::worker_rpc#0",
+   "file": "atom/model_engine/engine_core.py",
+   "line": 488,
+   "symbol": "EngineCore._poll_kv_transfer_progress",
+   "call": "self.runner_mgr.call_func_with_aggregation",
+   "shape": "worker_rpc",
+   "category": "A",
+   "peer": "process",
+   "why": "transfer completion reaches the scheduler only here, and the simulated connector releases a request when simulated time passes its priced deadline"
+  },
+  {
+   "id": "atom/model_engine/engine_core.py::EngineCore.process_input_sockets::input_socket.send::p2p#0",
+   "file": "atom/model_engine/engine_core.py",
+   "line": 536,
+   "symbol": "EngineCore.process_input_sockets",
+   "call": "input_socket.send",
+   "shape": "p2p",
+   "category": "ignore",
+   "peer": "process",
+   "why": "the empty frame that lets the front end's router address this process; startup"
+  },
+  {
+   "id": "atom/model_engine/engine_core.py::EngineCore.process_input_sockets::control_socket.send::p2p#0",
+   "file": "atom/model_engine/engine_core.py",
+   "line": 537,
+   "symbol": "EngineCore.process_input_sockets",
+   "call": "control_socket.send",
+   "shape": "p2p",
+   "category": "ignore",
+   "peer": "process",
+   "why": "the empty frame that lets the front end's router address this process; startup"
+  },
+  {
+   "id": "atom/model_engine/engine_core.py::EngineCore.process_input_sockets::poller.poll::poll#0",
+   "file": "atom/model_engine/engine_core.py",
+   "line": 544,
+   "symbol": "EngineCore.process_input_sockets",
+   "call": "poller.poll",
+   "shape": "poll",
+   "category": "B",
+   "peer": "process",
+   "why": "the engine's input thread parks with no bound for the front end's next frame"
+  },
+  {
+   "id": "atom/model_engine/engine_core.py::EngineCore.process_input_sockets::sock.recv::socket_recv#0",
+   "file": "atom/model_engine/engine_core.py",
+   "line": 546,
+   "symbol": "EngineCore.process_input_sockets",
+   "call": "sock.recv",
+   "shape": "socket_recv",
+   "category": "B",
+   "peer": "process",
+   "why": "the engine's input thread parks for the front end's next request or control frame"
+  },
+  {
+   "id": "atom/model_engine/engine_core.py::EngineCore.process_output_sockets::self.output_queue.get::queue_get#0",
+   "file": "atom/model_engine/engine_core.py",
+   "line": 588,
+   "symbol": "EngineCore.process_output_sockets",
+   "call": "self.output_queue.get",
+   "shape": "queue_get",
+   "category": "ignore",
+   "peer": "thread",
+   "why": "the output thread parks on a queue this process's own step loop fills, so declaring the engine blocked here would mark it idle while its step loop runs"
+  },
+  {
+   "id": "atom/model_engine/engine_core.py::EngineCore.process_output_sockets::socket.send::p2p#0",
+   "file": "atom/model_engine/engine_core.py",
+   "line": 593,
+   "symbol": "EngineCore.process_output_sockets",
+   "call": "socket.send",
+   "shape": "p2p",
+   "category": "ignore",
+   "peer": "process",
+   "why": "the engine returns finished sequences and status frames; the send does not park, and it is where a message's send time would be stamped"
+  },
+  {
+   "id": "atom/model_engine/engine_core.py::EngineCore.process_output_sockets::socket.send::p2p#1",
+   "file": "atom/model_engine/engine_core.py",
+   "line": 599,
+   "symbol": "EngineCore.process_output_sockets",
+   "call": "socket.send",
+   "shape": "p2p",
+   "category": "ignore",
+   "peer": "process",
+   "why": "the engine returns finished sequences and status frames; the send does not park, and it is where a message's send time would be stamped"
+  },
+  {
+   "id": "atom/model_engine/engine_core.py::EngineCore.process_output_sockets::socket.send::p2p#2",
+   "file": "atom/model_engine/engine_core.py",
+   "line": 605,
+   "symbol": "EngineCore.process_output_sockets",
+   "call": "socket.send",
+   "shape": "p2p",
+   "category": "ignore",
+   "peer": "process",
+   "why": "the engine returns finished sequences and status frames; the send does not park, and it is where a message's send time would be stamped"
+  },
+  {
+   "id": "atom/model_engine/engine_core.py::EngineCore.process_output_sockets::socket.send::p2p#3",
+   "file": "atom/model_engine/engine_core.py",
+   "line": 614,
+   "symbol": "EngineCore.process_output_sockets",
+   "call": "socket.send",
+   "shape": "p2p",
+   "category": "ignore",
+   "peer": "process",
+   "why": "the engine returns finished sequences and status frames; the send does not park, and it is where a message's send time would be stamped"
+  },
+  {
+   "id": "atom/model_engine/engine_core.py::EngineCore.process_output_sockets::socket.send::p2p#4",
+   "file": "atom/model_engine/engine_core.py",
+   "line": 625,
+   "symbol": "EngineCore.process_output_sockets",
+   "call": "socket.send",
+   "shape": "p2p",
+   "category": "ignore",
+   "peer": "process",
+   "why": "the engine returns finished sequences and status frames; the send does not park, and it is where a message's send time would be stamped"
+  },
+  {
+   "id": "atom/model_engine/engine_core.py::EngineCore.process_output_sockets::socket.send::p2p#5",
+   "file": "atom/model_engine/engine_core.py",
+   "line": 628,
+   "symbol": "EngineCore.process_output_sockets",
+   "call": "socket.send",
+   "shape": "p2p",
+   "category": "ignore",
+   "peer": "process",
+   "why": "the engine returns finished sequences and status frames; the send does not park, and it is where a message's send time would be stamped"
+  },
+  {
+   "id": "atom/model_engine/engine_core.py::DPEngineCoreProc.busy_loop::time.sleep::sleep#0",
+   "file": "atom/model_engine/engine_core.py",
+   "line": 721,
+   "symbol": "DPEngineCoreProc.busy_loop",
+   "call": "time.sleep",
+   "shape": "sleep",
+   "category": "ignore",
+   "peer": "none",
+   "why": "reached only while every rank has offloaded weights for reinforcement-learning training, which a simulated run never does"
+  },
+  {
+   "id": "atom/model_engine/engine_core.py::DPEngineCoreProc._execute_dummy_batch::self.runner_mgr.call_func::worker_rpc#0",
+   "file": "atom/model_engine/engine_core.py",
+   "line": 749,
+   "symbol": "DPEngineCoreProc._execute_dummy_batch",
+   "call": "self.runner_mgr.call_func",
+   "shape": "worker_rpc",
+   "category": "A",
+   "peer": "process",
+   "why": "the empty forward an idle rank runs to stay in lockstep; it consumes a step and its predicted duration is charged like any other"
+  },
+  {
+   "id": "atom/model_engine/engine_core.py::DPEngineCoreProc._sync_dp_state::torch.distributed.all_reduce::collective#0",
+   "file": "atom/model_engine/engine_core.py",
+   "line": 770,
+   "symbol": "DPEngineCoreProc._sync_dp_state",
+   "call": "torch.distributed.all_reduce",
+   "shape": "collective",
+   "category": "ignore",
+   "peer": "process",
+   "why": "the lockstep reduction across the ranks of one data-parallel group, which advance together and hold one clock between them"
+  },
+  {
+   "id": "atom/model_engine/engine_core.py::DPEngineCoreProc._sync_shutdown_state::torch.distributed.all_reduce::collective#0",
+   "file": "atom/model_engine/engine_core.py",
+   "line": 787,
+   "symbol": "DPEngineCoreProc._sync_shutdown_state",
+   "call": "torch.distributed.all_reduce",
+   "shape": "collective",
+   "category": "ignore",
+   "peer": "process",
+   "why": "a shutdown agreement across the ranks of one data-parallel group"
+  },
+  {
+   "id": "atom/model_engine/engine_core.py::PrefillEngineCore._post_model_load_hook::self.runner_mgr.call_func::worker_rpc#0",
+   "file": "atom/model_engine/engine_core.py",
+   "line": 872,
+   "symbol": "PrefillEngineCore._post_model_load_hook",
+   "call": "self.runner_mgr.call_func",
+   "shape": "worker_rpc",
+   "category": "ignore",
+   "peer": "deployment",
+   "why": "weight-handle export and its acknowledgement, during startup of the intra-device split"
+  },
+  {
+   "id": "atom/model_engine/engine_core.py::PrefillEngineCore._post_model_load_hook::w_sock.send::p2p#0",
+   "file": "atom/model_engine/engine_core.py",
+   "line": 881,
+   "symbol": "PrefillEngineCore._post_model_load_hook",
+   "call": "w_sock.send",
+   "shape": "p2p",
+   "category": "ignore",
+   "peer": "deployment",
+   "why": "weight-handle export and its acknowledgement, during startup of the intra-device split"
+  },
+  {
+   "id": "atom/model_engine/engine_core.py::PrefillEngineCore._post_model_load_hook::ack_sock.recv::socket_recv#0",
+   "file": "atom/model_engine/engine_core.py",
+   "line": 885,
+   "symbol": "PrefillEngineCore._post_model_load_hook",
+   "call": "ack_sock.recv",
+   "shape": "socket_recv",
+   "category": "ignore",
+   "peer": "deployment",
+   "why": "weight-handle export and its acknowledgement, during startup of the intra-device split"
+  },
+  {
+   "id": "atom/model_engine/engine_core.py::PrefillEngineCore._send_ready_signal::self.runner_mgr.call_func::worker_rpc#0",
+   "file": "atom/model_engine/engine_core.py",
+   "line": 891,
+   "symbol": "PrefillEngineCore._send_ready_signal",
+   "call": "self.runner_mgr.call_func",
+   "shape": "worker_rpc",
+   "category": "ignore",
+   "peer": "deployment",
+   "why": "cache-handle export during startup of the intra-device split"
+  },
+  {
+   "id": "atom/model_engine/engine_core.py::PrefillEngineCore._send_ready_signal::self._bootstrap_push_sock.send::p2p#0",
+   "file": "atom/model_engine/engine_core.py",
+   "line": 906,
+   "symbol": "PrefillEngineCore._send_ready_signal",
+   "call": "self._bootstrap_push_sock.send",
+   "shape": "p2p",
+   "category": "ignore",
+   "peer": "deployment",
+   "why": "cache-handle export during startup of the intra-device split"
+  },
+  {
+   "id": "atom/model_engine/engine_core.py::PrefillEngineCore._init_disagg::self.runner_mgr.call_func::worker_rpc#0",
+   "file": "atom/model_engine/engine_core.py",
+   "line": 919,
+   "symbol": "PrefillEngineCore._init_disagg",
+   "call": "self.runner_mgr.call_func",
+   "shape": "worker_rpc",
+   "category": "ignore",
+   "peer": "process",
+   "why": "a startup call to the workers"
+  },
+  {
+   "id": "atom/model_engine/engine_core.py::PrefillEngineCore._recv_block_assignments::sock.recv::socket_recv#0",
+   "file": "atom/model_engine/engine_core.py",
+   "line": 946,
+   "symbol": "PrefillEngineCore._recv_block_assignments",
+   "call": "sock.recv",
+   "shape": "socket_recv",
+   "category": "B",
+   "peer": "deployment",
+   "why": "a background thread parks for the decode side's block assignment; it enqueues under the scheduler's lock and the step loop reads it"
+  },
+  {
+   "id": "atom/model_engine/engine_core.py::PrefillEngineCore._process_engine_step::self.runner_mgr.call_func::worker_rpc#0",
+   "file": "atom/model_engine/engine_core.py",
+   "line": 992,
+   "symbol": "PrefillEngineCore._process_engine_step",
+   "call": "self.runner_mgr.call_func",
+   "shape": "worker_rpc",
+   "category": "A",
+   "peer": "process",
+   "why": "the prefill forward pass of the intra-device split: the predicted duration replaces the elapsed time of this call"
+  },
+  {
+   "id": "atom/model_engine/engine_core.py::PrefillEngineCore._process_engine_step::self._p2d_sock.send::p2p#0",
+   "file": "atom/model_engine/engine_core.py",
+   "line": 1014,
+   "symbol": "PrefillEngineCore._process_engine_step",
+   "call": "self._p2d_sock.send",
+   "shape": "p2p",
+   "category": "ignore",
+   "peer": "deployment",
+   "why": "reports a finished prefill to the decode side; the send does not park, and it is where a message's send time would be stamped"
+  },
+  {
+   "id": "atom/model_engine/engine_core.py::DecodeEngineCore.__init__::sock.recv::socket_recv#0",
+   "file": "atom/model_engine/engine_core.py",
+   "line": 1089,
+   "symbol": "DecodeEngineCore.__init__",
+   "call": "sock.recv",
+   "shape": "socket_recv",
+   "category": "ignore",
+   "peer": "deployment",
+   "why": "receives the cache handle during startup of the intra-device split"
+  },
+  {
+   "id": "atom/model_engine/engine_core.py::DecodeEngineCore.__init__::self.runner_mgr.call_func::worker_rpc#0",
+   "file": "atom/model_engine/engine_core.py",
+   "line": 1097,
+   "symbol": "DecodeEngineCore.__init__",
+   "call": "self.runner_mgr.call_func",
+   "shape": "worker_rpc",
+   "category": "ignore",
+   "peer": "process",
+   "why": "cache import and graph capture during startup"
+  },
+  {
+   "id": "atom/model_engine/engine_core.py::DecodeEngineCore.__init__::self.runner_mgr.call_func::worker_rpc#1",
+   "file": "atom/model_engine/engine_core.py",
+   "line": 1109,
+   "symbol": "DecodeEngineCore.__init__",
+   "call": "self.runner_mgr.call_func",
+   "shape": "worker_rpc",
+   "category": "ignore",
+   "peer": "process",
+   "why": "cache import and graph capture during startup"
+  },
+  {
+   "id": "atom/model_engine/engine_core.py::DecodeEngineCore._post_model_load_hook::w_sock.recv::socket_recv#0",
+   "file": "atom/model_engine/engine_core.py",
+   "line": 1144,
+   "symbol": "DecodeEngineCore._post_model_load_hook",
+   "call": "w_sock.recv",
+   "shape": "socket_recv",
+   "category": "ignore",
+   "peer": "deployment",
+   "why": "receives weight handles during startup of the intra-device split"
+  },
+  {
+   "id": "atom/model_engine/engine_core.py::DecodeEngineCore._post_model_load_hook::self.runner_mgr.call_func::worker_rpc#0",
+   "file": "atom/model_engine/engine_core.py",
+   "line": 1149,
+   "symbol": "DecodeEngineCore._post_model_load_hook",
+   "call": "self.runner_mgr.call_func",
+   "shape": "worker_rpc",
+   "category": "ignore",
+   "peer": "process",
+   "why": "imports the weight handles during startup"
+  },
+  {
+   "id": "atom/model_engine/engine_core.py::DecodeEngineCore._post_model_load_hook::time.sleep::sleep#0",
+   "file": "atom/model_engine/engine_core.py",
+   "line": 1156,
+   "symbol": "DecodeEngineCore._post_model_load_hook",
+   "call": "time.sleep",
+   "shape": "sleep",
+   "category": "ignore",
+   "peer": "none",
+   "why": "two real seconds for the device allocator to reclaim freed weight pages; it must stay on the real clock, and it is reached only under the intra-device split, which a simulated run does not enable"
+  },
+  {
+   "id": "atom/model_engine/engine_core.py::DecodeEngineCore._post_model_load_hook::ack_sock.send::p2p#0",
+   "file": "atom/model_engine/engine_core.py",
+   "line": 1162,
+   "symbol": "DecodeEngineCore._post_model_load_hook",
+   "call": "ack_sock.send",
+   "shape": "p2p",
+   "category": "ignore",
+   "peer": "deployment",
+   "why": "acknowledges the weight import during startup"
+  },
+  {
+   "id": "atom/model_engine/engine_core.py::DecodeEngineCore._init_disagg::self.runner_mgr.call_func::worker_rpc#0",
+   "file": "atom/model_engine/engine_core.py",
+   "line": 1179,
+   "symbol": "DecodeEngineCore._init_disagg",
+   "call": "self.runner_mgr.call_func",
+   "shape": "worker_rpc",
+   "category": "ignore",
+   "peer": "process",
+   "why": "a startup call to the workers"
+  },
+  {
+   "id": "atom/model_engine/engine_core.py::DecodeEngineCore._recv_prefill_done::sock.recv::socket_recv#0",
+   "file": "atom/model_engine/engine_core.py",
+   "line": 1204,
+   "symbol": "DecodeEngineCore._recv_prefill_done",
+   "call": "sock.recv",
+   "shape": "socket_recv",
+   "category": "B",
+   "peer": "deployment",
+   "why": "a background thread parks for the prefill side's completion message, then promotes the sequence and stamps its first-token time in that thread"
+  },
+  {
+   "id": "atom/model_engine/engine_core.py::DecodeEngineCore._send_block_assignment::self._d2p_sock.send::p2p#0",
+   "file": "atom/model_engine/engine_core.py",
+   "line": 1229,
+   "symbol": "DecodeEngineCore._send_block_assignment",
+   "call": "self._d2p_sock.send",
+   "shape": "p2p",
+   "category": "ignore",
+   "peer": "deployment",
+   "why": "sends a block assignment to the prefill side; the send does not park, and it is where a message's send time would be stamped"
+  },
+  {
+   "id": "atom/model_engine/engine_core.py::DecodeEngineCore._process_engine_step::self.runner_mgr.call_func::worker_rpc#0",
+   "file": "atom/model_engine/engine_core.py",
+   "line": 1264,
+   "symbol": "DecodeEngineCore._process_engine_step",
+   "call": "self.runner_mgr.call_func",
+   "shape": "worker_rpc",
+   "category": "A",
+   "peer": "process",
+   "why": "the decode forward pass of the intra-device split: the predicted duration replaces the elapsed time of this call"
+  },
+  {
+   "id": "atom/model_engine/engine_core_mgr.py::CoreManager.__init__::proc.join::join#0",
+   "file": "atom/model_engine/engine_core_mgr.py",
+   "line": 427,
+   "symbol": "CoreManager.__init__",
+   "call": "proc.join",
+   "shape": "join",
+   "category": "ignore",
+   "peer": "process",
+   "why": "on a worker node the front end parks for the whole life of its engine processes and does nothing else"
+  },
+  {
+   "id": "atom/model_engine/engine_core_mgr.py::CoreManager.__init__::input_socket.recv_multipart::socket_recv#0",
+   "file": "atom/model_engine/engine_core_mgr.py",
+   "line": 446,
+   "symbol": "CoreManager.__init__",
+   "call": "input_socket.recv_multipart",
+   "shape": "socket_recv",
+   "category": "ignore",
+   "peer": "process",
+   "why": "the startup handshake frame that gives the router an engine's identity"
+  },
+  {
+   "id": "atom/model_engine/engine_core_mgr.py::CoreManager.__init__::control_socket.recv_multipart::socket_recv#0",
+   "file": "atom/model_engine/engine_core_mgr.py",
+   "line": 453,
+   "symbol": "CoreManager.__init__",
+   "call": "control_socket.recv_multipart",
+   "shape": "socket_recv",
+   "category": "ignore",
+   "peer": "process",
+   "why": "the startup handshake frame that gives the router an engine's identity"
+  },
+  {
+   "id": "atom/model_engine/engine_core_mgr.py::CoreManager._wait_for_all_ready_signals::poller.poll::poll#0",
+   "file": "atom/model_engine/engine_core_mgr.py",
+   "line": 534,
+   "symbol": "CoreManager._wait_for_all_ready_signals",
+   "call": "poller.poll",
+   "shape": "poll",
+   "category": "B",
+   "peer": "process",
+   "why": "the front end parks with no bound for every engine's ready signal"
+  },
+  {
+   "id": "atom/model_engine/engine_core_mgr.py::CoreManager._wait_for_all_ready_signals::socket.recv::socket_recv#0",
+   "file": "atom/model_engine/engine_core_mgr.py",
+   "line": 544,
+   "symbol": "CoreManager._wait_for_all_ready_signals",
+   "call": "socket.recv",
+   "shape": "socket_recv",
+   "category": "B",
+   "peer": "process",
+   "why": "the front end parks for an engine's ready signal"
+  },
+  {
+   "id": "atom/model_engine/engine_core_mgr.py::CoreManager._create_output_thread.process_outputs_socket::poller.poll::poll#0",
+   "file": "atom/model_engine/engine_core_mgr.py",
+   "line": 576,
+   "symbol": "CoreManager._create_output_thread.process_outputs_socket",
+   "call": "poller.poll",
+   "shape": "poll",
+   "category": "B",
+   "peer": "process",
+   "why": "the front end's output thread parks with no bound for an engine's next frame"
+  },
+  {
+   "id": "atom/model_engine/engine_core_mgr.py::CoreManager._create_output_thread.process_outputs_socket::output_socket.recv::socket_recv#0",
+   "file": "atom/model_engine/engine_core_mgr.py",
+   "line": 586,
+   "symbol": "CoreManager._create_output_thread.process_outputs_socket",
+   "call": "output_socket.recv",
+   "shape": "socket_recv",
+   "category": "B",
+   "peer": "process",
+   "why": "the front end's output thread parks for an engine's next frame"
+  },
+  {
+   "id": "atom/model_engine/engine_core_mgr.py::CoreManager._async_output_handler::loop.run_in_executor::executor_handoff#0",
+   "file": "atom/model_engine/engine_core_mgr.py",
+   "line": 723,
+   "symbol": "CoreManager._async_output_handler",
+   "call": "loop.run_in_executor",
+   "shape": "executor_handoff",
+   "category": "B",
+   "peer": "process",
+   "why": "hands the blocking read of the engine output queue to a pool thread and parks the relay coroutine on it"
+  },
+  {
+   "id": "atom/model_engine/engine_core_mgr.py::CoreManager.get_output_async::self.async_output_queue.get::queue_get#0",
+   "file": "atom/model_engine/engine_core_mgr.py",
+   "line": 736,
+   "symbol": "CoreManager.get_output_async",
+   "call": "self.async_output_queue.get",
+   "shape": "queue_get",
+   "category": "ignore",
+   "peer": "thread",
+   "why": "parks on a queue this process's own relay coroutine fills; the wait for the engine is one hop earlier"
+  },
+  {
+   "id": "atom/model_engine/engine_core_mgr.py::CoreManager.close::shutdown_sender.send::p2p#0",
+   "file": "atom/model_engine/engine_core_mgr.py",
+   "line": 766,
+   "symbol": "CoreManager.close",
+   "call": "shutdown_sender.send",
+   "shape": "p2p",
+   "category": "ignore",
+   "peer": "process",
+   "why": "shutdown sends and joins, after the last step has been charged"
+  },
+  {
+   "id": "atom/model_engine/engine_core_mgr.py::CoreManager.close::thread.join::join#0",
+   "file": "atom/model_engine/engine_core_mgr.py",
+   "line": 772,
+   "symbol": "CoreManager.close",
+   "call": "thread.join",
+   "shape": "join",
+   "category": "ignore",
+   "peer": "process",
+   "why": "shutdown sends and joins, after the last step has been charged"
+  },
+  {
+   "id": "atom/model_engine/engine_core_mgr.py::CoreManager.close::proc.join::join#0",
+   "file": "atom/model_engine/engine_core_mgr.py",
+   "line": 785,
+   "symbol": "CoreManager.close",
+   "call": "proc.join",
+   "shape": "join",
+   "category": "ignore",
+   "peer": "process",
+   "why": "shutdown sends and joins, after the last step has been charged"
+  },
+  {
+   "id": "atom/model_engine/engine_core_mgr.py::CoreManager.close::proc.join::join#1",
+   "file": "atom/model_engine/engine_core_mgr.py",
+   "line": 793,
+   "symbol": "CoreManager.close",
+   "call": "proc.join",
+   "shape": "join",
+   "category": "ignore",
+   "peer": "process",
+   "why": "shutdown sends and joins, after the last step has been charged"
+  },
+  {
+   "id": "atom/model_engine/engine_core_mgr.py::CoreManager.close::proc.join::join#2",
+   "file": "atom/model_engine/engine_core_mgr.py",
+   "line": 800,
+   "symbol": "CoreManager.close",
+   "call": "proc.join",
+   "shape": "join",
+   "category": "ignore",
+   "peer": "process",
+   "why": "shutdown sends and joins, after the last step has been charged"
+  },
+  {
+   "id": "atom/model_engine/engine_core_mgr.py::CoreManager.broadcast_utility_command_sync::self.utility_response_queue.get::queue_get#0",
+   "file": "atom/model_engine/engine_core_mgr.py",
+   "line": 1334,
+   "symbol": "CoreManager.broadcast_utility_command_sync",
+   "call": "self.utility_response_queue.get",
+   "shape": "queue_get",
+   "category": "C1",
+   "peer": "process",
+   "why": "a bound on a utility command's reply that raises a timeout; it detects an unresponsive engine rather than pacing anything"
+  },
+  {
+   "id": "atom/model_engine/engine_core_mgr.py::CoreManager.get_output::self.outputs_queue.get::queue_get#0",
+   "file": "atom/model_engine/engine_core_mgr.py",
+   "line": 1379,
+   "symbol": "CoreManager.get_output",
+   "call": "self.outputs_queue.get",
+   "shape": "queue_get",
+   "category": "B",
+   "peer": "process",
+   "why": "the offline step loop parks for the engine's next batch of finished sequences"
+  },
+  {
+   "id": "atom/model_engine/engine_core_mgr.py::DisaggCoreManager.__init__._connect_proc::in_sock.recv_multipart::socket_recv#0",
+   "file": "atom/model_engine/engine_core_mgr.py",
+   "line": 1593,
+   "symbol": "DisaggCoreManager.__init__._connect_proc",
+   "call": "in_sock.recv_multipart",
+   "shape": "socket_recv",
+   "category": "ignore",
+   "peer": "process",
+   "why": "the startup handshake frames for the two processes of the intra-device split"
+  },
+  {
+   "id": "atom/model_engine/engine_core_mgr.py::DisaggCoreManager.__init__._connect_proc::ctrl_sock.recv_multipart::socket_recv#0",
+   "file": "atom/model_engine/engine_core_mgr.py",
+   "line": 1597,
+   "symbol": "DisaggCoreManager.__init__._connect_proc",
+   "call": "ctrl_sock.recv_multipart",
+   "shape": "socket_recv",
+   "category": "ignore",
+   "peer": "process",
+   "why": "the startup handshake frames for the two processes of the intra-device split"
+  },
+  {
+   "id": "atom/model_engine/engine_core_mgr.py::DisaggCoreManager._wait_for_single_ready::sock.recv::socket_recv#0",
+   "file": "atom/model_engine/engine_core_mgr.py",
+   "line": 1652,
+   "symbol": "DisaggCoreManager._wait_for_single_ready",
+   "call": "sock.recv",
+   "shape": "socket_recv",
+   "category": "ignore",
+   "peer": "process",
+   "why": "parks for one process's ready signal during startup of the intra-device split"
+  },
+  {
+   "id": "atom/model_engine/model_runner.py::tokenIDProcessor.send_to_cpu_async::data_ready.wait::event_wait#0",
+   "file": "atom/model_engine/model_runner.py",
+   "line": 221,
+   "symbol": "tokenIDProcessor.send_to_cpu_async",
+   "call": "data_ready.wait",
+   "shape": "event_wait",
+   "category": "ignore",
+   "peer": "none",
+   "why": "device-event waits inside the deferred token transfer of the runner the simulator replaces"
+  },
+  {
+   "id": "atom/model_engine/model_runner.py::tokenIDProcessor.recv_async_output::event.synchronize::device_sync#0",
+   "file": "atom/model_engine/model_runner.py",
+   "line": 236,
+   "symbol": "tokenIDProcessor.recv_async_output",
+   "call": "event.synchronize",
+   "shape": "device_sync",
+   "category": "ignore",
+   "peer": "none",
+   "why": "device-event waits inside the deferred token transfer of the runner the simulator replaces"
+  },
+  {
+   "id": "atom/model_engine/model_runner.py::tokenIDProcessor.recv_async_output_draft::event.synchronize::device_sync#0",
+   "file": "atom/model_engine/model_runner.py",
+   "line": 271,
+   "symbol": "tokenIDProcessor.recv_async_output_draft",
+   "call": "event.synchronize",
+   "shape": "device_sync",
+   "category": "ignore",
+   "peer": "none",
+   "why": "device-event waits inside the deferred token transfer of the runner the simulator replaces"
+  },
+  {
+   "id": "atom/model_engine/model_runner.py::tokenIDProcessor.send_mtp_status_to_cpu_async::data_ready.wait::event_wait#0",
+   "file": "atom/model_engine/model_runner.py",
+   "line": 290,
+   "symbol": "tokenIDProcessor.send_mtp_status_to_cpu_async",
+   "call": "data_ready.wait",
+   "shape": "event_wait",
+   "category": "ignore",
+   "peer": "none",
+   "why": "device-event waits inside the deferred token transfer of the runner the simulator replaces"
+  },
+  {
+   "id": "atom/model_engine/model_runner.py::tokenIDProcessor.recv_mtp_status_async::copy_done.synchronize::device_sync#0",
+   "file": "atom/model_engine/model_runner.py",
+   "line": 306,
+   "symbol": "tokenIDProcessor.recv_mtp_status_async",
+   "call": "copy_done.synchronize",
+   "shape": "device_sync",
+   "category": "ignore",
+   "peer": "none",
+   "why": "device-event waits inside the deferred token transfer of the runner the simulator replaces"
+  },
+  {
+   "id": "atom/model_engine/model_runner.py::ModelRunner._advance_forward_vars::self._fv_slot_events[self._fv_idx].synchronize::device_sync#0",
+   "file": "atom/model_engine/model_runner.py",
+   "line": 1404,
+   "symbol": "ModelRunner._advance_forward_vars",
+   "call": "self._fv_slot_events[self._fv_idx].synchronize",
+   "shape": "device_sync",
+   "category": "ignore",
+   "peer": "none",
+   "why": "device-event wait inside the runner the simulator replaces"
+  },
+  {
+   "id": "atom/model_engine/model_runner.py::ModelRunner._gate_staging_reuse::self._stage_h2d_done.synchronize::device_sync#0",
+   "file": "atom/model_engine/model_runner.py",
+   "line": 1439,
+   "symbol": "ModelRunner._gate_staging_reuse",
+   "call": "self._stage_h2d_done.synchronize",
+   "shape": "device_sync",
+   "category": "ignore",
+   "peer": "none",
+   "why": "device-event wait inside the runner the simulator replaces"
+  },
+  {
+   "id": "atom/model_engine/model_runner.py::ModelRunner.get_num_blocks::torch.distributed.all_reduce::collective#0",
+   "file": "atom/model_engine/model_runner.py",
+   "line": 1742,
+   "symbol": "ModelRunner.get_num_blocks",
+   "call": "torch.distributed.all_reduce",
+   "shape": "collective",
+   "category": "ignore",
+   "peer": "process",
+   "why": "a startup reduction that agrees one cache size across the workers; the simulator substitutes the device readings it is built from"
+  },
+  {
+   "id": "atom/model_engine/model_runner.py::ModelRunner.allocate_kv_cache::torch.distributed.barrier::barrier#0",
+   "file": "atom/model_engine/model_runner.py",
+   "line": 2077,
+   "symbol": "ModelRunner.allocate_kv_cache",
+   "call": "torch.distributed.barrier",
+   "shape": "barrier",
+   "category": "ignore",
+   "peer": "process",
+   "why": "a startup barrier across the workers, whose allocation the simulator makes a no-op"
+  },
+  {
+   "id": "atom/model_engine/model_runner.py::ModelRunner.postprocess::get_tp_group().broadcast::collective#0",
+   "file": "atom/model_engine/model_runner.py",
+   "line": 3138,
+   "symbol": "ModelRunner.postprocess",
+   "call": "get_tp_group().broadcast",
+   "shape": "collective",
+   "category": "ignore",
+   "peer": "process",
+   "why": "sampling collectives and gathers inside the runner the simulator replaces"
+  },
+  {
+   "id": "atom/model_engine/model_runner.py::ModelRunner.postprocess::log_probs.gather::collective#0",
+   "file": "atom/model_engine/model_runner.py",
+   "line": 3146,
+   "symbol": "ModelRunner.postprocess",
+   "call": "log_probs.gather",
+   "shape": "collective",
+   "category": "ignore",
+   "peer": "process",
+   "why": "sampling collectives and gathers inside the runner the simulator replaces"
+  },
+  {
+   "id": "atom/model_engine/model_runner.py::ModelRunner.postprocess::get_tp_group().broadcast::collective#1",
+   "file": "atom/model_engine/model_runner.py",
+   "line": 3150,
+   "symbol": "ModelRunner.postprocess",
+   "call": "get_tp_group().broadcast",
+   "shape": "collective",
+   "category": "ignore",
+   "peer": "process",
+   "why": "sampling collectives and gathers inside the runner the simulator replaces"
+  },
+  {
+   "id": "atom/model_engine/model_runner.py::ModelRunner.postprocess::torch.gather::collective#0",
+   "file": "atom/model_engine/model_runner.py",
+   "line": 3170,
+   "symbol": "ModelRunner.postprocess",
+   "call": "torch.gather",
+   "shape": "collective",
+   "category": "ignore",
+   "peer": "process",
+   "why": "sampling collectives and gathers inside the runner the simulator replaces"
+  },
+  {
+   "id": "atom/model_engine/model_runner.py::ModelRunner.postprocess::torch.gather::collective#1",
+   "file": "atom/model_engine/model_runner.py",
+   "line": 3199,
+   "symbol": "ModelRunner.postprocess",
+   "call": "torch.gather",
+   "shape": "collective",
+   "category": "ignore",
+   "peer": "process",
+   "why": "sampling collectives and gathers inside the runner the simulator replaces"
+  },
+  {
+   "id": "atom/model_engine/model_runner.py::ModelRunner._piecewise_skip_capture::dist.all_reduce::collective#0",
+   "file": "atom/model_engine/model_runner.py",
+   "line": 3655,
+   "symbol": "ModelRunner._piecewise_skip_capture",
+   "call": "dist.all_reduce",
+   "shape": "collective",
+   "category": "ignore",
+   "peer": "process",
+   "why": "a startup reduction over free device memory inside the runner the simulator replaces"
+  },
+  {
+   "id": "atom/model_engine/model_runner.py::ModelRunner.capture_cudagraph::torch.cuda.synchronize::device_sync#0",
+   "file": "atom/model_engine/model_runner.py",
+   "line": 3968,
+   "symbol": "ModelRunner.capture_cudagraph",
+   "call": "torch.cuda.synchronize",
+   "shape": "device_sync",
+   "category": "ignore",
+   "peer": "none",
+   "why": "device synchronization during graph capture, which a simulated run does not perform"
+  },
+  {
+   "id": "atom/model_engine/model_runner.py::ModelRunner.capture_cudagraph::torch.cuda.synchronize::device_sync#1",
+   "file": "atom/model_engine/model_runner.py",
+   "line": 4012,
+   "symbol": "ModelRunner.capture_cudagraph",
+   "call": "torch.cuda.synchronize",
+   "shape": "device_sync",
+   "category": "ignore",
+   "peer": "none",
+   "why": "device synchronization during graph capture, which a simulated run does not perform"
+  },
+  {
+   "id": "atom/model_engine/model_runner.py::ModelRunner._maybe_calibrate_dspark_sps::torch.cuda.synchronize::device_sync#0",
+   "file": "atom/model_engine/model_runner.py",
+   "line": 4135,
+   "symbol": "ModelRunner._maybe_calibrate_dspark_sps",
+   "call": "torch.cuda.synchronize",
+   "shape": "device_sync",
+   "category": "ignore",
+   "peer": "none",
+   "why": "device synchronization during a startup calibration inside the runner the simulator replaces"
+  },
+  {
+   "id": "atom/model_engine/model_runner.py::ModelRunner._maybe_calibrate_dspark_sps::end.synchronize::device_sync#0",
+   "file": "atom/model_engine/model_runner.py",
+   "line": 4143,
+   "symbol": "ModelRunner._maybe_calibrate_dspark_sps",
+   "call": "end.synchronize",
+   "shape": "device_sync",
+   "category": "ignore",
+   "peer": "none",
+   "why": "device synchronization during a startup calibration inside the runner the simulator replaces"
+  },
+  {
+   "id": "atom/model_engine/model_runner.py::RapidServeModelRunner._disagg_collect_rank_files::time.sleep::sleep#0",
+   "file": "atom/model_engine/model_runner.py",
+   "line": 4354,
+   "symbol": "RapidServeModelRunner._disagg_collect_rank_files",
+   "call": "time.sleep",
+   "shape": "sleep",
+   "category": "ignore",
+   "peer": "none",
+   "why": "a bounded startup poll for the other process's rank files, in the runner the simulator replaces"
+  },
+  {
+   "id": "atom/model_engine/model_runner.py::RapidServeModelRunner.prefill_forward::stream.synchronize::device_sync#0",
+   "file": "atom/model_engine/model_runner.py",
+   "line": 4681,
+   "symbol": "RapidServeModelRunner.prefill_forward",
+   "call": "stream.synchronize",
+   "shape": "device_sync",
+   "category": "ignore",
+   "peer": "none",
+   "why": "device-stream synchronization inside the runner the simulator replaces"
+  },
+  {
+   "id": "atom/model_engine/pp_engine_core.py::PPEngineCoreProc._head_busy_loop::while True::spin_loop#0",
+   "file": "atom/model_engine/pp_engine_core.py",
+   "line": 67,
+   "symbol": "PPEngineCoreProc._head_busy_loop",
+   "call": "while True",
+   "shape": "spin_loop",
+   "category": "ignore",
+   "peer": "none",
+   "why": "the head's step loop; everything that parks in it parks inside the calls it makes, which are listed separately"
+  },
+  {
+   "id": "atom/model_engine/pp_engine_core.py::PPEngineCoreProc._head_busy_loop::self.runner_mgr.call_func::worker_rpc#0",
+   "file": "atom/model_engine/pp_engine_core.py",
+   "line": 81,
+   "symbol": "PPEngineCoreProc._head_busy_loop",
+   "call": "self.runner_mgr.call_func",
+   "shape": "worker_rpc",
+   "category": "ignore",
+   "peer": "process",
+   "why": "a shutdown flush of any pending stage send"
+  },
+  {
+   "id": "atom/model_engine/pp_engine_core.py::PPEngineCoreProc._pp_head_step::self.runner_mgr.call_func::worker_rpc#0",
+   "file": "atom/model_engine/pp_engine_core.py",
+   "line": 118,
+   "symbol": "PPEngineCoreProc._pp_head_step",
+   "call": "self.runner_mgr.call_func",
+   "shape": "worker_rpc",
+   "category": "A",
+   "peer": "process",
+   "why": "the head's forward pass: the predicted duration replaces the elapsed time of this call"
+  },
+  {
+   "id": "atom/model_engine/pp_engine_core.py::PPEngineCoreProc._pp_head_step::self.runner_mgr.call_func::worker_rpc#1",
+   "file": "atom/model_engine/pp_engine_core.py",
+   "line": 125,
+   "symbol": "PPEngineCoreProc._pp_head_step",
+   "call": "self.runner_mgr.call_func",
+   "shape": "worker_rpc",
+   "category": "ignore",
+   "peer": "process",
+   "why": "flushes a pending stage send when the head launched nothing this tick"
+  },
+  {
+   "id": "atom/model_engine/pp_engine_core.py::PPEngineCoreProc._pp_head_step::while self._in_flight::spin_loop#0",
+   "file": "atom/model_engine/pp_engine_core.py",
+   "line": 130,
+   "symbol": "PPEngineCoreProc._pp_head_step",
+   "call": "while self._in_flight",
+   "shape": "spin_loop",
+   "category": "ignore",
+   "peer": "none",
+   "why": "drains the head's in-flight batches; the wait for each stage's tokens is the bounded poll inside it"
+  },
+  {
+   "id": "atom/model_engine/pp_engine_core.py::PPEngineCoreProc._poll_kv_transfer_progress::self.runner_mgr.call_func_with_aggregation::worker_rpc#0",
+   "file": "atom/model_engine/pp_engine_core.py",
+   "line": 252,
+   "symbol": "PPEngineCoreProc._poll_kv_transfer_progress",
+   "call": "self.runner_mgr.call_func_with_aggregation",
+   "shape": "worker_rpc",
+   "category": "A",
+   "peer": "process",
+   "why": "transfer completion reaches the head's scheduler only here, and the simulated connector releases a request when simulated time passes its priced deadline"
+  },
+  {
+   "id": "atom/model_engine/pp_engine_core.py::PPEngineCoreProc._downstream_busy_loop::self.runner_mgr.call_func::worker_rpc#0",
+   "file": "atom/model_engine/pp_engine_core.py",
+   "line": 362,
+   "symbol": "PPEngineCoreProc._downstream_busy_loop",
+   "call": "self.runner_mgr.call_func",
+   "shape": "worker_rpc",
+   "category": "ignore",
+   "peer": "process",
+   "why": "flushes a pending stage send when no batch arrived this tick"
+  },
+  {
+   "id": "atom/model_engine/pp_engine_core.py::PPEngineCoreProc._downstream_busy_loop::self.runner_mgr.call_func::worker_rpc#1",
+   "file": "atom/model_engine/pp_engine_core.py",
+   "line": 379,
+   "symbol": "PPEngineCoreProc._downstream_busy_loop",
+   "call": "self.runner_mgr.call_func",
+   "shape": "worker_rpc",
+   "category": "A",
+   "peer": "process",
+   "why": "a downstream stage's forward pass: the predicted duration replaces the elapsed time of this call"
+  },
+  {
+   "id": "atom/model_engine/pp_engine_core.py::PPEngineCoreProc._downstream_busy_loop::self.runner_mgr.call_func::worker_rpc#2",
+   "file": "atom/model_engine/pp_engine_core.py",
+   "line": 395,
+   "symbol": "PPEngineCoreProc._downstream_busy_loop",
+   "call": "self.runner_mgr.call_func",
+   "shape": "worker_rpc",
+   "category": "ignore",
+   "peer": "process",
+   "why": "a shutdown flush of any pending stage send"
+  },
+  {
+   "id": "atom/model_engine/pp_engine_core.py::PPEngineCoreProc._poll_and_send_kv_status::self.runner_mgr.call_func_with_aggregation::worker_rpc#0",
+   "file": "atom/model_engine/pp_engine_core.py",
+   "line": 406,
+   "symbol": "PPEngineCoreProc._poll_and_send_kv_status",
+   "call": "self.runner_mgr.call_func_with_aggregation",
+   "shape": "worker_rpc",
+   "category": "A",
+   "peer": "process",
+   "why": "a downstream stage collects transfer completion here before reporting it to the head, on the same priced deadline"
+  },
+  {
+   "id": "atom/model_engine/prefill_delayer.py::PrefillDelayer.should_allow_prefill::torch.distributed.all_reduce::collective#0",
+   "file": "atom/model_engine/prefill_delayer.py",
+   "line": 309,
+   "symbol": "PrefillDelayer.should_allow_prefill",
+   "call": "torch.distributed.all_reduce",
+   "shape": "collective",
+   "category": "ignore",
+   "peer": "process",
+   "why": "the coalescer's per-tick reduction across the ranks of one data-parallel group, which advance together and hold one clock between them"
+  },
+  {
+   "id": "atom/model_engine/scheduler.py::Scheduler.schedule::while delayer_allows and (self.delay_factor <= 0 or self._passed_delay(time.time())) and self.waiting and num_seqs_prefill < self.max_num_seqs and num_batched_tokens < self.max_num_batched_tokens::spin_loop#0",
+   "file": "atom/model_engine/scheduler.py",
+   "line": 1472,
+   "symbol": "Scheduler.schedule",
+   "call": "while delayer_allows and (self.delay_factor <= 0 or self._passed_delay(time.time())) and self.waiting and num_seqs_prefill < self.max_num_seqs and num_batched_tokens < self.max_num_batched_tokens",
+   "shape": "spin_loop",
+   "category": "ignore",
+   "peer": "none",
+   "why": "the admission loop; its one time-dependent term is the delay gate listed separately"
+  },
+  {
+   "id": "atom/model_engine/scheduler.py::Scheduler.schedule::while not self.block_manager.can_append(seq, num_new_tokens)::spin_loop#0",
+   "file": "atom/model_engine/scheduler.py",
+   "line": 1766,
+   "symbol": "Scheduler.schedule",
+   "call": "while not self.block_manager.can_append(seq, num_new_tokens)",
+   "shape": "spin_loop",
+   "category": "ignore",
+   "peer": "none",
+   "why": "preempts until the batch fits; it is arithmetic over block counts and does not park"
+  }
+ ],
+ "anchors": [
+  {
+   "file": "atom/model_engine/scheduler.py",
+   "line": 3108,
+   "anchor": "def _passed_delay",
+   "category": "A",
+   "peer": "none",
+   "why": "holds new prefills back until the earliest waiting request has aged past a multiple of the last prefill's latency; the age it compares is elapsed time and decides which batch is scheduled"
+  },
+  {
+   "file": "atom/model_engine/scheduler.py",
+   "line": 1194,
+   "anchor": "return max(0.0, (time.time() - oldest_arrive) * 1000.0)",
+   "category": "A",
+   "peer": "none",
+   "why": "the coalescer's queue-age guard force-releases a prefill when the oldest waiting request exceeds its limit; the age is elapsed time and decides which batch is scheduled"
+  },
+  {
+   "file": "atom/model_engine/llm_engine.py",
+   "line": 745,
+   "anchor": "seq.arrive_time = time.time()",
+   "category": "A",
+   "peer": "none",
+   "why": "every queueing age and every reported latency is measured from this stamp"
+  },
+  {
+   "file": "atom/model_engine/llm_engine.py",
+   "line": 777,
+   "anchor": "req.leave_time = time.time()",
+   "category": "A",
+   "peer": "none",
+   "why": "the end of the reported end-to-end latency"
+  },
+  {
+   "file": "atom/model_engine/scheduler.py",
+   "line": 2688,
+   "anchor": "seq.first_token_time = time.time()",
+   "category": "A",
+   "peer": "none",
+   "why": "the reported time to first token, stamped in the step loop as a batch is post-processed"
+  },
+  {
+   "file": "atom/model_engine/scheduler.py",
+   "line": 3364,
+   "anchor": "seq.first_token_time = time.time()",
+   "category": "A",
+   "peer": "thread",
+   "why": "the same stamp for the intra-device split, taken in the receiving background thread rather than where the step loop promotes the sequence"
+  },
+  {
+   "file": "atom/model_engine/engine_core.py",
+   "line": 455,
+   "anchor": "if now < self._next_idle_kv_drain:",
+   "category": "C2",
+   "peer": "none",
+   "why": "paces the idle transfer drain at one millisecond; a timer on simulated time plus a short real poll keeps the cadence without spending simulated time"
+  },
+  {
+   "file": "atom/model_engine/engine_core.py",
+   "line": 319,
+   "anchor": "next_metrics_push = now + METRICS_PUSH_INTERVAL_S",
+   "category": "ignore",
+   "peer": "none",
+   "why": "the metrics push cadence is deliberately left on the real clock; the reported timeline comes from sampling, not from this"
+  },
+  {
+   "file": "atom/model_engine/engine_core.py",
+   "line": 700,
+   "anchor": "next_metrics_push = now + METRICS_PUSH_INTERVAL_S",
+   "category": "ignore",
+   "peer": "none",
+   "why": "the same cadence in the data-parallel loop, deliberately left on the real clock"
+  },
+  {
+   "file": "atom/model_engine/engine_core.py",
+   "line": 470,
+   "anchor": "deadline = time.monotonic() + KV_SHUTDOWN_DRAIN_TIMEOUT_S",
+   "category": "ignore",
+   "peer": "none",
+   "why": "bounds a shutdown drain, after the last step has been charged"
+  },
+  {
+   "file": "atom/entrypoints/openai/api_server.py",
+   "line": 336,
+   "anchor": "_ANTHROPIC_PING_INTERVAL_SECONDS = 5.0",
+   "category": "C1",
+   "peer": "none",
+   "why": "sends a keep-alive frame every five seconds while reasoning output is dropped; under a clock slower than real it fires on a healthy stream, and there is no switch for it yet"
+  },
+  {
+   "file": "atom/entrypoints/openai/streaming_dispatch.py",
+   "line": 27,
+   "anchor": "SILENCE_LOG_SECONDS = 30.0",
+   "category": "C1",
+   "peer": "none",
+   "why": "warns and raises a gauge when a stream sends nothing for thirty seconds; under a clock slower than real it names healthy streams, and there is no switch for it yet"
+  },
+  {
+   "file": "atom/entrypoints/openai/api_server.py",
+   "line": 2480,
+   "anchor": "\"--timeout-keep-alive\",",
+   "category": "C1",
+   "peer": "none",
+   "why": "closes an idle keep-alive connection after five seconds by default; the flag exists and needs raising rather than new code"
+  },
+  {
+   "file": "atom/mesh/src/core/worker.rs",
+   "line": 29,
+   "anchor": "pub const DEFAULT_WORKER_HTTP_TIMEOUT_SECS",
+   "category": "C1",
+   "peer": "deployment",
+   "why": "the router's thirty-second bound on one worker request, compiled in; it fires whenever simulated time runs slower than real"
+  },
+  {
+   "file": "atom/mesh/src/core/worker_manager.rs",
+   "line": 24,
+   "anchor": "const REQUEST_TIMEOUT",
+   "category": "C1",
+   "peer": "deployment",
+   "why": "the router's five-second bound on a fan-out request, compiled in; it fires whenever simulated time runs slower than real"
+  },
+  {
+   "file": "atom/mesh/src/cliargs.rs",
+   "line": 423,
+   "anchor": "pub disable_health_check",
+   "category": "C1",
+   "peer": "deployment",
+   "why": "the router's worker health check, already switchable from the command line"
+  },
+  {
+   "file": "atom/mesh/src/cliargs.rs",
+   "line": 398,
+   "anchor": "pub disable_circuit_breaker",
+   "category": "C1",
+   "peer": "deployment",
+   "why": "the router's circuit breaker, already switchable from the command line"
+  }
+ ]
+}

@@ -750,7 +750,8 @@ merely noisy.
 
 ### Problem
 
-ATOM's serving path contains roughly 55 distinct synchronization points: blocking ZMQ
+ATOM's serving path contains 187 distinct synchronization points — "roughly 55" until
+they were counted, see the contract below: blocking ZMQ
 recvs, bounded pollers, queue gets with timeouts, Gloo and NCCL collectives,
 `multiprocessing` barriers and joins, busy-waits, and literal sleeps. "Intercept every
 blocking call" is the obvious reading of what a virtual clock demands. It is also the
@@ -762,34 +763,92 @@ scheduler.
 A wait matters to virtual time **only if its duration is observable in the simulated
 result.** That yields four categories.
 
-| Cat. | What it is | What you do | Approx. count |
-|---|---|---|---|
-| **A** | Wait whose duration **is** modelled time | **Rewrite.** Do not wait — `advance_to(now + d)` and continue. | ~6 |
-| **B** | Wait for a message another LP will send | **Annotate only.** `declare_blocked()` / `declare_running()` around the existing call. Leave the call itself alone. | ~10 |
-| **C1** | Timeout that is a failure detector | **Disable or raise.** No virtual semantics needed. | ~20 |
-| **C2** | Timeout that is pacing | **Virtual timer.** Declare next event at `now+d`; keep a short real poll so the thread stays responsive. | ~3 |
-| **—** | Wait *inside* one LP; startup; shutdown; OS-level | **Ignore.** Invisible to modelled time. | ~20 |
+**The counts below are measured, not estimated.** The classified list is
+`atom/compass/clock/sync_sites.json`, produced by the scanner beside it and held to the
+tree by `tests/compass/test_sync_inventory.py`; the estimates this table carried until
+2026-09-21 are kept in the last column so the diff stays visible.
 
-#### Category A — the short list
+| Cat. | What it is | What you do | Count | Est. |
+|---|---|---|---|---|
+| **A** | Wait whose duration **is** modelled time | **Rewrite.** Do not wait — `advance_to(now + d)` and continue. | **20** | ~6 |
+| **B** | Wait for a message another LP will send | **Annotate only.** `declare_blocked()` / `declare_running()` around the existing call. Leave the call itself alone. | **23** | ~10 |
+| **C1** | Timeout that is a failure detector | **Disable or raise.** No virtual semantics needed. | **11** | ~20 |
+| **C2** | Timeout that is pacing | **Virtual timer.** Declare next event at `now+d`; keep a short real poll so the thread stays responsive. | **3** | ~3 |
+| **—** | Wait *inside* one LP; startup; shutdown; OS-level | **Ignore.** Invisible to modelled time. | **128** | ~20 |
+| **?** | Reading depends on a decision not yet made | **Decide before building on it.** | **2** | — |
 
-- the forward pass (`engine_core.py:386-388`)
-- KV-transfer completion (D6)
-- the arrival gate (D8)
-- `Scheduler._passed_delay` / `--scheduler-delay-factor` (`scheduler.py:3108-3126`)
+**187 sites, not ~55**, over the serving-path modules named in the scanner's
+`SCANNED_ROOTS` — 170 call sites plus 17 pinned points that are not a call. The
+category totals move less than the grand total does: A, B and C2 are within a factor of
+three of the estimates and C1 is *below* its estimate. The whole of the growth is in
+`ignore`, and three-quarters of that is four groups the estimate did not count at all:
+the module the runner seam replaces (21), the two real RDMA transfer backends the
+simulated connector replaces (17), the send half of every cross-process message (25),
+and startup and shutdown (about 45). **Deliberately left alone: 128 of 187.**
+
+Two rules settle the boundaries the estimate left implicit, and both are in the
+artifact's own README rather than only here:
+
+- **B against C1/C2 is the bound, not the peer.** An unbounded wait for another process
+  is B; the same wait with a finite bound is C1 or C2 by what the bound is for. This is
+  the rule the B list below already used ("no timeout argument").
+- **B against ignore is the process.** A thread parked on a queue its *own* process
+  fills does not make that process idle — its step loop is running — so declaring it
+  blocked there is wrong rather than merely redundant.
+
+#### Category A — the short list, as measured
+
+Fourteen call sites and six clock readings:
+
+- the forward pass, at **five** call sites, not one: `engine_core.py:386` (the main
+  step), `:992` and `:1264` (the two halves of RapidServe), `pp_engine_core.py:118` and
+  `:379` (the PP head and a downstream stage)
+- the idle rank's empty batch, `engine_core.py:749` — it consumes a step and is charged
+  like any other
+- KV-transfer completion (D6), at **three** call sites: `engine_core.py:488`,
+  `pp_engine_core.py:252` and `:406`
+- **tokenization**, at the five `run_in_executor` hand-offs `06` D33 names
+  (`api_server.py:890`, `:1004`, `:1126`, `:1258`, `:1480`). D33 charges their service
+  time from the machine spec, which makes them category A by this table's own
+  definition; this list omitted them.
+- `Scheduler._passed_delay` / `--scheduler-delay-factor` (`scheduler.py:3108`)
 - `Scheduler._oldest_waiting_prefill_age_ms` feeding `PrefillDelayer` (`scheduler.py:1194`)
-- the idle jump (`Scheduler._advance_to_next_arrival`, replaced by `declare_next`)
+- the four stamps the result reports: `llm_engine.py:745`, `:777`, `scheduler.py:2688`
+  and `:3364` — D5 already lists these as business logic, and they are carried in the
+  inventory because a category applies to them
+
+**Two entries of the original list are not ATOM code.** The arrival gate (D8) and the
+idle jump (`Scheduler._advance_to_next_arrival`) do not exist in this tree:
+`_advance_to_next_arrival`, `_arrival_barrier_unmet`, `compass_workload_size` and
+`ARRIVAL_BARRIER_TIMEOUT_S` return nothing on the whole `atom/` tree. Both are things
+Compass adds, so neither is a site to intercept.
 
 #### Category B — annotate, do not intercept
 
-The important instance: **`call_func(..., wait_out=True)` (`async_proc.py:439`) is not
-intercepted.** It has no timeout and every forward goes through it. Two lines of status
-annotation are enough, because its duration was already charged by the *sender* when it
-called `advance_to`. The receiver is merely idle in wall time; the CA routes grants
-elsewhere meanwhile.
+The important instance: **`call_func(..., wait_out=True)` is not intercepted.** It has
+no timeout and every forward goes through it. Two lines of status annotation are enough,
+because its duration was already charged by the *sender* when it called `advance_to`.
+The receiver is merely idle in wall time; the CA routes grants elsewhere meanwhile.
+The blocking call is `self.outputs_queue.get()` at **`async_proc.py:431`**; this section
+said `:439`, which is inside the docstring of the *other* RPC entry point, and D1's own
+`:425-434` was right.
 
-Same treatment for `engine_core.py:546` (the CoreManager poller, no timeout argument),
-`engine_core.py:587`, `engine_core_mgr.py:534/544/576/586`, and the RapidServe recvs
-if that path is ever used.
+Same treatment for `engine_core.py:544/546` (the engine's input thread, no timeout
+argument — this section called it "the CoreManager poller", which is the peer, not the
+thread), `engine_core_mgr.py:534/544/576/586`, and the RapidServe recvs, which are now
+listed rather than deferred: `engine_core.py:946` (block assignments) and `:1204`
+(prefill completion).
+
+**Two of the sites named here are classified otherwise in the inventory, with reasons:**
+
+- `engine_core.py:587` — the line is `self.output_queue.get()` in the engine's *output*
+  thread, fed by this same process's step loop. It is `ignore`: annotating it would
+  declare the engine blocked while its step loop is running, which is the one direction
+  the annotation must not be wrong in.
+- `engine_core_mgr.py:534/544` — reached only from `CoreManager.__init__`, i.e. startup,
+  which this table's last row says to ignore. It is kept as **B** because the peer is
+  another process and the annotation is harmless; the contradiction between the two rows
+  is recorded rather than resolved by fiat.
 
 #### Why I4 is safe rather than merely careful
 
@@ -800,25 +859,60 @@ the loud side.
 
 ### The case that is not a "wait" problem at all
 
-`_recv_prefill_done` (`engine_core.py:1201`) blocks in a background thread and calls
-`Scheduler.on_prefill_done`, which stamps `seq.first_token_time = time.time()`
-(`scheduler.py:3357`). Intercepting the block fixes nothing. The rule is about who
+`_recv_prefill_done` (`engine_core.py:1204`) blocks in a background thread and calls
+`DecodeScheduler.on_prefill_done`, which stamps `seq.first_token_time = time.time()`
+(`scheduler.py:3364`). Intercepting the block fixes nothing. The rule is about who
 stamps:
 
 > **Background threads enqueue. The main loop stamps, at a granted time.**
 
-ATOM's queueing is already correct here (`_pending_assignments` under
-`scheduler._pending_lock`; the `prefill_done` deque). Only the stamping moves.
+The recv itself is category B and needs only the annotation. **But "ATOM's queueing is
+already correct here" is half right, and the half that is wrong is worth stating.**
+Measured at `7fc7a5ddd`:
+
+- The `prefill_done` deque *is* correct: `schedule()` pops it in the step loop
+  (`scheduler.py:3381-3383`), so promotion order follows message arrival order and
+  nothing else.
+- `on_prefill_done` does **more than enqueue**. In the background thread it also pops
+  `prefill_waiting`, sets `num_cached_tokens`, appends the sampled first token, and
+  stamps `first_token_time` — all before the deque append.
+- It takes **no lock** while doing so, although `_prefill_lock` was created for exactly
+  this (`scheduler.py:3302-3304`: *"Protects prefill_waiting and running: on_prefill_done
+  is called from the _recv_prefill_done background thread"*). The lock's two users are
+  `allocate_waiting` and `schedule`, both on the step-loop thread; the thread the comment
+  names never takes it.
+- The `_pending_assignments` half of the claim is about the **prefill** side
+  (`engine_core.py:952/956/968` under `PrefillScheduler._pending_lock`) and is correct
+  there. The two locks are different objects on different schedulers in different
+  processes, and only the prefill one is used as its comment says.
+
+So "only the stamping moves" understates it by three mutations. Moving the stamp alone
+would leave the sequence's token and cached-token count set at an ungranted moment by a
+thread holding no lock. Not a correctness defect in CPython today — the individual dict
+and deque operations are atomic — but it is not the shape the rule describes, and a task
+that assumes the enqueue is the only thing in that function will be surprised.
 
 ### Open issues
 
-- The counts above are estimates from a synchronization inventory, not from a completed
+- ~~The counts above are estimates from a synchronization inventory, not from a completed
   pass over the code. The first implementation task should be to produce the exact
-  classified list and check it in.
-- `engine_core.py:1156` is a literal `time.sleep(2)` whose purpose is GPU-allocator
-  settling after weight-handle import. It must stay on real time. It is RapidServe-only
-  and Compass loads no real weights, so it is probably moot — but it must be *checked*,
-  not assumed.
+  classified list and check it in.~~ **Done, 2026-09-21.** `atom/compass/clock/`.
+- ~~`engine_core.py:1156` is a literal `time.sleep(2)` ... it must be *checked*, not
+  assumed.~~ **Checked, 2026-09-21, and both halves hold.** It is reached only from
+  `DecodeEngineCore._post_model_load_hook`, and `DecodeEngineCore` is constructed only by
+  `DisaggCoreManager`, which `LLMEngine.__init__` selects only under
+  `config.enable_rapidserve` (`llm_engine.py:140-142`) — so "RapidServe-only" is exact.
+  Its purpose is verified by the code around it: the sleep sits between importing
+  decode's weight IPC handles and acknowledging to prefill, and prefill measures free
+  VRAM for KV sizing only after that ACK. It must stay on the real clock. It is not
+  *unconditionally* moot: nothing in ATOM couples it to whether weights are real, and
+  `--enable-rapidserve` selects `RapidServeModelRunner` only when `runner_qualname` is
+  still the default (`config.py:1727-1736`), so a simulated runner plus that flag would
+  reach the sleep. The cost is two real seconds of startup and no modelled time, because
+  it runs before READY and therefore before any arrival.
+- The scanner's boundary is a list of roots, not a graph. `UNSCANNED_ROOTS` names three
+  excluded trees and why; a blocking call added under one of them is invisible to the
+  test. The offload connectors are the largest of the three.
 
 ---
 
@@ -894,6 +988,13 @@ shutdown disagree.
 
 ### Open issues
 
+- Every `file:line` in this section was re-checked against `7fc7a5ddd` while the
+  synchronization inventory was built, and **all of them hold** — including the four
+  sites "deleted for free by D6", the two Rust constants, and the three clock reads in
+  `streaming_dispatch.py`. The three cites that had drifted are in D4, not here. The
+  rows this section owns are carried in `atom/compass/clock/sync_sites.json` as pinned
+  lines of text rather than as call sites, so a rename or a move fails the inventory
+  test instead of rotting quietly.
 - Disabling a failure detector removes a safety net from a long unattended run. The
   simulator should log, once at startup, exactly which detectors it disabled, so a
   hung run is diagnosable.
