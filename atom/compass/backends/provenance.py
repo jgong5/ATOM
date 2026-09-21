@@ -23,14 +23,17 @@ fits coefficients to timings is `FITTED`, not analytical, however tidy the
 closed form looks.
 
 A `Refusal` is a declined answer with a named reason, and it is a value rather
-than an error. It is carried on the `Provenance` of whatever cost was produced
-in its place, so a cost that came from further down a resolver ladder cannot
-be mistaken for one that came from the top of it.
+than an error. Every refusal collected while resolving a cost is carried on the
+provenance of the cost that was produced instead -- all of them, earliest
+first, not just the one that renders -- so a cost that came from further down a
+ladder cannot be mistaken for one that came from the top of it, and a count of
+reasons is not quietly missing the middle of the chain.
 """
 
 from __future__ import annotations
 
 import enum
+from collections.abc import Sequence
 from dataclasses import dataclass
 
 
@@ -76,36 +79,62 @@ class Provenance:
 
     `detail` is the unit or the key that was matched, free text, and is how
     `measured (op-level)` is distinguished from `measured (step-level)` without
-    inventing a species for each. `refusal` is set when this cost was produced
-    only because something above it declined; it is what makes a fall-through
-    visible in the record instead of an inference from a changed number.
+    inventing a species for each. `source` names the thing that answered, so
+    the record identifies the rung and not only the species. `refusals` holds
+    everything that declined on the way to this answer, earliest first, which
+    is what makes a fall-through visible in the record instead of an inference
+    from a changed number.
     """
 
     species: Species
     detail: str = ""
-    refusal: Refusal | None = None
+    source: str = ""
+    refusals: tuple[Refusal, ...] = ()
 
     def __post_init__(self) -> None:
         if not isinstance(self.species, Species):
             raise TypeError(f"species must be a Species, got {self.species!r}")
+        if not isinstance(self.refusals, tuple):
+            raise TypeError(f"refusals must be a tuple, got {self.refusals!r}")
+        for refusal in self.refusals:
+            if not isinstance(refusal, Refusal):
+                raise TypeError(f"not a refusal: {refusal!r}")
 
     @property
     def is_refused(self) -> bool:
-        return self.refusal is not None
+        return bool(self.refusals)
 
-    def after(self, refusal: Refusal) -> Provenance:
-        """This same origin, marked as the answer that stood in for a refusal.
+    @property
+    def refusal(self) -> Refusal | None:
+        """The earliest refusal, which is the one an operator has to close."""
+        return self.refusals[0] if self.refusals else None
 
-        The first refusal wins: it names the source that should have answered,
-        which is the one an operator has to go and measure. Later declines are
-        kept on the resolution, not here.
+    def resolved(self, source: str, declined: Sequence[Refusal] = ()) -> Provenance:
+        """This origin as a resolver produced it.
+
+        `declined` is prepended rather than merged or dropped, because a rung
+        may itself be resolver-backed: its own refusals are already here, and
+        they happened *after* the ones being added, so earliest-first ordering
+        puts the new ones in front and the first refusal is genuinely the
+        first. Nothing is discarded -- dropping the inner chain would let a
+        composed ladder report the wrong rung and undercount the reasons.
+
+        The answering name composes the same way: an answer from a rung that
+        is itself a ladder reads `outer/inner`, so the record names the path
+        that produced the number rather than only its outermost step.
         """
-        if self.refusal is not None:
-            return self
-        return Provenance(self.species, self.detail, refusal)
+        if not source.strip():
+            raise ValueError("an answer has to name the source that produced it")
+        named = f"{source}/{self.source}" if self.source else source
+        return Provenance(
+            self.species, self.detail, named, tuple(declined) + self.refusals
+        )
 
     def __str__(self) -> str:
         named = f"{self.species} ({self.detail})" if self.detail else str(self.species)
-        if self.refusal is None:
+        if self.source:
+            named = f"{named} via {self.source}"
+        if not self.refusals:
             return named
-        return f"{self.refusal} -> {named}"
+        listed = "; ".join(f"{r.source}: {r.reason}" for r in self.refusals)
+        return f"refused({listed}) -> {named}"

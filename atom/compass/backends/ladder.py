@@ -9,12 +9,19 @@ form, a law computed from geometry alone. `Resolver` walks them in order and
 takes the first answer.
 
 Falling through is allowed and is not free. A source that cannot answer says
-why, as a `Refusal`, and every refusal collected on the way down is carried on
-the `Resolution` and stamped onto the answer's provenance. So a run that drops
-from a measured price to a computed one says so in the record for that term:
-there is no path through this class that produces an unannotated answer from a
-lower source. The failure being designed out is a run that quietly answers from
-the bottom of the ladder and reports a tidy number.
+why, as a `Refusal`, and *every* refusal collected on the way down is carried
+on the answer's provenance -- not the first one with the rest discarded, which
+would undercount the reasons a coverage report exists to list. The answer is
+also stamped with the name of the rung that produced it, always and not only
+after a fall-through, so the record says what answered as well as what did
+not. There is no path through this class that produces an unannotated answer
+from a lower source. The failure being designed out is a run that quietly
+answers from the bottom of the ladder and reports a tidy number.
+
+A rung may itself be resolver-backed, which is the shape a layered backend
+takes. The chain composes rather than collapsing: the outer refusals go in
+front of the inner ones, so the earliest refusal is still the first, and the
+answering name reads `outer/inner`.
 
 When no source answers, nothing is invented. `CostRefused` is raised carrying
 every refusal in order, so the caller gets the complete list of what would have
@@ -106,10 +113,10 @@ class Resolver:
     def resolve(self, request: Any) -> Resolution:
         """The first source that answers, with every refusal above it attached.
 
-        The answer's provenance is stamped with the *first* refusal, because
-        that is the source an operator would have to feed to remove the
-        fall-through. The rest stay on the resolution, where the full list is
-        what a coverage report needs.
+        The answer carries the whole chain, earliest refusal first, and the
+        name of the rung that produced it. `Resolution.declined` holds this
+        ladder's own refusals; the provenance holds those plus any a
+        resolver-backed rung collected inside itself.
         """
         declined: list[Refusal] = []
         for source in self._sources:
@@ -126,9 +133,10 @@ class Resolver:
                 raise TypeError(
                     f"source {source.name!r} returned {answer!r}, not a cost term"
                 )
-            if declined:
-                answer = CostTerm(
-                    answer.name, answer.seconds, answer.provenance.after(declined[0])
-                )
-            return Resolution(answer, source.name, tuple(declined))
+            stamped = CostTerm(
+                answer.name,
+                answer.seconds,
+                answer.provenance.resolved(source.name, declined),
+            )
+            return Resolution(stamped, source.name, tuple(declined))
         raise CostRefused(request, declined)

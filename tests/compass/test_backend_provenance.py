@@ -9,7 +9,10 @@ property rather than the spellings.
 
 The refusal rendering is asserted too. It is not cosmetic: the string is what
 lands in a run record, and a stand-in answer that renders the same as a
-first-choice one would hide exactly the fall-through the record exists to show.
+first-choice one would hide exactly the fall-through the record exists to
+show. So is the composition rule -- a provenance that is resolved twice keeps
+both refusals and both names, because a rung that is itself a ladder is the
+ordinary shape and dropping half the chain there names the wrong rung.
 """
 
 import pytest
@@ -40,6 +43,11 @@ def test_provenance_refuses_a_species_shaped_string():
         Provenance("measured")
 
 
+def test_provenance_refuses_a_refusal_shaped_thing():
+    with pytest.raises(TypeError):
+        Provenance(Species.MEASURED, "", "", ("price_list declined",))
+
+
 def test_a_refusal_names_who_declined_and_why():
     r = Refusal("price_list", "no entry for gemm(4096,8192)")
     assert r.source == "price_list"
@@ -61,17 +69,53 @@ def test_plain_provenance_renders_species_and_unit():
     assert str(Provenance(Species.MEASURED, "op-level")) == "measured (op-level)"
 
 
+def test_an_answer_names_the_source_that_produced_it():
+    """The record says what answered, not only what species the answer was."""
+    p = Provenance(Species.MEASURED, "op-level").resolved("price_list")
+    assert str(p) == "measured (op-level) via price_list"
+    assert not p.is_refused
+
+
+def test_an_answer_must_name_a_source():
+    with pytest.raises(ValueError, match="name the source"):
+        Provenance(Species.MEASURED).resolved("  ")
+
+
 def test_a_stand_in_answer_renders_the_refusal_it_replaced():
     """Reading the record, a fall-through is visible without comparing runs."""
-    p = Provenance(Species.ANALYTICAL, "roofline").after(
-        Refusal("price_list", "unpriced leaf")
+    p = Provenance(Species.ANALYTICAL, "roofline").resolved(
+        "analytic_law", [Refusal("price_list", "unpriced leaf")]
     )
     assert p.is_refused
-    assert str(p) == "refused(price_list: unpriced leaf) -> analytical (roofline)"
+    assert str(p) == (
+        "refused(price_list: unpriced leaf) -> analytical (roofline) via analytic_law"
+    )
 
 
-def test_the_first_refusal_is_the_one_kept():
-    """Two sources declined; the top one is what an operator has to measure."""
-    p = Provenance(Species.ANALYTICAL).after(Refusal("price_list", "unpriced leaf"))
-    kept = p.after(Refusal("nearest_key", "outside the measured range"))
-    assert kept.refusal == Refusal("price_list", "unpriced leaf")
+def test_every_rung_that_declined_is_kept_not_just_the_first():
+    """A count of reasons that drops the middle of the chain undercounts."""
+    p = Provenance(Species.ANALYTICAL).resolved(
+        "analytic_law",
+        [
+            Refusal("price_list", "unpriced leaf"),
+            Refusal("nearest_key", "outside the measured range"),
+        ],
+    )
+    assert [r.source for r in p.refusals] == ["price_list", "nearest_key"]
+    assert p.refusal == Refusal("price_list", "unpriced leaf")
+    assert str(p) == (
+        "refused(price_list: unpriced leaf; nearest_key: outside the measured range)"
+        " -> analytical via analytic_law"
+    )
+
+
+def test_resolving_twice_composes_rather_than_collapses():
+    """A rung that is itself a ladder: outer refusals are the earlier ones."""
+    inner = Provenance(Species.ANALYTICAL).resolved(
+        "inner_law", [Refusal("inner_price_list", "unpriced leaf")]
+    )
+    outer = inner.resolved("layered", [Refusal("price_list", "unpriced leaf")])
+
+    assert [r.source for r in outer.refusals] == ["price_list", "inner_price_list"]
+    assert outer.refusal == Refusal("price_list", "unpriced leaf")
+    assert outer.source == "layered/inner_law"

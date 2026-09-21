@@ -4,22 +4,29 @@
 """The cost of one step, and the parts it was built from.
 
 A `StepCost` does not store a total. `seconds` is folded from `terms` on every
-read, so there is no state in which the whole disagrees with the parts, and an
-aggregate with no decomposition is not a thing this module can represent: the
-constructor refuses an empty breakdown.
+read, and the breakdown is re-checked on every read rather than only at
+construction, so the whole cannot come to disagree with its parts by any route
+that leaves the object itself in place. Subclassing is refused where it would
+shadow the total, the terms or the rows, because a subclass needs no bypass at
+all to return one number while its breakdown says another.
 
-That refusal is the interesting one. The failure it prevents is the mean of an
-empty sample, which is not an error, is not zero-ish, and is exactly 0.0 -- a
-precise and entirely fictional answer that reads as a fast step rather than as
-a missing model. An empty breakdown is the same defect one layer up.
+An empty breakdown is refused outright. The failure behind that is the mean of
+an empty sample, which is not an error, is not approximately zero, and is
+exactly 0.0 -- a precise and entirely fictional answer that reads as a fast
+step rather than as a missing model. The same shape is refused one layer up:
+`ProvenanceMix` will not divide by an empty run, because "nothing refused" and
+"nothing recorded" would otherwise be the same number, and it is the
+reassuring one.
 
-The fold order is part of the answer. Float addition is not associative, so two
-readers who sum the same terms in different orders get different bits, and a
-run that has to be reproducible cannot leave that to whoever writes the next
-summing loop. `fold_seconds` is the one order this package uses: a left fold
-from 0.0 over the terms in the order they were given. Anyone checking a
-breakdown against its total -- a reader with the artifact, a test, a later
-audit -- folds it the same way and gets the same bits.
+Every addition of seconds in this module goes through `fold_seconds`: a left
+fold from 0.0 over values in the order given, with `fold_step` as its one-step
+form for running totals. The only `+` outside them counts whole steps and
+reasons, which are integers. Float addition is not associative, so two readers
+who sum the same terms in different orders get different bits, and a run that
+has to be reproducible cannot leave that to whoever writes the next summing
+loop. Routing every sum through one function is what makes the order a
+property of the module rather than a coincidence that holds until someone
+adds a `+`.
 """
 
 from __future__ import annotations
@@ -41,6 +48,11 @@ def fold_seconds(values: Iterable[float]) -> float:
     for value in values:
         total += value
     return total
+
+
+def fold_step(total: float, value: float) -> float:
+    """One step of the same fold, for a running total kept across calls."""
+    return fold_seconds((total, value))
 
 
 @dataclass(frozen=True)
@@ -75,8 +87,28 @@ class CostTerm:
             )
 
     @property
-    def refusal(self) -> Refusal | None:
-        return self.provenance.refusal
+    def refusals(self) -> tuple[Refusal, ...]:
+        return self.provenance.refusals
+
+
+def _checked(terms: Sequence[CostTerm]) -> tuple[CostTerm, ...]:
+    """The breakdown, or the reason it is not one. Run at build and at read."""
+    terms = tuple(terms)
+    if not terms:
+        raise ValueError(
+            "a step cost with no terms is an aggregate with no decomposition; "
+            "name at least one part, even if the model has only one"
+        )
+    seen: set[str] = set()
+    for term in terms:
+        if not isinstance(term, CostTerm):
+            raise TypeError(f"not a cost term: {term!r}")
+        if term.name in seen:
+            raise ValueError(
+                f"duplicate term {term.name!r}: a breakdown is read by name"
+            )
+        seen.add(term.name)
+    return terms
 
 
 @dataclass(frozen=True)
@@ -91,31 +123,33 @@ class StepCost:
     terms: tuple[CostTerm, ...]
 
     def __init__(self, terms: Sequence[CostTerm]) -> None:
-        terms = tuple(terms)
-        if not terms:
-            raise ValueError(
-                "a step cost with no terms is an aggregate with no decomposition; "
-                "name at least one part, even if the model has only one"
+        object.__setattr__(self, "terms", _checked(terms))
+
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        """Refuse a subclass that shadows the total or its decomposition.
+
+        Overriding `seconds` needs no bypass and defeats every check here: the
+        object is valid, the breakdown is real, and the number returned has
+        nothing to do with it. There is no legitimate reason to redefine these
+        three, so the class is refused at definition rather than at use.
+        """
+        super().__init_subclass__(**kwargs)
+        shadowed = sorted({"seconds", "terms", "rows"} & set(cls.__dict__))
+        if shadowed:
+            raise TypeError(
+                f"{cls.__name__} redefines {', '.join(shadowed)}; a total that does "
+                "not come from the terms is the thing this class exists to prevent"
             )
-        seen: set[str] = set()
-        for term in terms:
-            if not isinstance(term, CostTerm):
-                raise TypeError(f"not a cost term: {term!r}")
-            if term.name in seen:
-                raise ValueError(
-                    f"duplicate term {term.name!r}: a breakdown is read by name"
-                )
-            seen.add(term.name)
-        object.__setattr__(self, "terms", terms)
 
     @property
     def seconds(self) -> float:
         """The total, folded from the terms in their stored order."""
-        return fold_seconds(term.seconds for term in self.terms)
+        return fold_seconds(term.seconds for term in _checked(self.terms))
 
     @property
     def refusals(self) -> tuple[Refusal, ...]:
-        return tuple(t.refusal for t in self.terms if t.refusal is not None)
+        """Every refusal behind this step, term order then chain order."""
+        return tuple(r for term in self.terms for r in term.refusals)
 
     @property
     def is_refused(self) -> bool:
@@ -132,16 +166,16 @@ class StepCost:
 
     def seconds_by_species(self) -> Mapping[Species, float]:
         """Seconds grouped by how they were obtained, terms in stored order."""
-        mix: dict[Species, float] = {}
+        grouped: dict[Species, list[float]] = {}
         for term in self.terms:
-            mix[term.provenance.species] = (
-                mix.get(term.provenance.species, 0.0) + term.seconds
-            )
-        return mix
+            grouped.setdefault(term.provenance.species, []).append(term.seconds)
+        return {species: fold_seconds(vals) for species, vals in grouped.items()}
 
     def rows(self) -> tuple[tuple[str, float, str], ...]:
         """The breakdown as an artifact writes it: name, seconds, provenance."""
-        return tuple((t.name, t.seconds, str(t.provenance)) for t in self.terms)
+        return tuple(
+            (t.name, t.seconds, str(t.provenance)) for t in _checked(self.terms)
+        )
 
 
 class ProvenanceMix:
@@ -151,6 +185,12 @@ class ProvenanceMix:
     of steps, and what fraction of predicted seconds. The seconds fraction is
     the one that decides whether a run is worth anything, and the reason counts
     are what say which measurement would close the gap.
+
+    A mix with nothing in it has no fractions. Returning 0.0 would make a run
+    that recorded no steps indistinguishable from one that refused none, at
+    exactly the layer that reads the fraction to decide whether a run counts as
+    evidence -- and of the two readings the wrong one is the reassuring one.
+    Ask `is_empty` first, or let the refusal say so.
     """
 
     def __init__(self) -> None:
@@ -163,25 +203,40 @@ class ProvenanceMix:
 
     def record(self, step: StepCost) -> None:
         self.steps += 1
-        self.seconds += step.seconds
+        self.seconds = fold_step(self.seconds, step.seconds)
         if step.is_refused:
             self.refused_steps += 1
-            self.refused_seconds += step.refused_seconds
+            self.refused_seconds = fold_step(self.refused_seconds, step.refused_seconds)
         for species, seconds in step.seconds_by_species().items():
-            self._species_seconds[species] = (
-                self._species_seconds.get(species, 0.0) + seconds
+            self._species_seconds[species] = fold_step(
+                self._species_seconds.get(species, 0.0), seconds
             )
         for refusal in step.refusals:
             key = (refusal.source, refusal.reason)
             self._reasons[key] = self._reasons.get(key, 0) + 1
 
     @property
+    def is_empty(self) -> bool:
+        return self.steps == 0
+
+    @property
     def refused_step_fraction(self) -> float:
-        return self.refused_steps / self.steps if self.steps else 0.0
+        if self.steps == 0:
+            raise ValueError(
+                "no steps were recorded, so there is no refused fraction of them; "
+                "0.0 here would read as a run that refused nothing"
+            )
+        return self.refused_steps / self.steps
 
     @property
     def refused_second_fraction(self) -> float:
-        return self.refused_seconds / self.seconds if self.seconds > 0.0 else 0.0
+        if self.seconds <= 0.0:
+            raise ValueError(
+                f"no predicted seconds were recorded over {self.steps} step(s), so "
+                "there is no refused fraction of them; 0.0 here would read as a run "
+                "that refused nothing"
+            )
+        return self.refused_seconds / self.seconds
 
     def seconds_by_species(self) -> Mapping[Species, float]:
         return dict(self._species_seconds)

@@ -7,18 +7,26 @@ The pieces, and the rule each exists to make structural rather than customary:
 
 - `CostBackend` -- `estimate(batch_view) -> StepCost` plus `describe()`. Takes a
   projection of the batch, so nothing here imports the engine.
-- `StepCost` / `CostTerm` -- a total that is folded from its parts on every
-  read, so it cannot drift from them, and a breakdown that cannot be empty.
-- `Provenance` / `Species` / `Refusal` -- every number says how it was obtained,
-  with no default that would let one avoid saying.
-- `Resolver` / `CostSource` -- sources consulted in a fixed order, with each
-  fall-through recorded on the answer rather than inferred from it.
+- `StepCost` / `CostTerm` -- a total folded from its parts on every read, with
+  the parts re-checked on every read, so it cannot drift from them; a breakdown
+  that cannot be empty; and no subclass that can shadow either.
+- `Provenance` / `Species` / `Refusal` -- every number says how it was obtained
+  and what produced it, with no default that would let one avoid saying.
+- `Resolver` / `CostSource` -- sources consulted in a fixed order, with every
+  refusal on the way down recorded on the answer rather than inferred from it.
 - `ProvenanceMix` -- the run-level mixture, and refusals counted by number, by
-  fraction of steps and by fraction of predicted seconds.
+  fraction of steps and by fraction of predicted seconds. A run with nothing in
+  it has no fractions and says so, rather than reporting a reassuring zero.
 """
 
 from atom.compass.backends.base import CostBackend, Tier
-from atom.compass.backends.cost import CostTerm, ProvenanceMix, StepCost, fold_seconds
+from atom.compass.backends.cost import (
+    CostTerm,
+    ProvenanceMix,
+    StepCost,
+    fold_seconds,
+    fold_step,
+)
 from atom.compass.backends.ladder import (
     CostRefused,
     CostSource,
@@ -41,4 +49,5 @@ __all__ = [
     "StepCost",
     "Tier",
     "fold_seconds",
+    "fold_step",
 ]
