@@ -110,18 +110,19 @@ joined two real numbers wrongly: the 28 counts `rocminfo` across the *whole* sui
 - **Per task — the CPU tier, re-measured by P0.1 and superseding the counts above.**
   `tests/` minus `tests/plugin/` (30 files) minus the 29 driver-dependent files in
   `scripts/compass/cpu_gate_exclude.txt`, driven by `scripts/compass/gate_cpu.sh`:
-  **130 of this tree's 189 test files, 4030 passed, 0 failed, 149 skipped, 3 xfailed, rc=0,
-  25.6-30.8 s of pytest inside 31.6-36.9 s of wall (`time` real), over six runs at
-`d737f15e7` and `7ff80cc4b`**, measured
-  2026-09-21 in `xiaobizh_n18_cpu`
-  on hjbog-srdc-18 against a `git archive` snapshot of the tree committed here, with
+  **130 of this tree's 189 test files, 4030 passed, 0 failed, 149 skipped, 3 xfailed,
+  rc=0** — identical in all ten runs taken on 2026-09-21 in `xiaobizh_n18_cpu` on
+  hjbog-srdc-18, where the clock read **25.4-31.7 s of pytest inside 31.1-37.8 s of
+  wall (`time` real)**, which is a measured spread rather than a bound: it tracks
+  what else is on the node. Run against a `git archive` snapshot of the tree, with
   `PYTHONPATH` asserted to resolve `atom` under that root and pytest's own exit status
   captured before any pipe. The 4030 is **3956 ATOM tests + 74 `tests/compass/` tests**,
   stated as its parts because a single total cannot show which half moved (principle 7). The
   file count moves 128 → 130 and the test count 3956 → 4030 because this tree adds
   `tests/compass/test_cpu_gate_exclude.py` and `tests/compass/test_gate_gpu_surplus.py`; the
-  P0.2 readings above are the same suite without them. The other totals in circulation are the same suite under a different exclusion
-  list or a different `tests/compass`, not discrepancies: **3925** was 32 exclusions with
+  P0.2 readings above are the same suite without them. The other totals in circulation are
+  the same suite under a different exclusion list or a different `tests/compass`, not
+  discrepancies: **3925** was 32 exclusions with
   `tests/compass` at 35 tests, **3956** is the ATOM-only half at 29 exclusions, and **4005**
   was this gate at `3afcb4880` with `tests/compass` at 49, and **4022** was it at 66. The
   49 → 66 step is mechanical: `tests/compass/test_cpu_gate_exclude.py` parametrises one case
