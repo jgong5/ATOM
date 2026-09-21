@@ -23,7 +23,7 @@ recorded line that moved, or a pinned line of text that is gone.
 
 | | Meaning | What is done to it |
 |---|---|---|
-| **A** | simulated time decides this, not the real clock | the duration is predicted, or the reading comes from the simulated clock |
+| **A** | simulated time decides this, not the real clock | the duration is predicted, the reading comes from the simulated clock, or an idle loop jumps to the next event instead of spinning |
 | **B** | parks until another **process** sends something, with no bound | the call is left alone; the process declares itself idle around it |
 | **C1** | a bound that exists to declare something broken | raise it, or switch it off |
 | **C2** | a bound that sets a cadence | keep the cadence on simulated time, poll briefly for real so the thread stays responsive |
@@ -39,16 +39,25 @@ wrong, not merely redundant.
 
 ## The counts
 
-Measured at the commit this file was written against, from the rows below.
+Measured at the commit this file was written against, from the rows below:
+**194 call sites plus 18 pinned points that are not a call.**
 
 | Category | Count | Where the weight is |
 |---|---|---|
-| A | 20 | five forward passes, three transfer-completion polls, the idle-rank batch, five tokenizer hand-offs, and six clock readings the result reports |
-| B | 23 | the worker RPC both ways, the front-end and engine socket threads, each request's own wait for its next chunk, and the two channels of the intra-device split |
+| A | 23 | five forward passes, three transfer-completion polls, the idle-rank batch, five tokenizer hand-offs, three idle step loops that spin, and six clock readings the result reports |
+| B | 36 | the worker RPC both ways, the nine out-of-band control commands, the front-end and engine socket threads, each request's own wait for its next chunk on all four streaming endpoints, and the two channels of the intra-device split |
 | C1 | 11 | four bounded receives and queue reads, four router and server bounds, a keep-alive frame and a silence warning |
 | C2 | 3 | the idle transfer drain, and the two pipeline-stage polls |
-| ignore | 128 | below the replaced forward pass, inside one process, at startup, at shutdown, or in a transfer backend the simulator substitutes |
+| ignore | 137 | below the replaced forward pass, inside one process, at startup, at shutdown, or in a transfer backend the simulator substitutes |
 | undecided | 2 | see below |
+
+Counting each site once, in this order, the 134 ignored **call sites** are: the
+runner module the seam replaces (21), the two real RDMA transfer backends (17),
+the send half of a cross-process message (24), startup and shutdown (35),
+collectives inside the real forward pass (4), text scanners whose loops park on
+nothing (4), and 29 others that each carry their own reason — an unstarted
+thread, an in-process hand-off, a lockstep reduction inside one rank group, a
+death detector, and so on.
 
 ### The two undecided rows
 
@@ -65,7 +74,7 @@ from a forced row is wrong in a way that does not announce itself.
 
 ## What the scanner does, and where it can be wrong
 
-It parses each file under `SCANNED_ROOTS` and reports calls whose **shape** can
+It parses every file under `SCANNED_ROOTS` and reports calls whose **shape** can
 park a thread: sleeps, socket receives, pollers, queue operations, joins, lock
 and event waits, collectives, device synchronization, sends, thread-pool
 hand-offs, and the worker RPC. It also reports `while` loops that go around
@@ -77,6 +86,12 @@ blocking reading can take that form: `d.get(key)` always passes the key
 positionally and `q.get()` never does; `",".join(parts)` always passes one
 iterable and `t.join(5)` a lone number. Those rules have their own tests.
 
+**Roots are directories, not a list of files.** A file allowlist declares its
+blind spot at a finer grain than it excludes: a module added beside a scanned
+one is invisible while the exclusion list still reads complete. Scanning the
+directory makes a new file a test failure on the day it lands, and a test
+asserts no scanned file is also declared unscanned.
+
 It over-reports on purpose. A `.send()` that never blocks in practice is still
 listed, because that is where a message leaves one process for another. The
 classification is what removes it from consideration, and an `ignore` row with
@@ -85,12 +100,24 @@ its reason is a better record than a silent omission.
 It can be wrong in two directions, and both are visible rather than hidden:
 
 - **Toward noise.** Some listed calls cannot park — an `enqueue` that appends to
-  a thread-local buffer, a `result()` on a task already finished. They carry an
-  `ignore` row saying so.
+  a thread-local buffer, a `result()` on a task already finished, a `while` loop
+  walking a string. They carry an `ignore` row saying so.
 - **Toward silence.** A blocking call reached through a name the shapes do not
-  know, or in a file outside `SCANNED_ROOTS`, is invisible. `UNSCANNED_ROOTS`
-  names each excluded root and why, so the boundary is arguable rather than
-  implicit, and a test asserts every named root still exists.
+  know, or in a directory outside `SCANNED_ROOTS`, is invisible.
+  `UNSCANNED_ROOTS` names each excluded directory and why, so the boundary is
+  arguable rather than implicit, and a test asserts every named root exists.
+
+## How a row keeps naming the same call
+
+A row's identity is `file::symbol::expression::shape#ordinal` — **not** the
+line, so an edit elsewhere in a file updates a line rather than re-opening a
+classification, and **with** the arguments, so two calls to one method in one
+function are told apart. An earlier version keyed on the callee alone: inserting
+one `call_func("flush_pp_send", ...)` above a `call_func("forward", ...)` then
+silently moved every later row onto the wrong site and reported only that a line
+had moved. Two sites that still share an ordinal are the same call written the
+same way in one function, and a test asserts the inventory answers both the same
+way, so the ordinal never carries meaning of its own.
 
 ## What the rows do not cover
 

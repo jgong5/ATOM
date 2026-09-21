@@ -18,13 +18,18 @@ Three failures are worth telling apart, and each has its own test:
   (`test_anchor_lines_are_still_where_they_say`) -- the same, for the points
   that are not a call.
 
+The second message is only safe to act on if a row cannot silently change which
+call it describes, which is what `test_inserting_a_call_above_another_leaves_
+its_neighbour_alone` pins: an earlier identity keyed on the callee alone, so
+inserting one `call_func("flush_pp_send", ...)` above a `call_func("forward",
+...)` moved every later row onto the wrong site and reported only a moved line.
+
 No driver, and no import of ATOM's serving modules: the scanner parses them.
 """
 
 from __future__ import annotations
 
 import ast
-import re
 from pathlib import Path
 
 import pytest
@@ -34,7 +39,13 @@ from atom.compass.clock import sync_scan
 TREE = sync_scan.repo_root_from_here()
 INVENTORY = sync_scan.load_inventory()
 CATEGORIES = set(INVENTORY["categories"])
-README = Path(sync_scan.__file__).with_name("README.md")
+
+# Every file that states the count per category. Each is parsed and compared
+# against the rows, so a table cannot drift from the data it describes.
+COUNT_TABLES = (
+    Path(sync_scan.__file__).with_name("README.md"),
+    TREE / "atom/compass/design/01_execution_and_time_model.md",
+)
 
 
 @pytest.fixture(scope="module")
@@ -89,23 +100,60 @@ def test_every_row_carries_a_category_and_a_reason():
         assert row["peer"] in {"none", "thread", "process", "deployment"}, key
 
 
+def test_calls_that_share_an_ordinal_are_answered_the_same_way(listed):
+    """Two sites can share an ordinal only by being the same call, written the
+    same way, in one function. The ordinal between them is positional, so the
+    inventory must not use it to say two different things."""
+    by_text: dict[tuple, set] = {}
+    for row in listed.values():
+        key = (row["file"], row["symbol"], row["expr"], row["shape"])
+        by_text.setdefault(key, set()).add((row["category"], row["why"]))
+    split = {k: v for k, v in by_text.items() if len(v) > 1}
+    assert not split, (
+        "identical calls in one function are classified differently, so their "
+        "ordinals carry meaning they cannot keep across an edit: "
+        + "; ".join(f"{k[0]}::{k[1]}::{k[2]}" for k in split)
+    )
+
+
 def test_scanned_and_unscanned_roots_all_exist():
     for rel, _why in sync_scan.SCANNED_ROOTS + sync_scan.UNSCANNED_ROOTS:
         assert (TREE / rel).exists(), f"{rel} is named in the scanner but is gone"
 
 
-def test_readme_counts_match_the_rows():
-    """The count per category is stated once in prose and derived once here."""
-    counts = sync_scan.category_counts(INVENTORY)
-    stated = {
-        m.group(1): int(m.group(2))
-        for m in re.finditer(
-            r"^\| (A|B|C1|C2|ignore|undecided) \| (\d+) \|",
-            README.read_text(encoding="utf-8"),
-            re.MULTILINE,
-        )
-    }
-    assert stated == counts
+def test_no_scanned_file_is_also_declared_unscanned():
+    """The two lists are at one granularity, so a file cannot be in both."""
+    scanned_files = set(sync_scan.iter_scanned_files(TREE))
+    for rel, _why in sync_scan.UNSCANNED_ROOTS:
+        inside = {f for f in scanned_files if f == rel or f.startswith(rel)}
+        assert not inside, f"{rel} is excluded but these are scanned: {sorted(inside)}"
+
+
+def _stated_counts(text: str) -> dict[str, int]:
+    """Read every markdown table that has a column headed `Count`."""
+    counts: dict[str, int] = {}
+    column = None
+    for line in text.splitlines():
+        if not line.startswith("|"):
+            column = None
+            continue
+        cells = [c.strip().strip("*`") for c in line.strip().strip("|").split("|")]
+        if "Count" in cells:
+            column = cells.index("Count")
+            continue
+        if column is None or column >= len(cells):
+            continue
+        if cells[0] in CATEGORIES and cells[column].isdigit():
+            counts[cells[0]] = int(cells[column])
+    return counts
+
+
+@pytest.mark.parametrize("path", COUNT_TABLES, ids=lambda p: p.name)
+def test_every_stated_count_matches_the_rows(path):
+    """The count per category is written down twice and derived once here."""
+    stated = _stated_counts(path.read_text(encoding="utf-8"))
+    assert stated, f"{path} states no counts; the parser or the table changed"
+    assert stated == sync_scan.category_counts(INVENTORY), path
 
 
 # --- the shape rules, against the forms they are written to tell apart ------
@@ -113,6 +161,12 @@ def test_readme_counts_match_the_rows():
 
 def _first_call(src: str) -> ast.Call:
     return next(n for n in ast.walk(ast.parse(src)) if isinstance(n, ast.Call))
+
+
+def _scan_source(src: str):
+    visitor = sync_scan._CallVisitor("made/up.py", src)
+    visitor.visit(ast.parse(src))
+    return sync_scan._number(visitor.sites)
 
 
 @pytest.mark.parametrize(
@@ -159,11 +213,25 @@ def test_a_worker_call_parks_only_when_it_asks_for_the_reply(src, blocking):
 def test_a_new_blocking_call_is_reported():
     """What the completeness test sees the day someone adds one."""
     src = "def handler(self):\n    item = self._inbox.get()\n    return item\n"
-    visitor = sync_scan._CallVisitor("made/up.py", src)
-    visitor.visit(ast.parse(src))
-    assert [(s.symbol, s.call, s.shape) for s in visitor.sites] == [
+    sites = _scan_source(src)
+    assert [(s.symbol, s.call, s.shape) for s in sites] == [
         ("handler", "self._inbox.get", "queue_get")
     ]
+
+
+def test_inserting_a_call_above_another_leaves_its_neighbour_alone():
+    """The defect this identity scheme exists to prevent.
+
+    Keyed on the callee alone, the two calls below are indistinguishable and
+    the ordinal that separated them is positional -- so inserting the flush
+    renamed the forward's row onto the flush and said only that a line moved.
+    """
+    forward = '    self.mgr.call_func("forward", batch, wait_out=True)\n'
+    flush = '    self.mgr.call_func("flush_pp_send", wait_out=True)\n'
+    before = {s.id for s in _scan_source("def step(self):\n" + forward)}
+    after = {s.id for s in _scan_source("def step(self):\n" + flush + forward)}
+    assert before < after, "the surviving call's identity changed under an insert"
+    assert len(after - before) == 1
 
 
 def test_a_loop_that_calls_nothing_that_parks_is_reported_as_a_spin():

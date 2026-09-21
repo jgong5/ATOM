@@ -340,7 +340,7 @@ one LP:
 
 | ATOM group | OS processes | LPs | Why |
 |---|---|---|---|
-| TP group | 1 EngineCore + N workers | **1** | Workers are slaved by a blocking RPC (`async_proc.py:439`) and hold no clock. Rank-0 authority validated at 0.06% (D0). |
+| TP group | 1 EngineCore + N workers | **1** | Workers are slaved by a blocking RPC (`async_proc.py:431`) and hold no clock. Rank-0 authority validated at 0.06% (D0). |
 | DP group | N EngineCores | **1** | Already `all_reduce`s every step for lockstep (`engine_core.py:751-781`) and runs `dummy_execution` on idle ranks (`:748-749`). Carry `max(step_seconds)` on the collective that already runs. |
 | Prefill container | — | **1** | |
 | Decode container | — | **1** | |
@@ -472,7 +472,7 @@ protocol itself.
 
 A DP group is **one** LP however many ranks it holds, because it already
 `all_reduce`s every step (`engine_core.py:751-781`). A TP group is **one** LP however
-wide, because its workers are slaved by a blocking RPC (`async_proc.py:439`) and hold no
+wide, because its workers are slaved by a blocking RPC (`async_proc.py:431`) and hold no
 clock. Adding GPUs to either does not create a time domain.
 
 Only three things create an LP:
@@ -750,7 +750,7 @@ merely noisy.
 
 ### Problem
 
-ATOM's serving path contains 187 distinct synchronization points — "roughly 55" until
+ATOM's serving path contains 212 distinct synchronization points — "roughly 55" until
 they were counted, see the contract below: blocking ZMQ
 recvs, bounded pollers, queue gets with timeouts, Gloo and NCCL collectives,
 `multiprocessing` barriers and joins, busy-waits, and literal sleeps. "Intercept every
@@ -765,26 +765,29 @@ result.** That yields four categories.
 
 **The counts below are measured, not estimated.** The classified list is
 `atom/compass/clock/sync_sites.json`, produced by the scanner beside it and held to the
-tree by `tests/compass/test_sync_inventory.py`; the estimates this table carried until
-2026-09-21 are kept in the last column so the diff stays visible.
+tree by `tests/compass/test_sync_inventory.py` — which parses **this table too**, so it
+cannot drift from the rows. The estimates this table carried until 2026-09-21 are kept
+in the last column so the diff stays visible.
 
 | Cat. | What it is | What you do | Count | Est. |
 |---|---|---|---|---|
-| **A** | Wait whose duration **is** modelled time | **Rewrite.** Do not wait — `advance_to(now + d)` and continue. | **20** | ~6 |
-| **B** | Wait for a message another LP will send | **Annotate only.** `declare_blocked()` / `declare_running()` around the existing call. Leave the call itself alone. | **23** | ~10 |
-| **C1** | Timeout that is a failure detector | **Disable or raise.** No virtual semantics needed. | **11** | ~20 |
-| **C2** | Timeout that is pacing | **Virtual timer.** Declare next event at `now+d`; keep a short real poll so the thread stays responsive. | **3** | ~3 |
-| **—** | Wait *inside* one LP; startup; shutdown; OS-level | **Ignore.** Invisible to modelled time. | **128** | ~20 |
-| **?** | Reading depends on a decision not yet made | **Decide before building on it.** | **2** | — |
+| A | Wait whose duration **is** modelled time, or a reading the result reports | **Rewrite.** Do not wait — `advance_to(now + d)` and continue. | **23** | ~6 |
+| B | Wait for a message another LP will send | **Annotate only.** `declare_blocked()` / `declare_running()` around the existing call. Leave the call itself alone. | **36** | ~10 |
+| C1 | Timeout that is a failure detector | **Disable or raise.** No virtual semantics needed. | **11** | ~20 |
+| C2 | Timeout that is pacing | **Virtual timer.** Declare next event at `now+d`; keep a short real poll so the thread stays responsive. | **3** | ~3 |
+| ignore | Wait *inside* one LP; startup; shutdown; OS-level | **Ignore.** Invisible to modelled time. | **137** | ~20 |
+| undecided | Reading depends on a decision not yet made | **Decide before building on it.** | **2** | — |
 
-**187 sites, not ~55**, over the serving-path modules named in the scanner's
-`SCANNED_ROOTS` — 170 call sites plus 17 pinned points that are not a call. The
+**212 sites, not ~55**, over the serving-path directories named in the scanner's
+`SCANNED_ROOTS` — 194 call sites plus 18 pinned points that are not a call. The
 category totals move less than the grand total does: A, B and C2 are within a factor of
-three of the estimates and C1 is *below* its estimate. The whole of the growth is in
-`ignore`, and three-quarters of that is four groups the estimate did not count at all:
+four of the estimates and C1 is *below* its estimate. Almost all of the growth is in
+`ignore`, and counting each site once, in this order, the 134 ignored *call sites* are:
 the module the runner seam replaces (21), the two real RDMA transfer backends the
-simulated connector replaces (17), the send half of every cross-process message (25),
-and startup and shutdown (about 45). **Deliberately left alone: 128 of 187.**
+simulated connector replaces (17), the send half of a cross-process message (24),
+startup and shutdown (35), collectives inside the real forward pass (4), text scanners
+whose loops park on nothing (4), and 29 others carrying their own reasons.
+**Deliberately left alone: 137 of 212.**
 
 Two rules settle the boundaries the estimate left implicit, and both are in the
 artifact's own README rather than only here:
@@ -798,7 +801,7 @@ artifact's own README rather than only here:
 
 #### Category A — the short list, as measured
 
-Fourteen call sites and six clock readings:
+Sixteen call sites and seven pinned points:
 
 - the forward pass, at **five** call sites, not one: `engine_core.py:386` (the main
   step), `:992` and `:1264` (the two halves of RapidServe), `pp_engine_core.py:118` and
@@ -811,18 +814,25 @@ Fourteen call sites and six clock readings:
   (`api_server.py:890`, `:1004`, `:1126`, `:1258`, `:1480`). D33 charges their service
   time from the machine spec, which makes them category A by this table's own
   definition; this list omitted them.
+- **the idle jump, which is a real site in ATOM even though the name this list gave it
+  is not.** `Scheduler._advance_to_next_arrival` does not exist here — but the loops it
+  would have served do, and all three spin rather than wait when there is nothing to
+  run, because `pull_and_process_input_queue` drains with `get_nowait` and nothing else
+  in the turn blocks: `EngineCore.busy_loop` (`engine_core.py:315`),
+  `DPEngineCoreProc.busy_loop` (`:696`), and `PPEngineCoreProc._head_busy_loop`
+  (`pp_engine_core.py:67`). D8's measurement of the prior design — first real step is
+  tick 1, first simulated step is tick **89,336** — is this loop counted. Simulated time
+  has to jump to the next declared event at each of the three.
 - `Scheduler._passed_delay` / `--scheduler-delay-factor` (`scheduler.py:3108`)
 - `Scheduler._oldest_waiting_prefill_age_ms` feeding `PrefillDelayer` (`scheduler.py:1194`)
 - the four stamps the result reports: `llm_engine.py:745`, `:777`, `scheduler.py:2688`
   and `:3364` — D5 already lists these as business logic, and they are carried in the
   inventory because a category applies to them
 
-**Two entries of the original list are not ATOM code.** The arrival gate (D8) and the
-idle jump (`Scheduler._advance_to_next_arrival`) do not exist in this tree:
-`_advance_to_next_arrival`, `_arrival_barrier_unmet`, `compass_workload_size` and
-`ARRIVAL_BARRIER_TIMEOUT_S` return nothing on the whole `atom/` tree. Both are things
-Compass adds, so neither is a site to intercept.
-
+**One entry of the original list is not ATOM code at all.** The arrival gate (D8) is
+something Compass adds: `_arrival_barrier_unmet`, `compass_workload_size` and
+`ARRIVAL_BARRIER_TIMEOUT_S` return nothing on the whole `atom/` tree, so there is no
+site to intercept, only a mechanism to build.
 #### Category B — annotate, do not intercept
 
 The important instance: **`call_func(..., wait_out=True)` is not intercepted.** It has
@@ -838,6 +848,27 @@ argument — this section called it "the CoreManager poller", which is the peer,
 thread), `engine_core_mgr.py:534/544/576/586`, and the RapidServe recvs, which are now
 listed rather than deferred: `engine_core.py:946` (block assignments) and `:1204`
 (prefill completion).
+
+**Two groups this list never reached**, both invisible until the scanner's roots became
+directories rather than a list of files:
+
+- the four streaming endpoints' own collector reads — `serving_chat.py:289` and `:596`,
+  `serving_completion.py:91` and `:252`. `api_server.py:2147` is the *same call* on the
+  Anthropic endpoint and was listed; these two are the endpoints a replay drives.
+- the nine out-of-band control commands in `engine_utility.py` (`:126`, `:147`, `:174`,
+  `:194`, `:203`, `:213`, `:236`, `:252`, `:264`). Each parks the engine's **step loop**
+  until every worker answers, with no bound, and unlike the startup calls they can
+  arrive at any point in a run.
+
+**On the send side, "it cannot park" is true of most of them and has to be said per
+socket, not once.** Of the 25 sends, the ones built by `make_zmq_socket`
+(`atom/utils/__init__.py:541-543`) carry `SNDHWM=0` and provably cannot park. The rest
+are bare `ctx.socket(...)` and keep ZeroMQ's default thousand-message bound: the three
+`pp_transport.py` sends, the disagg bootstrap sends, and — the two that matter at
+runtime — `engine_core.py:1014` on the **prefill step loop** and `:1229` on the decode
+one, whose sockets are created bare at `:925` and `:1182`. Their protocol is one message
+per sequence and the peer drains it every tick, so a thousand-message backlog is not
+reachable in a run; the rows say that rather than claiming the bound does not exist.
 
 **Two of the sites named here are classified otherwise in the inventory, with reasons:**
 
@@ -910,9 +941,15 @@ that assumes the enqueue is the only thing in that function will be surprised.
   still the default (`config.py:1727-1736`), so a simulated runner plus that flag would
   reach the sleep. The cost is two real seconds of startup and no modelled time, because
   it runs before READY and therefore before any arrival.
-- The scanner's boundary is a list of roots, not a graph. `UNSCANNED_ROOTS` names three
-  excluded trees and why; a blocking call added under one of them is invisible to the
-  test. The offload connectors are the largest of the three.
+- The scanner's boundary is a list of directories, not a graph. It reads every `.py`
+  file under `SCANNED_ROOTS`, so a module added beside a scanned one is caught; but a
+  blocking call under one of the three directories `UNSCANNED_ROOTS` names is invisible
+  to the test, and so is one reached through a call shape the scanner does not know. The
+  offload connectors are the largest of the three exclusions. The earlier version of
+  this scanner listed **files**, which declared its blind spot at a finer grain than it
+  excluded: 24 candidate sites sat inside scanned directories and outside both lists,
+  four of them the same streaming-collector read already classified B on another
+  endpoint.
 
 ---
 
@@ -988,13 +1025,14 @@ shutdown disagree.
 
 ### Open issues
 
-- Every `file:line` in this section was re-checked against `7fc7a5ddd` while the
-  synchronization inventory was built, and **all of them hold** — including the four
+- **All 34 `file:line` cites in this section were re-checked against `7fc7a5ddd`** while
+  the synchronization inventory was built, and every one holds — including the four
   sites "deleted for free by D6", the two Rust constants, and the three clock reads in
-  `streaming_dispatch.py`. The three cites that had drifted are in D4, not here. The
-  rows this section owns are carried in `atom/compass/clock/sync_sites.json` as pinned
-  lines of text rather than as call sites, so a rename or a move fails the inventory
-  test instead of rotting quietly.
+  `streaming_dispatch.py`. The drifted cites are elsewhere: three distinct ones, one of
+  which appears twice more in D3, for five occurrences in all. The rows this section
+  owns are carried in `atom/compass/clock/sync_sites.json` as pinned lines of text
+  rather than as call sites, so a rename or a move fails the inventory test instead of
+  rotting quietly.
 - Disabling a failure detector removes a safety net from a long unattended run. The
   simulator should log, once at startup, exactly which detectors it disabled, so a
   hung run is diagnosable.

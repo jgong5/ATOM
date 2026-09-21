@@ -44,58 +44,40 @@ import os
 from dataclasses import dataclass
 from pathlib import Path
 
-# Files whose calls are scanned. Everything a request passes through between
-# the HTTP socket and the KV cache, plus the machinery that moves it between
-# processes.
+# Directories whose calls are scanned, whole. Everything a request passes
+# through between the HTTP socket and the KV cache, plus the machinery that
+# moves it between processes.
+#
+# Directories, not a list of files: a file allowlist declares its blind spot at
+# a finer grain than it excludes, so a module added beside a scanned one is
+# invisible while the exclusion list still reads complete. Scanning the
+# directory makes a new file a test failure on the day it lands.
 SCANNED_ROOTS: tuple[tuple[str, str], ...] = (
     (
-        "atom/model_engine/engine_core.py",
-        "the engine step loop, its IPC threads, and the two disaggregated cores",
-    ),
-    (
-        "atom/model_engine/engine_core_mgr.py",
-        "the front-end side of the engine IPC, startup handshake and shutdown",
-    ),
-    (
-        "atom/model_engine/pp_engine_core.py",
-        "the pipeline-parallel head and downstream step loops",
-    ),
-    (
-        "atom/model_engine/async_proc.py",
-        "the worker RPC transport: shared-memory broadcast out, ZMQ back",
-    ),
-    (
-        "atom/model_engine/scheduler.py",
-        "admission and batching, including the disaggregated schedulers",
-    ),
-    ("atom/model_engine/llm_engine.py", "request entry, arrival stamping, egress"),
-    (
-        "atom/model_engine/prefill_delayer.py",
-        "the cross-rank prefill coalescer, which reduces every tick",
-    ),
-    (
-        "atom/model_engine/model_runner.py",
+        "atom/model_engine/",
         (
-            "the class the simulated runner replaces; scanned so the "
-            "replacement's obligations stay visible"
+            "the engine step loops and their IPC threads, the worker RPC "
+            "transport, admission and batching, request entry and egress, and "
+            "the runner class the simulated one replaces"
         ),
     ),
-    ("atom/entrypoints/openai/api_server.py", "HTTP entry, streaming egress, metrics"),
     (
-        "atom/entrypoints/openai/streaming_dispatch.py",
-        "the hand-off from the engine output threads to each stream",
+        "atom/entrypoints/openai/",
+        (
+            "HTTP entry, the per-endpoint response generators, the hand-off "
+            "from the engine output threads to each stream, and metrics"
+        ),
     ),
-    ("atom/distributed/pp_comm.py", "pipeline-stage tensor send and its completion"),
-    ("atom/distributed/pp_transport.py", "pipeline-stage metadata and token sockets"),
-    ("atom/distributed/kv_events.py", "the KV event publisher thread"),
+    (
+        "atom/distributed/",
+        "pipeline-stage transport and tensor sends, and the KV event publisher",
+    ),
     (
         "atom/kv_transfer/disaggregation/",
         "the prefill/decode transfer connectors and their handshake threads",
     ),
 )
 
-# Roots deliberately not scanned, with the reason each is out of scope. Listed
-# so the boundary is visible and arguable rather than implicit in a glob.
 UNSCANNED_ROOTS: tuple[tuple[str, str], ...] = (
     (
         "atom/kv_transfer/offload/",
@@ -314,6 +296,12 @@ NON_BLOCKING_NAMES = frozenset(
 )
 
 
+# How much of a call expression the identity carries. Long enough that two
+# calls to one method in one function differ by their arguments; short enough
+# that a wrapped multi-line call does not make the key unreadable.
+EXPR_CHARS = 160
+
+
 @dataclass
 class Site:
     """One candidate call site."""
@@ -322,12 +310,24 @@ class Site:
     line: int
     symbol: str
     call: str
+    expr: str
     shape: str
     ordinal: int = 0
 
     @property
     def id(self) -> str:
-        return f"{self.file}::{self.symbol}::{self.call}::{self.shape}#{self.ordinal}"
+        """What names this site across edits.
+
+        Deliberately not the line: an edit anywhere above a call would
+        otherwise re-open every classification below it. Deliberately *with*
+        the arguments: the callee alone cannot tell two calls to one method in
+        one function apart, and the ordinal that separated them was positional,
+        so inserting a call above another silently moved every row below it
+        onto the wrong site. Two sites that still collide are textually the
+        same call in the same function, which the inventory is required to
+        classify the same way.
+        """
+        return f"{self.file}::{self.symbol}::{self.expr}::{self.shape}#{self.ordinal}"
 
     def as_dict(self) -> dict:
         return {
@@ -336,6 +336,7 @@ class Site:
             "line": self.line,
             "symbol": self.symbol,
             "call": self.call,
+            "expr": self.expr,
             "shape": self.shape,
         }
 
@@ -370,12 +371,15 @@ class _CallVisitor(ast.NodeVisitor):
                     continue
                 text = ast.get_source_segment(self.source, func) or name
                 text = " ".join(text.split())
+                whole = ast.get_source_segment(self.source, node) or text
+                whole = " ".join(whole.split())[:EXPR_CHARS]
                 self.sites.append(
                     Site(
                         file=self.rel_path,
                         line=node.lineno,
                         symbol=".".join(self._scope) or "<module>",
                         call=text,
+                        expr=whole,
                         shape=shape.name,
                     )
                 )
@@ -404,12 +408,14 @@ class _SpinVisitor(ast.NodeVisitor):
     def visit_While(self, node: ast.While) -> None:
         if self._is_spin(node):
             text = ast.get_source_segment(self.source, node.test) or "while"
+            whole = f"while {' '.join(text.split())}"[:EXPR_CHARS]
             self.sites.append(
                 Site(
                     file=self.rel_path,
                     line=node.lineno,
                     symbol=".".join(self._scope) or "<module>",
-                    call=f"while {' '.join(text.split())}",
+                    call=whole,
+                    expr=whole,
                     shape="spin_loop",
                 )
             )
@@ -439,12 +445,15 @@ def _number(sites: list[Site]) -> list[Site]:
     """Give sites that share a symbol and call text a stable ordinal.
 
     Line numbers move with any edit above them, so identity is the enclosing
-    symbol plus the call text plus its position among identical siblings. The
-    line is still recorded, and checked separately, so the list stays quotable.
+    symbol plus the whole call expression plus its position among *textually
+    identical* siblings. Siblings that share an ordinal are the same call
+    written the same way in one function, so the inventory has to give them the
+    same answer, and a test asserts it does. The line is still recorded, and
+    checked separately, so the list stays quotable.
     """
     seen: dict[tuple[str, str, str], int] = {}
     for site in sites:
-        key = (site.file, site.symbol, f"{site.call}::{site.shape}")
+        key = (site.file, site.symbol, f"{site.expr}::{site.shape}")
         site.ordinal = seen.get(key, 0)
         seen[key] = site.ordinal + 1
     return sites
@@ -465,6 +474,9 @@ def iter_scanned_files(tree_root: str | os.PathLike) -> list[str]:
             if not target.is_file():
                 raise FileNotFoundError(f"scanned root is missing: {rel}")
             found.append(rel)
+    for rel, _why in UNSCANNED_ROOTS:
+        found = [f for f in found if not f.startswith(rel.rstrip("/") + "/")]
+        found = [f for f in found if f != rel]
     return sorted(set(found))
 
 
