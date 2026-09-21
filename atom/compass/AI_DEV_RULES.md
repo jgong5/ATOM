@@ -20,13 +20,15 @@
 - Working logs and scratch go in `agent_scratch/`. Nothing durable lives in the
   tree: the task record is the GitHub issue and its PR.
 - Task management is GitHub. One issue per task holds the brief and the handoff;
-  its PR holds the dev and review records; the PR closes the issue. Agents open,
-  assign, comment on and close issues, including issues they did not open.
+  its PR holds the dev and review records. The PR names its issue; the issue is
+  closed deliberately, with the handoff comment, since GitHub auto-closes only on
+  the default branch. Agents open, assign, comment on and close issues, including
+  issues they did not open.
 - Design and implement solutions while keeping the solution as simple as possible.
-- Concurrency: 5 tasks in flight, up to 10 agents (`16_execution_plan.md:29`).
+- Concurrency: 5 tasks in flight, up to 10 agents (`16_execution_plan.md`, D95).
 - Both developer and reviewer agents must be told to read `atom/compass/design/README.md`'s
   eight principles first.
-- Reviewer agents must post its review to the PR. GitHub refuses
+- Reviewer agents must post their review to the PR. GitHub refuses
   APPROVE/REQUEST_CHANGES on self-authored PRs, so **the verdict goes in the
   comment body text**.
 - Except for the main branch, free updates to `jgong5/ATOM` — branches, PRs and

@@ -88,7 +88,7 @@ commit. Claiming a task is assigning yourself its issue.
 
 **Every task's brief links to its predecessors' issues.** That is what makes continuity
 survive agent turnover: the context is in the graph, not in a context window. The PR
-closes its issue, so an implementation and the brief that asked for it stay joined.
+names its issue, so an implementation and the brief that asked for it stay joined.
 
 **A brief that cannot name its file set is under-specified** and is not claimable. This is
 the same discipline as `04` D21's declared nodes — the declaration is the contract.
@@ -106,8 +106,12 @@ records before this decision named where the brief goes.
 | **Integration branch** | `feature/atomcompass_new` — already the PR #3 branch |
 | **Per-task isolation** | a git worktree per in-flight task, under `atomcompass-worktrees/<task-id>` |
 | **The task** | one GitHub issue per task, holding its brief and its handoff (D96) |
-| **Landing** | one PR per task into the integration branch, closing that task's issue, reviewed by that task's reviewer agent |
+| **Landing** | one PR per task into the integration branch, naming its task's issue, reviewed by that task's reviewer agent |
 | **ATOM's `main`** | untouched until the milestone the project agrees to upstream |
+
+**Closing the issue is deliberate, not automatic.** GitHub auto-closes a linked issue
+only when the PR merges into the repository's default branch, and `main` is never that
+target here. The issue closes when its handoff comment is written (D96).
 
 **Four setup rules, from failures already recorded on this hardware.** None was caused by
 worktrees; all were caused by a shared mutable non-git source tree that things silently
@@ -217,7 +221,7 @@ and collective-free, so the known hang should not be reachable from P0.4. If P0.
 that, T52 drops to ordinary priority and gates nothing on the critical path.
 
 **Each of P0.3–P0.7 ends in an escalation, not a decision.** The result plus its options
-and their costs go to the project owner; the scope call is theirs (D103).
+and their costs go to the project owner; the scope call is theirs (D102).
 
 ---
 
