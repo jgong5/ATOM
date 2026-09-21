@@ -325,6 +325,58 @@ FORMS_THAT_STAY_QUIET = {
         "    for i in x:\n"
         "        yield i\n"
     ),
+    "shadowing-parameter": (
+        "s = set(['a'])\n\n\ndef f(s):\n    for x in s:\n        yield x\n"
+    ),
+    "shadowing-for-target": (
+        "names = set(['a'])\n"
+        "\n"
+        "\n"
+        "def f(rows):\n"
+        "    for names in rows:\n"
+        "        for x in names:\n"
+        "            yield x\n"
+    ),
+    "shadowing-comprehension-target": (
+        "names = set(['a'])\n"
+        "\n"
+        "\n"
+        "def f(rows):\n"
+        "    return [x for names in rows for x in names]\n"
+    ),
+    "shadowing-lambda-parameter": ("s = set(['a'])\n\nf = lambda s: [x for x in s]\n"),
+    "shadowing-with-as": (
+        "s = set(['a'])\n"
+        "\n"
+        "\n"
+        "def f(cm):\n"
+        "    with cm as s:\n"
+        "        for x in s:\n"
+        "            yield x\n"
+    ),
+    "shadowing-import": (
+        "s = set(['a'])\n\n\ndef f():\n    import s\n    for x in s:\n        yield x\n"
+    ),
+    "remedy-through-unpacking": (
+        "def f(n):\n"
+        "    s = set(n)\n"
+        "    s, t = sorted(s), 1\n"
+        "    for x in s:\n"
+        "        yield x\n"
+    ),
+    "remedy-through-a-for-target": (
+        "def f(n):\n"
+        "    s = set(n)\n"
+        "    for s in [sorted(s)]:\n"
+        "        for x in s:\n"
+        "            yield x\n"
+    ),
+    "max-two-arguments": (
+        "def f(a, b):\n    s = set(a)\n    t = set(b)\n    return max(s, t, key=len)\n"
+    ),
+    "min-two-arguments": (
+        "def f(a, b):\n    s = set(a)\n    t = set(b)\n    return min(s, t, key=len)\n"
+    ),
 }
 
 
@@ -446,6 +498,84 @@ class TestTheSetIterationLint:
             "        yield x\n"
         )
         assert SetIterationLint().scan_source(source, "engine.py") == ()
+
+    def test_the_remedy_is_still_the_remedy_at_the_spellings_that_are_not_assignments(
+        self,
+    ):
+        """`s = sorted(s)` is one way to apply the fix; these are two more.
+
+        A binder the pass does not model is neither a claim nor an unclaim, so
+        the claim from the scope outside reaches the shadowed name and the
+        check reports the line that applied its own remedy. Both of these are
+        that, written through a target an `Assign` to a bare `Name` misses.
+        """
+        lint = SetIterationLint()
+        unpacked = (
+            "def f(n):\n"
+            "    s = set(n)\n"
+            "    s, t = sorted(s), 1\n"
+            "    for x in s:\n"
+            "        yield x\n"
+        )
+        looped = (
+            "def f(n):\n"
+            "    s = set(n)\n"
+            "    for s in [sorted(s)]:\n"
+            "        for x in s:\n"
+            "            yield x\n"
+        )
+        assert lint.scan_source(unpacked, "engine.py") == ()
+        assert lint.scan_source(looped, "engine.py") == ()
+
+    def test_a_fix_on_a_branch_that_is_not_taken_silences_the_name_anyway(self):
+        """What the unbinding costs, written where it can be read off.
+
+        This is a pass over the text and not over the flow, so a rebinding is
+        a rebinding whether or not it runs. The price is bounded to the one
+        name: every other set in the same scope is still reported.
+        """
+        lint = SetIterationLint()
+        branched = (
+            "def f(n, flag):\n"
+            "    s = set(n)\n"
+            "    for x in s:\n"
+            "        yield x\n"
+            "    if flag:\n"
+            "        s = sorted(s)\n"
+        )
+        beside_it = (
+            "def f(n, m):\n"
+            "    s = set(n)\n"
+            "    t = set(m)\n"
+            "    for x in s:\n"
+            "        yield x\n"
+            "    for y in t:\n"
+            "        yield y\n"
+            "    s = sorted(s)\n"
+        )
+        assert lint.scan_source(branched, "engine.py") == ()
+        assert [str(read) for read in lint.scan_source(beside_it, "engine.py")] == [
+            "engine.py:6  for-loop over t  in f"
+        ]
+
+    def test_min_and_max_read_an_order_only_in_the_form_that_takes_one_set(self):
+        """`max(a, b, key=len)` compares the arguments it is given.
+
+        It iterates neither of them, so neither is a read. The form that does
+        iterate takes exactly one, and that one still fires.
+        """
+        lint = SetIterationLint()
+        compared = (
+            "def f(a, b):\n"
+            "    s = set(a)\n"
+            "    t = set(b)\n"
+            "    return max(s, t, key=len)\n"
+        )
+        iterated = "def f(a, cost):\n    s = set(a)\n    return max(s, key=cost)\n"
+        assert lint.scan_source(compared, "engine.py") == ()
+        assert [str(read) for read in lint.scan_source(iterated, "engine.py")] == [
+            "engine.py:3  max(key=...) over s  in f"
+        ]
 
     def test_a_name_is_a_set_only_where_it_was_bound_one(self):
         """`x`, `s` and `ready` are short names two functions both use."""

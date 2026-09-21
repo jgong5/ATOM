@@ -26,6 +26,12 @@ That costs a miss: a genuine read earlier in the same scope goes unreported once
 the name is rebound later. A check that fails the corrected code is a check
 somebody switches off, so the miss is the side to be wrong on.
 
+The miss is bounded to the one name and paid whether or not the rebinding
+runs. `if flag: s = sorted(s)` silences every read of `s` in that scope,
+because this is a pass over the text and not over the flow, and a branch that
+is never taken is a binding all the same. Other sets in the same scope are
+untouched, so the price is one name in one scope rather than the scope.
+
 **Finding a read takes two recognitions, not one.** The expression has to be
 recognised as a set, and the thing done to it has to be recognised as a read in
 order. Either one missing is a miss, and the two fail for different reasons, so
@@ -54,8 +60,10 @@ of what Python allows.** It is short on both sides of the two recognitions.
 A set it does not recognise: one returned by a call this module does not itself
 annotate, or by one defined in another module; one arriving in an unannotated
 parameter; one pulled out of a list, a dict or a tuple; any subclass of `set`;
-and a name that is also bound, anywhere in the same scope, to something the pass
-cannot see as a set.
+one read through the class rather than through `self`, as `Step.members`; and a
+name that is also bound, anywhere in the same scope, to something the pass
+cannot see as a set -- by an assignment, an unpacking, a parameter, a `for` or
+comprehension target, a `with ... as` or an import.
 
 A read it does not recognise: `itertools.chain`, `functools.reduce`,
 `heapq.nsmallest` and every other call not named above -- the list is the forms
@@ -131,9 +139,11 @@ ORDERED_READS = (
     "format",
 )
 
-#: Calls that read in order only when a `key` is given. Without one the answer
-#: is decided by the members; with one, ties are resolved first-wins, and first
-#: is whichever tied member the set handed over first.
+#: Calls that read in order only when a `key` is given, and only in the form
+#: that takes one iterable. Without a key the answer is decided by the members;
+#: with one, ties are resolved first-wins, and first is whichever tied member
+#: the set handed over first. `max(a, b, key=...)` is the other form: it
+#: compares the arguments it is given and iterates neither of them.
 KEYED_READS = ("min", "max")
 
 #: Methods that take a member out in hash order. `pop` is a mutation as well,
@@ -277,8 +287,12 @@ def _reads(node):
             return ((node.func.value, f"{tail}() from"),)
         if tail in ORDERED_READS:
             return tuple((argument, f"{tail}() over") for argument in node.args)
-        if tail in KEYED_READS and any(word.arg == "key" for word in node.keywords):
-            return tuple((argument, f"{tail}(key=...) over") for argument in node.args)
+        if (
+            tail in KEYED_READS
+            and len(node.args) == 1
+            and any(word.arg == "key" for word in node.keywords)
+        ):
+            return ((node.args[0], f"{tail}(key=...) over"),)
     return ()
 
 
@@ -434,6 +448,8 @@ def _set_valued_names(tree) -> _Names:
     from another that a later line binds and the walk order is not the source
     order. What is *not* a set is collected afterwards, against the finished
     table, so a name waiting on a later binding is not written off on the way.
+    The second pass is also where every binder that cannot bind a set lands,
+    which is what stops an outer claim reaching a name that shadows it.
     """
     known = _Names()
     for node, scope in _scoped(tree):
@@ -459,15 +475,30 @@ def _set_valued_names(tree) -> _Names:
 
 
 def _binds(node, known, scope):
-    """Every name this statement binds, and whether it binds it to a set."""
+    """Every name this statement binds, and whether it binds it to a set.
+
+    Three of these can bind a set. The rest cannot bind one this pass can see,
+    and they are here for the other half of the same rule: a name bound to
+    something unrecognised is not claimed, so a binder that is missing from
+    this list lets an outer claim through its own shadow and reports a name at
+    a line that is not reading that set. An unannotated parameter, a `for` or
+    comprehension target, a `with ... as`, an import and a tuple or list
+    unpacking are all that shadow. `except ... as` is left out: the name is
+    an exception, and nothing here iterates one.
+    """
     if isinstance(node, ast.Assign):
         holds_set = _is_set(node.value, known, scope)
-        return tuple(
-            (name, holds_set)
-            for target in node.targets
-            if isinstance(target, (ast.Name, ast.Attribute))
-            for name in _declared(scope, _dotted(target))
-        )
+        bound = []
+        for target in node.targets:
+            if isinstance(target, (ast.Name, ast.Attribute)):
+                bound.extend(
+                    (name, holds_set) for name in _declared(scope, _dotted(target))
+                )
+            else:
+                # An unpacking hands out members, not the container, so what
+                # the value is says nothing about what the names hold.
+                bound.extend(_shadows(scope, _bound_names(target)))
+        return tuple(bound)
     if isinstance(node, ast.AnnAssign) and isinstance(
         node.target, (ast.Name, ast.Attribute)
     ):
@@ -480,7 +511,36 @@ def _binds(node, known, scope):
         return tuple(
             (name, holds_set) for name in _declared(scope, _dotted(node.target))
         )
+    if isinstance(node, (ast.For, ast.AsyncFor, ast.comprehension)):
+        return _shadows(scope, _bound_names(node.target))
+    if isinstance(node, ast.arg):
+        if _annotates_set(node.annotation):
+            return ()
+        return _shadows(scope, (node.arg,))
+    if isinstance(node, ast.withitem):
+        return _shadows(scope, _bound_names(node.optional_vars))
+    if isinstance(node, (ast.Import, ast.ImportFrom)):
+        return _shadows(
+            scope,
+            tuple(alias.asname or alias.name.split(".")[0] for alias in node.names),
+        )
     return ()
+
+
+def _bound_names(target):
+    """Every name a binding target writes to, through tuples, lists and stars."""
+    if isinstance(target, (ast.Name, ast.Attribute)):
+        return (_dotted(target),)
+    if isinstance(target, ast.Starred):
+        return _bound_names(target.value)
+    if isinstance(target, (ast.Tuple, ast.List)):
+        return tuple(name for element in target.elts for name in _bound_names(element))
+    return ()
+
+
+def _shadows(scope, names):
+    """Those names, each bound to something this pass cannot see as a set."""
+    return tuple((name, False) for bound in names for name in _declared(scope, bound))
 
 
 def main(argv=None) -> int:
