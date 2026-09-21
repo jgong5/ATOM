@@ -37,13 +37,19 @@ single-process test can show:
   the reply waits for the life of the process. Absence is the quietest failure
   on this surface, which is why `RPC_SURFACE` below names every dispatched
   method rather than leaving it to whatever the class happens to inherit.
-* **A method that answers None is the same failure, one step later.** The reply
-  is never queued, so from the caller's side an answer of None and a method
-  that was never defined are one event: both park it, neither logs anything,
-  and no timeout ends either. The shapes here are therefore checked against
-  what the call site unpacks, not against what reads well. Returning None is
-  the case a plausible stub falls into by accident, which is why every name on
-  the surface is either replaced here or left to a base implementation that is
+* **A method that is present and answers None parks its caller in exactly the
+  same way.** This is one line below the skip, not a separate mechanism:
+  `async_proc.py:243` is `if out is not None:`, and **both** of the loop's
+  `put_nowait` calls -- the primary output queue at `:248` and the KV queue at
+  `:250` -- are inside it, while the `getattr` skip is at `:237-239`. So from
+  the caller's side an answer of None and a method that was never defined are
+  one event: nothing is queued, nothing logs, and no timeout ends either wait.
+  Naming only absence is worse than saying nothing, because it sends whoever
+  is debugging the hang to check whether the method is there, find that it is,
+  and stop. The shapes here are therefore checked against what the call site
+  unpacks, not against what reads well -- returning None is the case a
+  plausible stub falls into by accident, which is why every name on the
+  surface is either replaced here or left to a base implementation that is
   known to end in a value.
 * **Raising is the loud option, and it is louder in the worker than in the
   parent.** An exception leaves `busy_loop`, kills the worker, and the

@@ -252,7 +252,41 @@ def test_a_name_the_runner_lacks_is_skipped_and_not_raised():
 
 
 def test_a_reply_is_forwarded_only_when_it_is_not_none():
-    assert "if out is not None:" in ASYNC_PROC
+    """A present method answering None parks its caller like an absent one.
+
+    Asserted as the structure rather than as a string, because the claim is
+    that *every* way a reply leaves the loop is behind that guard. `busy_loop`
+    puts on two queues -- the primary output queue and the KV queue -- and if
+    either one were ever moved outside the `if`, a None would start reaching a
+    caller on that path and this file's whole account of the surface would be
+    wrong for it.
+    """
+    busy = next(
+        n
+        for n in ast.walk(ast.parse(ASYNC_PROC))
+        if isinstance(n, ast.FunctionDef) and n.name == "busy_loop"
+    )
+    guards = [
+        n
+        for n in ast.walk(busy)
+        if isinstance(n, ast.If)
+        and isinstance(n.test, ast.Compare)
+        and getattr(n.test.left, "id", None) == "out"
+        and isinstance(n.test.ops[0], ast.IsNot)
+        and n.test.comparators[0].value is None
+    ]
+    assert len(guards) == 1
+    puts = [
+        n.lineno
+        for n in ast.walk(busy)
+        if isinstance(n, ast.Call) and getattr(n.func, "attr", None) == "put_nowait"
+    ]
+    guarded = [
+        n.lineno
+        for n in ast.walk(guards[0])
+        if isinstance(n, ast.Call) and getattr(n.func, "attr", None) == "put_nowait"
+    ]
+    assert puts and sorted(puts) == sorted(guarded)
 
 
 def test_the_caller_that_waits_has_no_timeout_to_rescue_it():
