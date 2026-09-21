@@ -134,7 +134,7 @@ class Fragment:
 
     @property
     def machine(self) -> str:
-        """The machine this fragment claims to have been measured on."""
+        """The machine this fragment is authored for, which is the `name` it states."""
         return self.values["name"]
 
     @property
@@ -150,7 +150,7 @@ class Fragment:
         return None
 
     def stanza(self) -> str:
-        """Who measured what, where and when, as a refusal names it."""
+        """Who measured what, for which machine and when, as a refusal names it."""
         return (
             f"{self.source!r} (machine {self.machine!r}, {self.method}, "
             f"by {self.values['provenance.authored_by']} "
