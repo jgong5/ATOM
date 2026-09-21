@@ -71,6 +71,11 @@ compass_resolve_ref() {
     local root=$1 ref=$2 remote err
     err=$(git -C "$root" rev-parse --verify "$ref^{commit}" 2>&1 >/dev/null) &&
         { printf '%s' "$ref"; return 0; }
+    # `git remote` prints alphabetically, which is an order and not a
+    # preference: with two remotes both carrying the ref at different commits
+    # the first by name wins, and that picks a base and hence a diff, not just a
+    # name. The chosen remote is printed on the ref: and base: lines, which is
+    # what makes the choice checkable rather than silent.
     for remote in $(git -C "$root" remote); do
         git -C "$root" rev-parse --verify --quiet "$remote/$ref^{commit}" >/dev/null 2>&1 &&
             { printf '%s' "$remote/$ref"; return 0; }

@@ -117,6 +117,11 @@ elif git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1 &&
      BASE=$(git -C "$ROOT" merge-base HEAD "$REF" 2>/dev/null); then
     CHANGED=$(git -C "$ROOT" diff --name-only "$BASE")
     SRC="diff vs $REF (${BASE:0:9})"
+    # Announce the fallback the way snapshot.sh does. Without this the resolved
+    # name appears only inside the `gpu:` source string -- reported, not
+    # announced, so a caller who set nothing sees a prefix it never asked for.
+    [ "$REF" = "$INTEGRATION" ] ||
+        printf 'ref:    %s is not a ref here; resolved it as %s\n' "$INTEGRATION" "$REF"
 elif [ -r "$ROOT/.compass-changed" ]; then
     # A snapshot built by snapshot.sh, which is how this gate normally runs.
     # The stamp was written from the same rev-parse that selected the archived
@@ -146,7 +151,7 @@ if [ -z "$GPU_SRC_UNKNOWN" ]; then
 fi
 
 if [ -n "$GPU_SRC_UNKNOWN" ]; then
-    printf 'gpu:    UNKNOWN -- no git, no COMPASS_CHANGED_FILES, no .compass-changed stamp\n'
+    printf 'gpu:    UNKNOWN -- this tree was never stamped (no .compass-changed); a staging omission, see snapshot.sh\n'
 elif [ -n "$GPU_NEEDED" ]; then
     printf 'gpu:    REQUIRED (%s)\n' "$SRC"
     printf '%s' "$GPU_NEEDED" | sed 's/^/          /'
@@ -167,9 +172,9 @@ RC=$?
 printf '\npytest: rc=%s\n' "$RC"
 
 if [ "$RC" -ne 0 ]; then
-    printf 'CPU tier of the test gate FAILED. Baseline is 4030 passed, 0 failed at 29\n' >&2
-    printf 'exclusions (3956 ATOM + 74 tests/compass) -- see scripts/compass/README.md\n' >&2
-    printf 'for how that number moves.\n' >&2
+    printf 'CPU tier of the test gate FAILED. The baseline is measured, not read:\n' >&2
+    printf 'run this script on the integration head this branch forked from and\n' >&2
+    printf 'compare -- see scripts/compass/README.md.\n' >&2
     finish "$RC"
 fi
 

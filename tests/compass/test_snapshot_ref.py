@@ -127,6 +127,10 @@ def test_remote_qualified_ref_resolves_and_names_itself(tree, outdir):
     _git(tree, "update-ref", "refs/remotes/fork/feature/atomcompass_new", head)
     r = _snapshot(tree, outdir)
     assert r.returncode == 0, r.stderr
+    # The resolved name alone is printed by the `base:` line too, so asserting
+    # it does not pin the announcement: delete the `ref:` line and this test
+    # still passes. The fallback has to say it happened.
+    assert "is not a ref here" in r.stdout
     assert "fork/feature/atomcompass_new" in r.stdout
     assert (outdir / f"compass-{head[:9]}.tar").exists()
 
@@ -147,9 +151,20 @@ def test_snapshot_carries_both_stamps(tree, outdir):
 
 def test_bare_ref_is_preferred_and_the_fallback_is_not_claimed(tree, outdir):
     """A local branch of that name resolves on its own, and the run says nothing
-    about a remote -- the fallback is reported only when it happened."""
+    about a remote -- the fallback is reported only when it happened.
+
+    The remote ref is present too, at a different commit, so preference is
+    tested against something: without it the resolver never reaches its remote
+    loop and the assertion passes for a reason unrelated to its name. The base
+    named has to be the local branch's commit, not the remote one.
+    """
+    head = _git(tree, "rev-parse", "HEAD")
     _git(tree, "branch", "feature/atomcompass_new")
+    empty = _git(tree, "hash-object", "-t", "tree", "-w", "--stdin", stdin="")
+    other = _git(tree, "commit-tree", empty, "-m", "remote side, unrelated")
+    _git(tree, "remote", "add", "fork", "https://example.invalid/ATOM.git")
+    _git(tree, "update-ref", "refs/remotes/fork/feature/atomcompass_new", other)
     r = _snapshot(tree, outdir)
     assert r.returncode == 0, r.stderr
     assert "is not a ref here" not in r.stdout
-    assert "(feature/atomcompass_new)" in r.stdout
+    assert f"base:    {head[:9]} (feature/atomcompass_new)" in r.stdout
