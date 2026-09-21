@@ -37,7 +37,15 @@ one that steps over idle is not.
 
 Nothing here reads a clock, opens a socket or touches a device. Wall seconds
 arrive as a number somebody else measured, which is also what makes the summary
-auditable away from the machine that produced it: every field is a plain value.
+auditable away from the machine that produced it: every field is a plain value,
+and a value that is not a finite number is refused where it enters rather than
+written out. A run that spent no measurable wall time has no speed result and
+the record says so, rather than reporting an unlimited one to a gate that would
+read it as a pass.
+
+The timeline the summary reports on comes from the clock, never from the
+caller, so an empty count means the log was off and cannot also mean that
+somebody forgot to hand it over.
 """
 
 import enum
@@ -52,11 +60,34 @@ SPEED_TARGET_RATIO = 5.0
 
 
 def _seconds(value: float) -> str:
-    return "none" if value == math.inf else f"{value:.9g}s"
+    # `repr`, not a fixed precision. A nine-digit format stops resolving a
+    # microsecond advance once a clock passes about a thousand simulated
+    # seconds -- 1000.000001 and 1000.000002 both render as `1000` -- and the
+    # two columns a causality report subtracts are exactly the ones that
+    # collapse. Nothing says a run starts at zero, and the tightest floors are
+    # in the arrangement where the log is most wanted.
+    return "none" if value == math.inf else f"{value!r}s"
 
 
 def _emission(value: float) -> str:
-    return "never" if value == math.inf else f"{value:.9g}s"
+    return "never" if value == math.inf else f"{value!r}s"
+
+
+def _wall_seconds(value: float, what: str) -> float:
+    """A duration somebody measured, checked where it enters the record.
+
+    Refused rather than carried, because an infinity or a not-a-number here is
+    not a number any reader can carry: it leaves the record at the point where
+    the record's whole claim is that it can be read away from the machine that
+    made it.
+    """
+    seconds = float(value)
+    if not math.isfinite(seconds) or seconds < 0.0:
+        raise ValueError(
+            f"{what} must be a finite number of seconds and not negative, "
+            f"got {value!r}"
+        )
+    return seconds
 
 
 # --- the timeline ------------------------------------------------------------
@@ -68,8 +99,17 @@ class TimelineRecord:
 
     `event` says what ended the advance and is one word: `horizon` for an
     advance that stopped on an event the participant itself knew of, `bound`
-    for one a peer cut short, `release` for a grant of no span, which tells a
-    parked participant its wait is over rather than that time moved.
+    for one a peer cut short, `tie` where the two coincide and neither can be
+    said to have cut anything short, and `release` for a grant of no span,
+    which tells a parked participant its wait is over rather than that time
+    moved.
+
+    `tie` is separate rather than folded into `bound` because the count of
+    `bound` records is read as the fingerprint of how a run drove the clock. On
+    a symmetric arrangement, where every floor is the same and the participants
+    hold events at the same instants, over a third of the advances land on both
+    at once; calling those peer-truncated would put a third of the evidence on
+    the wrong side of the question it is asked to settle.
     """
 
     lp_id: LpId
@@ -80,8 +120,8 @@ class TimelineRecord:
 
     def __str__(self) -> str:
         return (
-            f"{self.lp_id} {self.virtual_time_from:.9g} "
-            f"{self.virtual_time_to:.9g} {self.event} {self.detail}"
+            f"{self.lp_id} {self.virtual_time_from!r} "
+            f"{self.virtual_time_to!r} {self.event} {self.detail}"
         )
 
 
@@ -93,22 +133,40 @@ class TimelineLog:
     and optionally handed line by line to `sink`, a callable somebody else
     supplies -- this module does not open a file for the same reason it does not
     open a socket.
+
+    **A sink does not, on its own, relieve the memory.** With `retain` left
+    true every record is also kept, so a caller streaming to a file still holds
+    the whole run: on an arrangement where each grant covers one microsecond
+    floor, that is millions of live records per simulated second, and the
+    object graph arrives long before the text does. `retain=False` keeps the
+    counts and drops the list, which is what makes the log usable where the
+    grant traffic is heaviest; `records()` and `lines()` then refuse rather
+    than answering from a list that was never kept.
     """
 
-    def __init__(self, sink=None) -> None:
+    def __init__(self, sink=None, retain: bool = True) -> None:
         if sink is not None and not callable(sink):
             raise TypeError(f"sink must be callable, got {type(sink).__name__}")
-        self._records: list[TimelineRecord] = []
+        if not retain and sink is None:
+            raise ValueError(
+                "a log that neither keeps its records nor hands them to a sink "
+                "would write nothing; pass a sink, or leave retain true"
+            )
+        self._records: list[TimelineRecord] | None = [] if retain else None
         self._sink = sink
+        self._written = 0
+        self._ended_at_peer_bound = 0
 
     def record(self, grant, next_event: float) -> TimelineRecord:
         """Write one granted advance. `next_event` is the horizon it was cut against."""
         if grant.advance_to == grant.advance_from:
             event = "release"
-        elif grant.advance_to == grant.bound:
-            event = "bound"
-        else:
+        elif grant.advance_to != grant.bound:
             event = "horizon"
+        elif grant.advance_to == next_event:
+            event = "tie"
+        else:
+            event = "bound"
         pinned = "--" if grant.bound_from is None else str(grant.bound_from)
         entry = TimelineRecord(
             grant.lp_id,
@@ -117,30 +175,41 @@ class TimelineLog:
             event,
             f"bound={_seconds(grant.bound)} from={pinned} next={_seconds(next_event)}",
         )
-        self._records.append(entry)
+        self._written += 1
+        if event == "bound":
+            self._ended_at_peer_bound += 1
+        if self._records is not None:
+            self._records.append(entry)
         if self._sink is not None:
             self._sink(str(entry))
         return entry
 
     def records(self) -> tuple[TimelineRecord, ...]:
-        """Every record written, oldest first."""
+        """Every record written, oldest first. Refuses a log that kept none."""
+        if self._records is None:
+            raise ValueError(
+                f"this log was asked not to retain its records; {self._written} "
+                "were written and handed to its sink. The counts are still here"
+            )
         return tuple(self._records)
 
     def lines(self) -> tuple[str, ...]:
         """The same records, rendered one line each."""
-        return tuple(str(entry) for entry in self._records)
+        return tuple(str(entry) for entry in self.records())
 
     def ended_at_peer_bound(self) -> int:
         """How many advances a peer cut short rather than the participant's own event.
 
         The fingerprint of how a run drove the clock. A participant that asks
         again the moment it is given time is cut by a peer almost every time;
-        one that waits until a peer moves is not.
+        one that waits until a peer moves is not. Advances where the two
+        coincide are `tie` and are not counted here, so this is what a peer
+        actually truncated and not an upper bound on it.
         """
-        return sum(1 for entry in self._records if entry.event == "bound")
+        return self._ended_at_peer_bound
 
     def __len__(self) -> int:
-        return len(self._records)
+        return self._written
 
 
 # --- the dump ----------------------------------------------------------------
@@ -181,7 +250,13 @@ _HEADLINE = {
     StallKind.EVENT_UNREACHABLE: (
         "every participant is parked, and at least one knows of a future event "
         "that no participant can be released to reach. This is not a finished "
-        "run: work remains and no participant was given the time to do it."
+        "run: work remains and no participant was given the time to do it. "
+        "What that rests on, since it is the whole of the claim: the clock "
+        "takes a declared horizon at its word and cannot check that it is an "
+        "event rather than a deadline. A participant that declared the timeout "
+        "of a poll instead of an event it knows of reaches this state on a run "
+        "that has in fact finished, and the sentence above is then wrong about "
+        "it. Declare events, never timeouts."
     ),
 }
 
@@ -224,7 +299,7 @@ def deadlock_dump(authority) -> str:
             candidate = earliest[link.source] + link.floor_seconds
             binds = " <- binds" if link.source == pinned_by else ""
             lines.append(
-                f"    from {link.source} floor {link.floor_seconds:.9g}s "
+                f"    from {link.source} floor {_seconds(link.floor_seconds)} "
                 f"earliest {_emission(earliest[link.source])} "
                 f"gives {_emission(candidate)}{binds}"
             )
@@ -409,9 +484,16 @@ class RunSummary:
         lazy_trace_wall_seconds: float = 0.0,
         detectors: DetectorState | None = None,
         refusals: RefusalTally | None = None,
-        timeline: TimelineLog | None = None,
     ) -> "RunSummary":
         """Read the clock once, at the end, and take everything else by value.
+
+        The timeline comes from the clock, never from the caller. Taking a
+        second copy of something the clock already owns makes the absence of
+        one ambiguous: `grants_recorded` would then be empty both for a run
+        that logged nothing and for a caller that forgot to hand the log over,
+        and those are opposite statements about the run. It would also accept a
+        log belonging to some other clock, and report its length beside this
+        clock's grant count.
 
         `discipline` has no default. The grant count is orders of magnitude
         apart on one topology depending on it, so a summary that let it be
@@ -423,15 +505,18 @@ class RunSummary:
                 f"for time, got {type(discipline).__name__}; the grant count "
                 "means nothing without it"
             )
+        wall = _wall_seconds(wall_seconds, "wall_seconds")
+        lazy_wall = _wall_seconds(lazy_trace_wall_seconds, "lazy_trace_wall_seconds")
+        timeline = authority.timeline
         ids = authority.registry.ids()
         return cls(
             tuple((str(lp_id), authority.now(lp_id)) for lp_id in ids),
             max(authority.now(lp_id) for lp_id in ids) - authority.start_time,
-            float(wall_seconds),
+            wall,
             tuple((str(lp_id), authority.grants_issued(lp_id)) for lp_id in ids),
             discipline,
             lazy_traces,
-            lazy_trace_wall_seconds,
+            lazy_wall,
             None if timeline is None else len(timeline),
             None if timeline is None else timeline.ended_at_peer_bound(),
             detectors if detectors is not None else DetectorState(),
@@ -443,15 +528,31 @@ class RunSummary:
         return sum(count for _, count in self.grants)
 
     @property
-    def speed_ratio(self) -> float:
-        """Simulated seconds per wall second. Unlimited if no wall time was spent."""
-        if not self.wall_seconds:
-            return math.inf
+    def speed_refused(self) -> str | None:
+        """Why there is no speed result, or `None` when there is one.
+
+        A run that spent no measurable wall time has no ratio -- not an
+        unlimited one. Reporting unlimited would be a guess where a refusal was
+        available, and the field it lands in is the one the acceptance gate
+        reads, so the guess would be read as a pass. It would also put a value
+        in the record that is not a number any reader can carry.
+        """
+        if self.wall_seconds == 0.0:
+            return "no wall time was measured, so this run has no speed result"
+        return None
+
+    @property
+    def speed_ratio(self) -> float | None:
+        """Simulated seconds per wall second, or `None` where there is no result."""
+        if self.speed_refused is not None:
+            return None
         return self.simulated_seconds / self.wall_seconds
 
     @property
-    def meets_speed_target(self) -> bool:
-        return self.speed_ratio >= SPEED_TARGET_RATIO
+    def meets_speed_target(self) -> bool | None:
+        """Whether the run met the ratio, or `None` where there is no result."""
+        ratio = self.speed_ratio
+        return None if ratio is None else ratio >= SPEED_TARGET_RATIO
 
     def schedule_record(self) -> dict:
         """The half that is a function of the simulated schedule alone."""
@@ -474,6 +575,7 @@ class RunSummary:
             "grants_ended_at_peer_bound": self.grants_ended_at_peer_bound,
             "wall_seconds": self.wall_seconds,
             "speed_ratio": self.speed_ratio,
+            "speed_refused": self.speed_refused,
             "speed_target_ratio": SPEED_TARGET_RATIO,
             "meets_speed_target": self.meets_speed_target,
             "lazy_traces": self.lazy_traces,

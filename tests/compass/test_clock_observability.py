@@ -216,13 +216,41 @@ def test_an_advance_says_what_ended_it():
     log = TimelineLog()
     _drive((0, 1, 2, 3), timeline=log)
     events = sorted({entry.event for entry in log.records()})
-    assert set(events) <= {"bound", "horizon", "release"}
+    assert set(events) <= {"bound", "horizon", "release", "tie"}
     assert "horizon" in events and "bound" in events
     for entry in log.records():
         if entry.event == "release":
             assert entry.virtual_time_from == entry.virtual_time_to
         else:
             assert entry.virtual_time_to > entry.virtual_time_from
+
+
+def test_an_advance_both_could_have_ended_is_neither_of_them():
+    # `bound` is read as the count of advances a peer cut short, and that
+    # reading is the only measured check on a declared discipline. Where the
+    # participant's own event lands on the same instant as the bound, nothing
+    # was cut short, and on a symmetric arrangement that is a large share of
+    # the run rather than a curiosity.
+    log = TimelineLog()
+    engine = LpId("engine")
+    peer = LpId("traffic-source")
+    assert log.record(Grant(engine, 0.0, 5.0, 5.0, peer), 5.0).event == "tie"
+    assert log.record(Grant(engine, 0.0, 5.0, 5.0, peer), 9.0).event == "bound"
+    assert log.record(Grant(engine, 0.0, 5.0, 9.0, peer), 5.0).event == "horizon"
+    assert log.ended_at_peer_bound() == 1
+
+
+def test_a_tie_is_common_enough_on_a_symmetric_arrangement_to_matter():
+    # Equal floors everywhere, which is the shape a ring of pipeline stages
+    # has. Counted here so the classification is not defended by argument.
+    log = TimelineLog()
+    _drive((0, 1, 2, 3), timeline=log, floors=(1.0,))
+    ties = sum(1 for entry in log.records() if entry.event == "tie")
+    assert ties > 0
+    assert ties > len(log) // 5
+    assert log.ended_at_peer_bound() == sum(
+        1 for entry in log.records() if entry.event == "bound"
+    )
 
 
 def test_a_release_is_recorded_as_a_grant_of_no_span():
@@ -243,6 +271,28 @@ def test_a_sink_sees_every_line_as_it_is_written():
 def test_a_sink_that_is_not_callable_is_refused_where_it_is_handed_over():
     with pytest.raises(TypeError, match="sink must be callable"):
         TimelineLog("timeline.log")
+
+
+def test_a_streaming_log_can_be_asked_not_to_keep_what_it_streamed():
+    # A sink alone does not relieve the memory: every record is retained as
+    # well, so a caller streaming to a file still holds the whole run. Where
+    # each grant covers one microsecond floor that is millions of live records
+    # per simulated second, and the object graph arrives before the text does.
+    seen = []
+    streaming = TimelineLog(seen.append, retain=False)
+    quiet = TimelineLog()
+    _drive((0, 1, 2, 3), timeline=streaming)
+    _drive((0, 1, 2, 3), timeline=quiet)
+    assert len(streaming) == len(quiet)
+    assert streaming.ended_at_peer_bound() == quiet.ended_at_peer_bound()
+    assert seen == list(quiet.lines())
+    with pytest.raises(ValueError, match="asked not to retain"):
+        streaming.records()
+
+
+def test_a_log_that_would_write_nothing_anywhere_is_refused():
+    with pytest.raises(ValueError, match="would write nothing"):
+        TimelineLog(retain=False)
 
 
 def test_the_share_of_advances_a_peer_cut_short_is_available_as_a_number():
@@ -291,11 +341,11 @@ def test_the_dump_names_every_participants_clock_state_and_bounding_row():
         authority.request_advance(ids[-1], math.inf)
     dump = raised.value.table
     for lp_id in ids:
-        assert f"{lp_id} blocked-on-message clock 0s" in dump
+        assert f"{lp_id} blocked-on-message clock 0.0s" in dump
         assert f"{lp_id} blocked-on-message" in dump
         for peer in ids:
             if peer is not lp_id:
-                assert f"    from {peer} floor 0s" in dump
+                assert f"    from {peer} floor 0.0s" in dump
     assert str(raised.value.table) in str(raised.value)
 
 
@@ -314,7 +364,9 @@ def test_the_dump_marks_the_one_term_in_the_row_that_binds():
     rows = _rows(dump)
     binding = [line for line in rows[str(ids[0])] if "<- binds" in line]
     assert len(binding) == 1
-    assert binding[0].startswith(f"    from {ids[1]} floor 0.5s earliest 0s gives 0.5s")
+    assert binding[0].startswith(
+        f"    from {ids[1]} floor 0.5s earliest 0.0s gives 0.5s"
+    )
 
 
 def test_a_stall_with_no_event_anywhere_cannot_tell_a_finished_run_from_a_deadlock():
@@ -347,7 +399,7 @@ def test_a_finished_looking_stall_says_so_without_claiming_the_run_finished():
         authority.request_advance(ids[1], math.inf)
     dump = raised.value.table
     assert "every participant was granted time" in dump
-    assert "the furthest clock reached 5s" in dump
+    assert "the furthest clock reached 5.0s" in dump
     assert "a run stuck part way through would look the same" in dump
 
 
@@ -380,12 +432,11 @@ def test_a_stall_holding_an_event_nobody_can_reach_is_not_a_finished_run():
 # --- the summary -------------------------------------------------------------
 
 
-def _summary(authority, wall_seconds=0.25, timeline=None, **kwargs):
+def _summary(authority, wall_seconds=0.25, **kwargs):
     return RunSummary.of(
         authority,
         wall_seconds,
         DriverDiscipline.PARK_WHEN_REFUSED,
-        timeline=timeline,
         **kwargs,
     )
 
@@ -436,12 +487,34 @@ def test_a_summary_cannot_be_written_without_naming_how_the_run_asked_for_time()
 def test_the_grant_count_carries_the_fingerprint_of_the_discipline_when_the_log_is_on():
     log = TimelineLog()
     authority = _drive((0, 1, 2, 3), timeline=log)
-    with_log = _summary(authority, timeline=log).cost_record()
+    with_log = _summary(authority).cost_record()
     assert with_log["grants_recorded"] == authority.grants_issued()
     assert with_log["grants_ended_at_peer_bound"] == log.ended_at_peer_bound()
-    without_log = _summary(authority).cost_record()
+    without_log = _summary(_drive((0, 1, 2, 3))).cost_record()
     assert without_log["grants_recorded"] is None
     assert without_log["grants_ended_at_peer_bound"] is None
+
+
+def test_an_empty_record_count_means_the_log_was_off_and_can_mean_nothing_else():
+    # The summary reads the log off the clock rather than taking a second copy
+    # from the caller. Otherwise an empty count means either "the log was off"
+    # or "whoever built the summary forgot to pass it", and those are opposite
+    # statements about the run -- on a clock that logged every grant.
+    log = TimelineLog()
+    logging_clock = _drive((0, 1, 2, 3), timeline=log)
+    quiet_clock = _drive((0, 1, 2, 3))
+    assert logging_clock.timeline is log
+    assert quiet_clock.timeline is None
+    assert _summary(logging_clock).grants_recorded == len(log)
+    assert _summary(quiet_clock).grants_recorded is None
+    # And there is no way to describe this run with somebody else's log.
+    with pytest.raises(TypeError):
+        RunSummary.of(
+            quiet_clock,
+            0.25,
+            DriverDiscipline.PARK_WHEN_REFUSED,
+            timeline=TimelineLog(),
+        )
 
 
 def test_grants_are_reported_per_participant_and_in_total():
@@ -461,9 +534,32 @@ def test_the_speed_result_is_simulated_seconds_over_wall_seconds():
     assert fast.simulated_seconds == simulated - authority.start_time
     assert fast.speed_ratio == pytest.approx(10.0)
     assert fast.meets_speed_target
+    assert fast.speed_refused is None
     assert slow.speed_ratio == pytest.approx(2.0)
     assert not slow.meets_speed_target
     assert SPEED_TARGET_RATIO == 5.0
+
+
+def test_a_run_that_spent_no_wall_time_has_no_speed_result_rather_than_an_unlimited_one():
+    # This is the field the acceptance gate reads, so an unlimited ratio would
+    # be a guess that reads as a pass. It is also the field that would put a
+    # value in the record that no reader outside Python can carry.
+    authority = _drive((0, 1, 2, 3))
+    summary = _summary(authority, wall_seconds=0.0)
+    assert summary.speed_ratio is None
+    assert summary.meets_speed_target is None
+    assert summary.speed_refused == (
+        "no wall time was measured, so this run has no speed result"
+    )
+
+
+def test_a_duration_that_is_not_a_finite_number_is_refused_where_it_enters():
+    authority = _drive((0, 1, 2, 3))
+    for bad in (math.inf, float("nan"), -1.0):
+        with pytest.raises(ValueError, match="finite number of seconds"):
+            _summary(authority, wall_seconds=bad)
+        with pytest.raises(ValueError, match="finite number of seconds"):
+            _summary(authority, lazy_trace_wall_seconds=bad)
 
 
 def test_lazy_traces_are_carried_as_a_count_and_the_wall_seconds_they_took():
@@ -519,18 +615,22 @@ def test_an_empty_run_divides_by_nothing():
     assert tally.fraction_of_predicted_seconds == 0.0
     registry, matrix, _ids = _topology()
     summary = _summary(ClockAuthority(registry, matrix), wall_seconds=0.0)
-    assert summary.speed_ratio == math.inf
-    assert summary.meets_speed_target
+    assert summary.simulated_seconds == 0.0
+    assert summary.speed_ratio is None
+    assert json.dumps(summary.as_record(), allow_nan=False)
 
 
 def test_the_summary_is_a_value_that_can_be_read_without_the_machine_that_made_it():
     log = TimelineLog()
     authority = _drive((0, 1, 2, 3), timeline=log)
-    record = _summary(
-        authority, timeline=log, refusals=RefusalTally.of(["x"], 9)
-    ).as_record()
+    record = _summary(authority, refusals=RefusalTally.of(["x"], 9)).as_record()
     assert sorted(record) == ["cost", "schedule"]
-    assert json.loads(json.dumps(record)) == record
+    # `allow_nan=False` is the point: Python's encoder emits `Infinity` and
+    # `NaN` by default, which are extensions no strict reader has to accept,
+    # and a record that only round-trips through the library that wrote it is
+    # not a record that can be read without the machine that produced it.
+    assert json.loads(json.dumps(record, allow_nan=False)) == record
+    assert len(log) == authority.grants_issued()
 
 
 # --- what the records may not contain ----------------------------------------
@@ -550,7 +650,7 @@ def test_nothing_the_clock_emits_cites_a_design_document():
     authority = _drive((0, 1, 2, 3), timeline=log)
     emitted = list(log.lines())
     emitted.append(deadlock_dump(authority))
-    emitted.append(json.dumps(_summary(authority, timeline=log).as_record()))
+    emitted.append(json.dumps(_summary(authority).as_record()))
     emitted += [str(kind) for kind in StallKind]
     emitted += [str(discipline) for discipline in DriverDiscipline]
     stalled, ids = _stalled()
@@ -578,16 +678,53 @@ def test_the_observability_module_reaches_no_clock_and_no_socket():
     assert "wall_seconds: float" in source
 
 
-def test_the_timeline_hook_is_one_test_when_the_log_is_off():
-    # What "costs nothing when off" is allowed to mean, checked structurally so
-    # it cannot drift into a loop that runs whether or not anyone asked for a
-    # log. The measurement above says what it costs; this says what it is.
+def _resolve_function():
     tree = ast.parse((CLOCK_PACKAGE / "authority.py").read_text())
+    for node in ast.walk(tree):
+        if isinstance(node, ast.FunctionDef) and node.name == "_resolve":
+            return node
+    raise AssertionError("the grant path is no longer a function named _resolve")
+
+
+def test_no_work_the_log_needs_happens_outside_the_guard():
+    # This is a shape check, not a cost check, and the difference is measured
+    # rather than assumed: a version that builds one tuple of horizons *before*
+    # the guard still has exactly one `if`, still tests `is not None` and still
+    # has no `else`, and costs a real fraction of a microsecond on every grant
+    # of a run that asked for no log. What separates the two is not the guard's
+    # shape but what stands outside it, so that is what is asserted. The
+    # measurement recorded with this task is the evidence about cost; this
+    # cannot be that, and should not be read as it.
+    resolve = _resolve_function()
     guards = [
-        node
-        for node in ast.walk(tree)
-        if isinstance(node, ast.If) and "self._timeline" in ast.unparse(node.test)
+        statement
+        for statement in resolve.body
+        if isinstance(statement, ast.If)
+        and ast.unparse(statement.test) == "self._timeline is not None"
     ]
-    assert len(guards) == 1
-    assert ast.unparse(guards[0].test) == "self._timeline is not None"
-    assert not guards[0].orelse
+    assert len(guards) == 1, "the grant path no longer has exactly one log guard"
+    guard = guards[0]
+    assert not guard.orelse
+    grant_loops = [
+        statement
+        for statement in resolve.body
+        if isinstance(statement, ast.For) and "issued.append" in ast.unparse(statement)
+    ]
+    assert len(grant_loops) == 1
+    for statement in resolve.body:
+        if statement is guard or statement is grant_loops[0]:
+            continue
+        text = ast.unparse(statement)
+        assert "_timeline" not in text, f"the log is touched outside its guard: {text}"
+        assert "self._next" not in text, f"a horizon is read for nobody: {text}"
+    # And nothing outside the guard walks the grants a second time, which is
+    # the shape the measured mutant took.
+    for statement in resolve.body:
+        if statement is guard:
+            continue
+        for node in ast.walk(statement):
+            if isinstance(node, (ast.For, ast.comprehension)):
+                assert "issued" not in ast.unparse(node.iter), (
+                    "the grants are walked again outside the guard: "
+                    f"{ast.unparse(node.iter)}"
+                )
