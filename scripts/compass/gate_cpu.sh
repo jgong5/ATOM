@@ -177,7 +177,8 @@ if [ "$RC" -ne 0 ]; then
     # $? but not the text: `2>&1 | tail -6` keeps only the last five of them,
     # and `2>/dev/null | tail -6` drops them all but keeps pytest's own FAILED
     # line. Either way the reader still ends up holding the test's identity.
-    # Prepending to this block breaks that, and nothing here will fail if it does.
+    # Appending to this block -- or inserting after the class name -- breaks
+    # that, and nothing here will fail if it does.
     printf 'CPU tier of the test gate FAILED. The baseline is measured, not read:\n' >&2
     printf 'run this script on the integration head this branch forked from and\n' >&2
     printf 'compare -- see scripts/compass/README.md.\n' >&2

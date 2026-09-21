@@ -141,9 +141,8 @@ observed failing the same way — `qwen: cost per KB grew 1.73x from 32 to 128 K
 comment 5765660762), which hit it on its own gate run. A sequential re-run of that
 same tree passed at **4496**, and 1 + 4495 = 4496 accounts for it exactly. Inherited,
 not measured here — so the failure belongs to the mechanism and not to the one
-method the counts came from. The two
-skip-variants both occurred under `gate_cpu.sh` and the failure under direct
-pytest.
+method the counts came from. The two skip-variants both occurred under
+`gate_cpu.sh`, and the one hard failure in the counts under direct pytest.
 
 **Run gates sequentially.** The failure was reproduced with two gate loops
 overlapping on node 18. Two gates on one box compete for the CPU the control arm is
