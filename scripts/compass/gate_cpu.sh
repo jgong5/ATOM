@@ -172,15 +172,21 @@ RC=$?
 printf '\npytest: rc=%s\n' "$RC"
 
 if [ "$RC" -ne 0 ]; then
+    # Keep these nine lines last in this block, and keep the class name and
+    # scripts/compass/README.md inside the final five. A caller who pipes loses
+    # $? but not the text: `2>&1 | tail -6` keeps only the last five of them,
+    # and `2>/dev/null | tail -6` drops them all but keeps pytest's own FAILED
+    # line. Either way the reader still ends up holding the test's identity.
+    # Prepending to this block breaks that, and nothing here will fail if it does.
     printf 'CPU tier of the test gate FAILED. The baseline is measured, not read:\n' >&2
     printf 'run this script on the integration head this branch forked from and\n' >&2
     printf 'compare -- see scripts/compass/README.md.\n' >&2
     printf 'Before you read it as your diff, check the FAILED line above. One test in\n' >&2
     printf 'ATOM'"'"'s own suite -- TestTheRegionIsNotCopiedPerChunk in\n' >&2
     printf 'tests/entrypoints/test_stream_marker_properties.py -- asserts a wall-clock\n' >&2
-    printf 'timing property and fails intermittently on a loaded box. That README\n' >&2
-    printf 'section names it, what it was measured to do, and to run gates one at a\n' >&2
-    printf 'time. It is not a Compass defect and is not excluded.\n' >&2
+    printf 'timing property and fails intermittently on a loaded box. The\n' >&2
+    printf 'scripts/compass/README.md section names it, what it was measured to do, and\n' >&2
+    printf 'to run gates one at a time. It is not a Compass defect and is not excluded.\n' >&2
     finish "$RC"
 fi
 

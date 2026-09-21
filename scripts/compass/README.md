@@ -39,14 +39,16 @@ on, which is the omission that let it pass for current; the same gate on
 container `xiaobizh_n18_cpu`, 2026-09-22, 36.2 s of pytest inside 43.0 s of wall.
 
 Two runs of the *same* tree can still differ by one: a ±1 in the passed/skipped
-split, and a non-zero `GATE_CPU_RC` with it, are both outcomes of one flaky test
-in ATOM's own suite — see "A red CPU gate that may not be your diff" below before
-attributing either to a diff.
+split, and — separately — a non-zero `GATE_CPU_RC`, are both outcomes of one
+flaky test in ATOM's own suite — see "A red CPU gate that may not be your diff"
+below before attributing either to a diff. They are alternatives: the
+skip-variant is `rc=0` with the total conserved, the hard failure is `1 failed`
+with a non-zero rc and no ±1.
 
 | Tier | Result | Measured |
 |---|---|---|
 | CPU gate (130 files) | **4030 passed, 0 failed**, 149 skipped, 3 xfailed, rc=0, **identical in every run on 2026-09-21, the clock 25.4-31.7 s of pytest inside 31.1-37.8 s of wall (`time` real) — a measured spread, not a bound** — decomposing as **3956 ATOM + 74 `tests/compass`** | node 18, container `xiaobizh_n18_cpu`, 2026-09-21, **commit not recorded**, against a `git archive` snapshot with `PYTHONPATH` asserted and pytest's own rc captured before any pipe |
-| CPU gate (130 files), same tier, current | **4501 passed, 0 failed**, 149 skipped, 3 xfailed, rc=0 — three runs, identical, 28.8-34.4 s of pytest inside 35-40 s of wall. The **4030** above and the **4380** in the paragraph above are this same gate at earlier trees; all three are history, and this one will be too | `186d12829` — the integration head, **read 2026-09-21T19:21Z**, node 18's own clock — node 18, container `xiaobizh_n18_cpu`, `git archive` snapshot staged by `snapshot.sh`, `PYTHONPATH` asserted, pytest's own rc captured before any pipe |
+| CPU gate (130 files), same tier, current | **4501 passed, 0 failed**, 149 skipped, 3 xfailed, rc=0 — three runs, identical, 28.8-34.4 s of pytest inside 35-40 s of wall. The **4030** above and the **4380** in the paragraph above are this same gate at earlier trees; all three are history, and this one will be too | `186d12829` — the commit this branch forks from, which is its merge-base with the integration head, **read 2026-09-21T19:21Z**, node 18's own clock — node 18, container `xiaobizh_n18_cpu`, `git archive` snapshot staged by `snapshot.sh`, `PYTHONPATH` asserted, pytest's own rc captured before any pipe |
 | GPU superset (`--ignore=tests/plugin`) | **4779 passed, 5 failed**, 0 errors, 105 skipped, 3 xfailed, **72.6 s**; two runs, byte-identical failing sets | `fe9ea043c`, node 18, container `xiaobizh_n18`, `HIP_VISIBLE_DEVICES=1`, 2026-09-20, torch **2.10.0+rocm7.2.4.git3d3aa833**, `torch.version.hip` **7.2.53211**, ROCm release **7.2.4**, AITER **v0.1.21.dev0-49-gf4e7c7509** (`git describe`) |
 | `ruff check .` | 1003 errors, 640 fixable — the gate is *no new* error, not zero | `83daf636d` |
 | `black --check .` | clean, 660 files | `83daf636d` |
@@ -87,7 +89,7 @@ do not claim green.
 is non-deterministic. It is ATOM's own test, it is present at **every** control, and
 it is not a Compass defect: do not modify it and do not put it in
 `cpu_gate_exclude.txt` — excluding it would change what the gate measures on both
-sides of the delta. It is written down here because five agents have been warned
+sides of the delta. It is written down here because four agents have been warned
 about it by hand and one lost a gate run to it.
 
 The class asserts a **timing** property — that a buffered region is not recopied
@@ -133,8 +135,13 @@ same `< 1.5` ratio assertion. Only
 `test_the_open_region_is_never_scanned_beyond_the_window` does not: it counts scans
 of the open region and is deterministic. The sibling
 `test_no_format_pays_more_per_byte_as_the_payload_grows[buffered-region]` has been
-observed failing the same way (`cost per KB grew 1.73x`), so the failure belongs to
-the mechanism and not to the one method the counts came from. The two
+observed failing the same way — `qwen: cost per KB grew 1.73x from 32 to 128 KB`,
+`1 failed, 4495 passed, rc=1`, on the integration head `669dc3f9d`; node 18,
+`xiaobizh_n18_cpu`, 2026-09-21, recorded in the round-2 review of PR #67 (issue
+comment 5765660762), which hit it on its own gate run. A sequential re-run of that
+same tree passed at **4496**, and 1 + 4495 = 4496 accounts for it exactly. Inherited,
+not measured here — so the failure belongs to the mechanism and not to the one
+method the counts came from. The two
 skip-variants both occurred under `gate_cpu.sh` and the failure under direct
 pytest.
 
