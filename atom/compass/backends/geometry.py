@@ -32,12 +32,22 @@ What each axis does to the KV, and the one that surprises people:
 - **EP** shards experts and leaves the KV alone -- structurally so here, since
   the expert width is not an input to the geometry at all.
 
-The collective that rides on that last point is measured, not deduced. An
-all-to-all exists only when more than one data-parallel rank is present: at
-one rank ATOM builds none at all even with expert parallelism on, and the MoE
-is local compute masked per rank plus the tensor-parallel all-reduce. Anything
-pricing a step reads `collectives()` rather than deciding from the expert
-width, because deciding from the expert width gets that case wrong.
+The collective that rides on that last point is measured, not deduced. With
+one data-parallel rank ATOM builds no all-to-all at all, even with expert
+parallelism on: the MoE is local compute masked per rank plus the
+tensor-parallel all-reduce. So `collectives()` names one on the data-parallel
+width and never on the expert width, which is the way round that gets that
+case wrong.
+
+`collectives()` is a **necessary** condition, not a sufficient one, and the
+gap is named here because nothing downstream can see it. ATOM builds its
+peer-to-peer MoE path only when two further things hold that these widths
+cannot express: the deployment is not being simulated wider than the box, and
+the peer-to-peer library is installed. There is also one case in the other
+direction -- the mega MoE backend installs its experts unconditionally and
+does run peer-to-peer at a single data-parallel rank. So a reader may take a
+collective missing from this list as absent, and must not take one present in
+it as built.
 """
 
 from __future__ import annotations
@@ -61,9 +71,22 @@ _DTYPE_BYTES = {
     "uint8": 1,
 }
 
-# Layer kinds that keep a recurrent state per request instead of a cache of
-# past tokens. They hold no paged KV, so a block costs nothing for them.
-_RECURRENT_LAYERS = frozenset({"linear_attention", "mamba", "recurrent"})
+# Layer kinds that hold a cache of every past token, which is the only thing
+# this geometry knows how to size.
+_PAGED_LAYER_KINDS = frozenset({"full_attention"})
+
+# Layer kinds that hold no such cache, keeping a per-request recurrent state
+# instead. A block costs nothing for them.
+_UNCACHED_LAYER_KINDS = frozenset({"linear_attention", "mamba", "recurrent"})
+
+# Fields ATOM reads to recognise a stack whose layers are not all alike. One
+# of these on a config that names no layer kinds means the kinds are missing,
+# not that the stack is uniform.
+_MIXED_STACK_FIELDS = (
+    "full_attention_interval",
+    "hybrid_layer_pattern",
+    "linear_attn_config",
+)
 
 
 def dtype_bytes(dtype) -> int:
@@ -78,6 +101,48 @@ def dtype_bytes(dtype) -> int:
             f"{', '.join(sorted(_DTYPE_BYTES))}"
         )
     return _DTYPE_BYTES[name]
+
+
+def paged_layers(hf_config, start: int, end: int) -> int:
+    """How many layers of a half-open span hold a cache of every past token.
+
+    A config that names its layer kinds is counted by them, and a kind this
+    module does not recognise is refused rather than taken for ordinary
+    attention. A windowed or chunked kind is the case that makes the
+    distinction matter: it keeps a bounded cache, sized by the window rather
+    than by the history, and counting it here would add a full history's bytes
+    to every block.
+
+    A config that names no kinds is a uniform stack, and that claim is
+    checked rather than assumed. On a stack that is one full-attention layer
+    in four, reading it as uniform gives four times the bytes per block and a
+    quarter of the blocks -- and the engine starts on the result.
+    """
+    kinds = getattr(hf_config, "layer_types", None)
+    if kinds is None:
+        mixed = [
+            field
+            for field in _MIXED_STACK_FIELDS
+            if getattr(hf_config, field, None) is not None
+        ]
+        if mixed:
+            raise ValueError(
+                f"this config carries {', '.join(mixed)} but no layer_types, so which "
+                "of its layers hold a cache is not stated; ATOM's own config classes "
+                "fill layer_types in, and building the config through one settles it"
+            )
+        return end - start
+    span = kinds[start:end]
+    known = _PAGED_LAYER_KINDS | _UNCACHED_LAYER_KINDS
+    unknown = sorted({kind for kind in span if kind not in known})
+    if unknown:
+        raise ValueError(
+            f"unrecognised layer kind(s) {', '.join(unknown)}; this geometry sizes a "
+            f"cache of the whole history ({', '.join(sorted(_PAGED_LAYER_KINDS))}) or "
+            f"none at all ({', '.join(sorted(_UNCACHED_LAYER_KINDS))}), and a bounded "
+            "cache is neither"
+        )
+    return sum(1 for kind in span if kind in _PAGED_LAYER_KINDS)
 
 
 def kv_heads_per_rank(total_kv_heads: int, tp_size: int) -> int:
@@ -138,6 +203,11 @@ class Parallelism:
         expert parallelism, which is the case that reads wrong: with one
         data-parallel rank there is no all-to-all however the experts are
         arranged.
+
+        Necessary, not sufficient, as the module docstring sets out: two
+        conditions these widths cannot express also gate ATOM's peer-to-peer
+        path, and the mega MoE backend takes it at one data-parallel rank
+        regardless. An absence here is an absence; a presence is a candidate.
         """
         names = []
         if self.tp_size > 1:
@@ -205,13 +275,7 @@ class KvGeometry:
         start, end = layer_range
         if not 0 <= start < end <= total:
             raise ValueError(f"layer range {layer_range} is not within {total} layers")
-        kinds = getattr(text, "layer_types", None)
-        if kinds is None:
-            layers = end - start
-        else:
-            layers = sum(
-                1 for kind in kinds[start:end] if kind not in _RECURRENT_LAYERS
-            )
+        layers = paged_layers(text, start, end)
         head_dim = getattr(text, "head_dim", None) or (
             text.hidden_size // text.num_attention_heads
         )

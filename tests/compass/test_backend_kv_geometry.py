@@ -22,6 +22,15 @@ The double leaves out the fp32 scale plane the aiter backends carry and sizes
 no recurrent state, so its numbers are smaller than a real model's by a
 declared amount. What it has to get right is that the count moves, correctly,
 with the width.
+
+One asymmetry to carry forward. At one pipeline stage the 16 can be checked
+against the engine twice over -- it is the count of full-attention entries in
+the config, and it is also `num_hidden_layers // full_attention_interval`,
+which is what the GDN builder sizes its paged pool from. At more than one
+stage there is no such check available, because ATOM's own GDN path mixes a
+pipeline-local layer count with a global one there and sizes a negative
+block. The four-per-stage figure below is the intended semantics and is
+right; it is not agreement with a live engine, and nothing here claims it is.
 """
 
 import json
@@ -188,3 +197,39 @@ def test_a_width_the_kv_heads_cannot_shard_is_refused(qwen):
         KvGeometry.from_hf_config(
             qwen, block_size=BLOCK_SIZE, parallelism=Parallelism(tp_size=3)
         )
+
+
+def test_an_unrecognised_layer_kind_is_refused_rather_than_paged(qwen):
+    """A windowed kind keeps a bounded cache, which this geometry cannot size."""
+    windowed = PretrainedConfig.from_dict(
+        {**qwen.to_dict(), "layer_types": ["sliding_attention"] * 64}
+    )
+    with pytest.raises(ValueError, match="sliding_attention"):
+        KvGeometry.from_hf_config(windowed, block_size=BLOCK_SIZE)
+
+
+def test_a_mixed_stack_that_names_no_layer_kinds_is_refused(qwen):
+    """The failure this catches sizes four times the bytes and still starts."""
+    unstated = qwen.to_dict()
+    del unstated["layer_types"]
+    unstated["full_attention_interval"] = 4
+    with pytest.raises(ValueError, match="full_attention_interval"):
+        KvGeometry.from_hf_config(
+            PretrainedConfig.from_dict(unstated), block_size=BLOCK_SIZE
+        )
+
+
+def test_a_uniform_stack_needs_no_layer_kinds():
+    """A dense model names none, and every one of its layers holds a cache."""
+    dense = PretrainedConfig.from_dict(
+        {
+            "num_hidden_layers": 32,
+            "num_key_value_heads": 8,
+            "num_attention_heads": 32,
+            "hidden_size": 4096,
+            "dtype": "float16",
+        }
+    )
+    geometry = KvGeometry.from_hf_config(dense, block_size=BLOCK_SIZE)
+    assert (geometry.layers, geometry.head_dim, geometry.element_bytes) == (32, 128, 2)
+    assert blocks_for(geometry) == KV_BUDGET_BYTES // geometry.bytes_per_block
