@@ -37,7 +37,7 @@
 #
 # A trailing / matches the whole subtree.
 #
-# Measured at 2f2e9ea2912a923e31efbb05297fe5d8c8bf765f over this tree:
+# Measured at fada7424eac354a6983560967ceb881a138002f3 over this tree:
 #   tests/        189 files  = 30 in tests/plugin/ + 29 excluded + 130 CPU tier
 #   CPU tier      108 files collect >=1 test, 22 collect none
 #   imports       190 indented `import atom.*` lines in non-plugin test files
