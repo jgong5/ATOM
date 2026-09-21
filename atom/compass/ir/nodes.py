@@ -479,8 +479,16 @@ class GroupingEvidence(abc.ABC):
     """What was compared before a repeat was allowed to replace a sequence.
 
     Collapsing *n* instances into one body is only free if pricing the body once
-    and multiplying gives what pricing the instances separately would give. The
-    two subclasses are the two things that can be compared: the instances'
+    and *reusing* that price for every instance gives what pricing the instances
+    separately would give -- the same prices, in the same order, added the same
+    way. Multiplying is a different sum, because it re-associates. Reuse
+    reproduces the recorded price exactly in all three shapes measured and
+    multiplying in none of them: eight identical layers, 3.2e-05 s multiplied
+    against 3.200000000000001e-05 s recorded; a four-block pattern repeated
+    twenty times, 0.00036 against 0.0003600000000000009; six instances of 0.1 s,
+    0.6000000000000001 against 0.6.
+
+    The two subclasses are the two things that can be compared: the instances'
     structure, and their price. A repeat takes one of them, mandatorily.
 
     Abstract, and not merely a base class, because an instance of this by itself
