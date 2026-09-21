@@ -1,5 +1,5 @@
 # SPDX-License-Identifier: MIT
-"""The nodes a cost graph is built from, and the rules that make one well formed.
+r"""The nodes a cost graph is built from, and the rules that make one well formed.
 
 A forward pass is a prologue, a great many near-identical layer bodies, and an
 epilogue. Recorded flat, one node per dispatched operator, a 27B model is 2,999
@@ -60,13 +60,35 @@ of one, because a snapshot records whichever value the tracing forward happened
 to see. One such capture took a maximum sequence length from a warm-up dummy and
 priced attention at 163.6 us against a true 23.0 us.
 
-`attrs` refuses such a snapshot two ways, and only the first is a guarantee: no
-value that looks like a tensor, and no name on `AMBIENT_READINGS`. The name list
-is a tripwire for the readings seen in the metadata so far, not a proof -- it
-cannot know the next field somebody adds, and two of its entries were added only
-after a review found them missing while one-character-different spellings were
-already there. What carries the weight is that ambient state is reached through
-`context_ref` when a price is asked for, not copied into the node at all.
+`attrs` refuses such a snapshot two ways, and the two cover different halves.
+
+The first is a type allowlist, and it is a guarantee. An attribute value is a
+number, a string, an enum member, `None`, or a tuple of those, and nothing else
+-- so a tensor cannot be stored, and neither can a live symbolic value. Stating
+it positively is the whole of why it holds. The earlier version asked whether a
+value could be hashed, which reads as a safe question and is not one: measured
+on torch 2.10.0+rocm7.2.4, that test refuses a `SymInt` loudly, accepts a
+`SymBool` and a `SymFloat` silently -- specialising them, and pinning a
+`SymFloat` to its trace-time hint with a guard nobody asked for -- and raises
+`GuardOnDataDependentSymNode` on an unbacked one. `isinstance` against `bool`,
+`int`, `float`, `str`, `bytes` and `tuple` answers False for all three symbolic
+types and moves the guard list not at all. Asking a value a question is the
+leak; asking its type is not.
+
+The second is `AMBIENT_READINGS`, a list of names, and it is not a guarantee. It
+exists because the type rule cannot see the difference between a width that is
+part of what the operator is and a token count copied out of this step's
+metadata: both are `int`. The names are the ones ATOM reads off its attention
+metadata, counted from the tree with
+
+    grep -rhoE '\b(attn_metadata|metadata|md|gdn_metadata|attn_md)\.[a-z_][a-z0-9_]*' \
+        atom/ --include=*.py | sed 's/.*\.//' | sort | uniq -c | sort -rn
+
+and matched case-insensitively, since a recorded name may arrive in any case.
+Regenerate it the same way when the metadata grows: it is incomplete the moment
+somebody adds a field, and it has already been extended twice after review. What
+carries the weight is that ambient state is reached through `context_ref` when a
+price is asked for, not copied into the node at all.
 
 For the same reason this module offers no price key built out of a node. A key
 made from shapes and static attributes alone has been measured unsound: two
@@ -81,6 +103,7 @@ import abc
 import enum
 import math
 import string
+from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Any
 
@@ -88,30 +111,56 @@ from .shapes import Shape, as_shapes
 
 #: Readings that decide an operator's cost and change every step. They are
 #: reached through the context reference when a price is asked for; a copy taken
-#: at trace time is a value from whichever forward did the tracing. A tripwire
-#: for the names seen so far, not a proof -- see the module docstring.
+#: at trace time is a value from whichever forward did the tracing. Counted from
+#: the tree, matched case-insensitively, and incomplete by construction: a
+#: tripwire for the readings seen so far, not a proof. See the module docstring.
 AMBIENT_READINGS = frozenset(
     {
+        "batch_id_per_token",
         "batch_ptr",
         "block_table_tensor",
         "block_tables",
         "context_lens",
+        "cu_seqlen_ks",
         "cu_seqlens_k",
         "cu_seqlens_q",
+        "index_topk",
         "kv_indices",
+        "kv_indices_csa",
         "kv_indptr",
         "kv_last_page_lens",
         "max_query_len",
         "max_seq_len",
         "max_seqlen_k",
         "max_seqlen_q",
+        "n_committed_csa_per_seq",
+        "n_committed_csa_per_seq_cpu",
+        "n_committed_hca_per_seq",
+        "n_committed_hca_per_seq_cpu",
+        "n_committed_per_token",
         "num_actual_tokens",
+        "num_decodes",
+        "num_prefills",
         "num_reqs",
         "nums_dict",
+        "qo_indptr",
         "query_start_loc",
+        "reduce_final_map",
+        "reduce_indptr",
+        "reduce_partial_map",
         "seq_lens",
+        "skip_prefix_len_csa",
         "slot_mapping",
+        "sparse_cu_seqlens_q",
+        "sparse_kv_indptr",
+        "sparse_kv_last_page_lens",
+        "state_slot_mapping",
+        "state_slot_out",
+        "state_slot_out_cpu",
         "token_chunk_offset_ptr",
+        "token_to_seq_idxs",
+        "work_indptr",
+        "work_info_set",
     }
 )
 
@@ -306,16 +355,14 @@ def _as_attrs(attrs: Any) -> tuple[tuple[str, Any], ...]:
     refused rather than resolved: the sort would silently pick one of them and
     the invariant would be a coin toss.
 
-    Hashable values only, for the same reason the shapes are. Nothing
-    tensor-shaped, and no name on `AMBIENT_READINGS`: both are per-step state
-    copied out of one forward, and a later step priced against the copy is
-    priced against a batch that is not the one being asked about. A tensor
-    hashes by identity, so the value check has to look at what it is rather than
-    ask whether it can be kept.
+    Values are checked by type and never by what they can do; the module
+    docstring says why that distinction is the whole of the guarantee. Names are
+    checked against `AMBIENT_READINGS`, which catches the per-step readings that
+    arrive as plain numbers and that no type rule could tell from a width.
     """
     if isinstance(attrs, (str, bytes)):
         raise TypeError(f"attributes are name/value pairs, got {attrs!r}")
-    items = attrs.items() if hasattr(attrs, "items") else attrs
+    items = attrs.items() if isinstance(attrs, Mapping) else attrs
     pairs: list[tuple[str, Any]] = []
     seen: dict[str, None] = {}
     for item in items:
@@ -336,27 +383,38 @@ def _as_attrs(attrs: Any) -> tuple[tuple[str, Any], ...]:
                 "name would make which value survives depend on the order."
             )
         seen[key] = None
-        if key in AMBIENT_READINGS:
+        if key.lower() in AMBIENT_READINGS:
             raise ValueError(
                 f"{key!r} changes every step and is read through the node's "
                 "context reference when a price is asked for. Stored here it "
                 "would be whatever value the tracing forward happened to see."
             )
-        if hasattr(value, "shape") and hasattr(value, "dtype"):
-            raise ValueError(
-                f"attribute {key!r} is a tensor. Its contents are this step's "
-                "state, not what the operator is; reach it through the node's "
-                "context reference when a price is asked for."
-            )
-        try:
-            hash(value)
-        except TypeError:
-            raise TypeError(
-                f"attribute {key!r} must be hashable; {type(value).__name__} "
-                "is not, and the node holding it is a value"
-            ) from None
-        pairs.append((key, value))
+        pairs.append((key, _as_attr_value(key, value)))
     return tuple(sorted(pairs, key=lambda pair: pair[0]))
+
+
+#: What an attribute value may be: what the operator is, never what this step
+#: is. Checked with `isinstance` and nothing else -- a live symbolic value
+#: answers False to every one of these and is refused without being asked a
+#: question it would answer by installing a guard.
+ATTR_VALUE_TYPES = (bool, int, float, str, bytes, enum.Enum)
+
+
+def _as_attr_value(key: str, value: Any) -> Any:
+    """Return `value` if it is one an attribute may hold, else refuse by type."""
+    if value is None or isinstance(value, ATTR_VALUE_TYPES):
+        return value
+    if isinstance(value, tuple):
+        return tuple(_as_attr_value(key, item) for item in value)
+    raise TypeError(
+        f"attribute {key!r} is a {type(value).__name__}. An attribute is a "
+        "number, a string, an enum member, None, or a tuple of those -- what "
+        "the operator is, not what this step is. A tensor and a size that is "
+        "not known yet are both refused here: their contents are this step's "
+        "state, reached through the node's context reference when a price is "
+        "asked for, and a size that is not known yet cannot be stored anywhere "
+        "without being asked a question that resolves it."
+    )
 
 
 @dataclass(frozen=True, slots=True)

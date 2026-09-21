@@ -14,6 +14,7 @@ runtime, so a graph can be built and checked anywhere.
 from .graph import Applicability, Graph
 from .nodes import (
     AMBIENT_READINGS,
+    ATTR_VALUE_TYPES,
     ContextRef,
     EqualPrice,
     GroupingEvidence,
@@ -31,6 +32,7 @@ from .shapes import Shape, SymDim, SymExpr, as_dim, as_shape, as_shapes, is_symb
 
 __all__ = [
     "AMBIENT_READINGS",
+    "ATTR_VALUE_TYPES",
     "Applicability",
     "ContextRef",
     "EqualPrice",

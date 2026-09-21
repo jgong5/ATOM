@@ -26,18 +26,26 @@ Two more, both from what the operators themselves turned out to be. The tensors
 that decide an opaque operator's cost are ambient rather than arguments, so
 `attrs` refuses to hold a copy of one -- a copy is whatever the tracing forward
 saw, and one such capture priced attention at 163.6 us against a true 23.0 us.
-And a size that is not known yet is canonicalised on the way in and never stored
-live, because the live object cannot be hashed at all and comparing it installs
-a guard.
+And a size that is not known yet is rendered by the caller and never stored
+live, because the live object cannot be held as a value and asking it anything
+resolves it.
+
+**On asking a value a question.** Three refusals in this package were written
+as "can this value be hashed?", and all three were wrong in the same way. A
+hashability test refuses a `SymInt` loudly, accepts a `SymBool` and a `SymFloat`
+silently -- specialising them, and installing a guard that pins a `SymFloat` to
+its trace-time hint -- and raises `GuardOnDataDependentSymNode` on an unbacked
+one. Every check in the package is now an `isinstance`, which all three symbolic
+types answer False to while leaving the guard list untouched.
 
 **On the stand-in for a symbolic size.** An earlier version of this file used
-one that defined `__hash__`, which is precisely the property the code under test
-reads -- so the suite passed while the package refused every real symbolic size
-it would ever be handed. A stand-in has to differ from the real type only in the
-ways the test does not depend on. `_Unhashable` below therefore refuses to hash
-and raises on every comparison and conversion, exactly as a live symbol does,
-and `test_a_real_symbolic_size_survives_as_a_node` runs the same path against
-the real thing.
+one that defined `__hash__`, which was precisely the property the code under
+test read -- so the suite passed while the package refused every real symbolic
+size. The round after that, no test passed a symbolic value as an *attribute*,
+one field over from where the first miss was. Both are why
+`test_a_live_symbolic_value_reaches_no_field_of_a_node` runs every field against
+real `SymInt`, `SymBool` and `SymFloat` objects under a live `ShapeEnv` and
+checks the guard list after each one.
 """
 
 import ast
@@ -48,6 +56,7 @@ import pytest
 from atom.compass import ir
 from atom.compass.ir import (
     AMBIENT_READINGS,
+    ATTR_VALUE_TYPES,
     Applicability,
     ContextRef,
     EqualPrice,
@@ -63,6 +72,7 @@ from atom.compass.ir import (
     Repeat,
     Seq,
     SymDim,
+    as_dim,
     as_shape,
     is_symbolic,
 )
@@ -70,6 +80,7 @@ from atom.compass.ir import (
 IR_PACKAGE = Path(__file__).resolve().parents[2] / "atom" / "compass" / "ir"
 
 STRUCTURE = IdenticalStructure("linear_attention_block")
+CAPTURE = "qwen3-27b/decode"
 
 
 def _op(name="aiter::gemm_a16w16", **kwargs):
@@ -79,27 +90,13 @@ def _op(name="aiter::gemm_a16w16", **kwargs):
     return Op(name=name, **kwargs)
 
 
-class _Unhashable:
-    """A stand-in for a live symbolic size, matching it where it matters.
+class _Unrenderable:
+    """An object with no rendering of its own, as most objects have none."""
 
-    A real one cannot be hashed -- `hash()` raises `TypeError: unhashable type:
-    non-nested SymInt` -- and comparing it or converting it is what installs a
-    guard. Rendering it is the one safe operation, so that is the only one this
-    permits.
-    """
 
-    __hash__ = None
-
+class _Compound:
     def __str__(self):
-        return "s52"
-
-    __repr__ = __str__
-
-    def _refuse(self, *_args):
-        raise AssertionError("a live symbolic size was compared or converted")
-
-    __eq__ = __lt__ = __le__ = __gt__ = __ge__ = _refuse
-    __int__ = __index__ = __bool__ = __float__ = _refuse
+        return "2*s26 + 1"
 
 
 class _Everywhere(Applicability):
@@ -367,23 +364,23 @@ def test_a_sequence_with_nothing_in_it_is_refused():
 # --- a size that is not known yet --------------------------------------------
 
 
-def test_a_live_symbolic_size_is_canonicalised_and_never_stored():
-    # The live object cannot be hashed and raises on every comparison. A node
-    # has to be both hashable and comparable, so the size is rendered once on
-    # the way in and the rendering is what the node holds.
-    tokens = _Unhashable()
-    op = _op(in_shapes=((tokens, 4096),), out_shapes=((tokens, 11008),))
-    held = op.in_shapes[0][0]
-    assert isinstance(held, SymDim) and str(held) == "s52"
-    assert held is not tokens
+def test_a_live_symbolic_size_is_not_rendered_on_anybody_s_behalf():
+    # Nothing is canonicalised implicitly. A value that is not a size renders to
+    # something that looks like one -- a width from another library renders to
+    # its digits, and an object with no rendering of its own to its address --
+    # so the caller says which of its values are sizes.
+    with pytest.raises(TypeError, match="SymDim.of"):
+        as_dim(_Compound())
+    assert as_dim(SymDim.of(_Compound(), CAPTURE)) == SymDim("2*s26 + 1", CAPTURE)
 
 
 def test_a_node_holding_a_symbolic_size_is_hashable_and_comparable():
     # This is the operation the repeat detector is built out of, and the one
     # that reaches a dimension: equality on two nodes compares every dimension.
-    first = _op(in_shapes=((_Unhashable(), 4096),))
-    second = _op(in_shapes=((_Unhashable(), 4096),))
-    third = _op(in_shapes=((SymDim("s99"), 4096),))
+    tokens = SymDim.of(_Compound(), CAPTURE)
+    first = _op(in_shapes=((tokens, 4096),))
+    second = _op(in_shapes=((SymDim("2*s26 + 1", CAPTURE), 4096),))
+    third = _op(in_shapes=((SymDim("s99", CAPTURE), 4096),))
     assert first == second
     assert first != third
     assert len({first, second, third}) == 2
@@ -391,20 +388,54 @@ def test_a_node_holding_a_symbolic_size_is_hashable_and_comparable():
     assert first in [second]
 
 
-def test_a_symbolic_size_is_identified_by_its_rendering():
-    assert SymDim("2*s26 + 1") == SymDim.of(_Compound())
-    assert is_symbolic(SymDim("s52")) and not is_symbolic(4096)
+def test_two_captures_that_spell_a_symbol_the_same_are_not_the_same_size():
+    # A shape environment numbers symbols per capture, so two unrelated traces
+    # both produce `s26` and both produce `u0`. Comparing a body recorded in one
+    # against a body recorded in another is what finding repetition and
+    # validating a grouping do, and on the text alone both would agree.
+    here, there = SymDim("s26", "capture-a"), SymDim("s26", "capture-b")
+    assert here != there
+    assert _op(in_shapes=((here, 8),)) != _op(in_shapes=((there, 8),))
+    assert here == SymDim("s26", "capture-a")
 
 
-class _Compound:
-    def __str__(self):
-        return "2*s26 + 1"
+def test_a_symbolic_size_names_the_capture_it_was_read_against():
+    with pytest.raises(ValueError, match="names the capture"):
+        SymDim("s26", "")
 
 
 @pytest.mark.parametrize("bad", ["", "   ", "s52\ns53"])
 def test_a_symbolic_size_with_no_usable_rendering_is_refused(bad):
     with pytest.raises(ValueError, match="needs a rendering"):
-        SymDim(bad)
+        SymDim(bad, CAPTURE)
+
+
+@pytest.mark.parametrize("bad", ["4096", " 17 ", "-3", "1.5", "inf"])
+def test_a_size_that_renders_as_a_number_is_a_known_size(bad):
+    # The trap behind this: a width from another library renders to its digits,
+    # so it would be held as a symbol that compares unequal to the int it is,
+    # and one shape would quietly become two nodes.
+    with pytest.raises(ValueError, match="belongs in the shape as an int"):
+        SymDim(bad, CAPTURE)
+
+
+def test_an_object_with_no_rendering_of_its_own_is_refused():
+    with pytest.raises(ValueError, match="no rendering of its own"):
+        SymDim.of(_Unrenderable(), CAPTURE)
+
+
+def test_a_width_from_another_library_is_converted_not_rendered():
+    numpy = pytest.importorskip("numpy")
+    with pytest.raises(TypeError, match="SymDim.of"):
+        as_dim(numpy.int64(4096))
+    with pytest.raises(ValueError, match="belongs in the shape as an int"):
+        SymDim.of(numpy.int64(4096), CAPTURE)
+    assert as_dim(int(numpy.int64(4096))) == 4096
+
+
+def test_a_known_size_and_an_open_one_are_told_apart():
+    assert is_symbolic(SymDim("s52", CAPTURE))
+    assert not is_symbolic(4096)
 
 
 def test_a_concrete_dimension_is_bounded():
@@ -413,10 +444,19 @@ def test_a_concrete_dimension_is_bounded():
         as_shape([-1])
 
 
-@pytest.mark.parametrize("bad", [True, 1.5, "8", None, b"8"])
+@pytest.mark.parametrize("bad", [True, 1.5, "8", None, b"8", _Unrenderable()])
 def test_a_dimension_that_only_arrives_by_mistake_is_refused(bad):
-    with pytest.raises(TypeError, match="concrete int or a symbolic size"):
+    with pytest.raises(TypeError, match="a dimension is a concrete int"):
         as_shape([bad])
+
+
+def test_a_tensor_is_not_a_dimension():
+    class _Tensor:
+        shape = (4, 8)
+        dtype = "bf16"
+
+    with pytest.raises(TypeError, match="a dimension is a concrete int"):
+        as_shape([_Tensor()])
 
 
 def test_shapes_are_one_per_operand():
@@ -425,10 +465,22 @@ def test_shapes_are_one_per_operand():
     assert op.out_shapes == ((4, 16),)
 
 
-def test_a_real_symbolic_size_survives_as_a_node():
-    # The regression the stand-in above cannot prove on its own. On torch 2.10 a
-    # SymInt is unhashable, backed or not, so a package that required a
-    # dimension to be hashable could hold no real symbolic shape at all.
+@pytest.mark.parametrize("shapes", [{(4, 8): "x"}, {"a": 1}])
+def test_a_mapping_is_not_a_shape(shapes):
+    # A mapping iterates as its keys, so it would be read as a shape nobody
+    # wrote, and accepted.
+    with pytest.raises(TypeError, match="iterates as its keys"):
+        _op(in_shapes=shapes)
+    with pytest.raises(TypeError, match="iterates as its keys"):
+        as_shape(shapes)
+
+
+def test_a_live_symbolic_value_reaches_no_field_of_a_node():
+    # The regression no stand-in can prove on its own, run against the real
+    # types. The three differ in how they answer the question this package used
+    # to ask -- hashing a SymInt raises, a SymBool hashes to 0, a SymFloat
+    # hashes to a number and pins itself to its trace-time hint -- and agree in
+    # how they answer the question it asks now.
     torch = pytest.importorskip("torch")
     from torch._subclasses.fake_tensor import FakeTensorMode
     from torch.fx.experimental.symbolic_shapes import ShapeEnv
@@ -443,15 +495,35 @@ def test_a_real_symbolic_size_survives_as_a_node():
         with pytest.raises(TypeError, match="unhashable"):
             hash(tokens)
 
+        causal = tokens > 100
+        scale = tokens * 1.5
+        unbacked = shape_env.create_unbacked_symint()
+        assert [type(v).__name__ for v in (causal, scale)] == ["SymBool", "SymFloat"]
+
+        for label, value in (
+            ("SymInt", tokens),
+            ("SymBool", causal),
+            ("SymFloat", scale),
+            ("unbacked SymInt", unbacked),
+            ("nested in a tuple", (tokens, 4)),
+        ):
+            before = len(shape_env.guards)
+            with pytest.raises(TypeError, match="An attribute is a number"):
+                _op(attrs=(("whatever", value),))
+            assert len(shape_env.guards) == before, label
+
         before = len(shape_env.guards)
-        op = _op(in_shapes=((tokens, 4096),), out_shapes=((tokens, 11008),))
+        with pytest.raises(TypeError, match="SymDim.of"):
+            _op(in_shapes=((tokens, 4096),))
+        rendered = SymDim.of(tokens, "one-capture")
+        op = _op(in_shapes=((rendered, 4096),), out_shapes=((rendered, 11008),))
         assert len(shape_env.guards) == before
 
-    held = op.in_shapes[0][0]
-    assert isinstance(held, SymDim) and str(held) == str(tokens)
+    assert str(rendered) == str(tokens)
     assert hash(op) == hash(op)
     assert op == _op(
-        in_shapes=((SymDim(str(tokens)), 4096),), out_shapes=((tokens, 11008),)
+        in_shapes=((SymDim(str(tokens), "one-capture"), 4096),),
+        out_shapes=((SymDim(str(tokens), "one-capture"), 11008),),
     )
 
 
@@ -464,22 +536,50 @@ def test_a_per_step_ambient_reading_cannot_be_frozen_into_a_node(reading):
     # price is asked for. Stored on the node they are whichever value the
     # tracing forward saw -- the failure that priced attention at 163.6 us
     # against a true 23.0 us, from a maximum sequence length left behind by a
-    # warm-up run. The list is a tripwire for the names seen so far and not a
-    # proof, which is why the tensor check below carries the guarantee.
+    # warm-up run. The list exists because six of these arrive as plain ints,
+    # which no type rule can tell from a width that really is the operator's.
     with pytest.raises(ValueError, match="changes every step"):
         _op(kind=NodeKind.OPAQUE_LEAF, attrs={reading: 16384})
 
 
+@pytest.mark.parametrize("spelling", ["MAX_SEQLEN_Q", "Max_Seqlen_Q", "max_seqlen_Q"])
+def test_an_ambient_reading_is_caught_however_it_is_capitalised(spelling):
+    with pytest.raises(ValueError, match="changes every step"):
+        _op(attrs={spelling: 16384})
+
+
+@pytest.mark.parametrize(
+    "value",
+    [4, 1.5, "bf16", True, None, b"raw", NodeKind.CAPTURED, (4, ("a", 1.5), None)],
+    ids=lambda v: type(v).__name__,
+)
+def test_an_attribute_holds_what_the_operator_is(value):
+    assert _op(attrs={"a": value}).attrs == (("a", value),)
+
+
+@pytest.mark.parametrize(
+    "value",
+    [[1, 2], {"a": 1}, {1, 2}, _Unrenderable(), (1, [2])],
+    ids=["list", "dict", "set", "object", "list nested in a tuple"],
+)
+def test_an_attribute_that_is_not_what_the_operator_is_is_refused(value):
+    with pytest.raises(TypeError, match="An attribute is a number"):
+        _op(attrs={"a": value})
+
+
 def test_a_tensor_valued_attribute_is_refused_whatever_it_is_called():
-    # A tensor hashes by identity, so hashability says nothing here. The check
-    # looks at what the value is, which is what covers a per-step reading under
-    # a name nobody thought to list.
+    # A tensor hashes by identity, so the question this package used to ask said
+    # nothing here. The type rule refuses it without asking it anything.
     class _Tensor:
         shape = (4, 8)
         dtype = "bf16"
 
-    with pytest.raises(ValueError, match="is a tensor"):
+    with pytest.raises(TypeError, match="An attribute is a number"):
         _op(attrs={"whatever_it_is_called": _Tensor()})
+
+
+def test_the_allowlist_is_what_the_package_exports():
+    assert ATTR_VALUE_TYPES == (bool, int, float, str, bytes, __import__("enum").Enum)
 
 
 def test_two_nodes_differing_only_in_where_they_read_state_are_different_nodes():
@@ -510,11 +610,6 @@ def test_a_name_given_twice_is_refused_rather_than_silently_resolved():
 def test_an_attribute_that_is_not_a_pair_is_refused(attrs):
     with pytest.raises((TypeError, ValueError), match="name, value"):
         _op(attrs=attrs)
-
-
-def test_an_attribute_a_node_cannot_keep_is_refused():
-    with pytest.raises(TypeError, match="must be hashable"):
-        _op(attrs={"scales": [1.0, 2.0]})
 
 
 def test_the_three_node_kinds_say_where_a_price_comes_from():
