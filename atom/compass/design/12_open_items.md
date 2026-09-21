@@ -255,7 +255,7 @@ Beyond the per-topic TODOs.
    who was not in these design conversations. Requested during review; belongs in the
    execution plan as its own task, not as a trailing chore.
 8. 7. **ATOM's `main` moves while Compass is built.** The seam (`Config.runner_qualname`) has
-   two in-tree users so it is unlikely to vanish, but the ~55 synchronization sites of
+   two in-tree users so it is unlikely to vanish, but the 212 synchronization sites of
    `01` D4 and the clock-read sites of `11` D72 are ordinary code that upstream will
    touch. The CI clock-source lint is the detector; a rebase cadence is an execution-plan
    question.
