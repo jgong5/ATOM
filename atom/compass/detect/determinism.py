@@ -91,6 +91,11 @@ def compare_step_tables(
     Non-zero fails CI. The report names the first row the two disagree on
     rather than the whole diff, because the first one is the one that has a
     cause and everything after it is that cause still unwinding.
+
+    A record with no rows is refused rather than compared. Two runs that
+    produced no schedule agree with each other, and the agreement carries none
+    of the meaning the identical wording would carry over a record that had
+    rows in it.
     """
     left_rows = left.split("\n")
     right_rows = right.split("\n")
@@ -103,6 +108,13 @@ def compare_step_tables(
         )
     configuration = left_rows[0][len(CONFIGURATION_PREFIX) :]
     counted = f"{len(left_rows) - 1} and {len(right_rows) - 1}"
+    if len(left_rows) == 1 or len(right_rows) == 1:
+        return 1, (
+            "determinism: a record with no rows is a run that scheduled "
+            "nothing, so there is nothing for the two to agree about:\n"
+            f"  {left_name}  {len(left_rows) - 1} row(s) of {configuration}\n"
+            f"  {right_name}  {len(right_rows) - 1} row(s) of {configuration}"
+        )
     for index, (one, other) in enumerate(zip(left_rows[1:], right_rows[1:])):
         if one != other:
             return 1, _differ(

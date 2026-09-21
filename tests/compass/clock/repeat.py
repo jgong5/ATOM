@@ -43,13 +43,21 @@ from .participants import DESIGN_WORKLOAD, scaled
 #: process got. Any string would do; a name the run actually holds is clearer.
 SEED_PROBE = "decode-00.stage-0"
 
-#: The configurations this check runs. Neither is the arrangement the detectors
-#: beside it were written against: the first is pipelined and split across the
-#: prefill/decode boundary, which is six participants and the tightest floor in
-#: the tree; the second is a single engine, which is two.
+#: The configurations this check runs, each as the deployment it drives, the
+#: requests and decode steps it drives it with, and how many participants it
+#: ends up with. Neither is the arrangement the detectors beside it were
+#: written against: the first is pipelined and split across the prefill/decode
+#: boundary and has the tightest floor in the tree; the second is a single
+#: engine.
+#:
+#: The participant count is last because it is the one the caller reasons
+#: about. The defect this check exists to catch reorders that set, so how many
+#: different records it can produce is bounded by how many orders the set
+#: takes: a large set comes out differently under nearly any two seeds, a set
+#: of two comes out one of two ways and two seeds may well draw the same one.
 CONFIGURATIONS = {
-    "tp8-pp4-four-requests": ("tp8-pp4", 4, 6),
-    "tp4-one-server-eight-requests": ("tp4-one-server", 8, 10),
+    "tp8-pp4-four-requests": ("tp8-pp4", 4, 6, 5),
+    "tp4-one-server-eight-requests": ("tp4-one-server", 8, 10, 2),
 }
 
 
@@ -108,7 +116,7 @@ class RecordedRun(SyntheticRun):
 
 def record(name, tie_break_by_set=False, sleep_seconds=0.0) -> StepTable:
     """Run one named configuration and hand back what it did."""
-    deployment_name, requests, decode_steps = CONFIGURATIONS[name]
+    deployment_name, requests, decode_steps, _participants = CONFIGURATIONS[name]
     deployment = next(one for one in DEPLOYMENTS if one.name == deployment_name)
     workload = scaled(DESIGN_WORKLOAD, requests, decode_steps)
     run = RecordedRun(name, deployment, workload, tie_break_by_set, sleep_seconds)

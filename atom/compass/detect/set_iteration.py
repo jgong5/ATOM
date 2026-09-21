@@ -17,18 +17,52 @@ mistake is invisible at the moment it is made.
 
 **Membership is not iteration.** `x in s`, `len(s)`, `s.add(...)` and
 `s.discard(...)` read nothing in order and are not reported. `sorted(s)` is not
-reported either: it is the fix, and so is keeping the members in a `dict` whose
-values are `None`.
+reported either: it is the fix.
 
-**What it finds, and what it cannot.** A set is recognised where the module
-itself says so -- a set literal or comprehension, a `set()` or `frozenset()`
-call, a set operator between two of those or over a `dict` view, a name or
-attribute assigned one of them, and a parameter or variable annotated as a set.
-Everything outside the module's own text is invisible to it: a set returned by a
-call with no annotation, one arriving in an unannotated parameter, one pulled
-out of a list or a dict, and any subclass of `set` are all unrecognised, and the
-iteration over them is not reported. It finds the forms this code is written in,
-not every form Python allows.
+**A report has to survive the fix it prescribes.** A name rebound to something
+this pass cannot see as a set stops being one, so applying the remedy in place
+-- `s = sorted(s)` -- ends the reports about `s` instead of continuing them.
+That costs a miss: a genuine read earlier in the same scope goes unreported once
+the name is rebound later. A check that fails the corrected code is a check
+somebody switches off, so the miss is the side to be wrong on.
+
+**Finding a read takes two recognitions, not one.** The expression has to be
+recognised as a set, and the thing done to it has to be recognised as a read in
+order. Either one missing is a miss, and the two fail for different reasons, so
+they are listed separately below.
+
+**What it recognises as a set.** A set literal or comprehension; a `set()` or
+`frozenset()` call; a set operator or the method spelling of the same operator
+applied to one of those, or to a `dict` view; a name or attribute assigned one
+of them, in the scope that assigned it and the scopes inside that one; a
+parameter or variable annotated as a set; a class or dataclass field annotated
+as a set and read through `self`; and a call to a function this module itself
+annotates as returning one.
+
+**What it recognises as a read in order.** `for` and `async for`, a
+comprehension or generator expression, tuple and starred unpacking, `yield
+from`; `list`, `tuple`, `iter`, `reversed`, `enumerate`, `zip`, `sum`, `join`,
+`map`, `filter` and `fromkeys`; `str`, `repr`, `format` and an f-string or `%`
+interpolation, because a set's `repr` lists its members in iteration order;
+`pop`, which takes a member out in hash order; and `min` or `max` given a `key`,
+because ties there are resolved first-wins and first is whichever member the set
+handed over first.
+
+**What it does not find. This list is what has been tried, not an enumeration
+of what Python allows.** It is short on both sides of the two recognitions.
+
+A set it does not recognise: one returned by a call this module does not itself
+annotate, or by one defined in another module; one arriving in an unannotated
+parameter; one pulled out of a list, a dict or a tuple; any subclass of `set`;
+and a name that is also bound, anywhere in the same scope, to something the pass
+cannot see as a set.
+
+A read it does not recognise: `itertools.chain`, `functools.reduce`,
+`heapq.nsmallest` and every other call not named above -- the list is the forms
+this code is written in, not the forms that exist. `sorted(s, key=...)` belongs
+on this side for a reason of its own rather than by omission: its ties keep the
+set's order, so it is a real order dependence, and it is not reported because
+`sorted` is the remedy this check prescribes.
 """
 
 import argparse
@@ -43,6 +77,20 @@ from .clock_source import ClockSourceLint, _scope_at, _scopes
 
 #: Builders that produce a set from anything.
 SET_BUILDERS = ("set", "frozenset")
+
+#: The set operators. Applied to a set, or to a `dict` view, each produces a set.
+SET_OPERATORS = (ast.BitOr, ast.BitAnd, ast.BitXor, ast.Sub)
+
+#: The method spellings of those same operators, and `copy`. `s - t` and
+#: `s.difference(t)` are one expression written two ways, so recognising one
+#: and not the other would be two rules where the language has one.
+SET_METHODS = (
+    "union",
+    "intersection",
+    "difference",
+    "symmetric_difference",
+    "copy",
+)
 
 #: Annotations that declare one. The subscript is stripped before the name is
 #: compared, so `set[str]` and `Set[LpId]` both land here.
@@ -62,7 +110,10 @@ VIEW_CALLS = ("keys", "items")
 #: Calls whose result depends on the order their argument came out in. `sorted`
 #: is deliberately absent: it is what a caller reaches for to fix one of these.
 #: `sum` is here because float addition is not associative, so the order the
-#: terms arrive in is the order the rounding happens in.
+#: terms arrive in is the order the rounding happens in. `fromkeys` is here
+#: because a dict built from a set holds the set's order and looks ordered
+#: afterwards, and `str`, `repr` and `format` are here because a set's `repr`
+#: lists its members in the order it holds them.
 ORDERED_READS = (
     "list",
     "tuple",
@@ -72,10 +123,22 @@ ORDERED_READS = (
     "zip",
     "sum",
     "join",
+    "map",
+    "filter",
+    "fromkeys",
+    "str",
+    "repr",
+    "format",
 )
 
-#: The set operators. Applied to a set, or to a `dict` view, each produces a set.
-SET_OPERATORS = (ast.BitOr, ast.BitAnd, ast.BitXor, ast.Sub)
+#: Calls that read in order only when a `key` is given. Without one the answer
+#: is decided by the members; with one, ties are resolved first-wins, and first
+#: is whichever tied member the set handed over first.
+KEYED_READS = ("min", "max")
+
+#: Methods that take a member out in hash order. `pop` is a mutation as well,
+#: which is why it is easy to file under the mutations that are not reported.
+SET_DRAINS = ("pop",)
 
 
 @dataclass(frozen=True)
@@ -112,9 +175,9 @@ class SetIterationLint:
         known = _set_valued_names(tree)
         scopes = _scopes(tree)
         found = {}
-        for node in ast.walk(tree):
+        for node, scope in _scoped(tree):
             for expression, form in _reads(node):
-                if not _is_set(expression, known):
+                if not _is_set(expression, known, scope):
                     continue
                 read = SetIteration(
                     path,
@@ -158,8 +221,9 @@ class SetIterationLint:
             "A set hands its members back in hash order, and a string is hashed "
             "from a seed the interpreter picks per process, so two runs of one "
             "configuration read the same set in two orders and diverge with "
-            "nothing to point at. Sort at the point of iteration, or hold the "
-            "members in a dict whose values are None and iterate that."
+            "nothing to point at. Sort at the point of iteration, or decide the "
+            "order once from a sorted list and carry that: a dict keyed from "
+            "sorted(s) holds an order, a dict keyed from s holds the hash table."
         )
         return "\n".join(lines)
 
@@ -168,6 +232,23 @@ class SetIterationLint:
         modules = self.modules(root)
         reads = self.scan_modules(modules)
         return (1 if reads else 0), self.report(reads, len(modules))
+
+
+def _scoped(node, scope=()):
+    """Every node under `node`, each with the def and class path enclosing it.
+
+    A name means different things in different scopes, and one flat table of
+    names makes a short name bound in one function a set in every other one.
+    """
+    for child in ast.iter_child_nodes(node):
+        if isinstance(child, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            inner = scope + (("def", child.name),)
+        elif isinstance(child, ast.ClassDef):
+            inner = scope + (("class", child.name),)
+        else:
+            inner = scope
+        yield child, inner
+        yield from _scoped(child, inner)
 
 
 def _reads(node):
@@ -180,14 +261,24 @@ def _reads(node):
         return ((node.value, "unpacking of"),)
     if isinstance(node, ast.YieldFrom):
         return ((node.value, "yield from"),)
+    if isinstance(node, ast.FormattedValue):
+        return ((node.value, "formatted string of"),)
+    if isinstance(node, ast.BinOp) and isinstance(node.op, ast.Mod):
+        filled = node.right
+        parts = filled.elts if isinstance(filled, ast.Tuple) else (filled,)
+        return tuple((part, "formatted string of") for part in parts)
     if isinstance(node, ast.Assign) and any(
         isinstance(target, (ast.Tuple, ast.List)) for target in node.targets
     ):
         return ((node.value, "unpacking of"),)
     if isinstance(node, ast.Call):
         tail = _tail(node.func)
+        if tail in SET_DRAINS and isinstance(node.func, ast.Attribute):
+            return ((node.func.value, f"{tail}() from"),)
         if tail in ORDERED_READS:
             return tuple((argument, f"{tail}() over") for argument in node.args)
+        if tail in KEYED_READS and any(word.arg == "key" for word in node.keywords):
+            return tuple((argument, f"{tail}(key=...) over") for argument in node.args)
     return ()
 
 
@@ -212,20 +303,26 @@ def _dotted(node) -> str | None:
     return ".".join(reversed(parts))
 
 
-def _is_set(node, known) -> bool:
+def _is_set(node, known, scope) -> bool:
     """Whether this expression is a set, as far as the module's own text says."""
     if isinstance(node, (ast.Set, ast.SetComp)):
         return True
     if isinstance(node, ast.Call):
-        return _tail(node.func) in SET_BUILDERS
+        tail = _tail(node.func)
+        if tail in SET_BUILDERS:
+            return True
+        if tail in SET_METHODS and isinstance(node.func, ast.Attribute):
+            return _is_set(node.func.value, known, scope) or _is_view(node.func.value)
+        return known.returns_a_set(scope, _dotted(node.func))
     if isinstance(node, (ast.Name, ast.Attribute)):
-        return _dotted(node) in known
+        return known.holds_a_set(scope, _dotted(node))
     if isinstance(node, ast.BinOp) and isinstance(node.op, SET_OPERATORS):
         return any(
-            _is_set(side, known) or _is_view(side) for side in (node.left, node.right)
+            _is_set(side, known, scope) or _is_view(side)
+            for side in (node.left, node.right)
         )
     if isinstance(node, ast.IfExp):
-        return _is_set(node.body, known) or _is_set(node.orelse, known)
+        return _is_set(node.body, known, scope) or _is_set(node.orelse, known, scope)
     return False
 
 
@@ -248,43 +345,141 @@ def _annotates_set(node) -> bool:
     return _tail(node) in SET_ANNOTATIONS
 
 
-def _set_valued_names(tree) -> dict[str, None]:
-    """Every name and attribute this module says holds a set.
+class _Names:
+    """What the module says each name holds, in the scope that says it.
 
-    Taken to a fixed point, because one name can be bound from another that a
-    later line binds, and the walk order is not the source order.
+    Two things this has to get right that a flat table of names cannot. A name
+    is only a set inside the scope that bound it and the scopes nested in that
+    one, or `x` bound to a set in one function makes every other function's `x`
+    a set. And a name bound anywhere in its scope to something that is not a
+    recognised set is not claimed at all, or applying the fix in place leaves
+    the report standing and the check reports its own remedy.
     """
-    known: dict[str, None] = {}
-    for node in ast.walk(tree):
+
+    def __init__(self) -> None:
+        self.sets: set[tuple[tuple, str]] = set()
+        self.others: set[tuple[tuple, str]] = set()
+        self.returns: set[tuple[tuple, str]] = set()
+
+    def learn(self, scope, name: str, table) -> bool:
+        """Write one binding down. True if this is the first time it is seen."""
+        key = (_owner(scope, name), name)
+        if key in table:
+            return False
+        table.add(key)
+        return True
+
+    def holds_a_set(self, scope, name) -> bool:
+        """Whether a name read in `scope` holds a set here."""
+        return self._look(scope, name, self.sets, self.others)
+
+    def returns_a_set(self, scope, name) -> bool:
+        """Whether a call made in `scope` reaches a function annotated to return one."""
+        return self._look(scope, name, self.returns, frozenset())
+
+    def _look(self, scope, name, yes, no) -> bool:
+        if name is None:
+            return False
+        start = _owner(scope, name)
+        levels = (start,) if name.startswith("self.") else _outward(start)
+        for level in levels:
+            if (level, name) in no:
+                return False
+            if (level, name) in yes:
+                return True
+        return False
+
+
+def _owner(scope, name: str):
+    """Where a name is written down. `self.x` belongs to its class, not its method."""
+    if not name.startswith("self."):
+        return scope
+    for depth in range(len(scope), 0, -1):
+        if scope[depth - 1][0] == "class":
+            return scope[:depth]
+    return scope
+
+
+def _outward(scope):
+    """The scopes a bare name is looked up in: this one, then out past the classes.
+
+    A class body is skipped on the way out because a method does not see its
+    class's names without going through `self`, and treating it as though it
+    did makes a class attribute shadow a global of the same name.
+    """
+    levels = [scope[:depth] for depth in range(len(scope), -1, -1)]
+    return levels[:1] + [
+        level for level in levels[1:] if not (level and level[-1][0] == "class")
+    ]
+
+
+def _declared(scope, name):
+    """The names one binding writes down.
+
+    A name bound in a class body is also reachable as `self.<name>` from every
+    method of that class, and an annotation-only field -- which is every field
+    of a frozen dataclass -- is reachable no other way.
+    """
+    if name is None:
+        return ()
+    if scope and scope[-1][0] == "class" and "." not in name:
+        return (name, f"self.{name}")
+    return (name,)
+
+
+def _set_valued_names(tree) -> _Names:
+    """Every name this module says holds a set, and every name it says does not.
+
+    The sets are taken to a fixed point first, because one name can be bound
+    from another that a later line binds and the walk order is not the source
+    order. What is *not* a set is collected afterwards, against the finished
+    table, so a name waiting on a later binding is not written off on the way.
+    """
+    known = _Names()
+    for node, scope in _scoped(tree):
         if isinstance(node, ast.arg) and _annotates_set(node.annotation):
-            known[node.arg] = None
+            known.learn(scope, node.arg, known.sets)
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        if _annotates_set(node.returns):
+            for name in _declared(scope[:-1], node.name):
+                known.learn(scope[:-1], name, known.returns)
     grew = True
     while grew:
         grew = False
-        for node in ast.walk(tree):
-            for name in _binds(node, known):
-                if name is not None and name not in known:
-                    known[name] = None
-                    grew = True
+        for node, scope in _scoped(tree):
+            for name, holds_set in _binds(node, known, scope):
+                if holds_set:
+                    grew |= known.learn(scope, name, known.sets)
+    for node, scope in _scoped(tree):
+        for name, holds_set in _binds(node, known, scope):
+            if not holds_set:
+                known.learn(scope, name, known.others)
     return known
 
 
-def _binds(node, known):
-    """Every name this statement binds to a set."""
-    if isinstance(node, ast.Assign) and _is_set(node.value, known):
+def _binds(node, known, scope):
+    """Every name this statement binds, and whether it binds it to a set."""
+    if isinstance(node, ast.Assign):
+        holds_set = _is_set(node.value, known, scope)
         return tuple(
-            _dotted(target)
+            (name, holds_set)
             for target in node.targets
             if isinstance(target, (ast.Name, ast.Attribute))
+            for name in _declared(scope, _dotted(target))
         )
-    if (
-        isinstance(node, ast.AnnAssign)
-        and isinstance(node.target, (ast.Name, ast.Attribute))
-        and (_annotates_set(node.annotation) or _is_set(node.value, known))
+    if isinstance(node, ast.AnnAssign) and isinstance(
+        node.target, (ast.Name, ast.Attribute)
     ):
-        return (_dotted(node.target),)
-    if isinstance(node, ast.NamedExpr) and _is_set(node.value, known):
-        return (_dotted(node.target),)
+        holds_set = _annotates_set(node.annotation) or _is_set(node.value, known, scope)
+        return tuple(
+            (name, holds_set) for name in _declared(scope, _dotted(node.target))
+        )
+    if isinstance(node, ast.NamedExpr):
+        holds_set = _is_set(node.value, known, scope)
+        return tuple(
+            (name, holds_set) for name in _declared(scope, _dotted(node.target))
+        )
     return ()
 
 
