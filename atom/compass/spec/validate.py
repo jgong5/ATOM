@@ -15,16 +15,37 @@ field per attempt, they measure one term, run again, and find the next. So the
 answer is the list, in the schema's own order, and a caller that wants an
 exception raises the first.
 
-The check runs in two phases and cannot be collapsed into one. The first asks
-whether the document is a complete instance of the schema -- every required
-field present and every value the shape its field declares. The second asks
-whether a complete spec is consistent: whether the widths the deployment will
-actually use were measured, whether the stack the constants were taken on is the
-stack now loaded, and whether constants carried over from another spec came from
-one pinned to the same stack. Consistency questions are asked of a resolved
-spec, so they wait until there is one; when the first phase has refusals the
-second has nothing to run against, and saying so is more honest than checking
-half of it.
+The check runs in two phases. The first asks whether the document is a complete
+instance of the schema -- every required field present and every value the shape
+its field declares. The second asks whether a complete spec is consistent:
+whether the widths the deployment will actually use were measured, whether the
+stack the constants were taken on is the stack now loaded, and whether constants
+carried over from another spec came from one pinned to the same stack. Each of
+those goes through a resolved spec, so they wait until there is one.
+
+**The ordering has a cost, and it is the one collecting refusals exists to
+avoid.** The questions of the second phase are not intrinsically about a
+resolved spec, only their implementation is: both width tables are present and
+schema-valid in a document that the first phase refuses for a single missing
+derate, and that derate is a value its author types in at a desk. So the cheap
+refusal is reported and the expensive one -- a width nobody measured, which
+costs an eight-GPU reservation to fix -- is hidden behind it, which is the
+one-measurement-per-attempt this module opens by rejecting, reintroduced at the
+phase boundary. Asking each consistency question of whatever fields did resolve
+would close it and is not done here. Until it is, the honest thing is to say
+what went unasked, so a `Validation` carries the conditions this run could not
+ask and why.
+
+**The same record makes the opt-in conditions legible.** Three of the five need
+something from the caller -- `tp_widths=`, `observed_stack=`, and a `Merge`
+rather than a document -- and a clear result that does not say what it declined
+to ask is the shape this package exists to refuse. The sharpest case is the
+transfer: its source's pin is in no field of the merged document, by the
+decision below, so `validate(document)` can never ask that condition however the
+document was built, and the same spec is refused as a `Merge` and clear as a
+document. That is not a wrong number, but it must be visible, because the verb
+the design writes -- `compass spec validate machine.yaml` -- is the form that
+cannot ask it.
 
 Two of those questions need something the document does not carry.
 
@@ -58,6 +79,11 @@ from .machine import MachineSpec, _missing, _walk
 from .merge import PINNED_BLOCK, Merge
 from .rules import Rule, SpecRefusal
 
+#: The consistency conditions, named so a result can say which went unasked.
+WIDTHS = "whether the widths this deployment will use were measured"
+STACK = "whether the constants' stack pin is the stack now loaded"
+TRANSFERS = "whether a transferred constant came from a spec pinned to this stack"
+
 
 @dataclass(frozen=True, slots=True)
 class Validation:
@@ -66,6 +92,7 @@ class Validation:
     spec: MachineSpec | None
     refusals: tuple[SpecRefusal, ...]
     stack_differences: tuple[tuple[str, str, Any], ...]
+    not_asked: tuple[str, ...] = ()
 
     @property
     def ok(self) -> bool:
@@ -77,6 +104,42 @@ class Validation:
         if self.refusals:
             raise self.refusals[0]
         return self.spec
+
+    def __str__(self) -> str:
+        """The verdict, every reason for it, and every question left unasked."""
+        return "\n".join(
+            [f"{'ok' if self.ok else 'refused'}: {len(self.refusals)} refusal(s)"]
+            + [f"  {refusal}" for refusal in self.refusals]
+            + [f"  not asked: {condition}" for condition in self.not_asked]
+        )
+
+
+def _not_asked(
+    spec: MachineSpec | None,
+    tp_widths: Sequence[int],
+    observed_stack: Mapping[str, str] | None,
+    merged: Merge | None,
+) -> tuple[str, ...]:
+    """The consistency questions this run did not ask, each with its reason."""
+    if spec is None:
+        return tuple(
+            f"{condition} -- the document is not a complete spec, so no "
+            "consistency question was asked of it at all; a refusal above can "
+            "be hiding a more expensive one"
+            for condition in (WIDTHS, STACK, TRANSFERS)
+        )
+    unasked = []
+    if not tp_widths:
+        unasked.append(f"{WIDTHS} -- no `tp_widths=` was given")
+    if observed_stack is None:
+        unasked.append(f"{STACK} -- no `observed_stack=` was given")
+    if merged is None:
+        unasked.append(
+            f"{TRANSFERS} -- the subject is a document, and a transfer's source "
+            "pin is in no field of one; ask this of the `Merge` while the "
+            "fragments are still in hand"
+        )
+    return tuple(unasked)
 
 
 def _complete(document: object):
@@ -166,7 +229,12 @@ def validate(
         except SpecRefusal as refusal:
             refusals.append(refusal)
     if spec is None:
-        return Validation(None, tuple(refusals), ())
+        return Validation(
+            None,
+            tuple(refusals),
+            (),
+            _not_asked(None, tp_widths, observed_stack, merged),
+        )
     refusals += _widths(spec, tp_widths)
     differences = ()
     if observed_stack is not None:
@@ -186,4 +254,9 @@ def validate(
             )
     if merged is not None:
         refusals += _transfers(spec, merged)
-    return Validation(spec, tuple(refusals), differences)
+    return Validation(
+        spec,
+        tuple(refusals),
+        differences,
+        _not_asked(spec, tp_widths, observed_stack, merged),
+    )

@@ -30,9 +30,15 @@ from atom.compass.spec import (
     merge,
     validate,
 )
-from atom.compass.spec.fields import BY_PATH
+from atom.compass.spec.fields import BY_PATH, Kind
+from atom.compass.spec.tokenizers import ENTRY_FIELDS
+from atom.compass.spec.validate import STACK as STACK_ASKED
+from atom.compass.spec.validate import TRANSFERS as TRANSFERS_ASKED
+from atom.compass.spec.validate import WIDTHS as WIDTHS_ASKED
 
 MACHINE = "mi355x-8gpu-2node"
+#: A tokenizer entry's fields by name, to say which of its rates is a peak.
+ENTRY_RATES = {field.path: field for field in ENTRY_FIELDS}
 STACK = {"rocm": "7.2.4", "aiter": "f4e7c7509", "rccl": "2.22.3"}
 MIB = 1024**2
 
@@ -208,6 +214,28 @@ def test_the_same_two_tokenizers_merge_when_the_machine_agrees():
     assert combination.document["provenance"]["fragments"] == [
         "tokenizer-a",
         "tokenizer-b",
+    ]
+
+
+def test_a_merged_document_merged_again_keeps_the_names_that_built_it():
+    # Incremental authoring: merge what has been measured, save it, merge next
+    # week's probe into the saved document. A merged document is a legal
+    # fragment, so this works -- and the block whose whole job is to say where
+    # the numbers came from must not lose the fragments of the first round.
+    first = merge([fragment("tier0", TIER0), fragment("tier1", TIER1)])
+    again = merge(
+        [
+            Fragment.from_mapping(first.document, "machine.yaml"),
+            fragment("tier2", TIER2),
+            fragment("links", LINKS),
+        ]
+    )
+    assert again.document["provenance"]["fragments"] == [
+        "tier0",
+        "tier1",
+        "machine.yaml",
+        "tier2",
+        "links",
     ]
 
 
@@ -484,6 +512,64 @@ def test_a_transfer_from_a_spec_pinned_to_this_stack_validates():
     assert validate(combination).ok
 
 
+def test_a_clear_check_says_which_conditions_it_could_not_ask():
+    # Three of the five conditions are opt-in, and a check that is silent about
+    # what it declined to ask is a clear with no content behind it.
+    bare = validate(merged().document)
+    assert bare.ok
+    assert [condition.split(" -- ")[0] for condition in bare.not_asked] == [
+        WIDTHS_ASKED,
+        STACK_ASKED,
+        TRANSFERS_ASKED,
+    ]
+    assert "`tp_widths=`" in bare.not_asked[0]
+    asked = validate(
+        merged(), tp_widths=(1, 2, 4, 8), observed_stack=STACK, strict=True
+    )
+    assert asked.ok and asked.not_asked == ()
+
+
+def test_the_transfer_condition_names_itself_as_unaskable_of_a_document():
+    # The same spec is refused as a `Merge` and clear as the document it makes,
+    # because the source's pin is deliberately in no field of the document. The
+    # verb the design writes takes a file, so the document must say as much.
+    carried = copy.deepcopy(TIER2)
+    carried["device"]["software_pinned_to"] = dict(STACK, rocm="7.0.2")
+    combination = merge(
+        fragments()[:2]
+        + [
+            fragment("tier2", carried, method="transferred-from:mi300x-8gpu"),
+            fragment("links", LINKS),
+        ]
+    )
+    assert not validate(combination).ok
+    as_document = validate(combination.document)
+    assert as_document.ok
+    assert any(
+        condition.startswith(TRANSFERS_ASKED) for condition in as_document.not_asked
+    )
+    assert "in no field" in str(as_document)
+
+
+def test_an_incomplete_document_says_no_consistency_question_was_asked():
+    # The phase-one refusal here is a derate an author types in at a desk; the
+    # width table behind it is present and schema-valid, and the width nobody
+    # measured costs an eight-GPU reservation. Phase two does not run, so the
+    # result has to say that rather than let the cheap refusal stand alone.
+    thin = without(TIER1, "device", "memory", "derate")
+    checked = validate(
+        merge(fragments(tier1=thin)).document,
+        tp_widths=(1, 2, 4, 8, 16),
+        observed_stack=dict(STACK, rocm="7.3.0"),
+        strict=True,
+    )
+    assert [refusal.rule for refusal in checked.refusals] == [Rule.DERATE]
+    assert len(checked.not_asked) == 3
+    for condition in checked.not_asked:
+        assert "not a complete spec" in condition
+    assert "hiding a more expensive one" in str(checked)
+
+
 def test_a_document_that_is_not_a_mapping_is_refused():
     checked = validate("a filename, not a document")
     assert [refusal.rule for refusal in checked.refusals] == [Rule.SHAPE]
@@ -575,11 +661,48 @@ def test_the_refusal_list_is_the_one_the_design_asks_for():
 
 
 def test_every_term_a_resolved_spec_holds_can_be_explained():
+    # The exit criterion, and it has to assert what is in the basis rather than
+    # that there is one: a path that is in `spec.values` cannot come back empty,
+    # so reachability alone survives every wrong value this module could report.
+    # Each row states the value the document holds, and carries a derate exactly
+    # when the field it came from is a spec peak.
     spec = resolved()
     for path in sorted(spec.values):
         basis = explain(spec, path)
         assert basis.contributions, path
         assert basis.digest == spec.digest()
+        field = BY_PATH[path]
+        if field.kind is Kind.WIDTH_TABLE:
+            assert {row.path for row in basis.contributions} == {
+                f"{path}[{width}]" for width in spec.values[path]
+            }, path
+        if field.kind is Kind.TOKENIZERS:
+            assert {row.path.split("].")[0] + "]" for row in basis.contributions} == {
+                f"{path}[{entry['id']} {entry['backend']}]"
+                for entry in spec.values[path]
+            }, path
+        for row in basis.contributions:
+            if field.kind is Kind.TOKENIZERS:
+                rate = ENTRY_RATES[row.path.rsplit(".", 1)[-1]]
+                assert (row.derate is not None) == rate.peak, row.path
+                continue
+            if field.kind is not Kind.WIDTH_TABLE:
+                assert row.value == spec.values[path], path
+            assert (row.derate is not None) == field.peak, path
+
+
+def test_a_tokenizer_row_names_the_fragment_that_supplied_the_entry():
+    # `merge` labels an entry with the raw backend string and `explain` rebuilds
+    # the label from the parsed `Backend`; nothing else asserts that the two
+    # still agree, and a row whose source is silently `()` looks identical to a
+    # row explained without an origin.
+    origin = merged()
+    basis = explain(
+        MachineSpec.from_mapping(origin.document), "host.tokenizers", origin=origin
+    )
+    assert basis.contributions
+    for row in basis.contributions:
+        assert row.supplied_by == ("tier0",), row.path
 
 
 def test_a_spec_peak_is_reported_with_its_derate_and_the_derated_value():

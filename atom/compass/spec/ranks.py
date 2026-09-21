@@ -5,11 +5,26 @@ A memory reading is taken per rank, and the ranks of a symmetric group do
 identical work, so the ranks are repetitions of one measurement and the spec
 wants one number out of them. Which number is not a detail.
 
-**The minimum is the reading.** A device-wide reading counts every process on
-the card, so a rank whose card also carries somebody else's work reads high by
-whatever the neighbour holds. No rank ever reads *low* for that reason, which
-makes the smallest reading the one least contaminated by a process that has
-nothing to do with this engine.
+**The minimum is the reading -- of a reading the whole device shares.** A
+device-wide reading counts every process on the card, so a rank whose card also
+carries somebody else's work reads high by whatever the neighbour holds. No rank
+ever reads *low* for that reason, which makes the smallest reading the one least
+contaminated by a process that has nothing to do with this engine.
+
+That argument is a property of the reading, not of this reduction, and it does
+not reach every term the spec keys by width.
+`driver_and_collective_reserve_bytes` is read off the device and is the one it
+was measured on. `allocator_retained_after_load_bytes` is torch-allocator bytes,
+i.e. per process: a neighbour cannot inflate it, ranks doing identical work
+should simply agree, and the failure that *is* available -- a rank read before
+its weight loading had settled -- reads **low**, where taking the minimum keeps
+the under-measurement and hands it on as more KV budget than exists. The spread
+looks the same either way. The same holds for anything rate-shaped: readings of
+`[8, 8, 8, 7]` TB/s are a 14.3% spread, accepted, and 7.0e12 is what is kept.
+So the contract of this function is narrower than its signature: it is the right
+reduction where contamination can only read high, the caller is choosing it for
+that reason rather than inheriting it, and a per-process or rate-shaped reading
+wants a reduction this module does not provide.
 
 **The spread is reported, never folded away.** Taking a minimum and reporting
 only that hides the disagreement, and the disagreement is the single-run
@@ -29,6 +44,20 @@ MiB in about 10.4 GiB is six per cent of the smallest reading, and
 case by two orders of magnitude. It is a parameter because it is a judgement
 about how quiet a machine has to be, and whoever is running the machine is
 better placed to make it than this module is.
+
+Two things the limit does not do, both narrower than the paragraph above would
+suggest on its own. It is **not an accuracy bound on the number kept**: taking
+the minimum has already discarded the contaminated rank, so a single rank
+carrying an extra 2.8 GB at width 8 passes here and does no harm downstream.
+What the limit asserts is that the machine was quiet enough for any rank to be
+believed at all -- a quietness assertion, not an error bar -- and a tighter one
+would only refuse readings whose minimum was fine. And it is **differential**,
+so it cannot see common-mode contamination: eight ranks each reading 2.5 GB high
+have a spread of zero and carry the 2.5 GB into the spec unremarked. The design
+pairs this check with an absolute one -- refuse a reading that far exceeds what
+the collective terms predict for its width -- and the two are only jointly
+sufficient. That one needs a probe to have read `free` and `total` separately,
+so it is not here, and it is recorded as left undone rather than assumed.
 
 The readings themselves are checked the way the schema checks a quantity, so a
 reading that could never be written into a spec is declined here, where the

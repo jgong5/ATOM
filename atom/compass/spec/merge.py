@@ -13,10 +13,24 @@ of one overlaps a field of the other, and a merge that only compared values
 would combine them into a single document that describes no machine at all. The
 error is then invisible for as long as the spec lives, and every number derived
 from it is wrong by however far the two hosts differ. So a fragment states the
-machine it was measured on, the merge refuses two fragments that name different
+machine it claims to be for, the merge refuses two fragments that name different
 machines, and the refusal prints both stanzas rather than the bare names -- what
 a reader needs is which two measurements are being combined, not that a string
 comparison failed.
+
+**What that arm compares is the declared name, not the host.** `name` is the
+machine the spec is being *authored for* -- `mi355x-8gpu-2node` is a class, not
+a host -- and no field of a fragment records where a probe actually ran. So a
+tokenizer fragment measured on a laptop and a device fragment measured on the
+node, both authored `name: node-18`, pass this arm; they share no field, so the
+second arm has nothing to contradict either, and they merge. That is the exact
+pair this module opens by naming, and it survives. The claim the arm can carry
+is therefore narrower than the one above: the fragments agree about which
+machine they are *for*, corroborated by nothing except their overlap -- and the
+overlap is where the second arm does the catching (`host.cpu.cores_physical` 8
+against 96). Closing the residue needs no schema field and is not done here: a
+tier-0 tokenizer probe that also emitted `host.cpu.cores_physical` would turn
+the pair above into a second-arm contradiction, and the probes are SPEC-3's.
 
 The second arm catches the same hazard from the other side. Two fragments that
 name one machine and disagree about one of its fields cannot both be true of it,
@@ -38,7 +52,14 @@ part of one is what a probe does:
 * the **provenance** block is rebuilt rather than merged. It names every
   fragment that went in, carries the latest date, and states one method only
   when the fragments agree on one -- a spec built from a datasheet and an engine
-  run is honestly `mixed` and not either of them.
+  run is honestly `mixed` and not either of them. Because a merged document is
+  itself a legal fragment, incremental authoring -- merge, save, merge next
+  week's probe into it -- would otherwise drop the names of the fragments that
+  built the saved document, in the one block whose job is to say where the
+  numbers came from. So any `provenance.fragments` a fragment already states is
+  carried forward ahead of its own source name. "Latest" is the lexicographic
+  maximum of the dates as written: the field is text, ISO-shaped dates order
+  correctly under it, and `'2026-9-9'` does not.
 
 Constants that were transferred from another spec are the exception to combining
 values. Such a fragment carries the stack the *source* spec was pinned to, which
@@ -213,11 +234,16 @@ def _provenance(fragments: tuple[Fragment, ...]) -> dict:
         for fragment in fragments
         if "provenance.notes" in fragment.values
     ]
+    named: dict[str, None] = {}
+    for fragment in fragments:
+        for earlier in fragment.values.get("provenance.fragments", ()):
+            named.setdefault(earlier, None)
+        named.setdefault(fragment.source, None)
     block = {
         "authored_by": ", ".join(authors),
         "date": max(fragment.values["provenance.date"] for fragment in fragments),
         "method": next(iter(methods)) if len(methods) == 1 else "mixed",
-        "fragments": [fragment.source for fragment in fragments],
+        "fragments": list(named),
     }
     if notes:
         block["notes"] = " | ".join(notes)
