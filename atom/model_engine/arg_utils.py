@@ -213,9 +213,11 @@ class EngineArgs:
             help="A captured graph whose kernels to price. With "
             "--compass-bench-out, prices each distinct operator signature once "
             "after warmup, calling it --compass-bench-iters times inside a "
-            "single pair of events. Needs a mode that really warms up (trace or "
-            "measure): aiter registers kernels lazily on first call, so nothing "
-            "can price one before the model has run.",
+            "single pair of events. Needs --compass-mode measure: pricing runs "
+            "from capture_cudagraph, which is the first point at which the KV "
+            "cache exists and aiter has registered its kernels, and trace mode "
+            "returns from there without capturing. Setting this under any other "
+            "mode writes no price list and warns.",
         )
         parser.add_argument(
             "--compass-bench-out",

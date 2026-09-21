@@ -899,6 +899,16 @@ class CompassModelRunner(ModelRunner):
         else:
             logger.debug("ATOMCompass: skipping CUDA graph capture")
             self._resolve_capture_ladder()
+        # Pricing only ever runs from the measure branch above, so asking for
+        # it here produces run.json, no price list, and exit 0 -- which reads
+        # as a pricing run that found nothing rather than one that never ran.
+        cfg = self._compass_config
+        if cfg.bench_graph and cfg.bench_out:
+            logger.warning(
+                "ATOMCompass WARNING: --compass-bench-graph was set under "
+                "--compass-mode %s, which does not price. No price list will "
+                "be written to %s. Re-run with --compass-mode measure.",
+                cfg.mode, cfg.bench_out)
         return 0.0, [], 0
 
     def _build_and_load_model(self, model_class):
