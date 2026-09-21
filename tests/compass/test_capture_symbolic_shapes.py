@@ -11,13 +11,16 @@ Four facts, each pinned rather than asserted in prose:
   nothing specialised.
 * A tensor allocated inside the mode is already static, and the specialisation
   check prescribed for a capture says nothing about that case.
-* On ATOM's real forward the trace is concrete, and the cause is ATOM's own
-  input staging: `CpuGpuBuffer.copy_to_gpu(n)` is `self.gpu[:n].copy_(...)`,
-  and a Python `int` bound makes the staged tensor a constant -- which every
-  operator downstream of the staging then inherits.
-* The same copy with the symbol itself as the bound keeps the symbol, through
-  `CpuGpuBuffer` unmodified. The repair belongs at the caller that chooses
-  `n`, not in the buffer.
+* On ATOM's real forward it does not, and the cause is ATOM's own input
+  staging -- in **two independent places**. The bound: `copy_to_gpu(n)`
+  returns `self.gpu[:n]`, and a Python `int` there makes the staged tensor a
+  constant, which every operator downstream inherits. And the copy itself:
+  `self.cpu` is a real numpy-backed tensor with constant dimensions, so
+  `copy_` solves every symbolic dimension of the destination that the slice
+  does not cover.
+* Only the first is reachable from the caller. Passing the symbol as the
+  bound keeps the sliced dimension and leaves the other site untouched, so
+  the buffer is not unchanged by a repair -- it holds one of the two sites.
 """
 
 from __future__ import annotations
@@ -37,6 +40,8 @@ from atom.compass.capture.fake_trace import Recorder, shape_entry_census
 # relationship matters.
 BUFFER_ROWS = 17
 FILLED_ROWS = 5
+# a second staging dimension, which the copy never slices
+BUFFER_COLS = 16384
 
 
 def _mode() -> tuple[ShapeEnv, FakeTensorMode]:
@@ -148,12 +153,14 @@ def test_staging_a_batch_by_a_python_int_specialises_what_the_model_then_reads()
     assert copies[-1].out_shapes == [[str(FILLED_ROWS), "8"]], copies[-1].out_shapes
 
 
-def test_staging_the_same_batch_by_the_symbol_keeps_it():
-    """The repair, through `CpuGpuBuffer` unmodified.
+def test_staging_the_same_batch_by_the_symbol_keeps_the_sliced_dimension():
+    """Half the repair: the bound can be carried, on the dimension it slices.
 
-    `copy_to_gpu` takes whatever bound it is given; passing the symbol rather
-    than an integer is enough. So what a symbolic capture needs changing is
-    the caller that decides `n`, not the buffer.
+    `copy_to_gpu` takes whatever bound it is given, and with the symbol rather
+    than an integer the staged tensor keeps it. That closes one of the two
+    measured specialisation sites and not the other -- the buffer has a second
+    one inside it, which no choice of bound reaches. See
+    `test_the_staging_copy_specialises_every_dimension_it_does_not_slice`.
     """
     shape_env, fake_mode = _mode()
     buf = _staging_buffer(fake_mode)
@@ -191,20 +198,19 @@ def test_the_staging_source_being_a_real_tensor_is_not_the_cause():
 
 
 # --------------------------------------------------------------------------
-# whether the symbol can reach the staging copy at all on ATOM's decode path
+# what actually stops the staged tensor being symbolic, measured as two
+# independent sites rather than one
 
 
-def test_a_symbolic_bound_used_as_a_numpy_index_is_specialised_silently():
-    """The reason the repair cannot be made at the caller.
+def test_a_symbolic_bound_is_collapsed_by_taking_its_index():
+    """Site one: any consumer that needs an `int` resolves the symbol.
 
-    Staging fills the CPU side through the buffer's numpy view before the
-    device copy happens. numpy takes `__index__` of whatever bound it is
-    given, and on a `SymInt` that resolves to the hint -- so the symbol is
-    replaced by a constant, with no error and no warning, before
-    `copy_to_gpu` is ever reached.
+    Staging fills the CPU side before the device copy, and that fill indexes
+    by the same count. Taking `__index__` of a `SymInt` returns its hint and
+    records the symbol as a constant -- with no error and no warning. This is
+    not a numpy behaviour: a bare `__index__` and a plain list slice do it
+    too, so it is every `int`-consuming use of the bound, not one library's.
     """
-    import numpy as np
-
     shape_env, fake_mode = _mode()
     sym = _dynamic_leading_dim(
         fake_mode, torch.empty(BUFFER_ROWS, 8, dtype=torch.int32)
@@ -213,18 +219,26 @@ def test_a_symbolic_bound_used_as_a_numpy_index_is_specialised_silently():
     assert _is_symbolic(bound), bound
     assert not shape_env.replacements
 
-    staging = np.zeros((BUFFER_ROWS, 8), dtype=np.int32)
-    staging[:bound] = -1
+    assert bound.__index__() == BUFFER_ROWS
 
-    # It did not raise, and it did not write the batch: it wrote the hint.
-    assert int((staging == -1).all(axis=1).sum()) == BUFFER_ROWS
-    # And the symbol is now a constant, which `capture()` refuses outright.
-    assert shape_env.replacements, "the numpy bound left the symbol free"
+    assert shape_env.replacements, "taking __index__ left the symbol free"
     assert str(BUFFER_ROWS) in str(dict(shape_env.replacements))
 
 
-def test_the_same_bound_stays_symbolic_when_numpy_does_not_see_it():
-    """The control for the test above: the slice itself is not the problem."""
+def test_the_same_collapse_happens_through_a_plain_list_slice():
+    """The generality of site one, without numpy or torch in the way."""
+    shape_env, fake_mode = _mode()
+    sym = _dynamic_leading_dim(
+        fake_mode, torch.empty(BUFFER_ROWS, 8, dtype=torch.int32)
+    )
+    bound = sym.shape[0]
+
+    assert len(list(range(BUFFER_ROWS))[:bound]) == BUFFER_ROWS
+    assert shape_env.replacements, dict(shape_env.replacements)
+
+
+def test_the_same_bound_stays_symbolic_when_nothing_takes_its_index():
+    """The control: the slice itself is not what collapses it."""
     shape_env, fake_mode = _mode()
     sym = _dynamic_leading_dim(
         fake_mode, torch.empty(BUFFER_ROWS, 8, dtype=torch.int32)
@@ -238,17 +252,78 @@ def test_the_same_bound_stays_symbolic_when_numpy_does_not_see_it():
     assert not shape_env.replacements, dict(shape_env.replacements)
 
 
-def test_the_decode_path_shares_one_bound_between_numpy_and_the_device_copy():
-    """The precondition the finding above rests on, checked against ATOM.
+def _two_dim_buffer(fake_mode: FakeTensorMode, dynamic_sizes):
+    """ATOM's buffer at a staging shape with two dimensions.
 
-    `prepare_decode` derives one count per staged buffer and uses it twice:
-    to fill the numpy view, and as the device copy's bound. Only the second
-    may be symbolic, and the first runs first. Separating them is a change to
-    this file, which is why a symbolic capture is not reachable from the
-    caller alone.
+    `block_tables` is `[max_num_seqs, max_blocks]`; the staging copy slices the
+    first and never the second.
+    """
+    from atom.utils import CpuGpuBuffer
 
-    If ATOM ever does separate them, this fails, and the conclusion drawn
-    from it has to be retaken rather than inherited.
+    buf = CpuGpuBuffer(
+        BUFFER_ROWS,
+        BUFFER_COLS,
+        dtype=torch.int32,
+        device=torch.device("cpu"),
+        pin_memory=False,
+        with_numpy=True,
+    )
+    buf.gpu = fake_mode.from_tensor(
+        buf.gpu,
+        static_shapes=False,
+        symbolic_context=StatelessSymbolicContext(dynamic_sizes=dynamic_sizes),
+    )
+    return buf
+
+
+def test_the_staging_copy_specialises_every_dimension_it_does_not_slice():
+    """Site two, and it is inside the buffer rather than at its caller.
+
+    `copy_to_gpu` is `self.gpu[:n].copy_(self.cpu[:n])`, and `self.cpu` is a
+    real numpy-backed tensor with concrete dimensions. `copy_` requires the
+    shapes to match, so every symbolic dimension of the destination other than
+    the sliced one is solved against the source's constant.
+
+    This is the site the measured `block_tables: ['512', 's64']` -> 16384 runs
+    through, and no choice of `n` reaches it.
+    """
+    shape_env, fake_mode = _mode()
+    buf = _two_dim_buffer(fake_mode, [DimDynamic.STATIC, DimDynamic.DYNAMIC])
+    assert _is_symbolic(buf.gpu.shape[1]), buf.gpu.shape
+
+    with fake_mode, torch._C._EnablePythonDispatcher():
+        staged = buf.copy_to_gpu(4)
+
+    assert list(staged.shape) == [4, BUFFER_COLS], staged.shape
+    assert shape_env.replacements, "the unsliced dimension stayed symbolic"
+    assert str(BUFFER_COLS) in str(dict(shape_env.replacements))
+
+
+def test_site_two_is_reached_whatever_the_bound_is():
+    """So the two sites are independent, and fixing the bound cannot close it.
+
+    With the bound the symbol itself -- the repair that closes site one -- the
+    unsliced dimension is specialised exactly as before.
+    """
+    shape_env, fake_mode = _mode()
+    buf = _two_dim_buffer(fake_mode, [DimDynamic.DYNAMIC, DimDynamic.DYNAMIC])
+
+    with fake_mode, torch._C._EnablePythonDispatcher():
+        staged = buf.copy_to_gpu(buf.gpu.shape[0])
+
+    # the sliced dimension survives, the other does not
+    assert _is_symbolic(staged.shape[0]), staged.shape
+    assert not _is_symbolic(staged.shape[1]), staged.shape
+    assert str(BUFFER_COLS) in str(dict(shape_env.replacements))
+
+
+def test_the_decode_path_shares_one_bound_between_the_fill_and_the_copy():
+    """The precondition site one rests on, checked against ATOM.
+
+    `prepare_decode` derives one count per staged buffer and uses it to fill
+    the numpy view and then as the device copy's bound. If ATOM ever separates
+    them, this fails, and the conclusion drawn from it is retaken rather than
+    inherited.
     """
     import pathlib
 
@@ -261,7 +336,6 @@ def test_the_decode_path_shares_one_bound_between_numpy_and_the_device_copy():
         / "aiter_attention.py"
     ).read_text()
 
-    # the numpy fill, the shared count, and the device copy that follows it
     assert 'var["slot_mapping"].np[:running_tokens]' in source
     assert '("slot_mapping", running_tokens),' in source
     assert "copy_to_gpu(num) for el, num in vars_used" in source

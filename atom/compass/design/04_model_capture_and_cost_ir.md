@@ -198,6 +198,13 @@ The open issue *"whether ATOM's real model classes trace cleanly under this mode
 TP>1"* is **answered yes**, on two models at both widths, with the collectives in the
 inventory rather than substituted away.
 
+> **These are DIAGNOSTIC inventories.** Every run below was taken with raw
+> `@triton.jit` launches recorded and **not executed** -- 33 launches across 3 kernels on
+> the 27B decode -- so anything downstream of a skipped kernel read uninitialised fake
+> memory, and each record carries `diagnostic_inventory: true`. The operator and
+> collective counts are an enumeration of what a step reaches. They are **not** a cost
+> model input at any width.
+
 | model | TP1 | TP2 | collectives recorded at TP2 |
 |---|---|---|---|
 | Qwen3.8-27B (hybrid; vision tower, linear attention) | 2,471 ops / 33 distinct | 2,611 / 38 | `aiter.all_reduce_` **129**, functional all-gather 1, broadcast 1 |
@@ -231,7 +238,17 @@ gathers to `[4, 124160]` as one recorded collective. This is the same fact as th
 A width-N group inside one process is available from torch's own `fake` backend and needs
 no peer. What one process cannot build is the **transport**: the device communicator opens
 a collective rendezvous that waits for absent ranks, as does the message-queue
-broadcaster. Neither is reached by a fake trace once the group exists.
+broadcaster, so both have to be declined when the group is built.
+
+Declining the device communicator is **not free**, and the earlier claim that nothing
+reaches it once the group exists is wrong. ATOM's default `ATOM_USE_CUSTOM_ALL_GATHER`
+takes `embed_head.py:257`'s vocab-parallel gather down the custom path, which asserts on
+`device_communicator.ca_comm` and fails with `'NoneType' object has no attribute
+'ca_comm'` after 2,588 operators. The runs above therefore set
+**`ATOM_USE_CUSTOM_ALL_GATHER=0`**, selecting the non-custom gather; that is a declared
+configuration of the capture and belongs in the record beside the device readings. It is
+the whole difference between the run that fails at 2,588 and the one that completes at
+2,611.
 
 Pinned by `tests/compass/test_capture_collectives.py`, which enumerates both operator sets
 by name, so a future torch growing a meta kernel for one of the legacy forms fails there

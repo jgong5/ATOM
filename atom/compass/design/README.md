@@ -2,8 +2,8 @@
 
 **Status: reviewed and approved, 2026-09-20. Design only — no code has been written
 against it yet.** Every document carries a matching header. **109 decisions — D0–D94
-with no gaps, plus 14 sub-decisions** — are indexed at the end of this file; **86 registered
-TODOs — T1–T80 and T82–T87, of which 80 are open** (T10, T15, T22, T48 and T65 are struck
+with no gaps, plus 14 sub-decisions** — are indexed at the end of this file; **87 registered
+TODOs — T1–T87, of which 81 are open** (T10, T15, T22, T48 and T65 are struck
 through as done, and T77 was opened and closed by P0.1); they, the load-bearing assumptions and the
 cross-cutting issues live in **`12_open_items.md`**. Implementation follows the execution
 plan in `16`.
@@ -541,7 +541,7 @@ The documents use these precisely; a reader will bounce off without them.
 
 | Doc | Title | What it holds |
 |---|---|---|
-| [`12`](12_open_items.md) | Open Items | The five load-bearing assumptions and their check plans; the missing-topic register; T1–T80 and T82–T87; cross-cutting issues; pending amendments. |
+| [`12`](12_open_items.md) | Open Items | The five load-bearing assumptions and their check plans; the missing-topic register; T1–T87; cross-cutting issues; pending amendments. |
 
 ### Part VII — How it gets built
 
