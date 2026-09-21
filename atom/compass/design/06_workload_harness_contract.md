@@ -567,7 +567,7 @@ class CompassAgenticReplay(AgenticReplayStrategy):
    **The rebind cannot be done inline in that bootstrap.** That is measured, and it is
    the same structural fact read the other way: the bootstrap runs at `plugins.py:1115`,
    *inside* the module body of `aiperf.plugin.plugins`, before the module-level API
-   names at `plugins.py:1120-1148` are bound. Any `import aiperf.…` from the bootstrap
+   names at `plugins.py:1122-1149` are bound. Any `import aiperf.…` from the bootstrap
    re-enters `aiperf/plugin/enums.py:21`, whose module body calls
    `plugins.list_categories()`, and raises
 
