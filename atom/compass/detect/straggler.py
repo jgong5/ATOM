@@ -30,10 +30,32 @@ defect and lowering it to the observed delay is the whole repair. If the floor
 already matches the path, the floor is innocent: the receiver was moved past an
 arrival that nothing had told the coordinator about, and the repair is on the
 send path, not in the constant.
+
+Telling those two apart is a subtraction, and a subtraction of two clocks is
+round-off. So the difference that counts as real is measured in units of the
+error the subtraction can produce -- units of the last place of the timestamps
+-- rather than as a fraction of the floor. The floor and the clock are
+independent quantities here: the tightest floor the deployments declare is a
+microsecond and a modelled run is minutes long, and a tolerance sized against
+the floor is blind to a round-off that grew with the clock.
+
+A third input reaches neither repair: stamps in the wrong order. `Arrival`
+refuses those where they are made, so the report never has to advise a floor
+that cannot be declared.
 """
 
 import math
 from dataclasses import dataclass
+
+#: How far apart the declared floor and the observed delay may be and still be
+#: the same number. Two terms, because two different errors reach here: a
+#: fraction of the floor, for a floor that was summed rather than written down,
+#: and a count of units in the last place of the clock, for the cancellation in
+#: `takes_effect_at - sent_at`. Sixteen units of the last place is a thousand
+#: times finer than the tightest floor any deployment declares, at any clock a
+#: modelled run reaches, and it grows with the clock the way the error does.
+FLOOR_RELATIVE_TOLERANCE = 1e-9
+CLOCK_ROUND_OFF_UNITS = 16
 
 
 class CausalityViolation(Exception):
@@ -57,6 +79,12 @@ class Arrival:
     `declared_floor_seconds` is the delay the sender promised on this ordered
     pair. It is carried on the message rather than looked up, because the
     receiver is checking the promise and has to see the promise that was made.
+
+    A message that takes effect before it was sent is refused here rather than
+    checked against a clock. It is a defect in whatever stamped it and not in
+    any floor: the delay it reports is negative, no floor can be declared at a
+    negative delay, and a check downstream of it can only offer repairs that
+    do not exist. Refusing it at the stamps names the thing that is wrong.
     """
 
     sender: str
@@ -64,6 +92,17 @@ class Arrival:
     sent_at: float
     takes_effect_at: float
     declared_floor_seconds: float
+
+    def __post_init__(self) -> None:
+        if self.takes_effect_at < self.sent_at:
+            raise ValueError(
+                f"{self.sender} -> {self.receiver} is stamped to take effect "
+                f"{self.sent_at - self.takes_effect_at:.9g}s before it was sent "
+                f"(sent at {self.sent_at:.9g}s, takes effect at "
+                f"{self.takes_effect_at:.9g}s), so its stamps are wrong. The "
+                f"declared floor is not in question: no floor can be declared at "
+                f"a negative delay"
+            )
 
     @property
     def observed_delay_seconds(self) -> float:
@@ -84,12 +123,16 @@ class StragglerCheck:
         self.checked = 0
         self.violations = 0
 
-    def arriving(self, arrival: Arrival, now: float, context: str = "") -> Arrival:
+    def arriving(self, arrival: Arrival, now: float, context=None) -> Arrival:
         """Check one message against the receiver's clock and return it.
 
-        `context` is whatever the caller can say about the state of every
-        participant at this moment. It is appended verbatim, because the value
-        of one of these is in seeing which clock was where when it fired.
+        `context` is called for whatever the caller can say about the state of
+        every participant at this moment, and it is called on the failing path
+        only. It is a callable rather than a string because the caller's answer
+        is a table over every participant and the check is one float
+        comparison: asking for the string on every message costs orders of
+        magnitude more than the check it decorates, and a check that costs more
+        than the work it guards is a check somebody turns off.
         """
         if not self.enabled:
             return arrival
@@ -98,8 +141,8 @@ class StragglerCheck:
             return arrival
         self.violations += 1
         report = self.report(arrival, now)
-        if context:
-            report = f"{report}\n\n{context}"
+        if context is not None:
+            report = f"{report}\n\n{context()}"
         raise CausalityViolation(arrival, now, report)
 
     @staticmethod
@@ -110,11 +153,25 @@ class StragglerCheck:
         sized exactly at its path agrees only to within rounding, so "larger
         than the path" is asked for as a real difference rather than as `>`. A
         floor out by one part in a billion is not what moved anybody.
+
+        The rounding to discount is the cancellation in
+        `takes_effect_at - sent_at`, whose size follows the clock those two
+        stamps were taken from and not the floor they are compared against. So
+        the tolerance carries the clock's scale as well as the floor's: on a
+        run long enough, a floor tight enough, and a tolerance sized only
+        against the floor, a difference that is entirely round-off is reported
+        as a constant to lower -- which is the misdiagnosis the tolerance is
+        here to prevent, at the one scale that most needs it.
         """
         behind = now - arrival.takes_effect_at
         declared = arrival.declared_floor_seconds
         observed = arrival.observed_delay_seconds
-        if declared > observed and not math.isclose(declared, observed, rel_tol=1e-9):
+        round_off = CLOCK_ROUND_OFF_UNITS * math.ulp(
+            max(abs(arrival.sent_at), abs(arrival.takes_effect_at), abs(now))
+        )
+        if declared > observed and not math.isclose(
+            declared, observed, rel_tol=FLOOR_RELATIVE_TOLERANCE, abs_tol=round_off
+        ):
             cause = (
                 f"the declared floor on {arrival.sender} -> {arrival.receiver} is "
                 f"{declared:.9g}s but the message took {observed:.9g}s, so the "

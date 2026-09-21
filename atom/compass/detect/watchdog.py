@@ -185,10 +185,24 @@ def _frame_of(ident: int) -> str:
     that is where a blocking call ends up, and on its own it names the same
     three files whatever stalled. The first frame outside it is the call the
     missing declaration belongs around, so both are reported.
+
+    This module's own frames are skipped first. A sampler on its own thread
+    never sees them, but one called straight from the thread it is reporting on
+    sees nothing else: the top of that stack is this function. Naming it would
+    put the detector where the answer goes.
+
+    The thread read here is the one that declared itself running, which is not
+    always the one that is blocked -- a participant whose blocking read happens
+    on a background thread it started is reported at the frame the declaration
+    was made from.
     """
     frame = sys._current_frames().get(ident)
     if frame is None:
         return "thread gone"
+    while frame is not None and frame.f_code.co_filename == __file__:
+        frame = frame.f_back
+    if frame is None:
+        return "nothing outside the watchdog"
     innermost = _where(frame)
     while frame is not None and frame.f_code.co_filename.startswith(_STDLIB):
         frame = frame.f_back

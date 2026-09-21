@@ -56,38 +56,44 @@ CORRECT_ROW = (
     "time to first token 0.354200s"
 )
 
-#: The row an undeclared send produces: 54 ms out, and still unremarkable.
+#: The row an undeclared send produces. How far out it lands is set by how far
+#: past the message this receiver happened to be granted -- one decode step --
+#: and not by the defect, which is the same defect at every distance. At a
+#: shorter distance the row is unremarkable; at this one it is outside the error
+#: this project says it will reject a model for, so a reader holding a real
+#: measurement beside it would query it -- as a validation failure, with nothing
+#: pointing at the cause, which is the expensive way to find this out.
 PLAUSIBLE_WITH_AN_UNDECLARED_SEND = (
     "request-0  handed over at 0.354000s  decode step 0.054000s  "
     "time to first token 0.408000s"
 )
 
 WRONG_LOOKAHEAD_REPORT = (
-    "causality violation: prefill-00.stage-0 -> decode-00.stage-0 took effect "
+    "causality violation: prefill-00.stage-00 -> decode-00.stage-00 took effect "
     "0.0008s into the receiver's past\n"
     "  sent at              0.3s\n"
     "  takes effect at      0.3002s\n"
     "  receiver's clock at  0.301s\n"
     "  declared floor       0.001s\n"
-    "the declared floor on prefill-00.stage-0 -> decode-00.stage-0 is 0.001s but "
+    "the declared floor on prefill-00.stage-00 -> decode-00.stage-00 is 0.001s but "
     "the message took 0.0002s, so the declaration is 0.0008s longer than the path "
     "it stands for. Lower it to 0.0002s or less.\n"
-    "Everything decode-00.stage-0 decided after 0.3002s was decided without this "
+    "Everything decode-00.stage-00 decided after 0.3002s was decided without this "
     "message, so the run stops here rather than reporting numbers taken off it."
 )
 
 INDUCED_STRAGGLER_REPORT = (
-    "causality violation: prefill-00.stage-0 -> decode-00.stage-0 took effect "
+    "causality violation: prefill-00.stage-00 -> decode-00.stage-00 took effect "
     "0.0538s into the receiver's past\n"
     "  sent at              0.3s\n"
     "  takes effect at      0.3002s\n"
     "  receiver's clock at  0.354s\n"
     "  declared floor       0.0002s\n"
-    "the declared floor on prefill-00.stage-0 -> decode-00.stage-0 is 0.0002s and "
+    "the declared floor on prefill-00.stage-00 -> decode-00.stage-00 is 0.0002s and "
     "the message took 0.0002s, so the declaration is not what let this happen. "
-    "decode-00.stage-0 was granted past an arrival nothing had declared -- look at "
+    "decode-00.stage-00 was granted past an arrival nothing had declared -- look at "
     "the send path, not at the constant.\n"
-    "Everything decode-00.stage-0 decided after 0.3002s was decided without this "
+    "Everything decode-00.stage-00 decided after 0.3002s was decided without this "
     "message, so the run stops here rather than reporting numbers taken off it."
 )
 
@@ -155,7 +161,7 @@ class TestWrongLookaheadOnALink:
         report, table = split_report(caught(scenarios.wrong_lookahead))
         assert report == WRONG_LOOKAHEAD_REPORT
         assert table.startswith("participant ")
-        assert "decode-00.stage-0    running             0.301s" in table
+        assert "decode-00.stage-00   running             0.301s" in table
 
     def test_the_run_counts_the_violation_and_refuses_to_claim_a_clean_order(self):
         check = StragglerCheck()
@@ -232,24 +238,34 @@ class TestAMissingAnnotation:
         assert stall.waited_seconds < scenarios.HANG_BOUND_SECONDS / 100
 
     def test_it_is_hung_for_the_designed_reason_and_not_a_broken_harness(
-        self, forgetful
+        self, forgetful, annotated
     ):
-        """Four readings, each ruling out a different way of sitting still.
+        """The control is the reading that excludes a harness which never drove it.
 
-        The forgetful participant is still executing at the clock it started
-        from, so it never asked for time -- a harness that simply failed to
-        drive it would have left it parked. Its peer is parked one floor ahead
-        and no further, and names it as what bounds them, so the peer stopped
-        because of this participant rather than because it ran out of work. And
-        the peer's own next event is still ahead of it, so there was work left
-        to do.
+        A participant nobody has touched reads exactly as this one does: still
+        running, at the clock it started from. Deliberately not declaring and
+        failing to be driven at all are the same state, and no reading of that
+        state separates them. What separates them is the same function with the
+        declaration put back: it is driven, it reads its message, and it returns
+        far inside the bound. The harness can drive this side, so this is not a
+        run where it did not.
+
+        The other readings say what kind of stop this is, once it is known to be
+        one. The forgetful participant never asked for time, which is the defect
+        itself. Its peer is parked one floor ahead and no further and names it
+        as what bounds them, so the peer stopped because of this participant and
+        not because it ran out of work. And the peer's own next event is still
+        ahead of it, so there was work left to do.
         """
         _watchdog, stall = forgetful
+        _control_watchdog, control = annotated
+        assert control.read is not None
+        assert control.waited_seconds < stall.waited_seconds / 100
         assert (stall.decode_status, stall.decode_now) == ("running", 0.0)
         assert stall.prefill_status == "blocked-on-message"
         assert stall.prefill_now == pytest.approx(scenarios.TRANSFER_SECONDS)
         assert stall.bound_from == str(DECODE)
-        assert "prefill-00.stage-0   blocked-on-message  0.0002s        0.3s" in (
+        assert "prefill-00.stage-00  blocked-on-message  0.0002s        0.3s" in (
             stall.lp_table
         )
 
@@ -257,12 +273,12 @@ class TestAMissingAnnotation:
         watchdog, _stall = forgetful
         assert len(watchdog.warnings) == 1
         warning = watchdog.warnings[0]
-        assert warning.lp_id == "decode-00.stage-0"
+        assert warning.lp_id == "decode-00.stage-00"
         assert warning.clock_at == 0.0
         assert warning.running_for_seconds >= scenarios.STALL_SECONDS
         assert "in missing_annotation" in warning.frame
         assert watchdog.summary() == (
-            "annotation watchdog: 1 warning(s) on decode-00.stage-0"
+            "annotation watchdog: 1 warning(s) on decode-00.stage-00"
         )
 
     def test_the_declaring_run_draws_no_warning(self, annotated):
@@ -275,10 +291,16 @@ class TestAMissingAnnotation:
 
         A grant is the only thing that moves a clock, and asking for one *is*
         the declaration. So a participant that skips it is stuck where it
-        stands. The silent failure -- moving past a message -- needs the
-        opposite: a declaration that is made while a message nothing declared is
-        already on the transport. That is a second mistake on top of a correct
-        annotation, and it is the induced straggler above, not this.
+        stands: omitting a declaration can cost a participant time and can never
+        buy it any, and that is the property being asserted here.
+
+        It is a property of omitting a declaration and not of mistakes in
+        general. Moving past a message needs a declaration that *is* made, over
+        a message the coordinator was not told about -- a second mistake on top
+        of a correct annotation, which is the induced straggler above. One
+        mistake on its own is silent often enough: the wrong floor in the first
+        scenario is a single wrong constant with a correctly declared send, and
+        it reports a row.
         """
         run = Injected(scenarios.TRANSFER_SECONDS, start_time=0.0)
         before = run.clock.now(DECODE)
@@ -354,6 +376,42 @@ class TestTheClockSourceLint:
         reads = ClockSourceLint().scan_source(source, "engine.py")
         assert [str(read) for read in reads] == ["engine.py:5  time.monotonic  in age"]
 
+    def test_a_read_an_assignment_renamed_is_still_found(self):
+        """The form a text search *would* have found, so the parse has to as well."""
+        source = (
+            "import time\n\nnow = time.monotonic\n\n\ndef age(since):\n"
+            "    return now() - since\n"
+        )
+        reads = ClockSourceLint().scan_source(source, "engine.py")
+        assert [str(read) for read in reads] == ["engine.py:7  time.monotonic  in age"]
+
+    def test_the_same_clock_in_nanoseconds_is_the_same_read(self):
+        """One divide separates these from the seconds they are listed beside."""
+        source = (
+            "import time\n\n\ndef age(since):\n"
+            "    return time.perf_counter_ns() / 1e9 - since\n"
+        )
+        reads = ClockSourceLint().scan_source(source, "engine.py")
+        assert [str(read) for read in reads] == [
+            "engine.py:5  time.perf_counter_ns  in age"
+        ]
+
+    def test_the_allow_list_matches_whole_directories_and_not_letters(self):
+        """A path that merely ends in the same text is a file nobody reviewed."""
+        lint = ClockSourceLint()
+        assert lint.allowed("atom/compass/detect/watchdog.py")
+        assert lint.allowed("/anywhere/atom/compass/detect/watchdog.py")
+        assert lint.allowed("/x/NOTatom/compass/detect/watchdog.py") is None
+
+    def test_the_clean_line_counts_what_this_scan_skipped(self, tmp_path):
+        """A tree holding none of the listed files is a tree with no exemptions."""
+        (tmp_path / "step.py").write_text("x = 1\n", encoding="utf-8")
+        code, report = ClockSourceLint().check(str(tmp_path))
+        assert code == 0
+        assert report == (
+            "clock-source lint: clean over 1 module(s), 0 file(s) allow-listed"
+        )
+
     def test_turning_the_lint_off_makes_the_tree_claim_nothing(self):
         off = ClockSourceLint(enabled=False)
         assert off.scan_source(SIMULATED_PATH_WITH_A_REAL_READ, "step.py") == ()
@@ -367,9 +425,9 @@ class TestWhatTheChecksReportOnTheirOwn:
     """The report text, pinned away from the runs that happen to produce it."""
 
     def test_a_watchdog_warning_says_the_participant_the_clock_and_the_frame(self):
-        warning = WatchdogWarning("decode-00.stage-0", 0.0603, 0.0, "q.py:9 in get")
+        warning = WatchdogWarning("decode-00.stage-00", 0.0603, 0.0, "q.py:9 in get")
         assert str(warning) == (
-            "annotation watchdog: decode-00.stage-0 has been executing for 0.0603s "
+            "annotation watchdog: decode-00.stage-00 has been executing for 0.0603s "
             "of real time with its simulated clock still at 0s. Real seconds are "
             "passing inside something nothing declared, and until it is declared "
             "every peer is bounded at 0s plus one floor. Innermost frame: "
@@ -386,6 +444,79 @@ class TestWhatTheChecksReportOnTheirOwn:
         watchdog.running(PREFILL, 0.30)
         assert watchdog.sample() == ()
         assert watchdog.sample()[0].clock_at == 0.30
+
+    def test_a_warning_names_where_the_participant_is_and_not_the_watchdog(self):
+        """Sampled from the thread it is reporting on, the top of the stack is ours.
+
+        A sampler on its own thread never sees this; one called straight from
+        the participant's thread sees nothing else, and the most actionable
+        field in the warning would name the detector instead of the wait.
+        """
+        ticks = iter([0.0, 10.0])
+        watchdog = AnnotationWatchdog(
+            stall_seconds=scenarios.STALL_SECONDS, wall_clock=lambda: next(ticks)
+        )
+        watchdog.running(PREFILL, 0.0)
+        frame = watchdog.sample()[0].frame.replace(os.sep, "/")
+        assert "compass/detect/watchdog.py" not in frame
+        assert "in test_a_warning_names_where_the_participant_is" in frame
+
+    def test_the_floor_is_judged_against_the_round_off_the_clock_produces(self):
+        """A tight floor on a long run, where the difference is entirely round-off.
+
+        Both stamps come off a clock hundreds of seconds in, and recovering the
+        delay from them loses the last bits of it. What is left is far below the
+        resolution of those stamps and far above any fraction of a microsecond
+        floor, so a tolerance sized against the floor alone reads it as a
+        constant to lower -- which is the misdiagnosis the tolerance exists to
+        prevent. The other end of the scale is the induced straggler above,
+        whose floor is sized at its path on a sub-second clock.
+        """
+        floor = 1.0e-6
+        for clock in (100.0, 300.0):
+            sent = clock - 1.0
+            arrival = Arrival("a", "b", sent, sent + floor, floor)
+            assert arrival.observed_delay_seconds < floor
+            assert "look at the send path, not at the constant" in (
+                StragglerCheck.report(arrival, clock)
+            )
+        blunt = Arrival("a", "b", 299.0, 299.0 + floor, 2.0 * floor)
+        assert "longer than the path it stands for" in (
+            StragglerCheck.report(blunt, 300.0)
+        )
+
+    def test_stamps_in_the_wrong_order_are_refused_where_they_are_made(self):
+        """A negative delay has no floor to lower, so it never reaches the report.
+
+        Left to the check, it produces a repair nobody can carry out -- lower
+        the floor to a negative number -- while the defect that produced it goes
+        unnamed.
+        """
+        with pytest.raises(ValueError) as refused:
+            Arrival("a", "b", 1.0, 0.95, 1.0e-3)
+        assert "so its stamps are wrong" in str(refused.value)
+        assert "no floor can be declared at a negative delay" in str(refused.value)
+        assert Arrival("a", "b", 1.0, 1.0, 0.0).observed_delay_seconds == 0.0
+
+    def test_the_context_is_built_for_the_message_that_fails_and_no_other(self):
+        """The check is one comparison; its context is a table over every participant.
+
+        A diagnostic built on every message costs orders of magnitude more than
+        the check it decorates, which is how an always-on check stops being on.
+        """
+        built = []
+
+        def context():
+            built.append(None)
+            return "participant          status"
+
+        check = StragglerCheck()
+        check.arriving(Arrival("a", "b", 1.0, 1.001, 1.0e-3), 1.0, context)
+        assert built == []
+        with pytest.raises(CausalityViolation) as raised:
+            check.arriving(Arrival("a", "b", 1.0, 1.001, 1.0e-3), 1.002, context)
+        assert len(built) == 1
+        assert raised.value.report.endswith("\n\nparticipant          status")
 
     def test_a_message_that_arrives_on_time_is_counted_and_passed_through(self):
         check = StragglerCheck()

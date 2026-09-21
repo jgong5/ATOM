@@ -166,12 +166,17 @@ class Injected:
         return grant
 
     def hand_over(self, lp_id, grant):
-        """Give the participant every message this grant reached, checked on the way in."""
+        """Give the participant every message this grant reached, checked on the way in.
+
+        The participant table is handed over as the function that builds it, not
+        as the string: it is built once, on the message that fails, rather than
+        on every message that does not.
+        """
         held = self.inbox[lp_id]
         handed = []
         while held and held[0].takes_effect_at <= grant.advance_to:
             arrival = self.straggler.arriving(
-                held.popleft(), self.clock.now(lp_id), self.clock.lp_table()
+                held.popleft(), self.clock.now(lp_id), self.clock.lp_table
             )
             handed.append(arrival)
         return tuple(handed)

@@ -12,8 +12,34 @@ not on the day a number taken off it is argued about.
 Reads are found by parsing rather than by matching text, because the forms that
 matter are not all spelled the same. `from time import monotonic` followed by a
 bare `monotonic()` is the same read as `time.monotonic()`, and a text search for
-the second does not find the first. Imports are resolved to the name they came
-from and the call target is compared against that.
+the second does not find the first. Imports and the aliases assigned from them
+are resolved to the name they came from, and the call target is compared against
+that -- so `now = time.monotonic` followed by `now()` is found as well, a form a
+text search for the assignment *would* have found and an earlier parse of only
+the imports did not.
+
+**What this pass does not see.** Naming the blind spots is part of the check,
+because a check whose limits are unstated gets read as a guarantee:
+
+* a read reached through a string -- `getattr(time, "perf_counter")()`, or
+  `importlib.import_module("time")` -- because the name is not in the syntax;
+* `from time import *`, because the names it binds are in the module it imports
+  and not in this one's text;
+* a name bound to the result of a call rather than to a name, since only a
+  dotted name on the right of an assignment is followed;
+* scope: a name bound anywhere in the file is treated as bound everywhere in
+  it, so a local alias in one function is resolved in another.
+
+Each of those is a read this pass would miss and a reviewer would not, which is
+the trade the pass is worth making and not a reason to trust it alone.
+
+**Pacing a loop is the same mistake and only one form of it is listed.**
+`asyncio.sleep` is flagged for that reason, and `time.sleep`,
+`threading.Event.wait(timeout=)` and `queue.Queue.get(timeout=)` are the same
+mistake spelled differently: each one turns a loop at a rate the modelled run
+knows nothing about. They are one class and they are worth taking as a class,
+against an inventory of the waits this code actually performs, rather than one
+name at a time here.
 
 **The allow-list is part of the check, not an escape from it.** A few reads are
 supposed to stay real -- a failure detector that measured itself in simulated
@@ -31,16 +57,24 @@ from dataclasses import dataclass
 #: The calls that return real seconds. `asyncio.sleep` is here with the rest
 #: because pacing a loop against the machine's clock is the same mistake as
 #: reading it: the loop turns at a rate the modelled run does not know about.
+#: The `_ns` forms are the same three machine clocks in different units, and a
+#: number divided by a billion after the fact is not distinguishable from one
+#: taken in seconds, so they are listed beside them rather than under them.
 CLOCK_READS = (
     "time.time",
+    "time.time_ns",
     "time.monotonic",
+    "time.monotonic_ns",
     "time.perf_counter",
+    "time.perf_counter_ns",
     "datetime.now",
     "asyncio.sleep",
 )
 
-#: Files whose real-clock reads are deliberate, and why. A path matches by
-#: suffix, so the same entry works from any root the check is run from.
+#: Files whose real-clock reads are deliberate, and why. A path matches on whole
+#: directory names ending at the entry, so the same entry works from any root
+#: the check is run from and a directory that merely ends in the same letters
+#: does not collect the exemption.
 DEFAULT_ALLOW_LIST = {
     "atom/compass/detect/watchdog.py": (
         "the annotation watchdog measures how long a participant has been "
@@ -75,10 +109,15 @@ class ClockSourceLint:
         self.enabled = enabled
 
     def allowed(self, path: str) -> str | None:
-        """The recorded reason this file may read a real clock, if it may."""
+        """The recorded reason this file may read a real clock, if it may.
+
+        The match is on whole path segments. A suffix on the text alone would
+        hand the exemption to any directory whose name happens to end in the
+        first segment of an entry, which is a file nobody reviewed.
+        """
         posix = path.replace(os.sep, "/")
         for entry in sorted(self.allow_list):
-            if posix.endswith(entry):
+            if posix == entry or posix.endswith("/" + entry):
                 return self.allow_list[entry]
         return None
 
@@ -87,7 +126,7 @@ class ClockSourceLint:
         if not self.enabled or self.allowed(path) is not None:
             return ()
         tree = ast.parse(source, filename=path)
-        origins = _import_origins(tree)
+        origins = _origins(tree)
         scopes = _scopes(tree)
         found = []
         for node in ast.walk(tree):
@@ -135,14 +174,20 @@ class ClockSourceLint:
             )
         return tuple(found)
 
-    def report(self, reads, scanned: int) -> str:
-        """What the check prints. Clean is a line; dirty is the list and the fix."""
+    def report(self, reads, scanned: int, allow_listed: int = 0) -> str:
+        """What the check prints. Clean is a line; dirty is the list and the fix.
+
+        `allow_listed` is how many of the files in this scan were passed over,
+        not how long the list is. The line reads as a statement about the scan,
+        so it has to be one: a tree containing none of the listed files is a
+        tree where nothing was exempted.
+        """
         if not self.enabled:
             return "clock-source lint: disabled, so this tree makes no claim about its clock reads"
         if not reads:
             return (
                 f"clock-source lint: clean over {scanned} module(s), "
-                f"{len(self.allow_list)} file(s) allow-listed"
+                f"{allow_listed} file(s) allow-listed"
             )
         lines = [
             f"clock-source lint: {len(reads)} real-clock read(s) on the simulated path:"
@@ -160,7 +205,8 @@ class ClockSourceLint:
         """Scan `root` and return an exit code beside the report. Non-zero fails CI."""
         modules = self.modules(root)
         reads = self.scan_modules(modules)
-        return (1 if reads else 0), self.report(reads, len(modules))
+        allow_listed = sum(1 for path in modules if self.allowed(path) is not None)
+        return (1 if reads else 0), self.report(reads, len(modules), allow_listed)
 
 
 def _dotted(node) -> str | None:
@@ -175,28 +221,66 @@ def _dotted(node) -> str | None:
     return ".".join(reversed(parts))
 
 
-def _import_origins(tree) -> dict[str, str]:
-    """Local name -> the dotted name it was imported from."""
-    origins = {}
+def _origins(tree) -> dict[str, str]:
+    """Local name -> the dotted name it stands for: imports, and aliases of them.
+
+    An alias is an assignment whose right-hand side is a dotted name, and it is
+    recorded whole -- `self._clock = time.perf_counter` binds `self._clock`, not
+    `self` -- so that the call it enables resolves the same way an import does.
+    The first binding a name gets is the one kept: a name assigned twice says
+    two things, and the check is not an interpreter.
+    """
+    origins: dict[str, str] = {}
     for node in ast.walk(tree):
         if isinstance(node, ast.Import):
             for alias in node.names:
-                origins[alias.asname or alias.name.split(".")[0]] = alias.name
+                origins.setdefault(alias.asname or alias.name.split(".")[0], alias.name)
         elif isinstance(node, ast.ImportFrom) and node.module:
             for alias in node.names:
-                origins[alias.asname or alias.name] = f"{node.module}.{alias.name}"
+                origins.setdefault(
+                    alias.asname or alias.name, f"{node.module}.{alias.name}"
+                )
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            source = _dotted(node.value)
+            if source is None:
+                continue
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            for target in targets:
+                name = _dotted(target)
+                if name is not None and name != source:
+                    origins.setdefault(name, source)
     return origins
 
 
 def _resolve(call: str | None, origins: dict[str, str]) -> str | None:
-    """Rewrite a call's head through the imports that introduced it."""
+    """Rewrite a call's head through the imports and aliases that introduced it.
+
+    An alias can stand on an alias, and `ast.walk` does not visit the bindings
+    in the order they were written, so the chain is followed rather than
+    stepped once. Each name is expanded at most once along a chain: a name can
+    legitimately stand for one that contains it -- `from datetime import
+    datetime` binds `datetime` to `datetime.datetime` -- and expanding that a
+    second time would grow the name instead of resolving it.
+    """
     if call is None:
         return None
-    head, _, rest = call.partition(".")
-    origin = origins.get(head)
-    if origin is None:
-        return call
-    return f"{origin}.{rest}" if rest else origin
+    expanded: dict[str, None] = {}
+    while True:
+        origin = origins.get(call)
+        if origin is not None:
+            if call in expanded:
+                return call
+            expanded[call] = None
+        else:
+            head, _, rest = call.partition(".")
+            head_origin = origins.get(head)
+            if head_origin is None or head in expanded:
+                return call
+            expanded[head] = None
+            origin = f"{head_origin}.{rest}" if rest else head_origin
+        if origin == call:
+            return call
+        call = origin
 
 
 def _scopes(tree) -> tuple[tuple[int, int, str], ...]:
