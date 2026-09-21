@@ -37,8 +37,14 @@ is carried by the types rather than by a convention a caller is asked to follow.
    for the sequence it replaces only if the two cost the same; where they do
    not, the region stays a `Seq`. Checking that is not this module's job, but
    making the unchecked version awkward is: `Repeat` takes a mandatory
-   `GroupingEvidence` naming what was compared, so grouping is a claim someone
-   made rather than a default a caller fell into.
+   `GroupingEvidence` naming what was compared, and that type is abstract, so
+   neither a bare instance nor a flag will do.
+
+Every region reports two sets of index names, each composed from its immediate
+children rather than by searching the tree. `bound_indices` is what the repeats
+at or below it bind. `free_indices` is what the context keys below it name and
+nothing binds -- an unresolved reference, which `Graph` refuses, because a body
+that names an index no enclosing repeat supplies cannot be priced per instance.
 
 **What an `Op` carries, and why cost is not a function of it.** ATOM registers
 whole subsystems as single dispatcher operators -- attention, mixture-of-experts
@@ -50,9 +56,17 @@ carry them was tried and reverted, and the reason generalises: arguments cannot
 carry non-tensor ambient state through a compiled graph, so no signature change
 would have worked. `context_ref` is the consequence -- the handle by which that
 state is found again at predict time -- and `attrs` refuses to hold a snapshot
-of any of those readings, because a snapshot records whichever value the tracing
-forward happened to see. One such capture took a maximum sequence length from a
-warm-up dummy and priced attention at 163.6 us against a true 23.0 us.
+of one, because a snapshot records whichever value the tracing forward happened
+to see. One such capture took a maximum sequence length from a warm-up dummy and
+priced attention at 163.6 us against a true 23.0 us.
+
+`attrs` refuses such a snapshot two ways, and only the first is a guarantee: no
+value that looks like a tensor, and no name on `AMBIENT_READINGS`. The name list
+is a tripwire for the readings seen in the metadata so far, not a proof -- it
+cannot know the next field somebody adds, and two of its entries were added only
+after a review found them missing while one-character-different spellings were
+already there. What carries the weight is that ambient state is reached through
+`context_ref` when a price is asked for, not copied into the node at all.
 
 For the same reason this module offers no price key built out of a node. A key
 made from shapes and static attributes alone has been measured unsound: two
@@ -63,6 +77,7 @@ deciding that two blocks are interchangeable -- and is not a statement that two
 nodes cost the same.
 """
 
+import abc
 import enum
 import math
 import string
@@ -73,16 +88,30 @@ from .shapes import Shape, as_shapes
 
 #: Readings that decide an operator's cost and change every step. They are
 #: reached through the context reference when a price is asked for; a copy taken
-#: at trace time is a value from whichever forward did the tracing.
+#: at trace time is a value from whichever forward did the tracing. A tripwire
+#: for the names seen so far, not a proof -- see the module docstring.
 AMBIENT_READINGS = frozenset(
     {
+        "batch_ptr",
+        "block_table_tensor",
         "block_tables",
         "context_lens",
-        "slot_mapping",
-        "cu_seqlens_q",
         "cu_seqlens_k",
-        "max_seqlen_q",
+        "cu_seqlens_q",
+        "kv_indices",
+        "kv_indptr",
+        "kv_last_page_lens",
+        "max_query_len",
+        "max_seq_len",
         "max_seqlen_k",
+        "max_seqlen_q",
+        "num_actual_tokens",
+        "num_reqs",
+        "nums_dict",
+        "query_start_loc",
+        "seq_lens",
+        "slot_mapping",
+        "token_chunk_offset_ptr",
     }
 )
 
@@ -147,6 +176,11 @@ class ContextRef:
     `model.layers.{layer}.self_attn`, and pricing instance *i* binds `layer` to
     that instance's index value. Written without placeholders, a body would name
     one layer and every other instance would be priced against it.
+
+    A placeholder has to be a name a repeat index could carry, so `{0}`, `{}`
+    and `{x.y}` are refused here rather than at the point somebody tries to bind
+    them, and a key that does not parse is refused with a reason rather than
+    raising out of the formatter later.
     """
 
     key: str
@@ -156,15 +190,29 @@ class ContextRef:
             raise TypeError(f"a context key is a str, got {type(self.key).__name__}")
         if not self.key.strip():
             raise ValueError("a context key must not be empty")
+        for name in self._fields():
+            if not name.isidentifier():
+                raise ValueError(
+                    f"{self.key!r} has the placeholder {{{name}}}, which no "
+                    "repeat index can be named; a placeholder is a plain name. "
+                    "An automatically numbered one is refused for the same "
+                    "reason: nothing can bind it."
+                )
+
+    def _fields(self) -> tuple[str, ...]:
+        """Every placeholder in the key, as written, including unusable ones."""
+        try:
+            fields = [field for _, field, _, _ in string.Formatter().parse(self.key)]
+        except ValueError as exc:
+            raise ValueError(
+                f"{self.key!r} is not a usable context key: {exc}"
+            ) from None
+        return tuple(field for field in fields if field is not None)
 
     @property
     def index_names(self) -> tuple[str, ...]:
         """The repeat indices this key is written in terms of, in order."""
-        return tuple(
-            dict.fromkeys(
-                name for _, name, _, _ in string.Formatter().parse(self.key) if name
-            )
-        )
+        return tuple(dict.fromkeys(self._fields()))
 
     def bind(self, **values: int) -> "ContextRef":
         """This key with its indices substituted, for one instance of a repeat."""
@@ -190,6 +238,11 @@ class Region:
     @property
     def bound_indices(self) -> frozenset[str]:
         """Every repeat index bound at or below this region."""
+        raise NotImplementedError
+
+    @property
+    def free_indices(self) -> frozenset[str]:
+        """Index names used below this region that nothing at or below it binds."""
         raise NotImplementedError
 
 
@@ -238,30 +291,62 @@ class Op(Region):
     def bound_indices(self) -> frozenset[str]:
         return frozenset()
 
+    @property
+    def free_indices(self) -> frozenset[str]:
+        if self.context_ref is None:
+            return frozenset()
+        return frozenset(self.context_ref.index_names)
+
 
 def _as_attrs(attrs: Any) -> tuple[tuple[str, Any], ...]:
     """Normalise attributes to a sorted tuple of pairs, refusing what cannot keep.
 
     Sorted, so two recordings of one operator compare equal whatever order the
-    tracer visited the arguments in. Hashable values only, for the same reason
-    the shapes are. And no entry may be named after a per-step ambient reading:
-    such an entry is a value copied out of one forward, and a later step priced
-    against the copy is priced against a batch that is not the one being asked
-    about.
+    tracer visited the arguments in -- which is why a name appearing twice is
+    refused rather than resolved: the sort would silently pick one of them and
+    the invariant would be a coin toss.
+
+    Hashable values only, for the same reason the shapes are. Nothing
+    tensor-shaped, and no name on `AMBIENT_READINGS`: both are per-step state
+    copied out of one forward, and a later step priced against the copy is
+    priced against a batch that is not the one being asked about. A tensor
+    hashes by identity, so the value check has to look at what it is rather than
+    ask whether it can be kept.
     """
     if isinstance(attrs, (str, bytes)):
         raise TypeError(f"attributes are name/value pairs, got {attrs!r}")
     items = attrs.items() if hasattr(attrs, "items") else attrs
-    pairs = []
+    pairs: list[tuple[str, Any]] = []
+    seen: dict[str, None] = {}
     for item in items:
+        if isinstance(item, (str, bytes)) or not isinstance(item, (tuple, list)):
+            raise TypeError(f"each attribute is a (name, value) pair, got {item!r}")
+        if len(item) != 2:
+            raise ValueError(
+                f"each attribute is a (name, value) pair, got {len(item)} "
+                f"items: {item!r}"
+            )
         key, value = item
         if not isinstance(key, str):
             raise TypeError(f"an attribute name is a str, got {key!r}")
+        if key in seen:
+            raise ValueError(
+                f"{key!r} is given twice. Attributes are sorted by name so that "
+                "two recordings of one operator compare equal, and a repeated "
+                "name would make which value survives depend on the order."
+            )
+        seen[key] = None
         if key in AMBIENT_READINGS:
             raise ValueError(
                 f"{key!r} changes every step and is read through the node's "
                 "context reference when a price is asked for. Stored here it "
                 "would be whatever value the tracing forward happened to see."
+            )
+        if hasattr(value, "shape") and hasattr(value, "dtype"):
+            raise ValueError(
+                f"attribute {key!r} is a tensor. Its contents are this step's "
+                "state, not what the operator is; reach it through the node's "
+                "context reference when a price is asked for."
             )
         try:
             hash(value)
@@ -292,6 +377,10 @@ class Seq(Region):
     @property
     def bound_indices(self) -> frozenset[str]:
         return frozenset().union(*(item.bound_indices for item in self.items))
+
+    @property
+    def free_indices(self) -> frozenset[str]:
+        return frozenset().union(*(item.free_indices for item in self.items))
 
 
 @dataclass(frozen=True, slots=True)
@@ -328,22 +417,34 @@ class IndexBinding:
         return self.start + self.step * position
 
 
-class GroupingEvidence:
+class GroupingEvidence(abc.ABC):
     """What was compared before a repeat was allowed to replace a sequence.
 
     Collapsing *n* instances into one body is only free if pricing the body once
     and multiplying gives what pricing the instances separately would give. The
     two subclasses are the two things that can be compared: the instances'
-    structure, and their price. A repeat takes one of them, mandatorily, so
-    grouping is always a claim somebody made about a specific comparison.
+    structure, and their price. A repeat takes one of them, mandatorily.
+
+    Abstract, and not merely a base class, because an instance of this by itself
+    would be a grouping justified by nothing -- cheaper to write than the flag
+    the mandatory field exists to refuse.
     """
 
     __slots__ = ()
 
+    @abc.abstractmethod
+    def describe(self) -> str:
+        """What was compared, in one line, for a record or a refusal to quote."""
+
 
 @dataclass(frozen=True, slots=True)
 class IdenticalStructure(GroupingEvidence):
-    """Every instance carries the same canonical signature."""
+    """Every instance carries the same canonical signature.
+
+    The signature has to be one a later reader can recompute from the repeat's
+    body. A signature nobody can reproduce is a claim that cannot be rechecked,
+    which is the same as no claim.
+    """
 
     signature: str
 
@@ -353,6 +454,9 @@ class IdenticalStructure(GroupingEvidence):
                 "name the signature the instances share; an empty one says "
                 f"nothing was compared, got {self.signature!r}"
             )
+
+    def describe(self) -> str:
+        return f"every instance carries the signature {self.signature}"
 
 
 @dataclass(frozen=True, slots=True)
@@ -371,6 +475,10 @@ class EqualPrice(GroupingEvidence):
                 )
             if not math.isfinite(value):
                 raise ValueError(f"{name} is not a number of seconds: {value!r}")
+            if value < 0:
+                raise ValueError(
+                    f"{name} is a duration and cannot be negative, got {value!r}"
+                )
             object.__setattr__(self, name, float(value))
         flat, grouped = self.flat_seconds, self.grouped_seconds
         if flat != grouped:
@@ -380,6 +488,9 @@ class EqualPrice(GroupingEvidence):
                 "prices differently grouped stays a sequence; the difference "
                 "would otherwise be multiplied by the repeat count."
             )
+
+    def describe(self) -> str:
+        return f"flat and grouped both price at {self.flat_seconds!r} s"
 
 
 @dataclass(frozen=True, slots=True)
@@ -432,6 +543,10 @@ class Repeat(Region):
     def bound_indices(self) -> frozenset[str]:
         return frozenset({self.index.name}) | self.body.bound_indices
 
+    @property
+    def free_indices(self) -> frozenset[str]:
+        return self.body.free_indices - {self.index.name}
+
     def index_values(self) -> tuple[int, ...]:
         """The index value each instance binds, in order."""
         return tuple(self.index.value_at(i) for i in range(self.count))
@@ -461,6 +576,10 @@ class Par(Region):
     @property
     def bound_indices(self) -> frozenset[str]:
         return frozenset().union(*(branch.bound_indices for branch in self.branches))
+
+    @property
+    def free_indices(self) -> frozenset[str]:
+        return frozenset().union(*(branch.free_indices for branch in self.branches))
 
 
 def _as_regions(regions: Any, what: str) -> tuple[Region, ...]:

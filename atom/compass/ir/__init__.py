@@ -28,7 +28,7 @@ from .nodes import (
     Repeat,
     Seq,
 )
-from .shapes import Shape, SymExpr, as_dim, as_shape, as_shapes, is_symbolic
+from .shapes import Shape, SymDim, SymExpr, as_dim, as_shape, as_shapes, is_symbolic
 
 __all__ = [
     "AMBIENT_READINGS",
@@ -48,6 +48,7 @@ __all__ = [
     "Repeat",
     "Seq",
     "Shape",
+    "SymDim",
     "SymExpr",
     "Verdict",
     "as_dim",

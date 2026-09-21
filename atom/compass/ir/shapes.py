@@ -1,35 +1,43 @@
 # SPDX-License-Identifier: MIT
-"""Shapes, and what counts as a size that is not known yet.
+"""Shapes, and the canonical form a size that is not known yet is held in.
 
 A traced operator records the shapes it was called with. Recording them as
 plain integers would tie the record to the one batch it was traced at, so a
-dimension here is either a concrete `int` or an object standing for a size that
+dimension here is either a concrete `int` or a `SymDim` standing for a size that
 is still open -- a token count, a batch size, a context length, a parallelism
 degree.
 
-**Nothing in this module compares a dimension it has not already proved to be
-concrete, and nothing calls `int()` on one.** Both of those install a guard on a
-symbolic size, which would mean the act of recording or checking a shape changes
-what the trace says about where it is valid. The bound on a concrete dimension
-below is therefore reached only after `isinstance(dim, int)` has settled that
-the dimension is a number.
+**A live symbolic size is canonicalised on the way in and never stored.** The
+object a tracer holds for an open size is not a value: on torch 2.10 it cannot
+be hashed at all -- `hash()` on one raises `TypeError: unhashable type:
+non-nested SymInt`, for a backed symbol and an unbacked one alike -- and
+comparing it or calling `int()` on it is how a guard gets installed, which would
+mean that recording or reading a shape changes what the trace says about where
+it is valid. A node has to be hashable and comparable, because deciding that two
+blocks are interchangeable is exactly how repetition is found. Those two
+requirements are irreconcilable for the live object, so `as_dim` renders it once
+into a `SymDim` and the node holds that.
 
-**What a symbolic dimension is, is deliberately not decided here.** This module
-imports neither a tensor library nor a symbolic-algebra library, so the data
-model stays constructible and testable on a machine with no device runtime, and
-so the class that carries a symbol stays the capture side's choice rather than a
-commitment made here. A dimension is accepted when it is hashable -- nodes are
-values and have to be comparable and keyable -- and when it is not one of the
-types that only ever arrives by mistake: a `bool` (which is an `int`, so `True`
-would otherwise pass as the size 1), a `float`, a `str`, or `None`.
+Rendering is the one operation that is safe: measured on torch
+2.10.0+rocm7.2.4, `str()` and `repr()` of a symbol left the shape environment's
+guard list untouched, for `s26`, for `2*s26 + 1` and for the unbacked `u0`.
+Nothing in this module compares a dimension it has not already proved to be a
+concrete `int`, and nothing calls `int()` on one; the bound below is reached only
+after `isinstance(dim, int)` has settled that the dimension is a number.
+
+**What a symbolic size is, is still not decided here.** This module imports
+neither a tensor library nor a symbolic-algebra library, so the data model stays
+constructible and testable on a machine with no device runtime. It needs only
+that an open size can render itself, and the text it renders to is its identity
+from then on. Rendering has to be the tracer's one convention: two spellings of
+one expression are two dimensions here.
 """
 
 from collections.abc import Iterable
+from dataclasses import dataclass
 from typing import Any
 
-#: One dimension: a concrete `int`, or an object standing for an open size.
-#: Left as `Any` on purpose -- the module docstring says why the symbolic half
-#: of that union is not named here.
+#: One dimension: a concrete `int`, or a `SymDim` standing for an open size.
 SymExpr = Any
 
 #: The shape of one tensor: its dimensions, in order.
@@ -38,30 +46,56 @@ Shape = tuple
 _REFUSED_DIM_TYPES = (bool, float, complex, str, bytes, bytearray)
 
 
+@dataclass(frozen=True, slots=True)
+class SymDim:
+    """A size that is not known yet, held as the text its expression renders to.
+
+    The text is the whole of the identity. Two dimensions are the same size when
+    they render the same, which makes a node hashable and comparable without any
+    operation ever reaching the live symbolic object.
+    """
+
+    text: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.text, str):
+            raise TypeError(
+                f"a symbolic dimension renders to a str, got {type(self.text).__name__}"
+            )
+        if not self.text.strip() or "\n" in self.text:
+            raise ValueError(
+                f"a symbolic dimension needs a rendering to be identified by, "
+                f"on one line; got {self.text!r}"
+            )
+
+    @classmethod
+    def of(cls, expr: object) -> "SymDim":
+        """Canonicalise a live symbolic size by rendering it, and nothing else."""
+        return cls(str(expr))
+
+    def __str__(self) -> str:
+        return self.text
+
+
 def is_symbolic(dim: SymExpr) -> bool:
     """True when `dim` stands for a size that is not known yet."""
     return not isinstance(dim, int)
 
 
 def as_dim(dim: SymExpr) -> SymExpr:
-    """Return `dim` as a dimension, refusing what cannot be one."""
+    """Return `dim` as a dimension, canonicalising a live symbolic size."""
     if dim is None or isinstance(dim, _REFUSED_DIM_TYPES):
         raise TypeError(
-            "a dimension is a concrete int or an object standing for an open "
-            f"size, got {type(dim).__name__}: {dim!r}"
+            "a dimension is a concrete int or a symbolic size, got "
+            f"{type(dim).__name__}: {dim!r}"
         )
     if isinstance(dim, int):
         if dim < 0:
             raise ValueError(f"a concrete dimension cannot be negative, got {dim}")
         return dim
-    try:
-        hash(dim)
-    except TypeError:
-        raise TypeError(
-            "a symbolic dimension must be hashable, because the node holding it "
-            f"is a value that is compared and keyed; {type(dim).__name__} is not"
-        ) from None
-    return dim
+    if isinstance(dim, SymDim):
+        return dim
+    return SymDim.of(dim)
 
 
 def as_shape(dims: Iterable[SymExpr]) -> Shape:
