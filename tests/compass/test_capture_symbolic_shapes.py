@@ -175,12 +175,18 @@ def test_staging_the_same_batch_by_the_symbol_keeps_the_sliced_dimension():
     assert not shape_env.replacements, dict(shape_env.replacements)
 
 
-def test_the_staging_source_being_a_real_tensor_is_not_the_cause():
-    """Separates the two candidate explanations.
+def test_an_int_bound_constants_the_sliced_dimension_even_with_a_symbolic_source():
+    """Isolates what the bound alone does, on the dimension it slices.
 
-    Both sides symbolic, the bound still a Python `int`: what the forward
-    reads is concrete anyway. So it is the integer bound that specialises,
-    not the source being a real numpy-backed CPU tensor.
+    Both sides symbolic and the bound still a Python `int`: the sliced
+    dimension of what the forward reads is a constant anyway, so the bound is
+    sufficient on its own to specialise that one.
+
+    It says nothing about the others. The staging source being a real tensor
+    with constant dimensions is a **separate and independent** cause, and the
+    earlier reading of this test -- that the real source is *not* a cause --
+    is withdrawn; see
+    `test_the_staging_copy_specialises_every_dimension_it_does_not_slice`.
     """
     _shape_env, fake_mode = _mode()
     src = _dynamic_leading_dim(
@@ -321,21 +327,26 @@ def test_the_decode_path_shares_one_bound_between_the_fill_and_the_copy():
     """The precondition site one rests on, checked against ATOM.
 
     `prepare_decode` derives one count per staged buffer and uses it to fill
-    the numpy view and then as the device copy's bound. If ATOM ever separates
-    them, this fails, and the conclusion drawn from it is retaken rather than
-    inherited.
+    the CPU side and then as the device copy's bound. Both builders the
+    recorded replacement stack names do it -- `aiter_attention` through the
+    buffer's numpy view, `gdn_attn` through its CPU tensor directly. If ATOM
+    ever separates the two uses, this fails, and the conclusion drawn from it
+    is retaken rather than inherited.
     """
     import pathlib
 
     import atom
 
-    source = (
-        pathlib.Path(atom.__file__).parent
-        / "model_ops"
-        / "attentions"
-        / "aiter_attention.py"
-    ).read_text()
+    attentions = pathlib.Path(atom.__file__).parent / "model_ops" / "attentions"
 
-    assert 'var["slot_mapping"].np[:running_tokens]' in source
-    assert '("slot_mapping", running_tokens),' in source
-    assert "copy_to_gpu(num) for el, num in vars_used" in source
+    aiter_src = (attentions / "aiter_attention.py").read_text()
+    assert 'var["slot_mapping"].np[:running_tokens]' in aiter_src
+    assert '("slot_mapping", running_tokens),' in aiter_src
+    assert "copy_to_gpu(num) for el, num in vars_used" in aiter_src
+
+    # The recorded replacement stack names a second builder, which stages the
+    # same way through `.cpu[...]` rather than `.np[...]`. Compared with
+    # whitespace removed so reflowing the call does not break the check.
+    gdn_src = "".join((attentions / "gdn_attn.py").read_text().split())
+    assert '["cu_seqlens_q"].cpu[running_bs:]=batch.total_tokens_num_decode' in gdn_src
+    assert '"cu_seqlens_q"].copy_to_gpu(running_bs+1)' in gdn_src
