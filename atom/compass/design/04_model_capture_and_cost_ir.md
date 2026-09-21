@@ -330,14 +330,15 @@ Node    := Op(name, kind, in_shapes: [SymExpr], out_shapes: [SymExpr],
 
 ### `Repeat` — the efficiency property
 
-An LLM forward is a prologue, N layer bodies, and an epilogue. `Repeat` prices the body
-once and **reuses that price** for every instance — the same prices, in the same order,
-added the same way. It does not multiply the body price by the count. Float addition is
-not associative, so multiplying re-associates, and it reproduces the recorded price in
-**none of the three shapes measured**: eight identical layers, 3.2e-05 s multiplied
-against 3.200000000000001e-05 s recorded; a four-block pattern repeated twenty times,
-0.00036 against 0.0003600000000000009; six instances of 0.1 s, 0.6000000000000001
-against 0.6. Reuse reproduces all three exactly.
+An LLM forward is a prologue, N layer bodies, and an epilogue. `Repeat` prices the body's
+operators once and **reuses those prices** for every instance — the same prices, in the
+same order, added the same way. What is reused is the body's sequence of per-operator
+prices, re-emitted in order once per instance, and not a body total; it does not multiply
+a body price by the count. Float addition is not associative, so multiplying re-associates,
+and it reproduces the recorded price in **none of the three shapes measured**: eight
+identical layers, 3.2e-05 s multiplied against 3.200000000000001e-05 s recorded; a
+four-block pattern repeated twenty times, 0.00036 against 0.0003600000000000009; six
+instances of 0.1 s, 0.6000000000000001 against 0.6. Reuse reproduces all three exactly.
 
 For Qwen3.8-27B that is 64 layers collapsing to roughly two bodies —
 **48 `linear_attention` and 16 `full_attention`**, `full_attention_interval: 4` — plus
