@@ -223,8 +223,8 @@ skipped. That is the mechanism doing the real work, and Compass does not replace
 turns out not to work on ATOM's model classes, `--load_dummy empty` plus
 `torch.device("meta")` gives a weight-free, GPU-free module tree — losing symbolic shapes,
 so capture would fall back to concrete traces at the shapes that actually occur (`04`
-option C), not to shape synthesis. That is a real degradation and an escalation
-(`16` D102), not a silent substitution.
+option C), not to shape synthesis. That is a real degradation and an escalation —
+one of `16`'s named escalation points — not a silent substitution.
 
 ### Decision
 

@@ -15,207 +15,7 @@ the answers arrive.
 
 ---
 
-## D95. The operating model
-
-### Tasks are a pool, not a track assignment
-
-Work is a **DAG of tasks**, and each task is a GitHub issue. A task becomes claimable when
-its dependencies land; any free agent assigns itself the issue. There are no permanent
-per-track ownerships.
-
-The cold-start problem this creates — an agent picking up a task without the accumulated
-context of the ones before it — is solved by making context **durable in the task** rather
-than resident in an agent. See D96.
-
-**Concurrency is capped at 5 tasks in flight**: five developer agents and five reviewer
-agents. The cap is review throughput, not the DAG — Wave 1 holds about ten independent
-tasks and will run in two batches rather than all at once.
-
-### Conflicts are tolerated, and are a signal
-
-Tasks are cut so that each touches one module plus its tests, which makes most of them
-disjoint. They are **not** guaranteed disjoint, and no allocation-time file locking is
-imposed — a merge conflict is cheaper than the machinery to prevent it.
-
-> **Frequent conflicts mean the task decomposition is wrong, not that coordination
-> failed.** The response is to re-cut the tasks, not to add a scheduler.
-
-### Developer and reviewer are separate agents
-
-Both are per-task. They share the project context and the task record; their **briefs
-differ in what they optimise for**:
-
-| | Optimises for |
-|---|---|
-| **developer** | does this work, and does it match the design decision it cites |
-| **reviewer** | what does this break, what does the design actually say, and what here is untested |
-
-Same context, opposed objectives. The reviewer is a separate agent specifically so the
-review is not performed by the context that produced the code.
-
-### The review loop needs its own stop
-
-Procedure is in `AI_DEV_RULES.md`. What belongs here is why: a finding that keeps
-recurring, or a loop that keeps running past a few cycles, is the developer and reviewer
-agents doing their jobs correctly against a task that cannot be done correctly — it is not
-a sign either agent is underperforming.
-
-> **A task whose review loop does not converge is mis-cut, not under-worked** — the same
-> decomposition signal as the conflicts above, arriving late instead of at allocation time.
-
-### The halt rule
-
-> **When something does not work as expected, stop and discuss. Do not work around it.**
-
-This is the agent-facing form of the design's own standing principle — *refuse rather than
-fall back* (`README` principle 6). A workaround improvised under build pressure is exactly
-the class of decision that never gets written down, and the prior effort has recorded
-instances of well-formed, wrong artifacts surviving review.
-
-"Not as expected" includes: a design document that contradicts the code; a test that fails
-for a reason the task did not predict; a measurement outside its stated range; an
-interface that cannot be implemented as specified.
-
-### The halt's visible form
-
-A halt reported only to the owner is invisible to any other agent that might pick the
-task back up before the owner acts on it. The `need human` label is what makes the stop
-**repository state** instead of just a message: while it is on an issue or PR, that stop
-is visible to every agent, not only to whichever one hit it. Procedure — who applies it,
-who removes it, what it blocks — is in `AI_DEV_RULES.md`.
-
----
-
-## D96. The task record, and why context lives in it
-
-The task record is **the GitHub issue and its PR**. Nothing durable lives in the tree.
-
-A task carries four sections. The first is written before the task is claimable; the rest
-are written as it runs.
-
-| Section | Written by | Lives in | Contains |
-|---|---|---|---|
-| **Brief** | the planner | the **issue body** | what to build; the governing decisions by number; the interfaces it **implements** and **consumes**; its file set; its exit criteria; its effort estimate |
-| **Dev record** | the developer | the **PR body** | what was found, what was decided that the design did not cover, what surprised it, what was left undone |
-| **Review record** | the reviewer | the **PR review comment** | what was checked, what was accepted with reservation, what the next task in this area should watch |
-| **Handoff** | both | a **closing comment on the issue** | what a successor needs to know that is not in the code |
-
-**The issue exists before the branch does.** That is why the brief lives there rather than
-in the PR: a PR needs a commit, and the brief is written before there is anything to
-commit. Claiming a task is assigning yourself its issue.
-
-**Every task's brief links to its predecessors' issues.** That is what makes continuity
-survive agent turnover: the context is in the graph, not in a context window. The PR
-names its issue, so an implementation and the brief that asked for it stay joined.
-
-**A brief that cannot name its file set is under-specified** and is not claimable. This is
-the same discipline as `04` D21's declared nodes — the declaration is the contract.
-
-**What this costs.** A `git archive` snapshot carries the code and not the reasoning, and
-the record is only as reachable as GitHub is. Both were already true of the dev and review
-records before this decision named where the brief goes.
-
----
-
-## D97. Where work lands
-
-| | |
-|---|---|
-| **Integration branch** | `feature/atomcompass_new` — already the PR #3 branch |
-| **Per-task isolation** | a git worktree per in-flight task, under `compass-worktrees/<task-id>`, beside the repo |
-| **The task** | one GitHub issue per task, holding its brief and its handoff (D96) |
-| **Landing** | one PR per task, **squash-merged** into the integration branch, naming its task's issue, reviewed by that task's reviewer agent. The repo permits squash merges only; the enforcing settings are in `AI_DEV_RULES.md` |
-| **Post-landing** | the main agent fast-forwards the main worktree to the integration branch promptly. The pull runs as root, which traps every landing in a file-ownership fix; procedure is in `AI_DEV_RULES.md` |
-| **ATOM's `main`** | untouched until the milestone the project agrees to upstream |
-
-**Closing the issue is deliberate, not automatic.** GitHub auto-closes a linked issue
-only when the PR merges into the repository's default branch, and `main` is never that
-target here. The issue closes when its handoff comment is written (D96).
-
-**Four setup rules, from failures already recorded on this hardware.** None was caused by
-worktrees; all were caused by a shared mutable non-git source tree that things silently
-resolved against.
-
-1. **No shared mutable source root exists.** Every tree is a worktree or a `git archive`
-   snapshot.
-2. **Containers mount the worktree parent**, so every task's tree is reachable at a stable
-   path. The CPU container previously mounted only one tree, which made `pytest` on
-   worktree code fail with a path error rather than a test failure.
-3. **Every command sets `PYTHONPATH` to its own worktree and verifies it** —
-   `python -c "import atom; print(atom.__file__)"` **before** trusting a result. A prior
-   run resolved `atom` to a non-git snapshot of a different branch, 72 files divergent,
-   and failed silently wherever both trees had the symbol.
-4. **Snapshots use `git archive`, never `rsync`** — so a snapshot names a commit and
-   cannot be a mixture of generations. One shared tree held two files from two different
-   generations, producing a `TypeError` that named the callee and read as a code bug.
-
-### D97.1 Stacked PRs: the force-push scope and the squash-restack cost
-
-A task that depends on one that has not landed need not wait for it: it may stack its
-PR on the dependency's branch instead, so both are reviewed in parallel. This is a
-**recommendation, not a requirement** — independent tasks do not stack — and procedure
-(the `gh stack` extension, its install command, its ephemerality) is in
-`AI_DEV_RULES.md`.
-
-**Stacking forces a choice about force-push that this repository had never written
-down.** `gh stack rebase`/`gh stack sync` rebase and force-push every branch above the
-one that changed — that is inherent to a stack, not an optional mode — and it collides
-with practice already in force but never recorded here: developer agents have been
-told "never force-push, never rebase a pushed branch" out of band. The owner scoped
-that instruction on 2026-09-21:
-
-- **Forbidden** on a branch **under review** — a force-push there destroys the
-  review's anchor to what was actually reviewed.
-- **Permitted** to **restack after its parent has landed** — mechanical and expected,
-  since the branch's own history is not what changed; its base was cut out from
-  under it.
-
-**The restack is also forced by D97 itself, independent of stacking.** Squash is the
-*only* merge this repository permits, and squashing the bottom PR of a stack rewrites
-its commits into one new commit on the integration branch. Every branch stacked above
-it now shares no history with that base and cannot land as-is. Landing a stack
-therefore costs **one restack of the remainder per landing** — every time the bottom
-of a stack merges, whatever is left above it restacks once before its own turn.
-
----
-
-## D98. What gates a task
-
-Four things, all required:
-
-1. **ATOM's test suite passes unmodified.** 187 files, no GPU needed (`08` D43.1). Needing
-   to edit an ATOM test means the change altered ATOM's behaviour and must be justified on
-   its own terms, not absorbed.
-2. **New CPU-only tests** for what the task added, in `tests/compass/`, in ATOM's style.
-3. **One named result**, stated in the issue body before the task is claimed and not
-   chosen afterwards — what this task now makes possible that was not possible before.
-4. **Review by the task's reviewer agent**, against its brief and the cited decisions,
-   repeating until the verdict is APPROVE (procedure for posting the verdict is in
-   `AI_DEV_RULES.md`). A loop that does not converge halts to the owner per D95's
-   stop condition.
-
-**Baseline first.** P0.2 records the suite's and ruff's current pass/fail state before the
-first Compass commit. A pre-existing failure attributed to Compass costs a day, and the
-lint baseline on this repository is already known to be dirty.
-
----
-
-## D99. Effort is estimated in lines of code
-
-Not in time. Agents do not have hours; they have output volume, and LOC is estimable from
-the design — `06` D34 already sizes the harness adapter at 450–650 lines.
-
-**Wall-clock appears only for machine time with a measured basis**: a TP2 engine run is
-~1 h because engine runs take that long, and the long sweep is six hours because it was
-measured at six hours. Those are hardware constraints, not effort.
-
-Estimates are ranges and are expected to be wrong. A task that overruns its estimate by
-more than ~2x is a **halt-and-discuss** event, not a reason to keep going — the usual
-cause is that the task was mis-cut.
-
----
-
-## D100. The module layout, which is also the task boundary
+## The module layout, which is also the task boundary
 
 Tasks are cut so each touches one module plus its tests.
 
@@ -269,7 +69,7 @@ and collective-free, so the known hang should not be reachable from P0.4. If P0.
 that, T52 drops to ordinary priority and gates nothing on the critical path.
 
 **Each of P0.3–P0.7 ends in an escalation, not a decision.** The result plus its options
-and their costs go to the project owner; the scope call is theirs (D102).
+and their costs go to the project owner; the scope call is theirs (see Escalation points below).
 
 ---
 
@@ -358,7 +158,7 @@ knowing while the fake model is still the only thing in play.
 
 ---
 
-## D101. The GPU booking queue
+## The GPU booking queue
 
 GPU is the scarce resource; almost everything else is CPU-only by design principle 2.
 Only calibration Phases 1b/1c/2, `--measure` runs, the real side of pairings, and the
@@ -401,7 +201,7 @@ pre-flight script, not this table.
 
 ---
 
-## D102. Escalation points
+## Escalation points
 
 Five checks can each reshape the plan. Each ends in a decision that belongs to the project
 owner, not to the agent that ran it.
@@ -418,7 +218,7 @@ owner, not to the agent that ran it.
 arrives with the options and their costs already worked out, so the decision is one round
 trip rather than a fresh analysis under time pressure.
 
-The halt rule (D95) is the general case: any surprise stops and is discussed.
+The halt rule (`AI_DEV_RULES.md`) is the general case: any surprise stops and is discussed.
 
 Reaching any of these five, like the loop's halt above, is an escalation — so it applies
 `need human` too (`AI_DEV_RULES.md`), for the same reason: the stop should be visible on
@@ -431,29 +231,13 @@ GitHub, not only inside an agent's report.
 Stated so it is not mistaken for an omission.
 
 - **Dates.** Effort is LOC; wall-clock appears only where it is machine time with a
-  measured basis (D99).
+  measured basis (`AI_DEV_RULES.md`).
 - **Detailed Wave 4+.** Deliberate — see above.
 - **Agent prompts.** Task briefs are written to be close to a prompt and generated from at
   launch, because embedded prompts go stale as tasks move.
 - **A test plan separate from `08`.** Validation is `08`; this document schedules it.
 - **Upstreaming to ATOM's `main`.** Out of scope until the project agrees a milestone is
   ready; the integration branch is the destination until then.
-
----
-
-## Decision log
-
-| # | Decision | Date |
-|---|---|---|
-| D95 | Tasks are a **pool**, not a track assignment; 5 dev + 5 reviewer agents cap concurrency at 5 in flight. Conflicts are tolerated and are a **decomposition signal**. Developer and reviewer are separate agents with opposed objectives. **The loop halts to the owner if the same finding survives two cycles, or after three cycles, applying `need human` to the PR.** **Halt and discuss on any surprise.** | 2026-09-21 |
-| D96 | The task record is the **GitHub issue and its PR** — brief in the issue body, dev record in the PR body, review record in the review comment, handoff in the closing comment — with each brief linking to its predecessors' issues. A brief that cannot name its file set is not claimable. | 2026-09-21 |
-| D97 | `feature/atomcompass_new` is the integration branch; one issue, one worktree and one PR per task, **squash-merged** (the repo permits squash merges only). Four setup rules from recorded failures: no shared mutable source root, containers mount the worktree parent, `PYTHONPATH` verified before trusting a result, `git archive` never `rsync`. On landing, the main agent fast-forwards the main worktree and restores file ownership. | 2026-09-21 |
-| D97.1 | Stacking a dependent task's PR on an unlanded parent is **recommended, not required** (independent tasks do not stack). Force-push is **forbidden on a branch under review** and **permitted only to restack after its parent lands**. Squash-only merging (D97) rewrites the bottom PR's commits on landing, so everything stacked above it must restack — **one restack of the remainder per stack landing**. | 2026-09-21 |
-| D98 | Four gates per task: ATOM's suite green **unmodified**, new CPU-only tests, one named result stated in advance, and review by a separate agent, looping to APPROVE per D95. Baselines recorded first. | 2026-09-21 |
-| D99 | Effort in **lines of code**. Wall-clock only for machine time with a measured basis. A 2x overrun is a halt-and-discuss event. | 2026-09-20 |
-| D100 | Twelve modules under `atom/compass/`; tasks are cut so each touches one plus its tests. ATOM edits outside that tree are enumerated per task. | 2026-09-20 |
-| D101 | One GPU queue; tasks declare their measurement before becoming claimable. Pre-flight is **three** checks — wedge, compute, **VRAM** — run before *and* after. | 2026-09-20 |
-| D102 | Five named escalation points, each prepared in advance so the decision is one round trip. Reaching one applies `need human` (`AI_DEV_RULES.md`), so the stop is visible on GitHub rather than only in a report. | 2026-09-21 |
 
 ---
 
