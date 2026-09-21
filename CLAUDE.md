@@ -11,7 +11,7 @@ python -m pytest tests/                   # needs a GPU: AITER and torch.cuda ar
                                           # the driver, and 3 of the 30 inside it do too, so
                                           # at least 32 of 189 -- not 29 of 189
 scripts/compass/gate_cpu.sh               # driver-free AS A BATCH: 130 files, 4030 passed,
-                                          # 0 failed, 31.2 s, green. Two of the 130 reach
+                                          # 0 failed, 32-37 s, green. Two of the 130 reach
                                           # rocminfo run alone; in the gate they module-skip.
                                           # Measured 2026-09-20 in xiaobizh_n18_cpu; an
                                           # earlier 128-file/3956 reading is superseded

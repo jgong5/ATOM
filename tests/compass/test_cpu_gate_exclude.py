@@ -135,7 +135,9 @@ def test_every_manual_entry_states_why(entry):
     )
 
 
-@pytest.mark.parametrize("entry", _paths(_lines(TRIGGERS)) if TRIGGERS.is_file() else [])
+@pytest.mark.parametrize(
+    "entry", _paths(_lines(TRIGGERS)) if TRIGGERS.is_file() else []
+)
 def test_every_trigger_path_still_exists(entry):
     # Same drift, one file over. A trigger naming a moved module matches
     # nothing, and gate_cpu.sh then reports "gpu: not required" for a diff that

@@ -42,13 +42,7 @@ def _stub_python(bindir, rc, summary):
     interpreter, which is what keeps these tests CPU-only and off the driver.
     """
     script = bindir / "python"
-    script.write_text(
-        "#!/bin/sh\n"
-        "cat <<'STUB_EOF'\n"
-        f"{summary}\n"
-        "STUB_EOF\n"
-        f"exit {rc}\n"
-    )
+    script.write_text(f"#!/bin/sh\ncat <<'STUB_EOF'\n{summary}\nSTUB_EOF\nexit {rc}\n")
     script.chmod(0o755)
 
 
@@ -59,6 +53,7 @@ def _count(tree, bindir):
         capture_output=True,
         text=True,
         env=env,
+        check=False,
     )
 
 
