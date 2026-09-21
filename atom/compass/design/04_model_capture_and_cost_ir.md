@@ -192,11 +192,73 @@ That composes with D20: **the trace stops at the opaque leaf**, which is where 6
 the step time lives and exactly where a parameterized price is wanted anyway. The ~231
 fake-less aiter ops sit *inside* those leaves and are never reached.
 
+### Collectives at TP>1 — measured, and the group is not what the trace needs
+
+The open issue *"whether ATOM's real model classes trace cleanly under this mode at
+TP>1"* is **answered yes**, on two models at both widths, with the collectives in the
+inventory rather than substituted away.
+
+> **These are DIAGNOSTIC inventories.** Every run below was taken with raw
+> `@triton.jit` launches recorded and **not executed** -- 33 launches across 3 kernels on
+> the 27B decode -- so anything downstream of a skipped kernel read uninitialised fake
+> memory, and each record carries `diagnostic_inventory: true`. The operator and
+> collective counts are an enumeration of what a step reaches. They are **not** a cost
+> model input at any width.
+
+| model | TP1 | TP2 | collectives recorded at TP2 |
+|---|---|---|---|
+| Qwen3.8-27B (hybrid; vision tower, linear attention) | 2,471 ops / 33 distinct | 2,611 / 38 | `aiter.all_reduce_` **129**, functional all-gather 1, broadcast 1 |
+| Qwen3-0.6B (dense MHA) | 389 / 17 | 457 / 23 | `aiter.all_reduce_` **57**, functional all-gather 1, broadcast 1 |
+
+Both widths complete a full decode step. The 27B's TP1 inventory is identical
+operator-for-operator to the TP1 record taken through `apply_simulated_tp`, so the TP2
+difference is attributable to width rather than to a different capture. The 0.6B's 57 is
+28 layers x 2 row-parallel linears plus 1 vocab-parallel reduce, which its parameter
+geometry predicts independently. A third model with a different collective pattern,
+Qwen3-30B-A3B, was attempted and is not reachable on this stack: `AutoConfig` rejects the
+checkpoint before any capture code runs.
+
+**Why no process-group substitution is required.** The collective ATOM issues at TP>1
+goes through a **registered custom operator with a registered fake implementation** —
+aiter's `all_reduce_`. Under `FakeTensorMode` the fake answers and the body that needs a
+device communicator is unreachable, so the operator is recorded with its real shapes
+having allocated and communicated nothing. It does not need the group to exist at all:
+called with a group name that does not, it still returns the input's shape.
+
+**The exception, which is not the group either.** Four call sites reach
+`torch.distributed`'s legacy entry points instead — the non-custom `all_gather`,
+`gather`, `broadcast`, and the `barrier` in `allocate_kv_cache`. On this stack those
+`c10d::*` operators carry a backend kernel and **neither a `Meta` nor a
+`CompositeExplicitAutograd` one**, so `FakeTensorMode` raises
+`UnsupportedOperatorException` rather than producing a meta operation. The functional
+forms do carry a kernel it can run, and give the same shapes — a `[2, 124160]` input
+gathers to `[4, 124160]` as one recorded collective. This is the same fact as the
+`c10d.broadcast_` gap, measured to be general rather than particular to `broadcast`.
+
+A width-N group inside one process is available from torch's own `fake` backend and needs
+no peer. What one process cannot build is the **transport**: the device communicator opens
+a collective rendezvous that waits for absent ranks, as does the message-queue
+broadcaster, so both have to be declined when the group is built.
+
+Declining the device communicator is **not free**, and the earlier claim that nothing
+reaches it once the group exists is wrong. ATOM's default `ATOM_USE_CUSTOM_ALL_GATHER`
+takes `embed_head.py:257`'s vocab-parallel gather down the custom path, which asserts on
+`device_communicator.ca_comm` and fails with `'NoneType' object has no attribute
+'ca_comm'` after 2,588 operators. The runs above therefore set
+**`ATOM_USE_CUSTOM_ALL_GATHER=0`**, selecting the non-custom gather; that is a declared
+configuration of the capture and belongs in the record beside the device readings. It is
+the whole difference between the run that fails at 2,588 and the one that completes at
+2,611.
+
+Pinned by `tests/compass/test_capture_collectives.py`, which enumerates both operator sets
+by name, so a future torch growing a meta kernel for one of the legacy forms fails there
+rather than leaving unexplained code behind.
+
 ### Open issues
 
-- Whether any op on the forward path **outside** an opaque leaf lacks a fake impl. Expected
-  to be small; unmeasured.
-- Whether ATOM's real model classes trace cleanly under this mode at TP>1.
+- Whether any op on the forward path **outside** an opaque leaf lacks a fake impl. One
+  class of them is now measured -- the legacy `c10d::*` collectives above. The rest is
+  expected to be small; unmeasured.
 
 ---
 
