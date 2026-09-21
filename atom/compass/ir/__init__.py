@@ -3,9 +3,9 @@
 
 Four regions compose into a tree -- an operator, a sequence, a repeat, an
 overlap -- and a graph pairs one of them with a statement of where the record is
-valid. Nothing here walks a tree, prices one, builds one from a trace, or
-decides whether a repeat was safe to take; those are separate, and each one
-reads this.
+valid. The detector that finds the repetition in a flat block sequence and names
+it is here too. Nothing here prices a tree, builds one from a trace, or decides
+whether a repeat was safe to take; those are separate, and each one reads this.
 
 Nothing here imports a tensor library, a symbolic-algebra library or a device
 runtime, so a graph can be built and checked anywhere.
@@ -27,6 +27,7 @@ from .nodes import (
     Repeat,
     Seq,
 )
+from .repeats import detect_repeats, signature_of
 from .shapes import Shape, SymExpr, as_dim, as_shape, as_shapes, is_symbolic
 
 __all__ = [
@@ -50,5 +51,7 @@ __all__ = [
     "as_dim",
     "as_shape",
     "as_shapes",
+    "detect_repeats",
     "is_symbolic",
+    "signature_of",
 ]
