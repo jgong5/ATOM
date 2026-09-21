@@ -2,6 +2,9 @@
 
 ATOM is a lightweight LLM inference engine built on AITER GPU kernels for the AMD ROCm platform.
 
+This is a development branch for ATOM Compass. Check its design doc under `atom/compass/design`.
+AI agents are given full autonomy under standing rules at `atom/compass/AI_DEV_RULES.md`.
+
 ## Build & Test & Lint
 
 ```bash
