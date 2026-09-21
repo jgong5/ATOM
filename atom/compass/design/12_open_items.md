@@ -88,7 +88,7 @@ M-f `14`; M-g `01` D3.5.
 | T3 | Build the per-leaf parameter-extractor table (~20 entries) |
 | T4 | Establish scratch constants per leaf for the 27B |
 | T5 | Verify ATOM's model classes trace cleanly under FakeTensorMode at TP>1 |
-| T6 | Validate that `Repeat` grouping reproduces the flat cost |
+| T6 | Validate that `Repeat` grouping reproduces the flat prices term by term |
 | T7 | Validate `Par` reconstruction from stream ids |
 | T8 | Decide whether tier (a) is fitted independently or derived from tier (b) |
 | T9 | Declare a row-ordering treatment for decode attention |
