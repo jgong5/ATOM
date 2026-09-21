@@ -1,10 +1,10 @@
 # ATOM Compass — Design
 
 **Status: reviewed and approved, 2026-09-20. Design only — no code has been written
-against it yet.** Every document carries a matching header. **108 decisions — D0–D94
-with no gaps, plus 13 sub-decisions** — are indexed at the end of this file; **77 registered
-TODOs — T1–T72, T77–T80 and T82, of which 73 are open** (T15, T22 and T48 are struck through
-as done, and T77 was opened and closed by P0.1); they, the load-bearing assumptions and the
+against it yet.** Every document carries a matching header. **109 decisions — D0–D94
+with no gaps, plus 14 sub-decisions** — are indexed at the end of this file; **81 registered
+TODOs — T1–T80 and T82, of which 76 are open** (T10, T15, T22 and T48 are struck through as
+done, and T77 was opened and closed by P0.1); they, the load-bearing assumptions and the
 cross-cutting issues live in **`12_open_items.md`**. Implementation follows the execution
 plan in `16`.
 
@@ -385,9 +385,10 @@ One thing that **is** in scope and is worth stating as a limit rather than a non
 
 ## Load-bearing assumptions
 
-Five assumptions hold up large parts of the design and **none has been tested.** Each now
-carries a named check, a place it runs, and a cost — in **`12_open_items.md` §1**, so they
-are schedulable work rather than caveats.
+Five assumptions hold up large parts of the design. **One has been tested** — T10, resolved
+by P0.3 on 2026-09-20; the other four have not. Each now carries a named check, a place it
+runs, and a cost — in **`12_open_items.md` §1**, so they are schedulable work rather than
+caveats.
 
 | # | Assumption | If false |
 |---|---|---|
@@ -395,12 +396,12 @@ are schedulable work rather than caveats.
 | **T25** | The real-vs-real noise floor stays narrow under closed-loop replay at high client count | those cells become ungradeable. All prior data is 20 requests, one session, declared arrivals. |
 | **T5** | ATOM's model classes trace cleanly under `FakeTensorMode` at TP>1 | tier b has no IR, and docs `04`, `07`, `09` rest on it |
 | **T52** | `TorchDispatchMode` instrumentation does not hang ATOM at width | capture is unusable at TP>1; gates T5. A mode-induced 8-rank hang already exists in-tree and is being root-caused, not worked around. |
-| **T10** | `AgenticReplayStrategy` can be subclassed rather than vendored | the harness adapter grows by ~2,000 lines to keep in sync with upstream |
+| ~~**T10**~~ | ~~`AgenticReplayStrategy` can be subclassed rather than vendored~~ — **resolved 2026-09-20 by P0.3: yes, and nothing is vendored** | the ~2,000-line consequence does not occur. What the spike found instead is that a subclass reaches only four of the nine pacing calls, so the adapter rebinds the runner's `LoopScheduler` (`06` D34.1) |
 
-**Order to settle them:** T10 (an hour, no hardware, largest swing per hour) → T52 → T5 →
-T21, T25. The last two are designed-in steps of the calibration and validation flows, not
-extra work — but they can each invalidate an acceptance claim, so they should not drift to
-the end.
+**Order to settle the four that remain:** T52 → T5 → T21, T25. T10 came first — an hour, no
+hardware, largest swing per hour — and is done. The last two are designed-in steps of the
+calibration and validation flows, not extra work — but they can each invalidate an
+acceptance claim, so they should not drift to the end.
 
 ---
 
@@ -559,7 +560,7 @@ The documents use these precisely; a reader will bounce off without them.
 | D13 – D16 | `03` Memory Model and the KV Pool |
 | D17 – D23 (+ D18.1) | `04` Model Capture and the Cost IR |
 | D24 – D26 (+ D25.1) | `05` Machine Specification and its Probes |
-| D27 – D35 | `06` Workload Harness Contract |
+| D27 – D35 (+ D34.1) | `06` Workload Harness Contract |
 | D36 – D43 (+ D38.1, D40.1) | `07` Calibration and Benchmarking Toolchain |
 | D43.1, D44 – D52 (+ D50.1) | `08` Validation Protocol |
 | D53 – D62 | `09` Fitting and Law Selection |

@@ -63,10 +63,10 @@ five-slot cap.
 | **P0.7** | **T52** — root-cause the dispatch-mode 8-rank hang. **Only if P0.4 hits it.** | spike | — | quiet node |
 
 **Why these seven.** Each can invalidate work that would otherwise be built on top of it.
-P0.3 swings an estimate by ~2,000 lines for one hour's work. P0.4 decides whether tier b
-has an IR at all, and **it is the task most likely to reshape Waves 2–4** — if tracing
-does not work at TP>1, `capture/` and `ir/` change shape. The plan marks that edge rather
-than pretending the DAG is stable across it.
+P0.3 swung an estimate by ~2,000 lines for one hour's work; it has since run and the swing
+did not happen. P0.4 decides whether tier b has an IR at all, and **it is the task most
+likely to reshape Waves 2–4** — if tracing does not work at TP>1, `capture/` and `ir/`
+change shape. The plan marks that edge rather than pretending the DAG is stable across it.
 
 **P0.7 is conditional.** `15` and `04` both argue a fake-tensor trace should be GPU-free
 and collective-free, so the known hang should not be reachable from P0.4. If P0.4 confirms
@@ -290,16 +290,44 @@ Phase 0's environment. All CPU-only.
 | **W1.6** | M1 fake model: HF-config geometry plus the shape-analytic cost stub of `02` D12, including the quadratic query term | `backends/` | 300–450 | consumes W1.5 |
 | **W1.7** | Machine-spec schema, `merge` / `validate` / `explain`. No probes yet | `spec/` | 400–600 | implements the spec artifact |
 | **W1.8** | Wire-contract fields on ATOM's real endpoint: one `compass` object each direction (`06` D28) | ATOM entrypoints | 100–200 | implements the wire contract |
-| **W1.9** | aiperf adapter package, out of tree: clock client, pacing redirect, latency anchors from response fields | out-of-tree | 450–650 | consumes W1.8 |
+| **W1.9** | aiperf adapter package, out of tree: clock client, pacing redirect, latency anchors from response fields | out-of-tree | 450–650, reopened | consumes W1.8 |
 | **W1.10** | Cost IR: `Seq` / `Repeat` / `Par`, the **nested** Repeat detector with its index binding, and the provably-free grouping rule (`04` D19) | `ir/` | 500–700 | implements the IR |
 
 **W1.2 is the one that earns its keep.** It is where the distributed CA — the riskiest
 component, and the one whose failures are silent — gets exercised without ATOM and without
 a GPU, so it runs in CI on every change thereafter.
 
-**W1.9's estimate is conditional on P0.3.** If `AgenticReplayStrategy` cannot be
-subclassed, this becomes ~2,000 lines of vendored code that must track upstream, and that
-is an escalation rather than a bigger task.
+**W1.9's estimate is no longer conditional on vendoring. P0.3 resolved T10 on
+2026-09-20:** subclassing works and nothing is vendored. The spike also found that a
+strategy subclass alone is **not sufficient** — further pacing sites live in
+`BranchOrchestrator` and `ReplayBarrierCoordinator`, which a subclass never sees.
+
+**Owner decision, 2026-09-20 — rebind *and* assert (option C).** W1.9 rebinds the shared
+`LoopScheduler` module global from a Compass bootstrap, **and** registers a strategy
+subclass that raises unless the scheduler it receives is already clock-paced (`06` D34).
+The subclass does no wrapping; it exists because the rebind's failure mode is silent, and
+a silently wall-clocked run is the worst result this design can produce.
+
+**Review of P0.3 then showed the tripwire is load-bearing, not belt-and-braces**, and that
+the 450–650 range needs re-costing before W1.9 starts:
+
+| Correction | Effect on W1.9 |
+|---|---|
+| A bootstrap that precedes the first `PhaseRunner` **does** exist. `discover_plugins()` resolves each entry point with `importlib.util.find_spec`, which on a *dotted* value imports the parent package, so `compass_harness.plugin:plugins.yaml` executes `compass_harness/__init__.py` during discovery. The rebind is deferred from there by a stdlib import hook, because that bootstrap runs inside `aiperf.plugin.plugins`' own module body and cannot import `aiperf` — executed, five combinations, 7/7 in the working shape (`06` D34, T73) | **T73 is a packaging choice plus ~20 lines of import hook, inside the existing "plugin manifest, bootstrap, config glue" row — not a precondition of the seam and not W1.9's first deliverable.** The bootstrap shape that *would* be too late is a side effect of the strategy module: phase 0 on the real clock, phase 1 rebound, smoke test passes. That is why the tripwire ships regardless |
+| `runner.py:191` calls `LoopScheduler()` with no arguments, so the rebound class must be no-arg constructible — `ClockPacedLoopScheduler(LoopScheduler)`, a subclass, not the spike's `ClockPacedScheduler(inner)` wrapper | The spike validated option A's shape. "About five lines" was costed against the wrong object, so that component row is **open** |
+| One scheduler per `PhaseRunner`, and `seamless=True` keeps two live | T76 — reconcile, or assert `seamless=False` |
+| Two `loop.call_later` idle-cap timers the rebind cannot reach, one of which upstream deliberately keeps outside the scheduler | T75 — override the two `_arm_*` methods, or declare the feature unsupported and assert both caps are `None` |
+
+**W1.9's acceptance is a list, not a count:** every one of the nine enumerated pacing calls
+in `06` D34 is observed to advance on the virtual clock — plus a stated disposition for the
+two timers in T75. Those line numbers are pinned to agentx-harness
+`56a0cf70f4c0359454ee4bd15a17770b541a3e3e`; re-verify them against that revision, or
+re-derive them from the whole-tree grep in `06` D34, before building the test to them.
+"None of the seven advances on the real clock" was unimplementable as written; the seven
+added four *methods* to three *call sites*.
+
+It does **not** cover the 32 `asyncio.wait_for` timeout sites, which bypass `LoopScheduler`
+entirely (T74).
 
 ---
 
@@ -430,12 +458,12 @@ pre-flight script, not this table.
 
 ## Escalation points
 
-Five checks can each reshape the plan. Each ends in a decision that belongs to the project
-owner, not to the agent that ran it.
+Five checks can each reshape the plan; T10 has been run and did not fire. Each ends in a
+decision that belongs to the project owner, not to the agent that ran it.
 
 | Trigger | What the escalation carries |
 |---|---|
-| **T10** fails | adapter cost rises to ~2,000 vendored lines — vendor, fork, or restrict the harness |
+| ~~**T10** fails~~ | ~~adapter cost rises to ~2,000 vendored lines — vendor, fork, or restrict the harness~~ — **did not fire.** P0.3, 2026-09-20: the subclass works and nothing is vendored. The escalation this row prepared for never arose |
 | **T5** fails | tier b has no IR at TP>1 — options and their effect on M2 onward |
 | **T21** fails | calibration does not transfer across width — per-width campaign, a reduced acceptance set, or generalisation reported as within-width only |
 | **T25** fails | the noise floor swamps 10% at high client count — those cells are **ungradeable**, and the acceptance set needs re-scoping |

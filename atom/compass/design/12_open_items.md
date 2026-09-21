@@ -12,35 +12,38 @@ backlog. Nothing here is a decision; every decision lives in its topic's decisio
 
 1. **Load-bearing assumptions** — hold up large parts of the design; each has a check plan
 2. **Missing topics** — design points nobody has written yet, with a recommendation
-3. **TODO register** — 77 rows, **T1–T72, T77–T80 and T82**, per topic, of which **73 are
-   open**: T15, T22 and T48 are struck through as done, and T77 was opened and closed by
-   P0.1. Both figures are the rows of section 3 below, counted as
+3. **TODO register** — 81 rows, **T1–T80 and T82**, per topic, of which **76 are open**:
+   T10, T15, T22 and T48 are struck through as done, and T77 was opened and closed by P0.1.
+   Both figures are the rows of section 3 below, counted as
    `grep -oE '^\| *~*\**T[0-9]+'` over that section and nothing else — prose elsewhere in
    this file names T-numbers that belong to other branches, and counting those tokens is
    what made two earlier counts disagree. The register is **not contiguous and is not a
    range**: T-numbers are allocated across parallel task branches and arrive when those
-   branches land. At the time of writing T73–T76 are open on P0.3's branch and T81 on P0.4's
+   branches land. T73–T76 arrive here, with P0.3; at the time of writing T81 is still open
+   on P0.4's branch
 4. **Cross-cutting issues and pending amendments**
 
 ---
 
 ## 1. Load-bearing assumptions, and how each gets checked
 
-Five assumptions hold up large parts of the design. **None has been tested.** Each row
-names the check, where it runs, and roughly what it costs — so these are schedulable work
-in the execution plan rather than caveats in a document.
+Five assumptions hold up large parts of the design. **One has been tested** — T10, resolved
+by P0.3 on 2026-09-20; the other four have not. Each row names the check, where it runs,
+and roughly what it costs — so these are schedulable work in the execution plan rather than
+caveats in a document.
 
 | # | Assumption | If false | The check | Cost |
 |---|---|---|---|---|
 | **T21** | The in-situ calibration transfers across TP width | the recipe's "calibrate at TP1, predict TP2/4/8" collapses and the campaign multiplies by the number of widths | **Doc `07` Phase 1c's one extra run.** Calibrate at TP1, predict a TP2 full-engine run, compare. Already a designed step of the recommended flow — it is step 6 — so the check is not extra work, it is the reason that step exists. | one TP2 engine run, ~1 h GPU |
 | **T25** | The real-vs-real noise floor stays narrow under closed-loop replay at high client count | those cells become ungradeable — not failed, *ungradeable*, which is worse because nothing is proven either way | **Doc `08` D45's step 1, run before any simulated comparison.** N≥3 spaced real repeats at the 64- and 256-client cells; report the pairwise spread. If it swamps 10%, say so and re-scope the acceptance cells. | 3 real cc-traces runs per cell, ~3 h GPU |
 | **T5** | ATOM's model classes trace cleanly under `FakeTensorMode` at TP>1 | tier b has no IR, and docs `04`, `07` and `09` rest on it | **Trace the 27B at TP2 under the doc `04` D18 mechanism and diff the captured structure against TP1.** Run this first and cheaply. A fake-tensor trace should be GPU- and collective-free, so the known mode hang should not be reachable from it; T5 is the experiment that settles whether that reasoning holds. Needs a non-wedged node (`rocminfo` under `timeout` before starting). | half a day, one node |
-| **T10** | `AgenticReplayStrategy` can be subclassed rather than vendored | the harness adapter grows by ~2,000 lines to keep in sync with upstream | **Read the class and attempt a minimal subclass that redirects pacing to the clock client.** No hardware, no ATOM. This is an hour of work that swings the adapter estimate by an order of magnitude. | 1 h, laptop |
+| ~~**T10**~~ | ~~`AgenticReplayStrategy` can be subclassed rather than vendored~~ — **resolved 2026-09-20 by P0.3.** Yes, and it is not needed on its own: the strategy is built by the plugin factory, so an out-of-tree subclass displaces it with no upstream edit — but a subclass reaches only four of the nine pacing sites. All nine share one `LoopScheduler` resolved as a module global, so the adapter **rebinds that global** instead (`06` D34). No vendoring. **W1.9's 450–650 total is reopened, not settled** — see `06` D34's component table: one row was costed against the option-A wrapper, and T75 and T76 are new, uncosted scope. Evidence: six executed claims, `agent_scratch/compass_dev/p0_3/spike_t10.py`, zero edits to agentx-harness. | done |
 | **T52** | `TorchDispatchMode` instrumentation does not hang ATOM at width | `--measure` runs and any mode-based instrumentation of a REAL execution are unusable. **Probably does not gate Phase 1a tracing** - the hazard is a `__torch_function__` guard on a real device, not a fake-tensor trace. | **Root-cause the known hang** at `atom/spec_decode/dspark_scheduler.py:264`. `rocgdb` attach, `info dispatches` per rank, identify which rank diverges. | <1 day, quiet node |
 
-**Ordering.** T10 first: no hardware, largest swing per hour. Then **T5** — a
-`FakeTensorMode` trace should be GPU-free and collective-free, so it is both the cheaper
-experiment and the one that tells us whether T52 gates anything on the critical path.
+**Ordering.** T10 came first — no hardware, largest swing per hour — and is done. Then
+**T5** — a `FakeTensorMode` trace should be GPU-free and collective-free, so it is both the
+cheaper experiment and the one that tells us whether T52 gates anything on the critical
+path.
 **T52** follows, at ordinary priority unless T5 actually hits the hang. T21 and T25 need
 the calibration and harness to exist, so they land later — but both are *designed-in
 steps*, not add-ons, and neither should slip to the end.
@@ -95,7 +98,7 @@ M-f `14`; M-g `01` D3.5.
 
 | # | Item |
 |---|---|
-| T10 | Verify `AgenticReplayStrategy` can be subclassed rather than vendored |
+| ~~T10~~ | ~~Verify `AgenticReplayStrategy` can be subclassed rather than vendored~~ — **done**: yes, but the adapter rebinds the shared `LoopScheduler` global instead, which covers all nine pacing sites |
 | T11 | Build the per-tokenizer vetted filler-token set |
 | T12 | Chase the 32 `asyncio.wait_for` sites under virtual time |
 | T13 | Decide the simulated KV connector's completion semantic |
@@ -185,6 +188,10 @@ M-f `14`; M-g `01` D3.5.
 |---|---|
 | T71 | Add Wave 4+ detail as Phase 0 and T21 answers arrive |
 | T72 | Decide whether reviewer agents use ATOM's `review-pr` skill or a Compass-specific checklist |
+| T73 | **Declare the plugin entry point with a dotted module path, and defer the rebind from that package's `__init__.py` with a `sys.meta_path` hook.** Successor to T10, opened 2026-09-20; re-scoped 2026-09-20 after review refuted its premise by execution, and re-measured 2026-09-21. `plugins.py:210` calls `importlib.util.find_spec` on the entry-point value, and on a **dotted** value that imports the parent package — so `compass_harness.plugin:plugins.yaml` executes `compass_harness/__init__.py` inside `discover_plugins()`, which runs at import of `aiperf.plugin.plugins` and therefore before any `PhaseRunner` is constructed, with the manifest still resolving and zero edits to agentx-harness. The rebind cannot run *inline* there: the bootstrap fires at `plugins.py:1115`, inside that module's own body, so any `import aiperf.…` re-enters `aiperf/plugin/enums.py:21` and raises `AttributeError: partially initialized module`. The bootstrap therefore installs a stdlib-only import hook that rebinds `LoopScheduler` on `aiperf.timing.phase.runner` after that module executes. Executed against `56a0cf70f` over five entry-point/bootstrap combinations, 7/7 in the working shape; decomposed in `06` D34. **A packaging decision plus ~20 lines, not a precondition of the seam** — the earlier "no such bootstrap exists today" was an asserted negative and is false. The tripwire ships regardless, because a bootstrap that silently fails to run has no other detector — but it covers only that half: an inline rebind de-registers the plugin the tripwire lives in, so W1.9 also needs a positive check that the Compass plugin registered at all (`06` D34, `16` W1.9) |
+| T74 | **Whether the 32 `asyncio.wait_for(..., timeout=T)` sites need virtual time.** Successor to T10, opened 2026-09-20. They bypass `LoopScheduler`, so the rebind does not reach them; under virtual time they may fire instantly. P0.3 did not examine them (`06` D34, second risk) |
+| T75 | **Decide the two `loop.call_later` idle-cap timers.** Opened 2026-09-20. `replay_dependencies.py:307` and `agentic_replay.py:592` arm real-clock timers the `LoopScheduler` rebind cannot reach; upstream's own docstring says the second deliberately lives outside the scheduler. Either override the two `_arm_*_idle_watchdog` methods from the Compass subclass, or declare the idle-cap feature unsupported under virtual time and assert both caps are `None`. Related: `agentic_replay.py:531` derives the virtual-time skip from `time.monotonic()` (`06` D34) |
+| T76 | **Reconcile `seamless=True`, which keeps two `PhaseRunner`s and two schedulers live at once.** Opened 2026-09-20. `phase_orchestrator.py:267` builds one runner per phase and tracks `_active_runners`. W1.9 either reconciles two concurrent schedulers against one virtual clock or asserts `seamless=False` (`06` D34) |
 | T80 | Raise with ATOM's owners: `tests/test_prefix_cache_accuracy.py` has no test function — it is an `argparse` script driving a live server — and `test_kv_connector_scheduler.py` / `test_transfer_engine.py` have been dead since #690. Measured: all three run nothing in **either** tier |
 
 ### Topics 02, 01 — gaps now closed
