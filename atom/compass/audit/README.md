@@ -46,7 +46,7 @@ Measured at the commit this file was written against, from the rows below:
 |---|---|---|
 | A | 23 | five forward passes, three transfer-completion polls, the idle-rank batch, five tokenizer hand-offs, three idle step loops that spin, and six clock readings the result reports |
 | B | 36 | the worker RPC both ways, the nine out-of-band control commands, the front-end and engine socket threads, each request's own wait for its next chunk on all four streaming endpoints, and the two channels of the intra-device split |
-| C1 | 11 | four bounded receives and queue reads, four router and server bounds, a keep-alive frame and a silence warning |
+| C1 | 11 | four bounded receives and queue reads, five router and server bounds, a keep-alive frame and a silence warning |
 | C2 | 3 | the idle transfer drain, and the two pipeline-stage polls |
 | ignore | 137 | below the replaced forward pass, inside one process, at startup, at shutdown, or in a transfer backend the simulator substitutes |
 | undecided | 2 | see below |
