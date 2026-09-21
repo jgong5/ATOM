@@ -35,17 +35,23 @@ one instance than another. Keeping the order fixed removes the question: the
 two forms are bit-identical exactly when every instance prices as the first
 one, which is the claim a repeat makes and the only thing worth checking.
 
-**And the comparison is of the prices, not only of their total.** A region's
-cost is not only what it sums to; it is what it contributes to the sum that
-contains it. Two different sequences of prices can fold to one number from zero
-and to two different numbers from a running total, so a check that compared
-totals alone would admit a grouping that moves the step it sits in. The two
-forms are therefore compared term by term, in order; the totals are then equal
-by construction, and are what the surviving repeat records. One consequence is
-worth stating rather than discovering: a difference too small to survive being
-added to the running total is refused all the same. It is a real difference
-between two instances, and the sum it vanishes into here is not the only sum it
-will ever be part of.
+**And the comparison is of the prices, not only of their total.** The reason is
+not that a total is fragile; it is that a total is not all anyone reads. A step
+cost is reported as a breakdown -- one row per term, and terms bucketed by how
+each price was obtained -- so the individual prices are read downstream, not
+just their sum. Two forms that agree on the sum and disagree on a term
+therefore disagree in what gets reported, whatever the sum does. The two forms
+are compared term by term, in order; the totals are then equal by construction,
+and are what the surviving repeat records.
+
+The sum is not safe either, which is the weaker half of the same point and
+still worth pinning. A difference can vanish into the total computed here and
+reappear in a total computed somewhere else: eight blocks of 5e-06 with one of
+them three bits high come to 4e-05 either way from zero, and to
+4.095367431640626e-05 against 4.095367431640625e-05 once a prologue has been
+added first. So a difference too small to survive one addition is refused all
+the same -- it is a real difference between two instances, and this sum is not
+the only sum it will ever be part of.
 
 So **equality here is bitwise, with no tolerance**, and it is affordable
 because nothing re-associates. A price is one law evaluated on one set of
@@ -251,7 +257,7 @@ def _prove_repeat(
     inner, end = _prove(items, pos, first, price, ignored, refusals)
     if end - pos != step:
         raise _Refused(
-            f"one instance of the body covers {end - pos} blocks and the index "
+            f"the body spans {end - pos} of the sequence's blocks and the index "
             f"steps by {step}, so the instances do not sit where they are bound"
         )
     apart = _instances(inner, repeat, pos, base, price, reuse=False)
@@ -395,11 +401,25 @@ def _fold(values: list) -> float:
 def _body_items(body: Region, step: int) -> tuple:
     """The blocks and sub-repeats one instance of `body` is made of.
 
-    A body that covers one block is that block, whatever it holds inside. A
-    body that covers several is a sequence of them, and the step the repeat
-    takes is what says which of the two this is.
+    A body that covers one block is that block, whatever it holds inside; a
+    body that covers several is a sequence of them. The step is what a repeat
+    records the difference as, so it is what this reads -- and because it is
+    the only record of it, a step that describes some other body prices the
+    right operators at the wrong layers with nothing else disagreeing.
+
+    So the step is read but not trusted. A sequence of operators standing side
+    by side is *always* one block here, whatever the step says: an operator on
+    its own and an operator inside a block are the same object, so a step
+    claiming several of them is claiming a boundary that is not in the record.
+    Read as one block it spans one, the caller's step then contradicts the
+    body, and the repeat is refused instead of being priced a layer apart per
+    operator. What that costs is a period of two or more bare operators, which
+    groups only when a caller hands operators over as blocks; that is a
+    grouping lost and never a price moved.
     """
     if step <= 1 or not isinstance(body, Seq):
+        return (body,)
+    if all(isinstance(item, Op) for item in body.items):
         return (body,)
     return body.items
 

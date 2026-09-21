@@ -123,15 +123,26 @@ SECONDS = {
     "aiter::linear_attention": 3e-6,
     "aiter::full_attention": 5e-6,
     "aiter::tenth": 0.1,
+    "aiter::five": 5e-6,
 }
 
 BLOCK_SECONDS = 1e-6 + 3e-6 + 2e-6
 
 
 def _op(name="aiter::gemm_a16w16", **kwargs):
+    """One operator, on a dimension of its own.
+
+    Its own, and not one shared symbol: two operators built from one object
+    compare equal on that dimension by identity before anything is asked of it,
+    so a stand-in shared across the file would sit behind every region-to-region
+    comparison without ever being reached. A fresh one per operator puts the
+    tripwire in the path -- comparing two of these regions raises rather than
+    answering, which is what makes "never compares two regions" a claim these
+    tests can fail.
+    """
+    kwargs.setdefault("in_shapes", ((_Symbol(), 4096),))
+    kwargs.setdefault("out_shapes", ((_Symbol(), 4096),))
     kwargs.setdefault("kind", NodeKind.CAPTURED)
-    kwargs.setdefault("in_shapes", ((TOKENS, 4096),))
-    kwargs.setdefault("out_shapes", ((TOKENS, 4096),))
     with _building():
         return Op(name=name, **kwargs)
 
@@ -262,6 +273,13 @@ def test_a_stack_with_one_costlier_layer_is_refused_and_the_difference_is_named(
 
 
 def test_a_first_layer_that_differs_stays_a_sibling_and_is_never_priced():
+    """Never priced is a claim about every call, not about the keyed ones.
+
+    A prologue is not one of the instances, so it takes no part in either form.
+    The count is asserted over the whole call record rather than over the keys,
+    because reading only the keys would pass a run that had priced the
+    prologue's keyless operators.
+    """
     blocks = [_block("full_attention"), *_dense_stack(7)]
     price = _Pricer()
 
@@ -274,6 +292,10 @@ def test_a_first_layer_that_differs_stays_a_sibling_and_is_never_priced():
     assert isinstance(grouped, Repeat)
     assert (grouped.count, grouped.index.start) == (7, 1)
     assert isinstance(grouped.evidence, EqualPrice)
+
+    assert len(price.asked) == 7 * 3 + 1 * 3
+    assert all(name != "aiter::full_attention" for name, _ in price.asked)
+    assert 0 not in price.layers
     assert price.layers == [*range(1, 8), 1]
 
 
@@ -383,9 +405,9 @@ def test_one_bit_of_difference_at_one_instance_refuses_the_grouping():
     One layer is priced one bit above the others. Added into a running total
     five orders of magnitude larger the bit disappears, so the two forms total
     to the same number -- and the grouping is refused anyway, because the
-    prices themselves differ and this total is not the only sum they will enter.
-    A check that compared totals alone would accept this, and would be
-    accepting a body that is not the body it stands for.
+    prices themselves differ and a breakdown reports them one by one. A check
+    that compared totals alone would accept this, and would be accepting a body
+    that is not the body it stands for.
     """
     blocks = _dense_stack(8)
     moved = lambda layer, s: math.nextafter(s, 1.0) if layer == 5 else s
@@ -395,6 +417,46 @@ def test_one_bit_of_difference_at_one_instance_refuses_the_grouping():
     assert len(refused) == 1
     assert refused[0].flat_seconds == refused[0].grouped_seconds
     assert "prices it at 3.0000000000000005e-06 s" in refused[0].reason
+
+
+def _fold_from(start, values):
+    """The same left fold, started from a total that is already running."""
+    total = start
+    for value in values:
+        total += value
+    return total
+
+
+def test_a_difference_the_total_hides_reappears_behind_a_prologue():
+    """The same eight prices, summed twice: once from zero, once after a prologue.
+
+    Eight blocks of 5e-06 with the seventh three bits high. From zero the two
+    forms are one number, so this is the grouping a total-only check calls
+    free. Put one addition in front of them -- which is all a prologue is --
+    and the same two lists come to 4.095367431640626e-05 and
+    …625e-05. The difference did not go anywhere; it was hidden by the
+    particular sum that was compared, and the sum a step is actually reported
+    through is not that one.
+    """
+    five = SECONDS["aiter::five"]
+    high = math.nextafter(math.nextafter(math.nextafter(five, 1.0), 1.0), 1.0)
+    apart = [*[five] * 6, high, five]
+    together = [five] * 8
+
+    assert _fold_from(0.0, apart) == _fold_from(0.0, together) == 4e-05
+    prologue = 2.0**-20
+    assert _fold_from(prologue, apart) == 4.095367431640626e-05
+    assert _fold_from(prologue, together) == 4.095367431640625e-05
+
+    key = ContextRef("model.layers.{layer}")
+    blocks = [_op("aiter::five", context_ref=key) for _ in range(8)]
+    price = _Pricer(by_layer=lambda layer, s: high if layer == 6 else s)
+
+    _, refused = prove_grouping(detect_repeats(blocks), price)
+
+    assert len(refused) == 1
+    assert refused[0].flat_seconds == refused[0].grouped_seconds == 4e-05
+    assert f"prices it at {high!r} s" in refused[0].reason
 
 
 def test_a_price_read_from_the_shapes_alone_agrees_where_the_keyed_price_does_not():
@@ -531,6 +593,47 @@ def test_a_repeat_bound_somewhere_other_than_where_it_sits_is_not_priced():
     assert price.layers == [7, 8, 9, 10, 7]
 
 
+def test_a_step_that_splits_a_block_into_its_operators_is_refused():
+    """A step is the only record of where the block boundaries are, so it is checked.
+
+    The detector always writes the span of the period it found. A repeat built
+    by hand -- or read back from an artifact -- can carry a step that describes
+    some other body, and the failure is silent: this one would price a
+    two-operator block as two blocks a layer apart, asking about layers 1, 3
+    and 5 for a stack whose layers are 0, 1 and 2, with every price it asked
+    for perfectly real.
+
+    Operators standing side by side are one block whatever the step claims,
+    because an operator on its own and an operator inside a block are the same
+    object and no boundary between them is recorded anywhere. Read that way the
+    body spans one block, the step says two, and the two disagree in the open.
+    """
+    key = ContextRef("model.layers.{layer}")
+    body = Seq((_op("aiter::rmsnorm"), _op("aiter::tenth", context_ref=key)))
+    proposal = Seq(
+        (
+            Repeat(
+                body=body,
+                count=3,
+                index=IndexBinding("layer", step=2),
+                evidence=IdenticalStructure(signature_of(body)),
+            ),
+        )
+    )
+    price = _Pricer()
+
+    proved, refused = prove_grouping(proposal, price)
+
+    assert len(refused) == 1
+    assert (
+        "the body spans 1 of the sequence's blocks and the index steps by 2"
+        in refused[0].reason
+    )
+    assert price.asked == []
+    assert isinstance(proved, Seq)
+    assert len(proved.items) == 3
+
+
 def test_a_key_naming_two_indices_is_refused_rather_than_guessed():
     """A block sits at one position and cannot say which of two indices it is."""
     key = ContextRef("model.layers.{layer}.experts.{expert}")
@@ -571,17 +674,28 @@ def test_what_prove_grouping_refuses_to_be_handed():
 
 
 def test_nothing_in_the_proof_reads_a_symbolic_dimension():
-    """The stand-in is armed, and the whole proof runs over it.
+    """The stand-in is armed, every way in reaches it, and the proof runs over it.
 
-    Every shape in this file carries it, so this is a statement about all of
-    the above as much as about the run below: comparing two regions, keying
-    anything by one, or rebuilding an operator to carry a resolved key would
-    each reach it and fail.
+    The three ways a dimension gets read are asserted separately because they
+    are reached by different code. Hashing and dict membership are the obvious
+    two. Region-to-region equality is the one that hides: two regions built
+    from one shared dimension compare equal on it by identity before anything
+    is asked, so a file that shared a stand-in would assert this and never
+    reach it. Each operator here carries a dimension of its own, so comparing
+    two blocks raises -- and every test above runs over that.
     """
     with pytest.raises(AssertionError, match="hashed"):
         hash(TOKENS)
     with pytest.raises(AssertionError, match="compared or converted"):
         TOKENS.__eq__(TOKENS)
+
+    one, two = _block(), _block()
+    with pytest.raises(AssertionError, match="compared or converted"):
+        one.__eq__(two)
+    with pytest.raises(AssertionError, match="compared or converted"):
+        one.items[0].__eq__(two.items[0])
+    with pytest.raises(AssertionError, match="hashed"):
+        hash(one)
 
     proved, refused = prove_grouping(detect_repeats(_hybrid_stack(5)), _Pricer())
 
