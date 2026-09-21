@@ -113,9 +113,13 @@
   finding that genuinely has no line to sit on — a missing file, a count wrong
   across a whole document, a claim in the PR body rather than the diff.
 - **Four gates land a task, all required:**
-  1. ATOM's test suite passes unmodified — 187 files, no GPU needed. Needing to
-     edit an ATOM test means the change altered ATOM's behaviour and must be
-     justified on its own terms, not absorbed.
+  1. ATOM's test suite passes unmodified — in two tiers, not as one GPU-free
+     suite. P0.2 measured it: of the 187 files, 30 are plugin and 29 of the
+     remaining 157 reach the GPU driver, so what is GPU-free is a tier, run per
+     task, and the rest is a GPU superset run per wave as a delta. `16`'s
+     measured test and lint baselines carry the derivation and the counts.
+     Needing to edit an ATOM test means the change altered ATOM's behaviour and
+     must be justified on its own terms, not absorbed.
   2. New CPU-only tests for what the task added, in `tests/compass/`, in ATOM's
      style.
   3. One named result, stated in the issue body before the task is claimed and
