@@ -13,28 +13,34 @@ What each group here is defending:
   fires on any of them.
 * **No grant steps over an undelivered message.** The clock cannot check this
   about itself; it knows what it accepted, and only the driver knows what the
-  participant was handed. Every run here drives participants with two events in
-  flight, because one is the case that cannot see a horizon record losing the
-  second of them.
+  participant was handed. Every run here drives a participant holding two events
+  at **two distinct timestamps** and grants it the earlier one while the later
+  one stands, because two events at one timestamp are one horizon record and a
+  clock that kept a single record would carry them correctly. A clock kept to
+  one record is run against a deployment below and fails it.
 * **The driver decides the cost.** Three disciplines, one deployment, same
-  trace, same schedule: the two that are not the contract pay three orders of
-  magnitude more, and on a deployment whose tightest floor is a microsecond
-  neither of them finishes at all.
+  trace, same schedule: the two that are not the contract pay over five hundred
+  times as many grants, and on a deployment whose tightest floor is a
+  microsecond neither of them finishes at all.
 * **A finished run is a deadlock.** Every clean run here ends by raising
   `ClockDeadlock` with every participant reporting it had finished, because
   there is no call that says so. The test asserts that pairing rather than
   working around it.
 
-The trace is shortened. The design's sizing -- 106 prefill and 4,346 decode
-steps -- is a measurement, reported in the pull request; these runs keep the
-shape and cut the length, so this stays a tier rather than becoming a job. The
-65-participant run is cut hardest because the rule's own arithmetic is
-quadratic in the participant count and costs about 1.3 ms per grant there.
+The trace is shortened. The full-length one -- 106 prefill and 4,346 decode
+steps, the shape of a measured prior run -- is measured separately and reported
+in the pull request; these runs keep that shape and cut the length, so this
+stays a tier rather than becoming a job. The 65-participant run is cut hardest
+because the rule's own arithmetic is quadratic in the participant count and
+costs about 1.3 ms per grant there.
 """
+
+import collections
+import dataclasses
 
 import pytest
 
-from atom.compass.clock import ClockDeadlock
+from atom.compass.clock import ClockAuthority, ClockDeadlock
 
 from . import participants as behaviours
 from .deployments import DEPLOYMENTS, Deployment, Replica, Role, clock_parts
@@ -53,7 +59,7 @@ EXPECTED = (
     ("tp4-one-server", 2, 4),
     ("tp4-prefill-tp4-decode", 3, 8),
     ("tp8-role-disaggregated", 3, 16),
-    ("tp8-pp4", 6, 40),
+    ("tp8-pp4", 5, 32),
     ("eight-replicas-each-tp8", 17, 128),
     ("eight-replicas-each-tp8-pp4", 65, 512),
 )
@@ -148,21 +154,35 @@ class TestEveryDeploymentRuns:
         """
         assert report.grants > 0
 
-    def test_participants_were_driven_with_more_than_one_event_in_flight(self, report):
-        """One event in flight cannot see a horizon record losing the second."""
+    def test_participants_held_two_events_at_two_different_times(self, report):
+        """Counting messages does not reach the case the second record is for.
+
+        Two messages at one timestamp are one horizon record, so a run that
+        only ever produced those would pass a count of events in flight while
+        exercising nothing a single-record horizon gets wrong. What has to
+        happen is a participant holding two events at two times *and* being
+        granted the earlier one while the later one still stands -- both
+        counted here, and the mutant below fails on exactly this.
+        """
         assert report.events_in_flight >= 2
+        assert report.event_times_in_flight >= 2
+        assert report.grants_that_kept_a_later_event > 0
 
     def test_the_protocol_cost_stays_near_one_grant_per_step_per_participant(
         self, report
     ):
         """Where a lost driver discipline shows up before it shows up anywhere else.
 
-        The design prices a run at one grant per participant per event. Measured
-        here it is between 1.7 and 3.6, and the extra is the grant an idle
-        participant has to take up before it is allowed to ask again. A driver
-        that stopped serving the furthest-behind participant last would not be
-        slightly outside this band; on the pipelined deployments it would be
-        outside it by three orders of magnitude.
+        One grant per participant per event is the floor -- a participant that
+        does something has to be granted the time to do it in. Measured on this
+        shortened trace it is 1.7 to 3.6, and on the full-length trace 1.3 to
+        2.1; the two differ because a shorter trace pays the same idle rounds
+        over fewer steps, and the band below is set wide enough to hold both.
+        The extra over 1.0 is the grant an idle participant has to take up
+        before it is allowed to ask again. A driver that stopped serving the
+        furthest-behind participant last would not be slightly outside this
+        band; on the pipelined deployments it would be outside it by three
+        orders of magnitude.
         """
         per_step = report.grants / (report.steps * report.participants)
         assert 1.0 < per_step < 8.0
@@ -174,8 +194,22 @@ class TestEveryInventoryCategoryIsDriven:
     def test_steps_are_charged_blocks_are_real_and_the_drain_keeps_a_cadence(
         self, monkeypatch
     ):
-        """One run has to reach all three of the shapes the inventory names."""
-        seen = {"receive": 0, "poll": 0, "_drain": 0}
+        """One run has to reach all three of the shapes the inventory names.
+
+        The count that matters is the **blocking** read, not the call that
+        asks for none. `receive` is called on every grant and most of those
+        calls ask for zero messages, so counting calls says nothing; counting
+        `inbox.get(timeout=...)` counts the real parks, and that number is
+        pinned to the messages rather than merely compared with them -- every
+        message is read exactly once, so anything other than equality means a
+        message was delivered without a park or a park happened without one.
+
+        The drain is pinned the same way. `poll` is reached only through
+        `_drain`, so equality is the statement -- a drain tick that stopped
+        polling would break it, and the inequality it replaces could not.
+        """
+        seen = {"poll": 0, "_drain": 0}
+        blocking_reads = collections.Counter()
 
         def counting(owner, name):
             original = getattr(owner, name)
@@ -186,14 +220,24 @@ class TestEveryInventoryCategoryIsDriven:
 
             monkeypatch.setattr(owner, name, wrapped)
 
-        counting(behaviours._Participant, "receive")
+        def counted_receive(self, count):
+            if count:
+                blocking_reads[str(self.lp_id)] += count
+            return [
+                self.inbox.get(timeout=behaviours.REAL_BLOCK_SECONDS)
+                for _ in range(count)
+            ]
+
+        monkeypatch.setattr(behaviours._Participant, "receive", counted_receive)
         counting(behaviours._Participant, "poll")
         counting(behaviours.EngineStage, "_drain")
-        report = SyntheticRun(DEPLOYMENTS[1], BRIEF).run()
+        deployment = DEPLOYMENTS[1]
+        report = SyntheticRun(deployment, BRIEF).run()
         assert report.steps > 0
-        assert seen["receive"] > report.messages
+        assert sum(blocking_reads.values()) == report.messages
+        assert set(blocking_reads) == {str(lp_id) for lp_id in deployment.participants}
         assert seen["_drain"] > 0
-        assert seen["poll"] >= seen["_drain"]
+        assert seen["poll"] == seen["_drain"]
 
     def test_an_idle_stretch_is_crossed_in_one_grant(self, report):
         """The idle step loop jumps rather than spinning, which is the point.
@@ -235,12 +279,13 @@ class TestTheDriverDecidesTheCost:
 
         Both disciplines here ask until they are refused. The only difference
         is which participant is offered its turn last, and on a two-role
-        deployment with millisecond floors that alone more than halves the
-        grants while charging exactly the same steps. Both are capped, because
-        the losing one does not always stop on its own: served in name order a
-        three-participant run that has finished every step of its work keeps
-        being granted time, at about 19 ms a pass, rather than reaching the
-        state that ends a run.
+        deployment with millisecond floors that alone costs half as many grants
+        again while charging exactly the same steps. Both are capped, because
+        the losing one does not always stop on its own: on a longer trace than
+        this one, served in name order, a three-participant run that has charged
+        every step of its work keeps being granted time -- 400,000 grants and
+        1,271 s of modelled time past the last of its 168 steps, about 3 ms a
+        grant -- rather than reaching the state that ends a run.
         """
         pair = DEPLOYMENTS[1]
         trace = scaled(DESIGN_WORKLOAD, requests=4, decode_steps=4)
@@ -251,8 +296,68 @@ class TestTheDriverDecidesTheCost:
         assert last.unfinished == named.unfinished == ()
 
 
+class _OneRecordHorizon(ClockAuthority):
+    """A clock that keeps only the earliest event accepted for a participant.
+
+    The shape a horizon has when its accepted side is one slot instead of a
+    list. It is correct for a participant holding one event, and correct for a
+    participant holding several at one timestamp, because the horizon is the
+    minimum either way. It loses the second of two events at two timestamps:
+    reaching the first empties the slot, and nothing then holds the participant
+    at the second.
+    """
+
+    def schedule_event(self, source, target, timestamp):
+        grants = super().schedule_event(source, target, timestamp)
+        accepted = self._accepted[target]
+        if len(accepted) > 1:
+            self._accepted[target] = [min(accepted)]
+            self._restate_horizon(target)
+        return grants
+
+
 class TestTheChecksFire:
     """A harness whose checks cannot fail is not checking anything."""
+
+    def test_a_clock_that_keeps_one_horizon_record_is_caught(self):
+        """The defect the second record exists for, run against this harness.
+
+        Not a broken driver: the driver is untouched and the clock is the thing
+        narrowed. It is caught because the traffic source offers a pair of
+        requests a tokenisation apart, so the engine they go to holds two
+        events at two timestamps and is granted the first while the second
+        stands -- the one shape in which the record that was dropped was the
+        one carrying an event.
+        """
+        run_under_test = SyntheticRun(
+            DEPLOYMENTS[1], scaled(DESIGN_WORKLOAD, 4, 2), clock=_OneRecordHorizon
+        )
+        with pytest.raises((SteppedOverEvent, ClockDeadlock)) as raised:
+            run_under_test.run()
+        assert raised.type is SteppedOverEvent
+
+    def test_the_one_record_clock_passes_the_run_that_never_holds_two_times(self):
+        """The mutant is discriminating, which is the other half of the claim.
+
+        A check that failed whatever it was pointed at would prove nothing
+        about the shape it is named for. Stretch the tokenisation slice past
+        twice the admission delay and the engine is released to the first
+        request before the second is offered, so the run holds one event at a
+        time -- and the narrowed clock, which is wrong, completes it with
+        nothing raised. That is the state the six deployments were in before
+        the slice was charged, and it is why a grant count taken from them was
+        no evidence about the second record.
+        """
+        trace = scaled(DESIGN_WORKLOAD, 4, 2)
+        one_at_a_time = dataclasses.replace(trace, tokenise_seconds=44.0e-3)
+        report = SyntheticRun(DEPLOYMENTS[1], one_at_a_time).run()
+        assert report.event_times_in_flight == 1
+        assert report.grants_that_kept_a_later_event == 0
+        narrowed = SyntheticRun(
+            DEPLOYMENTS[1], one_at_a_time, clock=_OneRecordHorizon
+        ).run()
+        assert narrowed.unfinished == ()
+        assert narrowed.grants == report.grants
 
     def test_a_message_held_back_is_reported_as_a_step_over(self):
         """Break the delivery, not the clock, and the harness must notice."""

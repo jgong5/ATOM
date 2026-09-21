@@ -80,9 +80,15 @@ class Replica:
         return self.tp * self.pp
 
     def stage_ids(self) -> tuple[LpId, ...]:
-        """One identity per stage, zero-padded so the name order is the index order."""
+        """One identity per stage, zero-padded so the name order is the index order.
+
+        Both numbers are padded, not just the replica's. The registry sorts by
+        name, so an unpadded `stage-10` sorts before `stage-2` and the sentence
+        above stops being true at ten stages -- which nothing here reaches, and
+        which is exactly why it would be found late.
+        """
         return tuple(
-            LpId(f"{self.role.value}-{self.index:02d}.stage-{stage}")
+            LpId(f"{self.role.value}-{self.index:02d}.stage-{stage:02d}")
             for stage in range(self.pp)
         )
 
@@ -121,14 +127,20 @@ def _roles(count: int, tp: int, pp: int) -> tuple[Replica, ...]:
 #: The arrangements ATOM is deployed in, smallest first. The participant count
 #: is a property of the collapse and is asserted; the GPU count is derived from
 #: the widths and is reported.
+#:
+#: The two pipelined rows place their stages differently and are not two sizes
+#: of one arrangement. `tp8-pp4` is **aggregated**: one replica does prefill and
+#: decode, four stages deep, so it is four engine participants plus the traffic
+#: source and 8 x 4 = 32 GPUs. `eight-replicas-each-tp8-pp4` is
+#: **role-disaggregated** with four stages on *both* roles, which is 16 replicas
+#: of four stages, 64 engine participants plus the traffic source, and 512 GPUs.
+#: Saying which one a row is matters because the participant count follows from
+#: it and the grant count follows from the participant count.
 DEPLOYMENTS = (
     Deployment("tp4-one-server", (Replica(Role.ENGINE, 0, 4, 1),)),
     Deployment("tp4-prefill-tp4-decode", _roles(1, 4, 1)),
     Deployment("tp8-role-disaggregated", _roles(1, 8, 1)),
-    Deployment(
-        "tp8-pp4",
-        (Replica(Role.PREFILL, 0, 8, 1), Replica(Role.DECODE, 0, 8, 4)),
-    ),
+    Deployment("tp8-pp4", (Replica(Role.ENGINE, 0, 8, 4),)),
     Deployment("eight-replicas-each-tp8", _roles(8, 8, 1)),
     Deployment("eight-replicas-each-tp8-pp4", _roles(8, 8, 4)),
 )

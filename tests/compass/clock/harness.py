@@ -24,18 +24,32 @@ furthest-behind participant is the one holding everybody else's bound, and while
 it stands still the others can catch up to it and park. Serve it first instead
 and it advances one floor, which puts every peer one floor behind it, and they
 are all granted that floor, and one of them is then the laggard. Measured on the
-four-request trace: the two-role deployment costs 1,723 grants served in name
-order and 729 served laggard-last, and the pipelined one does not finish at all
-in name order -- 2,000,000 grants bought 0.454 s of modelled time and 11 of its
-660 steps, because its tightest floor is a microsecond. Laggard-last runs the
-same trace in 7,997 grants.
+four-request trace: the two-role deployment served laggard-last charges its 168
+steps in **740** grants and stops, and served in name order it charges the same
+168 steps and then does not stop at all -- 400,000 grants and 1,271 s of
+modelled time later it is still being handed time, about 3 ms of it a grant. The
+pipelined one is worse because its tightest floor is a microsecond: laggard-last
+charges its 672 steps in **3,924** grants, and name order buys 33 of those steps
+and 0.549 s of modelled time for two million.
+
+**This half is not a contract a participant can keep.** A participant knows its
+own clock and nothing else; which of them is furthest behind is a fact about all
+of them at once, so it is knowable only where all the clocks are, and in a real
+deployment nobody chooses the order at all -- the host scheduler does, and the
+run lands somewhere between the two columns above. The half a participant *can*
+keep is the asking; the ordering has to be enforced wherever the clocks are held
+or it is not enforced. What that costs and what it buys is measured in the pull
+request, and it is not built here.
 
 The driver also holds the check the clock cannot make for itself. The clock
 knows the events it has accepted for a participant; only the harness knows which
 of them it has actually handed over. **No grant may move a participant past the
 timestamp of a message it has not been given**, and that is asserted on every
-grant of every run here. It is the shape a single-event driver cannot see:
-reaching the first of two events in flight must not forget the second.
+grant of every run here. It is the shape a single-record horizon cannot see:
+reaching the first of two events at two timestamps must not forget the second,
+which is why the traffic source offers a pair a tokenisation apart rather than
+together and why the run reports the distinct timestamps it held, not just the
+messages.
 
 **There is no way to say a participant has finished.** A run that ends with
 everybody parked and nothing left to do is exactly the deadlock condition, so a
@@ -95,6 +109,8 @@ class RunReport:
     modelled_seconds: float
     wall_seconds: float
     events_in_flight: int
+    event_times_in_flight: int
+    grants_that_kept_a_later_event: int
     longest_grant_seconds: float
     unfinished: tuple[str, ...]
     stopped_by: str
@@ -123,26 +139,44 @@ class SyntheticRun:
         workload,
         discipline=Discipline.PARK_LAGGARD_LAST,
         grant_cap=None,
+        clock=ClockAuthority,
     ):
         registry, matrix = clock_parts(deployment)
         self.deployment = deployment
         self.workload = workload
         self.discipline = discipline
         self.grant_cap = grant_cap
-        self.clock = ClockAuthority(registry, matrix)
+        # Named rather than built in place so a run can be driven against a
+        # narrowed clock and the difference stays one argument. The checks
+        # below are about the clock, and a check that cannot be pointed at a
+        # broken one is a check nobody has seen fail.
+        self.clock = clock(registry, matrix)
         self.people = build(deployment, workload)
         self.ids = registry.ids()
         self.pending = {lp_id: [] for lp_id in self.ids}
         self.messages = 0
         self.events_in_flight = 0
+        self.event_times_in_flight = 0
+        self.grants_that_kept_a_later_event = 0
         self.longest_grant_seconds = 0.0
 
     def send(self, source, target, when, payload):
-        """Place a message on a peer: on the clock first, then in the harness."""
+        """Place a message on a peer: on the clock first, then in the harness.
+
+        Two counts, because they are different questions. How many messages a
+        participant is holding says nothing about the horizon: two of them at
+        one timestamp are one record, and a clock that kept a single record
+        would carry them correctly. How many **distinct timestamps** it is
+        holding is the number the second record exists for.
+        """
         self.clock.schedule_event(source, target, when)
         self.pending[target].append((when, payload))
         self.messages += 1
-        self.events_in_flight = max(self.events_in_flight, len(self.pending[target]))
+        held = self.pending[target]
+        self.events_in_flight = max(self.events_in_flight, len(held))
+        self.event_times_in_flight = max(
+            self.event_times_in_flight, len({row[0] for row in held})
+        )
 
     def run(self):
         """Drive until the clock says nothing can move, and report."""
@@ -212,11 +246,20 @@ class SyntheticRun:
             )
 
     def _hand_over(self, lp_id, grant):
-        """Give the participant every message whose time it has now reached."""
+        """Give the participant every message whose time it has now reached.
+
+        A grant that delivers something and leaves something else still pending
+        is counted, because it is the only shape in which the second horizon
+        record is load-bearing: the clock has to carry the event it did not
+        release past this take-up, and a single-record horizon loses it here and
+        nowhere else.
+        """
         held = self.pending[lp_id]
         due = [payload for when, payload in held if when <= grant.advance_to]
         if due:
             self.pending[lp_id] = [row for row in held if row[0] > grant.advance_to]
+            if self.pending[lp_id]:
+                self.grants_that_kept_a_later_event += 1
             for payload in due:
                 self.people[lp_id].inbox.put(payload)
         return len(due)
@@ -237,6 +280,8 @@ class SyntheticRun:
             modelled_seconds=max(self.clock.now(lp_id) for lp_id in self.ids),
             wall_seconds=wall_seconds,
             events_in_flight=self.events_in_flight,
+            event_times_in_flight=self.event_times_in_flight,
+            grants_that_kept_a_later_event=self.grants_that_kept_a_later_event,
             longest_grant_seconds=self.longest_grant_seconds,
             unfinished=tuple(
                 str(lp_id) for lp_id in self.ids if not self.people[lp_id].finished
@@ -246,11 +291,11 @@ class SyntheticRun:
 
 
 def main():
-    """Print the grant table the design's sizing is compared against.
+    """Print the grant table for the full-length trace, a row at a time.
 
-    A row at a time, because the largest deployment is an hour of arithmetic on
-    its own and a run that prints nothing until the last of them reads exactly
-    like a run that has hung.
+    A row at a time because the largest deployment is about an hour of
+    arithmetic on its own, and a run that prints nothing until the last of them
+    reads exactly like a run that has hung.
     """
     for deployment in DEPLOYMENTS:
         report = SyntheticRun(deployment, DESIGN_WORKLOAD).run()
@@ -259,7 +304,10 @@ def main():
         print(
             f"    unfinished: {', '.join(report.unfinished) or 'none'}; "
             f"messages {report.messages}; most events in flight on one "
-            f"participant {report.events_in_flight}"
+            f"participant {report.events_in_flight} at "
+            f"{report.event_times_in_flight} distinct times; grants that "
+            f"delivered one event and kept a later one "
+            f"{report.grants_that_kept_a_later_event}"
         )
     print()
     trace = scaled(DESIGN_WORKLOAD, 4)

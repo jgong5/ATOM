@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: MIT
 """Synthetic participants driving the clock, without ATOM and without a GPU.
 
-Three modules and one test file:
+What a clock-driven run is built out of:
 
 * `deployments` — which participants a deployment has, and the floor on every
   ordered pair between them. This is where the collapse lives: adding tensor- or
@@ -12,5 +12,12 @@ Three modules and one test file:
 * `harness` — the driver. It decides when a participant asks for time, which is
   the thing that decides whether a run skips idle or crawls, and it holds the
   checks that a run is not quietly wrong.
-* `test_synthetic_deployments` — the six deployments, run.
+
+That is a description of the parts, **not a census of the directory**, and it
+deliberately gives no count. A docstring that enumerates its own package is
+wrong the first time anybody adds a file and then stays wrong quietly: this one
+said "three modules and one test file" and was overtaken twice in one afternoon,
+by two different branches, neither of which could correct it without colliding
+with a review in flight. Anything else that lands beside these is found by
+listing the directory.
 """

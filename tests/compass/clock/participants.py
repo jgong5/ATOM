@@ -64,11 +64,30 @@ class Message(enum.Enum):
 class Workload:
     """The trace a run replays, in steps and modelled seconds.
 
-    The design's sizing is 106 prefill and 4,346 decode steps over 267 s of
-    modelled time. Requests arrive in groups rather than one at a time, because
-    4,346 decode steps for 106 requests means requests were resident together --
-    and because a participant with only ever one event in flight never exercises
-    the part of the clock that holds more than one.
+    A measured prior run is 106 prefill and 4,346 decode steps over 267 s of
+    modelled time, and that is what `DESIGN_WORKLOAD` below carries. Requests
+    arrive in groups rather than one at a time, because 4,346 decode steps for
+    106 requests means requests were resident together -- and because a
+    participant with only ever one event in flight never exercises the part of
+    the clock that holds more than one.
+
+    `tokenise_seconds` is why two requests that arrive together are not offered
+    together. They are tokenised one after another on one executor, so the
+    second is offered a tokenisation later than the first, and the engine they
+    both go to can then hold two events at **two** timestamps rather than two
+    at one -- which is the shape a horizon with a single record cannot carry.
+
+    Whether it actually does is decided by this field against the admission
+    delay, and the threshold is not the obvious one. While the engine is parked
+    on the first request the source is bounded at that request's timestamp plus
+    the floor back out again, which is one tokenisation plus *two* admission
+    delays -- so the second request is offered onto an engine that still holds
+    the first exactly while the slice is at most twice the admission delay.
+    Measured on the two-role deployment at a 9 ms admission delay: 18 ms holds
+    two events at two timestamps, 20 ms holds one at a time, and so does a
+    slice of zero. A trace of long prompts therefore exercises *less* of the
+    clock than a trace of short ones, which is the opposite way round from most
+    sizing knobs and is why the value is stated here rather than buried.
     """
 
     requests: int
@@ -78,10 +97,18 @@ class Workload:
     prefill_step_seconds: float
     decode_step_seconds: float
     arrival_interval_seconds: float
+    tokenise_seconds: float
 
 
 #: The measured prior run: 106 prefill + 4,346 decode steps, last response at
-#: about 267 s of modelled time.
+#: about 267 s of modelled time. The tokenisation slice is **declared, not
+#: measured** -- it is a millisecond, a short prompt at a few million tokens a
+#: second -- and it is the one number here that was chosen rather than taken
+#: from the prior run, because the prior run did not record it. It is stated
+#: rather than folded into the 9 ms admission delay because it is charged per
+#: request while the admission delay is charged per hop, and because the two
+#: together decide whether a pair of requests is resident on one engine at two
+#: timestamps or at one.
 DESIGN_WORKLOAD = Workload(
     requests=106,
     requests_per_arrival=2,
@@ -90,6 +117,7 @@ DESIGN_WORKLOAD = Workload(
     prefill_step_seconds=0.30,
     decode_step_seconds=0.054,
     arrival_interval_seconds=5.0861,
+    tokenise_seconds=1.0e-3,
 )
 
 
@@ -103,6 +131,7 @@ def scaled(workload: Workload, requests: int, decode_steps: int = 0) -> Workload
         prefill_step_seconds=workload.prefill_step_seconds,
         decode_step_seconds=workload.decode_step_seconds,
         arrival_interval_seconds=workload.arrival_interval_seconds,
+        tokenise_seconds=workload.tokenise_seconds,
     )
 
 
@@ -145,7 +174,13 @@ class _Participant:
 
 
 class TrafficSource(_Participant):
-    """Offers requests at modelled arrival times and waits for their responses."""
+    """Offers requests at modelled arrival times and waits for their responses.
+
+    Requests arrive in groups and are **offered one at a time**, a tokenisation
+    apart, because that is what tokenising them one after another on a single
+    executor does to their offer times. It is the reason an engine here holds
+    two accepted events at two distinct timestamps rather than two at one.
+    """
 
     def __init__(self, workload, targets):
         super().__init__(TRAFFIC_SOURCE)
@@ -154,21 +189,29 @@ class TrafficSource(_Participant):
         self.arrivals = collections.deque()
         request = 0
         for slot in range(workload.requests // workload.requests_per_arrival):
-            when = slot * workload.arrival_interval_seconds
+            arrived = slot * workload.arrival_interval_seconds
             target = targets[slot % len(targets)]
-            for _ in range(workload.requests_per_arrival):
-                self.arrivals.append((when, request, target))
+            for index in range(workload.requests_per_arrival):
+                offered = arrived + (index + 1) * workload.tokenise_seconds
+                self.arrivals.append((offered, request, target))
                 request += 1
 
     def horizon(self, now):
-        """The next arrival, or nothing at all while it waits for a response.
+        """When the next request finishes tokenising, or nothing at all.
 
-        `atom/model_engine/llm_engine.py:745` stamps a request's arrival from the
-        clock, and every queueing age and reported latency is measured from that
-        stamp, so the arrival time is modelled time and the offer happens when
-        the clock reaches it. With no arrival left this declares no horizon,
-        which is the category-B park of
-        `atom/entrypoints/openai/api_server.py::generate_async::token_queue.get()
+        `atom/entrypoints/openai/api_server.py::generate_async::
+        loop.run_in_executor(None, do_preprocess)::executor_handoff#0` hands a
+        request's prompt to one executor and awaits it, so tokenisation is a
+        duration the run has to charge and requests that arrived together come
+        out of it one after another. The duration comes from the trace rather
+        than from however long this machine's tokeniser takes, which is what
+        makes the offer times a property of the workload and not of the host.
+
+        Past it, `atom/model_engine/llm_engine.py:745` stamps the request's
+        arrival from the clock and every queueing age and reported latency is
+        measured from that stamp, so the offer happens when the clock reaches
+        it. With no arrival left this declares no horizon, which is the
+        category-B park of `api_server.py::generate_async::token_queue.get()
         ::queue_get#0` -- the request's own coroutine waiting for its next chunk.
         """
         return self.arrivals[0][0] if self.arrivals else math.inf
@@ -230,8 +273,10 @@ class EngineStage(_Participant):
         Declaring nothing is not the same as having nothing to do: it is what
         makes the idle step loop jump instead of spinning, which
         `atom/model_engine/engine_core.py::EngineCore.busy_loop::while True::
-        spin_loop#0` says it must, since that loop turns with no pause and no
-        blocking call when the scheduler is empty.
+        spin_loop#0` and its pipelined sibling
+        `atom/model_engine/pp_engine_core.py::PPEngineCoreProc._head_busy_loop::
+        while True::spin_loop#0` both say it must, since those loops turn with no
+        pause and no blocking call when the scheduler is empty.
         """
         self._start_slice(now)
         dues = [due for due in (self._step_due, self._drain_due) if due is not None]
