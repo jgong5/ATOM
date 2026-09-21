@@ -87,6 +87,56 @@ class TestOutlierRejection:
         coeffs, dropped = _least_squares(rows, targets)
         assert coeffs is None and dropped == 0
 
+    def test_a_region_the_model_gets_wrong_is_not_called_contamination(self):
+        """The filter must reject bad samples, not bad predictions.
+
+        Its threshold is built from the fit's own residuals, so a region the
+        model is systematically wrong about looks exactly like contamination
+        and gets deleted -- taking with it the only evidence that would have
+        corrected the model. On the 27B table this emptied the small end: 90.6%
+        of prefill rows under 1024 tokens dropped, and 28 of the 28 rows holding
+        a short chunk at deep context, which is the shape every request ends
+        with. The floor is what separates the two.
+        """
+        sizes = list(range(100, 1600, 100))
+        rows, targets = self._linear(sizes)
+        for i in range(4):                      # a whole region, 25% off
+            targets[i] *= 1.25
+        coeffs, dropped = _least_squares(rows, targets)
+        assert dropped == 0
+        # And without the floor the same points go, which is the behaviour this
+        # pins against: the assertion above is a change, not a restatement.
+        _, dropped_unfloored = _least_squares(rows, targets, outlier_floor=0.0)
+        assert dropped_unfloored >= 1
+
+    def test_an_autotuning_launch_still_goes(self):
+        """The floor sits in a measured gap, not above the contamination.
+
+        Sorted by relative residual the 27B table reads 99.2%, 98.3%, 97.9% --
+        three Triton autotuning launches -- then nothing until 46.9%. A floor of
+        0.5 is inside that gap, so it keeps rejecting what the pass exists for.
+        """
+        sizes = list(range(100, 1600, 100))
+        rows, targets = self._linear(sizes)
+        targets[3] *= 30.0
+        _, dropped = _least_squares(rows, targets)
+        assert dropped >= 1
+
+    def test_the_drops_are_reported_per_band(self, caplog):
+        """One total cannot say whether the losses emptied a region."""
+        import logging
+        sizes = list(range(100, 1600, 100))
+        rows, targets = self._linear(sizes)
+        targets[3] *= 30.0
+        with caplog.at_level(logging.INFO):
+            _least_squares(rows, targets, band_column=1,
+                           band_edges=(400.0, 1000.0), label="prefill")
+        line = "\n".join(r.getMessage() for r in caplog.records)
+        assert "prefill fit dropped 1 of 15" in line
+        # The bands, not just the total: a region emptied and a region grazed
+        # have to read differently.
+        assert "0..400: 0/3" in line and "400..1000: 1/6" in line
+
 
 class TestOracle:
     def test_decode_cost_grows_with_context(self, tmp_path):

@@ -279,6 +279,8 @@ def _drop_constant_columns(rows: list[list[float]]) -> tuple[list[list[float]], 
 
 def _least_squares(
     rows: list[list[float]], targets: list[float], outlier_sigmas: float = 4.0,
+    outlier_floor: float = 0.5, band_column: int = 0,
+    band_edges: tuple[float, ...] = (), label: str = "",
 ) -> tuple[Optional[list[float]], int]:
     """Least squares, resistant to one-off contamination.
 
@@ -297,6 +299,13 @@ def _least_squares(
     deviation, since the contaminating points would otherwise inflate the very
     quantity used to detect them.
 
+    The spread sets how far out a point must be, and ``outlier_floor`` sets how
+    far out it must be in absolute terms as well. Without the floor the test is
+    purely comparative, and a comparative test on a model's own residuals
+    deletes the model's own errors -- see the comment at the rejection itself
+    for what that cost. With it, a fit that has become very good stops reaching
+    further in as a reward for improving.
+
     **Fitted on relative error, not absolute.** Ordinary least squares minimises
     seconds-squared, so a 250 ms sample counts sixty times a 32 ms one, and a
     prefill sweep spanning 64 to 16 000 tokens is decided almost entirely by its
@@ -311,12 +320,18 @@ def _least_squares(
     Returns the coefficients and how many points were dropped. The count is
     returned rather than logged and forgotten: a fit that quietly discarded half
     its evidence should not describe itself the same way as one that kept it.
+    Pass ``band_edges`` and ``band_column`` to also log the drops per band of
+    that feature, since one total says nothing about whether the losses fell
+    evenly or emptied a region.
     """
     try:
         import numpy as np
     except ImportError:  # pragma: no cover - numpy is a hard dep of torch
         return None, 0
     full_width = len(rows[0])
+    # Kept under its own name: `rows` is about to lose its constant columns,
+    # and the band report indexes the caller's feature width, not the reduced one.
+    original = rows
     # A feature with no variance in these samples cannot have a coefficient
     # identified for it, and leaves the normal equations singular. Dropped
     # here and returned as zero, so a rung calibrated without ragged batches
@@ -355,10 +370,49 @@ def _least_squares(
     if mad <= 0.0:
         return _expand(coeffs), 0
 
-    keep = residuals <= np.median(residuals) + outlier_sigmas * mad
+    # Rejected if far outside the spread of the rest -- but never for being
+    # merely further out than the rest. Both halves matter, and the second is
+    # the one that was missing.
+    #
+    # A residual is the model's error. A filter set from the residuals alone
+    # cannot tell "this sample is contaminated" from "the model is wrong here",
+    # and on the 27B table it resolved that ambiguity by deleting the evidence:
+    # 236 of 1512 prefill rows, but 90.6% of rows under 1024 tokens and 28 of
+    # the 28 rows holding a short chunk at deep context -- the one shape every
+    # request ends with, and the region the model was least accurate in. It
+    # also tightened as the model improved, since a better fit has a smaller
+    # MAD: the same table lost 138 rows before the per-request attention fix
+    # and 236 after it.
+    #
+    # The two populations do separate, just not there. Sorted by relative
+    # residual the table reads 99.2%, 98.3%, 97.9% -- the three Triton
+    # autotuning launches, 11.4 s, 6.0 s and 4.4 s at 8, 64 and 32 tokens --
+    # and then nothing until 46.9%. A floor anywhere in that gap keeps the
+    # rejection and stops the deletion. Measured on the four held-out
+    # cc-traces rungs, it is worth 1.2 points: 11.4% mean error against 10.2%.
+    threshold = max(float(np.median(residuals) + outlier_sigmas * mad),
+                    outlier_floor)
+    keep = residuals <= threshold
     dropped = int((~keep).sum())
     if not dropped or int(keep.sum()) < width + 1:
         return _expand(coeffs), 0
+
+    # Per band, not one total. A fit that keeps 84% of its rows overall and 9%
+    # of one region should not describe itself the same way as one that kept
+    # them evenly, and the total is what hid this for the whole of #67 and #97.
+    if band_edges:
+        edges = (0.0,) + tuple(band_edges) + (float("inf"),)
+        parts = []
+        column = np.asarray([r[band_column] for r in original], dtype=float)
+        for lo, hi in zip(edges, edges[1:]):
+            band = (column >= lo) & (column < hi)
+            n = int(band.sum())
+            if n:
+                parts.append(f"{lo:g}..{hi:g}: {int((band & ~keep).sum())}/{n}")
+        logger.info("ATOMCompass %s fit dropped %d of %d rows at relative "
+                    "residual > %.2f, by %s: %s", label or "least-squares",
+                    dropped, len(residuals), threshold,
+                    f"column {band_column}", "  ".join(parts))
 
     refit, *_ = np.linalg.lstsq(aw[keep], bw[keep], rcond=None)
     return _expand(refit), dropped
@@ -507,8 +561,13 @@ class CalibratedCostOracle:
         # than an extrapolation that can be arbitrarily wrong.
         if prefill_targets:
             self._fallback_prefill = sum(prefill_targets) / len(prefill_targets)
+            # Banded on column 1, the new-token count. Those edges are the
+            # prefill chunk size and its halves: a full chunk, a substantial
+            # partial one, and the short final chunk every request ends with.
             self._prefill, self._dropped_prefill = _least_squares(
-                prefill_rows, prefill_targets)
+                prefill_rows, prefill_targets,
+                band_column=1, band_edges=(1024.0, 4096.0, 16384.0),
+                label="prefill")
             if self._prefill is not None and self._warmup_enabled:
                 # After the fit, so "what its shape predicts" means the model
                 # this table produced, not one contaminated by the very steps
@@ -519,7 +578,8 @@ class CalibratedCostOracle:
         if decode_targets:
             self._fallback_decode = sum(decode_targets) / len(decode_targets)
             self._decode, self._dropped_decode = _least_squares(
-                decode_rows, decode_targets)
+                decode_rows, decode_targets,
+                band_column=1, band_edges=(4.0, 16.0, 64.0), label="decode")
 
         # Per rung. Three samples is the floor for two coefficients plus a
         # residual worth calling one; below that the rung falls back rather than
