@@ -436,8 +436,10 @@ carries.
   loop — step cost to queueing to a different batch — is what the whole design rests on,
   and constants cannot exercise it.
   - *Not* "the step time doubles". Measured against the form this section mandates, at
-    `b`=5e-7, `c`=2e-8 and a 256→512 single-request chunk: the intercept is 1.00x, the
-    token term exactly 2.00x, the quadratic exactly 4.00x, and the total **1.8836x**.
+    `a`=2e-5, `b`=5e-7, `c`=2e-11 and a 256→512 single-request *first* chunk — so the
+    cross term is zero and `d` does not enter: the step goes **149.31 µs → 281.24 µs**,
+    the intercept 1.00x, the token term exactly 2.00x, the quadratic exactly 4.00x, and
+    the total **1.8836x**.
     The total doubles only when `a = c = d = 0`, which is the degenerate linear case —
     i.e. only by deleting the quadratic term this same section requires. The property
     that holds for the mandated form is term by term, and the exit criterion of any task

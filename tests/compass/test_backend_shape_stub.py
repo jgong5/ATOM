@@ -46,6 +46,7 @@ from atom.compass.backends import (
 from atom.compass.backends.shape import (
     CANDIDATE,
     DECLARED,
+    UNCHECKED_RUNG,
     sum_context,
     sum_query_cached,
     sum_query_context,
@@ -57,9 +58,12 @@ from atom.sampling_params import SamplingParams
 
 # The two switches that publish ATOM's attention aggregates. Both are settable
 # from outside the scheduler -- one an env flag read once into
-# `_detailed_annotation_enabled`, the other the public `profile_active` the
-# profiler RPC flips -- so a stand-in for them is a stand-in for two
-# assignments and not for any code that would have to be written.
+# `_detailed_annotation_enabled`, the other the public `profile_active`, which
+# is a plain attribute -- so a stand-in for them is a stand-in for two
+# assignments and not for any code that would have to be written. Assign the
+# attribute; do not reach for the start-profile RPC that also flips it, because
+# that call starts a real torch profiler on the runner first and writes trace
+# files, which is not something a run with no device should be doing.
 PUBLISHING = SimpleNamespace(profile_active=True, _detailed_annotation_enabled=True)
 
 
@@ -225,6 +229,25 @@ class TestPerRequestSums:
                 def __post_init__(self) -> None:
                     return None
 
+    def test_a_subclass_that_redefines_nothing_is_accepted(self):
+        """The guard refuses shadowing, not subclassing, and this is which.
+
+        Adding a field changes nothing about where the sums come from, so it
+        is allowed; the sums still run over the rows.
+        """
+
+        @dataclass(frozen=True)
+        class Tagged(BatchView):
+            label: str = ""
+
+        view = Tagged((prefill(256, cached=768), prefill(256, cached=768)), label="x")
+        assert sum_query_context(view.requests) == 2 * 256 * 1024
+        assert ShapeStubBackend().estimate(view).seconds == pytest.approx(
+            ShapeStubBackend()
+            .estimate(BatchView((prefill(256, cached=768), prefill(256, cached=768))))
+            .seconds
+        )
+
     def test_two_batches_that_collapse_alike_are_priced_apart(self):
         """The rank deficiency, shown rather than described.
 
@@ -299,6 +322,29 @@ class TestTheRung:
     def test_without_a_rung_the_padding_term_is_zero_and_still_named(self):
         step = ShapeStubBackend().estimate(BatchView((decode(10), decode(10))))
         assert named(step)["decode.graph_padding"] == 0.0
+
+    def test_a_rung_no_ladder_would_hold_is_priced_and_labelled(self):
+        """The one rung disagreement the rows cannot settle, pinned.
+
+        A rung narrower than its rows is refused because the padding would go
+        negative; a rung wider than any ladder would hold is not refusable
+        from the rows, so it is charged at face value and the term says the
+        width came from the caller. A successor that bounds the rung breaks
+        this test rather than leaving the module's paragraph stale.
+        """
+        view = BatchView((decode(100),), capture_rung=10**9)
+        assert view.graph_padding == 10**9 * 100 - 100
+        step = ShapeStubBackend().estimate(view)
+        assert named(step)["decode.graph_padding"] == pytest.approx(99.9999999)
+        padding = {name: prov for name, _, prov in step.rows()}
+        assert UNCHECKED_RUNG in padding["decode.graph_padding"]
+
+    def test_with_no_rung_the_padding_term_carries_no_rung_qualifier(self):
+        """Nothing was supplied, so there is no unchecked width to declare."""
+        step = ShapeStubBackend().estimate(BatchView((decode(10), decode(10))))
+        padding = {name: prov for name, _, prov in step.rows()}
+        assert UNCHECKED_RUNG not in padding["decode.graph_padding"]
+        assert DECLARED in padding["decode.graph_padding"]
 
 
 # ── constant mode ───────────────────────────────────────────────────────────

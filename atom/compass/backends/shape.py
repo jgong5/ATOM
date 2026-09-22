@@ -58,16 +58,26 @@ was measured false. The type does not make the collapsed form unreachable.
 A one-row `BatchView` *is* `tokens x history` -- `RequestShape(512, 2048)`
 alone sums to 1048576 where the two 256-token rows it collapses sum to
 524288 -- and nothing in the type ties the row count to the number of
-requests a scheduler scheduled. `capture_rung` is a batch-level scalar field,
-correctly so, because a rung is a property of the replayed graph rather than
-of the rows; it is checked against the decode rows in both directions but is
-unbounded above and enters the price linearly, so a rung nobody would pass
-prices a single decode row at any duration one likes. Subclassing is refused
-outright (see `_refuse_shadowing`), which closes the two routes that fabricate
-a reading from a field a subclass added; the row count is not closed here and
-cannot be. What closes it is the projection -- one row per scheduled request,
-built by whoever holds the scheduled batch -- and that builder does not live
-in this package yet.
+requests a scheduler scheduled. Shadowing a reader is refused outright (see
+`_refuse_shadowing`); a subclass that adds a field and redefines nothing is
+accepted, and its sums still come from its rows. That closes the two routes
+that fabricate a reading from a field a subclass added. The row count it does
+not close and cannot: what closes that is the projection -- one row per
+scheduled request, built by whoever holds the scheduled batch -- and that
+builder does not live in this package yet.
+
+`capture_rung` is a batch-level scalar, correctly so, because a rung is a
+property of the replayed graph rather than of any row. Two disagreements with
+the rows are refused: a rung with no decode rows names a graph that replayed
+nothing, and a rung narrower than the decode row count makes the padding
+negative. Both are contradictions the rows settle by themselves. A rung far
+wider than the rows is not -- rows cannot contradict a width, only a ladder of
+captured widths can, and this backend has no ladder -- so such a rung is
+priced and labelled rather than refused: `capture_rung=10**9` on one decode
+row prices `decode.graph_padding` at 99.9999999 s, and that term's provenance
+says the width was supplied and nothing here bounds it. A test prices that
+batch, so a successor who bounds the rung fails a test rather than leaving
+this paragraph stale.
 
 The decode padding feature is the *rung's* rectangle, `rung.max - Sum`, and
 not the batch's `len.max - Sum`. A replayed graph runs its rung's worth of
@@ -99,6 +109,11 @@ DECLARED = "declared, not measured -- a plumbing figure, not an accuracy claim"
 # conclusively and rule it in only conditionally, so a charge for one states
 # which of the two it is rather than leaving a reader to assume the stronger.
 CANDIDATE = "a collective these widths admit, not one observed to run"
+
+# Added to the decode padding term whenever a rung was supplied. The rows can
+# show a rung is too narrow and can never show it is too wide, so that count
+# rests on the caller in a way the coefficient's own note does not cover.
+UNCHECKED_RUNG = "padding from a supplied rung width; nothing here bounds it above"
 
 
 def _refuse_shadowing(owner: type, cls: type) -> None:
@@ -425,7 +440,7 @@ class ShapeStubBackend(CostBackend):
                 "the projection is built by whoever holds the scheduled batch"
             )
         c = self.coefficients
-        counted: list[tuple[str, int, float]] = []
+        counted: list[tuple[str, int, float] | tuple[str, int, float, str]] = []
         prefill = batch_view.prefill
         if prefill:
             counted += [
@@ -448,7 +463,12 @@ class ShapeStubBackend(CostBackend):
                 ("decode.step", 1, c.decode_step),
                 ("decode.requests", len(decode), c.decode_request),
                 ("decode.context", sum_context(decode), c.decode_context),
-                ("decode.graph_padding", batch_view.graph_padding, c.decode_padding),
+                (
+                    "decode.graph_padding",
+                    batch_view.graph_padding,
+                    c.decode_padding,
+                    "" if batch_view.capture_rung is None else UNCHECKED_RUNG,
+                ),
             ]
         terms = [self._term(*row) for row in counted]
         layers = 0 if self.geometry is None else self.geometry.layers
