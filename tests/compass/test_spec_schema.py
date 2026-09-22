@@ -409,15 +409,20 @@ def _raise_sites():
     """Every `raise SpecRefusal` in the package, mapped to the rule it names.
 
     One site picks its rule from a local name rather than naming it inline, so
-    a name is resolved through the assignments in the function it sits in. A
-    site whose rule will not resolve is kept, carrying whatever it named,
+    a name is resolved through the assignments in the function it sits in. The
+    binding map is per-name and last-write-wins, so a second binding of the
+    same local in one function misattributes one of the two sites; the check
+    below then reddens for a site that is on the wrong side of the partition
+    rather than for the rule it actually names.
+
+    A site whose rule will not resolve is kept, carrying whatever it named,
     rather than dropped -- a dropped site would be a hole in the coverage check
     below, and holes of exactly that kind are why the check exists.
     """
     found = {}
     for source in sorted(PACKAGE.glob("*.py")):
         for scope in ast.walk(ast.parse(source.read_text())):
-            if not isinstance(scope, ast.FunctionDef):
+            if not isinstance(scope, (ast.FunctionDef, ast.AsyncFunctionDef)):
                 continue
             bound = {
                 target.id: ast.unparse(node.value)
@@ -447,6 +452,17 @@ def test_every_raise_site_in_the_package_resolves_to_a_rule():
         if not rule.startswith("Rule.")
     }
     assert unread == {}
+    # A site the walk never reaches -- in a scope it does not descend, or
+    # raising through a name that is not `SpecRefusal` -- is absent rather
+    # than unread, and absence is invisible to a check that reads only what
+    # the walk found. So the package's own `raise` statements are counted
+    # against what the resolver recognised.
+    written_in_the_package = sum(
+        isinstance(node, ast.Raise)
+        for source in sorted(PACKAGE.glob("*.py"))
+        for node in ast.walk(ast.parse(source.read_text()))
+    )
+    assert len(_raise_sites()) == written_in_the_package
 
 
 def test_every_site_that_declines_a_document_is_driven_here():
