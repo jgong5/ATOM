@@ -207,12 +207,32 @@ fake-less aiter ops sit *inside* those leaves and are never reached.
 > 27B row on what it is a claim about rather than on its totals: at TP2 it records
 > `aiter.all_reduce_` **129** — 128 row-parallel at `communication_op.py:58` plus the
 > vocab-parallel one at `embed_head.py:175`, the 128 predicted from the config's layer
-> types and not read off the inventory — one functional all-gather at
-> `embed_head.py:257` carrying `[2, 124160]` to `[4, 124160]`, and one broadcast. The raw
-> Triton traffic agrees exactly: **33 launches across 3 kernels**. The operator totals do
+> types and not read off the inventory — one all-gather at `embed_head.py:257`, and one
+> broadcast, plus two `_c10d_functional.wait_tensor` entries that belong to the
+> substitution below rather than to ATOM. The raw Triton traffic agrees exactly:
+> **33 launches across 3 kernels**. The operator totals do
 > **not** match and are not expected to: they are 2,521 at TP1 and 2,662 at TP2 against
 > 2,471 and 2,611 here, on a decode step of two sequences at a block size and a batch
 > budget this file never recorded, which is the reason a total is not the assertion.
+>
+> **The TP2 inventory is conditional on two declared substitutions, and every number in
+> the paragraph above inherits them.** `ATOM_USE_CUSTOM_ALL_GATHER=0` selects the
+> non-custom vocab-parallel gather: it is a **non-default** ATOM path, and a default TP2
+> deployment takes the `ca_comm` custom gather, which is not what was traced — with the
+> default the forward dies on `ca_comm` after roughly 2,500 operators, so this is the
+> difference between a run that refuses part-way and one that completes. Second, the four
+> call sites reaching `c10d`'s legacy in-place collectives are routed to their functional
+> forms, which is where every `_c10d_functional.*` entry, including both `wait_tensor`s,
+> comes from; only the 129 `aiter.all_reduce_` are ATOM's own dispatch.
+>
+> **The gather's shapes — both arrangements, each read off the live call.** ATOM hands
+> `all_gather_into_tensor` an output buffer of `(world_size,) + input_size`, measured as
+> `[2, 2, 124160]`; the functional substitute concatenates the `[2, 124160]` input along
+> dim 0 into `[4, 124160]`, and the shim reshapes that into ATOM's buffer. `[4, 124160]`
+> is therefore the **substitute's** arrangement and not the 27B's. An earlier revision of
+> this paragraph gave it as the 27B's output shape, and gave it from the width rather
+> than from any record: the dispatched operator carries only its input, so nothing
+> recorded a destination shape at all until the test began recording both.
 
 The open issue *"whether ATOM's real model classes trace cleanly under this mode at
 TP>1"* is **answered yes**, on two models at both widths, with the collectives in the
