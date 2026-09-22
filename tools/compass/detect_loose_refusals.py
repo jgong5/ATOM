@@ -28,7 +28,7 @@ filter, not a verdict; what it flags is then classified by hand against:
 A count over the tree is an aggregate, and an aggregate is not a result without
 the per-site lists printed beside it, which is why both are printed.
 
-What this tool cannot see -- four, and a clean run means nothing without them
+What this tool cannot see -- five, and a clean run means nothing without them
 =============================================================================
 
 1. **One template carrying two faults is invisible.**  A template counter can
@@ -59,7 +59,17 @@ What this tool cannot see -- four, and a clean run means nothing without them
    rendered text is unknown here and it leaves the population.  Every such
    needle is printed by name, because a broad flag that disappears when an
    assertion is rewritten as an f-string must not be read as a cleared one --
-   the tool cannot score a remedy written in that form.
+   the tool cannot score a remedy written in that form.  A needle held in a
+   variable is caught by this too, and named.
+
+5. **A needle behind a helper leaves the population with no word at all.**  A
+   ``match=`` keyword is read only off a call written as ``raises`` or ``warns``,
+   so an assertion wrapped in a project helper is not merely unreadable -- it is
+   never seen, which is strictly worse than the case above, where the needle is
+   at least named.  Measured at 92f1fdafe28817f864261f632d98cf5b052016dd: the 78
+   ``match=`` occurrences under ``tests/compass/`` are 72 read, 1 named as
+   unreadable, and 5 inside this tool's own fixtures and prose.  There is no
+   helper-wrapped assertion today, so this is a forward gap, not a present hole.
 """
 
 from __future__ import annotations
@@ -92,13 +102,17 @@ def literal_runs(node: ast.AST) -> list[str]:
     return []
 
 
-def raise_sites(source: str, label: str) -> list[dict]:
-    """Every ``raise Exc(...)`` in *source* that carries constant text.
+def raise_sites(source: str, label: str) -> tuple[list[dict], list[dict]]:
+    """The ``raise Exc(...)`` sites in *source* that carry text, and those that do not.
 
     Text is read from every string-bearing argument of the raised call, keyword
-    arguments included; runs from different arguments stay separate.
+    arguments included; runs from different arguments stay separate.  A refusal
+    that passes arguments but states nothing readable in any of them goes into
+    the second list under its own name, so half the population is not an
+    aggregate the output gives no account of.
     """
     sites: list[dict] = []
+    opaque: list[dict] = []
 
     def walk(node: ast.AST, scope: str) -> None:
         for child in ast.iter_child_nodes(node):
@@ -108,13 +122,18 @@ def raise_sites(source: str, label: str) -> list[dict]:
             if isinstance(child, ast.Raise) and isinstance(child.exc, ast.Call):
                 args = [*child.exc.args, *(kw.value for kw in child.exc.keywords)]
                 runs = [run for arg in args for run in literal_runs(arg)]
+                where = {"label": label, "line": child.lineno}
                 if runs:
-                    where = {"label": label, "line": child.lineno}
                     sites.append({**where, "scope": scope, "runs": runs})
+                elif args:
+                    kinds = ", ".join(sorted({type(arg).__name__ for arg in args}))
+                    opaque.append(
+                        {**where, "why": f"no text in any argument ({kinds})"}
+                    )
             walk(child, inner)
 
     walk(ast.parse(source), "")
-    return sites
+    return sites, opaque
 
 
 def match_needles(source: str, label: str) -> tuple[list[dict], list[dict]]:
@@ -171,22 +190,40 @@ def score(sites: list[dict], needles: list[dict]) -> tuple[list, list]:
 
 def main(root: Path) -> int:
     sites: list[dict] = []
+    opaque: list[dict] = []
     for path in sorted((root / "atom" / "compass").rglob("*.py")):
-        sites += raise_sites(path.read_text(), str(path.relative_to(root)))
+        found, blank = raise_sites(path.read_text(), str(path.relative_to(root)))
+        sites += found
+        opaque += blank
     needles: list[dict] = []
     dropped: list[dict] = []
     for path in sorted((root / "tests" / "compass").rglob("*.py")):
         kept, lost = match_needles(path.read_text(), str(path.relative_to(root)))
         needles += kept
         dropped += lost
+
+    # An empty population prints zeroes that read exactly like a clean tree, in
+    # a tool whose root is typed by hand -- the same silent-empty-collection
+    # fault this pass exists to find. Say so instead of reporting a clean run.
+    if not sites or not needles:
+        print(
+            f"REFUSED: {root} gave {len(sites)} production raise sites and "
+            f"{len(needles)} needles. A tree this tool can read has both, under "
+            f"atom/compass/ and tests/compass/; zero of either is a wrong root, "
+            f"not a clean result.",
+            file=sys.stderr,
+        )
+        return 2
+
     broad, sharp = score(sites, needles)
 
     print(
         f"production raise sites carrying text: {len(sites)}\n"
+        f"production refusals stating no text:  {len(opaque)}\n"
         f"match= needles read:                  {len(needles)}\n"
         f"match= needles unreadable, dropped:   {len(dropped)}"
     )
-    for entry in dropped:
+    for entry in [*opaque, *dropped]:
         print(f"  ! {entry['label']}:{entry['line']}  {entry['why']}")
 
     print(f"\nBROAD  (needle matches >= 2 production raise sites): {len(broad)}")
@@ -204,4 +241,7 @@ def main(root: Path) -> int:
 
 
 if __name__ == "__main__":
+    if len(sys.argv) != 2:
+        print(f"usage: {sys.argv[0]} <tree root>", file=sys.stderr)
+        raise SystemExit(2)
     raise SystemExit(main(Path(sys.argv[1])))
