@@ -220,11 +220,24 @@ when `pp_group.world_size > 1`.
 **Compass calls it; it never re-derives a split.** Same rule as `14` D86 for draft KV
 layers, and for the same reason: two spellings of one count drift.
 
-**Weights shard by layer range. KV does not.** Weights are per-layer tensors, so a stage's
-share of the sharded weight terms is `layers_in_stage / total_layers`. KV is held only by
-the layers that cache the whole history, and inside a span of a hybrid stack the paged
-count is not proportional to the span's length. A stage's share of the KV term is
+**Weights shard by layer range. KV does not.** What separates them is homogeneity, not
+per-layer-ness: KV is per-layer too. *Every* layer carries weights, so a stage's share of
+the sharded weight terms is `layers_in_stage / total_layers`; only the layers that cache
+the whole history carry paged KV, and inside a span of a hybrid stack that count is not
+proportional to the span's length. A stage's share of the KV term is
 `paged_layers_in_stage / total_paged_layers`, and on a hybrid the two fractions differ.
+
+The weights ratio is itself exact only where the layer kinds are equally sized, and on this
+hybrid they are merely close. The two kinds are different modules — `Qwen3NextAttention`
+against `Qwen3_5GatedDeltaNet` — and at TP1, counted from the vendored config over their
+projection shapes with norms and biases omitted (under 0.01% of a layer), a
+`full_attention` layer is **372,244,480** parameters against **383,262,720** for a
+`linear_attention` one, **+2.96%**. That moves a stage's true weight share off the layer
+ratio by at most **0.242%**, at pp = 7; 0.197% at pp = 6 and 0.104% at pp = 3. Two orders
+of magnitude inside the ≤10% target a non-KV memory term carries, so the layer range stays
+the weights key here — but it stays one because the two kinds happen to be nearly the same
+size, not because weights are per-layer, and on a hybrid whose kinds differ more it would
+not. How close that ratio has to be is a weights-term question rather than this decision's.
 
 **The paged count is read, not computed.** It comes from the same two sources as the split
 itself — `get_pp_indices` for the span, and the model's own `layer_types` for which layers
@@ -234,12 +247,25 @@ of this paragraph gave the KV share as the layer ratio. That is exactly the re-d
 the rule above forbids: it recomputed from the layer count something ATOM already holds,
 and the two spellings disagree on every hybrid.
 
+**A second spelling of this count already exists in the engine, and it is not the one to
+read.** `GDNStateMixin._init_gdn_state` (`atom/model_ops/attentions/gdn_attn.py`) sets
+`num_full_attn` by dividing `num_hidden_layers` by `full_attention_interval`, and the
+attention sizing in the same file consumes it. That count is **global**, so it cannot
+answer what a stage holds at all. It agrees at 16 on this config and not by luck:
+`Qwen3_5TextConfig.__init__` (`atom/model_config/qwen3_5.py`) fills `layer_types` *from*
+that interval when a config omits it, so anything built through ATOM's own config class is
+consistent by construction. A config carrying an explicit non-periodic `layer_types` would
+separate the two, and `layer_types` is the one that stays right.
+
 Derived at `feature/atomcompass_new` `92f1fdafe` from `get_pp_indices`, with
 `VLLM_PP_LAYER_PARTITION` cleared — left set it overrides the partitioner and a layout out
 of the environment reads as ATOM's — on the 64-layer hybrid vendored at
 `tests/compass/qwen3_5_27b_config.json`: one `full_attention` layer in four, so 16 of the
-64 are paged. The remainder goes to the *middle* stages, which is why no row here is the
-split a reader would write out:
+64 are paged. The layers that do not divide evenly are added walking back from the
+*second-to-last* partition, so the **last stage never takes one** and the rest fill in from
+the right; at pp = 5 that reaches stage 0, the first. *The middle stages* is true of 3, 6
+and 7 here and false of 5, which is why no row below is the split a reader would write
+out:
 
 | PP | `get_pp_indices` spans | layers held | paged layers | stages where `held/64` = `paged/16` |
 |---|---|---|---|---|

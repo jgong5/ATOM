@@ -14,9 +14,11 @@ first. So this file checks it on both, and then checks that the document still
 states what was checked.
 
 Neither the split nor the paged count is written out here. The span comes from
-ATOM's own `get_pp_indices`, which hands the remainder to the *middle*
-partitions, and the paged count comes from the model's own `layer_types`
-through the geometry that sizes a block. `VLLM_PP_LAYER_PARTITION` overrides
+ATOM's own `get_pp_indices`, which adds the layers that do not divide evenly
+walking back from the second-to-last partition -- so the last stage never
+takes one, and at five stages the *first* one does -- and the paged count
+comes from the model's own `layer_types` through the geometry that sizes a
+block. `VLLM_PP_LAYER_PARTITION` overrides
 the partitioner, so every derivation clears it first; left set, this reads a
 layer layout out of the environment and calls it ATOM's.
 
@@ -127,6 +129,31 @@ def test_the_kv_share_of_a_stage_is_not_its_layer_share(monkeypatch):
     }
 
 
+def test_the_last_stage_never_takes_a_layer_that_did_not_divide_evenly(monkeypatch):
+    """Where the partitioner puts a remainder, pinned rather than described.
+
+    The leftover layers are added walking back from the second-to-last
+    partition, so the last stage never receives one and the rest fill in from
+    the right. Describing that as "the middle stages" is right at three, six
+    and seven stages here and wrong at five, where the fourth leftover layer
+    lands on stage 0 -- inside the range this file already derives, which is
+    how a prose rule about a mechanism gets carried forward wrong.
+
+    Asserted as the exact set of stages that took one, for every width, so a
+    partitioner that started filling from the left or reached the last stage
+    fails here rather than being described again.
+    """
+    total = int(HYBRID.num_hidden_layers)
+    for pp in WIDTHS:
+        held = [count for _, count, _ in stages(HYBRID, pp, monkeypatch)]
+        remaining = total % pp
+        assert [rank for rank, count in enumerate(held) if count > total // pp] == list(
+            range(pp - 1 - remaining, pp - 1)
+        )
+    first_of_five, *_ = stages(HYBRID, 5, monkeypatch)
+    assert first_of_five[1] == total // 5 + 1
+
+
 def test_a_uniform_stack_is_the_case_the_layer_ratio_gets_right(monkeypatch):
     """The correction does not reach further than the hybrid.
 
@@ -158,6 +185,15 @@ def test_the_document_states_the_split_that_was_derived(monkeypatch):
     scale by neither, and that a uniform stack is unaffected. Each is a claim
     a reader would otherwise have to take on trust, and the last two are the
     places an over-reaching edit would show up.
+
+    The last assertion is about the *other* spelling of this count. The engine
+    also derives a full-attention layer count by dividing the stack by
+    `full_attention_interval`, which is global and so cannot answer what a
+    stage holds; the document says the two agree on this config and not by
+    luck, because ATOM's own config class fills `layer_types` from that same
+    interval. That agreement is derived here rather than asserted, so a
+    config whose kinds stop matching its interval fails instead of being
+    described.
     """
     text = DESIGN.read_text()
     total = int(HYBRID.num_hidden_layers)
@@ -186,3 +222,4 @@ def test_the_document_states_the_split_that_was_derived(monkeypatch):
     assert f"`held/{total}` = `paged/{total_paged}`" in text
     assert "The Class-C `runtime_constants` scale by neither key" in text
     assert "**Uniform stacks are unaffected.**" in text
+    assert total // int(HYBRID.full_attention_interval) == total_paged
