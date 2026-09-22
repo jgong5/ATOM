@@ -235,10 +235,40 @@ def test_a_body_reaches_its_instance_through_the_context_key():
     ref = ContextRef("model.layers.{layer}.self_attn")
     assert ref.index_names == ("layer",)
     assert str(ref.bind(layer=7)) == "model.layers.7.self_attn"
-    with pytest.raises(KeyError, match="missing"):
-        ref.bind()
-    with pytest.raises(KeyError, match="not used"):
-        ref.bind(layer=1, period=2)
+
+
+def test_an_index_with_no_value_is_refused_as_that_and_not_as_a_spare():
+    """The two ways to mis-bind are one membership test read in either
+    direction, so writing that test the other way up hands this call the other
+    branch.
+
+    What has to be asserted is therefore the attribution -- which name is at
+    fault, under which of the two headings -- together with the absence of the
+    sibling clause. Neither was assertable before: one template stated both
+    faults whatever had happened, so this call and the next one could be
+    exchanged and the file still passed.
+    """
+    with pytest.raises(
+        KeyError, match=r"no value was given for \['layer'\]"
+    ) as refused:
+        ContextRef("model.layers.{layer}.self_attn").bind()
+    assert "is not an index of it" not in str(refused.value)
+
+
+def test_a_value_naming_no_index_is_refused_as_that_and_not_as_a_shortfall():
+    with pytest.raises(
+        KeyError, match=r"\['period'\] is not an index of it"
+    ) as refused:
+        ContextRef("model.layers.{layer}.self_attn").bind(layer=1, period=2)
+    assert "no value was given for" not in str(refused.value)
+
+
+def test_a_binding_wrong_in_both_ways_still_names_both_faults():
+    """Separating the two clauses must not cost the call that earns both."""
+    with pytest.raises(KeyError) as refused:
+        ContextRef("model.layers.{layer}.self_attn").bind(period=2)
+    assert "no value was given for ['layer']" in str(refused.value)
+    assert "['period'] is not an index of it" in str(refused.value)
 
 
 def test_a_context_key_that_does_not_parse_is_refused_with_a_reason():
@@ -606,10 +636,27 @@ def test_a_name_given_twice_is_refused_rather_than_silently_resolved():
         _op(attrs=(("dtype", "bf16"), ("dtype", "fp8")))
 
 
-@pytest.mark.parametrize("attrs", [["ab"], [("dtype",)], [("a", 1, 2)], [3]])
-def test_an_attribute_that_is_not_a_pair_is_refused(attrs):
-    with pytest.raises((TypeError, ValueError), match="name, value"):
+@pytest.mark.parametrize("attrs", [["ab"], [3]])
+def test_an_item_that_is_not_a_pair_shaped_container_is_refused_as_that(attrs):
+    """Not-a-pair and wrong-length are alternatives over one shape test.
+
+    Writing that test the other way up -- `isinstance(item, (tuple, list))`
+    rather than `not isinstance(...)` -- sends both of these inputs to the
+    length check instead. A union of the two exception types with a needle both
+    templates carried is what the four cases used to share, and it settled
+    neither half. A str belongs in this group on purpose: a two-character one
+    would otherwise unpack into a name and a value.
+    """
+    with pytest.raises(TypeError, match="given as a tuple or list") as refused:
         _op(attrs=attrs)
+    assert "items, not 2" not in str(refused.value)
+
+
+@pytest.mark.parametrize("attrs", [[("dtype",)], [("a", 1, 2)]])
+def test_a_pair_shaped_container_of_the_wrong_length_is_refused_as_that(attrs):
+    with pytest.raises(ValueError, match="items, not 2") as refused:
+        _op(attrs=attrs)
+    assert "given as a tuple or list" not in str(refused.value)
 
 
 def test_the_three_node_kinds_say_where_a_price_comes_from():
