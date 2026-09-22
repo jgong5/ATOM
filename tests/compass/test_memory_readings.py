@@ -33,6 +33,7 @@ import torch
 from transformers import PretrainedConfig
 
 import atom.compass.memory as memory_package
+from atom.compass.backends.geometry import dtype_bytes as element_bytes
 from atom.compass.memory import (
     Basis,
     MemoryRefusal,
@@ -46,7 +47,6 @@ from atom.compass.memory import (
     predicts,
     reserves,
 )
-from atom.compass.backends.geometry import dtype_bytes as element_bytes
 from atom.compass.spec import MachineSpec, SpecRefusal
 
 # The package as the suite actually imported it, never as a walk up from this
