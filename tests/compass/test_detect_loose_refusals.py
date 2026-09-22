@@ -13,11 +13,19 @@ what a test can pin is the rule it applies, which is what these do.
 Both directions are pinned, because a detector that reports nothing passes
 forever. Every fixture pair below is one production source that must be flagged
 and one that must not, under the same needle.
+
+What the tool states is pinned on its output, not only on its return values.
+A population the tool computes and never prints is one the person reading it
+never learns of, so the counts and the per-site lines are asserted as text.
 """
 
 import ast
 import importlib.util
+import subprocess
+import sys
 from pathlib import Path
+
+import pytest
 
 TOOL = (
     Path(__file__).resolve().parents[2]
@@ -183,24 +191,64 @@ def test_a_refusal_stating_no_text_is_named_not_swallowed():
     ]
 
 
-def _fixture_tree(root):
-    """A miniature tree with the two subpaths the tool reads."""
-    for part, source in (("atom", COLLIDING), ("tests", DIVIDE_NEEDLE)):
+PRODUCTION_SOURCES = {"sample.py": COLLIDING, "opaque.py": OPAQUE}
+NEEDLE_SOURCES = {"sample.py": DIVIDE_NEEDLE}
+
+
+def _fixture_tree(root, parts=("atom", "tests")):
+    """A miniature tree carrying the named halves of the tool's population.
+
+    The production half carries both kinds of refusal the tool separates: two
+    that state text and collide under one needle, and one that states none.
+    Naming fewer parts builds the wrong roots a hand-typed argument produces --
+    the package without the tests, or the tests without the package.
+    """
+    for part, sources in (("atom", PRODUCTION_SOURCES), ("tests", NEEDLE_SOURCES)):
+        if part not in parts:
+            continue
         package = root / part / "compass"
         package.mkdir(parents=True)
-        (package / "sample.py").write_text(source)
+        for name, source in sources.items():
+            (package / name).write_text(source)
     return root
 
 
-def test_a_root_that_resolves_to_nothing_is_refused(tmp_path, capsys):
-    """Zero sites and zero needles print as a clean run, and the root is typed by
-    hand -- so an empty population is refused rather than reported."""
-    assert detector.main(tmp_path) == 2
+@pytest.mark.parametrize(
+    "parts", [(), ("atom",), ("tests",)], ids=["neither", "atom", "tests"]
+)
+def test_a_root_missing_either_population_is_refused(tmp_path, capsys, parts):
+    """Zero sites or zero needles print as a clean run, and the root is typed by
+    hand -- so either half being empty is refused rather than reported.
+
+    The asymmetric roots are the realistic typos: pointing at `atom/` rather
+    than the repo root leaves the needles empty, and a tree carrying the package
+    without `tests/compass/` leaves them empty the other way. Both must refuse,
+    not just the root that is empty on both sides.
+    """
+    assert detector.main(_fixture_tree(tmp_path, parts)) == 2
     assert "REFUSED" in capsys.readouterr().err
 
 
 def test_a_root_carrying_both_populations_is_read(tmp_path, capsys):
+    """Both populations are counted and each unreadable site is named.
+
+    A count with no per-site line beside it is the aggregate this output exists
+    to decompose, so the opaque refusal is asserted as printed text, not only as
+    a return value the person running the tool never sees.
+    """
     assert detector.main(_fixture_tree(tmp_path)) == 0
-    assert "SHARP  (>= 2 matching raise sites in ONE function): 1" in (
-        capsys.readouterr().out
+    out = capsys.readouterr().out
+    assert "SHARP  (>= 2 matching raise sites in ONE function): 1" in out
+    assert "production refusals stating no text:  1" in out
+    assert "  ! atom/compass/opaque.py:3  no text in any argument (Name)" in out
+
+
+def test_a_wrong_argument_count_is_refused_with_a_usage_line():
+    """The root is a hand-typed argument, so omitting it must say what to type
+    rather than raise `IndexError` out of `sys.argv` with no word about why."""
+    done = subprocess.run(
+        [sys.executable, str(TOOL)], capture_output=True, text=True, check=False
     )
+    assert done.returncode == 2
+    assert done.stderr.startswith("usage: ")
+    assert "REFUSED" not in done.stderr

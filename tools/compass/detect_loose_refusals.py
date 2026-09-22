@@ -66,10 +66,13 @@ What this tool cannot see -- five, and a clean run means nothing without them
    ``match=`` keyword is read only off a call written as ``raises`` or ``warns``,
    so an assertion wrapped in a project helper is not merely unreadable -- it is
    never seen, which is strictly worse than the case above, where the needle is
-   at least named.  Measured at 92f1fdafe28817f864261f632d98cf5b052016dd: the 78
-   ``match=`` occurrences under ``tests/compass/`` are 72 read, 1 named as
-   unreadable, and 5 inside this tool's own fixtures and prose.  There is no
-   helper-wrapped assertion today, so this is a forward gap, not a present hole.
+   at least named.  Measured at 92f1fdafe28817f864261f632d98cf5b052016dd, the
+   base this branch stands on: the 73 ``match=`` occurrences under
+   ``tests/compass/`` are 72 read and 1 named as unreadable, with none
+   unaccounted for.  The test file added beside this tool carries 5 more, in its
+   own fixtures and prose, for 78 at 3226ac0ee5fe9d67459f0ee996781f75d4bd38d2 --
+   where the 72 and the 1 are unchanged.  There is no helper-wrapped assertion
+   at either tree, so this is a forward gap, not a present hole.
 """
 
 from __future__ import annotations
