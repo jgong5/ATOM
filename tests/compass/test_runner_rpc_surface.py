@@ -45,6 +45,7 @@ ASYNC_PROC = (ENGINE / "async_proc.py").read_text()
 PACKAGE = REPO / "atom" / "compass" / "runner"
 PACKAGE_DOC = ast.get_docstring(ast.parse((PACKAGE / "__init__.py").read_text()))
 UNWAITED = {name for name, waits in RPC_SURFACE.items() if not waits}
+COMPOSED = (REPO / "atom/compass/runner/model_runner.py").read_text()
 BROADCAST = ("call_func", "call_func_with_aggregation")
 # Every class in the tree that answers a dispatched name and is not in
 # `model_runner.py`. The leftover names have to land on one of these; a name
@@ -79,6 +80,31 @@ def _classes(path):
 
 def _methods(node):
     return {n.name for n in node.body if isinstance(n, ast.FunctionDef)}
+
+
+def _busy_loop():
+    """`AsyncIOProc.busy_loop`, parsed."""
+    return next(
+        n
+        for n in ast.walk(ast.parse(ASYNC_PROC))
+        if isinstance(n, ast.FunctionDef) and n.name == "busy_loop"
+    )
+
+
+def _refusal_comment():
+    """The comment block the composed module's refusal is written inside.
+
+    Comments are not AST nodes, so this is source text: every indented `#`
+    line of `model_runner.py`, joined into one string. The module's only
+    indented comment is that block; the two unindented ones are the SPDX
+    header, which is why the column is enough to select it.
+    """
+    lines = [
+        line.strip().lstrip("#").strip()
+        for line in COMPOSED.splitlines()
+        if line.strip().startswith("#") and not line.startswith("#")
+    ]
+    return " ".join(line for line in lines if line)
 
 
 def _raised_name(node):
@@ -420,11 +446,10 @@ def test_the_binding_module_refuses_rather_than_composing_a_hole():
     partitions the missing names on `RPC_SURFACE` instead of telling one story
     about all twelve, since two of them are waited on by nobody.
     """
-    src = (REPO / "atom/compass/runner/model_runner.py").read_text()
-    assert "unanswered_rpc_names(CompassModelRunner)" in src
-    assert "raise RunnerRefusal(" in src
-    assert "RPC_SURFACE[name]" in src
-    assert "not RPC_SURFACE[name]" in src
+    assert "unanswered_rpc_names(CompassModelRunner)" in COMPOSED
+    assert "raise RunnerRefusal(" in COMPOSED
+    assert "RPC_SURFACE[name]" in COMPOSED
+    assert "not RPC_SURFACE[name]" in COMPOSED
 
 
 # --- capture_cudagraph: the three values, taken from the unpack ---------------
@@ -786,6 +811,166 @@ def test_the_two_names_no_caller_waits_for_and_what_replying_costs():
     assert not [n for n in ast.walk(silent) if isinstance(n, ast.Return) and n.value]
     assert bodies["exit"].body[-1].value.value is True
     assert 'if func_name == "exit":\n                break' in ASYNC_PROC
+
+
+# --- the break at `exit`, and the comment that describes it ------------------
+
+
+def test_the_break_on_exit_is_a_sibling_of_the_per_runner_loop():
+    """Where the break sits is the whole of why a hole at `exit` is not a hang.
+
+    Read off the structure rather than off the source text, because the
+    indentation *is* the claim: the `if` is a statement of the `while` body
+    beside `for runner in self.runners`, not a statement inside it. So it
+    fires on the name dequeued at the top of the iteration and consults no
+    reply -- a runner with no `exit` is skipped by the `getattr`, and the loop
+    still breaks.
+
+    The landed assertion in
+    `test_the_two_names_no_caller_waits_for_and_what_replying_costs` pins the
+    same two lines as an exact string. That catches the break moving one level
+    in, because its own indentation would change, but says nothing about what
+    the `if` is a sibling of or about what its test reaches. Both are here.
+    """
+    busy = _busy_loop()
+    loop = next(n for n in busy.body if isinstance(n, ast.While))
+    dispatch = next(n for n in loop.body if isinstance(n, ast.For))
+    guards = [
+        n
+        for n in loop.body
+        if isinstance(n, ast.If)
+        and isinstance(n.test, ast.Compare)
+        and getattr(n.test.left, "id", None) == "func_name"
+        and getattr(n.test.comparators[0], "value", None) == "exit"
+    ]
+    assert len(guards) == 1
+    guard = guards[0]
+    assert [type(n) for n in guard.body] == [ast.Break]
+    assert guard not in list(ast.walk(dispatch))
+    assert guard.col_offset == dispatch.col_offset
+    assert {n.col_offset for n in dispatch.body} == {dispatch.col_offset + 4}
+    dequeued = next(
+        n
+        for n in loop.body
+        if isinstance(n, ast.Assign)
+        and isinstance(n.value, ast.Call)
+        and getattr(n.value.func, "attr", None) == "get_func"
+    )
+    bound = {n.id for n in ast.walk(dequeued.targets[0]) if isinstance(n, ast.Name)}
+    reached = {n.id for n in ast.walk(guard.test) if isinstance(n, ast.Name)}
+    assert reached == {"func_name"} and reached <= bound
+
+
+def test_the_refusal_comment_says_the_loop_breaks_and_not_that_it_hangs():
+    """The prose beside the refusal, held to the structure above.
+
+    This is the half the surface was missing. One commit landed the comment,
+    the package docstring and the string assertion above together, and the
+    comment said the opposite of that assertion: that an unanswered `exit`
+    means "the loop never breaks". Nothing failed, because nothing read the
+    prose. So the words are read here.
+
+    `never breaks` in any spelling is the claim that was wrong. The three
+    phrases required are the three findings of the structure test -- that it
+    breaks, what the `if` is a sibling of, and that it tests a name rather
+    than a reply -- so prose and source now fail together.
+    """
+    comment = _refusal_comment()
+    assert "The loop breaks either way" in comment
+    assert "the break is a sibling of the per-runner loop" in comment
+    assert "tests the dispatched name rather than any reply" in comment
+    assert "never breaks" not in comment
+
+
+def test_what_the_comment_says_a_hole_at_exit_loses_is_what_exit_does():
+    """Each loss the comment names, against `ModelRunner.exit`'s own body.
+
+    The comment is the only place in this package that says what shutdown
+    fails to release, and it says it about ATOM's code rather than about this
+    package's, so it drifts whenever `exit` is edited. It also states which of
+    those losses is empty here -- the five KV deletions are `hasattr`-guarded
+    and this runner allocates no KV tensor, so they find nothing. The guard is
+    asserted too: dropping it would make the comment's own exception false.
+    """
+    comment = _refusal_comment()
+    body = next(
+        n
+        for n in ast.walk(_classes(ATOM_RUNNER)["ModelRunner"])
+        if isinstance(n, ast.FunctionDef) and n.name == "exit"
+    )
+    calls = {ast.unparse(n.func) for n in ast.walk(body) if isinstance(n, ast.Call)}
+    assert {"destroy_dist_env", "torch.cuda.empty_cache"} <= calls
+    assert "`ModelRunner.exit` never runs" in comment
+    assert "the distributed environment is never destroyed" in comment
+    assert "`torch.cuda.empty_cache()` never runs" in comment
+    deleted = {
+        ast.unparse(t)
+        for n in ast.walk(body)
+        if isinstance(n, ast.Delete)
+        for t in n.targets
+    }
+    assert "self.model" in deleted
+    assert "`self.model` is never dropped" in comment
+    kv = next(n for n in ast.walk(body) if isinstance(n, ast.For))
+    assert {e.value for e in kv.iter.elts} == {
+        "kv_cache",
+        "kv_scale",
+        "index_cache",
+        "mamba_k_cache",
+        "mamba_v_cache",
+    }
+    assert any(
+        isinstance(n, ast.If)
+        and getattr(getattr(n.test, "func", None), "id", None) == "hasattr"
+        for n in ast.walk(kv)
+    )
+    assert "five KV-tensor deletions are `hasattr`-guarded" in comment
+
+
+def test_the_unanswered_helper_describes_its_whole_return_and_not_one_half():
+    """The list is returned unpartitioned; its docstring may not be.
+
+    `unanswered_rpc_names` draws from all twelve, and its only caller in the
+    package splits them on `RPC_SURFACE` before reporting them. A docstring
+    that gives one story for the whole return is the claim
+    `test_the_two_names_no_caller_waits_for_and_what_replying_costs` already
+    calls false, so the two names it excepts are read back out of the prose
+    and compared with the table rather than typed here. The count word is
+    held to `len(RPC_SURFACE)` the same way, and the single-caller claim to
+    the tree.
+    """
+    doc = " ".join(unanswered_rpc_names.__doc__.split())
+    unwaited = {n for n, w in RPC_SURFACE.items() if not w}
+    assert {n for n in RPC_SURFACE if f"`{n}`" in doc} == unwaited
+    assert "a hole in either parks no one" in doc
+    assert "parks forever" not in doc
+    assert "all twelve" in doc and len(RPC_SURFACE) == 12
+    callers = [
+        str(f.relative_to(REPO))
+        for f in sorted((REPO / "atom").rglob("*.py"))
+        if any(
+            isinstance(n, ast.Call)
+            and getattr(n.func, "id", None) == "unanswered_rpc_names"
+            for n in ast.walk(ast.parse(f.read_text()))
+        )
+    ]
+    assert callers == ["atom/compass/runner/model_runner.py"]
+    tree = ast.parse(COMPOSED)
+    bound = next(
+        n.targets[0].id
+        for n in ast.walk(tree)
+        if isinstance(n, ast.Assign)
+        and isinstance(n.value, ast.Call)
+        and getattr(n.value.func, "id", None) == "unanswered_rpc_names"
+    )
+    splits = sorted(
+        ast.unparse(c.ifs[0])
+        for c in ast.walk(tree)
+        if isinstance(c, ast.comprehension)
+        and getattr(c.iter, "id", None) == bound
+        and c.ifs
+    )
+    assert splits == ["RPC_SURFACE[name]", "not RPC_SURFACE[name]"]
 
 
 def test_the_zero_block_form_in_the_tree_answers_two_of_the_four_keys():
