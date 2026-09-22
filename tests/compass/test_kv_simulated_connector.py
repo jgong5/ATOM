@@ -272,12 +272,25 @@ def test_the_connector_names_no_clock_of_its_own():
 
     Asserted against the source, because a wall-clock fallback reached only on
     a path no test drives would pass every timing test here and still silently
-    put a real run on the wall clock.
+    put a real run on the wall clock. The walk is recursive and the list of
+    spellings is wider than the module needs today, so a file added to this
+    package later is scanned by this test rather than exempt from it.
     """
     package = pathlib.Path(compass_kv.__file__).parent
-    for module in sorted(package.glob("*.py")):
+    scanned = sorted(package.rglob("*.py"))
+    assert scanned, "the package was not found, so nothing was checked"
+    for module in scanned:
         source = module.read_text()
-        for forbidden in ("import time", "monotonic", "perf_counter", "time.time"):
+        for forbidden in (
+            "import time",
+            "monotonic",
+            "perf_counter",
+            "time.time",
+            "datetime",
+            "os.times",
+            "get_event_loop",
+            "clock_gettime",
+        ):
             assert forbidden not in source, f"{module.name} names {forbidden}"
 
 
@@ -301,7 +314,16 @@ def test_the_named_side_of_the_node_boundary_is_the_one_priced(geometry):
 
 
 def test_a_spec_that_cannot_answer_for_the_link_refuses(geometry):
-    """The spec's refusal travels out; the other link is not substituted."""
+    """The spec's refusal travels out; the other link is not substituted.
+
+    The refusal has to name the field it could not answer for, and must name
+    nothing from the other side of the node boundary -- a message mentioning
+    the intra-node link here would be a fallback announcing itself. The rule's
+    own sentence is deliberately not pinned: a spec built by hand this way is
+    declined as "not a field of this schema", which is inaccurate for a field
+    the schema does declare, and freezing that wording here would make a
+    correction to the spec package fail this test.
+    """
     spec = spec_with(PEAKS[0])
     without = MachineSpec(
         values={
@@ -312,8 +334,11 @@ def test_a_spec_that_cannot_answer_for_the_link_refuses(geometry):
         tokenizers=spec.tokenizers,
     )
     TransferModel.from_spec(without, geometry, Scope.INTRA_NODE)
-    with pytest.raises(SpecRefusal, match="inter_node"):
+    with pytest.raises(SpecRefusal) as refusal:
         TransferModel.from_spec(without, geometry, Scope.INTER_NODE)
+    message = str(refusal.value)
+    assert "interconnect.inter_node.link_" in message, message
+    assert "intra_node" not in message, message
 
 
 def test_a_transfer_of_no_blocks_still_costs_the_latency(geometry):
@@ -329,29 +354,38 @@ def test_a_negative_block_count_is_refused(geometry):
         model_for(geometry, PEAKS[0]).duration_s(-1)
 
 
-def test_the_scheduler_queues_a_consumer_receive_once(geometry):
-    """What the scheduler half hands the workers, and that it hands it once."""
+def test_the_scheduler_declines_a_remote_load_it_could_not_wait_for(geometry):
+    """The two halves of a remote fill land together, or the request refuses.
+
+    A request asking to be filled from another deployment is client-reachable
+    -- `kv_transfer_params` rides the API request onto the sequence -- and the
+    engine calls this on every prefill allocation, before it decides whether
+    to suspend anything. Queueing the receive here while nothing suspends the
+    request would have the workers report a transfer finished against a
+    request the scheduler never suspended, and the scheduler has no path to
+    take that report back off its list.
+    """
     scheduler = connector(
         model_for(geometry, PEAKS[0]), lambda: ISSUE_AT, role="scheduler"
     )
     seq = SimpleNamespace(
         id="r", block_table=[0, 1, 2], kv_transfer_params={"do_remote_prefill": True}
     )
-    scheduler.update_state_after_alloc(seq)
-    assert seq.kv_transfer_params["do_remote_prefill"] is False
+    with pytest.raises(NotImplementedError, match="never suspended"):
+        scheduler.update_state_after_alloc(seq)
 
-    meta = scheduler.build_connector_meta()
-    assert set(meta.reqs_to_recv) == {"r"}
-    assert meta.reqs_to_recv["r"].local_block_ids == [0, 1, 2]
+    assert seq.kv_transfer_params["do_remote_prefill"] is True, "state was changed"
     assert scheduler.build_connector_meta().reqs_to_recv == {}
+    assert scheduler.get_num_new_matched_tokens(seq) == (0, False)
 
 
-def test_the_scheduler_parks_nothing_in_this_cut(geometry):
-    """The remote-prefill park path is absent, and says so by not acting."""
+def test_an_ordinary_request_passes_the_scheduler_untouched(geometry):
+    """Only a remote fill is declined; every other allocation is silent."""
     scheduler = connector(
         model_for(geometry, PEAKS[0]), lambda: ISSUE_AT, role="scheduler"
     )
-    seq = SimpleNamespace(
-        id="r", block_table=[0], kv_transfer_params={"do_remote_prefill": True}
-    )
+    seq = SimpleNamespace(id="r", block_table=[0, 1, 2], kv_transfer_params=None)
+    scheduler.update_state_after_alloc(seq)
     assert scheduler.get_num_new_matched_tokens(seq) == (0, False)
+    assert scheduler.build_connector_meta().reqs_to_recv == {}
+    assert scheduler.build_connector_meta().reqs_to_save == {}

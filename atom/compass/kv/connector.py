@@ -40,15 +40,17 @@ by its deadline against the clock and by nothing else, so two transfers issued
 in either order at one instant release together, and the sets carry no
 sequence for anything downstream to read.
 
-Two things are deliberately absent, and a deployment driven through the HTTP
-router will not work until they arrive: the parked remote-prefill path, where
-a consumer declares the whole prompt matched and waits, and the transfer
-parameter blob the router relays between the two deployments.
+**Filling a request from another deployment is declined, not half-done.** That
+path is two halves that only work together -- the request is suspended to wait
+for a remote load, and the receive is queued for the workers to carry -- and
+neither the suspension nor the transfer parameters the router relays between
+deployments is written yet. A queued receive whose request was never suspended
+is reported finished to a scheduler that has nothing waiting on it, so the
+scheduler side declines the queue by name instead.
 """
 
 from __future__ import annotations
 
-import logging
 from dataclasses import dataclass
 
 from atom.compass.kv.transfer import TransferModel
@@ -57,8 +59,6 @@ from atom.kv_transfer.disaggregation.base import (
     KVConnectorSchedulerBase,
 )
 from atom.kv_transfer.disaggregation.types import ConnectorMetadata, ReqId, ReqMeta
-
-logger = logging.getLogger("atom")
 
 #: Where the harness binds the clock this connector reads.
 CLOCK_KEY = "compass_clock"
@@ -180,45 +180,45 @@ class SimulatedKVConnector(KVConnectorBase):
 
 
 class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
-    """Scheduler side: queues what the workers are to move, and nothing more.
+    """Scheduler side: it holds no clock, and it takes on no remote load.
 
-    It holds no clock. Timing belongs to the workers, which are where the
-    transfer is announced and where it is reported finished.
+    Timing belongs to the workers, which are where a transfer is announced and
+    where it is reported finished.
+
+    What this half would otherwise own is the pair that fills a request from
+    another deployment: claiming the prompt as already held elsewhere, which
+    suspends the request, and queueing the receive that the workers then
+    carry. Doing the second without the first is worse than doing neither.
+    The scheduler suspends nothing, so it holds nothing waiting; the workers
+    would still mature the transfer and report it finished, and the report
+    would name a request the scheduler has no path to resume. So the queue
+    declines by name while the suspension is missing.
     """
 
     def __init__(self, config) -> None:
-        kv_config = _kv_config(config)
-        self.is_producer = _is_producer(kv_config)
-        self._reqs_need_recv: dict[ReqId, tuple] = {}
+        self.is_producer = _is_producer(_kv_config(config))
 
     def get_num_new_matched_tokens(self, seq) -> tuple[int, bool]:
-        """No remote match is claimed here, so no request is parked.
-
-        The path that declares the whole prompt already held on the producer,
-        and makes the scheduler wait for it, is not implemented yet.
-        """
+        """No remote match is claimed here, so no request is suspended."""
         return 0, False
 
     def update_state_after_alloc(self, seq) -> None:
-        """Queue a consumer's request for the receive its blocks are for."""
+        """Take on a remote load only if one could be waited for -- it cannot."""
         params = seq.kv_transfer_params or {}
         if not params.get("do_remote_prefill"):
             return
-        assert not self.is_producer, "only the consumer side receives remote KV"
-        self._reqs_need_recv[seq.id] = (seq, list(seq.block_table))
-        params["do_remote_prefill"] = False
+        raise NotImplementedError(
+            f"request {seq.id!r} asks to be filled from another deployment. "
+            "This connector declines rather than starting one: it does not "
+            "suspend a request to wait for a remote load, so a receive queued "
+            "here would be reported finished against a request the scheduler "
+            "never suspended, and the report has no path out of it. The two "
+            "halves land together or not at all"
+        )
 
     def build_connector_meta(self) -> ConnectorMetadata:
-        """This step's announcements, handed to the workers and then dropped."""
-        meta = ConnectorMetadata()
-        for req_id, (seq, block_ids) in self._reqs_need_recv.items():
-            meta.add_new_req_to_recv(
-                request_id=req_id,
-                local_block_ids=block_ids,
-                kv_transfer_params=seq.kv_transfer_params or {},
-            )
-        self._reqs_need_recv.clear()
-        return meta
+        """Nothing is queued, because no remote load was taken on."""
+        return ConnectorMetadata()
 
     def request_finished(self, seq) -> None:
         """Nothing is attached to a finished request yet.

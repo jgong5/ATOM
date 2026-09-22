@@ -32,8 +32,12 @@ It charges the same duration to both ends of the same wire. A push and a pull
 of the same blocks cost the same here, which is a claim about the fabric being
 symmetric that this model cannot check.
 
-Nothing here imports the engine or a tensor library, so the arithmetic runs
-anywhere Python does.
+Nothing in this module imports the engine or a tensor library. Reaching it
+through the package around it is not the same import: `atom.compass.kv` loads
+the connector beside it, and that brings the engine's connector interface and
+its factory -- seven modules, measured, none of them a tensor library and none
+of them a device runtime. So the arithmetic still runs where no driver does,
+which is the property worth having; it is not a bare import of this file.
 """
 
 from __future__ import annotations
