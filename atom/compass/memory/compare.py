@@ -1,0 +1,724 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+
+"""A predicted non-KV footprint held to its gate one term at a time.
+
+`03` D16's rule is **validate per term, never as a sum**, and the incident
+behind it is the reason this module has no call that returns a total. A summed
+non-KV check once read **+13.8%** while holding three errors, two of which
+cancelled: weights over by **+0.280 GB** (a tied `lm_head` that is never
+resident), activations compared at the wrong shape (**-0.015 GB**), and
+**-0.084 GB** of a resident term nobody had noticed existed. The largest of the
+three was **25% of its own term**, and the sum said 13.8%.
+
+So this module compares term by term, and the aggregate is available only as a
+`SummedCheck`, which cannot be constructed without the comparison it summarises
+and renders the per-term table underneath itself. That is principle 7 made
+structural rather than remembered, the same way `terms.Reading` makes it
+structural for a reading.
+
+**It costs no GPU time.** Every hardware run already prints its own breakdown;
+a `Recorded` is that printout, handed in as input data. Nothing here runs a
+model, imports the engine or touches a device, and a comparator that needed one
+would be a comparator nobody could run against the card they are sizing for.
+
+## What a term can come back as
+
+| outcome | when |
+|---|---|
+| `Verdict.PASS` | both sides present, within the gate, and the predicted side was obtained |
+| `Verdict.FAIL` | both sides present and outside the gate -- **including** when the predicted side is a declared coefficient, because a recording that contradicts a coefficient is evidence |
+| `Verdict.NOT_DISCHARGED` | both sides present and within the gate, but the predicted side is a declared coefficient. Agreement with one run does not turn a coefficient into a measurement, so the error is reported and the gate is not called discharged |
+| a `TermRefusal` | the two sides cannot be compared at all: the run records no such term, the shapes disagree, or the recorded peak is the warmup prefill's |
+
+The asymmetry in the middle two rows is deliberate and it is the whole of
+principle 6 applied to a gate: a declared term can **fail** its gate but cannot
+**pass** it. `03` D16 says so for two of the three terms it owes -- weights are
+exact via a meta build and buffers are recorded, not formula'd -- and its open
+issue says so for the third: "a graph without the scratch table does not
+discharge the 10% gate on this term".
+
+## The three traps this module refuses rather than papers over
+
+- **Shape.** Both sides state the shape they were taken at and a term taken at
+  a shape refuses against a side taken at another. The -0.015 GB above is an
+  activation term compared at the wrong shape, and a comparison that does not
+  say what shape it is at cannot notice.
+- **The allocator's high-water mark.** A tracing run must reset it around the
+  step it writes a graph for, or the peak belongs to the warmup prefill, whose
+  shape is nobody's choice -- **-14.7%** on one configuration. `Recorded` takes
+  that as a field with no default, and a recording that did not reset it
+  refuses every term it took at a shape.
+- **A term the run does not record.** Not a term of zero bytes. The refusal
+  names it and, when the predicted side is declared, carries that term's own
+  note -- which for buffers is `03` D16's reason for recording them rather than
+  computing them.
+
+## The graph pool is two numbers and stays two
+
+`graph_pool.reserves()` and `graph_pool.predicts()` disagree by 4-19x and only
+the first reserves anything. `compare_graph_pool` reports **both** against the
+recorded pool and labels which is which; there is no call here that returns one
+of them, and `compare` refuses a footprint term carrying either name so the
+pool cannot be folded into the per-term table as a single row.
+"""
+
+from __future__ import annotations
+
+import enum
+from collections.abc import Iterable, Mapping
+from dataclasses import dataclass
+
+from atom.compass.memory import graph_pool
+from atom.compass.memory.readings import DeviceReadings, MemoryRefusal
+from atom.compass.memory.terms import Basis, Reading, Term
+
+#: `03` D16's acceptance gate on a non-KV memory term, individually.
+NON_KV_TERM_GATE = 0.10
+
+
+class Verdict(enum.Enum):
+    """What a comparison of one term concluded. See the module docstring."""
+
+    PASS = "pass"
+    FAIL = "fail"
+    NOT_DISCHARGED = "not discharged"
+
+    def __str__(self) -> str:
+        return self.value
+
+
+@dataclass(frozen=True, slots=True)
+class Shape:
+    """The shape a footprint was taken at, which both sides have to state.
+
+    Two sides that disagree here are measuring different things, and the
+    -0.015 GB of `03` D16's incident is what that looks like when nobody says
+    so. Equality is the whole point of the type.
+    """
+
+    tokens: int
+    phase: str
+
+    def __post_init__(self) -> None:
+        if self.tokens < 1:
+            raise ValueError(f"a shape is at least one token: {self.tokens}")
+        if not self.phase.strip():
+            raise ValueError("a shape names its phase; prefill and decode differ")
+
+    def __str__(self) -> str:
+        return f"{self.tokens} tokens, {self.phase}"
+
+
+def _named(terms: Iterable[Term], where: str) -> dict[str, Term]:
+    by_name: dict[str, Term] = {}
+    for term in terms:
+        if not isinstance(term, Term):
+            raise TypeError(f"{where}: not a term: {term!r}")
+        if term.name in by_name:
+            raise ValueError(f"{where} carries two terms called {term.name!r}")
+        by_name[term.name] = term
+    return by_name
+
+
+@dataclass(frozen=True, slots=True)
+class Recorded:
+    """The breakdown one hardware run printed. Input data; nothing here makes one.
+
+    `run` identifies the run, because a recorded number whose run nobody can
+    name is a number without a source. `high_water_reset` has no default on
+    purpose: it is the difference between a peak that belongs to the step this
+    breakdown is about and one that belongs to the warmup prefill, and a
+    default would answer that question for a reader who never asked it.
+
+    `at_shape` names the terms that were taken at `shape`. It is stated rather
+    than inferred: which terms move with the shape is a property of how the
+    breakdown was produced, and the one thing this module must not do is guess
+    it from a term's name.
+    """
+
+    run: str
+    shape: Shape
+    high_water_reset: bool
+    terms: tuple[Term, ...]
+    at_shape: frozenset[str] = frozenset()
+
+    def __post_init__(self) -> None:
+        if not self.run.strip():
+            raise ValueError("a recording names its run, or its numbers have no source")
+        by_name = _named(self.terms, f"recording {self.run!r}")
+        if not by_name:
+            raise ValueError(f"recording {self.run!r} records nothing")
+        for term in self.terms:
+            if term.basis is not Basis.OBTAINED:
+                raise ValueError(
+                    f"{self.run}.{term.name} is {term.basis}; every term of a "
+                    "recording was read off the card, which is Basis.OBTAINED"
+                )
+        unknown = self.at_shape - by_name.keys()
+        if unknown:
+            raise ValueError(
+                f"recording {self.run!r} says {sorted(unknown)} were taken at "
+                f"{self.shape} and records no such term"
+            )
+
+    def by_name(self) -> dict[str, Term]:
+        return _named(self.terms, f"recording {self.run!r}")
+
+
+@dataclass(frozen=True, slots=True)
+class Predicted:
+    """The non-KV terms Compass predicts, and the shape they were taken at."""
+
+    label: str
+    shape: Shape
+    terms: tuple[Term, ...]
+    at_shape: frozenset[str] = frozenset()
+
+    def __post_init__(self) -> None:
+        if not self.label.strip():
+            raise ValueError("a prediction says what produced it")
+        by_name = _named(self.terms, f"prediction {self.label!r}")
+        if not by_name:
+            raise ValueError(f"prediction {self.label!r} predicts nothing")
+        unknown = self.at_shape - by_name.keys()
+        if unknown:
+            raise ValueError(
+                f"prediction {self.label!r} says {sorted(unknown)} were taken "
+                f"at {self.shape} and predicts no such term"
+            )
+
+    @classmethod
+    def from_readings(
+        cls, readings: DeviceReadings, *, shape: Shape, at_shape: frozenset[str]
+    ) -> Predicted:
+        """The footprint terms of a `DeviceReadings`: `peak_torch` and `non_torch`.
+
+        Three of the five readings are deliberately not here. `total` is the
+        card and `free` is the box that is left after the footprint, so neither
+        is a footprint term; folding either in would compare the card against
+        itself. `cudagraph_overhead` is one of **two** numbers that disagree by
+        4-19x, and a single row for it would pick one -- `compare_graph_pool`
+        takes both, and `compare` refuses a term carrying either name.
+
+        `at_shape` is required rather than defaulted to this package's own
+        shape-dependent term. A caller that adds a term to `ModelTerms` has to
+        say whether it moves with the shape, and a default here would answer
+        for them.
+        """
+        return cls(
+            label=f"{readings.spec_digest} at TP{readings.tp_width}",
+            shape=shape,
+            terms=tuple(readings.peak_torch.terms) + tuple(readings.non_torch.terms),
+            at_shape=at_shape,
+        )
+
+    def by_name(self) -> dict[str, Term]:
+        return _named(self.terms, f"prediction {self.label!r}")
+
+
+@dataclass(frozen=True, slots=True)
+class TermRefusal:
+    """One term that could not be compared, and why. A declined term is a result."""
+
+    name: str
+    what: str
+    remedy: str
+
+    def __str__(self) -> str:
+        return f"{self.name}: {self.what}. {self.remedy}"
+
+
+@dataclass(frozen=True, slots=True)
+class TermComparison:
+    """One term's predicted bytes against one run's, and the gate it carries.
+
+    `predicted` is `None` for a term the run records and nothing predicted --
+    the -0.084 GB of `03` D16's incident, a resident term nobody had noticed
+    existed. It is reported as the whole of itself rather than passed over,
+    because a term that is absent from a prediction is absent from its sum too
+    and that is exactly what makes a sum unable to see it.
+    """
+
+    name: str
+    predicted: Term | None
+    recorded: Term
+    gate: float
+    verdict: Verdict
+    why: str = ""
+
+    @property
+    def predicted_bytes(self) -> int:
+        return 0 if self.predicted is None else self.predicted.nbytes
+
+    @property
+    def delta_bytes(self) -> int:
+        return self.predicted_bytes - self.recorded.nbytes
+
+    @property
+    def relative(self) -> float:
+        """The error as a fraction of the recorded term, which is the gate's unit."""
+        if self.recorded.nbytes == 0:
+            raise MemoryRefusal(
+                f"{self.name} was recorded as zero bytes, so an error relative "
+                "to it has no value",
+                "compare this term in bytes, or record the run that allocated it",
+            )
+        return self.delta_bytes / self.recorded.nbytes
+
+    def row(self) -> tuple[str, ...]:
+        predicted = "-" if self.predicted is None else f"{self.predicted_bytes:,}"
+        return (
+            self.name,
+            predicted,
+            f"{self.recorded.nbytes:,}",
+            f"{self.delta_bytes:+,}",
+            f"{self.relative:+.2%}",
+            str(self.verdict),
+        )
+
+
+@dataclass(frozen=True, slots=True)
+class Comparison:
+    """Every non-KV term of one prediction against one run, and nothing summed.
+
+    There is no `total` here and no `__int__`. The aggregate is `summed`, which
+    returns an object that cannot be built without this one and prints this
+    table underneath itself -- `03` D16's rule is that an overall figure may be
+    emitted only beside the decomposition that produced it, and a call that
+    could return the figure alone is the defect rather than the convenience.
+    """
+
+    label: str
+    run: str
+    predicted_shape: Shape
+    recorded_shape: Shape
+    gate: float
+    compared: tuple[TermComparison, ...]
+    refused: tuple[TermRefusal, ...]
+
+    def failures(self) -> tuple[TermComparison, ...]:
+        return tuple(t for t in self.compared if t.verdict is Verdict.FAIL)
+
+    def not_discharged(self) -> tuple[TermComparison, ...]:
+        return tuple(t for t in self.compared if t.verdict is Verdict.NOT_DISCHARGED)
+
+    def worst(self) -> TermComparison:
+        """The largest single term error, as the term rather than as a number."""
+        if not self.compared:
+            raise MemoryRefusal(
+                f"{self.run} and {self.label} share no comparable term, so "
+                "there is no largest error",
+                "check the refusals: every term of this comparison is in them",
+            )
+        return max(self.compared, key=lambda t: abs(t.delta_bytes))
+
+    def table(self) -> str:
+        """The per-term table, then every refusal by name. Never a total."""
+        header = ("term", "predicted", "recorded", "delta", "of term", "verdict")
+        rows = [header] + [t.row() for t in self.compared]
+        widths = [max(len(r[i]) for r in rows) for i in range(len(header))]
+        shapes = (
+            f"  predicted at {self.predicted_shape}; recorded at "
+            f"{self.recorded_shape}; gate {self.gate:.0%} per term"
+        )
+        lines = [f"{self.label} against run {self.run}", shapes]
+        for row in rows:
+            lines.append(
+                "  "
+                + "  ".join(
+                    cell.rjust(widths[i]) if i else cell.ljust(widths[i])
+                    for i, cell in enumerate(row)
+                ).rstrip()
+            )
+        for comparison in self.compared:
+            if comparison.why:
+                lines.append(f"  * {comparison.name}: {comparison.why}")
+        for refusal in self.refused:
+            lines.append(f"  ! {refusal}")
+        return "\n".join(lines)
+
+    def summed(self, *, band: float) -> SummedCheck:
+        """The instrument `03` D16 exists to reject, kept so it can be shown wrong.
+
+        `band` has no default because this project states no band for a sum.
+        Every band it does state -- `03` D16's 10% and `10` D67.1's 25% -- is
+        **per term**, and choosing one of them for a sum is the substitution
+        that produced the +13.8%. Naming it at the call site is the moment a
+        caller has to notice that.
+        """
+        return SummedCheck(comparison=self, band=band)
+
+    def __str__(self) -> str:
+        return self.table()
+
+
+@dataclass(frozen=True, slots=True)
+class SummedCheck:
+    """One aggregate, and the table it came from, which it cannot be printed without.
+
+    This is the instrument that read +13.8% over three errors, two of which
+    cancelled. It is here so that the two can be run on one breakdown and the
+    difference shown, which is a stronger argument for `03` D16 than restating
+    the rule. It holds its `Comparison` rather than a pair of totals, so there
+    is no way to obtain the figure without also holding the decomposition.
+    """
+
+    comparison: Comparison
+    band: float
+
+    def __post_init__(self) -> None:
+        if not 0 < self.band < 10:
+            raise ValueError(f"a band is a fraction of the recorded sum: {self.band}")
+
+    @property
+    def folded(self) -> tuple[TermComparison, ...]:
+        return self.comparison.compared
+
+    @property
+    def predicted_total(self) -> int:
+        return sum(t.predicted_bytes for t in self.folded)
+
+    @property
+    def recorded_total(self) -> int:
+        return sum(t.recorded.nbytes for t in self.folded)
+
+    @property
+    def delta_bytes(self) -> int:
+        return self.predicted_total - self.recorded_total
+
+    @property
+    def relative(self) -> float:
+        if self.recorded_total == 0:
+            raise MemoryRefusal(
+                "the recorded terms sum to zero bytes",
+                "a relative error against nothing is not a figure; read the table",
+            )
+        return self.delta_bytes / self.recorded_total
+
+    @property
+    def passed(self) -> bool:
+        return abs(self.relative) <= self.band
+
+    def table(self) -> str:
+        """The aggregate, and underneath it the terms it folded."""
+        verdict = "passes" if self.passed else "fails"
+        refused = len(self.comparison.refused)
+        aggregate = (
+            f"summed check: {self.relative:+.1%} against a {self.band:.0%} "
+            f"band -- {verdict}"
+        )
+        folded = (
+            f"  folded {len(self.folded)} terms, {refused} refused and so not "
+            "folded; a sum names none of them"
+        )
+        return f"{aggregate}\n{folded}\n{self.comparison.table()}"
+
+    def __str__(self) -> str:
+        return self.table()
+
+
+def _refuse_shape(name: str, predicted: Shape, recorded: Shape) -> TermRefusal:
+    return TermRefusal(
+        name,
+        f"this term was taken at a shape on each side and the two disagree -- "
+        f"predicted at {predicted}, recorded at {recorded}",
+        "take the two sides at one shape. A -0.015 GB activation error in the "
+        "incident 03 D16 records is exactly this, and a difference in shape "
+        "looks like a difference in the model until somebody states both",
+    )
+
+
+def _refuse_high_water(name: str, run: str) -> TermRefusal:
+    return TermRefusal(
+        name,
+        f"run {run} did not reset the allocator's high-water mark around the "
+        "step this breakdown is about, so its peak belongs to whatever ran "
+        "before it -- on a tracing run, the warmup prefill",
+        "reset the peak around the step the breakdown is written for and "
+        "record again; the warmup prefill's shape is nobody's choice and "
+        "taking its peak for the step's was worth -14.7% on one configuration",
+    )
+
+
+def _refuse_unrecorded(name: str, run: str, term: Term) -> TermRefusal:
+    note = f" The predicted term says: {term.note}" if term.note else ""
+    return TermRefusal(
+        name,
+        f"run {run} records no {name!r}, so there is nothing to compare it "
+        "against; a term absent from a breakdown is not a term of zero bytes",
+        f"record this term separately in the run, or say that the run's own "
+        f"split cannot isolate it.{note}",
+    )
+
+
+def _verdict(predicted: Term, relative: float, gate: float) -> tuple[Verdict, str]:
+    if abs(relative) > gate:
+        return Verdict.FAIL, ""
+    if predicted.basis is not Basis.DECLARED:
+        return Verdict.PASS, ""
+    return Verdict.NOT_DISCHARGED, (
+        f"within the gate, and the gate is not discharged: the predicted side "
+        f"is a declared coefficient over {predicted.source}. {predicted.note}"
+    )
+
+
+def compare(
+    predicted: Predicted,
+    recorded: Recorded,
+    *,
+    gate: float = NON_KV_TERM_GATE,
+) -> Comparison:
+    """Every term of a predicted footprint against one run's, one term at a time.
+
+    A term appears in exactly one of two places. It is **compared** when both
+    sides carry it and the pair is comparable, and it is **refused** by name
+    when it is not -- an unrecorded term, a shape the two sides disagree on, or
+    a recorded peak that belongs to the warmup prefill. There is no third
+    place, and in particular there is no silent omission: the recorded-only
+    terms are compared against a predicted zero, because a resident term nobody
+    predicted is the error that a sum cannot see.
+    """
+    if not 0 < gate < 1:
+        raise ValueError(f"a gate is a fraction of a term: {gate}")
+    for side in (predicted.by_name(), recorded.by_name()):
+        for name in (graph_pool.RESERVES, graph_pool.PREDICTS):
+            if name in side:
+                raise MemoryRefusal(
+                    f"{name!r} was handed in as a footprint term, and the "
+                    "graph pool is two numbers that disagree by 4-19x",
+                    "pass both to `compare_graph_pool`, which reports each "
+                    "against the recorded pool and labels which one reserves; "
+                    "one row here would pick one and lose the finding",
+                )
+    at_shape = predicted.at_shape | recorded.at_shape
+    if predicted.shape != recorded.shape and not at_shape:
+        raise MemoryRefusal(
+            f"the two sides were taken at different shapes -- predicted at "
+            f"{predicted.shape}, recorded at {recorded.shape} -- and neither "
+            "names a term it took at one",
+            "state `at_shape` on the side whose terms move with the shape. A "
+            "comparison that cannot say which terms move with the shape cannot "
+            "say whether the two sides measured the same thing",
+        )
+    shapes_agree = predicted.shape == recorded.shape
+    predicted_terms = predicted.by_name()
+    recorded_terms = recorded.by_name()
+    compared: list[TermComparison] = []
+    refused: list[TermRefusal] = []
+    for name, term in predicted_terms.items():
+        if name not in recorded_terms:
+            refused.append(_refuse_unrecorded(name, recorded.run, term))
+    for name, recording in recorded_terms.items():
+        if name in recorded.at_shape and not recorded.high_water_reset:
+            refused.append(_refuse_high_water(name, recorded.run))
+            continue
+        if name in at_shape and not shapes_agree:
+            refused.append(_refuse_shape(name, predicted.shape, recorded.shape))
+            continue
+        term = predicted_terms.get(name)
+        if term is None:
+            compared.append(
+                TermComparison(
+                    name=name,
+                    predicted=None,
+                    recorded=recording,
+                    gate=gate,
+                    verdict=Verdict.FAIL,
+                    why=(
+                        "the run records this term and nothing predicted it, so "
+                        "the whole of it is missing from the prediction and from "
+                        "any sum over it"
+                    ),
+                )
+            )
+            continue
+        relative = (term.nbytes - recording.nbytes) / recording.nbytes
+        verdict, why = _verdict(term, relative, gate)
+        compared.append(
+            TermComparison(
+                name=name,
+                predicted=term,
+                recorded=recording,
+                gate=gate,
+                verdict=verdict,
+                why=why,
+            )
+        )
+    return Comparison(
+        label=predicted.label,
+        run=recorded.run,
+        predicted_shape=predicted.shape,
+        recorded_shape=recorded.shape,
+        gate=gate,
+        compared=tuple(compared),
+        refused=tuple(refused),
+    )
+
+
+@dataclass(frozen=True, slots=True)
+class GraphPoolComparison:
+    """Both graph-pool numbers against the recorded pool, labelled by which reserves.
+
+    `03` D16 keeps ATOM's estimator and the measured predictor as two functions
+    because they disagree by 4-19x, and the disagreement is the finding. So
+    this type has no accessor for *the* error: it has one for each, and its
+    table has a row for each, labelled with what that function does. A
+    comparator that reported one of them would have reconciled what the design
+    says to keep apart.
+    """
+
+    recorded: Term
+    reserves: Reading
+    predicts: Reading
+
+    def __post_init__(self) -> None:
+        if self.recorded.basis is not Basis.OBTAINED:
+            raise ValueError(
+                f"the recorded pool is {self.recorded.basis}; a pool to compare "
+                "against was read off a card, which is Basis.OBTAINED"
+            )
+        if self.reserves.name != graph_pool.RESERVES:
+            raise MemoryRefusal(
+                f"the reserving reading given is {self.reserves.name!r}",
+                f"pass `graph_pool.reserves(...)`, whose reading is named "
+                f"{graph_pool.RESERVES!r}; it is the number ATOM subtracts "
+                "from the budget, so it is the one that reserves",
+            )
+        if self.predicts.name != graph_pool.PREDICTS:
+            raise MemoryRefusal(
+                f"the predicting reading given is {self.predicts.name!r}",
+                f"pass `graph_pool.predicts(...)`, whose reading is named "
+                f"{graph_pool.PREDICTS!r}; it reserves nothing and says what "
+                "the pool really costs",
+            )
+
+    @property
+    def reserves_relative(self) -> float:
+        """What the number that reserves is off the recorded pool by."""
+        return (self.reserves.total - self.recorded.nbytes) / self.recorded.nbytes
+
+    @property
+    def predicts_relative(self) -> float:
+        """What the number that predicts is off the recorded pool by."""
+        return (self.predicts.total - self.recorded.nbytes) / self.recorded.nbytes
+
+    @property
+    def disagreement(self) -> float:
+        """How many times the reserving number is the predicting one."""
+        if self.predicts.total == 0:
+            raise MemoryRefusal(
+                "the predicted pool is zero bytes, so the two functions have "
+                "no ratio",
+                "read the two rows of the table, which are both still there",
+            )
+        return self.reserves.total / self.predicts.total
+
+    def table(self) -> str:
+        rows = [
+            ("function", "role", "bytes", "vs recorded"),
+            (
+                "reserves()",
+                "reserves the memory",
+                f"{self.reserves.total:,}",
+                f"{self.reserves_relative:+.2%}",
+            ),
+            (
+                "predicts()",
+                "reserves nothing",
+                f"{self.predicts.total:,}",
+                f"{self.predicts_relative:+.2%}",
+            ),
+            (
+                "recorded",
+                self.recorded.source,
+                f"{self.recorded.nbytes:,}",
+                "",
+            ),
+        ]
+        widths = [max(len(r[i]) for r in rows) for i in range(4)]
+        lines = [f"graph pool against {self.recorded.name}"]
+        for row in rows:
+            lines.append(
+                "  "
+                + "  ".join(
+                    cell.rjust(widths[i]) if i > 1 else cell.ljust(widths[i])
+                    for i, cell in enumerate(row)
+                ).rstrip()
+            )
+        lines.append(
+            f"  reserves() is {self.disagreement:.4f}x predicts(); only the "
+            "first is subtracted from the budget"
+        )
+        return "\n".join(lines)
+
+    def __str__(self) -> str:
+        return self.table()
+
+
+def compare_graph_pool(
+    recorded: Term, *, reserves: Reading, predicts: Reading
+) -> GraphPoolComparison:
+    """Both graph-pool numbers against one recorded pool. Neither is picked."""
+    return GraphPoolComparison(recorded=recorded, reserves=reserves, predicts=predicts)
+
+
+def tied_lm_head_bytes(config, *, dtype_bytes: int) -> int:
+    """The bytes a meta build over-counts because it has not been through the loader.
+
+    A meta build gives `03` D16 its exact weights, and this is the one
+    correction it cannot make for itself: the loader is what ties `lm_head` to
+    the input embedding, so before it has run the two are separate tensors and
+    one embedding of bytes that is never resident is counted. It was worth
+    **0.290 GiB on the 0.6B** and was once the whole of a gap.
+
+    A config that does not state `tie_word_embeddings` refuses rather than
+    assuming one way or the other, which is what a formula reading an absent
+    `partial_rotary_factor` did to the buffers term. The absence is observable
+    rather than hypothetical: a `PretrainedConfig` built without the field
+    raises on the attribute instead of answering, and the test asserts that
+    before it asserts the refusal.
+    """
+    text = getattr(config, "text_config", config)
+    tied = getattr(text, "tie_word_embeddings", None)
+    if tied is None:
+        raise MemoryRefusal(
+            "this config states no `tie_word_embeddings`, and whether the "
+            "input embedding is also the output head is the whole of this "
+            "correction",
+            "state the field on the config. Taking the library default would "
+            "answer a question this config did not answer, and an untied "
+            "assumption is the 0.290 GiB gap on the 0.6B",
+        )
+    if not tied:
+        return 0
+    vocab = int(_field(config, "vocab_size"))
+    hidden = int(_field(config, "hidden_size"))
+    return vocab * hidden * int(dtype_bytes)
+
+
+def _field(config, name: str) -> object:
+    text = getattr(config, "text_config", config)
+    value = getattr(text, name, None)
+    if value is None:
+        raise MemoryRefusal(
+            f"this config states no `{name}`, and the tied-head correction "
+            "is one embedding of it",
+            "name the model whose geometry this is, or build the config "
+            "through ATOM's own config classes, which fill it in",
+        )
+    return value
+
+
+def footprint_terms(mapping: Mapping[str, int], *, source: str) -> tuple[Term, ...]:
+    """Named byte counts from a run's printout, as recorded terms.
+
+    A convenience for the one shape a recording arrives in -- a printed
+    breakdown is names and byte counts -- and it does the one thing that must
+    not be got wrong, which is to label every one of them `Basis.OBTAINED` and
+    to make each name its run.
+    """
+    return tuple(
+        Term(name, int(nbytes), Basis.OBTAINED, source)
+        for name, nbytes in mapping.items()
+    )

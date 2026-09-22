@@ -30,6 +30,13 @@ side, and nothing on the model side of it is *obtained* yet -- every term
 read off a model config here is a declared formula, and labelling one
 `GEOMETRY` would say it was not.
 
+`OBTAINED` is the one that was missing, and it is the word the paragraph above
+already uses for what a declared term is not: the number was read off the thing
+itself -- a meta build of the model, a recording of a card, a traced graph. It
+is the successor every `DECLARED` term names, so a term that carries it is a
+term that no longer owes one. Nothing this package *produces* is obtained; the
+recorded side of a comparison is, which is why the member arrives with one.
+
 The two vocabularies are kept apart deliberately. A declared coefficient has no
 word in `Species` and adding one is an open owner ruling (**#87**), so nothing
 here touches that enum; `Basis.DECLARED` carries the distinction on this side of
@@ -55,6 +62,7 @@ class Basis(enum.Enum):
     DEPLOYMENT = "deployment"
     DECLARED = "declared"
     DERIVED = "derived"
+    OBTAINED = "obtained"
 
     def __str__(self) -> str:
         return self.value
