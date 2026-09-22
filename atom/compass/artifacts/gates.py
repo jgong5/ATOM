@@ -11,7 +11,8 @@ gate; five runs then faulted and each fault was read as evidence about
 whatever had changed most recently.
 
 So a gate is recorded as three things, and the third is the one the incident
-turns on. A gate states **what it read** to decide its state, and a recorded
+turns on -- which is why the check reports it even when the state moved as
+well, rather than letting the louder difference hide it. A gate states **what it read** to decide its state, and a recorded
 gate that read `WORLD_SIZE` disagrees with a gate in force that reads
 something else **even when both say off** -- because they are not the same
 gate, and the agreement is a coincidence of one being dead. `resolved_from`
@@ -134,10 +135,15 @@ class GateState:
                     f"`{name}` was {was.state} when this entry was made and is "
                     f"{now.state} now"
                 )
-            elif was.resolved_from != now.resolved_from:
+            # Not `elif`. When both moved, the source is the half that says
+            # *which* gate each side was: a reader told only "off, now on"
+            # re-runs under the old flag, and a reader told "and it read
+            # WORLD_SIZE" goes and looks at what that gate let through.
+            if was.resolved_from != now.resolved_from:
+                agreed = f", both saying {now.state}" if was.state == now.state else ""
                 disagreements.append(
                     f"`{name}` read {was.resolved_from} when this entry was made "
-                    f"and reads {now.resolved_from} now, both saying {now.state}"
+                    f"and reads {now.resolved_from} now{agreed}"
                 )
         if disagreements:
             raise ArtifactRefusal(

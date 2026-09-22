@@ -475,6 +475,32 @@ def test_a_gate_reading_another_variable_is_another_gate(tmp_path):
     assert "both saying off" in str(refused.value)
 
 
+def test_a_dead_gates_signature_survives_a_state_change_beside_it(tmp_path):
+    """Both facts, when both moved -- the louder one does not hide the other.
+
+    A reader told only "it was off and is on now" re-runs under the old flag.
+    A reader told "and it read `WORLD_SIZE`" goes and looks at what that gate
+    let through, which is the whole reason the source is recorded.
+    """
+    store = ArtifactStore(tmp_path)
+    publish(
+        store,
+        KEY_OF[Row.PRICE_LIST],
+        gates=GateState.of(Gate("PRICE_KERNELS", "off", "WORLD_SIZE")),
+    )
+    with pytest.raises(ArtifactRefusal) as refused:
+        store.load(
+            KEY_OF[Row.PRICE_LIST],
+            conditions=BASE,
+            gates=GateState.of(Gate("PRICE_KERNELS", "on", "COMPASS_PRICE_KERNELS")),
+        )
+    assert refused.value.rule is Rule.GATE_STATE
+    assert "was off when this entry was made and is on now" in str(refused.value)
+    assert "read WORLD_SIZE when this entry was made" in str(refused.value)
+    assert "reads COMPASS_PRICE_KERNELS now" in str(refused.value)
+    assert "both saying" not in str(refused.value)
+
+
 def test_a_gate_absent_from_one_side_is_named(tmp_path):
     """A gate that shaped the entry and is gone, and one that arrived since."""
     store = ArtifactStore(tmp_path)
@@ -624,6 +650,72 @@ def test_the_fingerprint_and_the_gate_state_are_in_the_entry(tmp_path):
     ]
     assert store.read(KEY_OF[Row.PRICE_LIST]).gate_state == GATES
     assert store.read(KEY_OF[Row.PRICE_LIST]).fingerprints == entry.fingerprints
+
+
+def test_a_recorded_row_the_matrix_no_longer_names_is_refused(tmp_path):
+    """A row nothing compares is a check that silently stopped.
+
+    The cell-level version of this refuses eleven lines away in
+    `Fingerprint.from_json`, and the row is the more likely one to move:
+    `ROWS_OF` is one edit, #174 may add two rows, and the schema version does
+    not change when the matrix does.
+    """
+    store = ArtifactStore(tmp_path)
+    entry = publish(store, KEY_OF[Row.MACHINE_SPEC_CAPACITY])
+    document = json.loads((entry.directory / "entry.json").read_bytes())
+    document["fingerprints"]["region_terms"] = fingerprint(
+        Row.REGION_TERMS, BASE
+    ).as_json()
+    (entry.directory / "entry.json").chmod(0o644)
+    (entry.directory / "entry.json").write_text(json.dumps(document))
+    with pytest.raises(ArtifactRefusal) as refused:
+        store.read(entry.key)
+    assert refused.value.rule is Rule.INVALIDATED
+    assert "records a fingerprint for `region_terms`" in str(refused.value)
+    assert "silently stopped" in str(refused.value)
+
+
+@pytest.mark.parametrize("given", [None, object(), [], {}, True])
+def test_an_axis_handed_something_that_is_not_a_reading_is_refused(given):
+    """`str()` is a fallback, and the two ends of it fail differently.
+
+    An object records a heap address, which moves between processes and then
+    refuses a change nobody made. `None` records the word `None`, which is
+    indistinguishable from a device called that and certifies clean forever.
+    """
+    with pytest.raises(ArtifactRefusal) as refused:
+        Reading.stated(given)
+    assert refused.value.rule is Rule.INVALIDATED
+    assert "is not a stated reading" in str(refused.value)
+
+    with pytest.raises(ArtifactRefusal):
+        BASE.with_reading(Axis.ENGINE_CONFIG, given)
+
+
+def test_a_scalar_is_still_a_stated_reading():
+    """The positive control, so the refusal above is not firing on everything."""
+    assert Reading.stated("MI308X-80CU") == Reading("stated", "MI308X-80CU")
+    assert Reading.stated(64).value == "64"
+    assert Reading.stated(0.9).value == "0.9"
+
+
+def test_an_incomparable_reading_does_not_swallow_the_cells_that_compared(tmp_path):
+    """Refuse on the one that cannot be asked, and still say what else moved.
+
+    Otherwise the caller re-takes the reading the entry's way, re-runs, and
+    discovers a second cell that had already moved when the first refusal was
+    written.
+    """
+    store = ArtifactStore(tmp_path)
+    publish(store, KEY_OF[Row.PRICE_LIST])
+    both = moved(BASE, Axis.DEVICE).with_reading(
+        Axis.ATOM_SRC, Reading("commit", "065f34f06bc7de314b37ec85b549feea104aa57e")
+    )
+    with pytest.raises(ArtifactRefusal) as refused:
+        store.load(KEY_OF[Row.PRICE_LIST], conditions=both, gates=GATES)
+    assert refused.value.rule is Rule.NOT_COMPARABLE
+    assert "recorded a tree and this run reads a commit" in str(refused.value)
+    assert "`price_list` x `device`" in str(refused.value)
 
 
 def test_a_publish_that_states_no_conditions_is_refused(tmp_path):

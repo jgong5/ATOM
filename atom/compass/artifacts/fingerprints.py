@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: MIT
 """What a row's fingerprint is, and what a mismatch in one is allowed to say.
 
-A fingerprint here is not one digest. It is **the readings of the axes the row
-depends on, kept apart**, because an artifact that refuses with a single moved
+A fingerprint is not one digest, and there is no method here that makes one.
+It is **the readings of the axes the row depends on, kept apart**, because an artifact that refuses with a single moved
 hash says only that something changed, and nothing about which of six things
 did. Keeping the cells apart is what lets a refusal say
 `region_terms x model`, and what lets a `price_list` be shown surviving the
@@ -26,8 +26,6 @@ answer to downgrade.
 """
 
 import enum
-import hashlib
-import json
 import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass
@@ -69,7 +67,27 @@ class Reading:
 
     @classmethod
     def stated(cls, value: object) -> "Reading":
-        """A configured reading: something a person or a config file declared."""
+        """A configured reading: something a person or a config file declared.
+
+        A scalar, and nothing else. `str()` of an arbitrary object records
+        its heap address, which differs between two processes and then
+        refuses a change nobody made -- the mirror of the mismatch this
+        module refuses to invent when two readings are of different kinds.
+        `str(None)` is worse and quieter: it records an axis nobody
+        measured as the word `None`, indistinguishable from a device
+        actually called that, and certifies clean forever after. A bool is
+        refused with the rest because `True` and the string `"True"` would
+        record the same text, which is why `Key.of` refuses one too.
+        """
+        if isinstance(value, bool) or not isinstance(value, (str, int, float)):
+            raise ArtifactRefusal(
+                Rule.INVALIDATED,
+                f"an axis was handed {value!r}, which is not a stated reading",
+                "write the text or the number that was configured; str() of "
+                "an object records a heap address that moves between "
+                "processes, and str(None) records an axis nobody measured "
+                "as the word None",
+            )
         return cls("stated", str(value))
 
     @classmethod
@@ -155,15 +173,6 @@ class Fingerprint:
     @property
     def axes(self) -> tuple[Axis, ...]:
         return tuple(axis for axis, _ in self.cells)
-
-    def digest(self) -> str:
-        """The row's whole fingerprint in one line, for a log that wants one.
-
-        Never the only thing recorded: the cells are kept beside it, because a
-        moved digest names nothing and this project has been here before.
-        """
-        payload = json.dumps(self.as_json(), sort_keys=True, separators=(",", ":"))
-        return "sha256:" + hashlib.sha256(payload.encode()).hexdigest()
 
     def as_json(self) -> dict:
         return {
@@ -281,8 +290,10 @@ def verify(
     """Check every recorded row against the conditions in force.
 
     Refuses by default and warns only under the explicit flag -- which reaches
-    the mismatches only. A comparison that could not be
-    made is refused either way, because there is no answer to downgrade.
+    the mismatches only. A comparison that could not be made is refused either
+    way, because there is no answer to downgrade; the refusal still names the
+    cells that *did* compare, so a caller who re-takes the reading does not
+    then discover a second cell that had already moved.
     """
     found: list[Mismatch] = []
     for row, was in recorded.items():
@@ -291,10 +302,12 @@ def verify(
     if unavailable:
         raise ArtifactRefusal(
             Rule.NOT_COMPARABLE,
-            "; ".join(moved.text for moved in unavailable),
+            "; ".join(moved.text for moved in found),
             "a git tree and a git commit are different objects in one field, "
             "so two entries from byte-identical source compare unequal; "
-            "re-take the reading the same way the entry did, or re-measure",
+            "re-take the reading the same way the entry did, or re-measure. "
+            "Any other cell named above had already moved, and will refuse "
+            "again once this one can be compared",
         )
     if not found:
         return ()

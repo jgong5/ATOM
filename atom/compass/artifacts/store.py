@@ -282,9 +282,21 @@ class ArtifactStore:
             stored = Key.of(Kind(document["kind"]), **document["key"])
             topology = Topology.from_mapping(document["topology"])
             provenance = Provenance.from_json(document["provenance"])
+            wanted = {row.field: row for row in rows_for(stored.kind)}
+            stale = sorted(set(document["fingerprints"]) - set(wanted))
+            if stale:
+                raise ArtifactRefusal(
+                    Rule.INVALIDATED,
+                    f"{directory} records a fingerprint for "
+                    f"`{', '.join(stale)}`, which is not a row this kind is "
+                    "checked against",
+                    "the matrix moved under this entry; re-measure it, "
+                    "because a recorded row nothing compares is a check "
+                    "that silently stopped",
+                )
             prints = {
-                row: Fingerprint.from_json(document["fingerprints"][row.field])
-                for row in rows_for(stored.kind)
+                row: Fingerprint.from_json(document["fingerprints"][field])
+                for field, row in wanted.items()
             }
             gate_state = GateState.from_json(document["gates"])
             notes, members = document["notes"], document["members"]
