@@ -74,7 +74,8 @@ AITER_ROOT = SourceRoot(
 
 
 #: What every publish here states about the conditions it was made under and
-#: the gates that shaped it. D43 requires both and this file is about neither:
+#: the gates that shaped it. A publish requires both and this file is about
+#: neither:
 #: what they *do* is exercised in `test_artifact_invalidation.py`, and here
 #: they are the fixture that lets a publish happen at all.
 CONDITIONS = Conditions.of(

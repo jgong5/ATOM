@@ -3,8 +3,8 @@
 
 A fingerprint here is not one digest. It is **the readings of the axes the row
 depends on, kept apart**, because an artifact that refuses with a single moved
-hash says only that something changed -- principle 7, in the place it is
-cheapest to get right. Keeping the cells apart is what lets a refusal say
+hash says only that something changed, and nothing about which of six things
+did. Keeping the cells apart is what lets a refusal say
 `region_terms x model`, and what lets a `price_list` be shown surviving the
 same change.
 
@@ -17,10 +17,10 @@ different refusals: `NOT_COMPARABLE` says the comparison is unavailable,
 `INVALIDATED` says it was made and failed. Returning `False` for the first
 would report a change nobody observed.
 
-**The conditions are stated, never probed** (principle 2). Nothing in this
-module reads a device, a driver or an environment variable; a caller hands in
-six readings and this module compares them. That is also why the flag D43
-allows is narrow: `OnMismatch.WARN` downgrades *the conditions moved* to a
+**The conditions are stated, never probed.** Nothing in this module reads a
+device, a driver or an environment variable; a caller hands in six readings and
+this module compares them, so a host with one ROCm can express a ROCm bump.
+That is also why the warning flag is narrow: `OnMismatch.WARN` downgrades *the conditions moved* to a
 warning, and does not touch *the comparison could not be made*, which has no
 answer to downgrade.
 """
@@ -37,7 +37,7 @@ from .rules import ArtifactRefusal, Rule
 
 
 class OnMismatch(enum.Enum):
-    """D43's "mismatch refuses, warn only under an explicit flag"."""
+    """Whether a mismatch refuses or warns. Refusing is the default."""
 
     REFUSE = "refuse"
     WARN = "warn"
@@ -122,7 +122,7 @@ class Conditions:
                 + (f"no {', '.join(missing)}" if missing else "")
                 + (" and " if missing and unknown else "")
                 + (f"an unknown {', '.join(unknown)}" if unknown else ""),
-                "state all six of D43's columns: " + ", ".join(sorted(wanted)),
+                "state all six axes: " + ", ".join(sorted(wanted)),
             )
         readings = {
             wanted[name]: (
@@ -185,7 +185,7 @@ class Fingerprint:
         if row is None:
             raise ArtifactRefusal(
                 Rule.INVALIDATED,
-                f"`{document.get('row')}` is not a row of D43's matrix",
+                f"`{document.get('row')}` is not a row of the invalidation matrix",
                 "the matrix rows " + ", ".join(str(known) for known in Row),
             )
         cells = document["cells"]
@@ -193,8 +193,8 @@ class Fingerprint:
         if unknown:
             raise ArtifactRefusal(
                 Rule.INVALIDATED,
-                f"this fingerprint records `{', '.join(unknown)}`, which D43's "
-                "matrix has no column for",
+                f"this fingerprint records `{', '.join(unknown)}`, which the "
+                "invalidation matrix has no column for",
                 "the matrix moved under this entry; re-measure it, because a "
                 "recorded cell nothing compares is a check that silently stopped",
             )
@@ -235,7 +235,7 @@ class Mismatch:
 
 
 def fingerprint(row: Row, conditions: Conditions) -> Fingerprint:
-    """A row's fingerprint: the axes D43 says it depends on, and nothing else."""
+    """A row's fingerprint: the axes the matrix rows it against, and no others."""
     return Fingerprint(
         row, tuple((axis, conditions.reading(axis)) for axis in axes_of(row))
     )
@@ -251,15 +251,15 @@ def differences(recorded: Fingerprint, current: Fingerprint) -> tuple[Mismatch, 
         raise ArtifactRefusal(
             Rule.NOT_COMPARABLE,
             f"a `{recorded.row}` fingerprint was compared with a `{current.row}` one",
-            "compare a row against itself; D43's rows have different columns, "
-            "which is the whole reason the matrix is not one fingerprint",
+            "compare a row against itself; different rows depend on different "
+            "axes, which is the whole reason this is not one fingerprint",
         )
     if recorded.axes != current.axes:
         raise ArtifactRefusal(
             Rule.NOT_COMPARABLE,
             f"`{recorded.row}` was fingerprinted over "
             f"{', '.join(str(axis) for axis in recorded.axes) or 'nothing'} and "
-            f"D43 now rows it over "
+            f"and the matrix now rows it over "
             f"{', '.join(str(axis) for axis in current.axes) or 'nothing'}",
             "the matrix moved under this entry; re-measure it, because an "
             "entry checked against a column it never recorded is unchecked",
@@ -280,8 +280,8 @@ def verify(
 ) -> tuple[Mismatch, ...]:
     """Check every recorded row against the conditions in force.
 
-    Refuses by default and warns only under the explicit flag D43 allows --
-    and the flag reaches the mismatches only. A comparison that could not be
+    Refuses by default and warns only under the explicit flag -- which reaches
+    the mismatches only. A comparison that could not be
     made is refused either way, because there is no answer to downgrade.
     """
     found: list[Mismatch] = []
@@ -300,8 +300,8 @@ def verify(
         return ()
     what = "; ".join(moved.text for moved in found)
     remedy = (
-        "this entry was measured under other conditions, and D43 rows these "
-        "cells as the ones that decide it; re-measure, or publish a new entry"
+        "this entry was measured under other conditions, and these cells are "
+        "the ones that decide it; re-measure, or publish a new entry"
     )
     if on_mismatch is OnMismatch.REFUSE:
         raise ArtifactRefusal(Rule.INVALIDATED, what, remedy)

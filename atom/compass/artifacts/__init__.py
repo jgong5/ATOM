@@ -3,8 +3,8 @@
 
 This package exists for eight incidents that share one shape -- the number was
 fine and the question of *which artifact answered* was not -- turned into
-refusals, plus D43's answer to the ninth: an artifact that is still read after
-the thing it was measured against has moved.
+refusals, plus the answer to a ninth: an artifact that is still read after the
+thing it was measured against has moved.
 
 * **A key is a tuple, never a path** (`keys`). The six artifacts and what keys
   each one; a `price_list` is `(model, width, source-root digest)`, because a
@@ -21,8 +21,9 @@ the thing it was measured against has moved.
   directory convention** -- no index, no manifest -- and publishing is a rename
   onto a name that must not exist, so an overwrite is impossible rather than
   discouraged.
-* **Invalidation is a per-artifact matrix** (`matrix`, `fingerprints`). D43's
-  table is a table in the code, so a reader can hold the two side by side.
+* **Invalidation is a per-artifact matrix** (`matrix`, `fingerprints`). The
+  design's table is a table in the code, so a reader can hold the two side by
+  side.
   Each entry records the fingerprint of *its own dependency row* -- three rows
   for a `machine_spec` -- and a load recomputes and compares cell by cell, so a
   refusal names the cell and a change in a cell the row does not depend on
@@ -35,10 +36,10 @@ the thing it was measured against has moved.
   states a count and not which of two stages declined.
 
 **Not decided here**: whether an aiter bump invalidates an artifact or only
-warns (T86, filed as #168) -- until it is ruled, D43's default stands and a
-bump refuses; whether a dirty source root may publish (also #168); and what
-D41's scalar `width` means against a four-axis topology (#165). D43's six
-columns hold no width, so nothing here binds one.
+warns (T86, filed as #168) -- until it is ruled the default stands and a bump
+refuses; whether a dirty source root may publish (also #168); and what
+an artifact key's scalar `width` means against a four-axis topology (#165).
+The matrix's six columns hold no width, so nothing here binds one.
 """
 
 from .fingerprints import (

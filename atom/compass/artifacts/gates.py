@@ -23,9 +23,9 @@ force. Re-reading the flag is what the incident did: the flag answered `off`
 in every worker, consistently and wrongly, and nothing held the answer beside
 the artifact it had shaped.
 
-D43's warn flag is not offered here. It covers "a mismatch refuses, warn only
-under an explicit flag" in the invalidation matrix; the gate paragraph offers
-no such escape, and a warning is what a dead gate already produces.
+The flag that downgrades an invalidation mismatch to a warning is not offered
+for a gate disagreement. A warning is what a dead gate already produces, and
+the point of recording the state is to get an answer that is not one.
 """
 
 from collections.abc import Mapping, Sequence

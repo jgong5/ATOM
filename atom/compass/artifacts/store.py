@@ -45,7 +45,7 @@ listed, or whose digest has moved is refused by name rather than returned.
 
 **What was ART-2's is now here too**, and it is two more things the entry
 states about itself. A published entry carries the **fingerprint of every row
-D43's matrix gives its kind** -- three of them for a `machine_spec`, whose
+the invalidation matrix gives its kind** -- three for a `machine_spec`, whose
 capacity, runtime constants and tokenizer terms are invalidated by different
 things -- and the **state of every gate that shaped it**. Both are required at
 publish rather than checked at load: a campaign that runs for hours and
@@ -54,9 +54,9 @@ decided the gate is not around to be asked afterwards. `read` states an entry;
 `load` states it *and certifies it*, and they are two calls because the first
 is how a person inspects something the second has just refused.
 
-D43's "mismatch refuses, warn only under an explicit flag" lives on `load`.
-The flag covers the invalidation matrix and nothing else -- a gate
-disagreement and a comparison that could not be made have no warning form.
+The flag that downgrades a mismatch to a warning lives on `load`, and it
+covers the invalidation matrix and nothing else -- a gate disagreement and a
+comparison that could not be made have no warning form.
 """
 
 import contextlib
@@ -239,12 +239,12 @@ class ArtifactStore:
     def _fingerprints(
         self, key: Key, conditions: Conditions, gates: GateState
     ) -> Mapping[Row, Fingerprint]:
-        """One fingerprint per row D43 gives this kind, or a refusal naming why not."""
+        """One fingerprint per row the matrix gives this kind, or a refusal."""
         if not isinstance(conditions, Conditions):
             raise ArtifactRefusal(
                 Rule.INVALIDATED,
                 f"{conditions!r} is not a set of conditions",
-                "state all six of D43's columns; an entry records the "
+                "state all six axes; an entry records the "
                 "fingerprint of its own dependency row and cannot take one "
                 "from conditions nobody stated",
             )
@@ -324,7 +324,8 @@ class ArtifactStore:
         every dependency read correctly and whose 164 per-kernel breakdowns
         were taken at a width the gate claimed to have excluded.
 
-        `on_mismatch` is D43's explicit flag and reaches the matrix only. A
+        `on_mismatch` is the explicit warning flag and reaches the matrix
+        only. A
         gate disagreement refuses under either setting, and so does a reading
         that cannot be compared: there is no answer there to downgrade.
         """

@@ -12,8 +12,9 @@ declined, what tripped it, and what would satisfy it. The third part is the
 only one the caller needs, and it is the one an exception message usually
 leaves out.
 
-Three of the rules are D43's rather than D41's, and the pair worth reading
-together is `INVALIDATED` and `NOT_COMPARABLE`. The first says a comparison
+Three of the rules are about whether an entry is still valid rather than
+about what names it, and the pair worth reading together is `INVALIDATED`
+and `NOT_COMPARABLE`. The first says a comparison
 was made and failed; the second says it could not be made at all, which is
 what a git tree and a git commit in one `revision` field amount to. Collapsing
 the second into the first would report a change nobody observed.

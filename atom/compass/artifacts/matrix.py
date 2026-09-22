@@ -5,7 +5,14 @@ A global fingerprint would force re-measuring everything on a torch bump. Each
 artifact records the fingerprint of **its own dependency row**, so a bump
 invalidates the rows that name it and leaves the rest alone.
 
-`MATRIX` below is D43's table transcribed, and it is deliberately a table: the
+The identifier `D43` survives in this module and in the test that reads the
+document, and nowhere else in the package. It is not a citation there:
+`test_the_matrix_is_d43s_table` opens
+`atom/compass/design/07_calibration_toolchain.md` and splits it on the literal
+string `"## D43. Invalidation"` to parse the table back out, so the name is a
+functional dependency of that test. Nothing this module *emits* carries it.
+
+`MATRIX` below is that table transcribed, and it is deliberately a table: the
 deliverable is that a reader can hold the document beside the code and check
 them cell by cell. `test_the_matrix_is_d43s_table` does the same check
 mechanically, parsing the document's own rows, marks and parentheses, so the
@@ -23,9 +30,9 @@ hand would take away:
   `machine_spec` is three rows here rather than one, and a device change
   invalidates two of them while a tokenizer change invalidates the third.
 
-**Two of D41's seven artifacts have no row at all.** `shape_population` and
-`coverage_hull` appear in D41's key table and nowhere in D43's matrix, and the
-two "sevens" are not the same seven. Guessing a row for them is the failure
+**Two of the seven artifacts this store holds have no row at all.**
+`shape_population` and `coverage_hull` appear in the artifact key table and
+nowhere in this one, and the two "sevens" are not the same seven (#174). Guessing a row for them is the failure
 this package exists to prevent -- an artifact answering under conditions
 nobody checked -- so `rows_for` refuses and names what is missing.
 """
@@ -164,7 +171,7 @@ MATRIX: Mapping[Row, Mapping[Axis, Cell]] = {
 }
 
 #: Which rows decide a kind's validity. `machine_spec` is three; two kinds are
-#: none, and that is D43's gap rather than this module's default.
+#: none, and that is a gap in the matrix rather than a default taken here.
 ROWS_OF: Mapping[Kind, tuple[Row, ...]] = {
     Kind.OP_GRAPH: (Row.OP_GRAPH,),
     Kind.PRICE_LIST: (Row.PRICE_LIST,),
@@ -179,7 +186,7 @@ ROWS_OF: Mapping[Kind, tuple[Row, ...]] = {
 
 
 def rows_for(kind: Kind) -> tuple[Row, ...]:
-    """The rows of D43's matrix a kind is checked against, or a refusal.
+    """The rows of the matrix a kind is checked against, or a refusal.
 
     `machine_spec` answers with three, because a device change invalidates its
     capacity and its runtime constants while leaving its tokenizer terms
@@ -189,15 +196,16 @@ def rows_for(kind: Kind) -> tuple[Row, ...]:
     if not rows:
         raise ArtifactRefusal(
             Rule.INVALIDATED,
-            f"D43's matrix states no dependency row for {kind}",
-            "D41 declares seven artifacts and D43 rows seven, and they are not "
-            f"the same seven: {kind} is in the first table and not the second. "
-            "Add a row to D43, or say there why the kind needs none; a row "
-            "guessed here would answer under conditions nobody checked",
+            f"the invalidation matrix states no dependency row for {kind}",
+            "the artifact key table declares seven artifacts and the matrix "
+            f"rows seven, and they are not the same seven: {kind} is in the "
+            "first and not the second. Add a row to the matrix, or say there "
+            "why the kind needs none (#174); a row guessed here would answer "
+            "under conditions nobody checked",
         )
     return rows
 
 
 def axes_of(row: Row) -> tuple[Axis, ...]:
-    """The axes a row depends on, in D43's column order."""
+    """The axes a row depends on, in the matrix's column order."""
     return tuple(axis for axis in Axis if MATRIX[row][axis].depends)

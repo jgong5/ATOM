@@ -1,11 +1,11 @@
 # SPDX-License-Identifier: MIT
-"""D43: the invalidation matrix, the gate state in the artifact, and the ledger.
+"""The invalidation matrix, the gate state in the artifact, and the ledger.
 
 **The whole matrix is exercised, not one row, and the zeroes as hard as the
 crosses.** `test_every_cell_of_the_matrix_decides_by_itself` walks all
-forty-two cells: where D43 says a row depends on an axis, moving that axis
-refuses and the refusal names the cell; where D43 says it does not, moving the
-same axis loads clean. A matrix that has been tidied into a uniform rule
+forty-two cells: where the matrix says a row depends on an axis, moving that
+axis refuses and the refusal names the cell; where it says the row does not,
+moving the same axis loads clean. A matrix that has been tidied into a uniform rule
 passes neither half, and the pair the brief names -- `price_list` surviving a
 model change while `region_terms` refuses one -- is also published and loaded
 through the store, because a table that is right in the abstract and unwired
@@ -14,19 +14,19 @@ found once already.
 
 Two things this file deliberately does not do, both inherited.
 
-**It binds no `width`.** D43's six columns contain no width at all, so the
-invalidation matrix does not need #165 ruled; where a key field happens to be
+**It binds no `width`.** The matrix's six columns contain no width at all, so
+invalidation does not need #165 ruled; where a key field happens to be
 called `width` the topology here is tensor-parallel only, so the two candidate
 readings coincide and no fixture settles the question by example.
 
 **It rules nothing that is the owner's.** T86 -- whether an aiter bump
-invalidates or only warns -- is #168, and until it is ruled D43's default
+invalidates or only warns -- is #168, and until it is ruled the default
 stands: `test_an_aiter_bump_refuses_until_t86_is_ruled` pins the default, and
 it is the test that changes when the ruling lands.
 
 Nothing here touches a driver, a device or a network. The conditions are
-stated, never probed (principle 2), which is also why a fixture can express a
-ROCm bump on a host that has one ROCm.
+stated and never probed, which is also why a fixture can express a ROCm bump
+on a host that has one ROCm.
 """
 
 import json
@@ -63,8 +63,11 @@ from atom.compass.artifacts import (
 )
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
+#: The document the table is read back out of. The section heading below is a
+#: literal this test parses, which is why the identifier survives here and in
+#: `matrix.py` and nowhere else.
 D43 = REPO / "atom" / "compass" / "design" / "07_calibration_toolchain.md"
-#: One cell of D43's table: the mark, and the parenthesis beside it.
+#: One cell of the document's table: the mark, and the parenthesis beside it.
 CELL = re.compile(r"^([X-])(?:\s*\*?\((.+)\)\*?)?$")
 
 ATOM_ROOT = SourceRoot(
@@ -104,7 +107,7 @@ BASE = Conditions.of(
     engine_config="cudagraph=piecewise,level=3",
 )
 
-#: A key per row of D43's matrix. The three `machine_spec` rows share one key,
+#: A key per row of the matrix. The three `machine_spec` rows share one key,
 #: because they are three facets of one artifact and that is the point of them.
 KEY_OF: dict[Row, Key] = {
     Row.OP_GRAPH: Key.of(Kind.OP_GRAPH, structure="qwen3-moe-48L"),
@@ -164,14 +167,14 @@ def publish(
     )
 
 
-# --- the matrix is a table, and it is D43's -------------------------------
+# --- the matrix is a table, and it is the document's ----------------------
 
 
 def test_the_matrix_is_d43s_table():
     """The code's table and the document's are one fact, cell by cell.
 
-    D43's is what a reader checks the code against by eye, so this checks the
-    same thing mechanically: the column headers, the row labels, every mark,
+    The document's table is what a reader checks the code against by eye, so
+    this checks the same thing mechanically: the column headers, the row labels, every mark,
     and every parenthesis. A note dropped here is a claim about *why* a cell
     is what it is, silently lost -- `- (shape-parametric)` is the sentence
     that makes one pricing campaign serve many shapes.
@@ -200,8 +203,8 @@ def test_the_matrix_is_d43s_table():
 def test_the_matrix_is_not_uniform():
     """The four cells a tidying hand takes away, named one at a time.
 
-    Each is a sentence D43 argues for, and a matrix that lost them would still
-    pass a test that only checked the crosses.
+    Each is a sentence the document argues for, and a matrix that lost them
+    would still pass a test that only checked the crosses.
     """
     assert not MATRIX[Row.PRICE_LIST][Axis.MODEL].depends
     assert MATRIX[Row.PRICE_LIST][Axis.MODEL].note == "shape-parametric"
@@ -213,7 +216,7 @@ def test_the_matrix_is_not_uniform():
 
 @pytest.mark.parametrize("kind", [Kind.SHAPE_POPULATION, Kind.COVERAGE_HULL])
 def test_a_kind_d43_does_not_row_is_refused_by_name(kind):
-    """D41 declares seven artifacts and D43 rows seven, and they differ by two.
+    """The key table declares seven artifacts and the matrix rows seven.
 
     The tempting default is "depends on nothing", which loads clean forever,
     and the other is "depends on everything", which re-measures forever. Both
@@ -242,7 +245,8 @@ def test_every_cell_of_the_matrix_decides_by_itself(row, axis):
     every axis would pass every cross and fail every zero, and a rule that
     refused on none would do the reverse.
 
-    It reads `MATRIX` rather than restating D43 by hand, so on its own it
+    It reads `MATRIX` rather than restating the document by hand, so on its
+    own it
     would pass against a wrong table that the code agreed with. The anchor is
     `test_the_matrix_is_d43s_table`, which ties `MATRIX` to the document; the
     chain is document -> table -> behaviour, and each link is a test.
@@ -275,10 +279,10 @@ def test_a_fingerprint_carries_only_the_cells_its_row_depends_on():
 def test_no_axis_of_the_matrix_is_a_width():
     """#165 does not block this cut, and this is why.
 
-    D43's columns are the software stack, torch, ATOM's source, the model, the
+    The columns are the software stack, torch, ATOM's source, the model, the
     device and the engine config. None of them is a width, so no fingerprint
-    here has to decide whether D41's scalar `width` is the tensor-parallel
-    width or the rank count.
+    here has to decide whether an artifact key's scalar `width` is the
+    tensor-parallel width or the rank count.
     """
     assert {axis.field for axis in Axis} == {
         "software_stack",
@@ -343,7 +347,7 @@ def test_a_machine_spec_is_three_rows_and_a_device_change_moves_two(tmp_path):
 
 
 def test_an_aiter_bump_refuses_until_t86_is_ruled(tmp_path):
-    """D43's default, implemented because T86's ruling is the owner's (#168).
+    """The default, implemented because T86's ruling is the owner's (#168).
 
     The four rows that carry ROCm/AITER/RCCL refuse a bump; `machine_spec`'s
     capacity does not, because the silicon did not move. If the ruling lands
@@ -384,7 +388,7 @@ def test_a_refusal_names_every_cell_that_moved(tmp_path):
 
 
 def test_the_explicit_flag_warns_and_still_names_the_cell(tmp_path):
-    """D43 allows a warning, and only under a flag the caller has to write."""
+    """A warning is allowed, and only under a flag the caller has to write."""
     store = ArtifactStore(tmp_path)
     published = publish(store, KEY_OF[Row.REGION_TERMS])
     with pytest.warns(StaleArtifact, match=r"`region_terms` x `model`"):
@@ -498,7 +502,7 @@ def test_a_gate_that_cannot_say_what_it_read_is_refused():
 
 
 def test_the_explicit_flag_does_not_reach_the_gate_state(tmp_path):
-    """D43 gives the warning escape to the matrix; the gate paragraph gives none."""
+    """The warning escape is the matrix's; a gate disagreement has none."""
     store = ArtifactStore(tmp_path)
     publish(store, KEY_OF[Row.PRICE_LIST])
     with pytest.raises(ArtifactRefusal) as refused:
@@ -599,11 +603,11 @@ def test_a_report_never_states_a_count_without_its_decomposition(tmp_path):
 
 
 def test_the_fingerprint_and_the_gate_state_are_in_the_entry(tmp_path):
-    """Recorded by value, in the document that is digested (`13` D81).
+    """Recorded by value, inside the document that is digested.
 
     Not beside it and not by reference: a fingerprint in a file the entry
     points at is a second statement of a fact, which is the shape of every
-    incident D41 opens with.
+    incident this package exists for.
     """
     store = ArtifactStore(tmp_path)
     entry = publish(store, KEY_OF[Row.PRICE_LIST], notes="first campaign")

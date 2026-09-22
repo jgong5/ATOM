@@ -1,8 +1,8 @@
 # SPDX-License-Identifier: MIT
 """Resolution names its answer: which artifacts answered a step, and which missed.
 
-D41 rule 3, and it is not diagnostics polish. *"Price refusal is not graph
-absence"* was a day's confusion on its own, and an `incomplete: N/2570` line
+This is not diagnostics polish. *"Price refusal is not graph absence"* was a
+day's confusion on its own, and an `incomplete: N/2570` line
 proves less than it looks: it states a count, not which of two stages
 declined. The same count is produced by a missing `op_graph` and by a
 `price_list` that refused -- one means the structure was never traced, the
@@ -15,8 +15,8 @@ depend on anyone's memory of which store was mounted. Each key that missed is
 recorded with **the refusal that declined it**, so the kind and the reason are
 both in the record.
 
-`report()` never states a count on its own -- principle 7 -- and
-`require_complete()` is the refusal a step ends on, naming every key that
+`report()` never states a count on its own, and `require_complete()` is the
+refusal a step ends on, naming every key that
 missed rather than the first. The misses are collected rather than raised
 where they happen for that reason alone: a step that stops at the first
 refusal reports one name where it could have reported all of them, and the
