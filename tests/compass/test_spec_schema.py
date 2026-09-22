@@ -13,6 +13,16 @@ ways: every knob the refusal message names has to be a real one, and no field of
 the spec's machine sections may collide with it. Parsed rather than imported --
 reading the source needs no driver, and this tier has none.
 
+Three sections are about the echo rather than about what a spec may hold, and
+they are one claim: the echo equals the document that was read, because that is
+the whole of what a run artifact can be held to. A field written under two
+spellings would leave one of two values out of it, and which one is decided by
+the order the keys happen to iterate in, so both orders are read. A document
+from a later schema has to be refused for its version rather than for the
+fields that version added, or the echo missing is the reader's fault and the
+message says it is the author's. And a checked value the document still owns
+can move after the artifact carrying its digest was written.
+
 The last section is about the refusals themselves rather than about what they
 refuse. A refusal is read by a person, so a message that is accurate about what
 could not be done and wrong about why costs that person the time it was meant to
@@ -33,6 +43,7 @@ from atom.compass.spec import (
     DECLARED,
     DEPLOYMENT_OWNED,
     SCHEMA,
+    SCHEMA_VERSION,
     Backend,
     FingerprintMismatch,
     Kind,
@@ -172,6 +183,179 @@ def test_the_digest_moves_when_any_number_does():
     shifted["device"]["memory"]["capacity_bytes"] = 287.0e9
     assert MachineSpec.from_mapping(shifted).digest() != before
     assert read().digest() == before
+
+
+# --- one field, however the document spells it -------------------------------
+#
+# A dotted key resolves to the nested path, deliberately: a probe fragment
+# writes them. So one field has two spellings and a document can carry both.
+# Reading such a document by keeping one of the two keeps whichever the mapping
+# yields last, which is decided by the order the keys were written in, and the
+# value that loses is then absent from the echo a run artifact records and
+# takes its digest over. The pair is refused by name instead, and both orders
+# are read here, because order-dependence is the defect and one order alone
+# does not test it.
+
+#: A field stated nested by the reference document, for a dotted twin to meet.
+TWIN = "host.cpu.cores_physical"
+
+
+def both_spellings(dotted_first):
+    """The reference document stating one field twice, in one of the two orders."""
+    nested = document()
+    dotted = {TWIN: 1}
+    return {**dotted, **nested} if dotted_first else {**nested, **dotted}
+
+
+def refusal_from(written):
+    """The refusal reading a document earns, for a test to read in full."""
+    with pytest.raises(SpecRefusal) as refusal:
+        MachineSpec.from_mapping(written)
+    return refusal.value
+
+
+def test_the_two_orders_differ_only_in_the_order():
+    # What makes the pair below a control rather than two tests: one mapping,
+    # written the other way round, so nothing but the iteration order changed.
+    assert both_spellings(True) == both_spellings(False)
+    assert list(both_spellings(True)) != list(both_spellings(False))
+
+
+@pytest.mark.parametrize("dotted_first", [True, False])
+def test_a_field_stated_twice_is_refused_by_name(dotted_first):
+    refusal = refusal_from(both_spellings(dotted_first))
+    assert refusal.rule is Rule.SHAPE
+    assert TWIN in refusal.what
+    assert "stated twice" in refusal.what
+    # Not the closed-schema refusal: both spellings are the schema's own field,
+    # and the reader is not being sent to the field table to look for it.
+    assert "not a field of this schema" not in refusal.what
+
+
+def test_both_orders_give_the_same_refusal():
+    # The named result. Order decided which value survived, so nothing in the
+    # message may depend on which spelling the mapping yielded first -- and a
+    # message that named the value it kept would.
+    dotted_first = refusal_from(both_spellings(True))
+    nested_first = refusal_from(both_spellings(False))
+    assert dotted_first.rule is nested_first.rule
+    assert str(dotted_first) == str(nested_first)
+    for value in ("96", "1"):
+        assert value not in str(dotted_first)
+
+
+def test_the_collision_is_about_the_path_and_not_about_the_top_level():
+    # Two spellings meeting one block down, neither of them the whole path, so
+    # what is compared is what each resolves to.
+    written = document()
+    written["host"]["cpu.cores_logical"] = 1
+    refusal = refusal_from(written)
+    assert refusal.rule is Rule.SHAPE
+    assert "host.cpu.cores_logical" in refusal.what
+
+
+def test_a_dotted_key_on_its_own_is_a_supported_spelling():
+    # The fix is not "refuse dotted keys". Written flat, every field reads, and
+    # the echo is the nested document -- which is also why carrying both
+    # spellings is one field twice rather than two fields.
+    written = document()
+    cpu = written["host"].pop("cpu")
+    flat = {f"host.cpu.{name}": value for name, value in cpu.items()}
+    machine = MachineSpec.from_mapping({**written, **flat})
+    assert machine.value(TWIN) == 96
+    assert machine.echo() == DOCUMENT
+    assert machine.digest() == read().digest()
+
+
+# --- the version is the one thing an old reader can say ----------------------
+
+
+def test_a_later_document_is_told_this_reader_is_old():
+    # The named result for the version. A v2 document carries what v2 added;
+    # the schema is closed, so a version checked after the fields lets the
+    # closed schema speak first and tells the author their new field is
+    # illegitimate, in the one case where this reader is what is out of date.
+    later = document()
+    later["schema_version"] = 2
+    later["device"]["power_cap_watts"] = 700
+    refusal = refusal_from(later)
+    assert refusal.rule is Rule.SHAPE
+    assert "schema_version 2" in refusal.what
+    assert f"understands version {SCHEMA_VERSION}" in refusal.what
+    assert "power_cap_watts" not in refusal.what
+    assert "not a field of this schema" not in refusal.what
+
+
+def test_the_version_is_read_before_the_fields_it_governs():
+    # Not only an added field: anything a later schema did differently reaches
+    # the field table first, and each of those refusals would be about the
+    # document when the thing to fix is the reader.
+    later = drop(document(), "device", "memory", "capacity_bytes")
+    later["schema_version"] = 2
+    refusal = refusal_from(later)
+    assert "schema_version 2" in refusal.what
+    assert "capacity_bytes" not in refusal.what
+
+
+def test_a_document_that_states_no_version_is_told_it_is_missing():
+    # The gate declines to speak for a document that names no version; the
+    # field table reports it with everything else the schema requires.
+    written = document()
+    del written["schema_version"]
+    refusal = refusal_from(written)
+    assert "schema_version` is missing" in refusal.what
+
+
+def test_a_version_that_is_not_one_is_refused_as_a_shape():
+    refusal = refusal_from(document(schema_version="1"))
+    assert refusal.rule is Rule.SHAPE
+    assert "a positive whole number" in refusal.what
+
+
+# --- a checked value belongs to the spec, not to the document ----------------
+
+
+def test_the_spec_does_not_move_when_the_document_does():
+    # The digest is written into a run artifact, so it has to be a property of
+    # what was read. A spec holding the document's own containers would move
+    # afterwards, under the artifact that already named it.
+    written = document()
+    written["provenance"]["fragments"] = ["probe-cpu"]
+    machine = MachineSpec.from_mapping(written)
+    before = machine.digest()
+    echoed = machine.echo()
+    constants = written["device"]["runtime_constants"]
+    entries = written["host"]["tokenizers"]
+    written["provenance"]["fragments"].append("probe-device")
+    constants["driver_and_collective_reserve_bytes"][16] = 1.0
+    entries.append(dict(TOKENIZER, id="another"))
+    entries[0]["encode_tokens_per_s"] = 1.0
+    entries[0]["applies_to"].append("LlamaForCausalLM")
+    assert machine.digest() == before
+    assert machine.echo() == echoed
+
+
+def test_no_container_the_document_owns_reaches_the_spec():
+    # A list of names copies with `tuple` and a width table with `dict`; a
+    # tokenizer entry holds mappings and lists of its own, so the same
+    # guarantee there is a walk rather than a constructor.
+    written = document()
+    written["provenance"]["fragments"] = ["probe-cpu"]
+    machine = MachineSpec.from_mapping(written)
+    constants = written["device"]["runtime_constants"]
+    entries = written["host"]["tokenizers"]
+    table_path = "device.runtime_constants.driver_and_collective_reserve_bytes"
+    held = machine.value("host.tokenizers")
+    assert (
+        machine.value("provenance.fragments") is not written["provenance"]["fragments"]
+    )
+    assert (
+        machine.value(table_path)
+        is not constants["driver_and_collective_reserve_bytes"]
+    )
+    assert held is not entries
+    assert held[0] is not entries[0]
+    assert held[0]["applies_to"] is not entries[0]["applies_to"]
 
 
 # --- the separation rule -----------------------------------------------------

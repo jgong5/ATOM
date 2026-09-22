@@ -8,12 +8,27 @@ chosen for what comes next: combining two documents, reporting on one, and
 explaining where a number came from are all per-field operations, and a nested
 mapping makes every one of them a recursive walk written again each time.
 
-Four properties are enforced here rather than described.
+Five properties are enforced here rather than described.
 
 **The schema is closed.** A key with no row in the field table is refused where
 it sits. That, and not a list of excluded knobs, is how the spec stays a
 description of the machine: a tensor-parallel width or a block size is refused
 because it is not a machine property, with no rule needed that names it.
+
+The stated version is read before any of that, and that ordering is the point.
+A document written to a later schema states fields this reader does not
+declare, and a closed schema refuses those wherever they sit, so a version
+checked after the fields never gets to speak in the one case it exists for: the
+author of a newer document would be told their new field is illegitimate rather
+than that this reader is old.
+
+**A field has one value, however it is spelled.** A dotted key resolves to the
+nested path, so a document may write `host.cpu.cores_physical` flat -- a probe
+fragment does -- or nested, and the two are the same field. Writing it both
+ways is refused and the path is named. Keeping one of the two instead would
+keep whichever the mapping happened to yield last, and the value that lost
+would be missing from the echo an artifact digest is taken over, silently and
+differently on a document whose keys were written in another order.
 
 **A runtime constant has no default.** The widths that were measured are the
 widths that can be asked for; a width that was not measured is refused by name,
@@ -118,9 +133,30 @@ def _unresolved(path: str) -> NoReturn:
     refuse_unknown_key(path)
 
 
+def _version(document: Mapping) -> None:
+    """Check the version the document states, before the fields it governs.
+
+    A document that states no version is left to the field table, which reports
+    it missing along with every other term the schema requires.
+    """
+    field = BY_PATH["schema_version"]
+    if field.path not in document:
+        return
+    stated = check(field, document[field.path], field.path)
+    if stated != SCHEMA_VERSION:
+        raise SpecRefusal(
+            Rule.SHAPE,
+            f"this document states schema_version {stated}, and this reader "
+            f"understands version {SCHEMA_VERSION}",
+            "read it with a Compass that knows that version; what a later "
+            "schema adds or renames is not this reader's to judge, so nothing "
+            "in the document is read past the version itself",
+        )
+
+
 def _survey(node: Mapping, prefix: str, found: dict):
     """Every key of a document, keeping what the table declares and yielding a
-    refusal for each key that it does not.
+    refusal for each key that it does not, or that states a field a second time.
 
     The walk carries on past a key it refuses, because one unrecognised key
     says nothing about the rest of the document: the block beside it holds the
@@ -132,6 +168,19 @@ def _survey(node: Mapping, prefix: str, found: dict):
     for key, value in node.items():
         path = f"{prefix}.{key}" if prefix else str(key)
         if path in BY_PATH:
+            if path in found:
+                yield SpecRefusal(
+                    Rule.SHAPE,
+                    f"`{path}` is stated twice by this document, under two "
+                    "spellings that resolve to the same field",
+                    "a dotted key resolves to the nested path, so `a.b` and a "
+                    "nested `b` under `a` are one field; state it once, "
+                    "because a reader that kept one of the two would keep "
+                    "whichever the mapping yielded last, and the echo every "
+                    "run artifact carries would stop equalling the document it "
+                    "was read from",
+                )
+                continue
             found[path] = value
         elif path in BLOCKS:
             if isinstance(value, Mapping):
@@ -170,6 +219,7 @@ class MachineSpec:
                 f"a spec is a mapping of its sections, not {type(document).__name__}",
                 "load the document before reading it as a spec",
             )
+        _version(document)
         found: dict[str, Any] = {}
         _walk(document, "", found)
         values = {}
@@ -179,13 +229,6 @@ class MachineSpec:
                     _missing(field)
                 continue
             values[field.path] = check(field, found[field.path], field.path)
-        version = values["schema_version"]
-        if version != SCHEMA_VERSION:
-            raise SpecRefusal(
-                Rule.SHAPE,
-                f"this document states schema_version {version}",
-                f"this reader understands version {SCHEMA_VERSION}",
-            )
         return cls(values, table(values["host.tokenizers"]))
 
     def value(self, path: str) -> Any:

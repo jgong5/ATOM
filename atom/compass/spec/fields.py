@@ -6,7 +6,7 @@ nothing else, which is what makes the schema closed -- a key with no row here is
 refused wherever it sits, so the separation rule holds without anyone
 maintaining a list of the knobs it excludes.
 
-Three things about the table are load-bearing.
+Four things about the table are load-bearing.
 
 **A spec-peak number is marked, and its derate is derived from the mark.** No
 row declares a derate. `closed()` adds one to the block of every field marked
@@ -22,6 +22,13 @@ measured values at widths 1, 2, 4 and 8 fit no fixed-plus-per-peer form, so
 there is nothing to interpolate along and a width that was not measured cannot
 be produced from the widths that were. `WIDTH_TABLE` holds what was measured and
 the accessor refuses the rest by name.
+
+**A checked value is the spec's own.** Every kind returns a copy rather than
+what the document handed over: `tuple` for a list of names, `dict` for a width
+table, and a walk for a tokenizer entry, which holds mappings and lists of its
+own where the other two hold scalars. A frozen spec that aliased its caller's
+document would have a digest that moves afterwards, under an artifact that
+already recorded it.
 
 **Types are checked positively.** A count is an `int` that is not a `bool`, a
 quantity is a positive real, a derate is a fraction in (0, 1]. `bool` is an
@@ -159,6 +166,20 @@ def _refuse(path: str, wanted: str, value: object) -> None:
     )
 
 
+def _detached(value: object) -> object:
+    """A document value copied, so the document cannot move it afterwards.
+
+    A list of names and a width table get this from `tuple` and `dict`, because
+    what they hold is scalars and the constructor is the whole copy. A
+    tokenizer entry holds mappings and lists, so the same guarantee is a walk.
+    """
+    if isinstance(value, Mapping):
+        return {key: _detached(item) for key, item in value.items()}
+    if isinstance(value, Sequence) and not isinstance(value, (str, bytes)):
+        return [_detached(item) for item in value]
+    return value
+
+
 def check(field: Field, value: object, path: str) -> object:
     """The value as the schema keeps it, or a refusal naming what was wanted."""
     kind = field.kind
@@ -202,4 +223,4 @@ def check(field: Field, value: object, path: str) -> object:
         return dict(value)
     if not isinstance(value, Sequence) or isinstance(value, (str, bytes)):
         _refuse(path, "a list of tokenizer entries", value)
-    return value
+    return tuple(_detached(entry) for entry in value)
