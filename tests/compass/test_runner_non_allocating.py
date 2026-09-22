@@ -187,8 +187,9 @@ def _self_assigned(node):
 
     Pairs, not a mapping keyed by name. A name can be assigned more than once --
     `forward_vars` is bound to the dict of buffers and later rebound to a slot
-    of the ring it already holds -- and `ast.walk` does not visit in source
-    order, so one value per name keeps an arbitrary one of them. Keeping the
+    of the ring it already holds -- and a mapping keeps only the last binding
+    walked, which here is the rebind. The rebind names no buffer, so keying by
+    name dropped `forward_vars` out of the holder set entirely. Keeping the
     pairs is what lets a name count as a holder when *any* of its bindings is.
     """
     return {
@@ -257,11 +258,15 @@ def test_the_overrides_bind_no_attribute_that_could_hold_a_tensor():
     `model` registers no parameter and no buffer, and `_token_stream` is the
     deferral bookkeeping `forward` builds on first use. Anything else appearing
     here is a tensor this class put on a device, which is the thing it exists
-    not to do. The class docstring names the same two, so neither list can be
-    trimmed to the other's shape without this failing.
+    not to do. The class docstring is held to the same two, by the mirror of
+    test 1's last two lines: the enumeration in the prose and the bindings in
+    the source fail together rather than drifting apart.
     """
     overrides = _classes(PACKAGE / "overrides.py")["NonAllocatingRunner"]
-    assert {n for n, _ in _self_assigned(overrides)} == {"model", "_token_stream"}
+    bound = {n for n, _ in _self_assigned(overrides)}
+    assert bound == {"model", "_token_stream"}
+    runner = _classes(PACKAGE / "model_runner.py")["CompassModelRunner"]
+    assert all(f"`{name}`" in ast.get_docstring(runner) for name in bound)
 
 
 # --- warmup drives a forward, which is why it is skipped ---------------------

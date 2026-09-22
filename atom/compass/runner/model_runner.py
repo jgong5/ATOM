@@ -60,13 +60,15 @@ if _UNANSWERED:
     # partitions them instead of asserting one story for all twelve. A waited
     # name parks its caller on an unbounded queue read for the life of the
     # process. An unwaited one parks nobody: `busy_loop` skips it and carries
-    # on -- which for `exit` means `ModelRunner.exit` never runs, so the
-    # distributed environment is never destroyed and the graphs and the five KV
-    # tensors it deletes stay held, while the loop still breaks, since the
-    # break is a sibling of the per-runner loop and tests the dispatched name
-    # rather than any reply; and for `process_kvconnector_output` means a KV
-    # load is silently never started. Both are real failures; neither is a
-    # park.
+    # on -- which for `exit` means `ModelRunner.exit` never runs: the
+    # distributed environment is never destroyed, `self.model` is never
+    # dropped, and `torch.cuda.empty_cache()` never runs, so the forward-vars
+    # ring stays in the allocator. Its five KV-tensor deletions are
+    # `hasattr`-guarded and find nothing here, because this runner allocated
+    # none. The loop breaks either way, since the break is a sibling of the
+    # per-runner loop and tests the dispatched name rather than any reply; and
+    # for `process_kvconnector_output` means a KV load is silently never
+    # started. Both are real failures; neither is a park.
     #
     # Two things about this raise itself. No CPU test tier can execute it:
     # importing this module imports `ModelRunner`, which runs aiter's
