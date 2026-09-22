@@ -693,6 +693,17 @@ class ScheduledBatch:
             else [seq.num_cached_tokens for seq in seqs.values()]
         )
 
+        # How much of each seq's context came from the prefix cache rather than
+        # from a forward this seq paid for. `num_cached_tokens` above cannot
+        # answer that: it starts at the hit and then advances by every finished
+        # chunk, so a middle chunk of a cache-cold prompt and a genuine cache
+        # hit present identically. Read off the seq, where it is set once at
+        # admission and is what RequestOutput reports as `num_cached_tokens`.
+        self.prefix_cache_hit_tokens = [
+            int(getattr(seq, "prefix_cache_hit_tokens", 0) or 0)
+            for seq in seqs.values()
+        ]
+
         self.is_final_chunk = is_final_chunk
         # Per seq, the token following this forward where the scheduler knows it
         # (a middle prefill chunk's successor prompt token), -1 where sampling

@@ -47,6 +47,7 @@ def _shape(row):
         num_scheduled_tokens=tuple(row["num_scheduled_tokens"]),
         context_lens=tuple(row["context_lens"]),
         num_prefill_tokens=row["num_prefill_tokens"],
+        prefix_cache_hit_tokens=tuple(row.get("prefix_cache_hit_tokens") or ()),
         topology=row.get("topology") or {},
         rank_coords=row.get("rank_coords") or {},
         capture_bucket=row.get("capture_bucket"),

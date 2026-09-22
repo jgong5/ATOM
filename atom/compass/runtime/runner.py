@@ -380,6 +380,15 @@ class CompassModelRunner(ModelRunner):
             "num_scheduled_tokens": list(shape.num_scheduled_tokens),
             "context_lens": list(shape.context_lens),
             "num_prefill_tokens": shape.num_prefill_tokens,
+            # Per request, how much of `context_lens` came from the prefix
+            # cache. Without it a short step at a deep context is ambiguous
+            # between a chunked prefill's final chunk and a cache hit, and the
+            # two do not cost the same -- a hit skips the KV write. The
+            # calibration sweep contains no hits by construction (run.py gives
+            # every prompt a distinct opening) and a cc-traces replay is mostly
+            # hits, so a table that does not record this cannot say whether the
+            # two instruments measured the same thing.
+            "prefix_cache_hit_tokens": list(shape.prefix_cache_hit_tokens),
             "topology": dict(shape.topology),
             "rank_coords": dict(shape.rank_coords),
             "capture_bucket": shape.capture_bucket,
@@ -747,6 +756,14 @@ class CompassModelRunner(ModelRunner):
             num_scheduled_tokens=num_scheduled,
             context_lens=context_lens,
             num_prefill_tokens=int(getattr(batch, "total_tokens_num_prefill", 0)),
+            # Per request, how much of `context_lens` was a prefix-cache hit.
+            # Not `batch.num_cached_tokens`, which is the computed frontier and
+            # is already what `context_lens` is built from -- recording it would
+            # say nothing new. Defaulted rather than required, so a batch
+            # from an engine that does not track hits still yields a shape.
+            prefix_cache_hit_tokens=tuple(
+                int(n) for n in getattr(batch, "prefix_cache_hit_tokens", ())
+            ),
             topology=self._topology(),
             rank_coords=self._rank_coords(),
             capture_bucket=self._capture_bucket(

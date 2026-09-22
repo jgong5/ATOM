@@ -138,6 +138,8 @@ class InterpolatedCostOracle:
                     num_scheduled_tokens=tuple(row["num_scheduled_tokens"]),
                     context_lens=tuple(row["context_lens"]),
                     num_prefill_tokens=row["num_prefill_tokens"],
+                    prefix_cache_hit_tokens=tuple(
+                        row.get("prefix_cache_hit_tokens") or ()),
                 )
                 kind = "prefill" if shape.is_prefill else "decode"
                 rows, targets = gathered[kind]

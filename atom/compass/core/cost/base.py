@@ -21,6 +21,14 @@ class StepShape:
         num_scheduled_tokens: New tokens per request, in batch order.
         context_lens: KV history length per request, in batch order.
         num_prefill_tokens: Of the scheduled tokens, how many are prefill.
+        prefix_cache_hit_tokens: Per request, how much of ``context_lens`` was
+            served from the prefix cache instead of being computed by a forward
+            this request paid for. Empty when the engine did not say. A step
+            cannot be read without it: a chunked prefill's middle chunk and a
+            cache hit both present as few scheduled tokens at a large context,
+            and they do not cost the same -- a hit skips the KV write. The
+            calibration sweep gives every prompt a distinct opening, so it
+            contains no hits at all, while a cc-traces replay is mostly hits.
         topology: Communication group sizes, e.g. ``{"tp": 2, "dp": 4}``.
             Compass does not interpret these names; a group is a size and a
             membership, and the operators recorded against it carry the meaning.
@@ -47,6 +55,7 @@ class StepShape:
     num_scheduled_tokens: tuple[int, ...]
     context_lens: tuple[int, ...]
     num_prefill_tokens: int = 0
+    prefix_cache_hit_tokens: tuple[int, ...] = ()
     topology: Mapping[str, int] = field(default_factory=dict)
     rank_coords: Mapping[str, int] = field(default_factory=dict)
     capture_bucket: int | None = None
