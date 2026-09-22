@@ -315,12 +315,37 @@ def test_the_guard_reads_the_imports_that_run_at_import(form, tmp_path, monkeypa
     sorted(PACKAGE.rglob("*.py")),
     ids=lambda p: p.name,
 )
-def test_only_the_binding_module_reaches_the_engine(path):
-    """Everything else stays runnable where the engine cannot be imported."""
+def test_only_the_binding_module_reaches_atoms_runner(path):
+    """Everything else stays importable where there is no driver.
+
+    This counted every `atom.` import outside this package until `projection.py`
+    landed, which reads a scheduled batch and a capture ladder and goes nowhere
+    near a device. That rule was wider than the property it stood for. What
+    strands a module is one import: `atom.model_engine.model_runner` runs
+    aiter's architecture probe, which shells out to `rocminfo` and raises where
+    there is no GPU. So that name is what this counts, and the test below runs
+    the import rather than reading it, which is the property itself.
+    """
     imported = _import_time_imports(path.read_text())
-    engine = {m for m in imported if m.split(".")[0] == "atom"} - {
-        m for m in imported if m.startswith("atom.compass.runner")
-    }
-    assert engine == (
-        {"atom.model_engine.model_runner"} if path.name == "model_runner.py" else set()
+    assert ("atom.model_engine.model_runner" in imported) == (
+        path.name == "model_runner.py"
     )
+
+
+@pytest.mark.parametrize(
+    "path",
+    [p for p in sorted(PACKAGE.rglob("*.py")) if p.name != "model_runner.py"],
+    ids=lambda p: p.name,
+)
+def test_every_other_module_imports_here(path):
+    """The measurement the scan above can only approximate.
+
+    A source scan cannot see a driver reached through an import of an import,
+    and the scan's own predicate is blind to a module-scope `try:`/`except
+    ImportError:` in a module it does not read. Running the import is blind to
+    neither. On the tier that has no driver this is the whole property; on a
+    machine that has one it degrades to a syntax and resolution check, which is
+    why the scan above is kept as well.
+    """
+    module = f"atom.compass.runner.{path.stem}".removesuffix(".__init__")
+    assert importlib.import_module(module) is not None
