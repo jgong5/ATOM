@@ -46,6 +46,7 @@ from atom.compass.memory import (
     predicts,
     reserves,
 )
+from atom.compass.backends.geometry import dtype_bytes as element_bytes
 from atom.compass.spec import MachineSpec, SpecRefusal
 
 # The package as the suite actually imported it, never as a walk up from this
@@ -176,13 +177,19 @@ def ladder():
 
 
 def reserved(qwen, total_bytes):
-    """What ATOM's own estimator would reserve for this ladder."""
+    """What ATOM's own estimator would reserve for this ladder.
+
+    The element size comes off the config, the way the module under test takes
+    it. Writing 2 here would be the same number and the same defaulting the
+    source just stopped doing -- a test that hardcodes what its subject derives
+    stops being able to see the derivation break.
+    """
     return reserves(
         piecewise=PiecewiseCapture(
             per_token_bytes=piecewise_per_token_bytes(
                 hidden_size=qwen.hidden_size,
                 layers=qwen.num_hidden_layers,
-                dtype_bytes=2,
+                dtype_bytes=element_bytes(qwen.dtype),
             ),
             token_shapes=ladder(),
             budget_bytes=int(total_bytes * GPU_MEMORY_UTILIZATION),
