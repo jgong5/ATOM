@@ -11,6 +11,11 @@ The numbers are the measured ones wherever a measurement exists, because two of
 these checks are judgements about size: the cross-rank spread accepted is the
 one the hardware really shows, and the spread refused is the one a neighbour
 really produced. Round numbers would make both tests vacuous.
+
+The last section is the probe that needs no device. Its fragments are built by
+the probe itself against a stand-in for the per-processor topology the kernel
+publishes, so the core counts in them are read by the code a real run reads
+them with rather than typed in beside the assertion that checks them.
 """
 
 import copy
@@ -28,10 +33,15 @@ from atom.compass.spec import (
     across_ranks,
     explain,
     merge,
+    tokenizer_fragment,
     validate,
 )
 from atom.compass.spec.fields import BY_PATH, Kind
+from atom.compass.spec.probes import cpu_counts
 from atom.compass.spec.tokenizers import ENTRY_FIELDS
+from atom.compass.spec.validate import CONDITIONS, WIDTH_TABLES
+from atom.compass.spec.validate import DERATES as DERATES_ASKED
+from atom.compass.spec.validate import MISSING as MISSING_ASKED
 from atom.compass.spec.validate import STACK as STACK_ASKED
 from atom.compass.spec.validate import TRANSFERS as TRANSFERS_ASKED
 from atom.compass.spec.validate import WIDTHS as WIDTHS_ASKED
@@ -582,23 +592,51 @@ def test_the_transfer_condition_names_itself_as_unaskable_of_a_document():
     assert "in no field" in str(as_document)
 
 
-def test_an_incomplete_document_says_no_consistency_question_was_asked():
+def test_a_desk_fix_refusal_does_not_hide_the_expensive_one():
     # The phase-one refusal here is a derate an author types in at a desk; the
     # width table behind it is present and schema-valid, and the width nobody
-    # measured costs an eight-GPU reservation. Phase two does not run, so the
-    # result has to say that rather than let the cheap refusal stand alone.
+    # measured costs an eight-GPU reservation. Both are reported, and so is the
+    # stack, because each question is asked of the fields that did resolve.
     thin = without(TIER1, "device", "memory", "derate")
+    with pytest.warns(StackMismatch):
+        checked = validate(
+            merge(fragments(tier1=thin)).document,
+            tp_widths=(1, 2, 4, 8, 16),
+            observed_stack=dict(STACK, rocm="7.3.0"),
+            strict=True,
+        )
+    rules = [refusal.rule for refusal in checked.refusals]
+    assert checked.spec is None
+    assert rules.count(Rule.DERATE) == 1
+    assert rules.count(Rule.NO_DEFAULTS) == len(WIDTH_TABLES)
+    assert rules.count(Rule.PINNED_STACK) == 1
+    assert [condition.split(" -- ")[0] for condition in checked.not_asked] == [
+        TRANSFERS_ASKED
+    ]
+    assert "16" in str(checked) and "7.3.0" in str(checked)
+
+
+def test_a_question_whose_field_did_not_resolve_names_that_field():
+    # The width tables are what the width question reads. With one of them
+    # gone the question is still asked of the other -- width 16 is still
+    # refused -- and the table it could not be asked of is named rather than
+    # passed over in a result that reads as though it had been asked.
+    absent = ("device", "runtime_constants", "allocator_retained_after_load_bytes")
     checked = validate(
-        merge(fragments(tier1=thin)).document,
-        tp_widths=(1, 2, 4, 8, 16),
-        observed_stack=dict(STACK, rocm="7.3.0"),
-        strict=True,
+        merge(
+            fragments(tier1=without(TIER1, *absent), tier2=without(TIER2, *absent))
+        ).document,
+        tp_widths=(16,),
     )
-    assert [refusal.rule for refusal in checked.refusals] == [Rule.DERATE]
-    assert len(checked.not_asked) == 3
-    for condition in checked.not_asked:
-        assert "not a complete spec" in condition
-    assert "hiding a more expensive one" in str(checked)
+    assert not checked.ok
+    assert any("16" in refusal.what for refusal in checked.refusals)
+    (unasked,) = [
+        condition
+        for condition in checked.not_asked
+        if condition.startswith(WIDTHS_ASKED)
+    ]
+    assert "allocator_retained_after_load_bytes" in unasked
+    assert "asked of the rest" in unasked
 
 
 def test_a_document_that_is_not_a_mapping_is_refused():
@@ -639,9 +677,8 @@ def test_raise_first_gives_the_spec_or_the_first_refusal():
         validate(without(merged().document, "device", "arch")).raise_first()
 
 
-def test_the_refusal_list_is_the_one_the_design_asks_for():
-    # Each condition, with the rule that declines it, in one place: a reader
-    # comparing this against the list it implements has one thing to read.
+def refused_by_condition():
+    """One subject per condition in the check set, each earning its refusal."""
     thin = without(TIER1, "device", "arch")
     no_constant = without(
         TIER1, "device", "runtime_constants", "persistent_forward_buffer_bytes"
@@ -660,32 +697,50 @@ def test_the_refusal_list_is_the_one_the_design_asks_for():
         moved = validate(
             merged(), observed_stack=dict(STACK, rocm="7.3.0"), strict=True
         )
-    conditions = {
-        "a missing required field": (
-            validate(merge(fragments(tier1=thin)).document),
-            Rule.SHAPE,
-        ),
-        "an unmeasured width the deployment uses": (
-            validate(merged(), tp_widths=(16,)),
-            Rule.NO_DEFAULTS,
-        ),
-        "a runtime constant with no default": (
-            validate(merge(fragments(tier1=no_constant)).document),
-            Rule.NO_DEFAULTS,
-        ),
-        "a derate missing beside a spec peak": (
-            validate(merge(fragments(tier1=no_derate)).document),
-            Rule.DERATE,
-        ),
-        "a stack that no longer matches": (moved, Rule.PINNED_STACK),
-        "a transfer out of a differently pinned spec": (
-            validate(transferred),
-            Rule.PINNED_STACK,
-        ),
+    return {
+        MISSING_ASKED: [
+            (validate(merge(fragments(tier1=thin)).document), Rule.SHAPE),
+            (
+                validate(merge(fragments(tier1=no_constant)).document),
+                Rule.NO_DEFAULTS,
+            ),
+        ],
+        DERATES_ASKED: [
+            (validate(merge(fragments(tier1=no_derate)).document), Rule.DERATE)
+        ],
+        WIDTHS_ASKED: [(validate(merged(), tp_widths=(16,)), Rule.NO_DEFAULTS)],
+        STACK_ASKED: [(moved, Rule.PINNED_STACK)],
+        TRANSFERS_ASKED: [(validate(transferred), Rule.PINNED_STACK)],
     }
-    for condition, (checked, rule) in conditions.items():
+
+
+def test_the_check_set_names_every_condition_a_spec_can_be_refused_by():
+    # The check set is what a result's `not_asked` is measured against and what
+    # the count of conditions the package says it reaches is a count of. A
+    # condition earnable in the code and absent from the list is one no result
+    # reports on; one listed and earnable by nothing is a count with no subject.
+    assert set(refused_by_condition()) == set(CONDITIONS)
+
+
+@pytest.mark.parametrize("condition", CONDITIONS)
+def test_each_condition_in_the_check_set_is_earned_by_a_spec(condition):
+    for checked, rule in refused_by_condition()[condition]:
         assert not checked.ok, condition
         assert rule in {refusal.rule for refusal in checked.refusals}, condition
+
+
+def test_a_document_reaches_every_condition_but_the_transfer():
+    # The verb the design writes takes a file, so this is the form that gets
+    # weaker: four of the five, because a transfer's source pin is in no field
+    # of a document however it was built. The four are held to the check set
+    # above rather than to a sentence, so a fifth becoming askable of a
+    # document, or a sixth being added, moves this test and not only prose.
+    checked = validate(merged().document, tp_widths=(1, 2, 4, 8), observed_stack=STACK)
+    assert checked.ok
+    assert [condition.split(" -- ")[0] for condition in checked.not_asked] == [
+        TRANSFERS_ASKED
+    ]
+    assert len(CONDITIONS) - len(checked.not_asked) == 4
 
 
 # --- explain: the basis of a number ------------------------------------------
@@ -906,3 +961,152 @@ def test_the_three_verbs_are_reachable_by_name():
     for name in ("merge", "validate", "explain", "across_ranks"):
         assert name in spec_package.__all__
         assert getattr(spec_package, name, None) is not None
+
+
+# --- the probe that needs no device, and the counts it writes down -----------
+
+#: A second tokenizer, so the two fragments below overlap in no entry either.
+ELSEWHERES = dict(
+    TOKENIZER,
+    id="llama-128k-bpe",
+    fingerprint="sha256:" + "d" * 64,
+    applies_to=["LlamaForCausalLM"],
+)
+
+
+def published_topology(root, *, cores_physical, threads_per_core=2, packages=1):
+    """A stand-in for the per-processor topology the kernel publishes."""
+    processor = 0
+    for package in range(packages):
+        for core in range(cores_physical // packages):
+            for _ in range(threads_per_core):
+                topology = root / f"cpu{processor}" / "topology"
+                topology.mkdir(parents=True)
+                (topology / "core_id").write_text(f"{core}\n")
+                (topology / "physical_package_id").write_text(f"{package}\n")
+                processor += 1
+    return str(root)
+
+
+def test_the_probe_counts_cores_and_the_threads_over_them_apart(tmp_path):
+    assert cpu_counts(published_topology(tmp_path, cores_physical=8)) == {
+        "cores_physical": 8,
+        "cores_logical": 16,
+    }
+
+
+def test_one_core_id_on_two_packages_is_two_cores(tmp_path):
+    # `core_id` is numbered within its package, so counting core ids alone
+    # would report half of a two-socket machine and the halving would look
+    # exactly like a correct reading of a smaller host.
+    assert cpu_counts(published_topology(tmp_path, cores_physical=96, packages=2)) == {
+        "cores_physical": 96,
+        "cores_logical": 192,
+    }
+
+
+def test_a_host_that_publishes_no_topology_is_refused_rather_than_halved(tmp_path):
+    with pytest.raises(SpecRefusal) as refused:
+        cpu_counts(str(tmp_path))
+    assert refused.value.rule is Rule.SHAPE
+    assert "lists no processor" in refused.value.what
+    (tmp_path / "cpu0").mkdir()
+    with pytest.raises(SpecRefusal) as unreadable:
+        cpu_counts(str(tmp_path))
+    assert "cpu0 publishes no topology" in unreadable.value.what
+
+
+def test_a_probe_that_measured_no_tokenizer_emits_no_fragment(tmp_path):
+    with pytest.raises(SpecRefusal) as refused:
+        tokenizer_fragment(
+            [],
+            machine="node-18",
+            authored_by="ana",
+            date="2026-09-22",
+            processors=published_topology(tmp_path, cores_physical=8),
+        )
+    assert refused.value.rule is Rule.TOKENIZER_IDENTITY
+
+
+def test_the_pair_this_closes_merged_cleanly_before_the_counts_were_emitted():
+    # The control the named result is measured against: what the tokenizer
+    # probe emitted before it wrote the processor down -- the rates and the
+    # stanza, and no field the node's own fragment also states. Nothing in
+    # their shape says the two were measured on different processors, so the
+    # merge has nothing to compare and combines them into one document.
+    elsewhere = fragment(
+        "tokenizer-laptop",
+        {"host": {"tokenizers": [ELSEWHERES]}},
+        machine="node-18",
+        authored_by="ana",
+    )
+    combination = merge([elsewhere, fragment("tier0", TIER0, machine="node-18")])
+    assert combination.document["host"]["cpu"]["cores_physical"] == 96
+    assert [entry["id"] for entry in combination.document["host"]["tokenizers"]] == [
+        "llama-128k-bpe",
+        "qwen3-151k-bpe",
+    ]
+
+
+def test_the_probes_counts_refuse_the_pair_that_used_to_merge(tmp_path):
+    # The named result. The same two fragments, with the tokenizer one built by
+    # the probe on a host of 8 physical cores instead of written out by hand.
+    # It now states a field the node's fragment also states, and one machine
+    # cannot have both counts, so the merge refuses and prints both.
+    laptop = tokenizer_fragment(
+        [ELSEWHERES],
+        machine="node-18",
+        authored_by="ana",
+        date="2026-09-22",
+        source="tokenizer-laptop",
+        processors=published_topology(tmp_path, cores_physical=8),
+    )
+    with pytest.raises(SpecRefusal) as refused:
+        merge([laptop, fragment("tier0", TIER0, machine="node-18")])
+    message = str(refused.value)
+    assert refused.value.rule is Rule.ONE_MACHINE
+    assert "`host.cpu.cores_physical` is 8 in" in message
+    assert "and 96 in" in message
+    for named in ("tokenizer-laptop", "tier0", "node-18", "ana"):
+        assert named in message, f"{named} is not named in: {message}"
+
+
+def test_the_same_pair_merges_when_the_counts_agree(tmp_path):
+    # The other half of the result: the refusal is about the two readings and
+    # not about the probe having spoken at all. Run on the machine the spec is
+    # authored for, the same probe supplies the same field and the pair merges.
+    here = tokenizer_fragment(
+        [ELSEWHERES],
+        machine="node-18",
+        authored_by="ana",
+        date="2026-09-22",
+        source="tokenizer-node",
+        processors=published_topology(tmp_path, cores_physical=96, packages=2),
+    )
+    combination = merge([here, fragment("tier0", TIER0, machine="node-18")])
+    assert combination.document["host"]["cpu"] == {
+        "cores_physical": 96,
+        "cores_logical": 192,
+    }
+    assert combination.sources["host.cpu.cores_physical"] == (
+        "tokenizer-node",
+        "tier0",
+    )
+
+
+def test_the_probes_fragment_states_where_it_is_authored_for_and_how(tmp_path):
+    emitted = tokenizer_fragment(
+        [TOKENIZER],
+        machine="node-18",
+        authored_by="ana",
+        date="2026-09-22",
+        processors=published_topology(tmp_path, cores_physical=8),
+    )
+    assert emitted.machine == "node-18"
+    assert emitted.method == "probed" and emitted.transferred_from is None
+    assert "by ana on 2026-09-22" in emitted.stanza()
+
+
+def test_the_probe_is_reachable_by_name():
+    assert "tokenizer_fragment" in spec_package.__all__
+    assert spec_package.tokenizer_fragment is tokenizer_fragment

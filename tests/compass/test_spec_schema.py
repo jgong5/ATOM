@@ -483,13 +483,16 @@ def test_the_package_imports_only_the_standard_library_it_names(module):
     # a spec can be authored and checked on any machine: no device runtime, no
     # engine, and no document parser either -- turning a file into a mapping is
     # the caller's, which keeps a dependency the engine does not declare out of
-    # the path that reads a spec.
+    # the path that reads a spec. `pathlib` is here for the probe that reads the
+    # processor topology the kernel publishes: reading a path is not a device
+    # runtime, and nothing on the path that checks a document touches it.
     allowed = {
         "collections",
         "dataclasses",
         "enum",
         "hashlib",
         "json",
+        "pathlib",
         "typing",
         "warnings",
     }

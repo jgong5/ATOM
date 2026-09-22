@@ -29,7 +29,10 @@ upgrade is a plausible-looking wrong answer.
 document from the checked values, and `digest` fingerprints it. A run artifact
 carries the echo, so every number it reports can be traced back to the spec that
 produced it; a partial echo would break that, so the echo is built from the
-field table rather than from whatever the reader happened to keep.
+field table rather than from whatever the reader happened to keep. Totality is
+`from_mapping`'s doing rather than the dataclass's: the checking verb builds one
+out of the fields a document did resolve, deliberately, so that it can ask its
+consistency questions of a document that is not yet a spec.
 """
 
 import hashlib
@@ -186,10 +189,16 @@ class MachineSpec:
         return self.tokenizers.resolve(architecture, backend, fingerprint)
 
     def check_stack(self, observed: Mapping[str, str]) -> tuple:
-        """Compare the pinned stack with the loaded one; warn on every difference."""
+        """Compare the pinned stack with the loaded one; warn on every difference.
+
+        A component this document does not carry is not compared, so a partial
+        one can still be asked this much of the question.
+        """
         found = []
         for component in PINNED:
-            pinned = self.values[f"device.software_pinned_to.{component}"]
+            pinned = self.values.get(f"device.software_pinned_to.{component}")
+            if pinned is None:
+                continue
             seen = observed.get(component)
             if seen != pinned:
                 found.append((component, pinned, seen))

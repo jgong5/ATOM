@@ -15,37 +15,37 @@ field per attempt, they measure one term, run again, and find the next. So the
 answer is the list, in the schema's own order, and a caller that wants an
 exception raises the first.
 
-The check runs in two phases. The first asks whether the document is a complete
+The check has two halves. The first asks whether the document is a complete
 instance of the schema -- every required field present and every value the shape
-its field declares. The second asks whether a complete spec is consistent:
+its field declares. The second asks whether what it describes is consistent:
 whether the widths the deployment will actually use were measured, whether the
 stack the constants were taken on is the stack now loaded, and whether constants
-carried over from another spec came from one pinned to the same stack. Each of
-those goes through a resolved spec, so they wait until there is one.
+carried over from another spec came from one pinned to the same stack.
 
-**The ordering has a cost, and it is the one collecting refusals exists to
-avoid.** The questions of the second phase are not intrinsically about a
-resolved spec, only their implementation is: both width tables are present and
-schema-valid in a document that the first phase refuses for a single missing
-derate, and that derate is a value its author types in at a desk. So the cheap
-refusal is reported and the expensive one -- a width nobody measured, which
-costs an eight-GPU reservation to fix -- is hidden behind it, which is the
-one-measurement-per-attempt this module opens by rejecting, reintroduced at the
-phase boundary. Asking each consistency question of whatever fields did resolve
-would close it and is not done here. Until it is, the honest thing is to say
-what went unasked, so a `Validation` carries the conditions this run could not
-ask and why.
+**The second half is asked of whatever resolved, and not only of a complete
+spec.** Those questions are not intrinsically about a resolved document, only
+their implementation was: both width tables are present and schema-valid in a
+document that the first half refuses for a single missing derate, and that
+derate is a value its author types in at a desk. Running the second half only
+when the first came back clear therefore hid the expensive refusal -- a width
+nobody measured, which costs an eight-GPU reservation to fix -- behind the cheap
+one, and reintroduced at the halfway line exactly the one-refusal-per-attempt
+this module opens by rejecting. So each question is asked of the fields that did
+check out, and a question that reads a field which did not resolve says so by
+name rather than being passed over in silence.
 
-**The same record makes the opt-in conditions legible.** Three of the five need
-something from the caller -- `tp_widths=`, `observed_stack=`, and a `Merge`
-rather than a document -- and a clear result that does not say what it declined
-to ask is the shape this package exists to refuse. The sharpest case is the
-transfer: its source's pin is in no field of the merged document, by the
+**The same record makes the opt-in conditions legible.** Three of the five in
+`CONDITIONS` need something from the caller -- `tp_widths=`, `observed_stack=`,
+and a `Merge` rather than a document -- and a clear result that does not say what
+it declined to ask is the shape this package exists to refuse. The sharpest case
+is the transfer: its source's pin is in no field of the merged document, by the
 decision below, so `validate(document)` can never ask that condition however the
 document was built, and the same spec is refused as a `Merge` and clear as a
 document. That is not a wrong number, but it must be visible, because the verb
 the design writes -- `compass spec validate machine.yaml` -- is the form that
-cannot ask it.
+cannot ask it, and so reaches four of the five. `CONDITIONS` is what that count
+is a count of; a condition added to the check set and not to it is one no result
+can report on.
 
 Two of those questions need something the document does not carry.
 
@@ -78,11 +78,22 @@ from .fields import PINNED, SCHEMA, Kind, check
 from .machine import MachineSpec, _missing, _walk
 from .merge import PINNED_BLOCK, Merge
 from .rules import Rule, SpecRefusal
+from .tokenizers import TokenizerTable
 
-#: The consistency conditions, named so a result can say which went unasked.
+#: The conditions a spec is checked for. The first two are asked of any
+#: document; each of the rest names itself in `not_asked` when a run could not
+#: reach it.
+MISSING = "whether every required field is present and every value its declared shape"
+DERATES = "whether a spec-peak number carries the derate it obliges"
 WIDTHS = "whether the widths this deployment will use were measured"
 STACK = "whether the constants' stack pin is the stack now loaded"
 TRANSFERS = "whether a transferred constant came from a spec pinned to this stack"
+#: The whole check set, in the order a run asks it. What `not_asked` is measured
+#: against: a condition missing from here is one no result can report on.
+CONDITIONS = (MISSING, DERATES, WIDTHS, STACK, TRANSFERS)
+#: The fields each consistency question reads before it can be asked at all.
+WIDTH_TABLES = tuple(field.path for field in SCHEMA if field.kind is Kind.WIDTH_TABLE)
+STACK_PINS = tuple(f"{PINNED_BLOCK}.{component}" for component in PINNED)
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,35 +131,50 @@ class Validation:
         )
 
 
+def _unreached(
+    condition: str, reads: Sequence[str], resolved: Mapping[str, Any]
+) -> tuple[str, ...]:
+    """What a condition was not asked of, because a field it reads did not resolve."""
+    absent = [path for path in reads if path not in resolved]
+    if not absent:
+        return ()
+    named = ", ".join(f"`{path}`" for path in absent)
+    reach = (
+        "so it could not be asked at all"
+        if len(absent) == len(reads)
+        else "so it was asked of the rest and not of those"
+    )
+    return (f"{condition} -- {named} did not resolve, {reach}",)
+
+
 def _not_asked(
-    spec: MachineSpec | None,
+    resolved: Mapping[str, Any],
     tp_widths: Sequence[int],
     observed_stack: Mapping[str, str] | None,
     merged: Merge | None,
 ) -> tuple[str, ...]:
     """The consistency questions this run did not ask, each with its reason."""
-    if spec is None:
-        return tuple(
-            f"{condition} -- the document is not a complete spec, so no "
-            "consistency question was asked of it at all; a refusal above can "
-            "be hiding a more expensive one"
-            for condition in (WIDTHS, STACK, TRANSFERS)
-        )
-    unasked = []
+    unasked: list[str] = []
     if not tp_widths:
         unasked.append(f"{WIDTHS} -- no `tp_widths=` was given")
+    else:
+        unasked.extend(_unreached(WIDTHS, WIDTH_TABLES, resolved))
     if observed_stack is None:
         unasked.append(f"{STACK} -- no `observed_stack=` was given")
+    else:
+        unasked.extend(_unreached(STACK, STACK_PINS, resolved))
     if merged is None:
         unasked.append(
             f"{TRANSFERS} -- the subject is a document, and a transfer's source "
             "pin is in no field of one; ask this of the `Merge` while the "
             "fragments are still in hand"
         )
+    elif merged.transfers:
+        unasked.extend(_unreached(TRANSFERS, STACK_PINS, resolved))
     return tuple(unasked)
 
 
-def _complete(document: object):
+def _complete(document: object, resolved: dict[str, Any]):
     if not isinstance(document, Mapping):
         yield SpecRefusal(
             Rule.SHAPE,
@@ -168,23 +194,23 @@ def _complete(document: object):
                 if field.required:
                     _missing(field)
             else:
-                check(field, found[field.path], field.path)
+                resolved[field.path] = check(field, found[field.path], field.path)
         except SpecRefusal as refusal:
             yield refusal
 
 
-def _widths(spec: MachineSpec, tp_widths: Sequence[int]):
-    for field in SCHEMA:
-        if field.kind is not Kind.WIDTH_TABLE:
+def _widths(spec: MachineSpec, tp_widths: Sequence[int], resolved: Mapping[str, Any]):
+    for path in WIDTH_TABLES:
+        if path not in resolved:
             continue
         for width in tp_widths:
             try:
-                spec.runtime_constant(field.path.rsplit(".", 1)[-1], width)
+                spec.runtime_constant(path.rsplit(".", 1)[-1], width)
             except SpecRefusal as refusal:
                 yield refusal
 
 
-def _transfers(spec: MachineSpec, merged: Merge):
+def _transfers(resolved: Mapping[str, Any], merged: Merge):
     for fragment in merged.transfers:
         declared = {
             component: fragment.values[f"{PINNED_BLOCK}.{component}"]
@@ -203,7 +229,9 @@ def _transfers(spec: MachineSpec, merged: Merge):
             )
             continue
         for component, version in declared.items():
-            here = spec.value(f"{PINNED_BLOCK}.{component}")
+            if f"{PINNED_BLOCK}.{component}" not in resolved:
+                continue
+            here = resolved[f"{PINNED_BLOCK}.{component}"]
             if version != here:
                 yield SpecRefusal(
                     Rule.PINNED_STACK,
@@ -227,24 +255,23 @@ def validate(
     """Check a document, or a merge of fragments, and report every refusal."""
     merged = subject if isinstance(subject, Merge) else None
     document = merged.document if merged is not None else subject
-    refusals = list(_complete(document))
+    resolved: dict[str, Any] = {}
+    refusals = list(_complete(document, resolved))
     spec = None
     if not refusals:
         try:
             spec = MachineSpec.from_mapping(document)
         except SpecRefusal as refusal:
             refusals.append(refusal)
-    if spec is None:
-        return Validation(
-            None,
-            tuple(refusals),
-            (),
-            _not_asked(None, tp_widths, observed_stack, merged),
-        )
-    refusals += _widths(spec, tp_widths)
-    differences = ()
+    # The consistency questions go through the fields that checked out, whether
+    # or not they add up to a spec. Where there is no spec this stands in for
+    # one, and it never leaves this function: a partial document is not a
+    # machine, and `Validation.spec` must not offer it as one.
+    asked_of = spec if spec is not None else MachineSpec(resolved, TokenizerTable(()))
+    refusals += _widths(asked_of, tp_widths, resolved)
+    differences: tuple = ()
     if observed_stack is not None:
-        differences = spec.check_stack(observed_stack)
+        differences = asked_of.check_stack(observed_stack)
         if differences and strict:
             refusals.append(
                 SpecRefusal(
@@ -259,10 +286,10 @@ def validate(
                 )
             )
     if merged is not None:
-        refusals += _transfers(spec, merged)
+        refusals += _transfers(resolved, merged)
     return Validation(
         spec,
         tuple(refusals),
         differences,
-        _not_asked(spec, tp_widths, observed_stack, merged),
+        _not_asked(resolved, tp_widths, observed_stack, merged),
     )
