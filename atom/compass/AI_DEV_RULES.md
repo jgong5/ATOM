@@ -72,6 +72,16 @@
 - Task management is GitHub: the PR names its issue, and the issue is closed
   deliberately, with the handoff comment. Agents open, assign, comment on and
   close issues, including issues they did not open.
+- **A finding that outlives its PR needs an issue, not a PR body.** PR bodies are
+  squashed away on landing, so a finding recorded only there is lost to the next
+  reader. Two reviews have now re-derived findings that had been written down
+  repeatedly with no issue to point at. If a finding is not fixed in the PR that
+  found it, open an issue and point the PR body at it.
+- **A PR's state is read from the last entry in its comment thread**, never from
+  a carried-forward summary. Developer rounds and review verdicts alternate in one
+  stream and both open with a bold heading, so a remembered approval may belong to
+  an earlier round. One PR sat recorded as approved through six consecutive checks
+  while its last entry was a developer record and no reviewer had seen its head.
 - Design and implement solutions while keeping the solution as simple as possible.
 - **When something does not work as expected, stop and discuss. Do not work
   around it.** This covers: a design document that contradicts the code; a test
@@ -122,8 +132,16 @@
      must be justified on its own terms, not absorbed.
   2. New CPU-only tests for what the task added, in `tests/compass/`, in ATOM's
      style.
+     **The tests must exercise something the PR did not itself add.** A new
+     module plus tests for that module, imported by nothing else, is
+     self-confirming: it passes every gate and demonstrates nothing. Where a
+     task is verification rather than implementation, the brief says so and the
+     deliverable is evidence, not a package.
   3. One named result, stated in the issue body before the task is claimed and
      not chosen afterwards.
+     An umbrella brief whose children carry the work states one anyway, or
+     names the child that carries it. A developer choosing one afterwards is
+     the case this rule forbids, and it has happened.
   4. Review by the task's reviewer agent, looping to APPROVE as above.
 
   Baselines are recorded first (the suite's and ruff's pass/fail state, before the
@@ -146,10 +164,31 @@
   survive a container rebuild; reinstall with
   `./shell.sh /workspace/gpu_docker/install-gh-stack.sh`, idempotent. Its
   stack metadata lives in `.git/gh-stack` and is not committed.
+- **Land a stack with `gh stack merge <pr-number> --squash --yes`**, which merges
+  up to and including that PR and leaves the rest open. Measured on this fork:
+  landing the bottom of a two-PR stack produced **one squashed commit carrying
+  that PR's message body**, left the upper PR open, **retargeted its base to the
+  merged branch automatically**, and left it at `mergeable_state=clean` — no
+  rebase, no force-push, no base patch. The plain endpoints are what fail on a
+  stacked PR: `PUT /pulls/<n>/merge` returns 403 naming the stack merge path, and
+  `PATCH /pulls/<n> -f base=` returns 422. Those are the wrong tools, not a
+  limitation.
+- **Four things about `gh stack` that cost time if rediscovered.** `gh stack link`
+  fails with `unable to determine default branch` unless `--base <branch>` is
+  given. `gh stack unstack <n>` refuses while any member is queued for merge, takes
+  no `--yes`, and can leave an orphan stack object; `DELETE /stacks/<n>` 404s. Only
+  open, non-draft PRs merge. And there is **no `--message` flag**, so a
+  hand-written squash message cannot be supplied at merge time — with one commit
+  the body survives, with many GitHub's default applies. Since the squash message
+  is where a task's measured result is recorded, that is the one real cost of
+  stacking.
 - **Never force-push a branch under review. A restack after its parent has
   landed is permitted.**
-- **Landing the bottom of a stack forces one restack of everything stacked
-  above it.**
+- **Landing the bottom of a hand-managed base chain forces one restack of
+  everything above it** — `git rebase --onto <new> <old> <branch>` plus a REST base
+  patch, per child, per parent move. A plain `git rebase` conflicts where `--onto`
+  does not. **A linked `gh stack` does not pay this**, which is the argument for
+  linking a chain rather than hand-managing it.
 - Except for the main branch, free updates to `jgong5/ATOM` — branches, PRs and
   issues alike, untouched until the project agrees to upstream the milestone.
   Never touch `ROCm/ATOM`.
