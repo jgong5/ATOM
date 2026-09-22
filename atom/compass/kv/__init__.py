@@ -6,9 +6,9 @@ Two pieces, split by what each one may depend on.
 `transfer` is arithmetic -- a latency, a derated bandwidth and an exact byte
 count -- and imports nothing from the engine itself. Importing it through this
 file is not that bare import, though: this file loads `connector` as well, and
-with it the engine's connector interface and its factory. Seven engine modules,
-measured, and no tensor library or device runtime among them, so a price can
-still be computed where no driver exists.
+with it the engine's connector interface, its factory, and what those pull in.
+No tensor library and no device runtime among them, so a price can still be
+computed where no driver exists.
 
 `connector` implements the engine's connector interface over that price and is
 what the connector factory builds under the name `compass`. It reads the clock
