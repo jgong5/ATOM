@@ -6,7 +6,7 @@
 This module keeps two graph-pool functions apart on purpose:
 
 - **`reserves()` mirrors ATOM's own `_estimate_cudagraph_overhead`**
-  (`model_runner.py:1546-1641`). It is not the better number and it is not meant
+  (`model_runner.py:1560-1655`). It is not the better number and it is not meant
   to be. It is the number that *actually reserves the memory*, because it is
   what `get_num_blocks` subtracts from the budget, so substituting anything else
   there would predict a block count ATOM would never produce.
@@ -48,20 +48,20 @@ RESERVES = "cudagraph_overhead"
 #: The name it refuses, because this one does not reserve anything.
 PREDICTS = "cudagraph_pool"
 
-#: ATOM's declared live-tensors-per-layer coefficient (`model_runner.py:3601`).
+#: ATOM's declared live-tensors-per-layer coefficient (`model_runner.py:3628`).
 #: Mirrored rather than re-derived: it is what the engine spends.
 LIVE_TENSORS_PER_LAYER = 2.8
-#: ATOM's whole-graph estimate, as a fraction of peak activations (`:1622`).
+#: ATOM's whole-graph estimate, as a fraction of peak activations (`:1636`).
 ACTIVATION_FRACTION = 0.2
 #: The fraction of the utilisation budget the piecewise branch will reserve
-#: before it stops taking buckets (`:1591`).
+#: before it stops taking buckets (`:1605`).
 TARGET_RESERVE_FRACTION = 0.15
 
 
 def piecewise_per_token_bytes(
     *, hidden_size: int, layers: int, dtype_bytes: int, dp_size: int = 1
 ) -> float:
-    """ATOM's per-token retained estimate, from model geometry (`:3589-3612`).
+    """ATOM's per-token retained estimate, from model geometry (`:3616-3639`).
 
     Mirrored including the sub-linear `dp ** 0.6` amplification, which is there
     because the MoE all-gathers hidden to about `dp_size` times the local tokens
@@ -98,7 +98,7 @@ class PiecewiseCapture:
     budget_bytes: int
 
     def taken(self) -> tuple[tuple[int, ...], int]:
-        """The buckets the capture loop keeps, and their token sum (`:1605-1611`).
+        """The buckets the capture loop keeps, and their token sum (`:1619-1625`).
 
         Greedy in ascending order and the first bucket is always taken, exactly
         as ATOM does it -- the cap is on how much of the budget the reservation
@@ -135,10 +135,10 @@ def reserves(
 
     - A DSpark confidence-schedule drafter rescales the whole-graph branch by
       the captured bucket count, `activation_bytes * 0.2 * n_buckets`
-      (`model_runner.py:1626-1632`). Without it this **under-reserves** by that
+      (`model_runner.py:1640-1646`). Without it this **under-reserves** by that
       factor and so predicts more KV blocks than ATOM would.
     - The piecewise branch drops buckets over `ATOM_PIECEWISE_DP_MAX_TOKENS`
-      when `dp_size > 1` and a drafter is attached (`:1602-1604`).
+      when `dp_size > 1` and a drafter is attached (`:1616-1618`).
       `capture_token_shapes` does not, so that configuration **over-reserves**
       and predicts fewer.
     """
@@ -152,7 +152,7 @@ def reserves(
                     Basis.DEPLOYMENT,
                     "config.enforce_eager",
                     "ATOM captures no graph under enforce_eager and reserves "
-                    "nothing for one (model_runner.py:1556)",
+                    "nothing for one (model_runner.py:1570)",
                 ),
             ),
         )
@@ -173,7 +173,7 @@ def reserves(
                     int(activation_bytes * ACTIVATION_FRACTION),
                     Basis.DECLARED,
                     f"{ACTIVATION_FRACTION} x {activation_bytes} activation bytes "
-                    "of the warmup shape (model_runner.py:1622)",
+                    "of the warmup shape (model_runner.py:1636)",
                     "ATOM's coefficient, mirrored because it is what reserves; "
                     "`predicts()` is the measured pool and disagrees by 4-19x",
                 ),
@@ -190,7 +190,7 @@ def reserves(
                 f"{piecewise.per_token_bytes / (1 << 20):.3f} MiB/token x "
                 f"{tokens} tokens over {len(taken)}/{len(piecewise.token_shapes)} "
                 f"buckets, capped at {TARGET_RESERVE_FRACTION} x budget "
-                "(model_runner.py:1565-1612)",
+                "(model_runner.py:1579-1626)",
                 "ATOM's geometry-derived coefficient, mirrored because it is "
                 "what reserves; `predicts()` is the measured pool",
             ),

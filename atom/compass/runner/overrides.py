@@ -14,8 +14,16 @@ and decline to do their work. The rest run afterwards, over the worker's RPC
 channel; `allocate_kv_cache` does the arithmetic and none of the allocation,
 `capture_cudagraph` captures nothing and says so in the shape its caller
 unpacks, `forward` reports what a step produced without running one, and
-`get_num_blocks` refuses by name because its answer is not this module's to
-invent -- a wrong block count would be indistinguishable from a measured one.
+`get_num_blocks` runs ATOM's own budget arithmetic against readings taken off a
+machine spec instead of off a card.
+
+That last one replaces no arithmetic, and the two methods beside it are the
+reason it does not have to. `ModelRunner.get_num_blocks` touches the device in
+exactly two calls -- `_read_device_memory` and `_estimate_cudagraph_overhead`
+-- and both are override points, so replacing them leaves every line of the
+budget formula, the clamp and `plan_pools` to run unchanged. A second copy of
+that formula would drift from it with no test failing; a substituted reading
+cannot.
 
 Order matters when mixing this in: `NonAllocatingRunner` must precede
 `ModelRunner` in the bases so these definitions win. The class deliberately
@@ -79,6 +87,7 @@ from typing import Any
 
 import torch
 
+from atom.compass.memory import DeviceReadings, SizedKVPool
 from atom.compass.runner.step_output import (
     DeferredTokenStream,
     reported_token_id,
@@ -156,6 +165,44 @@ class RunnerRefusal(RuntimeError):
     """Raised where this runner has no answer and will not invent one."""
 
 
+def install_device_readings(runner: Any, readings: DeviceReadings) -> None:
+    """Give a runner the readings its KV budget will be computed from.
+
+    Set on the instance rather than taken in an `__init__`, because the base
+    class runs the whole of its own before a subclass body would get control.
+    It is a function rather than a method so that every method on
+    `NonAllocatingRunner` is a replacement for one of ATOM's, which is a
+    property the tests check rather than a preference.
+
+    Reading a machine spec off a flag or a config field, and building the
+    readings from it, is the configuration surface's job and is not wired yet.
+    Until it is, whoever has the spec installs the readings here, and
+    `get_num_blocks` refuses by name in the meantime rather than sizing a pool
+    from nothing.
+    """
+    if not isinstance(readings, DeviceReadings):
+        raise RunnerRefusal(
+            "the KV budget is sized from the five substituted readings, and "
+            f"{type(readings).__name__} is not them; install what "
+            "`atom.compass.memory.device_readings` returned for this width"
+        )
+    runner.compass_readings = readings
+
+
+def _installed_readings(runner: Any) -> DeviceReadings:
+    """The installed readings, or a refusal that says what would supply them."""
+    readings = getattr(runner, "compass_readings", None)
+    if readings is None:
+        raise RunnerRefusal(
+            "no device readings are installed on this runner, so there is "
+            "nothing for ATOM's KV budget arithmetic to run against; call "
+            "`install_device_readings` with what "
+            "`atom.compass.memory.device_readings` produced from a machine "
+            "spec before the engine asks this worker for a block count."
+        )
+    return readings
+
+
 class UnbuiltModel(torch.nn.Module):
     """Stands in for the module tree a non-allocating runner never builds.
 
@@ -207,34 +254,110 @@ class NonAllocatingRunner:
         """
         return
 
-    def get_num_blocks(self) -> dict[str, object]:
-        """Refuse to size the KV pool.
+    def _read_device_memory(self) -> Any:
+        """Answer the four device figures off the machine spec.
 
-        The base sizes it from what a real device reports free after the weights
-        are resident. Neither figure exists here, and the substitute belongs to
-        the memory model rather than to the runner, so answering would mean
-        inventing a block count that the scheduler would then treat as measured.
+        ATOM's own reads this rank's allocator and the driver. These four come
+        from the device model instead, so every line of budget arithmetic below
+        the call runs unchanged against a card this host does not have -- which
+        is the whole of the substitution, and the reason no formula is copied
+        anywhere in this package.
 
-        Whoever supplies that count answers a dict, and `engine_core.py:132-141`
-        fixes its four keys: `num_kvcache_blocks` (`:133`) and `state_runtime`
-        (`:141`) are subscripted, `pool_entries` (`:139`) and
-        `pool_entries_per_req` (`:140`) are taken with a `{}` default. The block
-        count goes on to `BlockManager`, which asserts it is greater than zero
-        (`block_manager.py:78`).
-
-        `state_runtime` is not an opaque value. `:141` hands it to
-        `StateRuntime.from_wire` (`state_runtime.py:159-166`), which raises
-        `TypeError` unless it is a `Mapping` and `ValueError` unless its key set
-        is exactly `{"transfer", "checkpoint_spec"}`. The fourth value is a
-        two-key nested wire dict, and a successor who builds a four-key dict
-        with anything else under that key gets a `ValueError` in the parent on
-        the first RPC of the engine's life.
+        The named tuple is ATOM's, imported at call time so this module stays
+        importable where there is no driver, and built by keyword: four
+        same-typed integers handed over positionally are a reordering nobody
+        would see.
         """
-        raise RunnerRefusal(
-            "a non-allocating runner cannot size the KV pool from a device it "
-            "never allocated on; the block count has to come from a memory model "
-            "this runner has not been given."
+        from atom.model_engine.model_runner import DeviceMemoryReadings
+
+        readings = _installed_readings(self)
+        return DeviceMemoryReadings(
+            free=readings.free.total,
+            total=readings.total.total,
+            peak_torch=readings.peak_torch.total,
+            non_torch=readings.non_torch.total,
         )
+
+    def _estimate_cudagraph_overhead(self) -> int:
+        """The graph-pool bytes the budget holds back, off the machine spec.
+
+        ATOM's own derives this from the gap between the allocator's warmup
+        peak and its steady state, which is two more device reads, so it is the
+        second of the two places `get_num_blocks` touches the device and the
+        second thing replaced here.
+
+        The reading installed for it is the one `memory.graph_pool.reserves()`
+        produces -- the mirror of ATOM's estimator rather than the measured
+        pool, because this is the number that actually reserves and the two
+        disagree; `memory.device_readings` refuses the other one by name at the
+        call site. Two adjustments inside ATOM's estimator are not mirrored and
+        move the block count in opposite directions, and `reserves()`' own
+        docstring names both: neither is reachable without a drafter or a
+        second data-parallel rank, and this runner refuses a speculative config
+        in `forward` before either could be.
+        """
+        return _installed_readings(self).cudagraph_overhead.total
+
+    def get_num_blocks(self) -> dict[str, object]:
+        """Size the KV pool with ATOM's own arithmetic over substituted readings.
+
+        The base method is readings and then arithmetic: the utilisation
+        budget, the 2% safety margin, `_kv_budget_extra_reserve`, the
+        `min(budget, free)` clamp, `plan_pools`, and under pipeline parallelism
+        a minimum across stages. None of that is replaced, and none of it is
+        written down anywhere in this package. The two methods above are, and
+        `super()` does the rest.
+
+        The reply is the base's, forwarded unaltered, and
+        `engine_core.py:132-141` fixes its four keys: `num_kvcache_blocks`
+        (`:133`) and `state_runtime` (`:141`) are subscripted, `pool_entries`
+        (`:139`) and `pool_entries_per_req` (`:140`) are taken with a `{}`
+        default. The block count goes on to `BlockManager`, which asserts it is
+        greater than zero (`block_manager.py:78`); the base asserts the same
+        thing first and prints the whole budget with it. `state_runtime` is not
+        an opaque value: `:141` hands it to `StateRuntime.from_wire`
+        (`state_runtime.py:159-166`), which raises `TypeError` unless it is a
+        `Mapping` and `ValueError` unless its key set is exactly
+        `{"transfer", "checkpoint_spec"}`. Building that dict here instead of
+        forwarding the base's would put all of those failures on the first RPC
+        of the engine's life, so it is not built here.
+
+        What this adds is one record and no arithmetic. The count the scheduler
+        receives is an integer with nothing attached, and most of what produced
+        it is a coefficient somebody wrote down rather than a measurement of
+        the card being modelled; `kv_pool_sizing` keeps the count beside the
+        readings, so which terms those were is recoverable from the runner and
+        not only from a log line somebody kept.
+
+        The decode process of intra-GPU prefill/decode disaggregation is
+        refused rather than sized. ATOM's own runner for that answers a block
+        count of zero there, because decode imports the pool from prefill and
+        owns no device memory (`model_runner.py:4272-4286`), and it holds back
+        four safety margins on the prefill side because two processes share the
+        card (`:4266-4270`). Substituting readings into the base method reaches
+        neither: this path would hand a decode process a pool it does not own.
+        The base's `_kv_budget_extra_reserve` of zero is left alone for the
+        same reason it is right -- the card these readings describe is a
+        dedicated one, and a shared-card reservation would model a tenant that
+        the memory model has already declared out of scope.
+        """
+        if getattr(self.config, "disagg_is_decode", False):
+            raise RunnerRefusal(
+                "this runner does not model the decode process of intra-GPU "
+                "prefill/decode disaggregation: that process owns no device "
+                "memory and imports the pool from prefill, so its block count "
+                "is zero rather than a sizing, and the substituted readings "
+                "describe a card with one tenant on it."
+            )
+        readings = _installed_readings(self)
+        reply = super().get_num_blocks()
+        self.kv_pool_sizing = SizedKVPool(
+            num_kvcache_blocks=int(reply["num_kvcache_blocks"]),
+            entries=dict(reply["pool_entries"]),
+            readings=readings,
+        )
+        logger.info("%s", self.kv_pool_sizing.table())
+        return reply
 
     def allocate_kv_cache(self, num_kvcache_blocks: int) -> bool:
         """Record the block count and allocate nothing.
@@ -270,7 +393,7 @@ class NonAllocatingRunner:
         attention metadata builder reads them on every step. The reply
         deliberately disagrees with the attribute it preserves: the base sends
         `self.capture_sizes` -- the same `[0]` -- as the second element
-        (`model_runner.py:4085`), and this sends `[]`. Both are only ever
+        (`model_runner.py:4112`), and this sends `[]`. Both are only ever
         formatted into a log line, and `[]` is the truthful one.
 
         `engine_core.py:148` reaches this method only when `not enforce_eager

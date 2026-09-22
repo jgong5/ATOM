@@ -1,0 +1,402 @@
+# SPDX-License-Identifier: MIT
+"""The seam ATOM's KV budget is sized through, and the record it produces.
+
+Everything here runs without a driver. The block count itself cannot: sizing a
+pool means executing `ModelRunner.get_num_blocks`, which means importing
+`atom.model_engine.model_runner`, which runs aiter's architecture probe and
+raises where there is no GPU. That import is not stubbed around. The tree
+already carries an aiter stub for this exact problem (`tests/aiter_stub.py`),
+and it covers three module names -- measured 2026-09-22 in `xiaobizh_n18_cpu`,
+`model_runner.py:20` imports a fourth, `aiter.dist.parallel_state`, and the
+import fails there. Widening that stub is the thing `tests/conftest.py`'s own
+header records as having silently stopped four test modules from running, so
+the binding lives in `test_kv_budget_engine.py` and runs where there is a
+driver.
+
+What this tier holds is the half that decides whether the binding is right
+rather than whether it runs: that ATOM's budget method reaches the device
+through one call and through no other, that the four figures are handed back
+under the names they were taken by, that no line of that arithmetic is written
+down anywhere in this package, and that the count carries what sized it.
+
+The spec document and the model config are imported from `test_memory_readings`
+rather than copied. The numbers here are the numbers there; a second MI355X
+written out in this file would let the two drift and still pass.
+"""
+
+import ast
+import copy
+import json
+import os
+import pathlib
+import subprocess
+import sys
+from types import SimpleNamespace
+
+import pytest
+from test_memory_readings import (  # one spec document and one model, not two
+    CONFIG_JSON,
+    DOCUMENT,
+    EXPECTED,
+    readings_at,
+)
+from transformers import PretrainedConfig
+
+import atom.compass.memory as memory_package
+from atom.compass.backends.geometry import KvGeometry, Parallelism
+from atom.compass.memory import MemoryRefusal, SizedKVPool
+from atom.compass.memory.readings import DeviceReadings
+from atom.compass.runner.overrides import (
+    NonAllocatingRunner,
+    RunnerRefusal,
+    install_device_readings,
+)
+from atom.compass.spec import MachineSpec
+from atom.model_ops.attentions.sub_pool_spec import page_pool, plan_pools
+
+# Located through the package as the suite imported it, never by walking up
+# from this file: if `atom` resolves from another root -- an installed copy, a
+# PYTHONPATH ahead of the tree, a staged snapshot -- a path-derived root would
+# be read here while every other test imports the other one, and pass.
+COMPASS = pathlib.Path(memory_package.__file__).parent.parent
+REPO = COMPASS.parent.parent
+ATOM_RUNNER = REPO / "atom" / "model_engine" / "model_runner.py"
+BLOCK_SIZE = 64
+
+
+@pytest.fixture(scope="module")
+def qwen():
+    return PretrainedConfig.from_dict(
+        json.loads(CONFIG_JSON.read_text())["text_config"]
+    )
+
+
+@pytest.fixture(scope="module")
+def spec():
+    return MachineSpec.from_mapping(copy.deepcopy(DOCUMENT))
+
+
+def _classes(path):
+    tree = ast.parse(path.read_text())
+    return {n.name: n for n in ast.walk(tree) if isinstance(n, ast.ClassDef)}
+
+
+def _method(class_node, name):
+    for node in class_node.body:
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return node
+    raise AssertionError(f"{class_node.name} has no {name}")
+
+
+def _device_reads(node):
+    """Every `torch.cuda.X` this function definition names, at any depth."""
+    return {
+        n.attr
+        for n in ast.walk(node)
+        if isinstance(n, ast.Attribute)
+        and isinstance(n.value, ast.Attribute)
+        and isinstance(n.value.value, ast.Name)
+        and n.value.value.id == "torch"
+        and n.value.attr == "cuda"
+    }
+
+
+# --- the seam: one call down, and nothing beside it --------------------------
+
+
+def test_the_budget_method_names_no_device_read_of_its_own():
+    """What makes "substitute the readings, reuse the arithmetic" possible.
+
+    A fifth read added to that method upstream lands here as a failure rather
+    than as a block count that quietly came off the host's own card.
+    """
+    runner = _classes(ATOM_RUNNER)["ModelRunner"]
+    assert _device_reads(_method(runner, "get_num_blocks")) == set()
+
+
+def test_the_extracted_seam_holds_the_reads_it_took_over():
+    """And the control: the walker above finds reads where there are some.
+
+    Without it, a walker that matched nothing would report the same clean
+    result for a method full of device reads as for one with none.
+    """
+    runner = _classes(ATOM_RUNNER)["ModelRunner"]
+    assert _device_reads(_method(runner, "_read_device_memory")) == {
+        "mem_get_info",
+        "memory_stats",
+        "memory_reserved",
+    }
+    assert _device_reads(_method(runner, "_estimate_cudagraph_overhead")) == {
+        "mem_get_info",
+        "memory_stats",
+    }
+
+
+def test_the_four_figures_are_handed_back_under_the_names_they_were_taken_by():
+    """Four same-typed integers, so a swap is invisible everywhere but here.
+
+    The field names are read off ATOM's own named tuple, so a rename upstream
+    fails here instead of inside a worker; and each keyword is checked against
+    the reading it is given, so `free` and `total` trading places -- which
+    nothing downstream could detect, both being plausible -- is a failure
+    rather than a pool sized against the wrong box.
+    """
+    fields = [
+        node.target.id
+        for node in _classes(ATOM_RUNNER)["DeviceMemoryReadings"].body
+        if isinstance(node, ast.AnnAssign)
+    ]
+    assert fields == ["free", "total", "peak_torch", "non_torch"]
+
+    overrides = _classes(COMPASS / "runner" / "overrides.py")["NonAllocatingRunner"]
+    calls = [
+        node
+        for node in ast.walk(_method(overrides, "_read_device_memory"))
+        if isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Name)
+        and node.func.id == "DeviceMemoryReadings"
+    ]
+    assert len(calls) == 1
+    assert not calls[0].args, "positional, so the order is invisible to a reader"
+    assert {kw.arg: ast.unparse(kw.value) for kw in calls[0].keywords} == {
+        "free": "readings.free.total",
+        "total": "readings.total.total",
+        "peak_torch": "readings.peak_torch.total",
+        "non_torch": "readings.non_torch.total",
+    }
+
+
+def test_no_budget_arithmetic_is_written_anywhere_in_this_package():
+    """The claim the route rests on, checked over the package rather than said.
+
+    Read as imports and attribute names rather than as text: both words appear
+    in docstrings all over this package, so a grep would pass for as long as
+    somebody kept writing about the formula while copying it.
+    """
+    for module in sorted(COMPASS.rglob("*.py")):
+        tree = ast.parse(module.read_text())
+        imported = {
+            alias.name
+            for node in ast.walk(tree)
+            if isinstance(node, (ast.Import, ast.ImportFrom))
+            for alias in node.names
+        }
+        assert "plan_pools" not in imported, module
+        reads = {n.attr for n in ast.walk(tree) if isinstance(n, ast.Attribute)}
+        assert "gpu_memory_utilization" not in reads, module
+
+
+# --- the count carries what it was sized from --------------------------------
+
+
+def _sizing(spec, qwen, tp_width, blocks=100_000):
+    return SizedKVPool(
+        num_kvcache_blocks=blocks,
+        entries={"kv": blocks},
+        readings=readings_at(spec, qwen, tp_width),
+    )
+
+
+def test_the_count_says_how_much_of_the_footprint_was_a_coefficient(spec, qwen, capsys):
+    """The accessor MEM-1 left with no consumer, given one.
+
+    Both figures are derived from the per-term table that task pinned rather
+    than restated here, so a term that moves there moves here too instead of
+    this becoming a second place the same bytes are written down.
+    """
+    sizing = _sizing(spec, qwen, 1)
+    declared = {
+        "peak_torch.weights",
+        "peak_torch.buffers",
+        "peak_torch.activations",
+        "cudagraph_overhead.per-token x captured tokens",
+    }
+    assert set(sizing.declared_terms) == declared
+    expected = EXPECTED[1]
+    assert sizing.declared_bytes == sum(
+        expected[name.partition(".")[0]][name.partition(".")[2]] for name in declared
+    )
+    assert sizing.subtracted_bytes == sum(
+        sum(expected[name].values())
+        for name in ("peak_torch", "non_torch", "cudagraph_overhead")
+    )
+    with capsys.disabled():
+        print()
+        print(sizing.declared_line())
+
+
+def test_free_is_not_counted_as_footprint_because_it_is_made_of_the_others(spec, qwen):
+    """`free` is `total - peak_torch - non_torch`, so counting it as part of
+    the footprint would count two of the three subtracted readings twice."""
+    sizing = _sizing(spec, qwen, 1)
+    assert "free" not in {name.partition(".")[0] for name in sizing.declared_terms}
+    assert sizing.subtracted_bytes < sizing.readings.total.total
+
+
+def test_the_table_is_the_count_and_its_readings_and_never_the_count_alone(spec, qwen):
+    table = _sizing(spec, qwen, 2).table()
+    assert "100,000 paged blocks" in table
+    for term in ("weights", "buffers", "load residue", "persistent", "activations"):
+        assert term in table, term
+    assert "declared:" in table
+
+
+def test_a_count_of_zero_is_a_run_that_did_not_start_and_refuses_to_be_recorded(
+    spec, qwen
+):
+    with pytest.raises(MemoryRefusal, match="is not a pool"):
+        _sizing(spec, qwen, 1, blocks=0)
+
+
+def test_a_footprint_with_no_declared_term_says_so_rather_than_saying_nothing(
+    spec, qwen
+):
+    """Otherwise an absent line and a line nobody printed read the same."""
+    readings = readings_at(spec, qwen, 1)
+    obtained = DeviceReadings(
+        total=readings.total,
+        peak_torch=readings.non_torch,
+        non_torch=readings.non_torch,
+        cudagraph_overhead=readings.non_torch,
+        free=readings.free,
+        tp_width=1,
+        spec_digest=readings.spec_digest,
+    )
+    sizing = SizedKVPool(num_kvcache_blocks=7, entries={}, readings=obtained)
+    assert sizing.declared_terms == ()
+    assert sizing.declared_fraction == 0.0
+    assert "none of the subtracted footprint" in sizing.declared_line()
+
+
+# --- the two paths that are refused rather than sized ------------------------
+
+
+def _runner_stub(**config):
+    config.setdefault("disagg_is_decode", False)
+    return SimpleNamespace(config=SimpleNamespace(**config))
+
+
+def test_a_runner_with_no_readings_refuses_and_names_what_would_supply_them():
+    with pytest.raises(RunnerRefusal, match="install_device_readings"):
+        NonAllocatingRunner.get_num_blocks(_runner_stub())
+
+
+def test_the_disagg_decode_process_is_refused_rather_than_handed_a_pool():
+    """ATOM's own runner answers zero there. Substituting readings into the
+    base method reaches neither that short-circuit nor the four safety margins
+    the same class holds back on the prefill side."""
+    with pytest.raises(RunnerRefusal, match="owns no device memory"):
+        NonAllocatingRunner.get_num_blocks(_runner_stub(disagg_is_decode=True))
+
+
+def test_that_refusal_comes_before_the_readings_are_even_looked_for():
+    """Otherwise a disagg decode process with readings installed would size a
+    pool, and one without them would report the wrong reason for not."""
+    stub = _runner_stub(disagg_is_decode=True)
+    stub.compass_readings = "not readings, and not reached"
+    with pytest.raises(RunnerRefusal, match="owns no device memory"):
+        NonAllocatingRunner.get_num_blocks(stub)
+
+
+def test_installing_something_that_is_not_the_readings_is_refused(spec, qwen):
+    runner = SimpleNamespace()
+    with pytest.raises(RunnerRefusal, match="is not them"):
+        install_device_readings(runner, {"free": 1, "total": 2})
+    install_device_readings(runner, readings_at(spec, qwen, 1))
+    assert runner.compass_readings.tp_width == 1
+
+
+# --- the pipeline minimum, which is inert on an even split and not otherwise -
+
+
+def test_the_pipeline_minimum_is_inert_on_an_even_split_and_not_otherwise(qwen):
+    """The disposition, measured on ATOM's own `plan_pools`.
+
+    `get_num_blocks` reduces the block count to the minimum across pipeline
+    stages, and that reduction is guarded by `torch.distributed.is_initialized`
+    -- so with no process group it does not run at all and needs no stub, and
+    with one it runs ATOM's own code unchanged either way.
+
+    Whether it is *inert* is a different question and the answer is not
+    "always". Every stage computes the same readings here, because nothing in
+    the memory model varies with pipeline rank. But each stage sizes its pool
+    from the layers it holds -- `_get_total_num_layers` takes a
+    `get_pp_indices` slice under pipeline parallelism -- so an even split gives
+    every stage the same entry size and the same count, and an uneven one does
+    not. On this model, 64 layers with every fourth one paged, two stages
+    divide evenly and three do not.
+    """
+    budget = 200_000_000_000
+
+    def blocks(layer_range, pp_size):
+        geometry = KvGeometry.from_hf_config(
+            qwen,
+            block_size=BLOCK_SIZE,
+            parallelism=Parallelism(pp_size=pp_size),
+            layer_range=layer_range,
+        )
+        plan = plan_pools([page_pool(geometry.bytes_per_block)], budget, 256)
+        return plan.entries["kv"]
+
+    assert len({blocks(span, 2) for span in ((0, 32), (32, 64))}) == 1
+    uneven = {blocks(span, 3) for span in ((0, 22), (22, 43), (43, 64))}
+    assert len(uneven) > 1, "an uneven split is what makes the minimum bind"
+
+
+# --- the closure MEM-1's one-level guard could not give ----------------------
+
+
+def _pulls_a_tensor_library(module: str) -> bool:
+    """Import one module in a fresh interpreter and report what came with it."""
+    probe = (
+        f"import {module}, sys; "
+        "print('torch' in sys.modules or 'transformers' in sys.modules)"
+    )
+    done = subprocess.run(
+        [sys.executable, "-c", probe],
+        check=False,
+        capture_output=True,
+        text=True,
+        env=dict(os.environ, PYTHONPATH=str(REPO)),
+        timeout=300,
+    )
+    assert done.returncode == 0, done.stderr
+    return done.stdout.strip() == "True"
+
+
+def test_importing_the_memory_package_pulls_no_tensor_library_at_all():
+    """The whole import closure, not one level of it.
+
+    MEM-1's guard reads each module's own import statements, so a memory module
+    importing an `atom.compass` module that itself imports torch would pass it.
+    This is the same claim made over whatever actually arrives, and it matters
+    more now than it did then: the runner override imports this package at
+    module scope, and a worker that dies on an import dies before it can say
+    anything a reader would see.
+    """
+    assert not _pulls_a_tensor_library("atom.compass.memory")
+
+
+def test_the_probe_reports_true_when_a_tensor_library_really_does_arrive():
+    """Without this, a probe that always printed False would read as a clean
+    closure for every module in the tree."""
+    assert _pulls_a_tensor_library("torch")
+
+
+def test_the_runner_override_still_imports_no_engine_at_module_scope():
+    """It imports the memory package at module scope, which is new, and the
+    engine only inside the method that needs it -- so a worker on a machine
+    with no driver still gets as far as a refusal it can read."""
+    tree = ast.parse((COMPASS / "runner" / "overrides.py").read_text())
+    top = {
+        alias.name
+        for node in tree.body
+        if isinstance(node, (ast.Import, ast.ImportFrom))
+        for alias in node.names
+    } | {
+        node.module
+        for node in tree.body
+        if isinstance(node, ast.ImportFrom) and node.module
+    }
+    assert not any(name.startswith("atom.model_engine") for name in top), top
+    assert "atom.compass.memory" in top

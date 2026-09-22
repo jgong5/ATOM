@@ -53,6 +53,8 @@ ATOM_RUNNER = ENGINE / "model_runner.py"
 OVERRIDDEN = {
     "_build_and_load_model",
     "_maybe_warmup",
+    "_read_device_memory",
+    "_estimate_cudagraph_overhead",
     "get_num_blocks",
     "allocate_kv_cache",
     "capture_cudagraph",
@@ -117,20 +119,25 @@ def test_every_replaced_method_exists_on_the_class_being_replaced():
     assert OVERRIDDEN <= _methods(_classes(ATOM_RUNNER)["ModelRunner"])
 
 
-def test_the_difference_from_the_in_tree_non_allocating_runner_is_three_methods():
+def test_the_difference_from_the_in_tree_non_allocating_runner_is_five_methods():
     """`RapidServeModelRunner` is the working non-allocating runner in the tree.
 
     It overrides two things this one does not. `__init__`: it has to bind a
     method before the base runs, and this class has nothing to bind, so leaving
     `__init__` alone is what keeps every read lazy. `_kv_budget_extra_reserve`:
     it holds bytes back because a second process shares its GPU, and a runner
-    that allocates nothing has no tenant to hold anything back from.
+    whose readings describe a card with one tenant on it has nobody to hold
+    anything back from -- the base's zero is the right answer here, not an
+    override that was forgotten.
 
-    This one overrides one thing it does not: `capture_cudagraph`. RapidServe
-    allocates no weights of its own but imports real ones over CUDA IPC, so it
-    has a model to trace and keeps ATOM's capture. This runner has none, and
-    ATOM's capture zeroes device buffers and opens a graph pool before it finds
-    that out.
+    This one overrides three things it does not. `capture_cudagraph`:
+    RapidServe allocates no weights of its own but imports real ones over CUDA
+    IPC, so it has a model to trace and keeps ATOM's capture. This runner has
+    none, and ATOM's capture zeroes device buffers and opens a graph pool
+    before it finds that out. `_read_device_memory` and
+    `_estimate_cudagraph_overhead`: the two calls through which
+    `get_num_blocks` reaches the device, which RapidServe leaves alone because
+    it runs on the card it is sizing and this runner does not.
 
     Its `_init_weight_params_on_meta` is not in the difference because it is not
     an override -- it is a helper the base does not have.
@@ -138,7 +145,11 @@ def test_the_difference_from_the_in_tree_non_allocating_runner_is_three_methods(
     base = _methods(_classes(ATOM_RUNNER)["ModelRunner"])
     template = _methods(_classes(ATOM_RUNNER)["RapidServeModelRunner"]) & base
     assert template - OVERRIDDEN == {"__init__", "_kv_budget_extra_reserve"}
-    assert OVERRIDDEN - template == {"capture_cudagraph"}
+    assert OVERRIDDEN - template == {
+        "capture_cudagraph",
+        "_read_device_memory",
+        "_estimate_cudagraph_overhead",
+    }
 
 
 # --- construction allocates nothing -----------------------------------------
@@ -299,7 +310,13 @@ def test_skipping_warmup_is_what_lets_construction_finish():
 
 
 def test_sizing_the_kv_pool_refuses_rather_than_inventing_a_block_count():
-    with pytest.raises(RunnerRefusal, match="memory model"):
+    """It sizes a pool now, but only from readings somebody installed.
+
+    Without them the arithmetic would run against nothing, so the refusal
+    stayed and only its reason changed -- and it names the call that supplies
+    them rather than the absence.
+    """
+    with pytest.raises(RunnerRefusal, match="install_device_readings"):
         Runner().get_num_blocks()
 
 
@@ -446,10 +463,18 @@ def test_the_guard_finds_nothing_when_the_root_moves(monkeypatch, tmp_path):
     ids=lambda p: p.name,
 )
 def test_only_the_binding_module_reaches_the_engine(path):
-    """Everything else stays runnable where the engine cannot be imported."""
+    """Everything else stays runnable where the engine cannot be imported.
+
+    `atom.compass` is subtracted rather than `atom.compass.runner`, because
+    `overrides` now imports the memory package at module scope for the readings
+    the KV budget runs against. That is admissible for the same reason this
+    test exists: nothing under `atom.compass` imports a tensor library or the
+    engine, and `test_kv_budget.py` asserts it over the whole import closure
+    rather than one level of it.
+    """
     imported = _import_time_imports(path.read_text())
     engine = {m for m in imported if m.split(".")[0] == "atom"} - {
-        m for m in imported if m.startswith("atom.compass.runner")
+        m for m in imported if m.startswith("atom.compass")
     }
     assert engine == (
         {"atom.model_engine.model_runner"} if path.name == "model_runner.py" else set()
