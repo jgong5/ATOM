@@ -176,6 +176,72 @@ Three FakeTensor traps, each of which silently produces a wrong artifact:
 3. The torch 2.10 signature is
    `symbolic_context=StatelessSymbolicContext(dynamic_sizes=[...])`, not `dynamic_dims=`.
 
+### A fourth discipline: the engine's host arithmetic asks a symbol for a number
+
+The three disciplines above keep the *tracing* symbolic. They are not enough on a real
+engine, and the reason is one line of torch: **`SymInt.__index__` and `SymInt.__int__`
+are `guard_int`.** Every host-side use of a step's width — filling a staging buffer's
+numpy view, slicing a Python list, checking a staged array's length — asks for a number,
+gets the symbol's trace-time hint, and *records the ask as `Eq(s, hint)`*. The graph is
+constant from there, with no error and no warning.
+
+Measured on ATOM's decode path for the published 27B: **16 ATOM lines** convert the step's
+width to a number during one traced forward — 20 conversions in all — and they are host
+fills and slices, nothing else:
+
+| where | lines | conversions |
+|---|---|---|
+| `aiter_attention.py in prepare_decode` | 1106, 1115, 1121, 1122, 1123, 1131, 1132 | 10 |
+| `model_runner.py in prepare_inputs` | 2441, 2452, 2454 | 4 |
+| `model_runner.py in prepare_input_ids` | 510, 513 | 2 |
+| `model_runner.py in prepare_sample` | 2537 | 1 |
+| `backends.py in _mrope_cpu_view` | 398, 400 | 2 |
+| `gdn_attn.py in _attach_gdn_decode_metadata` | 1237 | 1 |
+
+A seventeenth sits in `forward_context`'s own `assert_shape_contract`, whose `_rows`
+helper takes `int(t.shape[0])`, and an eighteenth solves the width by *comparison* rather
+than conversion: `ScheduledBatch.__init__` checks the staged token array's length against
+the count. **Repairing them one at a time does not converge** — the two sites this
+property was originally recorded at were repaired and `_rows` appeared behind them.
+
+**The conversion is not the defect; the recording is.** A host fill genuinely needs a
+number, and the number it needs is the hint, which is the count the engine computed. So a
+symbolic capture keeps the conversion and replaces the guard with its own log — every
+conversion, with the line it happened on — and asserts that log against a declared set.
+**`__bool__` stays untouched**, so a branch on a width still installs its guard and a step
+whose shape decides which path the engine takes still records that it did.
+
+Two consequences worth stating, because both were expected the other way round:
+
+- **`copy_to_gpu` needs no change, and neither does `CpuGpuBuffer`.** The specialisation
+  recorded there was a *buffer capacity* — `max_model_len // block_size` — being solved
+  against the CPU side's constant, and it only existed because that capture symbolised
+  every dimension of the staged device tensor. Capacities are engine configuration and are
+  not a function of the step. With only the step's width symbolic, the two slices carry
+  the same symbol and the copy dispatches with it on both sides.
+- **One production line changes**, `_rows`'s `int(t.shape[0])` → `t.shape[0]`.
+  `torch.Size.__getitem__` already returns a Python `int` for a tensor with a real size,
+  so it is the identity in a served step; it matters only where the size is symbolic, and
+  there converting one side of an equality to a number forces the other to become it.
+
+**What the symbol has to be attached to is the batch, not the buffers.** Handing each
+staged buffer a bound of its own re-derives widths the engine did not run at. The width
+is set on the `ScheduledBatch` and the engine derives the rest — `ForwardMode.decide`
+settles both units off it, `prepare_inputs` writes the `cu_seqlens_q` boundary at
+`running_bs + 1`, `prepare_decode` uses it as every staged bound. A decode step is one
+query row per sequence, so its token count and its sequence count are **one** symbol; two
+would have to be equated later, which is the specialisation again by a longer route.
+
+**The evidence that the symbol is free, rather than a hint in disguise.** The engine
+computes its host values from the hint, so a graph built this way would still be a graph
+about one width if any dimension had taken the hint instead of the symbol — and nothing in
+a census would say so. The step is therefore traced at **two** widths and the inventories
+compared operator for operator and shape for shape with the symbol's name set aside. They
+are identical, which also says that every dimension that stayed a number is the same
+number at both widths and so is not a width in disguise.
+
+Pinned by `tests/compass/test_capture_real_model.py`.
+
 ### The gating cost turned out to be small
 
 An operator with no fake/meta impl is a **hard stop**, not a degradation:
