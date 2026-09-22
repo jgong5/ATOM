@@ -168,6 +168,84 @@ def test_calling_that_model_refuses_and_names_the_class_it_stands_for():
         UnbuiltModel(SomeModel)(torch.zeros(1))
 
 
+# --- what stays resident after construction, and which names hold it ---------
+
+# A value that builds or holds one of the ring's buffers, as it reads in the
+# source. `self.forward_vars` is one because the ring is built out of it.
+BUFFER_TERMS = ("CpuGpuBuffer", "torch.empty", "self.forward_vars")
+
+
+def _method_def(node, name):
+    """The `def name` in class definition *node*."""
+    return next(
+        n for n in node.body if isinstance(n, ast.FunctionDef) and n.name == name
+    )
+
+
+def _self_assigned(node):
+    """The `self.x = ...` names anywhere in *node*, against their value's source."""
+    return {
+        t.attr: ast.unparse(n.value)
+        for n in ast.walk(node)
+        if isinstance(n, ast.Assign)
+        for t in n.targets
+        if isinstance(t, ast.Attribute)
+        and isinstance(t.value, ast.Name)
+        and t.value.id == "self"
+    }
+
+
+def test_the_docstring_names_every_attribute_that_holds_the_ring():
+    """Construction leaves the base's forward-vars ring resident, and named
+    attributes of the runner hold it -- which the docstring denied until it was
+    corrected, with nothing asserting either way. Both holders are the base's,
+    so a rename or a third one upstream stops the sentence being true; this
+    fails then, rather than the prose drifting again.
+    """
+    base = _classes(ATOM_RUNNER)["ModelRunner"]
+    assigned = _self_assigned(_method_def(base, "allocate_forward_vars")) | (
+        _self_assigned(_method_def(base, "_init_forward_vars_ring"))
+    )
+    holders = {n for n, v in assigned.items() if any(t in v for t in BUFFER_TERMS)}
+    assert holders == {"forward_vars", "_fv_ring"}
+    runner = _classes(PACKAGE / "model_runner.py")["CompassModelRunner"]
+    assert all(f"`{name}`" in ast.get_docstring(runner) for name in holders)
+
+
+def test_what_that_ring_costs_is_the_batch_budget_by_the_hidden_size():
+    """The shape of the residue, read off the allocation the docstring names.
+
+    Its dominant term, so a runner that allocates no weights still holds
+    device memory that grows with the batch budget and the model's hidden
+    size. The bytes are a measurement and live in the task record; what is
+    checkable here is which two numbers they are a product of.
+    """
+    allocate = _method_def(
+        _classes(ATOM_RUNNER)["ModelRunner"], "allocate_forward_vars"
+    )
+    built = next(
+        n.value
+        for n in ast.walk(allocate)
+        if isinstance(n, ast.Assign)
+        and any(getattr(t, "attr", None) == "forward_vars" for t in n.targets)
+    )
+    outputs = dict(zip([k.value for k in built.keys], built.values))["outputs"]
+    assert ast.unparse(outputs.func) == "torch.empty"
+    assert ast.unparse(outputs.args[0]) == "self.max_num_batched_tokens"
+    assert ast.unparse(outputs.args[-1]) == "hidden_size"
+
+
+def test_the_overrides_bind_no_attribute_that_could_hold_a_tensor():
+    """The half of the claim that is this package's own: it adds none.
+
+    `model` registers no parameter and no buffer, and `_token_stream` is the
+    deferral bookkeeping. Anything else appearing here is a tensor this class
+    put on a device, which is the thing it exists not to do.
+    """
+    overrides = _classes(PACKAGE / "overrides.py")["NonAllocatingRunner"]
+    assert set(_self_assigned(overrides)) == {"model", "_token_stream"}
+
+
 # --- warmup drives a forward, which is why it is skipped ---------------------
 
 

@@ -23,11 +23,20 @@ class CompassModelRunner(NonAllocatingRunner, ModelRunner):
     step itself, by overriding the six methods that own them; see `overrides`,
     which holds the bodies and says why each one does what it does.
 
-    Construction is not free of device memory. What remains is the base's
-    forward-vars ring from `allocate_forward_vars`, whose dominant term is a
-    `max_num_batched_tokens` by `hidden_size` output buffer. It is sized by the
-    batch budget and the model's hidden size, not by the model's weights, and
-    no named tensor on the runner holds any of it.
+    Construction is not free of device memory. Almost all of what stays
+    resident is the base's forward-vars ring from `allocate_forward_vars`,
+    whose dominant term is a `max_num_batched_tokens` by `hidden_size` output
+    buffer; the rest is a stream, the ring's events, the attention metadata
+    builder and the expert-load-balancing runtime. So the residue is O(batch
+    budget x hidden size) rather than O(weights), and that dominant term is
+    allocated once however deep the pipeline is: a ring slot clones the
+    staging buffers and shares the one output buffer.
+
+    Two named attributes on the runner hold that ring for the life of the
+    process: `forward_vars`, the dict `allocate_forward_vars` builds, and
+    `_fv_ring`, the list of per-slot dicts built from it. Both are the base's.
+    What this class adds is no tensor at all: `model`, a module registering no
+    parameter and no buffer, and `config.num_kvcache_blocks`.
 
     `NonAllocatingRunner` comes first so its methods win over the base's. There
     is deliberately no `__init__`: the base runs all of its own before a
@@ -49,9 +58,10 @@ if _UNANSWERED:
     # partitions them instead of asserting one story for all twelve. A waited
     # name parks its caller on an unbounded queue read for the life of the
     # process. An unwaited one parks nobody: `busy_loop` skips it and carries
-    # on -- which for `exit` means the loop never breaks, and for
-    # `process_kvconnector_output` means a KV load is silently never started.
-    # Both are real failures; neither is a park.
+    # on -- which for `exit` means the runner's own shutdown never runs, while
+    # the loop still breaks, since it breaks on the dispatched name and not on
+    # the reply; and for `process_kvconnector_output` means a KV load is
+    # silently never started. Both are real failures; neither is a park.
     #
     # Two things about this raise itself. No CPU test tier can execute it:
     # importing this module imports `ModelRunner`, which runs aiter's
