@@ -30,10 +30,13 @@ from atom.compass.backends import (
     BatchView,
     CostBackend,
     CostTerm,
+    FakeModel,
+    HfConfig,
     Provenance,
     RequestShape,
     Species,
     StepCost,
+    SyntheticStack,
     Tier,
 )
 
@@ -148,18 +151,36 @@ def test_the_package_imports_nothing_from_the_engine(path):
             )
 
 
-@pytest.mark.parametrize("projection", [BatchView, RequestShape])
-def test_the_projection_type_is_where_the_scan_can_reach_it(projection):
-    """The engine-free property covers files, so the projection has to be one.
+@pytest.mark.parametrize(
+    "crossing",
+    [BatchView, RequestShape, FakeModel, SyntheticStack, HfConfig],
+)
+def test_the_type_that_crosses_the_seam_is_where_the_scan_can_reach_it(crossing):
+    """Every type this package hands out or takes in is defined in a file the
+    scan above reads.
 
-    The scan above walks this package and reads nothing outside it. A
-    projection defined next to the engine would satisfy the seam's signature
-    and be asserted by nobody, and would be buildable only where the engine
-    imports -- which is the machine this whole arrangement exists to avoid
-    needing. Moving either type out of the package fails here rather than
-    quietly thinning what the scan means.
+    The engine-free property is a property of files: the scan walks this
+    package and reads nothing outside it. So a type that leaves the package
+    takes its imports out of the scan's reach, and the types listed here are
+    the ones whose leaving would matter -- everything this package hands out
+    or takes in, not only the batch projection.
+
+    What this catches that the scan does not is one case: a move to a package
+    that is not `atom.*` at all. The scan filters on
+    `module.split(".")[0] == "atom"` and skips a third-party module entirely,
+    so a listed type moved to a vendor package fails here and nowhere else. A
+    move that stays under `atom.*` fails the scan too, and there this is a
+    second voice on the same fact rather than a new guarantee.
+
+    What it does not catch, and what no import scan can: a config type defined
+    beside the engine that reaches `FakeModel` as an argument.
+    `FakeModel.__init__(self, config, ...)` is unannotated and reads attribute
+    names off whatever it is handed, so that route needs no import in this
+    package and leaves nothing here to read. It was tried; neither guard
+    fires. The route is open, and closing it needs an instrument that reads
+    what is passed rather than what is imported.
     """
-    defined_in = pathlib.Path(inspect.getfile(projection)).resolve()
+    defined_in = pathlib.Path(inspect.getfile(crossing)).resolve()
     assert defined_in.parent == PACKAGE
     assert defined_in in set(PACKAGE.rglob("*.py"))
 
