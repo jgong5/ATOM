@@ -696,15 +696,18 @@ PRODUCER = FAKE_TREE[0]
 def _fake_repo(tmp_path, mentioning):
     """A three-file stand-in repo, with `trace_dir` written into `mentioning`.
 
-    One call builds either direction of the pin. The roots handed back are the
-    two the real scan uses, so the file under them and the file beside them
-    differ in nothing but where they sit.
+    One call builds either direction of the pin. The roots handed back are
+    `REPLY_SURFACE` re-rooted under `tmp_path` rather than two paths written
+    out again here: a scan widened to `atom/` would be widened here too, and
+    the direction it is widened past -- the package beside the runner -- is the
+    third file. Roots typed out a second time would pin `_mentions` and leave
+    the scope free, which is what these two tests exist to stop.
     """
     for rel in FAKE_TREE:
         path = tmp_path / rel
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text("# trace_dir\n" if rel in mentioning else "pass\n")
-    return (tmp_path / "atom/model_engine", tmp_path / "atom/compass/runner")
+    return tuple(tmp_path / root.relative_to(REPO) for root in REPLY_SURFACE)
 
 
 def test_the_scan_looks_at_both_sides_of_the_reply():
@@ -713,6 +716,12 @@ def test_the_scan_looks_at_both_sides_of_the_reply():
     The producer and the two Compass runner modules are named here, so a root
     that moves or a package that is renamed fails rather than quietly
     shrinking the set the assertion above is computed over.
+
+    Naming files bounds the scan from below only, and every wider scope -- up
+    to `atom/` itself, which is the scope this one replaced -- satisfies a
+    lower bound. The second assertion is the upper one: a package the reply
+    never reaches must sit outside every root, so a scan widened back over
+    `atom/compass` fails here instead of passing quietly.
     """
     scanned = {
         str(path.relative_to(REPO))
@@ -724,6 +733,8 @@ def test_the_scan_looks_at_both_sides_of_the_reply():
         "atom/compass/runner/overrides.py",
         "atom/compass/runner/model_runner.py",
     } <= scanned
+    spec = REPO / "atom" / "compass" / "spec"
+    assert not any(spec.is_relative_to(root) for root in REPLY_SURFACE)
 
 
 def test_the_scan_still_catches_the_string_inside_the_runner_package(tmp_path):
