@@ -1,0 +1,332 @@
+# SPDX-License-Identifier: MIT
+# Copyright (C) 2024-2025, Advanced Micro Devices, Inc. All rights reserved.
+
+"""The five readings `get_num_blocks` takes off a card, taken off a spec instead.
+
+`03` D14's rule is **substitute the readings, never the arithmetic**. ATOM's
+`get_num_blocks` (`model_runner.py:1652-1873`) is five device readings and then
+some arithmetic over them; this module owns the five, and the budget formula,
+the 2% margin, the `min(budget, free)` clamp and `plan_pools` stay ATOM's. A
+copy of that formula here is exactly the drift the substitution exists to avoid,
+and upstream will change it.
+
+| Reading | Where it comes from now |
+|---|---|
+| `total` | `device.memory.capacity_bytes` |
+| `peak_torch` | weights + buffers + load residue + persistent + activations |
+| `non_torch` | `driver_and_collective_reserve_bytes`, a width table |
+| `cudagraph_overhead` | `graph_pool.reserves()` -- the number that reserves |
+| `free` | derived as a clean box: `total - peak_torch - non_torch` |
+
+**`free` is derived and that is load-bearing, twice over.** ATOM reads it as
+`(total - free) - reserved`, and `total - free` counts every process on the
+card: six prior runs died at start-up with `non_torch=152.01GB` because a
+neighbour held 152 GB while this rank had reserved 2.9 GB. Taking `non_torch`
+from a spec removes that contamination by construction. And with `free` derived
+as the box that is left, the `min(budget, free)` clamp cannot bind -- the prior
+design needed a `free_was_binding()` guard to refuse records where it had, and
+this one does not. Making it inert is this task's job; proving it is MEM-2's.
+
+The declared scope boundary that follows, stated so it is not discovered as a
+gap: Compass models a **dedicated** device. It will not predict the OOM a shared
+box produces and will not reproduce a neighbour-induced admission cliff.
+
+**Two of the five `peak_torch` terms are not obtainable here.** `03` D16 says
+weights come from a meta build deduped by storage -- exact at every width on
+both models tested -- and that buffers are *recorded*, because the formula that
+matched the 0.6B was 4x wrong on the 27B. A meta build needs a module tree,
+which needs the engine, which this tier does not import; and there is no
+recording of a card nobody has run. So `ModelTerms` takes those two terms rather
+than deriving them, with no default -- the same shape as the spec's "a runtime
+constant has no default" rule, and for the same reason. `declared_for_m1` fills
+all three with declared formulas for M1 and labels every one of them, which is
+what `03` D16's open issue allows for the activation term and what this module
+extends, visibly, to the other two.
+"""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+
+from atom.compass.memory import graph_pool
+from atom.compass.memory.terms import Basis, Reading, Term
+
+#: Bytes of a cos/sin rotary plane entry. The tables are built in fp32.
+_ROTARY_PLANE_BYTES = 4
+#: Gate and up are both live before their product, so the MLP's intermediate
+#: activation is resident twice at the peak. Geometry, not a coefficient.
+_LIVE_INTERMEDIATE = 2
+
+
+class MemoryRefusal(Exception):
+    """A declined reading that names what it could not do and what would fix it."""
+
+    def __init__(self, what: str, remedy: str) -> None:
+        self.what = what
+        self.remedy = remedy
+        super().__init__(f"{what}. {remedy}")
+
+
+def _geometry(config, name: str):
+    """One field off a HF config, refusing by name rather than defaulting."""
+    text = getattr(config, "text_config", config)
+    value = getattr(text, name, None)
+    if value is None:
+        raise MemoryRefusal(
+            f"this config states no `{name}`, and the memory model reads it",
+            "build the config through ATOM's own config classes, which fill it "
+            "in, or name the model whose geometry this is",
+        )
+    return value
+
+
+@dataclass(frozen=True, slots=True)
+class ModelTerms:
+    """The three `peak_torch` terms that belong to the model, not to the card.
+
+    Kept together because they move together -- they are the same bytes on any
+    card, and only the other two terms of `peak_torch` change when the spec
+    does. Each is a `Term`, so each carries its own basis and its own source and
+    a caller that has a meta build can hand one in beside two that are declared.
+    """
+
+    weights: Term
+    buffers: Term
+    activations: Term
+
+    @classmethod
+    def declared_for_m1(
+        cls,
+        config,
+        *,
+        parameter_count: int,
+        tp_size: int,
+        warmup_tokens: int,
+        dtype_bytes: int = 2,
+    ) -> ModelTerms:
+        """All three from geometry and declared coefficients, each labelled.
+
+        For M1, with fake models, a declared formula suffices and must say so
+        (`03` D16). Every term below is `Basis.DECLARED` and every one names its
+        successor, because none of the three is the source that `03` D16 gives
+        it: weights are owed a meta build, buffers a recording, and activations
+        the liveness walk of `04` D22 *plus* the invisible-scratch constants of
+        `04` T4 -- and the second is the one with no law behind it. The measured
+        spread that makes it load-bearing is 0.1 KB/token on the 0.6B against
+        39.6 KB/token on the 27B, which is the difference between -35.0% and
+        +3.4% held out. A formula does not stand in for that past M1.
+        """
+        if tp_size < 1:
+            raise ValueError(f"tensor-parallel width is at least 1: {tp_size}")
+        hidden = int(_geometry(config, "hidden_size"))
+        intermediate = int(_geometry(config, "intermediate_size"))
+        head_dim = int(_geometry(config, "head_dim"))
+        positions = int(_geometry(config, "max_position_embeddings"))
+        partial = float(
+            getattr(
+                getattr(config, "text_config", config), "partial_rotary_factor", 1.0
+            )
+        )
+        rotary_dim = int(head_dim * partial)
+        weights = Term(
+            "weights",
+            parameter_count * dtype_bytes // tp_size,
+            Basis.DECLARED,
+            f"{parameter_count} stated parameters x {dtype_bytes} B / TP{tp_size}",
+            "a meta build deduped by storage (02 D10.1) replaces this and is "
+            "exact at every width; this shards every parameter, where a real "
+            "stack replicates its norms",
+        )
+        buffers = Term(
+            "buffers",
+            positions * rotary_dim * 2 * _ROTARY_PLANE_BYTES,
+            Basis.DECLARED,
+            f"{positions} positions x int({head_dim} head_dim x {partial} "
+            f"partial_rotary_factor) x 2 planes x {_ROTARY_PLANE_BYTES} B",
+            "03 D16 records buffers rather than computing them: the formula "
+            "that was 4x wrong on the 27B missed partial_rotary_factor, which "
+            "this one reads -- one known failure closed is not a recording",
+        )
+        activations = Term(
+            "activations",
+            int(
+                warmup_tokens
+                * dtype_bytes
+                * (
+                    graph_pool.LIVE_TENSORS_PER_LAYER * hidden
+                    + _LIVE_INTERMEDIATE * intermediate
+                )
+            ),
+            Basis.DECLARED,
+            f"{warmup_tokens} warmup tokens x {dtype_bytes} B x "
+            f"({graph_pool.LIVE_TENSORS_PER_LAYER} x {hidden} hidden + "
+            f"{_LIVE_INTERMEDIATE} x {intermediate} intermediate)",
+            "the liveness walk of 04 D22 plus the invisible-scratch constants "
+            "of 04 T4 replace this; the per-layer coefficient is ATOM's own "
+            "(model_runner.py:3602), over one live layer rather than all of them",
+        )
+        return cls(weights, buffers, activations)
+
+
+@dataclass(frozen=True, slots=True)
+class DeviceReadings:
+    """The five readings, each as its terms, for one width of one spec."""
+
+    total: Reading
+    peak_torch: Reading
+    non_torch: Reading
+    cudagraph_overhead: Reading
+    free: Reading
+    tp_width: int
+    spec_digest: str
+
+    def as_dict(self) -> dict[str, Reading]:
+        """The five by the name `get_num_blocks` knows each of them by."""
+        return {
+            "total": self.total,
+            "peak_torch": self.peak_torch,
+            "non_torch": self.non_torch,
+            "cudagraph_overhead": self.cudagraph_overhead,
+            "free": self.free,
+        }
+
+    @property
+    def declared(self) -> tuple[str, ...]:
+        """Every term across the five still standing on a declared coefficient."""
+        return tuple(
+            f"{name}.{term}"
+            for name, reading in self.as_dict().items()
+            for term in reading.declared
+        )
+
+    def table(self) -> str:
+        """Every reading as its terms. There is no rendering that is five totals."""
+        head = [f"device readings at TP{self.tp_width}, spec {self.spec_digest}"]
+        return "\n".join(head + [r.table() for r in self.as_dict().values()])
+
+    def __str__(self) -> str:
+        return self.table()
+
+
+def device_readings(
+    spec,
+    *,
+    tp_width: int,
+    model: ModelTerms,
+    cudagraph_overhead: Reading,
+) -> DeviceReadings:
+    """The five readings for one width, or a refusal naming the field and width.
+
+    `cudagraph_overhead` is the reading `graph_pool.reserves()` returns, and a
+    reading from `graph_pool.predicts()` is refused here by name. The two
+    disagree by 4-19x and only the first is what ATOM subtracts from the budget,
+    so which one reserves is settled at this call site by the code rather than
+    by a comment beside it (`03` D16).
+
+    A width absent from either width table refuses, and the spec's own refusal
+    names the field and the width -- `driver_and_collective_reserve_bytes` and
+    `allocator_retained_after_load_bytes` are `Kind.WIDTH_TABLE` because no
+    fixed-plus-per-peer form fits 5980/6340/9138 at widths 2/4/8, so there is
+    nothing to interpolate along. Nothing here catches that refusal.
+    """
+    if tp_width < 1:
+        raise ValueError(f"tensor-parallel width is at least 1: {tp_width}")
+    if cudagraph_overhead.name != graph_pool.RESERVES:
+        raise MemoryRefusal(
+            f"the graph-pool reading given is {cudagraph_overhead.name!r}, and "
+            f"only {graph_pool.RESERVES!r} reserves anything",
+            "pass `graph_pool.reserves(...)`, which mirrors ATOM's own "
+            "estimator; `graph_pool.predicts(...)` is what the pool really "
+            "costs and the two disagree by 4-19x, so substituting it would "
+            "produce a block count ATOM would never reach",
+        )
+    total = Reading(
+        "total",
+        (
+            Term(
+                "capacity",
+                int(spec.value("device.memory.capacity_bytes")),
+                Basis.SPEC,
+                "device.memory.capacity_bytes",
+            ),
+        ),
+    )
+    non_torch = Reading(
+        "non_torch",
+        (
+            Term(
+                "driver and collective reserve",
+                int(
+                    spec.runtime_constant(
+                        "driver_and_collective_reserve_bytes", tp_width
+                    )
+                ),
+                Basis.SPEC,
+                "device.runtime_constants."
+                f"driver_and_collective_reserve_bytes[{tp_width}]",
+            ),
+        ),
+    )
+    peak_torch = Reading(
+        "peak_torch",
+        (
+            model.weights,
+            model.buffers,
+            Term(
+                "load residue",
+                int(
+                    spec.runtime_constant(
+                        "allocator_retained_after_load_bytes", tp_width
+                    )
+                ),
+                Basis.SPEC,
+                "device.runtime_constants."
+                f"allocator_retained_after_load_bytes[{tp_width}]",
+            ),
+            Term(
+                "persistent",
+                int(spec.runtime_constant("persistent_forward_buffer_bytes")),
+                Basis.SPEC,
+                "device.runtime_constants.persistent_forward_buffer_bytes",
+            ),
+            model.activations,
+        ),
+    )
+    box = total.total - peak_torch.total - non_torch.total
+    if box < 0:
+        raise MemoryRefusal(
+            f"the non-KV footprint at TP{tp_width} is "
+            f"{(peak_torch.total + non_torch.total) / (1 << 30):.2f} GiB on a "
+            f"card of {total.total / (1 << 30):.2f} GiB, so the clean box is "
+            "negative and there is no free memory to report",
+            "this configuration does not start on this card; reduce the width, "
+            "the model or the warmup shape, or name a larger card. A clamped "
+            "zero here would be a free reading nobody could read as a refusal",
+        )
+    free = Reading(
+        "free",
+        (
+            Term("total", total.total, Basis.DERIVED, "the total reading"),
+            Term(
+                "less peak_torch",
+                -peak_torch.total,
+                Basis.DERIVED,
+                "the peak_torch reading",
+            ),
+            Term(
+                "less non_torch",
+                -non_torch.total,
+                Basis.DERIVED,
+                "the non_torch reading",
+            ),
+        ),
+    )
+    return DeviceReadings(
+        total=total,
+        peak_torch=peak_torch,
+        non_torch=non_torch,
+        cudagraph_overhead=cudagraph_overhead,
+        free=free,
+        tp_width=tp_width,
+        spec_digest=spec.digest(),
+    )
