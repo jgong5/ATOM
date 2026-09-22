@@ -194,6 +194,14 @@ fake-less aiter ops sit *inside* those leaves and are never reached.
 
 ### Collectives at TP>1 — measured, and the group is not what the trace needs
 
+> **Provenance — measured under a capture that has since been withdrawn.** Every count in
+> this section was taken with the fake-tensor capture module that PR #10 added under
+> `atom/compass/capture/`, driven by scripts that were never committed and writing JSON
+> records that no longer exist. That module and its tests have been withdrawn from the
+> tree, so **none of the numbers below is reproducible here**. They are kept because they
+> are the specification a replacement capture is written from, not because they can be
+> re-run; anything that builds on them re-takes them first.
+
 The open issue *"whether ATOM's real model classes trace cleanly under this mode at
 TP>1"* is **answered yes**, on two models at both widths, with the collectives in the
 inventory rather than substituted away.
@@ -250,9 +258,10 @@ configuration of the capture and belongs in the record beside the device reading
 the whole difference between the run that fails at 2,588 and the one that completes at
 2,611.
 
-Pinned by `tests/compass/test_capture_collectives.py`, which enumerates both operator sets
-by name, so a future torch growing a meta kernel for one of the legacy forms fails there
-rather than leaving unexplained code behind.
+The test that enumerated both operator sets by name — so that a future torch growing a
+meta kernel for one of the legacy forms would fail there rather than leave unexplained
+code behind — was withdrawn along with the capture module it exercised. Nothing on this
+tree holds either set in place today.
 
 ### Open issues
 
