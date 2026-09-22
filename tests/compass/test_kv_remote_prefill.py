@@ -20,8 +20,10 @@ holding one number that the rest of this package's tests use.
 """
 
 import ast
+import ipaddress
 import json
 import pathlib
+import socket
 from types import SimpleNamespace
 
 import pytest
@@ -129,18 +131,49 @@ def simulated_blob(tp_size=4, dp_rank=2) -> dict:
     return transfer_params(finished_sequence(), tp_size=tp_size, dp_rank=dp_rank)
 
 
-def connector(model, clock, *, role, kv_role="kv_consumer", tp_size=1):
-    """A connector built the way the engine builds one."""
-    config = atom_config_double(
-        tensor_parallel_size=tp_size,
-        kv_transfer_config={
+def connector(model, clock, *, role, kv_role="kv_consumer", tp_size=1, dp_rank=None):
+    """A connector built the way the engine builds one.
+
+    `dp_rank` reaches the connector through `parallel_config`, which is where
+    it reads it from; left alone, the double carries the real default.
+    """
+    settings = {
+        "tensor_parallel_size": tp_size,
+        "kv_transfer_config": {
             "kv_connector": "compass",
             "kv_role": kv_role,
             CLOCK_KEY: clock,
             TRANSFER_KEY: model,
         },
+    }
+    if dp_rank is not None:
+        settings["parallel_config"] = SimpleNamespace(data_parallel_rank=dp_rank)
+    return KVConnectorFactory.create_connector(
+        atom_config_double(**settings), role=role
     )
-    return KVConnectorFactory.create_connector(config, role=role)
+
+
+def assert_could_not_be_dialled(value, field) -> None:
+    """Refuse a value anything downstream could turn into a connection.
+
+    Asserted as a property of whatever the field holds, not as an identity
+    with the constant beside it, because a defect that moves the constant
+    moves both sides of such an identity and is invisible to it.
+    """
+    host = str(value).split(":")[0]
+    try:
+        ipaddress.ip_address(host)
+    except ValueError:
+        pass
+    else:
+        raise AssertionError(f"{field} carries the address {host!r}")
+    own = socket.gethostname()
+    labels = {part.lower() for part in str(value).replace(":", ".").split(".")}
+    borrowed = labels & {own.lower(), own.lower().split(".")[0]}
+    assert not borrowed, (
+        f"{field} carries {sorted(borrowed)}, taken from the name of the "
+        "machine this run is on"
+    )
 
 
 # -- The blob ------------------------------------------------------------
@@ -163,20 +196,59 @@ def test_dropping_one_field_from_the_blob_is_refused_by_name(field):
 
 
 def test_no_field_of_the_blob_names_a_machine_the_simulation_runs_on():
-    """A simulated peer has no address, and must not borrow a real one."""
+    """A simulated peer has no address, and must not borrow a real one.
+
+    Two kinds of assertion, and they catch different things. The identities
+    say the blob is built from the constants above rather than from a literal
+    typed into the emitter. The properties say what those constants may hold
+    -- and they are the half that survives the constants themselves changing,
+    which is the way this would actually go wrong: an endpoint reaches a blob
+    by somebody filling in the value that is already there.
+    """
     blob = simulated_blob()
     assert blob["remote_host"] == SIMULATED_HOST
-    assert blob["remote_host"].endswith(".invalid"), "a name that could resolve"
     assert blob["remote_port"] == SIMULATED_PORT == 0
     assert blob["remote_handshake_port"] == SIMULATED_PORT
     assert blob["remote_engine_id"] == SIMULATED_ENGINE_ID
 
+    host = blob["remote_host"]
+    assert host.endswith(".invalid"), "a name that could resolve"
+    assert host.count(".") == 1, (
+        f"{host!r} is a real name with the reserved suffix pinned on the end; "
+        "the whole point is that there is one label and it was invented here"
+    )
+    assert ":" not in blob["remote_engine_id"], "an identity, not host:port"
+    for field in ("remote_host", "remote_engine_id"):
+        assert_could_not_be_dialled(blob[field], field)
 
-def test_the_ranks_the_router_reads_are_numbers():
-    """The router drops `dp_rank` unless it is a number, and says nothing."""
+
+def test_the_ranks_the_router_reads_are_numbers(geometry):
+    """The router drops `dp_rank` unless it is a number, and says nothing.
+
+    Driven through the connector from a config carrying the widths as text,
+    because that is the only place they can arrive as anything but an int:
+    the request does not carry them, and handing `transfer_params` two
+    literal ints asserts nothing the cast is responsible for. A config field
+    filled from an environment variable or a JSON file is a string, and the
+    failure it causes is silent -- the router substitutes its own registry
+    value for the prefilling worker rather than refusing the blob.
+    """
     blob = simulated_blob(tp_size=8, dp_rank=3)
     assert isinstance(blob["dp_rank"], int) and blob["dp_rank"] == 3
     assert isinstance(blob["tp_size"], int) and blob["tp_size"] == 8
+
+    scheduler = connector(
+        model_for(geometry, PEAKS[0]),
+        lambda: ISSUE_AT,
+        role="scheduler",
+        tp_size="8",
+        dp_rank="3",
+    )
+    seq = finished_sequence()
+    scheduler.request_finished(seq)
+    relayed = seq.kv_transfer_params_output
+    assert isinstance(relayed["tp_size"], int) and relayed["tp_size"] == 8
+    assert isinstance(relayed["dp_rank"], int) and relayed["dp_rank"] == 3
 
 
 def test_the_blob_carries_the_request_and_not_a_template():
@@ -347,9 +419,14 @@ def test_a_parked_request_is_not_counted_as_admittable_work(geometry, seq_factor
     """
     model = model_for(geometry, PEAKS[0])
     engine = scheduler_with(connector(model, lambda: ISSUE_AT, role="scheduler"))
-    engine.add(remote_filled(seq_factory))
+    seq = remote_filled(seq_factory)
+    engine.add(seq)
     engine.schedule()
 
+    assert seq.status is SequenceStatus.WAITING_FOR_REMOTE_KVS, (
+        "nothing was parked, so the three signals below are reading an empty "
+        "queue rather than a suspended request"
+    )
     assert engine._waiting_new_token_count() == 0
     assert engine._can_admit_head_prefill() is False
     assert engine._oldest_waiting_prefill_age_ms() == 0.0
@@ -389,14 +466,24 @@ def test_the_prompt_is_claimed_once_and_the_request_keeps_its_intent(
 
 
 def test_an_ordinary_request_is_neither_claimed_nor_queued(geometry, seq_factory):
-    """Only a remote fill is taken on; every other allocation is silent."""
-    scheduler = connector(
-        model_for(geometry, PEAKS[0]), lambda: ISSUE_AT, role="scheduler"
-    )
-    seq = seq_factory(PROMPT)
-    assert scheduler.get_num_new_matched_tokens(seq) == (0, False)
-    scheduler.update_state_after_alloc(seq)
-    assert scheduler.build_connector_meta().reqs_to_recv == {}
+    """Only a remote fill is taken on; every other allocation is silent.
+
+    Both roles, because "silent" is two different things and only one of them
+    is visible in the metadata. On the consumer side an ordinary allocation
+    must leave the offer queue empty. On the producer side the refusal below
+    stands between every ordinary allocation and a `ValueError`, and no
+    announcement check can see that: the raise happens before there is
+    anything to announce.
+    """
+    model = model_for(geometry, PEAKS[0])
+    for kv_role in ("kv_consumer", "kv_producer"):
+        scheduler = connector(
+            model, lambda: ISSUE_AT, role="scheduler", kv_role=kv_role
+        )
+        seq = seq_factory(PROMPT)
+        assert scheduler.get_num_new_matched_tokens(seq) == (0, False)
+        scheduler.update_state_after_alloc(seq)
+        assert scheduler.build_connector_meta().reqs_to_recv == {}
 
 
 def test_the_producing_side_refuses_a_remote_fill(geometry, seq_factory):
