@@ -7,13 +7,15 @@ tripped it, and what would satisfy it. A message that names only the first two
 tells a user their spec is wrong and leaves them to guess the fix, and the fix
 is the only part they need.
 
-The same reading decides how many refusals there are. Two different things can
-stop a dotted path resolving, and they want opposite actions, so they are two
-refusals and not one: a key with no row in the field table is a typo or a knob
-that belongs to the deployment, while a declared field this object holds no
-value for is the schema's own field in a spec assembled from parts. A single
+The same reading decides how many refusals there are. Three different things
+can stop a dotted path resolving and they want three different actions, so
+there are three refusals and not one. A key with no row in the field table is a
+typo or a knob that belongs to the deployment. A declared field this object
+holds no value for is the schema's own field in a spec assembled from parts. A
+path that names a block names a group of fields rather than a value, which is
+the one of the three a reader can act on without changing anything. A single
 message would be true of whichever case it was written against and would send
-the other reader to the schema to find the field sitting there.
+the other two readers to the schema to find what they asked for sitting there.
 
 The separation rule is the one that decides every inclusion question:
 
@@ -36,6 +38,7 @@ list that drifts away from that surface would be folklore inside a month.
 """
 
 import enum
+from typing import NoReturn
 
 
 class Rule(enum.Enum):
@@ -57,7 +60,8 @@ class Rule(enum.Enum):
     PINNED_STACK = "the constants are pinned to a software stack"
     TOKENIZER_IDENTITY = "a tokenizer is measured or it is refused"
     SHAPE = "the document has the shape the schema declares"
-    TOTALITY = "a spec read from a document is total"
+    TOTALITY = "a spec resolves every field the document was required to state"
+    ADDRESSING = "a field is asked for by the path of the field itself"
     MEASURED = "a probe reports what it read, and refuses what it could not"
 
 
@@ -95,17 +99,45 @@ class FingerprintMismatch(UserWarning):
     """The tokenizer now loaded is not the one whose rates were measured."""
 
 
-def refuse_absent_field(path: str, required: bool) -> None:
+def refuse_block(path: str, holds: tuple[str, ...]) -> NoReturn:
+    """Decline a path that names a block, naming what the block groups instead.
+
+    The cheapest of the three to act on, and the one that reads worst when it
+    is lumped in with a typo: the path is in the schema, the spec is complete,
+    and the only thing wrong is that a block groups fields and is not itself a
+    value. So the remedy is the list of what it groups rather than a direction
+    to go and look.
+
+    The list is what the schema puts one segment under the block, which may
+    include other blocks, so it is stated as what is there rather than as an
+    instruction to ask for one of them -- for `device` several of those names
+    would arrive back here.
+    """
+    raise SpecRefusal(
+        Rule.ADDRESSING,
+        f"`{path}` is a block of this schema, not one of its fields",
+        "a block groups fields and holds no value of its own; the schema puts "
+        + ", ".join(holds)
+        + " under it, and a field is answered at its whole path",
+    )
+
+
+def refuse_absent_field(path: str, required: bool) -> NoReturn:
     """Decline a declared field this spec holds no value for, by how it is declared.
 
     The companion to `refuse_unknown_key`, and the reason the two are separate:
-    a path that does not resolve has two causes that want opposite actions. A
-    key with no row in the table is a typo or a deployment knob, and the reader
-    is sent to the schema. A key with a row that this object does not carry is
-    the schema's own field, and sending that reader to the schema sends them to
-    find it there and stop. The document path cannot produce the second case --
-    a spec read from a mapping resolves every required field or refuses -- so it
-    means a spec assembled some other way, which is what a probe fragment is.
+    a key with no row in the table is a typo or a deployment knob, and the
+    reader is sent to the schema. A key with a row that this object does not
+    carry is the schema's own field, and sending that reader to the schema
+    sends them to find it there and stop.
+
+    Which half of the rule applies is decided by how the field is declared,
+    because the two have different fixes. A required field cannot be missing
+    from a spec the reader produced -- it resolves every one of them or refuses
+    -- so the object was assembled some other way, which is what a probe
+    fragment is, and the fix is in whatever assembled it. An optional field the
+    document did not state is missing from a spec that was read, and the fix is
+    in the document.
     """
     if required:
         raise SpecRefusal(
@@ -125,7 +157,7 @@ def refuse_absent_field(path: str, required: bool) -> None:
     )
 
 
-def refuse_unknown_key(path: str) -> None:
+def refuse_unknown_key(path: str) -> NoReturn:
     """Decline a key the schema does not declare, saying why it is not one."""
     owner = DEPLOYMENT_OWNED.get(path.rsplit(".", 1)[-1])
     if owner is not None:

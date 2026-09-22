@@ -40,12 +40,14 @@ refusal and keeps walking, so a checking caller still gets the fields that sit
 beside a mistyped key. One unrecognised key would otherwise empty the whole
 document of resolved values, and the questions asked over them with it.
 
-Totality is also why `value` declines a path it cannot resolve in two different
-ways. Against a spec read from a document, a path that does not resolve is a key
-the schema does not declare, and the reader belongs at the field table. A spec
-assembled from parts -- a probe fragment, or an object built by hand in a test
--- can instead lack a field the schema does declare, and sending that reader to
-the table sends them to find the field sitting in it and stop.
+Totality is also why `value` declines a path it cannot resolve in three
+different ways. Against a spec read from a document, a path that does not
+resolve is either a key the schema does not declare, whose reader belongs at
+the field table, or a block, whose reader is one dotted segment away from what
+they wanted. A spec assembled from parts -- a probe fragment, or an object built
+by hand in a test -- can instead lack a field the schema does declare, and
+sending that reader to the table sends them to find the field sitting in it and
+stop.
 """
 
 import hashlib
@@ -53,7 +55,7 @@ import json
 import warnings
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, NoReturn
 
 from .fields import (
     BLOCKS,
@@ -71,6 +73,7 @@ from .rules import (
     SpecRefusal,
     StackMismatch,
     refuse_absent_field,
+    refuse_block,
     refuse_unknown_key,
 )
 from .tokenizers import Backend, TokenizerEntry, TokenizerTable, table
@@ -97,6 +100,22 @@ def _missing(field: Field) -> None:
         "the spec describes one machine completely; a term left out would be "
         "discovered by a run rather than by the person writing the document",
     )
+
+
+def _holds(block: str) -> tuple[str, ...]:
+    """What a block groups, one segment down, in the order the schema declares."""
+    depth = block.count(".") + 1
+    names = dict.fromkeys(
+        path.split(".")[depth] for path in BY_PATH if path.startswith(f"{block}.")
+    )
+    return tuple(names)
+
+
+def _unresolved(path: str) -> NoReturn:
+    """The refusal a path earns when the schema declares no field at it."""
+    if path in BLOCKS:
+        refuse_block(path, _holds(path))
+    refuse_unknown_key(path)
 
 
 def _survey(node: Mapping, prefix: str, found: dict):
@@ -174,7 +193,7 @@ class MachineSpec:
         if path not in self.values:
             field = BY_PATH.get(path)
             if field is None:
-                refuse_unknown_key(path)
+                _unresolved(path)
             refuse_absent_field(path, field.required)
         return self.values[path]
 
@@ -202,7 +221,7 @@ class MachineSpec:
         path = f"{RUNTIME_CONSTANTS}.{name}"
         field = BY_PATH.get(path)
         if field is None:
-            refuse_unknown_key(path)
+            _unresolved(path)
         if field.kind is not Kind.WIDTH_TABLE:
             return self.value(path)
         measured = self.value(path)
