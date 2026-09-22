@@ -1095,15 +1095,39 @@ A `SimulatedKVConnector` registered through the existing factory:
 - `latency` and `bandwidth` are configuration, satisfying the "interconnect is
   configurable" requirement directly.
 - It must still emit the `kv_transfer_params` blob that Atomesh relays, so
-  `AtomAdapter` works unmodified. The real shape is at `moriio_connector.py:970-1001`:
-  `{do_remote_prefill, remote_block_ids, remote_engine_id, remote_host, remote_port,
-  remote_handshake_port, tp_size, dp_rank, transfer_id, first_token_id,
-  draft_token_ids, prefix_cache_hit_tokens}`. The router hard-errors if it is absent
-  (`http_pd_router.rs:1073-1078`).
+  `AtomAdapter` works unmodified. The router hard-errors if it is absent
+  (`http_pd_router.rs:1073-1078`). The two backends emit **different shapes** --
+  thirteen fields and seventeen -- so the connector it stands in for decides which;
+  see *The blob, per backend* below.
 - The consumer side must still return `(len(prompt), True)` from
   `get_num_new_matched_tokens` when `do_remote_prefill` is set, i.e. park the request
   (`moriio_connector.py:904-917`), so `Scheduler._park_for_remote_load`
   (`scheduler.py:2207-2212`) and the `WAITING_FOR_REMOTE_KVS` state behave identically.
+
+### The blob, per backend
+
+Each connector assigns `seq.kv_transfer_params_output` exactly once, so there is no
+second site either row below could be describing. Each row's field set is the key
+list of that one dict literal, walked out of the AST at `92f1fdafe`.
+
+| Backend | Assignment | Keys | Field set, in source order |
+|---|---|---|---|
+| `moriio` (pull, the default) | `moriio_connector.py:983-997` | 13 | `do_remote_prefill`, `do_remote_decode`, `remote_block_ids`, `remote_engine_id`, `remote_host`, `remote_port`, `remote_handshake_port`, `tp_size`, `dp_rank`, `transfer_id`, `first_token_id`, `draft_token_ids`, `prefix_cache_hit_tokens` |
+| `mooncake` (push) | `mooncake_connector.py:432-452` | 17 | `do_remote_prefill`, `do_remote_decode`, `remote_block_ids`, `remote_swa_block_ids`, `remote_engine_id`, `remote_host`, `remote_port`, `remote_handshake_port`, `tp_size`, `dp_rank`, `remote_pp_size`, `hash_block_size`, `transfer_id`, `first_token_id`, `draft_token_ids`, `local_slot_index`, `prefix_cache_hit_tokens` |
+
+The push shape is the pull shape plus four: `remote_swa_block_ids`, `remote_pp_size`,
+`hash_block_size`, `local_slot_index`. They are a second backend's blob, not optional
+fields of one, and a simulated connector standing in for `moriio` emits the thirteen.
+
+One of the four is load-bearing rather than descriptive. The push consumer compares
+the producer's `hash_block_size` against its own and falls back to a full transfer --
+`num_computed_blocks = 0` -- whenever it is absent or differs
+(`mooncake_connector.py:389-401`), so a blob carrying only the thirteen can never
+take the incremental path.
+
+`tests/compass/test_d6_blob_fields.py` re-derives both sets from the connectors and
+fails naming the field that differs, so this table cannot drift from the source the
+way its twelve-field predecessor did.
 
 ### Pros
 
