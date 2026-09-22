@@ -40,13 +40,15 @@ Two config sources, because the milestone needs both:
   attribute names a config uses and is read by the same code path, so it
   exercises the reader rather than bypassing it.
 
-What this does not carry. The layer count a collective is charged per is the
-*paged* one, which is the count of layers holding a cache of every past token
-and not the count of layers in the stack: on a stack that is one full-
-attention layer in four they differ by four, and an all-reduce runs on all of
-them. `stage_layers` is exposed beside `geometry.layers` so the difference is
-readable rather than implied, and the pricing that consumes it is the shape
-stub's.
+Two layer counts, and each half reads its own. `geometry.layers` counts the
+layers holding a cache of every past token, which is what a KV block is sized
+from; `stage_layers` counts the layers this worker runs, which is what a
+collective is charged on, since an all-reduce runs on a layer keeping a bounded
+recurrent state exactly as it does on a paged one. On a stack that is one
+full-attention layer in four the two differ by four and on a uniform stack they
+coincide, so neither is recoverable from the other and both are handed on: the
+geometry to the pool, the span to the price. Both stay readable here rather
+than one being implied by the other.
 
 Nothing constrains where the config came from, either. The `config` argument
 is unannotated and read by attribute name, so a config type defined beside the
@@ -255,17 +257,21 @@ class FakeModel:
             layer_range=layer_range,
             kv_dtype=kv_dtype,
         )
-        self.backend = ShapeStubBackend(
-            coefficients=self.coefficients,
-            parallelism=self.parallelism,
-            geometry=self.geometry,
-        )
         text = getattr(config, "text_config", config)
         # The whole stack the config declares, which is what a set of pipeline
         # spans has to add up to; `stage_layers` below is this worker's share.
         self.stack_depth = int(text.num_hidden_layers)
         self.layer_range = (0, self.stack_depth) if layer_range is None else layer_range
         self.kv_dtype = kv_dtype
+        # The span reaches the price and the geometry reaches the pool. The
+        # backend is built after both are known because the span is what it
+        # charges a collective on, and this worker's span is the one it runs.
+        self.backend = ShapeStubBackend(
+            coefficients=self.coefficients,
+            parallelism=self.parallelism,
+            geometry=self.geometry,
+            stack_layers=self.stage_layers,
+        )
 
     @classmethod
     def from_json(cls, source, **declared) -> FakeModel:
@@ -279,7 +285,9 @@ class FakeModel:
         `geometry.layers` is the subset of these that holds a cache of every
         past token, and on a hybrid the two are different numbers: a layer
         that keeps a bounded recurrent state still runs, still has weights and
-        still takes part in a collective, it just costs a block nothing.
+        still takes part in a collective, it just costs a block nothing. This
+        count is what the price charges a collective on, and the subset is
+        what the pool is sized from.
         """
         start, end = self.layer_range
         return end - start

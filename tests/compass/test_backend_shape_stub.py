@@ -46,6 +46,7 @@ from atom.compass.backends import (
 from atom.compass.backends.shape import (
     CANDIDATE,
     DECLARED,
+    PER_STACK_LAYER,
     UNCHECKED_RUNG,
     sum_context,
     sum_query_cached,
@@ -417,9 +418,14 @@ class TestWhatTheOutputSays:
 
 
 class TestCollectives:
+    # One worker, described by two counts: 64 layers run and 16 of them hold a
+    # cache of every past token. A collective is charged on the first and a
+    # block is sized from the second, so each construction below states the
+    # one it needs and neither number stands in for the other.
     GEOMETRY = KvGeometry(
         layers=16, kv_heads=4, head_dim=256, element_bytes=2, block_size=64
     )
+    STACK_LAYERS = 64
 
     def test_a_single_rank_deployment_is_charged_for_no_collective(self):
         step = ShapeStubBackend(
@@ -429,18 +435,32 @@ class TestCollectives:
 
     def test_the_charged_collectives_are_the_ones_the_widths_produce(self):
         widths = Parallelism(tp_size=2, dp_size=2, expert_parallel=True)
-        step = ShapeStubBackend(parallelism=widths, geometry=self.GEOMETRY).estimate(
-            BatchView((prefill(128),))
-        )
+        step = ShapeStubBackend(
+            parallelism=widths,
+            geometry=self.GEOMETRY,
+            stack_layers=self.STACK_LAYERS,
+        ).estimate(BatchView((prefill(128),)))
         charged = [name for name in named(step) if name.startswith("collective")]
         assert charged == [f"collective.{n}" for n in widths.collectives()]
         assert named(step)["collective.tp-all-reduce"] == pytest.approx(
-            128 * 16 * Coefficients().collective_token_layer
+            128 * self.STACK_LAYERS * Coefficients().collective_token_layer
         )
 
-    def test_a_collective_with_no_geometry_to_price_it_is_refused(self):
+    def test_a_collective_with_no_stack_depth_to_price_it_is_refused(self):
+        """And a geometry does not answer it: what it counts is the subset."""
         with pytest.raises(ValueError, match="how many layers"):
             ShapeStubBackend(parallelism=Parallelism(tp_size=2))
+        with pytest.raises(ValueError, match="how many layers"):
+            ShapeStubBackend(parallelism=Parallelism(tp_size=2), geometry=self.GEOMETRY)
+
+    def test_a_span_shallower_than_its_paged_layers_is_refused(self):
+        """The two counts crossed: a subset cannot be larger than the set."""
+        with pytest.raises(ValueError, match="have been crossed"):
+            ShapeStubBackend(
+                parallelism=Parallelism(tp_size=2),
+                geometry=self.GEOMETRY,
+                stack_layers=4,
+            )
 
     def test_a_charged_collective_says_it_is_a_candidate(self):
         """The widths rule one out conclusively and rule it in conditionally.
@@ -454,9 +474,25 @@ class TestCollectives:
         step = ShapeStubBackend(
             parallelism=Parallelism(tp_size=2, dp_size=2, expert_parallel=True),
             geometry=self.GEOMETRY,
+            stack_layers=self.STACK_LAYERS,
         ).estimate(BatchView((prefill(128),)))
         for name, _, provenance in step.rows():
             assert (CANDIDATE in provenance) is name.startswith("collective.")
+
+    def test_a_charged_collective_says_which_layer_count_it_used(self):
+        """Two counts describe the worker and the seconds carry neither.
+
+        A charge on the paged layers of this geometry and one on its stack are
+        both a number of seconds in a total, so the term states the count it
+        multiplied where a reader of the record finds it.
+        """
+        step = ShapeStubBackend(
+            parallelism=Parallelism(tp_size=2),
+            geometry=self.GEOMETRY,
+            stack_layers=self.STACK_LAYERS,
+        ).estimate(BatchView((prefill(128),)))
+        for name, _, provenance in step.rows():
+            assert (PER_STACK_LAYER in provenance) is name.startswith("collective.")
 
 
 # ── chunk size ──────────────────────────────────────────────────────────────
