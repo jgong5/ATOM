@@ -43,9 +43,20 @@ named.
 read back through `naming.read_back`; a neighbour that does not parse, is not
 listed, or whose digest has moved is refused by name rather than returned.
 
-Not here, and deliberately: the invalidation matrix, fingerprint comparison on
-load, and gate state. What they need from this module is an entry that can
-state its key, its digest and what produced it.
+**What was ART-2's is now here too**, and it is two more things the entry
+states about itself. A published entry carries the **fingerprint of every row
+D43's matrix gives its kind** -- three of them for a `machine_spec`, whose
+capacity, runtime constants and tokenizer terms are invalidated by different
+things -- and the **state of every gate that shaped it**. Both are required at
+publish rather than checked at load: a campaign that runs for hours and
+produces an entry nobody can certify has spent the hours, and the flag that
+decided the gate is not around to be asked afterwards. `read` states an entry;
+`load` states it *and certifies it*, and they are two calls because the first
+is how a person inspects something the second has just refused.
+
+D43's "mismatch refuses, warn only under an explicit flag" lives on `load`.
+The flag covers the invalidation matrix and nothing else -- a gate
+disagreement and a comparison that could not be made have no warning form.
 """
 
 import contextlib
@@ -58,12 +69,16 @@ from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
 
+from .fingerprints import Conditions, Fingerprint, OnMismatch, fingerprint, verify
+from .gates import GateState
 from .keys import Key, Kind, refuse_not_a_key
+from .matrix import Row, rows_for
 from .naming import RankCoords, Topology, member_name, read_back
 from .provenance import Provenance
+from .resolution import Resolution
 from .rules import ArtifactRefusal, Rule
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 ENTRY_FILE = "entry.json"
 
 
@@ -109,6 +124,8 @@ class Entry:
     members: Mapping[str, str]
     digest: str
     directory: Path
+    fingerprints: Mapping[Row, Fingerprint]
+    gate_state: GateState
 
     def read_member(self, stem: str, coords: RankCoords, extension: str) -> bytes:
         """One rank's file, named by the same function that wrote it."""
@@ -159,10 +176,19 @@ class ArtifactStore:
         *,
         provenance: Provenance,
         topology: Topology,
+        conditions: Conditions,
+        gates: GateState,
         members: Mapping[str, bytes],
         notes: str = "",
     ) -> Entry:
-        """Hand an entry off. Once per key, with every rank present."""
+        """Hand an entry off. Once per key, with every rank present.
+
+        `conditions` and `gates` have no defaults on purpose. An entry that
+        states neither is one a `load` can only decline, and it would decline
+        it after the campaign that produced it had already run; and the flag
+        that decided a gate is not available to be asked once the worker that
+        read it has exited.
+        """
         if not isinstance(key, Key):
             refuse_not_a_key(key)
         if not isinstance(provenance, Provenance):
@@ -177,6 +203,15 @@ class ArtifactStore:
                 f"{topology!r} is not a topology",
                 "state every axis's width, so each member can name its rank",
             )
+        if not isinstance(notes, str):
+            raise ArtifactRefusal(
+                Rule.RESOLUTION,
+                f"`notes` holds {type(notes).__name__}, not text",
+                "the notes are inside the digested document, so anything that "
+                "is not text would leave the entry's identity depending on how "
+                "json.dumps happened to render it",
+            )
+        prints = self._fingerprints(key, conditions, gates)
         self._check_members(key, topology, members)
         if self.directory_for(key).exists():
             self._refuse_overwrite(key, members)
@@ -188,6 +223,10 @@ class ArtifactStore:
                 "key": key.values,
                 "topology": topology.widths,
                 "provenance": provenance.as_json(),
+                "fingerprints": {
+                    row.field: print_.as_json() for row, print_ in prints.items()
+                },
+                "gates": gates.as_json(),
                 "notes": notes,
                 "members": {
                     name: _digest(body) for name, body in sorted(members.items())
@@ -196,6 +235,27 @@ class ArtifactStore:
             members,
         )
         return self.read(key)
+
+    def _fingerprints(
+        self, key: Key, conditions: Conditions, gates: GateState
+    ) -> Mapping[Row, Fingerprint]:
+        """One fingerprint per row D43 gives this kind, or a refusal naming why not."""
+        if not isinstance(conditions, Conditions):
+            raise ArtifactRefusal(
+                Rule.INVALIDATED,
+                f"{conditions!r} is not a set of conditions",
+                "state all six of D43's columns; an entry records the "
+                "fingerprint of its own dependency row and cannot take one "
+                "from conditions nobody stated",
+            )
+        if not isinstance(gates, GateState):
+            raise ArtifactRefusal(
+                Rule.GATE_STATE,
+                f"{gates!r} is not a gate state",
+                "state the gates that shaped this entry, even when there are "
+                "none; `GateState.of()` says that and an omission does not",
+            )
+        return {row: fingerprint(row, conditions) for row in rows_for(key.kind)}
 
     def read(self, key: object) -> Entry:
         """The entry at a key, checked against what it says about itself."""
@@ -222,6 +282,11 @@ class ArtifactStore:
             stored = Key.of(Kind(document["kind"]), **document["key"])
             topology = Topology.from_mapping(document["topology"])
             provenance = Provenance.from_json(document["provenance"])
+            prints = {
+                row: Fingerprint.from_json(document["fingerprints"][row.field])
+                for row in rows_for(stored.kind)
+            }
+            gate_state = GateState.from_json(document["gates"])
             notes, members = document["notes"], document["members"]
         if stored != key:
             raise ArtifactRefusal(
@@ -231,7 +296,72 @@ class ArtifactStore:
                 "hand is found out rather than believed",
             )
         self._check_directory(directory, topology, members)
-        return Entry(key, topology, provenance, notes, members, _digest(raw), directory)
+        return Entry(
+            key,
+            topology,
+            provenance,
+            notes,
+            members,
+            _digest(raw),
+            directory,
+            prints,
+            gate_state,
+        )
+
+    def load(
+        self,
+        key: object,
+        *,
+        conditions: Conditions,
+        gates: GateState,
+        on_mismatch: OnMismatch = OnMismatch.REFUSE,
+    ) -> Entry:
+        """The entry at a key, certified against the conditions and gates in force.
+
+        The gate state is checked first and the fingerprint second, because a
+        measurement taken under other gates is not the thing the fingerprint
+        describes -- the dead `PRICE_KERNELS` gate produced a price list whose
+        every dependency read correctly and whose 164 per-kernel breakdowns
+        were taken at a width the gate claimed to have excluded.
+
+        `on_mismatch` is D43's explicit flag and reaches the matrix only. A
+        gate disagreement refuses under either setting, and so does a reading
+        that cannot be compared: there is no answer there to downgrade.
+        """
+        entry = self.read(key)
+        entry.gate_state.check(gates)
+        verify(entry.fingerprints, conditions, on_mismatch)
+        return entry
+
+    def answer(
+        self,
+        key: object,
+        resolution: Resolution,
+        *,
+        conditions: Conditions,
+        gates: GateState,
+        on_mismatch: OnMismatch = OnMismatch.REFUSE,
+    ) -> Entry | None:
+        """Load an entry into a step's ledger: the entry, or a recorded miss.
+
+        The refusal is recorded rather than raised so the step can name
+        **every** key that missed instead of the first, which is the whole
+        difference between `incomplete: N/2570` and a list. `Resolution.
+        require_complete` is where the step refuses, and a caller that never
+        calls it has a ledger and no gate -- so a caller that means "this must
+        answer" should call `load`.
+        """
+        if not isinstance(key, Key):
+            refuse_not_a_key(key)
+        try:
+            entry = self.load(
+                key, conditions=conditions, gates=gates, on_mismatch=on_mismatch
+            )
+        except ArtifactRefusal as declined:
+            resolution.missed(key, declined)
+            return None
+        resolution.answered(entry.key, entry.digest)
+        return entry
 
     def _check_members(
         self, key: Key, topology: Topology, members: Mapping[str, bytes]
@@ -316,7 +446,16 @@ class ArtifactStore:
     def _write(
         self, destination: Path, document: dict, members: Mapping[str, bytes]
     ) -> None:
-        """Build the entry beside its place, then move it there in one step."""
+        """Build the entry beside its place, then move it there in one step.
+
+        The `except` catches more than `OSError` because it did not, and the
+        staging directory survived an exception raised on the way to the
+        rename (#169). A `TypeError` out of `json.dumps` left
+        `.m-2-8f37148e79f6.sx267hib` behind and reported nothing about it --
+        litter that is never reclaimed, from a failure that never published.
+        The narrow `except` was right about the failure it was written for and
+        silent about every other one.
+        """
         destination.parent.mkdir(parents=True, exist_ok=True)
         staging = Path(
             tempfile.mkdtemp(dir=destination.parent, prefix=f".{destination.name}.")
@@ -330,12 +469,13 @@ class ArtifactStore:
             for item in staging.iterdir():
                 item.chmod(0o444)
             os.rename(staging, destination)
-        except OSError as clash:
+        except (OSError, TypeError, ValueError) as clash:
             shutil.rmtree(staging, ignore_errors=True)
             raise ArtifactRefusal(
                 Rule.IMMUTABLE,
-                f"{destination} could not be created: {clash}",
+                f"{destination} could not be created: {type(clash).__name__}: {clash}",
                 "an entry is moved into place onto a name a published entry "
                 "already occupies, so a second publisher loses the race rather "
-                "than the entry",
+                "than the entry; a publish that fails on the way there takes "
+                "its half-built staging directory with it",
             ) from clash
