@@ -229,12 +229,24 @@ Declared in advance, per quantity, because they are not equally hard:
 
 | Quantity | Tier-0 goal | Why this number |
 |---|---|---|
-| **Memory: weights, KV capacity, block count** | **≤5%**, same as empirical | Class A — exact from geometry. There is no modelling here to be wrong about; a miss is a bug. |
-| **Memory: each non-KV term** | **≤25%** | activations are approximate (`k_model` derived rather than walked) and invisible scratch is Class C. The spread that sets the number: scratch is 0.1 KB/token on the 0.6B and **39.6 KB/token** on the 27B. |
+| **Memory: KV capacity, block count** | **≤5%**, same as empirical | Class A — exact from geometry. There is no modelling here to be wrong about; a miss is a bug. |
+| **Memory: weights** | **≤5%**, *tighter* than empirical's ≤10% | Class A — exact from geometry, so a miss is a bug rather than modelling error. Weights is a non-KV memory term, and the acceptance table gates those at the bound quoted beside this one; tier 0 keeps its own goal at that level anyway, because a looser bound on an exact quantity would not catch the bug the row exists to catch. Tighter than the empirical gate, not the same as it. |
+| **Memory: each non-KV term except weights** | **≤25%** | activations are approximate (`k_model` derived rather than walked) and invisible scratch is Class C. The spread that sets the number: scratch is 0.1 KB/token on the 0.6B and **39.6 KB/token** on the 27B. |
 | **Step time (prefill and decode, separately)** | **≤30%** | roofline plus a declared derate, against the four known wrongnesses of D66. Anything tighter would be claiming the corrections are unnecessary. |
 | **End-to-end TTFT / TPOT / throughput** | **≤40%** | step error compounds through a scheduler with discontinuities (doc `08` D44). Reported, not gated on tighter. |
 | **Configuration ranking** | **top-1 must survive; top-3 set must survive** | **this is the primary gate.** The others are diagnostics for it. |
 | **Feasibility (does it fit)** | **no false "fits"** | a configuration tier 0 says fits and then OOMs is a hard failure regardless of byte error. One-sided on purpose. |
+
+**On the weights row.** The empirical acceptance table has two memory buckets —
+≤5% for KV capacity / block count and ≤10% for each non-KV memory term, of which
+weights is one (`03` D16 lists it first). So for KV and block count the tier-0 goal is
+the empirical gate; for weights it is *tighter* than the empirical gate. Tier 0 keeps
+the tighter goal deliberately — the quantity is exact from geometry and the goal
+exists to catch a bug, which a bound set for modelling error would not do. What is
+withdrawn is only the claim of parity: an earlier wording grouped all three quantities
+in one cell and called the number "same as empirical", which is true of KV capacity
+and block count and false of weights, and was read in review as evidence that the
+empirical weights gate is ≤5%.
 
 ### Why ranking is the primary gate and the others are not
 
@@ -334,7 +346,7 @@ that goal governs; the rows below cover the uses D67.1 does not gate.
 | tier 0, unmeasured device | **unbounded, derate-dominated** | D69. This is why D67.1's goals are validated only where both tiers exist. |
 | rung 4 gap-filling, promoted leaf | **~2%** | the promotion rule (D68) requires it |
 | rung 4 gap-filling, unpromoted leaf | **unknown** — that is why the fraction is capped | |
-| analytic memory: weights, KV | **exact** | Class A; D67.1 gates this at ≤5% purely to catch bugs |
+| analytic memory: weights, KV | **exact** | Class A; D67.1 gates both at ≤5% purely to catch bugs — for KV that is the empirical gate, for weights it is tighter than empirical's ≤10% |
 | analytic memory: block count end to end | **unknown** | depends on activations and the Class-C constants |
 
 Single digits on latency are not a target for tier 0 and should not be claimed. That is
@@ -350,7 +362,7 @@ what tier b exists for.
 | D64 | Roofline leaf `max(F/flops, M/bandwidth)` with derates, plus the host floor as a step-level `max`, not an addend. | 2026-09-19 |
 | D65 | Tier 0 is a smooth model and says so: it reports a band where a known discontinuity lies in range, and is not promoted for such leaves without a measured band table. | 2026-09-19 |
 | D66 | Two-regime collective model with the algorithm named in the spec. Textbook ring/log models are refuted on this fabric. | 2026-09-19 |
-| D67.1 | Tier-0 accuracy goals declared per quantity: ≤5% weights/KV/block count, ≤25% each non-KV memory term, ≤30% step time, ≤40% end-to-end. **Configuration ranking (top-1 and top-3 set) is the primary gate**; no false "fits". Checked against the empirical campaign at no extra GPU cost. | 2026-09-19 |
+| D67.1 | Tier-0 accuracy goals declared per quantity: ≤5% on weights and on KV capacity/block count (the empirical gate for KV, tighter than it for weights), ≤25% each other non-KV memory term, ≤30% step time, ≤40% end-to-end. **Configuration ranking (top-1 and top-3 set) is the primary gate**; no false "fits". Checked against the empirical campaign at no extra GPU cost. | 2026-09-19 |
 | D67 | Analytic memory is the existing memory model with the activation coefficient derived rather than walked. Weights and KV exact; scratch, `non_torch` and load residue stay declared constants. | 2026-09-19 |
 | D68 | Tier 0's laws are authored **during** the empirical campaign, because that campaign is their only validation set. Promotion to rung 4 is per leaf, requires tracking the measured price within ~2%, and is revocable. | 2026-09-19 |
 | D69 | On an unmeasured device, tier 0 is derate-dominated. Report the derate and a ±20% sensitivity band; prefer ranking claims to absolute ones. | 2026-09-19 |
