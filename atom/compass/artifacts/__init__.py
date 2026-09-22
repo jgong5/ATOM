@@ -30,13 +30,13 @@ from .keys import KEY_FIELDS, Key, Kind
 from .naming import AXES, RankCoords, Topology, member_name, read_back
 from .provenance import (
     REQUIRED_ROOTS,
+    REVISION_KINDS,
     Provenance,
     SourceRoot,
     git_described_root,
     git_tree_root,
     module_root,
     roots_for,
-    utc_now,
 )
 from .rules import ArtifactRefusal, Rule
 from .store import SCHEMA_VERSION, ArtifactStore, Entry
@@ -45,6 +45,7 @@ __all__ = [
     "AXES",
     "KEY_FIELDS",
     "REQUIRED_ROOTS",
+    "REVISION_KINDS",
     "SCHEMA_VERSION",
     "ArtifactRefusal",
     "ArtifactStore",
@@ -62,5 +63,4 @@ __all__ = [
     "module_root",
     "read_back",
     "roots_for",
-    "utc_now",
 ]

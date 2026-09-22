@@ -75,8 +75,16 @@ class Topology:
         return {axis: getattr(self, axis) for axis in AXES}
 
     @property
-    def width(self) -> int:
-        """How many ranks the topology holds, across every axis."""
+    def rank_count(self) -> int:
+        """How many ranks the topology holds, across every axis.
+
+        Deliberately **not** called `width`. D41 keys `price_list`,
+        `region_terms` and `memory_readings` on a scalar `width` and does not
+        say whether that is the tensor-parallel width or the total rank
+        count -- at `-tp 2 -dp 2` the two readings are 2 and 4. Spending the
+        word here would settle by naming a question that is open (#165), in
+        the one module that raised it.
+        """
         total = 1
         for axis in AXES:
             total *= getattr(self, axis)

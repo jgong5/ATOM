@@ -10,9 +10,14 @@ is what holds it -- but the four-ranks-one-file case still needs four ranks to
 be visible at all, and every test that could pass at width one by accident is
 run at width two as well.
 
-Nothing here touches a driver, a device or a network. `git` is reached only
-through an injected runner, so the two source-root resolvers are exercised
-without this tier depending on what tree it happens to be staged from.
+Two things these tests deliberately do **not** do. They never bind D41's
+scalar `width` to a topology: at `-tp 2 -dp 2` the tensor-parallel width and
+the rank count are 2 and 4, D41 does not say which its key field means, and a
+fixture that picked one would settle by example a question filed as #165. The
+multi-axis round trip is therefore keyed on `op_graph`, which has no width in
+its key at all. And nothing here touches a driver, a device or a network:
+`git` is reached only through an injected runner, so the source-root resolvers
+are exercised without this tier depending on the tree it was staged from.
 """
 
 import json
@@ -37,22 +42,29 @@ from atom.compass.artifacts import (
     git_tree_root,
     member_name,
     module_root,
+    roots_for,
 )
 
 REPO = pathlib.Path(__file__).resolve().parents[2]
 D41 = REPO / "atom" / "compass" / "design" / "07_calibration_toolchain.md"
+#: One row of D41's six-artifacts table: the name, and the `Keyed by` cell.
+ROW = re.compile(r"^\| `([a-z_]+)` \| [^|]*\| ([^|]*)\|", re.MULTILINE)
 
 ATOM_ROOT = SourceRoot(
     "atom",
     "/workspace/ATOM/atom",
     "0f1e2d3c4b5a69788796a5b4c3d2e1f00f1e2d3c",
+    "tree",
     "git rev-parse HEAD^{tree}, the tree git archive ships",
+    0,
 )
 AITER_ROOT = SourceRoot(
     "aiter",
     "/app/aiter-test/aiter",
     "v0.1.21.dev0-49-gf4e7c7509",
+    "describe",
     "git describe --tags --always --dirty",
+    0,
 )
 
 
@@ -70,6 +82,10 @@ def price_key(width: int = 2) -> Key:
     )
 
 
+def graph_key(structure: str = "qwen3-moe-48L") -> Key:
+    return Key.of(Kind.OP_GRAPH, structure=structure)
+
+
 def members_for(topology: Topology, stem: str, extension: str) -> dict[str, bytes]:
     """One file per rank, each naming the rank that wrote it."""
     return {
@@ -78,17 +94,44 @@ def members_for(topology: Topology, stem: str, extension: str) -> dict[str, byte
     }
 
 
+def words(text: str) -> str:
+    """Text with the punctuation that separates words flattened to spaces."""
+    return re.sub(
+        r"[-_*`]", lambda hit: "" if hit.group() in "*`" else " ", text.lower()
+    )
+
+
 # --- a key is a tuple, never a path -----------------------------------------
 
 
 def test_the_six_artifacts_are_the_ones_d41_declares():
-    """The kinds and D41's table are one fact; a doc that drifts is a defect."""
+    """The kinds *and their key fields* are one fact with D41's table.
+
+    The `Keyed by` column is compared per row, not just the set of names: an
+    earlier version of this test compared only the names and one tuple, and
+    stayed green with five of `memory_readings`' seven key fields deleted --
+    which is the row whose length is the whole point of `13` D81 separating
+    "part of the key" from "merely recorded".
+    """
     text = D41.read_text(encoding="utf-8")
     table = text.split("### The six artifacts", 1)[1].split("### Four rules", 1)[0]
-    named = set(re.findall(r"^\| `([a-z_]+)` \|", table, re.MULTILINE))
-    assert named == {kind.value for kind in Kind}
+    rows = dict(ROW.findall(table))
+    assert set(rows) == {kind.value for kind in Kind}
     assert set(KEY_FIELDS) == set(Kind)
-    assert KEY_FIELDS[Kind.PRICE_LIST] == ("model", "width", "source_root")
+    for kind in Kind:
+        cell = rows[kind.value]
+        stated = re.search(r"\(([^)]*)\)", cell)
+        fields = KEY_FIELDS[kind]
+        if stated is None:
+            assert len(fields) == 1, f"D41 keys {kind} by one thing, code has {fields}"
+        else:
+            named = [part for part in stated.group(1).split(",") if part.strip()]
+            assert len(fields) == len(named), (
+                f"D41 keys {kind} by {len(named)} fields and KEY_FIELDS has "
+                f"{len(fields)}: {fields}"
+            )
+        for field in fields:
+            assert words(field) in words(cell), f"D41's {kind} row omits `{field}`"
 
 
 def test_a_price_list_asked_for_by_path_is_refused_by_name(tmp_path):
@@ -167,13 +210,26 @@ def test_a_coordinate_taken_in_another_topology_is_refused():
     assert "dp1.pp1.pcp1.tp2" in str(refused.value)
 
 
+def test_the_topology_counts_ranks_without_spending_d41s_word():
+    """`rank_count`, not `width`: #165 is open and the code stays out of it."""
+    assert not hasattr(Topology(), "width")
+    assert Topology(dp=2, tp=2).rank_count == 4
+    assert Topology(dp=2, tp=2).widths == {"dp": 2, "pp": 1, "pcp": 1, "tp": 2}
+
+
 # --- one entry, round-tripped at width one and at width two -----------------
 
 
-@pytest.mark.parametrize("topology", [Topology(), Topology(tp=2), Topology(dp=2, tp=2)])
-def test_an_entry_round_trips_through_the_naming_function(tmp_path, topology):
+@pytest.mark.parametrize(
+    "topology, key",
+    [
+        (Topology(), price_key(1)),
+        (Topology(tp=2), price_key(2)),
+        (Topology(dp=2, tp=2), graph_key("qwen3-moe-48L-tp2dp2")),
+    ],
+)
+def test_an_entry_round_trips_through_the_naming_function(tmp_path, topology, key):
     store = ArtifactStore(tmp_path)
-    key = price_key(topology.width)
     members = members_for(topology, "steps", "jsonl")
     published = store.publish(
         key, provenance=stanza(), topology=topology, members=members, notes="first pass"
@@ -181,7 +237,7 @@ def test_an_entry_round_trips_through_the_naming_function(tmp_path, topology):
     entry = store.read(key)
     assert entry.digest == published.digest
     assert entry.topology == topology
-    assert len(entry.members) == topology.width
+    assert len(entry.members) == topology.rank_count
     for rank in topology.ranks():
         assert (
             entry.read_member("steps", rank, "jsonl")
@@ -234,7 +290,7 @@ def test_one_rank_writing_for_four_is_refused_at_hand_off(tmp_path):
     only = RankCoords(topology)
     with pytest.raises(ArtifactRefusal) as refused:
         store.publish(
-            Key.of(Kind.OP_GRAPH, structure="qwen3-moe-48L-tp2dp2"),
+            graph_key("qwen3-moe-48L-tp2dp2"),
             provenance=stanza(),
             topology=topology,
             members={member_name("graph", only, "json"): b"807 operators"},
@@ -282,12 +338,9 @@ def test_the_notes_are_inside_the_digest(tmp_path):
     members = members_for(topology, "prices", "json")
     digests = set()
     for index, note in enumerate(("as measured", "as measured, note corrected")):
-        key = Key.of(
-            Kind.REGION_TERMS, model=f"Qwen/Qwen3-32B-v{index}", width=topology.width
-        )
         digests.add(
             store.publish(
-                key,
+                graph_key(f"qwen3-moe-48L-v{index}"),
                 provenance=stanza(),
                 topology=topology,
                 members=members,
@@ -345,6 +398,104 @@ def test_a_missing_entry_names_the_key_that_missed(tmp_path):
     assert "width=8" in str(refused.value)
 
 
+@pytest.mark.parametrize(
+    "damage, expected",
+    [
+        (lambda doc: doc.pop("provenance"), "KeyError"),
+        (lambda doc: doc.update(kind="not_a_kind"), "ValueError"),
+        (lambda doc: doc.update(topology={"tp": 2}), "does not state every axis"),
+    ],
+)
+def test_a_hand_edited_entry_is_refused_by_name(tmp_path, damage, expected):
+    """A tampered document is declined, not raised as a bare traceback.
+
+    The module's argument for T19 is that the path is a place and never the
+    authority. That is only true if a document this store does not recognise
+    is refused by name; before this, three separate edits raised `KeyError`,
+    `JSONDecodeError` and `ValueError` and none of them named an artifact.
+    """
+    store = ArtifactStore(tmp_path)
+    topology = Topology(tp=2)
+    key = price_key(2)
+    entry = store.publish(
+        key,
+        provenance=stanza(),
+        topology=topology,
+        members=members_for(topology, "prices", "json"),
+    )
+    document = json.loads((entry.directory / "entry.json").read_bytes())
+    damage(document)
+    (entry.directory / "entry.json").chmod(0o644)
+    (entry.directory / "entry.json").write_text(json.dumps(document))
+    with pytest.raises(ArtifactRefusal) as refused:
+        store.read(key)
+    assert expected in str(refused.value)
+
+
+def test_a_truncated_entry_is_refused_by_name(tmp_path):
+    store = ArtifactStore(tmp_path)
+    topology = Topology(tp=2)
+    key = price_key(2)
+    entry = store.publish(
+        key,
+        provenance=stanza(),
+        topology=topology,
+        members=members_for(topology, "prices", "json"),
+    )
+    (entry.directory / "entry.json").chmod(0o644)
+    (entry.directory / "entry.json").write_text("{not json")
+    with pytest.raises(ArtifactRefusal) as refused:
+        store.read(key)
+    assert refused.value.rule is Rule.RESOLUTION
+    assert "is not an entry document" in str(refused.value)
+
+
+def test_an_empty_directory_in_the_way_is_not_silently_replaced(tmp_path):
+    """`os.rename` replaces an empty directory; the occupancy check does not.
+
+    Measured on ext4: `rename(2)` onto an existing *empty* directory succeeds.
+    So the exclusivity cannot come from the rename, and this is the check it
+    comes from instead — refused under immutability, naming what is in the way,
+    rather than under resolution saying nothing is published there.
+    """
+    store = ArtifactStore(tmp_path)
+    topology = Topology(tp=2)
+    key = price_key(2)
+    store.directory_for(key).mkdir(parents=True)
+    with pytest.raises(ArtifactRefusal) as refused:
+        store.publish(
+            key,
+            provenance=stanza(),
+            topology=topology,
+            members=members_for(topology, "prices", "json"),
+        )
+    assert refused.value.rule is Rule.IMMUTABLE
+    assert "is in the way of" in str(refused.value)
+    assert "nothing is published at" not in str(refused.value)
+
+
+def test_an_abandoned_staging_directory_does_not_block_a_publish(tmp_path):
+    """Staging is per-publisher, so a crashed one is not in anybody's way."""
+    store = ArtifactStore(tmp_path)
+    topology = Topology(tp=2)
+    key = price_key(2)
+    destination = store.directory_for(key)
+    abandoned = destination.parent / f".{destination.name}.crashed"
+    abandoned.mkdir(parents=True)
+    (abandoned / "prices.dp0of1.pp0of1.pcp0of1.tp0of2.json").write_bytes(b"half")
+    entry = store.publish(
+        key,
+        provenance=stanza(),
+        topology=topology,
+        members=members_for(topology, "prices", "json"),
+    )
+    assert {item.name for item in entry.directory.iterdir()} == {
+        "entry.json",
+        *entry.members,
+    }
+    assert abandoned.is_dir()
+
+
 # --- T19: the physical form is a directory convention -----------------------
 
 
@@ -387,6 +538,14 @@ def test_a_stanza_without_an_offset_is_refused():
     assert "states no offset" in str(refused.value)
 
 
+def test_a_revision_says_which_object_it_is():
+    """A tree and a commit in one field compare unequal for identical source."""
+    with pytest.raises(ArtifactRefusal) as refused:
+        SourceRoot("atom", "/t", "deadbeef", "sha", "somehow")
+    assert "revision_kind" in str(refused.value)
+    assert "tree, commit, describe" in str(refused.value)
+
+
 def test_atoms_root_is_the_tree_git_archive_ships():
     calls = []
 
@@ -398,11 +557,13 @@ def test_atoms_root_is_the_tree_git_archive_ships():
 
     root = git_tree_root("atom", "/workspace/ATOM/atom", run)
     assert calls[0][-1] == "HEAD^{tree}"
+    assert root.revision_kind == "tree"
     assert root.dirty == 1
     assert "git archive ships" in root.method
 
 
 def test_a_snapshot_with_no_git_falls_back_to_the_stamp(tmp_path):
+    """The stamp answers with a commit, and cannot know whether it was dirty."""
     (tmp_path / ".compass-commit").write_text("92f1fdafe\n")
     nested = tmp_path / "atom" / "compass"
     nested.mkdir(parents=True)
@@ -410,6 +571,8 @@ def test_a_snapshot_with_no_git_falls_back_to_the_stamp(tmp_path):
         "atom", str(nested), lambda argv: (128, "", "not a repository")
     )
     assert root.revision == "92f1fdafe"
+    assert root.revision_kind == "commit"
+    assert root.dirty is None
     assert ".compass-commit" in root.method
 
 
@@ -432,6 +595,7 @@ def test_aiters_version_is_gate_gpus_call():
     root = git_described_root("aiter", "/app/aiter-test/aiter", run)
     assert calls[0][3:] == ["describe", "--tags", "--always", "--dirty"]
     assert root.revision == "v0.1.20-103-g23f83724f"
+    assert root.revision_kind == "describe"
     assert root.dirty == 0
 
 
@@ -451,15 +615,77 @@ def test_a_source_root_is_located_without_importing_it():
     assert name not in sys.modules
 
 
-def test_every_module_that_can_answer_gets_its_own_row():
-    """Two modules resolving into different trees are two rows that disagree."""
-    roots = (
-        ATOM_ROOT,
-        SourceRoot("atom.compass.regions", "/other/tree", "deadbeef", "stamp"),
-        AITER_ROOT,
+def test_a_dotted_module_does_not_import_its_parents():
+    """`find_spec` alone is not enough: it executes the parents of a dotted name.
+
+    Measured before this was fixed: `find_spec("xml.dom.minidom")` leaves
+    `xml` and `xml.dom` in `sys.modules`. Under `aiter.*` that import is the
+    `rocminfo` shell-out that hangs on a wedged driver, and `roots_for`
+    anticipates dotted names.
+    """
+    candidates = ["wsgiref.simple_server", "xmlrpc.client", "dbm.dumb", "html.parser"]
+    dotted = next(
+        (name for name in candidates if name.split(".")[0] not in sys.modules), None
     )
-    recorded = Provenance("phase 1b", "2026-09-22T11:00:00+00:00", roots)
-    assert recorded.root("atom.compass.regions").revision != ATOM_ROOT.revision
+    assert dotted, "every candidate's package was already imported; pick another"
+    root = module_root(dotted)
+    assert pathlib.Path(root).is_dir()
+    for depth in range(1, dotted.count(".") + 2):
+        assert ".".join(dotted.split(".")[:depth]) not in sys.modules
+
+
+def test_a_dotted_name_with_no_such_module_is_refused():
+    with pytest.raises(ArtifactRefusal) as refused:
+        module_root("json.no_such_submodule")
+    assert "has no `no_such_submodule`" in str(refused.value)
+
+
+def test_roots_for_gives_every_module_that_can_answer_its_own_row():
+    """Rule 2's second half, through the function rather than beside it.
+
+    The regions incident is the third row: a module resolving into a different
+    tree shows up as a row that disagrees with ATOM's, instead of hiding
+    behind it.
+    """
+    trees = {
+        "/workspace/ATOM/atom": "aaaaaaaa",
+        "/stale/atom/compass": "bbbbbbbb",
+        "/app/aiter-test/aiter": "v0.1.21.dev0-49-gf4e7c7509",
+    }
+    seen = []
+
+    def run(argv):
+        seen.append(argv)
+        root = argv[2]
+        if "describe" in argv:
+            return 0, trees[root], ""
+        if "rev-parse" in argv:
+            return 0, trees[root], ""
+        return 0, "", ""
+
+    roots = roots_for(
+        {
+            "atom": "atom",
+            "atom.compass.regions": "atom.compass.regions",
+            "aiter": "aiter",
+        },
+        run,
+        locate={
+            "atom": "/workspace/ATOM/atom",
+            "atom.compass.regions": "/stale/atom/compass",
+            "aiter": "/app/aiter-test/aiter",
+        }.__getitem__,
+    )
+    by_name = {root.name: root for root in roots}
+    assert set(by_name) == {"atom", "atom.compass.regions", "aiter"}
+    assert by_name["atom"].revision_kind == "tree"
+    assert by_name["aiter"].revision_kind == "describe"
+    assert by_name["atom.compass.regions"].revision != by_name["atom"].revision
+    assert ["describe" in argv for argv in seen].count(True) == 1
+    Provenance("phase 1b", "2026-09-22T11:00:00+00:00", roots)
+
+
+def test_two_source_roots_may_not_share_a_name():
     with pytest.raises(ArtifactRefusal) as refused:
         Provenance(
             "phase 1b",

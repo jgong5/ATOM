@@ -9,9 +9,19 @@ over the key rather than a lookup, and there is no second record that can
 disagree with the first. D41's eight incidents are each a second statement of
 one fact drifting away from it; an index is one more of those, and it is the
 one a store would have to maintain on every write. Principle 3 -- and principle
-6 for what the filesystem gives free: publishing is a rename onto a name that
-must not exist, so immutability is enforced by the operating system rather than
-promised by this module.
+6 for what the filesystem gives free: an entry is built elsewhere and moved
+into place, and a published entry is never empty -- it always carries
+`entry.json` -- so `rename(2)` cannot replace one.
+
+Stated that way on purpose, because the obvious stronger claim is false and was
+in this PR until it was measured: on ext4, `os.rename` **succeeds** onto an
+existing *empty* directory and fails with ENOTEMPTY only onto a non-empty one.
+The exclusivity is a consequence of what a published entry contains, not of the
+rename primitive refusing an existing name -- so an entry form with no members
+would inherit a silent overwrite, and an empty directory sitting in the way is
+caught by the occupancy check before the rename, not by the rename. Staging is
+per-publisher (`mkdtemp`) rather than a function of the key, so two publishers
+at one key cannot write into each other's half-built entry.
 
 Three refusals the convention buys, each an incident from D41:
 
@@ -38,10 +48,12 @@ load, and gate state. Those are ART-2's, and what they need is an entry that
 can state its key, its digest and what produced it.
 """
 
+import contextlib
 import hashlib
 import json
 import os
 import shutil
+import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -57,6 +69,32 @@ ENTRY_FILE = "entry.json"
 
 def _digest(payload: bytes) -> str:
     return "sha256:" + hashlib.sha256(payload).hexdigest()
+
+
+@contextlib.contextmanager
+def _legible(directory: Path):
+    """Read an entry document, turning a malformed one into a named refusal.
+
+    A hand-edited `entry.json` otherwise surfaces as `JSONDecodeError`,
+    `KeyError` or `ValueError` -- three tracebacks that say nothing about
+    which artifact answered, which is the shape of failure D41 is about. The
+    module argues that the path is a place and never the authority; that is
+    only true if a document the store does not recognise is declined by name.
+    """
+    try:
+        yield
+    except ArtifactRefusal:
+        raise
+    except (ValueError, KeyError, TypeError, AttributeError) as malformed:
+        raise ArtifactRefusal(
+            Rule.RESOLUTION,
+            f"{directory / ENTRY_FILE} is not an entry document: "
+            f"{type(malformed).__name__}: {malformed}",
+            "an entry states its kind, key, topology, provenance, notes and "
+            "members; this one was edited or written by something else, and "
+            "a store that read it anyway would answer under a name it cannot "
+            "support",
+        ) from malformed
 
 
 @dataclass(frozen=True, slots=True)
@@ -171,15 +209,19 @@ class ArtifactStore:
                 "that missed, because a missing price is not a missing graph",
             )
         raw = (directory / ENTRY_FILE).read_bytes()
-        document = json.loads(raw)
-        if document.get("schema_version") != SCHEMA_VERSION:
-            raise ArtifactRefusal(
-                Rule.RESOLUTION,
-                f"{directory} states schema_version "
-                f"{document.get('schema_version')!r}",
-                f"this reader understands version {SCHEMA_VERSION}",
-            )
-        stored = Key.of(Kind(document["kind"]), **document["key"])
+        with _legible(directory):
+            document = json.loads(raw)
+            if document.get("schema_version") != SCHEMA_VERSION:
+                raise ArtifactRefusal(
+                    Rule.RESOLUTION,
+                    f"{directory} states schema_version "
+                    f"{document.get('schema_version')!r}",
+                    f"this reader understands version {SCHEMA_VERSION}",
+                )
+            stored = Key.of(Kind(document["kind"]), **document["key"])
+            topology = Topology.from_mapping(document["topology"])
+            provenance = Provenance.from_json(document["provenance"])
+            notes, members = document["notes"], document["members"]
         if stored != key:
             raise ArtifactRefusal(
                 Rule.RESOLUTION,
@@ -187,17 +229,8 @@ class ArtifactStore:
                 "an entry restates its key, so a directory moved or renamed by "
                 "hand is found out rather than believed",
             )
-        topology = Topology.from_mapping(document["topology"])
-        self._check_directory(directory, topology, document["members"])
-        return Entry(
-            key,
-            topology,
-            Provenance.from_json(document["provenance"]),
-            document["notes"],
-            document["members"],
-            _digest(raw),
-            directory,
-        )
+        self._check_directory(directory, topology, members)
+        return Entry(key, topology, provenance, notes, members, _digest(raw), directory)
 
     def _check_members(
         self, key: Key, topology: Topology, members: Mapping[str, bytes]
@@ -228,13 +261,23 @@ class ArtifactStore:
                 raise ArtifactRefusal(
                     Rule.EVERY_RANK_WRITES,
                     f"`{stem}.*.{extension}` covers {len(seen)} of "
-                    f"{topology.width} ranks of {topology.text}; missing {missing}",
+                    f"{topology.rank_count} ranks of {topology.text}; missing {missing}",
                     "every rank writes its own file, and a single-writer path "
                     "is indistinguishable from a correct one by inspection",
                 )
 
     def _refuse_overwrite(self, key: Key, members: Mapping[str, bytes]) -> None:
-        standing = self.read(key)
+        try:
+            standing = self.read(key)
+        except ArtifactRefusal as unreadable:
+            raise ArtifactRefusal(
+                Rule.IMMUTABLE,
+                f"{self.directory_for(key)} is in the way of {key} and is not "
+                f"an entry this store can read: {unreadable.what}",
+                "an occupied place is not a free one, whatever is in it; move "
+                "or remove that directory deliberately, and do not let a "
+                "publish decide it on a reader's behalf",
+            ) from unreadable
         incoming = {name: _digest(body) for name, body in members.items()}
         same = incoming == dict(standing.members)
         raise ArtifactRefusal(
@@ -274,9 +317,9 @@ class ArtifactStore:
     ) -> None:
         """Build the entry beside its place, then move it there in one step."""
         destination.parent.mkdir(parents=True, exist_ok=True)
-        staging = destination.parent / f".{destination.name}.publishing"
-        shutil.rmtree(staging, ignore_errors=True)
-        staging.mkdir()
+        staging = Path(
+            tempfile.mkdtemp(dir=destination.parent, prefix=f".{destination.name}.")
+        )
         try:
             for name, body in members.items():
                 (staging / name).write_bytes(body)
@@ -291,6 +334,7 @@ class ArtifactStore:
             raise ArtifactRefusal(
                 Rule.IMMUTABLE,
                 f"{destination} could not be created: {clash}",
-                "an entry is moved into place onto a name that must not exist, "
-                "so a second publisher loses the race rather than the entry",
+                "an entry is moved into place onto a name a published entry "
+                "already occupies, so a second publisher loses the race rather "
+                "than the entry",
             ) from clash
