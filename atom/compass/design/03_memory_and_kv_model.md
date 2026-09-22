@@ -222,7 +222,10 @@ is the right thing to model and it is stated here so it is not discovered as a g
 
 An earlier note here said that under PP the `all_reduce(MIN)` across stages
 (`model_runner.py:1737-1744`) is inert, *because every stage computes the same number*,
-and that it *still needs a live process group or a stub*. Both halves are wrong.
+and that it *still needs a live process group or a stub*. Both halves are wrong — and the
+engine's own comment on that reduce has said so all along (`model_runner.py:1732-1733`):
+*"PP stages compute different block counts; block ids must be valid on every stage's KV
+tensor, so reduce to the global minimum."* The code said what this document denied.
 
 **The stages do not compute the same number.** The five readings *are* identical across
 stages — nothing in the memory model varies with pipeline rank. The layer count is not:
@@ -230,38 +233,54 @@ stages — nothing in the memory model varies with pipeline rank. The layer coun
 each stage sizes its pool from the layers it actually holds. Re-derived from ATOM's own
 partitioner at `feature/atomcompass_new` `92f1fdafe`, over the 64-layer hybrid vendored at
 `tests/compass/qwen3_5_27b_config.json` — one full-attention layer in four, so 16 of the 64
-hold paged KV — at block size 64, `max_num_seqs` 256 and a fixed 200,000,000,000-byte KV
-budget:
+hold paged KV — at block size 64, `max_num_seqs` 256, and a KV budget fixed at
+200,000,000,000 bytes. **That budget is a chosen figure, not a sizing anyone runs at**: the
+absolute counts below are illustrative, and only their movement *between* stages is
+derived.
 
-| PP | paged layers per stage | distinct block counts |
-|---|---|---|
-| 2 | 8, 8 | 1 |
-| 3 | 5, 5, 6 | **2** — 152,587 / 152,587 / 127,156 |
-| 4 | 4, 4, 4, 4 | 1 |
-| 5 | 3, 3, 3, 4, 3 | **2** |
-| 6 | 2, 3, 3, 2, 3, 3 | **2** |
-| 7 | 2, 2, 2, 3, 2, 2, 3 | **2** |
-| 8 | 2, 2, 2, 2, 2, 2, 2, 2 | 1 |
+| PP | layers held per stage | paged layers per stage | distinct block counts |
+|---|---|---|---|
+| 2 | 32, 32 | 8, 8 | 1 |
+| 3 | 21, 22, 21 | 5, 5, 6 | 2 — 152,587 / 152,587 / 127,156 |
+| 4 | 16, 16, 16, 16 | 4, 4, 4, 4 | 1 |
+| 5 | 13, 13, 13, 13, 12 | 3, 3, 3, 4, 3 | 2 |
+| 6 | 10, 11, 11, 11, 11, 10 | 2, 3, 3, 2, 3, 3 | 2 |
+| 7 | 9, 9, 9, 9, 9, 10, 9 | 2, 2, 2, 3, 2, 2, 3 | 2 |
+| 8 | 8, 8, 8, 8, 8, 8, 8, 8 | 2, 2, 2, 2, 2, 2, 2, 2 | 1 |
 
-5/5/6 is **two** distinct counts, not three — the two five-layer stages share one. The
-reduction therefore binds wherever 64 does not divide evenly, which is pp = 3, 5, 6 and 7
-among the widths above. **The block count a PP deployment gets is the minimum over
-stages**, set by whichever stage holds the most paged layers — and the table shows that is
-not in general the last one.
+5/5/6 is **two** distinct counts, not three — the two five-layer stages share one.
+
+**What the counts turn on is the *paged* layer count, not the layer count.** A block costs
+`paged_layers × block_size × bytes_per_token_per_layer`, so two stages agree exactly when
+they hold the same number of paged layers — and an even division of *layers* does not give
+one. The counterexample is inside the table: at pp = 6 stages 1 and 3 each hold 11 layers,
+yet hold **3** and **2** paged ones, and their block counts differ. Layer division and
+paged-layer division coincide at pp = 2, 4 and 8 here only because this model's
+full-attention layers fall one in four; on a stack whose paged layers are spaced otherwise
+they need not. Over the widths above the reduction binds at pp = 3, 5, 6 and 7.
+
+**The block count a PP deployment gets is the minimum over stages**, set by whichever stage
+holds the most paged layers — which is not in general the last one: at pp = 5 it is stage
+3 of 5, and at pp = 6 it is four stages of the six.
 
 **Neither a live process group nor a stub is needed.** The reduce is already guarded by
 `torch.distributed.is_initialized()` (`model_runner.py:1738`): with no group it does not
 run, and with one it runs ATOM's own code unchanged. Building a stub for it is building
 something nothing asks for.
 
-`tests/compass/test_pipeline_minimum.py` re-derives the table above from `get_pp_indices`
-rather than restating it, and fails if this section and the partitioner disagree.
+`tests/compass/test_pipeline_minimum.py` re-derives the table and the widths sentence above
+from `get_pp_indices` rather than restating them, and reads the guard by parsing the runner
+rather than importing it.
 
 ### Open issues
 
 - Under PP the guard means the stages agree on a count only when a process group is live.
-  Whether a simulated PP run has one is `01` D1's question about topology; either way
-  nothing here needs a stub.
+  **Without one they do not converge at all**: each keeps its own `plan.paged_entries`, so
+  a simulated pp = 3 run leaves stage 0 holding 152,587 blocks where the deployment it
+  models runs 127,156 on every stage — and the comment cited above says why that is not
+  harmless, since block ids must be valid on every stage's KV tensor. Whether a simulated
+  PP run has a live group is `01` D1's question about topology and is left there; the
+  divergence without one is not a question, and is recorded here.
 - `gpu_memory_utilization` here is a fraction of **total**, with the non-KV footprint
   subtracted afterwards — the vLLM convention, **not** TRT-LLM's. Comparing the resulting
   block count against a number produced under the other convention is wrong.
