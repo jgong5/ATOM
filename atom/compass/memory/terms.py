@@ -31,11 +31,24 @@ read off a model config here is a declared formula, and labelling one
 `GEOMETRY` would say it was not.
 
 `OBTAINED` is the one that was missing, and it is the word the paragraph above
-already uses for what a declared term is not: the number was read off the thing
-itself -- a meta build of the model, a recording of a card, a traced graph. It
-is the successor every `DECLARED` term names, so a term that carries it is a
-term that no longer owes one. Nothing this package *produces* is obtained; the
-recorded side of a comparison is, which is why the member arrives with one.
+already uses for what a declared term is not: **the number was read off the
+thing it describes** -- a meta build of the model, a recording of a card, a
+traced graph. That is the whole of the definition, and it is deliberately not
+"a recording": a term on either side of a comparison can carry it, and the
+predicted side does whenever a meta build or a liveness walk produced the
+number. It is the successor every `DECLARED` term names, so a term that carries
+it is a term that no longer owes one. Nothing this package produces carries it
+*today* -- every model-side term it computes is a declared formula -- which is
+a statement about what has been built, not about who may use the member.
+
+`OBTAINED` is also not `Species.MEASURED` under another name, for the same
+reason the paragraph above separates the two enums at all. `Species` answers
+*how a cost answer was obtained* and its members are the ways a cost model can
+have been fitted; `MEASURED` there means a timing came from a benchmark rather
+than from a law. `OBTAINED` here answers *where a memory term's bytes came
+from*, and a meta build is neither a benchmark nor a law -- it is arithmetic
+over the model's own tensors. The two words sit on different subjects and one
+would be the wrong answer on the other's.
 
 The two vocabularies are kept apart deliberately. A declared coefficient has no
 word in `Species` and adding one is an open owner ruling, so nothing

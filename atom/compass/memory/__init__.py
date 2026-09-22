@@ -36,6 +36,7 @@ the per-term rule was written to reject.
 """
 
 from atom.compass.memory.compare import (
+    DISCHARGES,
     NON_KV_TERM_GATE,
     Comparison,
     GraphPoolComparison,
@@ -69,6 +70,7 @@ from atom.compass.memory.readings import (
 from atom.compass.memory.terms import Basis, Reading, Term
 
 __all__ = [
+    "DISCHARGES",
     "NON_KV_TERM_GATE",
     "PREDICTS",
     "RESERVES",

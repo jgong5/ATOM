@@ -41,6 +41,7 @@ from transformers import PretrainedConfig
 import atom.compass.memory as memory_package
 from atom.compass.backends.geometry import dtype_bytes as element_bytes
 from atom.compass.memory import (
+    DISCHARGES,
     NON_KV_TERM_GATE,
     Basis,
     Comparison,
@@ -178,13 +179,18 @@ def test_the_named_result_two_instruments_on_one_breakdown(capsys):
     assert all(t.verdict is Verdict.FAIL for t in comparison.compared)
     assert len(comparison.failures()) == 3
 
-    largest = comparison.worst()
+    # The two orderings disagree on this fixture, which is why there are two
+    # accessors and both name their unit. The gate is a fraction of the
+    # recorded term, so `worst` is the unattributed one at -100%; the
+    # incident's own "25% of its term" is a statement about bytes.
+    assert comparison.worst().name == UNATTRIBUTED
+    assert comparison.worst().relative == -1.0
+    largest = comparison.largest_by_bytes()
     assert largest.name == "weights"
     assert largest.relative == pytest.approx(0.25, abs=5e-5)
     # The one the sum cannot see at all: nothing predicted it, so it is absent
     # from the prediction and from any sum over the prediction.
     assert errors[UNATTRIBUTED].predicted is None
-    assert errors[UNATTRIBUTED].relative == -1.0
 
     assert summed.delta_bytes == 181_000_000
     assert summed.relative == pytest.approx(0.13775, abs=5e-5)
@@ -192,18 +198,27 @@ def test_the_named_result_two_instruments_on_one_breakdown(capsys):
     assert summed.passed
 
 
-def test_the_sum_at_the_per_term_band_still_names_nothing():
-    """Even given the per-term 10%, the sum fails without saying which term did.
+def test_at_the_per_term_band_the_sum_is_red_and_the_table_names_all_three():
+    """The contrast, asserted as a contrast rather than as an absence.
 
-    This is the half of the argument a looser band hides: the objection to a
-    summed check is not that its band was wrong, it is that its answer has no
-    decomposition. At 10% this sum is red and a reader is no closer to the
-    +0.280 GB than they were at 25%.
+    The objection to a summed check is not that its band was wrong. Given the
+    per-term band, the sum is red and still says only that something is wrong;
+    the per-term instrument on the same breakdown at the same band names all
+    three terms and their verdicts. That pair is the evidence. An assertion
+    that the aggregate line contains no term name would be pinned by the
+    format string rather than measured, so it is a regression pin below and
+    not the argument.
     """
-    summed = compare(HISTORICAL_PREDICTED, HISTORICAL_RECORDED).summed(
-        band=NON_KV_TERM_GATE
-    )
+    comparison = compare(HISTORICAL_PREDICTED, HISTORICAL_RECORDED)
+    summed = comparison.summed(band=NON_KV_TERM_GATE)
     assert not summed.passed
+    assert summed.table().splitlines()[0].endswith("10% band -- fails")
+    assert {t.name: t.verdict for t in comparison.compared} == {
+        "weights": Verdict.FAIL,
+        "activations": Verdict.FAIL,
+        UNATTRIBUTED: Verdict.FAIL,
+    }
+    # The pin, stated as a pin: nothing folds a term name into the headline.
     aggregate = summed.table().splitlines()[0]
     for name in ("weights", "activations", UNATTRIBUTED):
         assert name not in aggregate
@@ -240,11 +255,16 @@ def test_printing_a_sum_prints_the_terms_it_folded():
     assert "+13.8%" in rendered
 
 
-def test_the_largest_error_comes_back_as_its_term_not_as_a_number():
-    largest = compare(HISTORICAL_PREDICTED, HISTORICAL_RECORDED).worst()
-    assert isinstance(largest, TermComparison)
-    assert largest.recorded.nbytes == 1_120_000_000
-    assert largest.predicted is not None
+def test_both_orderings_come_back_as_their_term_not_as_a_number():
+    comparison = compare(HISTORICAL_PREDICTED, HISTORICAL_RECORDED)
+    for largest in (comparison.worst(), comparison.largest_by_bytes()):
+        assert isinstance(largest, TermComparison)
+    by_bytes = comparison.largest_by_bytes()
+    assert by_bytes.recorded.nbytes == 1_120_000_000
+    assert by_bytes.predicted is not None
+    # Ranked in the gate's unit it is the other term, and that is the point of
+    # having two accessors rather than one word covering both.
+    assert comparison.worst().name != by_bytes.name
 
 
 def test_a_comparison_with_no_comparable_term_refuses_a_largest_error():
@@ -311,6 +331,24 @@ def test_a_config_that_does_not_state_the_tie_refuses_rather_than_assuming():
     with pytest.raises(MemoryRefusal) as refusal:
         tied_lm_head_bytes(config, dtype_bytes=2)
     assert "tie_word_embeddings" in str(refusal.value)
+
+
+def test_a_model_config_class_supplies_the_field_and_its_default_is_untied():
+    """How far the refusal above reaches, measured rather than assumed.
+
+    A model's own config class fills the field in, and this family's class
+    default is untied -- the direction that leaves the meta build over by an
+    embedding. So on a config class the correction cannot tell a checkpoint
+    that said untied from a class that defaulted to it, and it returns zero for
+    both. That is a limit of this cut, asserted here so it is a known limit
+    rather than a claim nobody checked.
+    """
+    from transformers.models.qwen3.configuration_qwen3 import Qwen3Config
+
+    defaulted = Qwen3Config()
+    assert hasattr(defaulted, "tie_word_embeddings")
+    assert defaulted.tie_word_embeddings is False
+    assert tied_lm_head_bytes(defaulted, dtype_bytes=2) == 0
 
 
 #: The 0.6B's resident weight total is not in the design record. This fixture
@@ -435,7 +473,7 @@ def test_a_term_the_run_does_not_record_refuses_and_carries_its_own_reason(
     The rule for this term is *recorded, not formula'd*: the formula that
     matched the 0.6B exactly was 4x wrong on the 27B, was tested on a second
     model, failed and did not ship. The replacement that shipped was itself 4x
-    high and now says on the term that it is derived from ATOM'"'"'s rotary source
+    high and now says on the term that it is derived from ATOM's rotary source
     and validated against no card. A comparator cannot discharge a 10% gate on
     a term with no recording, and the refusal is the result.
     """
@@ -474,8 +512,8 @@ def test_the_two_terms_that_cannot_discharge_their_gate_while_agreeing_exactly(
     carries names a second reason that a better parameter count would not
     touch: it shards every parameter, where a real stack replicates its norms.
     `activations` is a declared formula over one live layer, and the memory
-    open issue says a graph without the invisible-scratch table does not
-    discharge the 10% gate on it.
+    model's own open issue says a traced graph without the invisible-scratch
+    table does not discharge the 10% gate on it.
     """
     prediction = live_prediction(spec, qwen)
     comparison = compare(prediction, agreeing_recording(prediction))
@@ -528,7 +566,7 @@ def test_a_declared_term_can_fail_its_gate_even_though_it_cannot_pass_one():
 
 def test_a_pair_taken_at_two_shapes_refuses_and_names_both():
     # 3,494 tokens is the trace the analytic memory law scales to an
-    # 4,096-token peak. Comparing the one against the other without saying so
+    # independently measured 4,096-token peak. Comparing the one against the other without saying so
     # is the -0.015 GB of the incident.
     at_3494 = Recorded(
         run="the 3,494-token trace",
@@ -623,6 +661,165 @@ def test_a_recorded_term_that_was_not_read_off_a_card_is_rejected():
             terms=(Term("weights", 1, Basis.SPEC, "a spec field"),),
         )
     assert "Basis.OBTAINED" in str(bad.value)
+
+
+def test_the_peak_guard_holds_when_only_the_prediction_names_a_shaped_term():
+    """The guard reads the union of the two sides, not the recording's alone.
+
+    `at_shape` is the one field on a recording that defaults, so a caller who
+    answers `high_water_reset=False` and leaves it empty was buying nothing
+    from a guard that read only their side -- the activation term would have
+    been compared against the warmup prefill's peak with no refusal at all.
+    The two shape guards now read one definition.
+    """
+    recorded = Recorded(
+        run="a tracing run that did not reset the peak and names no shaped term",
+        shape=HISTORICAL_SHAPE,
+        high_water_reset=False,
+        terms=HISTORICAL_RECORDED.terms,
+    )
+    assert recorded.at_shape == frozenset()
+    comparison = compare(HISTORICAL_PREDICTED, recorded)
+    assert {r.name for r in comparison.refused} == {"activations"}
+    assert "warmup prefill" in str(comparison.refused[0])
+    assert {t.name for t in comparison.compared} == {"weights", UNATTRIBUTED}
+
+
+def test_a_peak_that_was_not_reset_with_no_shaped_term_anywhere_refuses_outright():
+    # A recording that says its peak is wrong and then declines to say which
+    # terms it is wrong for leaves the guard nothing to refuse.
+    predicted = Predicted(
+        label="a prediction that names no shaped term",
+        shape=HISTORICAL_SHAPE,
+        terms=HISTORICAL_PREDICTED.terms,
+    )
+    recorded = Recorded(
+        run="a run that reset nothing and names nothing",
+        shape=HISTORICAL_SHAPE,
+        high_water_reset=False,
+        terms=HISTORICAL_RECORDED.terms,
+    )
+    with pytest.raises(MemoryRefusal) as refusal:
+        compare(predicted, recorded)
+    assert "neither side names a term it took at a shape" in str(refusal.value)
+
+
+# --- a term the run records as zero bytes ------------------------------------
+
+
+def zero_byte_recording(*, also_predicted):
+    predicted_terms = [Term("weights", 100, Basis.OBTAINED, "a meta build")]
+    if also_predicted:
+        predicted_terms.append(Term("ghost", 5, Basis.OBTAINED, "a meta build"))
+    return (
+        Predicted(
+            label="a prediction beside a term the run measured as empty",
+            shape=HISTORICAL_SHAPE,
+            terms=tuple(predicted_terms),
+        ),
+        Recorded(
+            run="a run that found one term empty",
+            shape=HISTORICAL_SHAPE,
+            high_water_reset=True,
+            terms=footprint_terms({"ghost": 0, "weights": 100}, source="the printout"),
+        ),
+    )
+
+
+@pytest.mark.parametrize("also_predicted", [True, False])
+def test_a_term_recorded_as_zero_bytes_refuses_by_name(also_predicted):
+    """No bare `ZeroDivisionError`, on either path, and a named reason instead.
+
+    Zero is not exotic: an eager-mode run holds no rotary cache and prints
+    `buffers: 0`, and so does any term a run instruments and finds empty. The
+    gate's unit is a fraction of the recorded term, so there is no error to
+    state -- which is a refusal, not an exception.
+    """
+    predicted, recorded = zero_byte_recording(also_predicted=also_predicted)
+    comparison = compare(predicted, recorded)
+    refused = {r.name: r for r in comparison.refused}
+    assert set(refused) == {"ghost"}
+    assert "zero bytes" in str(refused["ghost"])
+    assert {t.name for t in comparison.compared} == {"weights"}
+
+
+@pytest.mark.parametrize("also_predicted", [True, False])
+def test_one_zero_byte_term_does_not_take_the_table_down(also_predicted):
+    # The decomposition is this module's product, so a term that cannot state
+    # a relative error must not destroy the rows that can.
+    predicted, recorded = zero_byte_recording(also_predicted=also_predicted)
+    rendered = compare(predicted, recorded).table()
+    assert "weights" in rendered
+    assert "ghost" in rendered
+    assert "+0.00%" in rendered
+
+
+def test_the_named_refusal_for_a_zero_recorded_term_is_still_reachable():
+    # Kept on `TermComparison` for a pair built by hand, and asserted so that
+    # it is not a dead branch that a reader has to guess about.
+    pair = TermComparison(
+        name="ghost",
+        predicted=None,
+        recorded=Term("ghost", 0, Basis.OBTAINED, "the printout"),
+        gate=NON_KV_TERM_GATE,
+        verdict=Verdict.FAIL,
+    )
+    with pytest.raises(MemoryRefusal) as refusal:
+        _ = pair.relative
+    assert "zero bytes" in str(refusal.value)
+
+
+# --- bytes are whole, and the rounding stays at the call site ----------------
+
+
+def test_a_printout_carrying_a_float_byte_count_refuses_rather_than_truncating():
+    # The machine specification this package reads writes its byte counts as
+    # floats, so a breakdown arriving with 1.1e6 in it is the expected shape.
+    with pytest.raises(TypeError) as bad:
+        footprint_terms({"load residue": 1.1e6}, source="the printout")
+    assert "bytes are whole" in str(bad.value)
+
+
+# --- which bases discharge a gate -------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "basis, expected",
+    [
+        (Basis.SPEC, Verdict.PASS),
+        (Basis.DERIVED, Verdict.PASS),
+        (Basis.OBTAINED, Verdict.PASS),
+        (Basis.DECLARED, Verdict.NOT_DISCHARGED),
+        (Basis.DEPLOYMENT, Verdict.NOT_DISCHARGED),
+    ],
+)
+def test_the_bases_that_discharge_a_gate_are_the_stated_set(basis, expected):
+    """A stated set, so adding a `Basis` member is a decision rather than a grant.
+
+    A knob the serving config states is the one that would have been let
+    through by a rule reading "not declared": a knob agreeing with a run is not
+    evidence about bytes in either direction.
+    """
+    assert DISCHARGES == frozenset({Basis.SPEC, Basis.DERIVED, Basis.OBTAINED})
+    note = "a successor" if basis is Basis.DECLARED else ""
+    predicted = Predicted(
+        label=f"a prediction whose term is {basis}",
+        shape=HISTORICAL_SHAPE,
+        terms=(Term("persistent", 100, basis, "wherever it came from", note),),
+    )
+    recorded = Recorded(
+        run="a run that agrees to the byte",
+        shape=HISTORICAL_SHAPE,
+        high_water_reset=True,
+        terms=footprint_terms({"persistent": 100}, source="the printout"),
+    )
+    assert compare(predicted, recorded).compared[0].verdict is expected
+
+
+def test_every_basis_is_either_discharging_or_named_as_not():
+    # No member may fall through unclassified, which is what would happen if a
+    # future addition met a rule phrased as "not declared".
+    assert set(Basis) - DISCHARGES == {Basis.DECLARED, Basis.DEPLOYMENT}
 
 
 # --- the graph pool: two numbers, both reported ------------------------------

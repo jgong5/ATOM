@@ -26,19 +26,41 @@ would be a comparator nobody could run against the card they are sizing for.
 
 | outcome | when |
 |---|---|
-| `Verdict.PASS` | both sides present, within the gate, and the predicted side was obtained |
+| `Verdict.PASS` | both sides present, within the gate, and the predicted side carries a basis that can discharge one -- see below |
 | `Verdict.FAIL` | both sides present and outside the gate -- **including** when the predicted side is a declared coefficient, because a recording that contradicts a coefficient is evidence |
-| `Verdict.NOT_DISCHARGED` | both sides present and within the gate, but the predicted side is a declared coefficient. Agreement with one run does not turn a coefficient into a measurement, so the error is reported and the gate is not called discharged |
-| a `TermRefusal` | the two sides cannot be compared at all: the run records no such term, the shapes disagree, or the recorded peak is the warmup prefill's |
+| `Verdict.NOT_DISCHARGED` | both sides present and within the gate, but the predicted side carries a basis that cannot discharge one. The error is reported and the gate is not called discharged |
+| a `TermRefusal` | the two sides cannot be compared at all: the run records no such term, the run records it as zero bytes, the shapes disagree, or the recorded peak is the warmup prefill's |
 
-The asymmetry in the middle two rows is deliberate and it is the whole of
-rule applied to a gate: a declared term can **fail** its gate but cannot
-**pass** it. The memory model says so for two of the three terms it owes --
-weights are exact via a meta build and buffers are recorded, not formula'd --
-and its open issue says so for the third: a graph without the scratch table
-does not discharge the 10% gate on this term.
+**Which bases discharge a gate.** It is a stated list, not the single word
+"obtained", because the bases divide three ways and only one of the three is
+about a number having been read off the thing it describes.
 
-## The three traps this module refuses rather than papers over
+- `Basis.SPEC` **discharges.** A machine specification's runtime constants are
+  filled by probe runs on a card, so a spec number is a measurement taken
+  elsewhere rather than a coefficient somebody wrote down, and holding it
+  against this run is a real check. What a pass does *not* say is that a law
+  was validated: two of the constants this package reads -- the driver and
+  collective reserve, and the load residue -- are width tables exactly because
+  no closed form fits them, so a pass means the table's entry for this width
+  agrees with this run and means nothing at any other width.
+- `Basis.DERIVED` **discharges**, being arithmetic over readings that are
+  themselves one of these.
+- `Basis.OBTAINED` **discharges**: the number was read off the thing itself.
+- `Basis.DECLARED` **does not.** It is a coefficient with a named successor,
+  and agreement with one run does not turn a coefficient into a measurement.
+- `Basis.DEPLOYMENT` **does not.** It is a knob the serving config states, and
+  a knob agreeing with a run is not evidence about bytes in either direction.
+  No footprint term carries it today; the only one in this package labels the
+  eager-mode branch of the graph-pool estimator, which is not a footprint term.
+
+The asymmetry between the second and third rows is deliberate: a declared term
+can **fail** its gate but cannot **pass** it. The memory model is written that
+way for two of the three terms it owes -- weights are exact from a meta build,
+and buffers are recorded rather than computed -- and for the third it is stated
+outright, that a traced graph without the invisible-scratch table does not
+discharge the 10% gate on the activation term.
+
+## The traps this module refuses rather than papers over
 
 - **Shape.** Both sides state the shape they were taken at and a term taken at
   a shape refuses against a side taken at another. The -0.015 GB above is an
@@ -53,6 +75,11 @@ does not discharge the 10% gate on this term.
   names it and, when the predicted side is declared, carries that term's own
   note -- which for buffers is the reason for recording them rather than
   computing them.
+- **A term the run records as zero bytes.** An error relative to zero has no
+  value, and the gate's unit is relative. So it refuses in the comparison
+  rather than dividing, which also keeps it out of the renderer: one term that
+  cannot state a relative error must not take the table down for the terms that
+  can, in the module whose product *is* the table.
 
 ## The graph pool is two numbers and stays two
 
@@ -76,6 +103,11 @@ from atom.compass.memory.terms import Basis, Reading, Term
 #: The memory model's acceptance gate on a non-KV term, individually.
 NON_KV_TERM_GATE = 0.10
 
+#: The bases that can discharge a gate. Stated as a set rather than as "not
+#: DECLARED" so that adding a member to `Basis` is a decision about this list
+#: rather than a silent grant. See the module docstring for why each is here.
+DISCHARGES = frozenset({Basis.SPEC, Basis.DERIVED, Basis.OBTAINED})
+
 
 class Verdict(enum.Enum):
     """What a comparison of one term concluded. See the module docstring."""
@@ -94,7 +126,23 @@ class Shape:
 
     Two sides that disagree here are measuring different things, and the
     -0.015 GB of the incident this module exists for is what that looks like
-    so. Equality is the whole point of the type.
+    when nobody says so. Equality is the whole point of the type.
+
+    **What it deliberately does not carry, so that the absence is a decision
+    rather than a hole.** There is no batch dimension: the footprint terms this
+    package predicts are linear in tokens and none of them is a function of how
+    those tokens are split across sequences, so a batch field would be a
+    distinction nothing here can act on. The consequence is real and worth
+    stating -- two decode breakdowns at 256 tokens compare equal whatever the
+    batch, so a term that *does* move with batch would be compared across two
+    of them without a refusal. The first such term is where the field gets
+    added, and adding it is a new field rather than a change of shape.
+
+    `phase` is a free string rather than an enumeration for the same reason in
+    the other direction: this package has no list of phases to close over, and
+    an enumeration invented here would refuse a phase a caller has and this
+    module has not heard of. Equality is exact, so two spellings of one phase
+    refuse each other, which is the safe direction.
     """
 
     tokens: int
@@ -303,15 +351,36 @@ class Comparison:
     def not_discharged(self) -> tuple[TermComparison, ...]:
         return tuple(t for t in self.compared if t.verdict is Verdict.NOT_DISCHARGED)
 
-    def worst(self) -> TermComparison:
-        """The largest single term error, as the term rather than as a number."""
+    def _largest(self, key) -> TermComparison:
         if not self.compared:
             raise MemoryRefusal(
                 f"{self.run} and {self.label} share no comparable term, so "
                 "there is no largest error",
                 "check the refusals: every term of this comparison is in them",
             )
-        return max(self.compared, key=lambda t: abs(t.delta_bytes))
+        return max(self.compared, key=key)
+
+    def worst(self) -> TermComparison:
+        """The term furthest outside its gate, ranked in the gate's own unit.
+
+        The gate is a fraction of the recorded term, so that is what "worst"
+        is ranked by. The two orderings genuinely disagree -- a term the run
+        records and nothing predicted is 100% of itself and is usually not the
+        largest number of bytes -- and handing a reader the second-worst term
+        by the unit they are being held to is the wrong end of the finding.
+        `largest_by_bytes` is the other ordering, named for what it is.
+        """
+        return self._largest(lambda t: abs(t.relative))
+
+    def largest_by_bytes(self) -> TermComparison:
+        """The term whose error is the most bytes, which is not the same term.
+
+        This is the ordering the historical incident is stated in: the largest
+        single error was 25% of its term. That is a claim about bytes, and it
+        is history rather than a contract, so it is a separate accessor with
+        the unit in its name.
+        """
+        return self._largest(lambda t: abs(t.delta_bytes))
 
     def table(self) -> str:
         """The per-term table, then every refusal by name. Never a total."""
@@ -452,14 +521,34 @@ def _refuse_unrecorded(name: str, run: str, term: Term) -> TermRefusal:
     )
 
 
+def _refuse_zero(name: str, run: str) -> TermRefusal:
+    return TermRefusal(
+        name,
+        f"run {run} records {name!r} as zero bytes, and the gate this term "
+        "carries is a fraction of the recorded term, so there is no error to "
+        "state",
+        "compare this term in bytes, or record the run that allocated it. It "
+        "refuses here rather than in the renderer, so that one term with no "
+        "relative error does not take the table down for the terms that have "
+        "one",
+    )
+
+
 def _verdict(predicted: Term, relative: float, gate: float) -> tuple[Verdict, str]:
     if abs(relative) > gate:
         return Verdict.FAIL, ""
-    if predicted.basis is not Basis.DECLARED:
+    if predicted.basis in DISCHARGES:
         return Verdict.PASS, ""
+    if predicted.basis is Basis.DECLARED:
+        return Verdict.NOT_DISCHARGED, (
+            f"within the gate, and the gate is not discharged: the predicted "
+            f"side is a declared coefficient over {predicted.source}. "
+            f"{predicted.note}"
+        )
     return Verdict.NOT_DISCHARGED, (
         f"within the gate, and the gate is not discharged: the predicted side "
-        f"is a declared coefficient over {predicted.source}. {predicted.note}"
+        f"is {predicted.basis}, over {predicted.source}, and a knob the serving "
+        "config states agreeing with a run is not evidence about bytes"
     )
 
 
@@ -501,6 +590,17 @@ def compare(
             "comparison that cannot say which terms move with the shape cannot "
             "say whether the two sides measured the same thing",
         )
+    if not recorded.high_water_reset and not at_shape:
+        raise MemoryRefusal(
+            f"run {recorded.run} says its peak was not reset around the step "
+            "this breakdown is about, and neither side names a term it took "
+            "at a shape",
+            "state `at_shape` on the side whose terms carry a peak. A "
+            "recording that says the peak is wrong and then declines to say "
+            "which terms it is wrong for leaves nothing for the guard to "
+            "refuse, which is how a term gets compared against the warmup "
+            "prefill's peak without anybody noticing",
+        )
     shapes_agree = predicted.shape == recorded.shape
     predicted_terms = predicted.by_name()
     recorded_terms = recorded.by_name()
@@ -510,11 +610,18 @@ def compare(
         if name not in recorded_terms:
             refused.append(_refuse_unrecorded(name, recorded.run, term))
     for name, recording in recorded_terms.items():
-        if name in recorded.at_shape and not recorded.high_water_reset:
+        # Both shape guards read the same union, so the two agree on what
+        # "moves with the shape" means. Reading only the recording's own set
+        # here made this guard silent whenever the recording named none, which
+        # is the field's default.
+        if name in at_shape and not recorded.high_water_reset:
             refused.append(_refuse_high_water(name, recorded.run))
             continue
         if name in at_shape and not shapes_agree:
             refused.append(_refuse_shape(name, predicted.shape, recorded.shape))
+            continue
+        if recording.nbytes == 0:
+            refused.append(_refuse_zero(name, recorded.run))
             continue
         term = predicted_terms.get(name)
         if term is None:
@@ -672,12 +779,17 @@ def tied_lm_head_bytes(config, *, dtype_bytes: int) -> int:
     one embedding of bytes that is never resident is counted. It was worth
     **0.290 GiB on the 0.6B** and was once the whole of a gap.
 
-    A config that does not state `tie_word_embeddings` refuses rather than
-    assuming one way or the other, which is what a formula reading an absent
-    `partial_rotary_factor` did to the buffers term. The absence is observable
-    rather than hypothetical: a `PretrainedConfig` built without the field
-    raises on the attribute instead of answering, and the test asserts that
-    before it asserts the refusal.
+    **What the refusal below reaches, stated because it is narrower than it
+    looks.** It fires when the attribute is *absent*, and nothing more. A bare
+    `PretrainedConfig` that was never given the field does raise on the
+    attribute, so the refusal is real and the test drives it. But a model's own
+    config class supplies the field, and for at least one family the design
+    cites the class default is `False` -- untied, which is the direction that
+    costs an embedding. So on a config class this function cannot tell a
+    checkpoint that said untied from a class that defaulted to it, and it will
+    return zero for both. Telling those apart needs the raw config mapping,
+    which this function is not given; until it is, an absent key in a
+    `config.json` is a case this correction does not cover.
     """
     text = getattr(config, "text_config", config)
     tied = getattr(text, "tie_word_embeddings", None)
@@ -717,8 +829,16 @@ def footprint_terms(mapping: Mapping[str, int], *, source: str) -> tuple[Term, .
     breakdown is names and byte counts -- and it does the one thing that must
     not be got wrong, which is to label every one of them `Basis.OBTAINED` and
     to make each name its run.
+
+    **It converts nothing.** `Term` rejects a non-integer byte count and says
+    why -- round at the call site, so the rounding is visible where it happens
+    -- and a helper that called `int()` here would put the rounding in the one
+    place a reader is not looking, in the function whose input is a hardware
+    run's printout. That input is exactly where it bites: the machine
+    specification this package already reads writes its own byte counts as
+    floats, so a breakdown arriving with `1.1e6` in it is the expected shape
+    rather than a contrived one, and truncating it would be silent.
     """
     return tuple(
-        Term(name, int(nbytes), Basis.OBTAINED, source)
-        for name, nbytes in mapping.items()
+        Term(name, nbytes, Basis.OBTAINED, source) for name, nbytes in mapping.items()
     )
