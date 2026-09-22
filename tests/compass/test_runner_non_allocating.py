@@ -183,9 +183,16 @@ def _method_def(node, name):
 
 
 def _self_assigned(node):
-    """The `self.x = ...` names anywhere in *node*, against their value's source."""
+    """Every `self.x = ...` in *node*, as (name, the source of its value).
+
+    Pairs, not a mapping keyed by name. A name can be assigned more than once --
+    `forward_vars` is bound to the dict of buffers and later rebound to a slot
+    of the ring it already holds -- and `ast.walk` does not visit in source
+    order, so one value per name keeps an arbitrary one of them. Keeping the
+    pairs is what lets a name count as a holder when *any* of its bindings is.
+    """
     return {
-        t.attr: ast.unparse(n.value)
+        (t.attr, ast.unparse(n.value))
         for n in ast.walk(node)
         if isinstance(n, ast.Assign)
         for t in n.targets
@@ -199,14 +206,23 @@ def test_the_docstring_names_every_attribute_that_holds_the_ring():
     """Construction leaves the base's forward-vars ring resident, and named
     attributes of the runner hold it -- which the docstring denied until it was
     corrected, with nothing asserting either way. Both holders are the base's,
-    so a rename or a third one upstream stops the sentence being true; this
-    fails then, rather than the prose drifting again.
+    so a rename, or a third one bound anywhere in the class, stops the sentence
+    being true; this fails then, rather than the prose drifting again.
+
+    The whole `ModelRunner` body is read, not the two methods that build the
+    ring, because a holder bound in `__init__` is just as much a holder and an
+    earlier draft of this test could not see one. Over 94 `self.x = ...` in that
+    class the answer is the same two, which is the fact the docstring states.
+
+    Two nearby bindings are deliberately not in it. `self.forward_vars` is
+    assigned twice: `_advance_forward_vars` rebinds the name to a slot of the
+    ring it already holds, which is a rotation and not a fourth holder. And
+    `self.tokenID_processor.input_ids` is a fourth *name* reaching a ring
+    buffer, one attribute deeper -- true, and outside a claim about attributes
+    on the runner.
     """
-    base = _classes(ATOM_RUNNER)["ModelRunner"]
-    assigned = _self_assigned(_method_def(base, "allocate_forward_vars")) | (
-        _self_assigned(_method_def(base, "_init_forward_vars_ring"))
-    )
-    holders = {n for n, v in assigned.items() if any(t in v for t in BUFFER_TERMS)}
+    assigned = _self_assigned(_classes(ATOM_RUNNER)["ModelRunner"])
+    holders = {n for n, v in assigned if any(t in v for t in BUFFER_TERMS)}
     assert holders == {"forward_vars", "_fv_ring"}
     runner = _classes(PACKAGE / "model_runner.py")["CompassModelRunner"]
     assert all(f"`{name}`" in ast.get_docstring(runner) for name in holders)
@@ -239,11 +255,13 @@ def test_the_overrides_bind_no_attribute_that_could_hold_a_tensor():
     """The half of the claim that is this package's own: it adds none.
 
     `model` registers no parameter and no buffer, and `_token_stream` is the
-    deferral bookkeeping. Anything else appearing here is a tensor this class
-    put on a device, which is the thing it exists not to do.
+    deferral bookkeeping `forward` builds on first use. Anything else appearing
+    here is a tensor this class put on a device, which is the thing it exists
+    not to do. The class docstring names the same two, so neither list can be
+    trimmed to the other's shape without this failing.
     """
     overrides = _classes(PACKAGE / "overrides.py")["NonAllocatingRunner"]
-    assert set(_self_assigned(overrides)) == {"model", "_token_stream"}
+    assert {n for n, _ in _self_assigned(overrides)} == {"model", "_token_stream"}
 
 
 # --- warmup drives a forward, which is why it is skipped ---------------------

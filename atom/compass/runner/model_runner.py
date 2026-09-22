@@ -36,7 +36,9 @@ class CompassModelRunner(NonAllocatingRunner, ModelRunner):
     process: `forward_vars`, the dict `allocate_forward_vars` builds, and
     `_fv_ring`, the list of per-slot dicts built from it. Both are the base's.
     What this class adds is no tensor at all: `model`, a module registering no
-    parameter and no buffer, and `config.num_kvcache_blocks`.
+    parameter and no buffer, and `_token_stream`, the deferral bookkeeping
+    `forward` builds on first use. It also sets `config.num_kvcache_blocks`,
+    which is a count and not a buffer.
 
     `NonAllocatingRunner` comes first so its methods win over the base's. There
     is deliberately no `__init__`: the base runs all of its own before a
@@ -58,10 +60,13 @@ if _UNANSWERED:
     # partitions them instead of asserting one story for all twelve. A waited
     # name parks its caller on an unbounded queue read for the life of the
     # process. An unwaited one parks nobody: `busy_loop` skips it and carries
-    # on -- which for `exit` means the runner's own shutdown never runs, while
-    # the loop still breaks, since it breaks on the dispatched name and not on
-    # the reply; and for `process_kvconnector_output` means a KV load is
-    # silently never started. Both are real failures; neither is a park.
+    # on -- which for `exit` means `ModelRunner.exit` never runs, so the
+    # distributed environment is never destroyed and the graphs and the five KV
+    # tensors it deletes stay held, while the loop still breaks, since the
+    # break is a sibling of the per-runner loop and tests the dispatched name
+    # rather than any reply; and for `process_kvconnector_output` means a KV
+    # load is silently never started. Both are real failures; neither is a
+    # park.
     #
     # Two things about this raise itself. No CPU test tier can execute it:
     # importing this module imports `ModelRunner`, which runs aiter's
