@@ -55,9 +55,16 @@ runner must answer all of: `get_num_blocks`, `allocate_kv_cache`, `capture_cudag
 `async_proc_aggregation`, `start_profiler`, `stop_profiler`, `flush_pp_send`.
 
 **Return contracts are load-bearing across a process boundary.** `engine_core` calls
-`capture_cudagraph` with `wait_out=True` and unpacks three values; a stub that returned
-`None` killed the worker on an unpacking error while the parent waited forever. **Across
-a process boundary a breached contract becomes a hang, not a traceback.**
+`capture_cudagraph` with `wait_out=True` and unpacks three values — in the parent, at
+`engine_core.py:149`, not in the worker. The two ways that contract breaks do not fail
+alike. A reply of the wrong **shape** arrives and raises where it is unpacked,
+in-process and with a traceback. A reply that never **arrives** queues nothing: a name
+the runner does not define is skipped by `busy_loop`, a method that answers `None` is
+called and its result declined, and `call_func`'s `outputs_queue.get()` takes no
+timeout either way. That silence parks somebody only where somebody is waiting: ten of
+the twelve names above have a caller that waits for the reply, and `exit` and
+`process_kvconnector_output` do not. `atom/compass/runner/overrides.py` carries the
+third case — a method that raises — and the table of which names wait.
 
 ### Three semantics `forward()` must reproduce
 
