@@ -32,7 +32,7 @@ breakdown a hardware run printed -- as input data; nothing here runs a model --
 and returns a per-term table with no total in it. The aggregate exists only as
 a `SummedCheck`, which cannot be built without the comparison it summarises,
 because the instrument that reads one figure over a decomposition is the one
-`03` D16 was written to reject.
+the per-term rule was written to reject.
 """
 
 from atom.compass.memory.compare import (

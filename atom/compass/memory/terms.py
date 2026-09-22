@@ -38,7 +38,7 @@ term that no longer owes one. Nothing this package *produces* is obtained; the
 recorded side of a comparison is, which is why the member arrives with one.
 
 The two vocabularies are kept apart deliberately. A declared coefficient has no
-word in `Species` and adding one is an open owner ruling (**#87**), so nothing
+word in `Species` and adding one is an open owner ruling, so nothing
 here touches that enum; `Basis.DECLARED` carries the distinction on this side of
 the boundary, and it is the one place a ruling would land.
 

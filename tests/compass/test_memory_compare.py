@@ -1,41 +1,44 @@
 # SPDX-License-Identifier: MIT
 """Two instruments on one breakdown: the per-term gate, and the sum that hid it.
 
-`03` D16 records an incident rather than a rule and then draws the rule from
-it. A summed non-KV memory check read **+13.8%** and was three errors, two of
-which cancelled: weights over by **+0.280 GB**, activations compared at the
-wrong shape (**-0.015 GB**), and **-0.084 GB** of a resident term nobody had
-noticed existed. **The largest single error was 25% of its own term.**
+The memory model records an incident rather than a rule and then draws the
+rule from it. A summed non-KV memory check read **+13.8%** and was three
+errors, two of which cancelled: weights over by **+0.280 GB**, activations
+compared at the wrong shape (**-0.015 GB**), and **-0.084 GB** of a resident
+term nobody had noticed existed. **The largest single error was 25% of its own term.**
 
 `HISTORICAL` below is that breakdown, and the named result of this task is the
 two instruments run on it side by side -- the per-term comparator naming three
 failures, and the summed check reading +13.8% and passing.
 
-**How the fixture's totals were reconstructed, since D16 records deltas and
-ratios rather than totals.** Three deltas are given (+0.280, -0.015, -0.084 GB),
-and two ratios: the largest error is 25% of its term, and the sum is +13.8%.
-The largest error by bytes is the weights one, so the recorded weights follow
-exactly: `0.280 / 0.25 = 1.120 GB`. The sum of the three deltas is +0.181 GB, so
-the recorded terms sum to `0.181 / 0.138`, and the rounding of 13.8% pins that
-sum to `(1.30686, 1.31636]` GB -- leaving the recorded activations in
-`(0.10286, 0.11236]` GB. The fixture takes **0.110 GB**, the only figure here
-that the record does not determine, and the resulting sum is +13.77%, which is
-the +13.8% D16 states. Nothing else in the fixture is chosen.
+**How the fixture's totals were reconstructed, since the record carries deltas
+and ratios rather than totals.** Three deltas are given (+0.280, -0.015,
+-0.084 GB), and two ratios: the largest error is 25% of its term, and the sum
+is +13.8%. The largest error by bytes is the weights one, so the recorded
+weights follow exactly: `0.280 / 0.25 = 1.120 GB`. The three deltas sum to
++0.181 GB, so the recorded terms sum to `0.181 / 0.138`, and the rounding of
+13.8% pins that sum to `(1.30686, 1.31636]` GB -- leaving the recorded
+activations in `(0.10286, 0.11236]` GB. The fixture takes **0.110 GB**, the
+only figure the record does not determine, and the resulting sum is +13.77%,
+which is the +13.8% the record states. Nothing else in the fixture is chosen.
 
 Every test in this file runs with both device readings patched to raise, for the
-same reason MEM-1's do: a comparator that needed a card would be useless for
-sizing a card nobody has. The import-graph check that settles it for every
-branch at once lives in `test_memory_readings.py` and globs the package, so
-`compare.py` is inside it already.
+same reason the readings tests do: a comparator that needed a card would be
+useless for sizing a card nobody has. The import-graph check that settles it
+for every branch at once lives in `test_memory_readings.py` and globs the
+package, so `compare.py` is inside it already.
 """
 
 import copy
 import json
+import pathlib
+import re
 
 import pytest
 import torch
 from transformers import PretrainedConfig
 
+import atom.compass.memory as memory_package
 from atom.compass.backends.geometry import dtype_bytes as element_bytes
 from atom.compass.memory import (
     NON_KV_TERM_GATE,
@@ -109,13 +112,13 @@ HISTORICAL_SHAPE = Shape(tokens=4096, phase="prefill")
 #: The terms taken at that shape. Stated, never inferred from a name.
 AT_SHAPE = frozenset({"activations"})
 
-#: D16 does not name the third term. It is named here for the two things the
-#: record does say about it: it is resident, and the model that missed it
+#: The record does not name the third term. It is named here for the two things
+#: it does say about it: it is resident, and the model that missed it
 #: attributed nothing to it.
 UNATTRIBUTED = "resident (unattributed)"
 
 HISTORICAL_RECORDED = Recorded(
-    run="03 D16, the summed non-KV check that read +13.8%",
+    run="the summed non-KV check that read +13.8%",
     shape=HISTORICAL_SHAPE,
     high_water_reset=True,
     terms=footprint_terms(
@@ -158,10 +161,10 @@ def test_the_named_result_two_instruments_on_one_breakdown(capsys):
     one breakdown and the disagreement is the finding.
     """
     comparison = compare(HISTORICAL_PREDICTED, HISTORICAL_RECORDED)
-    # 10 D67.1 states no band for a sum. Every band this project does state --
-    # D16's 10% and D67.1's 25% -- is per term, and taking one of them for a
-    # sum is the substitution the incident is made of. 25% is the loosest, so
-    # it is the one that flatters the sum most.
+    # This project states no band for a sum. Every band it does state -- the
+    # 10% a non-KV term carries, and the 25% the unmeasured-device tier allows
+    # one -- is per term, and taking one of them for a sum is the substitution
+    # the incident is made of. 25% is the loosest, so it flatters the sum most.
     summed = comparison.summed(band=0.25)
     with capsys.disabled():
         print()
@@ -190,7 +193,7 @@ def test_the_named_result_two_instruments_on_one_breakdown(capsys):
 
 
 def test_the_sum_at_the_per_term_band_still_names_nothing():
-    """Even given D16's own 10%, the sum fails without saying which term did.
+    """Even given the per-term 10%, the sum fails without saying which term did.
 
     This is the half of the argument a looser band hides: the objection to a
     summed check is not that its band was wrong, it is that its answer has no
@@ -207,7 +210,7 @@ def test_the_sum_at_the_per_term_band_still_names_nothing():
 
 
 def test_the_two_compensating_errors_are_what_the_sum_folds():
-    """+0.280 and -0.099 GB of error make a sum of +0.181 GB, and D16's point."""
+    """+0.280 and -0.099 GB of error make a sum of +0.181 GB, which is the point."""
     comparison = compare(HISTORICAL_PREDICTED, HISTORICAL_RECORDED)
     over = sum(t.delta_bytes for t in comparison.compared if t.delta_bytes > 0)
     under = sum(t.delta_bytes for t in comparison.compared if t.delta_bytes < 0)
@@ -216,7 +219,7 @@ def test_the_two_compensating_errors_are_what_the_sum_folds():
     assert over + under == comparison.summed(band=0.25).delta_bytes
 
 
-# --- principle 7, structurally -----------------------------------------------
+# --- an aggregate never without its decomposition ---------------------------
 
 
 def test_a_comparison_has_no_total_and_a_sum_cannot_be_built_without_one():
@@ -287,7 +290,7 @@ def test_the_tied_head_is_one_embedding_and_the_design_records_its_size():
     nbytes = tied_lm_head_bytes(config, dtype_bytes=element_bytes(config.dtype))
     assert nbytes == 151_936 * 1_024 * 2
     assert nbytes == 311_164_928
-    # 03 D16: "worth one embedding, 0.290 GiB on the 0.6B".
+    # The record: "worth one embedding, 0.290 GiB on the 0.6B".
     assert round(nbytes / (1 << 30), 3) == 0.290
 
 
@@ -405,12 +408,12 @@ def agreeing_recording(prediction, *, drop=("buffers",)):
     the byte, whether a term's gate is discharged turns on nothing but where
     the predicted number came from.
 
-    `buffers` is dropped because `03` D16's split at source is three
+    `buffers` is dropped because the split at source is three
     non-subtractive readings -- `parameter_bytes`, `weights_torch`,
     `current_torch` -- and none of them is buffers. Buffers are not parameters,
     so they fall inside `weights_torch - parameter_bytes` together with every
     other resident non-parameter allocation; isolating them needs the recording
-    D16 asks for, which is a separate instrument.
+    the memory model asks for, which is a separate instrument.
     """
     return Recorded(
         run="fixture: every recorded term set to the predicted byte count",
@@ -427,14 +430,14 @@ def agreeing_recording(prediction, *, drop=("buffers",)):
 def test_a_term_the_run_does_not_record_refuses_and_carries_its_own_reason(
     spec, qwen, capsys
 ):
-    """`buffers` refuses by name, and the refusal quotes `03` D16's reason.
+    """`buffers` refuses by name, and the refusal quotes the reason.
 
-    D16's rule for this term is *recorded, not formula'd*: the formula that
+    The rule for this term is *recorded, not formula'd*: the formula that
     matched the 0.6B exactly was 4x wrong on the 27B, was tested on a second
-    model, failed and did not ship. MEM-1's replacement was itself 4x high and
-    now says on the term that it is derived from ATOM's rotary source and
-    validated against no card. A comparator cannot discharge a 10% gate on a
-    term with no recording, and the refusal is the result.
+    model, failed and did not ship. The replacement that shipped was itself 4x
+    high and now says on the term that it is derived from ATOM'"'"'s rotary source
+    and validated against no card. A comparator cannot discharge a 10% gate on
+    a term with no recording, and the refusal is the result.
     """
     prediction = live_prediction(spec, qwen)
     comparison = compare(prediction, agreeing_recording(prediction))
@@ -470,7 +473,7 @@ def test_the_two_terms_that_cannot_discharge_their_gate_while_agreeing_exactly(
     `weights` is a declared coefficient over a **round 27e9**, and the note it
     carries names a second reason that a better parameter count would not
     touch: it shards every parameter, where a real stack replicates its norms.
-    `activations` is a declared formula over one live layer, and `03` D16's own
+    `activations` is a declared formula over one live layer, and the memory
     open issue says a graph without the invisible-scratch table does not
     discharge the 10% gate on it.
     """
@@ -502,7 +505,7 @@ def test_a_declared_term_can_fail_its_gate_even_though_it_cannot_pass_one():
         200_000_000,
         Basis.DECLARED,
         "a coefficient over one live layer",
-        "the liveness walk of 04 D22",
+        "a liveness walk over a traced op graph",
     )
     predicted = Predicted(
         label="a declared activation term",
@@ -524,7 +527,7 @@ def test_a_declared_term_can_fail_its_gate_even_though_it_cannot_pass_one():
 
 
 def test_a_pair_taken_at_two_shapes_refuses_and_names_both():
-    # 3,494 tokens is the trace that 10 D67 scales to an independently measured
+    # 3,494 tokens is the trace the analytic memory law scales to an
     # 4,096-token peak. Comparing the one against the other without saying so
     # is the -0.015 GB of the incident.
     at_3494 = Recorded(
@@ -624,7 +627,7 @@ def test_a_recorded_term_that_was_not_read_off_a_card_is_rejected():
 
 # --- the graph pool: two numbers, both reported ------------------------------
 
-#: The measured pool of `03` D15, at this ladder: 91.1 MiB + 0.3033 MiB per
+#: The measured pool at this ladder: 91.1 MiB + 0.3033 MiB per
 #: captured token at width 1, and flat 104 MiB above it. This is the recording
 #: the two functions are compared against; the spec's own fields are the
 #: authored, rounded form of the same line, which is why `predicts()` lands on
@@ -640,8 +643,8 @@ def recorded_pool(nbytes, where):
 @pytest.mark.parametrize(
     "tp_width, pool, where",
     [
-        (1, RECORDED_POOL_W1, "03 D15: 91.1 MiB + 0.3033 MiB x 1023 captured tokens"),
-        (2, RECORDED_POOL_W_GT1, "03 D15: flat 104 MiB above width 1"),
+        (1, RECORDED_POOL_W1, "the measured line: 91.1 MiB + 0.3033 MiB x 1023 tokens"),
+        (2, RECORDED_POOL_W_GT1, "the measured line: flat 104 MiB above width 1"),
     ],
 )
 def test_both_graph_pool_numbers_are_reported_against_the_recorded_pool(
@@ -649,7 +652,7 @@ def test_both_graph_pool_numbers_are_reported_against_the_recorded_pool(
 ):
     """Neither function is picked, and the one that reserves is labelled.
 
-    `03` D16 keeps the two apart because they disagree by 4-19x. A comparator
+    The memory model keeps the two apart because they disagree by 4-19x. A
     that reported one of them would have reconciled what the design says to
     keep apart, so this one has a row for each and no accessor for *the* error.
     """
@@ -682,7 +685,8 @@ def test_the_recorded_band_is_the_four_to_nineteen_times_the_design_records(spec
     for tp_width in (1, 2):
         comparison = compare_graph_pool(
             recorded_pool(
-                RECORDED_POOL_W1 if tp_width == 1 else RECORDED_POOL_W_GT1, "03 D15"
+                RECORDED_POOL_W1 if tp_width == 1 else RECORDED_POOL_W_GT1,
+                "the measured line",
             ),
             reserves=reserved(qwen, total_bytes),
             predicts=predicts(spec, tp_width=tp_width, captured_tokens=captured),
@@ -700,7 +704,7 @@ def test_the_two_graph_pool_readings_cannot_be_handed_in_the_wrong_way_round(
     predicting = predicts(spec, tp_width=1, captured_tokens=sum(ladder()))
     with pytest.raises(MemoryRefusal) as refusal:
         compare_graph_pool(
-            recorded_pool(RECORDED_POOL_W1, "03 D15"),
+            recorded_pool(RECORDED_POOL_W1, "the measured line"),
             reserves=predicting,
             predicts=reserving,
         )
@@ -756,3 +760,59 @@ def test_the_footprint_is_peak_torch_and_non_torch_and_nothing_else(spec, qwen):
     assert "capacity" not in {t.name for t in prediction.terms}
     assert "per-token x captured tokens" not in {t.name for t in prediction.terms}
     assert readings.spec_digest in prediction.label
+
+
+# --- the package says what the code does, and cites nothing ------------------
+
+#: Built from parts so that this pattern does not match its own source, which
+#: lets the guard below read the file it is written in if it is ever widened.
+_TAGS = re.compile(
+    r"\b[DTW]\d+(\.\d+)?\b|principles? \d+|Gate \d+|`\d{2}`|\bMEM-\d+\b|#\d+"
+)
+
+#: The package as the suite imported it, never a walk up from this file: if
+#: `atom` resolves from another root, a path-derived location would scan one
+#: tree while every other test here imports another, and pass.
+PACKAGE = pathlib.Path(memory_package.__file__).parent
+
+
+@pytest.mark.parametrize(
+    "module", sorted(p.name for p in pathlib.Path(PACKAGE).glob("*.py"))
+)
+def test_no_module_in_the_package_carries_a_design_reference(module):
+    """Say what the code does. Nothing here points at a document by number.
+
+    The rule is mechanical and it reaches runtime data, which is the half that
+    matters most here: two refusal strings and every `why` this module renders
+    are emitted output, and a tag in one of them is a citation in whatever
+    record that output lands in.
+
+    This is parametrised over a glob rather than a list, so it covers a module
+    added after it was written -- the same shape as the device-free guard in
+    `test_memory_readings.py`, and for the same reason.
+    """
+    found = _TAGS.findall((PACKAGE / module).read_text())
+    assert not found, f"{module} carries {len(found)} design references"
+
+
+def test_the_guard_catches_the_forms_that_were_actually_removed():
+    """A guard nobody drove is a guard nobody knows the reach of.
+
+    Each string below was in this package before this cut swept it, and each
+    is a form the rule names. Driving them is how the guard is shown to hold
+    in the direction that matters -- it would be worth nothing if it only ever
+    saw text that was already clean.
+    """
+    removed = [
+        "03 D16 records buffers rather than computing them",
+        "a meta build deduped by storage (02 D10.1) replaces this",
+        "the liveness walk of 04 D22 plus the invisible-scratch constants of 04 T4",
+        "above width 1 (03 D15)",
+        "a number without one is a defect (principle 8)",
+        "an open owner ruling (**#87**)",
+        "proving it is MEM-2's",
+        "`16` row W2.2",
+    ]
+    for text in removed:
+        assert _TAGS.search(text), text
+    assert not _TAGS.search("buffers are recorded rather than computed")

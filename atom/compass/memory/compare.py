@@ -3,8 +3,8 @@
 
 """A predicted non-KV footprint held to its gate one term at a time.
 
-`03` D16's rule is **validate per term, never as a sum**, and the incident
-behind it is the reason this module has no call that returns a total. A summed
+The rule this module implements is **validate per term, never as a sum**, and
+the incident behind it is why it has no call that returns a total. A summed
 non-KV check once read **+13.8%** while holding three errors, two of which
 cancelled: weights over by **+0.280 GB** (a tied `lm_head` that is never
 resident), activations compared at the wrong shape (**-0.015 GB**), and
@@ -13,9 +13,9 @@ three was **25% of its own term**, and the sum said 13.8%.
 
 So this module compares term by term, and the aggregate is available only as a
 `SummedCheck`, which cannot be constructed without the comparison it summarises
-and renders the per-term table underneath itself. That is principle 7 made
-structural rather than remembered, the same way `terms.Reading` makes it
-structural for a reading.
+and renders the per-term table underneath itself. That is the rule against
+reporting an aggregate without its decomposition, made structural rather than
+remembered, the same way `terms.Reading` makes it structural for a reading.
 
 **It costs no GPU time.** Every hardware run already prints its own breakdown;
 a `Recorded` is that printout, handed in as input data. Nothing here runs a
@@ -32,11 +32,11 @@ would be a comparator nobody could run against the card they are sizing for.
 | a `TermRefusal` | the two sides cannot be compared at all: the run records no such term, the shapes disagree, or the recorded peak is the warmup prefill's |
 
 The asymmetry in the middle two rows is deliberate and it is the whole of
-principle 6 applied to a gate: a declared term can **fail** its gate but cannot
-**pass** it. `03` D16 says so for two of the three terms it owes -- weights are
-exact via a meta build and buffers are recorded, not formula'd -- and its open
-issue says so for the third: "a graph without the scratch table does not
-discharge the 10% gate on this term".
+rule applied to a gate: a declared term can **fail** its gate but cannot
+**pass** it. The memory model says so for two of the three terms it owes --
+weights are exact via a meta build and buffers are recorded, not formula'd --
+and its open issue says so for the third: a graph without the scratch table
+does not discharge the 10% gate on this term.
 
 ## The three traps this module refuses rather than papers over
 
@@ -51,7 +51,7 @@ discharge the 10% gate on this term".
   refuses every term it took at a shape.
 - **A term the run does not record.** Not a term of zero bytes. The refusal
   names it and, when the predicted side is declared, carries that term's own
-  note -- which for buffers is `03` D16's reason for recording them rather than
+  note -- which for buffers is the reason for recording them rather than
   computing them.
 
 ## The graph pool is two numbers and stays two
@@ -73,7 +73,7 @@ from atom.compass.memory import graph_pool
 from atom.compass.memory.readings import DeviceReadings, MemoryRefusal
 from atom.compass.memory.terms import Basis, Reading, Term
 
-#: `03` D16's acceptance gate on a non-KV memory term, individually.
+#: The memory model's acceptance gate on a non-KV term, individually.
 NON_KV_TERM_GATE = 0.10
 
 
@@ -93,7 +93,7 @@ class Shape:
     """The shape a footprint was taken at, which both sides have to state.
 
     Two sides that disagree here are measuring different things, and the
-    -0.015 GB of `03` D16's incident is what that looks like when nobody says
+    -0.015 GB of the incident this module exists for is what that looks like
     so. Equality is the whole point of the type.
     """
 
@@ -234,7 +234,7 @@ class TermComparison:
     """One term's predicted bytes against one run's, and the gate it carries.
 
     `predicted` is `None` for a term the run records and nothing predicted --
-    the -0.084 GB of `03` D16's incident, a resident term nobody had noticed
+    the -0.084 GB of the incident this module exists for, a resident term
     existed. It is reported as the whole of itself rather than passed over,
     because a term that is absent from a prediction is absent from its sum too
     and that is exactly what makes a sum unable to see it.
@@ -284,7 +284,7 @@ class Comparison:
 
     There is no `total` here and no `__int__`. The aggregate is `summed`, which
     returns an object that cannot be built without this one and prints this
-    table underneath itself -- `03` D16's rule is that an overall figure may be
+    table underneath itself: the rule is that an overall figure may be
     emitted only beside the decomposition that produced it, and a call that
     could return the figure alone is the defect rather than the convenience.
     """
@@ -339,10 +339,10 @@ class Comparison:
         return "\n".join(lines)
 
     def summed(self, *, band: float) -> SummedCheck:
-        """The instrument `03` D16 exists to reject, kept so it can be shown wrong.
+        """The instrument the per-term rule rejects, kept so it can be shown wrong.
 
         `band` has no default because this project states no band for a sum.
-        Every band it does state -- `03` D16's 10% and `10` D67.1's 25% -- is
+        Every band it does state -- the 10% a non-KV memory term carries, and
         **per term**, and choosing one of them for a sum is the substitution
         that produced the +13.8%. Naming it at the call site is the moment a
         caller has to notice that.
@@ -359,7 +359,7 @@ class SummedCheck:
 
     This is the instrument that read +13.8% over three errors, two of which
     cancelled. It is here so that the two can be run on one breakdown and the
-    difference shown, which is a stronger argument for `03` D16 than restating
+    difference shown, which is a stronger argument for the rule than restating
     the rule. It holds its `Comparison` rather than a pair of totals, so there
     is no way to obtain the figure without also holding the decomposition.
     """
@@ -424,7 +424,7 @@ def _refuse_shape(name: str, predicted: Shape, recorded: Shape) -> TermRefusal:
         f"this term was taken at a shape on each side and the two disagree -- "
         f"predicted at {predicted}, recorded at {recorded}",
         "take the two sides at one shape. A -0.015 GB activation error in the "
-        "incident 03 D16 records is exactly this, and a difference in shape "
+        "incident this comparison exists for is exactly this, and a difference "
         "looks like a difference in the model until somebody states both",
     )
 
@@ -560,7 +560,7 @@ def compare(
 class GraphPoolComparison:
     """Both graph-pool numbers against the recorded pool, labelled by which reserves.
 
-    `03` D16 keeps ATOM's estimator and the measured predictor as two functions
+    The memory model keeps ATOM's estimator and the measured predictor as two
     because they disagree by 4-19x, and the disagreement is the finding. So
     this type has no accessor for *the* error: it has one for each, and its
     table has a row for each, labelled with what that function does. A
@@ -666,7 +666,7 @@ def compare_graph_pool(
 def tied_lm_head_bytes(config, *, dtype_bytes: int) -> int:
     """The bytes a meta build over-counts because it has not been through the loader.
 
-    A meta build gives `03` D16 its exact weights, and this is the one
+    A meta build is what makes the weights term exact, and this is the one
     correction it cannot make for itself: the loader is what ties `lm_head` to
     the input embedding, so before it has run the two are separate tensors and
     one embedding of bytes that is never resident is counted. It was worth
