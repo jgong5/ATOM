@@ -1096,8 +1096,8 @@ A `SimulatedKVConnector` registered through the existing factory:
   configurable" requirement directly.
 - It must still emit the `kv_transfer_params` blob that Atomesh relays, so
   `AtomAdapter` works unmodified. The router hard-errors if it is absent
-  (`http_pd_router.rs:1073-1078`). The two backends emit **different shapes** --
-  thirteen fields and seventeen -- so the connector it stands in for decides which;
+  (`http_pd_router.rs:1073-1078`). The two backends emit **different shapes** —
+  thirteen fields and seventeen — so the connector it stands in for decides which;
   see *The blob, per backend* below.
 - The consumer side must still return `(len(prompt), True)` from
   `get_num_new_matched_tokens` when `do_remote_prefill` is set, i.e. park the request
@@ -1120,12 +1120,12 @@ The push shape is the pull shape plus four: `remote_swa_block_ids`, `remote_pp_s
 fields of one, and a simulated connector standing in for `moriio` emits the thirteen.
 
 One of the four is load-bearing rather than descriptive. The push consumer compares
-the producer's `hash_block_size` against its own and falls back to a full transfer --
-`num_computed_blocks = 0` -- whenever it is absent or differs
-(`mooncake_connector.py:389-401`), so a blob carrying only the thirteen can never
+the producer's `hash_block_size` against its own and falls back to a full transfer —
+`num_computed_blocks = 0` — whenever it is absent or differs
+(`mooncake_connector.py:388-401`), so a blob carrying only the thirteen can never
 take the incremental path.
 
-`tests/compass/test_d6_blob_fields.py` re-derives both sets from the connectors and
+`tests/compass/test_kv_blob_doc_table.py` re-derives both sets from the connectors and
 fails naming the field that differs, so this table cannot drift from the source the
 way its twelve-field predecessor did.
 
