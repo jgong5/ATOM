@@ -47,6 +47,10 @@ from atom.compass.memory.terms import Basis, Reading, Term
 RESERVES = "cudagraph_overhead"
 #: The name it refuses, because this one does not reserve anything.
 PREDICTS = "cudagraph_pool"
+#: The deployment field the eager branch names as the source of its only term.
+#: Read back by whoever installs the reading on a runner, which has its own
+#: copy of that flag and must not be allowed to disagree with it in silence.
+EAGER_SOURCE = "config.enforce_eager"
 
 #: ATOM's declared live-tensors-per-layer coefficient (`model_runner.py:3628`).
 #: Mirrored rather than re-derived: it is what the engine spends.
@@ -150,7 +154,7 @@ def reserves(
                     "no capture",
                     0,
                     Basis.DEPLOYMENT,
-                    "config.enforce_eager",
+                    EAGER_SOURCE,
                     "ATOM captures no graph under enforce_eager and reserves "
                     "nothing for one (model_runner.py:1570)",
                 ),

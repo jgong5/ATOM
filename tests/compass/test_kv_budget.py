@@ -26,6 +26,7 @@ written out in this file would let the two drift and still pass.
 
 import ast
 import copy
+import dataclasses
 import json
 import os
 import pathlib
@@ -44,7 +45,7 @@ from transformers import PretrainedConfig
 
 import atom.compass.memory as memory_package
 from atom.compass.backends.geometry import KvGeometry, Parallelism
-from atom.compass.memory import MemoryRefusal, SizedKVPool
+from atom.compass.memory import MemoryRefusal, SizedKVPool, reserves
 from atom.compass.memory.readings import DeviceReadings
 from atom.compass.runner.overrides import (
     NonAllocatingRunner,
@@ -53,6 +54,7 @@ from atom.compass.runner.overrides import (
 )
 from atom.compass.spec import MachineSpec
 from atom.model_ops.attentions.sub_pool_spec import page_pool, plan_pools
+from atom.models.utils import get_pp_indices
 
 # Located through the package as the suite imported it, never by walking up
 # from this file: if `atom` resolves from another root -- an installed copy, a
@@ -306,11 +308,51 @@ def test_installing_something_that_is_not_the_readings_is_refused(spec, qwen):
     assert runner.compass_readings.tp_width == 1
 
 
+def _eager_runner(spec, qwen, *, configured, built):
+    runner = SimpleNamespace(config=SimpleNamespace(enforce_eager=configured))
+    readings = readings_at(spec, qwen, 1)
+    if built:
+        readings = dataclasses.replace(
+            readings, cudagraph_overhead=reserves(enforce_eager=True)
+        )
+    install_device_readings(runner, readings)
+    return runner
+
+
+@pytest.mark.parametrize("configured,built", [(True, False), (False, True)])
+def test_a_graph_reading_built_for_the_other_deployment_is_refused(
+    spec, qwen, configured, built
+):
+    """The one thing the substitution cannot check for itself, checked.
+
+    ATOM returns zero here under `enforce_eager` and this returns whatever was
+    installed, so correctness would otherwise rest on whoever built the reading
+    having passed the same flag the runner is configured with -- and a reading
+    built for a capturing deployment, installed on a runner told not to
+    capture, holds back bytes ATOM never would and moves the block count in
+    silence. The reading says which deployment it was built for, and a
+    disagreement is declined naming both.
+    """
+    runner = _eager_runner(spec, qwen, configured=configured, built=built)
+    with pytest.raises(RunnerRefusal, match="enforce_eager"):
+        NonAllocatingRunner._estimate_cudagraph_overhead(runner)
+
+
+@pytest.mark.parametrize("agreed", [True, False])
+def test_a_graph_reading_built_for_this_deployment_is_answered(spec, qwen, agreed):
+    """The control: the guard above declines a mismatch and nothing else."""
+    runner = _eager_runner(spec, qwen, configured=agreed, built=agreed)
+    overhead = NonAllocatingRunner._estimate_cudagraph_overhead(runner)
+    assert (overhead == 0) is agreed
+
+
 # --- the pipeline minimum, which is inert on an even split and not otherwise -
 
 
-def test_the_pipeline_minimum_is_inert_on_an_even_split_and_not_otherwise(qwen):
-    """The disposition, measured on ATOM's own `plan_pools`.
+def test_the_pipeline_minimum_is_inert_on_an_even_split_and_not_otherwise(
+    qwen, monkeypatch
+):
+    """The disposition, measured over ATOM's own partitioner and `plan_pools`.
 
     `get_num_blocks` reduces the block count to the minimum across pipeline
     stages, and that reduction is guarded by `torch.distributed.is_initialized`
@@ -321,26 +363,43 @@ def test_the_pipeline_minimum_is_inert_on_an_even_split_and_not_otherwise(qwen):
     "always". Every stage computes the same readings here, because nothing in
     the memory model varies with pipeline rank. But each stage sizes its pool
     from the layers it holds -- `_get_total_num_layers` takes a
-    `get_pp_indices` slice under pipeline parallelism -- so an even split gives
-    every stage the same entry size and the same count, and an uneven one does
-    not. On this model, 64 layers with every fourth one paged, two stages
-    divide evenly and three do not.
+    `get_pp_indices` slice under pipeline parallelism -- so the entry size
+    differs whenever the split is uneven, and the minimum is then what decides
+    the count.
+
+    The spans come from `get_pp_indices` rather than being written out here,
+    so the test partitions the stack the way the runner does: it hands the
+    remainder to the middle partitions, which is not the split a reader would
+    guess. On this model -- 64 layers, every fourth one paged -- two and four
+    stages divide evenly and three, five and six do not.
+
+    `VLLM_PP_LAYER_PARTITION` overrides the partitioner, so it is cleared:
+    otherwise this reads a layout from the environment and calls it ATOM's.
     """
+    monkeypatch.delenv("VLLM_PP_LAYER_PARTITION", raising=False)
     budget = 200_000_000_000
+    layers = int(qwen.num_hidden_layers)
 
-    def blocks(layer_range, pp_size):
-        geometry = KvGeometry.from_hf_config(
-            qwen,
-            block_size=BLOCK_SIZE,
-            parallelism=Parallelism(pp_size=pp_size),
-            layer_range=layer_range,
-        )
-        plan = plan_pools([page_pool(geometry.bytes_per_block)], budget, 256)
-        return plan.entries["kv"]
+    def distinct_counts(pp_size):
+        counts = set()
+        for rank in range(pp_size):
+            geometry = KvGeometry.from_hf_config(
+                qwen,
+                block_size=BLOCK_SIZE,
+                parallelism=Parallelism(pp_size=pp_size),
+                layer_range=get_pp_indices(layers, rank, pp_size),
+            )
+            plan = plan_pools([page_pool(geometry.bytes_per_block)], budget, 256)
+            counts.add(plan.entries["kv"])
+        return len(counts)
 
-    assert len({blocks(span, 2) for span in ((0, 32), (32, 64))}) == 1
-    uneven = {blocks(span, 3) for span in ((0, 22), (22, 43), (43, 64))}
-    assert len(uneven) > 1, "an uneven split is what makes the minimum bind"
+    assert {pp: distinct_counts(pp) for pp in (2, 3, 4, 5, 6)} == {
+        2: 1,
+        3: 2,
+        4: 1,
+        5: 2,
+        6: 2,
+    }
 
 
 # --- the closure MEM-1's one-level guard could not give ----------------------

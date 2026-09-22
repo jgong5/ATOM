@@ -59,6 +59,7 @@ from atom.compass.memory.compare import (
     tied_lm_head_bytes,
 )
 from atom.compass.memory.graph_pool import (
+    EAGER_SOURCE,
     PREDICTS,
     RESERVES,
     PiecewiseCapture,
@@ -77,6 +78,7 @@ from atom.compass.memory.terms import Basis, Reading, Term
 
 __all__ = [
     "DISCHARGES",
+    "EAGER_SOURCE",
     "NON_KV_TERM_GATE",
     "PREDICTS",
     "RESERVES",

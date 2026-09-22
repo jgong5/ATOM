@@ -87,7 +87,7 @@ from typing import Any
 
 import torch
 
-from atom.compass.memory import DeviceReadings, SizedKVPool
+from atom.compass.memory import EAGER_SOURCE, DeviceReadings, SizedKVPool
 from atom.compass.runner.step_output import (
     DeferredTokenStream,
     reported_token_id,
@@ -117,7 +117,7 @@ logger = logging.getLogger(__name__)
 # runner (`config.py:1729-1736`) fires only while `runner_qualname` is still
 # ATOM's default -- which Compass overwrites. `enable_rapidserve=True` with this
 # runner is therefore seven silent parks on names this table deliberately
-# excludes. Tracked as issue #98; not closed here.
+# excludes. Recorded on the board and not closed here.
 #
 # Also outside the table, and outside anything a broadcast-derived enumeration
 # can see: three of these twelve are called in-process on the runner itself,
@@ -295,8 +295,30 @@ class NonAllocatingRunner:
         docstring names both: neither is reachable without a drafter or a
         second data-parallel rank, and this runner refuses a speculative config
         in `forward` before either could be.
+
+        `enforce_eager` is reconciled here rather than trusted. ATOM's own
+        returns zero under that flag (`model_runner.py:1570-1571`) and this
+        returns whatever was installed, so correctness would otherwise rest on
+        whoever built the reading having passed the same flag this runner is
+        configured with. A reading built for a capturing deployment, installed
+        on a runner told not to capture, holds back bytes ATOM would not and
+        moves the block count with nothing to show for it. The eager branch
+        names the config field as the source of its only term, so the reading
+        says which deployment it was built for and a disagreement declines.
         """
-        return _installed_readings(self).cudagraph_overhead.total
+        reading = _installed_readings(self).cudagraph_overhead
+        built_eager = any(term.source == EAGER_SOURCE for term in reading.terms)
+        configured_eager = bool(getattr(self.config, "enforce_eager", False))
+        if built_eager != configured_eager:
+            raise RunnerRefusal(
+                "the installed graph-pool reading was built for a deployment "
+                f"with enforce_eager={built_eager} and this runner is "
+                f"configured with enforce_eager={configured_eager}; ATOM "
+                "reserves nothing for a graph it never captures, so one of "
+                "the two would move the block count by the whole of the "
+                "reservation without saying so."
+            )
+        return reading.total
 
     def get_num_blocks(self) -> dict[str, object]:
         """Size the KV pool with ATOM's own arithmetic over substituted readings.

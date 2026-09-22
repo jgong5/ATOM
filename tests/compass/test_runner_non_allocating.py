@@ -465,16 +465,18 @@ def test_the_guard_finds_nothing_when_the_root_moves(monkeypatch, tmp_path):
 def test_only_the_binding_module_reaches_the_engine(path):
     """Everything else stays runnable where the engine cannot be imported.
 
-    `atom.compass` is subtracted rather than `atom.compass.runner`, because
-    `overrides` now imports the memory package at module scope for the readings
-    the KV budget runs against. That is admissible for the same reason this
-    test exists: nothing under `atom.compass` imports a tensor library or the
-    engine, and `test_kv_budget.py` asserts it over the whole import closure
-    rather than one level of it.
+    `atom.compass.memory` joins the exemption because `overrides` now imports
+    it at module scope for the readings the KV budget runs against, and
+    `test_kv_budget.py` asserts that package's whole import closure -- not one
+    level of its import statements -- reaches no tensor library and no engine.
+    The exemption is exactly the two packages whose closure something asserts;
+    widening it to `atom.compass` would exempt packages nothing has checked.
     """
     imported = _import_time_imports(path.read_text())
     engine = {m for m in imported if m.split(".")[0] == "atom"} - {
-        m for m in imported if m.startswith("atom.compass")
+        m
+        for m in imported
+        if m.startswith(("atom.compass.runner", "atom.compass.memory"))
     }
     assert engine == (
         {"atom.model_engine.model_runner"} if path.name == "model_runner.py" else set()

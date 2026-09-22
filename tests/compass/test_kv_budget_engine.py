@@ -20,6 +20,12 @@ The entry size the pool is planned from comes from `backends/geometry`, not
 from an attention builder, because a builder is attached to a constructed
 engine. That is the declaration `plan_pools` consumes; `plan_pools` itself, and
 every line of budget arithmetic above it, is ATOM's.
+
+Both halves of the sizing are built at the same width, and the entry size is
+pinned as well as the count so that they cannot drift apart again: the readings
+describe one rank's memory, so the block they are divided by has to be one
+rank's block. Nothing downstream of `plan_pools` can tell that it was not --
+the count comes back plausible either way.
 """
 
 import copy
@@ -37,7 +43,7 @@ from test_memory_readings import (
 )
 from transformers import PretrainedConfig
 
-from atom.compass.backends.geometry import KvGeometry
+from atom.compass.backends.geometry import KvGeometry, Parallelism
 from atom.compass.memory import Basis, Reading, Term
 from atom.compass.spec import MachineSpec
 from atom.model_ops.attentions.sub_pool_spec import page_pool
@@ -57,7 +63,16 @@ MAX_MODEL_LEN = 32768
 #: `xiaobizh_n18`, 2026-09-22, and pinned so that a term moving anywhere
 #: upstream of it is a failure here rather than a different number nobody
 #: compared. The arithmetic behind them is ATOM's: this file adds none.
-EXPECTED_BLOCKS = {1: 46641, 2: 51076}
+EXPECTED_BLOCKS = {1: 46641, 2: 102152}
+
+#: What one block costs the rank being modelled, pinned beside the count.
+#: Cycle 1 caught the TP2 row priced against a TP1 block: the readings were
+#: per-rank and the geometry was not, so a footprint for one rank was divided
+#: by a block belonging to the whole model. Both halves of the reply now state
+#: the width they were built at, and the entry size is the half that would
+#: have shown it -- 4 KV heads over 2 ranks halves the block exactly, so the
+#: count was out by a clean factor the reader had nothing to check it against.
+EXPECTED_ENTRY_BYTES = {1: 4_194_304, 2: 2_097_152}
 
 
 @pytest.fixture(autouse=True)
@@ -129,7 +144,11 @@ def _runner(spec, qwen, tp_width, *, utilisation=GPU_MEMORY_UTILIZATION, free=No
                 ),
             ),
         )
-    geometry = KvGeometry.from_hf_config(qwen, block_size=BLOCK_SIZE)
+    geometry = KvGeometry.from_hf_config(
+        qwen,
+        block_size=BLOCK_SIZE,
+        parallelism=Parallelism(tp_size=tp_width),
+    )
     runner = object.__new__(CompassModelRunner)
     runner.device = torch.device("cuda", 0)
     runner.block_size = BLOCK_SIZE
@@ -141,6 +160,7 @@ def _runner(spec, qwen, tp_width, *, utilisation=GPU_MEMORY_UTILIZATION, free=No
         max_model_len=MAX_MODEL_LEN,
         pipeline_parallel_size=1,
         decode_context_parallel_size=1,
+        enforce_eager=False,
         enable_rapidserve=False,
         disagg_is_decode=False,
     )
@@ -177,6 +197,10 @@ def test_the_pool_is_sized_by_atoms_arithmetic_with_the_card_unread(
     assert reply["num_kvcache_blocks"] > 0
     assert StateRuntime.from_wire(reply["state_runtime"]).transfer.copies is False
     assert reply["pool_entries"] == {"kv": EXPECTED_BLOCKS[tp_width]}
+    # The block the count is a count *of*, pinned beside it: the readings are
+    # per-rank, so the geometry has to be too, and nothing downstream of here
+    # can tell that it was not.
+    assert runner.pool_plan.entry_bytes["kv"] == EXPECTED_ENTRY_BYTES[tp_width]
 
     sizing = runner.kv_pool_sizing
     assert sizing.num_kvcache_blocks == reply["num_kvcache_blocks"]
