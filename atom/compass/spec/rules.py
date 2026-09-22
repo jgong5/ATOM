@@ -31,7 +31,14 @@ import enum
 
 
 class Rule(enum.Enum):
-    """The rules a spec is read against, as a refusal names them."""
+    """The rules a spec is read against, as a refusal names them, and the one a
+    probe filling it is held to.
+
+    The last is not about a document. A probe that cannot take its reading has
+    nothing wrong with its spec yet -- the host under it will not say what it
+    is -- and naming a document rule in front of that describes something that
+    did not happen, to a reader who then looks for it in the file.
+    """
 
     SEPARATION = "the spec describes the machine, not the deployment"
     ONE_MACHINE = "one spec describes one host"
@@ -41,6 +48,7 @@ class Rule(enum.Enum):
     PINNED_STACK = "the constants are pinned to a software stack"
     TOKENIZER_IDENTITY = "a tokenizer is measured or it is refused"
     SHAPE = "the document has the shape the schema declares"
+    MEASURED = "a probe reports what it read, and refuses what it could not"
 
 
 #: Knobs the engine already owns, mapped to where it owns them. Not the

@@ -39,7 +39,11 @@ from atom.compass.spec import (
 from atom.compass.spec.fields import BY_PATH, Kind
 from atom.compass.spec.probes import cpu_counts
 from atom.compass.spec.tokenizers import ENTRY_FIELDS
-from atom.compass.spec.validate import CONDITIONS, WIDTH_TABLES
+from atom.compass.spec.validate import (
+    ASKABLE_OF_A_DOCUMENT,
+    CONDITIONS,
+    WIDTH_TABLES,
+)
 from atom.compass.spec.validate import DERATES as DERATES_ASKED
 from atom.compass.spec.validate import MISSING as MISSING_ASKED
 from atom.compass.spec.validate import STACK as STACK_ASKED
@@ -564,10 +568,11 @@ def test_a_clear_check_says_which_conditions_it_could_not_ask():
         TRANSFERS_ASKED,
     ]
     assert "`tp_widths=`" in bare.not_asked[0]
+    assert bare.asked_in_part == ()
     asked = validate(
         merged(), tp_widths=(1, 2, 4, 8), observed_stack=STACK, strict=True
     )
-    assert asked.ok and asked.not_asked == ()
+    assert asked.ok and asked.not_asked == () and asked.asked_in_part == ()
 
 
 def test_the_transfer_condition_names_itself_as_unaskable_of_a_document():
@@ -616,11 +621,13 @@ def test_a_desk_fix_refusal_does_not_hide_the_expensive_one():
     assert "16" in str(checked) and "7.3.0" in str(checked)
 
 
-def test_a_question_whose_field_did_not_resolve_names_that_field():
+def test_a_question_asked_of_part_of_what_it_reads_is_not_called_unasked():
     # The width tables are what the width question reads. With one of them
     # gone the question is still asked of the other -- width 16 is still
-    # refused -- and the table it could not be asked of is named rather than
-    # passed over in a result that reads as though it had been asked.
+    # refused -- so the table it could not be asked of is named apart from the
+    # questions that went unasked. Filing it under those would report a refusal
+    # this run did make as a question it did not, and would subtract it from
+    # the count of conditions the run reached.
     absent = ("device", "runtime_constants", "allocator_retained_after_load_bytes")
     checked = validate(
         merge(
@@ -630,23 +637,91 @@ def test_a_question_whose_field_did_not_resolve_names_that_field():
     )
     assert not checked.ok
     assert any("16" in refusal.what for refusal in checked.refusals)
+    (in_part,) = checked.asked_in_part
+    assert in_part.startswith(WIDTHS_ASKED)
+    assert "allocator_retained_after_load_bytes" in in_part
+    assert "asked of the rest" in in_part
+    assert not any(
+        condition.startswith(WIDTHS_ASKED) for condition in checked.not_asked
+    )
+    assert "asked in part" in str(checked)
+
+
+def test_a_question_none_of_whose_fields_resolved_was_not_asked_at_all():
+    # The other side of the same split: with both width tables gone there is
+    # nothing the question could have been asked of, so it is unasked and the
+    # count of what the run reached must not include it.
+    thin1, thin2 = TIER1, TIER2
+    for name in (
+        "allocator_retained_after_load_bytes",
+        "driver_and_collective_reserve_bytes",
+    ):
+        thin1 = without(thin1, "device", "runtime_constants", name)
+        thin2 = without(thin2, "device", "runtime_constants", name)
+    checked = validate(
+        merge(fragments(tier1=thin1, tier2=thin2)).document, tp_widths=(16,)
+    )
     (unasked,) = [
         condition
         for condition in checked.not_asked
         if condition.startswith(WIDTHS_ASKED)
     ]
-    assert "allocator_retained_after_load_bytes" in unasked
-    assert "asked of the rest" in unasked
+    assert "could not be asked at all" in unasked
+    assert checked.asked_in_part == ()
 
 
 def test_a_document_that_is_not_a_mapping_is_refused():
     checked = validate("a filename, not a document")
     assert [refusal.rule for refusal in checked.refusals] == [Rule.SHAPE]
+    # Nothing was read against the schema here, so the two conditions that are
+    # otherwise asked of anything name themselves rather than being counted as
+    # questions this run answered.
+    assert [condition.split(" -- ")[0] for condition in checked.not_asked] == list(
+        CONDITIONS
+    )
 
 
 def test_an_unknown_key_is_refused_where_it_sits():
     checked = validate(dict(merged().document, gpu_memory_utilization=0.9))
     assert [refusal.rule for refusal in checked.refusals] == [Rule.SEPARATION]
+
+
+def test_one_mistyped_key_does_not_take_the_rest_of_the_document_with_it():
+    # The refusal a mistyped key earns is about that key. A check that stopped
+    # there would leave every other field unchecked and every consistency
+    # question with nothing resolved to be asked of -- the desk fix hiding the
+    # eight-GPU one again, on the form the verb takes: a hand-authored file no
+    # merge ever saw, since a merge refuses the unknown key before this runs.
+    document = merged().document
+    memory = document["device"]["memory"]
+    memory["capacity_byte"] = memory.pop("capacity_bytes")
+    with pytest.warns(StackMismatch):
+        checked = validate(
+            document,
+            tp_widths=(1, 2, 4, 8, 16),
+            observed_stack=dict(STACK, rocm="7.3.0"),
+            strict=True,
+        )
+    rules = [refusal.rule for refusal in checked.refusals]
+    assert rules.count(Rule.SEPARATION) == 1
+    assert rules.count(Rule.SHAPE) == 1
+    assert rules.count(Rule.NO_DEFAULTS) == len(WIDTH_TABLES)
+    assert rules.count(Rule.PINNED_STACK) == 1
+    assert [condition.split(" -- ")[0] for condition in checked.not_asked] == [
+        TRANSFERS_ASKED
+    ]
+
+
+def test_a_block_holding_a_scalar_does_not_take_the_rest_with_it_either():
+    # The other way the walk refuses: a block written as a number. The fields
+    # under it are gone, and everything beside it is still checked.
+    document = merged().document
+    document["device"]["memory"] = 288.0e9
+    checked = validate(document, tp_widths=(16,))
+    rules = [refusal.rule for refusal in checked.refusals]
+    assert rules.count(Rule.DERATE) == 1
+    assert rules.count(Rule.NO_DEFAULTS) == len(WIDTH_TABLES)
+    assert any("16" in refusal.what for refusal in checked.refusals)
 
 
 def test_a_value_of_the_wrong_shape_is_reported():
@@ -720,6 +795,9 @@ def test_the_check_set_names_every_condition_a_spec_can_be_refused_by():
     # condition earnable in the code and absent from the list is one no result
     # reports on; one listed and earnable by nothing is a count with no subject.
     assert set(refused_by_condition()) == set(CONDITIONS)
+    # And the package's own statement of reach is drawn from the same list, so
+    # it cannot name a condition no result reports on either.
+    assert set(ASKABLE_OF_A_DOCUMENT) <= set(CONDITIONS)
 
 
 @pytest.mark.parametrize("condition", CONDITIONS)
@@ -729,18 +807,19 @@ def test_each_condition_in_the_check_set_is_earned_by_a_spec(condition):
         assert rule in {refusal.rule for refusal in checked.refusals}, condition
 
 
-def test_a_document_reaches_every_condition_but_the_transfer():
+def test_a_document_reaches_what_the_package_says_a_document_reaches():
     # The verb the design writes takes a file, so this is the form that gets
-    # weaker: four of the five, because a transfer's source pin is in no field
-    # of a document however it was built. The four are held to the check set
-    # above rather than to a sentence, so a fifth becoming askable of a
-    # document, or a sixth being added, moves this test and not only prose.
+    # weaker: a transfer's source pin is in no field of a document however it
+    # was built. What the package states it reaches is a value, and this holds
+    # a run's own record to that value rather than to a sentence -- so a
+    # condition becoming askable of a document, one ceasing to be, or one added
+    # to the check set moves a test instead of going stale in prose.
     checked = validate(merged().document, tp_widths=(1, 2, 4, 8), observed_stack=STACK)
     assert checked.ok
-    assert [condition.split(" -- ")[0] for condition in checked.not_asked] == [
-        TRANSFERS_ASKED
-    ]
-    assert len(CONDITIONS) - len(checked.not_asked) == 4
+    unasked = {condition.split(" -- ")[0] for condition in checked.not_asked}
+    assert set(CONDITIONS) - unasked == set(ASKABLE_OF_A_DOCUMENT)
+    assert unasked == {TRANSFERS_ASKED}
+    assert len(CONDITIONS) - len(checked.not_asked) == len(ASKABLE_OF_A_DOCUMENT)
 
 
 # --- explain: the basis of a number ------------------------------------------
@@ -1008,24 +1087,72 @@ def test_one_core_id_on_two_packages_is_two_cores(tmp_path):
 def test_a_host_that_publishes_no_topology_is_refused_rather_than_halved(tmp_path):
     with pytest.raises(SpecRefusal) as refused:
         cpu_counts(str(tmp_path))
-    assert refused.value.rule is Rule.SHAPE
+    assert refused.value.rule is Rule.MEASURED
     assert "lists no processor" in refused.value.what
+    # No document is involved in this one: the host under the probe will not
+    # say what it is. Naming a rule about a document's shape would describe
+    # something that did not happen, to a reader who then looks for it.
+    assert "shape the schema declares" not in str(refused.value)
     (tmp_path / "cpu0").mkdir()
     with pytest.raises(SpecRefusal) as unreadable:
         cpu_counts(str(tmp_path))
     assert "cpu0 publishes no topology" in unreadable.value.what
 
 
-def test_a_probe_that_measured_no_tokenizer_emits_no_fragment(tmp_path):
+def test_a_topology_that_publishes_no_number_is_refused_rather_than_counted(tmp_path):
+    # A file that holds nothing a number can be read out of is not a reading.
+    # Counting it puts a core count into a spec that looks exactly like a
+    # measurement, on the same path that refuses a file which is not there.
+    processors = published_topology(tmp_path, cores_physical=1)
+    (tmp_path / "cpu1" / "topology" / "core_id").write_text("\n")
+    with pytest.raises(SpecRefusal) as refused:
+        cpu_counts(processors)
+    assert refused.value.rule is Rule.MEASURED
+    assert "cpu1 publishes core_id" in refused.value.what
+
+
+def test_a_fragment_carrying_no_tokenizer_is_refused(tmp_path):
     with pytest.raises(SpecRefusal) as refused:
         tokenizer_fragment(
             [],
             machine="node-18",
             authored_by="ana",
             date="2026-09-22",
+            method="probed",
             processors=published_topology(tmp_path, cores_physical=8),
         )
     assert refused.value.rule is Rule.TOKENIZER_IDENTITY
+
+
+def test_an_entry_that_is_not_a_tokenizer_entry_is_refused_here(tmp_path):
+    # The entries are the caller's, and this is where they are read against
+    # the table a tokenizer entry has. Left to `validate`, the same entry is
+    # refused after a merge, in a document whose other fields came from
+    # elsewhere and whose carrying fragment has to be worked back to.
+    with pytest.raises(SpecRefusal) as refused:
+        tokenizer_fragment(
+            [{"not": "a tokenizer"}],
+            machine="node-18",
+            authored_by="ana",
+            date="2026-09-22",
+            method="probed",
+            processors=published_topology(tmp_path, cores_physical=8),
+        )
+    assert refused.value.rule is Rule.SEPARATION
+
+
+def test_an_entry_without_the_derate_its_rates_oblige_is_refused_here(tmp_path):
+    incomplete = {name: TOKENIZER[name] for name in TOKENIZER if name != "derate"}
+    with pytest.raises(SpecRefusal) as refused:
+        tokenizer_fragment(
+            [incomplete],
+            machine="node-18",
+            authored_by="ana",
+            date="2026-09-22",
+            method="probed",
+            processors=published_topology(tmp_path, cores_physical=8),
+        )
+    assert refused.value.rule is Rule.DERATE
 
 
 def test_the_pair_this_closes_merged_cleanly_before_the_counts_were_emitted():
@@ -1058,6 +1185,7 @@ def test_the_probes_counts_refuse_the_pair_that_used_to_merge(tmp_path):
         machine="node-18",
         authored_by="ana",
         date="2026-09-22",
+        method="probed",
         source="tokenizer-laptop",
         processors=published_topology(tmp_path, cores_physical=8),
     )
@@ -1080,6 +1208,7 @@ def test_the_same_pair_merges_when_the_counts_agree(tmp_path):
         machine="node-18",
         authored_by="ana",
         date="2026-09-22",
+        method="probed",
         source="tokenizer-node",
         processors=published_topology(tmp_path, cores_physical=96, packages=2),
     )
@@ -1094,17 +1223,40 @@ def test_the_same_pair_merges_when_the_counts_agree(tmp_path):
     )
 
 
-def test_the_probes_fragment_states_where_it_is_authored_for_and_how(tmp_path):
+def test_the_fragment_states_where_it_is_authored_for_and_how(tmp_path):
     emitted = tokenizer_fragment(
         [TOKENIZER],
         machine="node-18",
         authored_by="ana",
         date="2026-09-22",
+        method="probed",
         processors=published_topology(tmp_path, cores_physical=8),
     )
     assert emitted.machine == "node-18"
     assert emitted.method == "probed" and emitted.transferred_from is None
     assert "by ana on 2026-09-22" in emitted.stanza()
+
+
+def test_how_the_rates_were_obtained_is_the_callers_claim_and_has_no_default(tmp_path):
+    # The rates arrive as an argument and nothing here encodes or decodes
+    # anything, so what the record claims about their source is the caller's to
+    # state. `provenance.method` is what a merge refusal quotes and what an
+    # artifact carries as the numbers' source, and a default here would be this
+    # function asserting a measurement it did not take, over data it received.
+    processors = published_topology(tmp_path, cores_physical=8)
+    stated = {
+        "machine": "node-18",
+        "authored_by": "ana",
+        "date": "2026-09-22",
+        "processors": processors,
+    }
+    carried = tokenizer_fragment(
+        [TOKENIZER], method="transferred-from:mi300x-8gpu", **stated
+    )
+    assert carried.method == "transferred-from:mi300x-8gpu"
+    assert carried.transferred_from == "mi300x-8gpu"
+    with pytest.raises(TypeError):
+        tokenizer_fragment([TOKENIZER], **stated)
 
 
 def test_the_probe_is_reachable_by_name():

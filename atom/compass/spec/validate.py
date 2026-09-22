@@ -34,6 +34,15 @@ this module opens by rejecting. So each question is asked of the fields that did
 check out, and a question that reads a field which did not resolve says so by
 name rather than being passed over in silence.
 
+**That holds for the schema half too, so the walk over the document collects.**
+A key the table does not declare, or a block holding a scalar where the schema
+has fields, is one refusal about one key -- and reading the document stops
+there, which would leave every other field unchecked and every consistency
+question with nothing resolved to be asked of. A typo in a hand-authored
+document is the cheapest fix there is, and it would have hidden the width
+nobody measured behind itself. So the walk yields its refusals and carries on,
+and the document is checked field by field whatever it holds elsewhere.
+
 **The same record makes the opt-in conditions legible.** Three of the five in
 `CONDITIONS` need something from the caller -- `tp_widths=`, `observed_stack=`,
 and a `Merge` rather than a document -- and a clear result that does not say what
@@ -43,9 +52,24 @@ decision below, so `validate(document)` can never ask that condition however the
 document was built, and the same spec is refused as a `Merge` and clear as a
 document. That is not a wrong number, but it must be visible, because the verb
 the design writes -- `compass spec validate machine.yaml` -- is the form that
-cannot ask it, and so reaches four of the five. `CONDITIONS` is what that count
-is a count of; a condition added to the check set and not to it is one no result
-can report on.
+cannot ask it. `CONDITIONS` is what a count of reach is a count of; a condition
+added to the check set and not to it is one no result can report on.
+
+**The reach of that form is `ASKABLE_OF_A_DOCUMENT`, which is a value and not a
+sentence.** Writing the number down in prose here puts a reviewer between the
+check set and the statement about it: the set changes, nobody rereads the
+paragraph, and the package goes on claiming a reach it no longer has. So the
+statement is the tuple below, a run's own `not_asked` is asserted against it,
+and a condition that becomes askable of a document -- or one that stops being
+-- fails a test rather than quietly contradicting a docstring.
+
+**What was asked of only part of its fields is reported apart from what was not
+asked at all.** A question whose fields all failed to resolve was not asked and
+must not be counted as reach. A question asked of two width tables where only
+one resolved *was* asked, and can already have earned a refusal; filing it under
+"not asked" would report a refusal the run did make as a question it did not,
+and would subtract it from the count of what the run reached. Both are results
+and neither is the other, so they are two fields of the record.
 
 Two of those questions need something the document does not carry.
 
@@ -75,14 +99,14 @@ from dataclasses import dataclass
 from typing import Any
 
 from .fields import PINNED, SCHEMA, Kind, check
-from .machine import MachineSpec, _missing, _walk
+from .machine import MachineSpec, _missing, _survey
 from .merge import PINNED_BLOCK, Merge
 from .rules import Rule, SpecRefusal
 from .tokenizers import TokenizerTable
 
-#: The conditions a spec is checked for. The first two are asked of any
-#: document; each of the rest names itself in `not_asked` when a run could not
-#: reach it.
+#: The conditions a spec is checked for. The first two are asked of anything
+#: that is a mapping at all and name themselves in `not_asked` when the subject
+#: is not one; each of the rest names itself there when a run could not reach it.
 MISSING = "whether every required field is present and every value its declared shape"
 DERATES = "whether a spec-peak number carries the derate it obliges"
 WIDTHS = "whether the widths this deployment will use were measured"
@@ -91,6 +115,15 @@ TRANSFERS = "whether a transferred constant came from a spec pinned to this stac
 #: The whole check set, in the order a run asks it. What `not_asked` is measured
 #: against: a condition missing from here is one no result can report on.
 CONDITIONS = (MISSING, DERATES, WIDTHS, STACK, TRANSFERS)
+#: What a document-taking run can reach, which is every condition but the
+#: transfer: a transfer's source pin is in no field of a document, however the
+#: document was built. This is the package's statement of its own reach, held to
+#: a run's `not_asked` by a test rather than written out in prose that nothing
+#: reads. A caller that takes a filename -- which is the form the verb takes --
+#: states its reach from here, or states one nothing checks.
+ASKABLE_OF_A_DOCUMENT = tuple(
+    condition for condition in CONDITIONS if condition != TRANSFERS
+)
 #: The fields each consistency question reads before it can be asked at all.
 WIDTH_TABLES = tuple(field.path for field in SCHEMA if field.kind is Kind.WIDTH_TABLE)
 STACK_PINS = tuple(f"{PINNED_BLOCK}.{component}" for component in PINNED)
@@ -104,6 +137,7 @@ class Validation:
     refusals: tuple[SpecRefusal, ...]
     stack_differences: tuple[tuple[str, str, Any], ...]
     not_asked: tuple[str, ...] = ()
+    asked_in_part: tuple[str, ...] = ()
 
     @property
     def ok(self) -> bool:
@@ -118,7 +152,8 @@ class Validation:
 
     def __str__(self) -> str:
         """The verdict, every reason for it, every stack difference it found,
-        and every question left unasked."""
+        every question left unasked, and every one asked of only part of what
+        it reads."""
         return "\n".join(
             [f"{'ok' if self.ok else 'refused'}: {len(self.refusals)} refusal(s)"]
             + [f"  {refusal}" for refusal in self.refusals]
@@ -128,41 +163,65 @@ class Validation:
                 for component, pinned, seen in self.stack_differences
             ]
             + [f"  not asked: {condition}" for condition in self.not_asked]
+            + [f"  asked in part: {condition}" for condition in self.asked_in_part]
         )
 
 
 def _unreached(
     condition: str, reads: Sequence[str], resolved: Mapping[str, Any]
-) -> tuple[str, ...]:
-    """What a condition was not asked of, because a field it reads did not resolve."""
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """A condition the fields it reads put out of reach, split by how far.
+
+    Two results, not one. Where nothing it reads resolved the condition was not
+    asked, and the count of what a run reached must not include it. Where some
+    of what it reads resolved it *was* asked, of those -- it can have earned a
+    refusal already -- and the fields it could not be asked of are named
+    separately so neither the wording nor the count says it went unasked.
+    """
     absent = [path for path in reads if path not in resolved]
     if not absent:
-        return ()
+        return (), ()
     named = ", ".join(f"`{path}`" for path in absent)
-    reach = (
-        "so it could not be asked at all"
-        if len(absent) == len(reads)
-        else "so it was asked of the rest and not of those"
+    if len(absent) == len(reads):
+        return (
+            f"{condition} -- {named} did not resolve, so it could not be asked at all",
+        ), ()
+    asked_of_the_rest = (
+        f"{condition} -- {named} did not resolve, so it was asked of the rest "
+        "and not of those"
     )
-    return (f"{condition} -- {named} did not resolve, {reach}",)
+    return (), (asked_of_the_rest,)
 
 
-def _not_asked(
+def _reach(
     resolved: Mapping[str, Any],
     tp_widths: Sequence[int],
     observed_stack: Mapping[str, str] | None,
     merged: Merge | None,
-) -> tuple[str, ...]:
-    """The consistency questions this run did not ask, each with its reason."""
+    read: bool,
+) -> tuple[tuple[str, ...], tuple[str, ...]]:
+    """The conditions this run did not ask, and those it asked of only part of
+    the fields they read. Each carries its reason."""
     unasked: list[str] = []
+    partial: list[str] = []
+
+    def reached(condition: str, reads: Sequence[str]) -> None:
+        none, some = _unreached(condition, reads, resolved)
+        unasked.extend(none)
+        partial.extend(some)
+
+    if not read:
+        why = "the subject is not a mapping, so there was no document to ask it of"
+        unasked.append(f"{MISSING} -- {why}")
+        unasked.append(f"{DERATES} -- {why}")
     if not tp_widths:
         unasked.append(f"{WIDTHS} -- no `tp_widths=` was given")
     else:
-        unasked.extend(_unreached(WIDTHS, WIDTH_TABLES, resolved))
+        reached(WIDTHS, WIDTH_TABLES)
     if observed_stack is None:
         unasked.append(f"{STACK} -- no `observed_stack=` was given")
     else:
-        unasked.extend(_unreached(STACK, STACK_PINS, resolved))
+        reached(STACK, STACK_PINS)
     if merged is None:
         unasked.append(
             f"{TRANSFERS} -- the subject is a document, and a transfer's source "
@@ -170,24 +229,31 @@ def _not_asked(
             "fragments are still in hand"
         )
     elif merged.transfers:
-        unasked.extend(_unreached(TRANSFERS, STACK_PINS, resolved))
-    return tuple(unasked)
+        reached(TRANSFERS, STACK_PINS)
+    return tuple(unasked), tuple(partial)
 
 
-def _complete(document: object, resolved: dict[str, Any]):
+def _complete(
+    document: object, resolved: dict[str, Any]
+) -> tuple[list[SpecRefusal], bool]:
+    """Every refusal the schema itself earns, and whether the subject was a
+    document the schema could be asked of at all.
+
+    A subject that is not a mapping is the one case where the two schema
+    conditions go unasked, and the caller needs to know that rather than infer
+    it from a refusal: a result that reported them as asked would count two
+    questions nothing answered.
+    """
     if not isinstance(document, Mapping):
-        yield SpecRefusal(
-            Rule.SHAPE,
-            f"a spec is a mapping of its sections, not {type(document).__name__}",
-            "load the document before checking it as a spec",
-        )
-        return
+        return [
+            SpecRefusal(
+                Rule.SHAPE,
+                f"a spec is a mapping of its sections, not {type(document).__name__}",
+                "load the document before checking it as a spec",
+            )
+        ], False
     found: dict[str, Any] = {}
-    try:
-        _walk(document, "", found)
-    except SpecRefusal as refusal:
-        yield refusal
-        return
+    refusals = list(_survey(document, "", found))
     for field in SCHEMA:
         try:
             if field.path not in found:
@@ -196,7 +262,8 @@ def _complete(document: object, resolved: dict[str, Any]):
             else:
                 resolved[field.path] = check(field, found[field.path], field.path)
         except SpecRefusal as refusal:
-            yield refusal
+            refusals.append(refusal)
+    return refusals, True
 
 
 def _widths(spec: MachineSpec, tp_widths: Sequence[int], resolved: Mapping[str, Any]):
@@ -256,7 +323,7 @@ def validate(
     merged = subject if isinstance(subject, Merge) else None
     document = merged.document if merged is not None else subject
     resolved: dict[str, Any] = {}
-    refusals = list(_complete(document, resolved))
+    refusals, read = _complete(document, resolved)
     spec = None
     if not refusals:
         try:
@@ -287,9 +354,5 @@ def validate(
             )
     if merged is not None:
         refusals += _transfers(resolved, merged)
-    return Validation(
-        spec,
-        tuple(refusals),
-        differences,
-        _not_asked(resolved, tp_widths, observed_stack, merged),
-    )
+    unasked, in_part = _reach(resolved, tp_widths, observed_stack, merged, read)
+    return Validation(spec, tuple(refusals), differences, unasked, in_part)
