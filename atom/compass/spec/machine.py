@@ -25,10 +25,17 @@ than that this reader is old.
 **A field has one value, however it is spelled.** A dotted key resolves to the
 nested path, so a document may write `host.cpu.cores_physical` flat -- a probe
 fragment does -- or nested, and the two are the same field. Writing it both
-ways is refused and the path is named. Keeping one of the two instead would
-keep whichever the mapping happened to yield last, and the value that lost
-would be missing from the echo an artifact digest is taken over, silently and
-differently on a document whose keys were written in another order.
+ways is refused and the path is named.
+
+The rule is about the shape and not about the two values, which is the part
+worth stating because the narrower rule looks equivalent. The echo is rebuilt
+nested from the field table, so it cannot equal a document that also states
+the field flat, whatever those two keys hold -- refusing only where they
+disagree would leave a document whose echo is missing a key it carries, which
+is the honesty measure gone either way. Where they do disagree there is a
+second cost on top: keeping one of the two would keep whichever the mapping
+yielded last, silently, and differently on a document whose keys were written
+in another order.
 
 **A runtime constant has no default.** The widths that were measured are the
 widths that can be asked for; a width that was not measured is refused by name,
@@ -175,10 +182,11 @@ def _survey(node: Mapping, prefix: str, found: dict):
                     "spellings that resolve to the same field",
                     "a dotted key resolves to the nested path, so `a.b` and a "
                     "nested `b` under `a` are one field; state it once, "
-                    "because a reader that kept one of the two would keep "
-                    "whichever the mapping yielded last, and the echo every "
-                    "run artifact carries would stop equalling the document it "
-                    "was read from",
+                    "because the echo every run artifact carries is rebuilt "
+                    "nested and cannot equal a document that states the field "
+                    "flat as well -- and where the two spellings disagree, "
+                    "keeping one of them would keep whichever the mapping "
+                    "yielded last",
                 )
                 continue
             found[path] = value

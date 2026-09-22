@@ -199,11 +199,14 @@ def test_the_digest_moves_when_any_number_does():
 #: A field stated nested by the reference document, for a dotted twin to meet.
 TWIN = "host.cpu.cores_physical"
 
+#: What the reference document states there, for a twin that agrees with it.
+AGREED = DOCUMENT["host"]["cpu"]["cores_physical"]
 
-def both_spellings(dotted_first):
+
+def both_spellings(dotted_first, value=1):
     """The reference document stating one field twice, in one of the two orders."""
     nested = document()
-    dotted = {TWIN: 1}
+    dotted = {TWIN: value}
     return {**dotted, **nested} if dotted_first else {**nested, **dotted}
 
 
@@ -242,6 +245,34 @@ def test_both_orders_give_the_same_refusal():
     assert str(dotted_first) == str(nested_first)
     for value in ("96", "1"):
         assert value not in str(dotted_first)
+
+
+@pytest.mark.parametrize("dotted_first", [True, False])
+def test_a_field_stated_twice_is_refused_even_where_the_two_agree(dotted_first):
+    # The rule is the shape, not the two values, and the narrower rule looks
+    # equivalent: `path in found and found[path] != value` passes every other
+    # test in this file. It would let this document through. Both orders are
+    # read here too, because a rule that compared the values could still turn
+    # on which spelling landed first, and one order alone would not see it.
+    refusal = refusal_from(both_spellings(dotted_first, AGREED))
+    assert refusal.rule is Rule.SHAPE
+    assert TWIN in refusal.what
+    assert "stated twice" in refusal.what
+
+
+def test_resolving_the_collision_would_leave_the_flat_key_out_of_the_echo():
+    # Why refusing is better than resolving, and the whole of what this test
+    # holds: it reads the same document with the flat key resolved away, which
+    # is what any resolution yields, because the echo is rebuilt from the field
+    # table and carries the nested spelling only. The echo is then missing a
+    # key the document states, whichever value the two keys agreed on. The
+    # refusal itself is held by the test above, not by this one.
+    written = both_spellings(False, AGREED)
+    resolved = {key: value for key, value in written.items() if key != TWIN}
+    echoed = MachineSpec.from_mapping(resolved).echo()
+    assert TWIN in written
+    assert TWIN not in echoed
+    assert set(written) - set(echoed) == {TWIN}
 
 
 def test_the_collision_is_about_the_path_and_not_about_the_top_level():

@@ -12,16 +12,19 @@ backlog. Nothing here is a decision; every decision lives in its topic's decisio
 
 1. **Load-bearing assumptions** — hold up large parts of the design; each has a check plan
 2. **Missing topics** — design points nobody has written yet, with a recommendation
-3. **TODO register** — 86 rows, **T1–T80 and T82–T87**, per topic, of which **80 are open**:
+3. **TODO register** — 88 rows, **T1–T88 with no gaps**, per topic, of which **82 are open**:
    T10, T15, T22, T48 and T65 are struck through as done, and T77 was opened and closed by
-   P0.1.
+   P0.1. **The previous figures, 86 rows and 80 open, were stale rather than differently
+   counted**: re-run at `fec23aecb` the rule below gives 87 rows and 5 struck, because T81
+   landed from P0.4 after the line was last written. T88 makes it 88.
    Both figures are the rows of section 3 below, counted as
    `grep -oE '^\| *~*\**T[0-9]+'` over that section and nothing else — prose elsewhere in
    this file names T-numbers that belong to other branches, and counting those tokens is
-   what made two earlier counts disagree. The register is **not contiguous and is not a
-   range**: T-numbers are allocated across parallel task branches and arrive when those
-   branches land. T73–T76 arrived with P0.3 and T83–T87 with P0.6; at the time of writing
-   T81 is still open on P0.4's branch
+   what made two earlier counts disagree. The register is **allocated across parallel task
+   branches rather than as a range**, and has read as non-contiguous whenever one of those
+   branches was in flight: T73–T76 arrived with P0.3, T83–T87 with P0.6, T81 with P0.4, and
+   T88 arrives here. It happens to be complete at this head; that is an observation about
+   what has landed, not a property to rely on
 4. **Cross-cutting issues and pending amendments**
 
 ---
@@ -230,6 +233,7 @@ M-f `14`; M-g `01` D3.5.
 | **T49** | The prefix-index *lookup* cost is charged to nobody — ~1,387 blocks hashed and probed per request at the cc-traces p50, magnitude unmeasured | `03` |
 | **T50** | Whether runtime memory constants transfer across dies (the working assumption says yes within a software generation) | `03`, `05` |
 | **T53** | Whether tokenizer throughput transfers across CPU classes (the working assumption says yes, adjusted by derate) | `05` |
+| **T88** | **D25 says the resolved spec is echoed *verbatim*, and `echo()` is canonical rather than verbatim.** Opened 2026-09-23 by #196 (issue #192). A dotted key resolves to the nested path — deliberately, because a probe fragment writes them — so one field has two spellings and `echo()` rebuilds only the nested one. Measured on `087f85e9d`: the reference document with `host.cpu` written flat reads, `value("host.cpu.cores_physical")` is 96, and `echo()` equals the **nested** document with `digest(flat) == digest(nested)` — while the document read was the flat one. For a digest that is the right answer, and it is why #196 refuses a document stating both spellings rather than picking one. But "verbatim" and "canonically" differ for a fragment a probe wrote flat, and D15's honesty measure is stated as the echo standing beside the number it produced. Either D25 says *canonically, after resolution*, or `echo()` records the spelling it was given. Nothing reads the echo as text today, so it is cheap to settle before the artifact store (#157, #161) takes a content digest over one. | `05` |
 
 ---
 
@@ -280,3 +284,4 @@ Corrections identified while writing later documents, not yet applied to earlier
 | `04` | **D18 does not say how `CpuGpuBuffer` is built under the mode, and it has to straddle it.** `CpuGpuBuffer.__init__` allocates a CPU tensor with `pin_memory`, allocates the device side `zeros_like` it, and takes `.numpy()` of the first. Under `FakeTensorMode` all three are faked and `.numpy()` raises `.numpy() is not supported for tensor subclasses`, so **no `ModelRunner` constructs at all** until this is dealt with. `tests/compass/test_capture_real_model.py` stages the three primitives around ATOM's own body rather than replacing the constructor: the host side and the numpy view are taken outside the mode, `pin_memory` is dropped (pinning is a real `hipHostMalloc`, a property of the transfer rather than of the shape, and nothing traced can observe it), and the device side is converted inside the mode. **Two traps on the way, each of which costs a day twice.** *One:* a `.numpy()` taken while the mode is active leaves the real storage marked **not resizable**, and the next operator on the CPU side then fails inside the converter, with a deprecation warning about reading a FakeTensor data pointer as the only clue. *Two:* converting `self.cpu` itself rather than a discarded template memoises the concrete side as a symbolic fake, so ATOM sees a symbolic shape on the side that is supposed to be concrete — `Trying to resize storage that is not resizable`. The two sides have to be two tensors, not two views of one conversion. This is also where T81's site two lives, so a repair here is the next task's; the constructor is executed rather than substituted precisely so that such a repair cannot land unnoticed. A related detail on the same path: `Tensor.numpy` is dispatched through the torch-function mode `set_default_device` installs, so a counter on it reads two per buffer unless it is guarded. |
 | `15` | **D92's decision row still reads *"inherits the TP group"* and *"remainder included"***, and P0.6 measured both false — the group is built in aiter and spans DP, and an indivisible expert count is refused rather than rounded (`15` D92, T65). D92's **conclusion** and D93's formula survive unchanged, so this is a correction to the decision's stated reasons, not to the decision. Rewriting a decision is the owner's call; the body of D92 carries the measurement in the meantime. |
 | `04`, `07` | The MoE all-to-all's block-count cap is stated as a single number in `04`'s `exclusive` join-policy text and in `07`'s calibration table; it is `min(128, CU)` for prefill and `min(64, CU)` for decode (**T87**) |
+| `05` | D25 rule 4's *"the whole resolved spec is echoed into every run artifact"* — and D15's "echoed verbatim" — describe `echo()` as it is not: it rebuilds the schema's nested spelling, so a fragment written with dotted keys round-trips to the same *digest* but not to the same *text* (**T88**) |
