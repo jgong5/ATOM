@@ -198,9 +198,21 @@ fake-less aiter ops sit *inside* those leaves and are never reached.
 > this section was taken with the fake-tensor capture module that PR #10 added under
 > `atom/compass/capture/`, driven by scripts that were never committed and writing JSON
 > records that no longer exist. That module and its tests have been withdrawn from the
-> tree, so **none of the numbers below is reproducible here**. They are kept because they
+> tree, so **none of the numbers below was reproducible here**. They are kept because they
 > are the specification a replacement capture is written from, not because they can be
 > re-run; anything that builds on them re-takes them first.
+>
+> **Partly re-taken since, by `tests/compass/test_capture_real_model.py`.** That test
+> traces the 27B at both widths through a group of the honest width, and agrees with the
+> 27B row on what it is a claim about rather than on its totals: at TP2 it records
+> `aiter.all_reduce_` **129** — 128 row-parallel at `communication_op.py:58` plus the
+> vocab-parallel one at `embed_head.py:175`, the 128 predicted from the config's layer
+> types and not read off the inventory — one functional all-gather at
+> `embed_head.py:257` carrying `[2, 124160]` to `[4, 124160]`, and one broadcast. The raw
+> Triton traffic agrees exactly: **33 launches across 3 kernels**. The operator totals do
+> **not** match and are not expected to: they are 2,521 at TP1 and 2,662 at TP2 against
+> 2,471 and 2,611 here, on a decode step of two sequences at a block size and a batch
+> budget this file never recorded, which is the reason a total is not the assertion.
 
 The open issue *"whether ATOM's real model classes trace cleanly under this mode at
 TP>1"* is **answered yes**, on two models at both widths, with the collectives in the
