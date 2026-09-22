@@ -42,10 +42,12 @@ sequence for anything downstream to read.
 
 **Filling a request from another deployment is two halves, and they land
 together.** The scheduler side claims the whole prompt as already held
-elsewhere, which is what suspends the request, and queues the receive that the
-workers then carry and report; the suspension has something waiting on it and
-the report has somewhere to go. A producer that finishes a request hands back
-the parameters the router relays to the deployment that will decode it.
+elsewhere, which is what suspends the request, and offers the receive that
+the workers then carry and report. The offer becomes an announcement only for
+a request the engine did suspend, so a report always has a suspension to
+resolve and never names a request nothing was waiting on. A producer that
+finishes a request hands back the parameters the router relays to the
+deployment that will decode it.
 """
 
 from __future__ import annotations
@@ -60,6 +62,7 @@ from atom.kv_transfer.disaggregation.base import (
     KVConnectorSchedulerBase,
 )
 from atom.kv_transfer.disaggregation.types import ConnectorMetadata, ReqId, ReqMeta
+from atom.model_engine.sequence import SequenceStatus
 
 #: Where the harness binds the clock this connector reads.
 CLOCK_KEY = "compass_clock"
@@ -181,26 +184,60 @@ class SimulatedKVConnector(KVConnectorBase):
 
 
 class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
-    """Scheduler side: it suspends a remote fill, queues it, and hands off.
+    """Scheduler side: it suspends a remote fill, announces it, and hands off.
 
     It holds no clock. Timing belongs to the workers, which are where a
     transfer is announced and where it is reported finished; what is decided
     here is only which requests have one and what the other deployment is
     told.
 
-    **The prompt is claimed once per request.** The engine asks on every
-    admission attempt, and a second claim on a request it has already
-    suspended would suspend it again. The mark that makes the claim once-only
-    is the request attribute the pull backend sets, and it is the reason this
-    connector never clears the request's own `do_remote_prefill`: the push
-    backend guards the same thing by clearing that flag instead, which
-    destroys the request's stated intent on its way past and hides it from
-    anything downstream that had not looked yet. The cost of the mark is that
-    a request matched on a step where it cannot be admitted -- the pool is
-    full, or the batch is -- has spent its claim, and is prefilled locally on
-    a later step rather than suspended. That is the pull backend's behaviour
-    at this head and it is reproduced rather than improved on, because the
-    engine's five reads of the suspended state were written against it.
+    **The prompt is claimed once per request, and the request keeps its own
+    intent.** The engine asks on every admission attempt, and a second claim
+    on a request it has already suspended would suspend it again. Both real
+    backends stop that by clearing the request's `do_remote_prefill` as they
+    queue; the pull backend additionally sets a mark on the request and reads
+    it back. This connector takes the mark and not the clearing, because the
+    flag is what the request said about itself and the clearing happens at a
+    point where nothing in that step has read it yet. The cost of declining it
+    is named rather than claimed away: under the composite backend this call
+    fans out to every sub-connector, so a second consumer beside this one
+    would still see the flag and queue its own receive. That is a
+    configuration this design does not contemplate -- a simulated deployment
+    has no second consumer to pair with -- but it is the thing the clearing
+    buys, and it is given up here.
+
+    **The cost of the mark, which is the pull backend's.** A request matched
+    on a step where it cannot be admitted -- the pool is full, or the batch is
+    -- has spent its claim, and is prefilled locally on a later step rather
+    than suspended. That is reproduced rather than improved on, because the
+    engine's reads of the suspended state were written against it.
+
+    **A transfer is announced only for a request the engine actually
+    suspended.** What `update_state_after_alloc` takes is an offer, not an
+    announcement; the announcement is made in `build_connector_meta`, which
+    the engine calls once its whole admission pass is over. By then every
+    suspension decision in that step is final and can be read off the
+    request's own status, and an offer whose request was not suspended is
+    dropped.
+
+    That is deliberately not the same moment as clearing the flag, and cannot
+    collapse into it. Clearing acts **on the request**, before the suspension
+    has been decided, and destroys what the request said about itself on the
+    way past. This acts **on this connector's own queue**, after the
+    suspension has happened, and leaves the request exactly as it arrived.
+
+    The case it exists for is the one the mark above creates: a request whose
+    claim was spent on an earlier step reaches the allocation with its flag
+    still set and is not suspended. Both real backends queue a receive for it
+    anyway -- the guard on both is the flag alone -- and the workers then
+    report a transfer finished against a request the scheduler never
+    suspended, whose id lands on a list with no reachable pop, after which the
+    engine rebuilds its waiting queue on every step for the rest of the run.
+    Nothing is announced for it here. The divergence has a cost and it is one
+    term wide: a deployment that really did issue that read spends the
+    bandwidth, and this does not charge for it, so a run containing such a
+    request under-reports by that request's block table -- once, because the
+    offer is dropped rather than carried.
 
     **How much of the block table moves is not decided here, and the reason
     is the blob.** A consumer that already holds a prefix could take only the
@@ -223,7 +260,7 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
         self.is_producer = _is_producer(kv_config)
         self._tp_size = config.tensor_parallel_size
         self._dp_rank = config.parallel_config.data_parallel_rank
-        self._reqs_need_recv: dict[ReqId, tuple[Any, list[int]]] = {}
+        self._offered: dict[ReqId, tuple[Any, list[int]]] = {}
 
     def get_num_new_matched_tokens(self, seq) -> tuple[int, bool]:
         """Claim a remote-filled prompt whole, once, so the engine suspends it.
@@ -239,11 +276,13 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
         return 0, False
 
     def update_state_after_alloc(self, seq) -> None:
-        """Queue the receive the suspension is waiting for.
+        """Offer the receive that a suspension would wait for.
 
         The engine calls this immediately after it allocates the request's
-        blocks and immediately before it decides to suspend it, so the block
-        table read here is the one the transfer will fill.
+        blocks and immediately before it decides whether to suspend it, so the
+        block table read here is the one a transfer would fill -- and whether
+        there is going to be a transfer at all is not known yet. Nothing is
+        announced from here, and the request is not touched.
         """
         params = seq.kv_transfer_params or {}
         if not params.get("do_remote_prefill"):
@@ -255,23 +294,26 @@ class SimulatedKVConnectorScheduler(KVConnectorSchedulerBase):
                 "decoding side takes a remote fill on; a producer queueing one "
                 "would wait for a transfer it is itself supposed to serve"
             )
-        self._reqs_need_recv[seq.id] = (seq, list(seq.block_table))
+        self._offered[seq.id] = (seq, list(seq.block_table))
 
     def build_connector_meta(self) -> ConnectorMetadata:
-        """Hand this step's queued receives to the workers, and forget them.
+        """Announce the offers the engine suspended, and drop the rest.
 
-        Cleared on the way out because the workers own each transfer from
-        here: announcing one twice is refused on their side, and a queue that
-        survived its own announcement is how that happens.
+        Called once the admission pass is over, so the status read here is
+        the engine's settled answer. Cleared on the way out either way,
+        because the workers own each announced transfer from here -- a queue
+        that survived its own announcement is how one request gets two.
         """
         meta = ConnectorMetadata()
-        for req_id, (seq, block_ids) in self._reqs_need_recv.items():
+        for req_id, (seq, block_ids) in self._offered.items():
+            if seq.status is not SequenceStatus.WAITING_FOR_REMOTE_KVS:
+                continue
             meta.add_new_req_to_recv(
                 request_id=req_id,
                 local_block_ids=block_ids,
                 kv_transfer_params=seq.kv_transfer_params or {},
             )
-        self._reqs_need_recv.clear()
+        self._offered.clear()
         return meta
 
     def request_finished(self, seq) -> None:

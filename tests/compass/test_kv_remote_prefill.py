@@ -47,7 +47,7 @@ from atom.compass.kv.handoff import (
 from atom.kv_transfer import disaggregation
 from atom.kv_transfer.disaggregation.aggregator import KVOutputAggregator
 from atom.kv_transfer.disaggregation.factory import KVConnectorFactory
-from atom.kv_transfer.disaggregation.types import KVConnectorOutput
+from atom.kv_transfer.disaggregation.types import ConnectorMetadata, KVConnectorOutput
 from atom.model_engine.scheduler import Scheduler
 from atom.model_engine.sequence import SequenceStatus
 
@@ -215,11 +215,15 @@ def remote_filled(seq_factory):
     )
 
 
-def scheduler_with(connector_half):
-    """A real scheduler with a pool big enough that nothing else declines."""
-    engine = Scheduler(
-        MockConfig(num_kvcache_blocks=100, max_num_seqs=4, max_num_batched_tokens=1000)
-    )
+def scheduler_with(connector_half, **config):
+    """A real scheduler, sized by the caller, carrying this connector."""
+    settings = {
+        "num_kvcache_blocks": 100,
+        "max_num_seqs": 4,
+        "max_num_batched_tokens": 1000,
+    }
+    settings.update(config)
+    engine = Scheduler(MockConfig(**settings))
     engine.kv_connector = connector_half
     return engine
 
@@ -234,6 +238,11 @@ def test_a_remote_filled_request_parks_and_leaves_on_its_deadline(
     decides in its own sequence, and what is read back is the status it chose.
     The transfer is announced from the metadata that same step produced, so
     the blocks the worker prices are the blocks the engine allocated.
+
+    The request's own `do_remote_prefill` is asserted at both ends of the
+    park, because the defect this connector's predecessor was fixed for was a
+    flag cleared on the way past the engine -- which no test that calls the
+    connector directly can see.
     """
     model = model_for(geometry, PEAKS[0])
     now = [ISSUE_AT]
@@ -246,6 +255,7 @@ def test_a_remote_filled_request_parks_and_leaves_on_its_deadline(
     assert seq.status is SequenceStatus.WAITING_FOR_REMOTE_KVS
     assert engine._num_parked_remote_kv == 1
     assert batch.total_seqs_num_prefill == 0, "it prefilled what it was sent"
+    assert seq.kv_transfer_params["do_remote_prefill"] is True, "intent destroyed"
 
     announced = batch.connector_meta_output.reqs_to_recv
     assert set(announced) == {seq.id}
@@ -263,6 +273,8 @@ def test_a_remote_filled_request_parks_and_leaves_on_its_deadline(
     assert seq.status is SequenceStatus.RUNNING
     assert engine._num_parked_remote_kv == 0
     assert seq.token_ids[seq.num_prompt_tokens] == FIRST_TOKEN_ID
+    assert seq.kv_transfer_params["do_remote_prefill"] is True, "intent destroyed"
+    assert engine.finished_recving_kv_req_ids == [], "an id with no reachable pop"
 
 
 def step(engine, worker):
@@ -273,6 +285,58 @@ def step(engine, worker):
     )
     engine._update_from_kv_xfer_finished(aggregated)
     engine.schedule()
+
+
+def test_nothing_is_announced_for_a_request_the_engine_did_not_suspend(
+    geometry, seq_factory
+):
+    """An offer is dropped when the suspension it was offered for did not happen.
+
+    The engine asks whether a request is held elsewhere *before* it knows
+    whether it can admit it, and the claim is spent on the asking. So a
+    request bounced by the admission cap arrives at the allocation on a later
+    step with its claim gone and its `do_remote_prefill` still set: it is
+    prefilled locally, and it is not suspended. Both real backends queue a
+    receive for it anyway -- their guard is the flag alone -- and the workers
+    then report a transfer finished against a request the scheduler never
+    suspended: an id on `finished_recving_kv_req_ids` with no reachable pop,
+    after which the engine rebuilds its waiting queue on every step for the
+    rest of the run.
+
+    Driven through a real scheduler over two steps, because each step is
+    individually correct and only the pair is wrong. The cap that bounced the
+    claim is lifted between them, which is the whole content of the second
+    step.
+    """
+    model = model_for(geometry, PEAKS[0])
+    now = [ISSUE_AT]
+    worker = connector(model, lambda: now[0], role="worker")
+    engine = scheduler_with(
+        connector(model, lambda: now[0], role="scheduler"), max_num_seqs=1
+    )
+    parked, bounced = remote_filled(seq_factory), remote_filled(seq_factory)
+    engine.add(parked)
+    engine.add(bounced)
+
+    first, _ = engine.schedule()
+    assert parked.status is SequenceStatus.WAITING_FOR_REMOTE_KVS
+    assert bounced.status is SequenceStatus.WAITING, "the cap did not bounce it"
+    assert bounced.kv_async_tagged is True, "the claim was not spent"
+    assert set(first.connector_meta_output.reqs_to_recv) == {parked.id}
+
+    engine.max_num_seqs = 4
+    second, _ = engine.schedule()
+    assert bounced.status is not SequenceStatus.WAITING_FOR_REMOTE_KVS
+    assert second.total_seqs_num_prefill == 1, "it did not prefill locally"
+    assert bounced.id not in second.connector_meta_output.reqs_to_recv
+
+    worker.start_load_kv(second.connector_meta_output)
+    now[0] = model.release_at(ISSUE_AT, len(bounced.block_table)) + 1.0
+    sending, recving = worker.get_finished()
+    engine._update_from_kv_xfer_finished(
+        KVConnectorOutput(finished_sending=sending, finished_recving=recving)
+    )
+    assert engine.finished_recving_kv_req_ids == [], "an id with no reachable pop"
 
 
 def test_a_parked_request_is_not_counted_as_admittable_work(geometry, seq_factory):
@@ -297,10 +361,12 @@ def test_the_prompt_is_claimed_once_and_the_request_keeps_its_intent(
     """The whole prompt, one claim, and the request's own flag left alone.
 
     The claim is spent on the first ask, which is what stops a request being
-    suspended twice. It is spent on a mark rather than by clearing the
-    request's `do_remote_prefill`, so anything that looks at the request after
-    this -- a sibling connector under the composite backend, or the engine
-    itself -- still sees what the request asked for.
+    suspended twice. It is spent on a mark and not by clearing the request's
+    `do_remote_prefill`, which is what both real backends do instead -- so the
+    request still states its own intent afterwards, and the guard against
+    announcing a receive nobody waits for has to live somewhere the request is
+    not: it is the suspension check in `build_connector_meta`, asserted here
+    by setting the status the engine would have set.
     """
     scheduler = connector(
         model_for(geometry, PEAKS[0]), lambda: ISSUE_AT, role="scheduler"
@@ -313,12 +379,13 @@ def test_the_prompt_is_claimed_once_and_the_request_keeps_its_intent(
 
     scheduler.update_state_after_alloc(seq)
     assert seq.kv_transfer_params["do_remote_prefill"] is True
+    seq.status = SequenceStatus.WAITING_FOR_REMOTE_KVS
     assert scheduler.build_connector_meta().reqs_to_recv[seq.id].local_block_ids == [
         0,
         1,
         2,
     ]
-    assert scheduler.build_connector_meta().reqs_to_recv == {}, "queued twice"
+    assert scheduler.build_connector_meta().reqs_to_recv == {}, "announced twice"
 
 
 def test_an_ordinary_request_is_neither_claimed_nor_queued(geometry, seq_factory):
@@ -343,3 +410,28 @@ def test_the_producing_side_refuses_a_remote_fill(geometry, seq_factory):
     seq = remote_filled(seq_factory)
     with pytest.raises(ValueError, match="producer side"):
         scheduler.update_state_after_alloc(seq)
+
+
+def test_the_emitted_blob_is_one_a_consumer_can_actually_consume():
+    """The blob goes back in where a consumer reads it, not just out.
+
+    Key-set equality says the router will relay every field. It does not say
+    the consumer half finds what it needs in them, because that half reads the
+    blob through the engine's own `ReqMeta` builder rather than by key. So the
+    emitted blob is fed back in as a received one.
+    """
+    blob = simulated_blob(tp_size=4, dp_rank=2)
+    meta = ConnectorMetadata()
+    meta.add_new_req_to_recv(
+        request_id=FINISHED_ID, local_block_ids=[0, 1], kv_transfer_params=blob
+    )
+    req = meta.reqs_to_recv[FINISHED_ID]
+
+    assert req.remote_block_ids == FINISHED_BLOCKS
+    assert req.remote_host == SIMULATED_HOST
+    assert req.remote_port == SIMULATED_PORT
+    assert req.remote_handshake_port == SIMULATED_PORT
+    assert req.remote_engine_id == SIMULATED_ENGINE_ID
+    assert req.tp_size == 4
+    assert req.transfer_id == FINISHED_ID
+    assert req.num_computed_blocks == 0, "the full table, as this field set forces"

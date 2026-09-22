@@ -53,9 +53,11 @@ def transfer_params(seq: Any, *, tp_size: int, dp_rank: int) -> dict[str, Any]:
 
     `tp_size` and `dp_rank` describe the deployment rather than the request,
     so they are passed in from the config the connector was built with. Both
-    are cast to `int` because the router reads `dp_rank` as a number and drops
-    it when it is anything else, which would cost the consumer its rank with
-    no error anywhere.
+    are cast to `int` because the router takes `dp_rank` only if it is a
+    number, and otherwise **substitutes its own registry value for the
+    prefilling worker**, dropping it outright only when it has none either
+    way. So a rank of the wrong type is not lost loudly; it is replaced by a
+    plausible one, with no error anywhere.
     """
     drafts = getattr(seq, "spec_token_ids", None)
     draft_token_ids = (
