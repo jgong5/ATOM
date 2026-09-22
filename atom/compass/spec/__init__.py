@@ -40,14 +40,27 @@ them against the table a tokenizer entry has, and emits them together with the
 core counts of the processor it read here -- which is what makes a fragment
 composed somewhere other than its target contradict the target rather than
 merge quietly into it. How the rates were obtained is the caller's to state,
-because nothing in this package measured them.
+because nothing in this package measured them. `probe_for` answers which probe
+fills a runtime constant at a width, and refuses for the one entry no probe
+fills rather than naming a probe that would not produce it.
+
+`DeviceMemory` is what a probe that does start an engine reads off each card,
+kept as four numbers rather than as the one the spec wants: free, total,
+reserved and the cache budget. `non_torch_across_ranks` takes those to the
+single reserve a spec carries, declining a rank whose readings cannot have come
+off one card, a rank whose cache was sized by what was free rather than by its
+budget, a spread too wide to be one machine, and a reading too large for what
+the collective terms predict at that width. The last of those is the only one
+that sees a card every rank shares with the same neighbour, and it can be asked
+only because free and total arrived apart.
 """
 
 from .explain import QUANTITIES, Basis, Contribution, explain
 from .fields import DECLARED, SCHEMA, SCHEMA_VERSION, Field, Kind
 from .machine import MachineSpec
+from .memory import ABSOLUTE_LIMIT, DeviceMemory, non_torch_across_ranks
 from .merge import Fragment, Merge, merge
-from .probes import tokenizer_fragment
+from .probes import probe_for, tokenizer_fragment
 from .ranks import SPREAD_LIMIT, RankSpread, across_ranks
 from .rules import (
     DEPLOYMENT_OWNED,
@@ -60,6 +73,7 @@ from .tokenizers import Backend, TokenizerEntry, TokenizerKey, TokenizerTable
 from .validate import Validation, validate
 
 __all__ = [
+    "ABSOLUTE_LIMIT",
     "DECLARED",
     "DEPLOYMENT_OWNED",
     "QUANTITIES",
@@ -69,6 +83,7 @@ __all__ = [
     "Backend",
     "Basis",
     "Contribution",
+    "DeviceMemory",
     "Field",
     "FingerprintMismatch",
     "Fragment",
@@ -86,6 +101,8 @@ __all__ = [
     "across_ranks",
     "explain",
     "merge",
+    "non_torch_across_ranks",
+    "probe_for",
     "tokenizer_fragment",
     "validate",
 ]
