@@ -218,11 +218,50 @@ Compass therefore models a **dedicated** device. It will not predict the OOM tha
 shared box produces, and it will not reproduce a neighbour-induced admission cliff. That
 is the right thing to model and it is stated here so it is not discovered as a gap.
 
+### The pipeline minimum is not inert
+
+An earlier note here said that under PP the `all_reduce(MIN)` across stages
+(`model_runner.py:1737-1744`) is inert, *because every stage computes the same number*,
+and that it *still needs a live process group or a stub*. Both halves are wrong.
+
+**The stages do not compute the same number.** The five readings *are* identical across
+stages — nothing in the memory model varies with pipeline rank. The layer count is not:
+`_get_total_num_layers` (`model_runner.py:1501-1524`) takes a `get_pp_indices` slice, so
+each stage sizes its pool from the layers it actually holds. Re-derived from ATOM's own
+partitioner at `feature/atomcompass_new` `92f1fdafe`, over the 64-layer hybrid vendored at
+`tests/compass/qwen3_5_27b_config.json` — one full-attention layer in four, so 16 of the 64
+hold paged KV — at block size 64, `max_num_seqs` 256 and a fixed 200,000,000,000-byte KV
+budget:
+
+| PP | paged layers per stage | distinct block counts |
+|---|---|---|
+| 2 | 8, 8 | 1 |
+| 3 | 5, 5, 6 | **2** — 152,587 / 152,587 / 127,156 |
+| 4 | 4, 4, 4, 4 | 1 |
+| 5 | 3, 3, 3, 4, 3 | **2** |
+| 6 | 2, 3, 3, 2, 3, 3 | **2** |
+| 7 | 2, 2, 2, 3, 2, 2, 3 | **2** |
+| 8 | 2, 2, 2, 2, 2, 2, 2, 2 | 1 |
+
+5/5/6 is **two** distinct counts, not three — the two five-layer stages share one. The
+reduction therefore binds wherever 64 does not divide evenly, which is pp = 3, 5, 6 and 7
+among the widths above. **The block count a PP deployment gets is the minimum over
+stages**, set by whichever stage holds the most paged layers — and the table shows that is
+not in general the last one.
+
+**Neither a live process group nor a stub is needed.** The reduce is already guarded by
+`torch.distributed.is_initialized()` (`model_runner.py:1738`): with no group it does not
+run, and with one it runs ATOM's own code unchanged. Building a stub for it is building
+something nothing asks for.
+
+`tests/compass/test_pipeline_minimum.py` re-derives the table above from `get_pp_indices`
+rather than restating it, and fails if this section and the partitioner disagree.
+
 ### Open issues
 
-- Under PP, `get_num_blocks` does an `all_reduce(MIN)` across stages
-  (`model_runner.py:1737-1744`). With a device model every stage computes the same number,
-  so the reduction is inert — but it still needs a live process group or a stub.
+- Under PP the guard means the stages agree on a count only when a process group is live.
+  Whether a simulated PP run has one is `01` D1's question about topology; either way
+  nothing here needs a stub.
 - `gpu_memory_utilization` here is a fraction of **total**, with the non-KV footprint
   subtracted afterwards — the vLLM convention, **not** TRT-LLM's. Comparing the resulting
   block count against a number produced under the other convention is wrong.
