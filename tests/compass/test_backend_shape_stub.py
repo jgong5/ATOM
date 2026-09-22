@@ -487,13 +487,17 @@ class TestCollectives:
         count it yields is the one the value equals rather than a guess at
         what a caller meant by it. `False` is refused by the `< 1` check,
         which is the same guard a stated 0 meets.
+
+        `== 1` alone does not say this happened: `True == 1`, so that
+        assertion passes equally against a value kept as the `bool` it
+        arrived as. The difference shows in the one place a count is written
+        out -- the record line, which exists here because the seconds do not
+        carry the count -- so the type and that line are asserted too.
         """
-        assert (
-            ShapeStubBackend(
-                parallelism=Parallelism(tp_size=2), stack_layers=True
-            ).stack_layers
-            == 1
-        )
+        taken = ShapeStubBackend(parallelism=Parallelism(tp_size=2), stack_layers=True)
+        assert taken.stack_layers == 1
+        assert "on 1 layers" in taken.describe()
+        assert not isinstance(taken.stack_layers, bool)
         with pytest.raises(ValueError, match="at least one layer"):
             ShapeStubBackend(parallelism=Parallelism(tp_size=2), stack_layers=False)
 
@@ -590,6 +594,37 @@ class TestCollectives:
         assert charged["collective.moe-all-to-all"] == pytest.approx(
             charged["collective.tp-all-reduce"]
         )
+
+    def test_the_stand_in_said_of_an_unargued_collective_is_about_that_one(
+        self, monkeypatch
+    ):
+        """The default is attached by absence, so it may not describe a name.
+
+        Today the only unargued name is the expert all-to-all, and a sentence
+        about expert-bearing layers is exact for it -- which is why today's
+        output cannot tell a general statement apart from that collective's
+        own. A second unargued name can. A point-to-point send between
+        pipeline stages is charged once per layer like the rest and the depth
+        stands in for its count the same way, and nothing about it is
+        expert-bearing; the set exists so that such a name is labelled a
+        stand-in rather than inheriting an argument made for a different
+        collective, so the sentence the absence attaches has to be one that
+        name can carry.
+        """
+        monkeypatch.setattr(
+            Parallelism,
+            "collectives",
+            lambda self: ("tp-all-reduce", "pp-send-recv"),
+        )
+        step = ShapeStubBackend(
+            parallelism=Parallelism(tp_size=2),
+            geometry=self.GEOMETRY,
+            stack_layers=self.STACK_LAYERS,
+        ).estimate(BatchView((prefill(128),)))
+        said = {name: provenance for name, _, provenance in step.rows()}
+        assert DEPTH_STANDS_IN in said["collective.pp-send-recv"]
+        assert DEPTH_STANDS_IN not in said["collective.tp-all-reduce"]
+        assert "expert" not in said["collective.pp-send-recv"]
 
 
 # ── chunk size ──────────────────────────────────────────────────────────────

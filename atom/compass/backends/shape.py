@@ -153,10 +153,14 @@ PER_STACK_LAYER = "one charge per layer of the worker's stack, not per paged lay
 # argued for below. The depth is the count in hand rather than the count that
 # collective runs on, and a term charged on a stand-in says so where the charge
 # is read; a reader who divides the charge back out otherwise recovers a number
-# and no indication that nothing here chose it.
+# and no indication that nothing here chose it. It names no collective and no
+# kind of layer, because it is attached by not being in the argued set: a
+# sentence about the layers one of them runs on would be a claim about every
+# later name that joins it unargued, made by the default rather than by
+# anybody.
 DEPTH_STANDS_IN = (
-    "the stack depth standing in for a count of expert-bearing layers, which "
-    "nothing here counts"
+    "the stack depth standing in for this collective's own count, which "
+    "nothing here argues it equals"
 )
 
 # The collectives whose charge on the worker's stack depth has an argument
@@ -464,20 +468,24 @@ class ShapeStubBackend(CostBackend):
         self.coefficients = Coefficients() if coefficients is None else coefficients
         self.parallelism = Parallelism() if parallelism is None else parallelism
         self.geometry = geometry
-        # A whole number of layers, or nothing. `int()` here would take 64.7
-        # for a precise 64 and "64" for a count that was never stated as one,
-        # which is the guess the refusals below exist to decline, made in the
-        # constructor that makes them. The wording and the `TypeError` are the
-        # ones this package already uses for a dialled count. A `bool` is an
-        # `int` to Python and is taken as the one-layer span it equals;
-        # refusing that here alone would be a second convention for one
-        # question, which is worse than the case it would catch.
+        # A whole number of layers, or nothing. `int()` on the argument would
+        # take 64.7 for a precise 64 and "64" for a count that was never
+        # stated as one, which is the guess the refusals below exist to
+        # decline, made in the constructor that makes them. The wording and
+        # the `TypeError` are the ones this package already uses for a dialled
+        # count. A `bool` is an `int` to Python and is taken as the one-layer
+        # span it equals; refusing that here alone would be a second
+        # convention for one question, which is worse than the case it would
+        # catch. It is stored as that span and not as `True`: the check has
+        # already declined everything that is not an `int`, so converting
+        # after it narrows nothing else, and `describe()` writes this value as
+        # the count the charge was made on, which `True` is not.
         if stack_layers is not None and not isinstance(stack_layers, int):
             raise TypeError(
                 f"stack_layers must be a whole number of at least 1, not "
                 f"{stack_layers!r}"
             )
-        self.stack_layers = stack_layers
+        self.stack_layers = None if stack_layers is None else int(stack_layers)
         named = self.parallelism.collectives()
         if named and self.stack_layers is None:
             raise ValueError(
