@@ -31,6 +31,18 @@ plus one term per collective the deployment's widths make possible. A step
 carrying both kinds of work is priced as both and pays both intercepts, because
 a step that did both launched both.
 
+A collective runs once per layer this worker holds, so its count is the depth
+of the worker's span and not the number of layers in it that hold a cache of
+every past token. The two are the same number only on a stack whose layers are
+all paged, and they diverge with the architecture rather than by a factor
+somebody could fold into the coefficient: a layer keeping a bounded recurrent
+state costs a KV block nothing and still takes part in the all-reduce, so a
+stack that is one paged layer in four charges four times what the paged count
+would. That depth is handed in -- the KV geometry cannot supply it, since what
+it counts is the paged subset -- and a deployment with a collective to price
+and no depth stated is refused rather than charged on the count that happens to
+be at hand.
+
 Two things the form does not know, stated because a reader of a number will
 otherwise assume it does. It has one quadratic coefficient for the whole batch
 and no notion of a layer kind, so a stack whose layers do not all grow with
@@ -114,6 +126,12 @@ CANDIDATE = "a collective these widths admit, not one observed to run"
 # show a rung is too narrow and can never show it is too wide, so that count
 # rests on the caller in a way the coefficient's own note does not cover.
 UNCHECKED_RUNG = "padding from a supplied rung width; nothing here bounds it above"
+
+# Added to a collective's own provenance, because the count it multiplies is
+# the one a reader is most likely to assume wrong. Two layer counts describe
+# one worker and a record that states seconds states neither, so the term says
+# which of them it was charged on where the charge is read.
+PER_STACK_LAYER = "one charge per layer of the worker's stack, not per paged layer"
 
 
 def _refuse_shadowing(owner: type, cls: type) -> None:
@@ -375,8 +393,17 @@ class ShapeStubBackend(CostBackend):
     What it returns is a candidate set: nothing it omits can run, and what it
     names can still be ruled out by conditions the widths do not express, so
     each such term carries that qualification in its own provenance rather
-    than being charged as a certainty. Pricing one needs the layer count, so a
-    deployment with any candidate must also hand in the geometry.
+    than being charged as a certainty.
+
+    Pricing one needs a layer count, and there are two of them. `stack_layers`
+    is the one the charge is made on: every layer this worker runs, whatever
+    each layer keeps. `geometry` is the KV a block is sized from, whose own
+    `layers` counts only the layers holding a cache of every past token -- the
+    same number on a uniform stack and a quarter of it on a stack that is one
+    paged layer in four. Both are held, neither is derived from the other, and
+    a deployment with a candidate collective and no stack depth is refused: a
+    count taken from the geometry there would be wrong in kind on every hybrid
+    and right by coincidence on everything else.
     """
 
     def __init__(
@@ -384,16 +411,34 @@ class ShapeStubBackend(CostBackend):
         coefficients: Coefficients | None = None,
         parallelism: Parallelism | None = None,
         geometry: KvGeometry | None = None,
+        stack_layers: int | None = None,
     ) -> None:
         self.coefficients = Coefficients() if coefficients is None else coefficients
         self.parallelism = Parallelism() if parallelism is None else parallelism
         self.geometry = geometry
+        self.stack_layers = None if stack_layers is None else int(stack_layers)
         named = self.parallelism.collectives()
-        if named and geometry is None:
+        if named and self.stack_layers is None:
             raise ValueError(
-                f"{', '.join(named)} to price and no geometry to price it from; a "
-                "collective runs once per layer, so hand in the KV geometry that "
-                "says how many layers this worker holds"
+                f"{', '.join(named)} to price and no stack depth to price it from; "
+                "a collective runs once per layer this worker runs, and a KV "
+                "geometry counts only the layers that hold a cache of every past "
+                "token, so state how many layers deep the span is"
+            )
+        if self.stack_layers is not None and self.stack_layers < 1:
+            raise ValueError(
+                "a worker runs at least one layer, got "
+                f"stack_layers={self.stack_layers}"
+            )
+        if (
+            self.stack_layers is not None
+            and geometry is not None
+            and self.stack_layers < geometry.layers
+        ):
+            raise ValueError(
+                f"a {self.stack_layers}-layer span holding {geometry.layers} paged "
+                "layers is not a span: the layers that hold a cache are a subset "
+                "of the layers there are, so the two counts have been crossed"
             )
 
     @property
@@ -471,17 +516,20 @@ class ShapeStubBackend(CostBackend):
                 ),
             ]
         terms = [self._term(*row) for row in counted]
-        layers = 0 if self.geometry is None else self.geometry.layers
-        moved = sum_tokens(batch_view.requests) * layers
-        for collective in self.parallelism.collectives():
-            terms.append(
-                self._term(
-                    f"collective.{collective}",
-                    moved,
-                    c.collective_token_layer,
-                    CANDIDATE,
+        collectives = self.parallelism.collectives()
+        if collectives:
+            # The constructor refuses a candidate collective with no depth
+            # stated, so there is a count here and it is the stack's.
+            moved = sum_tokens(batch_view.requests) * self.stack_layers
+            for collective in collectives:
+                terms.append(
+                    self._term(
+                        f"collective.{collective}",
+                        moved,
+                        c.collective_token_layer,
+                        f"{CANDIDATE}; {PER_STACK_LAYER}",
+                    )
                 )
-            )
         return StepCost(terms)
 
     def describe(self) -> str:
@@ -492,7 +540,15 @@ class ShapeStubBackend(CostBackend):
             f" pp{self.parallelism.pp_size}"
             f" dp{self.parallelism.dp_size}"
         )
-        named = ", ".join(self.parallelism.collectives()) or "no collectives"
+        named = ", ".join(self.parallelism.collectives())
+        if named:
+            # The depth belongs in the line because the seconds do not carry
+            # it: a collective charged on the paged layers of a hybrid and one
+            # charged on its stack read alike once they are in a total.
+            paged = "" if self.geometry is None else f", {self.geometry.layers} paged"
+            named += f" on {self.stack_layers} layers{paged}"
+        else:
+            named = "no collectives"
         return (
             f"step-level stand-in, {pricing} coefficients, {widths}, {named}"
             f" -- {DECLARED}"
