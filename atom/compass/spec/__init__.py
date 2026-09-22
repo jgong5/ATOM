@@ -17,7 +17,9 @@ so it holds for knobs nobody has thought of yet. Everything else here is a
 refusal: a missing runtime constant names itself and the width nobody measured,
 a spec-peak number without its derate is declined, a stack pin that no longer
 matches what is loaded warns and names both versions, and an unmeasured
-tokenizer is refused rather than guessed.
+tokenizer is refused rather than guessed. A refusal is read by whoever hit it,
+so a path that does not resolve says which of the two it is: a key the schema
+never declared, or a declared field the spec in hand was assembled without.
 
 Nothing here imports a tensor library, a device runtime or the engine, so a spec
 can be authored, read and checked anywhere Python runs. The document is a plain

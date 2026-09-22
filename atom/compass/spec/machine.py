@@ -39,6 +39,13 @@ a reader and raises the first thing wrong; `_survey` under it yields every
 refusal and keeps walking, so a checking caller still gets the fields that sit
 beside a mistyped key. One unrecognised key would otherwise empty the whole
 document of resolved values, and the questions asked over them with it.
+
+Totality is also why `value` declines a path it cannot resolve in two different
+ways. Against a spec read from a document, a path that does not resolve is a key
+the schema does not declare, and the reader belongs at the field table. A spec
+assembled from parts -- a probe fragment, or an object built by hand in a test
+-- can instead lack a field the schema does declare, and sending that reader to
+the table sends them to find the field sitting in it and stop.
 """
 
 import hashlib
@@ -59,7 +66,13 @@ from .fields import (
     Kind,
     check,
 )
-from .rules import Rule, SpecRefusal, StackMismatch, refuse_unknown_key
+from .rules import (
+    Rule,
+    SpecRefusal,
+    StackMismatch,
+    refuse_absent_field,
+    refuse_unknown_key,
+)
 from .tokenizers import Backend, TokenizerEntry, TokenizerTable, table
 
 
@@ -157,9 +170,12 @@ class MachineSpec:
         return cls(values, table(values["host.tokenizers"]))
 
     def value(self, path: str) -> Any:
-        """One checked field by its dotted path."""
+        """One checked field by its dotted path, or the refusal that fits."""
         if path not in self.values:
-            refuse_unknown_key(path)
+            field = BY_PATH.get(path)
+            if field is None:
+                refuse_unknown_key(path)
+            refuse_absent_field(path, field.required)
         return self.values[path]
 
     def echo(self) -> dict:
@@ -188,8 +204,8 @@ class MachineSpec:
         if field is None:
             refuse_unknown_key(path)
         if field.kind is not Kind.WIDTH_TABLE:
-            return self.values[path]
-        measured = self.values[path]
+            return self.value(path)
+        measured = self.value(path)
         if tp_width is None:
             raise SpecRefusal(
                 Rule.NO_DEFAULTS,
@@ -213,17 +229,23 @@ class MachineSpec:
         """The measured tokenizer for a model architecture, or a refusal."""
         return self.tokenizers.resolve(architecture, backend, fingerprint)
 
-    def check_stack(self, observed: Mapping[str, str]) -> tuple:
+    def check_stack(
+        self, observed: Mapping[str, str], *, carried_only: bool = False
+    ) -> tuple:
         """Compare the pinned stack with the loaded one; warn on every difference.
 
-        A component this document does not carry is not compared, so a partial
-        one can still be asked this much of the question.
+        Each pin is read through `value`, so one this spec holds no value for is
+        declined the way any absent field is. With `carried_only`, a component
+        this document does not carry is not compared instead, so a partial one
+        can still be asked this much of the question; the checking verb asks it
+        that way.
         """
         found = []
         for component in PINNED:
-            pinned = self.values.get(f"device.software_pinned_to.{component}")
-            if pinned is None:
+            path = f"device.software_pinned_to.{component}"
+            if carried_only and path not in self.values:
                 continue
+            pinned = self.value(path)
             seen = observed.get(component)
             if seen != pinned:
                 found.append((component, pinned, seen))

@@ -7,6 +7,14 @@ tripped it, and what would satisfy it. A message that names only the first two
 tells a user their spec is wrong and leaves them to guess the fix, and the fix
 is the only part they need.
 
+The same reading decides how many refusals there are. Two different things can
+stop a dotted path resolving, and they want opposite actions, so they are two
+refusals and not one: a key with no row in the field table is a typo or a knob
+that belongs to the deployment, while a declared field this object holds no
+value for is the schema's own field in a spec assembled from parts. A single
+message would be true of whichever case it was written against and would send
+the other reader to the schema to find the field sitting there.
+
 The separation rule is the one that decides every inclusion question:
 
     the spec describes the machine; ATOM's config describes the deployment;
@@ -49,6 +57,7 @@ class Rule(enum.Enum):
     PINNED_STACK = "the constants are pinned to a software stack"
     TOKENIZER_IDENTITY = "a tokenizer is measured or it is refused"
     SHAPE = "the document has the shape the schema declares"
+    TOTALITY = "a spec read from a document is total"
     MEASURED = "a probe reports what it read, and refuses what it could not"
 
 
@@ -84,6 +93,36 @@ class StackMismatch(UserWarning):
 
 class FingerprintMismatch(UserWarning):
     """The tokenizer now loaded is not the one whose rates were measured."""
+
+
+def refuse_absent_field(path: str, required: bool) -> None:
+    """Decline a declared field this spec holds no value for, by how it is declared.
+
+    The companion to `refuse_unknown_key`, and the reason the two are separate:
+    a path that does not resolve has two causes that want opposite actions. A
+    key with no row in the table is a typo or a deployment knob, and the reader
+    is sent to the schema. A key with a row that this object does not carry is
+    the schema's own field, and sending that reader to the schema sends them to
+    find it there and stop. The document path cannot produce the second case --
+    a spec read from a mapping resolves every required field or refuses -- so it
+    means a spec assembled some other way, which is what a probe fragment is.
+    """
+    if required:
+        raise SpecRefusal(
+            Rule.TOTALITY,
+            f"`{path}` is declared by this schema, and this spec carries no value "
+            "for it",
+            "a spec read with `MachineSpec.from_mapping` resolves every required "
+            "field, so this one was assembled from parts; merge the fragment "
+            "that measures this field before asking for it",
+        )
+    raise SpecRefusal(
+        Rule.TOTALITY,
+        f"`{path}` is declared by this schema as optional, and this spec states "
+        "no value for it",
+        "write it in the document if a reader needs it; a field the document "
+        "leaves out is left out here rather than invented",
+    )
 
 
 def refuse_unknown_key(path: str) -> None:
