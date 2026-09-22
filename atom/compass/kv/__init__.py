@@ -6,9 +6,9 @@ Three pieces, split by what each one may depend on.
 `transfer` is arithmetic -- a latency, a derated bandwidth and an exact byte
 count -- and imports nothing from the engine itself. Importing it through this
 file is not that bare import, though: this file loads `connector` as well, and
-with it the engine's connector interface, its factory, and what those pull in.
-No tensor library and no device runtime among them, so a price can still be
-computed where no driver exists.
+with it the engine's connector interface, its factory, the sequence state the
+scheduler half reads, and what those pull in. No tensor library and no device
+runtime among them, so a price can still be computed where no driver exists.
 
 `handoff` is the parameter blob a producing deployment hands back for the
 router to relay, whose field set belongs to the backend it stands in for and
