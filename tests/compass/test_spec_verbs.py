@@ -28,6 +28,7 @@ numbers.
 """
 
 import copy
+import importlib.util
 
 import pytest
 
@@ -48,7 +49,9 @@ from atom.compass.spec import (
     tokenizer_fragment,
     validate,
 )
-from atom.compass.spec.fields import BY_PATH, Kind
+from atom.compass.spec import fields as schema_module
+from atom.compass.spec import probes as probes_module
+from atom.compass.spec.fields import BY_PATH, Field, Kind
 from atom.compass.spec.probes import FILLED_BY, cpu_counts
 from atom.compass.spec.tokenizers import ENTRY_FIELDS
 from atom.compass.spec.validate import (
@@ -1408,6 +1411,40 @@ def test_a_rank_whose_free_memory_was_binding_is_refused_and_named():
     assert "92100000000.0" in refused.value.what
 
 
+def test_which_refusal_a_pair_of_readings_earns_is_not_decided_by_rank_order():
+    # One rank read numbers no card produced; the other built its cache out of
+    # the gap a neighbour left. Each fails a different one of the two per-rank
+    # checks, so the pair earns both -- and the two name different things to
+    # repair: a reading to take again, against a card to take it on. Every rank
+    # is asked the first question before any is asked the second, so the pair
+    # earns the same refusal whichever of them arrived first. Asked rank by
+    # rank instead, whichever was listed first would decide the remedy, and a
+    # run sent after the wrong one repairs it and is refused again.
+    binding = reading(200.0e9)
+    impossible = DeviceMemory(
+        free_bytes=400.0e9,
+        total_bytes=CAPACITY,
+        reserved_bytes=-120.0e9,
+        kv_budget_bytes=1.0,
+    )
+    assert binding.free_was_binding and not binding.impossible
+    assert impossible.impossible and not impossible.free_was_binding
+    for ranks, first_to_fail in (
+        ([binding, impossible], "rank 1"),
+        ([impossible, binding], "rank 0"),
+    ):
+        with pytest.raises(SpecRefusal) as refused:
+            non_torch_across_ranks(2, ranks, 7.2e9)
+        assert refused.value.rule is Rule.DEVICE_WIDE
+        assert "which is not a reading of a card" in refused.value.what
+        assert "set the cache size" not in refused.value.what
+        assert "take them again and find out" in refused.value.remedy
+        # Which check fired is the readings'; the rank it names is still the
+        # first that failed that check, which is a question about where in the
+        # sequence the reading came in and has no other answer.
+        assert first_to_fail in refused.value.what
+
+
 def test_a_reading_the_engine_would_floor_at_zero_is_refused_here():
     # The engine floors this term at zero. A probe does not: a floor turns an
     # impossible reading into a plausible one.
@@ -1623,6 +1660,75 @@ def test_the_probe_question_reads_only_the_tables_a_probe_can_fall_short_on():
     assert {path.rsplit(".", 1)[-1] for path in PROBE_TABLES} == {
         name for name, probes in FILLED_BY.items() if None in probes
     }
+
+
+def reimported_validate(name):
+    """`validate` imported again, the way a session imports it the first time.
+
+    The probe tables are derived once, while the module is being imported, so a
+    test about that derivation has to import the module rather than call
+    something in it. This loads a second instance out of the same file under a
+    name of its own, and does not register it, so the instance the rest of the
+    suite is holding is the one it started with.
+    """
+    location = importlib.util.find_spec("atom.compass.spec.validate").origin
+    loaded = importlib.util.spec_from_file_location(
+        f"atom.compass.spec.{name}", location
+    )
+    module = importlib.util.module_from_spec(loaded)
+    loaded.loader.exec_module(module)
+    return module
+
+
+def test_a_width_table_no_probe_is_named_for_is_refused_and_not_an_import_error(
+    monkeypatch,
+):
+    # A width-keyed constant written into the schema and not into the probe
+    # table is the ordinary shape of a half-finished change, and the two lists
+    # are held together by a test for exactly that reason. The derivation runs
+    # while the module is being imported, so a table it could not answer for
+    # would deny every caller of the package instead -- and that test would
+    # fail at collection, as an import error naming the test session rather
+    # than the term nobody entered.
+    added = Field("device.runtime_constants.graph_replay_pool_bytes", Kind.WIDTH_TABLE)
+    monkeypatch.setattr(schema_module, "SCHEMA", schema_module.SCHEMA + (added,))
+    under_test = reimported_validate("validate_with_a_table_no_probe_is_named_for")
+    assert added.path in under_test.WIDTH_TABLES
+    # A table with no entry has no hole to report, so it is not a probe table.
+    assert added.path not in under_test.PROBE_TABLES
+    # The term is named where a caller asks about it, by the refusal this
+    # package exists to give.
+    with pytest.raises(SpecRefusal) as refused:
+        probe_for("graph_replay_pool_bytes", 1)
+    assert refused.value.rule is Rule.NO_DEFAULTS
+    assert "`graph_replay_pool_bytes` is not one of the constants" in refused.value.what
+    # And what the test holding the two lists together now sees is its own
+    # comparison, failing on the term that is missing from the table.
+    assert set(FILLED_BY) != {
+        path.rsplit(".", 1)[-1] for path in under_test.WIDTH_TABLES
+    }
+
+
+def test_a_probe_given_the_width_that_has_none_empties_the_probe_tables(monkeypatch):
+    # The property the derivation exists for, and the one a second list would
+    # lose: give the hole a probe and the question has nothing left to ask
+    # about, with nothing else to edit. The run still counts it as asked -- it
+    # is not a question this run could not reach -- and it finds nothing to say.
+    monkeypatch.setitem(
+        FILLED_BY,
+        "allocator_retained_after_load_bytes",
+        (probes_module.SINGLE_CARD, probes_module.MULTI_RANK),
+    )
+    under_test = reimported_validate("validate_with_every_width_filled")
+    assert under_test.PROBE_TABLES == ()
+    checked = under_test.validate(merged().document, tp_widths=(16,))
+    assert not checked.ok
+    assert not any(
+        condition.startswith(PROBES_ASKED) for condition in checked.not_asked
+    )
+    assert not any(
+        condition.startswith(PROBES_ASKED) for condition in checked.asked_in_part
+    )
 
 
 def test_the_probe_question_says_it_could_not_be_asked_when_its_table_is_gone():

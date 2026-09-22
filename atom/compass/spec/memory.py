@@ -102,7 +102,16 @@ is asked per rank, where the rank that produced it can still be named.
 Four checks, then, narrowing: whether one rank's readings describe a card at
 all, whether the cache that rank built was sized by its own budget, the ranks
 against each other, and the one number that survives them. A contaminated run
-can fail more than one, and the one raised is the first in that order.
+can fail more than one, and **each check is asked of every rank before the next
+check is asked**, so the one raised is the first in that order. Asking them the
+other way round -- both questions of rank 0, then both of rank 1 -- would make
+the refusal a function of the order the ranks were listed in: two readings, one
+that is no card and one whose cache a neighbour sized, earn a different refusal
+depending on which of them is rank 0. The two name different things to repair,
+so a run sent after the wrong one can fix what it was told to fix and see the
+same refusal again. The rank a refusal names is still the first that failed the
+check that fired, which is a question about which reading came in where and has
+no other answer.
 
 One difference from the engine's own arithmetic is deliberate: the engine floors
 this term at zero and this does not. A floor turns an impossible reading into a
@@ -204,6 +213,10 @@ def non_torch_across_ranks(
                 "out plausible whether or not the readings themselves can be "
                 "true together",
             )
+    # Every rank is asked the first question before any is asked the second, so
+    # which of the two a run is refused by is decided by the readings and not by
+    # the position a failing rank happened to arrive in.
+    for rank, reading in enumerate(readings):
         if reading.free_was_binding:
             raise SpecRefusal(
                 Rule.DEVICE_WIDE,
