@@ -283,7 +283,8 @@ class TermComparison:
 
     `predicted` is `None` for a term the run records and nothing predicted --
     the -0.084 GB of the incident this module exists for, a resident term
-    existed. It is reported as the whole of itself rather than passed over,
+    nobody had noticed existed. It is reported as the whole of itself rather
+    than passed over,
     because a term that is absent from a prediction is absent from its sum too
     and that is exactly what makes a sum unable to see it.
     """
@@ -412,9 +413,10 @@ class Comparison:
 
         `band` has no default because this project states no band for a sum.
         Every band it does state -- the 10% a non-KV memory term carries, and
-        **per term**, and choosing one of them for a sum is the substitution
-        that produced the +13.8%. Naming it at the call site is the moment a
-        caller has to notice that.
+        the 25% the unmeasured-device tier allows one -- is **per term**, and
+        choosing one of those two for a sum is the substitution that produced
+        the +13.8%. Naming it at the call site is the moment a caller has to
+        notice that.
         """
         return SummedCheck(comparison=self, band=band)
 
@@ -494,7 +496,8 @@ def _refuse_shape(name: str, predicted: Shape, recorded: Shape) -> TermRefusal:
         f"predicted at {predicted}, recorded at {recorded}",
         "take the two sides at one shape. A -0.015 GB activation error in the "
         "incident this comparison exists for is exactly this, and a difference "
-        "looks like a difference in the model until somebody states both",
+        "in shape looks like a difference in the model until somebody states "
+        "both",
     )
 
 
