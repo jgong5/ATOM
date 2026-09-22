@@ -208,8 +208,12 @@
   limitation.
 - **Four things about `gh stack` that cost time if rediscovered.** `gh stack link`
   fails with `unable to determine default branch` unless `--base <branch>` is
-  given. `gh stack unstack <n>` refuses while any member is queued for merge, takes
-  no `--yes`, and can leave an orphan stack object; `DELETE /stacks/<n>` 404s. Only
+  given. `gh stack unstack <n>` takes no `--yes` and **can refuse outright** --
+  measured with *"Pull request #N cannot be removed from this stack"* both while a
+  member was queued for merge **and** later when every member was closed and its
+  branches deleted. `DELETE /stacks/<n>` 404s. So a stack object can outlive
+  everything it points at, and one orphan from a throwaway probe is stuck on this
+  fork: **linking is not freely reversible -- link a chain when you mean it.** Only
   open, non-draft PRs merge. And there is **no `--message` flag**, so a
   hand-written squash message cannot be supplied at merge time — with one commit
   the body survives, with many GitHub's default applies. Since the squash message
@@ -217,6 +221,30 @@
   stacking.
 - **Never force-push a branch under review. A restack after its parent has
   landed is permitted.**
+- **A chain is linked as a whole or not at all, and the check is an instrument
+  rather than a habit.** Linking a chain when it is quiescent and then letting it
+  grow leaves a **half-linked** chain, which is worse than none: `gh stack merge`
+  auto-retargets the members inside the stack and not the ones outside it, so two
+  disciplines apply to different PRs in one chain and nothing on the PR says which.
+  This happened: two chains were linked at two PRs each and grew to five and four.
+
+  **When a PR joins a chain, re-link the whole chain in the same step** --
+  `gh stack link --base feature/atomcompass_new <bottom> ... <top>` naming every
+  member. It updates an existing stack rather than creating a second one, so it is
+  idempotent and safe to repeat.
+
+  **Do not link a chain with `need human` anywhere below it.** The label stops
+  agent action on that PR, and linking acts on every member.
+
+  **The drift check**, which belongs in the slot check rather than in memory: for
+  each open PR whose base is another open PR's branch, assert both sit in one
+  stack. Build it from `gh pr list --json number,headRefName,baseRefName,labels` and
+  `gh api "repos/<o>/<r>/stacks?pull_request=<n>"`, exit non-zero on drift, and
+  count held chains separately rather than reporting them as failures. A working
+  copy may sit in `agent_scratch/`, which is git-ignored -- rebuild it rather than
+  assume it survived. **Run its positive
+  control before trusting a clean result** -- a check nobody has watched fire
+  proves nothing, which this project has now learned twice.
 - **Landing the bottom of a hand-managed base chain forces one restack of
   everything above it** — `git rebase --onto <new> <old> <branch>` plus a REST base
   patch, per child, per parent move. A plain `git rebase` conflicts where `--onto`
