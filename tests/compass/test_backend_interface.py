@@ -13,6 +13,11 @@ the day it is added. It reads nothing outside it, which is the limit worth
 stating: the property is a property of a *package*, not something a type
 inherits by being passed across the seam. Whoever defines the projection type
 somewhere else owns the same assertion over the package that defines it.
+
+Walking a root that does not resolve yields nothing, and a parametrisation of
+nothing is a pass. So the non-empty case is asserted on its own: without it a
+renamed or moved package collects zero cases and this file reports green, which
+is the one outcome a test whose job is to pin something must not have.
 """
 
 import ast
@@ -88,9 +93,32 @@ def _imported_modules(path):
             yield node, "." * node.level + (node.module or "")
 
 
+def _backend_modules():
+    # rglob, so a module added under the package is covered the day it lands.
+    return sorted(PACKAGE.rglob("*.py"))
+
+
+def test_the_package_was_found():
+    assert _backend_modules(), f"no modules under {PACKAGE}"
+
+
+def test_the_guard_finds_nothing_when_the_root_moves(monkeypatch, tmp_path):
+    """The control for the guard above, which otherwise only proves it is alive.
+
+    A guard that has never been seen failing is a liveness check: it passes
+    today because the package is where it always was. Pointed at a root that
+    does not resolve it must come back empty -- and the sibling module one level
+    out is there so a derivation that widened past its own root would be caught
+    here instead of quietly keeping the parametrisation non-empty.
+    """
+    (tmp_path / "sibling.py").write_text("")
+    monkeypatch.setitem(globals(), "PACKAGE", tmp_path / "moved")
+    assert not _backend_modules()
+
+
 @pytest.mark.parametrize(
     "path",
-    sorted(PACKAGE.rglob("*.py")),
+    _backend_modules(),
     ids=lambda p: str(p.relative_to(PACKAGE)),
 )
 def test_the_package_imports_nothing_from_the_engine(path):
