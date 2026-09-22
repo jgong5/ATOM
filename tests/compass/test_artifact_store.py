@@ -475,12 +475,19 @@ def test_an_empty_directory_in_the_way_is_not_silently_replaced(tmp_path):
 
 
 def test_an_abandoned_staging_directory_does_not_block_a_publish(tmp_path):
-    """Staging is per-publisher, so a crashed one is not in anybody's way."""
+    """Staging is per-publisher, so a crashed one is not in anybody's way.
+
+    The abandoned directory is named `.<entry>.publishing` on purpose: that is
+    the name the pre-`mkdtemp` code derived from the key, so a revert has
+    something to find and `shutil.rmtree` away. An earlier version of this test
+    called it `.crashed`, which no version of the code ever touched -- it
+    passed with the fix and passed reverted, and proved nothing.
+    """
     store = ArtifactStore(tmp_path)
     topology = Topology(tp=2)
     key = price_key(2)
     destination = store.directory_for(key)
-    abandoned = destination.parent / f".{destination.name}.crashed"
+    abandoned = destination.parent / f".{destination.name}.publishing"
     abandoned.mkdir(parents=True)
     (abandoned / "prices.dp0of1.pp0of1.pcp0of1.tp0of2.json").write_bytes(b"half")
     entry = store.publish(

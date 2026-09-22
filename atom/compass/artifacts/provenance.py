@@ -217,11 +217,16 @@ def module_root(module: str) -> str:
     wedged driver, so only the head is resolved by the import machinery and
     the remaining segments are walked as paths.
 
-    The walk is the rule `scripts/compass/README.md` already states for the
-    trigger derivation: `X.y` is `X/y/__init__.py`, else `X/y.py`. A segment
-    that is neither is refused rather than guessed, for the same reason that
-    file gives -- either the name was misread or the module is absent, and
-    both make the stanza wrong by an unknown amount.
+    The walk resolves the two forms `scripts/compass/README.md:265` names for
+    the trigger derivation, `X/y/` and `X/y.py`, and refuses a segment that is
+    neither -- for the reason that file gives: either the name was misread or
+    the module is absent, and both make the stanza wrong by an unknown amount.
+
+    **The precedence here is the opposite of that README line**, deliberately.
+    It resolves a name read out of source text and takes `X/y.py` first; this
+    resolves a name the import system would, and there a package shadows a
+    module of the same name. A tree holding both is digested under the
+    directory Python would have executed.
     """
     head, _, rest = module.partition(".")
     try:
