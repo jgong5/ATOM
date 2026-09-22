@@ -2,6 +2,14 @@
 - **If there are no blocking issues, say so explicitly** in every message.
 - **Quote the context; stop only for critical decisions.**
 - **Always communicate PR status.** The owner does not care about local worktree state.
+- **Answer with the conclusion first.** When the owner asks what a task
+  established, the first line is the **finding**, not the method, the process, or
+  what happens next. A reader who stops after one line should have the answer.
+  Supporting measurement follows; caveats and cost follow that. The shape, from a
+  capture task: *a real model traces at both widths, and its shapes are entirely
+  concrete -- 0 symbolic of 13,107* -- then the evidence for each half. What this
+  replaces is a status report that recites what was done and leaves the owner to
+  infer what it means.
 - Output shaping (`/i-have-adhd`): lead with the next action, number multi-step
   tasks, end with one concrete next action, restate state every turn, specific time
   estimates, matter-of-fact error tone, cap lists at 5, no preamble or closing
@@ -21,6 +29,31 @@
   which does not survive a full `teardown.sh`, so expect to re-add it after a
   container rebuild — script it under `/workspace` rather than doing it by hand
   each time. This happened on #11's landing and needed a manual repair.
+- **The fast-forward is easy to skip because nothing visibly breaks**, and it was
+  measured **14 commits behind** after a full session of landings. It matters
+  beyond tidiness: the main worktree holds the local `feature/atomcompass_new`,
+  **every linked worktree shares that ref**, and `compass_resolve_ref` tries the
+  bare name first -- so a stale local branch beats `fork/...` for any command that
+  omits `COMPASS_INTEGRATION_REF`. That is the defect the resolver was changed to
+  announce rather than resolve silently.
+- **The chown back is two steps, and the second is not optional.** The container
+  runs as uid 0 and the host user is 13797, so root writes with umask 0022 and the
+  tree stays root-owned without it. But `chown -R` over the main worktree also
+  hits `.git/worktrees/`, **which every linked worktree shares**, and container git
+  then refuses all of them with `dubious ownership`. Measured: it broke four
+  worktrees at once, mid-session, with agents running.
+
+  ```
+  cd <main worktree> && git fetch fork --quiet
+  git merge --ff-only fork/feature/atomcompass_new
+  chown -R 13797:13797 .      # working tree back to the host user
+  chown -R 0:0 .git           # MUST follow, or every linked worktree breaks
+  ```
+
+  Working tree 13797-owned, `.git` root-owned -- the state the repo was already
+  in, which is why no `safe.directory` entry is needed. Verify with
+  `stat -c "%u %n" . .git` and by running `git -C <each worktree> rev-parse HEAD`
+  afterwards. Do not assume it worked.
 - **Four setup rules, from failures already recorded on this hardware.** None was
   caused by worktrees; all were caused by a shared mutable non-git source tree
   that things silently resolved against.
