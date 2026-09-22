@@ -279,11 +279,7 @@ def test_each_name_waits_exactly_as_its_own_call_sites_say(name):
 
 def test_a_name_the_runner_lacks_is_skipped_and_not_raised():
     """`getattr(..., None)` plus `continue`: the worker never notices."""
-    busy = next(
-        n
-        for n in ast.walk(ast.parse(ASYNC_PROC))
-        if isinstance(n, ast.FunctionDef) and n.name == "busy_loop"
-    )
+    busy = _busy_loop()
     getattrs = [
         n
         for n in ast.walk(busy)
@@ -307,11 +303,7 @@ def test_a_reply_is_forwarded_only_when_it_is_not_none():
     caller on that path and this file's whole account of the surface would be
     wrong for it.
     """
-    busy = next(
-        n
-        for n in ast.walk(ast.parse(ASYNC_PROC))
-        if isinstance(n, ast.FunctionDef) and n.name == "busy_loop"
-    )
+    busy = _busy_loop()
     guards = [
         n
         for n in ast.walk(busy)
@@ -396,11 +388,7 @@ def test_a_refusal_reaches_the_caller_instead_of_stranding_it():
     assert "_self.exit()" in ASYNC_PROC
 
     # The worker's own dispatch catches nothing, which is what kills it.
-    busy = next(
-        n
-        for n in ast.walk(tree)
-        if isinstance(n, ast.FunctionDef) and n.name == "busy_loop"
-    )
+    busy = _busy_loop()
     assert not [n for n in ast.walk(busy) if isinstance(n, ast.Try)]
 
     # SystemExit is queued before the manager finalizes its parent.
@@ -911,8 +899,14 @@ def test_what_the_comment_says_a_hole_at_exit_loses_is_what_exit_does():
     }
     assert "self.model" in deleted
     assert "`self.model` is never dropped" in comment
-    kv = next(n for n in ast.walk(body) if isinstance(n, ast.For))
-    assert {e.value for e in kv.iter.elts} == {
+    literal_loops = [
+        n
+        for n in ast.walk(body)
+        if isinstance(n, ast.For) and isinstance(n.iter, (ast.Tuple, ast.List))
+    ]
+    assert len(literal_loops) == 1
+    kv = literal_loops[0]
+    assert {e.value for e in kv.iter.elts if isinstance(e, ast.Constant)} == {
         "kv_cache",
         "kv_scale",
         "index_cache",
@@ -936,15 +930,18 @@ def test_the_unanswered_helper_describes_its_whole_return_and_not_one_half():
     `test_the_two_names_no_caller_waits_for_and_what_replying_costs` already
     calls false, so the two names it excepts are read back out of the prose
     and compared with the table rather than typed here. The count word is
-    held to `len(RPC_SURFACE)` the same way, and the single-caller claim to
-    the tree.
+    held to `len(RPC_SURFACE)` the same way -- the word is looked up from the
+    table's length, not typed beside a literal 12 -- and the single-caller
+    claim to the tree.
     """
     doc = " ".join(unanswered_rpc_names.__doc__.split())
     unwaited = {n for n, w in RPC_SURFACE.items() if not w}
     assert {n for n in RPC_SURFACE if f"`{n}`" in doc} == unwaited
     assert "a hole in either parks no one" in doc
     assert "parks forever" not in doc
-    assert "all twelve" in doc and len(RPC_SURFACE) == 12
+    word = {10: "ten", 11: "eleven", 12: "twelve", 13: "thirteen"}.get(len(RPC_SURFACE))
+    assert word is not None, f"no count word for {len(RPC_SURFACE)} names"
+    assert f"all {word}" in doc
     callers = [
         str(f.relative_to(REPO))
         for f in sorted((REPO / "atom").rglob("*.py"))
