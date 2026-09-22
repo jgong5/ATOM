@@ -50,6 +50,12 @@ ROLLOUT = (
     "atom/rollout/weight_updater.py",
     "atom/rollout/memory_manager.py",
 )
+# The two trees the profiler reply crosses: `model_engine`, which builds the
+# dict and forwards it, and the Compass package that replaces the producer.
+# The `trace_dir` claim below is about these and nothing else -- reading the
+# whole `atom/` tree would let any package's passing mention of the string
+# fail a test about this one reply.
+REPLY_SURFACE = (ENGINE, REPO / "atom" / "compass" / "runner")
 
 
 class Site(NamedTuple):
@@ -95,6 +101,16 @@ def _arity(parent):
         target = parent.targets[0]
         return len(target.elts) if isinstance(target, ast.Tuple) else 1
     return 1
+
+
+def _mentions(roots, needle, base=REPO):
+    """Files under `roots` containing `needle`, as paths relative to `base`."""
+    return {
+        str(path.relative_to(base))
+        for root in roots
+        for path in root.rglob("*.py")
+        if needle in path.read_text()
+    }
 
 
 def _call_sites():
@@ -644,22 +660,90 @@ def test_the_profiler_replies_are_forwarded_whole_and_never_unpacked():
     is tempting to read that as the shape the call site requires. It is not.
     `engine_utility.py` logs the reply whole and puts it in a response
     envelope; `llm_engine.py:300`'s `.get("result", {})` is on that envelope,
-    not on the reply; and `trace_dir` appears nowhere in the tree except the
-    three lines of `model_runner.py` that produce it. What the callers impose
-    is non-None and picklable. The keys are a convention a successor inherits,
-    and stating them as a requirement would be stating a tighter contract than
-    anything checks -- which is a documentation defect even when it errs safe.
+    not on the reply; and `trace_dir` appears nowhere on either side of the
+    reply except the three lines of `model_runner.py` that produce it. What
+    the callers impose is non-None and picklable. The keys are a convention a
+    successor inherits, and stating them as a requirement would be stating a
+    tighter contract than anything checks -- which is a documentation defect
+    even when it errs safe.
+
+    The scan reads the engine and the Compass runner package -- the code this
+    reply crosses -- and not every package that will ever sit under
+    `atom/compass`. The three tests below hold it to both halves of that: it
+    still catches a mention inside the runner package, and it stays quiet
+    about one outside it.
     """
     assert {s.arity for s in SITES["start_profiler"]} == {1}
     assert {s.arity for s in SITES["stop_profiler"]} == {1}
-    producers = {
-        str(p.relative_to(REPO))
-        for p in (REPO / "atom").rglob("*.py")
-        if "trace_dir" in p.read_text()
+    assert _mentions(REPLY_SURFACE, "trace_dir") == {
+        "atom/model_engine/model_runner.py"
     }
-    assert producers == {"atom/model_engine/model_runner.py"}
     utility = (ENGINE / "engine_utility.py").read_text()
     assert '("UTILITY_RESPONSE", {"cmd": "stop_profile", "result": result})' in utility
+
+
+# --- the scan itself, which has to catch something and not everything --------
+
+
+FAKE_TREE = (
+    "atom/model_engine/model_runner.py",
+    "atom/compass/runner/overrides.py",
+    "atom/compass/spec/reader.py",
+)
+PRODUCER = FAKE_TREE[0]
+
+
+def _fake_repo(tmp_path, mentioning):
+    """A three-file stand-in repo, with `trace_dir` written into `mentioning`.
+
+    One call builds either direction of the pin. The roots handed back are the
+    two the real scan uses, so the file under them and the file beside them
+    differ in nothing but where they sit.
+    """
+    for rel in FAKE_TREE:
+        path = tmp_path / rel
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text("# trace_dir\n" if rel in mentioning else "pass\n")
+    return (tmp_path / "atom/model_engine", tmp_path / "atom/compass/runner")
+
+
+def test_the_scan_looks_at_both_sides_of_the_reply():
+    """A scan narrowed until it reaches nothing would pass forever.
+
+    The producer and the two Compass runner modules are named here, so a root
+    that moves or a package that is renamed fails rather than quietly
+    shrinking the set the assertion above is computed over.
+    """
+    scanned = {
+        str(path.relative_to(REPO))
+        for root in REPLY_SURFACE
+        for path in root.rglob("*.py")
+    }
+    assert {
+        "atom/model_engine/model_runner.py",
+        "atom/compass/runner/overrides.py",
+        "atom/compass/runner/model_runner.py",
+    } <= scanned
+
+
+def test_the_scan_still_catches_the_string_inside_the_runner_package(tmp_path):
+    """Where the contract does reach, the assertion is the old assertion."""
+    roots = _fake_repo(tmp_path, {PRODUCER, "atom/compass/runner/overrides.py"})
+    assert _mentions(roots, "trace_dir", tmp_path) == {
+        PRODUCER,
+        "atom/compass/runner/overrides.py",
+    }
+
+
+def test_the_scan_ignores_a_compass_package_the_reply_never_reaches(tmp_path):
+    """The half the whole-tree read got wrong, and the reason for this change.
+
+    A module under `atom/compass` that the reply never touches may mention
+    `trace_dir` -- in a comment, in a docstring, in a field name of its own --
+    without failing a test about the profiler reply.
+    """
+    roots = _fake_repo(tmp_path, {PRODUCER, "atom/compass/spec/reader.py"})
+    assert _mentions(roots, "trace_dir", tmp_path) == {PRODUCER}
 
 
 def test_the_two_names_no_caller_waits_for_and_what_replying_costs():
