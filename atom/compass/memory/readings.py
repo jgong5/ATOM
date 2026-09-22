@@ -48,11 +48,10 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from atom.compass.backends.geometry import dtype_bytes as element_bytes
 from atom.compass.memory import graph_pool
 from atom.compass.memory.terms import Basis, Reading, Term
 
-#: Bytes of a cos/sin rotary plane entry. The tables are built in fp32.
-_ROTARY_PLANE_BYTES = 4
 #: Gate and up are both live before their product, so the MLP's intermediate
 #: activation is resident twice at the peak. Geometry, not a coefficient.
 _LIVE_INTERMEDIATE = 2
@@ -80,6 +79,20 @@ def _geometry(config, name: str):
     return value
 
 
+def _dtype(config):
+    """The dtype a model's tensors are resident at, under either spelling."""
+    text = getattr(config, "text_config", config)
+    for name in ("dtype", "torch_dtype"):
+        value = getattr(text, name, None)
+        if value is not None:
+            return value
+    raise MemoryRefusal(
+        "this config states neither `dtype` nor `torch_dtype`, and every byte "
+        "of the model-side terms is twice or half what it should be without it",
+        "name the dtype on the config, or pass `dtype_bytes` explicitly",
+    )
+
+
 @dataclass(frozen=True, slots=True)
 class ModelTerms:
     """The three `peak_torch` terms that belong to the model, not to the card.
@@ -102,7 +115,7 @@ class ModelTerms:
         parameter_count: int,
         tp_size: int,
         warmup_tokens: int,
-        dtype_bytes: int = 2,
+        dtype_bytes: int | None = None,
     ) -> ModelTerms:
         """All three from geometry and declared coefficients, each labelled.
 
@@ -118,15 +131,21 @@ class ModelTerms:
         """
         if tp_size < 1:
             raise ValueError(f"tensor-parallel width is at least 1: {tp_size}")
+        text = getattr(config, "text_config", config)
         hidden = int(_geometry(config, "hidden_size"))
         intermediate = int(_geometry(config, "intermediate_size"))
         head_dim = int(_geometry(config, "head_dim"))
         positions = int(_geometry(config, "max_position_embeddings"))
-        partial = float(
-            getattr(
-                getattr(config, "text_config", config), "partial_rotary_factor", 1.0
-            )
-        )
+        if dtype_bytes is None:
+            dtype_bytes = element_bytes(_dtype(config))
+        # 1.0 is the right reading for a model with full rotary, so an absent
+        # field is not refused here. But a config that states 1.0 and one that
+        # states nothing must not render the same row: the second is the
+        # absence that 03 D15's recorded 4x came from, and an assumption that
+        # does not appear in the table is not an assumption a reader can see.
+        stated = getattr(text, "partial_rotary_factor", None)
+        partial = 1.0 if stated is None else float(stated)
+        assumed = "" if stated is not None else " (absent from config, assumed)"
         rotary_dim = int(head_dim * partial)
         weights = Term(
             "weights",
@@ -139,13 +158,17 @@ class ModelTerms:
         )
         buffers = Term(
             "buffers",
-            positions * rotary_dim * 2 * _ROTARY_PLANE_BYTES,
+            positions * rotary_dim * dtype_bytes,
             Basis.DECLARED,
             f"{positions} positions x int({head_dim} head_dim x {partial} "
-            f"partial_rotary_factor) x 2 planes x {_ROTARY_PLANE_BYTES} B",
-            "03 D16 records buffers rather than computing them: the formula "
-            "that was 4x wrong on the 27B missed partial_rotary_factor, which "
-            "this one reads -- one known failure closed is not a recording",
+            f"partial_rotary_factor{assumed}) x {dtype_bytes} B",
+            "03 D16 records buffers rather than computing them, and this is "
+            "not a recording -- it is derived from ATOM's own rotary source "
+            "and validated against no card. cos and sin together are "
+            "positions x rotary_dim elements, because inv_freq holds "
+            "rotary_dim/2 of them (model_ops/rotary_embedding.py:58-80), and "
+            "they are resident at the model dtype they are cast to, not the "
+            "fp32 they are computed in (:39-49, set at model_runner.py:700)",
         )
         activations = Term(
             "activations",
@@ -163,7 +186,7 @@ class ModelTerms:
             f"{_LIVE_INTERMEDIATE} x {intermediate} intermediate)",
             "the liveness walk of 04 D22 plus the invisible-scratch constants "
             "of 04 T4 replace this; the per-layer coefficient is ATOM's own "
-            "(model_runner.py:3602), over one live layer rather than all of them",
+            "(model_runner.py:3601), over one live layer rather than all of them",
         )
         return cls(weights, buffers, activations)
 
@@ -294,14 +317,23 @@ def device_readings(
     )
     box = total.total - peak_torch.total - non_torch.total
     if box < 0:
+        # Principle 7 applies to a refusal as much as to an answer: the reader
+        # has to see which of the six terms is the one that does not fit, and
+        # three of them are declared coefficients. Both readings render
+        # themselves, so the decomposition costs a newline.
+        needed = (peak_torch.total + non_torch.total) / total.total
         raise MemoryRefusal(
-            f"the non-KV footprint at TP{tp_width} is "
-            f"{(peak_torch.total + non_torch.total) / (1 << 30):.2f} GiB on a "
-            f"card of {total.total / (1 << 30):.2f} GiB, so the clean box is "
-            "negative and there is no free memory to report",
-            "this configuration does not start on this card; reduce the width, "
-            "the model or the warmup shape, or name a larger card. A clamped "
-            "zero here would be a free reading nobody could read as a refusal",
+            f"the non-KV footprint at TP{tp_width} does not fit the card, so "
+            f"the clean box is negative and there is no free memory to "
+            f"report:\n{total.table()}\n{peak_torch.table()}\n"
+            f"{non_torch.table()}",
+            "this configuration does not start on this card. Even "
+            "--gpu-memory-utilization 1.0 is insufficient -- the non-KV terms "
+            f"alone are {needed:.2f} of total -- so the lever ATOM names on "
+            "its own version of this failure (model_runner.py:1698-1706) will "
+            "not reach it; reduce the width, the model or the warmup shape, "
+            "or name a larger card. A clamped zero here would be a free "
+            "reading nobody could read as a refusal",
         )
     free = Reading(
         "free",

@@ -21,8 +21,13 @@ design, so this one cannot be:
 **`Basis` is not `Species`.** `backends/provenance.py` answers *how a cost was
 obtained* -- analytical, measured, fitted, interpolated, extrapolated. This enum
 answers a different question about a different subject: *where this memory
-term's bytes came from* -- a named field of the machine spec, the model's own
-geometry, arithmetic over other readings, or a coefficient somebody wrote down.
+term's bytes came from* -- a named field of the machine spec, a knob ATOM's
+own config states, arithmetic over other readings, or a coefficient somebody
+wrote down. There is deliberately no `GEOMETRY` member: `05` D24 draws the line
+between the machine and the deployment, and nothing on the model side of it is
+*obtained* yet -- every term read off a model config here is a declared
+formula, and labelling one `GEOMETRY` would say it was not.
+
 The two vocabularies are kept apart deliberately. A declared coefficient has no
 word in `Species` and adding one is an open owner ruling (**#87**), so nothing
 here touches that enum; `Basis.DECLARED` carries the distinction on this side of
@@ -45,7 +50,7 @@ class Basis(enum.Enum):
     """Where a term's bytes came from."""
 
     SPEC = "spec"
-    GEOMETRY = "geometry"
+    DEPLOYMENT = "deployment"
     DECLARED = "declared"
     DERIVED = "derived"
 

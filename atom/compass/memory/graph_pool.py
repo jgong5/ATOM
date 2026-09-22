@@ -48,10 +48,10 @@ RESERVES = "cudagraph_overhead"
 #: The name it refuses, because this one does not reserve anything.
 PREDICTS = "cudagraph_pool"
 
-#: ATOM's declared live-tensors-per-layer coefficient (`model_runner.py:3602`).
+#: ATOM's declared live-tensors-per-layer coefficient (`model_runner.py:3601`).
 #: Mirrored rather than re-derived: it is what the engine spends.
 LIVE_TENSORS_PER_LAYER = 2.8
-#: ATOM's whole-graph estimate, as a fraction of peak activations (`:1621`).
+#: ATOM's whole-graph estimate, as a fraction of peak activations (`:1622`).
 ACTIVATION_FRACTION = 0.2
 #: The fraction of the utilisation budget the piecewise branch will reserve
 #: before it stops taking buckets (`:1591`).
@@ -124,9 +124,23 @@ def reserves(
     """The number that reserves: ATOM's own estimator, with its readings given.
 
     This is `_estimate_cudagraph_overhead` with the two `torch.cuda` calls
-    replaced and nothing else. Its three branches are ATOM's three, and the
-    caller states which one applies rather than this module inferring it from
-    an engine it is not allowed to import.
+    replaced. The caller states which branch applies rather than this module
+    inferring it from an engine it is not allowed to import.
+
+    **Two of ATOM's own adjustments inside those branches are not mirrored
+    here, and they pull in opposite directions.** Neither fires at M1 -- no
+    drafter, one data-parallel rank -- and both are named because MEM-2 wires
+    this into `get_num_blocks` under a block-count gate and would otherwise
+    read "nothing else" as fidelity:
+
+    - A DSpark confidence-schedule drafter rescales the whole-graph branch by
+      the captured bucket count, `activation_bytes * 0.2 * n_buckets`
+      (`model_runner.py:1626-1632`). Without it this **under-reserves** by that
+      factor and so predicts more KV blocks than ATOM would.
+    - The piecewise branch drops buckets over `ATOM_PIECEWISE_DP_MAX_TOKENS`
+      when `dp_size > 1` and a drafter is attached (`:1602-1604`).
+      `capture_token_shapes` does not, so that configuration **over-reserves**
+      and predicts fewer.
     """
     if enforce_eager:
         return Reading(
@@ -135,7 +149,7 @@ def reserves(
                 Term(
                     "no capture",
                     0,
-                    Basis.GEOMETRY,
+                    Basis.DEPLOYMENT,
                     "config.enforce_eager",
                     "ATOM captures no graph under enforce_eager and reserves "
                     "nothing for one (model_runner.py:1556)",
@@ -159,7 +173,7 @@ def reserves(
                     int(activation_bytes * ACTIVATION_FRACTION),
                     Basis.DECLARED,
                     f"{ACTIVATION_FRACTION} x {activation_bytes} activation bytes "
-                    "of the warmup shape (model_runner.py:1621)",
+                    "of the warmup shape (model_runner.py:1622)",
                     "ATOM's coefficient, mirrored because it is what reserves; "
                     "`predicts()` is the measured pool and disagrees by 4-19x",
                 ),
@@ -190,8 +204,8 @@ def predicts(spec, *, tp_width: int, captured_tokens: int) -> Reading:
     Below width 2 the measured form is a line in the captured tokens and both
     of its coefficients are spec fields. At and above width 2 it is flat, and
     the captured-token count does not enter -- which is the measured result and
-    not an omission, so the argument is still taken and still named in the
-    table.
+    not an omission, so the argument is still taken and the source says that it
+    did not enter rather than leaving a reader to infer it from an absence.
     """
     if captured_tokens < 0:
         raise ValueError(f"a ladder captures no negative tokens: {captured_tokens}")
@@ -206,7 +220,8 @@ def predicts(spec, *, tp_width: int, captured_tokens: int) -> Reading:
                     "flat above width 1",
                     int(spec.runtime_constant(f"{field}.w_gt1_flat_bytes")),
                     Basis.SPEC,
-                    f"device.runtime_constants.{field}.w_gt1_flat_bytes",
+                    f"device.runtime_constants.{field}.w_gt1_flat_bytes "
+                    f"(flat; {captured_tokens} captured tokens do not enter)",
                     "flat is well supported as a shape -- the allocated delta "
                     "was byte-identical across three widths and three ladders "
                     "-- but that the step is at width 2 rests on one point "
