@@ -57,11 +57,13 @@ Where the shapes specialise
 ---------------------------
 Three sites, in an order rather than a set. A free symbol is solved by whichever
 line reaches it first, so repairing one does not always close what it solved:
-closing the first moves the caller's bound to a third site fourteen lines later,
-in an ATOM assertion helper. The plain symbolic pass records the first two; a
-third pass simulates the first closed, from outside ATOM, and records what is
-behind it. All three are pinned, and there is no claim that three is all there
-are -- only that these three are what this instrument can reach today.
+closing the first moves the caller's bound into an ATOM assertion helper in
+another file and a later phase of the step -- `forward_context.py:437`, reached
+from the `run_model` call at `model_runner.py:3254`, with `prepare_inputs`
+already returned. The plain symbolic pass records the first two; a third pass
+simulates the first closed, from outside ATOM, and records what is behind it.
+All three are pinned, and there is no claim that three is all there are -- only
+that these three are what this instrument can reach today.
 """
 
 from __future__ import annotations
@@ -578,7 +580,7 @@ def _watch_simulated_tp(tree_root):
     a TP>1 inventory taken through it both erases and fabricates, so a record
     that came through it is not a TP>1 record at all. It used to be carried by
     a literal written into the record and asserted against itself, which
-    cannot fail and cannot go stale -- the defect principle 8 exists for.
+    cannot fail and cannot go stale -- the defect that check exists for.
 
     The sentinel records every call, with the ATOM frames that made it, and
     does not call through: a run in which it fires produces a record naming
@@ -1384,10 +1386,10 @@ def test_atom_s_own_buffer_constructor_is_what_runs():
     The pin on the second specialisation site is worth only as much as the
     code it lets run. An earlier version of this file replaced `__init__`
     wholesale, and a `raise` as its first statement then changed nothing
-    anywhere in this file -- so the repair route T81 names for site two, a
-    symbolic `CpuGpuBuffer`, could have landed and this test would still have
-    reported the site unrepaired. It is ATOM's body that runs now, with three
-    primitives staged around it, and these counts are what says so.
+    anywhere in this file -- so the repair route the design record names for
+    site two, a symbolic `CpuGpuBuffer`, could have landed and this test would
+    still have reported the site unrepaired. It is ATOM's body that runs now,
+    with three primitives staged around it, and these counts are what says so.
 
     The counts are also the pin on the body itself, which no specialisation
     site covers: one host allocation and one numpy view per buffer, and in the
@@ -1526,24 +1528,26 @@ def test_the_first_two_specialisation_sites_are_where_they_were_measured():
 def test_closing_site_one_moves_the_bound_to_a_third_site():
     """Repairing the first site does not close the bound; it relocates it.
 
-    T81 recorded the two sites as independent and said a symbolic bound closes
-    the first and leaves the second as it is. Half of that is true. This is
-    the other half, and it is the reason the sites are an order rather than a
-    set: with the numpy view reading the bound's hint instead of solving it --
-    the simulated site-one repair, applied from outside ATOM -- the bound
-    survives `:1115` and is solved fourteen lines later, inside an ATOM
-    assertion helper that takes `int()` of a dimension.
+    The design record had the two sites as independent and said a symbolic
+    bound closes the first and leaves the second as it is. Half of that is
+    true. This is the other half, and it is the reason the sites are an order
+    rather than a set: with the numpy view reading the bound's hint instead of
+    solving it -- the simulated site-one repair, applied from outside ATOM --
+    the bound survives `:1115` and is solved in another file and a later phase
+    of the step, inside an ATOM assertion helper that takes `int()` of a
+    dimension: `forward_context.py:437`, reached from the `run_model` call at
+    `model_runner.py:3254`, with `prepare_inputs` already returned.
 
     The second site is untouched by the repair, exactly as recorded. The third
-    is the one CAP-2 meets the moment its site-one repair lands, and it is in
-    a module nothing in the design record named before this test.
+    is the one the next task meets the moment its site-one repair lands, and
+    it is in a module nothing in the design record named before this test.
     """
     record = capture(1, symbolic=True, repair_site_one=True)
     assert record["site_one_repair_simulated"] is True
     assert record["buffer_init"]["hint_sliced_views"] > 0
 
     two, three = record["specialisations"]
-    # Site two, unchanged by the repair -- which is the half of T81's sentence
+    # Site two, unchanged by the repair -- which is the half of that sentence
     # that holds.
     assert site(two, 2) == SITE_TWO
     assert site(three, 2) == SITE_THREE
