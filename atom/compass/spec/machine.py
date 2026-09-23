@@ -29,7 +29,16 @@ upgrade is a plausible-looking wrong answer.
 document from the checked values, and `digest` fingerprints it. A run artifact
 carries the echo, so every number it reports can be traced back to the spec that
 produced it; a partial echo would break that, so the echo is built from the
-field table rather than from whatever the reader happened to keep.
+field table rather than from whatever the reader happened to keep. Totality is
+`from_mapping`'s doing rather than the dataclass's: the checking verb builds one
+out of the fields a document did resolve, deliberately, so that it can ask its
+consistency questions of a document that is not yet a spec.
+
+The walk over the document has two forms for the same reason. `from_mapping` is
+a reader and raises the first thing wrong; `_survey` under it yields every
+refusal and keeps walking, so a checking caller still gets the fields that sit
+beside a mistyped key. One unrecognised key would otherwise empty the whole
+document of resolved values, and the questions asked over them with it.
 """
 
 import hashlib
@@ -77,21 +86,40 @@ def _missing(field: Field) -> None:
     )
 
 
-def _walk(node: Mapping, prefix: str, found: dict) -> None:
+def _survey(node: Mapping, prefix: str, found: dict):
+    """Every key of a document, keeping what the table declares and yielding a
+    refusal for each key that it does not.
+
+    The walk carries on past a key it refuses, because one unrecognised key
+    says nothing about the rest of the document: the block beside it holds the
+    width tables and the stack pin, and stopping here would take those out of
+    reach of every question asked further on. A reader that has to produce a
+    value wants the first refusal and `_walk` below raises it; a check wants
+    them all.
+    """
     for key, value in node.items():
         path = f"{prefix}.{key}" if prefix else str(key)
         if path in BY_PATH:
             found[path] = value
         elif path in BLOCKS:
-            if not isinstance(value, Mapping):
-                raise SpecRefusal(
+            if isinstance(value, Mapping):
+                yield from _survey(value, path, found)
+            else:
+                yield SpecRefusal(
                     Rule.SHAPE,
                     f"`{path}` holds {value!r}, where the schema has a block",
                     "write the block's fields there",
                 )
-            _walk(value, path, found)
         else:
-            refuse_unknown_key(path)
+            try:
+                refuse_unknown_key(path)
+            except SpecRefusal as refusal:
+                yield refusal
+
+
+def _walk(node: Mapping, prefix: str, found: dict) -> None:
+    for refusal in _survey(node, prefix, found):
+        raise refusal
 
 
 @dataclass(frozen=True, slots=True)
@@ -186,10 +214,16 @@ class MachineSpec:
         return self.tokenizers.resolve(architecture, backend, fingerprint)
 
     def check_stack(self, observed: Mapping[str, str]) -> tuple:
-        """Compare the pinned stack with the loaded one; warn on every difference."""
+        """Compare the pinned stack with the loaded one; warn on every difference.
+
+        A component this document does not carry is not compared, so a partial
+        one can still be asked this much of the question.
+        """
         found = []
         for component in PINNED:
-            pinned = self.values[f"device.software_pinned_to.{component}"]
+            pinned = self.values.get(f"device.software_pinned_to.{component}")
+            if pinned is None:
+                continue
             seen = observed.get(component)
             if seen != pinned:
                 found.append((component, pinned, seen))

@@ -33,12 +33,21 @@ predicted quantity back to the spec fields under it, which is what makes echoing
 the whole spec into every artifact worth anything. `across_ranks` reduces the
 one reading that is taken per rank, keeping the smallest and reporting how far
 the ranks disagreed.
+
+A probe fills part of the document for them to work over. `tokenizer_fragment`
+is the tier that needs no device: it takes the rates somebody measured, checks
+them against the table a tokenizer entry has, and emits them together with the
+core counts of the processor it read here -- which is what makes a fragment
+composed somewhere other than its target contradict the target rather than
+merge quietly into it. How the rates were obtained is the caller's to state,
+because nothing in this package measured them.
 """
 
 from .explain import QUANTITIES, Basis, Contribution, explain
 from .fields import DECLARED, SCHEMA, SCHEMA_VERSION, Field, Kind
 from .machine import MachineSpec
 from .merge import Fragment, Merge, merge
+from .probes import tokenizer_fragment
 from .ranks import SPREAD_LIMIT, RankSpread, across_ranks
 from .rules import (
     DEPLOYMENT_OWNED,
@@ -77,5 +86,6 @@ __all__ = [
     "across_ranks",
     "explain",
     "merge",
+    "tokenizer_fragment",
     "validate",
 ]

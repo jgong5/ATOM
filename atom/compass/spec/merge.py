@@ -22,15 +22,18 @@ comparison failed.
 machine the spec is being *authored for* -- `mi355x-8gpu-2node` is a class, not
 a host -- and no field of a fragment records where a probe actually ran. So a
 tokenizer fragment measured on a laptop and a device fragment measured on the
-node, both authored `name: node-18`, pass this arm; they share no field, so the
-second arm has nothing to contradict either, and they merge. That is the exact
-pair this module opens by naming, and it survives. The claim the arm can carry
-is therefore narrower than the one above: the fragments agree about which
-machine they are *for*, corroborated by nothing except their overlap -- and the
-overlap is where the second arm does the catching (`host.cpu.cores_physical` 8
-against 96). Closing the residue needs no schema field and is not done here: a
-tier-0 tokenizer probe that also emitted `host.cpu.cores_physical` would turn
-the pair above into a second-arm contradiction, and the probes are SPEC-3's.
+node, both authored `name: node-18`, pass this arm: it compares what they claim
+and a claim is not evidence. The claim it can carry is therefore narrower than
+the one above -- the fragments agree about which machine they are *for*,
+corroborated by nothing except their overlap. The overlap is where that pair is
+caught, and it is the second arm's business: the tokenizer probe writes the core
+counts of the processor it ran on into two fields the schema already required,
+so the laptop and the node now disagree about `host.cpu.cores_physical`, 8
+against 96, and are refused with both readings. Until the probe emitted them the
+pair shared no field at all, so the second arm had nothing to contradict and the
+exact pair this module opens by naming merged into a document describing neither
+host. Closing that residue took no schema field, and it is closed from the
+probe's side rather than here.
 
 The second arm catches the same hazard from the other side. Two fragments that
 name one machine and disagree about one of its fields cannot both be true of it,
