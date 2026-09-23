@@ -10,9 +10,12 @@ catch a call made at run time, and `test_the_package_imports_no_device` catches
 a device import. It reads every import statement of every module, in every
 branch, and it imports each module in a fresh interpreter, which sees a name
 whose lookup loads the engine (`atom.LLMEngine`, `from atom import *`) and a
-module reached through another. Neither sees a load that no import statement
-names and only a function body runs, such as `importlib.import_module("torch")`
-or a read of `atom.LLMEngine`.
+module reached through another. Neither sees a load reached only inside a
+function body that never runs at import, whether it is an import statement or
+an attribute access, unless the statement names a forbidden module itself:
+`importlib.import_module("torch")`, `atom.LLMEngine` or
+`from atom import LLMEngine` inside a `def`, or a `def` that imports a module
+which imports torch.
 
 The model is the vendored Qwen3.8-27B config, as `test_backend_kv_geometry.py`
 uses it, so the geometry here and the KV geometry there are the same model. The
@@ -632,12 +635,22 @@ def _imported_names(tree):
     return names
 
 
-def _device_modules_loaded(source):
-    """The forbidden modules loaded by running `source` inside the package, in a
-    fresh interpreter (this one imported torch above) started in the root this
-    suite imported `atom` from."""
-    probe = f"import sys; exec({source!r}, {{'__package__': {PACKAGE_DOTTED!r}}})"
-    run = [sys.executable, "-c", probe + "; print(*sys.modules)"]
+def _device_imports(source):
+    """The forbidden modules imported by running `source` inside the package, in
+    a fresh interpreter (this one imported torch above) started in the root this
+    suite imported `atom` from. The first forbidden import is refused before it
+    loads, so a caught row costs an interpreter start, not an engine."""
+    probe = (
+        "import os, sys\n"
+        "class Refuse:\n"
+        "    def find_spec(name, *_):\n"
+        f"        if name.split('.')[0] in {sorted(FORBIDDEN_ROOTS)} or name.startswith({FORBIDDEN_PREFIXES}):\n"
+        "            print(name, flush=True), os._exit(0)\n"
+        "sys.meta_path.insert(0, Refuse)\n"
+        f"exec({source!r}, {{'__package__': {PACKAGE_DOTTED!r}}})\n"
+        "print(*sys.modules)"
+    )
+    run = [sys.executable, "-c", probe]
     loaded = subprocess.check_output(run, cwd=PACKAGE.parents[2], text=True).split()
     return [name for name in loaded if _forbidden(name)]
 
@@ -650,7 +663,7 @@ def test_the_package_imports_no_device(module):
     for name in sorted(_imported_names(ast.parse((PACKAGE / module).read_text()))):
         assert not _forbidden(name), f"{module} -> {name}"
     dotted = f"{PACKAGE_DOTTED}.{module[:-3]}".removesuffix(".__init__")
-    assert _device_modules_loaded(f"import {dotted}") == [], module
+    assert _device_imports(f"import {dotted}") == [], module
 
 
 @pytest.mark.parametrize(
@@ -683,8 +696,8 @@ def test_the_import_guard_catches_what_it_claims_to(source, caught):
     ],
 )
 def test_the_import_run_catches_what_the_walk_does_not(source, caught):
-    # Every row passes the walk. Each True row loads a device anyway: a name,
-    # not a module, loads the engine through `atom/__init__.py`'s lazy lookup,
+    # Every row passes the walk. Each True row reaches a device import anyway: a
+    # name, not a module, loads the engine through `atom/__init__.py`'s lazy lookup,
     # or a module outside the package imports torch.
     assert not any(map(_forbidden, _imported_names(ast.parse(source))))
-    assert bool(_device_modules_loaded(source)) is caught
+    assert bool(_device_imports(source)) is caught
