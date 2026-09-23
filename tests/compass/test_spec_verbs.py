@@ -1057,25 +1057,77 @@ def test_an_empty_tokenizer_table_explains_to_no_rows_rather_than_refusing():
     assert spec.value("host.tokenizers") == ()
     basis = explain(spec, "host.tokenizers")
     assert basis.contributions == ()
-    assert str(basis) == f"host.tokenizers, from spec {spec.digest()}"
+    assert str(basis).splitlines() == [
+        f"host.tokenizers, from spec {spec.digest()}",
+        "  host.tokenizers = ()",
+    ]
 
 
-def test_a_block_an_assembled_spec_holds_nothing_under_names_its_first_field():
-    # A spec built from parts can lack required fields too, and then the
-    # absent field is required, so the remedy is in whatever assembled it.
+def test_an_empty_tokenizer_table_is_printed_as_empty_under_a_quantity():
+    # Three rows from the other fields and none from the table. Without its own
+    # line the table reads as a field the quantity does not use.
+    document = copy.deepcopy(merged().document)
+    document["host"]["tokenizers"] = []
+    basis = explain(MachineSpec.from_mapping(document), "admission")
+    assert len(basis.contributions) == 3
+    printed = str(basis).splitlines()
+    assert len(printed) == 5
+    assert printed[-1] == "  host.tokenizers = ()"
+
+
+def assembled_without(*paths):
+    """The resolved spec assembled from parts, with the named fields left out."""
     whole = resolved()
-    spec = MachineSpec(
-        values={p: v for p, v in whole.values.items() if not p.startswith("host.ipc.")},
+    return MachineSpec(
+        values={p: v for p, v in whole.values.items() if p not in paths},
         tokenizers=whole.tokenizers,
     )
+
+
+def test_a_quantity_missing_one_field_is_refused_rather_than_explained_from_the_rest():
+    # The other six fields still explain to twelve rows, which read as a whole
+    # basis for a number that cannot be computed. The refusal is the accessor's.
+    spec = assembled_without("device.memory.capacity_bytes")
+    with pytest.raises(SpecRefusal) as refused:
+        explain(spec, "kv_blocks")
+    with pytest.raises(SpecRefusal) as accessed:
+        spec.value("device.memory.capacity_bytes")
+    assert refused.value.rule is Rule.TOTALITY
+    assert str(refused.value) == str(accessed.value)
+
+
+def test_every_missing_field_under_a_quantity_is_named_and_not_only_the_first():
+    spec = assembled_without("host.admission_fixed_s", "host.ipc.shm_broadcast_s")
+    with pytest.raises(SpecRefusal) as refused:
+        explain(spec, "admission")
+    assert refused.value.rule is Rule.TOTALITY
+    assert refused.value.what.startswith(
+        "`host.admission_fixed_s`, `host.ipc.shm_broadcast_s` are declared by "
+        "this schema, and this spec carries no value for them"
+    )
+    assert "fragments that measure these fields" in refused.value.remedy
+
+
+def test_a_block_an_assembled_spec_holds_nothing_under_names_every_field():
+    # A spec built from parts can lack required fields too, and then the
+    # absent field is required, so the remedy is in whatever assembled it.
+    spec = assembled_without("host.ipc.zmq_roundtrip_s", "host.ipc.shm_broadcast_s")
     with pytest.raises(SpecRefusal) as refused:
         explain(spec, "host.ipc")
     assert refused.value.rule is Rule.TOTALITY
-    assert "`host.ipc.zmq_roundtrip_s` is declared by this schema" in (
+    assert "`host.ipc.zmq_roundtrip_s`, `host.ipc.shm_broadcast_s` are declared" in (
         refused.value.what
     )
-    assert "merge the fragment" in refused.value.remedy
+    assert "merge the fragments" in refused.value.remedy
     assert "optional" not in refused.value.what
+
+
+def test_a_block_explains_without_an_optional_field_the_document_left_out():
+    spec = resolved()
+    assert "provenance.notes" not in spec.values
+    paths = {row.path for row in explain(spec, "provenance").contributions}
+    assert "provenance.authored_by" in paths
+    assert "provenance.notes" not in paths
 
 
 def test_the_basis_prints_its_spec_and_one_line_per_field():
