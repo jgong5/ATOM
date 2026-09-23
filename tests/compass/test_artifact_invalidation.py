@@ -42,6 +42,7 @@ from atom.compass.artifacts import (
     Axis,
     Cell,
     Conditions,
+    Fingerprint,
     Gate,
     GateState,
     Key,
@@ -895,6 +896,17 @@ def test_two_rows_over_the_same_axes_are_still_not_compared():
     assert "a `region_terms` fingerprint was compared with a `memory_readings` one" in (
         str(refused.value)
     )
+
+
+def test_one_row_over_different_axes_names_both_sides_axes():
+    """A row recorded before the matrix gained a column: both axis lists are named."""
+    now = fingerprint(Row.PRICE_LIST, BASE)
+    with pytest.raises(ArtifactRefusal) as refused:
+        differences(Fingerprint(Row.PRICE_LIST, now.cells[:-1]), now)
+    assert (
+        "`price_list` was fingerprinted over ROCm / AITER / RCCL, torch, ATOM src, "
+        "but the matrix now rows it over ROCm / AITER / RCCL, torch, ATOM src, device"
+    ) in str(refused.value)
 
 
 def test_a_load_handed_something_that_is_not_a_gate_state_is_refused(tmp_path):
