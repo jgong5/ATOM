@@ -311,8 +311,8 @@ forward context only the runner establishes, and building it by hand means reimp
 
 The constraints point at the *runner*, not the server — a single-process `ModelRunner` **is**
 the worker, so Phase 1b's placement requirement is satisfied. ATOM already shows how to
-drive one without a scheduler: `dummy_execution` (`model_runner.py:1177-1217`) and
-`warmup_model` (`:1219-1284`) both fabricate `ScheduledBatch`es by hand.
+drive one without a scheduler: `dummy_execution` (`model_runner.py:1191-1231`) and
+`warmup_model` (`:1233-1298`) both fabricate `ScheduledBatch`es by hand.
 
 ```
   Phase 0 (device-free)            standalone bench (GPU, one process)
