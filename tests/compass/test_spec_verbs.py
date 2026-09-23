@@ -645,6 +645,13 @@ def test_a_saved_document_merged_again_does_not_claim_to_have_asked_the_transfer
     beside = validate(merge([saved, transfer]), **asked)
     assert [refusal.rule for refusal in beside.refusals] == [Rule.PINNED_STACK]
     assert [c.split(" -- ")[0] for c in beside.asked_in_part] == [TRANSFERS_ASKED]
+    # With no stack pin resolved it was not asked at all, and says so once.
+    unpinned = copy.deepcopy(combination.document)
+    del unpinned["device"]["software_pinned_to"]
+    unpinned = Fragment.from_mapping(unpinned, "machine.yaml")
+    nowhere = validate(merge([unpinned, transfer]), **asked)
+    assert sum(c.startswith(TRANSFERS_ASKED) for c in nowhere.not_asked) == 1
+    assert nowhere.asked_in_part == ()
     control = Fragment.from_mapping(merged().document, "machine.yaml")
     assert validate(merge([control]), **asked).not_asked == ()
 
