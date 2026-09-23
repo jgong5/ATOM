@@ -38,7 +38,7 @@ with exactly one point of GPU contact.
 | Prefix-cache hash (`compute_hash`, xxhash xxh64 chained with the parent) | `block_manager.py:233-245` | **No** |
 | Prefix-cache scan and claim (`can_allocate`, `allocate`) | `block_manager.py:469-561`, `:563-597` | **No** |
 | Prefix publish, deferred until the forward computed the KV (`hash_blocks`) | `block_manager.py:696-771` | **No** |
-| **`allocate_kv_cache`** — creating the actual tensors | **`model_runner.py:1901-2105`** | **Yes** |
+| **`allocate_kv_cache`** — creating the actual tensors | **`model_runner.py::ModelRunner.allocate_kv_cache`** | **Yes** |
 
 `BlockManager.__init__` asserts `num_blocks > 0` (`block_manager.py:77`) and nothing else
 about the device.
@@ -50,7 +50,8 @@ about the device.
 Two changes only:
 
 1. `allocate_kv_cache` becomes a no-op in the simulated runner (`RapidServeModelRunner`
-   already does exactly this at `model_runner.py:4288-4293`), so no tensor is created.
+   already does exactly this in `model_runner.py::RapidServeModelRunner.allocate_kv_cache`),
+   so no tensor is created.
 2. `get_num_blocks` returns a block count produced from a device model rather than from
    device readings. See D14.
 
@@ -126,10 +127,10 @@ probed per request. Whether that is 0.1 ms or 10 ms is unmeasured. Recorded as *
 
 ### Open issues
 
-- `allocate_kv_cache` also registers tensors globally via `set_kv_cache_data`
-  (`model_runner.py:2060-2065`) and cross-validates expected against actual bytes
-  (`:2067-2094`). The no-op must keep whatever downstream code reads from that registry
-  satisfied, or supply a descriptor-shaped stand-in.
+- `model_runner.py::ModelRunner.allocate_kv_cache` also registers tensors globally via
+  `set_kv_cache_data` and cross-validates expected against actual bytes. The no-op must
+  keep whatever downstream code reads from that registry satisfied, or supply a
+  descriptor-shaped stand-in.
 - `BlockManager.hash_block_size = block_size * dcp_world_size`
   (`block_manager.py:93`) — decode context parallelism changes the hash granularity.
   Out of scope now; noted so it is not discovered later.
@@ -140,28 +141,28 @@ probed per request. Whether that is 0.1 ms or 10 ms is unmeasured. Recorded as *
 
 ### Problem
 
-`ModelRunner.get_num_blocks()` (`model_runner.py:1686-1899`) is **five device readings
+`model_runner.py::ModelRunner.get_num_blocks` is **five device readings
 plus arithmetic**:
 
 ```
-# in _read_device_memory (:1666-1684), which get_num_blocks calls at :1693
-free, total        = torch.cuda.mem_get_info()                              # :1676
-peak_torch         = max(allocated_bytes.all.peak, .all.current)            # :1677-1680
-non_torch          = max((total - free) - torch.cuda.memory_reserved(), 0)  # :1683
-# in get_num_blocks (:1686-1899)
-cudagraph_overhead = self._estimate_cudagraph_overhead()                    # :1695
-safety_margin      = int(total * 0.02)                                      # :1696
-budget             = int(total * config.gpu_memory_utilization)             # :1698
+# in _read_device_memory, which get_num_blocks calls before any budget arithmetic
+free, total        = torch.cuda.mem_get_info()
+peak_torch         = max(allocated_bytes.all.peak, .all.current)
+non_torch          = max((total - free) - torch.cuda.memory_reserved(), 0)
+# in get_num_blocks
+cudagraph_overhead = self._estimate_cudagraph_overhead()
+safety_margin      = int(total * 0.02)
+budget             = int(total * config.gpu_memory_utilization)
 available_for_kv   = min(budget - (peak_torch + non_torch + cudagraph_overhead
                                    + safety_margin)
-                         - self._kv_budget_extra_reserve(total), free)      # :1699-1706
+                         - self._kv_budget_extra_reserve(total), free)
 plan                = plan_pools(self._sub_pool_specs(), available_for_kv,
-                                 config.max_num_seqs)                       # :1721
-num_kvcache_blocks  = plan.paged_entries                                    # :1764
-# under PP: all_reduce MIN across stages                                    # :1765-1771
+                                 config.max_num_seqs)
+num_kvcache_blocks  = plan.paged_entries
+# under PP: all_reduce MIN across stages
 ```
 
-Line numbers are `model_runner.py` at `feature/atomcompass_new` `75a265a3f`.
+`_read_device_memory` is `model_runner.py::ModelRunner._read_device_memory`.
 
 Consumed at `engine_core.py:132-145`, which sets `config.num_kvcache_blocks` before the
 `Scheduler` and `BlockManager` are constructed at `:170`.
@@ -225,15 +226,15 @@ is the right thing to model and it is stated here so it is not discovered as a g
 ### The pipeline minimum is not inert
 
 An earlier note here said that under PP the `all_reduce(MIN)` across stages
-(`model_runner.py:1764-1771`) is inert, *because every stage computes the same number*,
-and that it *still needs a live process group or a stub*. Both halves are wrong — and the
-engine's own comment on that reduce has said so all along (`model_runner.py:1759-1760`):
+(in `model_runner.py::ModelRunner.get_num_blocks`) is inert, *because every stage computes
+the same number*, and that it *still needs a live process group or a stub*. Both halves are
+wrong — and the engine's own comment on that reduce has said so all along:
 *"PP stages compute different block counts; block ids must be valid on every stage's KV
 tensor, so reduce to the global minimum."* The code said what this document denied.
 
 **The stages do not compute the same number.** The five readings *are* identical across
 stages — nothing in the memory model varies with pipeline rank. The layer count is not:
-`_get_total_num_layers` (`model_runner.py:1515-1538`) takes a `get_pp_indices` slice, so
+`model_runner.py::ModelRunner._get_total_num_layers` takes a `get_pp_indices` slice, so
 each stage sizes its pool from the layers it actually holds. Re-derived from ATOM's own
 partitioner at `feature/atomcompass_new` `92f1fdafe`, over the 64-layer hybrid vendored at
 `tests/compass/qwen3_5_27b_config.json` — one full-attention layer in four, so 16 of the 64
@@ -268,7 +269,7 @@ holds the most paged layers — which is not in general the last one: at pp = 5 
 3 of 5, and at pp = 6 it is four stages of the six.
 
 **Neither a live process group nor a stub is needed.** The reduce is already guarded by
-`torch.distributed.is_initialized()` (`model_runner.py:1765`): with no group it does not
+`torch.distributed.is_initialized()` (in `model_runner.py::ModelRunner.get_num_blocks`): with no group it does not
 run, and with one it runs ATOM's own code unchanged. Building a stub for it is building
 something nothing asks for.
 

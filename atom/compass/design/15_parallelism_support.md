@@ -327,10 +327,11 @@ answered — **T86**.
 every use site imports `get_ep_group` from `aiter.dist.parallel_state` (`moe.py:599`,
 `fused_moe/mori_v2_prepare_finalize.py:153,636`, `fused_moe/flydsl_mega_experts.py:186`,
 `eplb.py:1768`, `models/glm4_moe.py:96`, `models/qwen3_next.py:171`,
-`model_runner.py:3580`). Both of ATOM's distributed-init paths —
+`model_runner.py::ModelRunner._force_aiter_unreg_capture_for_piecewise`). Both of ATOM's distributed-init paths —
 `init_pp_aware_dist_env` (`distributed/pp_comm.py:46`) when `pp_size > 1`, aiter's
-`init_dist_env` (`aiter/ops/communication.py:22`) otherwise, chosen in
-`_setup_device_and_distributed` (`model_runner.py:946`, the branch at `:981`) — end in
+`init_dist_env` (`aiter/ops/communication.py:22`) otherwise, chosen by the
+`pipeline_parallel_size > 1` branch of
+`model_runner.py::ModelRunner._setup_device_and_distributed` — end in
 aiter's `initialize_model_parallel`, which builds the
 group at `aiter/dist/parallel_state.py:1926-1945` out of
 
@@ -369,7 +370,7 @@ Under DP-attention `CoreManager` rewrites `dp := dp × tp, tp := 1` before any o
 `dp × pcp × tp` either way: `init_dist_env` passes `world_size = pp × tp × pcp` with `pp`
 pinned to 1 (`aiter/ops/communication.py:33-40`) and `init_distributed_environment`
 multiplies DP back in (`parallel_state.py:1726-1729`); the PP branch computes the same
-index itself at `model_runner.py:986-988`.
+index itself in `model_runner.py::ModelRunner._setup_device_and_distributed`.
 
 **Ranks are contiguous whenever `pp == 1`**, which is every reachable EP configuration.
 The strided last row is the only non-contiguous case, and ATOM refuses it

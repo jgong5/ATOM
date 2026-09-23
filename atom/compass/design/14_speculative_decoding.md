@@ -272,7 +272,7 @@ Draft models add:
 | Term | Source |
 |---|---|
 | **draft weights** | Class A, exact from the draft's own HF config. `_MTP_CONFIG` (`config.py:1090-1096`) names the architecture and the `n_predict` attribute per model type. |
-| **draft KV layers** | `ModelRunner._num_draft_kv_layers()` (`model_runner.py:1491-1513`) — **the single source of truth, and it is already called out as such in the code.** A draft with a real layer stack (Eagle3, standalone DSpark) needs one slot per layer; serial MTP declares `num_nextn_predict_layers`. |
+| **draft KV layers** | `model_runner.py::ModelRunner._num_draft_kv_layers` — **the single source of truth, and it is already called out as such in the code.** A draft with a real layer stack (Eagle3, standalone DSpark) needs one slot per layer; serial MTP declares `num_nextn_predict_layers`. |
 
 Two properties inherited rather than designed, both consequences of `03` D13's decision to
 run ATOM's real block accounting:
