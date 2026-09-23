@@ -450,7 +450,7 @@ def live_readings(spec, qwen, tp_width=1):
     return device_readings(
         spec,
         tp_width=tp_width,
-        model=ModelTerms.declared(
+        model=ModelTerms.from_declared_config(
             qwen,
             parameter_count=PARAMETERS,
             tp_size=tp_width,
@@ -1103,7 +1103,25 @@ def test_the_guard_catches_the_forms_that_were_actually_removed():
     assert not _TAGS.search(replacement)
 
 
-def test_the_widths_and_dtypes_that_share_the_shape_are_not_swept():
-    """The pattern is not a bare letter-and-digit, and this is why."""
+def test_what_the_pattern_matches_beside_its_targets_is_on_record():
+    """The pattern's reach past the forms it targets, both ways, stated here.
+
+    It is not a bare letter-and-digit, so widths and dtypes stay clear. It does
+    match some of ATOM's own names, none of which this package carries; a hit
+    fails loudly, and rewording the line is the fix, not an exemption. And it
+    misses forms one step from the removed ones, because a pattern wide enough
+    to take them would take more of ATOM's names with it.
+    """
     for benign in ("TP1", "w1_base_bytes", "fp8", "int8", "bf16"):
         assert not _TAGS.search(benign), benign
+    for collision in (
+        "MiniMax-M3",
+        "minimax_m3",
+        "M128",
+        "tile_m128",
+        "seq_len_m1",
+        "fp8_m3",
+    ):
+        assert _TAGS.search(collision), collision
+    for escape in ("declared_for_m1_terms", "At m1", "M1a", "declared_for_M1"):
+        assert not _TAGS.search(escape), escape

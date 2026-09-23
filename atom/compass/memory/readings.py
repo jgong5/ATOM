@@ -39,8 +39,8 @@ tested -- and buffers need a recording, because the formula that matched the
 tree, which needs the engine, which this tier does not import; and there is no
 recording of a card nobody has run. So `ModelTerms` takes those two terms rather
 than deriving them, with no default -- the same shape as the spec's "a runtime
-constant has no default" rule, and for the same reason. `declared` fills
-all three with declared formulas and labels every one of them. For the
+constant has no default" rule, and for the same reason. `from_declared_config`
+fills all three with declared formulas and labels every one of them. For the
 activation term a declared formula is the only answer while no op graph
 exists; this module gives the other two the same treatment, visibly.
 """
@@ -108,7 +108,7 @@ class ModelTerms:
     activations: Term
 
     @classmethod
-    def declared(
+    def from_declared_config(
         cls,
         config,
         *,

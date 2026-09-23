@@ -228,7 +228,7 @@ def readings_at(spec, qwen, tp_width):
     return device_readings(
         spec,
         tp_width=tp_width,
-        model=ModelTerms.declared(
+        model=ModelTerms.from_declared_config(
             qwen,
             parameter_count=PARAMETERS,
             tp_size=tp_width,
@@ -376,7 +376,7 @@ def test_a_configuration_that_does_not_fit_refuses_rather_than_clamping(spec, qw
         device_readings(
             spec,
             tp_width=1,
-            model=ModelTerms.declared(
+            model=ModelTerms.from_declared_config(
                 qwen,
                 parameter_count=400_000_000_000,
                 tp_size=1,
@@ -397,7 +397,7 @@ def test_the_predicting_function_cannot_be_spent_as_the_reserving_one(spec, qwen
         device_readings(
             spec,
             tp_width=1,
-            model=ModelTerms.declared(
+            model=ModelTerms.from_declared_config(
                 qwen,
                 parameter_count=PARAMETERS,
                 tp_size=1,
@@ -492,10 +492,10 @@ def test_an_absent_partial_rotary_factor_says_so_in_the_table(qwen):
     # row must not look the same as a config that states 1.0.
     full = copy.deepcopy(qwen)
     del full.partial_rotary_factor
-    stated = ModelTerms.declared(
+    stated = ModelTerms.from_declared_config(
         qwen, parameter_count=PARAMETERS, tp_size=1, warmup_tokens=WARMUP_TOKENS
     )
-    assumed = ModelTerms.declared(
+    assumed = ModelTerms.from_declared_config(
         full, parameter_count=PARAMETERS, tp_size=1, warmup_tokens=WARMUP_TOKENS
     )
     assert "absent from config, assumed" in assumed.buffers.source
@@ -507,7 +507,7 @@ def test_the_model_dtype_sizes_the_model_terms(qwen):
     # Read off the config, not a module constant: a term sized in fp32 where
     # the tensors are resident in bf16 is twice what the model holds.
     assert str(qwen.dtype).endswith("bfloat16")
-    terms = ModelTerms.declared(
+    terms = ModelTerms.from_declared_config(
         qwen, parameter_count=PARAMETERS, tp_size=1, warmup_tokens=WARMUP_TOKENS
     )
     assert terms.buffers.nbytes == 262_144 * 64 * 2
@@ -530,7 +530,7 @@ def test_a_config_with_no_dtype_refuses_rather_than_assuming_one(qwen):
     nameless = copy.deepcopy(qwen)
     del nameless.dtype
     with pytest.raises(MemoryRefusal, match="states no `dtype`, and every byte"):
-        ModelTerms.declared(
+        ModelTerms.from_declared_config(
             nameless,
             parameter_count=PARAMETERS,
             tp_size=1,
@@ -545,7 +545,7 @@ def test_a_config_missing_a_geometry_field_refuses_naming_that_field(qwen, field
     shapeless = copy.deepcopy(qwen)
     delattr(shapeless, field)
     with pytest.raises(MemoryRefusal) as refusal:
-        ModelTerms.declared(
+        ModelTerms.from_declared_config(
             shapeless,
             parameter_count=PARAMETERS,
             tp_size=1,
@@ -564,7 +564,7 @@ def test_the_negative_box_refusal_carries_its_decomposition(spec, qwen):
         device_readings(
             spec,
             tp_width=1,
-            model=ModelTerms.declared(
+            model=ModelTerms.from_declared_config(
                 qwen,
                 parameter_count=400_000_000_000,
                 tp_size=1,
