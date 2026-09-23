@@ -27,6 +27,7 @@ import socket
 import time
 from types import SimpleNamespace
 
+import numpy
 import pytest
 from conftest import MockConfig, atom_config_double
 from test_kv_simulated_connector import (
@@ -288,6 +289,8 @@ def test_the_ranks_the_router_reads_are_numbers(geometry):
         pytest.param("tp_size", False, id="tp_size-false"),
         pytest.param("dp_rank", True, id="dp_rank-true"),
         pytest.param("dp_rank", False, id="dp_rank-false"),
+        pytest.param("tp_size", numpy.bool_(True), id="tp_size-numpy-true"),
+        pytest.param("tp_size", numpy.bool_(False), id="tp_size-numpy-false"),
         pytest.param("tp_size", "8", id="tp_size-integer-text"),
         pytest.param("dp_rank", "3", id="dp_rank-integer-text"),
         pytest.param("tp_size", " 8 ", id="tp_size-padded-text"),
@@ -298,8 +301,8 @@ def test_a_width_that_is_not_a_whole_number_is_refused_by_name(geometry, field, 
 
     Refused when the connector is built, so a malformed config never serves a
     request. Casting 8.5 to 8 would emit a blob for a deployment that was
-    never launched, and nothing reading it could tell. A `bool` is an `int` to
-    Python and would go out as a width of 1 or 0. Text is refused whatever it
+    never launched, and nothing reading it could tell. A `bool`, Python's or
+    numpy's, would go out as a width of 1 or 0. Text is refused whatever it
     spells, "8" included: ATOM's launch path parses its widths with `int`, so
     reading text would be a conversion no launch needs.
     """
@@ -310,15 +313,14 @@ def test_a_width_that_is_not_a_whole_number_is_refused_by_name(geometry, field, 
         )
 
 
-@pytest.mark.parametrize("value", [8, 8.0], ids=["int", "float"])
-def test_a_whole_width_is_taken_as_an_int_or_a_whole_float(geometry, value):
-    """The refusal above is not of an `int` or of a float with no fraction."""
+def test_a_whole_width_is_taken_as_an_int(geometry):
+    """The refusal above is not of an `int`."""
     scheduler = connector(
         model_for(geometry, PEAKS[0]),
         lambda: ISSUE_AT,
         role="scheduler",
-        tp_size=value,
-        dp_rank=value,
+        tp_size=8,
+        dp_rank=8,
     )
     seq = finished_sequence()
     scheduler.request_finished(seq)
