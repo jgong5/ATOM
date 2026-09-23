@@ -46,6 +46,8 @@ from atom.compass.backends import (
 from atom.compass.backends.shape import (
     CANDIDATE,
     DECLARED,
+    DEPTH_STANDS_IN,
+    PER_STACK_LAYER,
     UNCHECKED_RUNG,
     sum_context,
     sum_query_cached,
@@ -417,9 +419,14 @@ class TestWhatTheOutputSays:
 
 
 class TestCollectives:
+    # One worker, described by two counts: 64 layers run and 16 of them hold a
+    # cache of every past token. A collective is charged on the first and a
+    # block is sized from the second, so each construction below states the
+    # one it needs and neither number stands in for the other.
     GEOMETRY = KvGeometry(
         layers=16, kv_heads=4, head_dim=256, element_bytes=2, block_size=64
     )
+    STACK_LAYERS = 64
 
     def test_a_single_rank_deployment_is_charged_for_no_collective(self):
         step = ShapeStubBackend(
@@ -429,18 +436,105 @@ class TestCollectives:
 
     def test_the_charged_collectives_are_the_ones_the_widths_produce(self):
         widths = Parallelism(tp_size=2, dp_size=2, expert_parallel=True)
-        step = ShapeStubBackend(parallelism=widths, geometry=self.GEOMETRY).estimate(
-            BatchView((prefill(128),))
-        )
+        step = ShapeStubBackend(
+            parallelism=widths,
+            geometry=self.GEOMETRY,
+            stack_layers=self.STACK_LAYERS,
+        ).estimate(BatchView((prefill(128),)))
         charged = [name for name in named(step) if name.startswith("collective")]
         assert charged == [f"collective.{n}" for n in widths.collectives()]
         assert named(step)["collective.tp-all-reduce"] == pytest.approx(
-            128 * 16 * Coefficients().collective_token_layer
+            128 * self.STACK_LAYERS * Coefficients().collective_token_layer
         )
 
-    def test_a_collective_with_no_geometry_to_price_it_is_refused(self):
+    def test_a_collective_with_no_stack_depth_to_price_it_is_refused(self):
+        """And a geometry does not answer it: what it counts is the subset."""
         with pytest.raises(ValueError, match="how many layers"):
             ShapeStubBackend(parallelism=Parallelism(tp_size=2))
+        with pytest.raises(ValueError, match="how many layers"):
+            ShapeStubBackend(parallelism=Parallelism(tp_size=2), geometry=self.GEOMETRY)
+
+    def test_a_span_shallower_than_its_paged_layers_is_refused(self):
+        """The two counts crossed: a subset cannot be larger than the set."""
+        with pytest.raises(ValueError, match="have been crossed"):
+            ShapeStubBackend(
+                parallelism=Parallelism(tp_size=2),
+                geometry=self.GEOMETRY,
+                stack_layers=4,
+            )
+
+    @pytest.mark.parametrize("depth", [64.7, "64", 64.0])
+    def test_a_depth_that_is_not_a_whole_number_of_layers_is_refused(self, depth):
+        """Coercing it would be a guessed count inside the refusing constructor.
+
+        `int(64.7)` is a precise 64 from a source that was already wrong, and
+        `int("64")` is a count that was never stated as one. The wording is
+        the one this package already uses for a dialled count, so the two
+        constructors answer the same question the same way.
+        """
+        with pytest.raises(TypeError, match="whole number of at least 1"):
+            ShapeStubBackend(
+                parallelism=Parallelism(tp_size=2),
+                geometry=self.GEOMETRY,
+                stack_layers=depth,
+            )
+
+    def test_a_bool_is_the_one_layer_span_it_equals(self):
+        """A `bool` is an `int` to Python, and this takes it as the 1 it is.
+
+        Declared rather than special-cased. Refusing it only here would be a
+        second convention for the question the test above settles, and the
+        count it yields is the one the value equals rather than a guess at
+        what a caller meant by it. `False` is refused by the `< 1` check,
+        which is the same guard a stated 0 meets.
+
+        `== 1` alone does not say this happened: `True == 1`, so that
+        assertion passes equally against a value kept as the `bool` it
+        arrived as. The difference shows in the one place a count is written
+        out -- the record line, which exists here because the seconds do not
+        carry the count -- so the type and that line are asserted too.
+        """
+        taken = ShapeStubBackend(parallelism=Parallelism(tp_size=2), stack_layers=True)
+        assert taken.stack_layers == 1
+        assert "on 1 layers" in taken.describe()
+        assert not isinstance(taken.stack_layers, bool)
+        with pytest.raises(ValueError, match="at least one layer"):
+            ShapeStubBackend(parallelism=Parallelism(tp_size=2), stack_layers=False)
+
+    def test_a_collective_is_priced_with_no_geometry_paired_to_it(self):
+        """The geometry is not what a collective is charged on, so it is optional.
+
+        Nothing that computes seconds reads it: the charge is the tokens times
+        the stack depth times a declared coefficient. Refusing for want of it
+        would decline a price this makes identically either way, which is why
+        the refusal above is keyed on the depth alone. The cost of that is the
+        crossed-count check having one count to compare and the record having
+        one to write -- pinned here and in the test below.
+        """
+        step = ShapeStubBackend(
+            parallelism=Parallelism(tp_size=2), stack_layers=self.STACK_LAYERS
+        ).estimate(BatchView((prefill(128),)))
+        assert named(step)["collective.tp-all-reduce"] == pytest.approx(
+            128 * self.STACK_LAYERS * Coefficients().collective_token_layer
+        )
+
+    def test_the_record_says_when_no_paged_count_was_stated(self):
+        """One count written where two describe a worker, said rather than implied.
+
+        A lone `on 64 layers` reads as the whole description of the worker,
+        and on a hybrid it is a quarter of one. The line names the count it
+        does not have instead.
+        """
+        paired = ShapeStubBackend(
+            parallelism=Parallelism(tp_size=2),
+            geometry=self.GEOMETRY,
+            stack_layers=self.STACK_LAYERS,
+        ).describe()
+        alone = ShapeStubBackend(
+            parallelism=Parallelism(tp_size=2), stack_layers=self.STACK_LAYERS
+        ).describe()
+        assert "on 64 layers, 16 paged" in paired
+        assert "on 64 layers, paged count not stated" in alone
 
     def test_a_charged_collective_says_it_is_a_candidate(self):
         """The widths rule one out conclusively and rule it in conditionally.
@@ -454,9 +548,83 @@ class TestCollectives:
         step = ShapeStubBackend(
             parallelism=Parallelism(tp_size=2, dp_size=2, expert_parallel=True),
             geometry=self.GEOMETRY,
+            stack_layers=self.STACK_LAYERS,
         ).estimate(BatchView((prefill(128),)))
         for name, _, provenance in step.rows():
             assert (CANDIDATE in provenance) is name.startswith("collective.")
+
+    def test_a_charged_collective_says_which_layer_count_it_used(self):
+        """Two counts describe the worker and the seconds carry neither.
+
+        A charge on the paged layers of this geometry and one on its stack are
+        both a number of seconds in a total, so the term states the count it
+        multiplied where a reader of the record finds it.
+        """
+        step = ShapeStubBackend(
+            parallelism=Parallelism(tp_size=2),
+            geometry=self.GEOMETRY,
+            stack_layers=self.STACK_LAYERS,
+        ).estimate(BatchView((prefill(128),)))
+        for name, _, provenance in step.rows():
+            assert (PER_STACK_LAYER in provenance) is name.startswith("collective.")
+
+    def test_only_the_collective_whose_count_is_argued_claims_it(self):
+        """One count for both charges, and an argument behind one of them.
+
+        An all-reduce runs on every layer the worker runs. An expert
+        all-to-all runs on the layers holding experts, which is a third count
+        and one nothing in this package supplies, so it is charged on the
+        depth in hand and its term says that is what happened. Both are the
+        same seconds; only the record tells them apart.
+        """
+        step = ShapeStubBackend(
+            parallelism=Parallelism(tp_size=2, dp_size=2, expert_parallel=True),
+            geometry=self.GEOMETRY,
+            stack_layers=self.STACK_LAYERS,
+        ).estimate(BatchView((prefill(128),)))
+        stands_in = {
+            name: DEPTH_STANDS_IN in provenance for name, _, provenance in step.rows()
+        }
+        assert stands_in["collective.tp-all-reduce"] is False
+        assert stands_in["collective.moe-all-to-all"] is True
+        assert not any(
+            value for name, value in stands_in.items() if not name.startswith("coll")
+        )
+        charged = named(step)
+        assert charged["collective.moe-all-to-all"] == pytest.approx(
+            charged["collective.tp-all-reduce"]
+        )
+
+    def test_the_stand_in_said_of_an_unargued_collective_is_about_that_one(
+        self, monkeypatch
+    ):
+        """The default is attached by absence, so it may not describe a name.
+
+        Today the only unargued name is the expert all-to-all, and a sentence
+        about expert-bearing layers is exact for it -- which is why today's
+        output cannot tell a general statement apart from that collective's
+        own. A second unargued name can. A point-to-point send between
+        pipeline stages is charged once per layer like the rest and the depth
+        stands in for its count the same way, and nothing about it is
+        expert-bearing; the set exists so that such a name is labelled a
+        stand-in rather than inheriting an argument made for a different
+        collective, so the sentence the absence attaches has to be one that
+        name can carry.
+        """
+        monkeypatch.setattr(
+            Parallelism,
+            "collectives",
+            lambda self: ("tp-all-reduce", "pp-send-recv"),
+        )
+        step = ShapeStubBackend(
+            parallelism=Parallelism(tp_size=2),
+            geometry=self.GEOMETRY,
+            stack_layers=self.STACK_LAYERS,
+        ).estimate(BatchView((prefill(128),)))
+        said = {name: provenance for name, _, provenance in step.rows()}
+        assert DEPTH_STANDS_IN in said["collective.pp-send-recv"]
+        assert DEPTH_STANDS_IN not in said["collective.tp-all-reduce"]
+        assert "expert" not in said["collective.pp-send-recv"]
 
 
 # ── chunk size ──────────────────────────────────────────────────────────────
