@@ -35,9 +35,10 @@ are not a cost-model input at any width.
 What is substituted, and what is not
 ------------------------------------
 Substituted, all of it device facts declared by the caller rather than read from
-a runtime: the `torch.cuda` namespace (8 names to import ATOM, 14 more to build
-a `ModelRunner`); `rocminfo`, which aiter shells out to at import and which
-needs `/dev/kfd`; Triton's active device target; the collective *transport*, so
+a runtime: the `torch.cuda` namespace (22 names, 17 of which a capture reads --
+the record counts every read, see `_declare_cuda`); `rocminfo`, which aiter
+shells out to at import and which needs `/dev/kfd`; Triton's active device
+target; the collective *transport*, so
 a group of width N needs no peer; and the three primitives `CpuGpuBuffer`
 reaches for, because its two allocations and its numpy view have to straddle
 the mode -- see `_staged_allocators`. What is *not* substituted there is the
@@ -45,13 +46,18 @@ constructor: ATOM's own `CpuGpuBuffer.__init__` executes, and the record
 carries which one ran and what it allocated, so a change inside it cannot be
 silent here.
 
-Not substituted: the process group's width. `apply_simulated_tp` is never
-called -- observed by a sentinel over both bindings of it, not asserted against
-a constant. At one physical rank it both erases and fabricates -- row-parallel
-`all_reduce` becomes the identity and appears nowhere, while one `all_gather`
-becomes six dispatched ops over a half-zeros tensor -- so a TP2 inventory taken
-through it is not a TP2 inventory. The group here reports width 2 because it has
-width 2, and every collective ATOM issues is dispatched and recorded.
+Not substituted: the process group's width. The group here reports width 2
+because it has width 2, and every collective ATOM issues is dispatched and
+recorded. `apply_simulated_tp` is not what produced it: at one physical rank it
+both erases and fabricates -- row-parallel `all_reduce` becomes the identity and
+appears nowhere, while one `all_gather` becomes six dispatched ops over a
+half-zeros tensor -- so a TP2 inventory taken through it is not a TP2
+inventory. A sentinel sits over both bindings of it, but its one call site in
+ATOM (held by a scan of ATOM's source, not assumed) is inside the method this
+capture's runner overrides, so today the
+sentinel is a guard over a path the capture does not execute rather than an
+observation that ATOM at TP2 avoids it. What does observe the width is the
+group's own `world_size` and the collectives it issued.
 
 Where the shapes specialise, and what stopped it
 ------------------------------------------------
@@ -93,9 +99,11 @@ the only one of the three not reachable from a capture-time substitution.
 
 from __future__ import annotations
 
+import ast
 import collections
 import contextlib
 import hashlib
+import inspect
 import json
 import os
 import pathlib
@@ -230,6 +238,111 @@ SITE_THREE = (
 # Measured: 19 buffers, each one host allocation and one numpy view.
 BUFFER_INIT = "atom/utils/__init__.py:700"
 BUFFER_COUNT = 19
+
+# The `torch.cuda` names `_declare_cuda` stubs, split by whether a capture reads
+# them. Measured by counting every read of a stubbed name over a whole capture:
+# the same 17 at both widths and in every pass this file runs. The other five
+# are stubbed and never read -- removing all five leaves the TP1 and TP2 graph
+# digests unchanged -- so they are held here as unread rather than counted as
+# needed. One of them is `mem_get_info`, the reading ATOM sizes its KV budget
+# from; this capture sizes the pool itself with `allocate_kv_cache`, so nothing
+# asks.
+CUDA_NAMES_READ = frozenset(
+    {
+        "Event",
+        "Stream",
+        "_lazy_init",
+        "current_device",
+        "current_stream",
+        "default_stream",
+        "device_count",
+        "get_device_capability",
+        "get_device_properties",
+        "get_rng_state",
+        "is_available",
+        "memory_allocated",
+        "memory_stats",
+        "set_device",
+        "set_rng_state",
+        "stream",
+        "synchronize",
+    }
+)
+CUDA_NAMES_NEVER_READ = frozenset(
+    {
+        "empty_cache",
+        "max_memory_allocated",
+        "mem_get_info",
+        "memory_reserved",
+        "reset_peak_memory_stats",
+    }
+)
+
+# The families the concrete census is split into at each width. The concrete
+# result is that none of their entries is anything but an integer, and that
+# sentence is only as good as the count under it -- a family that stopped being
+# recorded would read as a family with no symbol in it. So the test holds which
+# families there are and that each carries entries, not how many: the counts
+# move with any change to ATOM's forward that leaves the inventory exactly as
+# concrete, one more view or one more elementwise operator per layer, and the
+# record reports them anyway.
+#
+# The price, chosen rather than missed: a recorder that loses *part* of a
+# family -- the GEMMs' input shapes, say, two thirds of that family's entries --
+# passes, because the family is still present and still counted. A family that
+# goes to zero, or a total that falls under the floor, does not.
+CONCRETE_FAMILIES = {
+    1: frozenset(
+        {
+            "activation",
+            "allocation",
+            "attention",
+            "bookkeeping",
+            "elementwise",
+            "embedding",
+            "gemm",
+            "normalisation",
+            "sampling",
+            "transfer",
+            "view",
+        }
+    ),
+}
+CONCRETE_FAMILIES[2] = CONCRETE_FAMILIES[1] | {"collective"}
+
+# What the census reads on the symbolic probe, keyed by whether site one is
+# simulated closed: the families carrying a non-integer shape entry, and the
+# operators carrying one. Kinds, not counts.
+#
+# This is the positive half of the concrete result. The concrete census reads
+# zero, and a census that could not tell a symbol from a number would read zero
+# too; these are the same census reading what it is there to find. It reads 26
+# entries today, and 32 with the repair, but those are not held: a staging
+# refactor that behaves identically -- `reshape` for `view` on a contiguous
+# buffer in `_copy_mrope_to_gpu` -- moves 26 to 27 while every site and line
+# pin in this file holds. What holds the detector instead is the loops that
+# count it, read against each other. That refactor still fails the probe test,
+# at the operator list: the `reshape` stops being dispatched, so the kinds
+# carrying a symbol change, and a change of kind is what this list is for.
+PROBE_FAMILIES = {
+    False: frozenset({"bookkeeping", "view"}),
+    True: frozenset({"bookkeeping", "transfer", "view"}),
+}
+PROBE_NON_NUMERIC_OPS = {
+    False: [
+        "aten.as_strided.default",
+        "aten.reshape.default",
+        "aten.slice.Tensor",
+        "prim.device.default",
+    ],
+    True: [
+        "aten.as_strided.default",
+        "aten.copy_.default",
+        "aten.reshape.default",
+        "aten.slice.Tensor",
+        "prim.device.default",
+    ],
+}
 
 
 # ── the step-symbol pass: what a capture that specialises nowhere records ──
@@ -577,7 +690,23 @@ def _declare_cuda():
     for group in (for_import, for_runner):
         for name, value in group.items():
             setattr(torch.cuda, name, value)
-    return {"import": sorted(for_import), "model_runner": sorted(for_runner)}
+
+    # Every read of a stubbed name, counted. A stub is a claim that something
+    # reads the name, and a list of names is not evidence of that: the list is
+    # what this function wrote. The count is what the capture did with it.
+    # Reads, not calls, because `Event` is read as a type in a class body and
+    # never called.
+    stubbed = frozenset(for_import) | frozenset(for_runner)
+    reads = collections.Counter()
+
+    class _ReadCountingModule(type(torch.cuda)):
+        def __getattribute__(self, name):
+            if name in stubbed:
+                reads[name] += 1
+            return super().__getattribute__(name)
+
+    torch.cuda.__class__ = _ReadCountingModule
+    return {"import": sorted(for_import), "model_runner": sorted(for_runner)}, reads
 
 
 def _decline_initialisers():
@@ -853,16 +982,26 @@ def _build_group(tp):
 def _watch_simulated_tp(tree_root):
     """A sentinel on `apply_simulated_tp`, in place of a hard-coded `False`.
 
-    That `apply_simulated_tp` never runs is the hardest claim this file makes:
-    a TP>1 inventory taken through it both erases and fabricates, so a record
-    that came through it is not a TP>1 record at all. It used to be carried by
-    a literal written into the record and asserted against itself, which
-    cannot fail and cannot go stale -- the defect that check exists for.
+    A TP>1 inventory taken through `apply_simulated_tp` both erases and
+    fabricates, so a record that came through it is not a TP>1 record at all.
+    That used to be carried by a literal written into the record and asserted
+    against itself, which cannot fail and cannot go stale.
 
     The sentinel records every call, with the ATOM frames that made it, and
     does not call through: a run in which it fires produces a record naming
     the site rather than a number nobody can check. Both bindings are taken,
     because `model_runner` imports the name rather than the module.
+
+    **It is a forward guard, not an observation about ATOM at TP2 today.**
+    ATOM calls `apply_simulated_tp` from one place,
+    `ModelRunner._setup_device_and_distributed`, and `_build_runner` overrides
+    that method, so no capture can reach the call and the list is empty by
+    construction. Replacing the sentinel's body with `raise SystemExit` leaves
+    every capture test passing. It fires only if ATOM comes to call the function
+    from a path this capture does execute. That ATOM has one call site, and
+    that it is the overridden method, is held by a scan of ATOM's source in
+    `test_apply_simulated_tp_is_called_only_where_the_capture_does_not_go`, so
+    a second caller fails there even where the sentinel cannot see it.
     """
     from atom.distributed import simulated_tp
     from atom.model_engine import model_runner
@@ -1605,7 +1744,7 @@ def _capture(
     two of them is what says the symbol is free rather than assumed free."""
     from torch.fx.experimental.symbolic_shapes import ShapeEnv
 
-    declared_cuda = _declare_cuda()
+    declared_cuda, cuda_reads = _declare_cuda()
     declared_arch = _declare_arch(tmpdir)
     declared_priming = _decline_context_priming()
     declared_init = _decline_initialisers()
@@ -1692,13 +1831,16 @@ def _capture(
         "step_symbol": step_symbol,
         "step_axis": str(axis),
         "step_axis_hint": width,
-        # Observed, not declared: every call the sentinel saw, with its ATOM
-        # frames. Empty is the claim; a non-empty list names the site.
+        # Every call the sentinel saw, with its ATOM frames. Empty today by
+        # construction, not by observation: see `_watch_simulated_tp`.
         "apply_simulated_tp_calls": simulated_tp_calls,
         # Which `CpuGpuBuffer.__init__` ran, and what it asked for. ATOM's own
         # body executes here, so a change to it moves one of these counts.
         "buffer_init": buffer_init,
-        "diagnostic_inventory": True,
+        # Diagnostic because a raw Triton kernel was reached and skipped, and
+        # everything downstream of one read uninitialised fake memory. Derived
+        # from the launches rather than written, so it says what happened.
+        "diagnostic_inventory": bool(triton.launches),
         "model": {
             "config_sha256": digest,
             "config_revision": CONFIG_REVISION,
@@ -1708,6 +1850,7 @@ def _capture(
         },
         "declared": {
             "cuda": declared_cuda,
+            "cuda_reads": dict(cuda_reads),
             "arch": declared_arch,
             "context_priming": declared_priming,
             "initialisers": declared_init,
@@ -1879,6 +2022,25 @@ def row_parallel_reduces():
     return len(layer_types) + full + linear
 
 
+def raw_triton_launches():
+    """The raw Triton kernels one decode step reaches, from the config alone.
+
+    Each full-attention layer normalises its query and key and applies the
+    multimodal rotary embedding through one raw kernel each -- `qk_norm` and
+    `try_mrope_qk_fused` in `Qwen3NextAttention.forward` -- and a linear-
+    attention layer launches neither. The step converts its block tables to KV
+    indices once, whatever the layer count. So the counts follow the config's
+    layer split rather than being read off the inventory they check.
+    """
+    layer_types = json.loads(CONFIG_JSON.read_bytes())["text_config"]["layer_types"]
+    full = layer_types.count("full_attention")
+    return {
+        "_fused_qk_norm_single_kernel": full,
+        "_mrope_qk_kernel": full,
+        "kv_indices_generate_kernel": 1,
+    }
+
+
 def site(event, depth):
     """One specialisation as `(value, the innermost `depth` ATOM frames)`.
 
@@ -1910,6 +2072,10 @@ def test_a_decode_step_traces_at_both_widths():
     and a test that pins one is a test that is edited every time it fails. The
     distinct set moves when the *kinds* of work change, which is the thing worth
     holding.
+
+    Both inventories are diagnostic, and the record says so because it counted
+    the raw Triton kernels it skipped, not because a literal says it: 33
+    launches over three kernels, the same at both widths.
     """
     tp1 = capture(1)
     tp2 = capture(2)
@@ -1917,6 +2083,7 @@ def test_a_decode_step_traces_at_both_widths():
     for record in (tp1, tp2):
         assert record["atom_package"].startswith(tree_root)
         assert record["ops"] > 0
+        assert record["triton_launches"] == raw_triton_launches()
         assert record["diagnostic_inventory"] is True
         assert record["model"]["architecture"] == "Qwen3_5ForConditionalGeneration"
     assert len(tp1["distinct_ops"]) == TP1_DISTINCT_OPS
@@ -1926,25 +2093,68 @@ def test_a_decode_step_traces_at_both_widths():
 
 
 def test_the_width_is_the_group_s_and_nothing_simulated_it():
-    """The two halves of "this is an honest TP2", both as measurements.
+    """The group's width is measured; `apply_simulated_tp` is guarded, not observed.
 
-    Neither is a constant. `tp_group_world_size` is read from
-    `get_tp_group().world_size`, so it is what the group has rather than what
-    the config asked for -- the one width figure in the record that a
-    substitution could not fake. `apply_simulated_tp_calls` is what a sentinel
-    installed over both bindings of the function observed; an empty list is the
-    claim, and a non-empty one carries the ATOM frames that called it.
+    `tp_group_world_size` is read from `get_tp_group().world_size`, so it is
+    what the group has rather than what the config asked for -- the one width
+    figure in the record that a substitution could not fake, and the
+    measurement half of this test.
 
-    This used to be `assert record["apply_simulated_tp"] is False` against a
-    literal `False` written into the record four hundred lines earlier, which
-    could not fail and could not go stale. It matters because a TP>1 inventory
-    taken through `apply_simulated_tp` both erases and fabricates: 129
-    `all_reduce` become the identity and appear nowhere, and one `all_gather`
-    becomes six dispatched operators over a half-zeros tensor.
+    `apply_simulated_tp_calls` is the other half, and **it is a forward guard,
+    not an observation about ATOM at TP2 today.** ATOM's one call site -- held
+    by the source scan in the next test -- is in
+    `ModelRunner._setup_device_and_distributed`, which `_build_runner`
+    overrides, so the list cannot be anything but empty: a sentinel whose body
+    is `raise SystemExit` leaves this test passing. It earns its place against
+    the future -- an ATOM that calls the function from a path the capture does
+    run fails here with the frames that called it -- and it replaced
+    `assert record["apply_simulated_tp"] is False` against a literal written
+    into the record, which could not fail at all. It matters because a TP>1
+    inventory taken through `apply_simulated_tp` both erases and fabricates:
+    129 `all_reduce` become the identity and appear nowhere, and one
+    `all_gather` becomes six dispatched operators over a half-zeros tensor.
     """
     for record in (capture(1), capture(2), capture(1, symbolic=True)):
         assert record["tp_group_world_size"] == record["tp"]
         assert record["apply_simulated_tp_calls"] == []
+
+
+def test_apply_simulated_tp_is_called_only_where_the_capture_does_not_go():
+    """The premise under the sentinel, held by reading ATOM rather than stated.
+
+    The sentinel in `_watch_simulated_tp` is a forward guard because ATOM calls
+    `apply_simulated_tp` from exactly one method, and `_build_runner` overrides
+    that method. Nothing checked the first half: a second call site in another
+    overridden method would leave every capture test green and the account
+    false. So every call to the name, anywhere under `atom/`, is listed with the
+    function it sits in, and the list is held.
+
+    Calls are matched by name, as a bare name or as an attribute, which is how
+    both bindings of it are spelled. A call through an alias under another name
+    would not be seen.
+    """
+    tree_root = pathlib.Path(__file__).resolve().parents[2]
+    scanned = 0
+    callers = set()
+    for path in sorted((tree_root / "atom").rglob("*.py")):
+        scanned += 1
+        module = ast.parse(path.read_text(), filename=str(path))
+        for function in ast.walk(module):
+            if not isinstance(function, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                continue
+            for node in ast.walk(function):
+                if not isinstance(node, ast.Call):
+                    continue
+                called = getattr(node.func, "id", getattr(node.func, "attr", None))
+                if called == "apply_simulated_tp":
+                    rel = path.relative_to(tree_root).as_posix()
+                    callers.add((rel, function.name))
+    assert scanned > 100
+    assert callers == {
+        ("atom/model_engine/model_runner.py", "_setup_device_and_distributed")
+    }
+    # And that method is the one the capture's runner replaces.
+    assert "def _setup_device_and_distributed" in inspect.getsource(_build_runner)
 
 
 def test_atom_s_own_buffer_constructor_is_what_runs():
@@ -1981,6 +2191,38 @@ def test_atom_s_own_buffer_constructor_is_what_runs():
     assert concrete["buffer_init"]["symbolic_device_allocations"] == 0
     symbolic_init = symbolic["buffer_init"]
     assert symbolic_init["symbolic_device_allocations"] == symbolic_init["constructed"]
+
+
+def test_the_stubbed_device_names_are_the_ones_the_capture_reads():
+    """Which `torch.cuda` stubs a capture reads, counted rather than listed.
+
+    The stub list is what `_declare_cuda` wrote, so asserting its length would
+    assert the function against itself. What is measured is every read of a
+    stubbed name over a whole capture, and that says which stubs are doing
+    anything: 17 of the 22, the same at both widths and in every pass. The
+    other five are stubbed and never read. They are held as such, so a path
+    that starts reading one -- `mem_get_info` above all, a fictional reading
+    that would size a real KV budget -- fails here instead of being answered
+    quietly.
+    """
+    for tp in (1, 2):
+        for arrangement in (
+            {},
+            {"symbolic": True},
+            {"symbolic": True, "repair_site_one": True},
+            {"step_symbol": True},
+            {"step_symbol": True, "width": SECOND_WIDTH},
+        ):
+            if tp == 2 and arrangement.get("symbolic"):
+                continue
+            record = capture(tp, **arrangement)
+            cuda = record["declared"]["cuda"]
+            declared = set(cuda["import"]) | set(cuda["model_runner"])
+            assert set(record["declared"]["cuda_reads"]) == CUDA_NAMES_READ, (
+                tp,
+                arrangement,
+            )
+            assert declared - CUDA_NAMES_READ == CUDA_NAMES_NEVER_READ
 
 
 def test_the_collectives_at_tp2_are_recorded_by_name_and_call_site():
@@ -2055,12 +2297,92 @@ def test_the_inventory_is_concrete_at_both_widths():
     staged dimension and watches ATOM's own path solve them. A concrete
     inventory is valid only at the shapes it was taken at, so this is the
     sentence that stops anyone evaluating one anywhere else.
+
+    A zero is a fraction, and both halves are held. The denominator is held by
+    family: which families there are, that each carries entries, and that they
+    add up to the total, so "none of the GEMM entries is symbolic" is about
+    GEMM entries that were recorded. The total's floor stays beside it, so a
+    recorder that stopped recording cannot read as a concrete one. The counts
+    themselves are not held; `CONCRETE_FAMILIES` says why and what that costs.
+    The numerator's zero is held by the test after this one, which shows the
+    same census reading a number other than zero when there is a symbol to read.
     """
     for tp in (1, 2):
         record = capture(tp)
         assert record["shape_entries"] > 10000
+        census = record["family_census"]
+        by_family = {family: row["shape_entries"] for family, row in census.items()}
+        assert set(by_family) == CONCRETE_FAMILIES[tp], tp
+        assert all(entries > 0 for entries in by_family.values()), (by_family, tp)
+        assert sum(by_family.values()) == record["shape_entries"], tp
         assert record["non_numeric_shape_entries"] == 0
         assert record["non_numeric_ops"] == []
+        for family, row in census.items():
+            assert row["non_numeric_shape_entries"] == 0, (family, tp)
+
+
+def test_the_census_counts_the_symbols_the_probe_leaves():
+    """The concreteness detector, read where there is something to detect.
+
+    The concrete inventory's census is zero, and zero is also what a census
+    returns when it cannot tell a symbol from a number. So the census is read
+    on the symbolic probe, which leaves a handful of symbols free on staging
+    views, and its four loops over the inventory are held against each other:
+    the total (`shape_census`), the family split (`family_census`), the
+    operators carrying one (`non_numeric_ops`) and the call sites where they
+    were dispatched (`symbolic_sites`). Each is counted separately, so a loop
+    that stops discriminating disagrees with the others, or reads zero where
+    the kinds below say there is something, and fails here by name rather than
+    agreeing with the concrete zero.
+
+    Kinds are held and counts are not: which families and which operators
+    carry a symbol, not how many entries. `PROBE_FAMILIES` says why.
+    """
+    for repaired in (False, True):
+        record = capture(1, symbolic=True, repair_site_one=repaired)
+        census = record["family_census"]
+        by_family = {
+            family: row["non_numeric_shape_entries"]
+            for family, row in census.items()
+            if row["non_numeric_shape_entries"]
+        }
+        assert set(by_family) == PROBE_FAMILIES[repaired], repaired
+        total = record["non_numeric_shape_entries"]
+        assert total == sum(by_family.values()) > 0, repaired
+        assert record["non_numeric_ops"] == PROBE_NON_NUMERIC_OPS[repaired]
+        # Operator by operator, the family loop and the call-site loop count
+        # the same dispatches.
+        from_families = collections.Counter()
+        for row in census.values():
+            from_families.update(row["ops_carrying_a_symbol"])
+        from_sites = collections.Counter()
+        for entry in record["symbolic_sites"]:
+            from_sites[entry["op"]] += entry["n"]
+        assert from_families == from_sites, repaired
+        assert sorted(from_families) == record["non_numeric_ops"], repaired
+
+
+def test_the_census_counts_an_expression_as_a_symbol():
+    """A dimension is numeric only if it is an integer; an expression is not.
+
+    Which expressions the probe happens to produce is a property of ATOM's
+    staging, not of the census, so the rule is held here on a recorder built
+    by hand, with no capture: a negative integer is a number, and each
+    expression -- `2*s0`, `s0 + 1` -- is one non-numeric entry. A detector
+    narrowed to "starts with s" fails here whatever the probe produces.
+    """
+    recorder = _Recorder(pathlib.Path(__file__).resolve().parents[2], COLLECTIVE_OPS)
+    recorder.ops = [
+        ("aten.view.default", [["2*s0", "4"]], [["s0 + 1"]]),
+        ("aten.add.Tensor", [["-1", "8"]], []),
+    ]
+    assert recorder.shape_census() == (5, 2)
+    assert recorder.non_numeric_ops() == ["aten.view.default"]
+    census = recorder.family_census()
+    assert census["view"]["non_numeric_shape_entries"] == 2
+    assert census["elementwise"]["non_numeric_shape_entries"] == 0
+    assert _Recorder._carries_symbol([["2*s0", "4"]], [])
+    assert not _Recorder._carries_symbol([["-1", "8"]], [])
 
 
 def test_the_first_two_specialisation_sites_are_where_they_were_measured():
