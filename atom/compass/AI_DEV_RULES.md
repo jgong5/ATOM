@@ -158,8 +158,8 @@
   gets the label. **Holds are landing preconditions, and there are three:**
   `need human` on the PR or below it (a label on an issue a PR delivers counts as
   on that PR; every escalation rule in this file holds through this label), an
-  APPROVE covering each head (the reviewer checks gates 1-3 before approving, and
-  the approval is gate 4), and the tree check below. A
+  APPROVE covering each head (the reviewer checks gates 1-3 as they apply per task
+  before approving, and the approval is gate 4), and the tree check below. A
   hold names the one that is unmet. **A violation of any other rule seen in an
   approved PR is landed and filed as an issue, not held.** Where a
   handoff note contradicts this file, this file wins.
