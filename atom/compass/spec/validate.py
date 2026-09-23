@@ -52,11 +52,14 @@ field of the merged document, by the decision below, so `validate(document)`
 can never ask that condition however the document was built, and the same spec
 is refused as a `Merge` and clear as a document. That is not a wrong number,
 but it must be visible, because a caller that holds only the document cannot
-ask it. A `validate` verb over a machine file -- `compass spec validate
-machine.yaml` -- is not built yet: no entry point names it, and nothing in this
-package reads a spec file. This module is what it would call. `CONDITIONS` is
-what a count of reach is a count of; a condition added to the check set and not
-to it is one no result can report on.
+ask it. Merging the document again does not recover the pin: a merge whose
+fragments disagree on a method states `mixed`, so a `Merge` holding the saved
+document reports the transfer as not asked too. A `validate` verb over a
+machine file -- `compass spec validate machine.yaml` -- is not built yet: no
+entry point names it, and nothing in this package reads a spec file. This
+module is what it would call. `CONDITIONS` is what a count of reach is a count
+of; a condition added to the check set and not to it is one no result can
+report on.
 
 **The reach of a document is `ASKABLE_OF_A_DOCUMENT`, which is a value and not
 a sentence.** Writing the number down in prose here puts a person between the
@@ -264,8 +267,25 @@ def _reach(
             "pin is in no field of one; ask this of the `Merge` while the "
             "fragments are still in hand"
         )
-    elif merged.transfers:
-        reached(TRANSFERS, STACK_PINS)
+    else:
+        if merged.transfers:
+            reached(TRANSFERS, STACK_PINS)
+        # `mixed` is the method a merge writes when its fragments disagree on
+        # one, so a saved document merged again does not say whether a
+        # transfer went into it, and the merge kept that transfer's source pin
+        # out of the document. Where none of the pins resolved, `reached` has
+        # already reported the condition as not asked.
+        hidden = [repr(f.source) for f in merged.fragments if f.method == "mixed"]
+        if hidden and not any(c.startswith(TRANSFERS) for c in unasked):
+            why = (
+                f"{TRANSFERS} -- method `mixed` in {', '.join(hidden)} does not "
+                "say whether a transfer went into it, and a transfer's source "
+                "pin is in no field of a document"
+            )
+            if merged.transfers:
+                partial.append(f"{why}; it was asked of the transfers stated")
+            else:
+                unasked.append(why)
     return tuple(unasked), tuple(partial)
 
 
