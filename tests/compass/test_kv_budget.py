@@ -195,15 +195,19 @@ def test_no_budget_arithmetic_is_written_anywhere_in_this_package():
     the budget -- as any string in its syntax tree (a name, attribute,
     parameter, keyword, import or string constant, so a call through the
     module, `setattr`, `getattr` and `__dict__` spellings count), none carries
-    `gpu_memory_utilization` the same way except as a dict-display key, and
-    none writes the coefficient of ATOM's safety margin -- read off ATOM's own
-    line, so it follows ATOM -- or its complement as a literal. What is not:
-    the `min(budget, free)` clamp, which has no name to find, a margin spelled
+    `gpu_memory_utilization` the same way except as a string-constant key of
+    a dict display, and none writes the coefficient of ATOM's safety margin --
+    read off ATOM's own line, so it follows ATOM -- or its complement as a
+    literal. An attribute in key position is not exempt, so
+    `{cfg.gpu_memory_utilization: 0}` is refused. What is not: the
+    `min(budget, free)` clamp, which has no name to find, a margin spelled
     some other way (`2 / 100`), a name built at runtime (a concatenation or an
     f-string) or held inside a longer string (source text handed to `exec`),
-    and `gpu_memory_utilization` as a dict-display key: `spec/rules.py` holds
-    it as one to word a refusal. A key names the knob without reading it; a
-    read keyed by one takes its name at runtime, which is listed above.
+    and `gpu_memory_utilization` as a string-constant dict-display key, which
+    `spec/rules.py` holds to word a refusal. What such a dict is then used for
+    is not seen: a read keyed by it (`getattr(cfg, k)`, `vars(cfg)[k]`,
+    including a key imported from another module) or a write through it
+    (`cfg.__dict__.update({...})`, `replace(cfg, **{...})`).
 
     Read as syntax trees rather than as text: the words appear in docstrings
     all over this package, so a grep would pass for as long as somebody kept
@@ -221,7 +225,11 @@ def test_no_budget_arithmetic_is_written_anywhere_in_this_package():
     for module in sorted(COMPASS.rglob("*.py")):
         tree = ast.parse(module.read_text())
         keys = {
-            id(k) for n in ast.walk(tree) if isinstance(n, ast.Dict) for k in n.keys
+            id(k)
+            for n in ast.walk(tree)
+            if isinstance(n, ast.Dict)
+            for k in n.keys
+            if isinstance(k, ast.Constant)
         }
         named = [
             (id(n), s)
@@ -387,8 +395,9 @@ def test_the_refusals_read_exactly_these_config_fields():
 
 @pytest.mark.parametrize("name", _fields_the_refusals_read())
 def test_each_config_field_a_refusal_reads_is_one_atom_declares(name):
-    """Every stub in this file supplies these fields itself, so none of them
-    would notice ATOM renaming one. This reads ATOM's config class instead."""
+    """The stubs that reach these reads supply the fields themselves, so none
+    of them would notice ATOM renaming one. This reads ATOM's config class
+    instead."""
     from atom.config import Config
 
     assert name in {f.name for f in dataclasses.fields(Config)}
