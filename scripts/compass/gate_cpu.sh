@@ -39,10 +39,30 @@ set -uo pipefail
 #     not failed safely.
 # The rule this encodes: the verdict is the script's only output contract, so no
 # path may skip it, including the ones that give up before measuring anything.
+#
+# The verdict line also carries its reason, because it is the only line every
+# pipe keeps. `gate_cpu.sh | tail -6` hands the caller tail's exit status, not
+# this script's, and nothing a script does can change that: the status of a
+# pipeline belongs to the caller's shell. What survives is the text, and the
+# three common pipes keep different parts of it -- `2>/dev/null | tail -6` drops
+# every stderr line, so a bare `GATE_CPU_RC=98` there sits under pytest's green
+# summary with nothing to say why it is not a pass. Stated on the verdict line,
+# the reason survives any pipe that keeps the verdict at all.
+#
+# Refusing to run when stdout is a pipe was weighed and rejected. It cannot tell
+# `| tail` from the callers that keep the status: under `docker exec`, which is
+# how the gate runs on the CPU node, stdout is a FIFO too, as it is under any
+# harness that captures output. Every normal run would need an override, and an
+# override set by habit lets `| tail` through with it.
 finish() {
-    printf 'GATE_CPU_RC=%s\n' "$1"
+    if [ "$1" -eq 0 ]; then
+        printf 'GATE_CPU_RC=0 PASSED\n'
+    else
+        printf 'GATE_CPU_RC=%s NOT PASSED -- %s\n' "$1" "$2"
+    fi
     exit "$1"
 }
+printf 'verdict: the last line of stdout; if this run is piped, $? is the pipe'"'"'s\n'
 
 # pytest's -r is store-last-wins, so a caller's -rE silently replaces the -rf
 # below. This gate's own verdict is pytest's exit code and survives that, but
@@ -58,23 +78,23 @@ for arg in "$@"; do
         printf 'REFUSED: %s sets pytest -r, which this gate owns. It selects the\n' "$arg" >&2
         printf '  report lines that name the failing tests, and -r is\n' >&2
         printf '  store-last-wins, so your flag would replace them silently.\n' >&2
-        finish 95
+        finish 95 "refused a -r argument; nothing was run"
         ;;
     esac
 done
 
 INTEGRATION=${COMPASS_INTEGRATION_REF:-feature/atomcompass_new}
 
-ROOT=$(compass_tree_root) || finish $?
-cd "$ROOT" || finish 90
+ROOT=$(compass_tree_root) || finish $? "the tree to measure could not be resolved; nothing was run"
+cd "$ROOT" || finish 90 "cannot cd into the tree; nothing was run"
 compass_env "$ROOT"
-compass_require_tree "$ROOT" || finish $?
+compass_require_tree "$ROOT" || finish $? "atom does not import from this tree; nothing was run"
 compass_describe "$ROOT"
 
 EXCLUDE=$ROOT/scripts/compass/cpu_gate_exclude.txt
 TRIGGERS=$ROOT/scripts/compass/gpu_gate_triggers.txt
-[ -r "$EXCLUDE" ] || { printf 'FATAL: cannot read %s\n' "$EXCLUDE" >&2; finish 94; }
-[ -r "$TRIGGERS" ] || { printf 'FATAL: cannot read %s\n' "$TRIGGERS" >&2; finish 94; }
+[ -r "$EXCLUDE" ] || { printf 'FATAL: cannot read %s\n' "$EXCLUDE" >&2; finish 94 "exclusion list unreadable; nothing was run"; }
+[ -r "$TRIGGERS" ] || { printf 'FATAL: cannot read %s\n' "$TRIGGERS" >&2; finish 94 "trigger list unreadable; nothing was run"; }
 
 # Parse defensively: strip a trailing CR so a list that has been through a
 # Windows editor does not turn into --ignore=tests/foo.py^M, which pytest
@@ -92,7 +112,7 @@ while IFS= read -r line || [ -n "$line" ]; do
     [ -e "$ROOT/$line" ] || {
         printf 'FATAL: %s lists %s, which does not exist.\n' "$EXCLUDE" "$line" >&2
         printf '       Re-run regen_cpu_gate_exclude.sh.\n' >&2
-        finish 94
+        finish 94 "exclusion list names a missing file; nothing was run"
     }
     IGN+=(--ignore="$line")
     NEX=$((NEX + 1))
@@ -109,7 +129,7 @@ SRC=
 GPU_SRC_UNKNOWN=
 if [ -n "${COMPASS_CHANGED_FILES:-}" ]; then
     [ -r "$COMPASS_CHANGED_FILES" ] ||
-        { printf 'FATAL: COMPASS_CHANGED_FILES=%s unreadable\n' "$COMPASS_CHANGED_FILES" >&2; finish 94; }
+        { printf 'FATAL: COMPASS_CHANGED_FILES=%s unreadable\n' "$COMPASS_CHANGED_FILES" >&2; finish 94 "COMPASS_CHANGED_FILES unreadable; nothing was run"; }
     CHANGED=$(cat "$COMPASS_CHANGED_FILES")
     SRC="COMPASS_CHANGED_FILES"
 elif git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1 &&
@@ -139,10 +159,19 @@ elif [ -r "$ROOT/.compass-changed" ]; then
     CHANGED=$(cat "$ROOT/.compass-changed")
     SRC=".compass-changed stamp"
 else
-    # No git, no supplied list, no stamp: the question cannot be answered. It is
-    # recorded as unanswered, and the run below exits 98 rather than passing --
-    # reporting "GPU not required" here would be a guess that reads as a clear.
-    GPU_SRC_UNKNOWN=1
+    # No supplied list, no usable diff, no stamp: the question cannot be
+    # answered. It is recorded as unanswered, with which of the three ways in
+    # failed, and the run below exits 98 rather than passing -- reporting "GPU
+    # not required" here would be a guess that reads as a clear. Only a tree with
+    # no .git is a staging omission; a git checkout reaches here because the
+    # integration ref does not resolve, or shares no commit with HEAD.
+    if ! git -C "$ROOT" rev-parse --git-dir >/dev/null 2>&1; then
+        GPU_SRC_UNKNOWN="this tree was never stamped (no .git, no .compass-changed); a staging omission, see snapshot.sh"
+    elif REF=$(compass_resolve_ref "$ROOT" "$INTEGRATION"); then
+        GPU_SRC_UNKNOWN="a git checkout with no .compass-changed, and $REF shares no commit with HEAD"
+    else
+        GPU_SRC_UNKNOWN="a git checkout with no .compass-changed, and $INTEGRATION resolves to no commit here"
+    fi
 fi
 
 if [ -z "$GPU_SRC_UNKNOWN" ]; then
@@ -160,7 +189,7 @@ if [ -z "$GPU_SRC_UNKNOWN" ]; then
 fi
 
 if [ -n "$GPU_SRC_UNKNOWN" ]; then
-    printf 'gpu:    UNKNOWN -- this tree was never stamped (no .compass-changed); a staging omission, see snapshot.sh\n'
+    printf 'gpu:    UNKNOWN -- %s\n' "$GPU_SRC_UNKNOWN"
 elif [ -n "$GPU_NEEDED" ]; then
     printf 'gpu:    REQUIRED (%s)\n' "$SRC"
     printf '%s' "$GPU_NEEDED" | sed 's/^/          /'
@@ -197,19 +226,17 @@ if [ "$RC" -ne 0 ]; then
     printf 'timing property and fails intermittently on a loaded box. The\n' >&2
     printf 'scripts/compass/README.md section names it, what it was measured to do, and\n' >&2
     printf 'to run gates one at a time. It is not a Compass defect and is not excluded.\n' >&2
-    finish "$RC"
+    finish "$RC" "pytest failed; the FAILED lines above name the tests"
 fi
 
 if [ -n "$GPU_SRC_UNKNOWN" ]; then
-    printf 'The CPU tier is green, but the test gate is not passed: this tree was\n' >&2
-    printf 'never stamped -- it carries no .compass-changed, which a bare `git\n' >&2
-    printf 'archive` does not write and snapshot.sh does. So this run cannot tell\n' >&2
-    printf 'whether the diff needs the GPU tier, and an unanswered question is not a\n' >&2
-    printf '"no". That is a staging omission, not a finding about the tree.\n' >&2
+    printf 'The CPU tier is green, but the test gate is not passed: %s.\n' "$GPU_SRC_UNKNOWN" >&2
+    printf 'So this run cannot tell whether the diff needs the GPU tier, and an\n' >&2
+    printf 'unanswered question is not a "no". It is not a finding about the tree.\n' >&2
     printf '  Fix by any one of: stage with scripts/compass/snapshot.sh, which stamps\n' >&2
     printf '  .compass-changed; set COMPASS_CHANGED_FILES=<file listing the diff>; or\n' >&2
     printf '  run in a tree where %s resolves.\n' "$INTEGRATION" >&2
-    finish 98
+    finish 98 "unknown whether this diff needs the GPU tier: $GPU_SRC_UNKNOWN"
 fi
 
 # A green CPU tier is not a passed gate when the diff lands in the blind spot:
@@ -219,7 +246,7 @@ if [ -n "$GPU_NEEDED" ]; then
     if [ -z "$DONE" ]; then
         printf 'this diff touches the CPU tier'"'"'s blind spot; the GPU tier has not run.\n' >&2
         printf '  Run gate_gpu.sh, then re-run with COMPASS_GPU_GATE_DONE=<that tree'"'"'s HEAD>\n' >&2
-        finish 98
+        finish 98 "this diff needs the GPU tier, which has not run; run gate_gpu.sh"
     fi
     # An attestation names a tree. Without a commit we cannot check it names
     # THIS tree, and accepting it unchecked would make the whole rule
@@ -229,12 +256,12 @@ if [ -n "$GPU_NEEDED" ]; then
         printf 'COMPASS_GPU_GATE_DONE=%s cannot be checked: this tree has no commit.\n' "$DONE" >&2
         printf '  No .git and no .compass-commit stamp, so the attestation could name\n' >&2
         printf '  any tree. Rebuild the snapshot with scripts/compass/snapshot.sh.\n' >&2
-        finish 98
+        finish 98 "COMPASS_GPU_GATE_DONE cannot be checked; this tree has no commit"
     fi
     if [ "$DONE" != "$HEAD_SHA" ]; then
         printf 'COMPASS_GPU_GATE_DONE=%s but this tree is %s.\n' "$DONE" "$HEAD_SHA" >&2
         printf '  The GPU tier passed on a different tree. Re-run it here.\n' >&2
-        finish 98
+        finish 98 "COMPASS_GPU_GATE_DONE names a different tree; run gate_gpu.sh here"
     fi
     printf 'gpu:    satisfied by COMPASS_GPU_GATE_DONE=%s\n' "${DONE:0:9}"
 fi
