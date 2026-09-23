@@ -5,9 +5,10 @@ The GPU gate judges an equality, not a floor: it expects its baseline pass count
 plus whatever `tests/compass/` contributes on the tree in front of it, minus what
 `tests/compass/` contributed at the baseline. That surplus therefore has to be
 derived on any tree the gate can be pointed at, including the trees that carry no
-Compass tests at all -- the integration branch, and every branch that has not
-taken this phase's work yet. A gate that produces no verdict there cannot be used
-to show that a branch is gate-neutral, which is most of what it is for.
+Compass tests at all -- every branch that has not taken this phase's work, as the
+integration branch had not until 4c16792d9. A gate that produces no verdict there
+cannot be used to show that a branch is gate-neutral, which is most of what it is
+for.
 
 The defect these tests pin: the derivation used to be
 `pytest tests/compass --collect-only`, which exits 4 with `file or directory not
@@ -165,16 +166,8 @@ def test_gate_gpu_states_the_expectation_for_a_tree_without_compass_tests():
     )
 
 
-@pytest.mark.parametrize(
-    "stated, constant",
-    [
-        (r"\*\*(\d+) passed / \d+ failed\*\*", "BASE_PASSED"),
-        (r"\*\*\d+ passed / (\d+) failed\*\*", "BASE_FAILED"),
-        (r"failed\*\* at `([0-9a-f]+)`", "BASE_COMMIT"),
-    ],
-    ids=["passed", "failed", "commit"],
-)
-def test_the_readme_states_the_baseline_the_gate_holds(stated, constant):
+@pytest.mark.parametrize("field", ["passed", "failed", "commit"])
+def test_the_readme_states_the_baseline_the_gate_holds(field):
     # README.md restates the baseline gate_gpu.sh judges against. A rebaseline
     # edits the gate's constants and nothing else, so without this join the README
     # keeps describing the previous baseline in silence. Same shape as the
@@ -185,10 +178,15 @@ def test_the_readme_states_the_baseline_the_gate_holds(stated, constant):
         if ln.startswith(f"| `{GATE_GPU.name}` |")
     ]
     assert len(row) == 1, f"{README.name} has {len(row)} rows for {GATE_GPU.name}"
+    stated = (
+        r"\*\*(?P<passed>\d+) passed / (?P<failed>\d+) failed\*\* "
+        r"at `(?P<commit>[0-9a-f]+)`"
+    )
     found = re.search(stated, row[0])
     assert found, f"{README.name}'s {GATE_GPU.name} row no longer states /{stated}/"
+    constant = f"BASE_{field.upper()}"
     value = _base()[constant]
-    assert found[1] == value, (
+    assert found[field] == value, (
         f"{README.name} states {found[0]} but {GATE_GPU.name} has {constant}={value}. "
         "Update the README row to match the gate."
     )

@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # SPDX-License-Identifier: MIT
 #
-# Per-task test gate: the test files that run without a GPU driver, ~30 s.
+# Per-task test gate: the test files that run without a GPU driver.
 # Green is the bar: this subset really is green.
 #
 # Excluded, and why neither is a judgement call:

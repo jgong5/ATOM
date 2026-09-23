@@ -14,7 +14,7 @@
 # indentation on the excluded side -- 190 of this tree's `import atom.*`
 # lines are indented -- but coverage is credited only for a module-level import
 # in a CPU-tier file that collects at least one test, because those are the only
-# imports that provably execute. The MODULE-LEVEL half is what carries both
+# imports that provably execute. At 236abfd9a the MODULE-LEVEL half carried both
 # measured counter-examples: test_moe_dp_token_capacity.py:39 imports topK
 # inside a test marked skipif(not torch.cuda.is_available()), and
 # tests/test_mla_index_cache.py:99-100 imports ModelRunner indented inside a

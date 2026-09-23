@@ -184,7 +184,7 @@ fi
 
 # The surplus this tree is allowed, derived from this tree rather than declared.
 # An absent tests/compass/ counts zero and the gate still produces a verdict --
-# on the integration branch that is 4779 + 0 - 49 = 4730, which is what a tree
+# on such a tree that is 4779 + 0 - 49 = 4730, which is what a tree
 # without this phase's tests measures. See compass_compass_pass_count in _lib.sh
 # for why that is a count and not a refusal.
 COMPASS_N=$(compass_compass_pass_count "$ROOT") || finish $? "the tests/compass pass count has no source; the suite was not run"

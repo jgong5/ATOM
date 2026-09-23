@@ -9,9 +9,9 @@
 # spot unless a CPU-tier test that actually runs names it too.
 #
 # Three decisions make that sentence operational. Decisions 1 and 3 were each
-# forced by a measured counter-example in this tree, named below so the next
-# reader does not have to rediscover it; decision 2 removes no path from this
-# tree and is kept as a forward guard, which is also said below rather than left
+# forced by a measured counter-example, named below with its commit so the next
+# reader does not have to rediscover it; decision 2 removed no path at 236abfd9a
+# and is kept as a forward guard, which is also said below rather than left
 # to be inferred from this sentence.
 #
 #   1. Imports are read at ANY indentation, not just column 0. The previous
@@ -23,14 +23,14 @@
 #   2. A test whose file is not collected covers nothing, so coverage is
 #      credited only from a CPU-tier file that `pytest --collect-only` shows
 #      collecting at least one test. MEASURED at 236abfd9a in xiaobizh_n18_cpu,
-#      2026-09-20: this probe removes NO path from this tree. Run whole with it,
+#      2026-09-20: this probe removed NO path from that tree. Run whole with it,
 #      and whole without it -- crediting every CPU-tier file, collecting or not
 #      -- the result is 30 triggers both ways and the difference is empty. It
-#      withholds 15 coverage paths; exactly one of them,
+#      withheld 15 coverage paths; exactly one of them,
 #      atom/model_ops/v4_kernels/state_writes.py, is even a candidate, and that
 #      one sits under the candidate SUBTREE entry atom/model_ops/v4_kernels/,
 #      so the collapse at the bottom of this script absorbs it whether its
-#      coverage was credited or not. It is kept as a forward guard on trees this
+#      coverage was credited or not. It is kept as a forward guard on trees that
 #      one does not represent, NOT because anything here depends on it, and it
 #      is not free: a full `pytest --collect-only` over the CPU tier, plus a
 #      refusal path (exit 97). Decision 3, not this one, carries both of the
@@ -130,7 +130,7 @@ N_DEAD=$((N_CPU - N_LIVE))
 # --- import extraction -------------------------------------------------------
 # `from a.b import c, d` yields a.b.c and a.b.d, not the bare package a.b. The
 # previous version produced a.b, and `from atom.model_ops import eplb` therefore
-# resolved to the whole 106-file atom/model_ops/ subtree, which then swallowed
+# resolved to the whole atom/model_ops/ subtree, which then swallowed
 # every sibling entry by the subtree rule at the bottom of this script.
 refs() { # $1 = the import-keyword prefix regex. The difference between the two
          # call sites is entirely here, so get it wrong and the asymmetry that
@@ -232,10 +232,12 @@ N_COV=$(grep -c . "$D/covered")
 N_IND=$(xargs -r grep -hcE '^[[:space:]]+(from|import)[[:space:]]+atom\.' <"$D/all" 2>/dev/null |
     awk '{ s += $1 } END { printf "%d", s + 0 }')
 
-# The header is generated, counts and all. Every number in it came from this
-# run over this tree. The previous file carried them by hand, and by hand they
-# went stale: a header shipped crediting its counts to a commit at which
-# tests/compass/ did not yet exist.
+# The header is generated, counts and all. Every count in its `Measured at`
+# block, and the indented-import figure, comes from this run over this tree; the
+# template's other figures and line citations name the commit they were measured
+# at. The previous file carried its counts by hand, and by hand they went stale:
+# a header shipped crediting its counts to a commit at which tests/compass/ did
+# not yet exist.
 TMP=$OUT.tmp
 {
     cat <<'HDR'
@@ -255,7 +257,7 @@ TMP=$OUT.tmp
 # indentation on the excluded side -- @@IND@@ of this tree's `import atom.*`
 # lines are indented -- but coverage is credited only for a module-level import
 # in a CPU-tier file that collects at least one test, because those are the only
-# imports that provably execute. The MODULE-LEVEL half is what carries both
+# imports that provably execute. At 236abfd9a the MODULE-LEVEL half carried both
 # measured counter-examples: test_moe_dp_token_capacity.py:39 imports topK
 # inside a test marked skipif(not torch.cuda.is_available()), and
 # tests/test_mla_index_cache.py:99-100 imports ModelRunner indented inside a
