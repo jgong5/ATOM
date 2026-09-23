@@ -645,6 +645,24 @@ def test_a_desk_fix_refusal_does_not_hide_the_expensive_one():
     assert "16" in str(checked) and "7.3.0" in str(checked)
 
 
+def test_the_stack_is_asked_of_the_pins_a_partial_document_carries():
+    # A pin the document leaves out is reported once, as missing, by the schema
+    # half. The stack question is still asked of the pins it does carry, so the
+    # moved one is found, and the absent one is named as the part it could not
+    # be asked of -- rather than the check itself declining the absent field and
+    # taking every other result of the run down with it.
+    document = merged().document
+    del document["device"]["software_pinned_to"]["rccl"]
+    with pytest.warns(StackMismatch):
+        checked = validate(document, observed_stack=dict(STACK, rocm="7.3.0"))
+    assert checked.spec is None
+    assert [refusal.rule for refusal in checked.refusals] == [Rule.SHAPE]
+    assert [component for component, _, _ in checked.stack_differences] == ["rocm"]
+    (in_part,) = checked.asked_in_part
+    assert in_part.startswith(STACK_ASKED)
+    assert "`device.software_pinned_to.rccl`" in in_part
+
+
 def test_a_question_asked_of_part_of_what_it_reads_is_not_called_unasked():
     # The width tables are what the width question reads. With one of them
     # gone the question is still asked of the other -- width 16 is still
