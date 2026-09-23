@@ -27,6 +27,7 @@ import ast
 import collections
 import pathlib
 import re
+from importlib.util import resolve_name
 from types import SimpleNamespace
 from typing import NamedTuple
 
@@ -746,9 +747,11 @@ def test_the_scan_looks_at_both_sides_of_the_reply():
 
     Naming files bounds the scan from below only, and every wider scope -- up
     to `atom/` itself, which is the scope this one replaced -- satisfies a
-    lower bound. The second assertion is the upper one: a package the reply
-    never reaches must sit outside every root, so a scan widened back over
-    `atom/compass` fails here instead of passing quietly.
+    lower bound. The second assertion is the upper one, and it is exact: the
+    roots are the engine and the runner package, each holding a
+    `model_runner.py` -- ATOM's, which produces the reply, and the Compass one
+    that stands in for it. A sibling added to the constant, `atom/compass/clock`
+    say, fails here instead of passing quietly.
     """
     scanned = {
         str(path.relative_to(REPO))
@@ -760,8 +763,8 @@ def test_the_scan_looks_at_both_sides_of_the_reply():
         "atom/compass/runner/overrides.py",
         "atom/compass/runner/model_runner.py",
     } <= scanned
-    spec = REPO / "atom" / "compass" / "spec"
-    assert not any(spec.is_relative_to(root) for root in REPLY_SURFACE)
+    producers = {root: (root / "model_runner.py").is_file() for root in REPLY_SURFACE}
+    assert producers == {ENGINE: True, PACKAGE: True}
 
 
 def test_the_scan_still_catches_the_string_inside_the_runner_package(tmp_path):
@@ -787,14 +790,24 @@ def test_the_scan_ignores_a_compass_package_the_reply_never_reaches(tmp_path):
 def test_the_reply_assertion_scans_the_roots_the_constant_names(monkeypatch):
     """The tests above hold `REPLY_SURFACE`; this one holds its reader.
 
-    With the surface emptied, the profiler-reply assertion has nowhere to find
-    the producer and must fail. An assertion that scans roots written out at
-    its own call site ignores the constant and passes here, and it is the
-    whole-tree scan that call site used to hold.
+    The surface is emptied and the scan replaced by a spy that records the
+    roots it is handed, so the profiler-reply assertion must scan the constant
+    and nothing else. Roots written out at the call site, a fallback for when
+    the constant is empty, or a root added beside it -- which lets a mention in
+    that package fail a test about this reply -- reach the spy as something
+    other than the empty tuple, and a scan that bypasses `_mentions` reaches it
+    not at all.
     """
+    seen = []
+
+    def spy(roots, needle):
+        seen.append(roots)
+        return {"atom/model_engine/model_runner.py"}
+
     monkeypatch.setitem(globals(), "REPLY_SURFACE", ())
-    with pytest.raises(AssertionError):
-        test_the_profiler_replies_are_forwarded_whole_and_never_unpacked()
+    monkeypatch.setitem(globals(), "_mentions", spy)
+    test_the_profiler_replies_are_forwarded_whole_and_never_unpacked()
+    assert seen == [()]
 
 
 def test_the_two_names_no_caller_waits_for_and_what_replying_costs():
@@ -1033,7 +1046,10 @@ def test_the_zero_block_form_in_the_tree_answers_two_of_the_four_keys():
 # The sentences between them are not read. Which half of the table parks its
 # caller, and whether an engine import sits at module scope, differ from their
 # false forms only in wording, and asserting wording is not a check on what the
-# wording claims.
+# wording claims. Which function holds which engine name is not read either: a
+# bullet is held to the union of the names and the functions they are imported
+# in, not to the pairs. Nor is an engine module loaded through `__import__`,
+# which is a call and not an import statement.
 
 CITATION = r"`([a-z_]+\.py:\d+)`"
 # Words from two up: a split needs two, so "the one module here" is no count.
@@ -1145,6 +1161,19 @@ def test_every_site_the_package_docstring_cites_is_one_no_caller_waits_for():
     }
 
 
+def _imported(node, alias):
+    """The absolute module an import names, relative spellings resolved.
+
+    The alias is joined on only when the module is not itself in the engine,
+    so `from atom import model_engine` reads as `atom.model_engine`.
+    """
+    if isinstance(node, ast.Import):
+        return alias.name
+    module = resolve_name("." * node.level + (node.module or ""), "atom.compass.runner")
+    engine = module.startswith("atom.model_engine")
+    return module if engine else f"{module}.{alias.name}"
+
+
 def _engine_imports(mod):
     """(name bound, engine module, enclosing function) for each engine import."""
     tree = ast.parse((PACKAGE / f"{mod}.py").read_text())
@@ -1155,11 +1184,11 @@ def _engine_imports(mod):
         for c in ast.walk(f)
     }
     return [
-        (a.asname or a.name, getattr(n, "module", None) or a.name, scope.get(n))
+        (a.asname or a.name, _imported(n, a), scope.get(n))
         for n in ast.walk(tree)
         if isinstance(n, (ast.Import, ast.ImportFrom))
         for a in n.names
-        if (getattr(n, "module", None) or a.name).startswith("atom.model_engine")
+        if _imported(n, a).startswith("atom.model_engine")
     ]
 
 
