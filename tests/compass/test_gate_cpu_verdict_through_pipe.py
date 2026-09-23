@@ -72,6 +72,14 @@ def test_unpiped_the_gate_exits_98(gpu_tree):
     assert out.returncode == 98, out.stdout + out.stderr
 
 
+def test_the_verdict_key_is_printed_exactly_once(gpu_tree):
+    # A reader taking the first match must land on the verdict, not on prose
+    # that mentions the key.
+    out = _run(gpu_tree, "{gate} 2>&1")
+    keyed = [line for line in out.stdout.splitlines() if "GATE_CPU_RC=" in line]
+    assert len(keyed) == 1, keyed
+
+
 @pytest.mark.parametrize(
     "pipe", ["| tail -6", "2>&1 | tail -6", "2>/dev/null | tail -6"]
 )
@@ -89,17 +97,27 @@ def test_a_piped_run_still_reads_as_not_passed_and_says_why(gpu_tree, pipe):
     )
 
 
-def test_a_git_checkout_is_not_called_unstamped(tmp_path):
+@pytest.mark.parametrize(
+    "orphan, cause",
+    [(False, "resolves to no commit"), (True, "shares no commit with HEAD")],
+)
+def test_a_git_checkout_is_not_called_unstamped(tmp_path, orphan, cause):
     root = _tree(tmp_path / "ATOM", stamped=False)
     git = ["git", "-C", str(root), "-c", "user.name=t", "-c", "user.email=t@t"]
     subprocess.run(git + ["init", "-q"], check=True)
     subprocess.run(git + ["add", "-A"], check=True)
     subprocess.run(git + ["commit", "-qm", "t"], check=True)
+    if orphan:
+        # An integration branch with no history in common with HEAD.
+        tree = git + ["commit-tree", "HEAD^{tree}", "-m", "o"]
+        sha = subprocess.run(tree, check=True, capture_output=True, text=True)
+        branch = ["branch", "feature/atomcompass_new", sha.stdout.strip()]
+        subprocess.run(git + branch, check=True)
     out = _run(root, "{gate}")
     gpu = [line for line in out.stdout.splitlines() if line.startswith("gpu:")]
     assert out.returncode == 98 and gpu, out.stdout + out.stderr
     assert "never stamped" not in gpu[0], gpu[0]
-    assert "feature/atomcompass_new resolves to no commit" in gpu[0], gpu[0]
+    assert f"feature/atomcompass_new {cause}" in gpu[0], gpu[0]
 
 
 def test_a_tree_with_no_git_and_no_stamp_is_still_called_unstamped(tmp_path):

@@ -62,7 +62,7 @@ finish() {
     fi
     exit "$1"
 }
-printf 'verdict: the last line, GATE_CPU_RC=<n>; if this run is piped, $? is the pipe'"'"'s\n'
+printf 'verdict: the last line of stdout; if this run is piped, $? is the pipe'"'"'s\n'
 
 # pytest's -r is store-last-wins, so a caller's -rE silently replaces the -rf
 # below. This gate's own verdict is pytest's exit code and survives that, but
